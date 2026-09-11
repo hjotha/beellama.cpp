@@ -1525,7 +1525,7 @@ struct ggml_backend_cuda_context {
     static size_t cuda_graph_memory_headroom_bytes() {
         static const size_t safe_headroom = [] {
             const char * env = getenv("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB");
-            const int headroom_mb = env != nullptr ? atoi(env) : 32;
+            const int headroom_mb = env != nullptr ? atoi(env) : 18;
             return (size_t) std::max(headroom_mb, 0) * 1024 * 1024;
         }();
         return safe_headroom;
