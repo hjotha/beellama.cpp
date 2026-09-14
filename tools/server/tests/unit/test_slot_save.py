@@ -546,3 +546,124 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("automatic", [False, True])
+def test_recurrent_slot_disk_cache(tmp_path, monkeypatch, automatic):
+    from pathlib import Path
+
+    model = os.environ.get("SLOT_SAVE_HTTP_MODEL")
+    if not model:
+        pytest.skip("SLOT_SAVE_HTTP_MODEL must point to a local FULL/recurrent GGUF")
+    monkeypatch.setenv("LLAMA_ARG_SLOT_SAVE_AUTO", "1" if automatic else "0")
+    srv = ServerProcess()
+    srv.model_file = model
+    srv.model_hf_repo = srv.model_hf_file = None
+    srv.n_ctx = 4096
+    srv.n_slots = 1
+    srv.n_batch = srv.n_ubatch = 256
+    srv.n_predict = 1
+    srv.temperature = 0.0
+    srv.fit = "off"
+    srv.fa = "on"
+    srv.cache_ram = 0
+    srv.no_cache_idle_slots = True
+    srv.slot_save_path = str(tmp_path)
+    srv.log_path = str(tmp_path / "server.log.tmp")
+    srv.server_metrics = True
+    srv.server_slots = True
+
+    def complete(tokens, **extra):
+        response = srv.make_request("POST", "/completion", {
+            "prompt": tokens, "n_predict": 1, "cache_prompt": True, "temperature": 0, **extra,
+        })
+        assert response.status_code == 200, response.body
+        return response.body
+
+    def restart():
+        srv.stop()
+        srv.start(timeout_seconds=180)
+
+    def restore(path):
+        if not automatic:
+            response = srv.make_request("POST", "/slots/0?action=restore", {"filename": path.name})
+            assert response.status_code == 200, response.body
+
+    srv.start(timeout_seconds=180)
+    response = srv.make_request("POST", "/tokenize", {
+        "content": "The reference code is BLUE. " * 100, "add_special": True,
+    })
+    tokens = response.body["tokens"]
+    assert len(tokens) > 256
+    first = complete(tokens)
+    if automatic:
+        deadline = time.monotonic() + 10
+        while not list(tmp_path.glob("auto-*.bin.meta")) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        paths = list(tmp_path.glob("auto-*.bin"))
+        assert len(paths) == 1
+        path = paths[0]
+    else:
+        path = tmp_path / "manual.bin"
+        response = srv.make_request("POST", "/slots/0?action=save", {"filename": path.name})
+        assert response.status_code == 200, response.body
+        assert response.body["n_saved"] == len(tokens)
+    sidecar = Path(str(path) + ".logits")
+    assert sidecar.is_file()
+    assert struct.unpack_from("<I", sidecar.read_bytes(), 12)[0] == len(tokens)
+    original_state = path.read_bytes()
+    original_logits = sidecar.read_bytes()
+
+    restart()
+    restore(path)
+    replay = complete(tokens)
+    assert replay["timings"]["prompt_n"] == 0, replay
+    assert replay["content"] == first["content"]
+    metrics = requests.get(f"http://{srv.server_host}:{srv.server_port}/metrics", timeout=10).text
+    predicted = re.search(r"^llamacpp:tokens_predicted_total ([0-9.]+)$", metrics, re.MULTILINE)
+    assert predicted and float(predicted.group(1)) == 1, metrics
+    print(f"disk-cache automatic={automatic}: cold prompt_n={first['timings']['prompt_n']}, replay prompt_n=0, content={replay['content']!r}")
+
+    restart()
+    restore(path)
+    suffix = srv.make_request("POST", "/tokenize", {"content": " Continue: BLUE"}).body["tokens"]
+    extended = complete(tokens + suffix)
+    assert 0 < extended["timings"]["prompt_n"] <= len(suffix) + 1, extended
+    print(f"disk-cache automatic={automatic}: suffix prompt_n={extended['timings']['prompt_n']}")
+
+    # A corrupt sidecar must use a complete prefill, not stale logits.
+    srv.stop()
+    path.write_bytes(original_state)
+    sidecar.write_bytes(original_logits[:8])
+    srv.start(timeout_seconds=180)
+    restore(path)
+    fallback = complete(tokens)
+    assert fallback["timings"]["prompt_n"] == len(tokens), fallback
+    assert fallback["content"] == first["content"]
+    print(f"disk-cache automatic={automatic}: corrupt-sidecar fallback prompt_n={fallback['timings']['prompt_n']}")
+
+    if automatic:
+        # The native token payload must agree with metadata before claiming reuse.
+        srv.stop()
+        altered = bytearray(original_state)
+        struct.pack_into("=i", altered, STATE_FILE_HEADER_SIZE, tokens[1])
+        path.write_bytes(altered)
+        sidecar.write_bytes(original_logits)
+        srv.start(timeout_seconds=180)
+        fallback = complete(tokens)
+        assert fallback["timings"]["prompt_n"] == len(tokens), fallback
+        assert fallback["content"] == first["content"]
+        print(f"disk-cache automatic=True: mismatched-state fallback prompt_n={fallback['timings']['prompt_n']}")
+
+        srv.stop()
+        path.write_bytes(original_state)
+        meta = Path(str(path) + ".meta")
+        data = bytearray(meta.read_bytes())
+        struct.pack_into("<I", data, len(data) - len(tokens) * 4 - 12, 0x7fffffff)
+        meta.write_bytes(data)
+        srv.start(timeout_seconds=180)
+        fallback = complete(tokens)
+        assert fallback["timings"]["prompt_n"] == len(tokens), fallback
+        print(f"disk-cache automatic=True: oversized-metadata fallback prompt_n={fallback['timings']['prompt_n']}")
+    srv.stop()

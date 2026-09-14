@@ -19,10 +19,11 @@
 
 ## About this fork
 
-This fork of `ggml-org/llama.cpp` adds adaptive MTP context switching with resident model weights, context-based model routing, cache migration, CUDA memory recovery, NVIDIA GPU governors, and experimental paged KV/SnapKV serving. Standard upstream capabilities, including the CLI, web UI, model conversion, quantization and OpenAI-compatible server, remain available.
+This fork of `ggml-org/llama.cpp` adds adaptive MTP context switching with resident model weights, context-based model routing, cache migration, automatic disk prompt/KV persistence, CUDA memory recovery, NVIDIA GPU governors, and experimental paged KV/SnapKV serving. Standard upstream capabilities, including the CLI, web UI, model conversion, quantization and OpenAI-compatible server, remain available.
 
 - [Current GOKAYA deployment](#current-gokaya-deployment-2026-09-14)
 - [Adaptive context and cache reuse](#adaptive-context-with-resident-weights)
+- [Automatic disk prompt cache](#automatic-disk-prompt-cache)
 - [Router mode](#context-based-router-mode)
 - [CUDA and GPU controls](#cuda-memory-recovery-and-gpu-governors)
 - [Paged KV, SnapKV and speculation](#paged-kv-snapkv-and-other-speculation)
@@ -30,9 +31,9 @@ This fork of `ggml-org/llama.cpp` adds adaptive MTP context switching with resid
 
 ### Current GOKAYA deployment (2026-09-14)
 
-The development checkout is `/home/hjotha/llama` on GOKAYA (`192.168.1.57`), branch `master`; `origin` is `hjotha/llama.cpp` and `upstream` is the official repository. The source includes upstream `093a2f86c` and the later upstream fix `661643e43`. The running build inspected for this update reports `b11080-5ca5b7ea6`.
+The development checkout is `/home/hjotha/llama` on GOKAYA (`192.168.1.57`), branch `master`; `origin` is `hjotha/llama.cpp` and `upstream` is the official repository. The source includes upstream `093a2f86c` and the later upstream fix `661643e43`. The slot-save release includes the reviewed integration of upstream PRs 24003/24004 with the fork's tri-profile and MTP paths.
 
-The system unit `llama-server-root.service` runs `/home/hjotha/releases/llama-adaptive-optimized-20260914/build-cuda-vulkan/bin/llama-server` on port `8090`. It loads `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` directly into a single adaptive process. The old `/home/hjotha/prod-two-tier.ini` still exists but is not used by the active unit.
+The system unit `llama-server-root.service` runs `/home/hjotha/releases/llama-slot-save-20260914/build-cuda-vulkan/bin/llama-server` on port `8090`. It loads `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` directly into a single adaptive process. The old `/home/hjotha/prod-two-tier.ini` still exists but is not used by the active unit.
 
 | Setting | Active configuration |
 | --- | --- |
@@ -46,7 +47,7 @@ The system unit `llama-server-root.service` runs `/home/hjotha/releases/llama-ad
 | RAM prompt cache / checkpoints | 2,048 MiB / one checkpoint per slot |
 | Speculation | `draft-mtp`, dynamic draft N (4 in short, 2 in medium, 0 in long), draft cutoff `0.80` |
 | Loading / fitting | `--load-mode none --fit off --no-context-shift` |
-| Slot persistence | `--slot-save-path /tmp/` |
+| Slot persistence | `--slot-save-path /home/hjotha/llama-slot-cache/ --slot-save-auto`; 64 snapshots / 32 GiB by default |
 | NVIDIA power | 200 W prefill, 170 W decode |
 | Memory-clock target | 11,001 MHz during decode; prefill/idle use automatic clocks |
 | Backend isolation | CUDA+Vulkan build, `GGML_DISABLE_VULKAN=1` for this CUDA process |
@@ -75,7 +76,7 @@ GGML_DISABLE_VULKAN=1 GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18 \
   --batch-size 256 --ubatch-size 256 --flash-attn on \
   --cache-type-k q4_0 --cache-type-v q4_0 \
   --cache-ram 2048 --ctx-checkpoints 1 --load-mode none \
-  --slot-save-path /tmp/ \
+  --slot-save-path /home/hjotha/llama-slot-cache/ --slot-save-auto \
   --no-context-shift --metrics --host 127.0.0.1 --port 8090
 ```
 
@@ -104,6 +105,37 @@ The adaptive RAM prompt cache carries target state, draft/speculative state and 
 **Supported scope:** dense Qwen35-family MTP models, including this Qwen3.8 GGUF, with one MTP head, one CUDA device, one slot, traditional KV and `fit=off`. CPU lifecycle checks are supported with `--gpu-layers 0`. Adaptive mode rejects external draft models, other speculative backends, paged KV, multimodal input, LoRA/control vectors and automatic sleep. These restrictions apply to adaptive mode, not to all upstream server features.
 
 See the [server usage guide](tools/server/README.md), [lifecycle and selection code](common/common.cpp), [server transitions and slot persistence](tools/server/server-context.cpp), [RAM cache implementation](tools/server/server-task.cpp) and [model identity implementation](tools/server/server-model-identity.cpp).
+
+### Automatic disk prompt cache
+
+This fork integrates the closed upstream [PR 24003](https://github.com/ggml-org/llama.cpp/pull/24003) and [PR 24004](https://github.com/ggml-org/llama.cpp/pull/24004), adapted to its token serialization, request statistics, adaptive contexts and MTP bootstrap. Automatic persistence is opt-in:
+
+```sh
+mkdir -p /home/hjotha/llama-slot-cache
+# Add these options to the server launch command:
+# --slot-save-path /home/hjotha/llama-slot-cache/ --slot-save-auto
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--slot-save-auto` | Disabled | Save completed generative requests and restore useful disk prefixes before prefill. Requires `--slot-save-path`. |
+| `--slot-save-block N` | 256 | Token block size for prefix lookup; disk reuse must improve the memory match by at least one block. |
+| `--slot-save-max-count N` | 64 | Maximum snapshot count; `0` disables this limit. |
+| `--slot-save-max-mb N` | 32768 | Store size limit in MiB; `0` disables this limit. A snapshot exceeding this limit is rejected without evicting the older snapshots. |
+
+The corresponding environment variables are `LLAMA_ARG_SLOT_SAVE_AUTO`, `LLAMA_ARG_SLOT_SAVE_BLOCK`, `LLAMA_ARG_SLOT_SAVE_MAX_COUNT` and `LLAMA_ARG_SLOT_SAVE_MAX_MB`. Both size/count limits apply to manual saves as well, including adaptive snapshots, even when automatic persistence is disabled.
+
+**Use a dedicated directory.** Bounded eviction treats regular files in `--slot-save-path` as owned by the server; never use `/tmp/` itself or mix unrelated files into this directory. State files and their `.meta`/`.logits` sidecars are evicted together by modification time; a successful automatic restore refreshes that time. `.tmp` is reserved for temporary files. Interrupted writes can leave temporary files that require operator cleanup after all writers stop.
+
+Completed requests save from the first turn, including with `--no-cache-idle-slots` or `--cache-ram 0`. Requests with `cache_prompt=false`, embeddings/reranking, and prompts containing media are excluded. Adapter/control-vector configurations disable automatic disk caching with a startup warning because their content identity is not captured. Saves and restores use synchronous disk I/O on the server loop, so large snapshots can delay queued requests.
+
+A cold process indexes compatible metadata and verifies the actual token prefix before accepting a native state. Identity uses the fork's existing model-content digest (including GGUF shards and metadata overrides), effective cache layout/RoPE/state versions, KV types and active context size. The fingerprint and index are refreshed after every adaptive profile rebind. Automatic files restore into the selected request profile; explicit adaptive `/slots` snapshots retain their separate format and profile-switching behavior. The stronger fingerprint deliberately invalidates automatic files from the initial integration; they remain eligible for normal LRU eviction.
+
+For target-only restores with MTP, the next real target suffix decode rebuilds the draft carry before speculation resumes. FULL/recurrent states require the whole saved token sequence to match; they cannot safely rewind arbitrary prefixes. An exact restored prompt can sample its first token from a validated `.logits` sidecar with `prompt_n=0`. Missing/invalid sidecars, speculative requests requiring unsaved draft state, and pre-sampling probability requests use a normal prefill instead. A matching hash alone never authorizes reuse. Snapshots from different branches, including tails shorter than a block, remain separate candidates.
+
+The store is a best-effort cache, not a durable conversation archive. Missing, incompatible or invalid snapshots fall back to prefill. Keep the directory restricted to trusted local writers and use the same build/configuration for cooperating processes; concurrent writer failure and hostile native-state payloads are not a hardened storage protocol. The model-content identity helper currently requires POSIX file identity support; automatic caching is not validated on Windows.
+
+Recurrent save/restore regressions live in [the existing slot tests](tools/server/tests/unit/test_slot_save.py). Set `SLOT_SAVE_HTTP_MODEL` to a local FULL/recurrent GGUF, `N_GPU_LAYERS` as appropriate and run `pytest tools/server/tests/unit/test_slot_save.py -k recurrent_slot_disk_cache -v -s` with `SLOW_TESTS=1` and `LLAMA_SERVER_BIN_PATH` pointing at the tested build. The tests cover manual and automatic cold restores, exact-prompt logits, suffix reuse, prediction metrics, corrupt sidecars and disagreement between metadata and native token payloads.
 
 ### Context-based router mode
 
