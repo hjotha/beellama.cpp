@@ -19,70 +19,140 @@
 
 ## About this fork
 
-This fork follows official `ggml-org/llama.cpp` and adds context-based model
-routing, CUDA memory fixes, GPU governors, and experimental paged KV serving.
-The feature list below distinguishes source additions from the configuration
-actually used by the GOKAYA production server.
+This fork of `ggml-org/llama.cpp` adds adaptive MTP context switching with resident model weights, context-based model routing, cache migration, CUDA memory recovery, NVIDIA GPU governors, and experimental paged KV/SnapKV serving. Standard upstream capabilities, including the CLI, web UI, model conversion, quantization and OpenAI-compatible server, remain available.
 
-### Upstream and production status (2026-09-08)
+- [Current GOKAYA deployment](#current-gokaya-deployment-2026-09-14)
+- [Adaptive context and cache reuse](#adaptive-context-with-resident-weights)
+- [Router mode](#context-based-router-mode)
+- [CUDA and GPU controls](#cuda-memory-recovery-and-gpu-governors)
+- [Paged KV, SnapKV and speculation](#paged-kv-snapkv-and-other-speculation)
+- [Validation and limitations](#validation-and-operational-history)
 
-Official upstream is integrated through `64e9bceb2` (21 upstream commits in the last sync).
-Production uses the `de57d0269` runtime base plus a server-library fix that removes a saved slot snapshot when the destination profile fails to load. The launcher, CUDA/model/GGML libraries are unchanged; only `libllama-server-impl.so` was rebuilt. All 18 selected local router tests pass against this release combination.
+### Current GOKAYA deployment (2026-09-14)
 
-GOKAYA `8090` runs `/home/hjotha/llama-releases/graph-headroom-20260908/build/bin` under `llama-server-root.service`. Its manifest and live loaded-library hashes were verified. The separate Vulkan compactor on `8092` retains its existing build.
+The development checkout is `/home/hjotha/llama` on GOKAYA (`192.168.1.57`), branch `master`; `origin` is `hjotha/llama.cpp` and `upstream` is the official repository. The source includes upstream `093a2f86c` and the later upstream fix `661643e43`. The running build inspected for this update reports `b11080-5ca5b7ea6`.
 
-Both profiles use `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`, public name `qwen-3.8-27b`, and `/home/hjotha/prod-two-tier.ini`; `models-max=1` keeps one child loaded at a time.
+The system unit `llama-server-root.service` runs `/home/hjotha/releases/llama-adaptive-optimized-20260914/build-cuda-vulkan/bin/llama-server` on port `8090`. It loads `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` directly into a single adaptive process. The old `/home/hjotha/prod-two-tier.ini` still exists but is not used by the active unit.
 
-| Profile | Context | Batch / ubatch | Validated input + output | Stable free VRAM |
-| --- | ---: | ---: | ---: | ---: |
-| MTP | 60,416 | 64 | 56,320 + 4,095 | 8 MiB |
-| No MTP | 97,536 | 512 | 93,440 + 4,096 | 4 MiB |
-
-The MTP route threshold is 60,416 **prompt plus requested output tokens**; larger budgets select the 97,536-token no-MTP profile. Existing conversation pinning prevents demotion. Cold-start routing retains its byte estimate until a tokenizer is available. Settings remain traditional q4_0 KV, `parallel=1`, `flash-attn=on`, `fit=off`, `load-mode=none`, `cache-ram=2048`, one checkpoint, and two MTP draft tokens with `spec-draft-p-min=0.80`.
-
-The previous 61,184/98,304 limits repeatedly ran out of VRAM while instantiating CUDA Graphs. A 256-token cut was insufficient: on no-MTP it enabled the graph but allowed a later fatal MMQ OOM. The selected 768-token reductions passed 86 requests including both maximum requests and 20 identical repeats per profile, with no fallback or fatal OOM. Free VRAM remained constant during those repeats. These are measured limits for this GPU/workload; they retain only the headroom shown in the table.
-
-Four real save/restore cycles reused 4164 cached tokens each with no leftover snapshots or OOM; the matching no-transfer control also passed. No progressive VRAM leak was observed. A separate RAM/tmpfs snapshot leak on target-load failure was reproduced and fixed. Compatible continuing prefixes, including the previous response, are still required for cache reuse by the hybrid/recurrent model.
-
-A separate post-canary GSP firmware fault (Xid 120/154 during memory-clock reset) required PCIe FLR recovery. The final preset leaves memory clocks automatic, while retaining the 200 W / 165 W power governor. The internal firmware cause was not isolated. All production canaries were repeated after recovery, plus alternating-profile idle/resume checks and a real 8092 completion; no new Xid, CUDA error or graph fallback was observed in that recovery window.
-
-Production canaries cover loaded hashes, exact routing boundaries, effective contexts, cache migration, Chat, Responses and sustained decoding. Full methodology, rejected limits, the same-context graphs-off control and raw artifact paths are in the [operational validation report](docs/mtp-router-split-plan.md#current-deployment---cuda-graph-headroom-and-slot-cleanup-2026-09-08).
-
-### Fork additions and what is not active in production
-
-| Addition beyond official upstream | Status on GOKAYA `8090` |
+| Setting | Active configuration |
 | --- | --- |
-| [Context route groups and conversation pinning](tools/server/README.md) | Enabled: one public name selects the two profiles above. |
-| Slot-state transfer across a tier swap | Enabled with `--slot-save-path /dev/shm`; a real Qwen migration preserved cached prompt tokens. |
-| Slot-state cleanup after failed destination load | Enabled; the saved snapshot is discarded before returning the load error. Fail-before/pass-after regression verified. |
-| Cold-autoload request reservations | Enabled; both concurrent cold-load regression cases pass. |
-| Responses compatibility and configured-context model metadata | Enabled; Chat and Responses canaries pass and the catalog advertises 97,536. |
-| CUDA graph capture/fallback fixes, bounded IQ1_M workspace, IQ1 MMQ kernels and selected-variant initialization | Compiled; numerical comparisons and varied-shape Qwen requests pass. Graph headroom is validated at the limits above; recoverable OOM fallback remains available. |
-| [NVIDIA power governor](docs/phase-aware-nvidia-gpu-power-governor.md) | Configured for 200 W prefill and 165 W decode. |
-| [GPU memory-clock governor](docs/phase-aware-nvidia-gpu-memory-clock-governor.md) | Compiled but disabled in the final preset after the GSP reset incident; driver-default memory clocks are used. |
-| Traditional-KV context fitting / calibration | Available in the binary; production uses explicit tested contexts with `fit=off`. |
-| Paged KV, shared multi-slot pools, physical-budget admission, dynamic growth and CPU/GPU page migration | Compiled CUDA/CPU paths; disabled by the current preset (`kv_paged=false`, one slot). |
-| `--kv-paged-prealloc-max` automatic pool calibration | Available; disabled in production. |
-| SnapKV streaming/per-head/per-sequence scoring and selective retention | Experimental source and CUDA/CPU support present; disabled in production. |
-| DFlash2 and stochastic draft verification | Available source path; no DFlash2 draft model is configured. Production speculation uses MTP only. |
-| Vulkan paged attention and Android compatibility changes | Present in the fork; the `8090` build has `GGML_VULKAN=OFF`. HIP/ROCm is also not compiled into this release. |
-| Paged examples and SnapKV benchmark tools | Operator tools in the source tree; not running as production services. |
+| GPU | RTX 4070, `--device CUDA0 --gpu-layers 99` |
+| Short profile | 56,320 context tokens, MTP enabled |
+| Long profile | 97,536 context tokens, MTP weights removed from GPU |
+| MTP selection threshold | Formatted prompt + output reserve <= 56,320 |
+| Batch / ubatch / slots | 256 / 256 / 1 |
+| KV cache | Traditional KV, target and draft K/V types `q4_0`, FlashAttention on |
+| RAM prompt cache / checkpoints | 2,048 MiB / one checkpoint per slot |
+| Speculation | `draft-mtp`, at most two draft tokens, draft probability cutoff `0.80` |
+| Loading / fitting | `--load-mode none --fit off --no-context-shift` |
+| NVIDIA power | 200 W prefill, 170 W decode |
+| Memory-clock target | 11,001 MHz during decode; prefill/idle use automatic clocks |
+| Backend isolation | CUDA+Vulkan build, `GGML_DISABLE_VULKAN=1` for this CUDA process |
+| CUDA graph recovery margin | `GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18` |
+| Monitoring | `--metrics`, `/health`, `/props`, `/slots`, `/v1/models` |
 
-Validation for this release: 7 CPU/parser/governor tests, 9 router tests,
-130 CUDA numerical comparisons, and 56 sequential Qwen requests.
-Both maximum requests were repeated through the router with `load-mode=none`.
-Each profile passed an input of `context - 4096`, a requested output of 4096,
-and another completion afterward. Production canaries checked both routing
-boundaries, real MTP-to-no-MTP cache transfer, Chat, Responses, and loaded-library
-hashes. An output of 4094-4096 at the context edge is accepted. These limits
-apply to the tested model, GPU, cache format and request sequence.
+After startup, read-only HTTP checks returned `/health: {"status":"ok"}`; `/props` and `/slots` reported `profile=mtp`, `state=ready`, `context_size=56320`, `context_size_long=97536` and `mtp_weights_resident=true`. The model catalog advertises the long context while the slot reports the active short context. These checks establish current status, not a new maximum-context benchmark.
 
-The current operational record is in
-[docs/mtp-router-split-plan.md](docs/mtp-router-split-plan.md).
-Earlier capacity and throughput experiments remain in
-[docs/kv-calibration-findings.md](docs/kv-calibration-findings.md) and
-[docs/oom-reproduction-trace.md](docs/oom-reproduction-trace.md); their old
-production profiles are superseded by the values above.
+The active unit has no `--alias`: its model ID is the full GGUF path reported by `/v1/models`. The former router name `qwen-3.8-27b` is not the catalog ID of this direct deployment. Use the returned ID, or configure `--alias` when starting a separate server.
+
+### Adaptive context with resident weights
+
+Enable this mode with `--ctx-size-mtp N`; the default `0` preserves ordinary server behavior. `--ctx-size` sets the long capacity. `--mtp-max-tokens` sets the short-profile budget threshold; `0` derives it from `--ctx-size-mtp`.
+
+For example, the core GOKAYA configuration is:
+
+```sh
+GGML_DISABLE_VULKAN=1 GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18 \
+./build-cuda-vulkan/bin/llama-server \
+  --model /home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf \
+  --ctx-size 97536 --ctx-size-mtp 56320 --mtp-max-tokens 56320 \
+  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80 \
+  --spec-draft-type-k q4_0 --spec-draft-type-v q4_0 \
+  --device CUDA0 --gpu-layers 99 --parallel 1 --fit off \
+  --batch-size 256 --ubatch-size 256 --flash-attn on \
+  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --cache-ram 2048 --ctx-checkpoints 1 --load-mode none \
+  --no-context-shift --metrics --host 127.0.0.1 --port 8090
+```
+
+Run this from a matching build directory's parent with the port free; it is a launch example, not a command to run alongside the production service. GPU governors are optional and described below.
+
+**Selection and lifecycle**
+
+- Selection counts the complete formatted prompt, including cached tokens, plus the normalized output reserve. With no finite request/server output limit, 4,096 tokens are reserved for selection only; this does not impose a new generation limit.
+- At the current threshold, 52,224 prompt tokens + 4,096 output tokens select MTP. A larger total selects the long profile; 93,440 + 4,096 reaches its configured ceiling. These are budget examples, not universal model/GPU limits. An explicit budget above the effective long capacity is rejected before switching.
+- The server initializes the short profile and switches between requests after active work is drained. A later smaller request can return to MTP.
+- A transition saves compatible slot/cache state, destroys inference contexts and their resources, and creates the destination context. The main model object and main GPU weights stay resident.
+- MTP-only weights have separate buffers and CPU backing. The long profile releases their GPU allocation; returning to MTP uploads that group and reconstructs the draft context. This avoids reloading the main GGUF, but context reconstruction and any uncached prefill still take time.
+- Transition failures attempt rollback. If rollback also fails, the server publishes `state=unavailable` and rejects inference with HTTP 503 rather than continuing with incomplete contexts.
+
+**RAM cache and explicit slot files**
+
+The adaptive RAM prompt cache carries target state, draft/speculative state and checkpoints where compatible. It validates model/layout identity, capacity, token positions, prefixes and snapshot integrity. Snapshots and temporary restore buffers share the `--cache-ram` budget; unusable entries become cache misses, and failed restores can be quarantined. A target-only restore can bootstrap MTP from a real target suffix decode; restoring target KV alone is not proof of a full speculative-cache hit.
+
+Explicit `POST /slots/{id_slot}?action=save` and `?action=restore` are also implemented for adaptive mode when `--slot-save-path` is configured. Their versioned format includes target/draft/speculative data, checkpoints, context limits and a model fingerprint based on GGUF shard SHA-256 hashes and typed metadata overrides. Writes use a temporary file and rename; reads validate size, checksum and compatibility before applying state, with rollback on failure. Legacy target-only slot files are rejected by this adaptive format. The current production unit does not configure `--slot-save-path`, so file persistence is available in source but not enabled there.
+
+`adaptive_context` in `/props`, `/models` and `/slots` exposes `enabled`, `profile`, `state`, `context_size`, `context_size_long` and `mtp_weights_resident`. Model metadata and the Codex-compatible catalog expose configured/effective context capacity instead of blindly advertising the GGUF training limit.
+
+**Supported scope:** dense Qwen35-family MTP models, including this Qwen3.8 GGUF, with one MTP head, one CUDA device, one slot, traditional KV and `fit=off`. CPU lifecycle checks are supported with `--gpu-layers 0`. Adaptive mode rejects external draft models, other speculative backends, paged KV, multimodal input, LoRA/control vectors and automatic sleep. Its current model-identity implementation rejects Windows. These restrictions apply to adaptive mode, not to all upstream server features.
+
+See the [server usage guide](tools/server/README.md), [lifecycle and selection code](common/common.cpp), [server transitions and slot persistence](tools/server/server-context.cpp), [RAM cache implementation](tools/server/server-task.cpp) and [model identity implementation](tools/server/server-model-identity.cpp).
+
+### Context-based router mode
+
+The earlier multi-process design remains available as an alternative to resident switching:
+
+- Preset entries can share a `route-group` public name and use `route-max-tokens` thresholds. The router chooses the smallest fitting tier for prompt plus requested output, with a byte estimate on cold start until tokenization is available.
+- Selection is recalculated for each request. Conversations can return to a smaller tier; the old README's claim that conversation pinning prevents demotion is obsolete.
+- `--models-max 1` limits loaded children. Swaps wait for active work, and cold-load request reservations protect concurrently arriving requests.
+- `X-Conversation-Id` supports best-effort slot-state migration on promotion when `--slot-save-path` is set. Failed destination loads discard the saved snapshot. This does not guarantee cache transfer on every downward swap or incompatible prefix.
+- Chat/Responses compatibility and both OpenAI/Codex model-list payloads remain available in router mode.
+
+Router swaps unload/load child processes; adaptive mode instead rebuilds contexts inside one model process. The historical two-tier preset is retained for that router mode. See [router implementation](tools/server/server-models.cpp), [server options](tools/server/README.md) and the [historical router design and measurements](docs/mtp-router-split-plan.md).
+
+### CUDA memory recovery and GPU governors
+
+| Feature | Behavior and controls |
+| --- | --- |
+| CUDA Graph stability | Handles changing prompt shapes, graph capture/instantiation failure and cleanup of stale graph resources. Recoverable memory pressure can fall back to ordinary kernel execution. |
+| Preventive graph margin and recovery | Checks free VRAM before capture and can re-enable graphs after memory recovers. `GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB` controls the margin: current source default 32 MiB, GOKAYA override 18 MiB. This margin does not reserve VRAM or make every OOM recoverable. |
+| CUDA allocator recovery | Restores recoverable VMM-pool OOM handling and limits retry/allocation behavior. |
+| IQ1_M workspace and kernels | Bounds the full-dequantization workspace via the existing MMVQ path; adds IQ1_M MMQ/tensor-core support and initializes only the selected MMQ kernel variant. |
+| Backend isolation | `GGML_DISABLE_VULKAN` prevents Vulkan instance creation in both static registration and plugin entry paths, avoiding unused Vulkan allocations in a CUDA-only process. Presence is enough: even `GGML_DISABLE_VULKAN=0` disables it. Set it before startup; omit it for Vulkan workloads. |
+| Power governor | `--gpu-power-prefill W` and `--gpu-power-decode W` select phase-specific NVML power limits; `--gpu-power-device N` selects the NVML device. Idle retains the last power limit; shutdown/sleep restore the original limit. |
+| Memory-clock governor | `--gpu-mem-clock-decode MHz` and optional `--gpu-mem-clock-prefill MHz` set phase-specific clocks. Idle and unconfigured phases reset memory clocks. Above-stock targets use supported locks plus a bounded offset when the driver supports it. |
+
+Governors run inside the server through NVML, deduplicate unchanged settings and require driver permission to change GPU controls. For the active RTX 4070 configuration, startup logs resolve the 11,001 MHz decode target to a 10,501 MHz lock plus a +1,500 MHz offset. This mapping is device/driver-specific. The historical statement that the memory governor is disabled is no longer current.
+
+Relevant sources are [CUDA graph/allocator handling](ggml/src/ggml-cuda/common.cuh), [CUDA kernels](ggml/src/ggml-cuda), [Vulkan registration](ggml/src/ggml-vulkan/ggml-vulkan.cpp) and the [GPU governor](tools/server/server-gpu-power.cpp). The [power](docs/phase-aware-nvidia-gpu-power-governor.md) and [memory-clock](docs/phase-aware-nvidia-gpu-memory-clock-governor.md) design documents retain earlier measurements and configurations.
+
+### Paged KV, SnapKV and other speculation
+
+These paths remain in the fork but are not enabled by the current traditional-KV adaptive deployment.
+
+| Capability | Options / implementation |
+| --- | --- |
+| Shared physical KV pool | `--kv-paged` shares blocks across sequences/slots. `--kv-block-size`, `--n-gpu-blocks` and `--n-cpu-blocks` control block size and physical capacity. |
+| Elastic growth and migration | `--kv-paged-dynamic`, `--n-gpu-blocks-initial` and `--n-gpu-blocks-growth` separate initial allocation from growth, with attention-layer migration across registered GPU backends and optional CPU spill. |
+| Automatic pool fitting | `--kv-paged-prealloc-max` calibrates capacity after model load, accounting for model, compute, hybrid/recurrent and MTP requirements, and caps dynamic growth. |
+| Request admission | `--kv-paged-admission-blocks` and `--kv-paged-watermark` gate physical demand instead of treating logical context size as unlimited memory. Over-budget requests are rejected cleanly. |
+| Multi-device placement | `--paged-attn-cuda` pins full-attention layers to the first offload device while tensor splitting can place recurrent-only layers elsewhere. Paged paths include shared multi-sequence batches and meta-buffer handling. |
+| SnapKV selective retention | `--snapkv OW`, `--snapkv-retention`, `--snapkv-recent`, `--snapkv-pinned` and `--snapkv-budget-blocks` score and retain selected old pages while protecting configured leading/trailing windows. Streaming, episodic, per-head and per-sequence scoring paths and eviction timing are present. |
+| Paged backends | CUDA/CPU paths plus Vulkan quantized paged attention, parallel prefill and Vulkan 1.1 Android compatibility work. Backend support does not imply equal speed or stability on every device. |
+| Traditional KV fitting | Model-specific, compute-aware context fitting accounts for hybrid/MTP state. Production selects explicit contexts with `--fit off`. |
+| DFlash2 | Separate draft-model speculation path with `p_min` and stochastic verification support; no DFlash draft model is configured in production. Adaptive mode supports only `draft-mtp`. |
+
+SnapKV retention is lossy and experimental: reducing physical KV can change output quality. Paged KV is not automatically faster than traditional KV; older Vulkan iGPU experiments include slowdown and failure cases. Context, pool sizes and throughput need validation for the selected model, backend and workload.
+
+Use the [paged example and controls](examples/paged/README.md), [SnapKV episode benchmark](tools/snapkv-episode-bench.py), [40K/MTP benchmark](tools/snapkv-40k-mtp-bench.py), [argument definitions](common/arg.cpp), [speculation implementation](common/speculative.cpp), [KV calibration findings](docs/kv-calibration-findings.md) and [Vulkan iGPU notes](docs/notes-paged-kv-vulkan-igpu.md).
+
+### Validation and operational history
+
+The [adaptive implementation plan and dated evidence](plans/001-adaptive-context-resident-weights.md) records CPU lifecycle/cache tests, sanitizer runs, real CUDA short/long/short transitions, maximum-context requests, repeated cycles, fault/rollback checks and subsequent production fixes. Recorded 20-pair CUDA runs kept one main-model instance/load through 40 completions; those serial results are workload-specific, not a general concurrency or latency guarantee.
+
+Reproducible coverage lives in [adaptive HTTP tests](tools/server/tests/unit/test_adaptive_context.py), [state/lifecycle tests](tests/test-save-load-state.cpp), [prompt-cache tests](tests/test-server-prompt-cache.cpp), [model-identity tests](tests/test-server-model-identity.cpp) and the [Gauntlet harnesses](gauntlet). The plan still records open work on detailed physical profiling, quantitative comparison with the router, broader concurrency, additional sanitizer coverage, persistence and rollback/soak validation. Implemented features and a successful deployment do not close all those gates.
+
+The [previous production capture](gauntlet/production/production-final-20260914.txt) and [unit snapshot](gauntlet/production/llama-server-root.service.final) describe the earlier `llama-adaptive-fix-20260914` release; the live optimized release path/build at the top of this README supersedes them. The [router report](docs/mtp-router-split-plan.md), [calibration notes](docs/kv-calibration-findings.md) and [OOM trace](docs/oom-reproduction-trace.md) preserve earlier results. Their 60,416-token MTP profile, no-demotion rule, disabled memory-clock setting and old free-VRAM figures are historical, not the current deployment.
 
 ## Quick start
 
