@@ -1,0 +1,48 @@
+[Unit]
+Description=Qwen3.8 27B adaptive resident MTP (CUDA+Vulkan Release, Vulkan disabled for CUDA profile)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hjotha/releases/llama-adaptive-fix-20260914
+Environment=LD_LIBRARY_PATH=/home/hjotha/releases/llama-adaptive-fix-20260914/build-cuda-vulkan/bin:/opt/cuda/lib64:/usr/lib
+Environment=GGML_DISABLE_VULKAN=1
+Environment=GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18
+ExecStart=/home/hjotha/releases/llama-adaptive-fix-20260914/build-cuda-vulkan/bin/llama-server \
+  --model /home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf \
+  --load-mode none \
+  --ctx-size 97536 \
+  --ctx-size-mtp 56320 \
+  --mtp-max-tokens 56320 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 2 \
+  --spec-draft-p-min 0.80 \
+  --spec-draft-type-k q4_0 \
+  --spec-draft-type-v q4_0 \
+  --gpu-layers 99 \
+  --device CUDA0 \
+  --flash-attn on \
+  --fit off \
+  --parallel 1 \
+  --batch-size 256 \
+  --ubatch-size 256 \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --cache-ram 2048 \
+  --ctx-checkpoints 1 \
+  --gpu-mem-clock-decode 11001 \
+  --gpu-power-prefill 200 \
+  --gpu-power-decode 170 \
+  --gpu-power-device 0 \
+  --no-context-shift \
+  --host 0.0.0.0 \
+  --port 8090 \
+  --metrics \
+  --log-file /home/hjotha/adaptive-resident-prod-fix-20260914.log
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

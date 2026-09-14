@@ -20294,6 +20294,9 @@ static const char * ggml_backend_vk_reg_get_name(ggml_backend_reg_t reg) {
 
 static size_t ggml_backend_vk_reg_get_device_count(ggml_backend_reg_t reg) {
     UNUSED(reg);
+    if (getenv("GGML_DISABLE_VULKAN") != nullptr) {
+        return 0;
+    }
     return ggml_backend_vk_get_device_count();
 }
 
@@ -20349,6 +20352,11 @@ static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
+    if (getenv("GGML_DISABLE_VULKAN") != nullptr) {
+        VK_LOG_DEBUG("ggml_backend_vk_reg(): disabled by GGML_DISABLE_VULKAN\n");
+        return nullptr;
+    }
+
     static ggml_backend_reg reg = {
         /* .api_version = */ GGML_BACKEND_API_VERSION,
         /* .iface       = */ ggml_backend_vk_reg_i,

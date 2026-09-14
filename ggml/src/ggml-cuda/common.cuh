@@ -1473,11 +1473,22 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
     bool disable_cuda_graphs_due_to_memory_pressure = false;
+    bool cuda_graphs_memory_cleanup_failed = false;
+    bool cuda_graphs_memory_check_failed = false;
 
     int64_t last_graph_eviction_sweep = 0;
 
+    static size_t cuda_graph_memory_headroom_bytes() {
+        static const size_t safe_headroom = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB");
+            const int headroom_mb = env != nullptr ? atoi(env) : 32;
+            return (size_t) std::max(headroom_mb, 0) * 1024 * 1024;
+        }();
+        return safe_headroom;
+    }
+
     void check_memory_pressure_recovery() {
-        if (!disable_cuda_graphs_due_to_memory_pressure) {
+        if (!disable_cuda_graphs_due_to_memory_pressure || cuda_graphs_memory_cleanup_failed || cuda_graphs_memory_check_failed) {
             return;
         }
 
@@ -1486,25 +1497,120 @@ struct ggml_backend_cuda_context {
         size_t free_bytes = 0;
         size_t total_bytes = 0;
         const cudaError_t mem_stat = cudaMemGetInfo(&free_bytes, &total_bytes);
-        if (mem_stat == cudaSuccess) {
-            static const size_t safe_headroom = [] {
-                const char * env = getenv("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB");
-                return (env != nullptr ? (size_t)atoi(env) : 18) * 1024 * 1024;
-            }();
+        if (mem_stat != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cannot query CUDA graph recovery headroom: %s\n",
+                          __func__, cudaGetErrorString(mem_stat));
+            cuda_graphs_memory_check_failed = true;
+            return;
+        }
 
-            if (free_bytes >= safe_headroom) {
-                disable_cuda_graphs_due_to_memory_pressure = false;
-                for (auto & pair : cuda_graphs) {
-                    if (pair.second) {
-                        pair.second->disable_due_to_memory_pressure = false;
-                        pair.second->warmup_complete = false;
-                        pair.second->warmup_stable_calls = 0;
-                    }
+        const size_t safe_headroom = cuda_graph_memory_headroom_bytes();
+
+        if (free_bytes >= safe_headroom) {
+            disable_cuda_graphs_due_to_memory_pressure = false;
+            for (auto & pair : cuda_graphs) {
+                if (pair.second) {
+                    pair.second->disable_due_to_memory_pressure = false;
+                    pair.second->warmup_complete = false;
+                    pair.second->warmup_stable_calls = 0;
                 }
-                GGML_LOG_INFO("%s: CUDA graphs re-enabled after VRAM headroom recovered (%.2f MiB free >= %.2f MiB)\n",
-                              __func__, free_bytes / (1024.0 * 1024.0), safe_headroom / (1024.0 * 1024.0));
+            }
+            GGML_LOG_INFO("%s: CUDA graphs re-enabled after VRAM headroom recovered (%.2f MiB free >= %.2f MiB headroom)\n",
+                          __func__, free_bytes / (1024.0 * 1024.0), safe_headroom / (1024.0 * 1024.0));
+        }
+    }
+
+    bool disable_cuda_graphs_for_memory_pressure() {
+        if (disable_cuda_graphs_due_to_memory_pressure) {
+            return !cuda_graphs_memory_cleanup_failed;
+        }
+
+        ggml_cuda_set_device(device);
+
+        if (any_cuda_graph_has_instance()) {
+            const cudaError_t sync_status = cudaStreamSynchronize(stream());
+            if (sync_status != cudaSuccess) {
+                GGML_LOG_ERROR("%s: CUDA graph stream synchronization failed while releasing VRAM pressure: %s\n",
+                              __func__, cudaGetErrorString(sync_status));
+                cuda_graphs_memory_cleanup_failed = true;
+                disable_cuda_graphs_due_to_memory_pressure = true;
+                return false;
             }
         }
+
+        size_t destroyed_instances = 0;
+        size_t destroyed_graphs = 0;
+        for (auto & pair : cuda_graphs) {
+            ggml_cuda_graph * graph = pair.second.get();
+            if (graph == nullptr) {
+                continue;
+            }
+
+            if (graph->instance != nullptr) {
+                const cudaError_t status = cudaGraphExecDestroy(graph->instance);
+                if (status != cudaSuccess) {
+                    GGML_LOG_ERROR("%s: CUDA graph executable release failed: %s\n",
+                                  __func__, cudaGetErrorString(status));
+                    cuda_graphs_memory_cleanup_failed = true;
+                    disable_cuda_graphs_due_to_memory_pressure = true;
+                    return false;
+                }
+                graph->instance = nullptr;
+                destroyed_instances++;
+            }
+            if (graph->graph != nullptr) {
+                const cudaError_t status = cudaGraphDestroy(graph->graph);
+                if (status != cudaSuccess) {
+                    GGML_LOG_ERROR("%s: CUDA graph capture release failed: %s\n",
+                                  __func__, cudaGetErrorString(status));
+                    cuda_graphs_memory_cleanup_failed = true;
+                    disable_cuda_graphs_due_to_memory_pressure = true;
+                    return false;
+                }
+                graph->graph = nullptr;
+                destroyed_graphs++;
+            }
+
+            graph->disable_due_to_memory_pressure = true;
+            graph->warmup_complete = false;
+            graph->warmup_stable_calls = 0;
+            graph->uid = 0;
+        }
+
+        disable_cuda_graphs_due_to_memory_pressure = true;
+        GGML_LOG_WARN("%s: released %zu CUDA graph executables and %zu captures under VRAM pressure\n",
+                      __func__, destroyed_instances, destroyed_graphs);
+        return true;
+    }
+
+    bool check_memory_pressure_before_graph() {
+        if (cuda_graphs_memory_check_failed || cuda_graphs_memory_cleanup_failed) {
+            return false;
+        }
+        if (disable_cuda_graphs_due_to_memory_pressure) {
+            return !cuda_graphs_memory_cleanup_failed;
+        }
+
+        ggml_cuda_set_device(device);
+
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        const cudaError_t mem_stat = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (mem_stat != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cannot query CUDA graph headroom: %s\n",
+                          __func__, cudaGetErrorString(mem_stat));
+            cuda_graphs_memory_check_failed = true;
+            return false;
+        }
+
+        const size_t safe_headroom = cuda_graph_memory_headroom_bytes();
+        if (free_bytes < safe_headroom) {
+            GGML_LOG_WARN("%s: disabling CUDA graphs before capture (%.2f MiB free < %.2f MiB headroom)\n",
+                          __func__, free_bytes / (1024.0 * 1024.0), safe_headroom / (1024.0 * 1024.0));
+            return disable_cuda_graphs_for_memory_pressure();
+        }
+
+        return true;
     }
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
