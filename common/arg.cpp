@@ -1677,6 +1677,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MTP_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--ctx-size-mtp-short"}, "N",
+        string_format("short context size for adaptive Ultra-MTP mode (default: %d, 0 = disabled)", params.ctx_size_mtp_short),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--ctx-size-mtp-short must be non-negative");
+            }
+            params.ctx_size_mtp_short = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_SIZE_MTP_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--mtp-short-max-tokens"}, "N",
+        string_format("prompt plus output threshold for adaptive Ultra-MTP mode (default: %d, 0 = ctx-size-mtp-short)", params.mtp_short_max_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--mtp-short-max-tokens must be non-negative");
+            }
+            params.mtp_short_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_MTP_SHORT_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-n-max-short"}, "N",
+        string_format("draft N for adaptive short Ultra-MTP profile (default: %d)", params.spec_draft_n_max_short),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--spec-draft-n-max-short must be non-negative");
+            }
+            params.spec_draft_n_max_short = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         { "--kv-unified-per-slot" }, "N",
         "context limit per parallel slot (default: unset, behavior unchanged).\n"
         "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",

@@ -2303,6 +2303,10 @@ int64_t common_context_mtp_limit(const common_params & params) {
     return params.mtp_max_tokens > 0 ? params.mtp_max_tokens : params.ctx_size_mtp;
 }
 
+int64_t common_context_mtp_short_limit(const common_params & params) {
+    return params.mtp_short_max_tokens > 0 ? params.mtp_short_max_tokens : params.ctx_size_mtp_short;
+}
+
 int64_t common_context_output_reserve(
         const common_params & params, int32_t request_n_predict, bool generates_output) {
     if (!generates_output) {
@@ -2338,9 +2342,16 @@ common_context_budget common_context_budget_for_task(
 
 common_context_profile common_context_profile_for_budget(
         const common_params & params, int64_t budget) {
-    return common_context_is_adaptive(params) && budget <= common_context_mtp_limit(params)
-        ? COMMON_CONTEXT_PROFILE_MTP
-        : COMMON_CONTEXT_PROFILE_LONG;
+    if (!common_context_is_adaptive(params)) {
+        return COMMON_CONTEXT_PROFILE_LONG;
+    }
+    if (params.ctx_size_mtp_short > 0 && budget <= common_context_mtp_short_limit(params)) {
+        return COMMON_CONTEXT_PROFILE_MTP_SHORT;
+    }
+    if (budget <= common_context_mtp_limit(params)) {
+        return COMMON_CONTEXT_PROFILE_MTP;
+    }
+    return COMMON_CONTEXT_PROFILE_LONG;
 }
 
 std::string common_context_adaptive_error(const common_params & params, int32_t effective_long_ctx) {
@@ -2350,13 +2361,51 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
     if (params.mtp_max_tokens < 0) {
         return "--mtp-max-tokens must be non-negative";
     }
+    if (params.ctx_size_mtp_short < 0) {
+        return "--ctx-size-mtp-short must be non-negative";
+    }
+    if (params.mtp_short_max_tokens < 0) {
+        return "--mtp-short-max-tokens must be non-negative";
+    }
+    if (params.spec_draft_n_max_short < 0) {
+        return "--spec-draft-n-max-short must be non-negative";
+    }
     if (!common_context_is_adaptive(params)) {
-        return params.mtp_max_tokens == 0 ? "" : "--mtp-max-tokens requires --ctx-size-mtp";
+        if (params.mtp_max_tokens != 0) {
+            return "--mtp-max-tokens requires --ctx-size-mtp";
+        }
+        if (params.ctx_size_mtp_short != 0) {
+            return "--ctx-size-mtp-short requires --ctx-size-mtp";
+        }
+        if (params.mtp_short_max_tokens != 0) {
+            return "--mtp-short-max-tokens requires --ctx-size-mtp-short";
+        }
+        return "";
+    }
+
+    if (params.ctx_size_mtp_short == 0 && params.mtp_short_max_tokens > 0) {
+        return "--mtp-short-max-tokens requires --ctx-size-mtp-short";
     }
 
     const int64_t mtp_limit = common_context_mtp_limit(params);
     if (mtp_limit <= 0 || mtp_limit > params.ctx_size_mtp) {
         return "--mtp-max-tokens must satisfy 0 < limit <= --ctx-size-mtp";
+    }
+
+    if (params.ctx_size_mtp_short > 0) {
+        const int64_t short_limit = common_context_mtp_short_limit(params);
+        if (short_limit <= 0 || short_limit > params.ctx_size_mtp_short) {
+            return "--mtp-short-max-tokens must satisfy 0 < limit <= --ctx-size-mtp-short";
+        }
+        if (params.ctx_size_mtp_short > params.ctx_size_mtp) {
+            return "--ctx-size-mtp-short must not exceed --ctx-size-mtp";
+        }
+        if (short_limit > mtp_limit) {
+            return "--mtp-short-max-tokens must not exceed --mtp-max-tokens";
+        }
+        if (params.spec_draft_n_max_short == 0) {
+            return "--spec-draft-n-max-short must be positive";
+        }
     }
 
     const int64_t long_ctx = effective_long_ctx > 0 ? effective_long_ctx : params.n_ctx;

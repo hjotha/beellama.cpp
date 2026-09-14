@@ -450,8 +450,11 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
-    int32_t ctx_size_mtp          =     0; // adaptive context short profile, 0 = disabled
-    int32_t mtp_max_tokens        =     0; // adaptive context threshold, 0 = ctx_size_mtp
+    int32_t ctx_size_mtp          =     0; // adaptive context medium profile, 0 = disabled
+    int32_t mtp_max_tokens        =     0; // adaptive context medium threshold, 0 = ctx_size_mtp
+    int32_t ctx_size_mtp_short    =     0; // adaptive context short profile, 0 = disabled
+    int32_t mtp_short_max_tokens  =     0; // adaptive context short threshold, 0 = ctx_size_mtp_short
+    int32_t spec_draft_n_max_short =     4; // draft N for short MTP profile
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
@@ -990,8 +993,9 @@ private:
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 enum common_context_profile {
-    COMMON_CONTEXT_PROFILE_MTP,
-    COMMON_CONTEXT_PROFILE_LONG,
+    COMMON_CONTEXT_PROFILE_MTP       = 0,
+    COMMON_CONTEXT_PROFILE_LONG      = 1,
+    COMMON_CONTEXT_PROFILE_MTP_SHORT = 2,
 };
 
 struct common_context_budget {
@@ -1002,6 +1006,7 @@ struct common_context_budget {
 
 bool common_context_is_adaptive(const common_params & params);
 int64_t common_context_mtp_limit(const common_params & params);
+int64_t common_context_mtp_short_limit(const common_params & params);
 int64_t common_context_output_reserve(
         const common_params & params, int32_t request_n_predict, bool generates_output);
 common_context_budget common_context_budget_for_task(

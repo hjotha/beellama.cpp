@@ -293,6 +293,25 @@ static void test(void) {
         capped.ctx_size_mtp = 400;
         capped.mtp_max_tokens = 400;
         assert(common_context_adaptive_error(capped, 512).empty());
+
+        common_params tri_profile = adaptive;
+        argv = {
+            "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+            "--mtp-max-tokens", "500", "--ctx-size-mtp-short", "300",
+            "--mtp-short-max-tokens", "250", "--spec-draft-n-max-short", "4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), tri_profile, LLAMA_EXAMPLE_SERVER));
+        assert(tri_profile.ctx_size_mtp_short == 300);
+        assert(tri_profile.mtp_short_max_tokens == 250);
+        assert(tri_profile.spec_draft_n_max_short == 4);
+        assert(common_context_mtp_short_limit(tri_profile) == 250);
+        assert(common_context_adaptive_error(tri_profile).empty());
+        assert(common_context_profile_for_budget(tri_profile, 249) == COMMON_CONTEXT_PROFILE_MTP_SHORT);
+        assert(common_context_profile_for_budget(tri_profile, 250) == COMMON_CONTEXT_PROFILE_MTP_SHORT);
+        assert(common_context_profile_for_budget(tri_profile, 251) == COMMON_CONTEXT_PROFILE_MTP);
+        assert(common_context_profile_for_budget(tri_profile, 500) == COMMON_CONTEXT_PROFILE_MTP);
+        assert(common_context_profile_for_budget(tri_profile, 501) == COMMON_CONTEXT_PROFILE_LONG);
     }
 
     {
@@ -316,6 +335,12 @@ static void test(void) {
         assert(common_context_adaptive_error(disabled).empty());
         disabled.mtp_max_tokens = 1;
         expect_error(disabled, "--mtp-max-tokens requires --ctx-size-mtp");
+        disabled.mtp_max_tokens = 0;
+        disabled.ctx_size_mtp_short = 200;
+        expect_error(disabled, "--ctx-size-mtp-short requires --ctx-size-mtp");
+        disabled.ctx_size_mtp_short = 0;
+        disabled.mtp_short_max_tokens = 200;
+        expect_error(disabled, "--mtp-short-max-tokens requires --ctx-size-mtp-short");
 
         auto adaptive = make_adaptive();
         adaptive.split_mtp_weights = false;
@@ -329,6 +354,31 @@ static void test(void) {
         adaptive = make_adaptive();
         adaptive.mtp_max_tokens = 601;
         expect_error(adaptive, "--mtp-max-tokens must satisfy 0 < limit <= --ctx-size-mtp");
+        adaptive = make_adaptive();
+        adaptive.ctx_size_mtp_short = -1;
+        expect_error(adaptive, "--ctx-size-mtp-short must be non-negative");
+        adaptive = make_adaptive();
+        adaptive.mtp_short_max_tokens = -1;
+        expect_error(adaptive, "--mtp-short-max-tokens must be non-negative");
+        adaptive = make_adaptive();
+        adaptive.spec_draft_n_max_short = -1;
+        expect_error(adaptive, "--spec-draft-n-max-short must be non-negative");
+        adaptive = make_adaptive();
+        adaptive.ctx_size_mtp_short = 700;
+        expect_error(adaptive, "--ctx-size-mtp-short must not exceed --ctx-size-mtp");
+        adaptive = make_adaptive();
+        adaptive.ctx_size_mtp_short = 400;
+        adaptive.mtp_short_max_tokens = 450;
+        expect_error(adaptive, "--mtp-short-max-tokens must satisfy 0 < limit <= --ctx-size-mtp-short");
+        adaptive = make_adaptive();
+        adaptive.ctx_size_mtp_short = 400;
+        adaptive.mtp_max_tokens = 300;
+        adaptive.mtp_short_max_tokens = 350;
+        expect_error(adaptive, "--mtp-short-max-tokens must not exceed --mtp-max-tokens");
+        adaptive = make_adaptive();
+        adaptive.ctx_size_mtp_short = 400;
+        adaptive.spec_draft_n_max_short = 0;
+        expect_error(adaptive, "--spec-draft-n-max-short must be positive");
         adaptive = make_adaptive();
         adaptive.n_ctx = 500;
         expect_error(adaptive, "--ctx-size-mtp must not exceed the long context size");

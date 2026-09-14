@@ -86,13 +86,22 @@ static bool adaptive_test_fault(const char * phase, common_context_profile profi
         return value.find("rollback-context") != std::string::npos;
     }
 
-    const std::string profile_name = profile == COMMON_CONTEXT_PROFILE_MTP ? "mtp" : "long";
-    return std::string(phase) == "candidate-after-residency" &&
-        value.find(profile_name) != std::string::npos;
+    if (std::string(phase) != "candidate-after-residency") {
+        return false;
+    }
+    if (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
+        return value.find("mtp-short") != std::string::npos;
+    }
+    if (profile == COMMON_CONTEXT_PROFILE_MTP) {
+        return value.find("mtp") != std::string::npos &&
+            value.find("mtp-short") == std::string::npos;
+    }
+    return value.find("long") != std::string::npos;
 }
 
 static llama_mtp_weights_fault adaptive_test_mtp_fault(const char * phase, common_context_profile profile) {
-    if (profile != COMMON_CONTEXT_PROFILE_MTP || std::string(phase) != "candidate") {
+    if ((profile != COMMON_CONTEXT_PROFILE_MTP && profile != COMMON_CONTEXT_PROFILE_MTP_SHORT) ||
+            std::string(phase) != "candidate") {
         return llama_mtp_weights_fault::none;
     }
     const char * raw = std::getenv("LLAMA_TEST_ADAPTIVE_TRANSITION_FAIL");
@@ -103,8 +112,15 @@ static llama_mtp_weights_fault adaptive_test_mtp_fault(const char * phase, commo
     if (value.find("mtp-allocation") != std::string::npos) {
         return llama_mtp_weights_fault::allocation;
     }
-    if (value.find("mtp-upload") != std::string::npos || value.find("mtp") != std::string::npos) {
-        return llama_mtp_weights_fault::upload;
+    if (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
+        if (value.find("mtp-upload") != std::string::npos || value.find("mtp-short") != std::string::npos) {
+            return llama_mtp_weights_fault::upload;
+        }
+    } else {
+        if (value.find("mtp-upload") != std::string::npos ||
+                (value.find("mtp") != std::string::npos && value.find("mtp-short") == std::string::npos)) {
+            return llama_mtp_weights_fault::upload;
+        }
     }
     return llama_mtp_weights_fault::none;
 }
@@ -208,14 +224,25 @@ struct server_batch {
         batch.pos = nullptr; // sentinel: uninitialized batch
     }
 
-    ~server_batch() {
+    void free() {
         if (batch.pos != nullptr) {
             clear();
             llama_batch_free(batch);
+            batch.pos = nullptr;
+            tokens.clear();
+            tokens.shrink_to_fit();
+            n_tokens_alloc = 0;
+            n_embd = 0;
+            tokens_ptr = nullptr;
         }
     }
 
+    ~server_batch() {
+        free();
+    }
+
     void init(int32_t n_tokens_alloc, int32_t n_embd) {
+        free();
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
         batch = llama_batch_init(n_tokens_alloc, 0, 1);
@@ -1131,7 +1158,9 @@ static adaptive_slot_snapshot_blob adaptive_slot_decode(const std::vector<uint8_
 
     adaptive_slot_snapshot_blob snapshot;
     snapshot.profile = reader.u32();
-    if (snapshot.profile != COMMON_CONTEXT_PROFILE_MTP && snapshot.profile != COMMON_CONTEXT_PROFILE_LONG) {
+    if (snapshot.profile != COMMON_CONTEXT_PROFILE_MTP &&
+            snapshot.profile != COMMON_CONTEXT_PROFILE_LONG &&
+            snapshot.profile != COMMON_CONTEXT_PROFILE_MTP_SHORT) {
         throw std::runtime_error("invalid adaptive slot snapshot profile");
     }
     snapshot.active_ctx = reader.i32();
@@ -1290,8 +1319,9 @@ static uint64_t adaptive_slot_serialized_size(const adaptive_slot_snapshot_blob 
 // attacker-controlled bytes; the multiplier covers both profiles and metadata.
 static size_t adaptive_slot_max_file_bytes(const server_slot & slot,
         llama_context * ctx_tgt, llama_context * ctx_dft,
-        int32_t ctx_size_mtp, int32_t long_ctx, int32_t cache_ram_mib, int32_t n_ctx_checkpoints) {
-    const uint64_t max_ctx = (uint64_t) std::max(ctx_size_mtp, long_ctx);
+        int32_t ctx_size_mtp_short, int32_t ctx_size_mtp, int32_t long_ctx,
+        int32_t cache_ram_mib, int32_t n_ctx_checkpoints) {
+    const uint64_t max_ctx = (uint64_t) std::max({ctx_size_mtp_short, ctx_size_mtp, long_ctx});
     const uint64_t active_ctx = (uint64_t) std::max(1u, ctx_tgt ? llama_n_ctx_seq(ctx_tgt) : 1u);
     uint64_t context_bytes = 0;
     uint64_t state_bytes = 0;
@@ -1610,7 +1640,9 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
     checkpoint->retained_count_tgt = source.retained_count_tgt;
     checkpoint->data_tgt = source.data_tgt;
 
-    if (ctx_dft && snapshot.profile == COMMON_CONTEXT_PROFILE_MTP && has_draft &&
+    const bool is_mtp_snapshot = snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ||
+                                 snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT;
+    if (ctx_dft && is_mtp_snapshot && has_draft &&
             source.layout_dft == common_prompt_cache_layout(ctx_dft)) {
         checkpoint->flags_dft = source.flags_dft;
         checkpoint->model_dft = llama_get_model(ctx_dft);
@@ -1678,13 +1710,15 @@ static bool adaptive_slot_restore(
     }
 
     const bool destination_mtp = ctx_dft != nullptr;
-    if ((snapshot.profile == COMMON_CONTEXT_PROFILE_MTP) != destination_mtp) {
+    const bool snapshot_mtp = snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ||
+                              snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT;
+    if (snapshot_mtp != destination_mtp) {
         error = "adaptive slot snapshot profile does not match destination context";
         return false;
     }
-    const bool complete_mtp = destination_mtp && snapshot.profile == COMMON_CONTEXT_PROFILE_MTP &&
+    const bool complete_mtp = destination_mtp && snapshot_mtp &&
         !snapshot.data_dft.empty() && !snapshot.data_spec.empty();
-    if (snapshot.profile == COMMON_CONTEXT_PROFILE_MTP) {
+    if (snapshot_mtp) {
         if (snapshot.data_dft.empty() != snapshot.data_spec.empty() ||
                 (snapshot.data_dft.empty() && snapshot.pos_dft >= 0) ||
                 (complete_mtp && snapshot.pos_dft != snapshot.pos_tgt)) {
@@ -1695,7 +1729,7 @@ static bool adaptive_slot_restore(
         error = "adaptive slot snapshot long profile carries draft state";
         return false;
     }
-    if (destination_mtp && snapshot.profile == COMMON_CONTEXT_PROFILE_MTP && !snapshot.data_dft.empty() &&
+    if (destination_mtp && snapshot_mtp && !snapshot.data_dft.empty() &&
             snapshot.layout_dft != common_prompt_cache_layout(ctx_dft)) {
         error = "adaptive slot snapshot draft layout differs";
         return false;
@@ -2018,6 +2052,8 @@ private:
 
     int32_t n_ctx; // total context for all clients / slots
     int32_t adaptive_long_ctx = 0;
+    int32_t adaptive_draft_n_medium = 2;
+    int32_t adaptive_draft_n_short  = 4;
     common_context_profile active_context_profile = COMMON_CONTEXT_PROFILE_LONG;
     bool adaptive_context_unavailable = false;
     bool adaptive_context_transitioning = false;
@@ -2070,8 +2106,33 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    void apply_profile_params(common_context_profile profile) {
+        if (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
+            params_base.n_ctx = params_base.ctx_size_mtp_short;
+            params_base.speculative.draft.n_max = adaptive_draft_n_short;
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        } else if (profile == COMMON_CONTEXT_PROFILE_MTP) {
+            params_base.n_ctx = params_base.ctx_size_mtp;
+            params_base.speculative.draft.n_max = adaptive_draft_n_medium;
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        } else {
+            params_base.n_ctx = adaptive_long_ctx;
+            params_base.speculative.draft.n_max = 0;
+            params_base.speculative.types = {};
+        }
+        params_base.n_parallel = 1;
+        const auto output_limits = server_output_limits(params_base);
+        params_base.n_outputs_max = output_limits.total;
+        params_base.n_outputs_max_per_seq = output_limits.per_seq;
+    }
+
     static std::string adaptive_status_profile_name(int profile) {
-        return profile == COMMON_CONTEXT_PROFILE_MTP ? "mtp" : "long";
+        switch (profile) {
+            case COMMON_CONTEXT_PROFILE_MTP_SHORT: return "mtp-short";
+            case COMMON_CONTEXT_PROFILE_MTP:       return "mtp";
+            case COMMON_CONTEXT_PROFILE_LONG:      return "long";
+            default:                               return "unknown";
+        }
     }
 
     static std::string adaptive_status_state_name(int state) {
@@ -2211,18 +2272,21 @@ private:
 
         params_base = params;
         if (adaptive) {
-            // Start in the short MTP profile. The requested long ceiling remains
-            // in adaptive_long_ctx and is never silently used for this allocation.
-            params_base.n_ctx = params.ctx_size_mtp;
-            params_base.n_parallel = 1;
-            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-            active_context_profile = COMMON_CONTEXT_PROFILE_MTP;
+            adaptive_draft_n_medium = params.speculative.draft.n_max;
+            adaptive_draft_n_short  = params.spec_draft_n_max_short;
+            if (params.ctx_size_mtp_short > 0) {
+                apply_profile_params(COMMON_CONTEXT_PROFILE_MTP_SHORT);
+                active_context_profile = COMMON_CONTEXT_PROFILE_MTP_SHORT;
+            } else {
+                apply_profile_params(COMMON_CONTEXT_PROFILE_MTP);
+                active_context_profile = COMMON_CONTEXT_PROFILE_MTP;
+            }
         } else {
             active_context_profile = COMMON_CONTEXT_PROFILE_LONG;
+            const auto output_limits = server_output_limits(params_base);
+            params_base.n_outputs_max = output_limits.total;
+            params_base.n_outputs_max_per_seq = output_limits.per_seq;
         }
-        const auto output_limits = server_output_limits(params_base);
-        params_base.n_outputs_max = output_limits.total;
-        params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -2606,9 +2670,9 @@ private:
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
-            const int32_t n_batch = llama_n_batch(ctx_tgt);
+            const int32_t n_batch = std::max({params_base.n_batch, (int32_t) llama_n_batch(ctx_tgt), params_base.n_parallel});
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+            batch.init(n_batch, n_embd);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -2907,7 +2971,7 @@ private:
             (long long) task.context_budget.prompt_tokens,
             (long long) task.context_budget.output_reserve,
             (long long) task.context_budget.total_tokens,
-            task.context_profile == COMMON_CONTEXT_PROFILE_MTP ? "mtp" : "long");
+            adaptive_status_profile_name((int) task.context_profile).c_str());
         return true;
     }
 
@@ -2967,7 +3031,7 @@ private:
         ctx_dft = nullptr;
         model_dft = nullptr;
 
-        const bool use_mtp = profile == COMMON_CONTEXT_PROFILE_MTP;
+        const bool use_mtp = (profile == COMMON_CONTEXT_PROFILE_MTP || profile == COMMON_CONTEXT_PROFILE_MTP_SHORT);
         if (!use_mtp) {
             ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
             ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -3066,8 +3130,10 @@ private:
             params_base = old_params;
             params_base.speculative.draft.ctx_tgt = nullptr;
             params_base.speculative.draft.ctx_dft = nullptr;
+            apply_profile_params(old_profile);
+            const bool old_resident = old_profile != COMMON_CONTEXT_PROFILE_LONG;
             if (!llama_model_mtp_weights_set_resident(model_tgt,
-                    old_profile == COMMON_CONTEXT_PROFILE_MTP, adaptive_test_mtp_fault("rollback", old_profile))) {
+                    old_resident, adaptive_test_mtp_fault("rollback", old_profile))) {
                 ctx_tgt = nullptr;
                 unbind_slots_from_context();
                 return false;
@@ -3098,21 +3164,16 @@ private:
 
         discard_context();
 
-        params_base.n_ctx = requested == COMMON_CONTEXT_PROFILE_MTP ? params_base.ctx_size_mtp : adaptive_long_ctx;
-        params_base.speculative.types = requested == COMMON_CONTEXT_PROFILE_MTP
-            ? std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }
-            : std::vector<common_speculative_type>{};
-        const auto limits = server_output_limits(params_base);
-        params_base.n_outputs_max = limits.total;
-        params_base.n_outputs_max_per_seq = limits.per_seq;
+        apply_profile_params(requested);
 
-        const bool resident = requested == COMMON_CONTEXT_PROFILE_MTP;
+        const bool resident = requested != COMMON_CONTEXT_PROFILE_LONG;
+        const auto req_name = adaptive_status_profile_name((int) requested);
         if (!llama_model_mtp_weights_set_resident(model_tgt, resident,
                 adaptive_test_mtp_fault("candidate", requested))) {
             SRV_WRN("adaptive test fault: candidate %s MTP residency/upload\n",
-                    resident ? "mtp" : "long");
+                    req_name.c_str());
             SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
-                    resident ? "mtp" : "long");
+                    req_name.c_str());
             if (!restore_old()) {
                 enter_adaptive_unavailable();
             }
@@ -3120,9 +3181,9 @@ private:
         }
         if (adaptive_test_fault("candidate-after-residency", requested)) {
             SRV_WRN("adaptive test fault: candidate %s after MTP residency\n",
-                    resident ? "mtp" : "long");
+                    req_name.c_str());
             SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
-                    resident ? "mtp" : "long");
+                    req_name.c_str());
             if (!restore_old()) {
                 enter_adaptive_unavailable();
             }
@@ -3130,7 +3191,7 @@ private:
         }
         if (!llama_init->recreate_context(params_base)) {
             SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
-                    resident ? "mtp" : "long");
+                    req_name.c_str());
             if (!restore_old()) {
                 enter_adaptive_unavailable();
             }
@@ -3148,11 +3209,15 @@ private:
         active_context_profile = requested;
         adaptive_context_unavailable = false;
         n_ctx = llama_n_ctx(ctx_tgt);
+        const int32_t target_batch = (int32_t) llama_n_batch(ctx_tgt);
+        if (target_batch > batch.n_tokens_alloc) {
+            batch.init(std::max(target_batch, batch.n_tokens_alloc), llama_model_n_embd_inp(model_tgt));
+        }
         const auto mtp_info = llama_model_mtp_weights_get_info(model_tgt);
         SRV_INF("adaptive context transition complete: %s, n_ctx=%d, transition_ms=%.3f, MTP_GPU=%zu, MTP_HOST=%zu, MTP_ALLOC=%zu, model_instance=%" PRIu64
                 ", model_loads=%" PRIu64 ", main_gpu_upload_bytes=%" PRIu64
                 ", mtp_gpu_upload_bytes=%" PRIu64 ", mtp_reloads=%" PRIu64 "\n",
-                requested == COMMON_CONTEXT_PROFILE_MTP ? "mtp" : "long", n_ctx,
+                adaptive_status_profile_name((int) requested).c_str(), n_ctx,
                 (ggml_time_us() - transition_start_us) / 1000.0,
                 mtp_info.gpu_allocated_bytes, mtp_info.host_bytes, mtp_info.allocated_bytes,
                 mtp_info.model_instance, mtp_info.model_load_count, mtp_info.main_gpu_upload_bytes,
@@ -4290,7 +4355,7 @@ private:
                                 throw std::runtime_error("adaptive model identity is unavailable");
                             }
                             const size_t max_file_bytes = adaptive_slot_max_file_bytes(
-                                *slot, ctx_tgt, ctx_dft, params_base.ctx_size_mtp,
+                                *slot, ctx_tgt, ctx_dft, params_base.ctx_size_mtp_short, params_base.ctx_size_mtp,
                                 adaptive_long_ctx, params_base.cache_ram_mib, params_base.n_ctx_checkpoints);
                             adaptive_slot_cache_reservation reservation;
                             if (!reservation.acquire(prompt_cache.get(), adaptive_slot_working_bytes(max_file_bytes))) {
@@ -4421,7 +4486,7 @@ private:
                             }
 
                             const size_t max_file_bytes = adaptive_slot_max_file_bytes(
-                                *slot, ctx_tgt, ctx_dft, params_base.ctx_size_mtp,
+                                *slot, ctx_tgt, ctx_dft, params_base.ctx_size_mtp_short, params_base.ctx_size_mtp,
                                 adaptive_long_ctx, params_base.cache_ram_mib, params_base.n_ctx_checkpoints);
                             if (!reservation.acquire(prompt_cache.get(), adaptive_slot_working_bytes(max_file_bytes))) {
                                 throw std::runtime_error("adaptive slot snapshot exceeds the global RAM cache budget");
@@ -4439,11 +4504,13 @@ private:
                                     snapshot.long_ctx != adaptive_long_ctx) {
                                 throw std::runtime_error("adaptive slot snapshot context limits differ");
                             }
-                            const int expected_ctx = std::min(
-                                snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ? params_base.ctx_size_mtp : adaptive_long_ctx,
-                                llama_model_n_ctx_train(model_tgt));
-                            if (params_base.kv_unified_per_slot > 0 && snapshot.active_ctx > params_base.kv_unified_per_slot) {
-                                throw std::runtime_error("adaptive slot snapshot active context exceeds the configured per-slot limit");
+                            const int raw_ctx = snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT
+                                ? params_base.ctx_size_mtp_short
+                                : (snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ? params_base.ctx_size_mtp : adaptive_long_ctx);
+                            const int padded_ctx = GGML_PAD(raw_ctx, 256);
+                            int expected_ctx = std::min(padded_ctx, llama_model_n_ctx_train(model_tgt));
+                            if (params_base.kv_unified_per_slot > 0) {
+                                expected_ctx = std::min(expected_ctx, params_base.kv_unified_per_slot);
                             }
                             if (snapshot.active_ctx != expected_ctx) {
                                 throw std::runtime_error("adaptive slot snapshot active context differs");
@@ -5468,11 +5535,14 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
-                            cur_tok,
-                            /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
-                            /* is_prompt = */ true);
+                        if (!batch.add(slot.id,
+                                cur_tok,
+                                /* pos       = */ slot.prompt.tokens.pos_next(),
+                                /* output    = */ slot.need_embd(),
+                                /* is_prompt = */ true)) {
+                            add_ok = false;
+                            break;
+                        }
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint

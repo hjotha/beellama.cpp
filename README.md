@@ -37,27 +37,29 @@ The system unit `llama-server-root.service` runs `/home/hjotha/releases/llama-ad
 | Setting | Active configuration |
 | --- | --- |
 | GPU | RTX 4070, `--device CUDA0 --gpu-layers 99` |
-| Short profile | 56,320 context tokens, MTP enabled |
-| Long profile | 97,536 context tokens, MTP weights removed from GPU |
-| MTP selection threshold | Formatted prompt + output reserve <= 56,320 |
+| Short profile (`mtp-short`) | 32,768 context tokens, MTP enabled with N=4 draft tokens |
+| Medium profile (`mtp`) | 56,320 context tokens, MTP enabled with N=2 draft tokens |
+| Long profile (`long`) | 97,536 context tokens, MTP disabled (N=0), MTP weights offloaded to host RAM |
+| Profile selection thresholds | Prompt + output reserve <= 32,768 -> mtp-short; <= 56,320 -> mtp; else -> long |
 | Batch / ubatch / slots | 256 / 256 / 1 |
 | KV cache | Traditional KV, target and draft K/V types `q4_0`, FlashAttention on |
 | RAM prompt cache / checkpoints | 2,048 MiB / one checkpoint per slot |
-| Speculation | `draft-mtp`, at most two draft tokens, draft probability cutoff `0.80` |
+| Speculation | `draft-mtp`, dynamic draft N (4 in short, 2 in medium, 0 in long), draft cutoff `0.80` |
 | Loading / fitting | `--load-mode none --fit off --no-context-shift` |
+| Slot persistence | `--slot-save-path /tmp/` |
 | NVIDIA power | 200 W prefill, 170 W decode |
 | Memory-clock target | 11,001 MHz during decode; prefill/idle use automatic clocks |
 | Backend isolation | CUDA+Vulkan build, `GGML_DISABLE_VULKAN=1` for this CUDA process |
 | CUDA graph recovery margin | `GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18` |
 | Monitoring | `--metrics`, `/health`, `/props`, `/slots`, `/v1/models` |
 
-After startup, read-only HTTP checks returned `/health: {"status":"ok"}`; `/props` and `/slots` reported `profile=mtp`, `state=ready`, `context_size=56320`, `context_size_long=97536` and `mtp_weights_resident=true`. The model catalog advertises the long context while the slot reports the active short context. These checks establish current status, not a new maximum-context benchmark.
+After startup, read-only HTTP checks returned `/health: {"status":"ok"}`; `/props` and `/slots` reported `profile=mtp-short`, `state=ready`, `context_size=32768`, `context_size_long=97536` and `mtp_weights_resident=true`. The model catalog advertises the long context while the slot reports the active profile context. These checks establish current status, not a new maximum-context benchmark.
 
 The active unit has no `--alias`: its model ID is the full GGUF path reported by `/v1/models`. The former router name `qwen-3.8-27b` is not the catalog ID of this direct deployment. Use the returned ID, or configure `--alias` when starting a separate server.
 
-### Adaptive context with resident weights
+### Adaptive context with resident weights (Tri-Profile Architecture)
 
-Enable this mode with `--ctx-size-mtp N`; the default `0` preserves ordinary server behavior. `--ctx-size` sets the long capacity. `--mtp-max-tokens` sets the short-profile budget threshold; `0` derives it from `--ctx-size-mtp`.
+Enable this mode with `--ctx-size-mtp N`; the default `0` preserves ordinary server behavior. `--ctx-size` sets the long capacity. `--mtp-max-tokens` sets the medium-profile budget threshold (defaults to `--ctx-size-mtp`). `--ctx-size-mtp-short` sets the short-profile context size, `--mtp-short-max-tokens` sets its budget threshold, and `--spec-draft-n-max-short` sets the draft N for the short profile (default: 4).
 
 For example, the core GOKAYA configuration is:
 
@@ -66,12 +68,14 @@ GGML_DISABLE_VULKAN=1 GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18 \
 ./build-cuda-vulkan/bin/llama-server \
   --model /home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf \
   --ctx-size 97536 --ctx-size-mtp 56320 --mtp-max-tokens 56320 \
-  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0.80 \
-  --spec-draft-type-k q4_0 --spec-draft-type-v q4_0 \
+  --ctx-size-mtp-short 32768 --mtp-short-max-tokens 32768 \
+  --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-n-max-short 4 \
+  --spec-draft-p-min 0.80 --spec-draft-type-k q4_0 --spec-draft-type-v q4_0 \
   --device CUDA0 --gpu-layers 99 --parallel 1 --fit off \
   --batch-size 256 --ubatch-size 256 --flash-attn on \
   --cache-type-k q4_0 --cache-type-v q4_0 \
   --cache-ram 2048 --ctx-checkpoints 1 --load-mode none \
+  --slot-save-path /tmp/ \
   --no-context-shift --metrics --host 127.0.0.1 --port 8090
 ```
 
@@ -80,21 +84,24 @@ Run this from a matching build directory's parent with the port free; it is a la
 **Selection and lifecycle**
 
 - Selection counts the complete formatted prompt, including cached tokens, plus the normalized output reserve. With no finite request/server output limit, 4,096 tokens are reserved for selection only; this does not impose a new generation limit.
-- At the current threshold, 52,224 prompt tokens + 4,096 output tokens select MTP. A larger total selects the long profile; 93,440 + 4,096 reaches its configured ceiling. These are budget examples, not universal model/GPU limits. An explicit budget above the effective long capacity is rejected before switching.
-- The server initializes the short profile and switches between requests after active work is drained. A later smaller request can return to MTP.
-- A transition saves compatible slot/cache state, destroys inference contexts and their resources, and creates the destination context. The main model object and main GPU weights stay resident.
-- MTP-only weights have separate buffers and CPU backing. The long profile releases their GPU allocation; returning to MTP uploads that group and reconstructs the draft context. This avoids reloading the main GGUF, but context reconstruction and any uncached prefill still take time.
-- Transition failures attempt rollback. If rollback also fails, the server publishes `state=unavailable` and rejects inference with HTTP 503 rather than continuing with incomplete contexts.
+- If total budget <= 32,768 tokens, the server selects the short profile (`mtp-short`, N=4).
+- If total budget is between 32,768 and 56,320 tokens, the server selects the medium profile (`mtp`, N=2).
+- If total budget exceeds 56,320 tokens, the server selects the long profile (`long`, N=0, up to 97,536 tokens).
+- An explicit budget above the effective long capacity is rejected before switching.
+- The server boots in the short profile (`mtp-short`) and switches between requests after active work is drained.
+- Transitions preserve model weights in GPU memory. Only the MTP head weights are moved between VRAM and host RAM when entering or exiting the long profile.
+- Transition failures attempt rollback to the previous profile. If rollback also fails, the server publishes `state=unavailable` and rejects inference with HTTP 503.
 
-**RAM cache and explicit slot files**
+**RAM cache and explicit slot files across profiles**
 
-The adaptive RAM prompt cache carries target state, draft/speculative state and checkpoints where compatible. It validates model/layout identity, capacity, token positions, prefixes and snapshot integrity. Snapshots and temporary restore buffers share the `--cache-ram` budget; unusable entries become cache misses, and failed restores can be quarantined. A target-only restore can bootstrap MTP from a real target suffix decode; restoring target KV alone is not proof of a full speculative-cache hit.
+The adaptive RAM prompt cache carries target state, draft/speculative state and checkpoints across profile switches:
+- Layout and attention semantics: `common_prompt_cache_layout()` checks tensor layout semantics rather than buffer capacity, so cached prefixes remain compatible across profile transitions.
+- Automatic cache preservation: when a profile switch occurs, `slot.prompt_save(*prompt_cache)` serializes valid prefixes and checkpoints into the global RAM cache (`--cache-ram`) before tearing down the old context. The new profile context rehydrates compatible prefixes via `slot.prompt_restore`, avoiding repeated prefill.
+- Explicit slot persistence: `POST /slots/{id_slot}?action=save` and `?action=restore` record profile identifiers (`0` = medium MTP, `1` = long, `2` = short MTP). When restoring a snapshot from a different profile, the server automatically triggers a dynamic transition (`switch_adaptive_context(snapshot.profile)`), reloads MTP weights to GPU if needed, and applies the saved KV state.
 
-Explicit `POST /slots/{id_slot}?action=save` and `?action=restore` are also implemented for adaptive mode when `--slot-save-path` is configured. Their versioned format includes target/draft/speculative data, checkpoints, context limits and a model fingerprint based on GGUF shard SHA-256 hashes and typed metadata overrides. Writes use a temporary file and rename; reads validate size, checksum and compatibility before applying state, with rollback on failure. Legacy target-only slot files are rejected by this adaptive format. The current production unit does not configure `--slot-save-path`, so file persistence is available in source but not enabled there.
+`adaptive_context` in `/props`, `/models` and `/slots` exposes `enabled`, `profile`, `state`, `context_size`, `context_size_long` and `mtp_weights_resident`.
 
-`adaptive_context` in `/props`, `/models` and `/slots` exposes `enabled`, `profile`, `state`, `context_size`, `context_size_long` and `mtp_weights_resident`. Model metadata and the Codex-compatible catalog expose configured/effective context capacity instead of blindly advertising the GGUF training limit.
-
-**Supported scope:** dense Qwen35-family MTP models, including this Qwen3.8 GGUF, with one MTP head, one CUDA device, one slot, traditional KV and `fit=off`. CPU lifecycle checks are supported with `--gpu-layers 0`. Adaptive mode rejects external draft models, other speculative backends, paged KV, multimodal input, LoRA/control vectors and automatic sleep. Its current model-identity implementation rejects Windows. These restrictions apply to adaptive mode, not to all upstream server features.
+**Supported scope:** dense Qwen35-family MTP models, including this Qwen3.8 GGUF, with one MTP head, one CUDA device, one slot, traditional KV and `fit=off`. CPU lifecycle checks are supported with `--gpu-layers 0`. Adaptive mode rejects external draft models, other speculative backends, paged KV, multimodal input, LoRA/control vectors and automatic sleep. These restrictions apply to adaptive mode, not to all upstream server features.
 
 See the [server usage guide](tools/server/README.md), [lifecycle and selection code](common/common.cpp), [server transitions and slot persistence](tools/server/server-context.cpp), [RAM cache implementation](tools/server/server-task.cpp) and [model identity implementation](tools/server/server-model-identity.cpp).
 
