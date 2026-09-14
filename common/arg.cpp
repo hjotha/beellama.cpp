@@ -877,6 +877,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    if (const std::string error = common_context_adaptive_normalize(params); !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+
     if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER) {
         const bool has_prefill_power = params.gpu_power_prefill != -1;
         const bool has_decode_power  = params.gpu_power_decode != -1;
@@ -1653,6 +1657,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
+        {"--ctx-size-mtp"}, "N",
+        string_format("short context size for adaptive MTP mode (default: %d, 0 = disabled)", params.ctx_size_mtp),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--ctx-size-mtp must be non-negative");
+            }
+            params.ctx_size_mtp = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_SIZE_MTP").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--mtp-max-tokens"}, "N",
+        string_format("prompt plus output threshold for adaptive MTP mode (default: %d, 0 = ctx-size-mtp)", params.mtp_max_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--mtp-max-tokens must be non-negative");
+            }
+            params.mtp_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_MTP_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         { "--kv-unified-per-slot" }, "N",
         "context limit per parallel slot (default: unset, behavior unchanged).\n"
         "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
@@ -1705,6 +1729,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
         [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoints must be non-negative");
+            }
             params.n_ctx_checkpoints = value;
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));

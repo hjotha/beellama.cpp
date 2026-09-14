@@ -73,6 +73,11 @@ public:
 
     // state write/load
 
+    bool state_partial_retained(std::vector<const llama_memory_i *> & out) const override {
+        out.push_back(mem_attn.get());
+        return true;
+    }
+
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 

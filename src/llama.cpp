@@ -5,6 +5,9 @@
 
 #include "llama-chat.h"
 #include "llama-context.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-kv-cache-dsa.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -34,6 +37,51 @@
 //
 // interface implementation
 //
+
+llama_prompt_cache_profile llama_get_prompt_cache_profile(const llama_context * ctx, llama_seq_id seq_id) {
+    const auto & p = ctx->get_cparams();
+    auto * mem = ctx->get_memory();
+    const auto * kv = dynamic_cast<const llama_kv_cache *>(mem);
+    const llama_kv_cache * aux = nullptr;
+    const auto * iswa = dynamic_cast<const llama_kv_cache_iswa *>(mem);
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        kv = hybrid->get_mem_attn();
+    } else if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
+        iswa = hybrid->get_mem_attn();
+    } else if (const auto * dsa = dynamic_cast<const llama_kv_cache_dsa *>(mem)) {
+        kv = dsa->get_mla();
+        aux = dsa->get_lid();
+    }
+    if (iswa) { kv = iswa->get_base(); aux = iswa->get_swa(); }
+    const bool known = kv || aux || !mem || dynamic_cast<const llama_memory_recurrent *>(mem);
+    llama_prompt_cache_profile result = {
+        ctx->get_context_instance(),
+        p.ctx_type, p.rope_scaling_type, p.rope_freq_base, p.rope_freq_scale,
+        p.n_ctx_orig_yarn, p.yarn_ext_factor, p.yarn_attn_factor, p.yarn_beta_fast, p.yarn_beta_slow,
+        p.causal_attn, p.kv_unified, p.kv_paged, p.flash_attn, p.nextn_layer_offset,
+        kv ? kv->type_k() : GGML_TYPE_COUNT, kv ? kv->type_v() : GGML_TYPE_COUNT,
+        aux ? aux->type_k() : GGML_TYPE_COUNT, aux ? aux->type_v() : GGML_TYPE_COUNT, known,
+        kv && seq_id >= 0 ? kv->seq_pos_min(seq_id) : -1, kv && seq_id >= 0 ? kv->seq_pos_max(seq_id) : -1,
+        aux && seq_id >= 0 ? aux->seq_pos_min(seq_id) : -1, aux && seq_id >= 0 ? aux->seq_pos_max(seq_id) : -1,
+        false, 0, {},
+    };
+    std::vector<const llama_memory_i *> retained;
+    result.partial_retained_known = !mem || mem->state_partial_retained(retained);
+    if (retained.size() > result.partial_retained_bounds.size()/2) {
+        result.partial_retained_known = false;
+    }
+    result.partial_retained_bounds.fill(-1);
+    if (result.partial_retained_known) {
+        result.partial_retained_count = retained.size();
+        if (seq_id >= 0) {
+            for (size_t i = 0; i < retained.size(); ++i) {
+                result.partial_retained_bounds[2*i] = retained[i]->seq_pos_min(seq_id);
+                result.partial_retained_bounds[2*i + 1] = retained[i]->seq_pos_max(seq_id);
+            }
+        }
+    }
+    return result;
+}
 
 const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type) {
     switch (flash_attn_type) {

@@ -28,6 +28,8 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
+#include <limits>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -1165,6 +1167,21 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    struct mtp_group {
+        size_t context_index;
+        ggml_backend_buffer_type_t buft;
+        std::vector<uint8_t> host;
+        llama_mlocks locks;
+    };
+    std::vector<mtp_group> mtp_groups;
+    bool mtp_resident = false;
+    uint64_t model_instance = 0;
+    uint64_t model_load_count = 0;
+    uint64_t main_gpu_upload_bytes = 0;
+    uint64_t mtp_gpu_upload_bytes = 0;
+    uint64_t mtp_reloads = 0;
+    uint64_t mtp_backing_hash = 0;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1183,6 +1200,8 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    static std::atomic<uint64_t> next_instance{0};
+    pimpl->model_instance = next_instance.fetch_add(1, std::memory_order_relaxed) + 1;
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1405,6 +1424,10 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
+    if (params.split_mtp_weights &&
+            (arch != LLM_ARCH_QWEN35 || !params.load_mtp || ml.no_alloc || hparams.router_layer >= 0)) {
+        throw std::runtime_error("separate MTP weights require an allocated qwen35 target with embedded MTP");
+    }
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
@@ -1694,6 +1717,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     ml.done_getting_tensors();
 
+    for (const auto & [key, ctx] : ml.ctx_map) {
+        if (!key.mtp) {
+            continue;
+        }
+        auto * dev = ggml_backend_buft_get_device(key.buft);
+        if (!dev) {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+        if (!dev || key.lazy || key.buft != ggml_backend_dev_buffer_type(dev) ||
+                (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0)) {
+            throw std::runtime_error(format("MTP host backing requires standard CPU/CUDA buffers, got %s "
+                    "(fully offload the MTP head, or use --no-host --no-repack for CPU checks)",
+                    ggml_backend_buft_name(key.buft)));
+        }
+        for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (t->view_src) {
+                throw std::runtime_error("optional MTP weights must own their storage, not view another tensor");
+            }
+        }
+    }
+
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
     GGML_ASSERT(!(output && tok_embd &&
@@ -1717,6 +1762,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
+    pimpl->mtp_groups.reserve(ml.ctx_map.size());
 
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
@@ -1745,6 +1791,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
+        llama_mlocks mtp_locks;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
@@ -1784,8 +1831,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
-                pimpl->mlock_bufs.emplace_back(new llama_mlock);
-                auto & mlock_buf = pimpl->mlock_bufs.back();
+                auto & locks = ctx_key.mtp ? mtp_locks : pimpl->mlock_bufs;
+                locks.emplace_back(new llama_mlock);
+                auto & mlock_buf = locks.back();
                 mlock_buf->init   (ggml_backend_buffer_get_base(buf));
                 mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
             }
@@ -1801,7 +1849,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
+        const size_t context_index = pimpl->ctxs_bufs.size();
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+        if (ctx_key.mtp) {
+            pimpl->mtp_groups.push_back({context_index, buft, {}, std::move(mtp_locks)});
+        }
 
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
@@ -1843,10 +1895,48 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    ++pimpl->model_load_count;
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+        const bool mtp = std::any_of(pimpl->mtp_groups.begin(), pimpl->mtp_groups.end(), [&](const auto & group) {
+            return pimpl->ctxs_bufs[group.context_index].first.get() == ctx;
+        });
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                (mtp ? pimpl->mtp_gpu_upload_bytes : pimpl->main_gpu_upload_bytes) += ggml_nbytes(t);
+            }
+        }
+    }
+
+    if (params.split_mtp_weights) {
+        if (pimpl->mtp_groups.empty()) {
+            throw std::runtime_error("no independently owned MTP weights were loaded");
+        }
+        pimpl->mtp_backing_hash = 14695981039346656037ULL;
+        for (auto & group : pimpl->mtp_groups) {
+            auto * ctx = pimpl->ctxs_bufs[group.context_index].first.get();
+            size_t size = 0;
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                const size_t bytes = ggml_nbytes(t);
+                if (bytes > std::numeric_limits<size_t>::max() - size) {
+                    throw std::runtime_error("MTP host backing size overflow");
+                }
+                size += bytes;
+            }
+            group.host.resize(size);
+            size_t offset = 0;
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                const size_t bytes = ggml_nbytes(t);
+                ggml_backend_tensor_get(t, group.host.data() + offset, 0, bytes);
+                offset += bytes;
+            }
+            for (uint8_t byte : group.host) {
+                pimpl->mtp_backing_hash = (pimpl->mtp_backing_hash ^ byte) * 1099511628211ULL;
+            }
+        }
+        pimpl->mtp_resident = true;
     }
 
     if (use_mmap_buffer) {
@@ -1923,6 +2013,120 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
     }
     return ret;
+}
+
+
+llama_mtp_weights_info llama_model::mtp_weights_info() const {
+    llama_mtp_weights_info info;
+    info.managed = params.split_mtp_weights;
+    info.resident = pimpl->mtp_resident;
+    info.model_instance = pimpl->model_instance;
+    info.model_load_count = pimpl->model_load_count;
+    info.main_gpu_upload_bytes = pimpl->main_gpu_upload_bytes;
+    info.mtp_gpu_upload_bytes = pimpl->mtp_gpu_upload_bytes;
+    info.mtp_reloads = pimpl->mtp_reloads;
+    info.backing_hash = pimpl->mtp_backing_hash;
+    for (const auto & group : pimpl->mtp_groups) {
+        info.host_bytes += group.host.size();
+        const auto & entry = pimpl->ctxs_bufs[group.context_index];
+        for (auto * t = ggml_get_first_tensor(entry.first.get()); t; t = ggml_get_next_tensor(entry.first.get(), t)) {
+            ++info.tensor_count;
+        }
+        for (const auto & buf : entry.second) {
+            info.allocated_bytes += ggml_backend_buffer_get_size(buf.get());
+            if (!ggml_backend_buffer_is_host(buf.get())) {
+                info.gpu_allocated_bytes += ggml_backend_buffer_get_size(buf.get());
+            }
+        }
+    }
+    return info;
+}
+
+bool llama_model::set_mtp_weights_resident(bool resident, llama_mtp_weights_fault fault) {
+    if (!params.split_mtp_weights || pimpl->mtp_groups.empty() || !loras.empty()) {
+        LLAMA_LOG_ERROR("%s: requires independently owned MTP weights and no adapters\n", __func__);
+        return false;
+    }
+    if (pimpl->mtp_resident == resident) {
+        return true;
+    }
+    const auto clear = [&]() {
+        for (auto & group : pimpl->mtp_groups) {
+            auto & entry = pimpl->ctxs_bufs[group.context_index];
+            group.locks.clear();
+            entry.second.clear();
+            for (auto * t = ggml_get_first_tensor(entry.first.get()); t; t = ggml_get_next_tensor(entry.first.get(), t)) {
+                t->data = nullptr;
+                t->buffer = nullptr;
+                t->extra = nullptr;
+            }
+        }
+        pimpl->mtp_resident = false;
+    };
+    if (!resident) {
+        clear();
+        return true;
+    }
+
+    try {
+        for (auto & group : pimpl->mtp_groups) {
+            auto & entry = pimpl->ctxs_bufs[group.context_index];
+            auto * ctx = entry.first.get();
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->data || t->buffer) {
+                    throw std::runtime_error("MTP tensor bindings were not cleared");
+                }
+            }
+            ggml_backend_buffer_ptr buf(fault == llama_mtp_weights_fault::allocation
+                    ? nullptr : ggml_backend_alloc_ctx_tensors_from_buft(ctx, group.buft));
+            if (!buf) {
+                throw std::runtime_error("MTP buffer allocation failed");
+            }
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            entry.second.push_back(std::move(buf));
+            auto * allocated = entry.second.back().get();
+            if ((params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) &&
+                    ggml_backend_buffer_is_host(allocated)) {
+                auto lock = std::make_unique<llama_mlock>();
+                lock->init(ggml_backend_buffer_get_base(allocated));
+                lock->grow_to(ggml_backend_buffer_get_size(allocated));
+                group.locks.push_back(std::move(lock));
+            }
+            size_t offset = 0;
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                const size_t bytes = ggml_nbytes(t);
+                if (offset > group.host.size() || bytes > group.host.size() - offset) {
+                    throw std::runtime_error("MTP host backing layout changed");
+                }
+                ggml_backend_tensor_set(t, group.host.data() + offset, 0, bytes);
+                if (!ggml_backend_buffer_is_host(t->buffer)) {
+                    pimpl->mtp_gpu_upload_bytes += bytes;
+                }
+                offset += bytes;
+                if (fault == llama_mtp_weights_fault::upload) {
+                    throw std::runtime_error("injected MTP upload failure");
+                }
+            }
+            if (offset != group.host.size()) {
+                throw std::runtime_error("MTP host backing has trailing bytes");
+            }
+        }
+        pimpl->mtp_resident = true;
+        ++pimpl->mtp_reloads;
+        return true;
+    } catch (const std::exception & error) {
+        clear();
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return false;
+    }
+}
+
+llama_mtp_weights_info llama_model_mtp_weights_get_info(const llama_model * model) {
+    return model ? model->mtp_weights_info() : llama_mtp_weights_info{};
+}
+
+bool llama_model_mtp_weights_set_resident(llama_model * model, bool resident, llama_mtp_weights_fault fault) {
+    return model && model->set_mtp_weights_resident(resident, fault);
 }
 
 uint64_t llama_model::n_elements() const {
@@ -2883,6 +3087,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.paged_attn_cuda             =*/ false,
+        /*.split_mtp_weights           =*/ false,
     };
 
     return result;

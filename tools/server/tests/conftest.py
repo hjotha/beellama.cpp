@@ -28,6 +28,8 @@ def stop_server_after_each_test():
 @pytest.fixture(scope="session", autouse=True)
 def load_server_presets(configure_worker_port, tmp_path_factory):
     # this will be run once per test session, before any tests
+    if os.environ.get("ADAPTIVE_HTTP_MODEL"):
+        return
 
     # serialize model downloads across parallel workers.
     root_tmp_dir = tmp_path_factory.getbasetemp().parent

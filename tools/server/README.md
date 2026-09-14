@@ -322,6 +322,40 @@ For the full list of features, please refer to [server's changelog](https://gith
 
 <!-- HELP_END -->
 
+### Adaptive context with resident MTP weights
+
+The opt-in adaptive profile keeps the main model weights resident and switches
+between a short MTP context and a long context between requests:
+
+```sh
+llama-server -m qwen35-mtp.gguf --ctx-size 97536 --ctx-size-mtp 56320 \
+  --mtp-max-tokens 56320 --spec-type draft-mtp --parallel 1 --fit off
+```
+
+`--ctx-size-mtp N` enables the profile and sets the short context. Its default
+is `0`, which leaves the existing server behavior unchanged. `--mtp-max-tokens
+N` sets the prompt-plus-output threshold; `0` derives the threshold from
+`--ctx-size-mtp`. A request at or below the threshold uses MTP; a larger
+request uses the long context. The complete formatted prompt is counted even
+when a prompt-cache hit is available, and an explicit budget above the long
+context is rejected before a transition.
+
+The first request starts in the short profile. A transition saves compatible
+slot state and checkpoints, destroys the active contexts, and releases the
+GPU-only MTP group in the long profile. Returning to the short profile uploads
+only that group from its CPU backing before rebuilding the MTP context. The
+main model is loaded once for the life of the process; an external
+`--model-draft`/`--spec-draft-model` is rejected when adaptive mode is enabled.
+
+The `adaptive_context` object in `/props`, `/models`, and `/slots` reports
+`enabled`, `profile` (`mtp`, `long`, or `none`), `state` (`ready`,
+`transitioning`, or `unavailable`), the effective `context_size`, the public
+`context_size_long`, and `mtp_weights_resident`. A failed rollback publishes
+`state: unavailable` and rejects further inference instead of serving with a
+null context. The profile currently supports one dense Qwen35 MTP model, one
+CUDA device, `--parallel 1`, traditional KV, `--fit off`, and no multimodal,
+LoRA, control-vector, sleep, or other speculative backend options.
+
 Note: If both command line argument and environment variable are both set for the same param, the argument will take precedence over env var.
 
 For string options like `--load-mode`, the environment variable is handled as shown in this example:

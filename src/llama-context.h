@@ -59,6 +59,7 @@ struct llama_context {
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
+    uint64_t get_context_instance() const { return context_instance; }
 
     ggml_backend_sched_t get_sched() const;
 
@@ -116,6 +117,8 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    uint64_t get_nextn_decode_id() const;
+    bool matches_nextn_decode(uint64_t id, const llama_batch & batch) const;
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -281,6 +284,7 @@ private:
     //
 
     const llama_model & model;
+    const uint64_t context_instance;
 
     llama_cparams cparams;
 
@@ -302,6 +306,11 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // Ephemeral identity of actual unmasked target rows, never part of a KV snapshot.
+    uint64_t nextn_decode_serial = 0;
+    uint64_t nextn_decode_id = 0;
+    std::vector<std::pair<llama_token, llama_pos>> nextn_decoded_batch;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

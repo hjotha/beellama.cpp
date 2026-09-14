@@ -38,6 +38,9 @@ def test_server_models():
     assert res.status_code == 200
     assert len(res.body["data"]) == 1
     assert res.body["data"][0]["id"] == server.model_alias
+    assert res.body["models"][0]["context_window"] == server.n_ctx
+    assert res.body["models"][0]["max_context_window"] == server.n_ctx
+    assert "adaptive_context" not in res.body
 
 
 def test_server_slots():

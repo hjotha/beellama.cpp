@@ -70,6 +70,9 @@ class ServerProcess:
     n_batch: int | None = None
     n_ubatch: int | None = None
     n_ctx: int | None = None
+    ctx_size_mtp: int | None = None
+    mtp_max_tokens: int | None = None
+    fit: str | None = None
     n_ga: int | None = None
     n_ga_w: int | None = None
     n_predict: int | None = None
@@ -190,8 +193,10 @@ class ServerProcess:
             server_args.extend(["--ubatch-size", self.n_ubatch])
         if self.n_threads:
             server_args.extend(["--threads", self.n_threads])
-        if self.n_gpu_layer:
+        if self.n_gpu_layer is not None:
             server_args.extend(["--n-gpu-layers", self.n_gpu_layer])
+        if self.fit is not None:
+            server_args.extend(["--fit", self.fit])
         if self.server_continuous_batching:
             server_args.append("--cont-batching")
         if self.server_embeddings:
@@ -245,8 +250,12 @@ class ServerProcess:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:
             server_args.extend(["--spec-draft-n-max", self.spec_draft_n_max])
-        if self.spec_draft_n_min:
+        if self.spec_draft_n_min is not None:
             server_args.extend(["--spec-draft-n-min", self.spec_draft_n_min])
+        if self.ctx_size_mtp is not None:
+            server_args.extend(["--ctx-size-mtp", self.ctx_size_mtp])
+        if self.mtp_max_tokens is not None:
+            server_args.extend(["--mtp-max-tokens", self.mtp_max_tokens])
         if self.spec_synth_len is not None:
             server_args.extend(["--spec-synth-len", self.spec_synth_len])
         if self.spec_synth_rates is not None:

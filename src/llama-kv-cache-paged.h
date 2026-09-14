@@ -112,6 +112,11 @@ class llama_kv_cache_paged : public llama_memory_i {
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // state write/load
+    bool state_partial_retained(std::vector<const llama_memory_i *> & out) const override {
+        out.push_back(this);
+        return true;
+    }
+
     void state_write(llama_io_write_i & /*io*/,
                      llama_seq_id /*seq_id*/         = -1,
                      llama_state_seq_flags /*flags*/ = 0) const override {}

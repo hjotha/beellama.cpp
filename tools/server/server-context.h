@@ -7,9 +7,11 @@
 #include "json.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 
 struct server_context_impl; // private implementation
 
@@ -52,6 +54,15 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+};
+
+struct server_context_adaptive_status {
+    bool enabled = false;
+    std::string profile = "disabled";
+    std::string state = "disabled";
+    int32_t context_size = 0;
+    int32_t context_size_long = 0;
+    bool mtp_weights_resident = false;
 };
 
 enum server_state {
@@ -107,6 +118,9 @@ struct server_context {
     // get server metadata (read-only), can only be called after load_model()
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;
+
+    // thread-safe snapshot for HTTP status endpoints
+    server_context_adaptive_status get_adaptive_status() const;
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);

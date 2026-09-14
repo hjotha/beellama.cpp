@@ -163,6 +163,23 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
+    llama_build(test-server-prompt-cache.cpp)
+    target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-prompt-cache PRIVATE server-context)
+    llama_build(test-server-model-identity.cpp)
+    target_include_directories(test-server-model-identity PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-model-identity PRIVATE server-context)
+    llama_test(test-server-model-identity ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-models/gemma2-dense.gguf)
+    set_tests_properties(test-server-model-identity PROPERTIES FIXTURES_REQUIRED generate-models)
+    if (DEFINED LLAMA_TEST_CACHE_MODEL)
+        add_test(NAME test-server-prompt-cache COMMAND test-server-prompt-cache ${LLAMA_TEST_CACHE_MODEL})
+    endif()
+    if (DEFINED LLAMA_TEST_CACHE_LEGACY_MODEL)
+        add_test(NAME test-server-prompt-cache-legacy-no-carry COMMAND test-server-prompt-cache ${LLAMA_TEST_CACHE_LEGACY_MODEL} legacy)
+    endif()
+    if (DEFINED LLAMA_TEST_CACHE_ISWA_MODEL)
+        add_test(NAME test-server-prompt-cache-iswa COMMAND test-server-prompt-cache ${LLAMA_TEST_CACHE_ISWA_MODEL} iswa)
+    endif()
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -255,6 +272,66 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    foreach(mode target prepare-failure)
+        llama_test(
+            test-save-load-state
+            NAME test-context-lifecycle-${mode}
+            LABEL main
+            ARGS --context-lifecycle ${mode} -m "${MODEL_DIR}/qwen35-dense.gguf"
+                 -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off
+        )
+        set_tests_properties(test-context-lifecycle-${mode} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    llama_test(
+        test-save-load-state
+        NAME test-context-lifecycle-yarn-zero-orig
+        LABEL main
+        ARGS --context-lifecycle target -m "${MODEL_DIR}/qwen35-dense.gguf"
+             -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off
+             --rope-scaling yarn --rope-scale 2 --override-kv qwen35.rope.scaling.original_context_length=int:0
+    )
+    set_tests_properties(test-context-lifecycle-yarn-zero-orig PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_test(
+        test-save-load-state
+        NAME test-context-lifecycle-mtp
+        LABEL main
+        ARGS --context-lifecycle mtp -m "${MODEL_DIR}/qwen35-mtp.gguf"
+             -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off --load-mode none --no-repack
+    )
+    set_tests_properties(test-context-lifecycle-mtp PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_test(
+        test-save-load-state
+        NAME test-mtp-carry-state
+        LABEL main
+        ARGS --context-lifecycle mtp-state -m "${MODEL_DIR}/qwen35-mtp.gguf"
+             -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off --load-mode none --no-repack
+    )
+    set_tests_properties(test-mtp-carry-state PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_test(
+        test-save-load-state
+        NAME test-mtp-context-cache-transfer
+        LABEL main
+        ARGS --context-lifecycle mtp-cache -m "${MODEL_DIR}/qwen35-mtp.gguf"
+             -c 256 -b 16 -ub 16 -n 2 -t 2 --backend-sampling --fit off --load-mode none --no-repack
+    )
+    set_tests_properties(test-mtp-context-cache-transfer PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_test(
+        test-save-load-state
+        NAME test-mtp-target-only-bootstrap
+        LABEL main
+        ARGS --context-lifecycle mtp-bootstrap -m "${MODEL_DIR}/qwen35-mtp.gguf"
+             -c 256 -b 16 -ub 16 -n 8 -t 2 --backend-sampling --fit off --load-mode none --no-repack
+    )
+    set_tests_properties(test-mtp-target-only-bootstrap PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_test(
+        test-save-load-state
+        NAME test-mtp-bootstrap-native-rollback
+        LABEL main
+        ARGS --context-lifecycle mtp-bootstrap-multi -m "${MODEL_DIR}/qwen35-mtp.gguf"
+             -c 256 -b 16 -ub 16 -n 8 -t 2 --backend-sampling --fit off --load-mode none --no-repack
+    )
+    set_tests_properties(test-mtp-bootstrap-native-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

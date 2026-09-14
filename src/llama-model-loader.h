@@ -83,6 +83,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    int32_t mtp_layer_begin = -1; // set by the architecture for independently owned MTP weights
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -151,10 +152,14 @@ struct llama_model_loader {
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool mtp = false;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
+            if (lhs.mtp != rhs.mtp) {
+                return lhs.mtp < rhs.mtp;
+            }
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
             }

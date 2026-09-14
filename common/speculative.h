@@ -90,15 +90,35 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// Managed resident weights, single-sequence, single-head MTP only. Call immediately after decoding this exact
+// token batch on the target with unmasked nextn embeddings enabled, instead of process().
+// The owner must exclude concurrent decode/state operations. Keeps target KV intact,
+// clears draft KV and seeds the next draft from the last real target hidden row.
+// Earlier draft history is deliberately absent and masked by the KV attention path.
+// Returns false without changing either context or the carry for unsupported/invalid input.
+// Pass the nonzero ID obtained from the target immediately after that successful decode.
+bool common_speculative_bootstrap(common_speculative * spec, const llama_batch & batch, uint64_t decode_id);
+
+// Allocation-free readiness for resident-weight MTP; checks carry and target/draft KV
+// boundaries before the next draft. Other modes keep their existing behavior.
+bool common_speculative_is_ready(common_speculative * spec, llama_seq_id seq_id, llama_pos next_pos);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
-void common_speculative_draft(common_speculative * spec);
+// False means resident MTP carry/KV is not aligned; no draft implementation is run.
+bool common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
-// (optional) get/set internal state
+// Optional host-owned internal state. These hooks do not save or restore KV.
+// The owner must quiesce decode/draft operations and restore matching target/draft state,
+// and may require a checkpoint position. No borrowed device state escapes these hooks.
+// Failed import leaves the previous implementation state unchanged.
+// For single-head MTP, empty data with expected_pos < 0 explicitly resets the carry;
+// the caller must separately clear any target/draft KV after a failed restore.
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data,
+        llama_pos expected_pos = -1);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

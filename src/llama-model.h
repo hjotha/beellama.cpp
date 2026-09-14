@@ -17,6 +17,8 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_mtp_weights_info;
+enum class llama_mtp_weights_fault : uint8_t;
 
 // available models
 enum llm_type {
@@ -734,6 +736,9 @@ struct llama_model {
     llama_split_mode split_mode() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+    llama_mtp_weights_info mtp_weights_info() const;
+    bool set_mtp_weights_resident(bool resident, llama_mtp_weights_fault fault);
 
     // total number of parameters in the model
     uint64_t n_elements() const;

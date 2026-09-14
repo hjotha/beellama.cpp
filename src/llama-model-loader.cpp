@@ -1113,7 +1113,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     bool is_lazy = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, mtp_layer_begin >= 0 && tn.bid >= mtp_layer_begin };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1174,6 +1174,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
             size_data -= nbytes;
             n_created++;
+
+            // Qwen35's generic scale pass only visits loaded weights. Account for
+            // sidecars of an explicitly skipped MTP weight without allocating them.
+            if (!load_mtp && hparams.n_layer_nextn > 0 && get_arch() == LLM_ARCH_QWEN35 &&
+                    (flags & TENSOR_SKIP) && tn.bid >= static_cast<int>(hparams.n_layer()) &&
+                    tn.suffix && strcmp(tn.suffix, "weight") == 0) {
+                for (const char * suffix : { "scale", "input_scale" }) {
+                    const auto name = LLM_TN_IMPL(get_arch(), tn.tensor, suffix, tn.bid, tn.xid).str();
+                    if (const auto * sidecar = get_tensor_meta(name.c_str())) {
+                        size_data -= ggml_nbytes(sidecar);
+                        ++n_created;
+                        LLAMA_LOG_DEBUG("%s: ignoring sidecar %s of skipped MTP weight\n", __func__, name.c_str());
+                    }
+                }
+            }
 
             return nullptr;
         }

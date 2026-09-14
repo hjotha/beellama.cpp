@@ -16,6 +16,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <array>
 #include <fstream>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -449,6 +450,8 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
+    int32_t ctx_size_mtp          =     0; // adaptive context short profile, 0 = disabled
+    int32_t mtp_max_tokens        =     0; // adaptive context threshold, 0 = ctx_size_mtp
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
@@ -604,6 +607,7 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+    bool split_mtp_weights = false; // internal opt-in for resident-model context transitions
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     bool single_turn       = false; // single turn chat conversation
@@ -966,17 +970,53 @@ struct common_init_result {
     llama_model * model();
     llama_context * context();
 
+    // Owner thread must synchronize backends, drop slot users, then speculation, then draft, and clear borrowed aliases first.
+    void release_context();
+    // Use post-common_init_from_params params (or a copy), preserving model/sampling/adapters and CPU configuration.
+    // Requires explicit non-paged context parameters without fitting; failure leaves the model alive and context absent.
+    bool recreate_context(common_params & params);
+
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
 private:
+    bool create_context(common_params & params, llama_context_params cparams);
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
+
+enum common_context_profile {
+    COMMON_CONTEXT_PROFILE_MTP,
+    COMMON_CONTEXT_PROFILE_LONG,
+};
+
+struct common_context_budget {
+    int64_t prompt_tokens = 0;
+    int64_t output_reserve = 0;
+    int64_t total_tokens = 0;
+};
+
+bool common_context_is_adaptive(const common_params & params);
+int64_t common_context_mtp_limit(const common_params & params);
+int64_t common_context_output_reserve(
+        const common_params & params, int32_t request_n_predict, bool generates_output);
+common_context_budget common_context_budget_for_task(
+        const common_params & params, int64_t prompt_tokens, int32_t request_n_predict, bool generates_output);
+common_context_profile common_context_profile_for_budget(
+        const common_params & params, int64_t budget);
+
+// Returns an empty string when valid. effective_long_ctx is optional when n_ctx is unset.
+std::string common_context_adaptive_error(
+        const common_params & params, int32_t effective_long_ctx = 0);
+// Validate and persist load-time ownership before constructing the model.
+std::string common_context_adaptive_normalize(
+        common_params & params, int32_t effective_long_ctx = 0);
+// Pin adaptive mode to one CUDA device, or to an explicit CPU check with -ngl 0.
+std::string common_context_prepare_devices(common_params & params);
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
@@ -1006,10 +1046,15 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+    bool can_attach(const common_params & params) const;
+    bool attach(llama_context * ctx, const common_params & params);
 
 private:
     ggml_threadpool * threadpool       = nullptr;
     ggml_threadpool * threadpool_batch = nullptr;
+
+    common_cpu_params cpuparams;
+    common_cpu_params cpuparams_batch;
 
     decltype(ggml_threadpool_free) * free_fn = nullptr;
 };
@@ -1195,15 +1240,35 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+std::string common_prompt_cache_layout(llama_context * ctx);
+
+struct common_speculative;
+enum class common_checkpoint_restore { restored, missing_base, incompatible, failed };
+
 struct common_prompt_checkpoint {
-    int64_t n_tokens;
+    int64_t n_tokens = 0;
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
-    llama_pos pos_min;
-    llama_pos pos_max;
+    llama_pos pos_min = -1;
+    llama_pos pos_max = -1;
+    llama_state_seq_flags flags_tgt = LLAMA_STATE_SEQ_FLAGS_NONE;
+    llama_state_seq_flags flags_dft = LLAMA_STATE_SEQ_FLAGS_NONE;
 
+    const llama_model * model_tgt = nullptr;
+    const llama_model * model_dft = nullptr;
+    uint64_t instance_tgt = 0;
+    uint64_t instance_dft = 0;
+    std::string layout_tgt;
+    std::string layout_dft;
+    std::array<llama_pos, 4> attention_tgt = {{-1, -1, -1, -1}};
+    std::array<llama_pos, 4> attention_dft = {{-1, -1, -1, -1}};
+    std::array<llama_pos, 8> retained_tgt = {{-1, -1, -1, -1, -1, -1, -1, -1}};
+    std::array<llama_pos, 8> retained_dft = {{-1, -1, -1, -1, -1, -1, -1, -1}};
+    uint32_t retained_count_tgt = UINT32_MAX; // Unknown is distinct from no retained components.
+    uint32_t retained_count_dft = UINT32_MAX;
+    bool draft_base_valid = false;
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
@@ -1240,6 +1305,15 @@ struct common_prompt_checkpoint {
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
+
+    bool restore_tgt(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+    common_checkpoint_restore restore_dft(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+    bool compatible_tgt(llama_context * ctx) const;
+    bool compatible_dft(llama_context * ctx) const;
+    void update_spec(common_speculative * spec, llama_seq_id seq_id);
+    bool host_only() const {
+        return !((flags_tgt | flags_dft) & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    }
 
     void clear_tgt();
     void clear_dft();

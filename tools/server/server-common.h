@@ -243,6 +243,10 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     server_tokens clone() const;
+    server_tokens clone_for_cache() const;
+    size_t cache_size(bool for_clone = false) const;
+    size_t digest_workspace() const;
+    uint64_t cache_digest() const;
 };
 
 

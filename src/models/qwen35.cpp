@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ext.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -34,6 +35,13 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    if (params.split_mtp_weights) {
+        if (mtp_only || !ml.load_mtp || hparams.n_layer() == 0 || hparams.n_layer_nextn != 1) {
+            throw std::runtime_error("separate MTP weights require a complete target with one embedded MTP head");
+        }
+        // load_hparams bounds all layers by LLAMA_MAX_LAYERS and nextn by all layers.
+        ml.mtp_layer_begin = static_cast<int32_t>(hparams.n_layer());
+    }
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
 
@@ -485,6 +493,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
 llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
+    const auto weights = model.mtp_weights_info();
+    if (weights.managed && !weights.resident) {
+        throw std::runtime_error("MTP weights are not resident");
+    }
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35 MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35 MTP currently only supports a single MTP block");
 

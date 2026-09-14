@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -128,6 +129,11 @@ struct llama_memory_i {
     //
     // state write/read
     //
+
+    // Read-only description of the components omitted by PARTIAL_ONLY. An empty
+    // list with true means the blob restores everything; false means unknown.
+    // Returned pointers are borrowed for this owner-thread query only.
+    virtual bool state_partial_retained(std::vector<const llama_memory_i *> & /*out*/) const { return false; }
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;

@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "hash/xxhash/xxhash.h"
 
 #include <random>
 #include <sstream>
@@ -836,6 +837,42 @@ server_tokens server_tokens::clone() const {
         res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
     }
     return res;
+}
+
+server_tokens server_tokens::clone_for_cache() const {
+    server_tokens result;
+    result.has_mtmd = has_mtmd;
+    result.tokens = tokens;
+    for (const auto & item : map_idx_to_media) {
+        mtmd::input_chunk_ptr chunk(mtmd_input_chunk_get_placeholder(item.second.get()));
+        if (!chunk) { throw std::runtime_error("cannot copy media cache metadata"); }
+        result.map_idx_to_media.emplace(item.first, std::move(chunk));
+    }
+    return result;
+}
+
+size_t server_tokens::cache_size(bool for_clone) const {
+    size_t size = (for_clone ? tokens.size() : tokens.capacity())*sizeof(llama_token);
+    if (has_mtmd) { size += 4*sizeof(uint32_t); }
+    for (const auto & item : map_idx_to_media) {
+        size_t encoded = 0;
+        if (mtmd_input_chunk_save(item.second.get(), nullptr, 0, &encoded) != 0) {
+            throw std::runtime_error("cannot measure media cache metadata");
+        }
+        // Cache chunks are placeholders. This covers metadata containers and serialization scratch, not image/audio buffers.
+        size += 8*encoded + sizeof(decltype(map_idx_to_media)::value_type) + 4*sizeof(void *);
+    }
+    return size;
+}
+
+size_t server_tokens::digest_workspace() const {
+    return has_mtmd ? 3*cache_size(true) : 0;
+}
+
+uint64_t server_tokens::cache_digest() const {
+    if (!has_mtmd) { return XXH64(tokens.data(), tokens.size()*sizeof(llama_token), 0); }
+    const auto packed = serialize();
+    return XXH64(packed.data(), packed.size(), 1);
 }
 
 //

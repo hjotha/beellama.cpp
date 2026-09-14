@@ -13,6 +13,8 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
+    server-model-identity.cpp
+    server-model-identity.h
     server-context.cpp
     server-context.h
     server-gpu-power.cpp
@@ -33,7 +35,7 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd vendor::hash ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 
 # llama-server-impl: server logic, reusable by app
 

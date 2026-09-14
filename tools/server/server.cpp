@@ -150,10 +150,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+            if (common_context_is_adaptive(params)) {
+                SRV_TRC("%s", "adaptive context is enabled, using n_parallel = 1\n");
+                params.n_parallel = 1;
+            } else {
+                SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 
-            params.n_parallel = 4;
-            params.kv_unified = true;
+                params.n_parallel = 4;
+                params.kv_unified = true;
+            }
+        }
+
+        if (const std::string error = common_context_prepare_devices(params); !error.empty()) {
+            SRV_ERR("invalid adaptive context device selection: %s\n", error.c_str());
+            return 1;
         }
     }
 

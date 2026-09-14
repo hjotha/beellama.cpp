@@ -365,6 +365,7 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool paged_attn_cuda; // pin full-attention layers to the first device
+        bool split_mtp_weights; // keep embedded MTP weights in independently releasable buffers with host backing
     };
 
     struct llama_sampler_seq_config {

@@ -153,6 +153,10 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
 
+    // Selected before slot/cache admission when adaptive context is enabled.
+    common_context_profile context_profile = COMMON_CONTEXT_PROFILE_LONG;
+    common_context_budget context_budget;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;
@@ -233,6 +237,8 @@ struct server_task {
         copy.params    = params;
         copy.type      = type;
         copy.tokens    = tokens.clone();
+        copy.context_profile = context_profile;
+        copy.context_budget = context_budget;
         copy.id_slot   = -1; // child tasks cannot specify slot
 
         // use different sampling seed for each child
@@ -566,7 +572,7 @@ struct server_task_result_apply_lora : server_task_result {
 struct server_prompt {
     server_tokens tokens;
 
-    std::list<common_prompt_checkpoint> checkpoints;
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
     void clear() {
         tokens.clear();
@@ -588,26 +594,45 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.capacity() + drft.capacity() + spec.capacity();
     }
 };
 
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    const llama_model * model = nullptr;
+    uint64_t model_instance = 0;
+    std::string layout_tgt;
+    std::string layout_dft;
+    llama_pos pos_tgt = -1;
+    llama_pos pos_dft = -1;
+    uint64_t checksum = 0;
+    bool quarantined = false;
+
+    bool has_draft() const { return !data.drft.empty(); }
+    uint64_t digest() const;
+
+    size_t private_size() const {
+        return sizeof(*this) + 2*sizeof(void *) + data.size() + prompt.tokens.cache_size() +
+            layout_tgt.capacity() + layout_dft.capacity() + prompt.checkpoints.size()*
+            (sizeof(std::shared_ptr<const common_prompt_checkpoint>) + 2*sizeof(void *));
+    }
 
     size_t size() const {
-        size_t res = data.size();
-
-        for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
-        }
-
+        size_t res = private_size();
+        for (const auto & ckpt : prompt.checkpoints) { res += ckpt->size() + 2*sizeof(void *); }
         return res;
     }
+
 };
+
+enum class server_prompt_cache_result { unchanged, hit, miss, needs_bootstrap };
+
+struct common_speculative;
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
@@ -623,15 +648,35 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    size_t size() const;
+    size_t size(const server_prompt_cache_state * extra = nullptr) const;
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    std::string last_reason;
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
+            common_speculative * spec, llama_seq_id id_slot);
+
+    server_prompt_cache_result load(server_prompt & prompt, const server_tokens & tokens_new,
+            llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot);
+
+    server_prompt_cache_result restore(server_prompt & prompt, const server_prompt_cache_state & state,
+            llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot);
+
+    bool make_room(size_t bytes, const server_prompt_cache_state * incoming = nullptr,
+            const server_prompt_cache_state * keep = nullptr);
+    bool reserve_transient(size_t bytes);
+    void release_transient(size_t bytes);
+    size_t evictions = 0;
 
     void update();
+
+private:
+    size_t transient_bytes = 0;
+    bool restore_invalid = false;
+    server_prompt_cache_result restore_impl(server_prompt & prompt, const server_prompt_cache_state & state,
+            llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot,
+            bool copy_prompt, bool allow_bootstrap);
 };
 
 // used exclusively by router mode

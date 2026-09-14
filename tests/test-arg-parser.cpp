@@ -186,6 +186,10 @@ static void test(void) {
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // checkpoint count cannot wrap through size_t during snapshot budgeting
+    argv = {"binary_name", "--ctx-checkpoints", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
     {
         common_params penalty_params;
         assert(penalty_params.sampling.penalty_last_n == 64);
@@ -248,6 +252,176 @@ static void test(void) {
     assert(params.model.path == "abc.gguf");
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
+
+    {
+        common_params adaptive;
+        argv = {
+            "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+            "--mtp-max-tokens", "500", "--fit", "off", "--parallel", "1",
+            "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive, LLAMA_EXAMPLE_SERVER));
+        assert(adaptive.ctx_size_mtp == 600);
+        assert(adaptive.mtp_max_tokens == 500);
+        assert(adaptive.split_mtp_weights);
+        assert(common_context_is_adaptive(adaptive));
+        assert(common_context_mtp_limit(adaptive) == 500);
+        assert(common_context_adaptive_error(adaptive).empty());
+
+        const auto budget = common_context_budget_for_task(adaptive, 499, -1, true);
+        assert(budget.prompt_tokens == 499);
+        assert(budget.output_reserve == 4096);
+        assert(budget.total_tokens == 4595);
+        assert(common_context_profile_for_budget(adaptive, 499) == COMMON_CONTEXT_PROFILE_MTP);
+        assert(common_context_profile_for_budget(adaptive, 500) == COMMON_CONTEXT_PROFILE_MTP);
+        assert(common_context_profile_for_budget(adaptive, 501) == COMMON_CONTEXT_PROFILE_LONG);
+        assert(common_context_output_reserve(adaptive, 0, true) == 0);
+        assert(common_context_output_reserve(adaptive, -1, false) == 0);
+        assert(common_context_output_reserve(adaptive, 7, true) == 7);
+        adaptive.n_predict = 123;
+        assert(common_context_output_reserve(adaptive, -1, true) == 123);
+
+        adaptive.mtp_max_tokens = 0;
+        assert(common_context_mtp_limit(adaptive) == 600);
+        assert(common_context_adaptive_error(adaptive, 599) ==
+               "--ctx-size-mtp must not exceed the long context size");
+
+        common_params capped = adaptive;
+        capped.mtp_max_tokens = 500;
+        assert(common_context_adaptive_error(capped, 512) ==
+               "--ctx-size-mtp must not exceed the long context size");
+        capped.ctx_size_mtp = 400;
+        capped.mtp_max_tokens = 400;
+        assert(common_context_adaptive_error(capped, 512).empty());
+    }
+
+    {
+        auto make_adaptive = [] {
+            common_params value;
+            value.n_ctx = 1000;
+            value.ctx_size_mtp = 600;
+            value.mtp_max_tokens = 500;
+            value.n_parallel = 1;
+            value.fit_params = false;
+            value.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            return value;
+        };
+        auto expect_error = [&](const common_params & value, const char * expected) {
+            assert(common_context_adaptive_error(value) == expected);
+        };
+
+        common_params disabled;
+        assert(!common_context_is_adaptive(disabled));
+        assert(common_context_profile_for_budget(disabled, 0) == COMMON_CONTEXT_PROFILE_LONG);
+        assert(common_context_adaptive_error(disabled).empty());
+        disabled.mtp_max_tokens = 1;
+        expect_error(disabled, "--mtp-max-tokens requires --ctx-size-mtp");
+
+        auto adaptive = make_adaptive();
+        adaptive.split_mtp_weights = false;
+        assert(common_context_adaptive_normalize(adaptive).empty());
+        assert(adaptive.split_mtp_weights);
+        adaptive.ctx_size_mtp = -1;
+        expect_error(adaptive, "--ctx-size-mtp must be non-negative");
+        adaptive = make_adaptive();
+        adaptive.mtp_max_tokens = -1;
+        expect_error(adaptive, "--mtp-max-tokens must be non-negative");
+        adaptive = make_adaptive();
+        adaptive.mtp_max_tokens = 601;
+        expect_error(adaptive, "--mtp-max-tokens must satisfy 0 < limit <= --ctx-size-mtp");
+        adaptive = make_adaptive();
+        adaptive.n_ctx = 500;
+        expect_error(adaptive, "--ctx-size-mtp must not exceed the long context size");
+        adaptive = make_adaptive();
+        adaptive.n_parallel = 2;
+        expect_error(adaptive, "adaptive context requires --parallel 1");
+        adaptive = make_adaptive();
+        adaptive.fit_params = true;
+        expect_error(adaptive, "adaptive context requires --fit off");
+        adaptive = make_adaptive();
+        adaptive.no_alloc = true;
+        expect_error(adaptive, "adaptive context requires allocated model tensors (no-alloc is unsupported)");
+        adaptive = make_adaptive();
+        adaptive.kv_paged = true;
+        expect_error(adaptive, "adaptive context requires traditional KV (paged KV is unsupported)");
+        adaptive = make_adaptive();
+        adaptive.kv_unified_per_slot = 1;
+        expect_error(adaptive, "adaptive context does not support --kv-unified-per-slot");
+        adaptive = make_adaptive();
+        adaptive.devices = { nullptr };
+        expect_error(adaptive, "adaptive context requires one CUDA device");
+        adaptive = make_adaptive();
+        adaptive.devices = { nullptr, nullptr };
+        expect_error(adaptive, "adaptive context requires one CUDA device");
+        assert(common_context_prepare_devices(adaptive) ==
+               "adaptive context requires exactly one selected CUDA device");
+        adaptive = make_adaptive();
+        adaptive.n_gpu_layers = 0;
+        adaptive.devices = { nullptr };
+        assert(common_context_adaptive_error(adaptive).empty());
+        assert(common_context_prepare_devices(adaptive).empty());
+        assert(adaptive.devices.size() == 1 && adaptive.devices.front() == nullptr);
+        adaptive = make_adaptive();
+        adaptive.mmproj.path = "mmproj.gguf";
+        expect_error(adaptive, "adaptive context does not support multimodal models");
+        adaptive = make_adaptive();
+        adaptive.lora_adapters.push_back({});
+        expect_error(adaptive, "adaptive context does not support LoRA or control vectors");
+        adaptive = make_adaptive();
+        adaptive.control_vectors.push_back({});
+        expect_error(adaptive, "adaptive context does not support LoRA or control vectors");
+        adaptive = make_adaptive();
+        adaptive.sleep_idle_seconds = 1;
+        expect_error(adaptive, "adaptive context does not support automatic sleep");
+        adaptive = make_adaptive();
+        adaptive.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
+        expect_error(adaptive, "adaptive context supports only draft-mtp speculative decoding");
+        adaptive = make_adaptive();
+        adaptive.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+        expect_error(adaptive, "adaptive context requires draft-mtp speculative decoding");
+        adaptive = make_adaptive();
+        adaptive.speculative.synth_len = 2.0;
+        expect_error(adaptive, "adaptive context does not support synthetic speculative decoding");
+        adaptive = make_adaptive();
+        adaptive.speculative.draft.mparams.path = "draft.gguf";
+        expect_error(adaptive, "adaptive context requires the resident model MTP head; external draft models are unsupported");
+
+        try {
+            common_context_budget_for_task(adaptive, -1, 0, true);
+            assert(false);
+        } catch (const std::invalid_argument & error) {
+            assert(std::string(error.what()) == "adaptive context prompt token count must be non-negative");
+        }
+        try {
+            common_context_budget_for_task(adaptive, std::numeric_limits<int64_t>::max(), 1, true);
+            assert(false);
+        } catch (const std::invalid_argument & error) {
+            assert(std::string(error.what()) == "adaptive context token budget overflow");
+        }
+
+        common_params parse_adaptive;
+        argv = {"binary_name", "--ctx-size-mtp", "600", "--fit", "off", "--parallel", "1",
+                "--mtp-max-tokens", "601", "--spec-type", "draft-mtp"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--ctx-size", "500", "--ctx-size-mtp", "600", "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--ctx-size-mtp", "600", "--parallel", "1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--ctx-size-mtp", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--mtp-max-tokens", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
+
+        common_params parse_external_draft;
+        argv = {"binary_name", "--model", "model.gguf", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+                "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+                "--model-draft", "draft.gguf"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_external_draft, LLAMA_EXAMPLE_SERVER));
+    }
 
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};

@@ -14,6 +14,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -80,10 +81,18 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static uint64_t next_context_instance() {
+    static std::atomic<uint64_t> next{0};
+    const uint64_t id = next.fetch_add(1, std::memory_order_relaxed) + 1;
+    GGML_ASSERT(id != 0); // Never recycle an identity, including on counter exhaustion.
+    return id;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    context_instance(next_context_instance()),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -1253,8 +1262,30 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
+        nextn_decode_id = 0;
+    }
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+}
+
+uint64_t llama_context::get_nextn_decode_id() const {
+    return nextn_decode_id;
+}
+
+bool llama_context::matches_nextn_decode(uint64_t id, const llama_batch & batch) const {
+    if (!id || id != nextn_decode_id || batch.n_tokens <= 0 ||
+            (size_t) batch.n_tokens != nextn_decoded_batch.size() ||
+            !batch.token || batch.embd || !batch.pos || !batch.n_seq_id || !batch.seq_id) {
+        return false;
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || !batch.seq_id[i] || batch.seq_id[i][0] != 0 ||
+                nextn_decoded_batch[i].first != batch.token[i] || nextn_decoded_batch[i].second != batch.pos[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -1486,6 +1517,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    nextn_decode_id = 0;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1724,6 +1756,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    nextn_decode_id = 0;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1790,6 +1823,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+    uint32_t n_nextn_copied = 0;
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {
@@ -2045,6 +2079,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (!masked) {
+                    n_nextn_copied += n_rows;
+                }
             }
         }
 
@@ -2112,6 +2149,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    if (model.mtp_weights_info().managed && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && n_nextn_copied == n_tokens_all &&
+            batch_inp.token && !batch_inp.embd && batch_inp.pos && batch_inp.n_seq_id && batch_inp.seq_id &&
+            nextn_decode_serial != std::numeric_limits<uint64_t>::max()) {
+        // Allocation failure only makes this decode ineligible for bootstrap; it must
+        // never turn otherwise successful inference into an exception across the C API.
+        try {
+            nextn_decoded_batch.clear();
+            for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+                if (batch_inp.n_seq_id[i] != 1 || !batch_inp.seq_id[i] || batch_inp.seq_id[i][0] != 0) {
+                    break;
+                }
+                nextn_decoded_batch.emplace_back(batch_inp.token[i], batch_inp.pos[i]);
+            }
+            if (nextn_decoded_batch.size() == (size_t) batch_inp.n_tokens) {
+                nextn_decode_id = ++nextn_decode_serial;
+            }
+        } catch (const std::bad_alloc &) {
+            nextn_decoded_batch.clear();
+        }
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
@@ -2123,6 +2182,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
+    nextn_decode_id = 0;
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -3147,6 +3207,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+    nextn_decode_id = 0;
     llama_io_read_host io(src, size);
     try {
         return state_read_data(io);
@@ -3191,6 +3252,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    nextn_decode_id = 0;
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -3384,6 +3446,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    nextn_decode_id = 0;
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -3418,6 +3481,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    nextn_decode_id = 0;
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -4021,6 +4085,14 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+uint64_t llama_get_nextn_decode_id(const llama_context * ctx) {
+    return ctx ? ctx->get_nextn_decode_id() : 0;
+}
+
+bool llama_matches_nextn_decode(const llama_context * ctx, uint64_t id, const llama_batch & batch) {
+    return ctx && ctx->matches_nextn_decode(id, batch);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

@@ -7,24 +7,36 @@
 #include "server-schema.h"
 #include "server-stream.h"
 #include "server-gpu-power.h"
+#include "server-model-identity.h"
 
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#define XXH_STATIC_LINKING_ONLY
+#include "hash/xxhash/xxhash.h"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdio>
+#include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
+#include <optional>
 #include <random>
+#include <stdexcept>
+#include <sstream>
 #include <utility>
 #include <fstream>
 
@@ -35,6 +47,10 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -51,6 +67,46 @@ static common_speculative_output_limits server_output_limits(const common_params
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
+}
+
+// Test-only fault injection; unset in production. Values: long, mtp,
+// long+rollback, mtp+rollback, mtp-allocation or mtp-upload.
+static bool adaptive_test_fault(const char * phase, common_context_profile profile) {
+    const char * raw = std::getenv("LLAMA_TEST_ADAPTIVE_TRANSITION_FAIL");
+    if (raw == nullptr) {
+        return false;
+    }
+
+    const std::string value(raw);
+    if (std::string(phase) == "rollback-after-residency") {
+        return value.find("rollback") != std::string::npos &&
+            value.find("rollback-context") == std::string::npos;
+    }
+    if (std::string(phase) == "rollback-after-context") {
+        return value.find("rollback-context") != std::string::npos;
+    }
+
+    const std::string profile_name = profile == COMMON_CONTEXT_PROFILE_MTP ? "mtp" : "long";
+    return std::string(phase) == "candidate-after-residency" &&
+        value.find(profile_name) != std::string::npos;
+}
+
+static llama_mtp_weights_fault adaptive_test_mtp_fault(const char * phase, common_context_profile profile) {
+    if (profile != COMMON_CONTEXT_PROFILE_MTP || std::string(phase) != "candidate") {
+        return llama_mtp_weights_fault::none;
+    }
+    const char * raw = std::getenv("LLAMA_TEST_ADAPTIVE_TRANSITION_FAIL");
+    if (raw == nullptr) {
+        return llama_mtp_weights_fault::none;
+    }
+    const std::string value(raw);
+    if (value.find("mtp-allocation") != std::string::npos) {
+        return llama_mtp_weights_fault::allocation;
+    }
+    if (value.find("mtp-upload") != std::string::npos || value.find("mtp") != std::string::npos) {
+        return llama_mtp_weights_fault::upload;
+    }
+    return llama_mtp_weights_fault::none;
 }
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
@@ -291,6 +347,8 @@ struct server_slot {
     int32_t n_ctx_reservation = 0;
     int32_t n_kv_reservation = 0;
     bool clear_context_on_release = false;
+    // Target-only adaptive snapshots need one real target suffix decode before MTP can resume.
+    bool bootstrap_pending = false;
 
     size_t last_nl_pos = 0;
 
@@ -315,44 +373,31 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
+        if ((task && !task->params.cache_prompt) || (!task && task_prev && !task_prev->params.cache_prompt)) {
+            prompt_cache.last_reason = "outgoing task disabled prompt caching";
             return false;
         }
+        const bool saved = prompt_cache.save(prompt, ctx_tgt, ctx_dft, spec, id);
+        if (!saved) { SLT_TRC(*this, "prompt cache save miss: %s\n", prompt_cache.last_reason.c_str()); }
+        return saved;
+    }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
-            return false;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        return true;
+    server_prompt_cache_result prompt_load_result(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        const auto result = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id);
+        SLT_TRC(*this, "prompt cache load: %s\n", prompt_cache.last_reason.c_str());
+        return result;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
-        if (!res) {
-            SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
-        }
-
-        return res;
+        const auto result = prompt_load_result(prompt_cache, tokens);
+        return result == server_prompt_cache_result::hit || result == server_prompt_cache_result::unchanged;
     }
 
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_set_state(spec, id, {});
 
         prompt.clear();
     }
@@ -388,6 +433,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        bootstrap_pending = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -732,7 +778,7 @@ struct server_slot {
             });
 
             if (!only_metrics) {
-                res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
+                res["prompt"] = ctx_tgt ? ptask->tokens.detokenize(ctx_tgt, true) : "";
                 res["generated"] = generated_text.empty() ? debug_generated_text : generated_text;
             }
         }
@@ -754,6 +800,1046 @@ struct server_slot {
         other.init_sampler();
     }
 };
+
+namespace {
+
+// One explicit snapshot can coexist with the file bytes, decoded vectors,
+// rollback copy, checkpoint copies and canonical comparison scratch. Reserve
+// the complete peak against the global prompt-cache budget before reading or
+// serializing so eviction and failure remain explicit.
+static constexpr uint64_t ADAPTIVE_SLOT_WORKING_COPIES = 5;
+
+struct adaptive_slot_cache_reservation {
+    server_prompt_cache * cache = nullptr;
+    size_t bytes = 0;
+
+    bool acquire(server_prompt_cache * value, size_t amount) {
+        if (!value || !value->reserve_transient(amount)) {
+            return !value;
+        }
+        cache = value;
+        bytes = amount;
+        return true;
+    }
+
+    ~adaptive_slot_cache_reservation() {
+        if (cache) {
+            cache->release_transient(bytes);
+        }
+    }
+};
+
+// Explicit adaptive slot files are deliberately separate from the upstream
+// sequence-state format: the latter has no model/configuration identity and
+// cannot carry a draft or MTP implementation state.
+static constexpr std::array<uint8_t, 8> ADAPTIVE_SLOT_MAGIC = {{
+    'L', 'L', 'A', 'M', 'A', 'S', 'L', 'T'
+}};
+static constexpr uint32_t ADAPTIVE_SLOT_VERSION = 1;
+
+class adaptive_slot_writer {
+public:
+    void reserve(size_t size) {
+        data.reserve(size);
+    }
+
+    void raw(const void * ptr, size_t size) {
+        if (size == 0) {
+            return;
+        }
+        if (ptr == nullptr) {
+            throw std::invalid_argument("adaptive slot writer received a null payload");
+        }
+        const auto * begin = static_cast<const uint8_t *>(ptr);
+        data.insert(data.end(), begin, begin + size);
+    }
+
+    void u8(uint8_t value) {
+        data.push_back(value);
+    }
+
+    void u32(uint32_t value) {
+        for (int i = 0; i < 4; ++i) {
+            data.push_back((uint8_t) (value >> (8*i)));
+        }
+    }
+
+    void u64(uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            data.push_back((uint8_t) (value >> (8*i)));
+        }
+    }
+
+    void i32(int32_t value) { u32((uint32_t) value); }
+    void i64(int64_t value) { u64((uint64_t) value); }
+
+    void string(const std::string & value) {
+        u64(value.size());
+        raw(value.data(), value.size());
+    }
+
+    void bytes(const std::vector<uint8_t> & value) {
+        u64(value.size());
+        raw(value.data(), value.size());
+    }
+
+    std::vector<uint8_t> finish() && {
+        u64(XXH64(data.data(), data.size(), 0x534c4f5453544154ULL));
+        return std::move(data);
+    }
+
+private:
+    std::vector<uint8_t> data;
+};
+
+class adaptive_slot_reader {
+public:
+    adaptive_slot_reader(const uint8_t * data, size_t size) : data(data), size(size) {}
+
+    void raw(void * dst, size_t count) {
+        if (count > remaining()) {
+            throw std::runtime_error("truncated adaptive slot snapshot");
+        }
+        if (count) {
+            std::memcpy(dst, data + pos, count);
+            pos += count;
+        }
+    }
+
+    uint8_t u8() {
+        uint8_t value = 0;
+        raw(&value, sizeof(value));
+        return value;
+    }
+
+    uint32_t u32() {
+        uint32_t value = 0;
+        for (int i = 0; i < 4; ++i) {
+            value |= (uint32_t) u8() << (8*i);
+        }
+        return value;
+    }
+
+    uint64_t u64() {
+        uint64_t value = 0;
+        for (int i = 0; i < 8; ++i) {
+            value |= (uint64_t) u8() << (8*i);
+        }
+        return value;
+    }
+
+    int32_t i32() { return (int32_t) u32(); }
+    int64_t i64() { return (int64_t) u64(); }
+
+    std::string string(const char * label) {
+        const uint64_t count = u64();
+        if (count > remaining() || count > std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error(std::string("invalid adaptive slot ") + label + " length");
+        }
+        std::string value(reinterpret_cast<const char *>(data + pos), (size_t) count);
+        pos += (size_t) count;
+        return value;
+    }
+
+    std::vector<uint8_t> bytes(const char * label) {
+        const uint64_t count = u64();
+        if (count > remaining() || count > std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error(std::string("invalid adaptive slot ") + label + " length");
+        }
+        std::vector<uint8_t> value((size_t) count);
+        raw(value.data(), value.size());
+        return value;
+    }
+
+    size_t remaining() const { return size - pos; }
+    bool done() const { return pos == size; }
+
+private:
+    const uint8_t * data;
+    size_t size;
+    size_t pos = 0;
+};
+
+struct adaptive_slot_checkpoint_blob {
+    int64_t n_tokens = 0;
+    int32_t id_task = -1;
+    llama_pos pos_min = -1;
+    llama_pos pos_max = -1;
+    uint32_t flags_tgt = LLAMA_STATE_SEQ_FLAGS_NONE;
+    uint32_t flags_dft = LLAMA_STATE_SEQ_FLAGS_NONE;
+    uint64_t instance_tgt = 0;
+    uint64_t instance_dft = 0;
+    std::string layout_tgt;
+    std::string layout_dft;
+    std::array<llama_pos, 4> attention_tgt = {{-1, -1, -1, -1}};
+    std::array<llama_pos, 4> attention_dft = {{-1, -1, -1, -1}};
+    std::array<llama_pos, 8> retained_tgt = {{-1, -1, -1, -1, -1, -1, -1, -1}};
+    std::array<llama_pos, 8> retained_dft = {{-1, -1, -1, -1, -1, -1, -1, -1}};
+    uint32_t retained_count_tgt = UINT32_MAX;
+    uint32_t retained_count_dft = UINT32_MAX;
+    bool draft_base_valid = false;
+    std::vector<uint8_t> data_tgt;
+    std::vector<uint8_t> data_dft;
+    std::vector<uint8_t> data_spec;
+};
+
+struct adaptive_slot_snapshot_blob {
+    uint32_t profile = COMMON_CONTEXT_PROFILE_LONG;
+    int32_t active_ctx = 0;
+    int32_t ctx_size_mtp = 0;
+    int32_t mtp_max_tokens = 0;
+    int32_t long_ctx = 0;
+    uint64_t model_instance = 0;
+    std::string model_fingerprint;
+    std::string layout_tgt;
+    std::string layout_dft;
+    llama_pos pos_tgt = -1;
+    llama_pos pos_dft = -1;
+    uint64_t n_tokens = 0;
+    std::vector<uint8_t> tokens;
+    std::vector<uint8_t> data_tgt;
+    std::vector<uint8_t> data_dft;
+    std::vector<uint8_t> data_spec;
+    std::vector<adaptive_slot_checkpoint_blob> checkpoints;
+};
+
+static uint64_t adaptive_slot_serialized_size(const adaptive_slot_snapshot_blob & snapshot);
+static uint64_t adaptive_slot_snapshot_memory_bytes(const adaptive_slot_snapshot_blob & snapshot);
+
+static void adaptive_slot_write_checkpoint(adaptive_slot_writer & writer,
+        const adaptive_slot_checkpoint_blob & checkpoint) {
+    writer.i64(checkpoint.n_tokens);
+    writer.i32(checkpoint.id_task);
+    writer.i32(checkpoint.pos_min);
+    writer.i32(checkpoint.pos_max);
+    writer.u32(checkpoint.flags_tgt);
+    writer.u32(checkpoint.flags_dft);
+    writer.u64(checkpoint.instance_tgt);
+    writer.u64(checkpoint.instance_dft);
+    writer.string(checkpoint.layout_tgt);
+    writer.string(checkpoint.layout_dft);
+    for (const llama_pos value : checkpoint.attention_tgt) { writer.i32(value); }
+    for (const llama_pos value : checkpoint.attention_dft) { writer.i32(value); }
+    for (const llama_pos value : checkpoint.retained_tgt) { writer.i32(value); }
+    for (const llama_pos value : checkpoint.retained_dft) { writer.i32(value); }
+    writer.u32(checkpoint.retained_count_tgt);
+    writer.u32(checkpoint.retained_count_dft);
+    writer.u8(checkpoint.draft_base_valid ? 1 : 0);
+    writer.bytes(checkpoint.data_tgt);
+    writer.bytes(checkpoint.data_dft);
+    writer.bytes(checkpoint.data_spec);
+}
+
+static adaptive_slot_checkpoint_blob adaptive_slot_read_checkpoint(adaptive_slot_reader & reader) {
+    adaptive_slot_checkpoint_blob checkpoint;
+    checkpoint.n_tokens = reader.i64();
+    checkpoint.id_task = reader.i32();
+    checkpoint.pos_min = reader.i32();
+    checkpoint.pos_max = reader.i32();
+    checkpoint.flags_tgt = reader.u32();
+    checkpoint.flags_dft = reader.u32();
+    checkpoint.instance_tgt = reader.u64();
+    checkpoint.instance_dft = reader.u64();
+    checkpoint.layout_tgt = reader.string("checkpoint target layout");
+    checkpoint.layout_dft = reader.string("checkpoint draft layout");
+    for (auto & value : checkpoint.attention_tgt) { value = reader.i32(); }
+    for (auto & value : checkpoint.attention_dft) { value = reader.i32(); }
+    for (auto & value : checkpoint.retained_tgt) { value = reader.i32(); }
+    for (auto & value : checkpoint.retained_dft) { value = reader.i32(); }
+    checkpoint.retained_count_tgt = reader.u32();
+    checkpoint.retained_count_dft = reader.u32();
+    checkpoint.draft_base_valid = reader.u8() != 0;
+    checkpoint.data_tgt = reader.bytes("checkpoint target state");
+    checkpoint.data_dft = reader.bytes("checkpoint draft state");
+    checkpoint.data_spec = reader.bytes("checkpoint MTP state");
+    return checkpoint;
+}
+
+static std::vector<uint8_t> adaptive_slot_encode(const adaptive_slot_snapshot_blob & snapshot, size_t max_bytes) {
+    const uint64_t wire_size = adaptive_slot_serialized_size(snapshot);
+    if (wire_size > max_bytes || wire_size > std::numeric_limits<size_t>::max()) {
+        throw std::runtime_error("adaptive slot snapshot exceeds the configured state budget (wire=" +
+                std::to_string(wire_size) + ", max=" + std::to_string(max_bytes) + ")");
+    }
+    adaptive_slot_writer writer;
+    writer.reserve((size_t) wire_size);
+    writer.raw(ADAPTIVE_SLOT_MAGIC.data(), ADAPTIVE_SLOT_MAGIC.size());
+    writer.u32(ADAPTIVE_SLOT_VERSION);
+    writer.u32(snapshot.profile);
+    writer.i32(snapshot.active_ctx);
+    writer.i32(snapshot.ctx_size_mtp);
+    writer.i32(snapshot.mtp_max_tokens);
+    writer.i32(snapshot.long_ctx);
+    writer.u64(snapshot.model_instance);
+    writer.string(snapshot.model_fingerprint);
+    writer.string(snapshot.layout_tgt);
+    writer.string(snapshot.layout_dft);
+    writer.i32(snapshot.pos_tgt);
+    writer.i32(snapshot.pos_dft);
+    writer.u64(snapshot.n_tokens);
+    writer.bytes(snapshot.tokens);
+    writer.bytes(snapshot.data_tgt);
+    writer.bytes(snapshot.data_dft);
+    writer.bytes(snapshot.data_spec);
+    writer.u64(snapshot.checkpoints.size());
+    for (const auto & checkpoint : snapshot.checkpoints) {
+        adaptive_slot_write_checkpoint(writer, checkpoint);
+    }
+    auto result = std::move(writer).finish();
+    if (result.size() != wire_size) {
+        throw std::runtime_error("adaptive slot snapshot size calculation failed");
+    }
+    return result;
+}
+
+static uint64_t adaptive_slot_read_u64_tail(const uint8_t * data) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= (uint64_t) data[i] << (8*i);
+    }
+    return value;
+}
+
+static adaptive_slot_snapshot_blob adaptive_slot_decode(const std::vector<uint8_t> & file,
+        size_t max_checkpoints, size_t max_decoded_bytes) {
+    constexpr size_t ADAPTIVE_SLOT_MIN_SIZE = ADAPTIVE_SLOT_MAGIC.size() + sizeof(uint32_t) + sizeof(uint64_t);
+    if (file.size() < ADAPTIVE_SLOT_MIN_SIZE) {
+        throw std::runtime_error("legacy or truncated adaptive slot snapshot");
+    }
+
+    if (std::memcmp(file.data(), ADAPTIVE_SLOT_MAGIC.data(), ADAPTIVE_SLOT_MAGIC.size()) != 0) {
+        throw std::runtime_error("legacy slot save file lacks adaptive snapshot identity");
+    }
+
+    const size_t payload_size = file.size() - sizeof(uint64_t);
+    const uint64_t expected = adaptive_slot_read_u64_tail(file.data() + payload_size);
+    const uint64_t actual = XXH64(file.data(), payload_size, 0x534c4f5453544154ULL);
+    if (actual != expected) {
+        throw std::runtime_error("adaptive slot snapshot checksum mismatch");
+    }
+
+    adaptive_slot_reader reader(file.data(), payload_size);
+    std::array<uint8_t, ADAPTIVE_SLOT_MAGIC.size()> magic = {};
+    reader.raw(magic.data(), magic.size());
+    if (magic != ADAPTIVE_SLOT_MAGIC) {
+        throw std::runtime_error("legacy slot save file lacks adaptive snapshot identity");
+    }
+
+    if (reader.u32() != ADAPTIVE_SLOT_VERSION) {
+        throw std::runtime_error("unsupported adaptive slot snapshot version");
+    }
+
+    adaptive_slot_snapshot_blob snapshot;
+    snapshot.profile = reader.u32();
+    if (snapshot.profile != COMMON_CONTEXT_PROFILE_MTP && snapshot.profile != COMMON_CONTEXT_PROFILE_LONG) {
+        throw std::runtime_error("invalid adaptive slot snapshot profile");
+    }
+    snapshot.active_ctx = reader.i32();
+    snapshot.ctx_size_mtp = reader.i32();
+    snapshot.mtp_max_tokens = reader.i32();
+    snapshot.long_ctx = reader.i32();
+    snapshot.model_instance = reader.u64();
+    snapshot.model_fingerprint = reader.string("model identity");
+    snapshot.layout_tgt = reader.string("target layout");
+    snapshot.layout_dft = reader.string("draft layout");
+    snapshot.pos_tgt = reader.i32();
+    snapshot.pos_dft = reader.i32();
+    snapshot.n_tokens = reader.u64();
+    if (snapshot.n_tokens > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error("adaptive slot snapshot token count is too large");
+    }
+    snapshot.tokens = reader.bytes("tokens");
+    snapshot.data_tgt = reader.bytes("target state");
+    snapshot.data_dft = reader.bytes("draft state");
+    snapshot.data_spec = reader.bytes("MTP state");
+
+    const uint64_t n_checkpoints = reader.u64();
+    if (n_checkpoints > max_checkpoints || n_checkpoints > reader.remaining() || n_checkpoints > 1000000 ||
+            n_checkpoints > max_decoded_bytes / sizeof(adaptive_slot_checkpoint_blob)) {
+        throw std::runtime_error("invalid adaptive slot snapshot checkpoint count");
+    }
+    snapshot.checkpoints.reserve((size_t) n_checkpoints);
+    for (uint64_t i = 0; i < n_checkpoints; ++i) {
+        snapshot.checkpoints.push_back(adaptive_slot_read_checkpoint(reader));
+    }
+    if (!reader.done()) {
+        throw std::runtime_error("trailing data in adaptive slot snapshot");
+    }
+    if (adaptive_slot_snapshot_memory_bytes(snapshot) > max_decoded_bytes) {
+        throw std::runtime_error("adaptive slot snapshot exceeds the decoded state budget");
+    }
+    if (snapshot.tokens.size() % sizeof(llama_token) != 0 || snapshot.data_tgt.empty()) {
+        throw std::runtime_error("adaptive slot snapshot has invalid target payload");
+    }
+    if (!snapshot.model_fingerprint.empty() && snapshot.layout_tgt.empty()) {
+        throw std::runtime_error("adaptive slot snapshot has incomplete identity");
+    }
+    return snapshot;
+}
+
+static uint64_t adaptive_slot_saturating_add(uint64_t left, uint64_t right) {
+    return left > std::numeric_limits<uint64_t>::max() - right
+        ? std::numeric_limits<uint64_t>::max() : left + right;
+}
+
+static uint64_t adaptive_slot_saturating_mul(uint64_t left, uint64_t right) {
+    return left != 0 && right > std::numeric_limits<uint64_t>::max() / left
+        ? std::numeric_limits<uint64_t>::max() : left * right;
+}
+
+static size_t adaptive_slot_working_bytes(size_t max_file_bytes) {
+    const uint64_t total = adaptive_slot_saturating_mul(
+        (uint64_t) max_file_bytes, ADAPTIVE_SLOT_WORKING_COPIES);
+    return (size_t) std::min<uint64_t>(total, std::numeric_limits<size_t>::max());
+}
+
+static uint64_t adaptive_slot_ceil_div(uint64_t value, uint64_t divisor) {
+    return value == 0 ? 0 : (value - 1) / divisor + 1;
+}
+
+static uint64_t adaptive_slot_ram_budget(int32_t cache_ram_mib) {
+    constexpr uint64_t MIB = 1024ULL * 1024ULL;
+    constexpr uint64_t FALLBACK = 8ULL * 1024ULL * MIB;
+
+    uint64_t configured = 0;
+    if (cache_ram_mib > 0) {
+        configured = adaptive_slot_saturating_mul((uint64_t) cache_ram_mib, MIB);
+    }
+
+    uint64_t available = FALLBACK;
+#ifndef _WIN32
+    const long pages = sysconf(_SC_AVPHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0) {
+        available = adaptive_slot_saturating_mul((uint64_t) pages, (uint64_t) page_size);
+        // Leave one quarter of currently available RAM for the server and allocator.
+        available -= available / 4;
+    }
+#endif
+    return configured ? std::min(configured, available) : available;
+}
+
+static uint64_t adaptive_slot_vector_storage(const std::vector<uint8_t> & value) {
+    return value.capacity();
+}
+
+static uint64_t adaptive_slot_string_storage(const std::string & value) {
+    return value.capacity();
+}
+
+static uint64_t adaptive_slot_snapshot_memory_bytes(const adaptive_slot_snapshot_blob & snapshot) {
+    uint64_t total = sizeof(snapshot);
+    const auto add = [&total](uint64_t value) {
+        total = adaptive_slot_saturating_add(total, value);
+    };
+    add(adaptive_slot_string_storage(snapshot.model_fingerprint));
+    add(adaptive_slot_string_storage(snapshot.layout_tgt));
+    add(adaptive_slot_string_storage(snapshot.layout_dft));
+    add(adaptive_slot_vector_storage(snapshot.tokens));
+    add(adaptive_slot_vector_storage(snapshot.data_tgt));
+    add(adaptive_slot_vector_storage(snapshot.data_dft));
+    add(adaptive_slot_vector_storage(snapshot.data_spec));
+    for (const auto & checkpoint : snapshot.checkpoints) {
+        add(sizeof(checkpoint));
+        add(adaptive_slot_string_storage(checkpoint.layout_tgt));
+        add(adaptive_slot_string_storage(checkpoint.layout_dft));
+        add(adaptive_slot_vector_storage(checkpoint.data_tgt));
+        add(adaptive_slot_vector_storage(checkpoint.data_dft));
+        add(adaptive_slot_vector_storage(checkpoint.data_spec));
+    }
+    return total;
+}
+
+static uint64_t adaptive_slot_wire_bytes(uint64_t size) {
+    return adaptive_slot_saturating_add(8, size);
+}
+
+static uint64_t adaptive_slot_wire_string(uint64_t size) {
+    return adaptive_slot_wire_bytes(size);
+}
+
+static uint64_t adaptive_slot_serialized_size(const adaptive_slot_snapshot_blob & snapshot) {
+    uint64_t total = 8 + 4 + 4 + 4*4 + 8;
+    const auto add = [&total](uint64_t value) {
+        total = adaptive_slot_saturating_add(total, value);
+    };
+    add(adaptive_slot_wire_string(snapshot.model_fingerprint.size()));
+    add(adaptive_slot_wire_string(snapshot.layout_tgt.size()));
+    add(adaptive_slot_wire_string(snapshot.layout_dft.size()));
+    add(4 + 4 + 8);
+    add(adaptive_slot_wire_bytes(snapshot.tokens.size()));
+    add(adaptive_slot_wire_bytes(snapshot.data_tgt.size()));
+    add(adaptive_slot_wire_bytes(snapshot.data_dft.size()));
+    add(adaptive_slot_wire_bytes(snapshot.data_spec.size()));
+    add(8);
+    for (const auto & checkpoint : snapshot.checkpoints) {
+        // i64 token count, id/positions, two flag words and two instances.
+        add(44);
+        add(adaptive_slot_wire_string(checkpoint.layout_tgt.size()));
+        add(adaptive_slot_wire_string(checkpoint.layout_dft.size()));
+        add(96 + 4 + 4 + 1);
+        add(adaptive_slot_wire_bytes(checkpoint.data_tgt.size()));
+        add(adaptive_slot_wire_bytes(checkpoint.data_dft.size()));
+        add(adaptive_slot_wire_bytes(checkpoint.data_spec.size()));
+    }
+    return adaptive_slot_saturating_add(total, 8);
+}
+
+// The file contains target/draft state plus up to n_ctx_checkpoints copies.  Use
+// the live state/KV footprint to derive a conservative bound before allocating
+// attacker-controlled bytes; the multiplier covers both profiles and metadata.
+static size_t adaptive_slot_max_file_bytes(const server_slot & slot,
+        llama_context * ctx_tgt, llama_context * ctx_dft,
+        int32_t ctx_size_mtp, int32_t long_ctx, int32_t cache_ram_mib, int32_t n_ctx_checkpoints) {
+    const uint64_t max_ctx = (uint64_t) std::max(ctx_size_mtp, long_ctx);
+    const uint64_t active_ctx = (uint64_t) std::max(1u, ctx_tgt ? llama_n_ctx_seq(ctx_tgt) : 1u);
+    uint64_t context_bytes = 0;
+    uint64_t state_bytes = 0;
+    for (llama_context * ctx : {ctx_tgt, ctx_dft}) {
+        if (!ctx) {
+            continue;
+        }
+        for (const auto & [unused, breakdown] : llama_get_memory_breakdown(ctx)) {
+            context_bytes = adaptive_slot_saturating_add(context_bytes, breakdown.context);
+        }
+        state_bytes = adaptive_slot_saturating_add(
+            state_bytes, llama_state_seq_get_size_ext(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+    }
+
+    const uint64_t n_tokens = std::max<uint64_t>(1, slot.prompt.tokens.size());
+    uint64_t bytes_per_token = adaptive_slot_ceil_div(state_bytes, n_tokens);
+    bytes_per_token = std::max<uint64_t>(bytes_per_token,
+        adaptive_slot_ceil_div(context_bytes, active_ctx));
+    bytes_per_token = std::max<uint64_t>(bytes_per_token, sizeof(llama_token));
+
+    const uint64_t checkpoint_count = n_ctx_checkpoints > 0 ? (uint64_t) n_ctx_checkpoints : 0;
+    const uint64_t state_budget = adaptive_slot_saturating_mul(
+        adaptive_slot_saturating_mul(bytes_per_token, max_ctx),
+        adaptive_slot_saturating_add(checkpoint_count, 2));
+    const uint64_t token_budget = adaptive_slot_saturating_mul(
+        max_ctx, sizeof(llama_token) * 16ULL);
+    const uint64_t limit = adaptive_slot_saturating_add(
+        adaptive_slot_saturating_add(state_budget, token_budget), 64ULL * 1024 * 1024);
+    const uint64_t working_budget = adaptive_slot_ram_budget(cache_ram_mib);
+    const uint64_t per_file = working_budget / ADAPTIVE_SLOT_WORKING_COPIES;
+    return (size_t) std::min<uint64_t>(limit, per_file);
+}
+
+static std::vector<uint8_t> adaptive_slot_read_file(const std::string & filepath, size_t max_bytes) {
+#ifndef _WIN32
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    const int fd = ::open(filepath.c_str(), flags);
+    if (fd < 0) {
+        throw std::runtime_error("cannot open adaptive slot snapshot");
+    }
+    struct fd_guard {
+        int fd;
+        ~fd_guard() { if (fd >= 0) { ::close(fd); } }
+    } guard { fd };
+
+    struct stat status = {};
+    if (::fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0) {
+        throw std::runtime_error("adaptive slot snapshot is not a regular file");
+    }
+    const uintmax_t file_size = (uintmax_t) status.st_size;
+    if (file_size > max_bytes || file_size > (uintmax_t) std::numeric_limits<size_t>::max()) {
+        throw std::runtime_error("adaptive slot snapshot exceeds the configured state budget");
+    }
+
+    std::vector<uint8_t> file((size_t) file_size);
+    size_t offset = 0;
+    while (offset < file.size()) {
+        const ssize_t count = ::read(fd, file.data() + offset, file.size() - offset);
+        if (count > 0) {
+            offset += (size_t) count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            throw std::runtime_error("cannot read adaptive slot snapshot");
+        }
+    }
+    return file;
+#else
+    std::error_code status_error;
+    const auto status = std::filesystem::status(filepath, status_error);
+    if (status_error || !std::filesystem::is_regular_file(status)) {
+        throw std::runtime_error("adaptive slot snapshot is not a regular file");
+    }
+    std::error_code size_error;
+    const uintmax_t file_size = std::filesystem::file_size(filepath, size_error);
+    if (size_error || file_size > max_bytes || file_size > (uintmax_t) std::numeric_limits<size_t>::max() ||
+            file_size > (uintmax_t) std::numeric_limits<std::streamsize>::max()) {
+        throw std::runtime_error("adaptive slot snapshot exceeds the configured state budget");
+    }
+
+    std::ifstream input(filepath, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open adaptive slot snapshot");
+    }
+    std::vector<uint8_t> file((size_t) file_size);
+    if (!file.empty()) {
+        input.read(reinterpret_cast<char *>(file.data()), (std::streamsize) file.size());
+    }
+    if (!input || input.gcount() != (std::streamsize) file.size()) {
+        throw std::runtime_error("cannot read adaptive slot snapshot");
+    }
+    return file;
+#endif
+}
+
+static size_t adaptive_slot_write_file(const std::string & filepath, const std::vector<uint8_t> & data) {
+    const std::string temporary = filepath + ".tmp-" + std::to_string(ggml_time_us());
+    try {
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                throw std::runtime_error("cannot create adaptive slot snapshot");
+            }
+            output.write(reinterpret_cast<const char *>(data.data()), (std::streamsize) data.size());
+            output.flush();
+            if (!output) {
+                throw std::runtime_error("cannot write adaptive slot snapshot");
+            }
+        }
+
+        std::error_code error;
+        std::filesystem::rename(temporary, filepath, error);
+        if (error) {
+            throw std::runtime_error("cannot publish adaptive slot snapshot: " + error.message());
+        }
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
+    }
+    return data.size();
+}
+
+static adaptive_slot_checkpoint_blob adaptive_slot_capture_checkpoint(
+        const common_prompt_checkpoint & source,
+        llama_context * ctx_dft,
+        int64_t evaluated,
+        llama_pos pos_tgt) {
+    adaptive_slot_checkpoint_blob checkpoint;
+    checkpoint.n_tokens = source.n_tokens;
+    checkpoint.id_task = source.id_task;
+    checkpoint.pos_min = source.pos_min;
+    checkpoint.pos_max = source.pos_max;
+    checkpoint.flags_tgt = source.flags_tgt;
+    checkpoint.flags_dft = source.flags_dft;
+    checkpoint.instance_tgt = source.instance_tgt;
+    checkpoint.instance_dft = source.instance_dft;
+    checkpoint.layout_tgt = source.layout_tgt;
+    checkpoint.layout_dft = source.layout_dft;
+    checkpoint.attention_tgt = source.attention_tgt;
+    checkpoint.attention_dft = source.attention_dft;
+    checkpoint.retained_tgt = source.retained_tgt;
+    checkpoint.retained_dft = source.retained_dft;
+    checkpoint.retained_count_tgt = source.retained_count_tgt;
+    checkpoint.retained_count_dft = source.retained_count_dft;
+    checkpoint.draft_base_valid = source.draft_base_valid;
+    checkpoint.data_tgt = source.data_tgt;
+
+    if (ctx_dft && source.compatible_dft(ctx_dft) && source.n_tokens <= evaluated && source.pos_max <= pos_tgt) {
+        checkpoint.data_dft = source.data_dft;
+        checkpoint.data_spec = source.data_spec;
+    } else {
+        checkpoint.layout_dft.clear();
+        checkpoint.instance_dft = 0;
+        checkpoint.attention_dft = {{-1, -1, -1, -1}};
+        checkpoint.retained_dft.fill(-1);
+        checkpoint.retained_count_dft = UINT32_MAX;
+        checkpoint.draft_base_valid = false;
+    }
+    return checkpoint;
+}
+
+static adaptive_slot_snapshot_blob adaptive_slot_capture(
+        const server_slot & slot,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        common_speculative * spec,
+        const server_model_identity & identity,
+        common_context_profile profile,
+        int32_t ctx_size_mtp,
+        int32_t mtp_max_tokens,
+        int32_t long_ctx,
+        size_t max_bytes,
+        bool include_checkpoints = true) {
+    if (!ctx_tgt || slot.prompt.tokens.empty()) {
+        throw std::runtime_error("cannot save an empty adaptive slot");
+    }
+
+    llama_synchronize(ctx_tgt);
+    if (ctx_dft) { llama_synchronize(ctx_dft); }
+
+    adaptive_slot_snapshot_blob snapshot;
+    const auto ensure_budget = [&](uint64_t extra) {
+        const uint64_t used = adaptive_slot_snapshot_memory_bytes(snapshot);
+        if (used > max_bytes || extra > max_bytes - used) {
+            throw std::runtime_error("adaptive slot snapshot exceeds the configured state budget (used=" +
+                    std::to_string(used) + ", extra=" + std::to_string(extra) +
+                    ", max=" + std::to_string(max_bytes) + ")");
+        }
+    };
+    snapshot.profile = (uint32_t) profile;
+    snapshot.active_ctx = slot.n_ctx;
+    snapshot.ctx_size_mtp = ctx_size_mtp;
+    snapshot.mtp_max_tokens = mtp_max_tokens;
+    snapshot.long_ctx = long_ctx;
+    snapshot.model_fingerprint = identity.fingerprint();
+    snapshot.layout_tgt = common_prompt_cache_layout(ctx_tgt);
+    snapshot.layout_dft = ctx_dft ? common_prompt_cache_layout(ctx_dft) : "";
+    snapshot.model_instance = llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt)).model_instance;
+
+    snapshot.pos_tgt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+    if (snapshot.pos_tgt < 0) {
+        throw std::runtime_error("adaptive slot target state is empty");
+    }
+    const size_t evaluated = slot.prompt.tokens.size_up_to_pos(snapshot.pos_tgt + 1);
+    if (!evaluated || slot.prompt.tokens.pos_next(evaluated) != snapshot.pos_tgt + 1) {
+        throw std::runtime_error("adaptive slot tokens do not cover target state");
+    }
+    snapshot.n_tokens = evaluated;
+
+    server_tokens tokens = slot.prompt.tokens.clone_for_cache();
+    tokens.keep_first(evaluated);
+    std::vector<char> packed = tokens.serialize();
+    ensure_budget(adaptive_slot_saturating_mul(packed.size(), 2));
+    snapshot.tokens.assign(reinterpret_cast<const uint8_t *>(packed.data()),
+            reinterpret_cast<const uint8_t *>(packed.data()) + packed.size());
+    std::vector<char>().swap(packed);
+
+    const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    ensure_budget(n_tgt);
+    snapshot.data_tgt.resize(n_tgt);
+    if (!n_tgt || llama_state_seq_get_data_ext(ctx_tgt, snapshot.data_tgt.data(), n_tgt, slot.id,
+            LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt) {
+        throw std::runtime_error("adaptive slot target serialization failed");
+    }
+
+    if (ctx_dft) {
+        snapshot.pos_dft = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id);
+        const size_t n_dft = llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        ensure_budget(n_dft);
+        snapshot.data_dft.resize(n_dft);
+        if (n_dft && llama_state_seq_get_data_ext(ctx_dft, snapshot.data_dft.data(), n_dft, slot.id,
+                LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft) {
+            throw std::runtime_error("adaptive slot draft serialization failed");
+        }
+        common_speculative_get_state(spec, slot.id, snapshot.data_spec);
+        ensure_budget(0);
+    }
+
+    if (include_checkpoints) {
+        for (const auto & checkpoint : slot.prompt.checkpoints) {
+            if (!checkpoint || !checkpoint->host_only() || !checkpoint->compatible_tgt(ctx_tgt) ||
+                    checkpoint->data_tgt.empty() || checkpoint->n_tokens > (int64_t) evaluated ||
+                    checkpoint->pos_max > snapshot.pos_tgt) {
+                continue;
+            }
+            const uint64_t checkpoint_bytes = adaptive_slot_saturating_add(
+                sizeof(adaptive_slot_checkpoint_blob),
+                adaptive_slot_saturating_add(checkpoint->layout_tgt.capacity(), checkpoint->layout_dft.capacity()));
+            const uint64_t checkpoint_data = adaptive_slot_saturating_add(
+                checkpoint->data_tgt.capacity(), adaptive_slot_saturating_add(
+                    checkpoint->data_dft.capacity(), checkpoint->data_spec.capacity()));
+            ensure_budget(adaptive_slot_saturating_add(checkpoint_bytes, checkpoint_data));
+            snapshot.checkpoints.push_back(adaptive_slot_capture_checkpoint(
+                *checkpoint, ctx_dft, evaluated, snapshot.pos_tgt));
+            ensure_budget(0);
+        }
+    }
+    return snapshot;
+}
+
+static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
+        const adaptive_slot_checkpoint_blob & source,
+        const adaptive_slot_snapshot_blob & snapshot,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        const server_tokens & tokens,
+        bool & dropped) {
+    const auto valid_bounds = [](const auto & bounds) {
+        for (size_t i = 0; i < bounds.size(); i += 2) {
+            const auto begin = bounds[i];
+            const auto end = bounds[i + 1];
+            if ((begin < 0) != (end < 0) || (begin >= 0 && end < begin)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool valid_flags = (source.flags_tgt | source.flags_dft) & ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const bool has_draft = !source.data_dft.empty();
+    const bool has_carry = !source.data_spec.empty();
+    const bool token_position_match = source.pos_max < std::numeric_limits<llama_pos>::max() &&
+        (size_t) source.n_tokens == tokens.size_up_to_pos(source.pos_max + 1);
+    if (source.n_tokens <= 0 || source.n_tokens > (int64_t) snapshot.n_tokens || source.pos_min < 0 ||
+            source.pos_max < source.pos_min || source.pos_max >= snapshot.pos_tgt || source.data_tgt.empty() ||
+            !token_position_match || source.flags_tgt != LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY ||
+            valid_flags || source.flags_tgt & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE ||
+            source.flags_dft & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE ||
+            (has_draft != has_carry) || (!has_draft && (source.flags_dft != LLAMA_STATE_SEQ_FLAGS_NONE ||
+                                                        !source.layout_dft.empty() || source.draft_base_valid)) ||
+            (has_draft && source.flags_dft != LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            (source.retained_count_tgt != UINT32_MAX && source.retained_count_tgt > 4) ||
+            (source.retained_count_dft != UINT32_MAX && source.retained_count_dft > 4) ||
+            !valid_bounds(source.attention_tgt) || !valid_bounds(source.attention_dft) ||
+            !valid_bounds(source.retained_tgt) || !valid_bounds(source.retained_dft) ||
+            (source.draft_base_valid && (source.data_dft.empty() || source.data_spec.empty())) ||
+            source.layout_tgt != common_prompt_cache_layout(ctx_tgt)) {
+        dropped = true;
+        return nullptr;
+    }
+
+    auto checkpoint = std::make_shared<common_prompt_checkpoint>();
+    checkpoint->n_tokens = source.n_tokens;
+    checkpoint->id_task = source.id_task;
+    checkpoint->pos_min = source.pos_min;
+    checkpoint->pos_max = source.pos_max;
+    checkpoint->flags_tgt = source.flags_tgt;
+    checkpoint->model_tgt = llama_get_model(ctx_tgt);
+    checkpoint->instance_tgt = llama_model_mtp_weights_get_info(checkpoint->model_tgt).model_instance;
+    checkpoint->layout_tgt = common_prompt_cache_layout(ctx_tgt);
+    checkpoint->attention_tgt = source.attention_tgt;
+    checkpoint->retained_tgt = source.retained_tgt;
+    checkpoint->retained_count_tgt = source.retained_count_tgt;
+    checkpoint->data_tgt = source.data_tgt;
+
+    if (ctx_dft && snapshot.profile == COMMON_CONTEXT_PROFILE_MTP && has_draft &&
+            source.layout_dft == common_prompt_cache_layout(ctx_dft)) {
+        checkpoint->flags_dft = source.flags_dft;
+        checkpoint->model_dft = llama_get_model(ctx_dft);
+        checkpoint->instance_dft = llama_model_mtp_weights_get_info(checkpoint->model_dft).model_instance;
+        checkpoint->layout_dft = common_prompt_cache_layout(ctx_dft);
+        checkpoint->attention_dft = source.attention_dft;
+        checkpoint->retained_dft = source.retained_dft;
+        checkpoint->retained_count_dft = source.retained_count_dft;
+        checkpoint->draft_base_valid = source.draft_base_valid;
+        checkpoint->data_dft = source.data_dft;
+        checkpoint->data_spec = source.data_spec;
+    } else if (has_draft) {
+        dropped = true;
+        return nullptr;
+    }
+    return checkpoint;
+}
+
+static bool adaptive_slot_restore(
+        const adaptive_slot_snapshot_blob & snapshot,
+        server_slot & slot,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        common_speculative * spec,
+        std::string & error) {
+    if (!ctx_tgt || snapshot.layout_tgt != common_prompt_cache_layout(ctx_tgt)) {
+        error = "adaptive slot snapshot target layout differs";
+        return false;
+    }
+    if (snapshot.pos_tgt < 0 || snapshot.n_tokens == 0 ||
+            snapshot.n_tokens > (uint64_t) llama_n_ctx_seq(ctx_tgt) ||
+            snapshot.pos_tgt >= (llama_pos) llama_n_ctx_seq(ctx_tgt)) {
+        error = "adaptive slot snapshot does not fit destination context";
+        return false;
+    }
+    if (snapshot.pos_dft < -1 || (ctx_dft && snapshot.pos_dft >= (llama_pos) llama_n_ctx_seq(ctx_dft))) {
+        error = "adaptive slot snapshot draft position does not fit destination context";
+        return false;
+    }
+    if (snapshot.tokens.size() % sizeof(llama_token) != 0) {
+        error = "adaptive slot snapshot token payload is malformed";
+        return false;
+    }
+
+    server_prompt candidate;
+    try {
+        llama_tokens packed(snapshot.tokens.size() / sizeof(llama_token));
+        if (!snapshot.tokens.empty()) {
+            std::memcpy(packed.data(), snapshot.tokens.data(), snapshot.tokens.size());
+        }
+        candidate.tokens = server_tokens::deserialize(packed, slot.mctx != nullptr);
+        if (candidate.tokens.size() != snapshot.n_tokens || !candidate.tokens.validate(ctx_tgt) ||
+                snapshot.pos_tgt == std::numeric_limits<llama_pos>::max() ||
+                candidate.tokens.pos_next() != snapshot.pos_tgt + 1) {
+            error = "adaptive slot snapshot tokens are invalid";
+            return false;
+        }
+
+    } catch (const std::bad_alloc &) {
+        error = "adaptive slot snapshot allocation failed";
+        return false;
+    } catch (const std::exception & exception) {
+        error = exception.what();
+        return false;
+    }
+
+    const bool destination_mtp = ctx_dft != nullptr;
+    if ((snapshot.profile == COMMON_CONTEXT_PROFILE_MTP) != destination_mtp) {
+        error = "adaptive slot snapshot profile does not match destination context";
+        return false;
+    }
+    const bool complete_mtp = destination_mtp && snapshot.profile == COMMON_CONTEXT_PROFILE_MTP &&
+        !snapshot.data_dft.empty() && !snapshot.data_spec.empty();
+    if (snapshot.profile == COMMON_CONTEXT_PROFILE_MTP) {
+        if (snapshot.data_dft.empty() != snapshot.data_spec.empty() ||
+                (snapshot.data_dft.empty() && snapshot.pos_dft >= 0) ||
+                (complete_mtp && snapshot.pos_dft != snapshot.pos_tgt)) {
+            error = "adaptive slot snapshot MTP state is incoherent";
+            return false;
+        }
+    } else if (!snapshot.data_dft.empty() || !snapshot.data_spec.empty() || snapshot.pos_dft >= 0) {
+        error = "adaptive slot snapshot long profile carries draft state";
+        return false;
+    }
+    if (destination_mtp && snapshot.profile == COMMON_CONTEXT_PROFILE_MTP && !snapshot.data_dft.empty() &&
+            snapshot.layout_dft != common_prompt_cache_layout(ctx_dft)) {
+        error = "adaptive slot snapshot draft layout differs";
+        return false;
+    }
+
+    // Only now clear the live sequence. Any malformed file or incompatible
+    // metadata has already returned, so a failed set operation leaves no
+    // published prompt and no partial cache hit.
+    slot.prompt_clear();
+    const bool target_ok = llama_state_seq_set_data_ext(ctx_tgt, snapshot.data_tgt.data(), snapshot.data_tgt.size(),
+            slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == snapshot.data_tgt.size() &&
+        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) == snapshot.pos_tgt;
+    bool draft_ok = true;
+    if (complete_mtp) {
+        draft_ok = llama_state_seq_set_data_ext(ctx_dft, snapshot.data_dft.data(), snapshot.data_dft.size(),
+                slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == snapshot.data_dft.size() &&
+            llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) == snapshot.pos_dft;
+    }
+    bool carry_ok = true;
+    if (destination_mtp) {
+        carry_ok = complete_mtp
+            ? common_speculative_set_state(spec, slot.id, snapshot.data_spec, snapshot.pos_tgt)
+            : common_speculative_set_state(spec, slot.id, {}, -1);
+        if (carry_ok && complete_mtp) {
+            carry_ok = common_speculative_is_ready(spec, slot.id, snapshot.pos_tgt + 1);
+        }
+    }
+    if (!target_ok || !draft_ok || !carry_ok) {
+        slot.prompt_clear();
+        error = !target_ok ? "adaptive slot target restore failed" :
+            !draft_ok ? "adaptive slot draft restore failed" : "adaptive MTP carry restore failed";
+        return false;
+    }
+
+    const auto state_matches = [](llama_context * ctx, llama_seq_id seq_id,
+            const std::vector<uint8_t> & expected, llama_state_seq_flags flags) {
+        const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+        if (size != expected.size()) {
+            return false;
+        }
+        std::vector<uint8_t> actual(size);
+        return llama_state_seq_get_data_ext(ctx, actual.data(), actual.size(), seq_id, flags) == size &&
+            actual == expected;
+    };
+    const auto restore_full_state = [&]() {
+        const bool target = llama_state_seq_set_data_ext(ctx_tgt, snapshot.data_tgt.data(), snapshot.data_tgt.size(),
+                slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == snapshot.data_tgt.size() &&
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) == snapshot.pos_tgt;
+        const bool draft = !complete_mtp ||
+            (llama_state_seq_set_data_ext(ctx_dft, snapshot.data_dft.data(), snapshot.data_dft.size(),
+                    slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == snapshot.data_dft.size() &&
+                llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) == snapshot.pos_dft);
+        const bool carry = !destination_mtp ||
+            (complete_mtp
+                ? (common_speculative_set_state(spec, slot.id, snapshot.data_spec, snapshot.pos_tgt) &&
+                   common_speculative_is_ready(spec, slot.id, snapshot.pos_tgt + 1))
+                : common_speculative_set_state(spec, slot.id, {}, -1));
+        return target && draft && carry;
+    };
+
+    bool dropped_checkpoint = false;
+    llama_pos previous_pos_max = -1;
+    int64_t previous_n_tokens = -1;
+    for (const auto & source : snapshot.checkpoints) {
+        if (source.n_tokens <= previous_n_tokens || source.pos_max <= previous_pos_max) {
+            dropped_checkpoint = true;
+            continue;
+        }
+        previous_n_tokens = source.n_tokens;
+        previous_pos_max = source.pos_max;
+
+        auto checkpoint = adaptive_slot_make_checkpoint(
+            source, snapshot, ctx_tgt, ctx_dft, candidate.tokens, dropped_checkpoint);
+        if (!checkpoint) {
+            continue;
+        }
+
+        const bool target_restored = checkpoint->restore_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const bool target_bounds = target_restored &&
+            llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id) == checkpoint->pos_min &&
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) == checkpoint->pos_max;
+        const bool target_state = target_bounds &&
+            state_matches(ctx_tgt, slot.id, checkpoint->data_tgt, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        bool valid = target_state;
+        bool draft_restored = true;
+        bool draft_bounds = true;
+        bool draft_state = true;
+        if (valid && ctx_dft) {
+            draft_restored = checkpoint->restore_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == common_checkpoint_restore::restored;
+            const auto draft_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_dft), slot.id);
+            const auto draft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id);
+            // MTP draft state may retain its base from position zero while the
+            // target PARTIAL_ONLY state starts at the checkpoint window. The
+            // end position must still align exactly; a swapped blob therefore
+            // fails even when both checkpoints have the same byte size.
+            draft_bounds = draft_restored && draft_pos_min >= 0 && draft_pos_min <= checkpoint->pos_min &&
+                draft_pos_max == checkpoint->pos_max;
+            draft_state = draft_bounds &&
+                state_matches(ctx_dft, slot.id, checkpoint->data_dft, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            valid = draft_state;
+            if (!draft_bounds) {
+                SLT_WRN(slot, "adaptive checkpoint draft bounds actual=[%d,%d] expected_end=%d start_max=%d\n",
+                        draft_pos_min, draft_pos_max, checkpoint->pos_max, checkpoint->pos_min);
+            }
+        }
+        if (valid && spec && !checkpoint->data_spec.empty()) {
+            valid = common_speculative_set_state(spec, slot.id, checkpoint->data_spec, checkpoint->pos_max) &&
+                common_speculative_is_ready(spec, slot.id, checkpoint->pos_max + 1);
+            if (valid) {
+                std::vector<uint8_t> actual_spec;
+                common_speculative_get_state(spec, slot.id, actual_spec);
+                valid = actual_spec == checkpoint->data_spec;
+            }
+        }
+
+        if (valid) {
+            candidate.checkpoints.push_back(std::move(checkpoint));
+        } else {
+            SLT_WRN(slot, "discarding adaptive checkpoint n_tokens=%" PRId64 " pos=[%d,%d] target=(restore:%d bounds:%d state:%d) draft=(restore:%d bounds:%d state:%d)\n",
+                    source.n_tokens, source.pos_min, source.pos_max, target_restored, target_bounds, target_state,
+                    draft_restored, draft_bounds, draft_state);
+            dropped_checkpoint = true;
+        }
+        if (!restore_full_state()) {
+            slot.prompt_clear();
+            error = "adaptive slot checkpoint validation disturbed the restored state";
+            return false;
+        }
+    }
+    if (dropped_checkpoint) {
+        SLT_WRN(slot, "%s", "adaptive slot snapshot dropped incompatible checkpoints\n");
+    }
+
+    slot.prompt = std::move(candidate);
+    slot.bootstrap_pending = destination_mtp && !complete_mtp;
+    SLT_TRC(slot, "adaptive slot restore published tokens=%zu checkpoints=%zu complete_mtp=%d bootstrap=%d\n",
+            slot.prompt.tokens.size(), slot.prompt.checkpoints.size(), complete_mtp, slot.bootstrap_pending);
+    if (slot.bootstrap_pending) {
+        SLT_INF(slot, "%s", "adaptive slot target restored; MTP bootstrap is required before a cache hit\n");
+    }
+    return true;
+}
+
+} // namespace
 
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
@@ -894,6 +1980,11 @@ public:
         metrics.reset_bucket();
     }
 
+    server_context_adaptive_status get_adaptive_status() const {
+        std::lock_guard<std::mutex> lock(adaptive_status_mutex);
+        return adaptive_status_snapshot;
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -912,6 +2003,10 @@ private:
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
+    // Prepared before loading the resident model; used to reject stale explicit
+    // snapshots without hashing a live model again during a transition.
+    std::optional<server_model_identity> adaptive_model_identity;
+
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -922,6 +2017,20 @@ private:
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
+    int32_t adaptive_long_ctx = 0;
+    common_context_profile active_context_profile = COMMON_CONTEXT_PROFILE_LONG;
+    bool adaptive_context_unavailable = false;
+    bool adaptive_context_transitioning = false;
+
+    enum adaptive_status_state : int {
+        ADAPTIVE_STATUS_DISABLED = 0,
+        ADAPTIVE_STATUS_READY,
+        ADAPTIVE_STATUS_TRANSITIONING,
+        ADAPTIVE_STATUS_UNAVAILABLE,
+    };
+
+    mutable std::mutex adaptive_status_mutex;
+    server_context_adaptive_status adaptive_status_snapshot;
     bool elastic_paged_context = false;
     uint32_t paged_admission_blocks = 0;
 
@@ -960,6 +2069,36 @@ private:
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
+
+    static std::string adaptive_status_profile_name(int profile) {
+        return profile == COMMON_CONTEXT_PROFILE_MTP ? "mtp" : "long";
+    }
+
+    static std::string adaptive_status_state_name(int state) {
+        switch (state) {
+            case ADAPTIVE_STATUS_READY:         return "ready";
+            case ADAPTIVE_STATUS_TRANSITIONING: return "transitioning";
+            case ADAPTIVE_STATUS_UNAVAILABLE:   return "unavailable";
+            default:                            return "disabled";
+        }
+    }
+
+    void publish_adaptive_status() {
+        const bool enabled = common_context_is_adaptive(params_base);
+        server_context_adaptive_status snapshot;
+        snapshot.enabled = enabled;
+        snapshot.profile = !enabled ? "disabled" : adaptive_context_unavailable ? "none" : adaptive_status_profile_name(static_cast<int>(active_context_profile));
+        snapshot.context_size_long = enabled ? n_ctx_slot() : 0;
+        snapshot.context_size = enabled && !adaptive_context_unavailable && ctx_tgt ? active_n_ctx_slot() : 0;
+        snapshot.mtp_weights_resident = enabled && model_tgt && llama_model_mtp_weights_get_info(model_tgt).resident;
+        const int state = !enabled ? ADAPTIVE_STATUS_DISABLED
+            : adaptive_context_unavailable ? ADAPTIVE_STATUS_UNAVAILABLE
+            : adaptive_context_transitioning ? ADAPTIVE_STATUS_TRANSITIONING
+            : ADAPTIVE_STATUS_READY;
+        snapshot.state = adaptive_status_state_name(state);
+        std::lock_guard<std::mutex> lock(adaptive_status_mutex);
+        adaptive_status_snapshot = std::move(snapshot);
+    }
 
     void destroy() {
         spec.reset();
@@ -1040,13 +2179,47 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        if (const std::string error = common_context_adaptive_normalize(params); !error.empty()) {
+            SRV_ERR("invalid adaptive context configuration: %s\n", error.c_str());
+            return false;
+        }
+        if (const std::string error = common_context_prepare_devices(params); !error.empty()) {
+            SRV_ERR("invalid adaptive context device selection: %s\n", error.c_str());
+            return false;
+        }
+
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
         const bool is_resume = sleeping;
+        const bool adaptive = common_context_is_adaptive(params);
+        const int32_t requested_long_ctx = adaptive_long_ctx > 0 ? adaptive_long_ctx : params.n_ctx;
+
+        std::optional<server_model_identity> prepared_identity;
+        if (adaptive) {
+            adaptive_model_identity.reset();
+            try {
+                prepared_identity.emplace(server_model_identity::prepare(params.model.path, params.kv_overrides));
+            } catch (const std::exception & error) {
+                SRV_ERR("failed to prepare adaptive model identity: %s\n", error.what());
+                return false;
+            }
+        } else {
+            adaptive_model_identity.reset();
+        }
 
         params_base = params;
+        if (adaptive) {
+            // Start in the short MTP profile. The requested long ceiling remains
+            // in adaptive_long_ctx and is never silently used for this allocation.
+            params_base.n_ctx = params.ctx_size_mtp;
+            params_base.n_parallel = 1;
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            active_context_profile = COMMON_CONTEXT_PROFILE_MTP;
+        } else {
+            active_context_profile = COMMON_CONTEXT_PROFILE_LONG;
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1147,11 +2320,43 @@ private:
             return false;
         }
 
+        if (prepared_identity) {
+            try {
+                prepared_identity->verify_sources();
+            } catch (const std::exception & error) {
+                SRV_ERR("adaptive model identity changed during load: %s\n", error.what());
+                destroy();
+                return false;
+            }
+            adaptive_model_identity = std::move(prepared_identity);
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
         const bool has_spec_mtp = std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const int32_t n_ctx_train = llama_model_n_ctx_train(model_tgt);
+        const int32_t requested_long_ctx_effective = requested_long_ctx > 0 ? requested_long_ctx : n_ctx_train;
+        // The model's post-load training context is the only valid long ceiling.
+        // Reject a larger declaration instead of silently serving a smaller one.
+        adaptive_long_ctx = common_context_is_adaptive(params_base)
+            ? std::min(requested_long_ctx_effective, n_ctx_train)
+            : n_ctx;
+        if (common_context_is_adaptive(params_base) && requested_long_ctx_effective > n_ctx_train) {
+            SRV_ERR("adaptive context long size (%d) exceeds model training context (%d)\n",
+                    requested_long_ctx_effective, n_ctx_train);
+            destroy();
+            return false;
+        }
+        if (common_context_is_adaptive(params_base) && adaptive_long_ctx <= 0) {
+            SRV_ERR("%s", "adaptive context requires a positive long context size\n");
+            return false;
+        }
+        if (const std::string error = common_context_adaptive_error(params_base, adaptive_long_ctx); !error.empty()) {
+            SRV_ERR("invalid effective adaptive context configuration: %s\n", error.c_str());
+            return false;
+        }
         // MTP's draft context uses the same dynamic paged block geometry as the
         // target.  The shared admission budget therefore covers both caches;
         // other speculative backends remain on the conservative path.
@@ -1249,8 +2454,6 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
-
-        const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
         int n_ctx_slot_value = llama_n_ctx_seq(ctx_tgt);
         if (elastic_paged_context) {
@@ -1416,7 +2619,8 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib,
+                common_context_is_adaptive(params_base) && adaptive_long_ctx > 0 ? adaptive_long_ctx : n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1443,13 +2647,25 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
-        // propagate new defaults back to caller
+        // Propagate public defaults back to the HTTP layer, but keep the
+        // adaptive ceiling visible there while params_base describes the
+        // currently allocated profile.
         params = params_base;
-
-        if (!is_resume) {
-            return init();
+        if (common_context_is_adaptive(params_base)) {
+            params.n_ctx = adaptive_long_ctx;
+            params.speculative.draft.ctx_tgt = nullptr;
+            params.speculative.draft.ctx_dft = nullptr;
         }
 
+        if (!is_resume) {
+            const bool ok = init();
+            if (ok) {
+                publish_adaptive_status();
+            }
+            return ok;
+        }
+
+        publish_adaptive_status();
         if (callback_state) {
             callback_state(SERVER_STATE_READY, {});
         }
@@ -1487,7 +2703,7 @@ private:
 
         metrics.init();
 
-        if (params_base.cache_idle_slots) {
+        if (params_base.cache_idle_slots && prompt_cache) {
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
@@ -1647,6 +2863,303 @@ private:
         return n_blocks <= paged_admission_blocks;
     }
 
+    bool select_adaptive_context(server_task & task) {
+        if (!common_context_is_adaptive(params_base)) {
+            return true;
+        }
+
+        if (adaptive_context_unavailable) {
+            send_error(task, "adaptive context is unavailable after a failed profile transition", ERROR_TYPE_UNAVAILABLE);
+            return false;
+        }
+
+        if (task.is_parent()) {
+            send_error(task, "adaptive context supports one completion per request", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
+        try {
+            task.context_budget = common_context_budget_for_task(
+                params_base, task.n_tokens(), task.params.n_predict, task.need_sampling());
+        } catch (const std::exception & error) {
+            send_error(task, string_format("invalid adaptive context budget: %s", error.what()), ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+        if (adaptive_long_ctx <= 0) {
+            send_error(task, "adaptive context has no positive long context", ERROR_TYPE_SERVER);
+            return false;
+        }
+        if (task.context_budget.total_tokens > adaptive_long_ctx) {
+            send_error(
+                task.id,
+                string_format("request (%lld tokens plus output) exceeds the shared context size (%d tokens)",
+                    (long long) task.context_budget.total_tokens, adaptive_long_ctx),
+                ERROR_TYPE_EXCEED_CONTEXT_SIZE,
+                task.n_tokens(),
+                adaptive_long_ctx);
+            return false;
+        }
+
+        task.context_profile = common_context_profile_for_budget(
+            params_base, task.context_budget.total_tokens);
+        SRV_INF("adaptive context task id = %d: %lld prompt + %lld output = %lld -> %s\n",
+            task.id,
+            (long long) task.context_budget.prompt_tokens,
+            (long long) task.context_budget.output_reserve,
+            (long long) task.context_budget.total_tokens,
+            task.context_profile == COMMON_CONTEXT_PROFILE_MTP ? "mtp" : "long");
+        return true;
+    }
+
+    bool adaptive_slots_idle() const {
+        return std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.is_processing();
+        });
+    }
+
+    void unbind_slots_from_context() {
+        for (auto & slot : slots) {
+            slot.ctx_tgt = nullptr;
+            slot.ctx_dft = nullptr;
+            slot.mem.init(nullptr, nullptr);
+            slot.spec = nullptr;
+            slot.n_ctx = 0;
+            slot.bootstrap_pending = false;
+        }
+    }
+
+    void enter_adaptive_unavailable() {
+        spec.reset();
+        spec_init.reset();
+        params_base.speculative.draft.ctx_tgt = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
+        ctx_dft = nullptr;
+        model_dft = nullptr;
+        if (llama_init && llama_init->context()) {
+            llama_init->release_context();
+        }
+        ctx_tgt = nullptr;
+        n_ctx = 0;
+        unbind_slots_from_context();
+        adaptive_context_unavailable = true;
+        publish_adaptive_status();
+        SRV_ERR("%s", "adaptive context is unavailable after a failed transition; rejecting inference tasks\n");
+    }
+
+    void bind_slots_to_active_context() {
+        const int slot_ctx = active_n_ctx_slot();
+        for (auto & slot : slots) {
+            slot.ctx_tgt = ctx_tgt;
+            slot.ctx_dft = ctx_dft;
+            slot.mem.init(ctx_tgt, ctx_dft);
+            slot.spec = spec.get();
+            slot.n_ctx = slot_ctx;
+            slot.bootstrap_pending = false;
+            slot.clear_context_on_release = elastic_paged_context;
+        }
+    }
+
+    bool rebuild_active_speculation(common_context_profile profile) {
+        spec.reset();
+        spec_init.reset();
+        params_base.speculative.draft.ctx_tgt = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
+        ctx_dft = nullptr;
+        model_dft = nullptr;
+
+        const bool use_mtp = profile == COMMON_CONTEXT_PROFILE_MTP;
+        if (!use_mtp) {
+            ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+            ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+            bind_slots_to_active_context();
+            return true;
+        }
+
+        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            return false;
+        }
+
+        try {
+            common_params params_dft = common_base_params_to_speculative(params_base);
+            spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+            model_dft = spec_init->model();
+            ctx_dft = spec_init->context();
+            if (!ctx_dft) {
+                return false;
+            }
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft;
+            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+            if (!spec) {
+                return false;
+            }
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+        } catch (const std::exception & error) {
+            SRV_ERR("adaptive speculative rebuild failed: %s\n", error.what());
+            return false;
+        }
+        bind_slots_to_active_context();
+        return true;
+    }
+
+    bool switch_adaptive_context(common_context_profile requested) {
+        if (!common_context_is_adaptive(params_base)) {
+            return true;
+        }
+        if (adaptive_context_unavailable) {
+            return false;
+        }
+        if (requested == active_context_profile) {
+            return true;
+        }
+        if (!adaptive_slots_idle()) {
+            return false;
+        }
+
+        const int64_t transition_start_us = ggml_time_us();
+        adaptive_context_transitioning = true;
+        publish_adaptive_status();
+        struct transition_status_guard {
+            server_context_impl * impl;
+            ~transition_status_guard() {
+                impl->adaptive_context_transitioning = false;
+                impl->publish_adaptive_status();
+            }
+        } transition_guard{this};
+
+        const common_context_profile old_profile = active_context_profile;
+        common_params old_params = params_base;
+        old_params.speculative.draft.ctx_tgt = nullptr;
+        old_params.speculative.draft.ctx_dft = nullptr;
+
+        // Publish every reusable idle state before destroying either context.
+        if (prompt_cache) {
+            for (auto & slot : slots) {
+                if (!slot.prompt.tokens.empty()) {
+                    slot.prompt_save(*prompt_cache);
+                }
+            }
+            prompt_cache->update();
+        }
+        for (auto & slot : slots) {
+            slot.prompt_clear();
+            slot.reset();
+        }
+
+        const auto discard_context = [&]() {
+            spec.reset();
+            spec_init.reset();
+            params_base.speculative.draft.ctx_tgt = nullptr;
+            params_base.speculative.draft.ctx_dft = nullptr;
+            ctx_dft = nullptr;
+            model_dft = nullptr;
+            if (llama_init && llama_init->context()) {
+                llama_init->release_context();
+            }
+            ctx_tgt = nullptr;
+            unbind_slots_from_context();
+        };
+
+        const auto restore_old = [&]() -> bool {
+            active_context_profile = old_profile;
+            params_base = old_params;
+            params_base.speculative.draft.ctx_tgt = nullptr;
+            params_base.speculative.draft.ctx_dft = nullptr;
+            if (!llama_model_mtp_weights_set_resident(model_tgt,
+                    old_profile == COMMON_CONTEXT_PROFILE_MTP, adaptive_test_mtp_fault("rollback", old_profile))) {
+                ctx_tgt = nullptr;
+                unbind_slots_from_context();
+                return false;
+            }
+            if (adaptive_test_fault("rollback-after-residency", old_profile)) {
+                SRV_WRN("%s", "adaptive test fault: rollback after MTP residency\n");
+                return false;
+            }
+            if (!llama_init->recreate_context(params_base)) {
+                ctx_tgt = nullptr;
+                unbind_slots_from_context();
+                return false;
+            }
+            ctx_tgt = llama_init->context();
+            if (adaptive_test_fault("rollback-after-context", old_profile)) {
+                SRV_WRN("%s", "adaptive test fault: rollback after context recreation\n");
+                discard_context();
+                return false;
+            }
+            if (ctx_tgt == nullptr || !rebuild_active_speculation(old_profile)) {
+                discard_context();
+                return false;
+            }
+            n_ctx = llama_n_ctx(ctx_tgt);
+            adaptive_context_unavailable = false;
+            return true;
+        };
+
+        discard_context();
+
+        params_base.n_ctx = requested == COMMON_CONTEXT_PROFILE_MTP ? params_base.ctx_size_mtp : adaptive_long_ctx;
+        params_base.speculative.types = requested == COMMON_CONTEXT_PROFILE_MTP
+            ? std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }
+            : std::vector<common_speculative_type>{};
+        const auto limits = server_output_limits(params_base);
+        params_base.n_outputs_max = limits.total;
+        params_base.n_outputs_max_per_seq = limits.per_seq;
+
+        const bool resident = requested == COMMON_CONTEXT_PROFILE_MTP;
+        if (!llama_model_mtp_weights_set_resident(model_tgt, resident,
+                adaptive_test_mtp_fault("candidate", requested))) {
+            SRV_WRN("adaptive test fault: candidate %s MTP residency/upload\n",
+                    resident ? "mtp" : "long");
+            SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
+                    resident ? "mtp" : "long");
+            if (!restore_old()) {
+                enter_adaptive_unavailable();
+            }
+            return false;
+        }
+        if (adaptive_test_fault("candidate-after-residency", requested)) {
+            SRV_WRN("adaptive test fault: candidate %s after MTP residency\n",
+                    resident ? "mtp" : "long");
+            SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
+                    resident ? "mtp" : "long");
+            if (!restore_old()) {
+                enter_adaptive_unavailable();
+            }
+            return false;
+        }
+        if (!llama_init->recreate_context(params_base)) {
+            SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
+                    resident ? "mtp" : "long");
+            if (!restore_old()) {
+                enter_adaptive_unavailable();
+            }
+            return false;
+        }
+        ctx_tgt = llama_init->context();
+        if (ctx_tgt == nullptr || !rebuild_active_speculation(requested)) {
+            SRV_ERR("%s", "adaptive context transition built an unusable speculative profile; attempting rollback\n");
+            discard_context();
+            if (!restore_old()) {
+                enter_adaptive_unavailable();
+            }
+            return false;
+        }
+        active_context_profile = requested;
+        adaptive_context_unavailable = false;
+        n_ctx = llama_n_ctx(ctx_tgt);
+        const auto mtp_info = llama_model_mtp_weights_get_info(model_tgt);
+        SRV_INF("adaptive context transition complete: %s, n_ctx=%d, transition_ms=%.3f, MTP_GPU=%zu, MTP_HOST=%zu, MTP_ALLOC=%zu, model_instance=%" PRIu64
+                ", model_loads=%" PRIu64 ", main_gpu_upload_bytes=%" PRIu64
+                ", mtp_gpu_upload_bytes=%" PRIu64 ", mtp_reloads=%" PRIu64 "\n",
+                requested == COMMON_CONTEXT_PROFILE_MTP ? "mtp" : "long", n_ctx,
+                (ggml_time_us() - transition_start_us) / 1000.0,
+                mtp_info.gpu_allocated_bytes, mtp_info.host_bytes, mtp_info.allocated_bytes,
+                mtp_info.model_instance, mtp_info.model_load_count, mtp_info.main_gpu_upload_bytes,
+                mtp_info.mtp_gpu_upload_bytes, mtp_info.mtp_reloads);
+        return true;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         if (elastic_paged_context && !has_context_reservation(task)) {
             SRV_DBG("%s", "deferring task: paged KV reservation exceeds an active admission limit\n");
@@ -1754,8 +3267,15 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                if (task.params.cache_prompt) {
+                    const auto cache_result = ret->prompt_load_result(*prompt_cache, task.tokens);
+                    if (cache_result == server_prompt_cache_result::needs_bootstrap) {
+                        ret->bootstrap_pending = true;
+                        SLT_INF(*ret, "%s", "target-only cache hit requires MTP bootstrap suffix\n");
+                    } else if (cache_result != server_prompt_cache_result::hit &&
+                               cache_result != server_prompt_cache_result::unchanged) {
+                        ret->prompt_clear();
+                    }
                 }
 
                 prompt_cache->update();
@@ -1813,6 +3333,16 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        struct bootstrap_guard {
+            server_slot & slot;
+            bool committed = false;
+            ~bootstrap_guard() {
+                if (!committed) {
+                    slot.bootstrap_pending = false;
+                }
+            }
+        } bootstrap_state{slot};
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1977,6 +3507,7 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        bootstrap_state.committed = true;
         return true;
     }
 
@@ -2180,7 +3711,7 @@ private:
         SRV_ERR("task id = %d, error: %s\n", id_task, error.c_str());
 
         if (type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
-            GGML_ASSERT(n_ctx > 0 && n_prompt_tokens > 0);
+            GGML_ASSERT(n_ctx > 0 && n_prompt_tokens >= 0);
         }
 
         auto res = std::make_unique<server_task_result_error>();
@@ -2466,21 +3997,21 @@ private:
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if ((*it)->id_task != id_task && last >= 0 && (*it)->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+                        (*it)->pos_min, (*it)->pos_max, (*it)->n_tokens, (float) (*it)->size() / 1024 / 1024);
 
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
 
-            last = it->n_tokens;
+            last = (*it)->n_tokens;
             ++it;
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            const auto & cur = *slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
@@ -2492,8 +4023,8 @@ private:
         {
             const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-                if (it->n_tokens == n_tokens_new) {
-                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                if ((*it)->n_tokens == n_tokens_new) {
+                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2501,7 +4032,8 @@ private:
             }
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        auto checkpoint = std::make_shared<common_prompt_checkpoint>();
+        auto & cur = *checkpoint;
 
         cur.id_task = id_task;
 
@@ -2513,7 +4045,9 @@ private:
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        cur.update_spec(spec.get(), slot.id);
+
+        slot.prompt.checkpoints.push_back(std::move(checkpoint));
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2544,6 +4078,23 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    if (!select_adaptive_context(task)) {
+                        break;
+                    }
+
+                    if (common_context_is_adaptive(params_base) &&
+                            task.context_profile != active_context_profile) {
+                        if (!adaptive_slots_idle()) {
+                            SRV_DBG("adaptive profile transition waits for idle slots, id_task = %d\n", id_task);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                        if (!switch_adaptive_context(task.context_profile)) {
+                            send_error(task, "adaptive context profile transition failed", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
 
                     if (elastic_paged_context && get_context_reservation(task) > n_ctx) {
                         send_error(task.id,
@@ -2592,7 +4143,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && prompt_cache) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -2682,6 +4233,7 @@ private:
             case SERVER_TASK_TYPE_SLOT_GET:
                 {
                     json slots_data = json::array();
+                    const auto adaptive_status = get_adaptive_status();
 
                     int n_idle_slots = 0;
 
@@ -2690,7 +4242,18 @@ private:
                             n_idle_slots++;
                         }
 
-                        slots_data.push_back(slot.to_json(slots_debug == 0));
+                        json slot_data = slot.to_json(slots_debug == 0);
+                        if (adaptive_status.enabled) {
+                            slot_data["adaptive_context"] = json {
+                                {"enabled",              adaptive_status.enabled},
+                                {"profile",              adaptive_status.profile},
+                                {"state",                adaptive_status.state},
+                                {"context_size",         adaptive_status.context_size},
+                                {"context_size_long",    adaptive_status.context_size_long},
+                                {"mtp_weights_resident", adaptive_status.mtp_weights_resident},
+                            };
+                        }
+                        slots_data.push_back(std::move(slot_data));
                     }
                     SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
 
@@ -2720,6 +4283,44 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+
+                    if (common_context_is_adaptive(params_base)) {
+                        try {
+                            if (!adaptive_model_identity) {
+                                throw std::runtime_error("adaptive model identity is unavailable");
+                            }
+                            const size_t max_file_bytes = adaptive_slot_max_file_bytes(
+                                *slot, ctx_tgt, ctx_dft, params_base.ctx_size_mtp,
+                                adaptive_long_ctx, params_base.cache_ram_mib, params_base.n_ctx_checkpoints);
+                            adaptive_slot_cache_reservation reservation;
+                            if (!reservation.acquire(prompt_cache.get(), adaptive_slot_working_bytes(max_file_bytes))) {
+                                throw std::runtime_error("adaptive slot snapshot exceeds the global RAM cache budget");
+                            }
+                            const auto snapshot = adaptive_slot_capture(
+                                *slot, ctx_tgt, ctx_dft, spec.get(), *adaptive_model_identity,
+                                active_context_profile, params_base.ctx_size_mtp,
+                                params_base.mtp_max_tokens, adaptive_long_ctx, max_file_bytes);
+                            const auto encoded = adaptive_slot_encode(snapshot, max_file_bytes);
+                            const size_t nwrite = adaptive_slot_write_file(filepath, encoded);
+
+                            const int64_t t_end = ggml_time_us();
+                            const double t_save_ms = (t_end - t_start) / 1000.0;
+                            auto res = std::make_unique<server_task_result_slot_save_load>();
+                            res->id       = task.id;
+                            res->id_slot  = id_slot;
+                            res->filename = filename;
+                            res->is_save  = true;
+                            res->n_tokens = snapshot.n_tokens;
+                            res->n_bytes  = nwrite;
+                            res->t_ms     = t_save_ms;
+                            queue_results.send(std::move(res));
+                        } catch (const std::bad_alloc &) {
+                            send_error(task, "Unable to save slot: adaptive snapshot allocation failed", ERROR_TYPE_SERVER);
+                        } catch (const std::exception & err) {
+                            send_error(task, std::string("Unable to save slot: ") + err.what(), ERROR_TYPE_SERVER);
+                        }
+                        break;
+                    }
 
                     std::vector<char> packed;
                     try {
@@ -2770,6 +4371,127 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+
+                    if (common_context_is_adaptive(params_base)) {
+                        const common_context_profile old_profile = active_context_profile;
+                        bool mutation_started = false;
+                        std::optional<adaptive_slot_snapshot_blob> previous_snapshot;
+
+                        auto rollback = [&]() -> bool {
+                            if (!mutation_started) {
+                                return true;
+                            }
+                            if (active_context_profile != old_profile && !switch_adaptive_context(old_profile)) {
+                                return false;
+                            }
+                            if (adaptive_context_unavailable || !ctx_tgt) {
+                                return false;
+                            }
+                            slot = get_slot_by_id(id_slot);
+                            if (!slot) {
+                                return false;
+                            }
+                            if (!previous_snapshot) {
+                                slot->prompt_clear();
+                                return true;
+                            }
+                            std::string rollback_error;
+                            if (!adaptive_slot_restore(*previous_snapshot, *slot, ctx_tgt, ctx_dft,
+                                    spec.get(), rollback_error)) {
+                                SRV_ERR("adaptive slot rollback failed: %s\n", rollback_error.c_str());
+                                return false;
+                            }
+                            return true;
+                        };
+
+                        auto fail_restore = [&](const std::string & reason, error_type type) {
+                            if (!rollback()) {
+                                enter_adaptive_unavailable();
+                                send_error(task,
+                                    "Unable to restore slot: " + reason + "; adaptive context is unavailable after rollback failure",
+                                    ERROR_TYPE_UNAVAILABLE);
+                                return;
+                            }
+                            send_error(task, "Unable to restore slot: " + reason, type);
+                        };
+                        adaptive_slot_cache_reservation reservation;
+                        try {
+                            if (!adaptive_model_identity) {
+                                throw std::runtime_error("adaptive model identity is unavailable");
+                            }
+
+                            const size_t max_file_bytes = adaptive_slot_max_file_bytes(
+                                *slot, ctx_tgt, ctx_dft, params_base.ctx_size_mtp,
+                                adaptive_long_ctx, params_base.cache_ram_mib, params_base.n_ctx_checkpoints);
+                            if (!reservation.acquire(prompt_cache.get(), adaptive_slot_working_bytes(max_file_bytes))) {
+                                throw std::runtime_error("adaptive slot snapshot exceeds the global RAM cache budget");
+                            }
+                            const auto file = adaptive_slot_read_file(filepath, max_file_bytes);
+                            const auto snapshot = adaptive_slot_decode(file,
+                                params_base.n_ctx_checkpoints > 0 ? (size_t) params_base.n_ctx_checkpoints : 0,
+                                max_file_bytes);
+                            if (snapshot.model_fingerprint.empty() ||
+                                    snapshot.model_fingerprint != adaptive_model_identity->fingerprint()) {
+                                throw std::runtime_error("adaptive slot snapshot model identity differs");
+                            }
+                            if (snapshot.ctx_size_mtp != params_base.ctx_size_mtp ||
+                                    snapshot.mtp_max_tokens != params_base.mtp_max_tokens ||
+                                    snapshot.long_ctx != adaptive_long_ctx) {
+                                throw std::runtime_error("adaptive slot snapshot context limits differ");
+                            }
+                            const int expected_ctx = std::min(
+                                snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ? params_base.ctx_size_mtp : adaptive_long_ctx,
+                                llama_model_n_ctx_train(model_tgt));
+                            if (params_base.kv_unified_per_slot > 0 && snapshot.active_ctx > params_base.kv_unified_per_slot) {
+                                throw std::runtime_error("adaptive slot snapshot active context exceeds the configured per-slot limit");
+                            }
+                            if (snapshot.active_ctx != expected_ctx) {
+                                throw std::runtime_error("adaptive slot snapshot active context differs");
+                            }
+
+                            if (!slot->prompt.tokens.empty()) {
+                                previous_snapshot = adaptive_slot_capture(
+                                    *slot, ctx_tgt, ctx_dft, spec.get(), *adaptive_model_identity,
+                                    old_profile, params_base.ctx_size_mtp, params_base.mtp_max_tokens,
+                                    adaptive_long_ctx, max_file_bytes, false);
+                            }
+
+                            if (snapshot.profile != (uint32_t) active_context_profile) {
+                                mutation_started = true;
+                                if (!switch_adaptive_context((common_context_profile) snapshot.profile)) {
+                                    throw std::runtime_error("adaptive context profile transition failed");
+                                }
+                                // The transition rebinds every slot to the new context.
+                                slot = get_slot_by_id(id_slot);
+                                if (!slot) {
+                                    throw std::runtime_error("adaptive slot disappeared during profile transition");
+                                }
+                            }
+
+                            mutation_started = true;
+                            std::string restore_error;
+                            if (!adaptive_slot_restore(snapshot, *slot, ctx_tgt, ctx_dft, spec.get(), restore_error)) {
+                                throw std::runtime_error(restore_error);
+                            }
+
+                            const int64_t t_end = ggml_time_us();
+                            const double t_restore_ms = (t_end - t_start) / 1000.0;
+                            auto res = std::make_unique<server_task_result_slot_save_load>();
+                            res->id       = task.id;
+                            res->id_slot  = id_slot;
+                            res->filename = filename;
+                            res->is_save  = false;
+                            res->n_tokens = snapshot.n_tokens;
+                            res->n_bytes  = file.size();
+                            res->t_ms     = t_restore_ms;
+                            queue_results.send(std::move(res));
+                        } catch (const std::bad_alloc &) {
+                            fail_restore("adaptive snapshot allocation failed", ERROR_TYPE_INVALID_REQUEST);
+                        } catch (const std::exception & err) {
+                            fail_restore(err.what(), ERROR_TYPE_INVALID_REQUEST);
+                        }
+                        break;
+                    }
 
                     size_t nread = 0;
                     try {
@@ -3279,6 +5001,13 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        // The first real target suffix after a target-only snapshot must fit the
+        // dense NextN output buffer. Restore the normal physical batch afterward.
+        if (std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.bootstrap_pending;
+                })) {
+            n_batch = std::min(n_batch, n_ubatch);
+        }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3393,6 +5122,8 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                SLT_TRC(slot, "adaptive cache common prefix=%d slot_tokens=%zu task_tokens=%zu bootstrap=%d\n",
+                                        n_past, slot.prompt.tokens.size(), input_tokens.size(), slot.bootstrap_pending);
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3462,6 +5193,7 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                                common_speculative_set_state(spec.get(), slot.id, {});
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -3529,30 +5261,43 @@ private:
                                         slot.prompt.checkpoints.rend(),
                                         [&](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur->pos_min, cur->pos_max, pos_min_thold);
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
+                                            if (cur->pos_max > pos_next) {
                                                 return false;
                                             }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            return cur->pos_min < pos_min_thold || cur->pos_min == 0;
                                         }
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
-
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        // PARTIAL_ONLY leaves future attention KV present until suffix removal below.
+                                        const auto & checkpoint = **it;
+                                        do_reset = !checkpoint.restore_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const auto draft_restore = do_reset ? common_checkpoint_restore::failed :
+                                            checkpoint.restore_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (draft_restore == common_checkpoint_restore::missing_base) {
+                                            SLT_WRN(slot, "%s", "checkpoint requires MTP bootstrap; cold fallback until bootstrap is connected\n");
+                                        }
+                                        do_reset = do_reset || draft_restore != common_checkpoint_restore::restored ||
+                                            (spec && !checkpoint.data_spec.empty() &&
+                                             !common_speculative_set_state(spec.get(), slot.id, checkpoint.data_spec, checkpoint.pos_max));
+                                        if (!do_reset) {
+                                            if (checkpoint.data_spec.empty()) { common_speculative_set_state(spec.get(), slot.id, {}); }
+                                            pos_next = std::min(pos_next, std::max(checkpoint.pos_min + 1, checkpoint.pos_max));
+                                            n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) checkpoint.n_tokens);
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n",
+                                                    checkpoint.pos_min, checkpoint.pos_max, checkpoint.n_tokens, n_past, (float) checkpoint.size() / 1024 / 1024);
+                                        } else {
+                                            SLT_WRN(slot, "%s", "checkpoint restore failed; clearing target, draft and carry\n");
+                                        }
                                     }
 
                                     if (do_reset) {
+                                        slot.mem.seq_rm(slot.id, -1, -1);
+                                        common_speculative_set_state(spec.get(), slot.id, {});
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
@@ -3565,8 +5310,8 @@ private:
                                 // erase any checkpoints with pos_max > pos_next
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                    if (cur->pos_max > pos_next) {
+                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur->pos_min, cur->pos_max, cur->n_tokens, n_swa, pos_next, (float) cur->size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -3735,7 +5480,7 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -3809,7 +5554,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
@@ -3932,7 +5677,27 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        bool bootstrapped = false;
         if (spec) {
+            for (auto & slot : slots) {
+                if (!slot.bootstrap_pending || !slot.is_processing()) {
+                    continue;
+                }
+                const uint64_t decode_id = llama_get_nextn_decode_id(ctx_tgt);
+                if (!common_speculative_bootstrap(spec.get(), batch_view, decode_id)) {
+                    SLT_ERR(slot, "%s", "target-only cache hit could not bootstrap MTP from the decoded suffix\n");
+                    slot.bootstrap_pending = false;
+                    slot.prompt_clear();
+                    throw std::runtime_error("failed to bootstrap MTP from target-only prompt cache");
+                }
+                slot.bootstrap_pending = false;
+                bootstrapped = true;
+                SLT_INF(slot, "target-only MTP bootstrap accepted: decoded_suffix=%d\n", batch_view.n_tokens);
+                break;
+            }
+        }
+
+        if (spec && !bootstrapped) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
@@ -3942,6 +5707,11 @@ private:
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
                 // TODO: handle error
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        slot.prompt_clear();
+                    }
+                }
                 throw std::runtime_error("failed to process speculative batch");
             }
         }
@@ -4223,7 +5993,7 @@ private:
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
-    int n_ctx_slot() const {
+    int active_n_ctx_slot() const {
         int res = llama_n_ctx_seq(ctx_tgt);
 
         if (params_base.kv_unified_per_slot > 0) {
@@ -4231,6 +6001,13 @@ private:
         }
 
         return std::min(res, llama_model_n_ctx_train(model_tgt));
+    }
+
+    int n_ctx_slot() const {
+        if (common_context_is_adaptive(params_base) && adaptive_long_ctx > 0) {
+            return adaptive_long_ctx;
+        }
+        return active_n_ctx_slot();
     }
 
     server_response_reader get_response_reader() {
@@ -4422,6 +6199,10 @@ server_context_meta server_context::get_meta() const {
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
     };
+}
+
+server_context_adaptive_status server_context::get_adaptive_status() const {
+    return impl->get_adaptive_status();
 }
 
 // generator-like API for HTTP response generation
@@ -4740,10 +6521,21 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
     });
 }
 
-static json get_res_model_info(const server_context_meta & meta) {
+static json adaptive_status_to_json(const server_context_adaptive_status & status) {
+    return json {
+        {"enabled",              status.enabled},
+        {"profile",              status.profile},
+        {"state",                status.state},
+        {"context_size",         status.context_size},
+        {"context_size_long",    status.context_size_long},
+        {"mtp_weights_resident", status.mtp_weights_resident},
+    };
+}
+
+static json get_res_model_info(const server_context_meta & meta, const server_context_adaptive_status & status) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
-    return {
+    json result = {
         {"id",       meta.model_name},
         {"aliases",  meta.model_aliases},
         {"tags",     meta.model_tags},
@@ -4761,23 +6553,33 @@ static json get_res_model_info(const server_context_meta & meta) {
             {"ftype",       meta.model_ftype},
         }},
     };
+    if (status.enabled) {
+        result["adaptive_context"] = adaptive_status_to_json(status);
+    }
+    return result;
 }
 
-static json get_res_models(const server_context_meta & meta, const common_params & params) {
+static json get_res_models(const server_context_meta & meta, const common_params & params,
+                           const server_context_adaptive_status & status) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
-    return json{
+    json result = json{
         {"models", json::array({
             format_codex_model_entry(meta.model_name, params.n_ctx, meta.has_mtmd),
         })},
         {"object", "list"},
         {"data", json::array({
-            get_res_model_info(meta),
-        })}
+            get_res_model_info(meta, status),
+        })},
     };
+    if (status.enabled) {
+        result["adaptive_context"] = adaptive_status_to_json(status);
+    }
+    return result;
 }
 
-static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping) {
+static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping,
+                          const server_context_adaptive_status & status) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
     task_params tparams;
@@ -4815,6 +6617,9 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
     };
+    if (status.enabled) {
+        props["adaptive_context"] = adaptive_status_to_json(status);
+    }
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
             props["chat_template_tool_use"] = tmpl_tools;
@@ -4825,7 +6630,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
 }
 
 json server_routes::get_model_info() const {
-    return get_res_model_info(*meta);
+    return get_res_model_info(*meta, ctx_server.get_adaptive_status());
 }
 
 void server_routes::init_routes() {
@@ -4989,7 +6794,7 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            res->ok(get_res_props(*meta, params, false, ctx_server.get_adaptive_status()));
         }
         return res;
     };
@@ -5257,7 +7062,7 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_models);
         } else {
-            res->ok(get_res_models(*meta, params));
+            res->ok(get_res_models(*meta, params, ctx_server.get_adaptive_status()));
         }
         return res;
     };
@@ -5722,8 +7527,9 @@ void server_routes::update_cached_responses(bool is_sleeping) {
     std::unique_lock<std::mutex> lock(mutex_cache);
 
     if (is_sleeping) {
-        cached_models  = get_res_models(*meta, params);
-        cached_props   = get_res_props(*meta, params, true);
+        const auto status = ctx_server.get_adaptive_status();
+        cached_models  = get_res_models(*meta, params, status);
+        cached_props   = get_res_props(*meta, params, true, status);
         cached_metrics = ctx_server.get_metrics();
 
         should_reset_buckets = false;
