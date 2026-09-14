@@ -7,7 +7,7 @@
 - Base histórica: `55ac3792ac126d19f6878bee22b30d1af638ccc3`, verificada em 12/09/2026; implementação consolidada no `master` em 14/09/2026.
 - Repositório: `/home/hjotha/llama`, branch principal `master`, acompanhamento `fork/master`.
 - Worktree documental histórica: `/home/hjotha/worktrees/llama-adaptive-context-plan`; código final validado em `/home/hjotha/llama`.
-- Branch deste plano: `plan/adaptive-context-resident-weights` (histórica); integração atual no `master` segue o fluxo de commit/push desta rodada.
+- Branch deste plano: `plan/adaptive-context-resident-weights` (histórica); integração atual está no commit `fa1d69ae2` do `master`, confirmado em `fork/master`.
 - Dependências externas novas: nenhuma. Reutilizar C++, RAII, GGML, CMake e pytest do projeto.
 
 Objetivo: um único processo de inferência na GOKAYA (`192.168.1.57`), sem router, recebe `qwen-3.8-27b`; decide entre contexto curto com MTP e contexto longo sem MTP usando prompt completo mais reserva de saída; volta ao curto no próximo pedido pequeno. Os pesos principais permanecem carregados durante as trocas. Liberar KV e outras alocações da GPU, salvando antes o estado reutilizável em RAM e restaurando-o no destino quando compatível. Save/restore entre perfis é requisito desta revisão, não uma otimização futura. A redução de aproximadamente 10 segundos por troca é uma hipótese a medir, informada pelo usuário, não uma medição desta análise.
