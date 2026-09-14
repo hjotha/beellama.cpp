@@ -1309,33 +1309,6 @@ struct server_slot {
         }
     }
 
-    result_timings get_timings() const {
-        result_timings timings;
-        timings.cache_n = n_prompt_tokens_cache;
-
-        timings.prompt_n            = n_prompt_tokens_processed;
-        timings.prompt_ms           = t_prompt_processing;
-        // Guard against n_prompt_tokens_processed == 0 (e.g. the restore-continue regenerate
-        // fast-path, where the entire prompt is reused and zero tokens are re-processed). Without
-        // this, the divisions emit inf/NaN which then serialize as invalid JSON in the response's
-        // "timings" object.
-        timings.prompt_per_token_ms = n_prompt_tokens_processed > 0 ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
-        timings.prompt_per_second   = n_prompt_tokens_processed > 0 ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
-
-        timings.predicted_n            = n_decoded;
-        timings.predicted_ms           = t_token_generation;
-        timings.predicted_per_token_ms = t_token_generation / n_decoded;
-        timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
-
-        // Add speculative metrics
-        if (n_draft_total > 0) {
-            timings.draft_n          = n_draft_total;
-            timings.draft_n_accepted = n_draft_accepted;
-        }
-
-        return timings;
-    }
-
     size_t find_stopping_strings(const std::string & text, const size_t last_token_size, bool is_full_stop) {
         GGML_ASSERT(task);
 
@@ -3236,6 +3209,12 @@ private:
         // rewind. For attention models the request may diverge inside the snapshot; keep_first(n_past)
         // + a PARTIAL seq_rm then reprefills the divergent tail (supported for PART). The verified
         // prefix is what we claim as reused.
+        // [FORK] MTP draft carry: the restored state covers only the target context; the resident
+        // MTP carry is stale (or unset). Flag the slot so the fork's next-decode bootstrap path
+        // re-syncs the carry from the decoded suffix (same mechanism as a target-only RAM cache hit).
+        // NOTE: must be set for PART models too — the production Qwen3.8-27B-RCO runs with MTP and
+        // a PART seq-rm type, and an un-synced carry breaks the next speculative process.
+        slot.bootstrap_pending = slot.can_speculate();
         // Bump the snapshot's mtime so the LRU treats a reused-but-not-rewritten base snapshot as
         // recently-used (true LRU, not least-recently-written) — critical for the fan-out case where
         // many requests restore one hot base prefix. Best-effort; never errors the restore (invariant 4).
@@ -3386,6 +3365,15 @@ private:
             if (!mec) {
                 auto_idx.dir_mtime = dmt;
             }
+        }
+    }
+
+    // Persist a just-finished slot's KV to the disk auto cache at task completion, so a cold
+    // process can reuse the snapshot from the very first request on (not only when the slot is
+    // evicted). Off by default; all correctness gates live in auto_save_slot_if_useful.
+    void auto_save_on_completion(server_slot & slot) {
+        if (auto_cache_enabled()) {
+            auto_save_slot_if_useful(slot);
         }
     }
 
@@ -5666,17 +5654,18 @@ private:
                     // left over from a prior task on this slot object) from persisting a sidecar that
                     // does not match the saved state — which would otherwise emit a wrong first token
                     // on a later regenerate with nothing to catch it.
+                    const int32_t n_slot_tokens = (int32_t) (packed.size() / sizeof(llama_token));
                     if (nwrite > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-                        if (slot->logits_last_n_tokens == (int32_t) token_count && !slot->logits_last.empty()) {
+                        if (slot->logits_last_n_tokens == n_slot_tokens && !slot->logits_last.empty()) {
                             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
                             const size_t nwrite_logits =
-                                slot_logits_write(filepath, slot->logits_last, nv, (uint32_t) token_count);
+                                slot_logits_write(filepath, slot->logits_last, nv, (uint32_t) n_slot_tokens);
                             if (nwrite_logits == 0) {
                                 SLT_WRN(*slot, "%s", "failed to write logits sidecar; regenerate fast-path disabled for this snapshot\n");
                             }
                         } else {
-                            SLT_DBG(*slot, "no matching captured logits for this state (stamp=%d, token_count=%zu); sidecar omitted\n",
-                                    slot->logits_last_n_tokens, token_count);
+                            SLT_DBG(*slot, "no matching captured logits for this state (stamp=%d, token_count=%d); sidecar omitted\n",
+                                    slot->logits_last_n_tokens, n_slot_tokens);
                         }
                     }
 
@@ -5854,6 +5843,7 @@ private:
                     }
 
                     size_t nread = 0;
+                    size_t n_restored_tokens = 0; // captured from n_packed (used below, outside the try block)
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
@@ -5866,6 +5856,7 @@ private:
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
                         }
                         packed.resize(n_packed);
+                        n_restored_tokens = n_packed;
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
 
@@ -5916,8 +5907,8 @@ private:
                     slot->restored_logits.clear();
                     if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                         const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-                        if (slot_logits_read(filepath, nv, (uint32_t) token_count, slot->restored_logits)) {
-                            SLT_INF(*slot, "loaded logits sidecar (%d vocab, %zu tokens) — regenerate fast-path armed\n", nv, token_count);
+                        if (slot_logits_read(filepath, nv, (uint32_t) n_restored_tokens, slot->restored_logits)) {
+                            SLT_INF(*slot, "loaded logits sidecar (%d vocab, %zu tokens) — regenerate fast-path armed\n", nv, n_restored_tokens);
                         }
                     }
 
@@ -6671,12 +6662,12 @@ private:
 
                                 if (!slot.restored_logits.empty()) {
                                     // --- fast path: emit first token from saved logits, no decode ---
-                                    slot.n_prompt_tokens_cache     = n_past; // entire prompt "reused"
-                                    slot.n_prompt_tokens_processed = 0;      // prompt_n = 0 => observable reuse signal
+                                    slot.stats.n_prompt_cached     = n_past; // entire prompt "reused"
+                                    slot.stats.n_prompt_processed  = 0;      // prompt_n = 0 => observable reuse signal
 
                                     // prime the sampler over the full restored prompt (penalties/grammar
                                     // history), exactly as the normal DONE_PROMPT transition (init_sampler) would.
-                                    slot.n_decoded = 0;
+                                    slot.stats.n_gen = 0;
                                     slot.init_sampler();
 
                                     slot.state   = SLOT_STATE_GENERATING;
@@ -6686,6 +6677,7 @@ private:
                                     // mirroring the normal prompt-done transition.
                                     if (slot.can_speculate()) {
                                         common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                                        slot.bootstrap_pending = false; // begin already re-synced the MTP carry
                                     }
 
                                     const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
@@ -6696,14 +6688,15 @@ private:
                                     common_sampler_accept(slot.smpl.get(), id, true);
 
                                     // mirror the generation accounting from the normal sample path
-                                    const int64_t t_current = ggml_time_us();
-                                    slot.n_decoded += 1;
-                                    slot.t_start_generation  = t_current;
-                                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                                    // fork-built metrics: on_prompt_eval equivalent (add_prompt expects
-                                    // tokens + t_us; n_prompt_tokens_processed is 0 on this fast path)
-                                    metrics.add_prompt(slot.n_prompt_tokens_processed, (uint64_t) (slot.t_prompt_processing * 1e3));
-                                    slot.t_token_generation  = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                                    // (fork stores timings in slot.stats: t_prompt_last marks the end of
+                                    // prompt processing — which here includes the disk restore —, then
+                                    // t_gen_last marks the start of generation; the first token is free).
+                                    slot.stats.n_gen = 1;
+                                    if (slot.stats.is_set()) {
+                                        slot.stats.update_prompt_last();
+                                        slot.stats.update_gen_last();
+                                        metrics.add_prompt(slot.stats.n_prompt_processed, (uint64_t) (slot.stats.t_prompt_ms() * 1000));
+                                    }
 
                                     if (slot.task->params.stream) {
                                         // mirror the normal prompt-start streaming signal exactly so a
@@ -6742,11 +6735,15 @@ private:
                                         slot.print_timings();
                                         send_final_response(slot);
                                         metrics_on_prediction(slot);
+                                        auto_save_on_completion(slot);
                                         slot.release();
                                     }
 
                                     SLT_INF(slot, "%s", "restore-continue: emitted first token from saved logits (prompt_n=0)\n");
-                                    continue; // skip ALL prompt-batch building for this slot this iteration
+                                    // all prompt-batch building for this slot is skipped: the restored KV
+                                    // already holds the full prompt and the first token was just emitted
+                                    // (this code runs inside the iterate(slots) lambda of update_slots)
+                                    return;
                                 }
 
                                 // --- safe fallback: no valid sidecar -> clear restored seq, then reprefill ---
@@ -7441,6 +7438,7 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
+                auto_save_on_completion(slot);
                 slot.release();
 
                 return;
@@ -7574,6 +7572,7 @@ private:
                 if (!process_token(result, slot)) {
                     slot.print_timings();
                     send_final_response(slot);
+                    auto_save_on_completion(slot);
                     slot.release();
 
                     return;
