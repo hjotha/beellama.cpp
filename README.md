@@ -124,6 +124,31 @@ Router swaps unload/load child processes; adaptive mode instead rebuilds context
 
 Governors run inside the server through NVML, deduplicate unchanged settings and require driver permission to change GPU controls. For the active RTX 4070 configuration, startup logs resolve the 11,001 MHz decode target to a 10,501 MHz lock plus a +1,500 MHz offset. This mapping is device/driver-specific. The historical statement that the memory governor is disabled is no longer current.
 
+**GPU core and memory-clock parameters**
+
+| Server parameter | Environment variable | Effect |
+| --- | --- | --- |
+| `--gpu-mem-clock-decode MHz` | `LLAMA_ARG_GPU_MEM_CLOCK_DECODE` | Memory-clock target during token generation; GOKAYA uses `11001`. |
+| `--gpu-mem-clock-prefill MHz` | `LLAMA_ARG_GPU_MEM_CLOCK_PREFILL` | Memory-clock target during prompt processing; omitted on GOKAYA. |
+| `--gpu-power-prefill W` | `LLAMA_ARG_GPU_POWER_PREFILL` | Prefill power limit; GOKAYA uses `200`. |
+| `--gpu-power-decode W` | `LLAMA_ARG_GPU_POWER_DECODE` | Decode power limit; GOKAYA uses `170`. |
+| `--gpu-power-device N` | `LLAMA_ARG_GPU_POWER_DEVICE` | NVML GPU index shared by both governors; default `0`. This is not the CUDA layer-offload selector. |
+
+Clock and power values must be positive. Omit both memory-clock options to disable the memory governor; with it enabled, idle and any phase without a configured target release its memory lock and restore any offset it applied. The two power options must be supplied together; the memory governor can run without them. Power limits influence available GPU boost but do not set a core frequency in MHz.
+
+The server has no GPU core/SM clock flag. NVIDIA's external controls are:
+
+| Command template | Effect |
+| --- | --- |
+| `sudo nvidia-smi -i N --lock-gpu-clocks=MIN,MAX` (`-lgc`) | Request a GPU core clock range in MHz; use equal bounds for one target. |
+| `sudo nvidia-smi -i N --reset-gpu-clocks` (`-rgc`) | Restore default GPU core clock control. |
+| `sudo nvidia-smi -i N --lock-memory-clocks=MIN,MAX` (`-lmc`) | Request a memory clock range in MHz, independently of server phases. |
+| `sudo nvidia-smi -i N --reset-memory-clocks` (`-rmc`) | Restore default memory clock control. |
+
+Replace `N` with the NVIDIA device index and `MIN,MAX` with supported MHz values. These controls require GPU/driver support and permission; external locks apply beyond a request and have no automatic server-idle reset. Use a single owner for memory clocks: manual locks can be overwritten by the server governor's phase transitions. A plain memory lock does not reproduce its above-stock offset logic.
+
+Read the observed clocks with `nvidia-smi -i 0 --query-gpu=clocks.current.sm,clocks.current.memory,power.limit --format=csv`.
+
 Relevant sources are [CUDA graph/allocator handling](ggml/src/ggml-cuda/common.cuh), [CUDA kernels](ggml/src/ggml-cuda), [Vulkan registration](ggml/src/ggml-vulkan/ggml-vulkan.cpp) and the [GPU governor](tools/server/server-gpu-power.cpp). The [power](docs/phase-aware-nvidia-gpu-power-governor.md) and [memory-clock](docs/phase-aware-nvidia-gpu-memory-clock-governor.md) design documents retain earlier measurements and configurations.
 
 ### Paged KV, SnapKV and other speculation
