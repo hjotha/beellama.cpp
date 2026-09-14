@@ -22,7 +22,7 @@
 This fork of `ggml-org/llama.cpp` adds adaptive MTP context switching with resident model weights, context-based model routing, cache migration, automatic disk prompt/KV persistence, CUDA memory recovery, NVIDIA GPU governors, and experimental paged KV/SnapKV serving. Standard upstream capabilities, including the CLI, web UI, model conversion, quantization and OpenAI-compatible server, remain available.
 
 - [Current GOKAYA deployment](#current-gokaya-deployment-2026-09-14)
-- [Adaptive context and cache reuse](#adaptive-context-with-resident-weights)
+- [Adaptive context and cache reuse](#adaptive-context-with-resident-weights-tri-profile-architecture)
 - [Automatic disk prompt cache](#automatic-disk-prompt-cache)
 - [Router mode](#context-based-router-mode)
 - [CUDA and GPU controls](#cuda-memory-recovery-and-gpu-governors)
@@ -31,7 +31,7 @@ This fork of `ggml-org/llama.cpp` adds adaptive MTP context switching with resid
 
 ### Current GOKAYA deployment (2026-09-14)
 
-The development checkout is `/home/hjotha/llama` on GOKAYA (`192.168.1.57`), branch `master`; `origin` is `hjotha/llama.cpp` and `upstream` is the official repository. The source includes upstream `093a2f86c` and the later upstream fix `661643e43`. The slot-save release includes the reviewed integration of upstream PRs 24003/24004 with the fork's tri-profile and MTP paths.
+The development checkout is `/home/hjotha/llama` on GOKAYA (`192.168.1.57`), branch `master`; `origin` is `hjotha/llama.cpp` and `upstream` is the official repository. The source includes upstream `093a2f86c` and the later upstream fix `661643e43`. The slot-save release includes the reviewed integration of upstream PRs 24003/24004 with the fork's tri-profile and MTP paths. The deployed binary reports `0.4.0-dev`, build `11088`, commit `65db067dc`.
 
 The system unit `llama-server-root.service` runs `/home/hjotha/releases/llama-slot-save-20260914/build-cuda-vulkan/bin/llama-server` on port `8090`. It loads `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` directly into a single adaptive process. The old `/home/hjotha/prod-two-tier.ini` still exists but is not used by the active unit.
 
@@ -135,7 +135,11 @@ For target-only restores with MTP, the next real target suffix decode rebuilds t
 
 The store is a best-effort cache, not a durable conversation archive. Missing, incompatible or invalid snapshots fall back to prefill. Keep the directory restricted to trusted local writers and use the same build/configuration for cooperating processes; concurrent writer failure and hostile native-state payloads are not a hardened storage protocol. The model-content identity helper currently requires POSIX file identity support; automatic caching is not validated on Windows.
 
-Recurrent save/restore regressions live in [the existing slot tests](tools/server/tests/unit/test_slot_save.py). Set `SLOT_SAVE_HTTP_MODEL` to a local FULL/recurrent GGUF, `N_GPU_LAYERS` as appropriate and run `pytest tools/server/tests/unit/test_slot_save.py -k recurrent_slot_disk_cache -v -s` with `SLOW_TESTS=1` and `LLAMA_SERVER_BIN_PATH` pointing at the tested build. The tests cover manual and automatic cold restores, exact-prompt logits, suffix reuse, prediction metrics, corrupt sidecars and disagreement between metadata and native token payloads.
+Recurrent save/restore regressions live in [the existing slot tests](tools/server/tests/unit/test_slot_save.py). Set `SLOT_SAVE_HTTP_MODEL` to a local FULL/recurrent GGUF, `N_GPU_LAYERS` as appropriate and run `pytest tools/server/tests/unit/test_slot_save.py -k recurrent_slot_disk_cache -v -s` with `SLOW_TESTS=1` and `LLAMA_SERVER_BIN_PATH` pointing at the tested build. The tests cover manual and automatic cold restores, exact-prompt logits, suffix reuse, prediction metrics, corrupt/oversized sidecars and disagreement between metadata and native token payloads.
+
+Validation on 2026-09-14: Qwen3.5-4B FULL/recurrent tests regenerated a cold 601-token snapshot with `prompt_n=0`, evaluated a three-token suffix with `prompt_n=3`, and safely reprefilled corrupt snapshots. A separate Qwen3.5-4B-MTP GPU run restored 301/1301/2401-token snapshots in short/medium/long profiles (1024/2048/4096 context), processing three new tokens in each case; count/size limits and `cache_prompt=false` also passed. Legacy slot save/restore/erase, model identity and RAM/MTP cache checks passed.
+
+The deployed Qwen3.8-27B MTP model processed 6653 prompt tokens, answered `AZUL`, and saved 6655 tokens. After a service restart, its continuation logged `auto-restore: reused 6655 tokens` and `target-only MTP bootstrap accepted: decoded_suffix=24`; it answered `4` with `prompt_n=28` in 0.748 s. The initial request took 6.991 s. These are different requests demonstrating disk reuse, not a controlled speedup benchmark. Production health returned `{"status":"ok"}` and the active profile remained `mtp-short` (32768 context). The previous release binaries are retained in `/home/hjotha/releases/llama-slot-save-20260914/pre-review-65db067dc-bin/` for rollback.
 
 ### Context-based router mode
 
