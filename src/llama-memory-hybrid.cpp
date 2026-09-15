@@ -306,8 +306,8 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
-llama_memory_i * llama_memory_hybrid::get_mem_attn() const {
-    return mem_attn.get();
+llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
+    return dynamic_cast<llama_kv_cache *>(mem_attn.get());
 }
 
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {

@@ -115,7 +115,7 @@ public:
     // llama_memory_hybrid specific API
     //
 
-    llama_memory_i * get_mem_attn() const;
+    llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
 private:
