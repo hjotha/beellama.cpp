@@ -55,6 +55,7 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_attn,
         nullptr,
         nullptr,
+        "",
         n_ubatch,
         tail_tokens,
         tail_type,
