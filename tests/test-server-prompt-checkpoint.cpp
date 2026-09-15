@@ -313,7 +313,7 @@ static void prompt_cache_make_room_keeps_kept_state() {
 
     // 1.2 MiB live + incoming exceed the 1 MiB budget; the evictable victim
     // goes, the kept state survives and the incoming fits.
-    assert(cache.make_room(100*KIB, &incoming, &existing));
+    assert(cache.make_room(100*KIB, &incoming, &cache.states.back()));
     assert(cache.states.size() == 1);
     assert(cache.accounted_size() == 200*KIB);
 }
@@ -328,7 +328,7 @@ static void prompt_cache_make_room_fails_when_single_state_exceeds_budget() {
     server_prompt current = make_prompt({3, 4});
     current.checkpoints.push_back(make_checkpoint(4, 4, 200*KIB));
 
-    assert(!cache.make_room(1000*KIB, nullptr, &existing));
+    assert(!cache.make_room(1000*KIB, nullptr, &cache.states.back()));
     assert(cache.states.size() == 1);
     assert(cache.accounted_size() == 100*KIB);
 }
