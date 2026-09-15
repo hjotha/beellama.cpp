@@ -357,7 +357,8 @@ int main() {
         ckpt.data_dft.resize(64);
         ckpt.data_spec.resize(32);
         assert(ckpt.size() == sizeof(ckpt) + ckpt.data_tgt.capacity() +
-                ckpt.data_dft.capacity() + ckpt.data_spec.capacity());
+                ckpt.data_dft.capacity() + ckpt.data_spec.capacity() +
+                ckpt.layout_tgt.capacity() + ckpt.layout_dft.capacity());
 
         ckpt.clear();
         assert(ckpt.n_tokens == 0);
@@ -383,9 +384,10 @@ int main() {
                 /*.drft =*/ std::vector<uint8_t>(32),
             },
         };
+        const auto & ckpt_ptr = state.prompt.checkpoints.front();
         assert(state.accounted_size() == 96 + sizeof(common_prompt_checkpoint) +
-                state.prompt.checkpoints.front()->data_tgt.capacity() +
-                state.prompt.checkpoints.front()->data_dft.capacity() +
+                ckpt_ptr->data_tgt.capacity() + ckpt_ptr->data_dft.capacity() +
+                ckpt_ptr->layout_tgt.capacity() + ckpt_ptr->layout_dft.capacity() +
                 2*sizeof(void *));
     }
 
