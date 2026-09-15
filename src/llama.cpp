@@ -45,14 +45,14 @@ llama_prompt_cache_profile llama_get_prompt_cache_profile(const llama_context * 
     const llama_kv_cache * aux = nullptr;
     const auto * iswa = dynamic_cast<const llama_kv_cache_iswa *>(mem);
     if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem)) {
-        kv = hybrid->get_mem_attn();
+        kv = dynamic_cast<const llama_kv_cache *>(hybrid->get_mem_attn());
     } else if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
         iswa = hybrid->get_mem_attn();
     } else if (const auto * dsa = dynamic_cast<const llama_kv_cache_dsa *>(mem)) {
         kv = dsa->get_mla();
         aux = dsa->get_lid();
     }
-    if (iswa) { kv = iswa->get_base(); aux = iswa->get_swa(); }
+    if (iswa) { kv = dynamic_cast<const llama_kv_cache *>(iswa->get_base()); aux = dynamic_cast<const llama_kv_cache *>(iswa->get_swa()); }
     const bool known = kv || aux || !mem || dynamic_cast<const llama_memory_recurrent *>(mem);
     llama_prompt_cache_profile result = {
         ctx->get_context_instance(),
