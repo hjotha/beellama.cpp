@@ -118,7 +118,7 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    macro(ggml_add_fattn_vec_pair OUT_VAR PREFIX K_TYPE V_TYPE)
+macro(ggml_add_fattn_vec_pair OUT_VAR PREFIX K_TYPE V_TYPE)
         set(_FILE "${PREFIX}/fattn-vec-instance-${K_TYPE}-${V_TYPE}.cu")
         if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_FILE}")
             message(FATAL_ERROR "Missing FA vec template instance: ${_FILE}")
@@ -146,8 +146,6 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
-
-    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)

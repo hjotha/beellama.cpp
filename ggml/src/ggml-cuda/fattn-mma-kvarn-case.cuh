@@ -547,7 +547,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             dst->src[1] = &k_win;
             dst->src[2] = &v_win;
             launch_fattn<DV, ncols1, ncols2>(
-                ctx, dst, f16_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
+                ctx, dst, f16_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, false, warp_size_host);
             dst->src[1] = orig_k;
             dst->src[2] = orig_v;
             return true;
@@ -832,7 +832,7 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     // need_f16_K=false, need_f16_V=false: KVarN K/V stay descriptor-backed.
     // Mixed prefill reconstructs original-domain V in the native loader.
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, false, warp_size_host);
     dst->src[1] = orig_k;
     dst->src[2] = orig_v;
 }

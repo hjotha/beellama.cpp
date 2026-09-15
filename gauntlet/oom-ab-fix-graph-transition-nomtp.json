@@ -1,0 +1,42 @@
+{
+  "port": 19443,
+  "steps": [
+    {
+      "name": "before",
+      "status": 200,
+      "elapsed_s": 15.588447235990316,
+      "tokens_predicted": 256,
+      "error": null
+    },
+    {
+      "name": "pressure",
+      "status": 200,
+      "elapsed_s": 17.37870238100004,
+      "tokens_predicted": 256,
+      "error": null
+    },
+    {
+      "name": "after1",
+      "status": 200,
+      "elapsed_s": 10.517015953999362,
+      "tokens_predicted": 256,
+      "error": null
+    },
+    {
+      "name": "after2",
+      "status": 200,
+      "elapsed_s": 18.845915821992094,
+      "tokens_predicted": 256,
+      "error": null
+    },
+    {
+      "name": "after3",
+      "status": 200,
+      "elapsed_s": 0.18271562800509855,
+      "tokens_predicted": 1,
+      "error": null
+    }
+  ],
+  "success": true,
+  "server_rc": 0
+}

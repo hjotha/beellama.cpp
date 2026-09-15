@@ -13,7 +13,6 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
-using json = nlohmann::ordered_json;
 
 struct common_speculative;
 
@@ -62,6 +61,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_CONTROL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
+    SERVER_TASK_TYPE_SLOT_GET,
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -194,6 +194,10 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
 
+    // Selected before slot/cache admission when adaptive context is enabled.
+    common_context_profile context_profile = COMMON_CONTEXT_PROFILE_LONG;
+    common_context_budget context_budget;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;
@@ -274,6 +278,8 @@ struct server_task {
         copy.params    = params;
         copy.type      = type;
         copy.tokens    = tokens.clone();
+        copy.context_profile = context_profile;
+        copy.context_budget = context_budget;
         copy.id_slot   = -1; // child tasks cannot specify slot
 
         // use different sampling seed for each child
@@ -298,31 +304,6 @@ struct server_task {
     bool is_child() const {
         return id_parent != -1;
     }
-};
-
-struct result_timings {
-    int32_t cache_n = -1;
-    int32_t cache_lcp_n = 0;
-    int32_t cache_planned_n = 0;
-    int32_t cache_reprocessed_n = 0;
-    std::string cache_source = "none";
-    std::string cache_reason = "none";
-
-    int32_t prompt_n = -1;
-    double prompt_ms = 0.0;
-    double prompt_per_token_ms = 0.0;
-    double prompt_per_second = 0.0;
-
-    int32_t predicted_n = -1;
-    double predicted_ms = 0.0;
-    double predicted_per_token_ms = 0.0;
-    double predicted_per_second = 0.0;
-
-    // Optional speculative metrics - only included when > 0
-    int32_t draft_n = 0;
-    int32_t draft_n_accepted = 0;
-
-    json to_json() const;
 };
 
 struct result_prompt_progress {
@@ -389,7 +370,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     bool stream;
     bool include_usage;
-    result_timings timings;
+    server_slot_stats stats;
     std::string prompt;
 
     bool truncated;
@@ -478,7 +459,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
     completion_token_output prob_output;
-    result_timings timings;
+    server_slot_stats stats;
     result_prompt_progress progress;
 
     // response formatting
@@ -562,22 +543,22 @@ struct server_task_result_error : server_task_result {
     virtual json to_json() override;
 };
 
+// used by /metrics API
 struct server_task_result_metrics : server_task_result {
-    int n_idle_slots;
-    int n_processing_slots;
-    int n_tasks_deferred;
-    int64_t t_start;
+    // these are immediate stats, not accumulated (server_metrics is cumulative)
+    int n_processing_slots = 0;
+    int n_tasks_deferred = 0;
 
-    // TODO: somehow reuse server_metrics in the future, instead of duplicating the fields
-    uint64_t n_prompt_tokens_processed_total = 0;
-    uint64_t t_prompt_processing_total       = 0;
-    uint64_t n_tokens_predicted_total        = 0;
-    uint64_t t_tokens_generation_total       = 0;
+    server_metrics metrics;
 
-    uint64_t n_tokens_max = 0;
+    virtual json to_json() override;
 
-    uint64_t n_prompt_tokens_processed = 0;
-    uint64_t t_prompt_processing       = 0;
+    struct metric_item {
+        std::string name;
+        std::string description;
+        double value; // prometheus values are always float64
+    };
+    std::string to_metrics();
 
     uint64_t n_tokens_predicted  = 0;
     uint64_t t_tokens_generation = 0;
@@ -602,6 +583,11 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_draft_accepted_total    = 0;
     uint64_t n_draft_verif_steps_total = 0;
     std::vector<uint64_t> n_accepted_per_pos_total;
+};
+
+// used by /slots API
+struct server_task_result_slots : server_task_result {
+    int n_idle_slots = 0;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
@@ -658,7 +644,7 @@ struct server_task_result_apply_lora : server_task_result {
 struct server_prompt {
     server_tokens tokens;
 
-    std::list<common_prompt_checkpoint> checkpoints;
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
     void clear() {
         tokens.clear();
@@ -718,12 +704,12 @@ static inline server_prompt_reuse_plan server_prompt_plan_reuse(
 
     const llama_pos requested_p0 = requested.pos_next(result.lexical_tokens);
     for (const auto & checkpoint : prompt.checkpoints) {
-        if (checkpoint.n_tokens > 0 &&
-                checkpoint.n_tokens <= int64_t(result.lexical_tokens) &&
-                checkpoint.n_tokens%alignment == 0 &&
-                checkpoint.pos_max <= requested_p0 &&
-                size_t(checkpoint.n_tokens) > result.restorable_tokens) {
-            result.restorable_tokens = size_t(checkpoint.n_tokens);
+        if (checkpoint->n_tokens > 0 &&
+                checkpoint->n_tokens <= int64_t(result.lexical_tokens) &&
+                checkpoint->n_tokens%alignment == 0 &&
+                checkpoint->pos_max <= requested_p0 &&
+                size_t(checkpoint->n_tokens) > result.restorable_tokens) {
+            result.restorable_tokens = size_t(checkpoint->n_tokens);
             result.reason = SERVER_PROMPT_REUSE_CHECKPOINT;
         }
     }
@@ -777,24 +763,51 @@ struct server_prompt_data {
     std::vector<uint8_t> spec;
 
     size_t size() const {
-        return main.size() + drft.size() + spec.size();
+        return main.capacity() + drft.capacity() + spec.capacity();
     }
 };
 
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    const llama_model * model = nullptr;
+    uint64_t model_instance = 0;
+    std::string layout_tgt;
+    std::string layout_dft;
+    llama_pos pos_tgt = -1;
+    llama_pos pos_dft = -1;
+    uint64_t checksum = 0;
+    bool quarantined = false;
 
-    size_t accounted_size() const {
-        size_t res = data.size();
+    bool has_draft() const { return !data.drft.empty(); }
+    uint64_t digest() const;
 
-        for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
-        }
+    size_t private_size() const {
+        return sizeof(*this) + 2*sizeof(void *) + data.size() + prompt.tokens.cache_size() +
+            layout_tgt.capacity() + layout_dft.capacity() + prompt.checkpoints.size()*
+            (sizeof(std::shared_ptr<const common_prompt_checkpoint>) + 2*sizeof(void *));
+    }
 
+size_t size() const {
+        size_t res = private_size();
+        for (const auto & ckpt : prompt.checkpoints) { res += ckpt->size() + 2*sizeof(void *); }
         return res;
     }
+
+    // Payload-only accounting: serialized target/draft/speculative bytes and
+    // shared checkpoint buffers. Container/token capacity and allocator
+    // overhead are intentionally excluded.
+    size_t accounted_size() const {
+        size_t res = data.size();
+        for (const auto & ckpt : prompt.checkpoints) { res += ckpt->size() + 2*sizeof(void *); }
+        return res;
+    }
+
 };
+
+enum class server_prompt_cache_result { unchanged, hit, miss, needs_bootstrap };
+
+struct common_speculative;
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
@@ -810,7 +823,7 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    uint64_t admission_attempts = 0;
+uint64_t admission_attempts = 0;
     uint64_t admission_successes = 0;
     uint64_t admission_failures = 0;
     uint64_t restore_attempts = 0;
@@ -822,35 +835,35 @@ struct server_prompt_cache {
     // allocator overhead are intentionally excluded.
     size_t accounted_size() const;
 
+    size_t size(const server_prompt_cache_state * extra = nullptr) const;
+
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    std::string last_reason;
 
-    server_prompt_cache_state * insert(const server_prompt & prompt, server_prompt_data && data);
+bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
+            common_speculative * spec, llama_seq_id id_slot);
 
-    bool erase(const server_prompt_cache_state * entry);
+    server_prompt_cache_result load(server_prompt & prompt, const server_tokens & tokens_new,
+            llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot);
 
-    bool load(
-            server_prompt & prompt,
-            const server_tokens & tokens_new,
-            size_t live_native_restorable_tokens,
-            int32_t reuse_alignment,
-            const server_prompt_cache_state_io & io);
+    server_prompt_cache_result restore(server_prompt & prompt, const server_prompt_cache_state & state,
+            llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot);
 
-    bool load(
-            server_prompt & prompt,
-            const server_tokens & tokens_new,
-            llama_context * ctx_tgt,
-            llama_context * ctx_dft,
-            common_speculative * spec,
-            int32_t id_slot,
-            size_t live_native_restorable_tokens,
-            int32_t reuse_alignment);
+    bool make_room(size_t bytes, const server_prompt_cache_state * incoming = nullptr,
+            const server_prompt_cache_state * keep = nullptr);
+    bool reserve_transient(size_t bytes);
+    void release_transient(size_t bytes);
+    size_t evictions = 0;
 
     void update();
 
 private:
-    server_prompt_cache_state * admit(server_prompt_cache_state && candidate);
+    size_t transient_bytes = 0;
+    bool restore_invalid = false;
+    server_prompt_cache_result restore_impl(server_prompt & prompt, const server_prompt_cache_state & state,
+            llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot,
+            bool copy_prompt, bool allow_bootstrap);
 };
 
 // used exclusively by router mode

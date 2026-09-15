@@ -138,12 +138,20 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int j = 0; j < 4; ++j) {
             const int q  = qxi[j];
 
+#if defined(GGML_USE_HIP)
+            const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
+            const uint32_t qy_bits    = q >> 8;
+            const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
+            const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
+            const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
+#else
             // unpack even and odd crumbs into byte values
             const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
             const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
             // unshuffle values
             const int qx = __byte_perm(qe, qo, 0x5140);
             const int qy = __byte_perm(qe, qo, 0x7362);
+#endif // defined(GGML_USE_HIP)
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride           + dst_offset + j*2+0] = qx;
@@ -1323,6 +1331,105 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_ds[i*sram_stride             + kqsx] = make_half2(d1q, d1q*delta);
 #else
         x_ds[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = make_half2(d1q, d1q*delta);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_m(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    // IQ1_M has two scales per 32 values, so it uses the same q8_0_16 tile layout as IQ2_XS:
+    // one float scale per 16 values, i.e. per 4 int32 of quantized data.
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ1_M, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR1_M);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_iq1_m * bxi = (const block_iq1_m *) x + kbx0 + i*stride;
+
+        const int       qs4 = get_int_b4(bxi->qs, kqsx);
+        const uint8_t * qs  = (const uint8_t *) &qs4;
+        const uint8_t   qh0 = bxi->qh[2*kqsx + 0];
+        const uint8_t   qh1 = bxi->qh[2*kqsx + 1];
+
+        int sgn[4];
+        sgn[0] = (qh0 & 0x08) ? -1 : 1;
+        sgn[1] = (qh0 & 0x80) ? -1 : 1;
+        sgn[2] = (qh1 & 0x08) ? -1 : 1;
+        sgn[3] = (qh1 & 0x80) ? -1 : 1;
+
+#pragma unroll
+        for (int l = 0; l < QR1_M/2; ++l) {
+            const int qhb = (l < 2) ? qh0 : qh1;
+            const int ql  = qs[l] | (((qhb >> (4*(l%2))) & 0x07) << 8);
+
+            const int grid = iq1s_grid_gpu[ql];
+
+            const int g0 = (grid >> 0) & 0x0F0F0F0F;
+            const int g1 = (grid >> 4) & 0x0F0F0F0F;
+
+            // Dequantized value is d*(v + delta). The grid lookup stores v+1 (bias).
+            // Store 8*v + sign(delta) per value so the delta is folded into the int8
+            // dot product and the bias cancels without needing a partial y sum.
+            int f0 = 0;
+            int f1 = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int v0 = ((g0 >> (8*b)) & 0xFF) - 1;
+                const int v1 = ((g1 >> (8*b)) & 0xFF) - 1;
+                const int e0 = 8*v0 + sgn[l];
+                const int e1 = 8*v1 + sgn[l];
+                f0 |= (e0 & 0xFF) << (8*b);
+                f1 |= (e1 & 0xFF) << (8*b);
+            }
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride               + 8*kqsx + (2*l+0)] = f0;
+            x_qs[i*sram_stride               + 8*kqsx + (2*l+1)] = f1;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + 8*kqsx + (2*l+0)] = f0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + 8*kqsx + (2*l+1)] = f1;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+
+        const uint16_t * sc = (const uint16_t *) bxi->scales;
+
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        const float d = __half2float(scale.f16);
+
+        const int tmp = sc[kqsx/2] >> (6*(kqsx%2));
+
+        // The tile values are scaled by 8 to fold the +-1/8 delta into the int8 dot product.
+        const float dl0 = d * (2*((tmp >> 0) & 0x07) + 1) / 8;
+        const float dl1 = d * (2*((tmp >> 3) & 0x07) + 1) / 8;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                             + 2*kqsx+0] = dl0;
+        x_df[i*sram_stride                             + 2*kqsx+1] = dl1;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+0] = dl0;
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+1] = dl1;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }

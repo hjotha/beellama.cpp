@@ -76,7 +76,7 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
-    macro(ggml_add_fattn_vec_pair_rocm OUT_VAR PREFIX K_TYPE V_TYPE)
+macro(ggml_add_fattn_vec_pair_rocm OUT_VAR PREFIX K_TYPE V_TYPE)
         set(_FILE "${PREFIX}/fattn-vec-instance-${K_TYPE}-${V_TYPE}.cu")
         if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_FILE}")
             message(FATAL_ERROR "Missing FA vec template instance: ${_FILE}")
@@ -143,9 +143,6 @@ endif()
 if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
 endif()
-
-# Fast math for HIP, like CUDA's -use_fast_math. Not -ffast-math: that implies -ffinite-math-only, which breaks ggml's INFINITY masking and produces NaNs.
-set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -funsafe-math-optimizations")
 
 if (NOT GGML_CUDA_FA)
     add_compile_definitions(GGML_CUDA_NO_FA)

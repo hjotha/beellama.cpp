@@ -1,9 +1,13 @@
 #include "llama.h"
 
 #include "llama-impl.h"
+#include "llama-version.h"
 
 #include "llama-chat.h"
 #include "llama-context.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-kv-cache-dsa.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -34,6 +38,51 @@
 // interface implementation
 //
 
+llama_prompt_cache_profile llama_get_prompt_cache_profile(const llama_context * ctx, llama_seq_id seq_id) {
+    const auto & p = ctx->get_cparams();
+    auto * mem = ctx->get_memory();
+    const auto * kv = dynamic_cast<const llama_kv_cache *>(mem);
+    const llama_kv_cache * aux = nullptr;
+    const auto * iswa = dynamic_cast<const llama_kv_cache_iswa *>(mem);
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        kv = hybrid->get_mem_attn();
+    } else if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
+        iswa = hybrid->get_mem_attn();
+    } else if (const auto * dsa = dynamic_cast<const llama_kv_cache_dsa *>(mem)) {
+        kv = dsa->get_mla();
+        aux = dsa->get_lid();
+    }
+    if (iswa) { kv = iswa->get_base(); aux = iswa->get_swa(); }
+    const bool known = kv || aux || !mem || dynamic_cast<const llama_memory_recurrent *>(mem);
+    llama_prompt_cache_profile result = {
+        ctx->get_context_instance(),
+        p.ctx_type, p.rope_scaling_type, p.rope_freq_base, p.rope_freq_scale,
+        p.n_ctx_orig_yarn, p.yarn_ext_factor, p.yarn_attn_factor, p.yarn_beta_fast, p.yarn_beta_slow,
+        p.causal_attn, p.kv_unified, p.kv_paged, p.flash_attn, p.nextn_layer_offset,
+        kv ? kv->type_k() : GGML_TYPE_COUNT, kv ? kv->type_v() : GGML_TYPE_COUNT,
+        aux ? aux->type_k() : GGML_TYPE_COUNT, aux ? aux->type_v() : GGML_TYPE_COUNT, known,
+        kv && seq_id >= 0 ? kv->seq_pos_min(seq_id) : -1, kv && seq_id >= 0 ? kv->seq_pos_max(seq_id) : -1,
+        aux && seq_id >= 0 ? aux->seq_pos_min(seq_id) : -1, aux && seq_id >= 0 ? aux->seq_pos_max(seq_id) : -1,
+        false, 0, {},
+    };
+    std::vector<const llama_memory_i *> retained;
+    result.partial_retained_known = !mem || mem->state_partial_retained(retained);
+    if (retained.size() > result.partial_retained_bounds.size()/2) {
+        result.partial_retained_known = false;
+    }
+    result.partial_retained_bounds.fill(-1);
+    if (result.partial_retained_known) {
+        result.partial_retained_count = retained.size();
+        if (seq_id >= 0) {
+            for (size_t i = 0; i < retained.size(); ++i) {
+                result.partial_retained_bounds[2*i] = retained[i]->seq_pos_min(seq_id);
+                result.partial_retained_bounds[2*i + 1] = retained[i]->seq_pos_max(seq_id);
+            }
+        }
+    }
+    return result;
+}
+
 const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type) {
     switch (flash_attn_type) {
         case LLAMA_FLASH_ATTN_TYPE_AUTO:
@@ -48,6 +97,8 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
 
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
+        case LLAMA_LOAD_MODE_AUTO:
+            return "auto";
         case LLAMA_LOAD_MODE_NONE:
             return "none";
         case LLAMA_LOAD_MODE_MMAP:
@@ -63,11 +114,12 @@ const char * llama_load_mode_name(enum llama_load_mode load_mode) {
 }
 
 enum llama_load_mode llama_load_mode_from_str(const char * str) {
-    if (std::strcmp(str, "none") == 0)       { return LLAMA_LOAD_MODE_NONE;       }
-    if (std::strcmp(str, "mmap") == 0)       { return LLAMA_LOAD_MODE_MMAP;       }
-    if (std::strcmp(str, "mlock") == 0)      { return LLAMA_LOAD_MODE_MLOCK;      }
+    if (std::strcmp(str, "auto")       == 0) { return LLAMA_LOAD_MODE_AUTO;       }
+    if (std::strcmp(str, "none")       == 0) { return LLAMA_LOAD_MODE_NONE;       }
+    if (std::strcmp(str, "mmap")       == 0) { return LLAMA_LOAD_MODE_MMAP;       }
+    if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
-    if (std::strcmp(str, "dio") == 0)        { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
     throw std::invalid_argument(std::string("unknown load mode: ") + str);
 }
 
@@ -109,6 +161,19 @@ bool llama_supports_rpc(void) {
         ggml_backend_load_all();
     }
     return ggml_backend_reg_by_name("RPC") != nullptr;
+}
+
+const char * llama_version(void) {
+#if defined(_WIN32) && defined(__HIP__)
+#define LLAMA_STRINGIFY_IMPL(x) #x
+#define LLAMA_STRINGIFY(x) LLAMA_STRINGIFY_IMPL(x)
+    // hipcc on Windows strips quotes from target_compile_definitions values.
+    return LLAMA_STRINGIFY(LLAMA_VERSION);
+#undef LLAMA_STRINGIFY
+#undef LLAMA_STRINGIFY_IMPL
+#else
+    return LLAMA_VERSION;
+#endif
 }
 
 void llama_backend_init(void) {
@@ -250,7 +315,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        if (igpus.empty()) {
+                        // igpus.empty() - workaround for integrated devices seen by multiple backends
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897
+                        // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
+                        if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back().dev)) {
                             igpus.push_back({false, dev});
                         }
                         break;
@@ -306,6 +375,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+
+        ml.lazy.mode = params.lazy_mode;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -603,4 +674,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

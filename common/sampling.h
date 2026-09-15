@@ -36,6 +36,7 @@
 //
 
 struct common_sampler;
+struct common_speculative_token_dist;
 
 struct common_sampler_accept_info {
     llama_token token = LLAMA_TOKEN_NULL;
@@ -60,6 +61,7 @@ void                    common_sampler_accept(struct common_sampler * gsmpl, lla
 common_sampler_accept_info common_sampler_accept_with_info(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
+void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
@@ -78,6 +80,21 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+
+// Sample a token directly from a caller-provided full-vocab logits buffer instead of reading them
+// from a llama_context. Mirrors common_sampler_sample()'s full-logits path exactly (reasoning
+// budget -> [grammar] -> chain, plus grammar rejection-resampling), so the selected token is
+// identical to what would have been produced had `logits` come from llama_get_logits_ith(ctx, idx).
+// `logits` must point to at least `n_vocab` floats in vocab-id order; the caller is responsible for
+// verifying n_vocab matches the live model. Does NOT call common_sampler_accept() (the caller
+// accepts separately, as with common_sampler_sample). Leaves cur_p populated for
+// common_sampler_get_candidates().
+// NOTE: the selected token also depends on the sampler's accumulated state (penalty/grammar/
+// reasoning-budget history and RNG position), exactly like common_sampler_sample(). The caller must
+// have advanced `gsmpl` to the intended decode step (e.g. by replaying the same accepted-token
+// history, as common_sampler_reset()+init does over a restored prompt) for the result to match a
+// live sample at that step; the helper is NOT stateless given only `logits`.
+llama_token common_sampler_sample_from_logits(struct common_sampler * gsmpl, const float * logits, int n_vocab, bool grammar_first = false);
 
 // generalized version of common_sampler_sample
 //
@@ -102,6 +119,23 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const llama_tokens    & draft,
         bool                    grammar_first = false,
         const common_sampler_accept_callback & on_accept = {});
+
+// maximal-coupling verification for stochastic speculative decoding
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first = false);
+
+// assume idxs == [ 0, 1, 2, ..., draft.size() ]
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first = false);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(

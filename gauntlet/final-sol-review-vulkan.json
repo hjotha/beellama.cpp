@@ -1,0 +1,10 @@
+{
+  "reviewer": "gpt-5.6-sol",
+  "decision": "ACCEPT_WITH_NOTES",
+  "blocker": false,
+  "diff_sha256": "1c7245ca6b0dadcd7d897efb3c2ea39f54b5f6a0686dce34daeee3cd9c8b041d",
+  "binary_sha256": "980f6b62e808a4518a89a6908fb6a4000de492b1327c47f6a7ebc1ed39790db3",
+  "production": {"active": true, "main_pid": 1497943, "n_restarts": 0, "health": 200, "props": 200, "completion": 200},
+  "ab": {"port": 19446, "success": "5/5", "server_rc": 0, "headroom_mib": 18, "free_before_request_disabled": 50, "free_before_request_enabled": 39, "cleanup_executables": 1, "cleanup_captures": 1},
+  "notes": ["GGML_BACKEND_DL=ON was not tested specifically", "GGML_DISABLE_VULKAN is presence-based and startup-only", "validated profile is parallel=1 and headroom=18 MiB; broad concurrency and soak remain open"]
+}

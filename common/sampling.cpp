@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "speculative.h"
 
 #include "ggml.h"
 
@@ -12,6 +13,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -122,10 +124,14 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    uint32_t speculative_seed;
+    std::mt19937 speculative_rng;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+        speculative_rng.seed(speculative_seed);
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -437,6 +443,8 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    // Keep verifier randomness independent from both target and draft sampling.
+    const uint32_t speculative_seed = llama_sampler_get_seed(chain) ^ 0x9e3779b9U;
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .vocab   = */ vocab,
@@ -446,6 +454,8 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .speculative_seed = */ speculative_seed,
+        /* .speculative_rng  = */ std::mt19937(speculative_seed),
     };
 
     return result;
@@ -588,7 +598,31 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .speculative_seed = */ gsmpl->speculative_seed,
+        /* .speculative_rng  = */ gsmpl->speculative_rng,
     };
+}
+
+void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+    if (!src || !dst || src == dst) {
+        return;
+    }
+
+    GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
+    GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
+
+    llama_sampler_copy(src->grmr,    dst->grmr);
+    llama_sampler_copy(src->rbudget, dst->rbudget);
+    llama_sampler_copy(src->chain,   dst->chain);
+
+    dst->params     = src->params;
+    dst->prev       = src->prev;
+    dst->cur        = src->cur;
+    dst->cur_p      = src->cur_p;
+    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->speculative_seed = src->speculative_seed;
+    dst->speculative_rng  = src->speculative_rng;
+    dst->t_total_us = src->t_total_us;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -744,6 +778,90 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+// Rebuild the candidate set from a raw full-vocab logits buffer, mirroring
+// common_sampler::set_logits()'s full-logits branch (the else-branch above). Used by
+// common_sampler_sample_from_logits() to sample from persisted logits instead of a llama_context.
+// Callers must pre-validate logits != nullptr && n_vocab > 0 (the only caller does so via asserts).
+static void common_sampler_set_logits_raw(struct common_sampler * gsmpl, const float * logits, int n_vocab) {
+    auto & cur = gsmpl->cur;
+
+    cur.resize(n_vocab);
+    for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+        cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+    }
+
+    gsmpl->cur_p = { cur.data(), cur.size(), -1, false };
+}
+
+llama_token common_sampler_sample_from_logits(struct common_sampler * gsmpl, const float * logits, int n_vocab, bool grammar_first) {
+    // This mirrors common_sampler_sample()'s CPU full-logits apply sequence exactly (reasoning
+    // budget -> [grammar] -> chain, plus grammar rejection-resampling), with set_logits(ctx,idx)
+    // replaced by common_sampler_set_logits_raw(). It intentionally omits two things that are
+    // inapplicable to replayed logits: llama_synchronize() (the logits are caller-provided, not
+    // pending in any llama_context) and the backend-sampler short-circuit (a replayed distribution
+    // never carries a backend-sampled token, and backend sampling is incompatible with
+    // grammar/reasoning-budget anyway — see common_sampler_sample).
+    GGML_ASSERT(logits != nullptr);
+    GGML_ASSERT(n_vocab > 0);
+
+    const auto tm = gsmpl->tm();
+
+    llama_token id = LLAMA_TOKEN_NULL;
+
+    auto & grmr    = gsmpl->grmr;
+    auto & rbudget = gsmpl->rbudget;
+    auto & chain   = gsmpl->chain;
+    auto & cur_p   = gsmpl->cur_p; // initialized by common_sampler_set_logits_raw
+
+    common_sampler_set_logits_raw(gsmpl, logits, n_vocab);
+
+    // apply reasoning budget first
+    llama_sampler_apply(rbudget, &cur_p);
+
+    if (grammar_first && grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    id = cur_p.data[cur_p.selected].id;
+
+    if (grammar_first || !grammar_should_apply(gsmpl)) {
+        return id;
+    }
+
+    // check if the sampled token fits the grammar (grammar-based rejection sampling)
+    {
+        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+        llama_sampler_apply(grmr, &single_token_data_array);
+
+        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
+        if (is_valid) {
+            return id;
+        }
+    }
+
+    // resampling:
+    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
+    common_sampler_set_logits_raw(gsmpl, logits, n_vocab);
+
+    llama_sampler_apply(rbudget,  &cur_p);
+
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr,  &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    id = cur_p.data[cur_p.selected].id;
+
+    return id;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context  * ctx,
@@ -792,6 +910,79 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
+struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    GGML_ASSERT(dists.size() == draft.size());
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        // Residual sampling needs the target distribution after every constraint.
+        const llama_token fallback = common_sampler_sample(gsmpl, ctx, idxs[i], true);
+        const auto & q = dists[i];
+        GGML_ASSERT(q.ids.size() == q.probs.size());
+
+        std::unordered_map<llama_token, float> q_probs;
+        q_probs.reserve(q.ids.size());
+        for (size_t j = 0; j < q.ids.size(); ++j) {
+            q_probs[q.ids[j]] += q.probs[j];
+        }
+        const auto q_prob = [&](llama_token id) {
+            const auto it = q_probs.find(id);
+            return it == q_probs.end() ? 0.0f : it->second;
+        };
+
+        auto * p = common_sampler_get_candidates(gsmpl, false);
+        float p_draft = 0.0f;
+        const float q_draft = q_prob(draft[i]);
+        for (size_t j = 0; j < p->size; ++j) {
+            if (p->data[j].id == draft[i]) {
+                p_draft = p->data[j].p;
+                break;
+            }
+        }
+
+        if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        std::vector<float> residual(p->size);
+        float residual_sum = 0.0f;
+        for (size_t j = 0; j < p->size; ++j) {
+            residual[j] = std::max(0.0f, p->data[j].p - q_prob(p->data[j].id));
+            residual_sum += residual[j];
+        }
+
+        llama_token id = fallback;
+        if (residual_sum > 0.0f) {
+            std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
+            id = p->data[sample(gsmpl->speculative_rng)].id;
+        }
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        break;
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
         struct llama_context  * ctx,
         const llama_tokens    & draft,
         bool                    grammar_first,
@@ -802,6 +993,19 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first, on_accept);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first) {
+    std::vector<int> idxs(draft.size() + 1);
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        idxs[i] = i;
+    }
+    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, dists, grammar_first);
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

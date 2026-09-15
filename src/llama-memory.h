@@ -128,6 +128,10 @@ struct llama_memory_i {
     // ops
     //
 
+    // Reserve physical capacity for a bounded request. Memory types that do not
+    // need an explicit reservation keep the default no-op.
+    virtual bool reserve(uint32_t n_tokens) { (void) n_tokens; return true; }
+
     // if data == true, the data buffers will also be cleared together with the metadata
     virtual void clear(bool data) = 0;
 
@@ -171,6 +175,9 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
+    // Optional hint for paged SnapKV users that feed a prompt in batches.
+    virtual void set_snapkv_prefill_end(llama_seq_id /*seq_id*/, llama_pos /*prefill_end*/) {}
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
@@ -212,6 +219,11 @@ struct llama_memory_i {
         GGML_UNUSED(flags);
         return state_seq_can_restore(seq_id);
     }
+
+    // Read-only description of the components omitted by PARTIAL_ONLY. An empty
+    // list with true means the blob restores everything; false means unknown.
+    // Returned pointers are borrowed for this owner-thread query only.
+    virtual bool state_partial_retained(std::vector<const llama_memory_i *> & /*out*/) const { return false; }
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;

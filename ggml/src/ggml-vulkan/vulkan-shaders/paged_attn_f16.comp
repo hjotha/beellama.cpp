@@ -1,0 +1,341 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifndef PAGED_ATTN_LOCAL_SIZE
+#define PAGED_ATTN_LOCAL_SIZE 128
+#endif
+
+layout(local_size_x = PAGED_ATTN_LOCAL_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Q          { float     data_q[]; };
+layout (binding = 1) readonly buffer KNew       { float     data_k_new[]; };
+layout (binding = 2) readonly buffer VNew       { float     data_v_new[]; };
+layout (binding = 3) buffer KCache              { float16_t data_k_cache[]; };
+layout (binding = 4) buffer VCache              { float16_t data_v_cache[]; };
+layout (binding = 5) readonly buffer BlockTable  { uint      data_block_table[]; };
+layout (binding = 6) readonly buffer WriteSlots  { uint      data_write_slots[]; };
+layout (binding = 7) readonly buffer ContextLens { uint      data_context_lens[]; };
+layout (binding = 8) readonly buffer BatchOffset { uint      data_batch_offsets[]; };
+layout (binding = 9) readonly buffer BatchLens   { uint      data_batch_lens[]; };
+layout (binding = 10) writeonly buffer Out       { float     data_out[]; };
+layout (binding = 11) buffer Scores               { float     data_scores[]; };
+
+layout (push_constant) uniform parameters {
+    uint head_dim;
+    uint n_heads;
+    uint n_heads_kv;
+    uint n_seq;
+    uint block_size;
+    uint max_blocks;
+    uint mode;
+
+    uint q_head_stride;
+    uint q_token_stride;
+    uint k_head_stride;
+    uint k_token_stride;
+    uint v_head_stride;
+    uint v_token_stride;
+    uint kv_token_stride;
+    uint kv_head_stride;
+    uint kv_block_stride;
+    uint out_head_stride;
+    uint out_token_stride;
+    float scale;
+    uint max_context;
+    uint context_groups;
+    uint partial_offset;
+    uint token_offset;
+} p;
+
+shared float reduce[PAGED_ATTN_LOCAL_SIZE];
+shared float reduced_qk;
+
+void write_cache() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+
+    if (head >= p.n_heads_kv || seq >= p.n_seq) {
+        return;
+    }
+
+    if (tid >= p.head_dim) {
+        return;
+    }
+
+    const uint seq_start = data_batch_offsets[seq];
+    const uint num_tokens = data_batch_lens[seq];
+
+    for (uint i = 0; i < num_tokens; ++i) {
+        const uint token = seq_start + i;
+        const uint slot = data_write_slots[token];
+        const uint block = slot / p.block_size;
+        const uint token_in_block = slot % p.block_size;
+        const uint cache_base = block * p.kv_block_stride + head * p.kv_head_stride + token_in_block * p.kv_token_stride + tid;
+        const uint input_k = token * p.k_token_stride + head * p.k_head_stride + tid;
+        const uint input_v = token * p.v_token_stride + head * p.v_head_stride + tid;
+
+        data_k_cache[cache_base] = float16_t(data_k_new[input_k]);
+        data_v_cache[cache_base + p.n_heads_kv * p.kv_head_stride] = float16_t(data_v_new[input_v]);
+    }
+}
+
+void decode() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+
+    if (head >= p.n_heads || seq >= p.n_seq) {
+        return;
+    }
+
+    const uint kv_head = head / (p.n_heads / p.n_heads_kv);
+    const bool lane_active = tid < p.head_dim;
+    const uint seq_start = data_batch_offsets[seq];
+    const uint num_new_tokens = data_batch_lens[seq];
+    const uint context_len = data_context_lens[seq];
+
+    for (uint i = 0; i < num_new_tokens; ++i) {
+        const uint token = seq_start + i;
+        float q_value = 0.0;
+        if (lane_active) {
+            q_value = data_q[token * p.q_token_stride + head * p.q_head_stride + tid] * p.scale;
+        }
+        float qk_max = -3.402823466e+38;
+        float exp_sum = 0.0;
+        float acc = 0.0;
+
+        const uint q_pos = context_len - num_new_tokens + i;
+        const uint num_blocks = q_pos / p.block_size + 1;
+
+        for (uint bid = 0; bid < num_blocks; ++bid) {
+            const uint physical_block = data_block_table[seq * p.max_blocks + bid];
+            const uint start_token = bid * p.block_size;
+            const uint end_token = min(start_token + p.block_size, q_pos + 1);
+
+            for (uint cached_token = start_token; cached_token < end_token; ++cached_token) {
+                const uint token_in_block = cached_token % p.block_size;
+                float k_value = 0.0;
+                float v_value = 0.0;
+                if (lane_active) {
+                    const uint cache_base = physical_block * p.kv_block_stride + kv_head * p.kv_head_stride + token_in_block * p.kv_token_stride + tid;
+                    k_value = float(data_k_cache[cache_base]);
+                    v_value = float(data_v_cache[cache_base + p.n_heads_kv * p.kv_head_stride]);
+                }
+
+                reduce[tid] = q_value * k_value;
+                barrier();
+                if (tid == 0) {
+                    float sum = 0.0;
+                    for (uint d = 0; d < p.head_dim; ++d) {
+                        sum += reduce[d];
+                    }
+                    reduced_qk = sum;
+                }
+                barrier();
+
+                const float qk = reduced_qk;
+                const float qk_max_new = max(qk_max, qk);
+                const float exp_old = exp(qk_max - qk_max_new);
+                const float exp_new = exp(qk - qk_max_new);
+
+                exp_sum = exp_sum * exp_old + exp_new;
+                acc = acc * exp_old + exp_new * v_value;
+                qk_max = qk_max_new;
+            }
+        }
+
+        if (lane_active) {
+            data_out[token * p.out_token_stride + head * p.out_head_stride + tid] = acc / (exp_sum + 1e-6);
+        }
+    }
+}
+
+float workgroup_max(const float value) {
+    const float subgroup_value = subgroupMax(value);
+    if (gl_SubgroupInvocationID == 0u) {
+        reduce[gl_SubgroupID] = subgroup_value;
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        float result = -3.402823466e+38;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+            result = max(result, reduce[i]);
+        }
+        reduced_qk = result;
+    }
+    barrier();
+    const float result = reduced_qk;
+    barrier();
+    return result;
+}
+
+float workgroup_sum(const float value) {
+    const float subgroup_value = subgroupAdd(value);
+    if (gl_SubgroupInvocationID == 0u) {
+        reduce[gl_SubgroupID] = subgroup_value;
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        float result = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+            result += reduce[i];
+        }
+        reduced_qk = result;
+    }
+    barrier();
+    const float result = reduced_qk;
+    barrier();
+    return result;
+}
+
+void score() {
+    const uint kv_head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint context_group = gl_WorkGroupID.z % p.context_groups;
+    const uint local_token_index = gl_WorkGroupID.z / p.context_groups;
+    const uint token_index = p.token_offset + local_token_index;
+    const uint num_new_tokens = data_batch_lens[seq];
+    const uint gqa = p.n_heads / p.n_heads_kv;
+    if (kv_head >= p.n_heads_kv || seq >= p.n_seq || token_index >= num_new_tokens || gqa > 8u) {
+        return;
+    }
+
+    const uint token = data_batch_offsets[seq] + token_index;
+    const uint q_pos = data_context_lens[seq] - num_new_tokens + token_index;
+    const uint subgroup = gl_SubgroupID;
+    for (uint cached_token = context_group * gl_NumSubgroups + subgroup;
+         cached_token <= q_pos;
+         cached_token += p.context_groups * gl_NumSubgroups) {
+        const uint bid = cached_token / p.block_size;
+        const uint physical_block = data_block_table[seq * p.max_blocks + bid];
+        const uint token_in_block = cached_token % p.block_size;
+        const uint k_base = physical_block * p.kv_block_stride + kv_head * p.kv_head_stride + token_in_block * p.kv_token_stride;
+        float qk[8] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+        for (uint dim = gl_SubgroupInvocationID; dim < p.head_dim; dim += gl_SubgroupSize) {
+            const float k = float(data_k_cache[k_base + dim]);
+            for (uint g = 0u; g < gqa; ++g) {
+                const uint head = kv_head * gqa + g;
+                const float q = data_q[token * p.q_token_stride + head * p.q_head_stride + dim] * p.scale;
+                qk[g] += q * k;
+            }
+        }
+        for (uint g = 0u; g < gqa; ++g) {
+            qk[g] = subgroupAdd(qk[g]);
+            if (gl_SubgroupInvocationID == 0u) {
+                const uint head = kv_head * gqa + g;
+                const uint score_base = (local_token_index * p.n_heads + head) * p.max_context;
+                data_scores[score_base + cached_token] = qk[g];
+            }
+        }
+    }
+}
+
+void softmax_scores() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint local_token_index = gl_WorkGroupID.z;
+    const uint token_index = p.token_offset + local_token_index;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint num_new_tokens = data_batch_lens[seq];
+    if (head >= p.n_heads || seq >= p.n_seq || token_index >= num_new_tokens) {
+        return;
+    }
+
+    const uint token = data_batch_offsets[seq] + token_index;
+    const uint q_pos = data_context_lens[seq] - num_new_tokens + token_index;
+    const uint score_base = (local_token_index * p.n_heads + head) * p.max_context;
+    float local_max = -3.402823466e+38;
+    for (uint cached_token = tid; cached_token <= q_pos; cached_token += PAGED_ATTN_LOCAL_SIZE) {
+        local_max = max(local_max, data_scores[score_base + cached_token]);
+    }
+    const float qk_max = workgroup_max(local_max);
+
+    float local_sum = 0.0;
+    for (uint cached_token = tid; cached_token <= q_pos; cached_token += PAGED_ATTN_LOCAL_SIZE) {
+        const float weight = exp(data_scores[score_base + cached_token] - qk_max);
+        data_scores[score_base + cached_token] = weight;
+        local_sum += weight;
+    }
+    const float exp_sum = workgroup_sum(local_sum);
+    for (uint cached_token = tid; cached_token <= q_pos; cached_token += PAGED_ATTN_LOCAL_SIZE) {
+        data_scores[score_base + cached_token] /= exp_sum + 1e-6;
+    }
+}
+
+void value_partial() {
+    const uint kv_head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint context_group = gl_WorkGroupID.z % p.context_groups;
+    const uint local_token_index = gl_WorkGroupID.z / p.context_groups;
+    const uint token_index = p.token_offset + local_token_index;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint num_new_tokens = data_batch_lens[seq];
+    const uint gqa = p.n_heads / p.n_heads_kv;
+    if (kv_head >= p.n_heads_kv || seq >= p.n_seq || token_index >= num_new_tokens || gqa > 8u) {
+        return;
+    }
+
+    const uint token = data_batch_offsets[seq] + token_index;
+    const uint q_pos = data_context_lens[seq] - num_new_tokens + token_index;
+    float acc[8] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    for (uint cached_token = context_group; cached_token <= q_pos; cached_token += p.context_groups) {
+        const uint bid = cached_token / p.block_size;
+        const uint physical_block = data_block_table[seq * p.max_blocks + bid];
+        const uint token_in_block = cached_token % p.block_size;
+        const uint v_base = physical_block * p.kv_block_stride + (p.n_heads_kv + kv_head) * p.kv_head_stride + token_in_block * p.kv_token_stride;
+        const float v = float(data_v_cache[v_base + tid]);
+        for (uint g = 0u; g < gqa; ++g) {
+            const uint head = kv_head * gqa + g;
+            const uint score_base = (local_token_index * p.n_heads + head) * p.max_context;
+            acc[g] += data_scores[score_base + cached_token] * v;
+        }
+    }
+    for (uint g = 0u; g < gqa; ++g) {
+        const uint head = kv_head * gqa + g;
+        const uint partial = p.partial_offset +
+            (((local_token_index * p.n_heads + head) * p.context_groups + context_group) * p.head_dim + tid);
+        data_scores[partial] = acc[g];
+    }
+}
+
+void value_reduce() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint local_token_index = gl_WorkGroupID.z;
+    const uint token_index = p.token_offset + local_token_index;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint num_new_tokens = data_batch_lens[seq];
+    if (head >= p.n_heads || seq >= p.n_seq || token_index >= num_new_tokens) {
+        return;
+    }
+
+    const uint token = data_batch_offsets[seq] + token_index;
+    float acc = 0.0;
+    for (uint group = 0u; group < p.context_groups; ++group) {
+        const uint partial = p.partial_offset +
+            (((local_token_index * p.n_heads + head) * p.context_groups + group) * p.head_dim + tid);
+        acc += data_scores[partial];
+    }
+    data_out[token * p.out_token_stride + head * p.out_head_stride + tid] = acc;
+}
+
+void main() {
+    if (p.mode == 0) {
+        write_cache();
+    } else if (p.mode == 1) {
+        decode();
+    } else if (p.mode == 2) {
+        score();
+    } else if (p.mode == 3) {
+        softmax_scores();
+    } else if (p.mode == 4) {
+        value_partial();
+    } else {
+        value_reduce();
+    }
+}

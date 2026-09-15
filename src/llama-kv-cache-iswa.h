@@ -124,6 +124,10 @@ public:
     bool state_seq_can_restore(llama_seq_id seq_id) const override;
     bool state_seq_can_save(llama_seq_id seq_id, llama_state_seq_flags flags) const override;
     bool state_seq_can_restore(llama_seq_id seq_id, llama_state_seq_flags flags) const override;
+    bool state_partial_retained(std::vector<const llama_memory_i *> & out) const override {
+        out.push_back(kv_base.get());
+        return kv_swa->state_partial_retained(out);
+    }
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 

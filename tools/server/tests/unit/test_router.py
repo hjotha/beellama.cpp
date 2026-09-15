@@ -65,14 +65,16 @@ def test_router_chat_completion_stream(model: str, success: bool):
         assert content == ""
 
 
-def _get_model_ids() -> set[str]:
-    res = server.make_request("GET", "/models")
+def _get_model_ids(is_reload: bool = False, headers: dict | None = None) -> set[str]:
+    res = server.make_request(
+        "GET", "/models" + ("?reload=1" if is_reload else ""), headers=headers
+    )
     assert res.status_code == 200
     return {item["id"] for item in res.body.get("data", [])}
 
 
-def _get_model_status(model_id: str) -> str:
-    res = server.make_request("GET", "/models")
+def _get_model_status(model_id: str, headers: dict | None = None) -> str:
+    res = server.make_request("GET", "/models", headers=headers)
     assert res.status_code == 200
     for item in res.body.get("data", []):
         if item.get("id") == model_id or item.get("model") == model_id:
@@ -80,11 +82,11 @@ def _get_model_status(model_id: str) -> str:
     raise AssertionError(f"Model {model_id} not found in /models response")
 
 
-def _wait_for_model_status(model_id: str, desired: set[str], timeout: int = 60) -> str:
+def _wait_for_model_status(model_id: str, desired: set[str], timeout: int = 60, headers: dict | None = None) -> str:
     deadline = time.time() + timeout
     last_status = None
     while time.time() < deadline:
-        last_status = _get_model_status(model_id)
+        last_status = _get_model_status(model_id, headers=headers)
         if last_status in desired:
             return last_status
         time.sleep(0.01)
@@ -102,7 +104,7 @@ def _load_model_and_wait(
     assert load_res.status_code == 200
     assert isinstance(load_res.body, dict)
     assert load_res.body.get("success") is True
-    _wait_for_model_status(model_id, {"loaded"}, timeout=timeout)
+    _wait_for_model_status(model_id, {"loaded"}, timeout=timeout, headers=headers)
 
 
 def test_router_unload_model():
@@ -189,6 +191,23 @@ class _Bg:
         assert self.error is None, f"{what} raised {self.error!r}"
         assert self.result is not None and self.result.status_code == 200, \
             f"{what} failed: {self.result.status_code if self.result else None} {self.result.body if self.result else None}"
+
+
+@pytest.mark.parametrize("status", ["loading", "unloaded"])
+def test_router_queue_preserves_cold_autoload(status):
+    """a cold autoload keeps its model until its waiting request reaches the proxy"""
+    global server
+    server.models_max = 1
+    server.start()
+
+    first = _Bg(lambda: _tokenize(MODEL_A)).start()
+    _wait_for_model_status(MODEL_A, {status})
+    second = _Bg(lambda: _tokenize(MODEL_B)).start()
+
+    first.join()
+    second.join()
+    first.assert_ok("cold autoload request")
+    second.assert_ok("queued request")
 
 
 def test_router_queue_does_not_evict_busy_model():
@@ -295,6 +314,26 @@ def test_router_queue_is_fifo():
     second.assert_ok("second queued request")
 
     assert first.done_at < second.done_at, "queue was not served in arrival order"
+
+
+def test_router_queue_two_waiters_share_one_eviction():
+    """two requests that both find the same idle model must both be served in the end"""
+    global server
+    server.models_max = 1
+    server.start()
+
+    _load_model_and_wait(MODEL_A, timeout=120)
+
+    # both arrive while MODEL_A is idle, so both want its slot; only one eviction can happen
+    first = _Bg(lambda: _tokenize(MODEL_B)).start()
+    second = _Bg(lambda: _tokenize(MODEL_C)).start()
+
+    first.join(90)
+    second.join(90)
+
+    first.assert_ok("first queued request")
+    second.assert_ok("second queued request")
+    assert _get_model_status(MODEL_A) == "unloaded"
 
 
 def test_router_no_models_autoload():
@@ -471,6 +510,157 @@ def test_router_models_status_args_preset():
         os.remove(preset_path)
 
 
+@pytest.mark.parametrize("fail_target_load", [False, True])
+def test_router_route_group_restores_slot_state(tmp_path, fail_target_load):
+    """a route-group migration restores or discards the outgoing child's prompt cache"""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_route_state.ini")
+    log_path = os.path.join(tmp_path, "route-state.log")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[*]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "batch-size = 32\n"
+            "ubatch-size = 32\n"
+            "\n"
+            "[route-fast]\n"
+            "ctx-size = 256\n"
+            "parallel = 1\n"
+            "route-group = route-test\n"
+            "route-max-tokens = 64\n"
+            "\n"
+            "[route-long]\n"
+            "ctx-size = 512\n"
+            "parallel = 1\n"
+            "route-group = route-test\n"
+        )
+
+    if fail_target_load:
+        with open(preset_path, "a") as f:
+            f.write(f"lora = {tmp_path / 'missing-adapter.gguf'}\n")
+
+    server.models_preset = preset_path
+    server.models_max = 1
+    server.slot_save_path = str(tmp_path)
+    server.log_path = log_path
+    server.start()
+
+    headers = {"X-Conversation-Id": "route-state-test"}
+    prefix = "The quick brown fox jumps"
+    first = server.make_request("POST", "/completion", headers=headers, data={
+        "model": "route-test",
+        "prompt": prefix,
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    assert first.status_code == 200
+    assert first.body["timings"]["prompt_n"] > 0
+
+    extended = prefix + " " + ("over the lazy dog " * 32)
+    second = server.make_request("POST", "/completion", headers=headers, data={
+        "model": "route-test",
+        "prompt": extended,
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    if fail_target_load:
+        assert second.status_code == 500
+        assert "failed to load" in str(second.body)
+        with open(log_path) as f:
+            assert "saved route state for conversation route-state-test" in f.read()
+        snapshots = list(tmp_path.glob("llama-router-state-*/slot-*.bin"))
+        assert not snapshots, [(str(path), path.stat().st_size) for path in snapshots]
+        os.remove(preset_path)
+        return
+
+    assert second.status_code == 200
+    assert not list(tmp_path.glob("llama-router-state-*/slot-*.bin"))
+    full_tokens = server.make_request("POST", "/tokenize", data={
+        "model": "route-test",
+        "content": extended,
+        "add_special": True,
+    })
+    assert full_tokens.status_code == 200
+    assert second.body["timings"]["prompt_n"] == (
+        len(full_tokens.body["tokens"]) - first.body["timings"]["prompt_n"]
+    )
+
+    # The same conversation returns to the fast tier after its prompt shrinks.
+    third = server.make_request("POST", "/completion", headers=headers, data={
+        "model": "route-test",
+        "prompt": prefix,
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    assert third.status_code == 200
+    assert not list(tmp_path.glob("llama-router-state-*/slot-*.bin"))
+
+    server.stop()
+    with open(log_path) as f:
+        log = f.read()
+    assert "saved route state for conversation route-state-test" in log
+    assert "restored route state for conversation route-state-test" in log
+    selections = [line.rsplit(" -> ", 1)[-1] for line in log.splitlines()
+                  if "route group 'route-test':" in line and " tokens -> " in line]
+    assert selections == ["route-fast", "route-long", "route-fast"]
+
+    os.remove(preset_path)
+
+
+def test_router_dedup_cache_models():
+    """dedup-cache-models hides the cache entry backing a preset from GET /models"""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_dedup.ini")
+    cache_id = "ggml-org/test-model-stories260K:F32"
+
+    with open(preset_path, "w") as f:
+        f.write(
+            "[model-dedup]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "dedup-cache-models = 1\n"
+        )
+
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        ids = _get_model_ids(is_reload=False)
+        assert "model-dedup" in ids
+        assert cache_id not in ids, "cache model should be hidden by dedup"
+        # other cache models are unaffected
+        assert "ggml-org/tinygemma3-GGUF:Q8_0" in ids
+
+        # the hidden model is only hidden from the listing, it can still be used
+        res = server.make_request("POST", "/tokenize", data={"model": cache_id, "content": "hello"})
+        assert res.status_code == 200
+
+        # disabling the flag brings the cache entry back on reload
+        with open(preset_path, "w") as f:
+            f.write(
+                "[model-dedup]\n"
+                "hf-repo = ggml-org/test-model-stories260K\n"
+            )
+        ids = _get_model_ids(is_reload=True)
+        assert cache_id in ids
+
+        # the flag also works from the global section
+        with open(preset_path, "w") as f:
+            f.write(
+                "[*]\n"
+                "dedup-cache-models = 1\n"
+                "\n"
+                "[model-dedup]\n"
+                "hf-repo = ggml-org/test-model-stories260K\n"
+            )
+        ids = _get_model_ids(is_reload=True)
+        assert "model-dedup" in ids
+        assert cache_id not in ids, "cache model should be hidden by global dedup"
+    finally:
+        os.remove(preset_path)
+
+
 def test_router_remote_preset():
     global server
     server.model_hf_repo = "ggml-org/test-preset-ci"
@@ -530,12 +720,16 @@ def _wait_for_sse_event(collected: list, event_type: str, model: str, timeout: i
 
 
 def test_router_download_model():
-    """Case 1: download a model, verify SSE events and GET /models."""
+    """Case 1: download a model at the model limit, verify SSE events and GET /models."""
     global server
+    server.models_max = 1
     server.start()
 
     # Ensure the model is not present before we start
     server.make_request("DELETE", f"/models?model={MODEL_DOWNLOAD_ID}")
+
+    # A download worker must not consume or evict a model slot
+    _load_model_and_wait(MODEL_B, timeout=120)
 
     sse_events: list = []
     stop = threading.Event()
@@ -570,6 +764,7 @@ def test_router_download_model():
     # Model should now appear in GET /models
     ids = _get_model_ids()
     assert MODEL_DOWNLOAD_ID in ids, f"{MODEL_DOWNLOAD_ID} not found in /models after download"
+    assert _get_model_status(MODEL_B) == "loaded"
 
 
 def test_router_delete_model():

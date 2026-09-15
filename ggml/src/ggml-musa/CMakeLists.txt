@@ -47,7 +47,7 @@ if (MUSAToolkit_FOUND)
         add_compile_definitions(GGML_MUSA_MUDNN_COPY)
     endif()
 
-    macro(ggml_add_fattn_vec_pair_musa OUT_VAR PREFIX K_TYPE V_TYPE)
+macro(ggml_add_fattn_vec_pair_musa OUT_VAR PREFIX K_TYPE V_TYPE)
         set(_FILE "${PREFIX}/fattn-vec-instance-${K_TYPE}-${V_TYPE}.cu")
         if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_FILE}")
             message(FATAL_ERROR "Missing FA vec template instance: ${_FILE}")
@@ -91,7 +91,6 @@ if (MUSAToolkit_FOUND)
     endif()
 
     add_compile_definitions(GGML_USE_MUSA)
-    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_MUSA_GRAPHS)
         add_compile_definitions(GGML_MUSA_GRAPHS)

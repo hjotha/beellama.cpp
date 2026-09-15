@@ -146,6 +146,14 @@ public:
     void reset_kv_tail_planner_timing() override;
     uint64_t get_kv_tail_planner_timing_ns() const override;
 
+    bool state_partial_retained(std::vector<const llama_memory_i *> & out) const override {
+        if (!kv_raw->state_partial_retained(out)) { return false; }
+        out.push_back(kv_csa.get());
+        out.push_back(kv_hca.get());
+        out.push_back(kv_lid.get());
+        return true;
+    }
+
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 

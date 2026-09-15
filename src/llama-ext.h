@@ -7,8 +7,76 @@
 #include "llama.h"
 #include "llama-kv-memory-stats.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
+
+struct llama_mtp_weights_info {
+    bool managed = false;
+    bool resident = false;
+    size_t host_bytes = 0;
+    size_t allocated_bytes = 0; // backend buffer sizes, not RSS or retained file mappings
+    size_t gpu_allocated_bytes = 0;
+    size_t tensor_count = 0;
+    uint64_t model_instance = 0;
+    uint64_t model_load_count = 0;
+    uint64_t main_gpu_upload_bytes = 0;
+    uint64_t mtp_gpu_upload_bytes = 0; // cumulative, including uploads to failed/retired allocations
+    uint64_t mtp_reloads = 0;
+    uint64_t backing_hash = 0;
+};
+
+enum class llama_mtp_weights_fault : uint8_t { none, allocation, upload };
+
+// Exclusive model owner only, with all contexts/speculation destroyed and no adapters.
+// Validation failure leaves residency unchanged. Failed reupload clears optional bindings;
+// the main model and host backing survive.
+// fault is for deterministic failure-injection checks; production callers use none.
+LLAMA_API bool llama_model_mtp_weights_set_resident(
+        llama_model * model, bool resident, llama_mtp_weights_fault fault = llama_mtp_weights_fault::none);
+// Do not read concurrently with residency changes; publish a copy for HTTP status.
+LLAMA_API llama_mtp_weights_info llama_model_mtp_weights_get_info(const llama_model * model);
+
+// Managed MTP target, owner-thread only. Zero means no tracked unmasked NextN decode.
+// State imports, failed/new decodes, encode, output reservation and a NextN mode change invalidate the ID.
+// IDs are monotonic within a context; a context and its ID must be kept together.
+LLAMA_API uint64_t llama_get_nextn_decode_id(const llama_context * ctx);
+LLAMA_API bool llama_matches_nextn_decode(const llama_context * ctx, uint64_t id, const llama_batch & batch);
+
+struct llama_prompt_cache_profile {
+    uint64_t context_instance;
+    llama_context_type ctx_type;
+    llama_rope_scaling_type rope_scaling_type;
+    float rope_freq_base;
+    float rope_freq_scale;
+    uint32_t n_ctx_orig_yarn;
+    float yarn_ext_factor;
+    float yarn_attn_factor;
+    float yarn_beta_fast;
+    float yarn_beta_slow;
+    bool causal_attn;
+    bool kv_unified;
+    bool kv_paged;
+    bool flash_attn;
+    int32_t nextn_layer_offset;
+    ggml_type type_k;
+    ggml_type type_v;
+    ggml_type type_k_aux;
+    ggml_type type_v_aux;
+    bool kv_layout_known;
+    llama_pos attn_min;
+    llama_pos attn_max;
+    llama_pos attn_aux_min;
+    llama_pos attn_aux_max;
+    // Components omitted by PARTIAL_ONLY, in stable implementation order.
+    // Four pairs cover the current maximum (DSV4); overflow/unknown refuses reuse.
+    bool partial_retained_known;
+    uint32_t partial_retained_count;
+    std::array<llama_pos, 8> partial_retained_bounds;
+};
+
+// Context owner thread only. Allocation size and recurrent rollback capacity do not change KV semantics.
+LLAMA_API llama_prompt_cache_profile llama_get_prompt_cache_profile(const llama_context * ctx, llama_seq_id seq_id = -1);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -121,6 +189,8 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 //
 // model/context data extraction
 //
+
+LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
 
 // returns pointer to the target-model layer indices
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);

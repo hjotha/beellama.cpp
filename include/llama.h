@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 2
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +62,7 @@ extern "C" {
     struct llama_model;
     struct llama_context;
     struct llama_sampler;
+    struct llama_paged_scheduler;
 
     typedef struct llama_memory_i * llama_memory_t;
 
@@ -243,15 +244,22 @@ extern "C" {
     };
 
     enum llama_load_mode {
-        LLAMA_LOAD_MODE_NONE       = 0, // no special loading mode
-        LLAMA_LOAD_MODE_MMAP       = 1, // memory map the model
-        LLAMA_LOAD_MODE_MLOCK      = 2, // force system to keep model in RAM rather than swapping or compressing
-        LLAMA_LOAD_MODE_MMAP_MLOCK = 3, // mmap + force system to keep model in RAM rather than swapping or compressing
-        LLAMA_LOAD_MODE_DIRECT_IO  = 4, // use direct I/O if available
+        LLAMA_LOAD_MODE_AUTO       = -1, // auto-detect based on device capabilities
+        LLAMA_LOAD_MODE_NONE       =  0, // no special loading mode
+        LLAMA_LOAD_MODE_MMAP       =  1, // memory map the model
+        LLAMA_LOAD_MODE_MLOCK      =  2, // force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_MMAP_MLOCK =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
     };
 
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
+
+    enum llama_lazy_mode {
+        LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
+        LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    };
 
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
@@ -302,6 +310,22 @@ extern "C" {
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
     } llama_batch;
+
+    // CPU-side metadata produced by the paged scheduler and consumed by
+    // llama_kv_cache_paged_context during graph build. These arrays are owned
+    // by the scheduler and must remain valid until the next scheduler step
+    // clears them.
+    typedef struct llama_paged_batch_info {
+        int32_t   n_blocks_per_seq;
+        int32_t   n_seq;
+        int32_t   n_tokens;
+
+        int32_t * write_slots;    // [n_tokens]
+        int32_t * block_table;    // [n_seq * n_blocks_per_seq]
+        int32_t * context_lens;   // [n_seq]
+        int32_t * batch_offsets;  // [n_seq]
+        int32_t * batch_lens;     // [n_seq]
+    } llama_paged_batch_info;
 
     enum llama_model_kv_override_type {
         LLAMA_KV_OVERRIDE_TYPE_INT,
@@ -354,6 +378,8 @@ extern "C" {
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
+        enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
@@ -378,6 +404,8 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool paged_attn_cuda; // pin full-attention layers to the first device
+        bool split_mtp_weights; // keep embedded MTP weights in independently releasable buffers with host backing
     };
 
     struct llama_sampler_seq_config {
@@ -430,14 +458,15 @@ extern "C" {
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
-        uint32_t n_ctx;             // text context, 0 = from model
-        uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
-        uint32_t n_ubatch;          // physical maximum batch size
-        uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
-        uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
-        uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
-        int32_t  n_threads;         // number of threads to use for generation
-        int32_t  n_threads_batch;   // number of threads to use for batch processing
+        uint32_t n_ctx;                 // text context, 0 = from model
+        uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
+        uint32_t n_ubatch;              // physical maximum batch size
+        uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
+        uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
+        uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        int32_t  n_threads;             // number of threads to use for generation
+        int32_t  n_threads_batch;       // number of threads to use for batch processing
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
@@ -479,6 +508,25 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        // Paged KV cache (experimental)
+        // Opt-in block-indexing KV cache with continuous-batching scheduling
+        bool     kv_paged;           // enable paged KV cache
+        bool     kv_paged_dynamic;   // grow and migrate KV pools between registered GPU backends
+        uint32_t block_size;         // tokens per physical KV block
+        uint32_t n_gpu_blocks;       // GPU block pool size
+        uint32_t n_gpu_blocks_initial; // initially allocated GPU blocks (0 = full pool)
+        uint32_t n_gpu_blocks_growth;  // dynamic pool growth step (0 = initial allocation)
+        uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
+        float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
+
+        // SnapKV-style selective KV retention over the paged cache
+        bool     snapkv_enabled;           // enable selective page eviction after prefill
+        uint32_t snapkv_observation_window; // tokens used to score page importance (0 = disabled)
+        uint32_t snapkv_recent_tokens;     // always-retained trailing window in tokens
+        uint32_t snapkv_pinned_tokens;     // always-retained leading window in tokens
+        float    snapkv_retention;         // fraction of old (non-pinned/non-recent) pages retained [0, 1]
+        uint32_t snapkv_budget_blocks;     // max physical blocks retained per sequence (0 = full GPU pool)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -526,6 +574,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
@@ -545,6 +594,8 @@ extern "C" {
 
     // lora adapter
     struct llama_adapter_lora;
+
+    LLAMA_API const char * llama_version(void);
 
     // Helpers for getting default parameters
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
@@ -847,6 +898,12 @@ extern "C" {
     // Memory
     //
 
+    // Reserve physical memory for a bounded request. This is a no-op for memory
+    // implementations that do not require explicit growth.
+    LLAMA_API bool llama_memory_reserve(
+            llama_memory_t mem,
+                   uint32_t n_tokens);
+
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata
     LLAMA_API void llama_memory_clear(
@@ -855,7 +912,7 @@ extern "C" {
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
-    // seq_id < 0 : match any sequence
+    // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
     LLAMA_API bool llama_memory_can_seq_rm(
@@ -1056,6 +1113,7 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
+    // If tokens_out is NULL, only the token count is reported through n_token_count_out and no state is loaded
     LLAMA_API size_t llama_state_seq_load_file(
             struct llama_context * ctx,
                       const char * filepath,
@@ -1189,6 +1247,13 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Tell paged SnapKV the final position of a prompt that will be decoded in batches.
+    // This is an optional no-op for contexts without paged SnapKV.
+    LLAMA_API void llama_set_snapkv_prefill_end(
+            struct llama_context * ctx,
+                       llama_seq_id seq_id,
+                          llama_pos prefill_end);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1266,6 +1331,9 @@ extern "C" {
     //
 
     // Get the backend sampled token for the ith token.
+    // With multiple outputs, sampler state advances when the token is accepted,
+    // not when it is read through this function.
+    // When accepting multiple outputs, accept a contiguous prefix in output order.
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
 
@@ -1482,9 +1550,12 @@ extern "C" {
         // [EXPERIMENTAL]
         // backend sampling interface:
 
-        // return true if the backend supports all ops needed by the sampler
+        // return true if the backend supports all ops needed by the sampler and can handle up to n_outputs_max_per_seq outputs per sequence
         // note: call once per sampler
-        bool (*backend_init)(struct llama_sampler * smpl, ggml_backend_buffer_type_t buft);
+        bool (*backend_init)(
+                struct llama_sampler       * smpl,
+                ggml_backend_buffer_type_t   buft,
+                uint32_t                     n_outputs_max_per_seq);
 
         // call after .backend_apply()
         void (*backend_accept)(
@@ -1502,6 +1573,13 @@ extern "C" {
 
         // called before graph execution to set inputs for the current ubatch
         void (*backend_set_input)(struct llama_sampler * smpl);
+
+        // called before rebuilding a sampling graph to clear any internal sampler state
+        void (*backend_reset)(struct llama_sampler * smpl);
+
+        // copy mutable state from src into dst while keeping dst's references to the current sampling graph
+        // src and dst must have the same type and configuration
+        void (*copy_state)(const struct llama_sampler * src, struct llama_sampler * dst);
     };
 
     struct llama_sampler {
@@ -1522,6 +1600,7 @@ extern "C" {
     LLAMA_API void                   llama_sampler_apply (      struct llama_sampler * smpl, llama_token_data_array * cur_p);
     LLAMA_API void                   llama_sampler_reset (      struct llama_sampler * smpl);
     LLAMA_API struct llama_sampler * llama_sampler_clone (const struct llama_sampler * smpl);
+    LLAMA_API void                   llama_sampler_copy  (const struct llama_sampler * src, struct llama_sampler * dst);
     // important: do not free if the sampler has been added to a llama_sampler_chain (via llama_sampler_chain_add)
     LLAMA_API void                   llama_sampler_free  (      struct llama_sampler * smpl);
 
@@ -1541,7 +1620,7 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_chain_get(      struct llama_sampler * chain, int32_t i);
 
     // the total number of samplers in the chain
-    LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+    LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
@@ -1710,6 +1789,7 @@ extern "C" {
     LLAMA_API uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl);
 
     /// @details Sample and accept a token from the idx-th output of the last evaluation
+    // For multiple outputs from one sampler, call this function in output order without gaps.
     //
     // Shorthand for:
     //    const auto * logits = llama_get_logits_ith(ctx, idx);
@@ -1813,6 +1893,53 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    //
+    // Paged inference
+    //
+    struct llama_paged_seq_state {
+        int32_t request_id;
+        int32_t n_prompt;
+        int32_t n_decoded;
+        int32_t n_past;
+        int64_t t_arrival_us;
+        int64_t t_first_token_us;
+    };
+
+    typedef void (*llama_paged_on_finish_cb)(int32_t             request_id,
+                                             const llama_token * tokens,
+                                             int32_t             n_tokens,
+                                             void *              user_data);
+    LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx);
+    LLAMA_API void llama_paged_scheduler_free(struct llama_paged_scheduler * sched);
+
+    // Queueing and stepping.
+    LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
+                                                     const llama_token *            tokens,
+                                                     int32_t                        n_tokens,
+                                                     int32_t                        request_id);
+
+    LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
+                                                       struct llama_batch *           batch);
+
+    LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
+                                                struct llama_batch *           batch,
+                                                const llama_token *            tokens,
+                                                const int8_t *                 stop_flags);
+
+    // Introspection.
+    LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,
+                                                       int32_t                        request_id,
+                                                       struct llama_paged_seq_state * out_state);
+
+    // Returns the current batch's paged routing metadata. Valid until the next
+    // call to llama_paged_scheduler_prepare_batch on this scheduler. Do not free.
+    LLAMA_API const struct llama_paged_batch_info * llama_paged_scheduler_get_batch_info(
+        const struct llama_paged_scheduler * sched);
+
+    // Optional finish callback.
+    LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
+                                                       llama_paged_on_finish_cb       cb,
+                                                       void *                         user_data);
 #ifdef __cplusplus
 }
 #endif

@@ -15,8 +15,23 @@ struct llama_cparams {
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
+    uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+
+    uint32_t block_size;
+    uint32_t n_gpu_blocks;
+    uint32_t n_gpu_blocks_initial;
+    uint32_t n_gpu_blocks_growth;
+    uint32_t n_cpu_blocks;
+    float    kv_paged_watermark;
+
+    bool     snapkv_enabled;
+    uint32_t snapkv_observation_window;
+    uint32_t snapkv_recent_tokens;
+    uint32_t snapkv_pinned_tokens;
+    float    snapkv_retention;
+    uint32_t snapkv_budget_blocks;
 
     int32_t  nextn_layer_offset = 0;
 
@@ -50,12 +65,15 @@ struct llama_cparams {
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
-    bool kv_unified;
+bool kv_unified;
+    bool kv_paged;
+    bool kv_paged_dynamic;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
+    enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
 
     // Structured KVarN cache settings.  Kept in the internal context params so

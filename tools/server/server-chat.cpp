@@ -104,6 +104,23 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 }
                 item["content"] = chatcmpl_content;
 
+                // Qwen chat templates require system content at position zero.
+                if (item.at("role") == "system" || item.at("role") == "developer") {
+                    item["role"] = "system";
+                    if (!chatcmpl_messages.empty() && chatcmpl_messages[0].value("role", "") == "system") {
+                        auto & first_msg = chatcmpl_messages[0];
+                        if (first_msg["content"].is_string()) {
+                            first_msg["content"] = json::array({json{{"text", first_msg["content"]}, {"type", "text"}}});
+                        }
+                        for (const auto & part : chatcmpl_content) {
+                            first_msg["content"].push_back(part);
+                        }
+                        continue;
+                    }
+                    chatcmpl_messages.insert(chatcmpl_messages.begin(), item);
+                    continue;
+                }
+
                 chatcmpl_messages.push_back(item);
             } else if (exists_and_is_string(item, "role") &&
                 item.at("role") == "assistant" &&
@@ -153,7 +170,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         prev_msg["content"] = json::array();
                     }
                     auto & prev_content = prev_msg["content"];
-                    prev_content.insert(prev_content.end(), chatcmpl_content.begin(), chatcmpl_content.end());
+                    prev_content.insert(chatcmpl_content);
                 } else {
                     item.erase("status");
                     item.erase("type");

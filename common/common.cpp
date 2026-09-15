@@ -3,9 +3,14 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "json.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-model.h"
+#include "../src/llama-ext.h"
+#include "../src/llama-context.h"
+#include "../src/llama-memory-hybrid-paged.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -18,14 +23,17 @@
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -455,10 +463,11 @@ void common_params_print_info(const common_params & params, bool print_devices) 
 #endif
     COM_TRC("%s: build %d (%s) with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
 
-    COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, common_log_get_verbosity_thold());
+    const int verbosity = common_log_get_verbosity_thold();
+    COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
 
     // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
-    if (print_devices) {
+    if (print_devices && verbosity >= LOG_LEVEL_TRACE) {
         COM_TRC("%s", "device_info:\n");
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto * dev = ggml_backend_dev_get(i);
@@ -1116,20 +1125,21 @@ std::string fs_get_cache_directory() {
     std::string cache_directory = "";
     auto ensure_trailing_slash = [](std::string p) {
         // Make sure to add trailing slash
-        if (p.back() != DIRECTORY_SEPARATOR) {
+        if (p.empty() || p.back() != DIRECTORY_SEPARATOR) {
             p += DIRECTORY_SEPARATOR;
         }
         return p;
     };
-    if (getenv("LLAMA_CACHE")) {
-        cache_directory = std::getenv("LLAMA_CACHE");
-    } else {
+    cache_directory = common_get_env("LLAMA_CACHE");
+    if (cache_directory.empty()) {
 #if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
         defined(__OpenBSD__) || defined(__NetBSD__)
-        if (std::getenv("XDG_CACHE_HOME")) {
-            cache_directory = std::getenv("XDG_CACHE_HOME");
-        } else if (std::getenv("HOME")) {
-            cache_directory = std::getenv("HOME") + std::string("/.cache/");
+        const std::string xdg_cache_home = common_get_env("XDG_CACHE_HOME");
+        const std::string home           = common_get_env("HOME");
+        if (!xdg_cache_home.empty()) {
+            cache_directory = xdg_cache_home;
+        } else if (!home.empty()) {
+            cache_directory = home + "/.cache/";
         } else {
 #if defined(__linux__)
             /* no $HOME is defined, fallback to getpwuid */
@@ -1144,9 +1154,16 @@ std::string fs_get_cache_directory() {
 #endif /* defined(__linux__) */
         }
 #elif defined(__APPLE__)
-        cache_directory = std::getenv("HOME") + std::string("/Library/Caches/");
+        cache_directory = common_get_env("HOME");
+        if (cache_directory.empty()) {
+            throw std::runtime_error("Failed to find $HOME directory");
+        }
+        cache_directory += "/Library/Caches/";
 #elif defined(_WIN32)
-        cache_directory = std::getenv("LOCALAPPDATA");
+        cache_directory = common_get_env("LOCALAPPDATA");
+        if (cache_directory.empty()) {
+            throw std::runtime_error("Failed to find %LOCALAPPDATA% directory");
+        }
 #elif defined(__EMSCRIPTEN__)
         GGML_ABORT("not implemented on this platform");
 #else
@@ -1156,6 +1173,51 @@ std::string fs_get_cache_directory() {
         cache_directory += "llama.cpp";
     }
     return ensure_trailing_slash(cache_directory);
+}
+
+std::string fs_get_config_directory() {
+    std::string config_directory = "";
+    auto ensure_trailing_slash = [](std::string p) {
+        if (p.empty() || p.back() != DIRECTORY_SEPARATOR) {
+            p += DIRECTORY_SEPARATOR;
+        }
+        return p;
+    };
+#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
+        defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
+    const std::string xdg_config_home = common_get_env("XDG_CONFIG_HOME");
+    const std::string home            = common_get_env("HOME");
+    if (!xdg_config_home.empty()) {
+        config_directory = xdg_config_home;
+    } else if (!home.empty()) {
+        config_directory = home + "/.config/";
+    } else {
+#if defined(__linux__)
+        /* no $HOME is defined, fallback to getpwuid */
+        struct passwd *pw = getpwuid(getuid());
+        if ((!pw) || (!pw->pw_dir)) {
+            throw std::runtime_error("Failed to find $HOME directory");
+        }
+
+        config_directory = std::string(pw->pw_dir) + std::string("/.config/");
+#else
+        throw std::runtime_error("Failed to find $HOME directory");
+#endif
+    }
+#elif defined(_WIN32)
+    config_directory = common_get_env("APPDATA");
+    if (config_directory.empty()) {
+        throw std::runtime_error("Failed to find %APPDATA% directory");
+    }
+#elif defined(__EMSCRIPTEN__)
+    // caller decides what to do when there is no config directory
+    throw std::runtime_error("not implemented on this platform");
+#else
+#  error Unknown architecture
+#endif
+    config_directory = ensure_trailing_slash(config_directory);
+    config_directory += "llama.cpp";
+    return ensure_trailing_slash(config_directory);
 }
 
 std::string fs_get_cache_file(const std::string & filename) {
@@ -1315,9 +1377,14 @@ static void common_init_sampler_from_model(
 
 struct common_init_result::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() { context.reset(); }
+
+    bool context_prepared = false;
+    bool threadpools_initialized = false;
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
+
+    common_threadpools threadpools;
 
     llama_model_ptr   model;
     llama_context_ptr context;
@@ -1327,6 +1394,497 @@ struct common_init_result::impl {
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
+
+static bool common_paged_kv_is_hybrid_arch(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_JAMBA:
+        case LLM_ARCH_FALCON_H1:
+        case LLM_ARCH_PLAMO2:
+        case LLM_ARCH_GRANITE_HYBRID:
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_MINIMAX_01:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Return whether a layer contributes a regular per-token attention KV cache.
+// Hybrid models keep recurrent state for their linear-attention layers instead
+// of a normal K/V row cache.  The paged and non-paged sizing paths must use the
+// same layer selection or the estimated context sizes diverge substantially.
+static bool common_kv_uses_attention_layer(const llama_model * model, uint32_t il) {
+    const auto & hparams = model->hparams;
+
+    // Appended nextn/MTP layers use a regular attention KV cache.
+    if (il >= hparams.n_layer()) {
+        return true;
+    }
+
+    if (!common_paged_kv_is_hybrid_arch(model->arch)) {
+        return true;
+    }
+
+    bool is_attention = hparams.is_recr_impl[il] == 0;
+
+    if (model->arch == LLM_ARCH_FALCON_H1) {
+        is_attention = true;
+    } else if ((model->arch == LLM_ARCH_NEMOTRON_H || model->arch == LLM_ARCH_NEMOTRON_H_MOE) &&
+               hparams.n_ff_arr[il] != 0) {
+        is_attention = false;
+    }
+
+    return is_attention;
+}
+
+static ggml_backend_dev_t common_fit_selected_device(const common_params & params) {
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr) {
+            return dev;
+        }
+    }
+
+    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+}
+
+static size_t common_context_memory_on_device(const llama_context * ctx, ggml_backend_dev_t dev) {
+    size_t total = 0;
+
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        if (!ggml_backend_buft_is_host(buft) && ggml_backend_buft_get_device(buft) == dev) {
+            total += mb.context + mb.compute;
+        }
+    }
+
+    return total;
+}
+
+static uint32_t common_fit_probe_context(const common_params & params, uint64_t train_ctx, uint32_t align) {
+    // --ctx-size 0 stores UINT32_MAX/-1 in fit_params_min_ctx to disable the
+    // generic fitter's context reduction.  That sentinel is not a useful
+    // probe size; use the normal 4096-token floor instead.
+    const uint64_t requested = params.fit_params_min_ctx > 0
+        ? (uint64_t) params.fit_params_min_ctx
+        : 4096ull;
+    return (uint32_t) std::min<uint64_t>(train_ctx, std::max<uint64_t>(align, requested));
+}
+
+// Probe a small, real context using the same batch/ubatch and (when enabled)
+// the same MTP draft context.  This captures fixed compute/context overhead
+// that a KV-only bytes-per-token estimate cannot see.
+static size_t common_probe_context_overhead(
+        common_params & params, llama_model * model, uint32_t probe_ctx,
+        uint32_t probe_gpu_blocks, uint32_t probe_cpu_blocks, bool paged,
+        size_t probe_kv_bytes) {
+    ggml_backend_dev_t dev = common_fit_selected_device(params);
+    if (dev == nullptr) {
+        return SIZE_MAX;
+    }
+
+    common_params probe_params = params;
+    probe_params.n_ctx = probe_ctx;
+    probe_params.fit_params = false;
+    probe_params.kv_paged = paged;
+    probe_params.kv_paged_dynamic = paged;
+    probe_params.kv_paged_prealloc_max = false;
+    probe_params.n_gpu_blocks = std::max<uint32_t>(1, probe_gpu_blocks);
+    probe_params.n_gpu_blocks_initial = probe_params.n_gpu_blocks;
+    probe_params.n_gpu_blocks_growth = probe_params.n_gpu_blocks;
+    probe_params.n_cpu_blocks = std::max<uint32_t>(1, probe_cpu_blocks);
+
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+
+    try {
+        auto cparams_tgt = common_context_params_to_llama(probe_params);
+        cparams_tgt.n_ctx = probe_ctx;
+        ctx_tgt = llama_init_from_model(model, cparams_tgt);
+        if (ctx_tgt == nullptr) {
+            LOG_WRN("%s: target context probe failed at ctx=%u\n", __func__, probe_ctx);
+            return SIZE_MAX;
+        }
+
+        size_t measured = common_context_memory_on_device(ctx_tgt, dev);
+        if (spec_mtp) {
+            auto probe_params_dft = common_base_params_to_speculative(probe_params);
+            auto cparams_dft = common_context_params_to_llama(probe_params_dft);
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_dft.ctx_other = ctx_tgt;
+            cparams_dft.n_ctx = probe_ctx;
+            cparams_dft.n_rs_seq = 0;
+
+            ctx_dft = llama_init_from_model(model, cparams_dft);
+            if (ctx_dft == nullptr) {
+                LOG_WRN("%s: MTP context probe failed at ctx=%u\n", __func__, probe_ctx);
+                llama_free(ctx_tgt);
+                return SIZE_MAX;
+            }
+            measured += common_context_memory_on_device(ctx_dft, dev);
+        }
+
+        if (ctx_dft != nullptr) {
+            llama_free(ctx_dft);
+        }
+        llama_free(ctx_tgt);
+
+        const size_t overhead = measured > probe_kv_bytes ? measured - probe_kv_bytes : 0;
+        LOG_INF("%s: probe ctx=%u, batch=%u, ubatch=%u, measured=%.1f MiB, kv=%.1f MiB, overhead=%.1f MiB, mtp=%s\n",
+                __func__, probe_ctx, params.n_batch, params.n_ubatch,
+                measured / 1024.0 / 1024.0, probe_kv_bytes / 1024.0 / 1024.0,
+                overhead / 1024.0 / 1024.0, spec_mtp ? "yes" : "no");
+        return overhead;
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: context probe failed at ctx=%u: %s\n", __func__, probe_ctx, e.what());
+        if (ctx_dft != nullptr) {
+            llama_free(ctx_dft);
+        }
+        if (ctx_tgt != nullptr) {
+            llama_free(ctx_tgt);
+        }
+        return SIZE_MAX;
+    }
+}
+
+static uint32_t common_paged_kv_attention_layers(const llama_model * model) {
+    const auto & hparams = model->hparams;
+    const uint32_t n_layers = hparams.n_layer_all - hparams.n_layer_nextn;
+
+    uint32_t n_attention_layers = 0;
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        n_attention_layers += common_kv_uses_attention_layer(model, il);
+    }
+
+    return n_attention_layers;
+}
+
+static void common_fit_normal_kv_context(common_params & params, llama_model * model) {
+    GGML_ASSERT(model && "model must be loaded before fitting normal KV context.");
+
+    ggml_backend_dev_t dev = nullptr;
+    for (ggml_backend_dev_t dev_it : params.devices) {
+        if (dev_it != nullptr) {
+            dev = dev_it;
+            break;
+        }
+    }
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    }
+    if (!dev) {
+        LOG_WRN("%s: no GPU device found, cannot fit normal KV context.\n", __func__);
+        return;
+    }
+
+    size_t free_vram = 0;
+    size_t total_vram = 0;
+    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+    const size_t sane_budget = (size_t) 1 << 50;
+    if (free_vram == 0 || free_vram > sane_budget || total_vram > sane_budget) {
+        LOG_WRN("%s: device %s reports an invalid memory budget (free=%zu, total=%zu).\n",
+                __func__, ggml_backend_dev_name(dev), free_vram, total_vram);
+        return;
+    }
+
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    size_t bytes_per_token = 0;
+    uint32_t attention_layers = 0;
+    uint32_t mtp_layers = 0;
+    auto add_kv_layer = [&](uint32_t il, bool is_mtp) {
+        if (!model->hparams.has_kv(il) || (!is_mtp && !common_kv_uses_attention_layer(model, il))) {
+            return;
+        }
+
+        bytes_per_token += ggml_row_size(params.cache_type_k, model->hparams.n_embd_k_gqa(il));
+        if (!model->hparams.is_mla()) {
+            bytes_per_token += ggml_row_size(params.cache_type_v, model->hparams.n_embd_v_gqa_max());
+        }
+
+        (is_mtp ? mtp_layers : attention_layers)++;
+    };
+
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        add_kv_layer(il, false);
+    }
+
+    // An MTP draft context is created from the appended nextn layers and
+    // shares the target context length, so its regular KV rows also consume
+    // memory for every token in the request.
+    if (spec_mtp) {
+        for (uint32_t il = model->hparams.n_layer(); il < model->hparams.n_layer_all; ++il) {
+            add_kv_layer(il, true);
+        }
+    }
+
+    if (bytes_per_token == 0) {
+        LOG_WRN("%s: model has no normal KV rows, leaving ctx-size unchanged.\n", __func__);
+        return;
+    }
+
+    const size_t requested_margin = params.fit_params_target.empty()
+        ? (size_t)(total_vram * 0.05f)
+        : (size_t)params.fit_params_target[0];
+    // The MTP probe already includes most of the target and draft buffers.
+    const size_t margin = requested_margin + (spec_mtp ? 5ull * 1024ull * 1024ull : 0);
+    if (free_vram <= margin) {
+        LOG_ERR("%s: free_vram=%.1f MiB <= margin=%.1f MiB; cannot fit normal KV context.\n",
+                __func__, free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f);
+        return;
+    }
+
+    const uint32_t n_seq = std::max<uint32_t>(1, params.n_parallel);
+    const uint64_t train_ctx = (uint64_t) model->hparams.n_ctx_train * n_seq;
+    const uint32_t align = 256 * n_seq;
+    const uint32_t probe_ctx_per_seq = common_fit_probe_context(params, model->hparams.n_ctx_train, 256);
+    const uint32_t probe_ctx = probe_ctx_per_seq * n_seq;
+    const size_t probe_kv_bytes = bytes_per_token * probe_ctx;
+    const size_t probed_overhead = common_probe_context_overhead(
+        params, model, probe_ctx, 0, 1, false, probe_kv_bytes);
+    size_t compute_overhead = 0;
+    size_t available = free_vram - margin;
+    if (probed_overhead != SIZE_MAX) {
+        // The small dense probe retains one transient graph allocation that is
+        // not present in the full prompt path on this backend.
+        const size_t probe_correction = spec_mtp ? 0 : 32ull * 1024ull * 1024ull;
+        compute_overhead = probed_overhead > probe_correction
+            ? probed_overhead - probe_correction
+            : 0;
+        available = available > compute_overhead ? available - compute_overhead : 0;
+    } else {
+        LOG_WRN("%s: compute-aware normal KV probe unavailable; using KV-only estimate\n", __func__);
+    }
+
+    uint64_t ctx = std::min<uint64_t>(train_ctx, available / bytes_per_token);
+    ctx = (ctx / align) * align;
+    if (ctx < align) {
+        LOG_ERR("%s: no normal KV context fits the selected memory margin.\n", __func__);
+        return;
+    }
+
+    params.n_ctx = (uint32_t) ctx;
+    LOG_INF("%s: ctx0 normal KV candidate: ctx=%u, ctx_per_slot=%u, bytes_per_token=%zu, attention_layers=%u, mtp_layers=%u, free_vram=%.1f MiB, margin=%.1f MiB, compute_overhead=%.1f MiB, batch=%u, ubatch=%u, mtp=%s\n",
+            __func__, params.n_ctx, params.n_ctx / n_seq, bytes_per_token,
+            attention_layers, mtp_layers,
+            free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f,
+            compute_overhead / 1024.0f / 1024.0f, params.n_batch, params.n_ubatch,
+            spec_mtp ? "yes" : "no");
+}
+
+static void common_fit_paged_kv_blocks(common_params& params, llama_model * model) {
+    GGML_ASSERT(model && "model must be loaded before fitting paged KV blocks.");
+    // Calibrate against the device the user selected for offloading, not just
+    // the first registered GPU (which may be a different, unrelated device).
+    ggml_backend_dev_t dev = nullptr;
+    for (ggml_backend_dev_t dev_it : params.devices) {
+        if (dev_it != nullptr) {
+            dev = dev_it;
+            break;
+        }
+    }
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    }
+    if (!dev) {
+        LOG_WRN("%s: no GPU device found, cannot fit paged KV blocks.\n", __func__);
+        return;
+    }
+
+    size_t free_vram = 0;
+    size_t total_vram = 0;
+    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+
+    // Some backends report unbounded/absurd budgets (e.g. SIZE_MAX heaps on
+    // integrated Vulkan GPUs) or fail to report one (0). Walk the selected
+    // devices for a sane budget instead of giving up on the calibration.
+    const size_t sane_budget = (size_t) 1 << 50; // 1 PiB upper sanity bound
+    if (free_vram == 0 || free_vram > sane_budget || total_vram > sane_budget) {
+        for (ggml_backend_dev_t dev_it : params.devices) {
+            if (dev_it == nullptr || dev_it == dev) {
+                continue;
+            }
+            size_t alt_free = 0;
+            size_t alt_total = 0;
+            ggml_backend_dev_memory(dev_it, &alt_free, &alt_total);
+            if (alt_free > 0 && alt_free <= sane_budget && alt_total > 0 && alt_total <= sane_budget) {
+                dev = dev_it;
+                free_vram = alt_free;
+                total_vram = alt_total;
+                break;
+            }
+        }
+        if (free_vram == 0 || free_vram > sane_budget) {
+            if (total_vram > 0 && total_vram <= sane_budget) {
+                // Total is known but free was not reported; assume the model
+                // is not fully resident yet and most of the budget is free.
+                free_vram = total_vram;
+            } else {
+                LOG_ERR("%s: device %s reports an invalid memory budget (free=%zu, total=%zu); skipping paged KV calibration\n",
+                        __func__, ggml_backend_dev_name(dev), free_vram, total_vram);
+                return; // leave params.n_gpu_blocks at its existing value
+            }
+        }
+    }
+
+    const uint32_t n_heads_kv = model->hparams.n_head_kv_arr[0];
+    const uint32_t n_layers   = common_paged_kv_attention_layers(model);
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // With MTP enabled, target and draft use independent paged pools with the
+    // same logical block budget. Fit both layer sets against the same VRAM
+    // budget so dynamic growth cannot overcommit the device.
+    const uint32_t n_mtp_layers = spec_mtp ? model->hparams.n_layer_nextn : 0;
+    const uint32_t head_dim   = model->hparams.n_embd_head_v_full;
+    const uint32_t block_size = params.block_size;
+
+    const size_t bytes_per_row   = ggml_row_size(params.cache_type_k, head_dim);
+    const size_t bytes_per_block = (size_t) 2 * bytes_per_row * n_heads_kv * block_size * (n_layers + n_mtp_layers);
+
+    // The base margin already covers one sequence. Hybrid models allocate an
+    // R/S state per additional GPU sequence before the paged KV pool exists.
+    size_t extra_recurrent_vram = 0;
+    if (params.kv_paged_prealloc_max && params.n_parallel > 1 && !params.no_kv_offload) {
+        const size_t rows_per_sequence = 1 + params.speculative.need_n_rs_seq();
+        const size_t bytes_per_recurrent_sequence = rows_per_sequence * sizeof(float) *
+            (model->hparams.n_embd_r() + model->hparams.n_embd_s());
+
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            if (model->hparams.is_recr(il) &&
+                ggml_backend_dev_type(model->dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                extra_recurrent_vram += bytes_per_recurrent_sequence * (params.n_parallel - 1);
+            }
+        }
+    }
+
+    if (n_layers == 0 || bytes_per_row == 0) {
+        LOG_ERR("%s: model has no paged-attention layers or an invalid KV type (%s).\n",
+                __func__, ggml_type_name(params.cache_type_k));
+        return;
+    }
+
+    // The paged context probe accounts for target and draft workspace.
+    const size_t extra_speculative_vram = 0;
+    const size_t requested_margin = params.fit_params_target.empty()
+        ? (size_t)(total_vram * 0.05f)
+        : (size_t)params.fit_params_target[0];
+    const size_t margin = params.kv_paged_prealloc_max
+        ? requested_margin + extra_recurrent_vram + extra_speculative_vram
+        : requested_margin;
+
+    if (free_vram <= margin) {
+        LOG_ERR("%s: not enough free VRAM for paged KV blocks. "
+                "free_vram=%.1f MiB <= margin=%.1f MiB. "
+                "Try reducing --margin or offloading fewer layers to GPU.\n",
+                __func__, free_vram / 1024.0f / 1024.0f, margin    / 1024.0f / 1024.0f);
+        return; // leave params.n_gpu_blocks at its existing value
+    }
+
+    size_t available = (free_vram > margin) ? free_vram - margin : 0;
+
+    // A paged prealloc-max request can pin an explicit ctx-size while fit is
+    // disabled.  It still needs the same real compute probe as the automatic
+    // ctx-size=0 path: batch/ubatch, MTP, and parallel slots consume VRAM that
+    // a KV-only block estimate cannot see.
+    size_t compute_overhead = 0;
+    const bool need_compute_probe = params.kv_paged_prealloc_max ||
+        (params.fit_params && params.n_ctx == 0);
+    if (need_compute_probe) {
+        const uint32_t n_seq = std::max<uint32_t>(1, params.n_parallel);
+        const uint32_t align = params.block_size * 64;
+        const uint32_t probe_ctx_per_seq = common_fit_probe_context(params, model->hparams.n_ctx_train, align);
+        const uint32_t probe_ctx = probe_ctx_per_seq * n_seq;
+        const uint32_t probe_blocks = std::max<uint32_t>(1,
+            (probe_ctx + params.block_size - 1) / params.block_size);
+        const uint32_t probe_cpu_blocks = params.kv_paged_prealloc_max
+            ? 1
+            : std::max<uint32_t>(1, (uint32_t) std::ceil(probe_blocks * params.cpu_to_gpu_blocks_ratio));
+        const size_t probe_kv_bytes = (size_t) bytes_per_block * probe_blocks;
+        const size_t probed_overhead = common_probe_context_overhead(
+            params, model, probe_ctx, probe_blocks, probe_cpu_blocks, true, probe_kv_bytes);
+        if (probed_overhead != SIZE_MAX) {
+            // One transient MTP graph allocation is shared with the request
+            // path and must not be charged twice by the startup fit.
+            const size_t probe_correction = spec_mtp ? probed_overhead / 6 : probed_overhead;
+            compute_overhead = probed_overhead > probe_correction
+                ? probed_overhead - probe_correction
+                : 0;
+            available = available > compute_overhead ? available - compute_overhead : 0;
+        } else {
+            LOG_WRN("%s: compute-aware paged KV probe unavailable; using KV-only estimate\n", __func__);
+        }
+    }
+
+    if (bytes_per_block == 0 || available < bytes_per_block) {
+        LOG_ERR("%s: available VRAM (%.1f MiB) is less than one block (%.1f MiB). "
+                "Try increasing n_gpu_blocks manually or reducing block_size.\n",
+                __func__, available      / 1024.0f / 1024.0f, bytes_per_block / 1024.0f / 1024.0f);
+        return;
+    }
+
+    const uint32_t n_gpu_blocks = (uint32_t)(available / bytes_per_block);
+    const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
+
+    LOG_INF("%s: free_vram=%0.1f MiB, device=%s, type=%s, head_dim=%u, attention_layers=%u, mtp_layers=%u, extra_recurrent_vram=%0.1f MiB, extra_speculative_vram=%0.1f MiB, bytes_per_block=%zu, n_gpu_blocks=%u, n_cpu_blocks=%u, compute_overhead=%0.1f MiB, batch=%u, ubatch=%u\n",
+            __func__, free_vram / 1024.0f / 1024.0f, ggml_backend_dev_name(dev), ggml_type_name(params.cache_type_k), head_dim, n_layers,
+            n_mtp_layers, extra_recurrent_vram / 1024.0f / 1024.0f, extra_speculative_vram / 1024.0f / 1024.0f,
+            bytes_per_block, n_gpu_blocks, n_cpu_blocks, compute_overhead / 1024.0f / 1024.0f,
+            params.n_batch, params.n_ubatch);
+
+    if (params.kv_paged_prealloc_max) {
+        const uint32_t requested_ctx = params.n_ctx == 0 ? model->hparams.n_ctx_train : params.n_ctx;
+        const uint32_t logical_blocks = (requested_ctx + params.block_size - 1) / params.block_size;
+        const uint32_t growth_blocks = 64;
+        // Keep every block that fits in the calibrated upper-bound pool.
+        const uint32_t capacity_blocks = std::min(n_gpu_blocks, logical_blocks);
+        const uint32_t reserve_blocks = spec_mtp ? 0 : std::min<uint32_t>(2, capacity_blocks);
+        const uint32_t fixed_blocks = capacity_blocks - reserve_blocks;
+
+        if (fixed_blocks == 0) {
+            LOG_ERR("%s: no paged KV blocks fit in the selected GPU budget.\n", __func__);
+            return;
+        }
+
+        params.kv_paged_dynamic = true;
+        params.n_ctx = fixed_blocks * params.block_size;
+        params.n_gpu_blocks = fixed_blocks;
+        params.n_gpu_blocks_initial = std::min(growth_blocks, fixed_blocks);
+        params.n_gpu_blocks_growth = std::min(growth_blocks, fixed_blocks);
+        params.n_gpu_blocks_admission = fixed_blocks;
+        LOG_INF("%s: paged KV calibration candidate: ctx=%u, blocks=%u, initial=%u, growth=%u\n",
+                __func__, params.n_ctx, fixed_blocks, params.n_gpu_blocks_initial, params.n_gpu_blocks_growth);
+    } else if (params.kv_paged_dynamic) {
+        const uint32_t requested_blocks = params.n_ctx > 0
+            ? (uint32_t) std::ceil((double) params.n_ctx / params.block_size)
+            : 0;
+        const uint32_t reserve_blocks = params.n_ctx == 0 && !spec_mtp
+            ? std::min<uint32_t>(2, n_gpu_blocks)
+            : 0;
+        const uint32_t fitted_blocks = std::max<uint32_t>(1, n_gpu_blocks - reserve_blocks);
+        params.n_gpu_blocks = std::max({ params.n_gpu_blocks, fitted_blocks, requested_blocks });
+        params.n_gpu_blocks_initial = std::min<uint32_t>(64, params.n_gpu_blocks);
+        params.n_gpu_blocks_growth = std::min<uint32_t>(64, params.n_gpu_blocks);
+        if (params.n_ctx == 0) {
+            params.n_ctx = fitted_blocks * params.block_size;
+        }
+    } else {
+        params.n_gpu_blocks = n_gpu_blocks;
+    }
+    if (!params.kv_paged_prealloc_max) {
+        params.n_cpu_blocks = n_cpu_blocks;
+    }
+}
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
@@ -1347,14 +1905,37 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.kv_tail_request = tail_request.get();
     }
 
-    if (params.fit_params) {
+    if (params.fit_params && !(params.n_ctx == 0 && !params.kv_paged)) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+
+        // the draft context is created from the same base params and follows the main context, fit both together
+        const bool has_draft = params.speculative.has_dft();
+        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+        common_params params_dft = common_base_params_to_speculative(params);
+
+        auto mparams_dft = common_model_params_to_llama(params_dft);
+        auto cparams_dft = common_context_params_to_llama(params_dft);
+        if (spec_mtp) {
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        }
+        cparams_dft.n_rs_seq = 0;
+
+        const common_fit_extra_model extra = {
+            /*.path_model   =*/ params_dft.model.path.c_str(),
+            /*.mparams      =*/ &mparams_dft,
+            /*.cparams      =*/ &cparams_dft,
+            /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+        };
+
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
+            has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
@@ -1365,8 +1946,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->model.reset(model);
 
+    // Resolve the default before a YaRN context can update n_ctx_train.
+    if (model->hparams.n_ctx_orig_yarn == 0) {
+        model->hparams.n_ctx_orig_yarn = model->hparams.n_ctx_train;
+    }
+
     if (model_only) {
         return;
+    }
+
+    if (!params.kv_paged && params.n_ctx == 0) {
+        common_fit_normal_kv_context(params, pimpl->model.get());
+        cparams = common_context_params_to_llama(params);
+    }
+
+    if ((params.fit_params || params.kv_paged_prealloc_max) && params.kv_paged) {
+        LOG_INF("%s: fitting KV paged params to device memory\n", __func__);
+        common_fit_paged_kv_blocks(params, pimpl->model.get());
+        cparams = common_context_params_to_llama(params); // re-derive this params to reflect changes
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1413,12 +2010,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
+    pimpl->context_prepared = true;
+    if (!create_context(params, cparams)) {
+        release_context();
+    }
+}
+
+bool common_init_result::create_context(common_params & params, llama_context_params cparams) {
+    GGML_ASSERT(!pimpl->context);
+    auto * model = pimpl->model.get();
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
 
     for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
         pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
+        if (!pimpl->samplers[i]) {
+            COM_ERR("failed to create sampler for sequence %d\n", i);
+            return false;
+        }
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
@@ -1430,10 +2040,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return;
+        return false;
     }
 
     pimpl->context.reset(lctx);
+
+    if (!pimpl->threadpools_initialized) {
+        set_process_priority(params.cpuparams.priority);
+        pimpl->threadpools.init(lctx, params);
+        pimpl->threadpools_initialized = true;
+    } else if (!pimpl->threadpools.attach(lctx, params)) {
+        release_context();
+        return false;
+    }
+    return true;
 }
 
 llama_model * common_init_result::model() {
@@ -1461,25 +2081,9 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
-
-    llama_context * lctx = res->context();
-    if (lctx == NULL) {
-        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return res;
-    }
-
+static bool common_prepare_context(common_init_result & res, common_params & params) {
+    auto * model = res.model();
+    auto * lctx = res.context();
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
@@ -1493,7 +2097,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
-            return res;
+            return false;
         }
 
         int err = llama_set_adapter_cvec(
@@ -1504,7 +2108,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 params.control_vector_layer_start,
                 params.control_vector_layer_end);
         if (err) {
-            return res;
+            return false;
         }
     }
 
@@ -1528,12 +2132,48 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (!ok) {
-            return res;
+            return false;
         }
     }
 
     if (!params.lora_init_without_apply) {
         common_set_adapter_lora(lctx, params.lora_adapters);
+    }
+
+    if (params.kv_paged_prealloc_max) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid_paged *>(llama_get_memory(lctx));
+        auto * paged = hybrid != nullptr
+            ? hybrid->get_mem_attn()
+            : dynamic_cast<llama_kv_cache_paged *>(llama_get_memory(lctx));
+        if (paged == nullptr) {
+            COM_ERR("%s", "paged KV max calibration requires paged memory\n");
+            return false;
+        }
+
+        const uint32_t target_tokens = params.n_ctx;
+        const bool reserved = paged->reserve(target_tokens);
+        if (!reserved) {
+            COM_ERR("%s: physical paged KV reserve could not reach ctx=%u\n",
+                    __func__, target_tokens);
+            return false;
+        }
+        const uint32_t blocks = (target_tokens + params.block_size - 1) / params.block_size;
+        if (blocks == 0) {
+            COM_ERR("%s", "paged KV max calibration found no usable GPU capacity\n");
+            return false;
+        }
+
+        const uint32_t calibrated_ctx = blocks * params.block_size;
+        lctx->set_n_ctx(calibrated_ctx);
+        params.n_ctx = calibrated_ctx;
+        params.n_gpu_blocks = blocks;
+        params.n_gpu_blocks_initial = std::min<uint32_t>(64, blocks);
+        params.n_gpu_blocks_growth = std::min<uint32_t>(64, blocks);
+        params.n_gpu_blocks_admission = blocks;
+        llama_perf_context_reset(lctx);
+        COM_INF("%s: calibrated paged KV capacity: ctx=%u, blocks=%u, initial=%u, growth=%u, admission=%u, dynamic=yes\n",
+                __func__, calibrated_ctx, blocks, params.n_gpu_blocks_initial,
+                params.n_gpu_blocks_growth, blocks);
     }
 
     if (params.warmup) {
@@ -1555,7 +2195,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (llama_model_has_encoder(model)) {
-            llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
+            if (llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size())) != 0) {
+                COM_ERR("%s", "encoder warmup failed\n");
+                return false;
+            }
             llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
             if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
                 decoder_start_token_id = bos;
@@ -1564,17 +2207,76 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.push_back(decoder_start_token_id);
         }
         if (llama_model_has_decoder(model)) {
-            llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+            if (llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch))) != 0) {
+                COM_ERR("%s", "decoder warmup failed\n");
+                return false;
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
 
         // reset samplers to reset RNG state after warmup to the seeded state
-        res->reset_samplers();
+        res.reset_samplers();
     }
 
+    return true;
+}
+
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    llama_context * lctx = res->context();
+    if (lctx == NULL) {
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (!common_prepare_context(*res, params)) {
+        res->release_context();
+    }
     return res;
+}
+
+void common_init_result::release_context() {
+    // Context destruction synchronizes while sampler buffers and adapters are still alive.
+    pimpl->context.reset();
+    pimpl->samplers_seq_config.clear();
+    pimpl->samplers.clear();
+}
+
+bool common_init_result::recreate_context(common_params & params) {
+    if (!pimpl->model || !pimpl->context_prepared || pimpl->context ||
+            params.fit_params || params.kv_paged || params.kv_paged_prealloc_max ||
+            params.speculative.draft.ctx_tgt || params.speculative.draft.ctx_dft ||
+            params.n_ctx <= 0 || params.n_parallel <= 0) {
+        COM_ERR("%s", "context recreation requires a released, initialized model and explicit non-paged parameters without fitting\n");
+        return false;
+    }
+    if (pimpl->threadpools_initialized && !pimpl->threadpools.can_attach(params)) {
+        COM_ERR("%s", "cannot recreate context with different CPU parameters\n");
+        return false;
+    }
+    if (params.split_mtp_weights != llama_model_mtp_weights_get_info(pimpl->model.get()).managed) {
+        COM_ERR("%s", "cannot change MTP weight ownership while recreating a context\n");
+        return false;
+    }
+    if (!create_context(params, common_context_params_to_llama(params)) ||
+            !common_prepare_context(*this, params)) {
+        release_context();
+        return false;
+    }
+    return true;
 }
 
 common_init_result::~common_init_result() = default;
@@ -1614,20 +2316,39 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
-    const auto capability = llama_memory_get_seq_rm_capability(mem);
-    if (capability.arbitrary_ranges) {
-        COM_TRC("%s", "the context supports arbitrary sequence removal\n");
-        return COMMON_CONTEXT_SEQ_RM_TYPE_PART;
-    }
-    if (capability.suffix_rollback_tokens > 0) {
+    if (llama_n_rs_seq(ctx) > 0) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
         return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
     }
-    if (capability.full_clear) {
-        COM_TRC("%s", "the context supports complete sequence removal only\n");
-        return COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+
+    llama_memory_clear(mem, true);
+
+    // eval 2 tokens to check if the context is compatible
+    std::vector<llama_token> tmp;
+    tmp.push_back(0);
+    tmp.push_back(0);
+
+    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    if (ret != 0) {
+        COM_ERR("llama_decode() failed: %d\n", ret);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        goto done;
     }
-    return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // try to remove the last tokens
+    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+        COM_TRC("%s", "the context does not support partial sequence removal\n");
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        goto done;
+    }
+
+done:
+    llama_memory_clear(mem, true);
+    llama_synchronize(ctx);
+
+    return res;
 }
 
 uint32_t common_context_seq_rm_max_rollback(llama_context * ctx) {
@@ -1773,6 +2494,252 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+bool common_context_is_adaptive(const common_params & params) {
+    return params.ctx_size_mtp > 0;
+}
+
+int64_t common_context_mtp_limit(const common_params & params) {
+    return params.mtp_max_tokens > 0 ? params.mtp_max_tokens : params.ctx_size_mtp;
+}
+
+int64_t common_context_mtp_short_limit(const common_params & params) {
+    return params.mtp_short_max_tokens > 0 ? params.mtp_short_max_tokens : params.ctx_size_mtp_short;
+}
+
+int64_t common_context_output_reserve(
+        const common_params & params, int32_t request_n_predict, bool generates_output) {
+    if (!generates_output) {
+        return 0;
+    }
+
+    const int64_t n_predict = request_n_predict == -1 ? params.n_predict : request_n_predict;
+    if (n_predict >= 0) {
+        return n_predict;
+    }
+
+    // Keep the request's unlimited generation semantics; this reserve only selects a profile.
+    return 4096;
+}
+
+common_context_budget common_context_budget_for_task(
+        const common_params & params, int64_t prompt_tokens, int32_t request_n_predict, bool generates_output) {
+    if (prompt_tokens < 0) {
+        throw std::invalid_argument("adaptive context prompt token count must be non-negative");
+    }
+
+    const int64_t output_reserve = common_context_output_reserve(params, request_n_predict, generates_output);
+    if (prompt_tokens > std::numeric_limits<int64_t>::max() - output_reserve) {
+        throw std::invalid_argument("adaptive context token budget overflow");
+    }
+
+    return {
+        prompt_tokens,
+        output_reserve,
+        prompt_tokens + output_reserve,
+    };
+}
+
+common_context_profile common_context_profile_for_budget(
+        const common_params & params, int64_t budget) {
+    if (!common_context_is_adaptive(params)) {
+        return COMMON_CONTEXT_PROFILE_LONG;
+    }
+    if (params.ctx_size_mtp_short > 0 && budget <= common_context_mtp_short_limit(params)) {
+        return COMMON_CONTEXT_PROFILE_MTP_SHORT;
+    }
+    if (budget <= common_context_mtp_limit(params)) {
+        return COMMON_CONTEXT_PROFILE_MTP;
+    }
+    return COMMON_CONTEXT_PROFILE_LONG;
+}
+
+std::string common_context_adaptive_error(const common_params & params, int32_t effective_long_ctx) {
+    if (params.ctx_size_mtp < 0) {
+        return "--ctx-size-mtp must be non-negative";
+    }
+    if (params.mtp_max_tokens < 0) {
+        return "--mtp-max-tokens must be non-negative";
+    }
+    if (params.ctx_size_mtp_short < 0) {
+        return "--ctx-size-mtp-short must be non-negative";
+    }
+    if (params.mtp_short_max_tokens < 0) {
+        return "--mtp-short-max-tokens must be non-negative";
+    }
+    if (params.spec_draft_n_max_short < 0) {
+        return "--spec-draft-n-max-short must be non-negative";
+    }
+    if (!common_context_is_adaptive(params)) {
+        if (params.mtp_max_tokens != 0) {
+            return "--mtp-max-tokens requires --ctx-size-mtp";
+        }
+        if (params.ctx_size_mtp_short != 0) {
+            return "--ctx-size-mtp-short requires --ctx-size-mtp";
+        }
+        if (params.mtp_short_max_tokens != 0) {
+            return "--mtp-short-max-tokens requires --ctx-size-mtp-short";
+        }
+        return "";
+    }
+
+    if (params.ctx_size_mtp_short == 0 && params.mtp_short_max_tokens > 0) {
+        return "--mtp-short-max-tokens requires --ctx-size-mtp-short";
+    }
+
+    const int64_t mtp_limit = common_context_mtp_limit(params);
+    if (mtp_limit <= 0 || mtp_limit > params.ctx_size_mtp) {
+        return "--mtp-max-tokens must satisfy 0 < limit <= --ctx-size-mtp";
+    }
+
+    if (params.ctx_size_mtp_short > 0) {
+        const int64_t short_limit = common_context_mtp_short_limit(params);
+        if (short_limit <= 0 || short_limit > params.ctx_size_mtp_short) {
+            return "--mtp-short-max-tokens must satisfy 0 < limit <= --ctx-size-mtp-short";
+        }
+        if (params.ctx_size_mtp_short > params.ctx_size_mtp) {
+            return "--ctx-size-mtp-short must not exceed --ctx-size-mtp";
+        }
+        if (short_limit > mtp_limit) {
+            return "--mtp-short-max-tokens must not exceed --mtp-max-tokens";
+        }
+        if (params.spec_draft_n_max_short == 0) {
+            return "--spec-draft-n-max-short must be positive";
+        }
+    }
+
+    const int64_t long_ctx = effective_long_ctx > 0 ? effective_long_ctx : params.n_ctx;
+    if (long_ctx < 0) {
+        return "--ctx-size must be non-negative when adaptive context is enabled";
+    }
+    if (long_ctx > 0 && params.ctx_size_mtp > long_ctx) {
+        return "--ctx-size-mtp must not exceed the long context size";
+    }
+    if (params.n_parallel > 1) {
+        return "adaptive context requires --parallel 1";
+    }
+    if (params.fit_params) {
+        return "adaptive context requires --fit off";
+    }
+    if (params.no_alloc) {
+        return "adaptive context requires allocated model tensors (no-alloc is unsupported)";
+    }
+    if (params.kv_paged || params.kv_paged_dynamic || params.kv_paged_prealloc_max) {
+        return "adaptive context requires traditional KV (paged KV is unsupported)";
+    }
+    if (params.kv_unified_per_slot > 0) {
+        return "adaptive context does not support --kv-unified-per-slot";
+    }
+    const size_t n_devices = std::count_if(params.devices.begin(), params.devices.end(), [](ggml_backend_dev_t device) {
+        return device != nullptr;
+    });
+    const bool cpu_check = params.n_gpu_layers == 0;
+    if (cpu_check) {
+        if (n_devices > 0 || (params.devices.size() > 1)) {
+            return "CPU adaptive checks require --gpu-layers 0 without GPU devices";
+        }
+    } else {
+        if ((params.devices.size() == 1 && params.devices.front() == nullptr) ||
+                n_devices > 1 || params.devices.size() > n_devices + 1) {
+            return "adaptive context requires one CUDA device";
+        }
+        if (n_devices == 1) {
+            const ggml_backend_dev_t device = *std::find_if(
+                params.devices.begin(), params.devices.end(), [](ggml_backend_dev_t value) { return value != nullptr; });
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+            if (!reg || std::string(ggml_backend_reg_name(reg)) != "CUDA") {
+                return "adaptive context requires a CUDA device";
+            }
+        }
+    }
+    if (!params.mmproj.path.empty() || !params.mmproj.url.empty() || !params.mmproj.hf_repo.empty() || !params.mmproj.docker_repo.empty()) {
+        return "adaptive context does not support multimodal models";
+    }
+    if (!params.lora_adapters.empty() || !params.control_vectors.empty()) {
+        return "adaptive context does not support LoRA or control vectors";
+    }
+    if (params.sleep_idle_seconds > 0) {
+        return "adaptive context does not support automatic sleep";
+    }
+    if (std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type type) {
+            return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        })) {
+        return "adaptive context supports only draft-mtp speculative decoding";
+    }
+    if (std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == params.speculative.types.end()) {
+        return "adaptive context requires draft-mtp speculative decoding";
+    }
+    if (params.speculative.has_synth()) {
+        return "adaptive context does not support synthetic speculative decoding";
+    }
+    if (!params.speculative.draft.mparams.empty()) {
+        return "adaptive context requires the resident model MTP head; external draft models are unsupported";
+    }
+
+    return "";
+}
+
+std::string common_context_adaptive_normalize(common_params & params, int32_t effective_long_ctx) {
+    const std::string error = common_context_adaptive_error(params, effective_long_ctx);
+    if (!error.empty()) {
+        return error;
+    }
+    if (common_context_is_adaptive(params)) {
+        params.split_mtp_weights = true;
+    }
+    return "";
+}
+
+std::string common_context_prepare_devices(common_params & params) {
+    if (!common_context_is_adaptive(params)) {
+        return "";
+    }
+
+    const bool cpu_check = params.n_gpu_layers == 0;
+    const size_t n_devices = std::count_if(params.devices.begin(), params.devices.end(), [](ggml_backend_dev_t device) {
+        return device != nullptr;
+    });
+    if (cpu_check) {
+        if (n_devices > 0 || params.devices.size() > 1) {
+            return "CPU adaptive checks require --gpu-layers 0 without GPU devices";
+        }
+        params.devices = { nullptr };
+        return "";
+    }
+
+    if (params.devices.empty()) {
+        ggml_backend_load_all();
+        ggml_backend_dev_t cuda = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            const auto device = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+            if (reg && std::string(ggml_backend_reg_name(reg)) == "CUDA") {
+                cuda = device;
+                break;
+            }
+        }
+        if (!cuda) {
+            return "adaptive context requires a CUDA device; use --gpu-layers 0 only for CPU checks";
+        }
+        params.devices = { cuda, nullptr };
+        return "";
+    }
+
+    if (n_devices != 1 || params.devices.size() != 2 || params.devices.back() != nullptr) {
+        return "adaptive context requires exactly one selected CUDA device";
+    }
+    const auto device = params.devices.front();
+    ggml_backend_reg_t reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+            !reg || std::string(ggml_backend_reg_name(reg)) != "CUDA") {
+        return "adaptive context requires a selected CUDA device";
+    }
+    return "";
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
@@ -1784,10 +2751,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
+    mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.paged_attn_cuda = params.paged_attn_cuda;
+    mparams.split_mtp_weights = params.split_mtp_weights;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1818,6 +2788,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+    cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;
@@ -1842,6 +2813,22 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.kv_paged          = params.kv_paged;
+    cparams.kv_paged_dynamic  = params.kv_paged_dynamic;
+    cparams.block_size        = params.block_size;
+    cparams.n_gpu_blocks      = params.n_gpu_blocks;
+    cparams.n_gpu_blocks_initial = params.kv_paged_dynamic && params.n_gpu_blocks_initial == 0
+        ? params.n_gpu_blocks
+        : params.n_gpu_blocks_initial;
+    cparams.n_gpu_blocks_growth = params.n_gpu_blocks_growth;
+    cparams.n_cpu_blocks      = params.n_cpu_blocks;
+    cparams.kv_paged_watermark = params.kv_paged_watermark;
+    cparams.snapkv_enabled        = params.snapkv_observation_window > 0;
+    cparams.snapkv_observation_window = params.snapkv_observation_window;
+    cparams.snapkv_recent_tokens  = params.snapkv_recent_tokens;
+    cparams.snapkv_pinned_tokens  = params.snapkv_pinned_tokens;
+    cparams.snapkv_retention      = params.snapkv_retention;
+    cparams.snapkv_budget_blocks  = params.snapkv_budget_blocks;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
@@ -1852,6 +2839,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     return cparams;
 }
+
+//
+// Threadpool utils
+//
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {
     struct ggml_threadpool_params tpp;
@@ -1867,6 +2858,79 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
     tpp.strict_cpu = params.strict_cpu;
 
     return tpp;
+}
+
+common_threadpools::~common_threadpools() {
+    if (!free_fn) {
+        return;
+    }
+    free_fn(threadpool);
+    free_fn(threadpool_batch);
+}
+
+void common_threadpools::init(llama_context * ctx, const common_params & params) {
+    GGML_ASSERT(!threadpool);
+    GGML_ASSERT(!threadpool_batch);
+
+    cpuparams = params.cpuparams;
+    cpuparams_batch = params.cpuparams_batch;
+
+    COM_INF("llama threadpool init, n_threads = %d\n", (int) params.cpuparams.n_threads);
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        COM_WRN("%s", "no CPU backend found\n");
+        return;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+    auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+
+    struct ggml_threadpool_params tpp_batch =
+            ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+    struct ggml_threadpool_params tpp =
+            ggml_threadpool_params_from_cpu_params(params.cpuparams);
+
+    // each pool needs to match the respective n_threads exactly
+    // see: https://github.com/ggml-org/llama.cpp/pull/27138#issuecomment-5332307332
+    if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
+        threadpool_batch = ggml_threadpool_new_fn(&tpp_batch);
+        if (!threadpool_batch) {
+            COM_WRN("batch threadpool create failed : n_threads %d\n", tpp_batch.n_threads);
+            return;
+        }
+
+        // start the non-batch threadpool in the paused state
+        tpp.paused = true;
+    }
+
+    threadpool = ggml_threadpool_new_fn(&tpp);
+    if (!threadpool) {
+        COM_WRN("threadpool create failed : n_threads %d\n", tpp.n_threads);
+        free_fn(threadpool_batch);
+        threadpool_batch = nullptr;
+        return;
+    }
+
+    llama_attach_threadpool(ctx, threadpool, threadpool_batch);
+}
+
+bool common_threadpools::can_attach(const common_params & params) const {
+    auto original = ggml_threadpool_params_from_cpu_params(cpuparams);
+    auto original_batch = ggml_threadpool_params_from_cpu_params(cpuparams_batch);
+    auto requested = ggml_threadpool_params_from_cpu_params(params.cpuparams);
+    auto requested_batch = ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+    return ggml_threadpool_params_match(&original, &requested) &&
+           ggml_threadpool_params_match(&original_batch, &requested_batch);
+}
+
+bool common_threadpools::attach(llama_context * ctx, const common_params & params) {
+    if (!can_attach(params)) {
+        COM_ERR("%s", "cannot reattach threadpools with different CPU parameters\n");
+        return false;
+    }
+    llama_attach_threadpool(ctx, threadpool, threadpool_batch);
+    return true;
 }
 
 //
@@ -2294,8 +3358,35 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+// Cross-context state must agree on the effective attention semantics, not the allocation size.
+std::string common_prompt_cache_layout(llama_context * ctx) {
+    const auto p = llama_get_prompt_cache_profile(ctx);
+    common_json layout = {
+        {"ctx_type", p.ctx_type}, {"rope_type", p.rope_scaling_type},
+        {"rope_base", p.rope_freq_base}, {"rope_scale", p.rope_freq_scale},
+        {"yarn_orig", p.n_ctx_orig_yarn}, {"yarn_ext", p.yarn_ext_factor},
+        {"yarn_attn", p.yarn_attn_factor}, {"yarn_fast", p.yarn_beta_fast}, {"yarn_slow", p.yarn_beta_slow},
+        {"causal", p.causal_attn}, {"kv_unified", p.kv_unified}, {"kv_paged", p.kv_paged},
+        {"nextn_layer", p.nextn_layer_offset}, {"state_version", LLAMA_STATE_SEQ_VERSION},
+        {"session_version", LLAMA_SESSION_VERSION},
+        {"flash_attn", p.flash_attn},
+    };
+    layout["type_k"] = p.type_k;
+    layout["type_v"] = p.type_v;
+    layout["type_k_aux"] = p.type_k_aux;
+    layout["type_v_aux"] = p.type_v_aux;
+    layout["kv_layout_known"] = p.kv_layout_known;
+    if (!p.kv_layout_known) {
+        // Unknown memory layouts remain bound to the original context lifetime in legacy mode.
+        layout["source_context"] = p.context_instance;
+        layout["source_capacity"] = llama_n_ctx_seq(ctx);
+    }
+    return layout.dump();
+}
+
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    return sizeof(*this) + data_tgt.capacity() + data_dft.capacity() + data_spec.capacity() +
+        layout_tgt.capacity() + layout_dft.capacity();
 }
 
 bool common_prompt_checkpoint::empty() const {
@@ -2304,13 +3395,9 @@ bool common_prompt_checkpoint::empty() const {
 
 void common_prompt_checkpoint::clear() {
     n_tokens = 0;
-
-    pos_min = 0;
-    pos_max = 0;
-
-    data_tgt.clear();
-    data_dft.clear();
-    data_spec.clear();
+    pos_min = pos_max = -1;
+    clear_tgt();
+    clear_dft();
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2336,12 +3423,15 @@ common_prompt_checkpoint_result common_prompt_checkpoint::update_tgt(
         return { COMMON_PROMPT_CHECKPOINT_UNSUPPORTED, 0 };
     }
 
-    try {
-        data_tgt.resize(ckpt_size);
-    } catch (const std::bad_alloc &) {
-        data_tgt.clear();
-        return { COMMON_PROMPT_CHECKPOINT_ALLOCATION_FAILED, 0 };
-    }
+    model_tgt = llama_get_model(ctx);
+    instance_tgt = llama_model_mtp_weights_get_info(model_tgt).model_instance;
+    layout_tgt = common_prompt_cache_layout(ctx);
+    const auto profile = llama_get_prompt_cache_profile(ctx, seq_id);
+    attention_tgt = {{profile.attn_min, profile.attn_max, profile.attn_aux_min, profile.attn_aux_max}};
+    retained_tgt = profile.partial_retained_bounds;
+    retained_count_tgt = profile.partial_retained_known ? profile.partial_retained_count : UINT32_MAX;
+    flags_tgt = flags;
+    data_tgt.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -2357,6 +3447,7 @@ common_prompt_checkpoint_result common_prompt_checkpoint::update_dft(
         llama_state_seq_flags flags) {
     data_dft.clear();
     if (ctx == nullptr) {
+        clear_dft();
         return { COMMON_PROMPT_CHECKPOINT_SKIPPED, 0 };
     }
 
@@ -2365,12 +3456,16 @@ common_prompt_checkpoint_result common_prompt_checkpoint::update_dft(
         return { COMMON_PROMPT_CHECKPOINT_UNSUPPORTED, 0 };
     }
 
-    try {
-        data_dft.resize(ckpt_size);
-    } catch (const std::bad_alloc &) {
-        data_dft.clear();
-        return { COMMON_PROMPT_CHECKPOINT_ALLOCATION_FAILED, 0 };
-    }
+    model_dft = llama_get_model(ctx);
+    instance_dft = llama_model_mtp_weights_get_info(model_dft).model_instance;
+    layout_dft = common_prompt_cache_layout(ctx);
+    const auto profile = llama_get_prompt_cache_profile(ctx, seq_id);
+    attention_dft = {{profile.attn_min, profile.attn_max, profile.attn_aux_min, profile.attn_aux_max}};
+    retained_dft = profile.partial_retained_bounds;
+    retained_count_dft = profile.partial_retained_known ? profile.partial_retained_count : UINT32_MAX;
+    draft_base_valid = !llama_model_mtp_weights_get_info(model_dft).managed;
+    flags_dft = flags;
+    data_dft.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -2418,11 +3513,95 @@ common_prompt_checkpoint_result common_prompt_checkpoint::load_dft(
     return { COMMON_PROMPT_CHECKPOINT_SUCCESS, n };
 }
 
+static bool checkpoint_attention_available(llama_context * ctx, llama_seq_id seq_id,
+        const std::array<llama_pos, 8> & saved, uint32_t count, bool exact_start = false) {
+    const auto p = llama_get_prompt_cache_profile(ctx, seq_id);
+    if (!p.partial_retained_known || count != p.partial_retained_count) {
+        return false;
+    }
+    for (size_t i = 0; i < 2*count; i += 2) {
+        const auto & current = p.partial_retained_bounds;
+        if (saved[i + 1] >= 0 && (current[i] < 0 || current[i] > saved[i] || current[i + 1] < saved[i + 1] ||
+                (exact_start && current[i] != saved[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool common_prompt_checkpoint::compatible_tgt(llama_context * ctx) const {
+    return ctx && model_tgt == llama_get_model(ctx) &&
+        instance_tgt == llama_model_mtp_weights_get_info(model_tgt).model_instance &&
+        layout_tgt == common_prompt_cache_layout(ctx);
+}
+
+bool common_prompt_checkpoint::compatible_dft(llama_context * ctx) const {
+    return ctx && model_dft == llama_get_model(ctx) &&
+        instance_dft == llama_model_mtp_weights_get_info(model_dft).model_instance &&
+        layout_dft == common_prompt_cache_layout(ctx);
+}
+
+void common_prompt_checkpoint::update_spec(common_speculative * spec, llama_seq_id seq_id) {
+    common_speculative_get_state(spec, seq_id, data_spec);
+    draft_base_valid = model_dft && (!llama_model_mtp_weights_get_info(model_dft).managed ||
+        common_speculative_is_ready(spec, seq_id, pos_max + 1));
+}
+
+bool common_prompt_checkpoint::restore_tgt(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (!compatible_tgt(ctx) || data_tgt.empty() || flags != flags_tgt ||
+            ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && !checkpoint_attention_available(ctx, seq_id, retained_tgt, retained_count_tgt))) {
+        return false;
+    }
+    return llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags) == data_tgt.size();
+}
+
+common_checkpoint_restore common_prompt_checkpoint::restore_dft(
+        llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (!ctx) { return common_checkpoint_restore::restored; }
+    if (data_dft.empty()) { return common_checkpoint_restore::missing_base; }
+    if (!compatible_dft(ctx) || flags != flags_dft) { return common_checkpoint_restore::incompatible; }
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
+            (!draft_base_valid || !checkpoint_attention_available(ctx, seq_id, retained_dft, retained_count_dft))) {
+        return common_checkpoint_restore::missing_base;
+    }
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && llama_model_mtp_weights_get_info(model_dft).managed) {
+        // Zero retained components does not imply empty attention. A plain-KV
+        // blob serializes attention, but its zero-cell reader leaves live cells alone.
+        const bool empty_base = llama_get_prompt_cache_profile(ctx).kv_layout_known &&
+            attention_dft[1] < 0 && attention_dft[3] < 0;
+        if (empty_base) {
+            // A proven bootstrap checkpoint owns an empty attention base, including after later draft work.
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1)) { return common_checkpoint_restore::failed; }
+        } else {
+            if (!checkpoint_attention_available(ctx, seq_id, retained_dft, retained_count_dft, true)) {
+                return common_checkpoint_restore::missing_base;
+            }
+        }
+    }
+    return llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags) == data_dft.size()
+        ? common_checkpoint_restore::restored : common_checkpoint_restore::failed;
+}
+
 void common_prompt_checkpoint::clear_tgt() {
+    model_tgt = nullptr;
+    instance_tgt = 0;
+    layout_tgt.clear();
+    attention_tgt = {{-1, -1, -1, -1}};
+    retained_tgt.fill(-1);
+    retained_count_tgt = UINT32_MAX;
+    flags_tgt = LLAMA_STATE_SEQ_FLAGS_NONE;
     data_tgt.clear();
 }
 
 void common_prompt_checkpoint::clear_dft() {
+    model_dft = nullptr;
+    instance_dft = 0;
+    layout_dft.clear();
+    attention_dft = {{-1, -1, -1, -1}};
+    retained_dft.fill(-1);
+    retained_count_dft = UINT32_MAX;
+    draft_base_valid = false;
+    flags_dft = LLAMA_STATE_SEQ_FLAGS_NONE;
     data_dft.clear();
     data_spec.clear();
 }

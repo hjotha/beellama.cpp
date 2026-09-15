@@ -2,17 +2,25 @@
 #include "common.h"
 #include "log.h"
 #include "llama-cpp.h"
+#include "sampling.h"
+#include "speculative.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-model.h"
+#include "../src/llama-ext.h"
 
-#include <clocale>
 #include <algorithm>
-#include <chrono>
+#include <clocale>
 #include <cctype>
+#include <chrono>
 #include <cmath>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
+#include <set>
+#include <string>
 #include <vector>
 
 struct llama_batch_ptr {
@@ -1052,7 +1060,9 @@ static bool test_tail_state_v1_compatibility(llama_model * model, const common_p
 // - decode the last token
 // - generate n_predict tokens
 static llama_tokens test_baseline(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_seq_max = 2;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
     if (!ctx) {
         LOG_ERR("%s: failed to create baseline context\n", __func__);
         return {};
@@ -1109,7 +1119,7 @@ static bool test_seq_rm_isolated(
     for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
         llama_batch_ptr batch(n_tokens, 0, 1);
         for (size_t i = 0; i < n_tokens; ++i) {
-            common_batch_add(batch.get(), tokens[i], i, { seq_id }, false);
+            common_batch_add(batch.get(), tokens[i], i, { seq_id }, i == n_tokens - 1);
         }
 
         if (llama_decode(ctx.get(), batch.get())) {
@@ -1167,7 +1177,9 @@ static bool test_seq_rm_isolated(
 // - replay the last prompt token
 // - generate n_predict tokens and compare against expected result
 static bool test_state_load(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_seq_max = 2;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
     if (!ctx) {
         LOG_ERR("%s: failed to create state-load context\n", __func__);
         return false;
@@ -1377,38 +1389,171 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 }
 
 
-int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
+// Test 6/7: seq copy (scatter)
+// - decode the same prefix on two sequences, interleaving seq 0 cells between the seq 1 cells
+// - save the seq 1 state, free the interleaved seq 0 cells, and restore via the given io path
+// - the restore destination is non-contiguous: scatter reads are batched per contiguous run
+// - save again on the host and compare the two blobs byte for byte
+static bool test_seq_cp_scatter(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, int test_num, bool on_device) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx      = 256;
+    params_ctx.n_seq_max  = 2;
+    params_ctx.kv_unified = true;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
 
-    common_params params;
-    params.prompt = "";
-    params.n_batch = 100;
-    params.out_file = "dump_state.bin";
-    params.sampling.seed = 1234;
+    LOG("\n=== Test %d: seq copy (%s, scatter) ===\n", test_num, on_device ? "device" : "host");
 
-    common_init();
+    const uint32_t flags = on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
-        return 1;
+    auto decode_one = [&](llama_token tok, int pos, llama_seq_id seq) {
+        llama_batch_ptr batch(1, 0, 1);
+        common_batch_add(batch.get(), tok, pos, { seq }, true);
+        return llama_decode(ctx.get(), batch.get()) == 0;
+    };
+
+    // seq 0 cells 0,1,4 interleave the seq 1 cells 2,3,5
+    if (!decode_one(tokens[0], 0, 0) ||
+        !decode_one(tokens[1], 1, 0) ||
+        !decode_one(tokens[0], 0, 1) ||
+        !decode_one(tokens[1], 1, 1) ||
+        !decode_one(tokens[2], 2, 0) ||
+        !decode_one(tokens[2], 2, 1)) {
+        LOG_ERR("%s: failed to build interleaved state\n", __func__);
+        return false;
     }
 
-    if (params.n_parallel == 1) {
-        LOG_TRC("%s: n_parallel == 1, enabling unified kv cache\n", __func__);
-        params.kv_unified = true;
+    const auto get_seq_state = [&](llama_seq_id seq_id, uint32_t fl, std::vector<uint8_t> & state) {
+        const size_t state_size = llama_state_seq_get_size_ext(ctx.get(), seq_id, fl);
+        if (state_size == 0) {
+            LOG_ERR("%s: sequence state is empty\n", __func__);
+            return false;
+        }
+
+        state.resize(state_size);
+        const size_t ncopy = llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), seq_id, fl);
+        if (ncopy != state.size()) {
+            LOG_ERR("%s: sequence state length %zu does not match expected length %zu\n",
+                    __func__, ncopy, state.size());
+            return false;
+        }
+
+        return true;
+    };
+
+    // host blob: contains the KV data, used for the byte-for-byte comparison
+    std::vector<uint8_t> state_before;
+    if (!get_seq_state(1, LLAMA_STATE_SEQ_FLAGS_NONE, state_before)) {
+        return false;
     }
 
-    if (params.n_predict < 0) {
-        params.n_predict = 16;
+    // save via the io path under test
+    std::vector<uint8_t> state_save;
+    if (!get_seq_state(1, flags, state_save)) {
+        return false;
+    }
+    LOG_TRC("%s: seq 1 saved via %s, %zu bytes\n", __func__, on_device ? "device" : "host", state_save.size());
+
+    // free seq 0's cells so the ring is fragmented: the restore destination (seq 1's interleaved cells) stays non-contiguous
+    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
+        LOG_ERR("%s: failed to remove sequence 0\n", __func__);
+        return false;
     }
 
-    ggml_backend_load_all();
+    // restore via the io path under test
+    const size_t nset = llama_state_seq_set_data_ext(ctx.get(), state_save.data(), state_save.size(), 1, flags);
+    if (nset != state_save.size()) {
+        LOG_ERR("%s: seq set data length %zu does not match expected length %zu\n", __func__, nset, state_save.size());
+        return false;
+    }
+    LOG_TRC("%s: seq 1 restored via %s, %zu bytes\n", __func__, on_device ? "device" : "host", nset);
+
+    std::vector<uint8_t> state_after;
+    if (!get_seq_state(1, LLAMA_STATE_SEQ_FLAGS_NONE, state_after)) {
+        return false;
+    }
+
+    // the blob is serialized in sequence cell order, so identical bytes iff the restore wrote the same KV
+    if (state_before.size() != state_after.size() || memcmp(state_before.data(), state_after.data(), state_before.size()) != 0) {
+        LOG_ERR("\n%s: error: restored KV state is not byte-identical to the saved state\n", __func__);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
+// Test 8: state blob round-trip
+// compares blobs rather than generated text: a partially restored cell still decodes to plausible tokens
+static bool test_state_roundtrip(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+
+    LOG("\n=== Test 8: state blob round-trip ===\n");
+
+    if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
+        LOG_ERR("\n%s: failed to decode prompt\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob_a(llama_state_seq_get_size(ctx.get(), 0));
+    const size_t n_a = llama_state_seq_get_data(ctx.get(), blob_a.data(), blob_a.size(), 0);
+    if (n_a != blob_a.size()) {
+        LOG_ERR("\n%s: saved %zu bytes, expected %zu\n", __func__, n_a, blob_a.size());
+        return false;
+    }
+
+    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
+        LOG_ERR("\n%s: failed to erase seq 0\n", __func__);
+        return false;
+    }
+
+    if (llama_state_seq_set_data(ctx.get(), blob_a.data(), blob_a.size(), 0) != blob_a.size()) {
+        LOG_ERR("\n%s: failed to restore seq 0\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob_b(llama_state_seq_get_size(ctx.get(), 0));
+    const size_t n_b = llama_state_seq_get_data(ctx.get(), blob_b.data(), blob_b.size(), 0);
+    if (n_b != n_a) {
+        LOG_ERR("\n%s: re-saved %zu bytes, expected %zu\n", __func__, n_b, n_a);
+        return false;
+    }
+
+    size_t n_diff = 0;
+    size_t i_diff = 0;
+    for (size_t i = 0; i < n_a; i++) {
+        if (blob_a[i] != blob_b[i]) {
+            if (n_diff == 0) {
+                i_diff = i;
+            }
+            n_diff++;
+        }
+    }
+
+    if (n_diff > 0) {
+        LOG_ERR("\n%s: state changed across a restore: %zu of %zu bytes differ, first at offset %zu\n",
+                __func__, n_diff, n_a, i_diff);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
+// Run the full save/load test suite (tests 1-8) for a single model.
+// Returns true if all tests pass, false otherwise.
+static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
+    struct common_params params = base_params;
+    params.model.path = model_path;
 
     auto llama_init = common_init_from_params(params, true);
     auto * model = llama_init->model();
 
     if (model == nullptr) {
-        LOG_ERR("%s: failed to init\n", __func__);
-        return 1;
+        LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
+        return false;
     }
 
     GGML_ASSERT(llama_init->context() == nullptr);
@@ -1445,7 +1590,7 @@ int main(int argc, char ** argv) {
     // Test 1: baseline (saves state to disk)
     auto result_baseline = test_baseline(model, params, tokens);
     if (result_baseline.empty()) {
-        return 1;
+        return false;
     }
     if (!test_kvarn_partial_checkpoint_history(model, params, tokens)) {
         return 1;
@@ -1476,25 +1621,1050 @@ int main(int argc, char ** argv) {
     }
     // Test 2: sequence removal isolation
     if (!test_seq_rm_isolated(model, params, tokens)) {
-        return 1;
+        return false;
     }
 
     // Test 3: state load
     if (!test_state_load(model, params, tokens, result_baseline)) {
-        return 1;
+        return false;
     }
 
     // Test 4: seq copy (host)
     if (!test_seq_cp_host(model, params, tokens, result_baseline)) {
-        return 1;
+        return false;
     }
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
-        return 1;
+        return false;
+    }
+
+    // Test 6: seq copy (host, scatter)
+    if (!test_seq_cp_scatter(model, params, tokens, 6, false)) {
+        return false;
+    }
+
+    // Test 7: seq copy (device, scatter)
+    if (!test_seq_cp_scatter(model, params, tokens, 7, true)) {
+        return false;
+    }
+
+    // Test 8: state blob round-trip
+    if (!test_state_roundtrip(model, params, tokens)) {
+        return false;
     }
 
     LOG("\nAll tests passed.\n");
 
-    return 0;
+    return true;
+}
+
+
+
+
+struct weight_binding {
+    ggml_tensor * tensor;
+    ggml_backend_buffer_t buffer;
+    void * data;
+    size_t bytes;
+};
+
+static bool weights_bound(const std::vector<weight_binding> & weights, bool original) {
+    for (const auto & w : weights) {
+        if (!w.tensor->buffer || !w.tensor->data || ggml_nbytes(w.tensor) != w.bytes ||
+                (original && (w.tensor->buffer != w.buffer || w.tensor->data != w.data))) {
+            LOG_ERR("lifecycle: weight binding changed for %s\n", w.tensor->name);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool weights_hash(const std::vector<weight_binding> & weights, uint64_t & hash) {
+    if (!weights_bound(weights, false)) {
+        return false;
+    }
+    std::vector<uint8_t> block(4 * 1024 * 1024);
+    hash = 14695981039346656037ULL;
+    for (const auto & w : weights) {
+        for (size_t offset = 0; offset < w.bytes;) {
+            const size_t size = std::min(block.size(), w.bytes - offset);
+            ggml_backend_tensor_get(w.tensor, block.data(), offset, size);
+            for (size_t i = 0; i < size; ++i) {
+                hash = (hash ^ block[i]) * 1099511628211ULL;
+            }
+            offset += size;
+        }
+    }
+    return true;
+}
+
+static bool mtp_unbound(llama_model * model, const std::vector<weight_binding> & weights) {
+    const auto info = llama_model_mtp_weights_get_info(model);
+    if (info.resident || info.allocated_bytes || info.gpu_allocated_bytes || info.host_bytes == 0) {
+        LOG_ERR("lifecycle: MTP allocations survived eviction\n");
+        return false;
+    }
+    for (const auto & w : weights) {
+        if (w.tensor->buffer || w.tensor->data || w.tensor->extra) {
+            LOG_ERR("lifecycle: stale MTP binding %s\n", w.tensor->name);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool test_mtp_carry(common_init_result & init, common_speculative_ptr & spec,
+        llama_context * draft, const common_params & params, const llama_tokens & tokens,
+        llama_tokens * proposals = nullptr) {
+    auto * target = init.context();
+    llama_synchronize(target);
+    llama_synchronize(draft);
+    const auto pos = llama_memory_seq_pos_max(llama_get_memory(target), 0);
+    std::vector<uint8_t> carry;
+    if (!common_speculative_get_state(spec.get(), 0, carry) || carry.empty() || pos < 0) {
+        LOG_ERR("carry: no valid MTP state after prefill\n");
+        return false;
+    }
+    int rejected = 0;
+    for (int fault = 0; fault < 8; ++fault) {
+        auto invalid = carry;
+        if (fault == 0) {
+            invalid[0] ^= 0xff;
+        } else if (fault == 1) {
+            invalid.pop_back();
+        } else if (fault == 3) {
+            const float value = std::numeric_limits<float>::quiet_NaN();
+            std::memcpy(invalid.data() + invalid.size() - sizeof(value), &value, sizeof(value));
+        } else if (fault == 4) {
+            invalid[sizeof(uint32_t)] ^= 1;
+        } else if (fault == 5) {
+            const uint32_t value = std::numeric_limits<uint32_t>::max();
+            std::memcpy(invalid.data() + 2 * sizeof(uint32_t), &value, sizeof(value));
+        } else if (fault == 6) {
+            const uint32_t value = pos + 2;
+            std::memcpy(invalid.data() + 3 * sizeof(uint32_t), &value, sizeof(value));
+        } else if (fault == 7) {
+            invalid.clear();
+        }
+        if (common_speculative_set_state(spec.get(), 0, invalid, fault == 2 ? pos + 1 : fault == 5 ? -1 : pos)) {
+            LOG_ERR("carry: invalid state was accepted\n");
+            return false;
+        }
+        ++rejected;
+        std::vector<uint8_t> after;
+        if (!common_speculative_get_state(spec.get(), 0, after) || after != carry) {
+            LOG_ERR("carry: failed import changed the valid state\n");
+            return false;
+        }
+    }
+    if (common_speculative_set_state(spec.get(), -1, carry, pos) ||
+            common_speculative_set_state(spec.get(), 1, carry, pos)) {
+        LOG_ERR("carry: invalid sequence was accepted\n");
+        return false;
+    }
+    rejected += 2;
+    std::vector<uint8_t> empty_test{1};
+    if (!common_speculative_set_state(spec.get(), 0, {}) ||
+            common_speculative_get_state(spec.get(), 0, empty_test) || !empty_test.empty() ||
+            common_speculative_is_ready(spec.get(), 0, pos + 1) ||
+            !common_speculative_set_state(spec.get(), 0, carry, pos) ||
+            !common_speculative_is_ready(spec.get(), 0, pos + 1)) {
+        LOG_ERR("carry: explicit empty reset failed\n");
+        return false;
+    }
+
+    std::vector<uint8_t> kv(llama_state_seq_get_size(draft, 0));
+    if (kv.empty() || llama_state_seq_get_data(draft, kv.data(), kv.size(), 0) != kv.size()) {
+        return false;
+    }
+    const auto next = common_sampler_sample(init.sampler(0), target, -1);
+    const auto propose = [&]() {
+        llama_tokens result;
+        auto & dp = common_speculative_get_draft_params(spec.get(), 0);
+        dp.drafting = true;
+        dp.pos0 = pos + 1;
+        dp.id_last = next;
+        dp.prompt = &tokens;
+        dp.result = &result;
+        common_speculative_draft(spec.get());
+        dp.prompt = nullptr;
+        dp.result = nullptr;
+        dp.drafting = false;
+        llama_synchronize(draft);
+        return result;
+    };
+    const auto restore_kv = [&]() {
+        return llama_memory_seq_rm(llama_get_memory(draft), 0, -1, -1) &&
+                llama_state_seq_set_data(draft, kv.data(), kv.size(), 0) == kv.size();
+    };
+    const auto control = propose();
+    if (control.empty()) {
+        return false;
+    }
+    spec.reset();
+    if (!restore_kv()) {
+        return false;
+    }
+    auto spec_params = params.speculative;
+    spec.reset(common_speculative_init(spec_params, 1));
+    if (!spec) {
+        return false;
+    }
+    std::vector<uint8_t> fresh{1};
+    if (common_speculative_get_state(spec.get(), 0, fresh) || !fresh.empty() ||
+            !common_speculative_set_state(spec.get(), 0, carry, pos) ||
+            !common_speculative_get_state(spec.get(), 0, fresh) || fresh != carry) {
+        LOG_ERR("carry: state did not survive speculation teardown/recreation\n");
+        return false;
+    }
+    const auto restored = propose();
+    if (restored != control || !restore_kv() || !common_speculative_set_state(spec.get(), 0, carry, pos)) {
+        LOG_ERR("carry: restored draft differs from cold control\n");
+        return false;
+    }
+    if (proposals) {
+        *proposals = restored;
+    }
+    LOG_INF("carry: PASS pos=%d host_bytes=%zu identical_drafts=%zu rejected_invalid_imports=%d\n",
+            pos, carry.size(), restored.size(), rejected);
+    return true;
+}
+
+static bool test_bootstrap_seed(common_init_result & init, common_speculative * spec, llama_context * draft,
+        const llama_batch & batch, const llama_tokens & tokens) {
+    auto * target = init.context();
+    const auto decode_id = llama_get_nextn_decode_id(target);
+    std::vector<uint8_t> before(llama_state_seq_get_size(target, 0));
+    if (!decode_id || !llama_matches_nextn_decode(target, decode_id, batch) ||
+            llama_state_seq_get_data(target, before.data(), before.size(), 0) != before.size() ||
+            !common_speculative_bootstrap(spec, batch, decode_id)) {
+        return false;
+    }
+    const llama_pos next_pos = batch.pos[batch.n_tokens - 1] + 1;
+    if (!common_speculative_is_ready(spec, 0, next_pos) || common_speculative_is_ready(spec, 0, next_pos + 1)) {
+        LOG_ERR("bootstrap diagnostics: initial readiness mismatch next_pos=%d\n", next_pos);
+        return false;
+    }
+    std::vector<uint8_t> carry;
+    if (!common_speculative_get_state(spec, 0, carry)) { return false; }
+    int rejected = 0;
+    for (int fault = 0; fault < 16; ++fault) {
+        auto invalid = batch;
+        auto id = decode_id;
+        std::vector<llama_token> ids(batch.token, batch.token + batch.n_tokens);
+        std::vector<llama_pos> positions(batch.pos, batch.pos + batch.n_tokens);
+        std::vector<int32_t> counts(batch.n_tokens, 1);
+        llama_seq_id wrong_seq = 1;
+        std::vector<llama_seq_id *> sequences(batch.seq_id, batch.seq_id + batch.n_tokens);
+        float dummy = 0;
+        invalid.token = ids.data(); invalid.pos = positions.data();
+        invalid.n_seq_id = counts.data(); invalid.seq_id = sequences.data();
+        switch (fault) {
+            case 0: invalid.n_tokens = 0; break;
+            case 1: invalid.token = nullptr; break;
+            case 2: invalid.embd = &dummy; break;
+            case 3: invalid.pos = nullptr; break;
+            case 4: invalid.n_seq_id = nullptr; break;
+            case 5: invalid.seq_id = nullptr; break;
+            case 6: counts[0] = 2; break;
+            case 7: sequences[0] = &wrong_seq; break;
+            case 8: positions[0] = -1; break;
+            case 9: positions.back() = std::numeric_limits<llama_pos>::max(); break;
+            case 10: ++positions.back(); break;
+            case 11: ids[0] = (ids[0] + 1) % llama_vocab_n_tokens(llama_model_get_vocab(init.model())); break;
+            case 12: id = 0; break;
+            case 13: id = decode_id + 1; break;
+            case 14: invalid.n_tokens = llama_n_ubatch(target) + 1; break;
+            case 15: sequences[0] = nullptr; break;
+        }
+        std::vector<uint8_t> after;
+        if (common_speculative_bootstrap(spec, invalid, id) ||
+                !common_speculative_get_state(spec, 0, after) || after != carry ||
+                llama_memory_seq_pos_max(llama_get_memory(draft), 0) != -1) {
+            LOG_ERR("bootstrap diagnostics: rejected-input check failed at %d\n", fault);
+            return false;
+        }
+        ++rejected;
+    }
+    float * row = llama_get_embeddings_nextn_ith(target, batch.n_tokens - 1);
+    const float real_value = row[0];
+    row[0] = std::numeric_limits<float>::quiet_NaN();
+    const bool accepted_nan = common_speculative_bootstrap(spec, batch, decode_id);
+    row[0] = real_value;
+    if (accepted_nan) { return false; }
+    ++rejected;
+    std::vector<uint8_t> unchanged;
+    if (common_speculative_process(spec, batch) ||
+            !common_speculative_get_state(spec, 0, unchanged) || unchanged != carry ||
+            llama_memory_seq_pos_max(llama_get_memory(draft), 0) != -1) {
+        LOG_ERR("bootstrap diagnostics: stale process carry was not rejected without mutation\n");
+        return false;
+    }
+    auto & dp = common_speculative_get_draft_params(spec, 0);
+    llama_tokens proposals;
+    dp.drafting = true; dp.pos0 = next_pos + 1;
+    dp.id_last = common_sampler_sample(init.sampler(0), target, -1);
+    dp.prompt = &tokens; dp.result = &proposals;
+    if (common_speculative_draft(spec) || !proposals.empty() ||
+            llama_memory_seq_pos_max(llama_get_memory(draft), 0) != -1) {
+        LOG_ERR("bootstrap diagnostics: wrong-pos draft guard failed\n");
+        return false;
+    }
+    dp.pos0 = next_pos;
+    dp.drafting = true;
+    if (!common_speculative_draft(spec)) {
+        LOG_ERR("bootstrap diagnostics: valid draft after bootstrap rejected\n");
+        return false;
+    }
+    dp.drafting = false; dp.prompt = nullptr; dp.result = nullptr;
+    const auto dirty_pos = llama_memory_seq_pos_max(llama_get_memory(draft), 0);
+    if (dirty_pos < next_pos || !common_speculative_bootstrap(spec, batch, decode_id) ||
+            llama_memory_seq_pos_max(llama_get_memory(draft), 0) != -1) {
+        LOG_ERR("bootstrap diagnostics: dirty draft clear failed dirty_pos=%d next_pos=%d\n", dirty_pos, next_pos);
+        return false;
+    }
+    std::vector<uint8_t> after(before.size());
+    if (llama_state_seq_get_data(target, after.data(), after.size(), 0) != after.size() || after != before) {
+        LOG_ERR("bootstrap diagnostics: target bytes changed\n");
+        return false;
+    }
+    LOG_INF("bootstrap diagnostics: rejected_inputs=%d wrong_draft_pos_rejected=1 stale_process_rejected=1 dirty_draft_pos=%d cleared=1 target_bytes_unchanged=%zu replay_batch_tokens=%d\n",
+            rejected, dirty_pos, before.size(), batch.n_tokens);
+    return true;
+}
+
+// Run after comparing the response, so this deliberately extra diagnostic decode
+// is not mistaken for prefill/reuse of that request.
+static bool test_bootstrap_stale_import(common_init_result & init, common_speculative * spec) {
+    auto * target = init.context();
+    const auto previous_id = llama_get_nextn_decode_id(target);
+    llama_batch_ptr batch(1, 0, 1);
+    const auto pos = llama_memory_seq_pos_max(llama_get_memory(target), 0) + 1;
+    common_batch_add(batch.get(), common_sampler_sample(init.sampler(0), target, -1), pos, {0}, true);
+    if (llama_decode(target, batch.get())) { return false; }
+    const auto id = llama_get_nextn_decode_id(target);
+    if (!id || id <= previous_id || !llama_matches_nextn_decode(target, id, batch.get())) { return false; }
+    std::vector<uint8_t> state(llama_state_seq_get_size(target, 0));
+    if (llama_state_seq_get_data(target, state.data(), state.size(), 0) != state.size() ||
+            !llama_memory_seq_rm(llama_get_memory(target), 0, -1, -1) ||
+            llama_state_seq_set_data(target, state.data(), state.size(), 0) != state.size() ||
+            llama_get_nextn_decode_id(target) != 0 || llama_matches_nextn_decode(target, id, batch.get()) ||
+            common_speculative_bootstrap(spec, batch.get(), id)) {
+        LOG_ERR("bootstrap diagnostics: restore left an apparently fresh hidden row\n");
+        return false;
+    }
+    LOG_INF("bootstrap diagnostics: post-response_target_decodes=1 stale_id_after_restore_rejected=1 last_real_id=%llu\n",
+            (unsigned long long) id);
+    return true;
+}
+
+// Use the server's sampler verifier, including partial acceptance and carry alignment.
+// Full host rollback is the control; the multi-token case also exercises native RS truncation.
+static bool test_mtp_verified_generation(common_init_result & init, common_speculative * spec,
+        llama_context * draft, const common_params & params, llama_tokens history,
+        llama_tokens & generated, size_t & proposed, size_t & accepted, size_t & useful,
+        const llama_tokens * rollback_control = nullptr) {
+    auto * target = init.context();
+    auto * sampler = init.sampler(0);
+    const auto initial_min = llama_memory_seq_pos_min(llama_get_memory(draft), 0);
+    const auto expected_min = initial_min < 0 ? (llama_pos) history.size() : initial_min;
+    size_t injected = 0;
+    size_t partial_rollbacks = 0;
+    int next_logits = -1;
+    llama_batch_ptr batch(params.n_batch, 0, 1);
+    while (generated.size() < (size_t) params.n_predict) {
+        const int pos = (int) history.size();
+        const auto next = common_sampler_sample(sampler, target, next_logits);
+        common_sampler_accept(sampler, next, true);
+        common_sampler_ptr sampler_before(common_sampler_clone(sampler));
+        std::vector<uint8_t> target_before(rollback_control ? 0 : llama_state_seq_get_size(target, 0));
+        std::vector<uint8_t> draft_before(rollback_control ? 0 : llama_state_seq_get_size(draft, 0));
+        std::vector<uint8_t> carry_before;
+        if (!rollback_control && (llama_state_seq_get_data(target, target_before.data(), target_before.size(), 0) != target_before.size() ||
+                llama_state_seq_get_data(draft, draft_before.data(), draft_before.size(), 0) != draft_before.size() ||
+                !common_speculative_get_state(spec, 0, carry_before))) {
+            return false;
+        }
+        llama_tokens proposals;
+        auto & dp = common_speculative_get_draft_params(spec, 0);
+        const int remaining = params.n_predict - (int) generated.size();
+        if (remaining > 1) {
+            dp.drafting = true;
+            dp.pos0 = pos;
+            dp.n_max = remaining - 1;
+            dp.id_last = next;
+            dp.prompt = &history;
+            dp.result = &proposals;
+            if (!common_speculative_draft(spec)) { return false; }
+            dp.prompt = nullptr;
+            dp.result = nullptr;
+            dp.drafting = false;
+            // No earlier draft KV exists after bootstrap; it must stay absent.
+            if (llama_memory_seq_pos_min(llama_get_memory(draft), 0) != expected_min) {
+                return false;
+            }
+        }
+        if (rollback_control && !injected && remaining >= 3 && !proposals.empty()) {
+            // A deterministic verifier fault, NOT evidence of natural MTP acceptance:
+            // use one known-correct cold-control token followed by a known-wrong one.
+            proposals = {rollback_control->at(generated.size() + 1),
+                (rollback_control->at(generated.size() + 2) + 1) % llama_vocab_n_tokens(llama_model_get_vocab(init.model()))};
+            ++injected;
+        }
+        proposed += proposals.size();
+        if (!llama_memory_seq_rm(llama_get_memory(draft), 0, pos, -1)) {
+            return false;
+        }
+        common_batch_clear(batch.get());
+        common_batch_add(batch.get(), next, pos, {0}, true);
+        for (size_t j = 0; j < proposals.size(); ++j) {
+            common_batch_add(batch.get(), proposals[j], pos + 1 + j, {0}, true);
+        }
+        if (llama_decode(target, batch.get()) || !common_speculative_process(spec, batch.get())) {
+            return false;
+        }
+        const auto verified = common_sampler_sample_and_accept_n(sampler, target, proposals);
+        const size_t n_accepted = verified.size() - 1;
+        common_speculative_accept(spec, 0, n_accepted);
+        // The bonus token is sampled again from the committed last row next iteration.
+        common_sampler_copy(sampler_before.get(), sampler);
+        next_logits = -1;
+        if (n_accepted < proposals.size()) {
+            if (rollback_control) {
+                const auto begin = pos + (llama_pos) n_accepted + 1;
+                if (proposals.size() - n_accepted > llama_n_rs_seq(target) ||
+                        !llama_memory_seq_rm(llama_get_memory(target), 0, begin, -1) ||
+                        !llama_memory_seq_rm(llama_get_memory(draft), 0, begin, -1)) {
+                    LOG_ERR("bootstrap diagnostics: native RS rollback failed\n");
+                    return false;
+                }
+                next_logits = (int) n_accepted;
+                partial_rollbacks += n_accepted > 0;
+            } else {
+                if (!llama_memory_seq_rm(llama_get_memory(target), 0, -1, -1) ||
+                    !llama_memory_seq_rm(llama_get_memory(draft), 0, -1, -1) ||
+                    llama_state_seq_set_data(target, target_before.data(), target_before.size(), 0) != target_before.size() ||
+                    llama_state_seq_set_data(draft, draft_before.data(), draft_before.size(), 0) != draft_before.size() ||
+                    !common_speculative_set_state(spec, 0, carry_before, pos - 1)) {
+                    return false;
+                }
+                batch.get().n_tokens = (int) n_accepted + 1;
+                if (llama_decode(target, batch.get()) || !common_speculative_process(spec, batch.get())) {
+                    return false;
+                }
+                common_speculative_accept(spec, 0, n_accepted);
+            }
+        }
+        generated.push_back(next);
+        history.push_back(next);
+        for (size_t j = 0; j < n_accepted; ++j) {
+            generated.push_back(verified[j]);
+            history.push_back(verified[j]);
+            common_sampler_accept(sampler, verified[j], true);
+            useful += !llama_vocab_is_eog(llama_model_get_vocab(init.model()), verified[j]);
+        }
+        accepted += n_accepted;
+        std::vector<uint8_t> aligned;
+        if (!common_speculative_get_state(spec, 0, aligned) ||
+                !common_speculative_set_state(spec, 0, aligned, (llama_pos) history.size() - 1) ||
+                llama_memory_seq_pos_max(llama_get_memory(target), 0) != (llama_pos) history.size() - 1 ||
+                llama_memory_seq_pos_max(llama_get_memory(draft), 0) != (llama_pos) history.size() - 1 ||
+                llama_memory_seq_pos_min(llama_get_memory(draft), 0) != expected_min) {
+            return false;
+        }
+    }
+    if (rollback_control) {
+        LOG_INF("bootstrap diagnostics: synthetic_verifier_faults=%zu strictly_partial_native_rollbacks=%zu\n",
+                injected, partial_rollbacks);
+        if (!injected || !partial_rollbacks) { return false; }
+    }
+    return true;
+}
+
+static bool test_context_lifecycle(common_params params, bool mtp, bool fail_prepare, bool check_carry,
+        bool check_cache, bool check_bootstrap, int replay_tokens) {
+    if (params.n_ctx <= 0 || params.n_ctx > std::numeric_limits<int32_t>::max() / 2 ||
+            params.n_parallel != 1 || params.kv_paged || params.n_predict <= 0 ||
+            replay_tokens < 1 || (replay_tokens > 1 && params.n_predict < 3)) {
+        LOG_ERR("lifecycle: requires an explicit context, one slot, non-paged KV and positive output\n");
+        return false;
+    }
+    params.fit_params = false;
+    params.sampling.temp = 0.0f;
+    params.speculative.types = mtp ? std::vector<common_speculative_type>{COMMON_SPECULATIVE_TYPE_DRAFT_MTP}
+                                  : std::vector<common_speculative_type>{};
+    if (mtp) {
+        params.ctx_size_mtp = params.n_ctx;
+        params.mtp_max_tokens = params.n_ctx;
+        if (!common_context_adaptive_normalize(params).empty() || !params.split_mtp_weights) {
+            LOG_ERR("lifecycle: adaptive ownership normalization failed\n");
+            return false;
+        }
+    } else {
+        params.split_mtp_weights = false;
+    }
+    params.speculative.draft.n_max = 2;
+    params.speculative.draft.n_min = 0;
+    params.speculative.draft.p_min = 0.0f;
+    params.n_outputs_max = params.n_batch;
+    params.n_outputs_max_per_seq = params.n_batch;
+
+    const std::string missing_cvec = params.model.path + ".lifecycle-missing-cvec";
+    if (std::filesystem::exists(missing_cvec)) {
+        LOG_ERR("lifecycle: negative-test path unexpectedly exists\n");
+        return false;
+    }
+    if (fail_prepare) {
+        params.control_vectors = {{1.0f, missing_cvec}};
+    }
+    auto init = common_init_from_params(params);
+    auto * model = init->model();
+    if (fail_prepare) {
+        const bool ok = model && !init->context() && !init->sampler(0);
+        LOG_INF("lifecycle: failed initial preparation retained model and cleared context/samplers: %s\n", ok ? "PASS" : "FAIL");
+        return ok;
+    }
+    if (!model || !init->context()) {
+        return false;
+    }
+    std::vector<weight_binding> main_weights;
+    std::vector<weight_binding> mtp_weights;
+    uint64_t main_hash = 0;
+    uint64_t mtp_hash = 0;
+    const auto initial_weights = llama_model_mtp_weights_get_info(model);
+    if (mtp) {
+        std::vector<std::string> prefixes;
+        const int32_t first_head = llama_model_n_layer(model);
+        const int32_t last_head = first_head + llama_model_n_layer_nextn(model);
+        for (int32_t il = first_head; il < last_head; ++il) {
+            prefixes.push_back("blk." + std::to_string(il) + ".");
+        }
+        std::set<ggml_backend_buffer_t> main_buffers;
+        size_t mtp_bytes = 0;
+        for (const auto & [name, tensor] : model->tensors_by_name) {
+            const bool head = std::any_of(prefixes.begin(), prefixes.end(), [&](const auto & prefix) {
+                return name.compare(0, prefix.size(), prefix) == 0;
+            });
+            weight_binding w{tensor, tensor->buffer, tensor->data, ggml_nbytes(tensor)};
+            (head ? mtp_weights : main_weights).push_back(w);
+            if (head) {
+                mtp_bytes += w.bytes;
+            } else {
+                main_buffers.insert(w.buffer);
+            }
+        }
+        if (!initial_weights.managed || !initial_weights.resident || initial_weights.model_load_count != 1 || initial_weights.mtp_reloads != 0 ||
+                initial_weights.host_bytes != mtp_bytes || initial_weights.tensor_count != mtp_weights.size() || mtp_weights.empty()) {
+            LOG_ERR("lifecycle: incomplete MTP ownership/backing\n");
+            return false;
+        }
+        for (const auto & w : mtp_weights) {
+            if (main_buffers.count(w.buffer)) {
+                LOG_ERR("lifecycle: MTP and main weights share a buffer\n");
+                return false;
+            }
+        }
+        if (!weights_hash(main_weights, main_hash) || !weights_hash(mtp_weights, mtp_hash) ||
+                mtp_hash != initial_weights.backing_hash) {
+            LOG_ERR("lifecycle: initial MTP backing does not match loaded bytes\n");
+            return false;
+        }
+    }
+    const auto * vocab = llama_model_get_vocab(model);
+    const bool no_vocab = llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE;
+    if (check_bootstrap && !no_vocab) {
+        // Same confidence threshold as the production profile; tiny random weights
+        // exercise structure at p_min=0 without pretending to prove useful acceptance.
+        params.speculative.draft.p_min = 0.8f;
+    }
+    auto tokens = no_vocab ? llama_tokens{1, 2, 3, 4} : common_tokenize(vocab, params.prompt, true);
+    if (tokens.empty() || tokens.size() + params.n_predict + 2 >= (size_t) params.n_ctx) {
+        LOG_ERR("lifecycle: prompt/output does not fit the short experiment context\n");
+        return false;
+    }
+    if (check_cache && tokens.size() <= (size_t) replay_tokens) {
+        LOG_ERR("cache transfer: need a prefix plus a final token to replay\n");
+        return false;
+    }
+    const auto biases = params.sampling.logit_bias.size();
+    const auto eog_biases = params.sampling.logit_bias_eog.size();
+    const auto n_ctx_train = llama_model_n_ctx_train(model);
+    llama_tokens control;
+    common_speculative_init_result_ptr draft_init;
+    common_speculative_ptr spec;
+    llama_context * retired_context = nullptr;
+    std::vector<uint8_t> saved_target;
+    std::vector<uint8_t> saved_long_target;
+    std::vector<uint8_t> saved_draft;
+    std::vector<uint8_t> saved_carry;
+    int saved_prefix = 0;
+    llama_pos saved_pos = -1;
+    llama_tokens cold_mtp_drafts;
+    const auto save_seq = [](llama_context * context, std::vector<uint8_t> & data) {
+        llama_synchronize(context);
+        data.resize(llama_state_seq_get_size(context, 0));
+        return !data.empty() && llama_state_seq_get_data(context, data.data(), data.size(), 0) == data.size();
+    };
+    const auto restore_seq = [](llama_context * context, const std::vector<uint8_t> & data) {
+        return llama_memory_seq_rm(llama_get_memory(context), 0, -1, -1) &&
+                llama_state_seq_set_data(context, data.data(), data.size(), 0) == data.size();
+    };
+
+    for (int phase = 0; phase < 3; ++phase) {
+        auto effective = params;
+        const bool use_mtp = mtp && phase != 1;
+        if (mtp && phase > 0) {
+            if (phase == 1) {
+                auto probe_params = common_context_params_to_llama(effective);
+                probe_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                {
+                    llama_context_ptr probe(llama_init_from_model(model, probe_params));
+                    if (!probe) {
+                        LOG_ERR("lifecycle: resident-head mirror probe failed\n");
+                        return false;
+                    }
+                    llama_synchronize(probe.get());
+                }
+                if (!llama_model_mtp_weights_set_resident(model, false) ||
+                        !llama_model_mtp_weights_set_resident(model, false) || !mtp_unbound(model, mtp_weights)) {
+                    return false;
+                }
+                llama_context_ptr probe(llama_init_from_model(model, probe_params));
+                if (probe || !mtp_unbound(model, mtp_weights) ||
+                        llama_model_mtp_weights_get_info(model).mtp_gpu_upload_bytes != initial_weights.mtp_gpu_upload_bytes) {
+                    LOG_ERR("lifecycle: absent MTP weights were used or implicitly reloaded\n");
+                    return false;
+                }
+                for (auto fault : {llama_mtp_weights_fault::allocation, llama_mtp_weights_fault::upload}) {
+                    if (llama_model_mtp_weights_set_resident(model, true, fault) || !mtp_unbound(model, mtp_weights) ||
+                            !weights_bound(main_weights, true)) {
+                        LOG_ERR("lifecycle: MTP failure did not clean up independently\n");
+                        return false;
+                    }
+                }
+            }
+            if (!llama_model_mtp_weights_set_resident(model, true)) {
+                return false;
+            }
+            const auto reloaded = llama_model_mtp_weights_get_info(model);
+            if (!llama_model_mtp_weights_set_resident(model, true) ||
+                    llama_model_mtp_weights_get_info(model).mtp_gpu_upload_bytes != reloaded.mtp_gpu_upload_bytes ||
+                    llama_model_mtp_weights_get_info(model).mtp_reloads != reloaded.mtp_reloads) {
+                LOG_ERR("lifecycle: repeated residency request uploaded weights again\n");
+                return false;
+            }
+            uint64_t restored_hash;
+            if (!weights_hash(mtp_weights, restored_hash) || restored_hash != mtp_hash) {
+                LOG_ERR("lifecycle: reloaded MTP bytes differ from original\n");
+                return false;
+            }
+            if (phase == 1 && (!llama_model_mtp_weights_set_resident(model, false) || !mtp_unbound(model, mtp_weights))) {
+                return false;
+            }
+        }
+        if (phase == 1) {
+            effective.n_ctx *= 2;
+            effective.speculative.types.clear();
+            auto incompatible = effective;
+            incompatible.split_mtp_weights = !params.split_mtp_weights;
+            if (init->recreate_context(incompatible) || init->context() || init->sampler(0) || init->model() != model) {
+                LOG_ERR("lifecycle: changed MTP weight ownership was accepted\n");
+                return false;
+            }
+            incompatible = effective;
+            ++incompatible.cpuparams.n_threads;
+            if (init->recreate_context(incompatible) || init->context() || init->sampler(0) || init->model() != model) {
+                LOG_ERR("lifecycle: invalid CPU parameters left a partial context\n");
+                return false;
+            }
+            auto invalid = effective;
+            invalid.speculative.draft.ctx_tgt = retired_context;
+            if (init->recreate_context(invalid) || init->context()) {
+                LOG_ERR("lifecycle: stale target alias was accepted\n");
+                return false;
+            }
+            std::swap(invalid.speculative.draft.ctx_tgt, invalid.speculative.draft.ctx_dft);
+            if (init->recreate_context(invalid) || init->context()) {
+                LOG_ERR("lifecycle: stale draft alias was accepted\n");
+                return false;
+            }
+            invalid = effective;
+            invalid.cache_type_v = GGML_TYPE_Q4_0;
+            invalid.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            if (init->recreate_context(invalid) || init->context() || init->sampler(0) || init->model() != model) {
+                LOG_ERR("lifecycle: failed context creation left partial state\n");
+                return false;
+            }
+            invalid = effective;
+            invalid.control_vectors = {{1.0f, missing_cvec}};
+            if (init->recreate_context(invalid) || init->context() || init->sampler(0) || init->model() != model) {
+                LOG_ERR("lifecycle: failed context preparation left partial state\n");
+                return false;
+            }
+        }
+        if (phase > 0 && !init->recreate_context(effective)) {
+            return false;
+        }
+        auto * ctx = init->context();
+        if (mtp) {
+            const auto info = llama_model_mtp_weights_get_info(model);
+            if (info.model_instance != initial_weights.model_instance || info.model_load_count != 1 ||
+                    info.main_gpu_upload_bytes != initial_weights.main_gpu_upload_bytes ||
+                    info.mtp_reloads != (uint64_t) phase ||
+                    info.resident != use_mtp || info.host_bytes != initial_weights.host_bytes ||
+                    !weights_bound(main_weights, true)) {
+                LOG_ERR("lifecycle: main weights or MTP residency changed incorrectly\n");
+                return false;
+            }
+            LOG_INF("lifecycle: model_instance=%llu loads=%llu mtp_resident=%d mtp_bytes=%zu mtp_gpu_bytes=%zu host_bytes=%zu main_gpu_upload_bytes=%llu mtp_gpu_upload_bytes=%llu mtp_reloads=%llu\n",
+                    (unsigned long long) info.model_instance, (unsigned long long) info.model_load_count, info.resident,
+                    info.allocated_bytes, info.gpu_allocated_bytes, info.host_bytes,
+                    (unsigned long long) info.main_gpu_upload_bytes, (unsigned long long) info.mtp_gpu_upload_bytes,
+                    (unsigned long long) info.mtp_reloads);
+        }
+        if (llama_n_ctx(ctx) != (uint32_t) effective.n_ctx) {
+            LOG_ERR("lifecycle: effective context %u differs from requested %d\n", llama_n_ctx(ctx), effective.n_ctx);
+            return false;
+        }
+        if (init->model() != model || llama_get_model(ctx) != model ||
+                llama_model_n_ctx_train(model) != n_ctx_train ||
+                effective.sampling.logit_bias.size() != biases ||
+                effective.sampling.logit_bias_eog.size() != eog_biases) {
+            LOG_ERR("lifecycle: model identity, training context or biases changed\n");
+            return false;
+        }
+        if (init->recreate_context(effective) || init->context() != ctx) {
+            LOG_ERR("lifecycle: creation with a live context must fail without replacing it\n");
+            return false;
+        }
+        if (use_mtp) {
+            auto draft_params = common_base_params_to_speculative(effective);
+            draft_init = common_speculative_init_from_params(draft_params, model, ctx);
+            if (!draft_init->context() || draft_init->model() ||
+                    llama_get_model(draft_init->context()) != model) {
+                LOG_ERR("lifecycle: embedded MTP must use the same model\n");
+                return false;
+            }
+            effective.speculative.draft.ctx_tgt = ctx;
+            effective.speculative.draft.ctx_dft = draft_init->context();
+            spec.reset(common_speculative_init(effective.speculative, 1));
+            if (!spec) {
+                return false;
+            }
+        }
+
+        llama_batch_ptr batch(effective.n_batch, 0, 1);
+        int n_past = 0;
+        int prefill_evaluated = 0;
+        if (check_cache && phase > 0 && !(check_bootstrap && phase == 1)) {
+            const auto & target_state = phase == 2 ? saved_long_target : saved_target;
+            if (saved_prefix <= 0 || saved_pos != saved_prefix - 1 ||
+                    target_state.empty() || !restore_seq(ctx, target_state) ||
+                    llama_memory_seq_pos_max(llama_get_memory(ctx), 0) != saved_pos) {
+                LOG_ERR("cache transfer: target restore failed after context replacement\n");
+                return false;
+            }
+            if (phase == 1 && !save_seq(ctx, saved_long_target)) {
+                LOG_ERR("cache transfer: could not serialize the restored long target\n");
+                return false;
+            }
+            if (use_mtp && !check_bootstrap && (!restore_seq(draft_init->context(), saved_draft) ||
+                    !common_speculative_set_state(spec.get(), 0, saved_carry, saved_pos))) {
+                LOG_ERR("cache transfer: draft/carry restore failed after context replacement\n");
+                return false;
+            }
+            n_past = saved_prefix;
+        }
+        while (n_past < (int) tokens.size()) {
+            common_batch_clear(batch.get());
+            int end = std::min<int>(tokens.size(), n_past + llama_n_ubatch(ctx));
+            const bool save_prefix = check_cache && ((phase == 0 && saved_target.empty()) ||
+                    (check_bootstrap && phase == 1 && saved_long_target.empty()));
+            if (save_prefix && n_past < (int) tokens.size() - replay_tokens) {
+                end = std::min<int>(end, tokens.size() - replay_tokens);
+            }
+            for (int pos = n_past; pos < end; ++pos) {
+                common_batch_add(batch.get(), tokens[pos], pos, {0}, true);
+            }
+            if (llama_decode(ctx, batch.get())) {
+                return false;
+            }
+            if (spec) {
+                if (check_bootstrap && phase == 2) {
+                    if (batch.get().n_tokens != replay_tokens ||
+                            !test_bootstrap_seed(*init, spec.get(), draft_init->context(), batch.get(), tokens) ||
+                            llama_memory_seq_pos_max(llama_get_memory(ctx), 0) != end - 1) {
+                        LOG_ERR("bootstrap: seed/identity/guard diagnostics failed\n");
+                        return false;
+                    }
+                } else if (!common_speculative_process(spec.get(), batch.get())) {
+                    return false;
+                }
+            }
+            prefill_evaluated += end - n_past;
+            n_past = end;
+            if (check_cache && phase == 0 && saved_target.empty() && n_past == (int) tokens.size() - replay_tokens) {
+                saved_prefix = n_past;
+                saved_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+                if (!save_seq(ctx, saved_target) || !save_seq(draft_init->context(), saved_draft) ||
+                        !common_speculative_get_state(spec.get(), 0, saved_carry) || saved_pos != saved_prefix - 1) {
+                    LOG_ERR("cache transfer: failed to capture a complete aligned host snapshot\n");
+                    return false;
+                }
+                LOG_INF("cache transfer: saved prefix=%d pos=%d target_bytes=%zu draft_bytes=%zu carry_bytes=%zu\n",
+                        saved_prefix, saved_pos, saved_target.size(), saved_draft.size(), saved_carry.size());
+            }
+            if (check_bootstrap && phase == 1 && saved_long_target.empty() && n_past == (int) tokens.size() - replay_tokens) {
+                if (!save_seq(ctx, saved_long_target)) {
+                    return false;
+                }
+                LOG_INF("bootstrap: saved NEW long-computed target prefix=%d bytes=%zu; no draft or carry\n",
+                        n_past, saved_long_target.size());
+            }
+        }
+        if (check_cache) {
+            const int expected = phase == 0 || (check_bootstrap && phase == 1) ? (int) tokens.size() : replay_tokens;
+            if (prefill_evaluated != expected) {
+                LOG_ERR("cache transfer: unexpected prefill count %d, expected %d\n", prefill_evaluated, expected);
+                return false;
+            }
+            LOG_INF("cache transfer: phase=%d restored_prefix=%d evaluated_prompt_tokens=%d\n",
+                    phase, phase == 0 || (check_bootstrap && phase == 1) ? 0 : saved_prefix, prefill_evaluated);
+        }
+        if (spec) {
+            common_speculative_begin(spec.get(), 0, tokens);
+            if (check_carry) {
+                llama_tokens proposals;
+                if (!test_mtp_carry(*init, spec, draft_init->context(), effective, tokens, &proposals)) {
+                    return false;
+                }
+                if (check_cache && !check_bootstrap) {
+                    if (phase == 0) {
+                        cold_mtp_drafts = proposals;
+                    } else if (proposals != cold_mtp_drafts) {
+                        LOG_ERR("cache transfer: restored MTP drafts differ from the cold short profile\n");
+                        return false;
+                    }
+                }
+            }
+        }
+        llama_tokens generated;
+        llama_tokens history = tokens;
+        size_t proposals = 0;
+        size_t accepted = 0;
+        size_t useful = 0;
+        if (check_bootstrap && spec && !test_mtp_verified_generation(*init, spec.get(), draft_init->context(),
+                effective, history, generated, proposals, accepted, useful,
+                phase == 2 && replay_tokens > 1 ? &control : nullptr)) {
+            LOG_ERR("bootstrap: target verification or rollback failed\n");
+            return false;
+        }
+        for (int i = 0; !(check_bootstrap && spec) && i < effective.n_predict; ++i) {
+            auto * sampler = init->sampler(0);
+            const auto token = common_sampler_sample(sampler, ctx, -1);
+            common_sampler_accept(sampler, token, true);
+            generated.push_back(token);
+            if (spec) {
+                llama_tokens draft;
+                auto & dp = common_speculative_get_draft_params(spec.get(), 0);
+                dp.drafting = true;
+                dp.pos0 = n_past;
+                dp.id_last = token;
+                dp.prompt = &history;
+                dp.result = &draft;
+                common_speculative_draft(spec.get());
+                proposals += draft.size();
+                // Exercise rejection/catch-up; the target produces the deterministic control.
+                if (!llama_memory_seq_rm(llama_get_memory(draft_init->context()), 0, n_past, -1)) {
+                    return false;
+                }
+                dp.prompt = nullptr;
+                dp.result = nullptr;
+            }
+            common_batch_clear(batch.get());
+            common_batch_add(batch.get(), token, n_past++, {0}, true);
+            if (llama_decode(ctx, batch.get()) ||
+                    (spec && !common_speculative_process(spec.get(), batch.get()))) {
+                return false;
+            }
+            if (spec) {
+                common_speculative_accept(spec.get(), 0, 0);
+            }
+            history.push_back(token);
+        }
+        if (use_mtp && proposals == 0) {
+            LOG_ERR("lifecycle: no real MTP proposals\n");
+            return false;
+        }
+        if (check_bootstrap && spec) {
+            LOG_INF("bootstrap: phase=%d p_min=%.2f proposed=%zu accepted=%zu accepted_non_eog=%zu verifier=%s\n",
+                    phase, effective.speculative.draft.p_min, proposals, accepted, useful,
+                    phase == 2 && replay_tokens > 1 ? "synthetic-partial-fault" : "natural");
+            if (phase == 2 && replay_tokens == 1 && !no_vocab && useful == 0) {
+                LOG_ERR("bootstrap: no useful acceptance with a real trained model\n");
+                return false;
+            }
+        }
+        if (phase == 0) {
+            control = generated;
+        } else if (generated != control) {
+            LOG_ERR("lifecycle: deterministic output differs across profiles\n");
+            return false;
+        }
+        LOG_INF("lifecycle: phase=%d model=%p ctx=%u mtp=%d proposals=%zu tokens=%zu text=", phase,
+                (void *) model, llama_n_ctx(ctx), use_mtp, proposals, generated.size());
+        for (const auto token : generated) {
+            if (no_vocab) {
+                LOG(" %d", token);
+            } else {
+                LOG("%s", common_token_to_piece(vocab, token).c_str());
+            }
+        }
+        LOG("\n");
+        if (check_bootstrap && phase == 2 && !test_bootstrap_stale_import(*init, spec.get())) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        if (draft_init) {
+            llama_synchronize(draft_init->context());
+        }
+        spec.reset();
+        draft_init.reset();
+        effective.speculative.draft.ctx_tgt = nullptr;
+        effective.speculative.draft.ctx_dft = nullptr;
+        retired_context = ctx;
+        init->release_context();
+        init->release_context();
+        if (init->context() || init->sampler(0) || init->model() != model) {
+            LOG_ERR("lifecycle: context/samplers not released or model replaced\n");
+            return false;
+        }
+    }
+    if (mtp) {
+        uint64_t final_hash;
+        if (!weights_hash(main_weights, final_hash) || final_hash != main_hash) {
+            LOG_ERR("lifecycle: main weight bytes changed\n");
+            return false;
+        }
+        LOG_INF("lifecycle: main_hash=%llu mtp_hash=%llu\n", (unsigned long long) main_hash, (unsigned long long) mtp_hash);
+    }
+    LOG_INF("lifecycle: PASS (one model; short/long/short; %s)\n", mtp ? "MTP weights evicted and restored" : "target-only fixture");
+    return true;
+}
+
+
+int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
+    common_params params;
+    params.prompt = "";
+    params.n_batch = 100;
+    params.out_file = "dump_state.bin";
+    params.sampling.seed = 1234;
+
+    common_init();
+
+    // extract our own --models DIR option before handing the rest to the common arg parser
+    std::string models_dir;
+    std::string lifecycle;
+    std::vector<char *> filtered_argv;
+    filtered_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--context-lifecycle") == 0) {
+            if (++i >= argc || (strcmp(argv[i], "mtp") != 0 && strcmp(argv[i], "mtp-state") != 0 && strcmp(argv[i], "mtp-cache") != 0 && strcmp(argv[i], "mtp-bootstrap") != 0 && strcmp(argv[i], "mtp-bootstrap-multi") != 0 && strcmp(argv[i], "target") != 0 && strcmp(argv[i], "prepare-failure") != 0)) {
+                LOG_ERR("--context-lifecycle requires mtp, mtp-state, mtp-cache, mtp-bootstrap, mtp-bootstrap-multi, target or prepare-failure\n");
+                return 1;
+            }
+            lifecycle = argv[i];
+        } else if (strcmp(argv[i], "--models") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERR("%s: --models requires a directory argument\n", __func__);
+                return 1;
+            }
+            models_dir = argv[i + 1];
+            i++;
+        } else {
+            filtered_argv.push_back(argv[i]);
+        }
+    }
+    filtered_argv.push_back(nullptr);
+    const int fargc = (int)filtered_argv.size() - 1;
+
+    // in --models mode there is no single model; set a placeholder so the common parser's
+    // "--model is required" check passes (each model is set individually inside the loop)
+    if (!models_dir.empty()) {
+        params.model.path = models_dir;
+    }
+
+    if (!common_params_parse(fargc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
+        return 1;
+    }
+
+    if (params.n_parallel == 1) {
+        LOG_TRC("%s: n_parallel == 1, enabling unified kv cache\n", __func__);
+        params.kv_unified = true;
+    }
+
+    if (params.n_predict < 0) {
+        params.n_predict = 16;
+    }
+
+    ggml_backend_load_all();
+
+    if (!lifecycle.empty()) {
+        if (!models_dir.empty()) {
+            LOG_ERR("--context-lifecycle cannot be combined with --models\n");
+            return 1;
+        }
+        return test_context_lifecycle(params, lifecycle == "mtp" || lifecycle == "mtp-state" || lifecycle == "mtp-cache" || lifecycle == "mtp-bootstrap" || lifecycle == "mtp-bootstrap-multi",
+                lifecycle == "prepare-failure", lifecycle == "mtp-state" || lifecycle == "mtp-cache",
+                lifecycle == "mtp-cache" || lifecycle == "mtp-bootstrap" || lifecycle == "mtp-bootstrap-multi",
+                lifecycle == "mtp-bootstrap" || lifecycle == "mtp-bootstrap-multi",
+                lifecycle == "mtp-bootstrap-multi" ? 2 : 1) ? 0 : 1;
+    }
+
+    if (!models_dir.empty()) {
+        // run the suite over every dummy model in the directory
+        if (!std::filesystem::exists(models_dir) || !std::filesystem::is_directory(models_dir)) {
+            LOG_ERR("%s: models directory '%s' does not exist\n", __func__, models_dir.c_str());
+            return 1;
+        }
+
+        std::vector<std::string> models;
+        for (const auto & entry : std::filesystem::directory_iterator(models_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+                models.push_back(entry.path().string());
+            }
+        }
+        std::sort(models.begin(), models.end());
+
+        if (models.empty()) {
+            LOG_ERR("%s: no .gguf models found in '%s'\n", __func__, models_dir.c_str());
+            return 1;
+        }
+
+        LOG_INF("%s: running save/load tests over %zu models in '%s'\n", __func__, models.size(), models_dir.c_str());
+
+        size_t n_pass = 0;
+        size_t n_fail = 0;
+        for (const auto & model_path : models) {
+            LOG("\n================================================================\n");
+            LOG_INF("%s: model %s\n", __func__, model_path.c_str());
+
+            if (run_save_load_tests_for_model(model_path, params)) {
+                n_pass++;
+            } else {
+                n_fail++;
+            }
+        }
+
+        LOG("\n================================================================\n");
+        LOG_INF("%s: summary: %zu passed, %zu failed (of %zu)\n", __func__, n_pass, n_fail, models.size());
+
+        return n_fail == 0 ? 0 : 1;
+    }
+
+    // single-model mode
+    return run_save_load_tests_for_model(params.model.path, params) ? 0 : 1;
 }

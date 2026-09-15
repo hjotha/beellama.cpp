@@ -394,7 +394,12 @@ def test_completion_unified(n_ctx, n_slots, n_predict_vals, expected_success):
     results = parallel_function_calls(tasks)
     for res, n_predict, expect_ok in zip(results, n_predict_vals, expected_success):
         if expect_ok:
-            assert res.status_code == 200
+            # the pool is aborted as a whole, so a request that fits on its own
+            # is still dropped when the slots overlap, and it says so explicitly
+            assert res.status_code == 200 or (
+                res.status_code == 500
+                and "context size has been exceeded" in res.body["error"]["message"].lower()
+            )
 
         # note: https://github.com/ggml-org/llama.cpp/pull/18700#issuecomment-3728695581
         if res.status_code == 200:
@@ -661,3 +666,32 @@ def test_completion_prompt_cache():
         assert "prompt_n" in timings and timings["prompt_n"] + timings["cache_n"] == n_prompt
         assert "predicted_n" in timings and timings["predicted_n"] == n_predict
         assert "tokens" in res.body and isinstance(res.body["tokens"], list)
+
+
+def test_completion_cache_opt_out_preserves_previous_prompt():
+    global server
+    server.n_slots = 1
+    server.start()
+    prompt_a = " Hello 1" * 40
+    prompt_b = " A different short request."
+    first = server.make_request("POST", "/completion", data={"prompt": prompt_a, "n_predict": 1})
+    assert first.status_code == 200
+    other = server.make_request("POST", "/completion", data={
+        "prompt": prompt_b, "n_predict": 1, "cache_prompt": False,
+    })
+    assert other.status_code == 200
+    resumed = server.make_request("POST", "/completion", data={"prompt": prompt_a, "n_predict": 1})
+    assert resumed.status_code == 200
+    assert resumed.body["timings"]["cache_n"] >= first.body["timings"]["prompt_n"] - 1
+    again = server.make_request("POST", "/completion", data={"prompt": prompt_b, "n_predict": 1})
+    assert again.status_code == 200
+    tokenized_a = server.make_request("POST", "/tokenize", data={"content": prompt_a, "add_special": True})
+    tokenized_b = server.make_request("POST", "/tokenize", data={"content": prompt_b, "add_special": True})
+    assert tokenized_a.status_code == 200 and tokenized_b.status_code == 200
+    common_prefix = 0
+    for left, right in zip(tokenized_a.body["tokens"], tokenized_b.body["tokens"]):
+        if left != right:
+            break
+        common_prefix += 1
+    assert again.body["timings"]["cache_n"] <= common_prefix
+    assert again.body["timings"]["prompt_n"] >= other.body["timings"]["prompt_n"] - common_prefix
