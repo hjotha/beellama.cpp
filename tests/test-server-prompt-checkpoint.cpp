@@ -134,13 +134,13 @@ static void prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp() {
 
 static void prompt_cache_self_contained_wins_over_native() {
     server_prompt current = make_prompt({1, 2, 3, 4});
-    server_tokens requested(llama_tokens {1, 2, 3, 9}, false);
+    server_tokens requested(llama_tokens {1, 2, 3, 4, 9}, false);
 
     // A large native restorable prefix exists, but the RAM prompt fully covers
     // the requested prefix, so the self-contained prefix wins.
     const auto plan = server_prompt_plan_reuse(current, requested, 1, 3, true);
-    assert(plan.lexical_tokens == 3);
-    assert(plan.restorable_tokens == 3);
+    assert(plan.lexical_tokens == 4);
+    assert(plan.restorable_tokens == 4);
     assert(plan.reason == SERVER_PROMPT_REUSE_SELF_CONTAINED);
 }
 
