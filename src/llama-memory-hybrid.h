@@ -116,6 +116,9 @@ public:
     //
 
     llama_kv_cache * get_mem_attn() const;
+    // base-interface accessor for the attention memory; valid for every attention
+    // cache implementation, including KVarN which does not derive from llama_kv_cache
+    llama_memory_i * get_mem_attn_base() const { return mem_attn.get(); }
     llama_memory_recurrent * get_mem_recr() const;
 
 private:

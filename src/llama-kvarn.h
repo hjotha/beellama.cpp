@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-arch.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,16 @@ enum llama_kvarn_iswa_policy {
     LLAMA_KVARN_ISWA_ALL_LAYERS,
     LLAMA_KVARN_ISWA_STANDARD_SWA_FALLBACK,
 };
+
+enum llama_kvarn_context_route {
+    LLAMA_KVARN_CONTEXT_ROUTE_OWNED,
+    LLAMA_KVARN_CONTEXT_ROUTE_SHARED_TARGET,
+    LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED,
+};
+
+llama_kvarn_context_route llama_kvarn_context_route_for(
+        llama_context_type ctx_type,
+        llm_arch arch);
 
 llama_kvarn_iswa_policy llama_kvarn_iswa_policy_for(
         bool enabled,

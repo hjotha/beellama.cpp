@@ -39,7 +39,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     const int stderr_fd = fileno(stderr);
     const int saved_fd  = dup(stderr_fd);
     assert(saved_fd >= 0);
-    assert(dup2(fileno(capture), stderr_fd) == 0);
+    assert(dup2(fileno(capture), stderr_fd) == stderr_fd);
 #endif
 
     fn();
@@ -56,7 +56,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     assert(_dup2(saved_fd, stderr_fd) == 0);
     _close(saved_fd);
 #else
-    assert(dup2(saved_fd, stderr_fd) == 0);
+    assert(dup2(saved_fd, stderr_fd) == stderr_fd);
     close(saved_fd);
 #endif
     fclose(capture);
@@ -284,7 +284,7 @@ params = common_params();
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
-    argv = {"binary_name", "--spec-draft-type-k", "kvarn8"};
+    argv = {"binary_name", "--spec-draft-type-k", "kvarn7"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
@@ -597,16 +597,56 @@ params = common_params();
     assert(params.cache_type_k == GGML_TYPE_Q3_0);
     assert(params.cache_type_v == GGML_TYPE_Q4_0);
 
-    // Draft contexts cannot use KVarN records, so the same aliases use matching q fallbacks.
+    // Draft KVarN uses the same pseudo types, bit-pair normalization, and legacy redirects as target KVarN.
+    for (const int bits : { 2, 3, 4, 5, 6, 8 }) {
+        for (const bool key : { false, true }) {
+            params = common_params();
+            const std::string option = key ? "--spec-draft-type-k" : "--spec-draft-type-v";
+            const std::string value = "kvarn" + std::to_string(bits);
+            argv = {"binary_name", "-m", "model_file.gguf", option, value};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+            const auto & draft = params.speculative.draft;
+            assert(draft.cache_kvarn_bits_k == bits);
+            assert(draft.cache_kvarn_bits_v == bits);
+            assert(draft.kvarn.type == llama_kvarn_type_from_name(
+                    ("kvarn_k" + std::to_string(bits) + "v" + std::to_string(bits) + "_g128").c_str()));
+            assert(draft.kvarn.key_bits == bits);
+            assert(draft.kvarn.value_bits == bits);
+            assert(draft.kvarn.swa_key_bits == 0);
+            assert(draft.kvarn.swa_value_bits == 0);
+        }
+    }
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K4V2_G128);
+    assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q4_0);
+    assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q2_0S);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "kvarn2", "--spec-draft-type-v", "kvarn4"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K2V4_G128);
+
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "turbo2_tcq", "--spec-draft-type-v", "turbo4"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K2V4_G128);
     assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q2_0S);
     assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q4_0);
 
     params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "kvarn4", "--spec-draft-type-k", "f16", "--spec-draft-type-v", "f16"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_TYPE_DISABLED);
+    assert(params.speculative.draft.cache_kvarn_bits_k == 0);
+    assert(params.speculative.draft.cache_kvarn_bits_v == 0);
+
+    params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "q2_1", "--spec-draft-type-v", "q3_0"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_TYPE_DISABLED);
     assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q2_1);
     assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q3_0);
 
@@ -850,6 +890,7 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_external_draft, LLAMA_EXAMPLE_SERVER));
     }
 
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
     assert(params.speculative.draft_n_max_explicit);
@@ -1035,7 +1076,7 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), incomplete_power_params, LLAMA_EXAMPLE_SERVER));
     }
 
-    argv = {"binary_name", "-lm", "none"};
+    argv = {"binary_name", "-m", "model_file.gguf", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 
@@ -1195,6 +1236,80 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
     printf("test-arg-parser: all tests OK\n\n");
 }
 
+static void test_draft_cache_configuration_is_independent() {
+    common_params defaults;
+    assert(defaults.speculative.draft.cache_kvarn_bits_k == 0);
+    assert(defaults.speculative.draft.cache_kvarn_bits_v == 0);
+    assert(defaults.speculative.draft.kvarn.type == LLAMA_KVARN_TYPE_DISABLED);
+
+    common_params target_kvarn;
+    target_kvarn.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+    target_kvarn.cache_kvarn_bits_k = 4;
+    target_kvarn.cache_kvarn_bits_v = 2;
+    target_kvarn.cache_type_k = GGML_TYPE_Q4_0;
+    target_kvarn.cache_type_v = GGML_TYPE_Q2_0S;
+    target_kvarn.kv_tail_tokens = "512";
+
+    common_params draft = common_base_params_to_speculative(target_kvarn);
+    assert(draft.kvarn.type == LLAMA_KVARN_TYPE_DISABLED);
+    assert(draft.cache_kvarn_bits_k == 0);
+    assert(draft.cache_kvarn_bits_v == 0);
+    assert(draft.cache_kvarn_swa_bits_k == 0);
+    assert(draft.cache_kvarn_swa_bits_v == 0);
+    assert(draft.kv_tail_tokens == "0");
+    assert(draft.kv_tail_type == GGML_TYPE_F16);
+
+    common_params independent;
+    independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    independent.speculative.draft.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K6V4_G128);
+    independent.speculative.draft.cache_kvarn_bits_k = 6;
+    independent.speculative.draft.cache_kvarn_bits_v = 4;
+    independent.speculative.draft.cache_type_k = GGML_TYPE_Q6_0;
+    independent.speculative.draft.cache_type_v = GGML_TYPE_Q4_0;
+    draft = common_base_params_to_speculative(independent);
+    assert(independent.kvarn.type == LLAMA_KVARN_TYPE_DISABLED);
+    assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+    assert(draft.cache_kvarn_bits_k == 6);
+    assert(draft.cache_kvarn_bits_v == 4);
+    assert(draft.cache_kvarn_swa_bits_k == 0);
+    assert(draft.cache_kvarn_swa_bits_v == 0);
+    assert(draft.kvarn.swa_key_bits == 0);
+    assert(draft.kvarn.swa_value_bits == 0);
+    assert(draft.kv_tail_tokens == "0");
+
+    independent.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+    draft = common_base_params_to_speculative(independent);
+    assert(independent.kvarn.type == LLAMA_KVARN_K4V2_G128);
+    assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+
+    for (const auto unsupported : {
+            COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
+            COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+            COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK }) {
+        independent.speculative.types = { unsupported };
+        try {
+            (void) common_base_params_to_speculative(independent);
+            assert(false && "unsupported draft KVarN mode must fail closed");
+        } catch (const std::invalid_argument & error) {
+            const std::string message = error.what();
+            assert(message.find("draft KVarN") != std::string::npos);
+            assert(message.find(common_speculative_type_to_str(unsupported)) != std::string::npos);
+        }
+    }
+
+    independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
+    draft = common_base_params_to_speculative(independent);
+    assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+
+    independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
+    try {
+        (void) common_base_params_to_speculative(independent);
+        assert(false && "ambiguous draft cache ownership must fail closed");
+    } catch (const std::invalid_argument &) {
+    }
+}
+
 static void test_single_device_draft_does_not_inherit_target_tensor_split() {
     common_params params;
     params.split_mode      = LLAMA_SPLIT_MODE_TENSOR;
@@ -1208,15 +1323,14 @@ static void test_single_device_draft_does_not_inherit_target_tensor_split() {
 
     const common_params draft = common_base_params_to_speculative(params);
 
-    assert(draft.split_mode == LLAMA_SPLIT_MODE_NONE);
-    for (float value : draft.tensor_split) {
-        assert(value == 0.0f);
-    }
+    assert(draft.split_mode == LLAMA_SPLIT_MODE_LAYER);
+    assert(draft.split_mode != LLAMA_SPLIT_MODE_TENSOR);
 }
 
 int main(void) {
     try {
         test();
+        test_draft_cache_configuration_is_independent();
         test_single_device_draft_does_not_inherit_target_tensor_split();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());

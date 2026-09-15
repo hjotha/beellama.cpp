@@ -6,6 +6,10 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "speculative.h"
+
+#include "../src/llama-context.h"
+#include "../src/llama-kv-cache-kvarn.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -65,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-mtp-ubatch-sync] [--test-mtp-request-reset] [--test-mtp-kvarn-routing]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -79,10 +83,10 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
-    const uint32_t n_ctx = 256;
+    const uint32_t n_ctx = mtp ? 256 : 128;
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -147,6 +151,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -420,6 +427,314 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+static bool mtp_sync_test_decode(llama_model * model, uint32_t n_ubatch) {
+    const int32_t n_tokens = 4;
+    const int32_t n_embd   = llama_model_n_embd_out(model);
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 8;
+    ctx_params.n_batch = n_tokens;
+    ctx_params.n_ubatch = n_ubatch;
+    ctx_params.n_threads = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+    llama_context_ptr ctx(llama_init_from_model(model, ctx_params));
+    if (!ctx) {
+        throw std::runtime_error("failed to create MTP context");
+    }
+
+    std::vector<llama_token> token(n_tokens);
+    std::vector<float> embd((size_t) n_tokens * n_embd, 1.0e-2f);
+    std::vector<llama_pos> pos(n_tokens);
+    std::vector<int32_t> n_seq_id(n_tokens, 1);
+    std::vector<llama_seq_id> seq_id_data(n_tokens, 0);
+    std::vector<llama_seq_id *> seq_id(n_tokens);
+    std::vector<int8_t> logits(n_tokens, 0);
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        token[i] = i;
+        pos[i] = i;
+        seq_id[i] = &seq_id_data[i];
+    }
+    logits.back() = 1;
+
+    llama_batch batch = {
+        /*.n_tokens =*/ n_tokens,
+        /*.token    =*/ token.data(),
+        /*.embd     =*/ embd.data(),
+        /*.pos      =*/ pos.data(),
+        /*.n_seq_id =*/ n_seq_id.data(),
+        /*.seq_id   =*/ seq_id.data(),
+        /*.logits   =*/ logits.data(),
+    };
+
+    llama_perf_context_reset(ctx.get());
+    const int32_t ret = llama_decode(ctx.get(), batch);
+    if (ret != 0) {
+        throw std::runtime_error("failed to decode MTP batch");
+    }
+
+    // A synchronized multi-ubatch decode accounts its queued prompt tokens
+    // before returning. The intentionally asynchronous single-ubatch path does not.
+    return llama_perf_context(ctx.get()).n_p_eval >= n_tokens;
+}
+
+static int test_mtp_ubatch_sync(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create MTP model");
+    }
+
+    if (!mtp_sync_test_decode(model.get(), 2)) {
+        fprintf(stderr, "MTP ubatches were not synchronized\n");
+        return 1;
+    }
+    if (mtp_sync_test_decode(model.get(), 4)) {
+        fprintf(stderr, "single MTP ubatch was synchronized\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_mtp_request_reset(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create MTP model");
+    }
+
+    llama_context_params target_params = llama_context_default_params();
+    target_params.n_ctx = 8;
+    target_params.n_batch = 4;
+    target_params.n_ubatch = 4;
+    llama_context_ptr ctx_tgt(llama_init_from_model(model.get(), target_params));
+    if (!ctx_tgt) {
+        throw std::runtime_error("failed to create target context");
+    }
+
+    llama_context_params draft_params = target_params;
+    draft_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    llama_context_ptr ctx_dft(llama_init_from_model(model.get(), draft_params));
+    if (!ctx_dft) {
+        throw std::runtime_error("failed to create MTP context");
+    }
+
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.draft.ctx_tgt = ctx_tgt.get();
+    params.draft.ctx_dft = ctx_dft.get();
+    params.draft.backend_sampling = false;
+    common_speculative_ptr spec(common_speculative_init(params, 1));
+    if (!spec) {
+        throw std::runtime_error("failed to create MTP speculative driver");
+    }
+
+    std::vector<uint8_t> state;
+    if (!common_speculative_get_state(spec.get(), 0, state)) {
+        throw std::runtime_error("failed to read initial MTP state");
+    }
+
+    size_t cursor = 0;
+    const auto read_u32 = [&]() {
+        uint32_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+    const auto read_i32 = [&]() {
+        int32_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+    const auto read_u64 = [&]() {
+        uint64_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+
+    const uint32_t magic = read_u32();
+    const uint32_t version = read_u32();
+    const uint32_t type = read_u32();
+    const int32_t seq_id = read_i32();
+    const uint64_t payload_size = read_u64();
+    const size_t checksum_offset = cursor;
+    (void) read_u64();
+    const size_t payload_offset = cursor;
+    if (magic != 0x43455053 || version != 1 ||
+            type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP || seq_id != 0 ||
+            payload_offset + payload_size != state.size() || payload_size < 3*sizeof(uint32_t)) {
+        throw std::runtime_error("unexpected serialized MTP state format");
+    }
+
+    uint32_t width;
+    std::memcpy(&width, state.data() + payload_offset + 2*sizeof(uint32_t), sizeof(width));
+    if (payload_size != 3*sizeof(uint32_t) + size_t(width)*sizeof(float)) {
+        throw std::runtime_error("unexpected serialized MTP state width");
+    }
+    std::vector<float> stale(width, 1.0f);
+    std::memcpy(state.data() + payload_offset + 3*sizeof(uint32_t), stale.data(), stale.size()*sizeof(float));
+
+    uint64_t checksum = 1469598103934665603ULL;
+    const auto hash_bytes = [&](const void * ptr, size_t size) {
+        const auto * bytes = static_cast<const uint8_t *>(ptr);
+        for (size_t i = 0; i < size; ++i) {
+            checksum = (checksum ^ bytes[i])*1099511628211ULL;
+        }
+    };
+    hash_bytes(&magic, sizeof(magic));
+    hash_bytes(&version, sizeof(version));
+    hash_bytes(&type, sizeof(type));
+    hash_bytes(&seq_id, sizeof(seq_id));
+    hash_bytes(&payload_size, sizeof(payload_size));
+    hash_bytes(state.data() + payload_offset, payload_size);
+    std::memcpy(state.data() + checksum_offset, &checksum, sizeof(checksum));
+
+    if (!common_speculative_set_state(spec.get(), 0, state)) {
+        throw std::runtime_error("failed to inject stale MTP state");
+    }
+    common_speculative_begin(spec.get(), 0, { 1 });
+
+    std::vector<uint8_t> reset_state;
+    if (!common_speculative_get_state(spec.get(), 0, reset_state) || reset_state.size() != state.size()) {
+        throw std::runtime_error("failed to read reset MTP state");
+    }
+    const size_t pending_offset = payload_offset + 3*sizeof(uint32_t);
+    for (size_t i = 0; i < width; ++i) {
+        float value;
+        std::memcpy(&value, reset_state.data() + pending_offset + i*sizeof(float), sizeof(value));
+        if (value != 0.0f) {
+            fprintf(stderr, "MTP request begin retained stale hidden state at element %zu\n", i);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static llama_model_ptr make_synthetic_mtp_model(llm_arch arch, bool moe, size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    return llama_model_ptr(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &seed, model_params));
+}
+
+static int test_mtp_kvarn_routing(const size_t seed) {
+    struct route_case {
+        llm_arch arch;
+        bool moe;
+    };
+    // Qwen4Exp is covered by the pure route policy and real-model acceptance.
+    // Its synthetic full-model fixture does not represent its standalone sidecar topology.
+    for (const route_case & test : {
+            route_case{ LLM_ARCH_QWEN35, false },
+            route_case{ LLM_ARCH_QWEN35MOE, true } }) {
+        fprintf(stderr, "checking owned MTP KVarN route for %s\n", llm_arch_name(test.arch));
+        llama_model_ptr model = make_synthetic_mtp_model(test.arch, test.moe, seed);
+        if (!model) {
+            throw std::runtime_error(std::string("failed to create synthetic MTP model for ") + llm_arch_name(test.arch));
+        }
+
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 256;
+        params.n_batch = 64;
+        params.n_ubatch = 32;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.offload_kqv = false;
+        params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+        params.kv_tail_tokens = 0;
+
+        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+        if (!ctx) {
+            fprintf(stderr, "owned MTP KVarN route rejected %s\n", llm_arch_name(test.arch));
+            return 1;
+        }
+        if (dynamic_cast<llama_kv_cache_kvarn *>(llama_get_memory(ctx.get())) == nullptr) {
+            fprintf(stderr, "owned MTP route did not construct KVarN storage for %s\n", llm_arch_name(test.arch));
+            return 1;
+        }
+        if (ctx->get_cparams().kv_tail_tokens != 128 || llama_get_memory(ctx.get())->get_kv_tail_group_count() != 1) {
+            fprintf(stderr, "owned MTP KVarN route did not retain one intrinsic 128-token exact suffix for %s\n",
+                    llm_arch_name(test.arch));
+            return 1;
+        }
+    }
+
+    // Exercise the full resident-MTP parameter path: the draft cache request
+    // must survive common_speculative_init_result before the MTP context is
+    // constructed. A direct llama_init_from_model test would not catch a
+    // dropped draft-only request in the common layer.
+    {
+        llama_model_ptr model = make_synthetic_mtp_model(LLM_ARCH_QWEN35, false, seed);
+        if (!model) {
+            throw std::runtime_error("failed to create propagation-test MTP model");
+        }
+
+        llama_context_params target_params = llama_context_default_params();
+        target_params.n_ctx = 256;
+        target_params.n_batch = 64;
+        target_params.n_ubatch = 32;
+        llama_context_ptr target(llama_init_from_model(model.get(), target_params));
+        if (!target) {
+            throw std::runtime_error("failed to create propagation-test target context");
+        }
+
+        common_params params;
+        params.model.path = "synthetic-mtp.gguf";
+        params.n_parallel = 1;
+        params.n_batch = 64;
+        params.n_ubatch = 32;
+        params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        params.speculative.draft.n_max = 2;
+        params.speculative.draft.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+        params.speculative.draft.cache_kvarn_bits_k = 4;
+        params.speculative.draft.cache_kvarn_bits_v = 2;
+        params.speculative.draft.cache_type_k = GGML_TYPE_Q4_0;
+        params.speculative.draft.cache_type_v = GGML_TYPE_Q2_0S;
+
+        common_speculative_init_result_ptr init =
+                common_speculative_init_from_params(params, model.get(), target.get());
+        if (!init || !init->context() ||
+                dynamic_cast<llama_kv_cache_kvarn *>(llama_get_memory(init->context())) == nullptr) {
+            fprintf(stderr, "resident MTP initialization dropped the draft KVarN cache request\n");
+            return 1;
+        }
+    }
+
+    llama_model_ptr unsupported = make_synthetic_mtp_model(LLM_ARCH_QWEN3NEXT, true, seed);
+    if (!unsupported) {
+        throw std::runtime_error("failed to create unsupported synthetic MTP model");
+    }
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 256;
+    params.n_batch = 64;
+    params.n_ubatch = 32;
+    params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    params.offload_kqv = false;
+    params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+    if (llama_init_from_model(unsupported.get(), params) != nullptr) {
+        fprintf(stderr, "unclassified MTP architecture accepted draft KVarN\n");
+        return 1;
+    }
+
+    return 0;
 }
 
 static std::vector<float> get_logits(
@@ -833,8 +1148,10 @@ int main(int argc, char ** argv) {
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
     std::string out;
-
     int verbosity = LOG_LEVEL_ERROR;
+    bool test_mtp_sync = false;
+    bool test_mtp_reset = false;
+    bool test_mtp_kvarn = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -878,12 +1195,30 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "--test-mtp-ubatch-sync") == 0) {
+            test_mtp_sync = true;
+        }
+        if (strcmp(argv[i], "--test-mtp-request-reset") == 0) {
+            test_mtp_reset = true;
+        }
+        if (strcmp(argv[i], "--test-mtp-kvarn-routing") == 0) {
+            test_mtp_kvarn = true;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
+        }
+        if (test_mtp_sync) {
+            return test_mtp_ubatch_sync(seed);
+        }
+        if (test_mtp_reset) {
+            return test_mtp_request_reset(seed);
+        }
+        if (test_mtp_kvarn) {
+            return test_mtp_kvarn_routing(seed);
         }
         return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {

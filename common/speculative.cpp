@@ -2774,8 +2774,50 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
     return spec->synth_probs;
 }
 
+static bool common_speculative_type_owns_draft_context(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void common_validate_draft_kvarn_mode(const common_params_speculative & params) {
+    if (params.draft.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return;
+    }
+
+    bool has_mtp = false;
+    std::vector<std::string> unsupported;
+    for (const common_speculative_type type : params.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            has_mtp = true;
+        } else if (common_speculative_type_owns_draft_context(type)) {
+            unsupported.push_back(common_speculative_type_to_str(type));
+        }
+    }
+
+    if (!has_mtp || !unsupported.empty()) {
+        std::string modes = common_speculative_type_name_str(params.types);
+        if (modes.empty()) {
+            modes = "none";
+        }
+        throw std::invalid_argument(string_format(
+                "draft KVarN is supported only for draft-mtp owned-KV contexts; selected speculative mode(s): %s. "
+                "Choose an ordinary --spec-draft-type-k/v cache type for this mode",
+                modes.c_str()));
+    }
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
+
+    common_validate_draft_kvarn_mode(params.speculative);
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
@@ -2806,8 +2848,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
         }
 
-    result.cache_type_k  = params_spec.cache_type_k;
-    result.cache_type_v  = params_spec.cache_type_v;
+    result.cache_type_k = params_spec.cache_type_k;
+    result.cache_type_v = params_spec.cache_type_v;
+    result.cache_kvarn_bits_k = params_spec.cache_kvarn_bits_k;
+    result.cache_kvarn_bits_v = params_spec.cache_kvarn_bits_v;
+    result.cache_kvarn_swa_bits_k = 0;
+    result.cache_kvarn_swa_bits_v = 0;
+    result.kvarn = params_spec.kvarn;
+    result.kvarn.swa_key_bits = 0;
+    result.kvarn.swa_value_bits = 0;
     result.kv_tail_tokens = "0";
     result.kv_tail_type   = GGML_TYPE_F16;
     result.n_outputs_max = params.n_parallel;
@@ -2854,8 +2903,9 @@ common_speculative_init_result::common_speculative_init_result(
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
+    common_params params_dft = common_base_params_to_speculative(params);
+    auto mparams = common_model_params_to_llama(params_dft);
+    auto cparams = common_context_params_to_llama(params_dft);
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -2876,7 +2926,7 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
