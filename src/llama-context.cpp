@@ -22,7 +22,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
-#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -4231,8 +4230,13 @@ constexpr uint32_t llama_state_q4_io_magic = 0xaf143cd8;
 // Reads the outer header shared by file and in-memory sequence states. Leaves
 // the source positioned at the start of the memory-specific body.
 bool llama_state_q4_read_outer_header(llama_state_q4_source & src, llama_state_q4_info & info,
-        const llama_token * ram_tokens, size_t ram_n_tokens, std::string & error) {
+        const llama_token * ram_tokens, size_t ram_n_tokens, uint64_t max_tokens,
+        std::string & error) {
     try {
+        if (max_tokens == 0 || max_tokens > SIZE_MAX / sizeof(llama_token)) {
+            throw std::runtime_error("invalid sequence state token budget");
+        }
+
         uint32_t magic = 0;
         src.read_raw(&magic, sizeof(magic));
         if (magic == LLAMA_STATE_SEQ_MAGIC) {
@@ -4242,6 +4246,14 @@ bool llama_state_q4_read_outer_header(llama_state_q4_source & src, llama_state_q
             src.read_raw(&n_tokens, sizeof(n_tokens));
             if (version != LLAMA_STATE_SEQ_VERSION) {
                 throw std::runtime_error("unsupported sequence state version");
+            }
+            if (n_tokens == 0 || uint64_t(n_tokens) > max_tokens) {
+                throw std::runtime_error("sequence state token count exceeds the destination budget");
+            }
+            const uint64_t token_bytes = uint64_t(n_tokens) * sizeof(llama_token);
+            const uint64_t pos = src.tell();
+            if (pos > src.size() || token_bytes > src.size() - pos) {
+                throw std::runtime_error("sequence state token header is truncated");
             }
             info.from_ram = false;
             info.n_tokens = n_tokens;
@@ -4254,11 +4266,13 @@ bool llama_state_q4_read_outer_header(llama_state_q4_source & src, llama_state_q
         if (magic == llama_state_q4_io_magic) {
             int32_t seq_id = 0;
             src.read_raw(&seq_id, sizeof(seq_id));
-            info.from_ram = true;
-            info.n_tokens = ram_n_tokens > UINT32_MAX ? UINT32_MAX : uint32_t(ram_n_tokens);
-            if (ram_n_tokens != 0 && ram_tokens != nullptr) {
-                info.tokens.assign(ram_tokens, ram_tokens + ram_n_tokens);
+            if (seq_id < 0 || ram_n_tokens == 0 || ram_tokens == nullptr ||
+                    ram_n_tokens > max_tokens || ram_n_tokens > UINT32_MAX) {
+                throw std::runtime_error("invalid in-memory sequence state token metadata");
             }
+            info.from_ram = true;
+            info.n_tokens = uint32_t(ram_n_tokens);
+            info.tokens.assign(ram_tokens, ram_tokens + ram_n_tokens);
             return true;
         }
         throw std::runtime_error("source is not a sequence state stream");
@@ -4277,7 +4291,8 @@ size_t llama_context::state_seq_convert_seq_stream(
     if (!count_out) { return 0; }
     *count_out = 0;
     if (!tokens_out || !memory || !dst_filepath || info.n_tokens == 0) { return 0; }
-    if (info.n_tokens > capacity || info.tokens.size() != info.n_tokens) {
+    if (info.n_tokens > capacity || info.n_tokens > uint64_t(cparams.n_ctx_seq) ||
+            info.tokens.size() != info.n_tokens) {
         LLAMA_LOG_ERROR("%s: converted token count exceeds the caller capacity\n", __func__);
         return 0;
     }
@@ -4327,7 +4342,7 @@ size_t llama_context::state_seq_convert_file(
         llama_state_q4_file_source source(&file, src_offset, src_offset + src_size);
         llama_state_q4_info info;
         std::string error;
-        if (!llama_state_q4_read_outer_header(source, info, nullptr, 0, error) ||
+        if (!llama_state_q4_read_outer_header(source, info, nullptr, 0, cparams.n_ctx_seq, error) ||
                 !memory->state_parse_q4(source, model.hparams, info, error)) {
             throw std::runtime_error("unsupported sequence state source: " + error);
         }
@@ -4353,7 +4368,8 @@ size_t llama_context::state_seq_convert_data(
         llama_state_q4_memory_source source(src, size);
         llama_state_q4_info info;
         std::string error;
-        if (!llama_state_q4_read_outer_header(source, info, ram_tokens, ram_n_tokens, error) ||
+        if (!llama_state_q4_read_outer_header(source, info, ram_tokens, ram_n_tokens,
+                    cparams.n_ctx_seq, error) ||
                 !memory->state_parse_q4(source, model.hparams, info, error)) {
             throw std::runtime_error("unsupported sequence state source: " + error);
         }

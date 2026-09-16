@@ -53,7 +53,10 @@ struct llama_state_q4_info {
 // cells 0..n-1 in order, positions 0..n-1 owned by a single sequence, both K
 // and V stored as untransposed q4_0 rows with the exact row sizes of the given
 // attention layers. `attn_layers` is the attention cache's layer order, in the
-// order the state stores them. On failure returns false and fills `error`.
+// order the state stores them. On failure returns false and fills `error`. The
+// caller must set `out.n_tokens` to the bounded count from the outer header
+// before calling; this prevents malformed body metadata from becoming an
+// unbounded allocation.
 LLAMA_API bool llama_state_q4_parse(
         llama_state_q4_source & src,
         const llama_hparams & hparams,

@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "ggml.h"
 
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -31,6 +32,25 @@ uint64_t read_u64(llama_state_q4_source & src) {
     throw std::runtime_error(message);
 }
 
+void require_available(llama_state_q4_source & src, uint64_t bytes, const char * what,
+        std::string & error) {
+    const uint64_t pos = src.tell();
+    const uint64_t size = src.size();
+    if (pos > size || bytes > size - pos) {
+        fail(error, std::string("source state is truncated while reading ") + what);
+    }
+}
+
+uint64_t checked_data_end(llama_state_q4_source & src, uint64_t row_bytes,
+        uint32_t n_rows, const char * what, std::string & error) {
+    if (n_rows != 0 && row_bytes > std::numeric_limits<uint64_t>::max() / n_rows) {
+        fail(error, std::string("source state ") + what + " span overflows");
+    }
+    const uint64_t bytes = row_bytes * uint64_t(n_rows);
+    require_available(src, bytes, what, error);
+    return src.tell() + bytes;
+}
+
 uint64_t row_bytes(const llama_hparams & hparams, uint32_t il, bool value) {
     const uint32_t n_embd = value ? hparams.n_embd_v_gqa(il) : hparams.n_embd_k_gqa(il);
     return uint64_t(ggml_row_size(GGML_TYPE_Q4_0, n_embd));
@@ -48,6 +68,10 @@ bool llama_state_q4_parse(
     const uint32_t n_expected_tokens = out.n_tokens;
     out.layers.clear();
     try {
+        if (n_expected_tokens == 0 || n_expected_tokens > uint32_t(std::numeric_limits<int32_t>::max())) {
+            fail(error, "source state has no bounded token count");
+        }
+
         const uint32_t n_stream = read_u32(src);
         if (n_stream != 1) {
             fail(error, "source state has more than one KV stream");
@@ -57,14 +81,23 @@ bool llama_state_q4_parse(
         if (cell_count == 0) {
             fail(error, "source state holds no cells");
         }
-        if (n_expected_tokens != 0 && cell_count != n_expected_tokens) {
+        if (cell_count != n_expected_tokens) {
             fail(error, "source state token count does not match its cells");
+        }
+
+        const uint64_t cell_bytes = sizeof(llama_pos) + sizeof(uint32_t) + sizeof(llama_seq_id) +
+            (has_cell_ext ? sizeof(llama_kv_cell_ext) : 0);
+        const uint64_t cell_pos = src.tell();
+        if (cell_bytes == 0 || cell_pos > src.size() ||
+                uint64_t(cell_count) > (src.size() - cell_pos) / cell_bytes) {
+            fail(error, "source state cell metadata is truncated");
         }
 
         out.has_cell_ext = has_cell_ext;
         out.exts.resize(cell_count);
         uint32_t range_begin = cell_count;
         uint32_t range_end = 0;
+        llama_seq_id source_seq_id = -1;
         for (uint32_t i = 0; i < cell_count; ++i) {
             const llama_pos pos = read_i32(src);
             const uint32_t n_seq_id = read_u32(src);
@@ -76,7 +109,11 @@ bool llama_state_q4_parse(
                 src.read_raw(&ext, sizeof(ext));
                 out.exts[i] = ext;
             }
-            read_i32(src); // sequence id: the destination sequence is chosen by the caller
+            const llama_seq_id seq_id = read_i32(src);
+            if (seq_id < 0 || (source_seq_id >= 0 && source_seq_id != seq_id)) {
+                fail(error, "source state cells have an invalid or inconsistent sequence owner");
+            }
+            source_seq_id = seq_id;
             if (pos != llama_pos(i)) {
                 fail(error, "source state is not a contiguous position prefix");
             }
@@ -87,6 +124,7 @@ bool llama_state_q4_parse(
             fail(error, "source state cells are not a contiguous range");
         }
 
+        require_available(src, 2 * sizeof(uint32_t), "attention layout header", error);
         const uint32_t v_trans = read_u32(src);
         if (v_trans != 0) {
             fail(error, "source state uses a transposed value layout");
@@ -99,6 +137,7 @@ bool llama_state_q4_parse(
 
         out.layers.resize(n_layer);
         for (uint32_t i = 0; i < n_layer; ++i) {
+            require_available(src, sizeof(int32_t) + sizeof(uint64_t), "key layout header", error);
             const int32_t k_type = read_i32(src);
             const uint64_t k_row = read_u64(src);
             const uint32_t il = attn_layers[i];
@@ -110,10 +149,11 @@ bool llama_state_q4_parse(
             out.layers[i].k_row_size = k_row;
             out.layers[i].k_data = src.tell();
             // A single contiguous cell range keeps every token row adjacent.
-            src.seek(out.layers[i].k_data + k_row * cell_count);
+            src.seek(checked_data_end(src, k_row, cell_count, "key rows", error));
         }
 
         for (uint32_t i = 0; i < n_layer; ++i) {
+            require_available(src, sizeof(int32_t) + sizeof(uint64_t), "value layout header", error);
             const int32_t v_type = read_i32(src);
             const uint64_t v_row = read_u64(src);
             const uint32_t il = out.layers[i].il;
@@ -123,12 +163,9 @@ bool llama_state_q4_parse(
             }
             out.layers[i].v_row_size = v_row;
             out.layers[i].v_data = src.tell();
-            src.seek(out.layers[i].v_data + v_row * cell_count);
+            src.seek(checked_data_end(src, v_row, cell_count, "value rows", error));
         }
 
-        if (out.n_tokens == 0) {
-            out.n_tokens = cell_count;
-        }
         return true;
     } catch (const std::exception &) {
         if (error.empty()) {

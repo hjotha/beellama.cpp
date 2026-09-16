@@ -3341,7 +3341,6 @@ private:
     // reuse it without converting again. Returns the converted path, empty on
     // any failure. This is lossy and is never reported as a native prefill.
     std::string convert_route_snapshot(const server_route_state_file & source_file,
-            const std::string & source_layout,
             server_route_state_lease * source_lease) {
         if (!ctx_tgt || !adaptive_model_identity || source_file.tokens.empty()) {
             return {};
@@ -3379,7 +3378,10 @@ private:
             return converted_path;
         }
 
-        const std::string native_tmp = converted_path + ".convert-native";
+        static std::atomic<uint64_t> conversion_nonce{0};
+        const std::string native_tmp = converted_path + ".tmp-convert-native-" +
+            std::to_string(ggml_time_us()) + "-" +
+            std::to_string(conversion_nonce.fetch_add(1, std::memory_order_relaxed));
         llama_tokens tokens(source_file.tokens.size());
         size_t count = 0;
         const size_t converted = llama_state_seq_convert_file(ctx_tgt,
@@ -6317,7 +6319,7 @@ slot.loop_guard.configure(task.params.reasoning_loop_guard);
                     // The converted snapshot is persisted with provenance and
                     // reused on later restores; this is a lossy conversion, not
                     // a native prefill.
-                    const std::string converted = convert_route_snapshot(file, file.layout, &reference);
+                    const std::string converted = convert_route_snapshot(file, &reference);
                     if (converted.empty()) {
                         throw std::runtime_error("router state layout differs and no conversion is available");
                     }

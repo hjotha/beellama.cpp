@@ -429,7 +429,7 @@ int main(int argc, char ** argv) {
             {
                 llama_tokens probe(evaluated.size());
                 size_t probe_count = 0;
-                const size_t before_pos = llama_memory_seq_pos_max(llama_get_memory(dest.get()), 0);
+                const llama_pos before_pos = llama_memory_seq_pos_max(llama_get_memory(dest.get()), 0);
                 require(llama_state_seq_load_file_streaming(dest.get(), kvarn_path.c_str(), 0,
                             probe.data(), probe.size(), &probe_count, kvarn_bytes.size(), checksum(kvarn_bytes)) == 0,
                         "nonempty destination accepted converted state");
@@ -624,6 +624,48 @@ int main(int argc, char ** argv) {
                   << " vs native KVarN=" << worst_kl_native
                   << " worst native maxdiff=" << worst_diff_native
                   << " worst record rel=" << worst_record_rel << '\n';
+
+        // Malformed outer headers must be rejected before they can size a
+        // token vector from an attacker-controlled count. This is deliberately
+        // a tiny file with UINT32_MAX in the token-count field: the regression
+        // used to attempt a multi-gigabyte allocation before noticing EOF.
+        {
+            const std::string malformed_path = dir + "/malformed-token-count.bin";
+            const uint32_t header[] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, UINT32_MAX };
+            std::vector<uint8_t> bytes(sizeof(header));
+            std::memcpy(bytes.data(), header, sizeof(header));
+            write_file(malformed_path, bytes);
+
+            llama_context_ptr malformed_dest(llama_init_from_model(model.get(), kvarn_params()));
+            require(bool(malformed_dest), "malformed header context failed");
+            llama_token token_out = 0;
+            size_t token_count = 123;
+            const std::string malformed_out = dir + "/malformed-token-count-out.bin";
+            require(llama_state_seq_convert_file(malformed_dest.get(), malformed_path.c_str(), 0,
+                        bytes.size(), 0, malformed_out.c_str(), &token_out, 1, &token_count) == 0 &&
+                    token_count == 0 && !std::filesystem::exists(malformed_out),
+                    "malformed token count was not rejected before allocation");
+        }
+
+        // The in-memory form has no token header, so a missing token array or
+        // an oversized external count must fail before pointer arithmetic or
+        // assignment from the caller-owned range.
+        {
+            const uint32_t io_magic = 0xaf143cd8u;
+            const int32_t seq_id = 0;
+            std::vector<uint8_t> bytes(sizeof(io_magic) + sizeof(seq_id));
+            std::memcpy(bytes.data(), &io_magic, sizeof(io_magic));
+            std::memcpy(bytes.data() + sizeof(io_magic), &seq_id, sizeof(seq_id));
+            llama_context_ptr malformed_dest(llama_init_from_model(model.get(), kvarn_params()));
+            require(bool(malformed_dest), "malformed RAM header context failed");
+            llama_token token_out = 0;
+            size_t token_count = 123;
+            const std::string malformed_out = dir + "/malformed-ram-out.bin";
+            require(llama_state_seq_convert_data(malformed_dest.get(), bytes.data(), bytes.size(), 0,
+                        nullptr, UINT32_MAX, malformed_out.c_str(), &token_out, 1, &token_count) == 0 &&
+                    token_count == 0 && !std::filesystem::exists(malformed_out),
+                    "malformed RAM token metadata was not rejected before allocation");
+        }
 
         // Unsupported source: a KVarN file is not a q4 conversion source.
         {

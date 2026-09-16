@@ -13,17 +13,25 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <mutex>
 #include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <unistd.h>
+#else
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
 #endif
 
 // ggml/src is not on this target's include path; only the q4_0 dequantizer is
@@ -2983,6 +2991,77 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
 
 namespace {
 
+// A conversion group must join every worker even when one of the dequantizers
+// or quantizers throws. Letting a joinable std::thread escape would call
+// std::terminate and could leave the caller without the normal atomic cleanup.
+class conversion_thread_group {
+public:
+    ~conversion_thread_group() {
+        for (auto & thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+
+    template<typename F>
+    void spawn(F && function) {
+        threads.emplace_back([this, function = std::forward<F>(function)]() mutable {
+            try {
+                function();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!error) {
+                    error = std::current_exception();
+                }
+            }
+        });
+    }
+
+    void join() {
+        for (auto & thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+
+private:
+    std::vector<std::thread> threads;
+    std::mutex mutex;
+    std::exception_ptr error;
+};
+
+std::string create_conversion_temp_path(const std::string & destination) {
+#ifndef _WIN32
+    std::string pattern = destination + ".tmp-convert-XXXXXX";
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    const int fd = ::mkstemp(name.data());
+    if (fd < 0) {
+        throw std::runtime_error("cannot create converted sequence state temporary file");
+    }
+    ::close(fd);
+    return name.data();
+#else
+    static std::atomic<uint64_t> nonce{0};
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        const std::string path = destination + ".tmp-convert-" + std::to_string((long) _getpid()) + "-" +
+            std::to_string(nonce.fetch_add(1, std::memory_order_relaxed));
+        const int fd = _open(path.c_str(), _O_CREAT | _O_EXCL | _O_BINARY | _O_RDWR,
+                _S_IREAD | _S_IWRITE);
+        if (fd >= 0) {
+            _close(fd);
+            return path;
+        }
+    }
+    throw std::runtime_error("cannot create converted sequence state temporary file");
+#endif
+}
+
 // Collects a host-only state stream (the metadata mirror owns no tensors).
 class llama_io_write_vector final : public llama_io_write_i {
 public:
@@ -3256,14 +3335,7 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
 
     // One temporary file in the destination directory, atomically renamed only
     // after the complete stream has been written, synced and closed.
-    const std::string tmp_path = std::string(dst_path) + ".tmp-convert-" +
-        std::to_string(
-#ifdef _WIN32
-            (long) GetCurrentProcessId()
-#else
-            (long) getpid()
-#endif
-        );
+    const std::string tmp_path = create_conversion_temp_path(dst_path);
 
     struct tmp_guard {
         std::string path;
@@ -3277,7 +3349,6 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
     } guard { tmp_path };
 
     std::error_code ec;
-    std::filesystem::remove(tmp_path, ec);
 
     llama_file out(tmp_path.c_str(), "wb");
     auto write_bytes = [&out](const void * data, size_t size) { out.write_raw(data, size); };
@@ -3409,8 +3480,7 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
 
             for (uint32_t g0 = 0; g0 < n_groups_used; g0 += n_workers) {
                 const uint32_t count = std::min(n_workers, n_groups_used - g0);
-                std::vector<std::thread> threads;
-                threads.reserve(count);
+                conversion_thread_group threads;
 
                 for (uint32_t i = 0; i < count; ++i) {
                     const uint32_t group = g0 + i;
@@ -3430,16 +3500,14 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
                     if (group == 0 || group >= complete_groups) {
                         continue;
                     }
-                    threads.emplace_back([&, i] {
+                    threads.spawn([&, i] {
                         kvarn_convert_component_records(
                                 in[i].data(), KVAR_N_GROUP, uint32_t(component.row_size),
                                 component.n_embd, component.shape, component.bits,
                                 params.sinkhorn_iters, component.value, out_buf[i].data());
                     });
                 }
-                for (auto & thread : threads) {
-                    thread.join();
-                }
+                threads.join();
 
                 for (uint32_t i = 0; i < count; ++i) {
                     const uint32_t group = g0 + i;
@@ -3471,17 +3539,14 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
                 src.seek(stage.data + size_t(group) * KVAR_N_GROUP * stage.row_size);
                 src.read_raw(rows.data(), rows.size());
 
-                std::vector<std::thread> threads;
-                threads.reserve(stage.shape.n_head_sliced);
+                conversion_thread_group threads;
                 for (uint32_t hs = 0; hs < stage.shape.n_head_sliced; ++hs) {
-                    threads.emplace_back([&, hs] {
+                    threads.spawn([&, hs] {
                         kvarn_convert_stage_slice(rows.data(), n_valid, uint32_t(stage.row_size),
                                 stage.n_embd, stage.shape, hs, slot, image.data());
                     });
                 }
-                for (auto & thread : threads) {
-                    thread.join();
-                }
+                threads.join();
             }
 
             write_bytes(image.data(), image.size());
