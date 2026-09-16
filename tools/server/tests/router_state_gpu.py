@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Exclusive GPU window against the promoted phase-1 router release.
+"""Exclusive GPU window against the promoted KVarN router release.
 
-The wrapper validates the live r1 unit, model ID and router idle/queue state
-before stopping anything. It clones the frozen r1 INI into the private artifact
+The wrapper validates the live release, model ID and router idle/queue state
+before stopping anything. It clones the frozen production INI into the private artifact
 directory and changes only the snapshot store path. The matrix always runs on
 8091 and every exit path, including SIGINT/SIGTERM and harness failure, starts
 the exact original unit and verifies health, release path and unit/drop-in
@@ -24,10 +24,10 @@ import urllib.parse
 import urllib.request
 
 
-DEFAULT_RELEASE = Path("/home/hjotha/releases/beellama-router-kv-streaming-20260916-r1")
+DEFAULT_RELEASE = Path("/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r2")
 DEFAULT_PRESET = DEFAULT_RELEASE / "qwen-3.8-27b-q4-mixed-20260916.ini"
 DEFAULT_MODEL = "/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
-PUBLIC_CONTEXT = 104448
+PUBLIC_CONTEXT = 114688
 
 
 def command(*argv):
@@ -163,13 +163,13 @@ def prepare_private_preset(root, source, model):
     store = matrix / "auto-store"
     text = source.read_text()
     if not re.search(r"(?m)^\s*slot-save-path\s*=", text):
-        raise RuntimeError("frozen r1 INI has no slot-save-path to isolate")
+        raise RuntimeError("frozen production INI has no slot-save-path to isolate")
     text = re.sub(r"(?m)^\s*slot-save-path\s*=.*$",
                   f"slot-save-path = {store}/", text, count=1)
     if "slot-save-auto = true" not in text:
-        raise RuntimeError("frozen r1 INI does not enable slot-save-auto")
+        raise RuntimeError("frozen production INI does not enable slot-save-auto")
     if f"model = {model}" not in text:
-        raise RuntimeError("frozen r1 INI model does not match the requested public model")
+        raise RuntimeError("frozen production INI model does not match the requested public model")
     if "/home/hjotha/llama-slot-cache" in text:
         raise RuntimeError("private GPU candidate still references the production cache")
     # Keep the candidate beside (not inside) the harness work root: the GPU
@@ -204,7 +204,7 @@ def validate_baseline(service, release, model_id, record):
     unit_text = command("systemctl", "cat", service)
     expected_binary = str(release / "bin" / "llama-server")
     if expected_binary not in unit_text or f"WorkingDirectory={release}" not in unit_text:
-        raise RuntimeError("active unit is not the promoted r1 release")
+        raise RuntimeError("active unit is not the promoted production release")
     record["before_state"] = state
     record["before_unit_sha256"] = sha256_bytes(unit_text.encode())
     record["before_exec_release"] = expected_binary
@@ -247,7 +247,7 @@ def validate_baseline(service, release, model_id, record):
     if external:
         raise RuntimeError(f"GPU has compute processes outside {service}: {external}")
     if not app_pids(apps):
-        raise RuntimeError("r1 service has no visible GPU compute child")
+        raise RuntimeError("production service has no visible GPU compute child")
     record["before_gpu"] = apps
     record["before_service_pids"] = sorted(service_pids)
 
@@ -291,7 +291,7 @@ def validate_restored_baseline(service, release, model_id, record):
             not context_ok or
             metrics.get("llamacpp:requests_processing") != 0 or
             metrics.get("llamacpp:requests_deferred") != 0):
-        raise RuntimeError("original r1 baseline did not restore exactly: child/model/slots/metrics validation failed")
+        raise RuntimeError("original production baseline did not restore exactly: child/model/slots/metrics validation failed")
     record["restored_exactly"] = True
 
 
@@ -309,7 +309,7 @@ def wait_for_restored_baseline(service, release, model_id, record, timeout=180):
             last_error = error
             time.sleep(1)
     record["restore_readiness_attempts"] = attempts
-    raise RuntimeError(f"r1 child readiness did not complete within {timeout}s: {last_error!r}")
+    raise RuntimeError(f"production child readiness did not complete within {timeout}s: {last_error!r}")
 
 
 def main():
@@ -337,7 +337,7 @@ def main():
     release = Path(args.release).resolve()
     source = Path(args.preset_source).resolve()
     if not release.is_dir() or not source.is_file():
-        raise RuntimeError("r1 release or frozen preset is missing")
+        raise RuntimeError("production release or frozen preset is missing")
     model_id = forwarded_value(args.harness_args, "--model-id") or forwarded_value(args.harness_args, "--model") or DEFAULT_MODEL
     record = {
         "service": args.service,
@@ -384,10 +384,10 @@ def main():
             record["validated"] = True
             record["finished"] = time.time()
             (root / "control.json").write_text(json.dumps(record, indent=2))
-            print(json.dumps({"dry_run": True, "baseline": "r1", "candidate": str(candidate)}), flush=True)
+            print(json.dumps({"dry_run": True, "baseline": "production", "candidate": str(candidate)}), flush=True)
             return
 
-        print("GPU_WINDOW_BEGIN: production r1 idle, stopping llama-server-root.service", flush=True)
+        print("GPU_WINDOW_BEGIN: production idle, stopping llama-server-root.service", flush=True)
         record["window_begin"] = time.time()
         stopped = True
         signal_state["stop_in_progress"] = True
@@ -440,7 +440,7 @@ def main():
                 except BaseException as error:
                     record["log_scan_failure"] = repr(error)
         if stopped:
-            print("GPU_WINDOW_END: restoring original r1 service", flush=True)
+            print("GPU_WINDOW_END: restoring original production service", flush=True)
             restore_error = None
             signal_state["restore_in_progress"] = True
             try:
@@ -458,7 +458,7 @@ def main():
                                stdout=subprocess.PIPE, text=True)
                 wait_for_restored_baseline(args.service, release, model_id, record)
                 if record.get("harness_gpu_residual"):
-                    raise RuntimeError("harness GPU process remained before r1 restore")
+                    raise RuntimeError("harness GPU process remained before production restore")
             except BaseException as error:
                 if restore_error is None:
                     restore_error = error
