@@ -13,6 +13,47 @@ transitions still use the existing RAM prompt-cache snapshots, including draft,
 carry and checkpoints. Explicit adaptive slot files retain their version-1
 format, model/profile validation, rollback and five-copy RAM reservation.
 
+## Current final promotion
+
+The unified snapshot implementation and the explicit q4_0 -> KVarN conversion
+tier are promoted on GOKAYA in
+`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r2`. The active
+unit is `llama-server-root.service`; it keeps the public model ID
+`/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` and exposes one route
+group with a public `context_window` of `114688`. The route members are the
+existing q4/MTP tri-profile, the q4 b/ub64 tier at 104448, and the uncapped
+KVarN4/KVarN4 b/ub64 child. q4/q4 remains the production KV format for the
+standard tiers and KVarN is used only by the compact child; the MTP draft/carry
+path remains q4/q4.
+
+The four production profiles are:
+
+| Profile | Context | MTP | Target b/ub | KV |
+| --- | ---: | --- | ---: | --- |
+| `mtp-short` | 32768 | on | 256/256 | q4/q4 |
+| `mtp` | 56320 | on | 256/256 | q4/q4 |
+| `long` | 97536 | off | 256/256 | q4/q4 |
+| `wide` | 104448 | off | 64/64 | q4/q4, with the separate KVarN4/KVarN4 child above it |
+
+The final distinct-prompt GPU supplement is recorded at
+`/home/hjotha/router-kv-snapshots-unificados-20260917/gpu-ab-distinct-final2`.
+For every profile it passed `A cold -> A RAM hit -> distinct B with no cache ->
+fresh-process A disk hit`; A and B had LCP=0 and different first tokens, and
+the A snapshot's inode/checksum survived B and restart. The disk-hit rows
+restored 28671/52223/93440/100352 tokens respectively; MTP bootstrap was
+verified for 32768 and 56320. Its log scan found zero OOM/CUDA allocation
+failures, zero recovery events and zero batch/slot fallbacks. Four preventive
+CUDA-graph headroom warnings were handled before capture.
+
+The full evidence set is split by scope: native streaming/conversion/lock
+tests and CPU matrices are under
+`/home/hjotha/router-merge-review-20260917-1`; the real-context GPU matrix,
+including 4096-token boundary/margin and disk-chain cases, is under
+`/home/hjotha/router-kv-snapshots-unificados-20260916/gpu-unified-window-20260916-2`.
+The release record and hashes are in
+`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r2/PROMOTION-RESULT.md`
+and `RELEASE-HASHES.txt`.
+
 ## Store separation and conversation contract
 
 An upward handoff is associated by `X-Conversation-Id`; requests without that
@@ -303,10 +344,24 @@ selected restore.
 
 ## Promotion and rollback record
 
+### Final unified promotion
+
+The final promotion used source commit `6e21b6754` and release
+`beellama-router-kvarn-convert-20260917-r2`. The exclusive GPU wrapper restored
+the previous service exactly before promotion (`matrix_passed=true`,
+`restored_exactly=true`, unchanged unit/drop-in, and health `ok`). After the
+promotion, the live unit, public model listing, KVarN route member, effective
+PID executable and a real one-token request were verified. The previous KVarN
+release remains untouched at
+`/home/hjotha/releases/beellama-router-kvarn-convert-20260916-r1`; the exact
+unit backup is `/etc/systemd/system/llama-server-root.service.pre-r2-20260917`.
+
+### Historical phase-1 promotion
+
 The reviewed unit remains checked in as
-`tools/server/llama-server-root.router-proposed.service`. Its frozen release
-copy is `/home/hjotha/releases/beellama-router-kv-streaming-20260916-r1/llama-server-root.service`,
-and that copy is now installed at `/etc/systemd/system/llama-server-root.service`.
+`tools/server/llama-server-root.router-proposed.service`. Its frozen phase-1
+release copy is retained at
+`/home/hjotha/releases/beellama-router-kv-streaming-20260916-r1/llama-server-root.service`.
 Promotion completed on 2026-09-16 at `14:10:40 CEST` after the service passed
 the idle check, health check, model listing, request/cache check, and journal
 inspection.
@@ -334,11 +389,13 @@ the router handoff directory. Output goes to journald (`journalctl -u
 llama-server-root.service`); no shared/truncating `--log-file` is configured.
 The public model ID remains the literal GGUF path.
 
-The promotion smoke returned `{"status":"ok"}`, `/v1/models` exposed one
-model with `context_window=104448`, and the first/repeated request reported
-`cache_n=0/1`. The child loaded `qwen-3.8-27b-q4-tri`; its startup indexed
-`2687` prefix boundaries from `/home/hjotha/llama-slot-cache/`, and the
-production store contained `64` automatic state files after the check.
+The historical promotion smoke returned `{"status":"ok"}`, `/v1/models`
+exposed one model with `context_window=104448`, and the first/repeated request
+reported `cache_n=0/1`. The child loaded `qwen-3.8-27b-q4-tri`; its startup
+indexed `2687` prefix boundaries from `/home/hjotha/llama-slot-cache/`, and the
+production store contained `64` automatic state files after the check. The
+current r2 promotion supersedes that phase-1 unit while preserving the same
+public model ID and persistent store.
 
 The exact rollback copy is
 `/home/hjotha/router-kv-streaming.KllpY2/promotion-20260916/llama-server-root.service`
@@ -465,6 +522,7 @@ shows `boundary_entries=400 unique_paths=1` and
 `payload_validation=deferred_to_selected_restore`, proving metadata/token-only
 lookup with one full validation at the selected restore.
 
-This is WIP evidence only: GPU/D and promotion of the unified infrastructure
-remain pending principal review. The phase-1 production release and its
-persistent cache are not used by these tests.
+The WIP artifacts above are retained as historical audit evidence. The former
+GPU/D and principal-review gaps were closed by the final real-context matrix,
+the distinct A/B supplement and the r2 promotion recorded above; the phase-1
+release and its persistent cache remain available only as rollback material.
