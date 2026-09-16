@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-model-identity.cpp
     server-model-identity.h
+    server-route-state.cpp
+    server-route-state.h
     server-context.cpp
     server-context.h
 server-loop-guard.cpp

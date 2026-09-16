@@ -32,6 +32,7 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsa-iswa.cpp
     llama-kv-cache-msa.cpp
     llama-kv-cache-dsv4.cpp
+    llama-state-q4.cpp
     llama-memory.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp

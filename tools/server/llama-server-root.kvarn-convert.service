@@ -1,0 +1,29 @@
+# Reviewed promotion unit for the five-profile router with the explicit
+# q4_0 -> KVarN conversion tier. The existing 10-gpu-ready.conf drop-in remains
+# in /etc/systemd/system.
+[Unit]
+Description=Qwen3.8 27B router: tri q4/MTP, capped q4 long, converting KVarN long
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hjotha/releases/beellama-router-kvarn-convert-20260916-r1
+Environment=LD_LIBRARY_PATH=/home/hjotha/releases/beellama-router-kvarn-convert-20260916-r1/bin:/opt/cuda/lib64:/usr/lib
+Environment=GGML_DISABLE_VULKAN=1
+Environment=GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-server-root
+ExecStart=/home/hjotha/releases/beellama-router-kvarn-convert-20260916-r1/bin/llama-server \
+  --models-preset /home/hjotha/releases/beellama-router-kvarn-convert-20260916-r1/qwen-3.8-27b-q4-mixed-20260916.ini \
+  --models-max 1 \
+  --host 0.0.0.0 \
+  --port 8090 \
+  --metrics
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

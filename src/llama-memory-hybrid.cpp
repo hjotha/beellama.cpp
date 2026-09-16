@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-state-q4.h"
 
 //
 // llama_memory_hybrid
@@ -286,6 +287,65 @@ bool llama_memory_hybrid::state_seq_can_restore(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
     return mem_attn->state_seq_can_restore(seq_id, flags) &&
            mem_recr->state_seq_can_restore(seq_id, flags);
+}
+
+bool llama_memory_hybrid::state_streaming_restore_supported() const {
+    return mem_attn->state_streaming_restore_supported() &&
+           mem_recr->state_streaming_restore_supported();
+}
+
+bool llama_memory_hybrid::state_parse_q4(
+        llama_state_q4_source & src,
+        const llama_hparams & hparams,
+        llama_state_q4_info & info,
+        std::string & error) {
+    if (!mem_attn->state_parse_q4(src, hparams, info, error)) {
+        return false;
+    }
+    // The recurrent/conv state follows the attention state and is preserved
+    // verbatim: it is not part of the quantized attention representation.
+    const uint64_t recr_begin = src.tell();
+    const uint64_t recr_end = src.size();
+    if (recr_end <= recr_begin) {
+        error = "source state is missing its recurrent state section";
+        return false;
+    }
+    try {
+        // The recurrent state is one logical cell per sequence, positioned at
+        // the end of the attention prefix.
+        uint32_t cell_count = 0;
+        src.read_raw(&cell_count, sizeof(cell_count));
+        if (cell_count != 1) {
+            error = "source recurrent state does not hold exactly one sequence";
+            return false;
+        }
+        int32_t pos = 0;
+        int32_t seq_id = 0;
+        src.read_raw(&pos, sizeof(pos));
+        src.read_raw(&seq_id, sizeof(seq_id));
+        if (seq_id != 0 || pos != int32_t(info.n_tokens) - 1) {
+            error = "source recurrent state does not match the attention prefix end";
+            return false;
+        }
+        const uint64_t expected = mem_recr->state_data_bytes(cell_count);
+        if (recr_end - src.tell() != expected) {
+            error = "source recurrent state data size is inconsistent";
+            return false;
+        }
+    } catch (const std::exception & err) {
+        error = err.what();
+        return false;
+    }
+    info.recr_offset = recr_begin;
+    info.recr_bytes = recr_end - recr_begin;
+    return true;
+}
+
+size_t llama_memory_hybrid::state_convert_q4(
+        llama_state_q4_source & src,
+        const llama_state_q4_info & info,
+        const char * dst_path) {
+    return mem_attn->state_convert_q4(src, info, dst_path);
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

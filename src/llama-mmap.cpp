@@ -292,7 +292,7 @@ struct llama_file::impl {
                     if (errno == EFAULT || errno == EINVAL) {
                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
                         auto curr_off = tell();
-                        close(fd);
+                        ::close(fd);
                         fd = -1;
                         alignment = 1;
                         init_fp("rb");
@@ -376,7 +376,7 @@ struct llama_file::impl {
 
     ~impl() {
         if (fd != -1) {
-            close(fd);
+            ::close(fd);
         } else if (owns_fp) {
             std::fclose(fp);
         }
@@ -402,6 +402,18 @@ llama_file::llama_file(const char * fname, const char * mode, const bool use_dir
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
 llama_file::~llama_file() = default;
+
+void llama_file::close() {
+    if (!pimpl->fp || !pimpl->owns_fp) {
+        throw std::runtime_error("cannot close borrowed or closed file");
+    }
+    FILE * fp = pimpl->fp;
+    pimpl->fp = nullptr;
+    pimpl->owns_fp = false;
+    if (std::fclose(fp) != 0) {
+        throw std::runtime_error(format("file close error: %s", strerror(errno)));
+    }
+}
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }

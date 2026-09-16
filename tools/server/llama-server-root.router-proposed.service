@@ -1,0 +1,29 @@
+# Reviewed promotion unit template; the deployed copy is in the versioned release.
+# The existing 10-gpu-ready.conf drop-in remains in /etc/systemd/system.
+[Unit]
+Description=Qwen3.8 27B q4 router tri-profile with streaming no-MTP handoff
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hjotha/releases/beellama-router-kv-streaming-20260916-r1
+Environment=LD_LIBRARY_PATH=/home/hjotha/releases/beellama-router-kv-streaming-20260916-r1/bin:/opt/cuda/lib64:/usr/lib
+Environment=GGML_DISABLE_VULKAN=1
+Environment=GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-server-root
+ExecStart=/home/hjotha/releases/beellama-router-kv-streaming-20260916-r1/bin/llama-server \
+  --models-preset /home/hjotha/releases/beellama-router-kv-streaming-20260916-r1/qwen-3.8-27b-q4-mixed-20260916.ini \
+  --models-max 1 \
+  --host 0.0.0.0 \
+  --port 8090 \
+  --metrics \
+  --log-file /home/hjotha/adaptive-resident-prod-slot-auto-20260916.log
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-context.h"
 #include "server-stream.h"
+#include "server-route-state.h"
 
 #include "build-info.h"
 #include "preset.h"
@@ -690,10 +691,12 @@ static int route_member_rank(const std::vector<route_group_member> & members, co
 static std::string route_state_filename(const std::string & conv_id) {
     const size_t first = std::hash<std::string>{}(conv_id);
     const size_t second = std::hash<std::string>{}(std::string("llama-route-state:") + conv_id);
-    return "slot-" + std::to_string(first) + "-" + std::to_string(second) + ".bin";
+    static std::atomic<uint64_t> nonce{0};
+    return "slot-" + std::to_string(first) + "-" + std::to_string(second) + "-" +
+        std::to_string(nonce.fetch_add(1, std::memory_order_relaxed)) + ".bin";
 }
 
-void server_models::ensure_route_state_dir() {
+void server_models::ensure_route_state_dir(const std::string & configured_store) {
     if (!route_state_dir.empty()) {
         std::error_code ec;
         if (std::filesystem::is_directory(route_state_dir, ec)) {
@@ -702,9 +705,24 @@ void server_models::ensure_route_state_dir() {
     }
 
     std::error_code ec;
-    const std::filesystem::path root = base_params.slot_save_path.empty()
-        ? std::filesystem::temp_directory_path(ec)
-        : std::filesystem::path(base_params.slot_save_path);
+    const bool has_persistent_store = !base_params.slot_save_path.empty() || !configured_store.empty();
+    const std::filesystem::path configured_path = !base_params.slot_save_path.empty()
+        ? std::filesystem::path(base_params.slot_save_path)
+        : std::filesystem::path(configured_store);
+    if (has_persistent_store) {
+        ec.clear();
+        std::filesystem::create_directories(configured_path, ec);
+        if (!ec && std::filesystem::is_directory(configured_path, ec) && !ec) {
+            route_state_dir = configured_path.string();
+            route_state_dir_owned = false;
+            SRV_INF("unified snapshot store: %s\n", route_state_dir.c_str());
+            return;
+        }
+        SRV_WRN("unable to use persistent snapshot store %s: %s\n", configured_path.string().c_str(), ec.message().c_str());
+        ec.clear();
+    }
+
+    const std::filesystem::path root = std::filesystem::temp_directory_path(ec);
     if (ec || root.empty()) {
         SRV_WRN("%s\n", "unable to create route state directory: no temporary directory is available");
         return;
@@ -744,11 +762,20 @@ void server_models::cleanup_route_state_dir() {
     std::lock_guard<std::mutex> route_lock(route_mutex);
     if (route_state_dir_owned && !route_state_dir.empty()) {
         std::error_code ec;
-        std::filesystem::remove_all(route_state_dir, ec);
+        for (std::filesystem::directory_iterator it(route_state_dir, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name.find(".tmp") != std::string::npos ||
+                    (name.size() >= 6 && name.compare(name.size() - 6, 6, ".lease") == 0)) {
+                std::filesystem::remove(it->path(), ec);
+                ec.clear();
+            }
+        }
         if (ec) {
-            SRV_WRN("unable to remove route state directory %s: %s\n", route_state_dir.c_str(), ec.message().c_str());
+            SRV_WRN("unable to clean temporary route state files in %s: %s\n", route_state_dir.c_str(), ec.message().c_str());
         }
     }
+    // Published unified snapshots are deliberately retained. They belong to
+    // the persistent store and are reclaimed only by the configured LRU.
     route_state_dir.clear();
     route_state_dir_owned = false;
     route_states.clear();
@@ -760,13 +787,41 @@ void server_models::render_child_args(server_model_meta & meta) {
         return;
     }
 
-    ensure_route_state_dir();
+    std::string configured_store;
+    for (size_t i = 0; i + 1 < meta.args.size(); ++i) {
+        if (meta.args[i] == "--slot-save-path") {
+            configured_store = meta.args[i + 1];
+            break;
+        }
+    }
+    ensure_route_state_dir(configured_store);
+
+    // Group children must expose the native slot action endpoint. POSIX route
+    // handoff keeps the child's configured slot-save path intact: --slot-save-
+    // auto owns that persistent store, while route_target_no_mtp selects
+    // route_state_dir via the private environment variable below.
+#ifndef _WIN32
+    if (configured_store.empty() && !route_state_dir.empty()) {
+        // Preserve the historical public /slots contract for route members
+        // that have no explicit store, without overriding an explicit
+        // persistent --slot-save-path.
+        meta.args.push_back("--slot-save-path");
+        std::string child_slot_path = route_state_dir;
+        if (child_slot_path.back() != std::filesystem::path::preferred_separator) {
+            child_slot_path += std::filesystem::path::preferred_separator;
+        }
+        meta.args.push_back(std::move(child_slot_path));
+    }
+    if (std::find(meta.args.begin(), meta.args.end(), "--slots") == meta.args.end()) {
+        meta.args.push_back("--slots");
+    }
+#else
+    // The native temporary/publication path is POSIX-only. Preserve the old
+    // Windows route contract by pointing the child slot store at route_state_dir.
     if (route_state_dir.empty()) {
         SRV_WRN("route member %s has no slot state directory; KV transfer is disabled\n", meta.name.c_str());
         return;
     }
-
-    // Group children must expose the native slot action endpoint and share one private directory.
     for (auto it = meta.args.begin(); it != meta.args.end();) {
         if (*it == "--slot-save-path") {
             it = meta.args.erase(it);
@@ -777,16 +832,28 @@ void server_models::render_child_args(server_model_meta & meta) {
             ++it;
         }
     }
-    meta.args.push_back("--slots");
+    if (std::find(meta.args.begin(), meta.args.end(), "--slots") == meta.args.end()) {
+        meta.args.push_back("--slots");
+    }
     meta.args.push_back("--slot-save-path");
-    meta.args.push_back(route_state_dir);
+    std::string child_slot_path = route_state_dir;
+    if (child_slot_path.empty() || child_slot_path.back() != std::filesystem::path::preferred_separator) {
+        child_slot_path += std::filesystem::path::preferred_separator;
+    }
+    meta.args.push_back(std::move(child_slot_path));
+#endif
+    if (route_state_dir.empty()) {
+        SRV_WRN("route member %s has no slot state directory; KV transfer is disabled\n", meta.name.c_str());
+    }
 }
 
 std::optional<json> server_models::route_slot_action(
         const server_model_meta & meta,
         const char * action,
         int id_slot,
-        const std::string & filename) {
+        const std::string & filename,
+        bool target_no_mtp,
+        bool reuse) {
     if (meta.port <= 0 || route_state_dir.empty()) {
         return std::nullopt;
     }
@@ -801,7 +868,20 @@ std::optional<json> server_models::route_slot_action(
     }
 
     const std::string path = "/slots/" + std::to_string(id_slot) + "?action=" + action;
-    const std::string body = json{{"filename", filename}}.dump();
+    json body_json = {{"filename", filename}};
+#ifndef _WIN32
+    body_json["route_state_transfer"] = true;
+    if (target_no_mtp) {
+        body_json["route_target_no_mtp"] = true;
+    }
+    if (reuse) {
+        body_json["route_state_reuse"] = true;
+    }
+#else
+    GGML_UNUSED(target_no_mtp);
+    GGML_UNUSED(reuse);
+#endif
+    const std::string body = body_json.dump();
     auto response = cli.Post(path, body, "application/json");
     if (!response) {
         SRV_WRN("route slot %s failed for model %s: no response\n", action, meta.name.c_str());
@@ -869,13 +949,60 @@ bool server_models::save_route_state(
     }
 
     const std::string filename = route_state_filename(conv_id);
-    const auto result = route_slot_action(*source_meta, "save", id_slot, filename);
+    const std::string filepath = (std::filesystem::path(route_state_dir) / filename).string();
+    // Reserve the reference stripe before the child publishes. This blocks
+    // eviction without blocking the child's separate publication lock.
+    auto lease = std::make_shared<server_route_state_lease>(filepath,
+            server_route_state_lock_mode::reservation);
+    if (!lease->acquired()) {
+        SRV_WRN("route state save deferred for conversation %s: snapshot is already in use\n", conv_id.c_str());
+        return false;
+    }
+    bool target_no_mtp = true;
+    for (size_t i = 0; i + 1 < target_meta->args.size(); ++i) {
+        if ((target_meta->args[i] == "--spec-type" && target_meta->args[i + 1] != "none") ||
+                (target_meta->args[i] == "--ctx-size-mtp" && target_meta->args[i + 1] != "0")) {
+            target_no_mtp = false;
+        }
+    }
+#ifdef _WIN32
+    // Content identity/atomic temporary-file support is currently POSIX-only.
+    // Keep conventional Windows route groups on their existing file contract.
+    target_no_mtp = false;
+#endif
+    SRV_INF("route state hand-off %s -> %s: target_no_mtp=%d\n",
+            pinned->c_str(), target.c_str(), target_no_mtp ? 1 : 0);
+    const auto result = route_slot_action(*source_meta, "save", id_slot, filename, target_no_mtp, true);
     if (!result.has_value()) {
         return false;
     }
 
     const int64_t n_tokens = result->at("n_saved").get<int64_t>();
-    route_states[conv_id] = { *pinned, target, model_identity, filename, id_slot, n_tokens };
+    if (n_tokens <= 0) { return false; }
+    std::string effective_filename = filename;
+    if (result->contains("filename") && result->at("filename").is_string()) {
+        effective_filename = result->at("filename").get<std::string>();
+    }
+    if (!fs_validate_filename(effective_filename)) {
+        SRV_WRN("route state save returned an invalid snapshot filename for conversation %s\n", conv_id.c_str());
+        return false;
+    }
+    if (effective_filename != filename) {
+        lease->release();
+        const std::string effective_path = (std::filesystem::path(route_state_dir) / effective_filename).string();
+        lease = std::make_shared<server_route_state_lease>(effective_path,
+                server_route_state_lock_mode::reservation);
+        if (!lease->acquired()) {
+            SRV_WRN("route state reference could not be acquired for conversation %s\n", conv_id.c_str());
+            return false;
+        }
+    }
+    bool unified = false;
+#ifndef _WIN32
+    unified = true;
+#endif
+    route_states[conv_id] = { *pinned, target, model_identity, effective_filename, id_slot, n_tokens,
+        target_no_mtp, unified, std::move(lease) };
     SRV_INF("saved route state for conversation %s: %s -> %s, slot=%d, tokens=%lld\n",
             conv_id.c_str(), pinned->c_str(), target.c_str(), id_slot, (long long) n_tokens);
     return true;
@@ -886,13 +1013,7 @@ void server_models::discard_route_state(const std::string & conv_id) {
     if (it == route_states.end()) {
         return;
     }
-    if (!route_state_dir.empty()) {
-        std::error_code ec;
-        std::filesystem::remove(std::filesystem::path(route_state_dir) / it->second.filename, ec);
-        if (ec) {
-            SRV_WRN("unable to remove route state file for conversation %s: %s\n", conv_id.c_str(), ec.message().c_str());
-        }
-    }
+    SRV_DBG("retaining unified route snapshot for conversation %s: %s\n", conv_id.c_str(), it->second.filename.c_str());
     route_states.erase(it);
 }
 
@@ -917,7 +1038,8 @@ bool server_models::restore_route_state(const std::string & conv_id, const std::
         discard_route_state(conv_id);
         return false;
     }
-    const auto result = route_slot_action(*target_meta, "restore", state.id_slot, state.filename);
+    const auto result = route_slot_action(*target_meta, "restore", state.id_slot, state.filename,
+            state.target_no_mtp, state.unified);
     if (!result.has_value()) {
         discard_route_state(conv_id);
         return false;
@@ -927,6 +1049,7 @@ bool server_models::restore_route_state(const std::string & conv_id, const std::
     if (state.n_tokens >= 0 && n_tokens != state.n_tokens) {
         SRV_WRN("route state restore count mismatch for conversation %s: saved=%lld restored=%lld\n",
                 conv_id.c_str(), (long long) state.n_tokens, (long long) n_tokens);
+        route_slot_action(*target_meta, "erase", state.id_slot, state.filename, state.target_no_mtp);
         discard_route_state(conv_id);
         return false;
     }
@@ -1520,6 +1643,15 @@ static int64_t route_count_prompt_tokens(const std::string & path, const json & 
     const bool has_messages = body.contains("messages");
     const bool has_prompt   = body.contains("prompt");
 
+    // Native completions may already contain token IDs. Count them exactly,
+    // without trying to tokenize numeric JSON through the text-only endpoint.
+    if (has_prompt && body.at("prompt").is_array() && path.find("infill") == std::string::npos) {
+        bool token_ids = true;
+        for (const auto & token : body.at("prompt")) { token_ids = token_ids && token.is_number_integer(); }
+        if (token_ids) { return body.at("prompt").size(); }
+    }
+    if (port <= 0) { return -1; }
+
     std::string count_path;
     json count_body = body;
     if (path.find("/chat/completions") != std::string::npos && has_messages) {
@@ -1607,9 +1739,7 @@ std::string server_models::resolve_route_target(const std::string & name, const 
             break;
         }
     }
-    int64_t prompt_tokens = counting_port > 0
-        ? route_count_prompt_tokens(req.path, body, counting_port)
-        : -1;
+    int64_t prompt_tokens = route_count_prompt_tokens(req.path, body, counting_port);
     if (prompt_tokens < 0) {
         // cold start (no member loaded) or the child did not answer: bytes/token heuristic,
         // biased upward in practice because the raw body carries JSON overhead
@@ -1742,6 +1872,14 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+#ifndef _WIN32
+        if (is_route_member(inst.meta)) {
+            set_environment_value(child_env, "LLAMA_SERVER_ROUTER_STATE", "1");
+            if (!route_state_dir.empty()) {
+                set_environment_value(child_env, "LLAMA_SERVER_ROUTER_STATE_DIR", route_state_dir);
+            }
+        }
+#endif
         if (!hf_token.empty()) {
             set_environment_value(child_env, "HF_TOKEN", hf_token);
         }

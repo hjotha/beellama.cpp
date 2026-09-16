@@ -5766,6 +5766,87 @@ std::vector<std::vector<int32_t>> llama_kv_cache::take_restored_tail_payload_slo
     return result;
 }
 
+std::vector<uint32_t> llama_kv_cache::import_sequence_prefix(
+        llama_seq_id seq_id, uint32_t n_tokens,
+        const std::vector<llama_kv_cell_ext> & exts) {
+    if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max) {
+        throw std::invalid_argument("invalid KV import sequence ID");
+    }
+    if (n_tokens == 0 || n_tokens > get_size()) {
+        throw std::invalid_argument("invalid KV import token count");
+    }
+    if (!exts.empty() && exts.size() != n_tokens) {
+        throw std::invalid_argument("invalid KV import extension count");
+    }
+    if (tail && !tail_metadata_only) {
+        throw std::runtime_error("KV import expects a metadata-only tail cache");
+    }
+
+    seq_rm(seq_id, -1, -1);
+
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens, 1);
+    llama_seq_id owner = seq_id;
+    ubatch.seq_id_unq[0] = seq_id;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        ubatch.pos[i]      = llama_pos(i);
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i]   = &owner;
+    }
+
+    const slot_info sinfo = find_slot(ubatch, false);
+    if (sinfo.empty() || sinfo.n_stream() != 1 || sinfo.idxs[0].size() != n_tokens) {
+        throw std::runtime_error("KV import could not allocate the prefix cells");
+    }
+
+    {
+        struct tail_preparing_guard {
+            bool & value;
+            bool old;
+            ~tail_preparing_guard() { value = old; }
+        } guard { tail_preparing, tail_preparing };
+        tail_preparing = true;
+        apply_ubatch(sinfo, ubatch);
+    }
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (!exts.empty()) {
+            v_cells[sinfo.strm[0]].ext_set(sinfo.idxs[0][i], exts[i]);
+        }
+    }
+    rebuild_allocation_head(seq_id);
+    return sinfo.idxs[0];
+}
+
+void llama_kv_cache::import_sequence_tail(llama_seq_id seq_id, uint32_t pos_begin, uint32_t pos_end) {
+    if (!tail || pos_end <= pos_begin) {
+        return;
+    }
+    if (pos_end > get_size()) {
+        throw std::invalid_argument("invalid KV import tail range");
+    }
+    const uint32_t strm = seq_to_stream.at(seq_id);
+    for (uint32_t pos = pos_begin; pos < pos_end; ++pos) {
+        uint32_t cell = 0;
+        if (cells_at_pos(seq_id, llama_pos(pos), &cell, 1) != 1) {
+            throw std::runtime_error("KV import tail position is missing");
+        }
+        const uint64_t generation = ++tail_generations[strm][cell];
+        const int32_t slot = tail->commit(seq_id, { strm, cell, generation },
+                llama_pos(pos), tail_ordinal++);
+        if (slot < 0) {
+            throw std::runtime_error("KV import tail could not reserve an exact slot");
+        }
+    }
+}
+
+std::vector<llama_kv_tail_snapshot_entry> llama_kv_cache::state_tail_snapshot(llama_seq_id seq_id) const {
+    if (!tail) {
+        return {};
+    }
+    return tail->snapshot(seq_id);
+}
+
 std::vector<uint32_t> llama_kv_cache::state_source_cells(llama_seq_id seq_id) const {
     if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max) {
         throw std::invalid_argument("invalid KV state sequence ID");

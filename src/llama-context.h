@@ -24,6 +24,10 @@ class llama_io_write_i;
 struct llama_memory_i;
 struct llama_memory_context_i;
 
+// q4_0/q4_0 conversion source (see llama-state-q4.h)
+struct llama_state_q4_source;
+struct llama_state_q4_info;
+
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
     int n_tensors = 0;
@@ -164,6 +168,26 @@ struct llama_context {
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
     llama_state_seq_restore_plan * state_seq_prepare_data(
             llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    size_t state_seq_load_file_streaming(llama_seq_id seq_id, const char * filepath,
+            llama_token * tokens_out, size_t capacity, size_t * count_out,
+            size_t state_size, uint64_t checksum);
+
+    size_t state_seq_convert_seq_stream(
+            llama_state_q4_source & src, const llama_state_q4_info & info,
+            const char * dst_filepath,
+            llama_token * tokens_out, size_t capacity, size_t * count_out);
+
+    size_t state_seq_convert_file(
+            const char * src_filepath, size_t src_offset, size_t src_size, uint64_t src_checksum,
+            const char * dst_filepath,
+            llama_token * tokens_out, size_t capacity, size_t * count_out);
+
+    size_t state_seq_convert_data(
+            const uint8_t * src, size_t size, uint64_t src_checksum,
+            const llama_token * ram_tokens, size_t ram_n_tokens,
+            const char * dst_filepath,
+            llama_token * tokens_out, size_t capacity, size_t * count_out);
 
     bool state_load_file(
             const char * filepath,

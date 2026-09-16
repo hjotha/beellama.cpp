@@ -1440,6 +1440,23 @@ private:
 
 std::string common_prompt_cache_layout(llama_context * ctx);
 
+// Layout compatibility for the explicit q4_0/q4_0 -> compact conversion path.
+// The two layouts must agree on every semantic field except the KV payload
+// types; the caller decides which type pairs may be converted. Returns the
+// source K/V type names through the optional outputs.
+bool common_prompt_cache_layout_convertible(
+        const std::string & source_layout,
+        const std::string & target_layout,
+        std::string * source_type_k = nullptr,
+        std::string * source_type_v = nullptr);
+
+// Automatic-snapshot reuse predicate: exact layout equality, or two layouts
+// that both report an unknown representation and differ only in their
+// context-lifetime binding. The restore path still validates the full state.
+bool common_prompt_cache_layout_reusable(
+        const std::string & stored_layout,
+        const std::string & current_layout);
+
 struct common_speculative;
 enum class common_checkpoint_restore { restored, missing_base, incompatible, failed };
 

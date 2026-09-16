@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-io-file.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-tail-request.h"
@@ -15,6 +16,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
+#include "llama-state-q4.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -3390,9 +3392,14 @@ public:
     }
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        temp_buffer.resize(size);
-        ggml_backend_tensor_get(tensor, temp_buffer.data(), offset, size);
-        write(temp_buffer.data(), temp_buffer.size());
+        temp_buffer.resize(std::min(size, LLAMA_STATE_FILE_BUFFER_SIZE));
+        while (size) {
+            const size_t chunk = std::min(size, temp_buffer.size());
+            ggml_backend_tensor_get(tensor, temp_buffer.data(), offset, chunk);
+            write(temp_buffer.data(), chunk);
+            offset += chunk;
+            size -= chunk;
+        }
     }
 
     size_t n_bytes() override {
@@ -4072,6 +4079,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     llama_io_write_file io(&file);
     state_write_data(io);
 
+    file.close();
     return true;
 }
 
@@ -4131,6 +4139,9 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory ||
+            !memory->state_seq_can_save(seq_id, 0) || n_token_count > UINT32_MAX ||
+            (n_token_count && !tokens)) { return 0; }
     if (llama_memory_status_is_fail(memory_update(false))) {
         return 0;
     }
@@ -4150,7 +4161,276 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
 
+    file.close();
     return res;
+}
+
+namespace {
+
+// Bounded-window view over a file region holding a sequence state stream.
+class llama_state_q4_file_source final : public llama_state_q4_source {
+public:
+    llama_state_q4_file_source(llama_file * file, uint64_t begin, uint64_t end)
+        : file(file), begin(begin), end(end) {}
+
+    uint64_t size() const override { return end - begin; }
+    uint64_t tell() const override { return uint64_t(file->tell()) - begin; }
+
+    void seek(uint64_t offset) override {
+        if (offset > end - begin) { throw std::runtime_error("truncated sequence state"); }
+        file->seek(begin + offset, SEEK_SET);
+    }
+
+    void read_raw(void * dst, size_t size) override {
+        const uint64_t pos = uint64_t(file->tell());
+        if (pos < begin || pos > end || size > end - pos) {
+            throw std::runtime_error("truncated sequence state");
+        }
+        file->read_raw(dst, size);
+    }
+
+private:
+    llama_file * file;
+    uint64_t begin;
+    uint64_t end;
+};
+
+class llama_state_q4_memory_source final : public llama_state_q4_source {
+public:
+    llama_state_q4_memory_source(const uint8_t * data, size_t size) : data(data), len(size) {}
+
+    uint64_t size() const override { return len; }
+    uint64_t tell() const override { return pos; }
+
+    void seek(uint64_t offset) override {
+        if (offset > len) { throw std::runtime_error("truncated sequence state"); }
+        pos = offset;
+    }
+
+    void read_raw(void * dst, size_t size) override {
+        if (size > len - pos) { throw std::runtime_error("truncated sequence state"); }
+        std::memcpy(dst, data + pos, size);
+        pos += size;
+    }
+
+private:
+    const uint8_t * data;
+    uint64_t len;
+    uint64_t pos = 0;
+};
+
+uint64_t llama_state_q4_checksum(const uint8_t * data, size_t size) {
+    XXH64_state_t hash;
+    XXH64_reset(&hash, 0);
+    XXH64_update(&hash, data, size);
+    return XXH64_digest(&hash);
+}
+
+constexpr uint32_t llama_state_q4_io_magic = 0xaf143cd8;
+
+// Reads the outer header shared by file and in-memory sequence states. Leaves
+// the source positioned at the start of the memory-specific body.
+bool llama_state_q4_read_outer_header(llama_state_q4_source & src, llama_state_q4_info & info,
+        const llama_token * ram_tokens, size_t ram_n_tokens, std::string & error) {
+    try {
+        uint32_t magic = 0;
+        src.read_raw(&magic, sizeof(magic));
+        if (magic == LLAMA_STATE_SEQ_MAGIC) {
+            uint32_t version = 0;
+            uint32_t n_tokens = 0;
+            src.read_raw(&version, sizeof(version));
+            src.read_raw(&n_tokens, sizeof(n_tokens));
+            if (version != LLAMA_STATE_SEQ_VERSION) {
+                throw std::runtime_error("unsupported sequence state version");
+            }
+            info.from_ram = false;
+            info.n_tokens = n_tokens;
+            info.tokens.resize(n_tokens);
+            if (n_tokens) {
+                src.read_raw(info.tokens.data(), size_t(n_tokens) * sizeof(llama_token));
+            }
+            return true;
+        }
+        if (magic == llama_state_q4_io_magic) {
+            int32_t seq_id = 0;
+            src.read_raw(&seq_id, sizeof(seq_id));
+            info.from_ram = true;
+            info.n_tokens = ram_n_tokens > UINT32_MAX ? UINT32_MAX : uint32_t(ram_n_tokens);
+            if (ram_n_tokens != 0 && ram_tokens != nullptr) {
+                info.tokens.assign(ram_tokens, ram_tokens + ram_n_tokens);
+            }
+            return true;
+        }
+        throw std::runtime_error("source is not a sequence state stream");
+    } catch (const std::exception & err) {
+        error = err.what();
+        return false;
+    }
+}
+
+} // namespace
+
+size_t llama_context::state_seq_convert_seq_stream(
+        llama_state_q4_source & src, const llama_state_q4_info & info,
+        const char * dst_filepath,
+        llama_token * tokens_out, size_t capacity, size_t * count_out) {
+    if (!count_out) { return 0; }
+    *count_out = 0;
+    if (!tokens_out || !memory || !dst_filepath || info.n_tokens == 0) { return 0; }
+    if (info.n_tokens > capacity || info.tokens.size() != info.n_tokens) {
+        LLAMA_LOG_ERROR("%s: converted token count exceeds the caller capacity\n", __func__);
+        return 0;
+    }
+    try {
+        const size_t written = memory->state_convert_q4(src, info, dst_filepath);
+        if (written == 0) {
+            LLAMA_LOG_ERROR("%s: destination memory has no q4 conversion path\n", __func__);
+            return 0;
+        }
+        std::copy(info.tokens.begin(), info.tokens.end(), tokens_out);
+        *count_out = info.tokens.size();
+        return written;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_convert_file(
+        const char * src_filepath, size_t src_offset, size_t src_size, uint64_t src_checksum,
+        const char * dst_filepath,
+        llama_token * tokens_out, size_t capacity, size_t * count_out) {
+    if (!count_out) { return 0; }
+    *count_out = 0;
+    if (!src_filepath || !dst_filepath) { return 0; }
+    try {
+        llama_file file(src_filepath, "rb");
+        if (src_size == 0 || src_offset > file.size() || src_size > file.size() - src_offset) {
+            throw std::runtime_error("invalid sequence state source range");
+        }
+        if (src_checksum != 0) {
+            std::vector<uint8_t> buffer(LLAMA_STATE_FILE_BUFFER_SIZE);
+            XXH64_state_t hash;
+            XXH64_reset(&hash, 0);
+            file.seek(src_offset, SEEK_SET);
+            for (size_t left = src_size; left;) {
+                const size_t count = std::min(left, buffer.size());
+                file.read_raw(buffer.data(), count);
+                XXH64_update(&hash, buffer.data(), count);
+                left -= count;
+            }
+            if (XXH64_digest(&hash) != src_checksum) {
+                throw std::runtime_error("sequence state source checksum mismatch");
+            }
+        }
+        file.seek(src_offset, SEEK_SET);
+        llama_state_q4_file_source source(&file, src_offset, src_offset + src_size);
+        llama_state_q4_info info;
+        std::string error;
+        if (!llama_state_q4_read_outer_header(source, info, nullptr, 0, error) ||
+                !memory->state_parse_q4(source, model.hparams, info, error)) {
+            throw std::runtime_error("unsupported sequence state source: " + error);
+        }
+        return state_seq_convert_seq_stream(source, info, dst_filepath, tokens_out, capacity, count_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_convert_data(
+        const uint8_t * src, size_t size, uint64_t src_checksum,
+        const llama_token * ram_tokens, size_t ram_n_tokens,
+        const char * dst_filepath,
+        llama_token * tokens_out, size_t capacity, size_t * count_out) {
+    if (!count_out) { return 0; }
+    *count_out = 0;
+    if (!src || size == 0 || !dst_filepath) { return 0; }
+    try {
+        if (src_checksum != 0 && llama_state_q4_checksum(src, size) != src_checksum) {
+            throw std::runtime_error("sequence state source checksum mismatch");
+        }
+        llama_state_q4_memory_source source(src, size);
+        llama_state_q4_info info;
+        std::string error;
+        if (!llama_state_q4_read_outer_header(source, info, ram_tokens, ram_n_tokens, error) ||
+                !memory->state_parse_q4(source, model.hparams, info, error)) {
+            throw std::runtime_error("unsupported sequence state source: " + error);
+        }
+        return state_seq_convert_seq_stream(source, info, dst_filepath, tokens_out, capacity, count_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const char * filepath,
+        llama_token * tokens_out, size_t capacity, size_t * count_out, size_t state_size, uint64_t checksum) {
+    if (!count_out) { return 0; }
+    *count_out = 0;
+    if (!tokens_out || !memory || seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max ||
+            !memory->state_seq_can_restore(seq_id, 0)) { return 0; }
+    // These representations may materialize their own payloads while parsing;
+    // do not claim a bounded streaming contract for them.
+    if (!memory->state_streaming_restore_supported()) {
+        LLAMA_LOG_ERROR("%s: compact/precision-tail memory requires the legacy restore API\n", __func__);
+        return 0;
+    }
+    // Streaming commit performs fallible I/O. Preserve the existing APIs'
+    // nonempty-destination contract and require an entirely empty context here.
+    for (uint32_t seq = 0; seq < cparams.n_seq_max; ++seq) {
+        if (memory->seq_pos_max(seq) >= 0) {
+            LLAMA_LOG_ERROR("%s: streaming restore requires an empty context\n", __func__);
+            return 0;
+        }
+    }
+    try {
+        llama_file file(filepath, "rb");
+        if (state_size > file.size() || state_size < 3*sizeof(uint32_t)) {
+            throw std::runtime_error("invalid sequence state file size");
+        }
+        // Verify integrity before handing any metadata to the native parser.
+        // The parse pass hashes again and commit checks every indexed chunk.
+        {
+            std::vector<uint8_t> buffer(LLAMA_STATE_FILE_BUFFER_SIZE);
+            XXH64_state_t hash;
+            XXH64_reset(&hash, 0);
+            for (size_t left = state_size; left;) {
+                const size_t count = std::min(left, buffer.size());
+                file.read_raw(buffer.data(), count);
+                XXH64_update(&hash, buffer.data(), count);
+                left -= count;
+            }
+            if (XXH64_digest(&hash) != checksum) {
+                throw std::runtime_error("sequence state file checksum mismatch");
+            }
+        }
+        file.seek(0, SEEK_SET);
+        llama_io_read_file_stream io(file, state_size);
+        uint32_t header[3];
+        io.read(header, sizeof(header));
+        if (header[0] != LLAMA_STATE_SEQ_MAGIC || header[1] != LLAMA_STATE_SEQ_VERSION ||
+                header[2] > capacity || header[2] > (state_size - sizeof(header))/sizeof(llama_token)) {
+            throw std::runtime_error("invalid sequence state file header");
+        }
+        io.read(tokens_out, size_t(header[2])*sizeof(llama_token));
+        state_seq_read_data(io, seq_id, 0);
+        if (io.n_bytes() != state_size || io.checksum() != checksum) {
+            throw std::runtime_error("sequence state file integrity check failed");
+        }
+        io.commit();
+        if (memory->seq_pos_max(seq_id) >= int64_t(cparams.n_ctx_seq)) {
+            throw std::runtime_error("sequence state position exceeds context");
+        }
+        *count_out = header[2];
+        return state_size;
+    } catch (const std::exception & error) {
+        // Also covers a throwing publication callback. Tensor bytes become
+        // unreachable, so a partial restore can never be advertised as a hit.
+        memory->clear(false);
+        LLAMA_LOG_ERROR("%s: %s; empty destination cleared\n", __func__, error.what());
+        return 0;
+    }
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io, llama_state_seq_flags flags) {
@@ -5336,6 +5616,28 @@ size_t llama_state_seq_restore_plan_commit(llama_state_seq_restore_plan * plan) 
 
 void llama_state_seq_restore_plan_free(llama_state_seq_restore_plan * plan) {
     delete plan;
+}
+
+size_t llama_state_seq_load_file_streaming(llama_context * ctx, const char * filepath, llama_seq_id seq_id,
+        llama_token * tokens_out, size_t capacity, size_t * count_out, size_t state_size, uint64_t checksum) {
+    if (!ctx || !filepath) { return 0; }
+    ctx->synchronize();
+    return ctx->state_seq_load_file_streaming(seq_id, filepath, tokens_out, capacity, count_out, state_size, checksum);
+}
+
+size_t llama_state_seq_convert_file(llama_context * ctx, const char * src_filepath, size_t src_offset, size_t src_size,
+        uint64_t src_checksum, const char * dst_filepath, llama_token * tokens_out, size_t capacity, size_t * count_out) {
+    if (!ctx || !src_filepath || !dst_filepath) { return 0; }
+    return ctx->state_seq_convert_file(src_filepath, src_offset, src_size, src_checksum, dst_filepath,
+            tokens_out, capacity, count_out);
+}
+
+size_t llama_state_seq_convert_data(llama_context * ctx, const uint8_t * src, size_t size, uint64_t src_checksum,
+        const llama_token * ram_tokens, size_t ram_n_tokens,
+        const char * dst_filepath, llama_token * tokens_out, size_t capacity, size_t * count_out) {
+    if (!ctx || !src || !dst_filepath) { return 0; }
+    return ctx->state_seq_convert_data(src, size, src_checksum, ram_tokens, ram_n_tokens,
+            dst_filepath, tokens_out, capacity, count_out);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

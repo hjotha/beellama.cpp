@@ -282,6 +282,16 @@ bool requires_state_for_partial_restore() const override;
     std::vector<int32_t> state_tail_payload_slots(llama_seq_id seq_id) const;
     std::vector<uint32_t> state_source_cells(llama_seq_id seq_id) const;
     std::vector<std::vector<int32_t>> take_restored_tail_payload_slots();
+
+    // Explicit conversion import helpers. They populate an empty cache logical
+    // state for a contiguous single-sequence prefix (positions 0..n-1 placed in
+    // allocation order) and commit the exact tail entries for the last
+    // [pos_begin, pos_end) positions. They are not general mutation APIs.
+    std::vector<uint32_t> import_sequence_prefix(
+            llama_seq_id seq_id, uint32_t n_tokens,
+            const std::vector<llama_kv_cell_ext> & exts);
+    void import_sequence_tail(llama_seq_id seq_id, uint32_t pos_begin, uint32_t pos_end);
+    std::vector<llama_kv_tail_snapshot_entry> state_tail_snapshot(llama_seq_id seq_id) const;
     void clone_logical_state_from(const llama_kv_cache & source);
     void set_allocation_group_size(uint32_t group_size, uint32_t stage_groups = 1);
     bool allocation_cell_uses_stage(uint32_t cell) const;

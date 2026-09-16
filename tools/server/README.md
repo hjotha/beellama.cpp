@@ -1962,11 +1962,18 @@ own name (useful for staging the group before relying on it).
 When a request carries `X-Conversation-Id`, the router preserves that conversation's slot state
 across an upward migration: it calls the native `save` action before evicting the old child and
 the native `restore` action after the new child is ready. This is best-effort; a failed transfer
-falls back to the normal full prefill. The group children are started with `--slots` and a private
-state directory below the router's `--slot-save-path`, or below the system temporary directory
-when that option is omitted. Use a path on a RAM filesystem such as `/dev/shm` only when the host
-has enough available memory. The transfer targets slot 0, which matches the supported
-`--parallel 1` deployment.
+falls back to the normal full prefill. The header is part of the contract: without it, the router
+cannot associate the request with a previous child and no inter-process transfer is attempted.
+
+The two adaptive transitions inside the tri-profile (short -> medium -> long) use the existing
+RAM prompt-cache snapshots. The large long -> fixed no-MTP transition uses the streaming file
+handoff. The route file is kept in a private child directory selected through the internal
+`LLAMA_SERVER_ROUTER_STATE_DIR` environment value; it is not the child's normal slot store.
+Children keep an explicitly configured `--slot-save-path`, including `--slot-save-auto` and its
+persistent cache. Route cleanup and route-specific limits apply only to that private directory.
+If no slot store was explicitly configured, POSIX route members receive the private directory as
+their fallback `--slot-save-path` so the public `/slots` endpoint retains its old behavior. The
+transfer targets slot 0, which matches the supported `--parallel 1` deployment.
 
 **What the group looks like from outside:**
 

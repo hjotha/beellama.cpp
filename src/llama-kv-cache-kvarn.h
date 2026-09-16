@@ -11,6 +11,8 @@
 
 struct llama_hparams;
 struct llama_model;
+struct llama_state_q4_source;
+struct llama_state_q4_info;
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev);
@@ -271,6 +273,22 @@ public:
     bool state_seq_can_restore(llama_seq_id seq_id, llama_state_seq_flags flags) const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read(llama_io_read_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    bool state_streaming_restore_supported() const override;
+
+    // Restricted q4_0/q4_0 -> native KVarN conversion. Only complete
+    // untransposed q4 source prefixes for this exact cache shape are accepted
+    // (no SWA ring, no exact tail, one stream). Writes a canonical sequence
+    // state file for this cache's layout and returns its native byte size.
+    bool state_parse_q4(
+            llama_state_q4_source & src,
+            const llama_hparams & hparams,
+            llama_state_q4_info & info,
+            std::string & error) override;
+    size_t state_convert_q4(
+            llama_state_q4_source & src,
+            const llama_state_q4_info & info,
+            const char * dst_path) override;
 
     llama_kv_cache * get_metadata_cache() const;
     int32_t mapped_layer_id(int32_t il) const;

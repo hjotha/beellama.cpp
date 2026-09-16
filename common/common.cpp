@@ -3384,6 +3384,83 @@ std::string common_prompt_cache_layout(llama_context * ctx) {
     return layout.dump();
 }
 
+namespace {
+bool common_prompt_cache_layout_known(const common_json & layout) {
+    return layout.contains("kv_layout_known") && layout.at("kv_layout_known").is_boolean() &&
+        layout.at("kv_layout_known").get<bool>();
+}
+
+void common_prompt_cache_layout_drop_types(common_json & layout) {
+    for (const char * key : { "type_k", "type_v", "type_k_aux", "type_v_aux" }) {
+        layout.erase(key);
+    }
+}
+
+void common_prompt_cache_layout_drop_lifetime(common_json & layout) {
+    for (const char * key : { "source_context", "source_capacity", "kv_layout_known" }) {
+        layout.erase(key);
+    }
+}
+} // namespace
+
+bool common_prompt_cache_layout_convertible(
+        const std::string & source_layout,
+        const std::string & target_layout,
+        std::string * source_type_k,
+        std::string * source_type_v) {
+    try {
+        common_json source = common_json::parse(source_layout);
+        common_json target = common_json::parse(target_layout);
+        if (!source.is_object() || !target.is_object()) {
+            return false;
+        }
+        // The cache payload types are not representable in the profile and are
+        // validated by the converter itself; a layout whose memory does not
+        // report a known representation is bound to its context lifetime, so
+        // that binding is dropped before comparing.
+        common_prompt_cache_layout_drop_types(source);
+        common_prompt_cache_layout_drop_types(target);
+        if (!common_prompt_cache_layout_known(source) || !common_prompt_cache_layout_known(target)) {
+            common_prompt_cache_layout_drop_lifetime(source);
+            common_prompt_cache_layout_drop_lifetime(target);
+        }
+        if (source_type_k) { *source_type_k = "unknown"; }
+        if (source_type_v) { *source_type_v = "unknown"; }
+        return source == target;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+// Reuse predicate for automatic snapshots: exact equality, or two unknown
+// representations whose context-lifetime fields differ (a KVarN child is
+// recreated with a new instance pointer while its native layout is identical).
+// The restore path still validates every state field before publishing.
+bool common_prompt_cache_layout_reusable(
+        const std::string & stored_layout,
+        const std::string & current_layout) {
+    if (stored_layout == current_layout) {
+        return true;
+    }
+    try {
+        common_json stored = common_json::parse(stored_layout);
+        common_json current = common_json::parse(current_layout);
+        if (!stored.is_object() || !current.is_object()) {
+            return false;
+        }
+        if (common_prompt_cache_layout_known(stored) || common_prompt_cache_layout_known(current)) {
+            return false;
+        }
+        common_prompt_cache_layout_drop_types(stored);
+        common_prompt_cache_layout_drop_types(current);
+        common_prompt_cache_layout_drop_lifetime(stored);
+        common_prompt_cache_layout_drop_lifetime(current);
+        return stored == current;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 size_t common_prompt_checkpoint::size() const {
     return sizeof(*this) + data_tgt.capacity() + data_dft.capacity() + data_spec.capacity() +
         layout_tgt.capacity() + layout_dft.capacity();

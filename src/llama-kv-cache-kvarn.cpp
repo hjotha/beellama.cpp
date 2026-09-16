@@ -5,17 +5,33 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-io-file.h"
 #include "llama-model.h"
+#include "llama-state-q4.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+// ggml/src is not on this target's include path; only the q4_0 dequantizer is
+// needed and it is part of the public ggml API surface at link time.
+struct block_q4_0;
+extern "C" {
+GGML_API void dequantize_row_q4_0(const block_q4_0 * x, float * y, int64_t k);
+}
 
 namespace {
 
@@ -2678,17 +2694,19 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                     const auto desired = install_stage_rows.find(cell.source_cell);
                     const bool install = desired != install_stage_rows.end();
                     const size_t offset = install ? size_t(desired->second)*row_size : 0;
-                    if (on_device) {
-                        if (!install) {
-                            throw std::runtime_error("on-device KVarN selective stage row became stale");
-                        }
+                    if (install) {
+                        // Indexed row installs stay within the bounded
+                        // transfer contract of the streaming reader; a
+                        // multi-layer state has far more stage rows than the
+                        // staging budget allows, and the empty-destination
+                        // contract makes late failures unreachable.
                         io.read_tensor(tensor, offset, row_size);
                     } else {
+                        if (on_device) {
+                            throw std::runtime_error("on-device KVarN selective stage row became stale");
+                        }
                         std::vector<uint8_t> row(row_size);
                         io.read(row.data(), row.size());
-                        if (install) {
-                            io.stage_tensor_set(tensor, row.data(), offset, row_size);
-                        }
                     }
                     selective_stage_bytes += install ? row_size : 0;
                 };
@@ -2950,4 +2968,577 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
                 stream_count);
     }
     return result;
+}
+// ---------------------------------------------------------------------------
+// q4_0/q4_0 -> KVarN conversion
+//
+// The source q4 cache stores post-RoPE K and V rows in the original domain.
+// This cache stores both in the rotated domain: every 128-dim head slice is
+// Hadamard-transformed, then corresponding lanes across slices are mixed by a
+// second Hadamard step (matching ggml_cuda_kvarn_store). Completed 128-token
+// groups are quantized into records; the sink group and the live tail groups
+// stay as F16 stage rows. The conversion reproduces that pipeline on the host
+// from dequantized q4 rows and emits a canonical KVarN "full" state image.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Collects a host-only state stream (the metadata mirror owns no tensors).
+class llama_io_write_vector final : public llama_io_write_i {
+public:
+    void write(const void * src, size_t size) override {
+        const auto * bytes = static_cast<const uint8_t *>(src);
+        data_.insert(data_.end(), bytes, bytes + size);
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        GGML_UNUSED(tensor);
+        GGML_UNUSED(offset);
+        GGML_UNUSED(size);
+        throw std::runtime_error("metadata conversion stream contains a tensor payload");
+    }
+
+    size_t n_bytes() override { return data_.size(); }
+
+    const std::vector<uint8_t> & data() const { return data_; }
+
+private:
+    std::vector<uint8_t> data_;
+};
+
+struct kvarn_convert_shape {
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t slices;
+    uint32_t n_head_sliced;
+};
+
+kvarn_convert_shape kvarn_convert_shape_for(uint32_t n_head_kv, uint32_t head_dim) {
+    const int slices = llama_kvarn_head_slices(int(head_dim));
+    if (slices <= 0) {
+        throw std::runtime_error(format("unsupported KVarN head dimension %u in conversion", head_dim));
+    }
+    return { n_head_kv, head_dim, uint32_t(slices), n_head_kv * uint32_t(slices) };
+}
+
+// Standalone record layouts: payload, then the three coefficient axes in the
+// exact native order (scale axis, zero point, other axis). K records have the
+// head dimension on the scale axis; V records have the token on it.
+llama_kvarn_tile_layout kvarn_convert_k_layout(int bits) {
+    llama_kvarn_tile_layout layout = {};
+    layout.k_payload_off = 0;
+    layout.k_payload_bytes = llama_kvarn_packed_bytes(KVAR_N_GROUP * KVAR_N_GROUP, bits);
+    layout.k_s_col_off = layout.k_payload_bytes;
+    layout.k_zp_off = layout.k_s_col_off + KVAR_N_GROUP * sizeof(uint16_t);
+    layout.k_s_row_off = layout.k_zp_off + KVAR_N_GROUP * sizeof(uint16_t);
+    layout.tile_bytes = layout.k_s_row_off + KVAR_N_GROUP * sizeof(uint16_t);
+    return layout;
+}
+
+llama_kvarn_tile_layout kvarn_convert_v_layout(int bits) {
+    llama_kvarn_tile_layout layout = {};
+    layout.v_payload_off = 0;
+    layout.v_payload_bytes = llama_kvarn_packed_bytes(KVAR_N_GROUP * KVAR_N_GROUP, bits);
+    layout.v_s_row_off = layout.v_payload_bytes;
+    layout.v_zp_off = layout.v_s_row_off + KVAR_N_GROUP * sizeof(uint16_t);
+    layout.v_s_col_off = layout.v_zp_off + KVAR_N_GROUP * sizeof(uint16_t);
+    layout.tile_bytes = layout.v_s_col_off + KVAR_N_GROUP * sizeof(uint16_t);
+    return layout;
+}
+
+// Rotated-domain row for every head slice, rounded to F16 exactly like the
+// runtime stage that the record quantizer reads.
+void kvarn_convert_rotate_row(const float * row, const kvarn_convert_shape & shape, float * rotated) {
+    const size_t row_len = size_t(shape.n_head_sliced) * KVAR_N_GROUP;
+    for (uint32_t hs = 0; hs < shape.n_head_sliced; ++hs) {
+        const uint32_t head = hs / shape.slices;
+        const uint32_t slice = hs % shape.slices;
+        float * dst = rotated + size_t(hs) * KVAR_N_GROUP;
+        std::memcpy(dst, row + size_t(head) * shape.head_dim + size_t(slice) * KVAR_N_GROUP,
+                KVAR_N_GROUP * sizeof(float));
+        llama_kvarn_hadamard_128(dst);
+    }
+    if (shape.slices > 1) {
+        for (uint32_t head = 0; head < shape.n_head_kv; ++head) {
+            float * base = rotated + size_t(head) * shape.slices * KVAR_N_GROUP;
+            for (uint32_t d = 0; d < KVAR_N_GROUP; ++d) {
+                float values[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (uint32_t slice = 0; slice < shape.slices; ++slice) {
+                    values[slice] = base[size_t(slice) * KVAR_N_GROUP + d];
+                }
+                for (uint32_t stride = 1; stride < shape.slices; stride <<= 1) {
+                    for (uint32_t b = 0; b + stride < shape.slices; b += 2 * stride) {
+                        for (uint32_t i = 0; i < stride && b + stride + i < shape.slices; ++i) {
+                            const float a = values[b + i];
+                            const float c = values[b + stride + i];
+                            values[b + i] = a + c;
+                            values[b + stride + i] = a - c;
+                        }
+                    }
+                }
+                const float scale = shape.slices == 2 ? 0.7071067811865475f : 0.5f;
+                for (uint32_t slice = 0; slice < shape.slices; ++slice) {
+                    base[size_t(slice) * KVAR_N_GROUP + d] = values[slice] * scale;
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < row_len; ++i) {
+        rotated[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(rotated[i]));
+    }
+}
+
+void kvarn_convert_dequantize_row(const uint8_t * bytes, float * row, uint32_t n_embd) {
+    dequantize_row_q4_0(reinterpret_cast<const block_q4_0 *>(bytes), row, n_embd);
+}
+
+// All head-slice records of one 128-token group for a single component.
+// `rows` holds n_tokens contiguous source rows; `out` receives
+// n_head_sliced * layout.tile_bytes bytes.
+void kvarn_convert_component_records(
+        const uint8_t * rows,
+        uint32_t n_tokens,
+        uint32_t row_bytes,
+        uint32_t n_embd,
+        const kvarn_convert_shape & shape,
+        int bits,
+        int sinkhorn_iters,
+        bool value,
+        uint8_t * out) {
+    const llama_kvarn_tile_layout layout = value ? kvarn_convert_v_layout(bits) : kvarn_convert_k_layout(bits);
+
+    std::vector<float> rotated(size_t(n_tokens) * shape.n_head_sliced * KVAR_N_GROUP);
+    std::vector<float> row(n_embd);
+    for (uint32_t token = 0; token < n_tokens; ++token) {
+        kvarn_convert_dequantize_row(rows + size_t(token) * row_bytes, row.data(), n_embd);
+        kvarn_convert_rotate_row(row.data(), shape,
+                rotated.data() + size_t(token) * shape.n_head_sliced * KVAR_N_GROUP);
+    }
+
+    std::vector<float> tile(KVAR_N_GROUP * KVAR_N_GROUP);
+    for (uint32_t hs = 0; hs < shape.n_head_sliced; ++hs) {
+        for (uint32_t token = 0; token < n_tokens; ++token) {
+            const float * src = rotated.data() +
+                (size_t(token) * shape.n_head_sliced + hs) * KVAR_N_GROUP;
+            if (value) {
+                for (uint32_t d = 0; d < KVAR_N_GROUP; ++d) {
+                    tile[size_t(token) * KVAR_N_GROUP + d] = src[d];
+                }
+            } else {
+                for (uint32_t d = 0; d < KVAR_N_GROUP; ++d) {
+                    tile[size_t(d) * KVAR_N_GROUP + token] = src[d];
+                }
+            }
+        }
+        uint8_t * record = out + size_t(hs) * layout.tile_bytes;
+        if (value) {
+            llama_kvarn_quantize_v_tile(tile.data(), sinkhorn_iters, bits, layout, record);
+        } else {
+            llama_kvarn_quantize_k_tile(tile.data(), sinkhorn_iters, bits, layout, record);
+        }
+    }
+}
+
+// Full rotated F16 row for one exact-tail payload.
+void kvarn_convert_tail_row(
+        const uint8_t * q4_row,
+        uint32_t n_embd,
+        const kvarn_convert_shape & shape,
+        std::vector<uint8_t> & out) {
+    std::vector<float> row(n_embd);
+    std::vector<float> rotated(size_t(shape.n_head_sliced) * KVAR_N_GROUP);
+    kvarn_convert_dequantize_row(q4_row, row.data(), n_embd);
+    kvarn_convert_rotate_row(row.data(), shape, rotated.data());
+    out.resize(rotated.size() * sizeof(ggml_fp16_t));
+    for (size_t i = 0; i < rotated.size(); ++i) {
+        const ggml_fp16_t half = ggml_fp32_to_fp16(rotated[i]);
+        std::memcpy(out.data() + i * sizeof(half), &half, sizeof(half));
+    }
+}
+
+// Fills the stage rows of one head slice from a group of source rows.
+void kvarn_convert_stage_slice(
+        const uint8_t * rows,
+        uint32_t n_valid,
+        uint32_t row_bytes,
+        uint32_t n_embd,
+        const kvarn_convert_shape & shape,
+        uint32_t hs,
+        uint32_t stage_slot,
+        uint8_t * image) {
+    std::vector<float> row(n_embd);
+    std::vector<float> rotated(shape.n_head_sliced * KVAR_N_GROUP);
+    for (uint32_t token = 0; token < n_valid; ++token) {
+        kvarn_convert_dequantize_row(rows + size_t(token) * row_bytes, row.data(), n_embd);
+        kvarn_convert_rotate_row(row.data(), shape, rotated.data());
+
+        const size_t stage_pos = size_t(stage_slot) * KVAR_N_GROUP + token;
+        ggml_fp16_t * dst = reinterpret_cast<ggml_fp16_t *>(image) +
+            (stage_pos * shape.n_head_sliced + hs) * KVAR_N_GROUP;
+        const float * src = rotated.data() + size_t(hs) * KVAR_N_GROUP;
+        for (uint32_t d = 0; d < KVAR_N_GROUP; ++d) {
+            dst[d] = ggml_fp32_to_fp16(src[d]);
+        }
+    }
+}
+
+} // namespace
+
+bool llama_kv_cache_kvarn::state_streaming_restore_supported() const {
+    // The bounded streaming reader can restore KVarN states whose payload
+    // travels through indexed tensor reads: records, full stage images and
+    // row-sized exact-tail payloads. SWA ring remapping still materializes
+    // whole record vectors, and a pending stream copy owns the destination.
+    return !swa && !has_pending_stream_copies();
+}
+
+bool llama_kv_cache_kvarn::state_parse_q4(
+        llama_state_q4_source & src,
+        const llama_hparams & hparams_ref,
+        llama_state_q4_info & info,
+        std::string & error) {
+    std::vector<uint32_t> attn_layers;
+    attn_layers.reserve(layers.size());
+    for (const auto & layer : layers) {
+        attn_layers.push_back(layer.il);
+    }
+    return llama_state_q4_parse(src, hparams_ref, attn_layers, metadata->has_cell_ext(), info, error);
+}
+
+size_t llama_kv_cache_kvarn::state_convert_q4(
+        llama_state_q4_source & src,
+        const llama_state_q4_info & info,
+        const char * dst_path) {
+    if (dst_path == nullptr || info.n_tokens == 0) {
+        return 0;
+    }
+    if (swa) {
+        throw std::runtime_error("q4 conversion requires a non-SWA destination");
+    }
+    if (n_stream != 1) {
+        throw std::runtime_error("q4 conversion requires a single-stream destination");
+    }
+    if (info.layers.size() != layers.size()) {
+        throw std::runtime_error("q4 conversion source layer count does not match the destination");
+    }
+    if (info.has_cell_ext != metadata->has_cell_ext()) {
+        throw std::runtime_error("q4 conversion source cell-extension layout does not match the destination");
+    }
+
+    const uint32_t n_tokens = info.n_tokens;
+    if (n_tokens > metadata->get_size()) {
+        throw std::runtime_error("q4 conversion source does not fit the destination context");
+    }
+    const uint32_t n_groups_used = (n_tokens + KVAR_N_GROUP - 1) / KVAR_N_GROUP;
+    if (n_groups_used > n_groups_per_stream) {
+        throw std::runtime_error("q4 conversion source exceeds the destination record ring");
+    }
+
+    const size_t k_record_bytes = kvarn_record_bytes(params.key_bits);
+    const size_t v_record_bytes = kvarn_record_bytes(params.value_bits);
+    const llama_kvarn_tile_layout k_layout = kvarn_convert_k_layout(params.key_bits);
+    const llama_kvarn_tile_layout v_layout = kvarn_convert_v_layout(params.value_bits);
+    if (k_layout.tile_bytes != k_record_bytes || v_layout.tile_bytes != v_record_bytes) {
+        throw std::runtime_error("q4 conversion destination record size is inconsistent");
+    }
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        const auto & source = info.layers[i];
+        if (source.il != layer.il) {
+            throw std::runtime_error("q4 conversion source layer order does not match the destination");
+        }
+        if (source.k_row_size != ggml_row_size(GGML_TYPE_Q4_0, hparams.n_embd_k_gqa(layer.il)) ||
+                source.v_row_size != ggml_row_size(GGML_TYPE_Q4_0, hparams.n_embd_v_gqa(layer.il))) {
+            throw std::runtime_error("q4 conversion source row sizes do not match the destination");
+        }
+    }
+
+    // One temporary file in the destination directory, atomically renamed only
+    // after the complete stream has been written, synced and closed.
+    const std::string tmp_path = std::string(dst_path) + ".tmp-convert-" +
+        std::to_string(
+#ifdef _WIN32
+            (long) GetCurrentProcessId()
+#else
+            (long) getpid()
+#endif
+        );
+
+    struct tmp_guard {
+        std::string path;
+        bool armed = true;
+        ~tmp_guard() {
+            if (armed) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+        }
+    } guard { tmp_path };
+
+    std::error_code ec;
+    std::filesystem::remove(tmp_path, ec);
+
+    llama_file out(tmp_path.c_str(), "wb");
+    auto write_bytes = [&out](const void * data, size_t size) { out.write_raw(data, size); };
+    auto write_u32 = [&out](uint32_t value) { out.write_u32(value); };
+
+    const uint32_t header[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, n_tokens };
+    write_bytes(header, sizeof(header));
+    write_bytes(info.tokens.data(), size_t(n_tokens) * sizeof(llama_token));
+
+    // Metadata prefix: populate a private metadata mirror and serialize it
+    // with its own writer, so the destination parser sees exactly the native
+    // manifest, body and exact-tail record layout.
+    auto metadata_prepared = make_metadata_cache();
+    {
+        std::vector<llama_kv_cell_ext> exts;
+        if (metadata->has_cell_ext()) {
+            exts.resize(n_tokens);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                llama_kv_cell_ext ext = info.exts[i];
+                if (ext.tok == LLAMA_TOKEN_NULL) {
+                    ext.tok = info.tokens[i];
+                }
+                exts[i] = ext;
+            }
+        }
+        metadata_prepared->import_sequence_prefix(0, n_tokens, exts);
+    }
+
+    std::vector<int32_t> payload_slots;
+    std::vector<uint32_t> payload_positions;
+    if (exact_tail_tokens > 0) {
+        const uint32_t tail_begin = n_tokens > exact_tail_tokens ? n_tokens - exact_tail_tokens : 0;
+        metadata_prepared->import_sequence_tail(0, tail_begin, n_tokens);
+        payload_slots = metadata_prepared->state_tail_payload_slots(0);
+        std::unordered_map<int32_t, uint32_t> position_by_slot;
+        for (const auto & entry : metadata_prepared->state_tail_snapshot(0)) {
+            position_by_slot.emplace(entry.slot, uint32_t(entry.position));
+        }
+        for (const int32_t slot : payload_slots) {
+            const auto it = position_by_slot.find(slot);
+            if (it == position_by_slot.end()) {
+                throw std::runtime_error("q4 conversion tail payload has no source position");
+            }
+            payload_positions.push_back(it->second);
+        }
+        if (payload_slots.size() != std::min<uint32_t>(n_tokens, exact_tail_tokens)) {
+            throw std::runtime_error("q4 conversion tail payload count is inconsistent");
+        }
+    }
+
+    {
+        llama_io_write_vector metadata_io;
+        metadata_prepared->state_write(metadata_io, 0, 0);
+        write_bytes(metadata_io.data().data(), metadata_io.data().size());
+    }
+
+    // KVarN header: a full record image plus the complete F16 stage image.
+    write_u32(KVAR_N_STATE_MAGIC);
+    write_u32(KVAR_N_STATE_VERSION);
+    write_u32(uint32_t(params.type));
+    write_u32(uint32_t(layers.size()));
+    write_u32(1); // saved streams
+    write_u32(0); // stream 0
+    write_u32(KVAR_N_STATE_RECORDS_FULL);
+    write_u32(stage_groups);
+    write_u32(tail_groups);
+    write_u32(exact_tail_tokens > 0 ? 1u : 0u);
+    write_u32(exact_tail_tokens);
+    write_u32(uint32_t(int32_t(exact_tail_type)));
+    write_u32(uint32_t(payload_slots.size()));
+    write_u32(n_groups_used);
+    const llama_pos saved_pos_max = llama_pos(n_tokens) - 1;
+    write_bytes(&saved_pos_max, sizeof(saved_pos_max));
+    write_u32(0); // selective stage rows
+    write_u32(0); // selective record groups
+
+    const uint32_t complete_groups = n_tokens / KVAR_N_GROUP;
+    const uint32_t last_group = (n_tokens - 1) / KVAR_N_GROUP;
+    const uint32_t stage_first_group = last_group >= tail_groups ? last_group - tail_groups + 1 : 1;
+
+    std::vector<uint32_t> staged_groups;
+    staged_groups.push_back(0);
+    for (uint32_t group = stage_first_group; group <= last_group; ++group) {
+        if (group != 0) {
+            staged_groups.push_back(group);
+        }
+    }
+
+    const unsigned hw = std::thread::hardware_concurrency();
+    const uint32_t n_workers = std::max(1u, std::min(16u, hw ? hw : 1u));
+
+    for (size_t li = 0; li < layers.size(); ++li) {
+        const auto & layer = layers[li];
+        const auto & source = info.layers[li];
+
+        const kvarn_convert_shape k_shape = kvarn_convert_shape_for(layer.n_head_kv, layer.head_dim_k);
+        const kvarn_convert_shape v_shape = kvarn_convert_shape_for(layer.n_head_kv, layer.head_dim_v);
+
+        write_u32(layer.il);
+        write_u32(0); // stream
+
+        struct component {
+            bool value;
+            uint64_t data;
+            uint64_t row_size;
+            uint32_t n_embd;
+            kvarn_convert_shape shape;
+            size_t record_bytes;
+            int bits;
+            uint64_t saved_size;
+        };
+        const component components[2] = {
+            { false, source.k_data, source.k_row_size, hparams.n_embd_k_gqa(layer.il), k_shape,
+              k_record_bytes, params.key_bits,
+              uint64_t(n_groups_used) * uint64_t(layer.k_records_stream[0]->nb[2]) },
+            { true, source.v_data, source.v_row_size, hparams.n_embd_v_gqa(layer.il), v_shape,
+              v_record_bytes, params.value_bits,
+              uint64_t(n_groups_used) * uint64_t(layer.v_records_stream[0]->nb[2]) },
+        };
+
+        for (const auto & component : components) {
+            write_bytes(&component.saved_size, sizeof(component.saved_size));
+
+            const size_t block_bytes = size_t(component.shape.n_head_sliced) * component.record_bytes;
+            const std::vector<uint8_t> zeros(block_bytes, 0);
+
+            std::vector<std::vector<uint8_t>> in(n_workers);
+            std::vector<std::vector<uint8_t>> out_buf(n_workers);
+
+            for (uint32_t g0 = 0; g0 < n_groups_used; g0 += n_workers) {
+                const uint32_t count = std::min(n_workers, n_groups_used - g0);
+                std::vector<std::thread> threads;
+                threads.reserve(count);
+
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint32_t group = g0 + i;
+                    in[i].clear();
+                    out_buf[i].clear();
+                    if (group == 0 || group >= complete_groups) {
+                        continue;
+                    }
+                    in[i].resize(size_t(KVAR_N_GROUP) * component.row_size);
+                    src.seek(component.data + size_t(group) * KVAR_N_GROUP * component.row_size);
+                    src.read_raw(in[i].data(), in[i].size());
+                    out_buf[i].assign(block_bytes, 0);
+                }
+
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint32_t group = g0 + i;
+                    if (group == 0 || group >= complete_groups) {
+                        continue;
+                    }
+                    threads.emplace_back([&, i] {
+                        kvarn_convert_component_records(
+                                in[i].data(), KVAR_N_GROUP, uint32_t(component.row_size),
+                                component.n_embd, component.shape, component.bits,
+                                params.sinkhorn_iters, component.value, out_buf[i].data());
+                    });
+                }
+                for (auto & thread : threads) {
+                    thread.join();
+                }
+
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint32_t group = g0 + i;
+                    if (group == 0 || group >= complete_groups) {
+                        write_bytes(zeros.data(), zeros.size());
+                    } else {
+                        write_bytes(out_buf[i].data(), out_buf[i].size());
+                    }
+                }
+            }
+        }
+
+        // Full F16 stage image: sink slot plus the live tail groups.
+        for (const auto & stage : components) {
+            const uint64_t stage_size = uint64_t(ggml_nbytes(stage.value
+                    ? layer.v_stage_stream[0] : layer.k_stage_stream[0]));
+            write_bytes(&stage_size, sizeof(stage_size));
+
+            std::vector<uint8_t> image(
+                    size_t(KVAR_N_GROUP) * stage_groups * stage.shape.n_head_sliced *
+                    KVAR_N_GROUP * sizeof(uint16_t), 0);
+
+            for (const uint32_t group : staged_groups) {
+                const uint32_t n_valid = std::min<uint32_t>(KVAR_N_GROUP,
+                        n_tokens - group * KVAR_N_GROUP);
+                const uint32_t slot = group == 0 ? 0 : 1 + ((group - 1) % tail_groups);
+
+                std::vector<uint8_t> rows(size_t(n_valid) * stage.row_size);
+                src.seek(stage.data + size_t(group) * KVAR_N_GROUP * stage.row_size);
+                src.read_raw(rows.data(), rows.size());
+
+                std::vector<std::thread> threads;
+                threads.reserve(stage.shape.n_head_sliced);
+                for (uint32_t hs = 0; hs < stage.shape.n_head_sliced; ++hs) {
+                    threads.emplace_back([&, hs] {
+                        kvarn_convert_stage_slice(rows.data(), n_valid, uint32_t(stage.row_size),
+                                stage.n_embd, stage.shape, hs, slot, image.data());
+                    });
+                }
+                for (auto & thread : threads) {
+                    thread.join();
+                }
+            }
+
+            write_bytes(image.data(), image.size());
+        }
+
+        // Exact tail rows, payload order (per layer: K rows, then V rows).
+        const uint64_t k_tail_row = layer.k_tail
+            ? uint64_t(ggml_row_size(layer.k_tail->type, layer.k_tail->ne[0])) : 0;
+        const uint64_t v_tail_row = layer.v_tail
+            ? uint64_t(ggml_row_size(layer.v_tail->type, layer.v_tail->ne[0])) : 0;
+        write_bytes(&k_tail_row, sizeof(k_tail_row));
+        write_bytes(&v_tail_row, sizeof(v_tail_row));
+        if ((k_tail_row != 0) != (exact_tail_tokens > 0) ||
+                (v_tail_row != 0) != (exact_tail_tokens > 0)) {
+            throw std::runtime_error("q4 conversion destination tail layout is inconsistent");
+        }
+        if (!payload_positions.empty()) {
+            for (const auto & tail : components) {
+                std::vector<uint8_t> row_bytes(size_t(tail.row_size));
+                std::vector<uint8_t> tail_out;
+                for (const uint32_t pos : payload_positions) {
+                    src.seek(tail.data + size_t(pos) * tail.row_size);
+                    src.read_raw(row_bytes.data(), row_bytes.size());
+                    kvarn_convert_tail_row(row_bytes.data(), tail.n_embd, tail.shape, tail_out);
+                    write_bytes(tail_out.data(), tail_out.size());
+                }
+            }
+        }
+    }
+
+    // Hybrid models carry a recurrent/conv state after the attention state.
+    // It is not part of the quantized representation and travels verbatim.
+    if (info.recr_bytes != 0) {
+        std::vector<uint8_t> buffer(LLAMA_STATE_FILE_BUFFER_SIZE);
+        src.seek(info.recr_offset);
+        for (uint64_t left = info.recr_bytes; left;) {
+            const size_t count = size_t(std::min<uint64_t>(left, buffer.size()));
+            src.read_raw(buffer.data(), count);
+            write_bytes(buffer.data(), count);
+            left -= count;
+        }
+    }
+
+    const size_t total = out.tell();
+#ifndef _WIN32
+    if (::fsync(out.file_id()) != 0) {
+        throw std::runtime_error("converted sequence state sync failed");
+    }
+#endif
+    out.close();
+
+    std::filesystem::rename(tmp_path, dst_path, ec);
+    if (ec) {
+        throw std::runtime_error("converted sequence state publication failed: " + ec.message());
+    }
+    guard.armed = false;
+    LLAMA_LOG_INFO("%s: converted q4_0 state into %s (tokens=%u bytes=%zu type=%s)\n",
+            __func__, dst_path, n_tokens, total, llama_kvarn_type_name(params.type));
+    return total;
 }

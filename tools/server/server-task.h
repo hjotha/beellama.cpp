@@ -211,6 +211,9 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        bool route_state_transfer = false;
+        bool route_target_no_mtp = false;
+        bool route_state_reuse = false;
     };
     slot_action slot_action;
 

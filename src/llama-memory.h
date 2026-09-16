@@ -19,6 +19,9 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+struct llama_state_q4_source;
+struct llama_state_q4_info;
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -227,6 +230,36 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // Bounded streaming restore support. Representations that materialize more
+    // than the transfer staging budget while parsing must keep the legacy
+    // in-RAM readers. Defaults to the historical contract.
+    virtual bool state_streaming_restore_supported() const {
+        return !requires_state_for_partial_restore();
+    }
+
+    // Explicit conversion path: parse the attention portion of a q4_0/q4_0
+    // source sequence state (positioned after the outer header) into `info`.
+    // Composite memories parse their attention child here and record any
+    // preserved trailing state in info.recr_offset/info.recr_bytes.
+    virtual bool state_parse_q4(
+            llama_state_q4_source & /* src */,
+            const llama_hparams & /* hparams */,
+            llama_state_q4_info & /* info */,
+            std::string & /* error */) {
+        return false;
+    }
+
+    // Write the converted canonical sequence state file for a parsed q4 source.
+    // The source is positioned where state_parse_q4 stopped; composite memories
+    // may hand the trailing preserved bytes to the attention child unmodified.
+    // Returns the converted state size in bytes, or 0 without a conversion path.
+    virtual size_t state_convert_q4(
+            llama_state_q4_source & /* src */,
+            const llama_state_q4_info & /* info */,
+            const char * /* dst_path */) {
+        return 0;
+    }
 
     // KV-cache-compatible hooks used by composite memories such as hybrid and iSWA.
     // Non-KV memory types keep the defaults and should not be used as attention memory.

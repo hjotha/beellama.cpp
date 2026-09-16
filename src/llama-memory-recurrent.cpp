@@ -939,6 +939,8 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
 
+    if (cell_count > size) { throw std::runtime_error("recurrent state cell count exceeds capacity"); }
+
     const uint32_t old_head = head;
     const uint32_t old_used = used;
     const int32_t old_rs_z = rs_z;
@@ -958,12 +960,11 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 
     if (!res) {
-        // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
-        if (seq_id == -1) {
-            clear(true);
-        } else {
-            seq_rm(seq_id, -1, -1);
-        }
+        head = old_head;
+        used = old_used;
+        rs_z = old_rs_z;
+        cells = std::move(old_cells);
+        rs_idx = std::move(old_rs_idx);
         throw std::runtime_error("failed to restore kv cache");
     }
 
@@ -1032,6 +1033,28 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
             }
         }
     }
+}
+
+uint64_t llama_memory_recurrent::state_data_bytes(uint32_t cell_count) const {
+    uint64_t bytes = 2 * sizeof(uint32_t); // s_trans + n_layer
+    const uint32_t n_layer = hparams.n_layer();
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il] != nullptr) {
+            bytes += sizeof(int32_t) + sizeof(uint64_t);
+            bytes += uint64_t(cell_count) * ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            if (p_l[il] != nullptr) {
+                bytes += sizeof(uint64_t);
+                bytes += uint64_t(cell_count) * ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
+            }
+        }
+    }
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (s_l[il] != nullptr) {
+            bytes += sizeof(int32_t) + sizeof(uint64_t);
+            bytes += uint64_t(cell_count) * ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+        }
+    }
+    return bytes;
 }
 
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
@@ -1284,7 +1307,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             }
 
             if (cell_count) {
-                io.read_tensor(p_l[il], head * p_size_row, cell_count * p_size_row);
+                io.read_tensor(p_l[il], restore_head * p_size_row, cell_count * p_size_row);
             }
         }
     }

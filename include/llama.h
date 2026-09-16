@@ -1122,6 +1122,64 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+    // Bounded file restore into an entirely EMPTY context (all sequences), for
+    // standard attention/recurrent memory without compact or precision tails.
+    // Reads a native sequence file prefix of state_size bytes, checked against
+    // XXH64(seed=0). Trailing application metadata is not read. tokens_out must
+    // be non-null. Returns state_size on success, zero on failure. Nonempty
+    // contexts are rejected unchanged. Parse is transactional; if I/O fails
+    // during commit, the empty destination is cleared before returning zero.
+    // Caller must validate model identity/layout and token semantics separately.
+    // Tensor transfer buffer: 8 MiB; index and synthesized-row staging are each
+    // bounded by 8 MiB (allocator growth can reserve up to twice that). Memory
+    // metadata remains proportional to the destination context, not KV payload.
+    LLAMA_API size_t llama_state_seq_load_file_streaming(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out,
+                          size_t   state_size,
+                        uint64_t   checksum);
+
+    // Explicit, restricted conversion of a q4_0/q4_0 sequence state into the
+    // destination context's native compact representation. The source is a
+    // canonical sequence state file ([src_offset, src_offset + src_size) of
+    // src_filepath, checked against src_checksum when nonzero) or the in-memory
+    // snapshot form via llama_state_seq_convert_data. Only a single contiguous
+    // text prefix with untransposed q4_0 K and V is accepted; everything else
+    // is rejected without touching the destination. On success a canonical
+    // sequence state file for the destination layout is written to dst_filepath
+    // (atomically replaced) and its native state size in bytes is returned.
+    // The conversion is lossy: the q4 error is preserved and requantization can
+    // add more. It is not equivalent to a native compact prefill.
+    LLAMA_API size_t llama_state_seq_convert_file(
+            struct llama_context * ctx,
+                      const char * src_filepath,
+                          size_t   src_offset,
+                          size_t   src_size,
+                        uint64_t   src_checksum,
+                      const char * dst_filepath,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out);
+
+    // In-memory variant. The canonical file form carries its own token header;
+    // the raw state_seq_get_data form does not, so when the source starts with
+    // the in-memory header the caller must pass the matching prompt tokens.
+    LLAMA_API size_t llama_state_seq_convert_data(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                        uint64_t   src_checksum,
+                 const llama_token * ram_tokens,
+                          size_t   ram_n_tokens,
+                      const char * dst_filepath,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out);
+
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 
 // for backwards-compat

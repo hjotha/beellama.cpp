@@ -19,6 +19,9 @@ struct llama_file {
     llama_file(FILE * file);
     ~llama_file();
 
+    // Checked flush/close for writers; the destructor cannot report late errors.
+    void close();
+
     size_t tell() const;
     size_t size() const;
 

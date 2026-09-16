@@ -111,6 +111,17 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    bool state_streaming_restore_supported() const override;
+    bool state_parse_q4(
+            llama_state_q4_source & src,
+            const llama_hparams & hparams,
+            llama_state_q4_info & info,
+            std::string & error) override;
+    size_t state_convert_q4(
+            llama_state_q4_source & src,
+            const llama_state_q4_info & info,
+            const char * dst_path) override;
+
     //
     // llama_memory_hybrid specific API
     //

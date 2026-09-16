@@ -107,6 +107,8 @@ struct server_model_meta {
     void update_caps();
 };
 
+class server_route_state_lease;
+
 // one tier of a routing group: a member child that serves requests up to max_tokens
 // (prompt + output budget). max_tokens < 0 means uncapped: the group's fallback tier
 struct route_group_member {
@@ -149,6 +151,9 @@ private:
         std::string filename;
         int id_slot = 0;
         int64_t n_tokens = -1;
+        bool target_no_mtp = false;
+        bool unified = false;
+        std::shared_ptr<server_route_state_lease> lease;
     };
 
     std::string route_state_dir;
@@ -246,9 +251,10 @@ private:
     void update_meta(const std::string & name, const server_model_meta & meta);
 
     void render_child_args(server_model_meta & meta);
-    void ensure_route_state_dir();
+    void ensure_route_state_dir(const std::string & configured_store = {});
     void cleanup_route_state_dir();
-    std::optional<json> route_slot_action(const server_model_meta & meta, const char * action, int id_slot, const std::string & filename);
+    std::optional<json> route_slot_action(const server_model_meta & meta, const char * action, int id_slot,
+            const std::string & filename, bool target_no_mtp = false, bool reuse = false);
     bool save_route_state(const std::string & group, const std::string & conv_id, const std::string & target, int id_slot);
     bool restore_route_state(const std::string & conv_id, const std::string & target);
     void discard_route_state(const std::string & conv_id);
