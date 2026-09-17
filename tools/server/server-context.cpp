@@ -3277,7 +3277,11 @@ private:
         h = auto_hash_mix(h, (int32_t) (np & 0xFFFFFFFFu)); h = auto_hash_mix(h, (int32_t) (np >> 32));
 
         GGML_ASSERT(adaptive_model_identity);
-        const std::string identity = adaptive_model_identity->fingerprint() + common_prompt_cache_layout(ctx_tgt);
+        // Mix only the model identity: the KV representation is deliberately NOT
+        // part of the salt, so a q4_0 branch point stays discoverable from a
+        // KVarN context (and the reverse). The restore path converts convertible
+        // layouts and rejects the rest by layout.
+        const std::string identity = adaptive_model_identity->fingerprint();
         for (unsigned char c : identity) {
             h = auto_hash_mix(h, c);
         }
@@ -3450,7 +3454,14 @@ private:
                     source_file.layout.c_str(), target_layout.c_str());
             return {};
         }
-        if (params_base.cache_kvarn_bits_k == 0 || params_base.cache_kvarn_bits_v == 0) {
+        bool destination_kvarn = false;
+        try {
+            const common_json layout = common_json::parse(target_layout);
+            destination_kvarn = layout.value("kv_layout_known", true) == false;
+        } catch (...) {
+            destination_kvarn = false;
+        }
+        if (!destination_kvarn) {
             SRV_WRN("%s", "route conversion rejected: destination is not a KVarN cache\n");
             return {};
         }
@@ -3555,6 +3566,31 @@ private:
         auto_idx.index_blocks.insert(auto_index_block(block));
     }
 
+    // A q4_0/q4_0 snapshot is convertible to a KVarN destination by the restricted
+    // converter, and the restore path persists the conversion before loading it.
+    // Such snapshots stay indexable and selectable instead of being a hard miss.
+    bool auto_convertible_q4_layout(const std::string & layout) const {
+        // The KVarN destination is an unknown-memory-layout profile
+        // (kv_layout_known=false); the q4 family is a known one. The restricted
+        // converter validates the exact q4_0 source shape itself.
+        bool destination_kvarn = false;
+        try {
+            const common_json target = common_json::parse(common_prompt_cache_layout(ctx_tgt));
+            destination_kvarn = target.value("kv_layout_known", true) == false;
+        } catch (...) {
+            destination_kvarn = false;
+        }
+        if (!destination_kvarn) {
+            return false;
+        }
+        try {
+            const common_json parsed = common_json::parse(layout);
+            return parsed.value("kv_layout_known", false) == true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     // Read canonical snapshot metadata and skip incompatible files. Caller holds auto_idx.mtx.
     // Both route handoff files and auto-cache files are intentionally discovered here.
     void auto_index_scan_locked() {
@@ -3606,8 +3642,10 @@ private:
                 SRV_WRN("unified snapshot ignored at %s: model identity mismatch\n", p.c_str());
                 continue; // identity mismatch is a safe miss, not a fallback restore
             }
-            if (!common_prompt_cache_layout_reusable(file->layout, current_layout)) {
-                SRV_WRN("unified snapshot ignored at %s: KV/attention/RoPE layout mismatch\n", p.c_str());
+            if (!common_prompt_cache_layout_reusable(file->layout, current_layout) &&
+                    !auto_convertible_q4_layout(file->layout)) {
+                SRV_WRN("unified snapshot ignored at %s: KV/attention/RoPE layout mismatch\n  source=%s\n  target=%s\n",
+                        p.c_str(), file->layout.c_str(), current_layout.c_str());
                 continue; // layout mismatch is a safe miss, not a fallback restore
             }
             if (file->tokens.empty()) {
@@ -3691,7 +3729,8 @@ private:
                         }
                         auto file = read_unified_snapshot(it->second.state_path, false);
                         if (!file || file->model != adaptive_model_identity->fingerprint() ||
-                                !common_prompt_cache_layout_reusable(file->layout, common_prompt_cache_layout(ctx_tgt)) ||
+                                (!common_prompt_cache_layout_reusable(file->layout, common_prompt_cache_layout(ctx_tgt)) &&
+                                 !auto_convertible_q4_layout(file->layout)) ||
                                 auto_index_block(file->index_block) != block) {
                             continue;
                         }
@@ -3869,6 +3908,31 @@ private:
             return 0;
         }
         auto file = read_unified_snapshot(cand.state_path, false);
+        std::unique_ptr<server_route_state_lease> converted_reference;
+        if (file && file->model == adaptive_model_identity->fingerprint() &&
+                !common_prompt_cache_layout_reusable(file->layout, common_prompt_cache_layout(ctx_tgt))) {
+            // The store may hold the branch point in a different convertible
+            // representation (q4_0 -> KVarN when crossing into the xxlong
+            // profile); the converter validates the source shape itself.
+            if (auto_convertible_q4_layout(file->layout)) {
+                const std::string converted = convert_route_snapshot(*file, &reference);
+                if (!converted.empty()) {
+                    converted_reference = std::make_unique<server_route_state_lease>(
+                            converted, server_route_state_lock_mode::reference);
+                    if (converted_reference->acquired()) {
+                        auto converted_file = read_unified_snapshot(converted, false);
+                        if (converted_file &&
+                                converted_file->model == adaptive_model_identity->fingerprint() &&
+                                common_prompt_cache_layout_reusable(converted_file->layout,
+                                    common_prompt_cache_layout(ctx_tgt))) {
+                            file = converted_file;
+                            SLT_INF(slot, "auto-restore: converted cached snapshot %s (%zu tokens)\n",
+                                    converted.c_str(), file->tokens.size());
+                        }
+                    }
+                }
+            }
+        }
         if (!file || file->model != adaptive_model_identity->fingerprint() ||
                 !common_prompt_cache_layout_reusable(file->layout, common_prompt_cache_layout(ctx_tgt))) {
             return 0; // invariant 3/4: incompatible or incomplete publication
