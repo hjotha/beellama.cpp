@@ -66,6 +66,33 @@
     { "name": "x64-linux-gcc-release", "inherits": [ "base", "x64-linux-gcc", "release" ] },
     { "name": "x64-linux-gcc-reldbg", "inherits": [ "base", "x64-linux-gcc", "reldbg" ] },
     { "name": "x64-linux-gcc+static-release", "inherits": [ "base", "x64-linux-gcc", "release", "static" ] },
+    {
+        "name": "optimized",
+        "inherits": [ "base", "x64-linux-gcc", "release" ],
+        "binaryDir": "${sourceDir}/build-optimized",
+        "cacheVariables": {
+            "CMAKE_BUILD_TYPE": "Release",
+            "CMAKE_C_FLAGS": "-march=native -mtune=native -ffunction-sections -fdata-sections",
+            "CMAKE_CXX_FLAGS": "-march=native -mtune=native -ffunction-sections -fdata-sections",
+            "CMAKE_EXE_LINKER_FLAGS": "-Wl,--gc-sections",
+            "CMAKE_SHARED_LINKER_FLAGS": "-Wl,--gc-sections",
+            "BUILD_SHARED_LIBS": "ON",
+            "GGML_NATIVE": "ON",
+            "GGML_CUDA": "ON",
+            "GGML_CUDA_COMPRESSION_MODE": "speed",
+            "GGML_CUDA_FA": "ON",
+            "GGML_CUDA_FA_ALL_QUANTS": "OFF",
+            "GGML_CUDA_FA_QUANTS": "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16",
+            "GGML_CUDA_GRAPHS": "ON",
+            "GGML_CUDA_NCCL": "ON",
+            "GGML_CUDA_KVARN": "ON",
+            "GGML_VULKAN": "ON",
+            "LLAMA_BUILD_COMMON": "ON",
+            "LLAMA_BUILD_SERVER": "ON",
+            "LLAMA_BUILD_MTMD": "OFF",
+            "LLAMA_BUILD_UI": "OFF"
+        }
+    },
 
     { "name": "arm64-windows-llvm-debug", "inherits": [ "base", "arm64-windows-llvm", "debug" ] },
     { "name": "arm64-windows-llvm-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg" ] },
