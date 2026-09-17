@@ -6201,6 +6201,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_kvarn_store_route_stats_get") == 0) {
         return (void *)ggml_cuda_kvarn_store_route_stats_get;
     }
+    if (strcmp(name, "ggml_backend_kvarn_convert_q4") == 0) {
+        return (void *)ggml_cuda_kvarn_convert_q4;
+    }
 #endif
     if (strcmp(name, "ggml_backend_kv_memory_transient_stats_reset") == 0) {
         return (void *)ggml_cuda_kv_memory_transient_stats_reset;

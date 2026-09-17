@@ -1,5 +1,7 @@
 #include "kvarn.cuh"
 
+#include "dequantize.cuh"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -743,6 +745,180 @@ static __device__ void kvarn_quantize_stage(
     __syncthreads();
     // Stage and records are rotated-domain for both K and V.
     kvarn_quantize_tile(record, bits, iterations, shared);
+}
+
+// --- q4_0 -> KVarN bulk conversion -----------------------------------------
+// Converts complete 128-token groups of a q4_0 cache (original post-RoPE
+// domain) into KVarN records. The per-slice Hadamard and the cross-slice
+// Hadamard are applied in the input domain, which is exact because the
+// transform is linear:
+//     Hslice[out] . WHT(x_j) == WHT(Hslice[out] . x_j)
+// This matches the CPU converter in src/llama-kv-cache-kvarn.cpp and the
+// rotated domain consumed by ggml_cuda_op_kvarn_store.
+
+struct ggml_cuda_kvarn_convert_scratch {
+    void  * rows    = nullptr;
+    void  * rotated = nullptr;
+    void  * records = nullptr;
+    size_t rows_bytes    = 0;
+    size_t rotated_bytes = 0;
+    size_t records_bytes = 0;
+};
+
+static ggml_cuda_kvarn_convert_scratch g_kvarn_convert_scratch;
+static std::mutex g_kvarn_convert_mutex;
+static bool g_kvarn_convert_attrs = false;
+
+static bool kvarn_convert_scratch_grow(void ** ptr, size_t & capacity, size_t need) {
+    if (capacity >= need) {
+        return true;
+    }
+    if (*ptr != nullptr) {
+        cudaFree(*ptr);
+        *ptr = nullptr;
+        capacity = 0;
+    }
+    if (need == 0 || cudaMalloc(ptr, need) != cudaSuccess) {
+        return false;
+    }
+    capacity = need;
+    return true;
+}
+
+static __global__ void kvarn_convert_rotate_kernel(
+        const uint8_t * __restrict__ rows,
+        int row_bytes,
+        int head_dim,
+        int slices,
+        int n_head_sliced,
+        half * __restrict__ rotated) {
+    extern __shared__ float shared[];
+    const int token = blockIdx.x;
+    const int hs    = blockIdx.y;
+    const int head  = hs / slices;
+    const int slice = hs % slices;
+    const int d     = threadIdx.x;
+
+    float values[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const uint8_t * row = rows + (size_t) token * (size_t) row_bytes;
+    for (int s = 0; s < slices; ++s) {
+        const int dim = head * head_dim + s * KVAR_N_DIM + d;
+        const int in_block = dim % 32;
+        float2 pair = make_float2(0.0f, 0.0f);
+        dequantize_q4_0(row, dim / 32, in_block % 16, pair);
+        values[s] = in_block < 16 ? pair.x : pair.y;
+    }
+    for (int stride = 1; stride < slices; stride <<= 1) {
+        for (int b = 0; b + stride < slices; b += 2 * stride) {
+            for (int i = 0; i < stride && b + stride + i < slices; ++i) {
+                const float a = values[b + i];
+                const float c = values[b + stride + i];
+                values[b + i] = a + c;
+                values[b + stride + i] = a - c;
+            }
+        }
+    }
+    const float scale = slices == 2 ? 0.7071067811865475f : (slices == 4 ? 0.5f : 1.0f);
+    shared[d] = values[slice] * scale;
+    __syncthreads();
+    kvarn_wht_128(shared);
+    rotated[((size_t) token * n_head_sliced + hs) * KVAR_N_DIM + d] = __float2half_rn(shared[d]);
+}
+
+static __global__ void kvarn_convert_records_kernel(
+        const half * __restrict__ rotated,
+        uint8_t * __restrict__ records,
+        int n_head_sliced,
+        int bits,
+        int iterations,
+        bool value,
+        int record_bytes) {
+    extern __shared__ float shared[];
+    const int group = blockIdx.x;
+    const int hs    = blockIdx.y;
+    for (int i = threadIdx.x; i < KVAR_N_TILE_VALUES; i += blockDim.x) {
+        const int row = i / KVAR_N_DIM;
+        const int col = i % KVAR_N_DIM;
+        const int token = value ? row : col;
+        const int dim   = value ? col : row;
+        shared[i] = __half2float(rotated[
+                ((size_t) (group * KVAR_N_DIM + token) * n_head_sliced + hs) * KVAR_N_DIM + dim]);
+    }
+    __syncthreads();
+    kvarn_quantize_tile(records + ((size_t) group * n_head_sliced + hs) * record_bytes,
+            bits, iterations, shared);
+}
+
+bool ggml_cuda_kvarn_convert_q4(
+        const void * rows,
+        size_t row_bytes,
+        int n_tokens,
+        int n_embd,
+        int n_head_kv,
+        int head_dim,
+        int bits,
+        int iterations,
+        bool value,
+        void * records) {
+    if (rows == nullptr || records == nullptr || n_tokens <= 0 || row_bytes == 0 || n_embd <= 0 ||
+            n_head_kv <= 0 || head_dim <= 0 || head_dim % KVAR_N_DIM != 0 ||
+            n_tokens % KVAR_N_DIM != 0 || !ggml_cuda_kvarn_valid_bits(bits)) {
+        return false;
+    }
+    const int slices = head_dim / KVAR_N_DIM;
+    if (slices < 1 || slices > 4) {
+        return false;
+    }
+    const int n_head_sliced = n_head_kv * slices;
+    const int record_bytes = KVAR_N_TILE_VALUES * bits / 8 + 3 * KVAR_N_DIM * (int) sizeof(half);
+    const int groups = n_tokens / KVAR_N_DIM;
+
+    std::lock_guard<std::mutex> guard(g_kvarn_convert_mutex);
+    if (!kvarn_convert_scratch_grow(&g_kvarn_convert_scratch.rows,
+                g_kvarn_convert_scratch.rows_bytes, (size_t) n_tokens * row_bytes) ||
+            !kvarn_convert_scratch_grow(&g_kvarn_convert_scratch.rotated,
+                g_kvarn_convert_scratch.rotated_bytes,
+                (size_t) n_tokens * n_head_sliced * KVAR_N_DIM * sizeof(half)) ||
+            !kvarn_convert_scratch_grow(&g_kvarn_convert_scratch.records,
+                g_kvarn_convert_scratch.records_bytes,
+                (size_t) groups * n_head_sliced * record_bytes)) {
+        return false;
+    }
+    if (!g_kvarn_convert_attrs) {
+#if defined(GGML_USE_HIP)
+        if (hipFuncSetAttribute(reinterpret_cast<const void *>(&kvarn_convert_records_kernel),
+                    hipFuncAttributeMaxDynamicSharedMemorySize, KVAR_N_SHARED_BYTES) != hipSuccess) {
+            return false;
+        }
+#elif !defined(GGML_USE_MUSA)
+        if (cudaFuncSetAttribute(kvarn_convert_records_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, KVAR_N_SHARED_BYTES) != cudaSuccess) {
+            return false;
+        }
+#endif
+        g_kvarn_convert_attrs = true;
+    }
+    if (cudaMemcpy(g_kvarn_convert_scratch.rows, rows, (size_t) n_tokens * row_bytes,
+                cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+    kvarn_convert_rotate_kernel<<<dim3((unsigned) n_tokens, (unsigned) n_head_sliced),
+            KVAR_N_DIM, KVAR_N_DIM * sizeof(float), 0>>>(
+            (const uint8_t *) g_kvarn_convert_scratch.rows, (int) row_bytes, head_dim, slices,
+            n_head_sliced, (half *) g_kvarn_convert_scratch.rotated);
+    kvarn_convert_records_kernel<<<dim3((unsigned) groups, (unsigned) n_head_sliced),
+            KVAR_N_DIM, KVAR_N_SHARED_BYTES, 0>>>(
+            (const half *) g_kvarn_convert_scratch.rotated,
+            (uint8_t *) g_kvarn_convert_scratch.records,
+            n_head_sliced, bits, iterations, value, record_bytes);
+    if (cudaGetLastError() != cudaSuccess) {
+        return false;
+    }
+    if (cudaMemcpy(records, g_kvarn_convert_scratch.records,
+                (size_t) groups * n_head_sliced * record_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
+    }
+    return cudaDeviceSynchronize() == cudaSuccess;
 }
 
 static __device__ float kvarn_stage_rotated_value(

@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -111,6 +112,36 @@ bool kvarn_backend_supports_native_tail(
             ggml_backend_reg_get_proc_address(
                 reg, "ggml_backend_kv_tail_attention_supported")) : nullptr;
     return fn && fn(GGML_TYPE_F16, GGML_TYPE_F16, exact_type, exact_type, d_k, d_v);
+}
+
+using backend_kvarn_convert_q4_t = bool (*)(
+        const void *, size_t, int, int, int, int, int, int, bool, void *);
+
+// Opt-out switch for A/B validation of the GPU converter (default: enabled).
+bool kvarn_convert_gpu_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("LLAMA_KVARN_CONVERT_GPU");
+        return raw == nullptr || std::atoi(raw) != 0;
+    }();
+    return enabled;
+}
+
+// First backend device exposing the CUDA/HIP bulk q4_0 -> KVarN converter.
+backend_kvarn_convert_q4_t kvarn_convert_gpu_proc() {
+    static backend_kvarn_convert_q4_t proc = [] {
+        const size_t count = ggml_backend_dev_count();
+        for (size_t i = 0; i < count; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto * fn = reg ? reinterpret_cast<backend_kvarn_convert_q4_t>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_convert_q4")) : nullptr;
+            if (fn != nullptr) {
+                return fn;
+            }
+        }
+        return (backend_kvarn_convert_q4_t) nullptr;
+    }();
+    return proc;
 }
 
 bool kvarn_backend_supports_tail_write(
@@ -3528,6 +3559,41 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
 
             const size_t block_bytes = size_t(component.shape.n_head_sliced) * component.record_bytes;
             const std::vector<uint8_t> zeros(block_bytes, 0);
+
+            // Bulk GPU path: convert all complete groups except the sink into a
+            // host image, then publish it. The q4 rows are uploaded in small
+            // chunks, so the VRAM scratch stays bounded and the source cache is
+            // never duplicated on the GPU.
+            backend_kvarn_convert_q4_t gpu_convert =
+                kvarn_convert_gpu_enabled() ? kvarn_convert_gpu_proc() : nullptr;
+            if (gpu_convert != nullptr && complete_groups > 1) {
+                std::vector<uint8_t> records_out(size_t(n_groups_used) * block_bytes, 0);
+                const uint32_t chunk_groups = 32;
+                bool gpu_ok = true;
+                for (uint32_t g = 1; g < complete_groups && gpu_ok; g += chunk_groups) {
+                    const uint32_t count = std::min(chunk_groups, complete_groups - g);
+                    const size_t rows_bytes = size_t(count) * KVAR_N_GROUP * component.row_size;
+                    std::vector<uint8_t> rows_in(rows_bytes);
+                    src.seek(component.data + size_t(g) * KVAR_N_GROUP * component.row_size);
+                    src.read_raw(rows_in.data(), rows_in.size());
+                    std::vector<uint8_t> chunk_out(size_t(count) * block_bytes, 0);
+                    gpu_ok = gpu_convert(
+                            rows_in.data(), size_t(component.row_size),
+                            int(count * KVAR_N_GROUP), int(component.n_embd),
+                            int(layer.n_head_kv),
+                            int(component.value ? layer.head_dim_v : layer.head_dim_k),
+                            int(component.bits), int(params.sinkhorn_iters), component.value,
+                            chunk_out.data());
+                    if (gpu_ok) {
+                        std::memcpy(records_out.data() + size_t(g) * block_bytes,
+                                chunk_out.data(), chunk_out.size());
+                    }
+                }
+                if (gpu_ok) {
+                    write_bytes(records_out.data(), records_out.size());
+                    continue;
+                }
+            }
 
             std::vector<std::vector<uint8_t>> in(n_workers);
             std::vector<std::vector<uint8_t>> out_buf(n_workers);
