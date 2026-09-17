@@ -10,6 +10,17 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <vector>
+
+// Convert a q4_0 sequence state held in RAM straight into a caller-owned
+// buffer (no temporary file on the critical path). Returns the converted byte
+// count and fills `out`; tokens are copied to `tokens_out`.
+LLAMA_API size_t llama_state_seq_convert_data_to_mem(
+        llama_context * ctx,
+        const uint8_t * src, size_t size, uint64_t src_checksum,
+        const llama_token * ram_tokens, size_t ram_n_tokens,
+        std::vector<uint8_t> & out,
+        llama_token * tokens_out, size_t capacity, size_t * count_out);
 
 struct llama_mtp_weights_info {
     bool managed = false;

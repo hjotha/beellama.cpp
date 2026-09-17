@@ -177,7 +177,8 @@ struct llama_context {
     size_t state_seq_convert_seq_stream(
             llama_state_q4_source & src, const llama_state_q4_info & info,
             const char * dst_filepath,
-            llama_token * tokens_out, size_t capacity, size_t * count_out);
+            llama_token * tokens_out, size_t capacity, size_t * count_out,
+            std::vector<uint8_t> * out_mem = nullptr);
 
     size_t state_seq_convert_file(
             const char * src_filepath, size_t src_offset, size_t src_size, uint64_t src_checksum,
@@ -188,6 +189,11 @@ struct llama_context {
             const uint8_t * src, size_t size, uint64_t src_checksum,
             const llama_token * ram_tokens, size_t ram_n_tokens,
             const char * dst_filepath,
+            llama_token * tokens_out, size_t capacity, size_t * count_out);
+    size_t state_seq_convert_data_to_mem(
+            const uint8_t * src, size_t size, uint64_t src_checksum,
+            const llama_token * ram_tokens, size_t ram_n_tokens,
+            std::vector<uint8_t> & out,
             llama_token * tokens_out, size_t capacity, size_t * count_out);
 
     bool state_load_file(

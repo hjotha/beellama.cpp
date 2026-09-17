@@ -300,7 +300,8 @@ public:
     size_t state_convert_q4(
             llama_state_q4_source & src,
             const llama_state_q4_info & info,
-            const char * dst_path) override;
+            const char * dst_path,
+            std::vector<uint8_t> * out_mem = nullptr) override;
 
     llama_kv_cache * get_metadata_cache() const;
     ggml_tensor * get_materialization_source(int32_t il, bool value) const;

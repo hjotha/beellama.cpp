@@ -5207,28 +5207,6 @@ private:
         if (!prompt_cache || !ctx_tgt) {
             return false;
         }
-        // The converted payload is copied into RAM right after the call and the
-        // file is discarded, so stage it on tmpfs when it fits: the kernel's
-        // file staging then costs RAM bandwidth instead of a spinning-disk
-        // roundtrip. Fall back to the snapshot store when /dev/shm is missing
-        // or too small.
-        std::string tmp = params_base.slot_save_path;
-        if (tmp.empty()) {
-            tmp = "/tmp/";
-        }
-        {
-            std::error_code sec;
-            const auto shm = std::filesystem::space("/dev/shm", sec);
-            if (!sec && std::filesystem::is_directory("/dev/shm", sec) && !sec &&
-                    shm.available > (4ULL << 30)) {
-                tmp = "/dev/shm/";
-            }
-        }
-        if (tmp.back() != '/' && tmp.back() != '\\') {
-            tmp += '/';
-        }
-        tmp += "adaptive-convert-" + std::to_string(ggml_time_us()) + ".bin";
-
         bool converted_any = false;
         for (auto & state : prompt_cache->states) {
             if (state.data.main.empty() || state.prompt.tokens.empty() ||
@@ -5274,33 +5252,23 @@ private:
             size_t count = 0;
             const llama_tokens & prompt_tokens = state.prompt.tokens.get_tokens();
             std::vector<llama_token> tokens_out(prompt_tokens.size());
-            const size_t written = llama_state_seq_convert_data(
+            std::vector<uint8_t> converted;
+            const size_t written = llama_state_seq_convert_data_to_mem(
                     ctx_tgt, state.data.main.data(), state.data.main.size(), 0,
-                    prompt_tokens.data(), prompt_tokens.size(), tmp.c_str(),
+                    prompt_tokens.data(), prompt_tokens.size(), converted,
                     tokens_out.data(), tokens_out.size(), &count);
             if (written == 0 || count != state.prompt.tokens.size()) {
-                std::remove(tmp.c_str());
                 SRV_WRN("adaptive conversion: cached prompt (%zu tokens) is not convertible\n",
                         state.prompt.tokens.size());
                 continue;
             }
-            // Keep the in-memory header, then release the q4 source before the
-            // converted payload is read back so the two never coexist.
+            // Keep the in-memory header, then release the q4 source so the two
+            // payloads never coexist in RAM.
             uint8_t ram_header[2 * sizeof(uint32_t)];
             std::memcpy(ram_header, state.data.main.data(), sizeof(ram_header));
             state.data.main.clear();
             state.data.main.shrink_to_fit();
-            std::vector<uint8_t> converted(written);
-            std::ifstream input(tmp, std::ios::binary);
-            const bool read_ok = bool(input) &&
-                bool(input.read(reinterpret_cast<char *>(converted.data()), (std::streamsize) written));
-            input.close();
-            std::remove(tmp.c_str());
-            if (!read_ok) {
-                SRV_WRN("%s", "adaptive conversion: converted state could not be read back\n");
-                continue;
-            }
-            // The conversion writes the canonical file form (magic + version +
+            // The converter emits the canonical file form (magic + version +
             // token header + body); the prompt cache stores the in-memory form
             // ([u32 magic][i32 seq id] + body). Re-wrap the converted body with
             // the source payload's own in-memory header.

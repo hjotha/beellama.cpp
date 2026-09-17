@@ -4447,17 +4447,18 @@ bool llama_state_q4_read_outer_header(llama_state_q4_source & src, llama_state_q
 size_t llama_context::state_seq_convert_seq_stream(
         llama_state_q4_source & src, const llama_state_q4_info & info,
         const char * dst_filepath,
-        llama_token * tokens_out, size_t capacity, size_t * count_out) {
+        llama_token * tokens_out, size_t capacity, size_t * count_out,
+        std::vector<uint8_t> * out_mem) {
     if (!count_out) { return 0; }
     *count_out = 0;
-    if (!tokens_out || !memory || !dst_filepath || info.n_tokens == 0) { return 0; }
+    if (!tokens_out || !memory || (!dst_filepath && !out_mem) || info.n_tokens == 0) { return 0; }
     if (info.n_tokens > capacity || info.n_tokens > uint64_t(cparams.n_ctx_seq) ||
             info.tokens.size() != info.n_tokens) {
         LLAMA_LOG_ERROR("%s: converted token count exceeds the caller capacity\n", __func__);
         return 0;
     }
     try {
-        const size_t written = memory->state_convert_q4(src, info, dst_filepath);
+        const size_t written = memory->state_convert_q4(src, info, dst_filepath, out_mem);
         if (written == 0) {
             LLAMA_LOG_ERROR("%s: destination memory has no q4 conversion path\n", __func__);
             return 0;
@@ -4563,6 +4564,33 @@ size_t llama_context::state_seq_convert_data(
             throw std::runtime_error("unsupported sequence state source: " + error);
         }
         return state_seq_convert_seq_stream(source, info, dst_filepath, tokens_out, capacity, count_out);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_convert_data_to_mem(
+        const uint8_t * src, size_t size, uint64_t src_checksum,
+        const llama_token * ram_tokens, size_t ram_n_tokens,
+        std::vector<uint8_t> & out,
+        llama_token * tokens_out, size_t capacity, size_t * count_out) {
+    if (!count_out) { return 0; }
+    *count_out = 0;
+    if (!src || size == 0) { return 0; }
+    try {
+        if (src_checksum != 0 && llama_state_q4_checksum(src, size) != src_checksum) {
+            throw std::runtime_error("sequence state source checksum mismatch");
+        }
+        llama_state_q4_memory_source source(src, size);
+        llama_state_q4_info info;
+        std::string error;
+        if (!llama_state_q4_read_outer_header(source, info, ram_tokens, ram_n_tokens,
+                    cparams.n_ctx_seq, error) ||
+                !memory->state_parse_q4(source, model.hparams, info, error)) {
+            throw std::runtime_error("unsupported sequence state source: " + error);
+        }
+        return state_seq_convert_seq_stream(source, info, nullptr, tokens_out, capacity, count_out, &out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
         return 0;
@@ -5853,6 +5881,14 @@ size_t llama_state_seq_convert_data(llama_context * ctx, const uint8_t * src, si
     if (!ctx || !src || !dst_filepath) { return 0; }
     return ctx->state_seq_convert_data(src, size, src_checksum, ram_tokens, ram_n_tokens,
             dst_filepath, tokens_out, capacity, count_out);
+}
+
+size_t llama_state_seq_convert_data_to_mem(llama_context * ctx, const uint8_t * src, size_t size, uint64_t src_checksum,
+        const llama_token * ram_tokens, size_t ram_n_tokens,
+        std::vector<uint8_t> & out, llama_token * tokens_out, size_t capacity, size_t * count_out) {
+    if (!ctx || !src) { return 0; }
+    return ctx->state_seq_convert_data_to_mem(src, size, src_checksum, ram_tokens, ram_n_tokens,
+            out, tokens_out, capacity, count_out);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

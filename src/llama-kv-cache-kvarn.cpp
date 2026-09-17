@@ -3607,8 +3607,9 @@ bool llama_kv_cache_kvarn::state_parse_q4(
 size_t llama_kv_cache_kvarn::state_convert_q4(
         llama_state_q4_source & src,
         const llama_state_q4_info & info,
-        const char * dst_path) {
-    if (dst_path == nullptr || info.n_tokens == 0) {
+        const char * dst_path,
+        std::vector<uint8_t> * out_mem) {
+    if ((dst_path == nullptr && out_mem == nullptr) || info.n_tokens == 0) {
         return 0;
     }
     if (swa) {
@@ -3653,15 +3654,16 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
         }
     }
 
-    // One temporary file in the destination directory, atomically renamed only
-    // after the complete stream has been written, synced and closed.
-    const std::string tmp_path = create_conversion_temp_path(dst_path);
+    // Memory output writes straight into the caller's buffer (no file at all);
+    // otherwise a temporary file in the destination directory is used and
+    // atomically renamed only after the complete stream was written and synced.
+    const std::string tmp_path = out_mem ? std::string() : create_conversion_temp_path(dst_path);
 
     struct tmp_guard {
         std::string path;
         bool armed = true;
         ~tmp_guard() {
-            if (armed) {
+            if (armed && !path.empty()) {
                 std::error_code ec;
                 std::filesystem::remove(path, ec);
             }
@@ -3670,9 +3672,27 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
 
     std::error_code ec;
 
-    llama_file out(tmp_path.c_str(), "wb");
-    auto write_bytes = [&out](const void * data, size_t size) { out.write_raw(data, size); };
-    auto write_u32 = [&out](uint32_t value) { out.write_u32(value); };
+    std::unique_ptr<llama_file> out;
+    if (out_mem) {
+        out_mem->clear();
+    } else {
+        out = std::make_unique<llama_file>(tmp_path.c_str(), "wb");
+    }
+    auto write_bytes = [&](const void * data, size_t size) {
+        if (out_mem) {
+            const uint8_t * p = static_cast<const uint8_t *>(data);
+            out_mem->insert(out_mem->end(), p, p + size);
+        } else {
+            out->write_raw(data, size);
+        }
+    };
+    auto write_u32 = [&](uint32_t value) {
+        if (out_mem) {
+            write_bytes(&value, sizeof(value));
+        } else {
+            out->write_u32(value);
+        }
+    };
 
     const uint32_t header[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, n_tokens };
     write_bytes(header, sizeof(header));
@@ -3943,20 +3963,21 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
         }
     }
 
-    const size_t total = out.tell();
+    const size_t total = out_mem ? out_mem->size() : out->tell();
+    if (!out_mem) {
 #ifndef _WIN32
-    if (::fsync(out.file_id()) != 0) {
-        throw std::runtime_error("converted sequence state sync failed");
-    }
+        if (::fsync(out->file_id()) != 0) {
+            throw std::runtime_error("converted sequence state sync failed");
+        }
 #endif
-    out.close();
-
-    std::filesystem::rename(tmp_path, dst_path, ec);
-    if (ec) {
-        throw std::runtime_error("converted sequence state publication failed: " + ec.message());
+        out->close();
+        std::filesystem::rename(tmp_path, dst_path, ec);
+        if (ec) {
+            throw std::runtime_error("converted sequence state publication failed: " + ec.message());
+        }
     }
     guard.armed = false;
     LLAMA_LOG_INFO("%s: converted q4_0 state into %s (tokens=%u bytes=%zu type=%s)\n",
-            __func__, dst_path, n_tokens, total, llama_kvarn_type_name(params.type));
+            __func__, out_mem ? "memory" : dst_path, n_tokens, total, llama_kvarn_type_name(params.type));
     return total;
 }

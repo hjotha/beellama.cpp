@@ -344,8 +344,9 @@ bool llama_memory_hybrid::state_parse_q4(
 size_t llama_memory_hybrid::state_convert_q4(
         llama_state_q4_source & src,
         const llama_state_q4_info & info,
-        const char * dst_path) {
-    return mem_attn->state_convert_q4(src, info, dst_path);
+        const char * dst_path,
+        std::vector<uint8_t> * out_mem) {
+    return mem_attn->state_convert_q4(src, info, dst_path, out_mem);
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
