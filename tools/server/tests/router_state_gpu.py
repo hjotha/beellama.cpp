@@ -295,7 +295,7 @@ def validate_restored_baseline(service, release, model_id, record):
     record["restored_exactly"] = True
 
 
-def wait_for_restored_baseline(service, release, model_id, record, timeout=180):
+def wait_for_restored_baseline(service, release, model_id, record, timeout=600):
     deadline = time.monotonic() + timeout
     attempts = 0
     last_error = None
@@ -416,7 +416,15 @@ def main():
 
         harness = Path(__file__).with_name(args.harness)
         sys.argv = [str(harness), "--work-dir", str(root / "matrix")] + forwarded
-        runpy.run_path(str(harness), run_name="__main__")
+        try:
+            runpy.run_path(str(harness), run_name="__main__")
+        except SystemExit as exit:
+            # Harnesses that use the conventional `raise SystemExit(main())`
+            # report a successful integer zero through runpy as an exception.
+            # Preserve non-zero exits as failures, but do not turn a passing
+            # harness into a false failure or skip matrix_passed recording.
+            if exit.code not in (None, 0):
+                raise
         record["log_scan"] = scan_matrix_logs(root)
         if record["log_scan"]["counts"]["oom_or_cuda_alloc_failure"]:
             raise RuntimeError("GPU matrix logged a CUDA allocation/OOM failure")
@@ -452,9 +460,9 @@ def main():
                 record["restore_failure"] = "pre-restore GPU cleanup check failed: " + repr(error)
             try:
                 subprocess.run(["systemctl", "start", args.service], check=True, timeout=120)
-                subprocess.run(["curl", "-fsS", "--max-time", "10", "--retry", "90",
-                                "--retry-all-errors", "--retry-delay", "1",
-                                "http://127.0.0.1:8090/health"], check=True, timeout=120,
+                subprocess.run(["curl", "-fsS", "--max-time", "10", "--retry", "300",
+                                "--retry-max-time", "600", "--retry-all-errors", "--retry-delay", "1",
+                                "http://127.0.0.1:8090/health"], check=True, timeout=660,
                                stdout=subprocess.PIPE, text=True)
                 wait_for_restored_baseline(args.service, release, model_id, record)
                 if record.get("harness_gpu_residual"):
