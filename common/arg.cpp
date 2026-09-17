@@ -1994,7 +1994,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"-c", "--ctx-size"}, "N",
+        {"-c", "--ctx-size", "--ctx-size-l", "--ctx-size-long"}, "N",
         string_format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
         [](common_params & params, int value) {
             params.n_ctx = value;
@@ -2006,7 +2006,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
-        {"--ctx-size-mtp"}, "N",
+        {"--ctx-size-m", "--ctx-size-mtp"}, "N",
         string_format("short context size for adaptive MTP mode (default: %d, 0 = disabled)", params.ctx_size_mtp),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -2016,7 +2016,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE_MTP").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
-        {"--mtp-max-tokens"}, "N",
+        {"--m-max-tokens", "--mtp-max-tokens"}, "N",
         string_format("prompt plus output threshold for adaptive MTP mode (default: %d, 0 = ctx-size-mtp)", params.mtp_max_tokens),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -2026,7 +2026,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MTP_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
-        {"--ctx-size-mtp-short"}, "N",
+        {"--ctx-size-s", "--ctx-size-short", "--ctx-size-mtp-short"}, "N",
         string_format("short context size for adaptive Ultra-MTP mode (default: %d, 0 = disabled)", params.ctx_size_mtp_short),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -2036,7 +2036,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE_MTP_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
-        {"--mtp-short-max-tokens"}, "N",
+        {"--s-max-tokens", "--short-max-tokens", "--mtp-short-max-tokens"}, "N",
         string_format("prompt plus output threshold for adaptive Ultra-MTP mode (default: %d, 0 = ctx-size-mtp-short)", params.mtp_short_max_tokens),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -2046,7 +2046,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MTP_SHORT_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
-        {"--spec-draft-n-max-short"}, "N",
+        {"--spec-draft-n-max-s", "--spec-draft-n-max-short"}, "N",
         string_format("draft N for adaptive short Ultra-MTP profile (default: %d)", params.spec_draft_n_max_short),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -2056,7 +2056,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
-        {"--spec-draft-n-max-long"}, "N",
+        {"--spec-draft-n-max-l", "--spec-draft-n-max-long"}, "N",
         string_format("draft N for adaptive long profile (default: %d, must be 0: MTP is disabled)", params.spec_draft_n_max_long),
         [](common_params & params, int value) {
             if (value != 0) {
@@ -5117,7 +5117,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
-        {"--spec-draft-n-max"}, "N",
+        {"--spec-draft-n-max", "--spec-draft-n-max-m"}, "N",
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
             if (value < 0) {
