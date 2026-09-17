@@ -493,7 +493,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --models "${MODEL_DIR}"
     )
-set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+set_tests_properties(test-save-load-state-archs PROPERTIES FIXTURES_REQUIRED generate-models)
 
     foreach(mode target prepare-failure)
         llama_test(
