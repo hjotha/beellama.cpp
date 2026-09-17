@@ -114,15 +114,6 @@ bool llama_kv_cache_dsa_iswa::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx
     return kv_swa->seq_rm_cell(seq_id, cell_idx);
 }
 
-int llama_kv_cache_dsa_iswa::cells_at_pos(
-        llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
-    return kv_dsa->cells_at_pos(seq_id, pos, cell_indices, n_max);
-}
-
-bool llama_kv_cache_dsa_iswa::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
-    return kv_swa->seq_rm_cell(seq_id, cell_idx);
-}
-
 int llama_kv_cache_dsa_iswa::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
     return kv_swa->cells_at_pos(seq_id, pos, cell_indices, n_max);
 }

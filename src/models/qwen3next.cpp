@@ -244,6 +244,7 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
+    const int64_t n_head_kv_il = hparams.n_head_kv(il);
     auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
             n_embd_head * 2, n_head,
             n_embd_head,     n_head_kv_il,

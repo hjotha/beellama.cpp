@@ -3035,12 +3035,15 @@ std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_shared_metadata_cache
             [](int32_t) { return false; },
             nullptr,
             nullptr,
-            metadata_n_ubatch,
-            0,
-            GGML_TYPE_F16,
-            0,
-            false,
-            0);
+            "",                 // name_tag
+            metadata_n_ubatch,  // n_ubatch
+            0,                  // tail_tokens
+            GGML_TYPE_F16,      // tail_type
+            UINT32_MAX,         // tail_tokens_requested
+            false,              // tail_metadata_only
+            0,                  // tail_rollback_tokens
+            0,                  // tail_visibility_window
+            false);             // disable_attn_rot
 }
 
 int32_t llama_kv_cache_kvarn::mapped_layer_id(int32_t il) const {
