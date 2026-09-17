@@ -2600,6 +2600,15 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
     if (params.xxlong_max_tokens < 0) {
         return "--xxlong-max-tokens must be non-negative";
     }
+    if (params.spec_draft_n_max_long != 0) {
+        return "--spec-draft-n-max-long must be 0: MTP is disabled on the long profile";
+    }
+    if (params.spec_draft_n_max_xlong != 0) {
+        return "--spec-draft-n-max-xlong must be 0: MTP is disabled on the xlong profile";
+    }
+    if (params.spec_draft_n_max_xxlong != 0) {
+        return "--spec-draft-n-max-xxlong must be 0: MTP is disabled on the xxlong profile";
+    }
     if (!common_context_is_adaptive(params)) {
         if (params.mtp_max_tokens != 0) {
             return "--mtp-max-tokens requires --ctx-size-mtp";

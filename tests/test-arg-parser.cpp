@@ -735,8 +735,12 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
             "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
             "--mtp-max-tokens", "500", "--ctx-size-mtp-short", "300",
             "--mtp-short-max-tokens", "250", "--spec-draft-n-max-short", "4",
+            "--spec-draft-n-max-long", "0",
             "--ctx-size-xl", "1200", "--xl-max-tokens", "1200", "--batch-size-xl", "64",
+            "--spec-draft-n-max-xl", "0",
+            "--cache-type-k-xl", "q4_0", "--cache-type-v-xl", "q4_0",
             "--ctx-size-xxl", "1400", "--xxl-max-tokens", "1400", "--batch-size-xxl", "64",
+            "--spec-draft-n-max-xxl", "0",
             "--cache-type-k-xxl", "kvarn4", "--cache-type-v-xxl", "kvarn4",
             "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
         };
@@ -744,10 +748,19 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(five_profile.ctx_size_xlong == 1200);
         assert(five_profile.xlong_max_tokens == 1200);
         assert(five_profile.batch_size_xlong == 64);
+        assert(five_profile.spec_draft_n_max_long == 0);
+        assert(five_profile.spec_draft_n_max_xlong == 0);
+        assert(five_profile.cache_type_k_xlong == GGML_TYPE_Q4_0);
+        assert(five_profile.cache_type_v_xlong == GGML_TYPE_Q4_0);
+        assert(five_profile.cache_kvarn_bits_k_xlong == 0);
+        assert(five_profile.kvarn_xlong.type == LLAMA_KVARN_TYPE_DISABLED);
         assert(five_profile.ctx_size_xxlong == 1400);
         assert(five_profile.xxlong_max_tokens == 1400);
         assert(five_profile.batch_size_xxlong == 64);
+        assert(five_profile.spec_draft_n_max_xxlong == 0);
         assert(five_profile.kvarn_xxlong.type != LLAMA_KVARN_TYPE_DISABLED);
+        assert(five_profile.cache_kvarn_bits_k_xxlong == 4);
+        assert(five_profile.cache_kvarn_bits_v_xxlong == 4);
         assert(common_context_xlong_limit(five_profile) == 1200);
         assert(common_context_xxlong_limit(five_profile) == 1400);
         assert(common_context_adaptive_error(five_profile).empty());
@@ -758,6 +771,46 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(common_context_profile_for_budget(five_profile, 1200) == COMMON_CONTEXT_PROFILE_XLONG);
         assert(common_context_profile_for_budget(five_profile, 1201) == COMMON_CONTEXT_PROFILE_XXLONG);
         assert(common_context_profile_for_budget(five_profile, 1400) == COMMON_CONTEXT_PROFILE_XXLONG);
+
+        common_params xlong_inherit = tri_profile;
+        argv = {
+            "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+            "--mtp-max-tokens", "500", "--ctx-size-mtp-short", "300",
+            "--mtp-short-max-tokens", "250", "--spec-draft-n-max-short", "4",
+            "--ctx-size-xl", "1200", "--xl-max-tokens", "1200",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), xlong_inherit, LLAMA_EXAMPLE_SERVER));
+        assert(xlong_inherit.cache_type_k_xlong == xlong_inherit.cache_type_k);
+        assert(xlong_inherit.cache_type_v_xlong == xlong_inherit.cache_type_v);
+        assert(xlong_inherit.cache_kvarn_bits_k_xlong == xlong_inherit.cache_kvarn_bits_k);
+        assert(xlong_inherit.cache_kvarn_bits_v_xlong == xlong_inherit.cache_kvarn_bits_v);
+        assert(xlong_inherit.kvarn_xlong.type == xlong_inherit.kvarn.type);
+
+        common_params xlong_kvarn = tri_profile;
+        argv = {
+            "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+            "--mtp-max-tokens", "500", "--ctx-size-mtp-short", "300",
+            "--mtp-short-max-tokens", "250", "--spec-draft-n-max-short", "4",
+            "--ctx-size-xl", "1200", "--xl-max-tokens", "1200", "--batch-size-xl", "64",
+            "--cache-type-k-xl", "kvarn4", "--cache-type-v-xl", "kvarn4",
+            "--ctx-size-xxl", "1400", "--xxl-max-tokens", "1400", "--batch-size-xxl", "64",
+            "--cache-type-k-xxl", "kvarn4", "--cache-type-v-xxl", "kvarn4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), xlong_kvarn, LLAMA_EXAMPLE_SERVER));
+        assert(xlong_kvarn.cache_kvarn_bits_k_xlong == 4);
+        assert(xlong_kvarn.cache_kvarn_bits_v_xlong == 4);
+        assert(xlong_kvarn.kvarn_xlong.type != LLAMA_KVARN_TYPE_DISABLED);
+
+        common_params wide_mtp_rejected = tri_profile;
+        argv = {
+            "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+            "--ctx-size-xl", "1200", "--ctx-size-xxl", "1400",
+            "--spec-draft-n-max-xxl", "2",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), wide_mtp_rejected, LLAMA_EXAMPLE_SERVER));
     }
 
     {

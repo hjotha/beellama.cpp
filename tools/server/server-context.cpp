@@ -3016,6 +3016,7 @@ private:
     int32_t adaptive_long_ctx = 0;
     int32_t adaptive_draft_n_medium = 2;
     int32_t adaptive_draft_n_short  = 4;
+    int32_t adaptive_draft_n_long   = 0;
     int32_t adaptive_batch_normal   = 256;
     int32_t adaptive_ubatch_normal  = 256;
     ggml_type adaptive_cache_type_k_normal = GGML_TYPE_Q4_0;
@@ -3026,9 +3027,16 @@ private:
 
     int32_t adaptive_batch_xlong    = 64;
     int32_t adaptive_ubatch_xlong   = 64;
+    int32_t adaptive_draft_n_xlong  = 0;
+    ggml_type adaptive_cache_type_k_xlong = GGML_TYPE_Q4_0;
+    ggml_type adaptive_cache_type_v_xlong = GGML_TYPE_Q4_0;
+    llama_kvarn_params adaptive_kvarn_xlong{};
+    int32_t adaptive_cache_kvarn_bits_k_xlong = 0;
+    int32_t adaptive_cache_kvarn_bits_v_xlong = 0;
 
     int32_t adaptive_batch_xxlong   = 64;
     int32_t adaptive_ubatch_xxlong  = 64;
+    int32_t adaptive_draft_n_xxlong = 0;
     ggml_type adaptive_cache_type_k_xxlong = GGML_TYPE_Q4_0;
     ggml_type adaptive_cache_type_v_xxlong = GGML_TYPE_Q4_0;
     llama_kvarn_params adaptive_kvarn_xxlong{};
@@ -3111,11 +3119,25 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    int32_t adaptive_draft_n_for_profile(common_context_profile profile) const {
+        switch (profile) {
+            case COMMON_CONTEXT_PROFILE_MTP_SHORT: return adaptive_draft_n_short;
+            case COMMON_CONTEXT_PROFILE_MTP:       return adaptive_draft_n_medium;
+            case COMMON_CONTEXT_PROFILE_LONG:      return adaptive_draft_n_long;
+            case COMMON_CONTEXT_PROFILE_XLONG:     return adaptive_draft_n_xlong;
+            case COMMON_CONTEXT_PROFILE_XXLONG:    return adaptive_draft_n_xxlong;
+            default:                               return 0;
+        }
+    }
+
     void apply_profile_params(common_context_profile profile) {
+        const int32_t draft_n = adaptive_draft_n_for_profile(profile);
+        params_base.speculative.draft.n_max = draft_n;
+        params_base.speculative.types = draft_n > 0
+            ? std::vector<enum common_speculative_type>{ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }
+            : std::vector<enum common_speculative_type>{};
         if (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
             params_base.n_ctx = params_base.ctx_size_mtp_short;
-            params_base.speculative.draft.n_max = adaptive_draft_n_short;
-            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
             params_base.n_batch = adaptive_batch_normal;
             params_base.n_ubatch = adaptive_ubatch_normal;
             params_base.cache_type_k = adaptive_cache_type_k_normal;
@@ -3125,8 +3147,6 @@ private:
             params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
         } else if (profile == COMMON_CONTEXT_PROFILE_MTP) {
             params_base.n_ctx = params_base.ctx_size_mtp;
-            params_base.speculative.draft.n_max = adaptive_draft_n_medium;
-            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
             params_base.n_batch = adaptive_batch_normal;
             params_base.n_ubatch = adaptive_ubatch_normal;
             params_base.cache_type_k = adaptive_cache_type_k_normal;
@@ -3136,8 +3156,6 @@ private:
             params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
         } else if (profile == COMMON_CONTEXT_PROFILE_LONG) {
             params_base.n_ctx = adaptive_long_ctx;
-            params_base.speculative.draft.n_max = 0;
-            params_base.speculative.types = {};
             params_base.n_batch = adaptive_batch_normal;
             params_base.n_ubatch = adaptive_ubatch_normal;
             params_base.cache_type_k = adaptive_cache_type_k_normal;
@@ -3147,19 +3165,15 @@ private:
             params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
         } else if (profile == COMMON_CONTEXT_PROFILE_XLONG) {
             params_base.n_ctx = params_base.ctx_size_xlong;
-            params_base.speculative.draft.n_max = 0;
-            params_base.speculative.types = {};
             params_base.n_batch = adaptive_batch_xlong;
             params_base.n_ubatch = adaptive_ubatch_xlong;
-            params_base.cache_type_k = adaptive_cache_type_k_normal;
-            params_base.cache_type_v = adaptive_cache_type_v_normal;
-            params_base.kvarn = adaptive_kvarn_normal;
-            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_normal;
-            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
+            params_base.cache_type_k = adaptive_cache_type_k_xlong;
+            params_base.cache_type_v = adaptive_cache_type_v_xlong;
+            params_base.kvarn = adaptive_kvarn_xlong;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_xlong;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_xlong;
         } else if (profile == COMMON_CONTEXT_PROFILE_XXLONG) {
             params_base.n_ctx = params_base.ctx_size_xxlong;
-            params_base.speculative.draft.n_max = 0;
-            params_base.speculative.types = {};
             params_base.n_batch = adaptive_batch_xxlong;
             params_base.n_ubatch = adaptive_ubatch_xxlong;
             params_base.cache_type_k = adaptive_cache_type_k_xxlong;
@@ -4207,6 +4221,7 @@ private:
         if (adaptive) {
             adaptive_draft_n_medium = params.speculative.draft.n_max;
             adaptive_draft_n_short  = params.spec_draft_n_max_short;
+            adaptive_draft_n_long   = params.spec_draft_n_max_long;
             adaptive_batch_normal   = params.n_batch;
             adaptive_ubatch_normal  = params.n_ubatch;
             adaptive_cache_type_k_normal = params.cache_type_k;
@@ -4217,16 +4232,33 @@ private:
 
             adaptive_batch_xlong    = params.batch_size_xlong > 0 ? params.batch_size_xlong : 64;
             adaptive_ubatch_xlong   = params.ubatch_size_xlong > 0 ? params.ubatch_size_xlong : 64;
+            adaptive_draft_n_xlong  = params.spec_draft_n_max_xlong;
+            adaptive_cache_type_k_xlong = params.cache_type_k_xlong != GGML_TYPE_COUNT
+                ? params.cache_type_k_xlong : params.cache_type_k;
+            adaptive_cache_type_v_xlong = params.cache_type_v_xlong != GGML_TYPE_COUNT
+                ? params.cache_type_v_xlong : params.cache_type_v;
+            adaptive_kvarn_xlong    = params.cache_type_k_xlong != GGML_TYPE_COUNT
+                ? params.kvarn_xlong : params.kvarn;
+            adaptive_cache_kvarn_bits_k_xlong = params.cache_type_k_xlong != GGML_TYPE_COUNT
+                ? params.cache_kvarn_bits_k_xlong : params.cache_kvarn_bits_k;
+            adaptive_cache_kvarn_bits_v_xlong = params.cache_type_v_xlong != GGML_TYPE_COUNT
+                ? params.cache_kvarn_bits_v_xlong : params.cache_kvarn_bits_v;
 
             adaptive_batch_xxlong   = params.batch_size_xxlong > 0 ? params.batch_size_xxlong : 64;
             adaptive_ubatch_xxlong  = params.ubatch_size_xxlong > 0 ? params.ubatch_size_xxlong : 64;
-            adaptive_cache_type_k_xxlong = params.cache_type_k_xxlong;
-            adaptive_cache_type_v_xxlong = params.cache_type_v_xxlong;
-            adaptive_kvarn_xxlong   = params.kvarn_xxlong;
-            adaptive_cache_kvarn_bits_k_xxlong = params.cache_kvarn_bits_k_xxlong;
-            adaptive_cache_kvarn_bits_v_xxlong = params.cache_kvarn_bits_v_xxlong;
+            adaptive_draft_n_xxlong = params.spec_draft_n_max_xxlong;
+            adaptive_cache_type_k_xxlong = params.cache_type_k_xxlong != GGML_TYPE_COUNT
+                ? params.cache_type_k_xxlong : params.cache_type_k;
+            adaptive_cache_type_v_xxlong = params.cache_type_v_xxlong != GGML_TYPE_COUNT
+                ? params.cache_type_v_xxlong : params.cache_type_v;
+            adaptive_kvarn_xxlong   = params.cache_type_k_xxlong != GGML_TYPE_COUNT
+                ? params.kvarn_xxlong : params.kvarn;
+            adaptive_cache_kvarn_bits_k_xxlong = params.cache_type_k_xxlong != GGML_TYPE_COUNT
+                ? params.cache_kvarn_bits_k_xxlong : params.cache_kvarn_bits_k;
+            adaptive_cache_kvarn_bits_v_xxlong = params.cache_type_v_xxlong != GGML_TYPE_COUNT
+                ? params.cache_kvarn_bits_v_xxlong : params.cache_kvarn_bits_v;
 
-            if (params.ctx_size_xxlong > 0 && adaptive_cache_kvarn_bits_k_xxlong == 0) {
+            if (params.ctx_size_xxlong > 0 && params.cache_type_k_xxlong == GGML_TYPE_COUNT) {
                 adaptive_cache_kvarn_bits_k_xxlong = 4;
                 adaptive_cache_kvarn_bits_v_xxlong = 4;
                 adaptive_cache_type_k_xxlong = GGML_TYPE_Q4_0;
@@ -5010,7 +5042,7 @@ private:
         ctx_dft = nullptr;
         model_dft = nullptr;
 
-        const bool use_mtp = (profile == COMMON_CONTEXT_PROFILE_MTP || profile == COMMON_CONTEXT_PROFILE_MTP_SHORT);
+        const bool use_mtp = adaptive_draft_n_for_profile(profile) > 0;
         if (!use_mtp) {
             ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
             ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -5110,7 +5142,7 @@ private:
             params_base.speculative.draft.ctx_tgt = nullptr;
             params_base.speculative.draft.ctx_dft = nullptr;
             apply_profile_params(old_profile);
-            const bool old_resident = (old_profile == COMMON_CONTEXT_PROFILE_MTP_SHORT || old_profile == COMMON_CONTEXT_PROFILE_MTP);
+            const bool old_resident = adaptive_draft_n_for_profile(old_profile) > 0;
             if (!llama_model_mtp_weights_set_resident(model_tgt,
                     old_resident, adaptive_test_mtp_fault("rollback", old_profile))) {
                 ctx_tgt = nullptr;
@@ -5145,7 +5177,7 @@ private:
 
         apply_profile_params(requested);
 
-        const bool resident = (requested == COMMON_CONTEXT_PROFILE_MTP_SHORT || requested == COMMON_CONTEXT_PROFILE_MTP);
+        const bool resident = adaptive_draft_n_for_profile(requested) > 0;
         const auto req_name = adaptive_status_profile_name((int) requested);
         if (!llama_model_mtp_weights_set_resident(model_tgt, resident,
                 adaptive_test_mtp_fault("candidate", requested))) {
