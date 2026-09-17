@@ -17,7 +17,7 @@ format, model/profile validation, rollback and five-copy RAM reservation.
 
 The unified snapshot implementation and the explicit q4_0 -> KVarN conversion
 tier are promoted on GOKAYA in
-`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r2`. The active
+`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r3`. The active
 unit is `llama-server-root.service`; it keeps the public model ID
 `/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` and exposes one route
 group with a public `context_window` of `114688`. The route members are the
@@ -51,7 +51,7 @@ tests and CPU matrices are under
 including 4096-token boundary/margin and disk-chain cases, is under
 `/home/hjotha/router-kv-snapshots-unificados-20260916/gpu-unified-window-20260916-2`.
 The release record and hashes are in
-`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r2/PROMOTION-RESULT.md`
+`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r3/PROMOTION-RESULT.md`
 and `RELEASE-HASHES.txt`.
 
 The corrected aggregate `test-save-load-state --models` run is `112 passed, 0
@@ -377,15 +377,15 @@ selected restore.
 
 ### Final unified promotion
 
-The final promotion used source commit `6e21b6754` and release
-`beellama-router-kvarn-convert-20260917-r2`. The exclusive GPU wrapper restored
+The final promotion used source commit `5931242e2` and release
+`beellama-router-kvarn-convert-20260917-r3`. The exclusive GPU wrapper restored
 the previous service exactly before promotion (`matrix_passed=true`,
 `restored_exactly=true`, unchanged unit/drop-in, and health `ok`). After the
 promotion, the live unit, public model listing, KVarN route member, effective
 PID executable and a real one-token request were verified. The previous KVarN
 release remains untouched at
-`/home/hjotha/releases/beellama-router-kvarn-convert-20260916-r1`; the exact
-unit backup is `/etc/systemd/system/llama-server-root.service.pre-r2-20260917`.
+`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r2`; the exact
+unit backup is `/etc/systemd/system/llama-server-root.service.pre-r3-20260917`.
 
 ### Historical phase-1 promotion
 
