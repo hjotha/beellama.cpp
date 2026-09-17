@@ -5101,6 +5101,42 @@ private:
                     state.layout_tgt == common_prompt_cache_layout(ctx_tgt)) {
                 continue;
             }
+            bool already_destination_representation = false;
+            try {
+                const common_json layout = common_json::parse(state.layout_tgt);
+                const std::string type_k = layout.value("type_k", std::string());
+                const std::string type_v = layout.value("type_v", std::string());
+                already_destination_representation =
+                    type_k.find("kvarn") != std::string::npos || type_v.find("kvarn") != std::string::npos;
+            } catch (...) {
+                already_destination_representation = false;
+            }
+            if (already_destination_representation) {
+                continue;
+            }
+            // The conversion needs the source plus the converted payload (and
+            // the kernel's file staging) at once; skip rather than risk a
+            // global OOM when RAM is tight.
+            {
+                uint64_t available = 0;
+                {
+                    std::ifstream meminfo("/proc/meminfo");
+                    std::string key, unit;
+                    uint64_t value = 0;
+                    while (meminfo >> key >> value >> unit) {
+                        if (key == "MemAvailable:") {
+                            available = value * 1024;
+                            break;
+                        }
+                    }
+                }
+                const uint64_t needed = uint64_t(state.data.main.size()) * 3;
+                if (available > 0 && available < needed) {
+                    SRV_WRN("adaptive conversion: skipping %zu-byte prompt (available RAM %zu < %zu)\n",
+                            state.data.main.size(), size_t(available), size_t(needed));
+                    continue;
+                }
+            }
             size_t count = 0;
             const llama_tokens & prompt_tokens = state.prompt.tokens.get_tokens();
             std::vector<llama_token> tokens_out(prompt_tokens.size());
@@ -5114,6 +5150,12 @@ private:
                         state.prompt.tokens.size());
                 continue;
             }
+            // Keep the in-memory header, then release the q4 source before the
+            // converted payload is read back so the two never coexist.
+            uint8_t ram_header[2 * sizeof(uint32_t)];
+            std::memcpy(ram_header, state.data.main.data(), sizeof(ram_header));
+            state.data.main.clear();
+            state.data.main.shrink_to_fit();
             std::vector<uint8_t> converted(written);
             std::ifstream input(tmp, std::ios::binary);
             const bool read_ok = bool(input) &&
@@ -5129,12 +5171,12 @@ private:
             // ([u32 magic][i32 seq id] + body). Re-wrap the converted body with
             // the source payload's own in-memory header.
             const size_t file_header = 3 * sizeof(uint32_t) + size_t(count) * sizeof(llama_token);
-            if (converted.size() <= file_header || state.data.main.size() < 2 * sizeof(uint32_t)) {
+            if (converted.size() <= file_header) {
                 SRV_WRN("%s", "adaptive conversion: converted state has an unexpected size\n");
                 continue;
             }
             std::vector<uint8_t> ram_payload(2 * sizeof(uint32_t) + converted.size() - file_header);
-            std::memcpy(ram_payload.data(), state.data.main.data(), 2 * sizeof(uint32_t));
+            std::memcpy(ram_payload.data(), ram_header, sizeof(ram_header));
             std::memcpy(ram_payload.data() + 2 * sizeof(uint32_t),
                     converted.data() + file_header, converted.size() - file_header);
             state.data.main.swap(ram_payload);
