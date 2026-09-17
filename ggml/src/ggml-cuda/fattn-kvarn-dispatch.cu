@@ -844,6 +844,39 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     return true;
 }
 
+
+// Bound the split-decode batch so the CUDA pool reservation stays bounded at
+// deep contexts. The split partial buffer holds
+// n_stream * n_q_heads * n_q * n_splits * D floats; ggml_cuda_pool_vmm never
+// returns pages to the driver, so a wide verification batch at n_kv ~ 110k
+// (n_splits ~ 1728) would otherwise reserve ~226 MiB permanently and starve
+// the following kvarn prefill windows. Falling back to the generic MMA path at
+// deep n_kv matches the pre-v0.4.6 behavior with no decode TPS loss.
+static int ggml_cuda_fattn_kvarn_split_max_q(
+        const ggml_cuda_fattn_kvarn_plan & plan, const ggml_tensor * Q) {
+    if (const char * env = getenv("GGML_CUDA_KVARN_SPLIT_MAX_Q")) {
+        const int forced = atoi(env);
+        if (forced > 0) {
+            return std::min(forced, GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q);
+        }
+    }
+    size_t budget = size_t(64) << 20;
+    if (const char * env = getenv("GGML_CUDA_KVARN_SPLIT_PARTIAL_MB")) {
+        const long mb = atol(env);
+        if (mb > 0) {
+            budget = size_t(mb) << 20;
+        }
+    }
+    constexpr int min_split_tokens = 64; // smallest partition any geometry picks
+    const size_t n_splits = (size_t(std::max(plan.n_kv, 1)) + min_split_tokens - 1) / min_split_tokens;
+    const size_t bytes_per_q = size_t(std::max(plan.n_stream, 1)) * size_t(Q->ne[2]) * n_splits *
+        (size_t(Q->ne[0]) * sizeof(float) + sizeof(float2));
+    if (bytes_per_q == 0) {
+        return GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q;
+    }
+    return int(std::clamp<size_t>(budget / bytes_per_q, 1, GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q));
+}
+
 static bool ggml_cuda_flash_attn_ext_kvarn_decode(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -1147,7 +1180,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         int(Q->ne[0]), int(Q->ne[1]), gqa, plan.k.bits, plan.v.bits,
         plan.k.swa && plan.v.swa, dst->src[8] != nullptr,
         vector_eligible, split_eligible, prompt_prefill,
-        GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q,
+        ggml_cuda_fattn_kvarn_split_max_q(plan, Q),
     });
 
     if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {
