@@ -2506,6 +2506,14 @@ int64_t common_context_mtp_short_limit(const common_params & params) {
     return params.mtp_short_max_tokens > 0 ? params.mtp_short_max_tokens : params.ctx_size_mtp_short;
 }
 
+int64_t common_context_xlong_limit(const common_params & params) {
+    return params.xlong_max_tokens > 0 ? params.xlong_max_tokens : params.ctx_size_xlong;
+}
+
+int64_t common_context_xxlong_limit(const common_params & params) {
+    return params.xxlong_max_tokens > 0 ? params.xxlong_max_tokens : params.ctx_size_xxlong;
+}
+
 int64_t common_context_output_reserve(
         const common_params & params, int32_t request_n_predict, bool generates_output) {
     if (!generates_output) {
@@ -2550,6 +2558,17 @@ common_context_profile common_context_profile_for_budget(
     if (budget <= common_context_mtp_limit(params)) {
         return COMMON_CONTEXT_PROFILE_MTP;
     }
+    const int64_t long_limit = params.ctx_size_long > 0 ? params.ctx_size_long : params.n_ctx;
+    if (params.ctx_size_xlong > 0 && budget > long_limit) {
+        if (budget <= common_context_xlong_limit(params)) {
+            return COMMON_CONTEXT_PROFILE_XLONG;
+        }
+        if (params.ctx_size_xxlong > 0) {
+            return COMMON_CONTEXT_PROFILE_XXLONG;
+        }
+    } else if (params.ctx_size_xxlong > 0 && budget > long_limit) {
+        return COMMON_CONTEXT_PROFILE_XXLONG;
+    }
     return COMMON_CONTEXT_PROFILE_LONG;
 }
 
@@ -2569,6 +2588,18 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
     if (params.spec_draft_n_max_short < 0) {
         return "--spec-draft-n-max-short must be non-negative";
     }
+    if (params.ctx_size_xlong < 0) {
+        return "--ctx-size-xlong must be non-negative";
+    }
+    if (params.xlong_max_tokens < 0) {
+        return "--xlong-max-tokens must be non-negative";
+    }
+    if (params.ctx_size_xxlong < 0) {
+        return "--ctx-size-xxlong must be non-negative";
+    }
+    if (params.xxlong_max_tokens < 0) {
+        return "--xxlong-max-tokens must be non-negative";
+    }
     if (!common_context_is_adaptive(params)) {
         if (params.mtp_max_tokens != 0) {
             return "--mtp-max-tokens requires --ctx-size-mtp";
@@ -2579,11 +2610,29 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
         if (params.mtp_short_max_tokens != 0) {
             return "--mtp-short-max-tokens requires --ctx-size-mtp-short";
         }
+        if (params.ctx_size_xlong != 0) {
+            return "--ctx-size-xlong requires --ctx-size-mtp";
+        }
+        if (params.xlong_max_tokens != 0) {
+            return "--xlong-max-tokens requires --ctx-size-xlong";
+        }
+        if (params.ctx_size_xxlong != 0) {
+            return "--ctx-size-xxlong requires --ctx-size-mtp";
+        }
+        if (params.xxlong_max_tokens != 0) {
+            return "--xxlong-max-tokens requires --ctx-size-xxlong";
+        }
         return "";
     }
 
     if (params.ctx_size_mtp_short == 0 && params.mtp_short_max_tokens > 0) {
         return "--mtp-short-max-tokens requires --ctx-size-mtp-short";
+    }
+    if (params.ctx_size_xlong == 0 && params.xlong_max_tokens > 0) {
+        return "--xlong-max-tokens requires --ctx-size-xlong";
+    }
+    if (params.ctx_size_xxlong == 0 && params.xxlong_max_tokens > 0) {
+        return "--xxlong-max-tokens requires --ctx-size-xxlong";
     }
 
     const int64_t mtp_limit = common_context_mtp_limit(params);
@@ -2613,6 +2662,31 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
     }
     if (long_ctx > 0 && params.ctx_size_mtp > long_ctx) {
         return "--ctx-size-mtp must not exceed the long context size";
+    }
+    if (params.ctx_size_xlong > 0) {
+        const int64_t xlong_limit = common_context_xlong_limit(params);
+        if (xlong_limit <= 0 || xlong_limit > params.ctx_size_xlong) {
+            return "--xlong-max-tokens must satisfy 0 < limit <= --ctx-size-xlong";
+        }
+        if (long_ctx > 0 && params.ctx_size_xlong < long_ctx) {
+            return "--ctx-size-xlong must not be smaller than the long context size";
+        }
+        if (long_ctx > 0 && xlong_limit < long_ctx) {
+            return "--xlong-max-tokens must not be smaller than the long context size";
+        }
+    }
+    if (params.ctx_size_xxlong > 0) {
+        const int64_t xxlong_limit = common_context_xxlong_limit(params);
+        if (xxlong_limit <= 0 || xxlong_limit > params.ctx_size_xxlong) {
+            return "--xxlong-max-tokens must satisfy 0 < limit <= --ctx-size-xxlong";
+        }
+        const int64_t prev_ceiling = params.ctx_size_xlong > 0 ? params.ctx_size_xlong : long_ctx;
+        if (prev_ceiling > 0 && params.ctx_size_xxlong < prev_ceiling) {
+            return "--ctx-size-xxlong must not be smaller than the preceding context size";
+        }
+        if (prev_ceiling > 0 && xxlong_limit < prev_ceiling) {
+            return "--xxlong-max-tokens must not be smaller than the preceding context size";
+        }
     }
     if (params.n_parallel > 1) {
         return "adaptive context requires --parallel 1";

@@ -729,6 +729,35 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(common_context_profile_for_budget(tri_profile, 251) == COMMON_CONTEXT_PROFILE_MTP);
         assert(common_context_profile_for_budget(tri_profile, 500) == COMMON_CONTEXT_PROFILE_MTP);
         assert(common_context_profile_for_budget(tri_profile, 501) == COMMON_CONTEXT_PROFILE_LONG);
+
+        common_params five_profile = tri_profile;
+        argv = {
+            "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+            "--mtp-max-tokens", "500", "--ctx-size-mtp-short", "300",
+            "--mtp-short-max-tokens", "250", "--spec-draft-n-max-short", "4",
+            "--ctx-size-xl", "1200", "--xl-max-tokens", "1200", "--batch-size-xl", "64",
+            "--ctx-size-xxl", "1400", "--xxl-max-tokens", "1400", "--batch-size-xxl", "64",
+            "--cache-type-k-xxl", "kvarn4", "--cache-type-v-xxl", "kvarn4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), five_profile, LLAMA_EXAMPLE_SERVER));
+        assert(five_profile.ctx_size_xlong == 1200);
+        assert(five_profile.xlong_max_tokens == 1200);
+        assert(five_profile.batch_size_xlong == 64);
+        assert(five_profile.ctx_size_xxlong == 1400);
+        assert(five_profile.xxlong_max_tokens == 1400);
+        assert(five_profile.batch_size_xxlong == 64);
+        assert(five_profile.kvarn_xxlong.type != LLAMA_KVARN_TYPE_DISABLED);
+        assert(common_context_xlong_limit(five_profile) == 1200);
+        assert(common_context_xxlong_limit(five_profile) == 1400);
+        assert(common_context_adaptive_error(five_profile).empty());
+        assert(common_context_profile_for_budget(five_profile, 250) == COMMON_CONTEXT_PROFILE_MTP_SHORT);
+        assert(common_context_profile_for_budget(five_profile, 500) == COMMON_CONTEXT_PROFILE_MTP);
+        assert(common_context_profile_for_budget(five_profile, 1000) == COMMON_CONTEXT_PROFILE_LONG);
+        assert(common_context_profile_for_budget(five_profile, 1001) == COMMON_CONTEXT_PROFILE_XLONG);
+        assert(common_context_profile_for_budget(five_profile, 1200) == COMMON_CONTEXT_PROFILE_XLONG);
+        assert(common_context_profile_for_budget(five_profile, 1201) == COMMON_CONTEXT_PROFILE_XXLONG);
+        assert(common_context_profile_for_budget(five_profile, 1400) == COMMON_CONTEXT_PROFILE_XXLONG);
     }
 
     {

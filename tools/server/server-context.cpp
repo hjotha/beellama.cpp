@@ -155,6 +155,12 @@ static bool adaptive_test_fault(const char * phase, common_context_profile profi
         return value.find("mtp") != std::string::npos &&
             value.find("mtp-short") == std::string::npos;
     }
+    if (profile == COMMON_CONTEXT_PROFILE_XLONG) {
+        return value.find("xlong") != std::string::npos;
+    }
+    if (profile == COMMON_CONTEXT_PROFILE_XXLONG) {
+        return value.find("xxlong") != std::string::npos;
+    }
     return value.find("long") != std::string::npos;
 }
 
@@ -2114,7 +2120,9 @@ static adaptive_slot_snapshot_blob adaptive_slot_decode(const std::vector<uint8_
     snapshot.profile = reader.u32();
     if (snapshot.profile != COMMON_CONTEXT_PROFILE_MTP &&
             snapshot.profile != COMMON_CONTEXT_PROFILE_LONG &&
-            snapshot.profile != COMMON_CONTEXT_PROFILE_MTP_SHORT) {
+            snapshot.profile != COMMON_CONTEXT_PROFILE_MTP_SHORT &&
+            snapshot.profile != COMMON_CONTEXT_PROFILE_XLONG &&
+            snapshot.profile != COMMON_CONTEXT_PROFILE_XXLONG) {
         throw std::runtime_error("invalid adaptive slot snapshot profile");
     }
     snapshot.active_ctx = reader.i32();
@@ -2575,7 +2583,7 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
             !valid_bounds(source.attention_tgt) || !valid_bounds(source.attention_dft) ||
             !valid_bounds(source.retained_tgt) || !valid_bounds(source.retained_dft) ||
             (source.draft_base_valid && (source.data_dft.empty() || source.data_spec.empty())) ||
-            source.layout_tgt != common_prompt_cache_layout(ctx_tgt)) {
+            !common_prompt_cache_layout_reusable(source.layout_tgt, common_prompt_cache_layout(ctx_tgt))) {
         dropped = true;
         return nullptr;
     }
@@ -2597,7 +2605,7 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
     const bool is_mtp_snapshot = snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ||
                                  snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT;
     if (ctx_dft && is_mtp_snapshot && has_draft &&
-            source.layout_dft == common_prompt_cache_layout(ctx_dft)) {
+            common_prompt_cache_layout_reusable(source.layout_dft, common_prompt_cache_layout(ctx_dft))) {
         checkpoint->flags_dft = source.flags_dft;
         checkpoint->model_dft = llama_get_model(ctx_dft);
         checkpoint->instance_dft = llama_model_mtp_weights_get_info(checkpoint->model_dft).model_instance;
@@ -2622,7 +2630,7 @@ static bool adaptive_slot_restore(
         llama_context * ctx_dft,
         common_speculative * spec,
         std::string & error) {
-    if (!ctx_tgt || snapshot.layout_tgt != common_prompt_cache_layout(ctx_tgt)) {
+    if (!ctx_tgt || !common_prompt_cache_layout_reusable(snapshot.layout_tgt, common_prompt_cache_layout(ctx_tgt))) {
         error = "adaptive slot snapshot target layout differs";
         return false;
     }
@@ -2684,7 +2692,7 @@ static bool adaptive_slot_restore(
         return false;
     }
     if (destination_mtp && snapshot_mtp && !snapshot.data_dft.empty() &&
-            snapshot.layout_dft != common_prompt_cache_layout(ctx_dft)) {
+            !common_prompt_cache_layout_reusable(snapshot.layout_dft, common_prompt_cache_layout(ctx_dft))) {
         error = "adaptive slot snapshot draft layout differs";
         return false;
     }
@@ -3008,6 +3016,35 @@ private:
     int32_t adaptive_long_ctx = 0;
     int32_t adaptive_draft_n_medium = 2;
     int32_t adaptive_draft_n_short  = 4;
+    int32_t adaptive_batch_normal   = 256;
+    int32_t adaptive_ubatch_normal  = 256;
+    ggml_type adaptive_cache_type_k_normal = GGML_TYPE_Q4_0;
+    ggml_type adaptive_cache_type_v_normal = GGML_TYPE_Q4_0;
+    llama_kvarn_params adaptive_kvarn_normal{};
+    int32_t adaptive_cache_kvarn_bits_k_normal = 0;
+    int32_t adaptive_cache_kvarn_bits_v_normal = 0;
+
+    int32_t adaptive_batch_xlong    = 64;
+    int32_t adaptive_ubatch_xlong   = 64;
+
+    int32_t adaptive_batch_xxlong   = 64;
+    int32_t adaptive_ubatch_xxlong  = 64;
+    ggml_type adaptive_cache_type_k_xxlong = GGML_TYPE_Q4_0;
+    ggml_type adaptive_cache_type_v_xxlong = GGML_TYPE_Q4_0;
+    llama_kvarn_params adaptive_kvarn_xxlong{};
+    int32_t adaptive_cache_kvarn_bits_k_xxlong = 4;
+    int32_t adaptive_cache_kvarn_bits_v_xxlong = 4;
+
+    int32_t adaptive_max_ctx() const {
+        if (params_base.ctx_size_xxlong > 0) {
+            return params_base.ctx_size_xxlong;
+        }
+        if (params_base.ctx_size_xlong > 0) {
+            return params_base.ctx_size_xlong;
+        }
+        return adaptive_long_ctx;
+    }
+
     common_context_profile active_context_profile = COMMON_CONTEXT_PROFILE_LONG;
     bool adaptive_context_unavailable = false;
     bool adaptive_context_transitioning = false;
@@ -3079,14 +3116,57 @@ private:
             params_base.n_ctx = params_base.ctx_size_mtp_short;
             params_base.speculative.draft.n_max = adaptive_draft_n_short;
             params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            params_base.n_batch = adaptive_batch_normal;
+            params_base.n_ubatch = adaptive_ubatch_normal;
+            params_base.cache_type_k = adaptive_cache_type_k_normal;
+            params_base.cache_type_v = adaptive_cache_type_v_normal;
+            params_base.kvarn = adaptive_kvarn_normal;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_normal;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
         } else if (profile == COMMON_CONTEXT_PROFILE_MTP) {
             params_base.n_ctx = params_base.ctx_size_mtp;
             params_base.speculative.draft.n_max = adaptive_draft_n_medium;
             params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-        } else {
+            params_base.n_batch = adaptive_batch_normal;
+            params_base.n_ubatch = adaptive_ubatch_normal;
+            params_base.cache_type_k = adaptive_cache_type_k_normal;
+            params_base.cache_type_v = adaptive_cache_type_v_normal;
+            params_base.kvarn = adaptive_kvarn_normal;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_normal;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
+        } else if (profile == COMMON_CONTEXT_PROFILE_LONG) {
             params_base.n_ctx = adaptive_long_ctx;
             params_base.speculative.draft.n_max = 0;
             params_base.speculative.types = {};
+            params_base.n_batch = adaptive_batch_normal;
+            params_base.n_ubatch = adaptive_ubatch_normal;
+            params_base.cache_type_k = adaptive_cache_type_k_normal;
+            params_base.cache_type_v = adaptive_cache_type_v_normal;
+            params_base.kvarn = adaptive_kvarn_normal;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_normal;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
+        } else if (profile == COMMON_CONTEXT_PROFILE_XLONG) {
+            params_base.n_ctx = params_base.ctx_size_xlong;
+            params_base.speculative.draft.n_max = 0;
+            params_base.speculative.types = {};
+            params_base.n_batch = adaptive_batch_xlong;
+            params_base.n_ubatch = adaptive_ubatch_xlong;
+            params_base.cache_type_k = adaptive_cache_type_k_normal;
+            params_base.cache_type_v = adaptive_cache_type_v_normal;
+            params_base.kvarn = adaptive_kvarn_normal;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_normal;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
+        } else if (profile == COMMON_CONTEXT_PROFILE_XXLONG) {
+            params_base.n_ctx = params_base.ctx_size_xxlong;
+            params_base.speculative.draft.n_max = 0;
+            params_base.speculative.types = {};
+            params_base.n_batch = adaptive_batch_xxlong;
+            params_base.n_ubatch = adaptive_ubatch_xxlong;
+            params_base.cache_type_k = adaptive_cache_type_k_xxlong;
+            params_base.cache_type_v = adaptive_cache_type_v_xxlong;
+            params_base.kvarn = adaptive_kvarn_xxlong;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_xxlong;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_xxlong;
         }
         params_base.n_parallel = 1;
         const auto output_limits = server_output_limits(params_base);
@@ -3099,6 +3179,8 @@ private:
             case COMMON_CONTEXT_PROFILE_MTP_SHORT: return "mtp-short";
             case COMMON_CONTEXT_PROFILE_MTP:       return "mtp";
             case COMMON_CONTEXT_PROFILE_LONG:      return "long";
+            case COMMON_CONTEXT_PROFILE_XLONG:     return "xlong";
+            case COMMON_CONTEXT_PROFILE_XXLONG:    return "xxlong";
             default:                               return "unknown";
         }
     }
@@ -3435,9 +3517,11 @@ private:
     }
 
     uint32_t auto_store_max_tokens() const {
-        uint64_t result = std::max<int32_t>(llama_n_ctx_seq(ctx_tgt), adaptive_long_ctx);
+        uint64_t result = std::max<int32_t>(llama_n_ctx_seq(ctx_tgt), adaptive_max_ctx());
         result = std::max<uint64_t>(result, params_base.ctx_size_mtp);
         result = std::max<uint64_t>(result, params_base.ctx_size_mtp_short);
+        result = std::max<uint64_t>(result, params_base.ctx_size_xlong);
+        result = std::max<uint64_t>(result, params_base.ctx_size_xxlong);
         return result > UINT32_MAX ? UINT32_MAX : (uint32_t) result;
     }
 
@@ -4120,9 +4204,36 @@ private:
         }
 
         params_base = params;
-if (adaptive) {
+        if (adaptive) {
             adaptive_draft_n_medium = params.speculative.draft.n_max;
             adaptive_draft_n_short  = params.spec_draft_n_max_short;
+            adaptive_batch_normal   = params.n_batch;
+            adaptive_ubatch_normal  = params.n_ubatch;
+            adaptive_cache_type_k_normal = params.cache_type_k;
+            adaptive_cache_type_v_normal = params.cache_type_v;
+            adaptive_kvarn_normal   = params.kvarn;
+            adaptive_cache_kvarn_bits_k_normal = params.cache_kvarn_bits_k;
+            adaptive_cache_kvarn_bits_v_normal = params.cache_kvarn_bits_v;
+
+            adaptive_batch_xlong    = params.batch_size_xlong > 0 ? params.batch_size_xlong : 64;
+            adaptive_ubatch_xlong   = params.ubatch_size_xlong > 0 ? params.ubatch_size_xlong : 64;
+
+            adaptive_batch_xxlong   = params.batch_size_xxlong > 0 ? params.batch_size_xxlong : 64;
+            adaptive_ubatch_xxlong  = params.ubatch_size_xxlong > 0 ? params.ubatch_size_xxlong : 64;
+            adaptive_cache_type_k_xxlong = params.cache_type_k_xxlong;
+            adaptive_cache_type_v_xxlong = params.cache_type_v_xxlong;
+            adaptive_kvarn_xxlong   = params.kvarn_xxlong;
+            adaptive_cache_kvarn_bits_k_xxlong = params.cache_kvarn_bits_k_xxlong;
+            adaptive_cache_kvarn_bits_v_xxlong = params.cache_kvarn_bits_v_xxlong;
+
+            if (params.ctx_size_xxlong > 0 && adaptive_cache_kvarn_bits_k_xxlong == 0) {
+                adaptive_cache_kvarn_bits_k_xxlong = 4;
+                adaptive_cache_kvarn_bits_v_xxlong = 4;
+                adaptive_cache_type_k_xxlong = GGML_TYPE_Q4_0;
+                adaptive_cache_type_v_xxlong = GGML_TYPE_Q4_0;
+                adaptive_kvarn_xxlong.type = llama_kvarn_type_from_name("kvarn_k4v4_g128");
+            }
+
             if (params.ctx_size_mtp_short > 0) {
                 apply_profile_params(COMMON_CONTEXT_PROFILE_MTP_SHORT);
                 active_context_profile = COMMON_CONTEXT_PROFILE_MTP_SHORT;
@@ -4256,6 +4367,7 @@ if (adaptive) {
         adaptive_long_ctx = common_context_is_adaptive(params_base)
             ? std::min(requested_long_ctx_effective, n_ctx_train)
             : n_ctx;
+        params_base.ctx_size_long = adaptive_long_ctx;
         if (common_context_is_adaptive(params_base) && requested_long_ctx_effective > n_ctx_train) {
             SRV_ERR("adaptive context long size (%d) exceeds model training context (%d)\n",
                     requested_long_ctx_effective, n_ctx_train);
@@ -4533,7 +4645,7 @@ if (adaptive) {
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib,
-                common_context_is_adaptive(params_base) && adaptive_long_ctx > 0 ? adaptive_long_ctx : n_ctx);
+                common_context_is_adaptive(params_base) && adaptive_max_ctx() > 0 ? adaptive_max_ctx() : n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -4565,7 +4677,7 @@ if (adaptive) {
         // currently allocated profile.
         params = params_base;
         if (common_context_is_adaptive(params_base)) {
-            params.n_ctx = adaptive_long_ctx;
+            params.n_ctx = adaptive_max_ctx();
             params.speculative.draft.ctx_tgt = nullptr;
             params.speculative.draft.ctx_dft = nullptr;
         }
@@ -4811,18 +4923,19 @@ if (adaptive) {
             send_error(task, string_format("invalid adaptive context budget: %s", error.what()), ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
-        if (adaptive_long_ctx <= 0) {
-            send_error(task, "adaptive context has no positive long context", ERROR_TYPE_SERVER);
+        const int32_t max_allowed_ctx = adaptive_max_ctx();
+        if (max_allowed_ctx <= 0) {
+            send_error(task, "adaptive context has no positive maximum context", ERROR_TYPE_SERVER);
             return false;
         }
-        if (task.context_budget.total_tokens > adaptive_long_ctx) {
+        if (task.context_budget.total_tokens > max_allowed_ctx) {
             send_error(
                 task.id,
                 string_format("request (%lld tokens plus output) exceeds the shared context size (%d tokens)",
-                    (long long) task.context_budget.total_tokens, adaptive_long_ctx),
+                    (long long) task.context_budget.total_tokens, max_allowed_ctx),
                 ERROR_TYPE_EXCEED_CONTEXT_SIZE,
                 task.n_tokens(),
-                adaptive_long_ctx);
+                max_allowed_ctx);
             return false;
         }
 
@@ -4997,7 +5110,7 @@ if (adaptive) {
             params_base.speculative.draft.ctx_tgt = nullptr;
             params_base.speculative.draft.ctx_dft = nullptr;
             apply_profile_params(old_profile);
-            const bool old_resident = old_profile != COMMON_CONTEXT_PROFILE_LONG;
+            const bool old_resident = (old_profile == COMMON_CONTEXT_PROFILE_MTP_SHORT || old_profile == COMMON_CONTEXT_PROFILE_MTP);
             if (!llama_model_mtp_weights_set_resident(model_tgt,
                     old_resident, adaptive_test_mtp_fault("rollback", old_profile))) {
                 ctx_tgt = nullptr;
@@ -5032,7 +5145,7 @@ if (adaptive) {
 
         apply_profile_params(requested);
 
-        const bool resident = requested != COMMON_CONTEXT_PROFILE_LONG;
+        const bool resident = (requested == COMMON_CONTEXT_PROFILE_MTP_SHORT || requested == COMMON_CONTEXT_PROFILE_MTP);
         const auto req_name = adaptive_status_profile_name((int) requested);
         if (!llama_model_mtp_weights_set_resident(model_tgt, resident,
                 adaptive_test_mtp_fault("candidate", requested))) {
@@ -6659,7 +6772,7 @@ res->metrics             = metrics;
                             }
                             const size_t max_file_bytes = adaptive_slot_max_file_bytes(
                                 *slot, ctx_tgt, ctx_dft, params_base.ctx_size_mtp_short, params_base.ctx_size_mtp,
-                                adaptive_long_ctx, params_base.cache_ram_mib, params_base.n_ctx_checkpoints);
+                                adaptive_max_ctx(), params_base.cache_ram_mib, params_base.n_ctx_checkpoints);
                             adaptive_slot_cache_reservation reservation;
                             if (!reservation.acquire(prompt_cache.get(), adaptive_slot_working_bytes(max_file_bytes))) {
                                 throw std::runtime_error("adaptive slot snapshot exceeds the global RAM cache budget");
@@ -6848,7 +6961,7 @@ res->metrics             = metrics;
 
                             const size_t max_file_bytes = adaptive_slot_max_file_bytes(
                                 *slot, ctx_tgt, ctx_dft, params_base.ctx_size_mtp_short, params_base.ctx_size_mtp,
-                                adaptive_long_ctx, params_base.cache_ram_mib, params_base.n_ctx_checkpoints);
+                                adaptive_max_ctx(), params_base.cache_ram_mib, params_base.n_ctx_checkpoints);
                             if (!reservation.acquire(prompt_cache.get(), adaptive_slot_working_bytes(max_file_bytes))) {
                                 throw std::runtime_error("adaptive slot snapshot exceeds the global RAM cache budget");
                             }
@@ -6867,7 +6980,9 @@ res->metrics             = metrics;
                             }
                             const int raw_ctx = snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT
                                 ? params_base.ctx_size_mtp_short
-                                : (snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ? params_base.ctx_size_mtp : adaptive_long_ctx);
+                                : (snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ? params_base.ctx_size_mtp
+                                : (snapshot.profile == COMMON_CONTEXT_PROFILE_XLONG ? params_base.ctx_size_xlong
+                                : (snapshot.profile == COMMON_CONTEXT_PROFILE_XXLONG ? params_base.ctx_size_xxlong : adaptive_long_ctx)));
                             const int padded_ctx = GGML_PAD(raw_ctx, 256);
                             int expected_ctx = std::min(padded_ctx, llama_model_n_ctx_train(model_tgt));
                             if (params_base.kv_unified_per_slot > 0) {
@@ -8861,7 +8976,7 @@ if (slot.uses_dflash() && slot.adaptive_dm.dm_adaptive && slot.adaptive_cycle_st
 
     int n_ctx_slot() const {
         if (common_context_is_adaptive(params_base) && adaptive_long_ctx > 0) {
-            return adaptive_long_ctx;
+            return adaptive_max_ctx();
         }
         return active_n_ctx_slot();
     }

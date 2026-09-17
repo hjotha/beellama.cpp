@@ -1542,6 +1542,30 @@ static void common_params_draft_kvarn_normalize(common_params & params) {
             "--spec-draft-type-v");
 }
 
+static void common_params_xxlong_kvarn_normalize(common_params & params) {
+    if (params.ctx_size_long <= 0 && params.n_ctx > 0) {
+        params.ctx_size_long = params.n_ctx;
+    }
+    if (params.ctx_size_xxlong <= 0) {
+        return;
+    }
+    if (params.cache_kvarn_bits_k_xxlong == 0 && params.cache_kvarn_bits_v_xxlong == 0 &&
+            params.cache_type_k_xxlong == GGML_TYPE_COUNT && params.cache_type_v_xxlong == GGML_TYPE_COUNT) {
+        params.cache_kvarn_bits_k_xxlong = 4;
+        params.cache_kvarn_bits_v_xxlong = 4;
+        params.cache_type_k_xxlong = GGML_TYPE_Q4_0;
+        params.cache_type_v_xxlong = GGML_TYPE_Q4_0;
+    }
+    common_kvarn_pair_normalize(
+            params.cache_type_k_xxlong,
+            params.cache_type_v_xxlong,
+            params.cache_kvarn_bits_k_xxlong,
+            params.cache_kvarn_bits_v_xxlong,
+            params.kvarn_xxlong,
+            "--cache-type-k-xxlong",
+            "--cache-type-v-xxlong");
+}
+
 static common_speculative_dm_controller common_speculative_dm_controller_from_name(const std::string & value) {
     if (value == "off") {
         return COMMON_SPECULATIVE_DM_CONTROLLER_OFF;
@@ -1594,6 +1618,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
         common_params_kvarn_normalize(ctx_arg.params);
         common_params_draft_kvarn_normalize(ctx_arg.params);
+        common_params_xxlong_kvarn_normalize(ctx_arg.params);
         ctx_arg.params.lr.init();
         common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
         ctx_arg.params.sampling.reasoning_budget_tracking =
@@ -1931,6 +1956,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
         [](common_params & params, int value) {
             params.n_ctx = value;
+            params.ctx_size_long = value;
             if (value == 0) {
                 // disable context reduction in llama_params_fit if the user explicitly requests the full context size:
                 params.fit_params_min_ctx = UINT32_MAX;
@@ -1987,6 +2013,100 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.spec_draft_n_max_short = value;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--ctx-size-xl", "--ctx-size-xlong"}, "N",
+        string_format("context size for adaptive xlong profile (default: %d, 0 = disabled)", params.ctx_size_xlong),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--ctx-size-xlong must be non-negative");
+            }
+            params.ctx_size_xlong = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_SIZE_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--xl-max-tokens", "--xlong-max-tokens"}, "N",
+        string_format("prompt plus output threshold for adaptive xlong profile (default: %d, 0 = ctx-size-xlong)", params.xlong_max_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--xlong-max-tokens must be non-negative");
+            }
+            params.xlong_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_XLONG_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--batch-size-xl", "--batch-size-xlong"}, "N",
+        string_format("logical batch size for adaptive xlong profile (default: %d)", params.batch_size_xlong),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--batch-size-xlong must be positive");
+            }
+            params.batch_size_xlong = value;
+        }
+    ).set_env("LLAMA_ARG_BATCH_SIZE_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--ubatch-size-xl", "--ubatch-size-xlong"}, "N",
+        string_format("physical batch size for adaptive xlong profile (default: %d)", params.ubatch_size_xlong),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--ubatch-size-xlong must be positive");
+            }
+            params.ubatch_size_xlong = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_SIZE_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--ctx-size-xxl", "--ctx-size-xxlong"}, "N",
+        string_format("context size for adaptive xxlong profile (default: %d, 0 = disabled)", params.ctx_size_xxlong),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--ctx-size-xxlong must be non-negative");
+            }
+            params.ctx_size_xxlong = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_SIZE_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--xxl-max-tokens", "--xxlong-max-tokens"}, "N",
+        string_format("prompt plus output threshold for adaptive xxlong profile (default: %d, 0 = ctx-size-xxlong)", params.xxlong_max_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--xxlong-max-tokens must be non-negative");
+            }
+            params.xxlong_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_XXLONG_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--batch-size-xxl", "--batch-size-xxlong"}, "N",
+        string_format("logical batch size for adaptive xxlong profile (default: %d)", params.batch_size_xxlong),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--batch-size-xxlong must be positive");
+            }
+            params.batch_size_xxlong = value;
+        }
+    ).set_env("LLAMA_ARG_BATCH_SIZE_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--ubatch-size-xxl", "--ubatch-size-xxlong"}, "N",
+        string_format("physical batch size for adaptive xxlong profile (default: %d)", params.ubatch_size_xxlong),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--ubatch-size-xxlong must be positive");
+            }
+            params.ubatch_size_xxlong = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_SIZE_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--cache-type-k-xxl", "--cache-type-k-xxlong"}, "TYPE",
+        "KV cache type for K for xxlong profile (default: kvarn4)",
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.cache_type_k_xxlong, params.cache_kvarn_bits_k_xxlong, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--cache-type-v-xxl", "--cache-type-v-xxlong"}, "TYPE",
+        "KV cache type for V for xxlong profile (default: kvarn4)",
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.cache_type_v_xxlong, params.cache_kvarn_bits_v_xxlong, value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         { "--kv-unified-per-slot" }, "N",
         "context limit per parallel slot (default: unset, behavior unchanged).\n"
