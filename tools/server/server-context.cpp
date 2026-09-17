@@ -5150,9 +5150,22 @@ private:
         if (!prompt_cache || !ctx_tgt) {
             return false;
         }
+        // The converted payload is copied into RAM right after the call and the
+        // file is discarded, so stage it on tmpfs when it fits: the kernel's
+        // file staging then costs RAM bandwidth instead of a spinning-disk
+        // roundtrip. Fall back to the snapshot store when /dev/shm is missing
+        // or too small.
         std::string tmp = params_base.slot_save_path;
         if (tmp.empty()) {
             tmp = "/tmp/";
+        }
+        {
+            std::error_code sec;
+            const auto shm = std::filesystem::space("/dev/shm", sec);
+            if (!sec && std::filesystem::is_directory("/dev/shm", sec) && !sec &&
+                    shm.available > (4ULL << 30)) {
+                tmp = "/dev/shm/";
+            }
         }
         if (tmp.back() != '/' && tmp.back() != '\\') {
             tmp += '/';
