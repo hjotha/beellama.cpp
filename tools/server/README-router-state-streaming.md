@@ -15,9 +15,9 @@ format, model/profile validation, rollback and five-copy RAM reservation.
 
 ## Current final promotion
 
-The unified snapshot implementation and the explicit q4_0 -> KVarN conversion
-tier are promoted on GOKAYA in
-`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r3`. The active
+The unified snapshot implementation, the explicit q4_0 -> KVarN conversion
+tier, and the source-side SSE fix are promoted on GOKAYA in
+`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r5`. The active
 unit is `llama-server-root.service`; it keeps the public model ID
 `/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` and exposes one route
 group with a public `context_window` of `114688`. The route members are the
@@ -51,7 +51,7 @@ tests and CPU matrices are under
 including 4096-token boundary/margin and disk-chain cases, is under
 `/home/hjotha/router-kv-snapshots-unificados-20260916/gpu-unified-window-20260916-2`.
 The release record and hashes are in
-`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r3/PROMOTION-RESULT.md`
+`/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r5/PROMOTION-RESULT.md`
 and `RELEASE-HASHES.txt`.
 
 The corrected aggregate `test-save-load-state --models` run is `112 passed, 0
@@ -70,6 +70,14 @@ snapshot reuse and fresh-process disk restore. The optimized converter logged
 335 s in the earlier run, a measured reduction of about 23.6%. It uses CPU
 mmap/persistent workers for the serialized disk source; no additional GPU
 round-trip is introduced.
+
+The direct `/v1/chat/completions` SSE path is source-clean. The pre-fix canary
+reproduced an initial `data: null`: the begin marker was compared with
+`json == nullptr`, and later progress-only results could also serialize an
+empty JSON sentinel. The server now detects JSON null with `is_null()` and
+skips null continuation results. The r5 direct canary had a JSON object as its
+first event, zero `data: null` events, and one normal `[DONE]`; OpenCode 1.18.31
+then returned `TESTE_OK` against `127.0.0.1:8090` without the 18090 proxy.
 
 ## Store separation and conversation contract
 
@@ -375,7 +383,7 @@ selected restore.
 
 ## Promotion and rollback record
 
-### Final unified promotion
+### Optimized unified promotion (historical r3)
 
 The final promotion used source commit `5931242e2` and release
 `beellama-router-kvarn-convert-20260917-r3`. The exclusive GPU wrapper restored
@@ -386,6 +394,16 @@ PID executable and a real one-token request were verified. The previous KVarN
 release remains untouched at
 `/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r2`; the exact
 unit backup is `/etc/systemd/system/llama-server-root.service.pre-r3-20260917`.
+
+### Final SSE source fix promotion
+
+The r5 release contains source commits `b67dc76e6` and `2d7515684`. The first
+fix detects the initial begin-marker JSON null with `is_null()`; the second
+skips later progress-only null sentinels in the streaming continuation path.
+The direct canary on port 8090 starts with a JSON object, has zero `data: null`
+events and one `[DONE]`, and `opencode run` returned `TESTE_OK` without using
+the 18090 proxy. r4 remains available as the immediately previous release and
+r3 remains the rollback for the optimized unified snapshot implementation.
 
 ### Historical phase-1 promotion
 
