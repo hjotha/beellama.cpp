@@ -9334,7 +9334,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                     );
                     json res_json = result->to_json();
-                    if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                    // A progress-only partial and the explicit begin marker can
+                    // intentionally have no wire payload.  Do not serialize
+                    // that internal sentinel as an OpenAI `data: null` event;
+                    // keep the stream open so the next real result is sent.
+                    if (res_json.is_null()) {
+                        output.clear();
+                        return true;
+                    } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
                         output = format_oai_resp_sse(res_json);
