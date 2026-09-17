@@ -772,6 +772,39 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(common_context_profile_for_budget(five_profile, 1201) == COMMON_CONTEXT_PROFILE_XXLONG);
         assert(common_context_profile_for_budget(five_profile, 1400) == COMMON_CONTEXT_PROFILE_XXLONG);
 
+        common_params five_profile_shorthand = adaptive;
+        argv = {
+            "binary_name", "--ctx-size-l", "1000", "--ctx-size-m", "600",
+            "--m-max-tokens", "500", "--ctx-size-s", "300",
+            "--s-max-tokens", "250", "--spec-draft-n-max-s", "4",
+            "--spec-draft-n-max-m", "2", "--spec-draft-n-max-l", "0",
+            "--ctx-size-xl", "1200", "--batch-size-xl", "64", "--ubatch-size-xl", "64",
+            "--spec-draft-n-max-xl", "0",
+            "--ctx-size-xxl", "1400", "--batch-size-xxl", "64", "--ubatch-size-xxl", "64",
+            "--spec-draft-n-max-xxl", "0",
+            "--cache-type-k-xxl", "kvarn4", "--cache-type-v-xxl", "kvarn4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), five_profile_shorthand, LLAMA_EXAMPLE_SERVER));
+        assert(five_profile_shorthand.n_ctx == 1000);
+        assert(five_profile_shorthand.ctx_size_long == 1000);
+        assert(five_profile_shorthand.ctx_size_mtp == 600);
+        assert(five_profile_shorthand.mtp_max_tokens == 500);
+        assert(five_profile_shorthand.ctx_size_mtp_short == 300);
+        assert(five_profile_shorthand.mtp_short_max_tokens == 250);
+        assert(five_profile_shorthand.spec_draft_n_max_short == 4);
+        assert(five_profile_shorthand.speculative.draft.n_max == 2);
+        assert(five_profile_shorthand.spec_draft_n_max_long == 0);
+        assert(five_profile_shorthand.ctx_size_xlong == 1200);
+        assert(five_profile_shorthand.batch_size_xlong == 64);
+        assert(five_profile_shorthand.ubatch_size_xlong == 64);
+        assert(five_profile_shorthand.spec_draft_n_max_xlong == 0);
+        assert(five_profile_shorthand.ctx_size_xxlong == 1400);
+        assert(five_profile_shorthand.batch_size_xxlong == 64);
+        assert(five_profile_shorthand.ubatch_size_xxlong == 64);
+        assert(five_profile_shorthand.spec_draft_n_max_xxlong == 0);
+        assert(common_context_adaptive_error(five_profile_shorthand).empty());
+
         common_params xlong_inherit = tri_profile;
         argv = {
             "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
