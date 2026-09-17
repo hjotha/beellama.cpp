@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -190,7 +191,48 @@ server_model_identity server_model_identity::prepare(const std::string & loader_
             throw std::runtime_error("model identity GGUF shard index mismatch");
         }
         if (std::fseek(file.get(), 0, SEEK_SET) != 0) { throw std::runtime_error("cannot rewind model identity source"); }
-        const std::string file_hash = hash_sha256_hex(file.get());
+        // The full-file SHA-256 dominates startup for large models on spinning
+        // disks. Cache it in a sidecar keyed by the complete file stamp (device,
+        // inode, size, mode, mtime and ctime with nanoseconds): replacing the
+        // model changes the stamp and forces a re-hash. The sidecar is advisory,
+        // so a missing or unwritable one only costs the hash again.
+        std::string file_hash;
+#ifndef _WIN32
+        const std::string cache_path = paths[index] + ".identity-sha256";
+        {
+            std::ifstream cache(cache_path);
+            uint64_t cached_stamp[8] = {0};
+            bool hit = bool(cache);
+            for (int i = 0; hit && i < 8; ++i) { hit = bool(cache >> cached_stamp[i]); }
+            if (hit) { hit = bool(cache >> file_hash); }
+            if (hit) {
+                for (int i = 0; i < 8; ++i) {
+                    if (cached_stamp[i] != before.file[size_t(i)]) { hit = false; break; }
+                }
+            }
+            if (hit && (file_hash.size() != 64 ||
+                    file_hash.find_first_not_of("0123456789abcdef") != std::string::npos)) {
+                hit = false;
+            }
+            if (!hit) { file_hash.clear(); }
+        }
+#endif
+        if (file_hash.empty()) {
+            file_hash = hash_sha256_hex(file.get());
+#ifndef _WIN32
+            std::error_code wec;
+            const std::string tmp_path = cache_path + ".tmp";
+            {
+                std::ofstream out(tmp_path, std::ios::trunc);
+                if (out) {
+                    for (size_t i = 0; i < before.file.size(); ++i) { out << before.file[i] << ' '; }
+                    out << file_hash << '\n';
+                }
+            }
+            std::filesystem::rename(tmp_path, cache_path, wec);
+            if (wec) { std::filesystem::remove(tmp_path, wec); }
+#endif
+        }
 #ifndef _WIN32
         if (descriptor_stamp(file.get()) != before.file) {
             throw std::runtime_error("model identity source changed while hashing: " + paths[index]);
