@@ -4323,14 +4323,44 @@ size_t llama_context::state_seq_convert_file(
         if (src_size == 0 || src_offset > file.size() || src_size > file.size() - src_offset) {
             throw std::runtime_error("invalid sequence state source range");
         }
+        // Conversion reads the same bounded q4 rows in a non-linear order
+        // (records, stage and exact tail). A private, non-populated mmap keeps
+        // the source out of a second user-space buffer while avoiding a
+        // seek/fread pair for every 128-token group. Pages are faulted in only
+        // as the converter touches them, so this does not materialize the KV
+        // payload in RAM. Fall back to the checked file source when mmap is
+        // unavailable or rejected by the OS.
+        std::unique_ptr<llama_mmap> mapped;
+        std::unique_ptr<llama_state_q4_source> source;
+        bool source_is_mapped = false;
+        if (llama_mmap::SUPPORTED) {
+            try {
+                mapped = std::make_unique<llama_mmap>(&file, 0, false);
+                if (mapped->addr() != nullptr && src_offset <= mapped->size() &&
+                        src_size <= mapped->size() - src_offset) {
+                    source = std::make_unique<llama_state_q4_memory_source>(
+                            static_cast<const uint8_t *>(mapped->addr()) + src_offset, src_size);
+                    source_is_mapped = true;
+                }
+            } catch (const std::exception & error) {
+                LLAMA_LOG_DEBUG("%s: q4 source mmap unavailable, using file reads: %s\n",
+                        __func__, error.what());
+                mapped.reset();
+            }
+        }
+        if (!source) {
+            source = std::make_unique<llama_state_q4_file_source>(&file, src_offset, src_offset + src_size);
+        }
+        LLAMA_LOG_DEBUG("%s: q4 conversion source=%s bytes=%zu\n", __func__,
+                source_is_mapped ? "mmap" : "file", src_size);
         if (src_checksum != 0) {
             std::vector<uint8_t> buffer(LLAMA_STATE_FILE_BUFFER_SIZE);
             XXH64_state_t hash;
             XXH64_reset(&hash, 0);
-            file.seek(src_offset, SEEK_SET);
+            source->seek(0);
             for (size_t left = src_size; left;) {
                 const size_t count = std::min(left, buffer.size());
-                file.read_raw(buffer.data(), count);
+                source->read_raw(buffer.data(), count);
                 XXH64_update(&hash, buffer.data(), count);
                 left -= count;
             }
@@ -4338,15 +4368,14 @@ size_t llama_context::state_seq_convert_file(
                 throw std::runtime_error("sequence state source checksum mismatch");
             }
         }
-        file.seek(src_offset, SEEK_SET);
-        llama_state_q4_file_source source(&file, src_offset, src_offset + src_size);
+        source->seek(0);
         llama_state_q4_info info;
         std::string error;
-        if (!llama_state_q4_read_outer_header(source, info, nullptr, 0, cparams.n_ctx_seq, error) ||
-                !memory->state_parse_q4(source, model.hparams, info, error)) {
+        if (!llama_state_q4_read_outer_header(*source, info, nullptr, 0, cparams.n_ctx_seq, error) ||
+                !memory->state_parse_q4(*source, model.hparams, info, error)) {
             throw std::runtime_error("unsupported sequence state source: " + error);
         }
-        return state_seq_convert_seq_stream(source, info, dst_filepath, tokens_out, capacity, count_out);
+        return state_seq_convert_seq_stream(*source, info, dst_filepath, tokens_out, capacity, count_out);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
         return 0;

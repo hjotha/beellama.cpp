@@ -3384,15 +3384,18 @@ private:
             std::to_string(conversion_nonce.fetch_add(1, std::memory_order_relaxed));
         llama_tokens tokens(source_file.tokens.size());
         size_t count = 0;
+        const int64_t conversion_started = ggml_time_us();
         const size_t converted = llama_state_seq_convert_file(ctx_tgt,
                 source_file.state_path.c_str(), 0, source_file.state_bytes, source_file.state_checksum,
                 native_tmp.c_str(), tokens.data(), tokens.size(), &count);
         if (!converted || count != source_file.tokens.size() || tokens != source_file.tokens) {
             std::error_code ec;
             std::filesystem::remove(native_tmp, ec);
-            SRV_WRN("route conversion failed for %s\n", source_file.state_path.c_str());
+            SRV_WRN("route conversion failed for %s elapsed_ms=%.3f backend=cpu source=disk\n",
+                    source_file.state_path.c_str(), (ggml_time_us() - conversion_started) / 1000.0);
             return {};
         }
+        const double conversion_ms = (ggml_time_us() - conversion_started) / 1000.0;
         const std::string target_format = string_format("kvarn_k%dv%d_g128",
                 params_base.cache_kvarn_bits_k, params_base.cache_kvarn_bits_v);
         const std::string provenance = common_json{
@@ -3419,9 +3422,10 @@ private:
         }
         std::error_code ec;
         std::filesystem::remove(native_tmp, ec);
-        SRV_INF("route snapshot converted: %s -> %s tokens=%zu bytes=%zu target=%s layout=%s\n",
+        SRV_INF("route snapshot converted: %s -> %s tokens=%zu bytes=%zu target=%s "
+                "conversion_ms=%.3f backend=cpu source=disk layout=%s\n",
                 source_file.state_path.c_str(), converted_path.c_str(), source_file.tokens.size(),
-                converted, target_format.c_str(), target_layout.c_str());
+                converted, target_format.c_str(), conversion_ms, target_layout.c_str());
         return converted_path;
     }
 

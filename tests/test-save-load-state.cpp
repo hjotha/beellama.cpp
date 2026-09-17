@@ -1102,6 +1102,10 @@ static bool test_seq_rm_isolated(
     if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
         return true;
     }
+    if (llama_model_is_diffusion(model)) {
+        LOG("\n=== Test 2: sequence removal isolation (SKIP: diffusion model) ===\n");
+        return true;
+    }
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_ctx      = 256;
     params_ctx.n_seq_max  = 2;
@@ -1395,11 +1399,27 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 // - the restore destination is non-contiguous: scatter reads are batched per contiguous run
 // - save again on the host and compare the two blobs byte for byte
 static bool test_seq_cp_scatter(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, int test_num, bool on_device) {
+    if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+        LOG("\n=== Test %d: seq copy (%s, scatter) (SKIP: full KVarN state requires an exclusive stream) ===\n",
+                test_num, on_device ? "device" : "host");
+        return true;
+    }
+    if (llama_model_is_diffusion(model)) {
+        LOG("\n=== Test %d: seq copy (%s, scatter) (SKIP: diffusion model) ===\n", test_num,
+                on_device ? "device" : "host");
+        return true;
+    }
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_ctx      = 256;
     params_ctx.n_seq_max  = 2;
     params_ctx.kv_unified = true;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create %s scatter context (n_ctx=%u)\n", __func__,
+                params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ? "standard" : "KVarN",
+                params_ctx.n_ctx);
+        return false;
+    }
 
     LOG("\n=== Test %d: seq copy (%s, scatter) ===\n", test_num, on_device ? "device" : "host");
 

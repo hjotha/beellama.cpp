@@ -54,6 +54,23 @@ The release record and hashes are in
 `/home/hjotha/releases/beellama-router-kvarn-convert-20260917-r2/PROMOTION-RESULT.md`
 and `RELEASE-HASHES.txt`.
 
+The corrected aggregate `test-save-load-state --models` run is `112 passed, 0
+failed (of 112)`. The four diffusion fixtures that previously failed are now
+explicitly marked as unsupported for sequence-removal/full-scatter checks;
+their applicable baseline, load, copy and round-trip checks still run. The
+KVarN4/KVarN4 focused qwen35 target-only run passes capacity sharing, freed-group
+reuse, load, host/device sequence copy and round-trip; full-state scatter is
+skipped because KVarN requires an exclusive stream for that operation.
+
+The real-model current-release conversion run is recorded at
+`/home/hjotha/router-merge-review-20260917-1/kvarn5-conversion-opt-final`.
+It passed tri -> wide -> KVarN conversion, 4.096-token generation, converted
+snapshot reuse and fresh-process disk restore. The optimized converter logged
+`conversion_ms=255878.361` for the 104447-token q4 source, versus approximately
+335 s in the earlier run, a measured reduction of about 23.6%. It uses CPU
+mmap/persistent workers for the serialized disk source; no additional GPU
+round-trip is introduced.
+
 ## Store separation and conversation contract
 
 An upward handoff is associated by `X-Conversation-Id`; requests without that
@@ -107,6 +124,20 @@ snapshot is converted into the destination child's native compact layout:
 - Publication is transactional. The destination is only mutated by the normal
   streaming restore of the converted file, which requires an empty context and
   clears it on any late failure.
+
+Conversion placement is intentionally CPU-side. The q4 source belongs to a
+different child process from the KVarN destination, and the route contract is
+the persistent q4 state file; a CUDA tensor pointer cannot cross that process
+boundary. The existing CUDA `kvarn_store` operator also consumes an F32 graph
+tensor, not serialized q4 rows. Rehydrating the q4 file into a second GPU KV
+cache just to run that operator would add a large upload, a second cache
+allocation and another device-to-host publication, so it is not a faster or
+safer implementation for this route. File conversion now uses a non-populated
+memory map (with checked file-read fallback) and a persistent bounded worker
+pool, avoiding the old seek/fread and per-group thread-creation overhead while
+keeping the full q4 payload out of a user-space vector. The in-RAM
+`llama_state_seq_convert_data` path remains CPU-side and does not copy the
+source a second time.
 
 The conversion is lossy. The error introduced by the q4_0 source remains and
 requantization can add more; a converted prefix is not equivalent to a native

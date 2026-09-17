@@ -12,12 +12,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <limits>
 #include <map>
+#include <deque>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -2994,19 +2997,67 @@ namespace {
 // A conversion group must join every worker even when one of the dequantizers
 // or quantizers throws. Letting a joinable std::thread escape would call
 // std::terminate and could leave the caller without the normal atomic cleanup.
-class conversion_thread_group {
+// Keep the workers alive for the entire conversion: creating and joining a
+// fresh set for every 128-token group otherwise adds thousands of thread
+// lifetimes to the large q4 -> KVarN handoff.
+class conversion_thread_pool {
 public:
-    ~conversion_thread_group() {
-        for (auto & thread : threads) {
-            if (thread.joinable()) {
-                thread.join();
+    explicit conversion_thread_pool(size_t count) {
+        count = std::max<size_t>(1, count);
+        workers.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            workers.emplace_back([this] { worker_loop(); });
+        }
+    }
+
+    ~conversion_thread_pool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        work.notify_all();
+        for (auto & worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
             }
         }
     }
 
     template<typename F>
-    void spawn(F && function) {
-        threads.emplace_back([this, function = std::forward<F>(function)]() mutable {
+    void submit(F && function) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping) {
+                throw std::runtime_error("q4 conversion worker pool is stopped");
+            }
+            tasks.emplace_back(std::forward<F>(function));
+            ++pending;
+        }
+        work.notify_one();
+    }
+
+    void join() {
+        std::unique_lock<std::mutex> lock(mutex);
+        finished.wait(lock, [this] { return pending == 0; });
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            std::function<void()> function;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                work.wait(lock, [this] { return stopping || !tasks.empty(); });
+                if (stopping && tasks.empty()) {
+                    return;
+                }
+                function = std::move(tasks.front());
+                tasks.pop_front();
+            }
+
             try {
                 function();
             } catch (...) {
@@ -3015,23 +3066,25 @@ public:
                     error = std::current_exception();
                 }
             }
-        });
-    }
 
-    void join() {
-        for (auto & thread : threads) {
-            if (thread.joinable()) {
-                thread.join();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                GGML_ASSERT(pending > 0);
+                --pending;
+                if (pending == 0) {
+                    finished.notify_all();
+                }
             }
         }
-        if (error) {
-            std::rethrow_exception(error);
-        }
     }
 
-private:
-    std::vector<std::thread> threads;
+    std::vector<std::thread> workers;
+    std::deque<std::function<void()>> tasks;
     std::mutex mutex;
+    std::condition_variable work;
+    std::condition_variable finished;
+    size_t pending = 0;
+    bool stopping = false;
     std::exception_ptr error;
 };
 
@@ -3439,6 +3492,7 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
 
     const unsigned hw = std::thread::hardware_concurrency();
     const uint32_t n_workers = std::max(1u, std::min(16u, hw ? hw : 1u));
+    conversion_thread_pool workers(n_workers);
 
     for (size_t li = 0; li < layers.size(); ++li) {
         const auto & layer = layers[li];
@@ -3480,8 +3534,6 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
 
             for (uint32_t g0 = 0; g0 < n_groups_used; g0 += n_workers) {
                 const uint32_t count = std::min(n_workers, n_groups_used - g0);
-                conversion_thread_group threads;
-
                 for (uint32_t i = 0; i < count; ++i) {
                     const uint32_t group = g0 + i;
                     in[i].clear();
@@ -3500,14 +3552,14 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
                     if (group == 0 || group >= complete_groups) {
                         continue;
                     }
-                    threads.spawn([&, i] {
+                    workers.submit([&, i] {
                         kvarn_convert_component_records(
                                 in[i].data(), KVAR_N_GROUP, uint32_t(component.row_size),
                                 component.n_embd, component.shape, component.bits,
                                 params.sinkhorn_iters, component.value, out_buf[i].data());
                     });
                 }
-                threads.join();
+                workers.join();
 
                 for (uint32_t i = 0; i < count; ++i) {
                     const uint32_t group = g0 + i;
@@ -3539,14 +3591,13 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
                 src.seek(stage.data + size_t(group) * KVAR_N_GROUP * stage.row_size);
                 src.read_raw(rows.data(), rows.size());
 
-                conversion_thread_group threads;
                 for (uint32_t hs = 0; hs < stage.shape.n_head_sliced; ++hs) {
-                    threads.spawn([&, hs] {
+                    workers.submit([&, hs] {
                         kvarn_convert_stage_slice(rows.data(), n_valid, uint32_t(stage.row_size),
                                 stage.n_embd, stage.shape, hs, slot, image.data());
                     });
                 }
-                threads.join();
+                workers.join();
             }
 
             write_bytes(image.data(), image.size());
