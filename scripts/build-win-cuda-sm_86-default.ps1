@@ -1,9 +1,9 @@
 param(
     [string]$OutputDir = "release-packages",
-    [string]$PackageName = "build-win-cuda-13.1-sm_86-default",
-    [string]$BuildName = "build-win-cuda-13.1-sm_86-default",
+    [string]$PackageName = "build-win-cuda-sm_86-default",
+    [string]$BuildName = "build-win-cuda-sm_86-default",
     [string]$Target = "",
-    [int]$Parallel = 16,
+    [int]$Parallel = 24,
     [switch]$Package = $false,
     [switch]$AllTests = $false,
     [switch]$SkipStage = $false,
@@ -16,7 +16,7 @@ $ProgressPreference = "SilentlyContinue"
 $env:MSBUILDDISABLENODEREUSE = "1"
 
 $repoRoot = $PSScriptRoot | Split-Path -Parent
-$cudaVer = "13.1"
+$cudaVer = "13.3"
 $cudaArch = "86" # RTX 3090 / GA102 / Ampere
 $cudaBase = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
 $cudaPath = Join-Path $cudaBase "v$cudaVer"
@@ -33,18 +33,8 @@ if (Test-Path $ninjaExe) {
     exit 1
 }
 
-# Keep sccache enabled, but prevent its request-based idle timer from expiring
-# while a long CUDA template translation unit is still compiling. The daemon
-# retains a bounded lifetime after the build becomes truly inactive.
-$sccacheExe = Get-Command sccache.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($sccacheExe) {
-    $env:PATH = "$($sccacheExe.DirectoryName);$env:PATH"
-    $env:SCCACHE_IDLE_TIMEOUT = "7200"
-    Write-Host "[ENV] sccache on PATH: $($sccacheExe.Source)"
-    Write-Host "[ENV] sccache idle timeout: $($env:SCCACHE_IDLE_TIMEOUT)s"
-} else {
-    Write-Host "[WARN] sccache.exe not found; compiler cache disabled"
-}
+# sccache 0.16.0 is incompatible with CUDA 13.3 nvcc: it can lose the generated
+# PTX file during fatbinary creation. Keep CUDA compilation uncached for this toolkit.
 
 # Activate MSVC environment for Ninja (cl.exe, link.exe, etc.).
 $vcvarsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
@@ -78,16 +68,16 @@ $buildDir = Join-Path $repoRoot $BuildName
 $pkgDir = Join-Path $repoRoot "$OutputDir\$PackageName"
 $binDir = Join-Path $buildDir "bin"
 
-# Release flags narrowed to CUDA 13.1 + RTX 3090 with the default FA matrices.
+# Release flags narrowed to CUDA 13.3 + RTX 3090 with the default FA matrices.
 # Ninja generator avoids MSBuild CUDA targets interference (lets us pick nvcc per toolkit).
 $commonFlags = @(
     "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DGGML_CUDA=ON",
+    "-DGGML_CCACHE=OFF",
     "-DGGML_CUDA_FA_ALL_QUANTS=OFF",
     "-DGGML_CUDA_KVARN=ON",
     "-DGGML_CUDA_CUB_3DOT2=ON",
-    "-DGGML_CCACHE=ON",
     "-DGGML_NATIVE=OFF",
     "-DGGML_BACKEND_DL=$(if ($AllTests) { 'OFF' } else { 'ON' })",
     "-DBUILD_SHARED_LIBS=$(if ($AllTests) { 'OFF' } else { 'ON' })",
@@ -101,7 +91,7 @@ $commonFlags = @(
 )
 
 Write-Host "========================================"
-Write-Host "BeeLlama.cpp Windows CUDA 13.1 sm_86 Default-Pairs Build"
+Write-Host "BeeLlama.cpp Windows CUDA 13.3 sm_86 Default-Pairs Build"
 Write-Host "FA mode: DEFAULT standard pairs; 15 default KVarN fast-decode pairs"
 Write-Host "CUDA:    $cudaVer"
 Write-Host "Arch:    sm_$cudaArch"

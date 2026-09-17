@@ -29,6 +29,10 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(server_prompt_checkpoint_boundary(795, 132, 128) == 640);
     assert(server_prompt_checkpoint_boundary(795,   4, 128) == 768);
     assert(server_prompt_checkpoint_boundary(3,     4, 128) == 0);
+
+    assert(!server_draft_context_owns_state(false, false));
+    assert( server_draft_context_owns_state(true,  false));
+    assert(!server_draft_context_owns_state(true,  true));
 }
 
 static server_prompt make_prompt(const llama_tokens & tokens) {
@@ -85,6 +89,38 @@ static void restore_transaction_validation_failures_are_atomic() {
         };
         assert(!server_prompt_restore_transaction(states[0], states[1], states[2], io));
         assert(prepared >= 1 && prepared <= 3);
+        assert(committed == 0);
+    }
+}
+
+static void restore_transaction_validation_failure_identifies_prepare_leg() {
+    const server_prompt_state_view states[] = {
+        { reinterpret_cast<const uint8_t *>("target"), 6 },
+        { reinterpret_cast<const uint8_t *>("draft"), 5 },
+        { reinterpret_cast<const uint8_t *>("spec"), 4 },
+    };
+    const server_prompt_state_kind kinds[] = {
+        SERVER_PROMPT_STATE_MAIN,
+        SERVER_PROMPT_STATE_DRAFT,
+        SERVER_PROMPT_STATE_SPECULATIVE,
+    };
+
+    for (const auto failed_kind : kinds) {
+        int committed = 0;
+        server_prompt_restore_transaction_io io {
+            /*.restore_target =*/ true,
+            /*.restore_draft =*/ true,
+            /*.restore_speculative =*/ true,
+            /*.prepare =*/ [&](server_prompt_state_kind kind, server_prompt_state_view) {
+                return kind != failed_kind;
+            },
+            /*.commit =*/ [&](server_prompt_state_kind) { ++committed; },
+        };
+        const auto result = server_prompt_restore_transaction_diagnostic(
+                states[0], states[1], states[2], io);
+        assert(!result.success);
+        assert(result.component == failed_kind);
+        assert(result.reason == SERVER_PROMPT_RESTORE_PREPARE_REJECTED);
         assert(committed == 0);
     }
 }
@@ -165,6 +201,73 @@ static void checkpoint_failed_target_save_cannot_reuse_stale_bytes() {
 
     assert(checkpoint.data_tgt.empty());
     assert(checkpoint.empty());
+}
+
+static void speculative_draft_rollback_uses_draft_axis_and_recovers() {
+    assert(server_speculative_draft_rollback_p0(4096, 63) == 4096);
+    assert(server_speculative_draft_rollback_p0(0, 63) == 64);
+
+    std::vector<std::pair<llama_pos, llama_pos>> removals;
+    server_speculative_draft_rollback_io exact_io {
+        /*.plan =*/ {},
+        /*.remove =*/ [&](llama_pos p0, llama_pos p1) {
+            removals.emplace_back(p0, p1);
+            return true;
+        },
+    };
+    llama_pos applied_p0 = -1;
+    assert(server_speculative_draft_rollback(4096, exact_io, applied_p0) ==
+            SERVER_SPECULATIVE_DRAFT_ROLLBACK_EXACT);
+    const std::vector<std::pair<llama_pos, llama_pos>> exact_expected = {{4096, -1}};
+    assert(applied_p0 == 4096 && removals == exact_expected);
+
+    removals.clear();
+    server_speculative_draft_rollback_io widened_io {
+        /*.plan =*/ [](llama_pos p0, llama_pos p1, llama_pos & planned_p0, llama_pos & planned_p1) {
+            assert(p0 == 4096 && p1 == -1);
+            planned_p0 = 3968;
+            planned_p1 = -1;
+            return true;
+        },
+        /*.remove =*/ [&](llama_pos p0, llama_pos p1) {
+            removals.emplace_back(p0, p1);
+            return p0 == 3968 && p1 == -1;
+        },
+    };
+    assert(server_speculative_draft_rollback(4096, widened_io, applied_p0) ==
+            SERVER_SPECULATIVE_DRAFT_ROLLBACK_WIDENED);
+    assert(applied_p0 == 3968);
+    const std::vector<std::pair<llama_pos, llama_pos>> widened_expected = {{4096, -1}, {3968, -1}};
+    assert(removals == widened_expected);
+
+    removals.clear();
+    server_speculative_draft_rollback_io clear_io {
+        /*.plan =*/ [](llama_pos, llama_pos, llama_pos & planned_p0, llama_pos & planned_p1) {
+            planned_p0 = -1;
+            planned_p1 = -1;
+            return true;
+        },
+        /*.remove =*/ [&](llama_pos p0, llama_pos p1) {
+            removals.emplace_back(p0, p1);
+            return p0 == -1 && p1 == -1;
+        },
+    };
+    assert(server_speculative_draft_rollback(4096, clear_io, applied_p0) ==
+            SERVER_SPECULATIVE_DRAFT_ROLLBACK_CLEARED);
+    assert(applied_p0 == -1);
+    const std::vector<std::pair<llama_pos, llama_pos>> clear_expected = {{4096, -1}, {-1, -1}};
+    assert(removals == clear_expected);
+
+    server_speculative_draft_rollback_io failed_io {
+        /*.plan =*/ [](llama_pos, llama_pos, llama_pos & planned_p0, llama_pos & planned_p1) {
+            planned_p0 = 3968;
+            planned_p1 = -1;
+            return true;
+        },
+        /*.remove =*/ [](llama_pos, llama_pos) { return false; },
+    };
+    assert(server_speculative_draft_rollback(4096, failed_io, applied_p0) ==
+            SERVER_SPECULATIVE_DRAFT_ROLLBACK_FAILED);
 }
 
 static void server_unsupported_removal_falls_back_to_full_reprocess() {
@@ -339,8 +442,10 @@ int main() {
     prompt_cache_checkpoint_must_respect_alignment_and_position();
     restore_transaction_validation_failures_are_atomic();
     restore_transaction_draft_failure_commits_nothing();
+    restore_transaction_validation_failure_identifies_prepare_leg();
     speculative_rollback_checkpoint_boundary();
     checkpoint_failed_target_save_cannot_reuse_stale_bytes();
+    speculative_draft_rollback_uses_draft_axis_and_recovers();
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();
     server_planned_removal_preserves_atomic_media_chunks();
@@ -382,6 +487,7 @@ int main() {
             /*.data =*/ {
                 /*.main =*/ std::vector<uint8_t>(64),
                 /*.drft =*/ std::vector<uint8_t>(32),
+                /*.spec =*/ { },
             },
         };
         const auto & ckpt_ptr = state.prompt.checkpoints.front();

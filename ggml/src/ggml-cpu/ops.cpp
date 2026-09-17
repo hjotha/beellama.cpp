@@ -11739,15 +11739,25 @@ static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;
 static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9;
 static constexpr int KVAR_N_OP_PARAM_READ_INDIRECT = 10;
-static inline int64_t kvarn_cpu_read_cell(int64_t encoded, bool read_indirect, bool swa, bool & staged) {
+static inline int64_t kvarn_cpu_index_payload(int64_t encoded) {
+    return encoded < -1 ? -(encoded + 2) : encoded;
+}
+
+static inline int64_t kvarn_cpu_read_cell(
+        int64_t encoded, bool read_indirect, bool swa, bool & staged,
+        int64_t * assigned_slot = nullptr) {
     GGML_UNUSED(read_indirect);
-    GGML_UNUSED(swa);
-    staged = false;
-    if (encoded >= -1) {
-        return encoded;
+    staged = !swa && encoded < -1;
+    const uint64_t payload = uint64_t(kvarn_cpu_index_payload(encoded));
+    if (assigned_slot != nullptr) {
+        const uint32_t packed = uint32_t(payload >> 32u);
+        *assigned_slot = swa || packed == 0 ? -1 : int64_t(packed - 1u);
     }
-    staged = true;
-    return -encoded - 2;
+    return int64_t(uint32_t(payload));
+}
+
+static inline int64_t kvarn_cpu_swa_stream(int64_t encoded) {
+    return int64_t(uint64_t(encoded) >> 32u);
 }
 
 static void kvarn_cpu_hadamard(float * values) {
@@ -12067,11 +12077,15 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
     const int64_t groups_per_stream = records->ne[2] / n_stream;
 
     for (int64_t t = 0; t < n_tokens; ++t) {
-        const int64_t idx = idx_data[t];
-        GGML_ASSERT(idx >= 0);
+        const int64_t encoded_idx = idx_data[t];
+        GGML_ASSERT(encoded_idx >= 0);
+        const uint64_t payload = uint64_t(encoded_idx);
+        const uint32_t packed_slot = uint32_t(payload >> 32u);
+        const int64_t assigned_slot = swa || packed_slot == 0 ? -1 : int64_t(packed_slot - 1u);
+        const int64_t idx = int64_t(uint32_t(payload));
         const int64_t group_global = idx / 128;
         const int64_t pos = idx % 128;
-        const int64_t stream = swa ? 0 : group_global / groups_per_stream;
+        const int64_t stream = swa ? kvarn_cpu_swa_stream(encoded_idx) : group_global / groups_per_stream;
         const int64_t group = swa ? group_global : group_global - stream * groups_per_stream;
         GGML_ASSERT(stream >= 0 && stream < n_stream);
         if (!swa) {
@@ -12091,7 +12105,9 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
             }
         }
 
-        const int64_t stage_slot = swa ? group % stage_groups : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
+        const int64_t stage_slot = assigned_slot >= 0 ? assigned_slot :
+            (swa ? group % stage_groups : (group == 0 ? 0 : 1 + ((group - 1) % tail_groups)));
+        GGML_ASSERT(stage_slot >= 0 && stage_slot < stage_groups);
         const int64_t stage_pos = stage_base + stage_slot * 128 + pos;
         for (int64_t h0 = 0; h0 < n_heads; h0 += head_slices) {
             std::array<std::array<float, KVAR_N_GROUP>, 4> rows = {};
@@ -12165,7 +12181,7 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t idx = kvarn_cpu_read_cell(encoded, read_indirect, swa, staged);
         const int64_t group_global = idx / KVAR_N_GROUP;
         const int64_t pos = idx % KVAR_N_GROUP;
-        const int64_t stream = swa ? stream_start : group_global / groups_per_stream;
+        const int64_t stream = swa ? kvarn_cpu_swa_stream(encoded) : group_global / groups_per_stream;
         if (stream < stream_start || stream >= stream_start + n_stream) {
             continue;
         }
@@ -12188,11 +12204,14 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t cell = cell_stream % n_kv;
         const int64_t out_stream = cell_stream / n_kv;
         const int64_t stream = stream_start + out_stream;
-        const int64_t encoded = (swa || read_indirect) ? idx_data[cell] : cell;
+        const int64_t encoded = swa ? idx_data[stream*n_kv + cell] :
+                (read_indirect ? idx_data[cell] : cell);
         std::array<std::array<float, KVAR_N_GROUP>, 4> rows = {};
         if (encoded != -1) {
             bool explicitly_staged;
-            const int64_t abs_pos = kvarn_cpu_read_cell(encoded, read_indirect, swa, explicitly_staged);
+            int64_t assigned_slot = -1;
+            const int64_t abs_pos = kvarn_cpu_read_cell(
+                    encoded, read_indirect, swa, explicitly_staged, &assigned_slot);
             const int64_t group = abs_pos / KVAR_N_GROUP;
             const int64_t pos = abs_pos % KVAR_N_GROUP;
             const int64_t live_group = live_groups[out_stream];
@@ -12204,8 +12223,9 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
             int64_t record_group = 0;
             if (explicitly_staged) {
                 from_stage = true;
-                stage_pos = stage_base + (group == 0 ? pos :
-                    KVAR_N_GROUP + ((group - 1) % tail_groups) * KVAR_N_GROUP + pos);
+                const int64_t stage_slot = assigned_slot >= 0 ? assigned_slot :
+                    (group == 0 ? 0 : 1 + ((group - 1) % tail_groups));
+                stage_pos = stage_base + stage_slot*KVAR_N_GROUP + pos;
             } else if (read_indirect && !swa) {
                 from_stage = explicitly_staged;
                 from_record = !from_stage;
@@ -12389,95 +12409,119 @@ static bool kvarn_cpu_attn_parse_side(const ggml_tensor * tensor, kvarn_cpu_attn
     return true;
 }
 
-static float kvarn_cpu_attn_load(
+struct kvarn_cpu_attn_ref {
+    bool from_stage = false;
+    bool from_record = false;
+    int64_t stage_pos = 0;
+    int64_t record_group = 0;
+    int64_t position = 0;
+};
+
+static kvarn_cpu_attn_ref kvarn_cpu_attn_resolve(
         const kvarn_cpu_attn_side & side,
         int64_t token,
-        int64_t logical_head,
-        int64_t out_stream,
-        int64_t dim) {
+        int64_t out_stream) {
     GGML_ASSERT(token >= 0 && token < side.view->ne[2]);
     GGML_ASSERT(out_stream >= 0 && out_stream < side.n_stream);
-    GGML_ASSERT(dim >= 0 && dim < KVAR_N_GROUP * side.head_slices);
 
     const int64_t stream = side.stream_start + out_stream;
-    const int64_t slice = dim / KVAR_N_GROUP;
-    const int64_t local_dim = dim % KVAR_N_GROUP;
-    const int64_t head = logical_head * side.head_slices + slice;
     const int64_t * indices = (const int64_t *) side.indices->data;
     const int64_t encoded = (side.swa || side.read_indirect) ? indices[token] : token;
     if (encoded == -1) {
-        return 0.0f;
+        return {};
     }
     bool explicitly_staged;
-    const int64_t absolute_pos = kvarn_cpu_read_cell(encoded, side.read_indirect, side.swa, explicitly_staged);
+    int64_t assigned_slot = -1;
+    const int64_t absolute_pos = kvarn_cpu_read_cell(
+            encoded, side.read_indirect, side.swa, explicitly_staged, &assigned_slot);
 
     const int64_t group = absolute_pos / KVAR_N_GROUP;
     const int64_t position = absolute_pos % KVAR_N_GROUP;
     const int64_t live_group = side.live_groups[size_t(out_stream)];
     const int64_t live_position = side.live_positions[size_t(out_stream)];
     const int64_t stage_base = stream * KVAR_N_GROUP * side.stage_groups;
-    bool from_stage = false;
-    bool from_record = false;
-    int64_t stage_pos = 0;
-    int64_t record_group = 0;
+    kvarn_cpu_attn_ref result;
+    result.position = position;
 
     if (explicitly_staged) {
-        from_stage = true;
-        stage_pos = stage_base + (group == 0 ? position :
-            KVAR_N_GROUP + ((group - 1) % side.tail_groups) * KVAR_N_GROUP + position);
+        result.from_stage = true;
+        const int64_t stage_slot = assigned_slot >= 0 ? assigned_slot :
+            (group == 0 ? 0 : 1 + ((group - 1) % side.tail_groups));
+        result.stage_pos = stage_base + stage_slot*KVAR_N_GROUP + position;
     } else if (side.read_indirect && !side.swa) {
-        from_stage = explicitly_staged;
-        from_record = !from_stage;
-        stage_pos = stage_base + (group == 0 ? position :
+        result.from_stage = explicitly_staged;
+        result.from_record = !result.from_stage;
+        result.stage_pos = stage_base + (group == 0 ? position :
             KVAR_N_GROUP + ((group - 1) % side.tail_groups) * KVAR_N_GROUP + position);
-        record_group = stream * side.groups_per_stream + group;
+        result.record_group = stream * side.groups_per_stream + group;
     } else if (side.eager_records) {
-        from_stage = (!side.swa && group == 0) ||
+        result.from_stage = (!side.swa && group == 0) ||
             (group == live_group && live_position < KVAR_N_GROUP - 1);
         const bool completed = group < live_group ||
             (group == live_group && live_position == KVAR_N_GROUP - 1);
-        from_record = !from_stage && completed && (side.swa ?
+        result.from_record = !result.from_stage && completed && (side.swa ?
             live_group - group < side.groups_per_stream :
             group > 0 && group < side.groups_per_stream);
-        stage_pos = stage_base + (side.swa ? group % side.stage_groups :
+        result.stage_pos = stage_base + (side.swa ? group % side.stage_groups :
             (group == 0 ? 0 : 1 + ((group - 1) % side.tail_groups))) *
             KVAR_N_GROUP + position;
-        record_group = stream * side.groups_per_stream +
+        result.record_group = stream * side.groups_per_stream +
             (side.swa ? group % side.groups_per_stream : group);
     } else if (side.swa) {
         const int64_t stage_begin = live_group >= side.tail_groups - 1 ?
             live_group - (side.tail_groups - 1) : 0;
-        from_stage = group >= stage_begin && group <= live_group;
-        from_record = !from_stage && group >= 0 && group < stage_begin &&
+        result.from_stage = group >= stage_begin && group <= live_group;
+        result.from_record = !result.from_stage && group >= 0 && group < stage_begin &&
             live_group - group < side.groups_per_stream + side.tail_groups;
-        stage_pos = stage_base + (group % side.stage_groups) * KVAR_N_GROUP + position;
-        record_group = stream * side.groups_per_stream + (group % side.groups_per_stream);
+        result.stage_pos = stage_base + (group % side.stage_groups) * KVAR_N_GROUP + position;
+        result.record_group = stream * side.groups_per_stream + (group % side.groups_per_stream);
     } else {
-        from_stage = group == 0 ||
+        result.from_stage = group == 0 ||
             (group > 0 && group <= live_group &&
              group + (side.tail_groups - 1) >= live_group);
-        from_record = !from_stage && group < live_group && group < side.groups_per_stream;
-        stage_pos = stage_base + (group == 0 ? position :
+        result.from_record = !result.from_stage && group < live_group && group < side.groups_per_stream;
+        result.stage_pos = stage_base + (group == 0 ? position :
             KVAR_N_GROUP + ((group - 1) % side.tail_groups) *
             KVAR_N_GROUP + position);
-        record_group = stream * side.groups_per_stream + group;
+        result.record_group = stream * side.groups_per_stream + group;
     }
+    return result;
+}
 
-    if (from_stage) {
-        const char * src = (const char *) side.stage->data +
-            local_dim * side.stage->nb[0] +
-            head * side.stage->nb[1] +
-            stage_pos * side.stage->nb[2];
-        return ggml_fp16_to_fp32(*(const ggml_fp16_t *) src);
+static void kvarn_cpu_attn_load_row(
+        const kvarn_cpu_attn_side & side,
+        int64_t token,
+        int64_t logical_head,
+        int64_t out_stream,
+        float * dst) {
+    const kvarn_cpu_attn_ref ref = kvarn_cpu_attn_resolve(side, token, out_stream);
+    const int64_t head0 = logical_head * side.head_slices;
+    if (ref.from_stage) {
+        for (int64_t slice = 0; slice < side.head_slices; ++slice) {
+                const int64_t head = head0 + slice;
+            for (int64_t dim = 0; dim < KVAR_N_GROUP; ++dim) {
+                const char * src = (const char *) side.stage->data +
+                    dim * side.stage->nb[0] + head * side.stage->nb[1] +
+                    ref.stage_pos * side.stage->nb[2];
+                dst[slice * KVAR_N_GROUP + dim] =
+                    ggml_fp16_to_fp32(*(const ggml_fp16_t *) src);
+            }
+        }
+        return;
     }
-    if (from_record) {
-        const uint8_t * record = (const uint8_t *) side.records->data +
-            head * side.records->nb[1] +
-            record_group * side.records->nb[2];
-        return kvarn_cpu_record_value(
-            record, side.bits, side.value, int(position), int(local_dim));
+    if (ref.from_record) {
+        for (int64_t slice = 0; slice < side.head_slices; ++slice) {
+            const int64_t head = head0 + slice;
+            const uint8_t * record = (const uint8_t *) side.records->data +
+                head * side.records->nb[1] + ref.record_group * side.records->nb[2];
+            for (int64_t dim = 0; dim < KVAR_N_GROUP; ++dim) {
+                dst[slice * KVAR_N_GROUP + dim] = kvarn_cpu_record_value(
+                    record, side.bits, side.value, int(ref.position), int(dim));
+            }
+        }
+        return;
     }
-    return 0.0f;
+    std::fill(dst, dst + KVAR_N_GROUP * side.head_slices, 0.0f);
 }
 
 static bool ggml_compute_forward_flash_attn_ext_kvarn(
@@ -12647,12 +12691,16 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
             const float mask_value = body_mask_row ?
                 slope * ggml_fp16_to_fp32(*(const ggml_fp16_t *)
                     ((const char *) body_mask_row + token * mask->nb[0])) : 0.0f;
+            std::array<float, 4*KVAR_N_GROUP> k_values;
+            std::array<float, 4*KVAR_N_GROUP> v_values;
+            kvarn_cpu_attn_load_row(k, token, kv_head, body_stream, k_values.data());
+            kvarn_cpu_attn_load_row(v, token, kv_head, body_stream, v_values.data());
             consume(mask_value,
                 [&](int64_t dim) {
-                    return kvarn_cpu_attn_load(k, token, kv_head, body_stream, dim);
+                    return k_values[size_t(dim)];
                 },
                 [&](int64_t dim) {
-                    return kvarn_cpu_attn_load(v, token, kv_head, body_stream, dim);
+                    return v_values[size_t(dim)];
                 });
         }
 

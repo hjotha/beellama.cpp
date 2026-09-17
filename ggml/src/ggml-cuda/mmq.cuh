@@ -286,9 +286,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         return ggml_cuda_mmq_retag_config(ggml_cuda_mmq_get_config_ampere(config_type, J, fallback), type);
     }
 if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
-        return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+        return ggml_cuda_mmq_retag_config(ggml_cuda_mmq_get_config_pascal_dp4a(config_type, J, fallback), type);
     }
-    return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
+    return ggml_cuda_mmq_retag_config(ggml_cuda_mmq_get_config_pascal_older(config_type, J, fallback), type);
 }
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback) {
@@ -311,11 +311,11 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #ifdef BLACKWELL_MMA_AVAILABLE
     return ggml_cuda_mmq_retag_config(ggml_cuda_mmq_get_config_blackwell(config_type, J, fallback), type);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+    return ggml_cuda_mmq_retag_config(ggml_cuda_mmq_get_config_ampere(config_type, J, fallback), type);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
-    return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+    return ggml_cuda_mmq_retag_config(ggml_cuda_mmq_get_config_pascal_dp4a(config_type, J, fallback), type);
 #else
-    return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
+    return ggml_cuda_mmq_retag_config(ggml_cuda_mmq_get_config_pascal_older(config_type, J, fallback), type);
 #endif // BLACKWELL_MMA_AVAILABLE
 #endif // GGML_USE_HIP
     GGML_UNUSED_VARS(type, config_type, J, fallback);

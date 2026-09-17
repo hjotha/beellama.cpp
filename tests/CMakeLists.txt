@@ -4,6 +4,12 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
     add_test(
+        NAME test-save-load-state-result-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-save-load-state-result-static.py)
+    set_property(TEST test-save-load-state-result-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-release-workflow-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-workflow-static.py)
@@ -16,10 +22,28 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-release-cache-parent PROPERTY LABELS main)
 
     add_test(
+        NAME test-verify-windows-package
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-verify-windows-package.py)
+    set_property(TEST test-verify-windows-package PROPERTY LABELS main)
+
+    add_test(
         NAME test-backend-ops-seed-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-backend-ops-seed-static.py)
     set_property(TEST test-backend-ops-seed-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-metal-low-bit-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-metal-low-bit-static.py)
+    set_property(TEST test-metal-low-bit-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-arm-cpu-feats-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-arm-cpu-feats-static.py)
+    set_property(TEST test-arm-cpu-feats-static PROPERTY LABELS main)
 
     add_test(
         NAME test-cuda-graph-source-properties-static
@@ -93,6 +117,20 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-upstream-merge-keepers-static.py)
     set_property(TEST test-upstream-merge-keepers-static PROPERTY LABELS main)
 
+    foreach(meta_static_test IN ITEMS
+            meta-context-headroom
+            meta-gqa-split
+            meta-softmax-split
+            meta-host-boundary
+            dflash2-selector-placement
+            windows-meta-stack)
+        add_test(
+            NAME test-${meta_static_test}-static
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-${meta_static_test}-static.py)
+        set_property(TEST test-${meta_static_test}-static PROPERTY LABELS main)
+    endforeach()
+
     add_test(
         NAME test-kvarn-eager-workspace-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
@@ -106,10 +144,34 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-kvarn-rollback-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-kvarn-mtp-sharing-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-mtp-sharing-static.py)
+    set_property(TEST test-kvarn-mtp-sharing-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-kvarn-fit-fail-closed-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-fit-fail-closed-static.py)
+    set_property(TEST test-kvarn-fit-fail-closed-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-kvarn-port-safety-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-port-safety-static.py)
+    set_property(TEST test-kvarn-port-safety-static PROPERTY LABELS cuda)
+
+    add_test(
         NAME test-kvarn-hip-tail-capability-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-hip-tail-capability-static.py)
     set_property(TEST test-kvarn-hip-tail-capability-static PROPERTY LABELS hip)
+
+    add_test(
+        NAME test-cuda-binary-equivalence
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-binary-equivalence.py)
+    set_property(TEST test-cuda-binary-equivalence PROPERTY LABELS cuda)
 
     add_test(
         NAME test-kvarn-hip-runtime-validation
@@ -354,7 +416,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    llama_build(test-llama-archs.cpp)
+    llama_build_and_test(test-llama-archs.cpp)
+    llama_test(
+        test-llama-archs
+        NAME test-mtp-ubatch-sync
+        LABEL main
+        ARGS --test-mtp-ubatch-sync
+    )
+    llama_test(
+        test-llama-archs
+        NAME test-mtp-request-reset
+        LABEL main
+        ARGS --test-mtp-request-reset
+    )
     llama_test(
         test-llama-archs
         NAME test-mtp-kvarn-routing
@@ -415,10 +489,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
         test-save-load-state
+        NAME test-save-load-state-archs
         LABEL main
         ARGS --models "${MODEL_DIR}"
     )
-    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
     foreach(mode target prepare-failure)
         llama_test(
@@ -480,6 +555,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-mtp-bootstrap-native-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
     llama_build(test-fusion.cpp)
+    set_tests_properties(test-save-load-state-archs PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -526,6 +602,9 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-kv-history.cpp)
+target_include_directories(test-kv-history PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-kv-cache-tail.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-kv-cache-tail PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-kv-tail-request.cpp ../src/llama-kv-tail-request.cpp ../src/llama-kvarn.cpp)
@@ -533,6 +612,12 @@ target_include_directories(test-kv-tail-request PRIVATE ${PROJECT_SOURCE_DIR}/sr
 
 llama_build_and_test(test-fit-kvarn-tail.cpp ../common/fit-kvarn-tail.cpp)
 target_include_directories(test-fit-kvarn-tail PRIVATE ${PROJECT_SOURCE_DIR}/common)
+add_executable(test-meta-graph-reuse test-meta-graph-reuse.cpp)
+target_link_libraries(test-meta-graph-reuse PRIVATE ggml)
+llama_test(test-meta-graph-reuse)
+llama_test(test-meta-graph-reuse NAME test-meta-kvarn-graph-reuse ARGS kvarn)
+llama_test(test-meta-graph-reuse NAME test-meta-cuda-graph-reuse LABEL cuda ARGS cuda)
+llama_test(test-meta-graph-reuse NAME test-meta-kvarn-cuda-graph-reuse LABEL cuda ARGS kvarn-cuda)
 llama_build_and_test(test-kv-cache-placement.cpp ../src/llama-kv-cache-placement.cpp)
 target_include_directories(test-kv-cache-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
@@ -601,6 +686,8 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 # registered as an additional named test on the same target.
 llama_test(test-save-load-state NAME test-save-load-state-model LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state-model PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_test(test-save-load-state LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # QuantFactory packages the Apache-2.0 SmolLM2 base model at a pinned revision.
 # Its 64-element attention heads are compatible with standard q4_0 KV tails.

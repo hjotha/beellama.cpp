@@ -3,7 +3,6 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
-#include <array>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -560,7 +559,7 @@ std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
-void seq_pos_dec(llama_seq_id s, uint32_t i) {
+    void seq_pos_dec(llama_seq_id s, uint32_t i) {
         const auto n = seq_pos[s].erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);

@@ -1606,7 +1606,6 @@ static void common_params_xxlong_kvarn_normalize(common_params & params) {
             "--cache-type-k-xxlong",
             "--cache-type-v-xxlong");
 }
-
 static common_speculative_dm_controller common_speculative_dm_controller_from_name(const std::string & value) {
     if (value == "off") {
         return COMMON_SPECULATIVE_DM_CONTROLLER_OFF;
@@ -1661,6 +1660,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         common_params_draft_kvarn_normalize(ctx_arg.params);
         common_params_xlong_kvarn_normalize(ctx_arg.params);
         common_params_xxlong_kvarn_normalize(ctx_arg.params);
+        common_validate_draft_kvarn_mode(ctx_arg.params.speculative);
         ctx_arg.params.lr.init();
         common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
         ctx_arg.params.sampling.reasoning_budget_tracking =
@@ -5069,7 +5069,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "KVarN values require a supported draft-owned Qwen MTP context\n"
+            "KVarN values require one model-backed speculative mode with an owned draft KV cache\n"
             "(default: %s)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
             kv_cache_type_name(params.speculative.draft.cache_type_k)
@@ -5083,7 +5083,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "KVarN values require a supported draft-owned Qwen MTP context\n"
+            "KVarN values require one model-backed speculative mode with an owned draft KV cache\n"
             "(default: %s)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
             kv_cache_type_name(params.speculative.draft.cache_type_v)

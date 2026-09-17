@@ -19,8 +19,8 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-paged.h"
-#include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -479,17 +479,16 @@ static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
-if (cache_component.valid) {
+if (is_dsv4 && (std::regex_match(tensor_name, pattern_kv_cache) ||
+                std::regex_match(tensor_name, pattern_dsv4_state))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        if (cache_component.valid) {
             return get_tensor_config_impl(
                     ggml_backend_meta_split_axis(cache_component.split_axis),
                     "attn_output.weight");
         }
-
         if (is_dsv4) {
-            if (std::regex_match(tensor_name, pattern_kv_cache) ||
-                    std::regex_match(tensor_name, pattern_dsv4_state)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-            }
             if (std::regex_match(tensor_name, pattern_attn_sinks)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output_a.weight");
             }
@@ -511,13 +510,9 @@ if (cache_component.valid) {
             }
         }
 
-        // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
-        if (std::regex_match(tensor_name, pattern_idx_cache)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        }
-
-        // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
-        if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
+        // QSA's indexer cache and PLE convolution history are mirrored across tensor-split devices.
+        if (std::regex_match(tensor_name, pattern_idx_cache) ||
+                std::regex_match(tensor_name, pattern_ple_r_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
@@ -711,10 +706,18 @@ if (cache_component.valid) {
             const uint32_t n_gqa    = hparams.n_gqa(il);
             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
 
-            // to handle head sizes like 80, only increase granularity while it doesn't cause underutilization
+            // Increase quant-block granularity only while the resulting head-aligned split can
+            // still use every device. Checking the block size alone is insufficient for head
+            // sizes such as 80, where lcm(80, 32) would jump to 160.
             int64_t blck_size_perf = blck_size;
-            while (blck_size_perf < 128 && blck_size_perf*ud->n_devices < n_embd_q) {
-                blck_size_perf *= 2;
+            const int64_t n_embd_q_total = hparams.n_embd_k_gqa(il) * n_gqa;
+            while (blck_size_perf < 128) {
+                const int64_t blck_size_next = blck_size_perf * 2;
+                const int64_t granularity_next = std::lcm(n_embd_q, blck_size_next);
+                if (granularity_next * int64_t(ud->n_devices) > n_embd_q_total) {
+                    break;
+                }
+                blck_size_perf = blck_size_next;
             }
 
             const int64_t granularity_q    = std::lcm(n_embd_q, blck_size_perf);
@@ -2776,7 +2779,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
@@ -2797,9 +2800,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-                    // only the sparse-attention architectures use llama_memory_hybrid_idx
-                    // a null filter_idx means the GGUF has no indexer tensors
-                    llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                    llama_memory_hybrid::layer_filter_cb filter_idx = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
@@ -2818,13 +2819,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
-
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
                             filter_idx = [&](uint32_t il) {
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
                         }
+
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2856,7 +2856,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* SWA requested     */ params.kv_tail_tokens_swa_requested,
                             /* rollback reserve  */ params.kv_tail_rollback_tokens,
                             /* SWA native exact  */ params.kv_tail_native_exact_swa);
-                    } else if (cparams.kv_paged) {
+} else if (cparams.kv_paged) {
                         GGML_ASSERT(!cparams.kv_unified && "conflicting parameters: kv_unified cannot be used with kv_paged.");
                         GGML_ASSERT(cparams.n_ubatch == cparams.n_batch && "kv_paged requires n_ubatch == n_batch.");
                         LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_memory_hybrid_paged.\n", __func__, cparams.kv_paged);
@@ -2895,27 +2895,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.snapkv_retention,
                                 cparams.snapkv_budget_blocks);
                         }
-                    } else if (needs_mem_idx) {
-                        // sparse attention over a per-token indexer cache, in its own memory type
+                    } else if (needs_mem_idx && params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+                        // QSA's indexer mirrors the ordinary KV cell layout. The shared attention builder
+                        // remains authoritative for standard quantized caches and precision tails.
                         res = new llama_memory_hybrid_idx(
-                            /* model             */ *this,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
-                            /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                            /* n_seq_max         */ cparams.n_seq_max,
-                            /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* offload           */ cparams.offload_kqv,
-                            /* unified           */ cparams.kv_unified,
-                            /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            *this, params.type_k, params.type_v, !cparams.flash_attn,
+                            cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
+                            GGML_TYPE_F32, GGML_TYPE_F32,
+                            std::max((uint32_t) 1, cparams.n_seq_max), cparams.n_seq_max,
+                            cparams.n_rs_seq, cparams.n_ubatch, cparams.offload_kqv, cparams.kv_unified,
+                            std::move(filter_attn), std::move(filter_recr), std::move(filter_idx),
+                            params.kv_tail_tokens, params.kv_tail_type,
+                            params.kv_tail_tokens_requested, params.kv_tail_rollback_tokens);
                     } else {
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
                             std::unique_ptr<llama_memory_i> mem_attn;
@@ -2946,7 +2937,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.n_seq_max,
                                     cparams.n_rs_seq,
                                     filter_recr);
-                            res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
+                            if (needs_mem_idx) {
+                                res = new llama_memory_hybrid_idx(
+                                        *this, std::move(mem_attn), std::move(mem_recr),
+                                        params.type_k, params.type_v, !cparams.flash_attn,
+                                        cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
+                                        cparams.n_seq_max, cparams.n_ubatch,
+                                        cparams.offload_kqv, cparams.kv_unified, std::move(filter_idx));
+                            } else {
+                                res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
+                            }
                         } else {
                             res = new llama_memory_hybrid(
                                 /* model             */ *this,
@@ -3178,7 +3178,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_type,
                                     params.kv_tail_tokens_requested,
                                     false,
-                                    params.kv_tail_rollback_tokens);
+                                    params.kv_tail_rollback_tokens,
+                                    0,
+                                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP);
                             }
                         }
                         }

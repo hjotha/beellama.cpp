@@ -6490,8 +6490,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SET_ROWS:
             {
-if (op->src[0] == nullptr || op->src[1] == nullptr ||
-                    (op->src[1]->type != GGML_TYPE_I64 && op->src[1]->type != GGML_TYPE_I32)) {
+                if (op->src[0] == nullptr || op->src[1] == nullptr || op->type == GGML_TYPE_TQ2_0 ||
+                (op->src[1]->type != GGML_TYPE_I64 && op->src[1]->type != GGML_TYPE_I32)) {
                     return false;
                 }
                 if (op->src[3] == nullptr) {

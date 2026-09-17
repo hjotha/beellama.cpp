@@ -4654,8 +4654,7 @@ struct test_ssm_scan_rollback : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
@@ -4969,7 +4968,7 @@ struct test_mul_mat : public test_case {
     const std::array<int64_t, 4> per; // permutation of dimensions
     const int64_t k_v; // size of k in memory, resulting in a non-contiguous view for k_v > k, no view for k_v == 0
     const uint32_t o; // number of outputs
-const int64_t k_v_rhs; // optional RHS-only physical k; -1 preserves the shared k_v behavior
+    const int64_t k_v_rhs; // optional RHS-only physical k; -1 preserves the shared k_v behavior
     const size_t rhs_offset; // byte offset of the RHS view
     const bool src_overlap; // a and b are overlapping views of the same tensor
 
@@ -4981,7 +4980,7 @@ const int64_t k_v_rhs; // optional RHS-only physical k; -1 preserves the shared 
         if (rhs_offset != 0) {
             result += ",rhs_offset=" + std::to_string(rhs_offset);
         }
-        result += ",src_overlap=" + std::to_string(src_overlap);
+        result += ",src_overlap=" + std::to_string(int(src_overlap));
         return result;
     }
 
@@ -5011,7 +5010,8 @@ const int64_t k_v_rhs; // optional RHS-only physical k; -1 preserves the shared 
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, int64_t k_v_rhs = -1, size_t rhs_offset = 0, bool src_overlap = false)
+            int64_t k_v = 0, uint32_t o = 1, int64_t k_v_rhs = -1, size_t rhs_offset = 0,
+            bool src_overlap = false)
         : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o),
           k_v_rhs(k_v_rhs), rhs_offset(rhs_offset), src_overlap(src_overlap) {}
 
@@ -5026,6 +5026,7 @@ const int64_t k_v_rhs; // optional RHS-only physical k; -1 preserves the shared 
             GGML_ASSERT(k_v == 0); // not handled
             GGML_ASSERT(k_v_rhs == -1); // not handled
             GGML_ASSERT(rhs_offset == 0); // not handled
+            GGML_ASSERT(!src_overlap); // not handled
             GGML_ASSERT(!ggml_is_quantized(type_a) || per[0] == 0);
             GGML_ASSERT(!ggml_is_quantized(type_b) || per[0] == 0);
 
@@ -5051,6 +5052,8 @@ const int64_t k_v_rhs; // optional RHS-only physical k; -1 preserves the shared 
         } else if (src_overlap) {
             GGML_ASSERT(type_a == type_b);
             GGML_ASSERT(k_v == 0);
+            GGML_ASSERT(k_v_rhs == -1);
+            GGML_ASSERT(rhs_offset == 0);
 
             // a and b are interleaved views of the same tensor: (e.g. fused QKV in MiniMax-01)
             ggml_tensor * base = ggml_new_tensor_4d(ctx, type_a, 2*k, std::max(m, n), bs[0]*nr[0], bs[1]*nr[1]);
@@ -7865,7 +7868,7 @@ struct test_flash_attn_ext : public test_case {
     const int64_t n_kv_max;
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
             " n_tail=" + std::to_string(n_tail) + " tail_only=" + std::to_string(int(tail_only)) +
             " type_tail_k=" + ggml_type_name(type_tail_k) + " type_tail_v=" + ggml_type_name(type_tail_v) +
             " tail_interleaved=" + std::to_string(int(tail_interleaved)) +
@@ -7941,16 +7944,25 @@ struct test_flash_attn_ext : public test_case {
                         bool full_coverage_equivalence = false, bool split_equivalence = false,
                         int64_t n_tail_current = 0, bool segmented_equivalence = false,
                         float scale = 0.0f, int64_t n_tail_active = -1,
-                        int64_t n_tail_history_slots = 0,
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        int64_t n_tail_history_slots = 0, bool kv_view = true, bool v_is_view_of_k = false,
+                        int64_t n_kv_max = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
           tail_all_masked(tail_all_masked), canonical_body(canonical_body),
           full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
           n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
-          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots),
-          kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots), kv_view(kv_view),
+          v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+
+    test_flash_attn_ext(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                        bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
+                        ggml_type type_K, ggml_type type_V, std::array<int32_t, 4> permute,
+                        bool kv_view, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec,
+                             type_K, type_V, permute, 0, false, GGML_TYPE_F16, GGML_TYPE_COUNT,
+                             false, false, false, false, false, 0, false, 0.0f, -1, 0,
+                             kv_view, v_is_view_of_k, n_kv_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -10482,7 +10494,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 260, sizeof(float)));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, -1, 0, true));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
@@ -10548,10 +10560,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
     }
 
-test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
+    // Bee regression coverage for small, padded, and offset expert matrices.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 8, 2, false, 128, 8, 256, 257));
     test_cases.emplace_back(new test_mul_mat_id(
         GGML_TYPE_F16, GGML_TYPE_F32, 8, 2, false, 128, 8, 256, 260, sizeof(float)));
+
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
 
@@ -10863,7 +10877,7 @@ test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, 
         }
     }
 
-// Standard-cache exact BF16 tails are rotated in place during KV shifts.
+    // Standard-cache exact BF16 tails are rotated in place during KV shifts.
     // Keep focused forward/backward coverage here because test-rope is not
     // available in GGML_BACKEND_DL builds.
     test_cases.emplace_back(new test_rope(
@@ -10872,6 +10886,7 @@ test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, 
     test_cases.emplace_back(new test_rope(
         GGML_TYPE_BF16, {128, 4, 3, 1}, 128, GGML_ROPE_TYPE_NORMAL,
         512, 1.0f, 0.0f, 1.0f, false, 0, false, false));
+
     // rotated dims window at an offset (ggml_rope_set_offset), not supported for vision mode
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (bool fw : {true, false}) { // fw == forward
@@ -11205,6 +11220,18 @@ test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, 
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+    for (ggml_type type_KV : { GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1, GGML_TYPE_Q3_0,
+                               GGML_TYPE_Q3_1, GGML_TYPE_Q6_0, GGML_TYPE_Q6_1 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, type_KV, type_KV));
+    }
+    for (const auto & type_KV : {
+            std::pair{ GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 },
+            std::pair{ GGML_TYPE_Q3_0,  GGML_TYPE_Q3_1 },
+            std::pair{ GGML_TYPE_Q6_0,  GGML_TYPE_Q6_1 } }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, type_KV.first, type_KV.second));
+    }
     // Query-specific exact tails: isolate the tail partial, then exercise the
     // FP32 global-softmax merge with a quantized body partial.
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {2, 1}, 256, 2, true, false, 0, 0,
@@ -11264,7 +11291,7 @@ test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, 
         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 40, false,
         GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 8, false));
     // Exact-tail composite contract: every ordered F16/BF16 K/V pair.
-    for (const auto tail_types : {
+    for (const auto & tail_types : {
             std::pair{ GGML_TYPE_F16,  GGML_TYPE_F16  },
             std::pair{ GGML_TYPE_BF16, GGML_TYPE_BF16 },
             std::pair{ GGML_TYPE_F16,  GGML_TYPE_BF16 },

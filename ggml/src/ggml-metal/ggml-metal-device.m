@@ -1509,6 +1509,7 @@ static bool ggml_metal_is_std_cache_quant(enum ggml_type type) {
 
 static bool ggml_metal_is_set_rows_type(enum ggml_type type, bool has_bfloat) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+           type == GGML_TYPE_TQ2_0 ||
            (type == GGML_TYPE_BF16 && has_bfloat) || ggml_metal_is_std_cache_quant(type);
 }
 

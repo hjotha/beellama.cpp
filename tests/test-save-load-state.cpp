@@ -782,20 +782,20 @@ static bool test_kvarn_partial_checkpoint_history(
     if (kvarn_frame != std::string::npos) {
         std::memcpy(&version, checkpoint_b.data() + kvarn_frame + sizeof(uint32_t), sizeof(version));
     }
-    if (kvarn_frame == std::string::npos || version != 15) {
-        LOG_ERR("%s: expected KVarN partial checkpoint format v15, found v%u\n", __func__, version);
+    if (kvarn_frame == std::string::npos || version != 16) {
+        LOG_ERR("%s: expected KVarN partial checkpoint format v16, found v%u\n", __func__, version);
         return false;
     }
 
     auto corrupt = checkpoint_b;
-    const uint32_t unsupported_version = 16;
+    const uint32_t unsupported_version = 17;
     std::memcpy(corrupt.data() + kvarn_frame + sizeof(uint32_t), &unsupported_version, sizeof(unsupported_version));
     std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> corrupt_plan(
             llama_state_seq_prepare_data_ext(
                     context.get(), corrupt.data(), corrupt.size(), 0, partial_flags),
             llama_state_seq_restore_plan_free);
     if (corrupt_plan) {
-        LOG_ERR("%s: corrupt KVarN v15 frame produced a restore plan\n", __func__);
+        LOG_ERR("%s: corrupt KVarN v16 frame produced a restore plan\n", __func__);
         return false;
     }
     if (llama_state_seq_set_data_ext(
@@ -1118,6 +1118,13 @@ static bool test_seq_rm_isolated(
     }
 
     LOG("\n=== Test 2: sequence removal isolation ===\n");
+
+    // Diffusion architectures do not use persistent sequence memory. There is
+    // consequently no state for one sequence to corrupt when another is removed.
+    if (!llama_get_memory(ctx.get())) {
+        LOG("PASS (no persistent sequence memory)\n");
+        return true;
+    }
 
     const size_t n_tokens = tokens.size() < 128 ? tokens.size() : 128;
     for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
@@ -1600,7 +1607,7 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
         auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
         if (!ctx) {
             LOG_ERR("%s: failed to create prompt-tokenization context\n", __func__);
-            return 1;
+            return false;
         }
         tokens = common_tokenize(ctx.get(), params.prompt, true);
     }
@@ -1613,31 +1620,31 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
         return false;
     }
     if (!test_kvarn_partial_checkpoint_history(model, params, tokens)) {
-        return 1;
+        return false;
     }
     if (!test_kvarn_unified_capacity(model, params, tokens)) {
-        return 1;
+        return false;
     }
     if (!test_kvarn_unified_reuses_freed_groups(model, params, tokens)) {
-        return 1;
+        return false;
     }
 
     if (!test_tail_state_contract(model, params, tokens)) {
-        return 1;
+        return false;
     }
     if (!test_cross_ubatch_tail_state(model, params, tokens, 128, 512) ||
             !test_cross_ubatch_tail_state(model, params, tokens, 512, 128)) {
-        return 1;
+        return false;
     }
     if (!test_tail_copy_is_immediately_saveable(model, params, tokens, true) ||
             !test_tail_copy_is_immediately_saveable(model, params, tokens, false)) {
-        return 1;
+        return false;
     }
     if (!test_tail_state_v1_compatibility(model, params)) {
-        return 1;
+        return false;
     }
     if (!test_kvarn_full_window_native_exact(model, params, tokens)) {
-        return 1;
+        return false;
     }
     // Test 2: sequence removal isolation
     if (!test_seq_rm_isolated(model, params, tokens)) {

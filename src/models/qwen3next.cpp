@@ -246,8 +246,8 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
     // Qwen3Next uses a single Q projection that outputs query + gate
     auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
             n_embd_head * 2, n_head,
-            n_embd_head,     n_head_kv,
-            n_embd_head,     n_head_kv,
+            n_embd_head,     n_head_kv_il,
+            n_embd_head,     n_head_kv_il,
             il, false);
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
@@ -266,8 +266,8 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], n_embd_head * ggml_element_size(Qcur_full));
     cb(gate, "gate", il);
 
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);
 
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);

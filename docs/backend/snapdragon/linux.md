@@ -90,4 +90,3 @@ Alternatively, you can run the binary directly on the device:
 ```
 $ ./bin/llama-cli -m Llama-3.2-3B-Instruct-Q4_0.gguf --device HTP0 -ngl 99 -p "what is the most popular cookie in the world?"
 ```
-

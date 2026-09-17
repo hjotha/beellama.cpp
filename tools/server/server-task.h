@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "server-loop-guard.h"
 
 #include <string>
 #include <functional>
@@ -25,6 +26,48 @@ static inline bool server_speculative_rollback_requires_checkpoint(
         size_t                     proposed_rollback) {
     return type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
           (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && proposed_rollback > max_rollback);
+}
+
+static inline llama_pos server_speculative_draft_rollback_p0(
+        llama_pos checkpoint_position, llama_pos target_pos_max) {
+    return checkpoint_position > 0 ? checkpoint_position : target_pos_max + 1;
+}
+
+enum server_speculative_draft_rollback_result {
+    SERVER_SPECULATIVE_DRAFT_ROLLBACK_EXACT,
+    SERVER_SPECULATIVE_DRAFT_ROLLBACK_WIDENED,
+    SERVER_SPECULATIVE_DRAFT_ROLLBACK_CLEARED,
+    SERVER_SPECULATIVE_DRAFT_ROLLBACK_FAILED,
+};
+
+struct server_speculative_draft_rollback_io {
+    std::function<bool(llama_pos, llama_pos, llama_pos &, llama_pos &)> plan;
+    std::function<bool(llama_pos, llama_pos)> remove;
+};
+
+static inline server_speculative_draft_rollback_result server_speculative_draft_rollback(
+        llama_pos requested_p0,
+        const server_speculative_draft_rollback_io & io,
+        llama_pos & applied_p0) {
+    applied_p0 = requested_p0;
+    if (io.remove(requested_p0, -1)) {
+        return SERVER_SPECULATIVE_DRAFT_ROLLBACK_EXACT;
+    }
+
+    llama_pos planned_p0 = requested_p0;
+    llama_pos planned_p1 = -1;
+    if (io.plan && io.plan(requested_p0, -1, planned_p0, planned_p1) &&
+            planned_p0 >= 0 && planned_p1 < 0 && planned_p0 < requested_p0 &&
+            io.remove(planned_p0, planned_p1)) {
+        applied_p0 = planned_p0;
+        return SERVER_SPECULATIVE_DRAFT_ROLLBACK_WIDENED;
+    }
+
+    if (io.remove(-1, -1)) {
+        applied_p0 = -1;
+        return SERVER_SPECULATIVE_DRAFT_ROLLBACK_CLEARED;
+    }
+    return SERVER_SPECULATIVE_DRAFT_ROLLBACK_FAILED;
 }
 
 // Some memory layouts need a durable checkpoint even when ordinary attention
@@ -388,9 +431,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     int32_t reasoning_output_tokens = 0;
     int32_t visible_output_tokens = 0;
-    bool loop_guard_triggered = false;
-    std::string loop_guard_action;
-    std::string loop_guard_reason;
+    server_loop_guard_telemetry loop_guard_event;
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
@@ -563,7 +604,7 @@ struct server_task_result_metrics : server_task_result {
     };
     std::string to_metrics();
 
-    uint64_t n_tokens_predicted  = 0;
+uint64_t n_tokens_predicted  = 0;
     uint64_t t_tokens_generation = 0;
 
     uint64_t n_decode_total     = 0;
@@ -719,6 +760,10 @@ static inline server_prompt_reuse_plan server_prompt_plan_reuse(
     return result;
 }
 
+inline bool server_draft_context_owns_state(bool has_draft_context, bool draft_memory_is_shared) {
+    return has_draft_context && !draft_memory_is_shared;
+}
+
 struct server_prompt_cache_state_io {
     bool has_draft;
     bool has_speculative;
@@ -741,6 +786,26 @@ struct server_prompt_restore_transaction_io {
     std::function<void(server_prompt_state_kind)> commit;
 };
 
+enum server_prompt_restore_reason {
+    SERVER_PROMPT_RESTORE_NONE,
+    SERVER_PROMPT_RESTORE_INVALID_IO,
+    SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE,
+    SERVER_PROMPT_RESTORE_PREPARE_REJECTED,
+};
+
+struct server_prompt_restore_result {
+    bool success = false;
+    bool has_component = false;
+    server_prompt_state_kind component = SERVER_PROMPT_STATE_MAIN;
+    server_prompt_restore_reason reason = SERVER_PROMPT_RESTORE_NONE;
+};
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
+        server_prompt_state_view target,
+        server_prompt_state_view draft,
+        server_prompt_state_view speculative,
+        const server_prompt_restore_transaction_io & io);
+
 bool server_prompt_restore_transaction(
         server_prompt_state_view target,
         server_prompt_state_view draft,
@@ -748,6 +813,19 @@ bool server_prompt_restore_transaction(
         const server_prompt_restore_transaction_io & io);
 
 bool server_prompt_restore_transaction(
+        llama_context * target,
+        llama_context * draft,
+        common_speculative * speculative,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        server_prompt_state_view target_state,
+        server_prompt_state_view draft_state,
+        server_prompt_state_view speculative_state,
+        bool restore_target,
+        bool restore_draft,
+        bool restore_speculative);
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         llama_context * target,
         llama_context * draft,
         common_speculative * speculative,

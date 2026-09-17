@@ -148,8 +148,11 @@ def main() -> None:
     )[1].split("llama_model * model = llama_model_load_from_file", 1)[0]
     if "common_fit_params(" not in fit_callsite:
         raise AssertionError("common init no longer invokes upstream parameter fitting")
-    if "fit_status" in fit_callsite or "failed to fit parameters with exact Bee validation" in fit_callsite:
+    if "fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS" in fit_callsite or \
+            "failed to fit parameters with exact Bee validation" in fit_callsite:
         raise AssertionError("common init hard-fails an advisory upstream fit conflict")
+    if "fit_status == COMMON_PARAMS_FIT_STATUS_UNSAFE_EXTRA" not in fit_callsite:
+        raise AssertionError("unsafe KVarN extra-context measurements do not fail closed")
 
     server_tests = (ROOT / "tests/test-server-prompt-checkpoint.cpp").read_text(encoding="utf-8")
     for regression in (
@@ -172,7 +175,7 @@ def main() -> None:
         raise AssertionError("standard exact-tail device restore does not use the device tensor protocol")
 
     state_v2_installer = state_cache_source.split(
-        "void llama_kv_cache::state_v2_read_payload_and_install(", 1
+        "llama_kv_cache::state_v2_read_payload_and_install(", 1
     )[1].split("void llama_kv_cache::state_write(", 1)[0]
     if "if (manifest.body_only)" not in state_v2_installer:
         raise AssertionError("v2 state restore does not distinguish an explicit body-only frame")
@@ -269,6 +272,49 @@ def main() -> None:
         raise AssertionError("standard-tail source is not independently listed in src/CMakeLists.txt")
 
     cache_source = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+    prepare_body = cache_source.split(
+        "llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(", 1
+    )[1].split("llama_kv_memory_stats llama_kv_cache::kv_memory_stats", 1)[0]
+    if "tail_preparing_guard" not in prepare_body or "std::rethrow_exception(prepare_error)" not in prepare_body:
+        raise AssertionError("KV prepare can poison or mutate planning state when planning throws")
+
+    seq_cp_body = cache_source.split("void llama_kv_cache::seq_cp(", 1)[1].split(
+        "bool llama_kv_cache::seq_keep", 1
+    )[0]
+    if seq_cp_body.count("materialize_pending_copies();") < 3:
+        raise AssertionError("same-stream sequence copy leaves a pending tail transaction")
+
+    speculative_restore = server_context.split(
+        "// speculative decoding - main model sample and accept", 1
+    )[1].split("const int64_t t_now", 1)[0]
+    if "true, use_ckpt_dft, true" not in speculative_restore:
+        raise AssertionError("speculative rollback restores an uncaptured draft checkpoint")
+
+    lost_sequence = server_context.split("if (pos_min == -1)", 1)[1].split(
+        "// when the prompt prefix does not match", 1
+    )[0]
+    if "GGML_ABORT" in lost_sequence or "slot.release()" not in lost_sequence:
+        raise AssertionError("lost per-slot KV state can still abort or poison the server")
+
+    decode_failure = server_context.split("if (ret != 0)", 1)[1].split(
+        "// retry with half the batch size", 1
+    )[0]
+    if "batch_view.seq_id[0]" not in decode_failure or "return true" not in decode_failure:
+        raise AssertionError("attributable one-token decode failure still cancels unrelated slots")
+
+    decode_body = server_context.split("bool decode(int32_t & n_batch", 1)[1].split(
+        "void post_decode", 1
+    )[0]
+    if "llama_synchronize(ctx_tgt);" not in decode_body:
+        raise AssertionError("server exposes asynchronous target KV updates")
+
+    context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
+    context_decode = context_source.split("llama_context::decode(const llama_batch & batch_inp)", 1)[1].split(
+        "llama_context::encode", 1
+    )[0]
+    if "cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP" not in context_decode or "synchronize();" not in context_decode:
+        raise AssertionError("MTP decode exposes asynchronous draft KV updates")
+
     constructor = cache_source.split("llama_kv_cache::llama_kv_cache(", 1)[1].split(
         "void llama_kv_cache::clear(bool data)", 1
     )[0]
@@ -284,6 +330,8 @@ def main() -> None:
         raise AssertionError("exact-shadow allocation must be guarded by the overlay storage plan")
     if "tail_plan.kind == LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" not in cache_source:
         raise AssertionError("raw standard cache lacks the native-exact storage route")
+    if "!storage_request.already_exact" not in constructor:
+        raise AssertionError("already-exact bodies must not acquire an attached-tail execution route")
     if "model.split_mode()" in constructor:
         raise AssertionError("standard overlay placement still uses CLI split mode instead of realized body storage")
     standard_order = [
@@ -296,6 +344,8 @@ def main() -> None:
         raise AssertionError("standard cache must validate its realized meta split before allocating tail metadata/tensors")
     if "realized %s body uses a tensor/meta split buffer" in constructor:
         raise AssertionError("standard precision tails still reject a valid upstream tensor/meta owner")
+    if "for (const auto & [il, il_share] : shared_layer_ids)" in constructor:
+        raise AssertionError("C++17 code must not capture structured-binding names in the shared-tail route lambda")
 
     model_source = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
     placement_header = (ROOT / "src/llama-kv-cache-placement.h").read_text(encoding="utf-8")
@@ -311,8 +361,15 @@ def main() -> None:
         raise AssertionError("upstream split callback does not consume the typed cache component adapter")
     if "handle_kvarn_cache" not in meta_source:
         raise AssertionError("meta dispatch does not preserve KVarN's sharded payload state")
-    if "cgraph_ij->uid = 0" not in meta_source:
-        raise AssertionError("projected meta graphs must declare that they have no stable identity")
+    for marker in (
+        "projection_matches(cgraph)",
+        "graph_snapshot.push_back({tensor, *tensor})",
+        "cgraph_ij->uid = ggml_graph_next_uid()",
+    ):
+        if marker not in meta_source:
+            raise AssertionError(
+                f"projected meta graphs lack property-safe executable identity: missing {marker}"
+            )
     cuda_graph_source = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
     cuda_graph_compatibility = cuda_graph_source.split(
         "static bool ggml_cuda_graph_check_compability", 1
@@ -328,10 +385,34 @@ def main() -> None:
     context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_resolve_groups" not in context_source or "config.automatic ? automatic_standard : true" not in context_source:
         raise AssertionError("automatic and explicit group resolution are not separated at context construction")
+    decline_block = context_source.split("if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0)", 1)[1].split(
+        "if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED && !tail_request_resolved)", 1
+    )[0]
+    if "cparams.offload_kqv ? model.dev_layer(il) : nullptr" not in decline_block:
+        raise AssertionError("KV-tail decline probe does not follow CPU placement for --no-kv-offload")
+    if "cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP" not in decline_block or "hparams.n_layer_all" not in decline_block:
+        raise AssertionError("KV-tail decline probe does not inspect the owned MTP layer range")
+    if ("params.ctx_other->get_cparams()" not in decline_block or
+            "shared_cparams.kv_tail_tokens" not in decline_block or
+            "shared_cparams.kv_tail_tokens_swa" not in decline_block):
+        raise AssertionError("shared Gemma MTP tails do not preserve the target cache decision")
+    for reset in (
+        "cparams.kv_tail_native_exact = false",
+        "cparams.kv_tail_native_exact_swa = false",
+        "tail_request_resolved = false",
+    ):
+        if reset not in decline_block:
+            raise AssertionError(f"KV-tail decline leaves derived KVarN state stale: missing {reset}")
 
     iswa_source = (ROOT / "src/llama-kv-cache-iswa.cpp").read_text(encoding="utf-8")
     if "llama_kv_tail_storage_plan_for" in iswa_source or "LLAMA_KV_TAIL_STORAGE_NATIVE_EXACT" in iswa_source:
         raise AssertionError("iSWA wrapper must not override raw-cache representation planning")
+    full_coverage_branch = iswa_source.split(
+        "if ((is_swa_group && tail_native_exact_swa)", 1
+    )[1].split("// Structured KVarN records", 1)[0]
+    if ("is_swa_group ? type_k : tail_type" not in full_coverage_branch or
+            "is_swa_group ? type_v : tail_type" not in full_coverage_branch):
+        raise AssertionError("fully covered non-SWA KVarN windows must use exact body storage")
 
     ggml_cmake = (ROOT / "ggml/CMakeLists.txt").read_text(encoding="utf-8")
     cuda_cmake = (ROOT / "ggml/src/ggml-cuda/CMakeLists.txt").read_text(encoding="utf-8")
@@ -501,10 +582,10 @@ def main() -> None:
         raise AssertionError("non-native backends lack the bounded history/current composition route")
     if graph.count(
             "tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE &&\n"
-            "            !kvarn_plan.native_attention") != 2:
+            "            !kvarn_plan.native_attention && (arch != LLM_ARCH_DFLASH || cparams.causal_attn))") != 2:
         raise AssertionError(
-            "KVarN full/iSWA graphs do not fail closed to the generic tail oracle "
-            "outside the backend's bounded native query matrix")
+            "KVarN full/iSWA graphs must retain the generic backend-query fallback, "
+            "but preserve the validated native F16 tail merge for materialized non-causal DFlash")
 
     tail_build_calls = re.findall(r"build_attn_inp_tail\((?:(?!\);).)*\);", graph, re.DOTALL)[1:]
     if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):

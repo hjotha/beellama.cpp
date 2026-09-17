@@ -659,8 +659,6 @@ def test_router_dedup_cache_models():
         assert cache_id not in ids, "cache model should be hidden by global dedup"
     finally:
         os.remove(preset_path)
-
-
 def test_router_remote_preset():
     global server
     server.model_hf_repo = "ggml-org/test-preset-ci"

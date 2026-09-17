@@ -760,8 +760,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
+ggml_tensor * raw_tail = build_raw_tail(inp_attn, il);
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
-    ggml_tensor * raw_tail = build_raw_tail(inp_attn, il);
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il,
             raw_tail, raw_tail, inp_attn->get_kq_mask_tail(), nullptr);
     if (k_rot) {

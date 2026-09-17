@@ -7,14 +7,16 @@
 #include "speculative.h"
 
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <filesystem>
 #include <limits>
 #include <string>
 #include <vector>
 #include <sstream>
+#include <string>
 #include <unordered_set>
-#include <functional>
+#include <vector>
 
 #ifdef _WIN32
 #include <io.h>
@@ -603,7 +605,7 @@ params = common_params();
             params = common_params();
             const std::string option = key ? "--spec-draft-type-k" : "--spec-draft-type-v";
             const std::string value = "kvarn" + std::to_string(bits);
-            argv = {"binary_name", "-m", "model_file.gguf", option, value};
+            argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", option, value};
             assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
             const auto & draft = params.speculative.draft;
             assert(draft.cache_kvarn_bits_k == bits);
@@ -618,19 +620,19 @@ params = common_params();
     }
 
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2"};
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K4V2_G128);
     assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q4_0);
     assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q2_0S);
 
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "kvarn2", "--spec-draft-type-v", "kvarn4"};
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", "--spec-draft-type-k", "kvarn2", "--spec-draft-type-v", "kvarn4"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K2V4_G128);
 
     params = common_params();
-    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "turbo2_tcq", "--spec-draft-type-v", "turbo4"};
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-simple", "--spec-draft-type-k", "turbo2_tcq", "--spec-draft-type-v", "turbo4"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.kvarn.type == LLAMA_KVARN_K2V4_G128);
     assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q2_0S);
@@ -1054,7 +1056,7 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
     assert(false == dflash_parsed);
     assert(dflash_error.find("unknown speculative type: dflash") != std::string::npos);
 
-    for (const std::string & removed : {"copyspec", "suffix", "recycle"}) {
+    for (const std::string removed : {"copyspec", "suffix", "recycle"}) {
         params = common_params();
         argv = {"binary_name", "--spec-type", removed};
         bool parsed = true;
@@ -1163,7 +1165,7 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
 
-    {
+{
         common_params power_params;
         argv = {
             "binary_name",
@@ -1397,25 +1399,40 @@ static void test_draft_cache_configuration_is_independent() {
     assert(independent.kvarn.type == LLAMA_KVARN_K4V2_G128);
     assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
 
-    for (const auto unsupported : {
+    independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    draft = common_base_params_to_speculative(independent);
+    assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+
+    for (const auto supported : {
             COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
             COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
-            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
             COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK }) {
-        independent.speculative.types = { unsupported };
-        try {
-            (void) common_base_params_to_speculative(independent);
-            assert(false && "unsupported draft KVarN mode must fail closed");
-        } catch (const std::invalid_argument & error) {
-            const std::string message = error.what();
-            assert(message.find("draft KVarN") != std::string::npos);
-            assert(message.find(common_speculative_type_to_str(unsupported)) != std::string::npos);
-        }
+        independent.speculative.types = { supported };
+        draft = common_base_params_to_speculative(independent);
+        assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+        assert(draft.kv_tail_tokens == "0");
+        assert(draft.kv_tail_type == GGML_TYPE_F16);
     }
 
     independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
     draft = common_base_params_to_speculative(independent);
     assert(draft.kvarn.type == LLAMA_KVARN_K6V4_G128);
+
+    for (const char * unsupported : { "none", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache" }) {
+        common_params parsed;
+        std::vector<std::string> argv = {
+            "binary_name", "-m", "model.gguf", "--spec-type", unsupported,
+            "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn2",
+        };
+        std::vector<char *> argv_ptrs;
+        for (std::string & arg : argv) {
+            argv_ptrs.push_back(arg.data());
+        }
+        const std::string error = capture_stderr([&]() {
+            assert(!common_params_parse((int) argv_ptrs.size(), argv_ptrs.data(), parsed, LLAMA_EXAMPLE_SPECULATIVE));
+        });
+        assert(error.find("requires exactly one model-backed speculative mode") != std::string::npos);
+    }
 
     independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
     try {

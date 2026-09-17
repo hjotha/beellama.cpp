@@ -10877,9 +10877,6 @@ static void ggml_vk_kvarn_store(ggml_backend_vk_context * ctx, vk_context& subct
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(records->ne[2] % n_stream == 0);
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
-    if (swa) {
-        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single stream");
-    }
     const auto workspace = ggml_vk_kvarn_store_workspace_plan_for(
         dst, size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment));
 
@@ -21208,6 +21205,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_F16:
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q6_0:
+                    case GGML_TYPE_Q6_1:
+                    case GGML_TYPE_Q3_0:
+                    case GGML_TYPE_Q3_1:
+                    case GGML_TYPE_Q2_0S:
+                    case GGML_TYPE_Q2_1:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q4_1:

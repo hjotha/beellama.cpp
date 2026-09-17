@@ -39,7 +39,7 @@ def load_server_presets(request, configure_worker_port, tmp_path_factory):
     if os.environ.get("ADAPTIVE_HTTP_MODEL"):
         return
     if not _server_presets_loaded:
-        # serialize model downloads across parallel workers.
+# serialize model downloads across parallel workers.
         root_tmp_dir = tmp_path_factory.getbasetemp().parent
         with FileLock(str(root_tmp_dir / "load_all.lock")):
             ServerPreset.load_all()

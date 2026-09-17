@@ -3,6 +3,15 @@
 
 #include "ggml_type_ids.glsl"
 
+// BeeLlama KV-only formats (mirror ggml.h). These are not part of the
+// upstream ggml_type_ids.glsl set.
+#define GGML_TYPE_Q6_0   43u
+#define GGML_TYPE_Q6_1   44u
+#define GGML_TYPE_Q3_0   45u
+#define GGML_TYPE_Q3_1   46u
+#define GGML_TYPE_Q2_0S  47u
+#define GGML_TYPE_Q2_1   48u
+
 // Number of matrix elements per buffer block, derived from the K/V type spec
 // constant. F32 is treated as a vec4 "block" of 4 floats. F16 uses block size 1
 // and bypasses the dequant path entirely. Quants follow their ggml block sizes.
@@ -17,6 +26,12 @@ uint fa_block_elems(uint ty) {
         case GGML_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
         case GGML_TYPE_IQ4_NL: return uint(QUANT_K_IQ4_NL);
         case GGML_TYPE_BF16: return 1u;
+        case GGML_TYPE_Q6_0: return uint(QUANT_K_Q6_0);
+        case GGML_TYPE_Q6_1: return uint(QUANT_K_Q6_1);
+        case GGML_TYPE_Q3_0: return uint(QUANT_K_Q3_0);
+        case GGML_TYPE_Q3_1: return uint(QUANT_K_Q3_1);
+        case GGML_TYPE_Q2_0S: return uint(QUANT_K_Q2_0S);
+        case GGML_TYPE_Q2_1: return uint(QUANT_K_Q2_1);
         default:           return 1u;
     }
 }

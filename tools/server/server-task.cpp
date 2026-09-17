@@ -377,11 +377,20 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"tokens_cached",       n_tokens_cached},
         {"timings",             stats.to_json()},
     };
-    if (loop_guard_triggered) {
+    if (loop_guard_event.triggered) {
         res["loop_guard"] = json {
             {"triggered", true},
-            {"action", loop_guard_action},
-            {"reason", loop_guard_reason},
+            {"region", loop_guard_event.region},
+            {"detector", loop_guard_event.detector},
+            {"period", loop_guard_event.period},
+            {"coverage", loop_guard_event.coverage},
+            {"score", loop_guard_event.score},
+            {"interventions", loop_guard_event.interventions},
+            {"action", loop_guard_event.action},
+            {"decoded_token_index", loop_guard_event.decoded_token_index},
+            {"token", loop_guard_event.token},
+            {"token_piece", loop_guard_event.token_piece},
+            {"reason", loop_guard_event.reason},
         };
     }
     if (!stream && !probs_output.empty()) {
@@ -1595,6 +1604,30 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "prompt_cache_admission_attempts_total",
+            "Total immutable RAM prompt-cache admission attempts",
+            (double) metrics.prompt_cache_admission_attempts
+        }, {
+            "prompt_cache_admission_successes_total",
+            "Total immutable RAM prompt-cache admissions",
+            (double) metrics.prompt_cache_admission_successes
+        }, {
+            "prompt_cache_admission_failures_total",
+            "Total rejected RAM prompt-cache admissions",
+            (double) metrics.prompt_cache_admission_failures
+        }, {
+            "prompt_cache_restore_attempts_total",
+            "Total transactional RAM prompt-cache restore attempts",
+            (double) metrics.prompt_cache_restore_attempts
+        }, {
+            "prompt_cache_restore_successes_total",
+            "Total committed RAM prompt-cache restores",
+            (double) metrics.prompt_cache_restore_successes
+        }, {
+            "prompt_cache_restore_failures_total",
+            "Total aborted RAM prompt-cache restores",
+            (double) metrics.prompt_cache_restore_failures
         },
     };
 
@@ -1619,6 +1652,34 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "kv_tail_requested_tokens",
+            "Configured exact-tail tokens currently requested across server slots and cache groups",
+            (double) metrics.kv_tail_requested
+        }, {
+            "kv_tail_exact_tokens",
+            "Exact-tail tokens currently covered across server slots and cache groups",
+            (double) metrics.kv_tail_exact
+        }, {
+            "kv_tail_complete_groups",
+            "Server slot cache groups with complete exact-tail coverage",
+            (double) metrics.kv_tail_complete_groups
+        }, {
+            "kv_tail_partial_groups",
+            "Server slot cache groups with partial exact-tail coverage",
+            (double) metrics.kv_tail_partial_groups
+        }, {
+            "kv_tail_none_groups",
+            "Server slot cache groups with no exact-tail coverage",
+            (double) metrics.kv_tail_none_groups
+        }, {
+            "kv_tail_degraded_sequences",
+            "Server slots reporting an explicit exact-tail degradation reason",
+            (double) metrics.kv_tail_degraded_sequences
+        }, {
+            "prompt_cache_accounted_bytes",
+            "Serialized RAM prompt-cache payload bytes, excluding container and allocator overhead",
+            (double) metrics.prompt_cache_accounted_bytes
         },
     };
 
@@ -1820,21 +1881,41 @@ bool server_prompt_cache::make_room(size_t bytes, const server_prompt_cache_stat
     }
 }
 
-bool server_prompt_restore_transaction(
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view target,
         server_prompt_state_view draft,
         server_prompt_state_view speculative,
         const server_prompt_restore_transaction_io & io) {
-    if ((io.restore_target && target.size == 0) ||
-            (io.restore_draft && draft.size == 0) ||
-            !io.prepare || !io.commit) {
-        return false;
+    if (!io.prepare || !io.commit) {
+        return { false, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_INVALID_IO };
+    }
+    if (io.restore_target && target.size == 0) {
+        return { false, true, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE };
+    }
+    if (io.restore_draft && draft.size == 0) {
+        return { false, true, SERVER_PROMPT_STATE_DRAFT, SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE };
     }
 
-    if ((io.restore_target && !io.prepare(SERVER_PROMPT_STATE_MAIN, target)) ||
-            (io.restore_draft && !io.prepare(SERVER_PROMPT_STATE_DRAFT, draft)) ||
-            (io.restore_speculative && !io.prepare(SERVER_PROMPT_STATE_SPECULATIVE, speculative))) {
-        return false;
+    const auto prepare = [&](bool enabled, server_prompt_state_kind kind, server_prompt_state_view state) {
+        if (enabled && !io.prepare(kind, state)) {
+            return server_prompt_restore_result {
+                false, true, kind, SERVER_PROMPT_RESTORE_PREPARE_REJECTED
+            };
+        }
+        return server_prompt_restore_result {
+            true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE
+        };
+    };
+    for (const auto & step : {
+            std::pair { io.restore_target, SERVER_PROMPT_STATE_MAIN },
+            std::pair { io.restore_draft, SERVER_PROMPT_STATE_DRAFT },
+            std::pair { io.restore_speculative, SERVER_PROMPT_STATE_SPECULATIVE } }) {
+        const server_prompt_state_view state = step.second == SERVER_PROMPT_STATE_MAIN ? target :
+                step.second == SERVER_PROMPT_STATE_DRAFT ? draft : speculative;
+        const auto result = prepare(step.first, step.second, state);
+        if (!result.success) {
+            return result;
+        }
     }
 
     // Speculative apply is prepared and no-fail. Memory commits likewise only
@@ -1848,10 +1929,18 @@ bool server_prompt_restore_transaction(
     if (io.restore_draft) {
         io.commit(SERVER_PROMPT_STATE_DRAFT);
     }
-    return true;
+    return { true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE };
 }
 
 bool server_prompt_restore_transaction(
+        server_prompt_state_view target,
+        server_prompt_state_view draft,
+        server_prompt_state_view speculative,
+        const server_prompt_restore_transaction_io & io) {
+    return server_prompt_restore_transaction_diagnostic(target, draft, speculative, io).success;
+}
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         llama_context * target,
         llama_context * draft,
         common_speculative * speculative,
@@ -1904,7 +1993,7 @@ bool server_prompt_restore_transaction(
             GGML_ASSERT(llama_state_seq_restore_plan_commit(plan.get()) == expected);
         },
     };
-    return server_prompt_restore_transaction(
+    return server_prompt_restore_transaction_diagnostic(
             target_state, draft_state, speculative_state, io);
 }
 
@@ -1918,6 +2007,24 @@ bool server_prompt_cache::reserve_transient(size_t bytes) {
     }
     transient_bytes += bytes;
     return true;
+}
+
+bool server_prompt_restore_transaction(
+        llama_context * target,
+        llama_context * draft,
+        common_speculative * speculative,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        server_prompt_state_view target_state,
+        server_prompt_state_view draft_state,
+        server_prompt_state_view speculative_state,
+        bool restore_target,
+        bool restore_draft,
+        bool restore_speculative) {
+    return server_prompt_restore_transaction_diagnostic(
+            target, draft, speculative, seq_id, flags,
+            target_state, draft_state, speculative_state,
+            restore_target, restore_draft, restore_speculative).success;
 }
 
 void server_prompt_cache::release_transient(size_t bytes) {

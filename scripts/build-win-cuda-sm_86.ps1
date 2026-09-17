@@ -1,9 +1,9 @@
 param(
     [string]$OutputDir = "release-packages",
-    [string]$PackageName = "build-win-cuda-13.1-sm_86",
-    [string]$BuildName = "build-win-cuda-13.1-sm_86",
+    [string]$PackageName = "build-win-cuda-sm_86",
+    [string]$BuildName = "build-win-cuda-sm_86",
     [string]$Target = "",
-    [int]$Parallel = 16,
+    [int]$Parallel = 24,
     [switch]$Package = $false,
     [switch]$StdQuantIteration = $false,
     [switch]$AllTests = $false,
@@ -16,7 +16,7 @@ $ProgressPreference = "SilentlyContinue"
 $env:MSBUILDDISABLENODEREUSE = "1"
 
 $repoRoot = $PSScriptRoot | Split-Path -Parent
-$cudaVer = "13.1"
+$cudaVer = "13.3"
 $cudaArch = "86" # RTX 3090 / GA102 / Ampere
 $cudaBase = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
 $cudaPath = Join-Path $cudaBase "v$cudaVer"
@@ -33,31 +33,8 @@ if (Test-Path $ninjaExe) {
     exit 1
 }
 
-# Ensure sccache (compiler cache) is on PATH so the GGML_CCACHE wiring activates and the baked
-# `sccache` launcher resolves at build time. Installed via `winget install Mozilla.sccache`.
-# Restrict the fallback search to the package directory: recursively walking every WinGet
-# package adds roughly fifteen minutes to every incremental target build on this host.
-$sccacheExe = Get-Command sccache.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $sccacheExe) {
-    $wingetPackages = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
-    $sccachePackage = Get-ChildItem $wingetPackages -Directory -Filter "Mozilla.sccache_*" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($sccachePackage) {
-        $sccacheExe = Get-ChildItem $sccachePackage.FullName -Recurse -Filter sccache.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    }
-}
-if ($sccacheExe) {
-    $env:PATH = "$($sccacheExe.DirectoryName);$env:PATH"
-    # A single CUDA template compilation can run for more than sccache's
-    # 10-minute default inactivity timeout. The server resets this timer on
-    # incoming requests, not compiler progress, and gives active compilers only
-    # 10 seconds after it expires. Keep a bounded but comfortably long timeout
-    # so fresh parallel CUDA builds cannot lose the daemon mid-compilation.
-    $env:SCCACHE_IDLE_TIMEOUT = "7200"
-    Write-Host "[ENV] sccache on PATH: $($sccacheExe.FullName)"
-    Write-Host "[ENV] sccache idle timeout: $($env:SCCACHE_IDLE_TIMEOUT)s"
-} else {
-    Write-Host "[WARN] sccache.exe not found under WinGet packages; compiler cache disabled"
-}
+# sccache 0.16.0 is incompatible with CUDA 13.3 nvcc: it can lose the generated
+# PTX file during fatbinary creation. Keep CUDA compilation uncached for this toolkit.
 
 # Ensure vswhere.exe is locatable; vcvarsall.bat calls it and the script aborts under
 # -ErrorAction Stop when it is not on PATH. Standard Visual Studio Installer location.
@@ -106,12 +83,13 @@ $buildDir = Join-Path $repoRoot $BuildName
 $pkgDir = Join-Path $repoRoot "$OutputDir\$PackageName"
 $binDir = Join-Path $buildDir "bin"
 
-# Same release flags as build-release.ps1, narrowed to CUDA 13.1 + RTX 3090 only.
+# Same release flags as build-release.ps1, narrowed to CUDA 13.3 + RTX 3090 only.
 # Ninja generator avoids MSBuild CUDA targets interference (lets us pick nvcc per toolkit).
 $commonFlags = @(
     "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DGGML_CUDA=ON",
+    "-DGGML_CCACHE=OFF",
     "-DGGML_CUDA_FA_ALL_QUANTS=ON",
     "-DGGML_CUDA_KVARN=$(if ($StdQuantIteration) { 'OFF' } else { 'ON' })",
     "-DGGML_CUDA_CUB_3DOT2=ON",
@@ -132,7 +110,7 @@ if ($AllTests) {
 }
 
 Write-Host "========================================"
-Write-Host "BeeLlama.cpp Windows CUDA 13.1 sm_86 Build"
+Write-Host "BeeLlama.cpp Windows CUDA 13.3 sm_86 Build"
 Write-Host "CUDA:    $cudaVer"
 Write-Host "Arch:    sm_$cudaArch"
 Write-Host "Build:   $buildDir"

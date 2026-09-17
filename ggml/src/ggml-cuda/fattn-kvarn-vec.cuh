@@ -33,7 +33,9 @@ ggml_cuda_fattn_kvarn_vec_resolve(
             return ref;
         }
         bool explicitly_staged;
-        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(desc, encoded, explicitly_staged);
+        int assigned_slot = -1;
+        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(
+                desc, encoded, explicitly_staged, &assigned_slot);
         group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
         ref.pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
         const bool from_stage = explicitly_staged ||
@@ -42,11 +44,8 @@ ggml_cuda_fattn_kvarn_vec_resolve(
             ggml_cuda_fattn_kvarn_group_from_record(desc, group));
         if (from_stage) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_STAGE;
-            const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
-            ref.stage_pos = desc.swa ?
-                (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos :
-                stage_base + (group == 0 ? ref.pos : GGML_CUDA_FATTN_KVARN_DIM +
-                    ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + ref.pos);
+            ref.stage_pos = ggml_cuda_fattn_kvarn_stage_pos(
+                    desc, group, ref.pos, assigned_slot);
         } else if (from_record) {
             ref.source = GGML_CUDA_FATTN_KVARN_VEC_RECORD;
             ref.record_group = desc.swa ? group % desc.groups_per_stream :
@@ -326,7 +325,7 @@ static void ggml_cuda_fattn_kvarn_vec_launch_tps(
 
 template<int D, int K_BITS, int V_BITS>
 void ggml_cuda_fattn_kvarn_vec_launch(const ggml_cuda_fattn_kvarn_decode_args & args) {
-    switch (ggml_cuda_fattn_kvarn_vec_tokens_per_split()) {
+    switch (args.split_tokens) {
         case 8:
             ggml_cuda_fattn_kvarn_vec_launch_tps<D, 8, K_BITS, V_BITS>(args);
             break;
@@ -340,13 +339,15 @@ void ggml_cuda_fattn_kvarn_vec_launch(const ggml_cuda_fattn_kvarn_decode_args & 
             GGML_ABORT("invalid KVarN vec token partition");
     }
 
+    static const ggml_cuda_fattn_kvarn_decode_combine_kernel_t combine_kernel =
+        ggml_cuda_fattn_kvarn_decode_combine_get_kernel<D>();
     const dim3 blocks_combine(
         (uint32_t) args.n_q_heads, 1, (uint32_t) args.n_stream);
     const int nbytes_shared_combine = args.n_splits * (int) sizeof(float);
-    // Same combine kernel as the MMA decode path: raise the dynamic-shared-mem
-    // limit to the device opt-in max so larger n_splits launches succeed.
-    ggml_cuda_fattn_kvarn_decode_combine_prepare<D>(nbytes_shared_combine);
-    ggml_cuda_fattn_kvarn_decode_combine_kernel<D>
+    // Same canonical combine kernel as the MMA decode path: preserve vec
+    // decode's direct single-query launch without a per-token host wrapper.
+    ggml_cuda_fattn_kvarn_decode_combine_prepare<D>(combine_kernel, nbytes_shared_combine);
+    combine_kernel
         <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS,
             nbytes_shared_combine, args.stream>>>(
             args.partial, args.partial_meta, args.dst, args.dst_meta,
