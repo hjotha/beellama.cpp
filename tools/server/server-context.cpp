@@ -9237,7 +9237,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // next responses are streamed
         // to be sent immediately
         json first_result_json = first_result->to_json();
-        if (first_result_json == nullptr) {
+        if (first_result_json.is_null()) {
             res->data = ""; // simply send HTTP headers and status code
         } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
             res->data = format_anthropic_sse(first_result_json);
