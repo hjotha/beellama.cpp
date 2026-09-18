@@ -1,6 +1,6 @@
-# BeeLlama v0.4.3 features
+# BeeLlama v0.4.7 features
 
-BeeLlama v0.4.3 keeps a small fork surface on top of upstream llama.cpp. Use
+BeeLlama v0.4.7 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
@@ -11,7 +11,9 @@ for exact names, environment variables, defaults, and validation ranges.
 KVarN is Huawei's calibration-free, variance-normalized KV-cache quantizer,
 adapted here for llama.cpp. It applies a per-head Hadamard rotation after RoPE,
 normalizes both axes of each 128-token tile, and stores structured 2-, 3-, 4-,
-5-, 6-, or 8-bit records with scale metadata. K and V widths are independent,
+5-, 6-, or 8-bit records with scale metadata. Logical 64-dimensional heads use
+true rectangular K records (64 x 128) and V records (128 x 64); wider heads
+retain the established 128 x 128 sliced-record ABI. K and V widths are independent,
 and supported Qwen 3.6 and Gemma 4 SWA layers can use a separate KVarN pair.
 Non-SWA layers keep the first 128 attention-sink tokens exact. Bee also keeps at
 least the newest 128 tokens exact, unlike the reference implementation's
@@ -139,15 +141,18 @@ GPUs, then falls back to a portable
 direct-record route when those matrix instructions are unavailable or the
 complete body-plus-tail request does not fit a specialized route. The portable
 CUDA route consumes rotated compressed records and attached F16 or BF16 tails
-directly for D128, D256, and D512 heads. Its correctness limit is not the
-specialized decode threshold of 16 queries, so prompt-sized query batches stay
-native instead of creating a full F32 KQ tensor.
+directly for D64, D128, D256, and D512 heads. CUDA D64 decode remains on that
+direct route at every KV length. Query batches above the backend's native
+rotated-query limit transiently materialize the rectangular records and use
+tiled FlashAttention. Persistent KVarN storage remains compressed, and the
+native exact-tail merge avoids a full F32 KQ tensor.
 
 ROCm/HIP selects between record-tiled split decode, eligible descriptor-native
 WMMA/MFMA, and the same portable direct-record kernel. Unsupported AMD matrix
 shapes remain on portable native attention instead of materializing the cache.
-CPU has a backend-native direct-record attention path. Vulkan directly consumes
-KVarN records and exact tails for supported D128, D256, and D512 shapes. Its
+CPU has a backend-native direct-record attention path, including D64. Vulkan directly consumes
+KVarN records and exact tails for supported D128, D256, and D512 shapes; D64
+remains fail-closed there pending rectangular shader qualification. Its
 standard-cache segmented route likewise consumes a quantized body, F16/BF16
 history, and current K/V with one online FP32 softmax. Explicit materialization
 remains a fallback for unsupported placements or shapes. Matrix-capable HIP and
@@ -170,13 +175,20 @@ correctness, memory behavior, or performance on that GPU.
 
 | HIP architecture | Physical wave | Native KVarN route |
 |---|---:|---|
-| RDNA3, RDNA3.5, RDNA4 | 32 | WMMA generic/prefill and occupancy-selected split decode |
+| RDNA3, RDNA3.5 | 32 | WMMA generic/prefill (D256 on fp32-accumulator tiles, qualified on gfx1100) and occupancy-selected split decode |
+| RDNA4 | 32 | WMMA generic/prefill up to D128; D256+ stays on portable direct-record attention until its fp32 tiles qualify |
 | CDNA1-CDNA4 | 64 | MFMA generic/prefill and physical-wave split decode |
 | Older GCN, RDNA1, RDNA2 | device default | Portable direct-record attention |
 
 CDNA fast routing is compiled and selected by capability but remains
 experimental until hardware parity and performance results are published.
 MUSA explicitly remains on the portable route.
+
+On HIP, Bee reports `integrated = false`, backing out the upstream APU
+zero-copy host-buffer path after async-execution corruption was observed
+(PPL 5.9243 -> 8.51+ without `HIP_LAUNCH_BLOCKING`). This changes APU
+tensor placement off host-mapped memory and therefore VRAM headroom; the
+trade-off is unmeasured (no APU hardware available).
 
 Set `GGML_KVARN_DEBUG_ROUTES=1` to log the selected CUDA/HIP route, compute
 capability, rotated/original domain, K/V bit widths, query and KV counts,

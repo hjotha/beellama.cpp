@@ -2965,7 +2965,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
-    if (!sinfo.group_stage_slots.empty()) {
+    // Ordinary mirrored caches (the qwen4exp QSA index cache) borrow the attention
+    // slot infos, KVarN-only allocation metadata included, but only a structured
+    // cache tracks post-allocation stage slots.
+    if (allocation_group_size > 1 && !sinfo.group_stage_slots.empty()) {
         GGML_ASSERT(sinfo.group_stage_slots.size() == allocation_group_stage_slots.size());
         allocation_group_stage_slots = sinfo.group_stage_slots;
     } else {
@@ -3636,6 +3639,13 @@ void llama_kv_cache::set_input_tail_idxs(ggml_tensor * dst, const llama_ubatch *
     GGML_ASSERT(uint32_t(dst->ne[1]) == tail_write_levels);
     GGML_ASSERT(tail_write_slots.size() == size_t(ubatch->n_tokens)*tail_write_levels);
     std::memcpy(dst->data, tail_write_slots.data(), tail_write_slots.size()*sizeof(int64_t));
+    if (has_compact_tail()) {
+        // A batch can recycle compact slots several times. The tail is updated
+        // after attention, so only the final occupant needs to be stored.
+        // Passing all writes to SET_ROWS races on both CPU and GPU backends.
+        llama_kv_tail_keep_last_writes(
+                static_cast<int64_t *>(dst->data), ubatch->n_tokens, tail_write_levels);
+    }
 }
 
 void llama_kv_cache::set_input_tail_body_idxs(ggml_tensor * dst) const {

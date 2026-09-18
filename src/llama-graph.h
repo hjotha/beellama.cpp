@@ -389,6 +389,7 @@ public:
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+    ggml_tensor * self_kvarn_rot_64  = nullptr;
     ggml_tensor * self_kvarn_rot_128 = nullptr;
     ggml_tensor * self_kvarn_rot_256 = nullptr;
     ggml_tensor * self_kvarn_rot_512 = nullptr;
@@ -613,6 +614,7 @@ public:
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+    ggml_tensor * self_kvarn_rot_64  = nullptr;
     ggml_tensor * self_kvarn_rot_128 = nullptr;
     ggml_tensor * self_kvarn_rot_256 = nullptr;
     ggml_tensor * self_kvarn_rot_512 = nullptr;

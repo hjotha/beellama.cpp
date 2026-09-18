@@ -29,7 +29,8 @@ std::string common_chat_template_direct_apply_impl(
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override = std::nullopt,
     const std::optional<json> & tools_override = std::nullopt,
-    const std::optional<json> & additional_context = std::nullopt);
+    const std::optional<json> & additional_context = std::nullopt,
+    std::vector<jinja::string_part> * out_parts = nullptr);
 
 // the suffix a template appends when add_generation_prompt is set
 std::string common_chat_template_generation_prompt_impl(

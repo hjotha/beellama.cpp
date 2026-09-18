@@ -1,4 +1,4 @@
-# BeeLlama v0.4.5 argument reference
+# BeeLlama v0.4.7 argument reference
 
 This page covers Bee-owned arguments and the upstream arguments whose behavior
 BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
@@ -8,7 +8,9 @@ limits, and measurement guidance.
 ## KVarN cache types and SWA overrides
 
 KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
-`kvarn8`. K and V may use different bit widths.
+`kvarn8`. K and V may use different bit widths. Logical 64-dimensional K/V heads are
+supported on the qualified CPU and CUDA routes with rectangular 64 x 128 K and
+128 x 64 V records. D128/D256/D512 retain their existing 128 x 128 record ABI.
 
 CUDA, ROCm/HIP, Vulkan, and CPU consume compressed KVarN records directly in
 native FlashAttention paths. Vulkan requires shader Int64 and
@@ -27,12 +29,35 @@ body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
 | `--cache-type-k-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_K_SWA` | Same as `--cache-type-k` | Overrides KVarN K precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the V override. |
 | `--cache-type-v-swa TYPE` | `LLAMA_ARG_CACHE_TYPE_V_SWA` | Same as `--cache-type-v` | Overrides KVarN V precision for SWA layers. Accepts only the six `kvarnN` values, requires target KVarN, and must be paired with the K override. |
 
-Draft KVarN is qualified on CUDA and the CPU reference route. It fails closed
-for DFlash, DSpark, Eagle3, draft-simple, shared Gemma 4 MTP, and MTP
-architectures outside the explicit owned-cache allowlist. For Gemma 4 MTP,
-select target KVarN with `--cache-type-k/v`; the assistant reads that shared
-persistent cache. Vulkan and HIP target KVarN support does not by itself qualify
-the draft-owned MTP route.
+Draft KVarN is runtime-qualified on CUDA for draft-simple, EAGLE3, the owned
+MTP allowlist, DFlash1/DFlash2, and non-MLA DSpark. The CPU reference route is qualified
+for owned MTP. Non-causal DFlash-family models keep KVarN persistent storage but
+use materialized attention; the direct record-consuming route is not enabled.
+DSV4/MLA DSpark is incompatible with KVarN's dense K/V representation and fails
+closed. Shared Gemma 4 MTP and MTP architectures outside the allowlist fail closed. For
+Gemma 4 MTP, select target KVarN with `--cache-type-k/v`; the assistant reads
+that shared persistent cache. HIP/ROCm and Vulkan DFlash-family draft KVarN
+remain unqualified until backend runtime tests pass. N-gram modes do not own a
+KV context and reject explicit KVarN `--spec-draft-type-k/v` selections during
+argument validation.
+
+CUDA multi-token KVarN prefill uses transient F16 K/V materialization windows.
+D64 uses this tiled route when a query batch exceeds the backend's native
+rotated-query limit. Decode remains record-native at every KV length.
+`GGML_KVARN_WINDOW_CHUNK` sets the positive token count per window and defaults
+to `65536`; missing, zero, and negative values use that default, while values
+above the active KV length are capped to that length. A smaller value reduces
+peak transient scratch for concurrent long prompts but adds partial-softmax
+merges and changes floating-point reduction order. It does not alter context or
+persistent KV-cache capacity.
+
+On HIP/ROCm, KVarN prompt prefill defaults to the F32-accumulator WMMA route
+on arches whose tiles accumulate in fp32 (RDNA3/gfx11); RDNA4 stays on the
+portable route until its fp32 tiles qualify. `GGML_KVARN_AMD_PROMPT_PORTABLE`
+opts a prompt back into portable-native direct-record attention: any nonzero
+value (conventionally `1`) selects portable, while unset, `0`, or
+non-numeric values keep the WMMA default. The check runs before the generic
+probe, so opting in does not pay for a discarded WMMA pass.
 
 ## KV cache precision tail for quantized caches
 
@@ -272,6 +297,14 @@ select the intended target explicitly with `CMAKE_CUDA_ARCHITECTURES` when the
 build host cannot detect it. Pre-Turing support remains runtime-unqualified
 until matching real devices pass the KVarN parity, memory, and model-smoke
 tests.
+
+## CUDA/HIP dequant matvec knobs
+
+| Env var | Default | Behavior |
+|---|---|---|
+| `GGML_CUDA_DQ_MMV` | Arch default (on for RDNA3.5) | `0` forces the K-quant dequant-float matvec off, `1` forces it on. Unset or anything else warns (when set) and keeps the arch default. |
+| `GGML_CUDA_DQ_Q6K` | Arch default (on for RDNA3.5) | Same `0`/`1`/arch-default semantics for the Q6_K dequant-float matvec arm. |
+| `GGML_CUDA_DQ_ROWS` | `1` | Rows per block for the dequant matvec kernels. Only `1`/`2`/`4`/`8` are instantiated; anything else warns and uses `1`. |
 
 ## Migration from earlier versions
 

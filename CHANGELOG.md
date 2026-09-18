@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.7
+
+- Added true rectangular KVarN storage and attention for 64-dimensional K/V heads, including 64x128 K records, 128x64 V records, WHT64 transforms, target and owned draft caches, full-context and iSWA routing, and F16/BF16 precision tails. Existing D128, D256, and D512 record layouts and state formats remain compatible, while unsupported backend placements continue to fail closed.
+- Optimized CUDA D64 KVarN with block-parallel quantization, batched workspace staging and commit, grouped materialization, split portable/GQA attention, and generated split-MMA decode kernels. Decode consumes compressed records directly at every KV length; prompt batches above the native rotated-query limit use transient tiled materialization. Packed K2/K4 decoding now handles odd indirect and SWA offsets without slowing aligned pairs.
+- Optimized CUDA D128 KVarN decode for low GQA with exact GQA2/GQA4 geometries, an eight-warp split-128 route with a measured shallow-context crossover, cooperative staging of complete packed records, and shared-word unpacking of adjacent 3-, 5-, and 6-bit values, raising occupancy and halving deep-context split/combine work.
+- Fixed tensor-split speculative graph reuse after Meta context growth. Resetting the rotating graph context now recreates every reserved subgraph slot, preventing stale graph pointers when speculative topology changes. Attention planning uses the query-token dimension, and the original four-argument KVarN planner symbol remains available for binary compatibility.
+- Fixed Qwen4Exp QSA serving on KVarN caches. Index-mirroring hybrid memories keep one attention row per physical cache cell, KVarN-only stage slots no longer reach the plain index cache, and state save/restore selects stage rows with the mapping the store actually uses.
+- Fixed a first-decode abort from stale scheduler hash entries after graph reserve and tensor probing: inserting into the hash set now invalidates the reset state, so the next reset always clears it.
+
+## v0.4.6
+
+- Updated the llama.cpp base from `57291f264` (`b10689`) to `465e49b9c` (`b10830`) and ggml to 0.23.0. Notable inherited changes include sparse FlashAttention for DeepSeek V4 and GLM, fused DFlash encoder injection, concurrent CUDA streams for multi-GPU splits, CUDA MoE reduction and FlashAttention improvements, faster KV-cell history lookup and state restoration, new Tencent Hunyuan 4 and Spark 2.5 model support, expanded DeepSeek V4 vision and Nemotron support, broader OpenCL/Metal/SYCL/Vulkan/Hexagon backend coverage, and upstream server, conversion, RPC, multimodal, and Web UI updates through that merge point.
+- Restored property-safe CUDA graph reuse for tensor splits. Projected Meta graphs now keep stable nonzero identities for standard and KVarN execution, while snapshots of reachable tensor metadata, graph roots, use counts, and operation parameters force rebuilding when executable properties change. Consumer synchronization and generation-scoped projected storage preserve asynchronous tensor lifetimes instead of relying on the broad UID-zero capture suppression introduced with sharded precision tails.
+- Restored the default CUDA KVarN prefill materialization window to 65,536 tokens, avoiding an additional floating-point partial-softmax merge through 64K contexts. Memory-constrained concurrent workloads can select a smaller transient window with `GGML_KVARN_WINDOW_CHUNK` without changing persistent cache capacity.
+
 ## v0.4.5
 
 - Added independently selectable KVarN caches for draft-owned Qwen3.5/Qwen3.6 dense and MoE MTP and standalone Qwen3.8/Qwen4Exp MTP sidecars. `--spec-draft-type-k/v` accept all six KVarN widths and preserve the intrinsic 128-token exact suffix without a draft-tail option. Target and draft cache settings are isolated, actual MTP cache layers drive capability checks, and unsupported, shared Gemma 4, and non-MTP routes fail closed instead of using the ordinary backing cache.
