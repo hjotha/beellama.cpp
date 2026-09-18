@@ -21,7 +21,7 @@ int main() {
     // No model tensors: exercise the same metadata cache used by structured caches.
     llama_kv_cache cache(*model, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
             false, false, true, 32, 2, 1, 0, LLAMA_SWA_TYPE_NONE,
-            nullptr, {}, {}, {}, 4, 2, GGML_TYPE_F16, 2, true, 0);
+            nullptr, {}, {}, {}, "", 4, 2, GGML_TYPE_F16, 2, true, 0);
     check(cache.has_compact_tail(), "fixture must use a compact tail");
     llama_kv_tail_layer_route route = {};
     route.capability.supported = true;
