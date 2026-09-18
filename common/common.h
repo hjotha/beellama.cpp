@@ -525,7 +525,15 @@ struct common_params {
     int32_t xlong_max_tokens      =     0; // adaptive context xlong threshold, 0 = ctx_size_xlong
     int32_t batch_size_xlong      =    64; // logical batch size for xlong profile
     int32_t ubatch_size_xlong     =    64; // physical batch size for xlong profile
+    int32_t batch_size_long       =   256; // logical batch size for long profile
+    int32_t ubatch_size_long      =   256; // physical batch size for long profile
     int32_t spec_draft_n_max_xlong =     0; // draft N for xlong profile (fixed at 0: MTP disabled)
+    enum ggml_type cache_type_k_long = GGML_TYPE_COUNT;
+    enum ggml_type cache_type_v_long = GGML_TYPE_COUNT;
+    int32_t cache_kvarn_bits_k_long = 0;
+    int32_t cache_kvarn_bits_v_long = 0;
+    llama_kvarn_params kvarn_long{};
+    int32_t kvarn_long_set = 0;
     enum ggml_type cache_type_k_xlong = GGML_TYPE_COUNT;
     enum ggml_type cache_type_v_xlong = GGML_TYPE_COUNT;
     int32_t cache_kvarn_bits_k_xlong = 0;

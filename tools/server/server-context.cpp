@@ -3072,6 +3072,13 @@ private:
     int32_t adaptive_cache_kvarn_bits_k_normal = 0;
     int32_t adaptive_cache_kvarn_bits_v_normal = 0;
 
+    int32_t adaptive_batch_long     = 256;
+    int32_t adaptive_ubatch_long    = 256;
+    ggml_type adaptive_cache_type_k_long = GGML_TYPE_Q4_0;
+    ggml_type adaptive_cache_type_v_long = GGML_TYPE_Q4_0;
+    llama_kvarn_params adaptive_kvarn_long{};
+    int32_t adaptive_cache_kvarn_bits_k_long = 0;
+    int32_t adaptive_cache_kvarn_bits_v_long = 0;
     int32_t adaptive_batch_xlong    = 64;
     int32_t adaptive_ubatch_xlong   = 64;
     int32_t adaptive_draft_n_xlong  = 0;
@@ -3203,8 +3210,13 @@ private:
             params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
         } else if (profile == COMMON_CONTEXT_PROFILE_LONG) {
             params_base.n_ctx = adaptive_long_ctx;
-            params_base.n_batch = adaptive_batch_normal;
-            params_base.n_ubatch = adaptive_ubatch_normal;
+            params_base.n_batch = adaptive_batch_long;
+            params_base.n_ubatch = adaptive_ubatch_long;
+            params_base.cache_type_k = adaptive_cache_type_k_long;
+            params_base.cache_type_v = adaptive_cache_type_v_long;
+            params_base.kvarn = adaptive_kvarn_long;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_long;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_long;
             params_base.cache_type_k = adaptive_cache_type_k_normal;
             params_base.cache_type_v = adaptive_cache_type_v_normal;
             params_base.kvarn = adaptive_kvarn_normal;
@@ -4349,6 +4361,18 @@ private:
             adaptive_cache_kvarn_bits_k_normal = params.cache_kvarn_bits_k;
             adaptive_cache_kvarn_bits_v_normal = params.cache_kvarn_bits_v;
 
+            adaptive_batch_long     = params.batch_size_long > 0 ? params.batch_size_long : 256;
+            adaptive_ubatch_long    = params.ubatch_size_long > 0 ? params.ubatch_size_long : 256;
+            adaptive_cache_type_k_long = params.cache_type_k_long != GGML_TYPE_COUNT
+                ? params.cache_type_k_long : params.cache_type_k;
+            adaptive_cache_type_v_long = params.cache_type_v_long != GGML_TYPE_COUNT
+                ? params.cache_type_v_long : params.cache_type_v;
+            adaptive_kvarn_long     = params.cache_type_k_long != GGML_TYPE_COUNT
+                ? params.kvarn_long : params.kvarn;
+            adaptive_cache_kvarn_bits_k_long = params.cache_type_k_long != GGML_TYPE_COUNT
+                ? params.cache_kvarn_bits_k_long : params.cache_kvarn_bits_k;
+            adaptive_cache_kvarn_bits_v_long = params.cache_type_v_long != GGML_TYPE_COUNT
+                ? params.cache_kvarn_bits_v_long : params.cache_kvarn_bits_v;
             adaptive_batch_xlong    = params.batch_size_xlong > 0 ? params.batch_size_xlong : 64;
             adaptive_ubatch_xlong   = params.ubatch_size_xlong > 0 ? params.ubatch_size_xlong : 64;
             adaptive_draft_n_xlong  = params.spec_draft_n_max_xlong;
