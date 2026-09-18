@@ -64,6 +64,28 @@ viável seria ~neutro (kvarn ~+10% sobre q4 ao mesmo ubatch). Decode kvarn é ma
 (23.9 vs 20.3 tps). Flag de investigação: por que o reserva do perfil long usa mais VRAM
 que o xxlong para a mesma geometria.
 
+## Sweep: maior contexto kvarn4 que cabe com ubatch 256 (3 tiers: s/m/kvarn)
+
+Teste isolado (8091, build com `--batch-size-l`/`--ubatch-size-l`/`--cache-type-k-l`),
+request = lctx-4096, output 4096, ubatch 256:
+
+| lctx (kvarn4) | resultado | prefillTPS | decodeTPS |
+|---|---|---|---|
+| 110592 | FAIL (compute pp buffers) | — | — |
+| 104448 | FAIL | — | — |
+| 103424 | crash (RemoteDisconnected) | — | — |
+| 102400 | **OK** | 617.6 | 20.5 |
+| 101376 | OK | 619.7 | 20.6 |
+| 99840 | OK | 603.1 | 20.7 |
+| 98304 | OK | 642.9 | 21.0 |
+| 92160 | OK | 657.6 | 22.1 |
+
+**Conclusão**: com 3 tiers (s 32k q4, m 56k q4, kvarn4 único) e ubatch 256, o maior contexto
+kvarn4 é **~102400 (100k)** — redução de ~10% vs o xxl atual (114688). O prefill fica em
+**~618–643 tps** (mesmo nível do tier l q4 638, e ~+63% vs o xxl ub64 de 379 tps); o decode
+~20.5–21 tps (similar ao q4, um pouco abaixo do kvarn ub64 de 23.9). Para manter 110k+ com
+kvarn4 é preciso ubatch 64 (o layout atual), aceitando prefill ~379 tps.
+
 ## Notas
 - O build mesclado para a geração em ~320 tokens (vs 4096 do r7) — comportamento de stop do reasoning pós-merge; não é falha da suíte (o cap era 4096, "máximo").
 - Linhas `*-prime`/`*-restore` sem campo `pass` aparecem como FAIL no resumo; os veredictos por teste (C-*-slot) são todos PASS.
