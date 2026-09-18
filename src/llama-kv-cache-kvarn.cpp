@@ -3669,8 +3669,8 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
         throw std::runtime_error("q4 conversion source exceeds the destination record ring");
     }
 
-    const size_t k_record_bytes = kvarn_record_bytes(params.key_bits);
-    const size_t v_record_bytes = kvarn_record_bytes(params.value_bits);
+    const size_t k_record_bytes = kvarn_record_bytes(KVAR_N_GROUP, params.key_bits, false);
+    const size_t v_record_bytes = kvarn_record_bytes(KVAR_N_GROUP, params.value_bits, true);
     const llama_kvarn_tile_layout k_layout = kvarn_convert_k_layout(params.key_bits);
     const llama_kvarn_tile_layout v_layout = kvarn_convert_v_layout(params.value_bits);
     if (k_layout.tile_bytes != k_record_bytes || v_layout.tile_bytes != v_record_bytes) {
