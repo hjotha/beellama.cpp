@@ -5202,6 +5202,23 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
+    std::random_device rd;
+    std::default_random_engine rng(rd());
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+            continue;
+        }
+        for (int64_t r = 0; r < ggml_nrows(t); r++) {
+            std::vector<int32_t> data(t->ne[0]);
+            for (int i = 0; i < t->ne[0]; i++) {
+                data[i] = i % n_mats;
+            }
+            std::shuffle(data.begin(), data.end(), rng);
+            ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+        }
+    }
+}
+
 // sign flip + reshape + FWHT-hint matmul, the fusable Hadamard activation path
 struct test_fwht_signed : public test_case {
     const int64_t blk;
@@ -5267,23 +5284,6 @@ struct test_fwht_signed : public test_case {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-        if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
-            continue;
-        }
-        for (int64_t r = 0; r < ggml_nrows(t); r++) {
-            std::vector<int32_t> data(t->ne[0]);
-            for (int i = 0; i < t->ne[0]; i++) {
-                data[i] = i % n_mats;
-            }
-            std::shuffle(data.begin(), data.end(), rng);
-            ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
-        }
-    }
-}
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
