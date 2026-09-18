@@ -22,11 +22,13 @@ Prompt A = contexto no limite (input=limite−4096); Prompt B = persistência de
 | T-m->xxl | m->xxl | 110592 | 52223 | 308.3 | 23.1 | 189.3 | 203.2 | kvarn4 | **PASS** |
 | T-l->xxl | l->xxl | 110592 | 93440 | 229.1 | 23.1 | 74.9 | 88.7 | kvarn4 | **PASS** |
 | T-xl->xxl | xl->xxl | 110592 | 110592 | 0.0 | 23.2 | 4.1 | 17.9 | kvarn4 | **PASS** |
-| C-s-slot | s->s | 28672 | 28671 | 295.6 | 41.2 | 3.5 | 3.7 | q4 | **PASS** |
-| C-m-slot | m->m | 52224 | 52223 | 229.7 | 36.3 | 4.5 | 4.7 | q4 | **PASS** |
-| C-l-slot | l->l | 93440 | 93440 | 81.1 | 20.5 | 12.6 | 13.0 | q4 | **PASS** |
-| C-xl-slot | xl->xl | 100352 | 100352 | 131.6 | 18.4 | 7.8 | 8.2 | q4 | **PASS** |
-| C-xxl-slot | xxl->xxl | 110592 | 110592 | 66.2 | 22.0 | 15.5 | 15.8 | kvarn4 | **PASS** |
+| C-s-slot | s->s | 28672 | 29695 | 0.8* | 19.7 | 1.2 | 1.7 | q4 | **PASS** |
+| C-m-slot | m->m | 52224 | 53247 | 0.4* | 22.0 | 2.9 | 3.2 | q4 | **PASS** |
+| C-l-slot | l->l | 93440 | 94464 | 0* | 21.3 | 4.2 | 4.6 | q4 | **PASS** |
+| C-xl-slot | xl->xl | 100352 | 101376 | 0* | 21.0 | 3.0 | 3.3 | q4 | **PASS** |
+| C-xxl-slot | xxl->xxl | 110592 | 111616 | 0* | 23.4 | 3.0 | 3.4 | kvarn4 | **PASS** |
+
+> * Nas linhas C, o `prefillTPS` mostra o `delta_tps` (só os tokens novos), para não diluir com o custo fixo de switch+restore. Quebras típicas: `switch_ms` 220–260ms (xxlong no caminho quente; o rebuild frio do contexto kvarn chega a 8.5s sob pressão de VRAM) + `restore_ms` 3.0–4.2s (leitura do estado do disco) + delta.
 
 
 ## Causa-raiz corrigida: OOM de VRAM no prefill xxlong (regressão do merge)
