@@ -323,6 +323,23 @@ bool requires_state_for_partial_restore() const override;
     void finish_tail_batch(bool success, bool payload_may_be_modified);
 
     //
+    // K-cache mean-centering (see docs/kv-mean-center.md)
+    //
+
+    // load a per-layer bias file (GGUF, tensors named "kv_bar.blk.<il>.k") and enable
+    // mean-centering for every layer it covers: the bias is subtracted from the K vector
+    // right before it is written into the cache in cpy_k().
+    //
+    // when require_q4_0 is true (the default, used by the --kv-mean-center CLI flag), loading
+    // fails for any layer whose K cache type is not GGML_TYPE_Q4_0, since that is the only case
+    // this feature is intended/validated for. require_q4_0 = false is used by tests to exercise
+    // the exact same subtraction code path against an unquantized (e.g. F32) K cache, in order to
+    // validate the softmax-invariance argument without confounding it with quantization error.
+    //
+    // returns false (and logs an error) on failure; the cache is left with centering disabled.
+    bool load_kv_mean_center(const char * path, bool require_q4_0 = true);
+
+    //
     // preparation API
     //
 
@@ -540,6 +557,15 @@ private:
     bool uses_shared_tail() const;
     bool is_shared_layer(int32_t il) const;
     int32_t shared_layer_id(int32_t il) const;
+
+    // K-cache mean-centering bias (see load_kv_mean_center()):
+    //   k_bar[ikv] is indexed like `layers` and is nullptr for layers without a bias, or if
+    //   centering was never enabled (k_bar.empty() in that case).
+    //   each tensor is F32, shaped [n_embd_head_k(il), n_head_kv(il)] so it broadcasts against
+    //   the [n_embd_head, n_head, n_tokens] k_cur tensor seen in cpy_k().
+    std::vector<ggml_tensor *> k_bar;
+    std::vector<ggml_context_ptr> k_bar_ctxs;
+    std::vector<ggml_backend_buffer_ptr> k_bar_bufs;
 
     size_t total_size() const;
 

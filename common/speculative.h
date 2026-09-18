@@ -149,6 +149,23 @@ void common_speculative_state_restore_plan_free(common_speculative_state_restore
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// TEST/DEBUG ONLY: directly stage target-tap context rows for the dspark
+// implementation (if registered), bypassing the normal process()-driven
+// capture path, which requires a real target context with
+// llama_set_capture_layers engaged and logits requested on every row. Used by
+// the Phase 2 synthetic-target harness (tests/test-dspark-loop.cpp) to drive
+// the block-draft loop deterministically without a target model.
+// `feat` is [n_rows * n_embd_cap] row-major, `pos` is [n_rows] absolute
+// positions, both appended to the sequence's pending context buffer exactly
+// as process() would have. Returns false if no dspark implementation is
+// registered.
+bool common_speculative_dspark_stage_ctx_test(common_speculative * spec,
+                                              llama_seq_id         seq_id,
+                                              const float *        feat,
+                                              int64_t              n_rows,
+                                              int64_t              n_embd_cap,
+                                              const int32_t *      pos);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };

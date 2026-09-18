@@ -175,6 +175,20 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_PTQ1_0)
+#include "ptq1_0.glsl"
+
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(ptq1_0_trit(ib, a_offset, iqs), ptq1_0_trit(ib, a_offset, iqs + 1u));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(ptq1_0_trit(ib, a_offset, iqs),
+                ptq1_0_trit(ib, a_offset, iqs + 1u),
+                ptq1_0_trit(ib, a_offset, iqs + 2u),
+                ptq1_0_trit(ib, a_offset, iqs + 3u));
+}
+#endif
+
 #if defined(DATA_A_Q1_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint bits = uint(data_a[a_offset + ib].qs[iqs / 8u]) >> (iqs % 8u);

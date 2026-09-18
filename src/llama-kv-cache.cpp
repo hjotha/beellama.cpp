@@ -2,6 +2,7 @@
 #include "llama-kv-cache-state.h"
 #include "llama-kv-cache-update.h"
 
+#include "gguf.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-kvarn.h"
@@ -12,6 +13,9 @@
 #include <cassert>
 #include <exception>
 #include <chrono>
+
+#include <cinttypes>
+
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +28,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include <string>
+
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -3153,6 +3160,18 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         return nullptr;
     }
 
+    // optional per-(head,channel) mean-centering: subtract a fixed bias from the K vector
+    // before it is written into the cache. this is exactly softmax-invariant (the same
+    // constant is added to every logit of a query's row, which softmax does not see), so
+    // nothing else in attention needs to change. see load_kv_mean_center().
+    if (!k_bar.empty() && k_bar[ikv] != nullptr) {
+        ggml_tensor * bias = k_bar[ikv];
+        if (bias->type != k_cur->type) {
+            bias = ggml_cast(ctx, bias, k_cur->type);
+        }
+        k_cur = ggml_sub(ctx, k_cur, bias);
+    }
+
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
     const int64_t n_tokens    = k_cur->ne[2];
@@ -3247,6 +3266,7 @@ ggml_tensor * llama_kv_cache::cpy_k_with_tail(
         ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
         ggml_tensor * tail_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
+
 
     const int32_t ikv = map_layer_ids.at(il);
     ggml_tensor * body = layers[ikv].k;

@@ -50,6 +50,7 @@ const std::vector<std::string> type_names = {
     "f32",
     "f16",
     "q1_0",
+    "ptq1_0",
     "q2_0",
     "q4_0",
     "q4_1",
@@ -597,6 +598,13 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (tname == "bf16") {
             continue;
         }
+        // PTQ1_0 has no coopmat2 decoder: dequant_funcs_cm2.glsl carries no PTQ1_0 entry,
+        // so emitting mul_mm_cm2 for it fails shader compilation and takes the whole
+        // Vulkan build down, not just this type. Skip it; it falls back to the scalar and
+        // coopmat1 matmul paths, which are the ones implemented and tested.
+        if (coopmat2 && tname == "ptq1_0") {
+            continue;
+        }
 
         // Float types keep per-type compilation (different accumulation loop structure)
         if (tname == "f32" || tname == "f16") {
@@ -1123,6 +1131,8 @@ void process_shaders() {
     string_to_spv("kvarn_wht_d256", "kvarn_wht_parallel.comp", {{"HEAD_WIDTH", "256"}});
     string_to_spv("kvarn_wht_d512", "kvarn_wht_parallel.comp", {{"HEAD_WIDTH", "512"}});
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
+    string_to_spv("fwht_f16", "fwht.comp", {{"FWHT_F16", "1"}});
+    string_to_spv("fwht_shmem_f16", "fwht.comp", {{"FWHT_F16", "1"}, {"FWHT_SHMEM", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
