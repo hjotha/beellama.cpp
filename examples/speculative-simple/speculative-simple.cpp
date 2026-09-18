@@ -65,6 +65,10 @@ int main(int argc, char ** argv) {
 
     llama_context * ctx_dft = params.speculative.draft.ctx_dft;
 
+    // Prism drafter path uses these aliases for the seq-removal capabilities.
+    const common_context_seq_rm_type seq_rm_tgt = common_context_can_seq_rm(ctx_tgt);
+    const common_context_seq_rm_type seq_rm_dft = ctx_dft ? common_context_can_seq_rm(ctx_dft) : COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
     // check if the context supports partial sequence removal
     const auto ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
     const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
