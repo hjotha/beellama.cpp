@@ -45,6 +45,25 @@ O merge do upstream `anbeeld/main` (v0.4.6, `b01db3d84`) mudou a partição do s
 3. **Persistência de slots** (Prompt B, 5 tiers): prime → restart do serviço → restore do disco → `cache_n` igual ao estado salvo, sem prefill completo indevido.
 4. **KVarN comprovado**: destinos xxl restaurados em kvarn4 (log `route snapshot converted` / `auto-restore`), conversão ~1–4 s.
 
+## Acompanhamento: teste do tier kvarn único (s/m/l, l = xxl atual)
+
+Pedido: substituir o tier l (q4 97k) por um único tier kvarn até 110k. Testado isolado
+(porta 8091, build `b1f188532` com as novas flags `--batch-size-l`/`--ubatch-size-l`/
+`--cache-type-k-l`/`--cache-type-v-l`), request de 110592 + 4096 de saída:
+
+- **ubatch 128**: `failed to allocate compute pp buffers` na criação do contexto long
+  (VRAM) -> 500 "adaptive context profile transition failed".
+- **ubatch 64**: mesmo erro -> o reserva de buffers de compute do perfil long (kvarn4,
+  114688) NÃO cabe em VRAM, embora o perfil xxlong com a mesma geometria (kvarn4,
+  ubatch 64) funcione. => o dimensionamento do buffer do perfil long difere do xxlong
+  (investigação pendente antes de adotar o layout de tier kvarn único).
+
+Implicação: a perda de prefill do tier kvarn único fica como o medido no xxl (379 tps
+vs 638 do l q4, +68% TTFT para 93k) enquanto o ubatch não puder subir; com ubatch
+viável seria ~neutro (kvarn ~+10% sobre q4 ao mesmo ubatch). Decode kvarn é mais rápido
+(23.9 vs 20.3 tps). Flag de investigação: por que o reserva do perfil long usa mais VRAM
+que o xxlong para a mesma geometria.
+
 ## Notas
 - O build mesclado para a geração em ~320 tokens (vs 4096 do r7) — comportamento de stop do reasoning pós-merge; não é falha da suíte (o cap era 4096, "máximo").
 - Linhas `*-prime`/`*-restore` sem campo `pass` aparecem como FAIL no resumo; os veredictos por teste (C-*-slot) são todos PASS.
