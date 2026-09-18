@@ -210,12 +210,6 @@ struct common_speculative_impl {
         return data.empty();
     }
     virtual bool set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/, llama_pos /*expected_pos*/) { return false; }
-
-    // true if this implementation requires the target context to extract post-norm embeddings
-    virtual bool need_embd() const { return false; }
-
-    // true if this implementation requires the target context to extract pre-norm embeddings
-    virtual bool need_embd_nextn() const { return false; }
 };
 
 struct common_speculative_impl_draft_dspark : public common_speculative_impl {
@@ -284,7 +278,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     std::vector<int32_t> i_batch_end;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq) :
-        common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq),
+        common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq, params.draft.n_max),
         params(params.draft) {
         auto * ctx_dft = this->params.ctx_dft;
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -612,7 +606,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             auto & pos  = ctx_pos[seq_id];
 
             int64_t       L       = n_cache[seq_id];
-            const int64_t start   = dp.n_past;
+            const int64_t start   = dp.pos0;
             int64_t       ctx_len = start - L;
 
             if (ctx_len <= 0) {
@@ -1733,7 +1727,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<bool> selector_reset;
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
-    const bool is_dspark;
+    bool is_dspark;
 
     // dspark speculators
     bool sample_from_anchor = true;

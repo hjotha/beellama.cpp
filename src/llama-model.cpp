@@ -1598,7 +1598,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (params.split_mtp_weights &&
             (arch != LLM_ARCH_QWEN35 || !params.load_mtp || ml.no_alloc || hparams.router_layer >= 0)) {
         throw std::runtime_error("separate MTP weights require an allocated qwen35 target with embedded MTP");
-if (params.dspark_head_source && arch != LLM_ARCH_DSPARK) {
+    }
+
+    if (params.dspark_head_source && arch != LLM_ARCH_DSPARK) {
         throw std::runtime_error("Shared target head is supported only for DSpark");
 
     }

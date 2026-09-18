@@ -346,6 +346,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         }
     }
 }
+}
 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
     switch (params.gtype) {
@@ -887,11 +888,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-    // KV cache injection
-    if (ubatch.embd) {
         // DFly ships one fused context per draft layer, so the incoming row is n_layer wide
         const bool    is_dfly      = model.dfly_layer_fusion != nullptr;
         const int64_t n_embd_batch = is_dfly ? (int64_t) hparams.n_embd_out() : n_embd;
@@ -914,8 +910,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g, layer.wv_s);
             // plain DFlash injects one shared context into every layer; DFly slices out this
             // layer's own fused context (encoder writes them layer-major within each token)
             ggml_tensor * ctx_il = inp_g;
@@ -925,8 +919,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 cb(ctx_il, "dfly_ctx_layer", il);
             }
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, ctx_il);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, ctx_il);
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, ctx_il, layer.wk_s);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, ctx_il, layer.wv_s);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -1195,6 +1189,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (model.dfly_hc_down && getenv("LLAMA_DFLY_NO_CHAIN") == nullptr) {
         build_dfly_correction_head(*this, model, inp_tokens, inp_embd_raw);
     }
+}
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):

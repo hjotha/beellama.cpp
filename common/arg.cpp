@@ -3281,6 +3281,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_target_kvarn_swa_cache_type(params, /*key =*/ false, value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_SWA"));
+    add_opt(common_arg(
         {"--kv-mean-center"}, "FNAME",
         "path to a K-cache mean-centering bias file (GGUF), generated with tools/kv-mean-center\n"
         "subtracts a fixed per-(head,channel) bias from K before it is quantized into the cache;\n"
