@@ -22,11 +22,12 @@ Prompt A = contexto no limite (input=limite−4096); Prompt B = persistência de
 | T-m->xxl | m->xxl | 110592 | 52223 | 308.3 | 23.1 | 189.3 | 203.2 | kvarn4 | **PASS** |
 | T-l->xxl | l->xxl | 110592 | 93440 | 229.1 | 23.1 | 74.9 | 88.7 | kvarn4 | **PASS** |
 | T-xl->xxl | xl->xxl | 110592 | 110592 | 0.0 | 23.2 | 4.1 | 17.9 | kvarn4 | **PASS** |
-| C-s-slot | s->s | 28672 | 28671 |  |  | 0.0 | 0.0 | q4 | **PASS** |
-| C-m-slot | m->m | 52224 | 52223 |  |  | 0.0 | 0.0 | q4 | **PASS** |
-| C-l-slot | l->l | 93440 | 93440 |  |  | 0.0 | 0.0 | q4 | **PASS** |
-| C-xl-slot | xl->xl | 100352 | 100352 |  |  | 0.0 | 0.0 | q4 | **PASS** |
-| C-xxl-slot | xxl->xxl | 110592 | 110592 |  |  | 0.0 | 0.0 | kvarn4 | **PASS** |
+| C-s-slot | s->s | 28672 | 28671 | 295.6 | 41.2 | 3.5 | 3.7 | q4 | **PASS** |
+| C-m-slot | m->m | 52224 | 52223 | 229.7 | 36.3 | 4.5 | 4.7 | q4 | **PASS** |
+| C-l-slot | l->l | 93440 | 93440 | 81.1 | 20.5 | 12.6 | 13.0 | q4 | **PASS** |
+| C-xl-slot | xl->xl | 100352 | 100352 | 131.6 | 18.4 | 7.8 | 8.2 | q4 | **PASS** |
+| C-xxl-slot | xxl->xxl | 110592 | 110592 | 66.2 | 22.0 | 15.5 | 15.8 | kvarn4 | **PASS** |
+
 
 ## Causa-raiz corrigida: OOM de VRAM no prefill xxlong (regressão do merge)
 
