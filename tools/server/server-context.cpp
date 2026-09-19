@@ -8461,11 +8461,25 @@ if (task.params.cache_prompt) {
                                         do_reset = !checkpoint.restore_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         const auto draft_restore = do_reset ? common_checkpoint_restore::failed :
                                             checkpoint.restore_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        if (draft_restore == common_checkpoint_restore::missing_base) {
-                                            SLT_WRN(slot, "%s", "checkpoint requires MTP bootstrap; cold fallback until bootstrap is connected\n");
+                                        const bool bootstrap_needed = draft_restore == common_checkpoint_restore::missing_base;
+                                        if (bootstrap_needed) {
+                                            // Target-only checkpoint: the draft base is absent/stale, but the target
+                                            // prefix was restored above. Reuse it instead of a cold-fallback re-prefill.
+                                            // Managed MTP (resident weights) re-syncs the carry via the bootstrap API on
+                                            // the next decode; unmanaged MTP (embedded head) keeps the legacy draft
+                                            // catch-up path. Mirror what the RAM-cache / disk-restore paths do.
+                                            const bool mtp_managed =
+                                                llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt)).managed;
+                                            if (spec) { common_speculative_set_state(spec.get(), slot.id, {}); }
+                                            if (mtp_managed) {
+                                                SLT_WRN(slot, "%s", "checkpoint requires MTP bootstrap; scheduling bootstrap from decoded suffix\n");
+                                                slot.bootstrap_pending = slot.can_speculate();
+                                            } else {
+                                                SLT_WRN(slot, "%s", "target-only checkpoint restored; unmanaged MTP uses legacy draft catch-up\n");
+                                            }
                                         }
-                                        do_reset = do_reset || draft_restore != common_checkpoint_restore::restored ||
-                                            (spec && !checkpoint.data_spec.empty() &&
+                                        do_reset = do_reset || (!bootstrap_needed && draft_restore != common_checkpoint_restore::restored) ||
+                                            (!bootstrap_needed && spec && !checkpoint.data_spec.empty() &&
                                              !common_speculative_set_state(spec.get(), slot.id, checkpoint.data_spec, checkpoint.pos_max));
                                         if (!do_reset) {
                                             if (checkpoint.data_spec.empty()) { common_speculative_set_state(spec.get(), slot.id, {}); }
