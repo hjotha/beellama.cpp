@@ -274,7 +274,9 @@ static void llama_verify_hadamard_graph(
                     }
                 }
             }
-            LLAMA_LOG_WARN("%s: non-fatal: Hadamard-latent table is read without the inverse transform (MTP draft head, verified by target)\n", __func__);
+            throw std::runtime_error(format(
+                "Hadamard-latent table '%s' is read without the inverse transform",
+                node->src[0]->name));
         }
     }
 }
