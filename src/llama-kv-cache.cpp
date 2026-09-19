@@ -3039,11 +3039,15 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
-    return layers[0].k ? layers[0].k->type : layers[0].k_tail->type;
+    if (layers.empty()) return GGML_TYPE_COUNT;
+    const auto & l0 = layers[0];
+    return l0.k ? l0.k->type : (l0.k_tail ? l0.k_tail->type : GGML_TYPE_COUNT);
 }
 
 ggml_type llama_kv_cache::type_v() const {
-    return layers[0].v ? layers[0].v->type : layers[0].v_tail->type;
+    if (layers.empty()) return GGML_TYPE_COUNT;
+    const auto & l0 = layers[0];
+    return l0.v ? l0.v->type : (l0.v_tail ? l0.v_tail->type : GGML_TYPE_COUNT);
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {

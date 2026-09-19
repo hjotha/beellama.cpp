@@ -852,6 +852,14 @@ static void build_dfly_correction_head(llm_graph_context & g, const llama_model 
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    // Shared Bonsai embeddings/head are stored in a rotated basis. The draft's
+    // own tensors are unrotated, so only shared target tensor pointers match.
+    if (cparams.ctx_other && (!model.tok_embd || !model.output)) {
+        const auto * target = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model.hadamard_rotations.empty() && model.hadamard_inverses.empty());
+        hadamard_rotations = &target->hadamard_rotations;
+        hadamard_inverses = &target->hadamard_inverses;
+    }
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -890,7 +898,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (ubatch.embd) {
         // DFly ships one fused context per draft layer, so the incoming row is n_layer wide
         const bool    is_dfly      = model.dfly_layer_fusion != nullptr;
-        const int64_t n_embd_batch = is_dfly ? (int64_t) hparams.n_embd_out() : n_embd;
+        const int64_t n_embd_batch = is_dfly ? (int64_t) hparams.n_embd_out() : (int64_t) hparams.n_embd_inp_enc();
 
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_batch);
 
@@ -986,6 +994,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * inp_tokens = inp->tokens;
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    if (hadamard_inverses) {
+        const auto it = hadamard_inverses->find(tok_embd);
+        if (it != hadamard_inverses->end()) {
+            inpL = llama_mul_mat_hadamard(ctx0, inpL, it->second.rot);
+            if (it->second.signs) inpL = ggml_mul(ctx0, inpL, it->second.signs);
+        }
+    }
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
