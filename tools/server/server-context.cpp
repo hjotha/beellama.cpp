@@ -7138,6 +7138,44 @@ if (task.params.cache_prompt) {
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+
+                    // [TAG_SLOT_SAVE_ALIGNED] A hybrid/recurrent memory cannot trim a
+                    // generation tail on restore (recurrent rollback snapshots n_rs_seq are 0
+                    // for these models), so a state that ends on an unaligned boundary would
+                    // force a full cold re-prefill for the first request after restore. Prefer
+                    // the last aligned prompt checkpoint: the saved state then ends exactly on
+                    // a KVarN descriptor boundary with no generated tail, which the reuse path
+                    // (and the restore-created checkpoint) can consume directly. The dropped
+                    // tail (< 1 group) is re-prefilled on the next matching request.
+                    {
+                        const int32_t save_alignment = prompt_reuse_alignment();
+                        const int64_t n_full = (int64_t) slot->prompt.tokens.size();
+                        const int64_t n_save_aligned = (n_full / save_alignment) * save_alignment;
+                        std::shared_ptr<const common_prompt_checkpoint> save_ckpt;
+                        for (auto it = slot->prompt.checkpoints.rbegin();
+                                it != slot->prompt.checkpoints.rend(); ++it) {
+                            const auto & cp = **it;
+                            if (cp.n_tokens > 0 && cp.n_tokens <= n_save_aligned && !cp.data_tgt.empty()) {
+                                save_ckpt = *it;
+                                break;
+                            }
+                        }
+                        if (save_ckpt && save_ckpt->n_tokens < n_full &&
+                                save_ckpt->restore_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                            const size_t n_saved_tokens = (size_t) save_ckpt->n_tokens;
+                            slot->prompt.tokens.keep_first(n_saved_tokens);
+                            // The restored-prefix KV no longer carries the state the live
+                            // logits were captured for; invalidate so no stale sidecar is
+                            // persisted and the regenerate fast-path is not armed for a
+                            // mismatched snapshot.
+                            slot->logits_last.clear();
+                            slot->logits_last_n_tokens = -1;
+                            packed = slot->prompt.tokens.serialize();
+                            SLT_INF(*slot, "saving aligned prompt state (%zu tokens) instead of the full slot state (%" PRId64 " tokens)\n",
+                                    n_saved_tokens, n_full);
+                        }
+                    }
+
                     const size_t nwrite = llama_state_seq_save_file(
                         ctx_tgt, filepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
@@ -8453,7 +8491,8 @@ if (task.params.cache_prompt) {
                                         }
                                     );
 
-                                    bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    const bool no_checkpoint = it == slot.prompt.checkpoints.rend();
+                                    bool do_reset = no_checkpoint;
 
                                     if (!do_reset) {
                                         // PARTIAL_ONLY leaves future attention KV present until suffix removal below.
@@ -8493,15 +8532,27 @@ if (task.params.cache_prompt) {
                                     }
 
                                     if (do_reset) {
-                                        if (slot_was_restored) {
-                                            SLT_WRN(slot, "%s", "target-only snapshot restore discarded; no valid MTP/checkpoint suffix was available, falling back to cold prefill\n");
+                                        if (slot_was_restored && no_checkpoint) {
+                                            // A verified disk restore left the full saved state
+                                            // resident in the KV cache, so the prefix [0, n_past)
+                                            // is valid even though KVarN's tail-anchored
+                                            // seq_pos_min made the checkpoint search believe the
+                                            // prefix was missing. Keep the live prefix instead of
+                                            // cold-fallback re-prefilling; the suffix removal
+                                            // below trims the cells beyond the planned boundary.
+                                            SLT_WRN(slot, "restored prefix is resident in the KV cache; reusing n_past = %d without a checkpoint\n", n_past);
+                                            common_speculative_set_state(spec.get(), slot.id, {});
+                                        } else {
+                                            if (slot_was_restored) {
+                                                SLT_WRN(slot, "%s", "target-only snapshot restore discarded; no valid MTP/checkpoint suffix was available, falling back to cold prefill\n");
+                                            }
+                                            slot.mem.seq_rm(slot.id, -1, -1);
+                                            common_speculative_set_state(spec.get(), slot.id, {});
+                                            SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
+                                                    "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                            pos_next = 0;
+                                            n_past = 0;
                                         }
-                                        slot.mem.seq_rm(slot.id, -1, -1);
-                                        common_speculative_set_state(spec.get(), slot.id, {});
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
-                                        n_past = 0;
                                     }
                                 }
                             }
