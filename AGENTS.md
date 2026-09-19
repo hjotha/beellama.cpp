@@ -161,6 +161,7 @@ candidate. Record both values with every result.
 
 ## Git Conventions
 
+- Do not use git worktrees for `beellama` or `llama.cpp`; edit directly in the repository checkout on a branch based on `main` (e.g. `git checkout -b <branch> main`).
 - Keep fork-specific changes small and aligned with current upstream
   abstractions.
 - Do not treat old benchmark notes as current evidence without rerunning them.
