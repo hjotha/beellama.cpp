@@ -7139,46 +7139,43 @@ if (task.params.cache_prompt) {
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
 
-                    // [TAG_SLOT_SAVE_ALIGNED] A hybrid/recurrent memory cannot trim a
-                    // generation tail on restore (recurrent rollback snapshots n_rs_seq are 0
-                    // for these models), so a state that ends on an unaligned boundary would
-                    // force a full cold re-prefill for the first request after restore. Prefer
-                    // the last aligned prompt checkpoint: the saved state then ends exactly on
-                    // a KVarN descriptor boundary with no generated tail, which the reuse path
-                    // (and the restore-created checkpoint) can consume directly. The dropped
-                    // tail (< 1 group) is re-prefilled on the next matching request.
-                    {
-                        const int32_t save_alignment = prompt_reuse_alignment();
-                        const int64_t n_full = (int64_t) slot->prompt.tokens.size();
-                        const int64_t n_save_aligned = (n_full / save_alignment) * save_alignment;
-                        std::shared_ptr<const common_prompt_checkpoint> save_ckpt;
-                        for (auto it = slot->prompt.checkpoints.rbegin();
-                                it != slot->prompt.checkpoints.rend(); ++it) {
-                            const auto & cp = **it;
-                            if (cp.n_tokens > 0 && cp.n_tokens <= n_save_aligned && !cp.data_tgt.empty()) {
-                                save_ckpt = *it;
-                                break;
-                            }
-                        }
-                        if (save_ckpt && save_ckpt->n_tokens < n_full &&
-                                save_ckpt->restore_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-                            const size_t n_saved_tokens = (size_t) save_ckpt->n_tokens;
+                    // [TAG_SLOT_SAVE_ALIGNED] A memory that can only drop whole sequences cannot
+                    // trim a generation tail on restore (hybrid/recurrent models report
+                    // n_rs_seq == 0), so a state that ends on an unaligned boundary is only
+                    // reusable by a request that repeats it in full: a shorter one needs a suffix
+                    // removal the memory cannot perform, and pays a full cold re-prefill. Roll the
+                    // slot back to the newest aligned prompt checkpoint so the file ends exactly
+                    // on a reuse boundary that any request sharing that prefix can pick up.
+                    //
+                    // The rollback is NOT undone: a partial-only checkpoint is a rollback anchor,
+                    // not a copy of the KV cells, so the live tail cannot be put back once it is
+                    // dropped. The slot therefore keeps the aligned prefix and re-prefills the
+                    // tail (< 1 reuse group per checkpoint interval) on the next request, which is
+                    // orders of magnitude cheaper than the cold re-prefill it prevents.
+                    //
+                    // A memory that can trim a suffix by itself loses nothing on restore, so it
+                    // keeps saving the exact live state.
+                    size_t n_saved_tokens = slot->prompt.tokens.size();
+                    if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                        const auto save_ckpt = server_prompt_save_aligned_checkpoint(
+                                slot->prompt.checkpoints, (int64_t) n_saved_tokens, prompt_reuse_alignment());
+                        if (save_ckpt && save_ckpt->restore_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                            SLT_INF(*slot, "saving aligned prompt state (%d tokens) instead of the full slot state (%zu tokens)\n",
+                                    (int) save_ckpt->n_tokens, n_saved_tokens);
+                            n_saved_tokens = (size_t) save_ckpt->n_tokens;
                             slot->prompt.tokens.keep_first(n_saved_tokens);
-                            // The restored-prefix KV no longer carries the state the live
-                            // logits were captured for; invalidate so no stale sidecar is
-                            // persisted and the regenerate fast-path is not armed for a
-                            // mismatched snapshot.
+                            packed = slot->prompt.tokens.serialize();
+
+                            // the slot no longer holds the state those logits were sampled from
                             slot->logits_last.clear();
                             slot->logits_last_n_tokens = -1;
-                            packed = slot->prompt.tokens.serialize();
-                            SLT_INF(*slot, "saving aligned prompt state (%zu tokens) instead of the full slot state (%" PRId64 " tokens)\n",
-                                    n_saved_tokens, n_full);
                         }
                     }
 
                     const size_t nwrite = llama_state_seq_save_file(
                         ctx_tgt, filepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+
                     if (nwrite == 0) {
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
@@ -7196,7 +7193,7 @@ if (task.params.cache_prompt) {
                     // left over from a prior task on this slot object) from persisting a sidecar that
                     // does not match the saved state - which would otherwise emit a wrong first token
                     // on a later regenerate with nothing to catch it.
-                    const int32_t n_slot_tokens = (int32_t) slot->prompt.tokens.size();
+                    const int32_t n_slot_tokens = (int32_t) n_saved_tokens;
                     std::error_code sidecar_ec;
                     std::filesystem::remove(slot_logits_sidecar_path(filepath), sidecar_ec);
                     if (nwrite > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
@@ -7238,7 +7235,7 @@ if (task.params.cache_prompt) {
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = true;
-                    res->n_tokens = slot->prompt.tokens.size();
+                    res->n_tokens = n_saved_tokens;
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));

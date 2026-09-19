@@ -2,6 +2,7 @@
 
 #undef NDEBUG
 #include <cassert>
+#include <list>
 #include <memory>
 
 static constexpr size_t KIB = 1024;
@@ -191,6 +192,38 @@ static void prompt_cache_checkpoint_must_respect_alignment_and_position() {
     assert(plan.lexical_tokens == 5);
     assert(plan.restorable_tokens == 4);
     assert(plan.reason == SERVER_PROMPT_REUSE_CHECKPOINT);
+}
+
+static void slot_save_prefers_only_the_last_aligned_checkpoint() {
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
+    checkpoints.push_back(make_checkpoint(512,  512, 16));
+    checkpoints.push_back(make_checkpoint(6656, 6656, 16));
+
+    // an unaligned live state is persisted from the newest aligned checkpoint, so a later
+    // request whose prefix stops short of the live tail still restores without a rollback
+    const auto aligned = server_prompt_save_aligned_checkpoint(checkpoints, 6734, 128);
+    assert(aligned && aligned->n_tokens == 6656);
+
+    // no checkpoint on the boundary itself: the newest one below it is still the closest
+    // state the memory can be rolled back to
+    const auto older = server_prompt_save_aligned_checkpoint(checkpoints, 6800, 128);
+    assert(older && older->n_tokens == 6656);
+
+    // an already-aligned live state is saved as-is, with no rollback at all
+    assert(!server_prompt_save_aligned_checkpoint(checkpoints, 6656, 128));
+
+    // without KVarN there is no descriptor boundary to honour
+    assert(!server_prompt_save_aligned_checkpoint(checkpoints, 6734, 1));
+
+    // a checkpoint carrying no target bytes cannot be restored, so it is not eligible
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> empty_data;
+    empty_data.push_back(make_checkpoint(6656, 6656, 0));
+    assert(!server_prompt_save_aligned_checkpoint(empty_data, 6734, 128));
+
+    // and neither is a checkpoint that sits past the boundary
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> too_new;
+    too_new.push_back(make_checkpoint(6784, 6784, 16));
+    assert(!server_prompt_save_aligned_checkpoint(too_new, 6734, 128));
 }
 
 static void checkpoint_failed_target_save_cannot_reuse_stale_bytes() {
@@ -445,6 +478,7 @@ int main() {
     restore_transaction_validation_failure_identifies_prepare_leg();
     speculative_rollback_checkpoint_boundary();
     checkpoint_failed_target_save_cannot_reuse_stale_bytes();
+    slot_save_prefers_only_the_last_aligned_checkpoint();
     speculative_draft_rollback_uses_draft_axis_and_recovers();
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();

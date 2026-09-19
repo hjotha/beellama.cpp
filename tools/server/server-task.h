@@ -760,6 +760,32 @@ static inline server_prompt_reuse_plan server_prompt_plan_reuse(
     return result;
 }
 
+// [TAG_SLOT_SAVE_ALIGNED] A slot save substitutes a prompt checkpoint for the live state
+// when the live state does not already end on a descriptor boundary. A hybrid/recurrent
+// memory cannot trim a suffix on restore, so an unaligned snapshot is reusable only by a
+// request that repeats it in full - anything shorter falls back to a cold re-prefill. The
+// newest aligned checkpoint is the closest boundary the memory can actually be rolled back
+// to, so it is the state worth persisting; the dropped tail is re-prefilled on the next
+// matching request.
+static inline std::shared_ptr<const common_prompt_checkpoint> server_prompt_save_aligned_checkpoint(
+        const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints,
+        int64_t n_tokens_live,
+        int32_t reuse_alignment) {
+    const int32_t alignment = std::max(1, reuse_alignment);
+    const int64_t boundary = n_tokens_live - n_tokens_live%alignment;
+    if (boundary <= 0 || boundary >= n_tokens_live) {
+        return nullptr; // already aligned (or nothing to keep): save the live state as-is
+    }
+    for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
+        const auto & checkpoint = *it;
+        if (checkpoint && checkpoint->n_tokens > 0 && checkpoint->n_tokens <= boundary &&
+                !checkpoint->data_tgt.empty()) {
+            return checkpoint;
+        }
+    }
+    return nullptr;
+}
+
 inline bool server_draft_context_owns_state(bool has_draft_context, bool draft_memory_is_shared) {
     return has_draft_context && !draft_memory_is_shared;
 }
