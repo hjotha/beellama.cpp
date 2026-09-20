@@ -783,14 +783,17 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
-    // NVIDIA GPU power governor; -1 keeps the feature disabled
+    // GPU power/memory clock governor; -1 keeps the feature disabled
     int32_t gpu_power_prefill = -1;
     int32_t gpu_power_decode  = -1;
     int32_t gpu_power_device  = 0;
 
-    // NVIDIA GPU memory clock governor; -1 keeps the feature disabled
+    // GPU memory clock governor; -1 keeps the feature disabled
     int32_t gpu_mem_clock_decode  = -1;
     int32_t gpu_mem_clock_prefill = -1;
+
+    // GPU governor backend: "auto" (NVML first, AMDGPU fallback), "nvml" or "amdgpu"
+    std::string gpu_power_backend = "auto";
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

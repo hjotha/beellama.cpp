@@ -31,12 +31,19 @@ class server_gpu_power_phase_arbitrator {
     server_gpu_power_phase phase_ = server_gpu_power_phase::idle;
 };
 
+enum class server_gpu_power_backend_type {
+    auto_detect,
+    nvml,
+    amdgpu,
+};
+
 struct server_gpu_power_config {
     int32_t prefill_w         = -1;
     int32_t decode_w          = -1;
     int32_t mem_clock_decode  = -1;
     int32_t mem_clock_prefill = -1;
     int32_t device            = 0;
+    server_gpu_power_backend_type backend = server_gpu_power_backend_type::auto_detect;
 
     bool enabled() const;
     bool power_enabled() const;
@@ -70,6 +77,9 @@ class server_gpu_power_backend {
 };
 
 std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_nvml_backend();
+std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_amdgpu_backend();
+
+server_gpu_power_backend_type server_gpu_power_backend_from_string(const std::string & backend);
 
 class server_gpu_power {
   public:

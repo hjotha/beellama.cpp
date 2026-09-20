@@ -4467,6 +4467,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_MEM_CLOCK_PREFILL"));
     add_opt(common_arg(
+        {"--gpu-power-backend"}, "TYPE",
+        "GPU power governor backend: auto, nvml or amdgpu (sysfs). "
+        "auto tries NVML first and falls back to the AMDGPU sysfs backend. "
+        "amdgpu drives power_dpm_force_performance_level / pp_od_clk_voltage directly",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && value != "nvml" && value != "amdgpu") {
+                throw std::invalid_argument("--gpu-power-backend must be one of: auto, nvml, amdgpu");
+            }
+            params.gpu_power_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_POWER_BACKEND"));
+    add_opt(common_arg(
         {"--cache-reuse"}, "N",
         string_format(
             "min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: %d)\n"

@@ -4,9 +4,13 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
@@ -473,10 +477,290 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
 #endif
 };
 
+// AMDGPU sysfs backend: drives the Radeon power/clock state through the
+// kernel sysfs interface (the same native mechanism hhd and other tools use),
+// without depending on any external daemon.
+//
+//   power_dpm_force_performance_level : auto|low|high|manual|profile_*
+//   pp_od_clk_voltage                 : "s 0 <min>", "s 1 <max>", "c"
+//
+// The phase-aware governor maps the "decode" phase to the high performance
+// level (which lets the GPU run at its maximum clock) and restores the
+// original level when idle, mirroring the NVML memory-clock locking behavior.
+
+static bool server_gpu_power_write_sysfs(const std::string & path, const std::string & value) {
+    std::ofstream f(path, std::ios::out | std::ios::trunc);
+    if (!f) {
+        return false;
+    }
+    f << value;
+    return f.good();
+}
+
+static bool server_gpu_power_read_sysfs(const std::string & path, std::string & value) {
+    std::ifstream f(path);
+    if (!f) {
+        return false;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    value = ss.str();
+    return f.good() || f.eof();
+}
+
+static std::string server_gpu_power_trim(const std::string & s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+        return "";
+    }
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
+  public:
+    ~server_gpu_power_amdgpu_backend() override { shutdown(); }
+
+    bool init(int32_t device, server_gpu_power_device_info & info, std::string & error) override {
+        shutdown();
+        info = {};
+
+        if (device < 0) {
+            error = "AMDGPU device index must be non-negative";
+            return false;
+        }
+
+        // Locate the AMD GPU drm cards in /sys/class/drm (vendor 0x1002).
+        std::vector<std::string> amd_cards;
+        const std::string drm_dir = "/sys/class/drm";
+        if (std::filesystem::exists(drm_dir)) {
+            for (const auto & entry : std::filesystem::directory_iterator(drm_dir)) {
+                const std::string name = entry.path().filename().string();
+                if (name.rfind("card", 0) != 0) {
+                    continue;
+                }
+                const std::string vendor_path = entry.path().string() + "/device/vendor";
+                std::string vendor;
+                if (!server_gpu_power_read_sysfs(vendor_path, vendor)) {
+                    continue;
+                }
+                if (server_gpu_power_trim(vendor) == "0x1002") {
+                    amd_cards.push_back(entry.path().string());
+                }
+            }
+        }
+        std::sort(amd_cards.begin(), amd_cards.end());
+
+        if (amd_cards.empty()) {
+            error = "no AMDGPU drm card found in /sys/class/drm";
+            return false;
+        }
+        if (static_cast<size_t>(device) >= amd_cards.size()) {
+            error = "AMDGPU device index " + std::to_string(device) +
+                    " is out of range (found " + std::to_string(amd_cards.size()) + " AMD card(s))";
+            return false;
+        }
+
+        card_dir_ = amd_cards[device];
+
+        const std::string level_path = card_dir_ + "/device/power_dpm_force_performance_level";
+        const std::string od_path    = card_dir_ + "/device/pp_od_clk_voltage";
+
+        if (!server_gpu_power_read_sysfs(level_path, original_level_)) {
+            error = "cannot read " + level_path;
+            return false;
+        }
+        original_level_ = server_gpu_power_trim(original_level_);
+
+        // Parse the OD range (min/max SCLK) and the supported clock levels.
+        std::string od;
+        if (server_gpu_power_read_sysfs(od_path, od)) {
+            for (const auto & line : split_lines(od)) {
+                const auto t = server_gpu_power_trim(line);
+                if (t.rfind("OD_RANGE", 0) == 0) {
+                    std::istringstream iss(line);
+                    std::string label, unit;
+                    int lo = 0, hi = 0;
+                    if (iss >> label >> lo >> hi >> unit) {
+                        od_sclk_min_ = lo;
+                        od_sclk_max_ = hi;
+                    }
+                }
+            }
+        }
+
+        std::string sclk;
+        if (server_gpu_power_read_sysfs(card_dir_ + "/device/pp_dpm_sclk", sclk)) {
+            for (const auto & line : split_lines(sclk)) {
+                std::istringstream iss(line);
+                std::string level;
+                int mhz = 0;
+                std::string unit;
+                if (iss >> level >> mhz >> unit) {
+                    if (mhz > 0) {
+                        info.supported_mem_clocks_mhz.push_back(static_cast<uint32_t>(mhz));
+                    }
+                }
+            }
+            std::sort(info.supported_mem_clocks_mhz.begin(), info.supported_mem_clocks_mhz.end());
+            info.supported_mem_clocks_mhz.erase(
+                std::unique(info.supported_mem_clocks_mhz.begin(), info.supported_mem_clocks_mhz.end()),
+                info.supported_mem_clocks_mhz.end());
+        }
+
+        if (info.supported_mem_clocks_mhz.empty()) {
+            error = "cannot read supported SCLK levels from " + card_dir_ + "/device/pp_dpm_sclk";
+            return false;
+        }
+
+        info.name                    = "AMDGPU " + card_dir_ + " (sysfs)";
+        info.device                  = device;
+        info.original_power_limit_mw = 0;
+        info.min_power_limit_mw      = 0;
+        info.max_power_limit_mw      = 0;
+        info.memory_clock_offset_supported = false;
+
+        LOG_INF("AMDGPU governor: card %s, original level %s, SCLK range %u-%u MHz\n",
+                card_dir_.c_str(), original_level_.c_str(), od_sclk_min_, od_sclk_max_);
+
+        initialized_ = true;
+        return true;
+    }
+
+    bool set_power_limit(uint32_t power_limit_mw, std::string & error) override {
+        (void) power_limit_mw;
+        error = "AMDGPU sysfs backend does not support power limit changes";
+        return false;
+    }
+
+    bool set_memory_locked_clocks(uint32_t min_mhz, uint32_t max_mhz, std::string & error) override {
+        if (!initialized_) {
+            error = "AMDGPU backend is not initialized";
+            return false;
+        }
+
+        // Drive the GPU into manual DPM and pin the SCLK range so the iGPU
+        // runs at its maximum clock during decode. This is the exact flow
+        // validated on the Radeon 780M: without it, "auto" stays on the lowest
+        // DPM state (800 MHz) even at ~90% busy, capping decode throughput.
+        const std::string level_path = card_dir_ + "/device/power_dpm_force_performance_level";
+        if (!server_gpu_power_write_sysfs(level_path, "manual\n")) {
+            error = "cannot write " + level_path;
+            return false;
+        }
+
+        const uint32_t target = max_mhz > 0 ? std::min(max_mhz, od_sclk_max_) : od_sclk_max_;
+        if (target > 0) {
+            const std::string od_path = card_dir_ + "/device/pp_od_clk_voltage";
+            if (!server_gpu_power_write_sysfs(od_path, "s 0 " + std::to_string(target) + "\n")) {
+                error = "cannot write " + od_path;
+                return false;
+            }
+            if (!server_gpu_power_write_sysfs(od_path, "s 1 " + std::to_string(target) + "\n")) {
+                error = "cannot write " + od_path;
+                return false;
+            }
+            if (!server_gpu_power_write_sysfs(od_path, "c\n")) {
+                error = "cannot commit " + od_path;
+                return false;
+            }
+            pinned_max_mhz_ = target;
+        }
+
+        level_locked_ = true;
+        return true;
+    }
+
+    bool reset_memory_locked_clocks(std::string & error) override {
+        if (!initialized_) {
+            error = "AMDGPU backend is not initialized";
+            return false;
+        }
+
+        // Restore the original pinned OD range, then the original level.
+        if (pinned_max_mhz_ > 0) {
+            const std::string od_path = card_dir_ + "/device/pp_od_clk_voltage";
+            if (od_sclk_min_ > 0) {
+                server_gpu_power_write_sysfs(od_path, "s 0 " + std::to_string(od_sclk_min_) + "\n");
+            }
+            if (od_sclk_max_ > 0) {
+                server_gpu_power_write_sysfs(od_path, "s 1 " + std::to_string(od_sclk_max_) + "\n");
+            }
+            server_gpu_power_write_sysfs(od_path, "c\n");
+            pinned_max_mhz_ = 0;
+        }
+
+        if (level_locked_) {
+            const std::string level_path = card_dir_ + "/device/power_dpm_force_performance_level";
+            if (!original_level_.empty()) {
+                server_gpu_power_write_sysfs(level_path, original_level_ + "\n");
+            }
+            level_locked_ = false;
+        }
+        return true;
+    }
+
+    bool set_memory_clock_offset(int32_t offset_mhz, std::string & error) override {
+        (void) offset_mhz;
+        error = "AMDGPU sysfs backend does not support clock offsets";
+        return false;
+    }
+
+    bool reset_memory_clock_offset(std::string & error) override {
+        (void) error;
+        return true;
+    }
+
+    void shutdown() override {
+        if (initialized_) {
+            std::string error;
+            reset_memory_locked_clocks(error);
+        }
+        initialized_     = false;
+        level_locked_    = false;
+        pinned_max_mhz_  = 0;
+        card_dir_.clear();
+        original_level_.clear();
+    }
+
+  private:
+    static std::vector<std::string> split_lines(const std::string & s) {
+        std::vector<std::string> out;
+        std::istringstream iss(s);
+        std::string line;
+        while (std::getline(iss, line)) {
+            out.push_back(line);
+        }
+        return out;
+    }
+
+    std::string card_dir_;
+    std::string original_level_;
+    uint32_t    od_sclk_min_   = 0;
+    uint32_t    od_sclk_max_   = 0;
+    uint32_t    pinned_max_mhz_ = 0;
+    bool        level_locked_  = false;
+    bool        initialized_   = false;
+};
+
 }  // namespace
 
 std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_nvml_backend() {
     return std::make_unique<server_gpu_power_nvml_backend>();
+}
+
+std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_amdgpu_backend() {
+    return std::make_unique<server_gpu_power_amdgpu_backend>();
+}
+
+server_gpu_power_backend_type server_gpu_power_backend_from_string(const std::string & backend) {
+    if (backend == "amdgpu") {
+        return server_gpu_power_backend_type::amdgpu;
+    }
+    if (backend == "nvml") {
+        return server_gpu_power_backend_type::nvml;
+    }
+    return server_gpu_power_backend_type::auto_detect;
 }
 
 server_gpu_power::server_gpu_power(std::unique_ptr<server_gpu_power_backend> backend) : backend_(std::move(backend)) {}
@@ -522,7 +806,14 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
     }
 
     if (!backend_) {
-        backend_ = server_gpu_power_create_nvml_backend();
+        if (config_.backend == server_gpu_power_backend_type::amdgpu) {
+            backend_ = server_gpu_power_create_amdgpu_backend();
+        } else if (config_.backend == server_gpu_power_backend_type::nvml) {
+            backend_ = server_gpu_power_create_nvml_backend();
+        } else {
+            // auto: prefer NVML for NVIDIA GPUs, fall back to the AMDGPU sysfs backend.
+            backend_ = server_gpu_power_create_nvml_backend();
+        }
     }
 
     std::string error;
