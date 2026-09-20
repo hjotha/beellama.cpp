@@ -2850,7 +2850,11 @@ static bool adaptive_slot_restore(
     }
 
     slot.prompt = std::move(candidate);
-    slot.bootstrap_pending = destination_mtp && !complete_mtp;
+    // Only managed MTP supports the resident-weight bootstrap API; unmanaged
+    // (embedded head) MTP must keep the legacy draft catch-up path instead.
+    const bool mtp_managed =
+        llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt)).managed;
+    slot.bootstrap_pending = destination_mtp && !complete_mtp && mtp_managed;
     SLT_TRC(slot, "adaptive slot restore published tokens=%zu checkpoints=%zu complete_mtp=%d bootstrap=%d\n",
             slot.prompt.tokens.size(), slot.prompt.checkpoints.size(), complete_mtp, slot.bootstrap_pending);
     if (slot.bootstrap_pending) {
@@ -4059,7 +4063,13 @@ private:
         // re-syncs the carry from the decoded suffix (same mechanism as a target-only RAM cache hit).
         // NOTE: must be set for PART models too - the production Qwen3.8-27B-RCO runs with MTP and
         // a PART seq-rm type, and an un-synced carry breaks the next speculative process.
-        slot.bootstrap_pending = slot.can_speculate();
+        // Gate on managed MTP: the bootstrap API (common_speculative_bootstrap) only works for
+        // resident/managed MTP weights and returns false for unmanaged (embedded head) MTP, which
+        // would deterministically 500 the first request after every disk restore. Unmanaged MTP
+        // uses the legacy draft catch-up path instead (mirrors the checkpoint restore path).
+        const bool mtp_managed =
+            llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt)).managed;
+        slot.bootstrap_pending = slot.can_speculate() && mtp_managed;
         slot.prompt_cache_source = "disk";
         slot.prompt_cache_reason = "unified_snapshot_restore";
         // Bump the snapshot's mtime so the LRU treats a reused-but-not-rewritten base snapshot as
