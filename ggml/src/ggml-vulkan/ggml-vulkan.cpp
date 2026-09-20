@@ -1135,7 +1135,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
-    vk_pipeline pipeline_fwht_f32[4];
+    vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
+    uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
     vk_pipeline pipeline_kvarn_store;
     vk_pipeline pipeline_kvarn_materialize;
     vk_pipeline pipeline_kvarn_flash_attn;

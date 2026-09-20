@@ -645,6 +645,13 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_PTQ1_0)
+vec2 get_dm(uint ib, uint a_offset) {
+    const float d = float(data_a[a_offset + ib].d);
+    return vec2(d, 0);
+}
+#endif
+
 #if defined(DATA_A_Q1_0)
 vec2 get_dm(uint ib, uint a_offset) {
     const float d = float(data_a[a_offset + ib].d);
