@@ -1188,6 +1188,35 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(mem_params.gpu_mem_clock_decode == 10501);
         assert(mem_params.gpu_mem_clock_prefill == 10251);
 
+        common_params fabric_params;
+        argv = {"binary_name", "--gpu-power-backend", "amdgpu", "--gpu-fabric-state", "0"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), fabric_params, LLAMA_EXAMPLE_SERVER));
+        assert(fabric_params.gpu_fabric_state == 0);
+        for (const auto * invalid : {"-1", "32"}) {
+            common_params invalid_fabric;
+            argv = {"binary_name", "--gpu-power-backend", "amdgpu", "--gpu-fabric-state", invalid};
+            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_fabric, LLAMA_EXAMPLE_SERVER));
+        }
+        common_params wrong_backend;
+        argv = {"binary_name", "--gpu-fabric-state", "0"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), wrong_backend, LLAMA_EXAMPLE_SERVER));
+
+        common_params tdp_params;
+        argv = {"binary_name", "--gpu-power-backend", "amdgpu", "--apu-tdp", "20"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), tdp_params, LLAMA_EXAMPLE_SERVER));
+        assert(tdp_params.apu_tdp == 20);
+        for (const auto * invalid : {"-1", "0"}) {
+            common_params invalid_tdp;
+            argv = {"binary_name", "--gpu-power-backend", "amdgpu", "--apu-tdp", invalid};
+            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_tdp, LLAMA_EXAMPLE_SERVER));
+        }
+        common_params tdp_wrong_backend;
+        argv = {"binary_name", "--apu-tdp", "20"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), tdp_wrong_backend, LLAMA_EXAMPLE_SERVER));
+        common_params conflicting_tdp;
+        argv = {"binary_name", "--gpu-power-backend", "amdgpu", "--apu-tdp", "20", "--gpu-power-prefill", "15", "--gpu-power-decode", "10"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), conflicting_tdp, LLAMA_EXAMPLE_SERVER));
+
         common_params incomplete_power_params;
         argv = {"binary_name", "--gpu-power-prefill", "200"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), incomplete_power_params, LLAMA_EXAMPLE_SERVER));
@@ -1309,6 +1338,24 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
     assert(mem_env_params.gpu_mem_clock_prefill == 10251);
     unsetenv("LLAMA_ARG_GPU_MEM_CLOCK_DECODE");
     unsetenv("LLAMA_ARG_GPU_MEM_CLOCK_PREFILL");
+
+    setenv("LLAMA_ARG_GPU_POWER_BACKEND", "amdgpu", true);
+    setenv("LLAMA_ARG_GPU_FABRIC_STATE", "0", true);
+    common_params fabric_env_params;
+    argv = {"binary_name"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), fabric_env_params, LLAMA_EXAMPLE_SERVER));
+    assert(fabric_env_params.gpu_fabric_state == 0);
+    unsetenv("LLAMA_ARG_GPU_POWER_BACKEND");
+    unsetenv("LLAMA_ARG_GPU_FABRIC_STATE");
+
+    setenv("LLAMA_ARG_GPU_POWER_BACKEND", "amdgpu", true);
+    setenv("LLAMA_ARG_APU_TDP", "20", true);
+    common_params tdp_env_params;
+    argv = {"binary_name"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), tdp_env_params, LLAMA_EXAMPLE_SERVER));
+    assert(tdp_env_params.apu_tdp == 20);
+    unsetenv("LLAMA_ARG_GPU_POWER_BACKEND");
+    unsetenv("LLAMA_ARG_APU_TDP");
 #endif // _WIN32
 
     printf("test-arg-parser: test download functions\n\n");

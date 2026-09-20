@@ -4280,6 +4280,8 @@ private:
                     params_base.gpu_mem_clock_prefill,
                     params_base.gpu_power_device,
                     server_gpu_power_backend_from_string(params_base.gpu_power_backend),
+                    params_base.gpu_fabric_state,
+                    params_base.apu_tdp,
                 })) {
                 GGML_ABORT("failed to reinitialize GPU power governor after sleeping");
             }
@@ -4913,6 +4915,8 @@ private:
                 params_base.gpu_mem_clock_prefill,
                 params_base.gpu_power_device,
                 server_gpu_power_backend_from_string(params_base.gpu_power_backend),
+                params_base.gpu_fabric_state,
+                params_base.apu_tdp,
             })) {
             return false;
         }

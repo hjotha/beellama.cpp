@@ -3,6 +3,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -89,7 +90,7 @@ server_gpu_power_phase server_gpu_power_phase_arbitrator::phase() const {
 }
 
 bool server_gpu_power_config::enabled() const {
-    return power_enabled() || mem_clock_enabled();
+    return power_enabled() || mem_clock_enabled() || fabric_state != -1 || apu_tdp_w != -1;
 }
 
 bool server_gpu_power_config::power_enabled() const {
@@ -484,9 +485,8 @@ class server_gpu_power_nvml_backend final : public server_gpu_power_backend {
 //   power_dpm_force_performance_level : auto|low|high|manual|profile_*
 //   pp_od_clk_voltage                 : "s 0 <min>", "s 1 <max>", "c"
 //
-// The phase-aware governor maps the "decode" phase to the high performance
-// level (which lets the GPU run at its maximum clock) and restores the
-// original level when idle, mirroring the NVML memory-clock locking behavior.
+// Legacy memory-clock options control SCLK (the graphics clock) on AMD.
+// Fabric control uses the raw pp_dpm_fclk index, not MHz or a display index.
 
 static bool server_gpu_power_write_sysfs(const std::string & path, const std::string & value) {
     std::ofstream f(path, std::ios::out | std::ios::trunc);
@@ -494,7 +494,8 @@ static bool server_gpu_power_write_sysfs(const std::string & path, const std::st
         return false;
     }
     f << value;
-    return f.good();
+    f.close(); // sysfs errors may only surface when the stream buffer is flushed.
+    return !f.fail();
 }
 
 static bool server_gpu_power_read_sysfs(const std::string & path, std::string & value) {
@@ -519,6 +520,12 @@ static std::string server_gpu_power_trim(const std::string & s) {
 
 class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
   public:
+    server_gpu_power_amdgpu_backend(std::string drm_dir,
+                                   std::function<bool(const std::string &, const std::string &)> writer,
+                                   const server_gpu_power_ryzenadj_api * apu_api)
+        : drm_dir_(std::move(drm_dir)), writer_(writer ? std::move(writer) : server_gpu_power_write_sysfs),
+          apu_api_(apu_api ? *apu_api : server_gpu_power_ryzenadj_api{}), apu_api_injected_(apu_api != nullptr) {}
+
     ~server_gpu_power_amdgpu_backend() override { shutdown(); }
 
     bool init(int32_t device, server_gpu_power_device_info & info, std::string & error) override {
@@ -532,7 +539,7 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
 
         // Locate the AMD GPU drm cards in /sys/class/drm (vendor 0x1002).
         std::vector<std::string> amd_cards;
-        const std::string drm_dir = "/sys/class/drm";
+        const std::string & drm_dir = drm_dir_;
         if (std::filesystem::exists(drm_dir)) {
             for (const auto & entry : std::filesystem::directory_iterator(drm_dir)) {
                 const std::string name = entry.path().filename().string();
@@ -552,7 +559,7 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
         std::sort(amd_cards.begin(), amd_cards.end());
 
         if (amd_cards.empty()) {
-            error = "no AMDGPU drm card found in /sys/class/drm";
+            error = "no AMDGPU drm card found in " + drm_dir;
             return false;
         }
         if (static_cast<size_t>(device) >= amd_cards.size()) {
@@ -572,25 +579,34 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
         }
         original_level_ = server_gpu_power_trim(original_level_);
 
-        // Parse the OD range (min/max SCLK) and the supported clock levels.
+        // OD_SCLK is the current custom range; OD_RANGE is only the allowed range.
         std::string od;
         if (server_gpu_power_read_sysfs(od_path, od)) {
+            bool in_sclk = false;
             for (const auto & line : split_lines(od)) {
-                std::istringstream iss(line);
+                const std::string text = server_gpu_power_trim(line);
+                if (text.rfind("OD_", 0) == 0) {
+                    in_sclk = text == "OD_SCLK:";
+                    continue;
+                }
+                std::istringstream iss(text);
                 std::string label;
-                std::string lo_str, hi_str;
-                if (iss >> label >> lo_str >> hi_str) {
-                    if (server_gpu_power_trim(label) == "SCLK:") {
-                        const uint32_t lo = static_cast<uint32_t>(std::atoi(lo_str.c_str()));
-                        const uint32_t hi = static_cast<uint32_t>(std::atoi(hi_str.c_str()));
-                        if (lo > 0 && hi >= lo) {
-                            od_sclk_min_ = lo;
-                            od_sclk_max_ = hi;
-                        }
+                uint32_t lo = 0, hi = 0;
+                std::string unit;
+                if (iss >> label >> lo) {
+                    if (in_sclk && label == "0:") original_sclk_min_ = lo;
+                    if (in_sclk && label == "1:") original_sclk_max_ = lo;
+                    if (label == "SCLK:" && iss >> unit >> hi && lo > 0 && hi >= lo) {
+                        od_sclk_min_ = lo;
+                        od_sclk_max_ = hi;
                     }
                 }
             }
         }
+        std::string fabric;
+        info.fabric_state_supported = original_level_ != "manual" &&
+            server_gpu_power_read_sysfs(card_dir_ + "/device/pp_dpm_fclk", fabric) &&
+            !server_gpu_power_trim(fabric).empty();
 
         std::string sclk;
         if (server_gpu_power_read_sysfs(card_dir_ + "/device/pp_dpm_sclk", sclk)) {
@@ -611,10 +627,6 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
                 info.supported_mem_clocks_mhz.end());
         }
 
-        if (info.supported_mem_clocks_mhz.empty()) {
-            error = "cannot read supported SCLK levels from " + card_dir_ + "/device/pp_dpm_sclk";
-            return false;
-        }
 
         info.name                    = "AMDGPU " + card_dir_ + " (sysfs)";
         info.device                  = device;
@@ -637,70 +649,67 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
     }
 
     bool set_memory_locked_clocks(uint32_t min_mhz, uint32_t max_mhz, std::string & error) override {
-        (void) min_mhz;
-        if (!initialized_) {
-            error = "AMDGPU backend is not initialized";
+        if (!initialized_ || original_sclk_min_ == 0 || original_sclk_max_ < original_sclk_min_ ||
+            min_mhz < od_sclk_min_ || max_mhz > od_sclk_max_ || min_mhz == 0 || min_mhz > max_mhz) {
+            error = "AMDGPU SCLK range is unavailable or requested clock is outside OD_RANGE";
             return false;
         }
-
-        // Drive the GPU into manual DPM and pin the SCLK range so the iGPU
-        // runs at its maximum clock during decode. This is the exact flow
-        // validated on the Radeon 780M: without it, "auto" stays on the lowest
-        // DPM state (800 MHz) even at ~90% busy, capping decode throughput.
-        const std::string level_path = card_dir_ + "/device/power_dpm_force_performance_level";
-        if (!server_gpu_power_write_sysfs(level_path, "manual\n")) {
-            error = "cannot write " + level_path;
-            return false;
+        if (!enter_manual(error)) {
+            return rollback(error);
         }
-
-        const uint32_t target = max_mhz > 0 ? std::min(max_mhz, od_sclk_max_) : od_sclk_max_;
-        if (target > 0) {
-            const std::string od_path = card_dir_ + "/device/pp_od_clk_voltage";
-            if (!server_gpu_power_write_sysfs(od_path, "s 0 " + std::to_string(target) + "\n")) {
-                error = "cannot write " + od_path;
-                return false;
-            }
-            if (!server_gpu_power_write_sysfs(od_path, "s 1 " + std::to_string(target) + "\n")) {
-                error = "cannot write " + od_path;
-                return false;
-            }
-            if (!server_gpu_power_write_sysfs(od_path, "c\n")) {
-                error = "cannot commit " + od_path;
-                return false;
-            }
-            pinned_max_mhz_ = target;
+        // Mark dirty before the first write: a later write or commit can fail.
+        sclk_changed_ = true;
+        if (!write("pp_od_clk_voltage", "s 0 " + std::to_string(min_mhz) + "\n", error) ||
+            !write("pp_od_clk_voltage", "s 1 " + std::to_string(max_mhz) + "\n", error) ||
+            !write("pp_od_clk_voltage", "c\n", error)) {
+            return rollback(error);
         }
-
-        level_locked_ = true;
         return true;
     }
 
     bool reset_memory_locked_clocks(std::string & error) override {
-        if (!initialized_) {
-            error = "AMDGPU backend is not initialized";
+        bool success = true;
+        if (sclk_changed_) {
+            // Reset and commit the driver defaults before restoring custom OD.
+            level_locked_ = true;
+            success = write("power_dpm_force_performance_level", "manual\n", error);
+            if (success) success = write("pp_od_clk_voltage", "r\n", error);
+            if (success) success = write("pp_od_clk_voltage", "c\n", error);
+            if (success && (original_sclk_min_ != od_sclk_min_ || original_sclk_max_ != od_sclk_max_)) {
+                success = write("pp_od_clk_voltage", "s 0 " + std::to_string(original_sclk_min_) + "\n", error) &&
+                          write("pp_od_clk_voltage", "s 1 " + std::to_string(original_sclk_max_) + "\n", error) &&
+                          write("pp_od_clk_voltage", "c\n", error);
+            }
+            if (success) sclk_changed_ = false;
+        }
+        if (!fabric_locked_ || !success) {
+            std::string level_error;
+            if (!restore_level(level_error)) {
+                if (!success) error += "; restore level: " + level_error;
+                else error = level_error;
+                success = false;
+            }
+        }
+        return success;
+    }
+
+    bool set_fabric_state(int32_t state, std::string & error) override {
+        if (!initialized_ || state < 0 || state > 31 || original_level_ == "manual") {
+            error = "AMDGPU fabric requires a raw state 0..31 and a restorable non-manual original level";
             return false;
         }
+        if (!enter_manual(error)) return rollback(error);
+        fabric_locked_ = true;
+        if (!write("pp_dpm_fclk", std::to_string(state) + "\n", error)) return rollback(error);
+        return true;
+    }
 
-        // Restore the original pinned OD range, then the original level.
-        if (pinned_max_mhz_ > 0) {
-            const std::string od_path = card_dir_ + "/device/pp_od_clk_voltage";
-            if (od_sclk_min_ > 0) {
-                server_gpu_power_write_sysfs(od_path, "s 0 " + std::to_string(od_sclk_min_) + "\n");
-            }
-            if (od_sclk_max_ > 0) {
-                server_gpu_power_write_sysfs(od_path, "s 1 " + std::to_string(od_sclk_max_) + "\n");
-            }
-            server_gpu_power_write_sysfs(od_path, "c\n");
-            pinned_max_mhz_ = 0;
-        }
-
-        if (level_locked_) {
-            const std::string level_path = card_dir_ + "/device/power_dpm_force_performance_level";
-            if (!original_level_.empty()) {
-                server_gpu_power_write_sysfs(level_path, original_level_ + "\n");
-            }
-            level_locked_ = false;
-        }
+    bool reset_fabric_state(std::string & error) override {
+        if (!fabric_locked_) return restore_level_if_unused(error);
+        // The governor resets SCLK first. Release the fabric mask and profile
+        // even if that earlier OD restore failed; keep SCLK dirty for a retry.
+        if (!restore_level(error)) return false;
+        fabric_locked_ = false;
         return true;
     }
 
@@ -715,19 +724,161 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
         return true;
     }
 
+    bool init_apu_tdp(std::string & error) override {
+        if (!initialized_) {
+            error = "AMDGPU backend is not initialized";
+            return false;
+        }
+        if (apu_access_) return true;
+        if (!apu_api_injected_) {
+#if defined(__linux__)
+            apu_library_ = dlopen("libryzenadj.so", RTLD_NOW | RTLD_LOCAL);
+            if (!apu_library_) {
+                error = "cannot load libryzenadj.so for --apu-tdp";
+                return false;
+            }
+            bool resolved = server_gpu_power_resolve_symbol(apu_library_, "init_ryzenadj", apu_api_.init) &&
+                            server_gpu_power_resolve_symbol(apu_library_, "cleanup_ryzenadj", apu_api_.cleanup) &&
+                            server_gpu_power_resolve_symbol(apu_library_, "init_table", apu_api_.init_table) &&
+                            server_gpu_power_resolve_symbol(apu_library_, "refresh_table", apu_api_.refresh_table);
+            const char * names[] = {"stapm", "fast", "slow"};
+            for (int i = 0; i < 3 && resolved; ++i) {
+                resolved = server_gpu_power_resolve_symbol(apu_library_, ("get_" + std::string(names[i]) + "_limit").c_str(), apu_api_.get_limits[i]) &&
+                           server_gpu_power_resolve_symbol(apu_library_, ("set_" + std::string(names[i]) + "_limit").c_str(), apu_api_.set_limits[i]);
+            }
+            if (!resolved) {
+                error = "libryzenadj.so lacks required TDP symbols";
+                cleanup_apu_tdp();
+                return false;
+            }
+#else
+            error = "AMDGPU RyzenAdj TDP control requires Linux";
+            return false;
+#endif
+        }
+        bool complete = apu_api_.init && apu_api_.cleanup && apu_api_.init_table && apu_api_.refresh_table;
+        for (int i = 0; i < 3; ++i) complete = complete && apu_api_.get_limits[i] && apu_api_.set_limits[i];
+        if (!complete) {
+            error = "incomplete RyzenAdj TDP API";
+            cleanup_apu_tdp();
+            return false;
+        }
+        apu_access_ = apu_api_.init();
+        if (!apu_access_ || apu_api_.init_table(apu_access_) != 0 || apu_api_.refresh_table(apu_access_) != 0) {
+            error = "cannot initialize RyzenAdj access or refresh the APU power table";
+            cleanup_apu_tdp();
+            return false;
+        }
+        for (int i = 0; i < 3; ++i) {
+            const double mw = static_cast<double>(apu_api_.get_limits[i](apu_access_)) * 1000.0;
+            if (!std::isfinite(mw) || mw < 1 || mw > std::numeric_limits<uint32_t>::max()) {
+                error = "RyzenAdj returned an invalid original APU power limit";
+                cleanup_apu_tdp();
+                return false;
+            }
+            original_apu_limits_[i] = static_cast<uint32_t>(std::llround(mw));
+        }
+        LOG_INF("APU TDP: original STAPM/fast/slow limits %u/%u/%u mW\n",
+                original_apu_limits_[0], original_apu_limits_[1], original_apu_limits_[2]);
+        return true;
+    }
+
+    bool set_apu_tdp(uint32_t mw, std::string & error) override {
+        if (!apu_access_ || mw == 0) {
+            error = "APU TDP is not initialized or target is zero";
+            return false;
+        }
+        for (int i = 0; i < 3; ++i) {
+            apu_limit_changed_[i] = true;
+            const int result = apu_api_.set_limits[i](apu_access_, mw);
+            if (result != 0) {
+                error = "RyzenAdj set APU limit " + std::to_string(i) + " failed: " + std::to_string(result);
+                std::string restore_error;
+                if (!reset_apu_tdp(restore_error)) error += "; rollback: " + restore_error;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool reset_apu_tdp(std::string & error) override {
+        bool success = true;
+        for (int i = 0; i < 3; ++i) {
+            if (!apu_limit_changed_[i]) continue;
+            const int result = apu_api_.set_limits[i](apu_access_, original_apu_limits_[i]);
+            if (result != 0) {
+                if (!success) error += "; ";
+                else error.clear();
+                error += "RyzenAdj restore APU limit " + std::to_string(i) + " failed: " + std::to_string(result);
+                success = false;
+            } else {
+                apu_limit_changed_[i] = false;
+            }
+        }
+        return success;
+    }
+
     void shutdown() override {
         if (initialized_) {
             std::string error;
-            reset_memory_locked_clocks(error);
+            if (!reset_memory_locked_clocks(error)) LOG_WRN("AMDGPU SCLK restore failed: %s\n", error.c_str());
+            if (!reset_fabric_state(error)) LOG_WRN("AMDGPU fabric restore failed: %s\n", error.c_str());
+            if (!reset_apu_tdp(error)) LOG_WRN("APU TDP restore failed: %s\n", error.c_str());
         }
-        initialized_     = false;
-        level_locked_    = false;
-        pinned_max_mhz_  = 0;
+        cleanup_apu_tdp();
+        initialized_ = false;
+        level_locked_ = sclk_changed_ = fabric_locked_ = false;
+        od_sclk_min_ = od_sclk_max_ = original_sclk_min_ = original_sclk_max_ = 0;
         card_dir_.clear();
         original_level_.clear();
     }
 
   private:
+    void cleanup_apu_tdp() {
+        if (apu_access_) apu_api_.cleanup(apu_access_);
+        apu_access_ = nullptr;
+#if defined(__linux__)
+        if (apu_library_) dlclose(apu_library_);
+#endif
+        apu_library_ = nullptr;
+        if (!apu_api_injected_) apu_api_ = {};
+        for (int i = 0; i < 3; ++i) {
+            original_apu_limits_[i] = 0;
+            apu_limit_changed_[i] = false;
+        }
+    }
+
+    bool write(const char * file, const std::string & value, std::string & error) {
+        const std::string path = card_dir_ + "/device/" + file;
+        if (writer_(path, value)) return true;
+        error = "cannot write " + path + " (" + server_gpu_power_trim(value) + ")";
+        return false;
+    }
+
+    bool enter_manual(std::string & error) {
+        if (level_locked_) return true;
+        level_locked_ = true;
+        return write("power_dpm_force_performance_level", "manual\n", error);
+    }
+
+    bool restore_level(std::string & error) {
+        if (!level_locked_) return true;
+        if (!write("power_dpm_force_performance_level", original_level_ + "\n", error)) return false;
+        level_locked_ = false;
+        return true;
+    }
+
+    bool restore_level_if_unused(std::string & error) {
+        return sclk_changed_ || restore_level(error);
+    }
+
+    bool rollback(std::string & error) {
+        std::string restore_error;
+        if (!reset_memory_locked_clocks(restore_error)) error += "; rollback: " + restore_error;
+        if (!reset_fabric_state(restore_error)) error += "; rollback: " + restore_error;
+        return false;
+    }
+
     static std::vector<std::string> split_lines(const std::string & s) {
         std::vector<std::string> out;
         std::istringstream iss(s);
@@ -738,13 +889,24 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
         return out;
     }
 
+    std::string drm_dir_;
+    std::function<bool(const std::string &, const std::string &)> writer_;
     std::string card_dir_;
     std::string original_level_;
-    uint32_t    od_sclk_min_   = 0;
-    uint32_t    od_sclk_max_   = 0;
-    uint32_t    pinned_max_mhz_ = 0;
-    bool        level_locked_  = false;
-    bool        initialized_   = false;
+    uint32_t od_sclk_min_ = 0;
+    uint32_t od_sclk_max_ = 0;
+    uint32_t original_sclk_min_ = 0;
+    uint32_t original_sclk_max_ = 0;
+    bool level_locked_ = false;
+    bool sclk_changed_ = false;
+    bool fabric_locked_ = false;
+    bool initialized_ = false;
+    server_gpu_power_ryzenadj_api apu_api_;
+    bool apu_api_injected_ = false;
+    void * apu_library_ = nullptr;
+    _ryzen_access * apu_access_ = nullptr;
+    uint32_t original_apu_limits_[3] = {};
+    bool apu_limit_changed_[3] = {};
 };
 
 }  // namespace
@@ -753,8 +915,10 @@ std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_nvml_backend()
     return std::make_unique<server_gpu_power_nvml_backend>();
 }
 
-std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_amdgpu_backend() {
-    return std::make_unique<server_gpu_power_amdgpu_backend>();
+std::unique_ptr<server_gpu_power_backend> server_gpu_power_create_amdgpu_backend(
+    const std::string & drm_dir, std::function<bool(const std::string &, const std::string &)> write_sysfs,
+    const server_gpu_power_ryzenadj_api * apu_api) {
+    return std::make_unique<server_gpu_power_amdgpu_backend>(drm_dir, std::move(write_sysfs), apu_api);
 }
 
 server_gpu_power_backend_type server_gpu_power_backend_from_string(const std::string & backend) {
@@ -779,6 +943,19 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
 
     if (!config_.enabled()) {
         return true;
+    }
+
+    if (config_.fabric_state < -1 || config_.fabric_state > 31 ||
+        (config_.fabric_state >= 0 && config_.backend != server_gpu_power_backend_type::amdgpu)) {
+        LOG_ERR("GPU fabric state requires --gpu-power-backend amdgpu and a raw state index 0..31\n");
+        return false;
+    }
+
+    if (config_.apu_tdp_w != -1 &&
+        (config_.backend != server_gpu_power_backend_type::amdgpu || config_.power_enabled() ||
+         !server_gpu_power_w_to_mw(config_.apu_tdp_w, apu_tdp_mw_))) {
+        LOG_ERR("APU TDP requires positive watts, explicit amdgpu backend, and no GPU power-limit options\n");
+        return false;
     }
 
     if (config_.device < 0) {
@@ -815,7 +992,7 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
         } else if (config_.backend == server_gpu_power_backend_type::nvml) {
             backend_ = server_gpu_power_create_nvml_backend();
         } else {
-            // auto: prefer NVML for NVIDIA GPUs, fall back to the AMDGPU sysfs backend.
+            // auto uses NVML; AMDGPU sysfs requires an explicit backend.
             backend_ = server_gpu_power_create_nvml_backend();
         }
     }
@@ -826,6 +1003,13 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
         return false;
     }
     backend_initialized_ = true;
+
+    if (config_.fabric_state >= 0 && !device_info_.fabric_state_supported) {
+        LOG_ERR("GPU fabric state requires readable pp_dpm_fclk and a non-manual original performance level\n");
+        backend_->shutdown();
+        backend_initialized_ = false;
+        return false;
+    }
 
     if (config_.power_enabled()) {
         const auto validate_limit = [&](uint32_t power_mw, const char * profile) {
@@ -910,6 +1094,16 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
         }
     }
 
+    if (config_.apu_tdp_w != -1) {
+        std::string error;
+        if (!backend_->init_apu_tdp(error)) {
+            LOG_ERR("APU TDP initialization failed: %s\n", error.c_str());
+            backend_->shutdown();
+            backend_initialized_ = false;
+            return false;
+        }
+    }
+
     phase_                       = server_gpu_power_phase::idle;
     transition_count_            = 0;
     last_applied_power_limit_mw_ = device_info_.original_power_limit_mw;
@@ -922,7 +1116,9 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
 
     LOG_INF("GPU governor enabled\n");
     LOG_INF("  device: %s\n", device_info_.name.c_str());
-    LOG_INF("  NVML index: %d\n", device_info_.device);
+    LOG_INF("  device index: %d\n", device_info_.device);
+    if (config_.fabric_state >= 0) LOG_INF("  fabric raw state: %d\n", config_.fabric_state);
+    if (config_.apu_tdp_w != -1) LOG_INF("  active APU TDP: %d W\n", config_.apu_tdp_w);
     if (config_.power_enabled()) {
         LOG_INF("  original PL: %s W\n", server_gpu_power_mw_to_string(device_info_.original_power_limit_mw).c_str());
         LOG_INF("  allowed range: %s-%s W\n", server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
@@ -949,6 +1145,17 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
     const server_gpu_power_phase previous = phase_;
     phase_                                = phase;
     transition_count_++;
+
+    if (config_.apu_tdp_w != -1 && phase != server_gpu_power_phase::idle && !apu_tdp_applied_) {
+        std::string error;
+        // Also retry cleanup from the governor if the backend's local rollback fails.
+        apu_tdp_applied_ = true;
+        if (!backend_->set_apu_tdp(apu_tdp_mw_, error)) {
+            disable_after_error(error);
+            return;
+        }
+        LOG_INF("APU TDP: active limit %d W\n", config_.apu_tdp_w);
+    }
 
     if (config_.power_enabled()) {
         if (phase == server_gpu_power_phase::idle) {
@@ -1039,6 +1246,33 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
             last_applied_mem_offset_mhz_ = target_offset;
         }
     }
+
+    if (config_.fabric_state >= 0) {
+        const bool active = phase != server_gpu_power_phase::idle;
+        std::string error;
+        if (active && !fabric_state_applied_) {
+            if (!backend_->set_fabric_state(config_.fabric_state, error)) {
+                disable_after_error(error);
+                return;
+            }
+            fabric_state_applied_ = true;
+        } else if (!active && fabric_state_applied_) {
+            if (!backend_->reset_fabric_state(error)) {
+                disable_after_error(error);
+                return;
+            }
+            fabric_state_applied_ = false;
+        }
+    }
+    if (phase == server_gpu_power_phase::idle && apu_tdp_applied_) {
+        std::string error;
+        if (!backend_->reset_apu_tdp(error)) {
+            disable_after_error(error);
+            return;
+        }
+        apu_tdp_applied_ = false;
+        LOG_INF("APU TDP: restored original limits\n");
+    }
 }
 
 void server_gpu_power::on_sleeping(bool sleeping) {
@@ -1046,8 +1280,8 @@ void server_gpu_power::on_sleeping(bool sleeping) {
         return;
     }
 
-    if (sleeping) {
-        restore_original();
+    if (sleeping && !restore_original()) {
+        disable_after_error("failed to restore GPU/APU state before sleep");
     }
 
     phase_ = server_gpu_power_phase::idle;
@@ -1069,6 +1303,8 @@ void server_gpu_power::shutdown() {
         backend_initialized_ = false;
     }
 
+    fabric_state_applied_        = false;
+    apu_tdp_applied_             = false;
     enabled_                     = false;
     phase_                       = server_gpu_power_phase::idle;
     power_limit_changed_         = false;
@@ -1127,6 +1363,26 @@ bool server_gpu_power::restore_original() {
         } else {
             mem_clock_locked_           = false;
             last_applied_mem_clock_mhz_ = 0;
+        }
+    }
+
+    if (fabric_state_applied_) {
+        std::string error;
+        if (!backend_->reset_fabric_state(error)) {
+            LOG_WRN("GPU fabric: failed to restore original profile: %s\n", error.c_str());
+            success = false;
+        } else {
+            fabric_state_applied_ = false;
+        }
+    }
+
+    if (apu_tdp_applied_) {
+        std::string error;
+        if (!backend_->reset_apu_tdp(error)) {
+            LOG_WRN("APU TDP: failed to restore original limits: %s\n", error.c_str());
+            success = false;
+        } else {
+            apu_tdp_applied_ = false;
         }
     }
 

@@ -2,7 +2,13 @@
 
 #undef NDEBUG
 #include <cassert>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <utility>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -107,7 +113,350 @@ static server_gpu_power_phase arbitrate(std::initializer_list<server_gpu_power_s
     return arbitrator.phase();
 }
 
+struct fake_amdgpu_sysfs {
+    std::filesystem::path root = std::filesystem::temp_directory_path() /
+        ("test-amdgpu-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::path device = root / "card0/device";
+    std::vector<std::string> writes;
+    std::string fail_once;
+
+    fake_amdgpu_sysfs(const std::string & level = "auto", bool custom = false) {
+        std::filesystem::create_directories(device);
+        put("vendor", "0x1002\n");
+        put("power_dpm_force_performance_level", level + "\n");
+        put("pp_od_clk_voltage", custom ?
+            "OD_SCLK:\n0: 900Mhz\n1: 2400Mhz\nOD_RANGE:\nSCLK: 800Mhz 2700Mhz\n" :
+            "OD_SCLK:\n0: 800Mhz\n1: 2700Mhz\nOD_RANGE:\nSCLK: 800Mhz 2700Mhz\n");
+        put("pp_dpm_sclk", "0: 800Mhz\n1: 2700Mhz *\n");
+        // Display order is deliberately reversed relative to firmware indices.
+        put("pp_dpm_fclk", "0: 400Mhz\n1: 933Mhz\n2: 1467Mhz\n3: 1875Mhz *\n");
+    }
+    ~fake_amdgpu_sysfs() { std::filesystem::remove_all(root); }
+    void put(const std::string & name, const std::string & text) {
+        std::ofstream f(device / name);
+        f << text;
+        f.close();
+        assert(!f.fail());
+    }
+    std::unique_ptr<server_gpu_power_backend> backend(const server_gpu_power_ryzenadj_api * api = nullptr) {
+        return server_gpu_power_create_amdgpu_backend(root.string(),
+            [this](const std::string & path, const std::string & value) {
+                const auto op = std::filesystem::path(path).filename().string() + ":" + value;
+                writes.push_back(op);
+                if (op == fail_once) {
+                    fail_once.clear();
+                    return false;
+                }
+                return true;
+            }, api);
+    }
+};
+
+struct fake_ryzenadj {
+    static fake_ryzenadj * current;
+    float limits[3] = {8, 20, 15};
+    int init_calls = 0;
+    int cleanup_calls = 0;
+    int init_table_calls = 0;
+    int refresh_calls = 0;
+    bool fail_init = false;
+    bool fail_table = false;
+    bool fail_refresh = false;
+    std::vector<std::pair<int, uint32_t>> writes;
+    std::vector<std::pair<int, uint32_t>> failures;
+    fake_ryzenadj() { current = this; }
+    static fake_ryzenadj & from(_ryzen_access * access) {
+        return *reinterpret_cast<fake_ryzenadj *>(access);
+    }
+    template<int I> static float get(_ryzen_access * access) { return from(access).limits[I]; }
+    template<int I> static int set(_ryzen_access * access, uint32_t mw) {
+        auto & fake = from(access);
+        const auto op = std::make_pair(I, mw);
+        fake.writes.push_back(op);
+        fake.limits[I] = mw / 1000.0f;
+        // Even a failing setter may have partially applied its hardware write.
+        if (!fake.failures.empty() && fake.failures.front() == op) {
+            fake.failures.erase(fake.failures.begin());
+            return -4;
+        }
+        return 0;
+    }
+    server_gpu_power_ryzenadj_api api() {
+        return {
+            []() -> _ryzen_access * {
+                ++current->init_calls;
+                return current->fail_init ? nullptr : reinterpret_cast<_ryzen_access *>(current);
+            },
+            [](_ryzen_access * access) { ++from(access).cleanup_calls; },
+            [](_ryzen_access * access) { ++from(access).init_table_calls; return from(access).fail_table ? -5 : 0; },
+            [](_ryzen_access * access) { ++from(access).refresh_calls; return from(access).fail_refresh ? -5 : 0; },
+            {get<0>, get<1>, get<2>}, {set<0>, set<1>, set<2>}
+        };
+    }
+    void assert_original() const {
+        assert(limits[0] == 8 && limits[1] == 20 && limits[2] == 15);
+    }
+};
+fake_ryzenadj * fake_ryzenadj::current = nullptr;
+
+static void test_apu_tdp() {
+    const auto amd = server_gpu_power_backend_type::amdgpu;
+    // Real AMD backend and governor, fake RyzenAdj: no writes until inference.
+    {
+        fake_amdgpu_sysfs sys;
+        fake_ryzenadj ryzen;
+        auto api = ryzen.api();
+        server_gpu_power governor(sys.backend(&api));
+        assert(governor.init({-1, -1, -1, -1, 0, amd, -1, 20}));
+        assert(ryzen.init_calls == 1 && ryzen.refresh_calls == 1 && ryzen.writes.empty());
+        governor.update(server_gpu_power_phase::prefill);
+        assert((ryzen.writes == std::vector<std::pair<int, uint32_t>>{{0, 20000}, {1, 20000}, {2, 20000}}));
+        governor.update(server_gpu_power_phase::decode);
+        assert(ryzen.writes.size() == 3);
+        governor.update(server_gpu_power_phase::idle);
+        ryzen.assert_original();
+        assert((ryzen.writes == std::vector<std::pair<int, uint32_t>>{
+            {0, 20000}, {1, 20000}, {2, 20000}, {0, 8000}, {1, 20000}, {2, 15000}}));
+        governor.update(server_gpu_power_phase::decode);
+        governor.on_sleeping(true);
+        ryzen.assert_original();
+        governor.on_sleeping(false);
+        governor.update(server_gpu_power_phase::prefill);
+        governor.shutdown();
+        ryzen.assert_original();
+        assert(ryzen.cleanup_calls == 1);
+        assert(sys.writes.empty()); // TDP does not touch DPM, clocks, thermal limits or time constants.
+    }
+    // Existing GFX/fabric options do not initialize RyzenAdj at all.
+    {
+        fake_amdgpu_sysfs sys;
+        fake_ryzenadj ryzen;
+        auto api = ryzen.api();
+        server_gpu_power governor(sys.backend(&api));
+        assert(governor.init({-1, -1, 2700, 2700, 0, amd, 0}));
+        governor.update(server_gpu_power_phase::prefill);
+        governor.update(server_gpu_power_phase::idle);
+        assert(ryzen.init_calls == 0 && ryzen.writes.empty());
+    }
+    // Each partial apply failure is undone; a failed local rollback is retried by the governor.
+    for (int failed_limit = 0; failed_limit < 3; ++failed_limit) {
+        for (bool fail_rollback : {false, true}) {
+            fake_amdgpu_sysfs sys;
+            fake_ryzenadj ryzen;
+            auto api = ryzen.api();
+            server_gpu_power governor(sys.backend(&api));
+            assert(governor.init({-1, -1, -1, -1, 0, amd, -1, 20}));
+            ryzen.failures = {{failed_limit, 20000}};
+            if (fail_rollback) ryzen.failures.push_back({0, 8000});
+            governor.update(server_gpu_power_phase::prefill);
+            assert(!governor.enabled());
+            assert(ryzen.failures.empty());
+            ryzen.assert_original();
+        }
+    }
+    // Idle/sleep restore continues past an error and retries only dirty limits.
+    for (bool sleeping : {false, true}) {
+        fake_amdgpu_sysfs sys;
+        fake_ryzenadj ryzen;
+        auto api = ryzen.api();
+        server_gpu_power governor(sys.backend(&api));
+        assert(governor.init({-1, -1, -1, -1, 0, amd, -1, 20}));
+        governor.update(server_gpu_power_phase::decode);
+        ryzen.failures = {{0, 8000}};
+        if (sleeping) governor.on_sleeping(true);
+        else governor.update(server_gpu_power_phase::idle);
+        assert(!governor.enabled());
+        ryzen.assert_original();
+        assert((ryzen.writes == std::vector<std::pair<int, uint32_t>>{
+            {0, 20000}, {1, 20000}, {2, 20000}, {0, 8000}, {1, 20000}, {2, 15000}, {0, 8000}}));
+    }
+    // A clock failure after TDP application must also return the original TDP limits.
+    {
+        fake_amdgpu_sysfs sys;
+        fake_ryzenadj ryzen;
+        auto api = ryzen.api();
+        server_gpu_power governor(sys.backend(&api));
+        assert(governor.init({-1, -1, 2700, 2700, 0, amd, 0, 20}));
+        sys.fail_once = "pp_od_clk_voltage:s 0 2700\n";
+        governor.update(server_gpu_power_phase::prefill);
+        assert(!governor.enabled());
+        ryzen.assert_original();
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+    }
+    // API, access, table and snapshot failures clean up without writing any limit.
+    for (int scenario = 0; scenario < 8; ++scenario) {
+        fake_amdgpu_sysfs sys;
+        fake_ryzenadj ryzen;
+        auto api = ryzen.api();
+        if (scenario == 0) api.set_limits[2] = nullptr;
+        if (scenario == 1) ryzen.fail_init = true;
+        if (scenario == 2) ryzen.fail_table = true;
+        if (scenario == 3) ryzen.fail_refresh = true;
+        if (scenario == 4) ryzen.limits[0] = std::numeric_limits<float>::quiet_NaN();
+        if (scenario == 5) ryzen.limits[1] = std::numeric_limits<float>::infinity();
+        if (scenario == 6) ryzen.limits[2] = 0;
+        if (scenario == 7) ryzen.limits[0] = std::numeric_limits<float>::max();
+        server_gpu_power governor(sys.backend(&api));
+        assert(!governor.init({-1, -1, -1, -1, 0, amd, -1, 20}));
+        assert(ryzen.writes.empty());
+        assert(ryzen.cleanup_calls == (scenario >= 2 ? 1 : 0));
+    }
+    for (int watts : {-2, 0, std::numeric_limits<int32_t>::max()}) {
+        fake_amdgpu_sysfs sys;
+        server_gpu_power governor(sys.backend());
+        assert(!governor.init({-1, -1, -1, -1, 0, amd, -1, watts}));
+        assert(sys.writes.empty());
+    }
+    for (auto backend : {server_gpu_power_backend_type::auto_detect, server_gpu_power_backend_type::nvml}) {
+        fake_amdgpu_sysfs sys;
+        server_gpu_power governor(sys.backend());
+        assert(!governor.init({-1, -1, -1, -1, 0, backend, -1, 20}));
+    }
+    {
+        fake_amdgpu_sysfs sys;
+        server_gpu_power governor(sys.backend());
+        assert(!governor.init({20, 20, -1, -1, 0, amd, -1, 20}));
+    }
+}
+
+static void test_amdgpu() {
+    const auto amd = server_gpu_power_backend_type::amdgpu;
+    // Real AMD backend over fake sysfs: exact restore sequence, including custom OD.
+    for (bool custom : {false, true}) {
+        fake_amdgpu_sysfs sys("auto", custom);
+        auto backend = sys.backend();
+        server_gpu_power_device_info info;
+        std::string error;
+        assert(backend->init(0, info, error));
+        assert(backend->set_memory_locked_clocks(2700, 2700, error));
+        assert(backend->reset_memory_locked_clocks(error));
+        std::vector<std::string> expected = {
+            "power_dpm_force_performance_level:manual\n", "pp_od_clk_voltage:s 0 2700\n",
+            "pp_od_clk_voltage:s 1 2700\n", "pp_od_clk_voltage:c\n",
+            "power_dpm_force_performance_level:manual\n", "pp_od_clk_voltage:r\n", "pp_od_clk_voltage:c\n"};
+        if (custom) {
+            expected.push_back("pp_od_clk_voltage:s 0 900\n");
+            expected.push_back("pp_od_clk_voltage:s 1 2400\n");
+            expected.push_back("pp_od_clk_voltage:c\n");
+        }
+        expected.push_back("power_dpm_force_performance_level:auto\n");
+        assert(sys.writes == expected);
+        assert(backend->reset_memory_locked_clocks(error));
+        assert(sys.writes == expected);
+    }
+    // Every partial setter failure rolls back immediately, before governor bookkeeping.
+    for (const auto & fail : {"power_dpm_force_performance_level:manual\n",
+                              "pp_od_clk_voltage:s 0 2700\n", "pp_od_clk_voltage:s 1 2700\n",
+                              "pp_od_clk_voltage:c\n"}) {
+        fake_amdgpu_sysfs sys;
+        auto backend = sys.backend();
+        server_gpu_power_device_info info;
+        std::string error;
+        assert(backend->init(0, info, error));
+        sys.fail_once = fail;
+        assert(!backend->set_memory_locked_clocks(2700, 2700, error));
+        assert(!error.empty());
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+    }
+    // Reset failures propagate and retain dirty state so the next cleanup retries.
+    for (const auto & fail : {"pp_od_clk_voltage:r\n", "pp_od_clk_voltage:c\n",
+                              "power_dpm_force_performance_level:auto\n"}) {
+        fake_amdgpu_sysfs sys;
+        auto backend = sys.backend();
+        server_gpu_power_device_info info;
+        std::string error;
+        assert(backend->init(0, info, error));
+        assert(backend->set_memory_locked_clocks(2700, 2700, error));
+        sys.fail_once = fail;
+        assert(!backend->reset_memory_locked_clocks(error));
+        assert(backend->reset_memory_locked_clocks(error));
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+    }
+    // A failed OD restore must still release manual mode while fabric is locked.
+    for (const auto & fail : {"pp_od_clk_voltage:r\n", "pp_od_clk_voltage:c\n"}) {
+        fake_amdgpu_sysfs sys;
+        auto backend = sys.backend();
+        server_gpu_power_device_info info;
+        std::string error;
+        assert(backend->init(0, info, error));
+        assert(backend->set_fabric_state(0, error));
+        assert(backend->set_memory_locked_clocks(2700, 2700, error));
+        sys.fail_once = fail;
+        assert(!backend->reset_memory_locked_clocks(error));
+        assert(error.find("pp_od_clk_voltage") != std::string::npos);
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+        assert(backend->reset_memory_locked_clocks(error));
+        assert(backend->reset_fabric_state(error));
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+    }
+    // Fabric alone and combined decode-only GFX: active in BOTH phases, raw index unchanged.
+    for (bool gfx : {false, true}) {
+        fake_amdgpu_sysfs sys;
+        server_gpu_power governor(sys.backend());
+        assert(governor.init({-1, -1, gfx ? 2700 : -1, -1, 0, amd, 0}));
+        assert(governor.enabled());
+        governor.update(server_gpu_power_phase::prefill);
+        assert(sys.writes == std::vector<std::string>({"power_dpm_force_performance_level:manual\n", "pp_dpm_fclk:0\n"}));
+        governor.update(server_gpu_power_phase::decode);
+        governor.update(server_gpu_power_phase::prefill);
+        assert(sys.writes.back() != "power_dpm_force_performance_level:auto\n");
+        governor.update(server_gpu_power_phase::idle);
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+        governor.update(server_gpu_power_phase::decode);
+        governor.on_sleeping(true);
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+    }
+    // Kernel rejection restores the prior performance profile and disables the governor.
+    {
+        fake_amdgpu_sysfs sys("high");
+        server_gpu_power governor(sys.backend());
+        assert(governor.init({-1, -1, 2700, 2700, 0, amd, 31}));
+        sys.fail_once = "pp_dpm_fclk:31\n";
+        governor.update(server_gpu_power_phase::prefill);
+        assert(!governor.enabled());
+        assert(sys.writes.back() == "power_dpm_force_performance_level:high\n");
+    }
+    // Original manual masks cannot be read back faithfully; fail without touching hardware.
+    {
+        fake_amdgpu_sysfs sys("manual");
+        server_gpu_power governor(sys.backend());
+        assert(!governor.init({-1, -1, -1, -1, 0, amd, 0}));
+        assert(sys.writes.empty());
+    }
+    for (int state : {-2, 32}) {
+        fake_amdgpu_sysfs sys;
+        server_gpu_power governor(sys.backend());
+        assert(!governor.init({-1, -1, -1, -1, 0, amd, state}));
+        assert(sys.writes.empty());
+    }
+    for (auto backend : {server_gpu_power_backend_type::auto_detect, server_gpu_power_backend_type::nvml}) {
+        fake_amdgpu_sysfs sys;
+        server_gpu_power governor(sys.backend());
+        assert(!governor.init({-1, -1, -1, -1, 0, backend, 0}));
+        assert(sys.writes.empty());
+    }
+#if defined(__linux__)
+    // A buffered ofstream write to /dev/full succeeds until flush/close: detect it.
+    {
+        fake_amdgpu_sysfs sys;
+        auto backend = server_gpu_power_create_amdgpu_backend(sys.root.string());
+        server_gpu_power_device_info info;
+        std::string error;
+        assert(backend->init(0, info, error));
+        std::filesystem::remove(sys.device / "pp_od_clk_voltage");
+        std::filesystem::create_symlink("/dev/full", sys.device / "pp_od_clk_voltage");
+        assert(!backend->set_memory_locked_clocks(2700, 2700, error));
+        std::ifstream level(sys.device / "power_dpm_force_performance_level");
+        std::string current;
+        level >> current;
+        assert(current == "auto");
+    }
+#endif
+}
+
 int main() {
+    test_amdgpu();
+    test_apu_tdp();
     assert(arbitrate({}) == server_gpu_power_phase::idle);
     assert(arbitrate({ server_gpu_power_slot_state::idle }) == server_gpu_power_phase::idle);
     assert(arbitrate({ server_gpu_power_slot_state::wait_other }) == server_gpu_power_phase::idle);

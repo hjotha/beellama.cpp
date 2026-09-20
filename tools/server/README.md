@@ -237,8 +237,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--gpu-power-prefill W` | NVIDIA GPU power limit in watts during prompt processing (requires --gpu-power-decode)<br/>(env: LLAMA_ARG_GPU_POWER_PREFILL) |
 | `--gpu-power-decode W` | NVIDIA GPU power limit in watts during token generation (requires --gpu-power-prefill)<br/>(env: LLAMA_ARG_GPU_POWER_DECODE) |
 | `--gpu-power-device N` | NVML device index used by the NVIDIA GPU power governor (default: 0)<br/>(env: LLAMA_ARG_GPU_POWER_DEVICE) |
-| `--gpu-mem-clock-decode MHz` | NVIDIA GPU memory clock in MHz locked during token generation<br/>(env: LLAMA_ARG_GPU_MEM_CLOCK_DECODE) |
-| `--gpu-mem-clock-prefill MHz` | NVIDIA GPU memory clock in MHz locked during prompt processing<br/>(env: LLAMA_ARG_GPU_MEM_CLOCK_PREFILL) |
+| `--gpu-mem-clock-decode MHz` | GPU clock locked during token generation: NVIDIA memory or AMDGPU graphics (SCLK), in MHz<br/>(env: LLAMA_ARG_GPU_MEM_CLOCK_DECODE) |
+| `--gpu-mem-clock-prefill MHz` | GPU clock locked during prompt processing: NVIDIA memory or AMDGPU graphics (SCLK), in MHz<br/>(env: LLAMA_ARG_GPU_MEM_CLOCK_PREFILL) |
+| `--apu-tdp W` | Ryzen APU STAPM/fast/slow limits during prefill/decode; each original limit is restored on idle. Requires AMDGPU, `libryzenadj`, and Ryzen SMU access.<br/>(env: LLAMA_ARG_APU_TDP) |
+| `--gpu-fabric-state N` | AMDGPU raw fabric DPM state (0-31) during prefill/decode; requires `--gpu-power-backend amdgpu` and write permission on `pp_dpm_fclk`. Restored when idle.<br/>(env: LLAMA_ARG_GPU_FABRIC_STATE) |
 | `--cache-reuse N` | min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: 0)<br/>[(card)](https://ggml.ai/f0.png)<br/>(env: LLAMA_ARG_CACHE_REUSE) |
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
@@ -396,6 +398,66 @@ down. The equivalent environment variables are
 
 Only one governor owner should target a physical GPU; multiple independent
 router or server processes must not control the same device concurrently.
+
+### Ryzen APU TDP
+
+`--gpu-power-backend amdgpu --apu-tdp 20` sets the APU's STAPM, fast PPT and slow
+PPT limits to 20 W while any slot is processing a prompt or generating tokens.
+Idle, sleep and shutdown restore each captured limit independently. For example,
+an original STAPM/fast/slow configuration of 8/20/15 W returns to 8/20/15 W;
+it is not replaced by three identical idle limits. Partial failures also attempt
+to restore all limits that may have changed.
+
+This is package power shared by CPU, graphics and memory access, not a graphics
+clock. The option programs firmware limits; it does not guarantee that reported
+package power stays below the target when graphics/fabric clocks are forced.
+On the tested Phoenix APU, combining fixed SCLK and fabric exceeded the programmed
+20 W in telemetry, so measured power must be checked for the chosen clock settings. It does not modify temperature limits, power time constants or the platform
+profile. It can be combined with `--gpu-fabric-state` and the AMD graphics-clock
+options, but cannot be combined with `--gpu-power-prefill/decode`.
+
+The server loads the existing `libryzenadj.so` only when this option is enabled.
+The library and compatible Ryzen SMU access must be available to the server user;
+missing library/API/permissions fail initialization. On the tested Phoenix host,
+RyzenAdj uses the `ryzen_smu` module and needs read/write access to
+`/sys/kernel/ryzen_smu_drv/smn`. Keep the library installed and arrange module
+loading and permissions through the host's existing system configuration. Only
+one controller should change the APU limits at a time.
+
+```bash
+llama-server -m model.gguf --gpu-power-backend amdgpu --apu-tdp 20
+```
+
+### AMDGPU graphics and fabric clocks
+
+Select `--gpu-power-backend amdgpu` explicitly. For compatibility, the existing
+`--gpu-mem-clock-prefill` and `--gpu-mem-clock-decode` options control **graphics
+SCLK** on this backend, not memory. NVIDIA still uses them for memory clocks.
+AMDGPU clock controls require write permission on `power_dpm_force_performance_level`
+and `pp_od_clk_voltage`.
+
+`--gpu-fabric-state N` additionally selects a raw kernel DPM state through
+`pp_dpm_fclk` during both prefill and decode, then restores the previous power
+level when idle, sleeping or shutting down. It can be used without locking SCLK.
+This controls the fabric and, on APUs with coupled DF states, the memory state;
+it does not provide independent MCLK control. The driver must support the write,
+and the server user needs write permission on `pp_dpm_fclk` as well. An initial
+`manual` power level is rejected for fabric control because sysfs does not expose
+the original enabled-state mask for reliable restoration.
+
+The value is a **raw kernel state index**, not MHz. Check the target driver:
+some Phoenix kernels display FCLK states in reverse order from the write indices.
+On the tested Radeon 780M, raw state `0` selected FCLK 1875 MHz and MCLK 937 MHz,
+although sysfs displayed that FCLK as state `3`. Do not assume the mapping is
+identical on other hardware or kernels.
+
+```bash
+llama-server -m model.gguf --gpu-power-backend amdgpu --gpu-fabric-state 0
+```
+
+The feature is disabled by default. Pinning graphics or fabric clocks can reduce
+throughput when the CPU, GPU and memory compete for the APU power budget; verify
+latency and all clock domains under load before enabling it in production.
 
 For boolean options like `--kv-offload`:
 - `LLAMA_ARG_KV_OFFLOAD=true` means enabled, other accepted values are: `1`, `on`, `enabled`

@@ -792,7 +792,13 @@ struct common_params {
     int32_t gpu_mem_clock_decode  = -1;
     int32_t gpu_mem_clock_prefill = -1;
 
-    // GPU governor backend: "auto" (NVML first, AMDGPU fallback), "nvml" or "amdgpu"
+    // AMDGPU raw fabric DPM state during active inference; -1 leaves it unchanged.
+    int32_t gpu_fabric_state = -1;
+
+    // Ryzen APU package TDP during active inference; restore original limits when idle.
+    int32_t apu_tdp = -1;
+
+    // GPU governor backend: "auto" (NVML), "nvml" or explicit "amdgpu"
     std::string gpu_power_backend = "auto";
 
     std::string hostname      = "127.0.0.1";
