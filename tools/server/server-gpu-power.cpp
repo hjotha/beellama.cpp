@@ -576,14 +576,17 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
         std::string od;
         if (server_gpu_power_read_sysfs(od_path, od)) {
             for (const auto & line : split_lines(od)) {
-                const auto t = server_gpu_power_trim(line);
-                if (t.rfind("OD_RANGE", 0) == 0) {
-                    std::istringstream iss(line);
-                    std::string label, unit;
-                    int lo = 0, hi = 0;
-                    if (iss >> label >> lo >> hi >> unit) {
-                        od_sclk_min_ = lo;
-                        od_sclk_max_ = hi;
+                std::istringstream iss(line);
+                std::string label;
+                std::string lo_str, hi_str;
+                if (iss >> label >> lo_str >> hi_str) {
+                    if (server_gpu_power_trim(label) == "SCLK:") {
+                        const uint32_t lo = static_cast<uint32_t>(std::atoi(lo_str.c_str()));
+                        const uint32_t hi = static_cast<uint32_t>(std::atoi(hi_str.c_str()));
+                        if (lo > 0 && hi >= lo) {
+                            od_sclk_min_ = lo;
+                            od_sclk_max_ = hi;
+                        }
                     }
                 }
             }
@@ -634,6 +637,7 @@ class server_gpu_power_amdgpu_backend final : public server_gpu_power_backend {
     }
 
     bool set_memory_locked_clocks(uint32_t min_mhz, uint32_t max_mhz, std::string & error) override {
+        (void) min_mhz;
         if (!initialized_) {
             error = "AMDGPU backend is not initialized";
             return false;
