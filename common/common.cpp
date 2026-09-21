@@ -2603,8 +2603,8 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
     if (params.xxlong_max_tokens < 0) {
         return "--xxlong-max-tokens must be non-negative";
     }
-    if (params.spec_draft_n_max_long != 0) {
-        return "--spec-draft-n-max-long must be 0: MTP is disabled on the long profile";
+    if (params.spec_draft_n_max_long < 0) {
+        return "--spec-draft-n-max-long must be non-negative";
     }
     if (params.spec_draft_n_max_xlong != 0) {
         return "--spec-draft-n-max-xlong must be 0: MTP is disabled on the xlong profile";
@@ -3464,7 +3464,12 @@ bool common_prompt_batch_decode(
 std::string common_prompt_cache_layout(llama_context * ctx) {
     const auto p = llama_get_prompt_cache_profile(ctx);
     common_json layout = {
-        {"ctx_type", p.ctx_type}, {"rope_type", p.rope_scaling_type},
+        // nlohmann/json treats the uncast ggml/llama enums as boolean-like
+        // values in this build.  Persist their numeric identity explicitly;
+        // otherwise q4 and KVarN metadata caches can look reusable and a
+        // native restore reaches the wrong state reader.
+        {"ctx_type", static_cast<int32_t>(p.ctx_type)},
+        {"rope_type", static_cast<int32_t>(p.rope_scaling_type)},
         {"rope_base", p.rope_freq_base}, {"rope_scale", p.rope_freq_scale},
         {"yarn_orig", p.n_ctx_orig_yarn}, {"yarn_ext", p.yarn_ext_factor},
         {"yarn_attn", p.yarn_attn_factor}, {"yarn_fast", p.yarn_beta_fast}, {"yarn_slow", p.yarn_beta_slow},
@@ -3473,10 +3478,10 @@ std::string common_prompt_cache_layout(llama_context * ctx) {
         {"session_version", LLAMA_SESSION_VERSION},
         {"flash_attn", p.flash_attn},
     };
-    layout["type_k"] = p.type_k;
-    layout["type_v"] = p.type_v;
-    layout["type_k_aux"] = p.type_k_aux;
-    layout["type_v_aux"] = p.type_v_aux;
+    layout["type_k"] = static_cast<int32_t>(p.type_k);
+    layout["type_v"] = static_cast<int32_t>(p.type_v);
+    layout["type_k_aux"] = static_cast<int32_t>(p.type_k_aux);
+    layout["type_v_aux"] = static_cast<int32_t>(p.type_v_aux);
     layout["kv_layout_known"] = p.kv_layout_known;
     if (!p.kv_layout_known) {
         // Unknown memory layouts remain bound to the original context lifetime in legacy mode.
@@ -3519,7 +3524,10 @@ bool common_prompt_cache_layout_convertible(
         // The cache payload types are not representable in the profile and are
         // validated by the converter itself; a layout whose memory does not
         // report a known representation is bound to its context lifetime, so
-        // that binding is dropped before comparing.
+        // that binding is dropped before comparing.  This deliberately also
+        // permits the semantic half of a known q4 -> unknown KVarN conversion:
+        // the caller still has to select that conversion and the state parser
+        // rejects every source format other than the supported q4 shape.
         common_prompt_cache_layout_drop_types(source);
         common_prompt_cache_layout_drop_types(target);
         if (!common_prompt_cache_layout_known(source) || !common_prompt_cache_layout_known(target)) {

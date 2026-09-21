@@ -119,17 +119,17 @@ GGML_DISABLE_VULKAN=1 GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18 \
 
 Create the dedicated cache directory first and use a free port. GPU governors are optional and described below.
 
-The source also supports optional fourth/fifth profiles, `xlong` and `xxlong`, through `--ctx-size-xlong` / `--ctx-size-xxlong` and `--xlong-max-tokens` / `--xxlong-max-tokens`. Their context sizes and thresholds must follow the preceding tiers. Long, xlong and xxlong disable MTP (`--spec-draft-n-max-long`, `--spec-draft-n-max-xlong` and `--spec-draft-n-max-xxlong` must be zero). Each has independent batch/ubatch controls, such as `--batch-size-xlong` and `--ubatch-size-xlong`, to reduce workspace at larger contexts. Short aliases `--ctx-size-s`, `--ctx-size-m`, `--ctx-size-l`, `--ctx-size-xl` and `--ctx-size-xxl` are available. Long/XL/XXL also expose per-profile K/V type controls, such as `--cache-type-k-xlong` and `--cache-type-v-xlong`; representation changes remain subject to restore compatibility. These options do not establish a hardware-independent context ceiling.
+The source also supports optional fourth/fifth profiles, `xlong` and `xxlong`, through `--ctx-size-xlong` / `--ctx-size-xxlong` and `--xlong-max-tokens` / `--xxlong-max-tokens`. Their context sizes and thresholds must follow the preceding tiers. LONG may keep MTP enabled with `--spec-draft-n-max-long N`; XL and XXL remain target-only (`--spec-draft-n-max-xlong` and `--spec-draft-n-max-xxlong` must be zero). Each has independent batch/ubatch controls, such as `--batch-size-xlong` and `--ubatch-size-xlong`, to reduce workspace at larger contexts. Short aliases `--ctx-size-s`, `--ctx-size-m`, `--ctx-size-l`, `--ctx-size-xl` and `--ctx-size-xxl` are available. Long/XL/XXL also expose per-profile K/V type controls, such as `--cache-type-k-xlong` and `--cache-type-v-xlong`; representation changes remain subject to restore compatibility. These options do not establish a hardware-independent context ceiling.
 
 **Selection and lifecycle (three-profile example above)**
 
 - Selection counts the complete formatted prompt, including cached tokens, plus the normalized output reserve. With no finite request/server output limit, 4,096 tokens are reserved for selection only; this does not impose a new generation limit.
 - If total budget <= 32,768 tokens, the server selects the short profile (`mtp-short`, N=4).
 - If total budget is between 32,768 and 56,320 tokens, the server selects the medium profile (`mtp`, N=2).
-- If total budget exceeds 56,320 tokens, the server selects the long profile (`long`, N=0, up to 97,536 tokens).
+- If total budget exceeds 56,320 tokens, the server selects the long profile (`long`, N=`--spec-draft-n-max-long`, or target-only when zero, up to 97,536 tokens).
 - An explicit budget above the largest enabled capacity is rejected before switching.
 - The server boots in the short profile (`mtp-short`) and switches between requests after active work is drained.
-- Transitions preserve model weights in GPU memory. Only the MTP head weights are moved between VRAM and host RAM when entering or exiting the long profile.
+- Transitions preserve model weights in GPU memory. The MTP head weights are moved between VRAM and host RAM only when crossing between an MTP profile and a target-only profile.
 - Transition failures attempt rollback to the previous profile. If rollback also fails, the server publishes `state=unavailable` and rejects inference with HTTP 503.
 
 **RAM cache and explicit slot files across profiles**

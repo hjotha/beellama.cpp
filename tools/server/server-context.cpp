@@ -168,9 +168,9 @@ static bool adaptive_test_fault(const char * phase, common_context_profile profi
     return value.find("long") != std::string::npos;
 }
 
-static llama_mtp_weights_fault adaptive_test_mtp_fault(const char * phase, common_context_profile profile) {
-    if ((profile != COMMON_CONTEXT_PROFILE_MTP && profile != COMMON_CONTEXT_PROFILE_MTP_SHORT) ||
-            std::string(phase) != "candidate") {
+static llama_mtp_weights_fault adaptive_test_mtp_fault(
+        const char * phase, common_context_profile profile, bool mtp_resident) {
+    if (!mtp_resident || std::string(phase) != "candidate") {
         return llama_mtp_weights_fault::none;
     }
     const char * raw = std::getenv("LLAMA_TEST_ADAPTIVE_TRANSITION_FAIL");
@@ -2014,6 +2014,18 @@ struct adaptive_slot_snapshot_blob {
     std::vector<adaptive_slot_checkpoint_blob> checkpoints;
 };
 
+// LONG is a dual-purpose profile: old snapshots may be target-only, while a
+// new LONG profile can carry the resident MTP draft state.  Keep the wire
+// profile IDs stable and infer the LONG snapshot's mode from its payload.
+static bool adaptive_slot_snapshot_carries_mtp(const adaptive_slot_snapshot_blob & snapshot) {
+    if (snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ||
+            snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
+        return true;
+    }
+    return snapshot.profile == COMMON_CONTEXT_PROFILE_LONG &&
+        (!snapshot.data_dft.empty() || !snapshot.data_spec.empty() || snapshot.pos_dft >= 0);
+}
+
 static uint64_t adaptive_slot_serialized_size(const adaptive_slot_snapshot_blob & snapshot);
 static uint64_t adaptive_slot_snapshot_memory_bytes(const adaptive_slot_snapshot_blob & snapshot);
 
@@ -2626,8 +2638,7 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
     checkpoint->retained_count_tgt = source.retained_count_tgt;
     checkpoint->data_tgt = source.data_tgt;
 
-    const bool is_mtp_snapshot = snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ||
-                                 snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT;
+    const bool is_mtp_snapshot = adaptive_slot_snapshot_carries_mtp(snapshot);
     if (ctx_dft && is_mtp_snapshot && has_draft &&
             common_prompt_cache_layout_reusable(source.layout_dft, common_prompt_cache_layout(ctx_dft))) {
         checkpoint->flags_dft = source.flags_dft;
@@ -2696,8 +2707,7 @@ static bool adaptive_slot_restore(
     }
 
     const bool destination_mtp = ctx_dft != nullptr;
-    const bool snapshot_mtp = snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ||
-                              snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT;
+    const bool snapshot_mtp = adaptive_slot_snapshot_carries_mtp(snapshot);
     if (snapshot_mtp != destination_mtp) {
         error = "adaptive slot snapshot profile does not match destination context";
         return false;
@@ -5278,46 +5288,64 @@ private:
                         }
                     }
                 }
-                const uint64_t needed = uint64_t(state.data.main.size()) * 3;
+                const uint64_t source_bytes = uint64_t(state.data.main.size());
+                const uint64_t needed = source_bytes > std::numeric_limits<uint64_t>::max() / 3
+                    ? std::numeric_limits<uint64_t>::max() : source_bytes * 3;
                 if (available > 0 && available < needed) {
                     SRV_WRN("adaptive conversion: skipping %zu-byte prompt (available RAM %zu < %zu)\n",
                             state.data.main.size(), size_t(available), size_t(needed));
                     continue;
                 }
             }
-            size_t count = 0;
-            const llama_tokens & prompt_tokens = state.prompt.tokens.get_tokens();
-            std::vector<llama_token> tokens_out(prompt_tokens.size());
-            std::vector<uint8_t> converted;
-            const size_t written = llama_state_seq_convert_data_to_mem(
-                    ctx_tgt, state.data.main.data(), state.data.main.size(), 0,
-                    prompt_tokens.data(), prompt_tokens.size(), converted,
-                    tokens_out.data(), tokens_out.size(), &count);
-            if (written == 0 || count != state.prompt.tokens.size()) {
-                SRV_WRN("adaptive conversion: cached prompt (%zu tokens) is not convertible\n",
-                        state.prompt.tokens.size());
+            try {
+                if (state.data.main.size() < 2 * sizeof(uint32_t)) {
+                    SRV_WRN("%s", "adaptive conversion: cached prompt has a truncated in-memory header\n");
+                    continue;
+                }
+                size_t count = 0;
+                const llama_tokens & prompt_tokens = state.prompt.tokens.get_tokens();
+                std::vector<llama_token> tokens_out(prompt_tokens.size());
+                std::vector<uint8_t> converted;
+                const size_t written = llama_state_seq_convert_data_to_mem(
+                        ctx_tgt, state.data.main.data(), state.data.main.size(), 0,
+                        prompt_tokens.data(), prompt_tokens.size(), converted,
+                        tokens_out.data(), tokens_out.size(), &count);
+                if (written == 0 || count != state.prompt.tokens.size() ||
+                        !std::equal(prompt_tokens.begin(), prompt_tokens.end(), tokens_out.begin())) {
+                    SRV_WRN("adaptive conversion: cached prompt (%zu tokens) is not convertible\n",
+                            state.prompt.tokens.size());
+                    continue;
+                }
+                // The converter emits the canonical file form (magic + version
+                // + token header + body); the prompt cache stores the in-memory
+                // form ([u32 magic][i32 seq id] + body). Build the replacement
+                // completely before touching the source so a rejected format or
+                // allocation failure leaves the q4 snapshot intact.
+                if (count > (std::numeric_limits<size_t>::max() - 3 * sizeof(uint32_t)) /
+                        sizeof(llama_token)) {
+                    SRV_WRN("%s", "adaptive conversion: cached prompt token header is too large\n");
+                    continue;
+                }
+                const size_t file_header = 3 * sizeof(uint32_t) + count * sizeof(llama_token);
+                if (converted.size() <= file_header ||
+                        converted.size() - file_header > std::numeric_limits<size_t>::max() - 2 * sizeof(uint32_t)) {
+                    SRV_WRN("%s", "adaptive conversion: converted state has an unexpected size\n");
+                    continue;
+                }
+                uint8_t ram_header[2 * sizeof(uint32_t)];
+                std::memcpy(ram_header, state.data.main.data(), sizeof(ram_header));
+                std::vector<uint8_t> ram_payload(2 * sizeof(uint32_t) + converted.size() - file_header);
+                std::memcpy(ram_payload.data(), ram_header, sizeof(ram_header));
+                std::memcpy(ram_payload.data() + 2 * sizeof(uint32_t),
+                        converted.data() + file_header, converted.size() - file_header);
+                state.data.main.swap(ram_payload);
+            } catch (const std::bad_alloc &) {
+                SRV_WRN("%s", "adaptive conversion: skipping cached prompt after allocation failure\n");
+                continue;
+            } catch (const std::exception & error) {
+                SRV_WRN("adaptive conversion: skipping cached prompt: %s\n", error.what());
                 continue;
             }
-            // Keep the in-memory header, then release the q4 source so the two
-            // payloads never coexist in RAM.
-            uint8_t ram_header[2 * sizeof(uint32_t)];
-            std::memcpy(ram_header, state.data.main.data(), sizeof(ram_header));
-            state.data.main.clear();
-            state.data.main.shrink_to_fit();
-            // The converter emits the canonical file form (magic + version +
-            // token header + body); the prompt cache stores the in-memory form
-            // ([u32 magic][i32 seq id] + body). Re-wrap the converted body with
-            // the source payload's own in-memory header.
-            const size_t file_header = 3 * sizeof(uint32_t) + size_t(count) * sizeof(llama_token);
-            if (converted.size() <= file_header) {
-                SRV_WRN("%s", "adaptive conversion: converted state has an unexpected size\n");
-                continue;
-            }
-            std::vector<uint8_t> ram_payload(2 * sizeof(uint32_t) + converted.size() - file_header);
-            std::memcpy(ram_payload.data(), ram_header, sizeof(ram_header));
-            std::memcpy(ram_payload.data() + 2 * sizeof(uint32_t),
-                    converted.data() + file_header, converted.size() - file_header);
-            state.data.main.swap(ram_payload);
             if (ctx_dft == nullptr) {
                 state.data.drft.clear();
                 state.data.spec.clear();
@@ -5399,7 +5427,7 @@ private:
             apply_profile_params(old_profile);
             const bool old_resident = adaptive_draft_n_for_profile(old_profile) > 0;
             if (!llama_model_mtp_weights_set_resident(model_tgt,
-                    old_resident, adaptive_test_mtp_fault("rollback", old_profile))) {
+                    old_resident, adaptive_test_mtp_fault("rollback", old_profile, old_resident))) {
                 ctx_tgt = nullptr;
                 unbind_slots_from_context();
                 return false;
@@ -5435,7 +5463,7 @@ private:
         const bool resident = adaptive_draft_n_for_profile(requested) > 0;
         const auto req_name = adaptive_status_profile_name((int) requested);
         if (!llama_model_mtp_weights_set_resident(model_tgt, resident,
-                adaptive_test_mtp_fault("candidate", requested))) {
+                adaptive_test_mtp_fault("candidate", requested, resident))) {
             SRV_WRN("adaptive test fault: candidate %s MTP residency/upload\n",
                     req_name.c_str());
             SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
@@ -5475,8 +5503,13 @@ private:
         active_context_profile = requested;
         adaptive_context_unavailable = false;
         n_ctx = llama_n_ctx(ctx_tgt);
-        if (prompt_cache && old_params.cache_kvarn_bits_k == 0 &&
-                old_params.cache_type_k == GGML_TYPE_Q4_0 && params_base.cache_kvarn_bits_k > 0) {
+        const bool source_is_q4 = old_params.cache_kvarn_bits_k == 0 &&
+            old_params.cache_kvarn_bits_v == 0 &&
+            old_params.cache_type_k == GGML_TYPE_Q4_0 &&
+            old_params.cache_type_v == GGML_TYPE_Q4_0;
+        const bool destination_is_kvarn = params_base.cache_kvarn_bits_k > 0 &&
+            params_base.cache_kvarn_bits_v > 0;
+        if (prompt_cache && source_is_q4 && destination_is_kvarn) {
             const int64_t conversion_start_us = ggml_time_us();
             const bool converted = adaptive_convert_cached_prompts_to_kvarn();
             SRV_INF("adaptive context KVarN conversion: %s, conversion_ms=%.3f\n",

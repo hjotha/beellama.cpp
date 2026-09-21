@@ -4,9 +4,9 @@
 Tiers exercised:
   1. short:   <= 128 (mtp-short, draft-4, resident MTP)
   2. medium:  <= 256 (mtp, draft-2, resident MTP)
-  3. long:    <= 384 (long, non-resident MTP)
-  4. xlong:   <= 448 (xlong, batch 32, non-resident MTP)
-  5. xxlong:  <= 512 (xxlong, batch 32, non-resident MTP, kvarn)
+  3. long:    <= 384 (long, draft-2, resident MTP)
+  4. xlong:   <= 448 (xlong, batch 32, KVarN4, target-only)
+  5. xxlong:  <= 512 (xxlong, batch 32, KVarN4, target-only)
 """
 
 import json
@@ -61,11 +61,11 @@ CMD = [
     "--mtp-max-tokens", "256",
     "--spec-draft-n-max", "2",
     "--ctx-size", "384",
-    "--spec-draft-n-max-long", "0",
+    "--spec-draft-n-max-long", "2",
     "--ctx-size-xl", "448",
     "--spec-draft-n-max-xl", "0",
-    "--cache-type-k-xl", "q4_0",
-    "--cache-type-v-xl", "q4_0",
+    "--cache-type-k-xl", "kvarn4",
+    "--cache-type-v-xl", "kvarn4",
     "--ctx-size-xxl", "512",
     "--spec-draft-n-max-xxl", "0",
     "--cache-type-k-xxl", "kvarn4",
@@ -213,7 +213,7 @@ try:
     assert status == 200, comp3
     status, props, _ = http_call("GET", "/props")
     assert props["adaptive_context"]["profile"] == "long", f"Expected long, got {props['adaptive_context']}"
-    assert props["adaptive_context"]["mtp_weights_resident"] is False
+    assert props["adaptive_context"]["mtp_weights_resident"] is True
 
     status, save3, _ = http_call("POST", "/slots/0?action=save", {"filename": "p3_long.bin"})
     assert status == 200 and save3.get("n_saved", 0) > 0, save3
@@ -310,7 +310,7 @@ try:
     assert status == 200 and rest3.get("n_restored", 0) > 0, rest3
     status, props, _ = http_call("GET", "/props")
     assert props["adaptive_context"]["profile"] == "long", props["adaptive_context"]
-    assert props["adaptive_context"]["mtp_weights_resident"] is False
+    assert props["adaptive_context"]["mtp_weights_resident"] is True
     print(f"Restored p3_long: profile={props['adaptive_context']['profile']}")
 
     # 6f. Restore p1_short.bin while in long -> must transition long -> mtp-short

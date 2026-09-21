@@ -600,6 +600,9 @@ int main(int argc, char ** argv) {
                 require(!common_prompt_cache_layout_reusable(
                             common_prompt_cache_layout(source.get()), native_layout),
                         "q4 layout was incorrectly considered reusable as KVarN");
+                require(common_prompt_cache_layout_convertible(
+                            common_prompt_cache_layout(source.get()), native_layout),
+                        "q4 layout was not recognized as convertible to KVarN");
 
                 server_prompt_cache cache(2048, 0);
                 server_prompt cached;

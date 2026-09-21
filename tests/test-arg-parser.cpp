@@ -774,6 +774,69 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(common_context_profile_for_budget(five_profile, 1201) == COMMON_CONTEXT_PROFILE_XXLONG);
         assert(common_context_profile_for_budget(five_profile, 1400) == COMMON_CONTEXT_PROFILE_XXLONG);
 
+        common_params ista_profile;
+        argv = {
+            "binary_name", "--ctx-size-s", "24576", "--s-max-tokens", "24576",
+            "--spec-draft-n-max-s", "6",
+            "--ctx-size-m", "40960", "--m-max-tokens", "40960",
+            "--spec-draft-n-max-m", "4",
+            "--ctx-size-l", "56320", "--spec-draft-n-max-l", "2",
+            "--cache-type-k-l", "q4_0", "--cache-type-v-l", "q4_0",
+            "--ctx-size-xl", "73728", "--xl-max-tokens", "73728",
+            "--spec-draft-n-max-xl", "0",
+            "--cache-type-k-xl", "kvarn4", "--cache-type-v-xl", "kvarn4",
+            "--ctx-size-xxl", "102400", "--xxl-max-tokens", "102400",
+            "--spec-draft-n-max-xxl", "0",
+            "--cache-type-k-xxl", "kvarn4", "--cache-type-v-xxl", "kvarn4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), ista_profile, LLAMA_EXAMPLE_SERVER));
+        assert(ista_profile.n_ctx == 56320);
+        assert(ista_profile.ctx_size_long == 56320);
+        assert(ista_profile.ctx_size_mtp_short == 24576);
+        assert(ista_profile.ctx_size_mtp == 40960);
+        assert(ista_profile.spec_draft_n_max_short == 6);
+        assert(ista_profile.speculative.draft.n_max == 4);
+        assert(ista_profile.spec_draft_n_max_long == 2);
+        assert(ista_profile.cache_type_k_long == GGML_TYPE_Q4_0);
+        assert(ista_profile.cache_type_v_long == GGML_TYPE_Q4_0);
+        assert(ista_profile.cache_kvarn_bits_k_long == 0);
+        assert(ista_profile.cache_kvarn_bits_v_long == 0);
+        assert(ista_profile.ctx_size_xlong == 73728);
+        assert(ista_profile.cache_kvarn_bits_k_xlong == 4);
+        assert(ista_profile.cache_kvarn_bits_v_xlong == 4);
+        assert(ista_profile.ctx_size_xxlong == 102400);
+        assert(ista_profile.cache_kvarn_bits_k_xxlong == 4);
+        assert(ista_profile.cache_kvarn_bits_v_xxlong == 4);
+        assert(common_context_adaptive_error(ista_profile).empty());
+        assert(common_context_profile_for_budget(ista_profile, 24576) == COMMON_CONTEXT_PROFILE_MTP_SHORT);
+        assert(common_context_profile_for_budget(ista_profile, 24577) == COMMON_CONTEXT_PROFILE_MTP);
+        assert(common_context_profile_for_budget(ista_profile, 40960) == COMMON_CONTEXT_PROFILE_MTP);
+        assert(common_context_profile_for_budget(ista_profile, 40961) == COMMON_CONTEXT_PROFILE_LONG);
+        assert(common_context_profile_for_budget(ista_profile, 56320) == COMMON_CONTEXT_PROFILE_LONG);
+        assert(common_context_profile_for_budget(ista_profile, 56321) == COMMON_CONTEXT_PROFILE_XLONG);
+        assert(common_context_profile_for_budget(ista_profile, 73728) == COMMON_CONTEXT_PROFILE_XLONG);
+        assert(common_context_profile_for_budget(ista_profile, 73729) == COMMON_CONTEXT_PROFILE_XXLONG);
+        assert(common_context_profile_for_budget(ista_profile, 102400) == COMMON_CONTEXT_PROFILE_XXLONG);
+
+        common_params ista_long_target_only = ista_profile;
+        ista_long_target_only.spec_draft_n_max_long = 0;
+        assert(common_context_adaptive_error(ista_long_target_only).empty());
+        assert(common_context_profile_for_budget(ista_long_target_only, 40961) == COMMON_CONTEXT_PROFILE_LONG);
+
+        common_params ista_invalid = ista_profile;
+        ista_invalid.spec_draft_n_max_long = -1;
+        assert(common_context_adaptive_error(ista_invalid) ==
+               "--spec-draft-n-max-long must be non-negative");
+        common_params ista_parse_invalid;
+        argv = {
+            "binary_name", "--ctx-size-l", "56320", "--ctx-size-m", "40960",
+            "--m-max-tokens", "40960", "--spec-draft-n-max-l", "-1",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(),
+                                    ista_parse_invalid, LLAMA_EXAMPLE_SERVER));
+
         common_params five_profile_shorthand = adaptive;
         argv = {
             "binary_name", "--ctx-size-l", "1000", "--ctx-size-m", "600",

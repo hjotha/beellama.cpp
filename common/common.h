@@ -521,7 +521,7 @@ struct common_params {
     int32_t ctx_size_mtp_short    =     0; // adaptive context short profile, 0 = disabled
     int32_t mtp_short_max_tokens  =     0; // adaptive context short threshold, 0 = ctx_size_mtp_short
     int32_t spec_draft_n_max_short =     4; // draft N for short MTP profile
-    int32_t spec_draft_n_max_long  =     0; // draft N for long profile (fixed at 0: MTP disabled)
+    int32_t spec_draft_n_max_long  =     0; // draft N for long profile (0 = target-only)
     int32_t ctx_size_xlong        =     0; // adaptive context xlong profile, 0 = disabled
     int32_t xlong_max_tokens      =     0; // adaptive context xlong threshold, 0 = ctx_size_xlong
     int32_t batch_size_xlong      =    64; // logical batch size for xlong profile

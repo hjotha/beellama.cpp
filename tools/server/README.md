@@ -343,8 +343,9 @@ context is rejected before a transition.
 
 The first request starts in the short profile. A transition saves compatible
 slot state and checkpoints, destroys the active contexts, and releases the
-GPU-only MTP group in the long profile. Returning to the short profile uploads
-only that group from its CPU backing before rebuilding the MTP context. The
+GPU-only MTP group only for a target-only profile. LONG can remain an MTP
+profile when `--spec-draft-n-max-long` is positive; returning to an MTP profile
+uploads that group from its CPU backing before rebuilding the MTP context. The
 main model is loaded once for the life of the process; an external
 `--model-draft`/`--spec-draft-model` is rejected when adaptive mode is enabled.
 
