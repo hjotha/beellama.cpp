@@ -1158,6 +1158,9 @@ extern "C" {
                           size_t   state_size,
                         uint64_t   checksum);
 
+    // These legacy conversion entry points assume UNROTATED source rows.
+    // Standard quantized caches usually rotate K/V: callers holding their
+    // rotation metadata must use the *_rotated extensions in llama-ext.h.
     // Explicit, restricted conversion of a q4_0/q4_0 sequence state into the
     // destination context's native compact representation. The source is a
     // canonical sequence state file ([src_offset, src_offset + src_size) of

@@ -202,13 +202,13 @@ struct llama_context {
     size_t state_seq_convert_file(
             const char * src_filepath, size_t src_offset, size_t src_size, uint64_t src_checksum,
             const char * dst_filepath,
-            llama_token * tokens_out, size_t capacity, size_t * count_out);
+            llama_token * tokens_out, size_t capacity, size_t * count_out, int32_t rotation_k = 0, int32_t rotation_v = 0);
 
     size_t state_seq_convert_data(
             const uint8_t * src, size_t size, uint64_t src_checksum,
             const llama_token * ram_tokens, size_t ram_n_tokens,
             const char * dst_filepath,
-            llama_token * tokens_out, size_t capacity, size_t * count_out);
+            llama_token * tokens_out, size_t capacity, size_t * count_out, int32_t rotation_k = 0, int32_t rotation_v = 0);
     size_t state_seq_convert_data_to_mem(
             const uint8_t * src, size_t size, uint64_t src_checksum,
             const llama_token * ram_tokens, size_t ram_n_tokens,

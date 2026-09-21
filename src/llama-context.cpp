@@ -4715,7 +4715,7 @@ size_t llama_context::state_seq_convert_seq_stream(
 size_t llama_context::state_seq_convert_file(
         const char * src_filepath, size_t src_offset, size_t src_size, uint64_t src_checksum,
         const char * dst_filepath,
-        llama_token * tokens_out, size_t capacity, size_t * count_out) {
+        llama_token * tokens_out, size_t capacity, size_t * count_out, int32_t rotation_k, int32_t rotation_v) {
     if (!count_out) { return 0; }
     *count_out = 0;
     if (!src_filepath || !dst_filepath) { return 0; }
@@ -4771,6 +4771,8 @@ size_t llama_context::state_seq_convert_file(
         }
         source->seek(0);
         llama_state_q4_info info;
+        info.rotation_k = rotation_k;
+        info.rotation_v = rotation_v;
         std::string error;
         if (!llama_state_q4_read_outer_header(*source, info, nullptr, 0, cparams.n_ctx_seq, error) ||
                 !memory->state_parse_q4(*source, model.hparams, info, error)) {
@@ -4787,7 +4789,7 @@ size_t llama_context::state_seq_convert_data(
         const uint8_t * src, size_t size, uint64_t src_checksum,
         const llama_token * ram_tokens, size_t ram_n_tokens,
         const char * dst_filepath,
-        llama_token * tokens_out, size_t capacity, size_t * count_out) {
+        llama_token * tokens_out, size_t capacity, size_t * count_out, int32_t rotation_k, int32_t rotation_v) {
     if (!count_out) { return 0; }
     *count_out = 0;
     if (!src || size == 0 || !dst_filepath) { return 0; }
@@ -4797,6 +4799,8 @@ size_t llama_context::state_seq_convert_data(
         }
         llama_state_q4_memory_source source(src, size);
         llama_state_q4_info info;
+        info.rotation_k = rotation_k;
+        info.rotation_v = rotation_v;
         std::string error;
         if (!llama_state_q4_read_outer_header(source, info, ram_tokens, ram_n_tokens,
                     cparams.n_ctx_seq, error) ||
@@ -6311,4 +6315,19 @@ llama_kv_memory_stats llama_get_kv_memory_stats(const struct llama_context * ctx
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+size_t llama_state_seq_convert_data_rotated(llama_context * ctx, const uint8_t * src, size_t size,
+    uint64_t checksum, const llama_token * tokens, size_t n_tokens, const char * dst,
+    llama_token * out, size_t capacity, size_t * count, int32_t rotation_k, int32_t rotation_v) {
+    if (!ctx || !src || !dst) { return 0; }
+    return ctx->state_seq_convert_data(src, size, checksum, tokens, n_tokens, dst,
+                                      out, capacity, count, rotation_k, rotation_v);
+}
+size_t llama_state_seq_convert_file_rotated(llama_context * ctx, const char * src, size_t offset,
+    size_t size, uint64_t checksum, const char * dst, llama_token * out,
+    size_t capacity, size_t * count, int32_t rotation_k, int32_t rotation_v) {
+    if (!ctx || !src || !dst) { return 0; }
+    return ctx->state_seq_convert_file(src, offset, size, checksum, dst,
+                                      out, capacity, count, rotation_k, rotation_v);
 }

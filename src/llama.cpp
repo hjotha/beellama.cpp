@@ -56,6 +56,7 @@ llama_prompt_cache_profile llama_get_prompt_cache_profile(const llama_context * 
     const bool known = kv || aux || !mem || dynamic_cast<const llama_memory_recurrent *>(mem);
     llama_prompt_cache_profile result = {
         ctx->get_context_instance(),
+        kv ? kv->rotation_k() : 0, kv ? kv->rotation_v() : 0,
         p.ctx_type, p.rope_scaling_type, p.rope_freq_base, p.rope_freq_scale,
         p.n_ctx_orig_yarn, p.yarn_ext_factor, p.yarn_attn_factor, p.yarn_beta_fast, p.yarn_beta_slow,
         p.causal_attn, p.kv_unified, p.kv_paged, p.flash_attn, p.nextn_layer_offset,

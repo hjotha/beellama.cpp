@@ -37,6 +37,7 @@ bool ggml_cuda_kvarn_convert_q4(
         int bits,
         int iterations,
         bool value,
+        int source_rotation,
         void * records);
 
 size_t ggml_cuda_kvarn_required_shared_bytes();

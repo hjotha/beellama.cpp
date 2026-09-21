@@ -115,7 +115,7 @@ bool kvarn_backend_supports_native_tail(
 }
 
 using backend_kvarn_convert_q4_t = bool (*)(
-        const void *, size_t, int, int, int, int, int, int, bool, void *);
+        const void *, size_t, int, int, int, int, int, int, bool, int, void *);
 
 // Opt-out switch for A/B validation of the GPU converter (default: enabled).
 bool kvarn_convert_gpu_enabled() {
@@ -134,7 +134,7 @@ backend_kvarn_convert_q4_t kvarn_convert_gpu_proc() {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             auto * fn = reg ? reinterpret_cast<backend_kvarn_convert_q4_t>(
-                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_convert_q4")) : nullptr;
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_convert_q4_v2")) : nullptr;
             if (fn != nullptr) {
                 return fn;
             }
@@ -3445,11 +3445,12 @@ struct kvarn_convert_shape {
     uint32_t head_dim;
     uint32_t slices;
     uint32_t n_head_sliced;
+    int32_t source_rotation = 0;
 };
 
 kvarn_convert_shape kvarn_convert_shape_for(uint32_t n_head_kv, uint32_t head_dim) {
     const int slices = llama_kvarn_head_slices(int(head_dim));
-    if (slices <= 0) {
+    if (slices <= 0 || head_dim % KVAR_N_GROUP != 0) {
         throw std::runtime_error(format("unsupported KVarN head dimension %u in conversion", head_dim));
     }
     return { n_head_kv, head_dim, uint32_t(slices), n_head_kv * uint32_t(slices) };
@@ -3484,41 +3485,23 @@ llama_kvarn_tile_layout kvarn_convert_v_layout(int bits) {
 // runtime stage that the record quantizer reads.
 void kvarn_convert_rotate_row(const float * row, const kvarn_convert_shape & shape, float * rotated) {
     const size_t row_len = size_t(shape.n_head_sliced) * KVAR_N_GROUP;
-    for (uint32_t hs = 0; hs < shape.n_head_sliced; ++hs) {
-        const uint32_t head = hs / shape.slices;
-        const uint32_t slice = hs % shape.slices;
-        float * dst = rotated + size_t(hs) * KVAR_N_GROUP;
-        std::memcpy(dst, row + size_t(head) * shape.head_dim + size_t(slice) * KVAR_N_GROUP,
-                KVAR_N_GROUP * sizeof(float));
-        llama_kvarn_hadamard_128(dst);
-    }
-    if (shape.slices > 1) {
-        for (uint32_t head = 0; head < shape.n_head_kv; ++head) {
-            float * base = rotated + size_t(head) * shape.slices * KVAR_N_GROUP;
-            for (uint32_t d = 0; d < KVAR_N_GROUP; ++d) {
-                float values[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                for (uint32_t slice = 0; slice < shape.slices; ++slice) {
-                    values[slice] = base[size_t(slice) * KVAR_N_GROUP + d];
-                }
-                for (uint32_t stride = 1; stride < shape.slices; stride <<= 1) {
-                    for (uint32_t b = 0; b + stride < shape.slices; b += 2 * stride) {
-                        for (uint32_t i = 0; i < stride && b + stride + i < shape.slices; ++i) {
-                            const float a = values[b + i];
-                            const float c = values[b + stride + i];
-                            values[b + i] = a + c;
-                            values[b + stride + i] = a - c;
-                        }
-                    }
-                }
-                const float scale = shape.slices == 2 ? 0.7071067811865475f : 0.5f;
-                for (uint32_t slice = 0; slice < shape.slices; ++slice) {
-                    base[size_t(slice) * KVAR_N_GROUP + d] = values[slice] * scale;
+    std::copy(row, row + row_len, rotated);
+    const uint32_t first = std::max(1, shape.source_rotation);
+    const float scale = 1.0f / std::sqrt(float(shape.head_dim / first));
+    for (uint32_t head = 0; head < shape.n_head_kv; ++head) {
+        float * dst = rotated + size_t(head) * shape.head_dim;
+        for (uint32_t stride = first; stride < shape.head_dim; stride *= 2) {
+            for (uint32_t base = 0; base < shape.head_dim; base += 2 * stride) {
+                for (uint32_t i = 0; i < stride; ++i) {
+                    const float a = dst[base + i], b = dst[base + stride + i];
+                    dst[base + i] = a + b;
+                    dst[base + stride + i] = a - b;
                 }
             }
         }
-    }
-    for (size_t i = 0; i < row_len; ++i) {
-        rotated[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(rotated[i]));
+        for (uint32_t i = 0; i < shape.head_dim; ++i) {
+            dst[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(dst[i] * scale));
+        }
     }
 }
 
@@ -3573,19 +3556,29 @@ void kvarn_convert_component_records(
     }
 }
 
-// Full rotated F16 row for one exact-tail payload.
+// Native exact tails store the original domain (store_tail copies current
+// K/V directly), unlike the rotated records and stage. Undo only the source
+// q4 Hadamard here; applying the destination rotation corrupts continuation.
 void kvarn_convert_tail_row(
-        const uint8_t * q4_row,
-        uint32_t n_embd,
-        const kvarn_convert_shape & shape,
-        std::vector<uint8_t> & out) {
+        const uint8_t * q4_row, uint32_t n_embd,
+        const kvarn_convert_shape & shape, std::vector<uint8_t> & out) {
     std::vector<float> row(n_embd);
-    std::vector<float> rotated(size_t(shape.n_head_sliced) * KVAR_N_GROUP);
     kvarn_convert_dequantize_row(q4_row, row.data(), n_embd);
-    kvarn_convert_rotate_row(row.data(), shape, rotated.data());
-    out.resize(rotated.size() * sizeof(ggml_fp16_t));
-    for (size_t i = 0; i < rotated.size(); ++i) {
-        const ggml_fp16_t half = ggml_fp32_to_fp16(rotated[i]);
+    const uint32_t width = std::max(1, shape.source_rotation);
+    for (uint32_t base = 0; base < n_embd; base += width) {
+        for (uint32_t stride = 1; stride < width; stride *= 2) {
+            for (uint32_t b = 0; b < width; b += 2 * stride) {
+                for (uint32_t i = 0; i < stride; ++i) {
+                    const float a = row[base+b+i], c = row[base+b+stride+i];
+                    row[base+b+i] = a+c;
+                    row[base+b+stride+i] = a-c;
+                }
+            }
+        }
+    }
+    out.resize(size_t(n_embd) * sizeof(ggml_fp16_t));
+    for (size_t i = 0; i < row.size(); ++i) {
+        const ggml_fp16_t half = ggml_fp32_to_fp16(row[i] / std::sqrt(float(width)));
         std::memcpy(out.data() + i * sizeof(half), &half, sizeof(half));
     }
 }
@@ -3815,13 +3808,23 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
     const unsigned hw = std::thread::hardware_concurrency();
     const uint32_t n_workers = std::max(1u, std::min(16u, hw ? hw : 1u));
     conversion_thread_pool workers(n_workers);
+    uint64_t gpu_groups = 0, cpu_groups = 0;
 
     for (size_t li = 0; li < layers.size(); ++li) {
         const auto & layer = layers[li];
         const auto & source = info.layers[li];
 
-        const kvarn_convert_shape k_shape = kvarn_convert_shape_for(layer.n_head_kv, layer.head_dim_k);
-        const kvarn_convert_shape v_shape = kvarn_convert_shape_for(layer.n_head_kv, layer.head_dim_v);
+        kvarn_convert_shape k_shape = kvarn_convert_shape_for(layer.n_head_kv, layer.head_dim_k);
+        kvarn_convert_shape v_shape = kvarn_convert_shape_for(layer.n_head_kv, layer.head_dim_v);
+
+        k_shape.source_rotation = info.rotation_k;
+        v_shape.source_rotation = info.rotation_v;
+        for (const auto & shape : {k_shape, v_shape}) {
+            const int r = shape.source_rotation;
+            if (r < 0 || (r && ((r & (r-1)) || r > int(shape.head_dim) || shape.head_dim % r))) {
+                throw std::runtime_error("unsupported source attention rotation");
+            }
+        }
 
         write_u32(layer.il);
         write_u32(0); // stream
@@ -3851,39 +3854,48 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
             const size_t block_bytes = size_t(component.shape.n_head_sliced) * component.record_bytes;
             const std::vector<uint8_t> zeros(block_bytes, 0);
 
-            // Bulk GPU path: convert all complete groups except the sink into a
-            // host image, then publish it. The q4 rows are uploaded in small
-            // chunks, so the VRAM scratch stays bounded and the source cache is
-            // never duplicated on the GPU.
+            // Stream bounded GPU chunks into the output sink. Never build an
+            // entire component's record image on the host. A failed GPU chunk
+            // is recomputed on CPU before publishing that chunk.
             backend_kvarn_convert_q4_t gpu_convert =
                 kvarn_convert_gpu_enabled() ? kvarn_convert_gpu_proc() : nullptr;
             if (gpu_convert != nullptr && complete_groups > 1) {
-                std::vector<uint8_t> records_out(size_t(n_groups_used) * block_bytes, 0);
+                write_bytes(zeros.data(), zeros.size()); // sink group
                 const uint32_t chunk_groups = 32;
-                bool gpu_ok = true;
-                for (uint32_t g = 1; g < complete_groups && gpu_ok; g += chunk_groups) {
+                for (uint32_t g = 1; g < complete_groups; g += chunk_groups) {
                     const uint32_t count = std::min(chunk_groups, complete_groups - g);
                     const size_t rows_bytes = size_t(count) * KVAR_N_GROUP * component.row_size;
                     std::vector<uint8_t> rows_in(rows_bytes);
                     src.seek(component.data + size_t(g) * KVAR_N_GROUP * component.row_size);
                     src.read_raw(rows_in.data(), rows_in.size());
                     std::vector<uint8_t> chunk_out(size_t(count) * block_bytes, 0);
-                    gpu_ok = gpu_convert(
+                    const bool gpu_ok = gpu_convert(
                             rows_in.data(), size_t(component.row_size),
                             int(count * KVAR_N_GROUP), int(component.n_embd),
                             int(layer.n_head_kv),
                             int(component.value ? layer.head_dim_v : layer.head_dim_k),
                             int(component.bits), int(params.sinkhorn_iters), component.value,
-                            chunk_out.data());
-                    if (gpu_ok) {
-                        std::memcpy(records_out.data() + size_t(g) * block_bytes,
-                                chunk_out.data(), chunk_out.size());
+                            component.shape.source_rotation, chunk_out.data());
+                    if (gpu_ok) { gpu_groups += count; }
+                    else { cpu_groups += count; }
+                    if (!gpu_ok) {
+                        for (uint32_t i = 0; i < count; ++i) {
+                            workers.submit([&, i] {
+                                kvarn_convert_component_records(
+                                    rows_in.data() + size_t(i) * KVAR_N_GROUP * component.row_size,
+                                    KVAR_N_GROUP, uint32_t(component.row_size), component.n_embd,
+                                    component.shape, component.bits, params.sinkhorn_iters,
+                                    component.value, chunk_out.data() + size_t(i) * block_bytes);
+                            });
+                        }
+                        workers.join();
                     }
+                    write_bytes(chunk_out.data(), chunk_out.size());
                 }
-                if (gpu_ok) {
-                    write_bytes(records_out.data(), records_out.size());
-                    continue;
+                for (uint32_t g = complete_groups; g < n_groups_used; ++g) {
+                    write_bytes(zeros.data(), zeros.size());
                 }
+                continue;
             }
 
             std::vector<std::vector<uint8_t>> in(n_workers);
@@ -3923,6 +3935,7 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
                     if (group == 0 || group >= complete_groups) {
                         write_bytes(zeros.data(), zeros.size());
                     } else {
+                        ++cpu_groups;
                         write_bytes(out_buf[i].data(), out_buf[i].size());
                     }
                 }
@@ -4012,7 +4025,8 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
         }
     }
     guard.armed = false;
-    LLAMA_LOG_INFO("%s: converted q4_0 state into %s (tokens=%u bytes=%zu type=%s)\n",
-            __func__, out_mem ? "memory" : dst_path, n_tokens, total, llama_kvarn_type_name(params.type));
+    LLAMA_LOG_INFO("%s: converted q4_0 state into %s (tokens=%u bytes=%zu type=%s gpu_groups=%llu cpu_groups=%llu)\n",
+            __func__, out_mem ? "memory" : dst_path, n_tokens, total, llama_kvarn_type_name(params.type),
+            (unsigned long long) gpu_groups, (unsigned long long) cpu_groups);
     return total;
 }

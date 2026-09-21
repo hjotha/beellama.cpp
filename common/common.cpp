@@ -3464,6 +3464,7 @@ bool common_prompt_batch_decode(
 std::string common_prompt_cache_layout(llama_context * ctx) {
     const auto p = llama_get_prompt_cache_profile(ctx);
     common_json layout = {
+        {"cache_layout_version", 2},
         // nlohmann/json treats the uncast ggml/llama enums as boolean-like
         // values in this build.  Persist their numeric identity explicitly;
         // otherwise q4 and KVarN metadata caches can look reusable and a
@@ -3478,6 +3479,8 @@ std::string common_prompt_cache_layout(llama_context * ctx) {
         {"session_version", LLAMA_SESSION_VERSION},
         {"flash_attn", p.flash_attn},
     };
+    layout["rotation_k"] = p.rotation_k;
+    layout["rotation_v"] = p.rotation_v;
     layout["type_k"] = static_cast<int32_t>(p.type_k);
     layout["type_v"] = static_cast<int32_t>(p.type_v);
     layout["type_k_aux"] = static_cast<int32_t>(p.type_k_aux);
@@ -3498,7 +3501,7 @@ bool common_prompt_cache_layout_known(const common_json & layout) {
 }
 
 void common_prompt_cache_layout_drop_types(common_json & layout) {
-    for (const char * key : { "type_k", "type_v", "type_k_aux", "type_v_aux" }) {
+    for (const char * key : { "type_k", "type_v", "type_k_aux", "type_v_aux", "rotation_k", "rotation_v" }) {
         layout.erase(key);
     }
 }

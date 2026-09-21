@@ -835,6 +835,7 @@ static __global__ void kvarn_convert_rotate_kernel(
         int head_dim,
         int slices,
         int n_head_sliced,
+        int source_rotation,
         half * __restrict__ rotated) {
     extern __shared__ float shared[];
     const int token = blockIdx.x;
@@ -852,7 +853,7 @@ static __global__ void kvarn_convert_rotate_kernel(
         dequantize_q4_0(row, dim / 32, in_block % 16, pair);
         values[s] = in_block < 16 ? pair.x : pair.y;
     }
-    for (int stride = 1; stride < slices; stride <<= 1) {
+    for (int stride = max(1, source_rotation / KVAR_N_DIM); stride < slices; stride <<= 1) {
         for (int b = 0; b + stride < slices; b += 2 * stride) {
             for (int i = 0; i < stride && b + stride + i < slices; ++i) {
                 const float a = values[b + i];
@@ -862,10 +863,15 @@ static __global__ void kvarn_convert_rotate_kernel(
             }
         }
     }
-    const float scale = slices == 2 ? 0.7071067811865475f : (slices == 4 ? 0.5f : 1.0f);
+    const float scale = rsqrtf(float(head_dim / max(1, source_rotation)));
     shared[d] = values[slice] * scale;
     __syncthreads();
-    kvarn_wht_128(shared);
+    for (int stride = max(1, source_rotation); stride < KVAR_N_DIM; stride *= 2) {
+        const float a = shared[d], b = shared[d ^ stride];
+        __syncthreads();
+        shared[d] = (d & stride) ? b - a : a + b;
+        __syncthreads();
+    }
     rotated[((size_t) token * n_head_sliced + hs) * KVAR_N_DIM + d] = __float2half_rn(shared[d]);
 }
 
@@ -903,10 +909,14 @@ bool ggml_cuda_kvarn_convert_q4(
         int bits,
         int iterations,
         bool value,
+        int source_rotation,
         void * records) {
     if (rows == nullptr || records == nullptr || n_tokens <= 0 || row_bytes == 0 || n_embd <= 0 ||
             n_head_kv <= 0 || head_dim <= 0 || head_dim % KVAR_N_DIM != 0 ||
-            n_tokens % KVAR_N_DIM != 0 || !ggml_cuda_kvarn_valid_bits(bits)) {
+            n_tokens % KVAR_N_DIM != 0 || !ggml_cuda_kvarn_valid_bits(bits) ||
+            source_rotation < 0 || (source_rotation &&
+                ((source_rotation & (source_rotation - 1)) || source_rotation > head_dim ||
+                 head_dim % source_rotation))) {
         return false;
     }
     const int slices = head_dim / KVAR_N_DIM;
@@ -949,7 +959,7 @@ bool ggml_cuda_kvarn_convert_q4(
     kvarn_convert_rotate_kernel<<<dim3((unsigned) n_tokens, (unsigned) n_head_sliced),
             KVAR_N_DIM, KVAR_N_DIM * sizeof(float), 0>>>(
             (const uint8_t *) g_kvarn_convert_scratch.rows, (int) row_bytes, head_dim, slices,
-            n_head_sliced, (half *) g_kvarn_convert_scratch.rotated);
+            n_head_sliced, source_rotation, (half *) g_kvarn_convert_scratch.rotated);
     kvarn_convert_records_kernel<<<dim3((unsigned) groups, (unsigned) n_head_sliced),
             KVAR_N_DIM, KVAR_N_SHARED_BYTES, 0>>>(
             (const half *) g_kvarn_convert_scratch.rotated,

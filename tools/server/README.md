@@ -2350,3 +2350,28 @@ You can specify default preferences for the web UI using `--ui-config <JSON conf
 > **Note:** The old flags `--webui-config` and `--webui-config-file` are deprecated but still work as aliases.
 
 You may find available preferences in [settings-keys.ts](../ui/src/lib/constants/settings-keys.ts).
+
+### Adaptive q4 to KVarN handoff
+
+For a single-slot transition from a q4 MTP tier to a target-only KVarN tier,
+the server converts the newest compatible snapshot to a private temporary
+file in the slot directory (or TMPDIR when no slot directory is configured).
+CUDA conversion emits chunks of at most 4096 tokens, with CPU fallback for a
+failed chunk. The checked streaming loader restores the file directly into
+the empty destination context. No full converted host vector is allocated;
+the q4 RAM snapshot remains intact until the live prefix is committed.
+Temporary files are removed on success or failure. A rejected conversion
+falls back to normal prefill.
+
+Snapshot layouts record the source K/V Hadamard widths. Conversion composes
+the source and destination rotations for records/stage, while exact tails
+are restored in the original domain. Layout version 2 rejects older snapshots
+whose rotation semantics cannot be established. Automatic slot saving remains
+available; old snapshots may require one fresh prefill.
+
+Regression (real Qwen MTP model with vocabulary):
+
+```sh
+python3 gauntlet/test-adaptive-stream-conversion.py \
+  --server build-optimized/bin/llama-server --model /path/to/qwen-mtp.gguf
+```

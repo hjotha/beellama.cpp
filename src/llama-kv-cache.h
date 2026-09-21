@@ -414,6 +414,14 @@ bool requires_state_for_partial_restore() const override;
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    int32_t rotation_k() const {
+        if (!attn_rot_k) { return 0; }
+        int32_t n = 64;
+        while (n_embd_head_k_all % (n * 2) == 0) { n *= 2; }
+        return n;
+    }
+    int32_t rotation_v() const { return attn_rot_v ? 64 : 0; }
+
 private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);

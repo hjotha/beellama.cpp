@@ -34,6 +34,8 @@ struct llama_state_q4_info {
 
     uint32_t n_tokens = 0;
     bool from_ram = false;
+    int32_t rotation_k = 0;
+    int32_t rotation_v = 0;
     bool has_cell_ext = false;
     std::vector<llama_token> tokens;
     // Per-token cell extension when the model stores one (M-RoPE spatial

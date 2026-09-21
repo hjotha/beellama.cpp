@@ -3561,9 +3561,16 @@ private:
         llama_tokens tokens(source_file.tokens.size());
         size_t count = 0;
         const int64_t conversion_started = ggml_time_us();
-        const size_t converted = llama_state_seq_convert_file(ctx_tgt,
+        const auto source_layout = common_json::parse(source_file.layout);
+        if (!source_layout.contains("rotation_k") || !source_layout.contains("rotation_v")) {
+            SRV_WRN("%s", "route conversion rejected: source rotation metadata missing\n");
+            return {};
+        }
+        const size_t converted = llama_state_seq_convert_file_rotated(ctx_tgt,
                 source_file.state_path.c_str(), 0, source_file.state_bytes, source_file.state_checksum,
-                native_tmp.c_str(), tokens.data(), tokens.size(), &count);
+                native_tmp.c_str(), tokens.data(), tokens.size(), &count,
+                source_layout.at("rotation_k").get<int32_t>(),
+                source_layout.at("rotation_v").get<int32_t>());
         if (!converted || count != source_file.tokens.size() || tokens != source_file.tokens) {
             std::error_code ec;
             std::filesystem::remove(native_tmp, ec);
@@ -5244,121 +5251,100 @@ private:
         return true;
     }
 
-    // Converts cached q4 target states into the KVarN representation so the
-    // prompt cache survives a q4 -> KVarN profile switch instead of forcing a
-    // full re-prefill. Runs after the destination context exists; the
-    // converter uses the GPU bulk path when a CUDA device is available.
+    // Convert the newest compatible q4 snapshot to a private file and restore
+    // it directly into the empty target context. The original RAM cache stays
+    // intact until commit; no complete converted host vector is needed.
     bool adaptive_convert_cached_prompts_to_kvarn() {
-        if (!prompt_cache || !ctx_tgt) {
+        if (!prompt_cache || !ctx_tgt || ctx_dft || slots.size() != 1) {
             return false;
         }
         const std::string target_layout = common_prompt_cache_layout(ctx_tgt);
-        bool converted_any = false;
-        for (auto & state : prompt_cache->states) {
-            if (state.data.main.empty() || state.prompt.tokens.empty() ||
+        for (auto it = prompt_cache->states.rbegin(); it != prompt_cache->states.rend(); ++it) {
+            const auto & state = *it;
+            if (state.quarantined || state.data.main.empty() || state.prompt.tokens.empty() ||
+                    state.model != model_tgt || state.prompt.tokens.has_mtmd ||
+                    state.model_instance != llama_model_mtp_weights_get_info(model_tgt).model_instance ||
+                    state.prompt.tokens.size() > llama_n_ctx_seq(ctx_tgt) ||
+                    !common_prompt_cache_layout_convertible(state.layout_tgt, target_layout) ||
                     common_prompt_cache_layout_reusable(state.layout_tgt, target_layout)) {
                 continue;
             }
-            bool already_destination_representation = false;
             try {
-                const common_json layout = common_json::parse(state.layout_tgt);
-                const std::string type_k = layout.value("type_k", std::string());
-                const std::string type_v = layout.value("type_v", std::string());
-                already_destination_representation =
-                    type_k.find("kvarn") != std::string::npos || type_v.find("kvarn") != std::string::npos;
-            } catch (...) {
-                already_destination_representation = false;
-            }
-            if (already_destination_representation) {
-                continue;
-            }
-            // The conversion needs the source plus the converted payload (and
-            // the kernel's file staging) at once; skip rather than risk a
-            // global OOM when RAM is tight.
-            {
-                uint64_t available = 0;
-                {
-                    std::ifstream meminfo("/proc/meminfo");
-                    std::string key, unit;
-                    uint64_t value = 0;
-                    while (meminfo >> key >> value >> unit) {
-                        if (key == "MemAvailable:") {
-                            available = value * 1024;
-                            break;
-                        }
-                    }
-                }
-                const uint64_t source_bytes = uint64_t(state.data.main.size());
-                const uint64_t needed = source_bytes > std::numeric_limits<uint64_t>::max() / 3
-                    ? std::numeric_limits<uint64_t>::max() : source_bytes * 3;
-                if (available > 0 && available < needed) {
-                    SRV_WRN("adaptive conversion: skipping %zu-byte prompt (available RAM %zu < %zu)\n",
-                            state.data.main.size(), size_t(available), size_t(needed));
+                if (state.digest() != state.checksum) {
+                    SRV_WRN("%s", "adaptive streaming conversion: source checksum mismatch\n");
                     continue;
                 }
-            }
-            try {
-                if (state.data.main.size() < 2 * sizeof(uint32_t)) {
-                    SRV_WRN("%s", "adaptive conversion: cached prompt has a truncated in-memory header\n");
+                const auto & tokens = state.prompt.tokens.get_tokens();
+                if (tokens.size() != state.prompt.tokens.size() ||
+                        state.pos_tgt != (llama_pos) tokens.size() - 1) {
                     continue;
                 }
+                // Prefer the configured disk cache over /tmp, which may be tmpfs.
+                const auto base = params_base.slot_save_path.empty()
+                    ? std::filesystem::temp_directory_path()
+                    : std::filesystem::path(params_base.slot_save_path);
+                const auto dir = base / (".adaptive-convert-" + std::to_string(getpid()) +
+                                         "-" + std::to_string(ggml_time_us()));
+                if (!std::filesystem::create_directory(dir)) {
+                    throw std::runtime_error("cannot create private conversion directory");
+                }
+                struct cleanup {
+                    std::filesystem::path dir;
+                    ~cleanup() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+                } guard{dir};
+                std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
+                                             std::filesystem::perm_options::replace);
+                const std::string path = (dir / "state.bin").string();
                 size_t count = 0;
-                const llama_tokens & prompt_tokens = state.prompt.tokens.get_tokens();
-                std::vector<llama_token> tokens_out(prompt_tokens.size());
-                std::vector<uint8_t> converted;
-                const size_t written = llama_state_seq_convert_data_to_mem(
-                        ctx_tgt, state.data.main.data(), state.data.main.size(), 0,
-                        prompt_tokens.data(), prompt_tokens.size(), converted,
-                        tokens_out.data(), tokens_out.size(), &count);
-                if (written == 0 || count != state.prompt.tokens.size() ||
-                        !std::equal(prompt_tokens.begin(), prompt_tokens.end(), tokens_out.begin())) {
-                    SRV_WRN("adaptive conversion: cached prompt (%zu tokens) is not convertible\n",
-                            state.prompt.tokens.size());
+                std::vector<llama_token> restored(tokens.size());
+                const int64_t convert_start = ggml_time_us();
+                const auto layout = common_json::parse(state.layout_tgt);
+                const size_t written = llama_state_seq_convert_data_rotated(
+                    ctx_tgt, state.data.main.data(), state.data.main.size(), 0,
+                    tokens.data(), tokens.size(), path.c_str(),
+                    restored.data(), restored.size(), &count,
+                    layout.at("rotation_k").get<int32_t>(), layout.at("rotation_v").get<int32_t>());
+                if (!written || count != tokens.size() || restored != tokens) {
+                    SRV_WRN("%s", "adaptive streaming conversion: source rejected\n");
                     continue;
                 }
-                // The converter emits the canonical file form (magic + version
-                // + token header + body); the prompt cache stores the in-memory
-                // form ([u32 magic][i32 seq id] + body). Build the replacement
-                // completely before touching the source so a rejected format or
-                // allocation failure leaves the q4 snapshot intact.
-                if (count > (std::numeric_limits<size_t>::max() - 3 * sizeof(uint32_t)) /
-                        sizeof(llama_token)) {
-                    SRV_WRN("%s", "adaptive conversion: cached prompt token header is too large\n");
+                const double convert_ms = (ggml_time_us() - convert_start) / 1000.0;
+                XXH64_state_t hash;
+                XXH64_reset(&hash, 0);
+                std::ifstream input(path, std::ios::binary);
+                std::vector<char> buffer(1024 * 1024);
+                for (size_t left = written; left;) {
+                    const size_t n = std::min(left, buffer.size());
+                    if (!input.read(buffer.data(), n)) {
+                        throw std::runtime_error("short converted state read");
+                    }
+                    XXH64_update(&hash, buffer.data(), n);
+                    left -= n;
+                }
+                server_prompt candidate = state.prompt.clone();
+                candidate.checkpoints.clear(); // q4 checkpoints do not match KVarN
+                auto & slot = slots.front();
+                const size_t loaded = llama_state_seq_load_file_streaming(
+                    ctx_tgt, path.c_str(), slot.id, restored.data(), restored.size(),
+                    &count, written, XXH64_digest(&hash));
+                if (loaded != written || count != tokens.size() || restored != tokens ||
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != state.pos_tgt) {
+                    slot.prompt_clear();
+                    SRV_WRN("%s", "adaptive streaming conversion: restore rejected\n");
                     continue;
                 }
-                const size_t file_header = 3 * sizeof(uint32_t) + count * sizeof(llama_token);
-                if (converted.size() <= file_header ||
-                        converted.size() - file_header > std::numeric_limits<size_t>::max() - 2 * sizeof(uint32_t)) {
-                    SRV_WRN("%s", "adaptive conversion: converted state has an unexpected size\n");
-                    continue;
-                }
-                uint8_t ram_header[2 * sizeof(uint32_t)];
-                std::memcpy(ram_header, state.data.main.data(), sizeof(ram_header));
-                std::vector<uint8_t> ram_payload(2 * sizeof(uint32_t) + converted.size() - file_header);
-                std::memcpy(ram_payload.data(), ram_header, sizeof(ram_header));
-                std::memcpy(ram_payload.data() + 2 * sizeof(uint32_t),
-                        converted.data() + file_header, converted.size() - file_header);
-                state.data.main.swap(ram_payload);
-            } catch (const std::bad_alloc &) {
-                SRV_WRN("%s", "adaptive conversion: skipping cached prompt after allocation failure\n");
-                continue;
+                slot.prompt = std::move(candidate);
+                slot.bootstrap_pending = false;
+                SRV_INF("adaptive streaming conversion: restored %zu tokens, %zu bytes directly into target, convert_ms=%.3f, restore_ms=%.3f\n",
+                        tokens.size(), written, convert_ms,
+                        (ggml_time_us() - convert_start) / 1000.0 - convert_ms);
+                return true;
             } catch (const std::exception & error) {
-                SRV_WRN("adaptive conversion: skipping cached prompt: %s\n", error.what());
-                continue;
+                slots.front().prompt_clear();
+                SRV_WRN("adaptive streaming conversion: %s\n", error.what());
             }
-            if (ctx_dft == nullptr) {
-                state.data.drft.clear();
-                state.data.spec.clear();
-                state.pos_dft = -1;
-            }
-            state.prompt.checkpoints.clear();
-            state.layout_tgt = target_layout;
-            state.checksum = state.digest();
-            converted_any = true;
-            SRV_INF("adaptive conversion: cached prompt converted to the destination layout (%zu tokens, %zu bytes)\n",
-                    state.prompt.tokens.size(), state.data.main.size());
         }
-        return converted_any;
+        return false;
     }
 
     bool switch_adaptive_context(common_context_profile requested) {

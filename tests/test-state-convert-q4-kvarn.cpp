@@ -12,6 +12,7 @@
 #include "llama-cpp.h"
 #include "../src/llama-kvarn.h"
 #include "../src/llama-state-q4.h"
+#include "../src/llama-ext.h"
 
 #include <algorithm>
 #include <cmath>
@@ -28,6 +29,19 @@
 
 #define XXH_INLINE_ALL
 #include "../vendor/hash/xxhash/xxhash.h"
+
+static int32_t source_rotation_k = 0, source_rotation_v = 0;
+static size_t convert_file(llama_context * ctx, const char * src, size_t off, size_t size,
+        uint64_t hash, const char * dst, llama_token * tokens, size_t cap, size_t * count) {
+    return llama_state_seq_convert_file_rotated(ctx, src, off, size, hash, dst, tokens, cap, count,
+                                               source_rotation_k, source_rotation_v);
+}
+static size_t convert_data(llama_context * ctx, const uint8_t * src, size_t size, uint64_t hash,
+        const llama_token * tokens, size_t n, const char * dst,
+        llama_token * out, size_t cap, size_t * count) {
+    return llama_state_seq_convert_data_rotated(ctx, src, size, hash, tokens, n, dst, out, cap, count,
+                                               source_rotation_k, source_rotation_v);
+}
 
 struct block_q4_0;
 extern "C" {
@@ -235,7 +249,29 @@ static kvarn_reader parse_kvarn(const std::vector<uint8_t> & bytes, uint32_t n_l
 
 // --- independent rotation reference --------------------------------------
 
-static void reference_rotate(const float * row, uint32_t n_head_kv, uint32_t head_dim, std::vector<float> & rotated) {
+static void reference_rotate(const float * row, uint32_t n_head_kv, uint32_t head_dim, std::vector<float> & rotated, bool destination_rotation = true) {
+    // Undo the source transform using an explicit normalized matrix.
+    std::vector<float> original(row, row + size_t(n_head_kv) * head_dim);
+    if (source_rotation_k) {
+        const uint32_t width = source_rotation_k;
+        for (size_t base = 0; base < original.size(); base += width) {
+            for (uint32_t out = 0; out < width; ++out) {
+                double sum = 0;
+                for (uint32_t in = 0; in < width; ++in) {
+                    uint32_t bits = out & in;
+                    int sign = 1;
+                    while (bits) { sign = -sign; bits &= bits - 1; }
+                    sum += sign * row[base + in];
+                }
+                original[base + out] = sum / std::sqrt(double(width));
+            }
+        }
+    }
+    if (!destination_rotation) {
+        rotated = std::move(original);
+        return;
+    }
+    row = original.data();
     const uint32_t slices = head_dim / 128;
     rotated.assign(size_t(n_head_kv) * head_dim, 0.0f);
     for (uint32_t head = 0; head < n_head_kv; ++head) {
@@ -254,10 +290,29 @@ static void reference_rotate(const float * row, uint32_t n_head_kv, uint32_t hea
             }
             for (uint32_t i = 0; i < 128; ++i) {
                 rotated[size_t(head) * head_dim + size_t(slice) * 128 + i] =
-                    ggml_fp16_to_fp32(ggml_fp32_to_fp16(slice_values[i] * 0.08838834764831845f));
+                    slice_values[i] * 0.08838834764831845f;
+            }
+        }
+        // A 256/512-dimensional head also mixes the 128-wide slices.
+        // Compute the normalized Hadamard matrix explicitly as an independent
+        // reference (rather than copying the converter's butterfly loop).
+        if (slices > 1) {
+            const auto unmixed = rotated;
+            for (uint32_t out = 0; out < slices; ++out) {
+                for (uint32_t d = 0; d < 128; ++d) {
+                    float sum = 0;
+                    for (uint32_t in = 0; in < slices; ++in) {
+                        uint32_t bits = out & in;
+                        int sign = 1;
+                        while (bits) { sign = -sign; bits &= bits - 1; }
+                        sum += sign * unmixed[size_t(head) * head_dim + in * 128 + d];
+                    }
+                    rotated[size_t(head) * head_dim + out * 128 + d] = sum / std::sqrt(float(slices));
+                }
             }
         }
     }
+    for (auto & value : rotated) { value = ggml_fp16_to_fp32(ggml_fp32_to_fp16(value)); }
 }
 
 static void q4_row(const uint8_t * bytes, float * row, uint32_t n_embd) {
@@ -318,7 +373,8 @@ static source_info parse_source(const std::string & path, const llama_hparams & 
 
 int main(int argc, char ** argv) {
     try {
-        require(argc == 2, "usage: test-state-convert-q4-kvarn MODEL");
+        require(argc == 2 || (argc == 3 && std::string(argv[2]) == "--quick"),
+                "usage: test-state-convert-q4-kvarn MODEL [--quick]");
         const char * tmpdir = std::getenv("TMPDIR");
         require(tmpdir && *tmpdir, "TMPDIR must be an explicit disk directory");
         std::string pattern = std::string(tmpdir) + "/convert-XXXXXX";
@@ -358,7 +414,8 @@ int main(int argc, char ** argv) {
 
         // Prefix boundaries around the 128-token group size, an incomplete
         // group, and a continuation after generation.
-        const int boundaries[] = { 1, 127, 128, 129, 255, 256, 257, 300 };
+        const std::vector<int> boundaries = argc == 3 ? std::vector<int>{300}
+            : std::vector<int>{1, 127, 128, 129, 255, 256, 257, 300};
         double worst_kl_native = 0.0;
         double worst_kl_source = 0.0;
         float worst_diff_native = 0.0f;
@@ -371,6 +428,9 @@ int main(int argc, char ** argv) {
             auto src_params = base_params();
             llama_context_ptr source(llama_init_from_model(model.get(), src_params));
             require(bool(source), "source context failed");
+            const auto source_profile = llama_get_prompt_cache_profile(source.get());
+            source_rotation_k = source_profile.rotation_k;
+            source_rotation_v = source_profile.rotation_v;
             decode(source.get(), evaluated);
 
             const std::string q4_path = dir + "/q4-" + std::to_string(prompt_len) + ".bin";
@@ -385,11 +445,21 @@ int main(int argc, char ** argv) {
             const std::string kvarn_path = dir + "/kvarn4-" + std::to_string(prompt_len) + ".bin";
             llama_tokens out_tokens(evaluated.size());
             size_t out_count = 777;
-            const size_t converted = llama_state_seq_convert_file(dest.get(), q4_path.c_str(), 0,
+            const size_t converted = convert_file(dest.get(), q4_path.c_str(), 0,
                     q4_bytes.size(), 0, kvarn_path.c_str(), out_tokens.data(), out_tokens.size(), &out_count);
             require(converted > 0 && out_count == evaluated.size() && out_tokens == evaluated,
                     "conversion failed or returned wrong tokens");
             require(read_file(q4_path) == q4_bytes, "conversion modified the q4 source");
+            {
+                const std::string invalid_path = dir + "/invalid-rotation.bin";
+                size_t invalid_count = 999;
+                require(llama_state_seq_convert_file_rotated(dest.get(), q4_path.c_str(), 0,
+                            q4_bytes.size(), 0, invalid_path.c_str(), out_tokens.data(), out_tokens.size(),
+                            &invalid_count, -1, source_rotation_v) == 0 && invalid_count == 0,
+                        "invalid source rotation was accepted");
+                require(!std::filesystem::exists(invalid_path), "invalid rotation published output");
+            }
+
 
             // The same conversion through a real in-memory snapshot (the
             // state_seq_get_data form, which carries no token header) must
@@ -406,7 +476,7 @@ int main(int argc, char ** argv) {
                 const std::string ram_path = dir + "/kvarn4-ram-" + std::to_string(prompt_len) + ".bin";
                 llama_tokens ram_tokens(evaluated.size());
                 size_t ram_count = 0;
-                const size_t ram_converted = llama_state_seq_convert_data(dest_ram.get(),
+                const size_t ram_converted = convert_data(dest_ram.get(),
                         ram_data.data(), ram_data.size(), 0,
                         evaluated.data(), evaluated.size(), ram_path.c_str(),
                         ram_tokens.data(), ram_tokens.size(), &ram_count);
@@ -453,9 +523,9 @@ int main(int argc, char ** argv) {
                 require(source_parsed.info.layers.size() == n_layer, "source parser layer count");
                 const auto & sl = source_parsed.info.layers[0];
                 require(sl.il == parsed.layers[0].il, "source/destination layer order");
-                const uint32_t n_head_kv = hparams.n_head_kv(0);
-                const uint32_t head_dim_k = hparams.n_embd_head_k(0);
-                const uint32_t n_embd_k = hparams.n_embd_k_gqa(0);
+                const uint32_t n_head_kv = hparams.n_head_kv(sl.il);
+                const uint32_t head_dim_k = hparams.n_embd_head_k(sl.il);
+                const uint32_t n_embd_k = hparams.n_embd_k_gqa(sl.il);
                 const uint32_t n_head_sliced = n_head_kv * (head_dim_k / 128);
                 const uint32_t n_valid_group0 = std::min<uint32_t>(128, prompt_len);
 
@@ -482,14 +552,13 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                // Exact tail: the last payload row must be the rotated F16 row
-                // of the last token, not the unrotated domain.
+                // Exact tails must use the original domain, matching native store_tail.
                 if (prompt_len > 0 && parsed.n_exact_payloads != 0) {
                     const uint32_t last = uint32_t(prompt_len - 1);
                     std::memcpy(raw.data(), source_parsed.bytes.data() + sl.k_data + size_t(last) * sl.k_row_size,
                             raw.size());
                     q4_row(raw.data(), row.data(), n_embd_k);
-                    reference_rotate(row.data(), n_head_kv, head_dim_k, rotated);
+                    reference_rotate(row.data(), n_head_kv, head_dim_k, rotated, false);
                     const size_t tail_row_bytes = parsed.layers[0].k_tail.size() / parsed.n_exact_payloads;
                     require(tail_row_bytes == rotated.size() * sizeof(ggml_fp16_t), "tail row extent");
                     const uint8_t * last_tail = parsed.layers[0].k_tail.data() +
@@ -499,7 +568,7 @@ int main(int argc, char ** argv) {
                         std::memcpy(&stored, last_tail + i * sizeof(stored), sizeof(stored));
                         require(std::fabs(ggml_fp16_to_fp32(stored) - rotated[i]) <=
                                 1e-3f + 1e-3f * std::fabs(rotated[i]),
-                                "exact tail row does not match the rotated q4 reference");
+                                "exact tail row does not match the original-domain q4 reference");
                     }
                 }
 
@@ -680,7 +749,7 @@ int main(int argc, char ** argv) {
             llama_token token_out = 0;
             size_t token_count = 123;
             const std::string malformed_out = dir + "/malformed-token-count-out.bin";
-            require(llama_state_seq_convert_file(malformed_dest.get(), malformed_path.c_str(), 0,
+            require(convert_file(malformed_dest.get(), malformed_path.c_str(), 0,
                         bytes.size(), 0, malformed_out.c_str(), &token_out, 1, &token_count) == 0 &&
                     token_count == 0 && !std::filesystem::exists(malformed_out),
                     "malformed token count was not rejected before allocation");
@@ -700,7 +769,7 @@ int main(int argc, char ** argv) {
             llama_token token_out = 0;
             size_t token_count = 123;
             const std::string malformed_out = dir + "/malformed-ram-out.bin";
-            require(llama_state_seq_convert_data(malformed_dest.get(), bytes.data(), bytes.size(), 0,
+            require(convert_data(malformed_dest.get(), bytes.data(), bytes.size(), 0,
                         nullptr, UINT32_MAX, malformed_out.c_str(), &token_out, 1, &token_count) == 0 &&
                     token_count == 0 && !std::filesystem::exists(malformed_out),
                     "malformed RAM token metadata was not rejected before allocation");
@@ -711,12 +780,12 @@ int main(int argc, char ** argv) {
             auto dest_params = kvarn_params();
             llama_context_ptr dest(llama_init_from_model(model.get(), dest_params));
             require(bool(dest), "format rejection context failed");
-            const std::string kvarn_src = dir + "/kvarn4-128.bin";
+            const std::string kvarn_src = dir + "/kvarn4-300.bin";
             const std::string out_path = dir + "/reject.bin";
             llama_tokens tokens_out(8);
             size_t count = 0;
             const auto bytes = read_file(kvarn_src);
-            require(llama_state_seq_convert_file(dest.get(), kvarn_src.c_str(), 0, bytes.size(), 0,
+            require(convert_file(dest.get(), kvarn_src.c_str(), 0, bytes.size(), 0,
                         out_path.c_str(), tokens_out.data(), tokens_out.size(), &count) == 0 && count == 0,
                     "non-q4 source was accepted");
             require(!std::filesystem::exists(out_path), "rejected conversion published an output file");
@@ -732,7 +801,7 @@ int main(int argc, char ** argv) {
             llama_tokens tokens_out(300);
             size_t count = 0;
             const std::string trunc_out = dir + "/trunc-out.bin";
-            require(llama_state_seq_convert_file(dest.get(), trunc_path.c_str(), 0,
+            require(convert_file(dest.get(), trunc_path.c_str(), 0,
                         bytes.size() / 2, 0, trunc_out.c_str(),
                         tokens_out.data(), tokens_out.size(), &count) == 0 && count == 0,
                     "truncated source was accepted");
@@ -744,7 +813,7 @@ int main(int argc, char ** argv) {
             count = 0;
             const std::string q4_300 = dir + "/q4-300.bin";
             const std::string f16_out = dir + "/f16-out.bin";
-            require(llama_state_seq_convert_file(f16_ctx.get(), q4_300.c_str(), 0,
+            require(convert_file(f16_ctx.get(), q4_300.c_str(), 0,
                         bytes.size(), 0, f16_out.c_str(),
                         tokens_out.data(), tokens_out.size(), &count) == 0 && count == 0,
                     "conversion into a standard KV context was accepted");

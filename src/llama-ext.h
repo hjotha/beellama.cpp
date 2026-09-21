@@ -56,6 +56,8 @@ LLAMA_API bool llama_matches_nextn_decode(const llama_context * ctx, uint64_t id
 
 struct llama_prompt_cache_profile {
     uint64_t context_instance;
+    int32_t rotation_k;
+    int32_t rotation_v;
     llama_context_type ctx_type;
     llama_rope_scaling_type rope_scaling_type;
     float rope_freq_base;
@@ -304,3 +306,14 @@ LLAMA_API bool llama_model_dspark_get_meta(const struct llama_model * model, lla
 LLAMA_API bool llama_model_dspark_get_markov(const struct llama_model * model,
                                              std::vector<float> &       w1,
                                              std::vector<float> &       w2);
+
+// Explicit source Hadamard widths (0 = unrotated). The q4 wire format does
+// not encode these; callers must preserve them with the snapshot metadata.
+LLAMA_API size_t llama_state_seq_convert_data_rotated(
+    llama_context * ctx, const uint8_t * src, size_t size, uint64_t checksum,
+    const llama_token * tokens, size_t n_tokens, const char * dst,
+    llama_token * out, size_t capacity, size_t * count, int32_t rotation_k, int32_t rotation_v);
+LLAMA_API size_t llama_state_seq_convert_file_rotated(
+    llama_context * ctx, const char * src, size_t offset, size_t size, uint64_t checksum,
+    const char * dst, llama_token * out, size_t capacity, size_t * count,
+    int32_t rotation_k, int32_t rotation_v);
