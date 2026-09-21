@@ -972,7 +972,10 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
-        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+        // EAGLE3, DFlash and DSpark fixtures require trained sidecar/head
+        // metadata that the generic random architecture saver cannot provide.
+        // Their dedicated tests generate the complete fixture instead.
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_DSPARK) {
             continue;
         }
         for (bool moe : {false, true}) {

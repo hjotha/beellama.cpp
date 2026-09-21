@@ -2066,7 +2066,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE_MTP").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
-        {"--m-max-tokens", "--mtp-max-tokens"}, "N",
+        {"--m-max-tokens", "--mtp-max-tokens", "--mtp-m-max-tokens"}, "N",
         string_format("prompt plus output threshold for adaptive MTP mode (default: %d, 0 = ctx-size-mtp)", params.mtp_max_tokens),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -2086,7 +2086,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE_MTP_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
-        {"--s-max-tokens", "--short-max-tokens", "--mtp-short-max-tokens"}, "N",
+        {"--s-max-tokens", "--short-max-tokens", "--mtp-short-max-tokens", "--mtp-s-max-tokens"}, "N",
         string_format("prompt plus output threshold for adaptive Ultra-MTP mode (default: %d, 0 = ctx-size-mtp-short)", params.mtp_short_max_tokens),
         [](common_params & params, int value) {
             if (value < 0) {

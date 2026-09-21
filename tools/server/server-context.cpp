@@ -3221,11 +3221,6 @@ private:
             params_base.kvarn = adaptive_kvarn_long;
             params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_long;
             params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_long;
-            params_base.cache_type_k = adaptive_cache_type_k_normal;
-            params_base.cache_type_v = adaptive_cache_type_v_normal;
-            params_base.kvarn = adaptive_kvarn_normal;
-            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_normal;
-            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
         } else if (profile == COMMON_CONTEXT_PROFILE_XLONG) {
             params_base.n_ctx = params_base.ctx_size_xlong;
             params_base.n_batch = adaptive_batch_xlong;
@@ -5247,10 +5242,11 @@ private:
         if (!prompt_cache || !ctx_tgt) {
             return false;
         }
+        const std::string target_layout = common_prompt_cache_layout(ctx_tgt);
         bool converted_any = false;
         for (auto & state : prompt_cache->states) {
             if (state.data.main.empty() || state.prompt.tokens.empty() ||
-                    state.layout_tgt == common_prompt_cache_layout(ctx_tgt)) {
+                    common_prompt_cache_layout_reusable(state.layout_tgt, target_layout)) {
                 continue;
             }
             bool already_destination_representation = false;
@@ -5328,7 +5324,7 @@ private:
                 state.pos_dft = -1;
             }
             state.prompt.checkpoints.clear();
-            state.layout_tgt = common_prompt_cache_layout(ctx_tgt);
+            state.layout_tgt = target_layout;
             state.checksum = state.digest();
             converted_any = true;
             SRV_INF("adaptive conversion: cached prompt converted to the destination layout (%zu tokens, %zu bytes)\n",

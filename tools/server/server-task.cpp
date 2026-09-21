@@ -2142,8 +2142,9 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
         return server_prompt_cache_result::miss;
     };
     if (state.model != llama_get_model(ctx_tgt) || state.model_instance != info.model_instance ||
-            state.layout_tgt != common_prompt_cache_layout(ctx_tgt) ||
-            (ctx_dft && state.has_draft() && state.layout_dft != common_prompt_cache_layout(ctx_dft))) {
+            !common_prompt_cache_layout_reusable(state.layout_tgt, common_prompt_cache_layout(ctx_tgt)) ||
+            (ctx_dft && state.has_draft() &&
+             !common_prompt_cache_layout_reusable(state.layout_dft, common_prompt_cache_layout(ctx_dft)))) {
         return miss("snapshot model or attention layout differs");
     }
     if (state.pos_tgt < 0 || state.prompt.tokens.empty() || state.pos_tgt >= (llama_pos) llama_n_ctx_seq(ctx_tgt) ||
@@ -2232,7 +2233,9 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
             continue;
         }
         if (it->model != llama_get_model(ctx_tgt) || it->model_instance != info.model_instance ||
-                it->layout_tgt != target_layout || (ctx_dft && it->has_draft() && it->layout_dft != draft_layout)) {
+                !common_prompt_cache_layout_reusable(it->layout_tgt, target_layout) ||
+                (ctx_dft && it->has_draft() &&
+                 !common_prompt_cache_layout_reusable(it->layout_dft, draft_layout))) {
             reject("snapshot model or attention layout differs");
             continue;
         }

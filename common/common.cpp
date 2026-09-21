@@ -3534,10 +3534,11 @@ bool common_prompt_cache_layout_convertible(
     }
 }
 
-// Reuse predicate for automatic snapshots: exact equality, or two unknown
-// representations whose context-lifetime fields differ (a KVarN child is
-// recreated with a new instance pointer while its native layout is identical).
-// The restore path still validates every state field before publishing.
+// Reuse predicate for cross-context snapshots: exact layout equality, or two
+// unknown representations whose context-lifetime or unavailable type fields
+// differ (a KVarN child is recreated with a new instance pointer while its
+// native layout is identical). The restore path still validates every state
+// field before publishing.
 bool common_prompt_cache_layout_reusable(
         const std::string & stored_layout,
         const std::string & current_layout) {
@@ -3711,13 +3712,13 @@ static bool checkpoint_attention_available(llama_context * ctx, llama_seq_id seq
 bool common_prompt_checkpoint::compatible_tgt(llama_context * ctx) const {
     return ctx && model_tgt == llama_get_model(ctx) &&
         instance_tgt == llama_model_mtp_weights_get_info(model_tgt).model_instance &&
-        layout_tgt == common_prompt_cache_layout(ctx);
+        common_prompt_cache_layout_reusable(layout_tgt, common_prompt_cache_layout(ctx));
 }
 
 bool common_prompt_checkpoint::compatible_dft(llama_context * ctx) const {
     return ctx && model_dft == llama_get_model(ctx) &&
         instance_dft == llama_model_mtp_weights_get_info(model_dft).model_instance &&
-        layout_dft == common_prompt_cache_layout(ctx);
+        common_prompt_cache_layout_reusable(layout_dft, common_prompt_cache_layout(ctx));
 }
 
 void common_prompt_checkpoint::update_spec(common_speculative * spec, llama_seq_id seq_id) {

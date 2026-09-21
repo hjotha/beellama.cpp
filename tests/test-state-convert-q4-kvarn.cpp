@@ -8,6 +8,7 @@
 // I/O) that must never publish a partial cache or destroy the source.
 
 #include "common.h"
+#include "server-task.h"
 #include "llama-cpp.h"
 #include "../src/llama-kvarn.h"
 #include "../src/llama-state-q4.h"
@@ -582,6 +583,41 @@ int main(int argc, char ** argv) {
             const size_t native_written = llama_state_seq_save_file(dest.get(), native_path.c_str(), 0,
                     continued.data(), continued.size());
             require(native_written > 0, "native KVarN save of converted state failed");
+
+            // The adaptive prompt cache must reuse a native KVarN snapshot
+            // across capacities when the KVarN geometry is unchanged. The
+            // layout predicate ignores only context lifetime/capacity here;
+            // the state importer still validates the KVarN descriptor.
+            if (prompt_len == 256) {
+                auto wide_params = kvarn_params();
+                wide_params.n_ctx = 640;
+                llama_context_ptr wide(llama_init_from_model(model.get(), wide_params));
+                require(bool(wide), "wider KVarN context failed");
+                const std::string native_layout = common_prompt_cache_layout(native_ctx.get());
+                const std::string wide_layout = common_prompt_cache_layout(wide.get());
+                require(common_prompt_cache_layout_reusable(native_layout, wide_layout),
+                        "KVarN layouts with different capacities were not reusable");
+                require(!common_prompt_cache_layout_reusable(
+                            common_prompt_cache_layout(source.get()), native_layout),
+                        "q4 layout was incorrectly considered reusable as KVarN");
+
+                server_prompt_cache cache(2048, 0);
+                server_prompt cached;
+                cached.tokens = server_tokens(continued, false);
+                require(cache.save(cached, native_ctx.get(), nullptr, nullptr, 0),
+                        "native KVarN prompt-cache save failed");
+                server_prompt restored_prompt;
+                server_tokens request(continued, false);
+                request.push_back(3);
+                require(cache.load(restored_prompt, request, wide.get(), nullptr, nullptr, 0) ==
+                            server_prompt_cache_result::hit,
+                        "native KVarN prompt-cache restore across capacities failed");
+                require(restored_prompt.n_tokens() == (int) continued.size() &&
+                            llama_memory_seq_pos_max(llama_get_memory(wide.get()), 0) ==
+                                (llama_pos) continued.size() - 1,
+                        "cross-capacity KVarN restore position mismatch");
+            }
+
             llama_context_ptr reload(llama_init_from_model(model.get(), kvarn_params()));
             require(bool(reload), "native reload context failed");
             const auto native_bytes = read_file(native_path);

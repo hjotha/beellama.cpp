@@ -517,7 +517,11 @@ int main(int argc, char ** argv) {
     cache.limit_size = cache.size();
     CHECK(cache.save(prompt, init->context(), draft->context(), spec.get(), 0));
     CHECK(cache.size() <= cache.limit_size && cache.states.size() == 1);
-    cache.limit_size = cache.states.front().size() - 1;
+    // `update()` enforces the payload-only accounting limit.  `state.size()`
+    // also includes container/checkpoint ownership overhead, so using it here
+    // can leave a payload below the configured limit and make this eviction
+    // assertion depend on allocator details.
+    cache.limit_size = cache.accounted_size() - 1;
     cache.update();
     CHECK(cache.states.empty());
 

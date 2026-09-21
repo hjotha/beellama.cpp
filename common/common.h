@@ -1497,9 +1497,10 @@ bool common_prompt_cache_layout_convertible(
         std::string * source_type_k = nullptr,
         std::string * source_type_v = nullptr);
 
-// Automatic-snapshot reuse predicate: exact layout equality, or two layouts
-// that both report an unknown representation and differ only in their
-// context-lifetime binding. The restore path still validates the full state.
+// Cross-context snapshot reuse predicate: exact layout equality, or two
+// layouts that both report an unknown representation and differ only in their
+// context-lifetime or unavailable type metadata. The restore path still
+// validates the full state.
 bool common_prompt_cache_layout_reusable(
         const std::string & stored_layout,
         const std::string & current_layout);
