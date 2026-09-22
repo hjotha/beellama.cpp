@@ -5328,7 +5328,7 @@ private:
     // it directly into the empty target context. The original RAM cache stays
     // intact until commit; no complete converted host vector is needed.
     bool adaptive_convert_cached_prompts_to_kvarn() {
-        if (!prompt_cache || !ctx_tgt || slots.size() != 1) {
+        if (!prompt_cache || !ctx_tgt || ctx_dft || slots.size() != 1) {
             return false;
         }
         const std::string target_layout = common_prompt_cache_layout(ctx_tgt);
@@ -5408,11 +5408,10 @@ private:
                 }
                 slot.prompt = std::move(candidate);
                 // The converted prefix is target-only: with an MTP destination the
-                // draft context was rebuilt from scratch, so flag the slot to re-sync
-                // the resident draft/carry on the next decode (mirrors do_slot_restore).
-                const bool mtp_managed =
-                    llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt)).managed;
-                slot.bootstrap_pending = slot.can_speculate() && mtp_managed;
+                // RAM prompt-cache loader restores it (with q4->KVarN conversion) and
+                // the decode re-syncs the rebuilt draft/carry via bootstrap; a direct
+                // target-only load needs no pending bootstrap.
+                slot.bootstrap_pending = false;
                 SRV_INF("adaptive streaming conversion: restored %zu tokens, %zu bytes directly into target, convert_ms=%.3f, restore_ms=%.3f\n",
                         tokens.size(), written, convert_ms,
                         (ggml_time_us() - convert_start) / 1000.0 - convert_ms);
