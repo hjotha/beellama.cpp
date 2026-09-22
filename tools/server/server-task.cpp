@@ -2197,6 +2197,9 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
                 return miss("restore prompt copy exceeds RAM cache budget");
             }
             candidate = state.prompt.clone();
+            if (converted_mode) {
+                candidate.checkpoints.clear();
+            }
         }
     } catch (const std::bad_alloc &) { return miss("restore allocation failed"); }
     prompt_cache_clear(ctx_tgt, ctx_dft, spec, id_slot);
@@ -2315,10 +2318,19 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
             continue;
         }
         if (lcp < 0.25*it->prompt.tokens.size()) { continue; }
-        // A convertible snapshot can only be restored whole (no partial q4->KVarN
-        // resume), so require the entire snapshot to be a verified prefix.
-        if (convertible_candidate && lcp != (int) it->prompt.tokens.size()) {
-            continue;
+        // A convertible snapshot can be restored whole if the entire snapshot is a verified prefix,
+        // or if the destination KVarN context can cleanly truncate the tail beyond lcp.
+        if (convertible_candidate) {
+            bool can_truncate = (lcp == (int) it->prompt.tokens.size());
+            if (!can_truncate && it->pos_tgt >= 0) {
+                const llama_pos group = 128; // KVAR_N_GROUP
+                const llama_pos live_group = it->pos_tgt / group;
+                const llama_pos earliest_exact = std::max<llama_pos>(0, live_group - 1) * group;
+                can_truncate = (lcp >= earliest_exact);
+            }
+            if (!can_truncate) {
+                continue;
+            }
         }
         if (!convertible_candidate && info.managed && (lcp < it->prompt.n_tokens() || lcp == (int) tokens_new.size())) {
             const bool can_rewind = std::any_of(it->prompt.checkpoints.begin(), it->prompt.checkpoints.end(),
@@ -2358,7 +2370,7 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
         result = restore_impl(prompt, *best, ctx_tgt, ctx_dft, spec, id_slot, info.managed, true);
     }
     if (result == server_prompt_cache_result::miss && restore_invalid) { best->quarantined = true; }
-    if (result == server_prompt_cache_result::hit) {
+    if (result == server_prompt_cache_result::hit || result == server_prompt_cache_result::needs_bootstrap) {
         if (info.managed) { states.splice(states.end(), states, best); }
         else {
             prompt = std::move(best->prompt);
