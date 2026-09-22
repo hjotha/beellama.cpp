@@ -528,7 +528,7 @@ struct common_params {
     int32_t ubatch_size_xlong     =    64; // physical batch size for xlong profile
     int32_t batch_size_long       =   256; // logical batch size for long profile
     int32_t ubatch_size_long      =   256; // physical batch size for long profile
-    int32_t spec_draft_n_max_xlong =     0; // draft N for xlong profile (fixed at 0: MTP disabled)
+    int32_t spec_draft_n_max_xlong =     0; // draft N for xlong profile (0 = target-only)
     enum ggml_type cache_type_k_long = GGML_TYPE_COUNT;
     enum ggml_type cache_type_v_long = GGML_TYPE_COUNT;
     int32_t cache_kvarn_bits_k_long = 0;

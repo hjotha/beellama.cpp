@@ -837,6 +837,41 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(),
                                     ista_parse_invalid, LLAMA_EXAMPLE_SERVER));
 
+        // XLONG may now carry resident MTP (73k tier); XXLONG remains target-only.
+        common_params ista_xl_mtp = ista_profile;
+        ista_xl_mtp.spec_draft_n_max_xlong = 2;
+        assert(common_context_adaptive_error(ista_xl_mtp).empty());
+        assert(common_context_profile_for_budget(ista_xl_mtp, 56321) == COMMON_CONTEXT_PROFILE_XLONG);
+        assert(common_context_profile_for_budget(ista_xl_mtp, 73728) == COMMON_CONTEXT_PROFILE_XLONG);
+        common_params ista_xl_invalid = ista_profile;
+        ista_xl_invalid.spec_draft_n_max_xlong = -1;
+        assert(common_context_adaptive_error(ista_xl_invalid) ==
+               "--spec-draft-n-max-xlong must be non-negative");
+        common_params ista_parse_xl_mtp = ista_profile;
+        argv = {
+            "binary_name", "--ctx-size-l", "56320", "--ctx-size-m", "40960",
+            "--m-max-tokens", "40960", "--spec-draft-n-max-l", "2",
+            "--ctx-size-xl", "73728", "--xl-max-tokens", "73728",
+            "--spec-draft-n-max-xl", "2",
+            "--cache-type-k-xl", "kvarn4", "--cache-type-v-xl", "kvarn4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(),
+                                           ista_parse_xl_mtp, LLAMA_EXAMPLE_SERVER));
+        assert(ista_parse_xl_mtp.spec_draft_n_max_xlong == 2);
+        common_params ista_parse_xxl_mtp = ista_profile;
+        argv = {
+            "binary_name", "--ctx-size-l", "56320", "--ctx-size-m", "40960",
+            "--m-max-tokens", "40960", "--spec-draft-n-max-l", "2",
+            "--ctx-size-xl", "73728", "--xl-max-tokens", "73728",
+            "--spec-draft-n-max-xl", "2",
+            "--ctx-size-xxl", "102400", "--xxl-max-tokens", "102400",
+            "--spec-draft-n-max-xxl", "2",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(),
+                                            ista_parse_xxl_mtp, LLAMA_EXAMPLE_SERVER));
+
         common_params five_profile_shorthand = adaptive;
         argv = {
             "binary_name", "--ctx-size-l", "1000", "--ctx-size-m", "600",

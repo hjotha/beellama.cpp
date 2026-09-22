@@ -2014,15 +2014,16 @@ struct adaptive_slot_snapshot_blob {
     std::vector<adaptive_slot_checkpoint_blob> checkpoints;
 };
 
-// LONG is a dual-purpose profile: old snapshots may be target-only, while a
-// new LONG profile can carry the resident MTP draft state.  Keep the wire
-// profile IDs stable and infer the LONG snapshot's mode from its payload.
+// LONG and XLONG are dual-purpose profiles: old snapshots may be target-only,
+// while a newer profile can carry the resident MTP draft state.  Keep the wire
+// profile IDs stable and infer the snapshot's mode from its payload.
 static bool adaptive_slot_snapshot_carries_mtp(const adaptive_slot_snapshot_blob & snapshot) {
     if (snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ||
             snapshot.profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
         return true;
     }
-    return snapshot.profile == COMMON_CONTEXT_PROFILE_LONG &&
+    return (snapshot.profile == COMMON_CONTEXT_PROFILE_LONG ||
+            snapshot.profile == COMMON_CONTEXT_PROFILE_XLONG) &&
         (!snapshot.data_dft.empty() || !snapshot.data_spec.empty() || snapshot.pos_dft >= 0);
 }
 

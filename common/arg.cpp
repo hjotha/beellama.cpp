@@ -2177,10 +2177,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UBATCH_SIZE_LONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--spec-draft-n-max-xl", "--spec-draft-n-max-xlong"}, "N",
-        string_format("draft N for adaptive xlong profile (default: %d, must be 0: MTP is disabled)", params.spec_draft_n_max_xlong),
+        string_format("draft N for adaptive xlong profile (default: %d, 0 = target-only)", params.spec_draft_n_max_xlong),
         [](common_params & params, int value) {
-            if (value != 0) {
-                throw std::invalid_argument("--spec-draft-n-max-xlong must be 0: MTP is disabled on the xlong profile");
+            if (value < 0) {
+                throw std::invalid_argument("--spec-draft-n-max-xlong must be non-negative");
             }
             params.spec_draft_n_max_xlong = value;
         }
