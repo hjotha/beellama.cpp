@@ -3215,6 +3215,15 @@ private:
         }
     }
 
+    // The adaptive MTP draft context never processes more than draft_n+1 tokens
+    // per speculative step, but its catch-up mirrors the target batch, so the
+    // batch capacity must stay at the target size. Only the ubatch (which sizes
+    // the GPU compute buffers) is capped to a small window; llama_decode splits
+    // the catch-up batch into these ubatches internally.
+    int32_t adaptive_draft_ubatch_for_profile(common_context_profile profile) const {
+        return std::max<int32_t>(16, adaptive_draft_n_for_profile(profile) + 2);
+    }
+
     void apply_profile_params(common_context_profile profile) {
         const int32_t draft_n = adaptive_draft_n_for_profile(profile);
         const int32_t draft_n_max = std::max({
@@ -4681,6 +4690,10 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
+                if (common_context_is_adaptive(params_base)) {
+                    params_dft.n_ubatch = adaptive_draft_ubatch_for_profile(active_context_profile);
+                }
+
                 spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
@@ -5308,6 +5321,7 @@ private:
 
         try {
             common_params params_dft = common_base_params_to_speculative(params_base);
+            params_dft.n_ubatch = adaptive_draft_ubatch_for_profile(profile);
             spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
             model_dft = spec_init->model();
             ctx_dft = spec_init->context();

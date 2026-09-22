@@ -2873,6 +2873,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // The attention KV tail rollback stays at the max draft depth across tiers
+    // (n_rs_seq_target) so every adaptive tier allocates identical tail slots
+    // and cross-tier snapshots restore cleanly; the recurrent R/S state rows
+    // above only cover the tier's own rollback depth.
+    cparams.kv_tail_rollback_tokens = params.speculative.n_rs_seq_target;
     // recurrent/hybrid memory keeps the last n_rs_seq + 1 tokens of a sequence inside one micro-batch, so the window has to fit or we keep the checkpoint path
     // llama_context clamps the micro-batch to min(n_batch, n_ubatch), and n_batch to n_ctx, so the check uses the effective size and not the requested one
     {

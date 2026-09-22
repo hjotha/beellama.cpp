@@ -440,7 +440,11 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return std::max(n_rs_seq_target, needs_rs_seq ? draft.n_max : 0u);
+        // Per-tier rollback window: the recurrent R/S state rows only need to
+        // cover the rollback depth of this tier's own draft. n_rs_seq_target
+        // separately keeps the attention KV tail rollback equal across tiers so
+        // that cross-tier snapshots restore with identical tail slots.
+        return needs_rs_seq ? draft.n_max : 0u;
     }
 };
 
