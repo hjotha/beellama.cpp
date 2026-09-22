@@ -1551,6 +1551,108 @@ static void common_params_draft_kvarn_normalize(common_params & params) {
             "--spec-draft-type-v");
 }
 
+// Resolve one adaptive tier's draft KV selection: inherit the global draft KV
+// when the tier is untouched, otherwise normalize its KVarN representation.
+// Mirrors common_params_long_kvarn_normalize for the resident MTP draft cache.
+static void common_params_spec_draft_tier_kvarn_normalize(
+        common_params & params,
+        ggml_type & type_k,
+        ggml_type & type_v,
+        int32_t & bits_k,
+        int32_t & bits_v,
+        llama_kvarn_params & kvarn,
+        const char * arg_k,
+        const char * arg_v) {
+    const auto & draft = params.speculative.draft;
+    const bool selection_untouched =
+            type_k == GGML_TYPE_COUNT && type_v == GGML_TYPE_COUNT &&
+            bits_k == 0 && bits_v == 0;
+    if (selection_untouched) {
+        type_k = draft.cache_type_k;
+        type_v = draft.cache_type_v;
+        bits_k = draft.cache_kvarn_bits_k;
+        bits_v = draft.cache_kvarn_bits_v;
+        kvarn = draft.kvarn;
+        return;
+    }
+
+    if (type_k == GGML_TYPE_COUNT && bits_k == 0) {
+        type_k = draft.cache_type_k;
+        bits_k = draft.cache_kvarn_bits_k;
+    }
+    if (type_v == GGML_TYPE_COUNT && bits_v == 0) {
+        type_v = draft.cache_type_v;
+        bits_v = draft.cache_kvarn_bits_v;
+    }
+
+    if (bits_k == 0 && bits_v == 0) {
+        kvarn = llama_kvarn_default_params();
+        return;
+    }
+
+    common_kvarn_pair_normalize(type_k, type_v, bits_k, bits_v, kvarn, arg_k, arg_v);
+}
+
+static void common_params_short_spec_draft_kvarn_normalize(common_params & params) {
+    common_params_spec_draft_tier_kvarn_normalize(
+            params,
+            params.spec_draft_type_k_short,
+            params.spec_draft_type_v_short,
+            params.spec_draft_kvarn_bits_k_short,
+            params.spec_draft_kvarn_bits_v_short,
+            params.spec_draft_kvarn_short,
+            "--spec-draft-type-k-s",
+            "--spec-draft-type-v-s");
+}
+
+static void common_params_medium_spec_draft_kvarn_normalize(common_params & params) {
+    common_params_spec_draft_tier_kvarn_normalize(
+            params,
+            params.spec_draft_type_k_medium,
+            params.spec_draft_type_v_medium,
+            params.spec_draft_kvarn_bits_k_medium,
+            params.spec_draft_kvarn_bits_v_medium,
+            params.spec_draft_kvarn_medium,
+            "--spec-draft-type-k-m",
+            "--spec-draft-type-v-m");
+}
+
+static void common_params_spec_draft_long_kvarn_normalize(common_params & params) {
+    common_params_spec_draft_tier_kvarn_normalize(
+            params,
+            params.spec_draft_type_k_long,
+            params.spec_draft_type_v_long,
+            params.spec_draft_kvarn_bits_k_long,
+            params.spec_draft_kvarn_bits_v_long,
+            params.spec_draft_kvarn_long,
+            "--spec-draft-type-k-l",
+            "--spec-draft-type-v-l");
+}
+
+static void common_params_spec_draft_xlong_kvarn_normalize(common_params & params) {
+    common_params_spec_draft_tier_kvarn_normalize(
+            params,
+            params.spec_draft_type_k_xlong,
+            params.spec_draft_type_v_xlong,
+            params.spec_draft_kvarn_bits_k_xlong,
+            params.spec_draft_kvarn_bits_v_xlong,
+            params.spec_draft_kvarn_xlong,
+            "--spec-draft-type-k-xl",
+            "--spec-draft-type-v-xl");
+}
+
+static void common_params_spec_draft_xxlong_kvarn_normalize(common_params & params) {
+    common_params_spec_draft_tier_kvarn_normalize(
+            params,
+            params.spec_draft_type_k_xxlong,
+            params.spec_draft_type_v_xxlong,
+            params.spec_draft_kvarn_bits_k_xxlong,
+            params.spec_draft_kvarn_bits_v_xxlong,
+            params.spec_draft_kvarn_xxlong,
+            "--spec-draft-type-k-xxl",
+            "--spec-draft-type-v-xxl");
+}
+
 static void common_params_long_kvarn_normalize(common_params & params) {
     const bool selection_untouched =
             params.cache_type_k_long == GGML_TYPE_COUNT && params.cache_type_v_long == GGML_TYPE_COUNT &&
@@ -1707,6 +1809,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
         common_params_kvarn_normalize(ctx_arg.params);
         common_params_draft_kvarn_normalize(ctx_arg.params);
+        common_params_short_spec_draft_kvarn_normalize(ctx_arg.params);
+        common_params_medium_spec_draft_kvarn_normalize(ctx_arg.params);
+        common_params_spec_draft_long_kvarn_normalize(ctx_arg.params);
+        common_params_spec_draft_xlong_kvarn_normalize(ctx_arg.params);
+        common_params_spec_draft_xxlong_kvarn_normalize(ctx_arg.params);
         common_params_long_kvarn_normalize(ctx_arg.params);
         common_params_xlong_kvarn_normalize(ctx_arg.params);
         common_params_xxlong_kvarn_normalize(ctx_arg.params);
@@ -2249,6 +2356,116 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.spec_draft_n_max_xxlong = value;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-k-s", "--spec-draft-type-k-short"}, "TYPE",
+        string_format(
+            "KV cache data type for K for the draft model on the short profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-k)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_k_short, params.spec_draft_kvarn_bits_k_short, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-v-s", "--spec-draft-type-v-short"}, "TYPE",
+        string_format(
+            "KV cache data type for V for the draft model on the short profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-v)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_v_short, params.spec_draft_kvarn_bits_v_short, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-k-m", "--spec-draft-type-k-medium"}, "TYPE",
+        string_format(
+            "KV cache data type for K for the draft model on the medium profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-k)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_k_medium, params.spec_draft_kvarn_bits_k_medium, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_MEDIUM").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-v-m", "--spec-draft-type-v-medium"}, "TYPE",
+        string_format(
+            "KV cache data type for V for the draft model on the medium profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-v)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_v_medium, params.spec_draft_kvarn_bits_v_medium, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_MEDIUM").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-k-l", "--spec-draft-type-k-long"}, "TYPE",
+        string_format(
+            "KV cache data type for K for the draft model on the long profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-k)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_k_long, params.spec_draft_kvarn_bits_k_long, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_LONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-v-l", "--spec-draft-type-v-long"}, "TYPE",
+        string_format(
+            "KV cache data type for V for the draft model on the long profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-v)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_v_long, params.spec_draft_kvarn_bits_v_long, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_LONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-k-xl", "--spec-draft-type-k-xlong"}, "TYPE",
+        string_format(
+            "KV cache data type for K for the draft model on the xlong profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-k)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_k_xlong, params.spec_draft_kvarn_bits_k_xlong, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-v-xl", "--spec-draft-type-v-xlong"}, "TYPE",
+        string_format(
+            "KV cache data type for V for the draft model on the xlong profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-v)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_v_xlong, params.spec_draft_kvarn_bits_v_xlong, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-k-xxl", "--spec-draft-type-k-xxlong"}, "TYPE",
+        string_format(
+            "KV cache data type for K for the draft model on the xxlong profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-k)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_k_xxlong, params.spec_draft_kvarn_bits_k_xxlong, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--spec-draft-type-v-xxl", "--spec-draft-type-v-xxlong"}, "TYPE",
+        string_format(
+            "KV cache data type for V for the draft model on the xxlong profile\n"
+            "allowed values: %s\n"
+            "(default: the global --spec-draft-type-v)",
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
+        [](common_params & params, const std::string & value) {
+            parse_kvarn_cache_type(params.spec_draft_type_v_xxlong, params.spec_draft_kvarn_bits_v_xxlong, value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-k-xxl", "--cache-type-k-xxlong"}, "TYPE",
         "KV cache type for K for xxlong profile (default: kvarn4)",

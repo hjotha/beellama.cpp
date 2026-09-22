@@ -872,6 +872,34 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(),
                                             ista_parse_xxl_mtp, LLAMA_EXAMPLE_SERVER));
 
+        // Per-tier draft KV types: explicit overrides and global inheritance.
+        common_params ista_draft_tiers = ista_profile;
+        argv = {
+            "binary_name", "--ctx-size-l", "56320", "--ctx-size-m", "40960",
+            "--m-max-tokens", "40960", "--spec-draft-n-max-l", "2",
+            "--ctx-size-xl", "73728", "--xl-max-tokens", "73728",
+            "--spec-draft-n-max-xl", "2",
+            "--cache-type-k-xl", "kvarn4", "--cache-type-v-xl", "kvarn4",
+            "--spec-draft-type-k-s", "q8_0", "--spec-draft-type-v-s", "q8_0",
+            "--spec-draft-type-k-l", "q8_0", "--spec-draft-type-v-l", "q8_0",
+            "--spec-draft-type-k-xl", "kvarn4", "--spec-draft-type-v-xl", "kvarn4",
+            "--spec-draft-type-k-xxl", "q8_0", "--spec-draft-type-v-xxl", "q8_0",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(),
+                                           ista_draft_tiers, LLAMA_EXAMPLE_SERVER));
+        assert(ista_draft_tiers.spec_draft_type_k_short == GGML_TYPE_Q8_0);
+        assert(ista_draft_tiers.spec_draft_type_v_short == GGML_TYPE_Q8_0);
+        assert(ista_draft_tiers.spec_draft_type_k_long == GGML_TYPE_Q8_0);
+        assert(ista_draft_tiers.spec_draft_kvarn_bits_k_xlong == 4);
+        assert(ista_draft_tiers.spec_draft_kvarn_bits_v_xlong == 4);
+        assert(ista_draft_tiers.spec_draft_type_k_xxlong == GGML_TYPE_Q8_0);
+        // Untouched tiers inherit the global draft KV type.
+        assert(ista_draft_tiers.spec_draft_type_k_medium ==
+               ista_draft_tiers.speculative.draft.cache_type_k);
+        assert(ista_draft_tiers.spec_draft_type_v_medium ==
+               ista_draft_tiers.speculative.draft.cache_type_v);
+
         common_params five_profile_shorthand = adaptive;
         argv = {
             "binary_name", "--ctx-size-l", "1000", "--ctx-size-m", "600",

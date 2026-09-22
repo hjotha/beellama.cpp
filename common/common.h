@@ -550,6 +550,33 @@ struct common_params {
     int32_t cache_kvarn_bits_k_xxlong = 0;
     int32_t cache_kvarn_bits_v_xxlong = 0;
     struct llama_kvarn_params kvarn_xxlong{};
+    // Per-tier draft KV cache types for the resident MTP draft context
+    // (default: inherit the global --spec-draft-type-k / --spec-draft-type-v).
+    enum ggml_type spec_draft_type_k_short = GGML_TYPE_COUNT;
+    enum ggml_type spec_draft_type_v_short = GGML_TYPE_COUNT;
+    int32_t spec_draft_kvarn_bits_k_short = 0;
+    int32_t spec_draft_kvarn_bits_v_short = 0;
+    llama_kvarn_params spec_draft_kvarn_short{};
+    enum ggml_type spec_draft_type_k_medium = GGML_TYPE_COUNT;
+    enum ggml_type spec_draft_type_v_medium = GGML_TYPE_COUNT;
+    int32_t spec_draft_kvarn_bits_k_medium = 0;
+    int32_t spec_draft_kvarn_bits_v_medium = 0;
+    llama_kvarn_params spec_draft_kvarn_medium{};
+    enum ggml_type spec_draft_type_k_long = GGML_TYPE_COUNT;
+    enum ggml_type spec_draft_type_v_long = GGML_TYPE_COUNT;
+    int32_t spec_draft_kvarn_bits_k_long = 0;
+    int32_t spec_draft_kvarn_bits_v_long = 0;
+    llama_kvarn_params spec_draft_kvarn_long{};
+    enum ggml_type spec_draft_type_k_xlong = GGML_TYPE_COUNT;
+    enum ggml_type spec_draft_type_v_xlong = GGML_TYPE_COUNT;
+    int32_t spec_draft_kvarn_bits_k_xlong = 0;
+    int32_t spec_draft_kvarn_bits_v_xlong = 0;
+    llama_kvarn_params spec_draft_kvarn_xlong{};
+    enum ggml_type spec_draft_type_k_xxlong = GGML_TYPE_COUNT;
+    enum ggml_type spec_draft_type_v_xxlong = GGML_TYPE_COUNT;
+    int32_t spec_draft_kvarn_bits_k_xxlong = 0;
+    int32_t spec_draft_kvarn_bits_v_xxlong = 0;
+    llama_kvarn_params spec_draft_kvarn_xxlong{};
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt

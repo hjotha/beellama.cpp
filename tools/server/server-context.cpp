@@ -3112,6 +3112,22 @@ private:
     int32_t adaptive_cache_kvarn_bits_k_xxlong = 4;
     int32_t adaptive_cache_kvarn_bits_v_xxlong = 4;
 
+    // Per-tier KV cache for the resident MTP draft context. Each tier inherits
+    // the global --spec-draft-type-k/-v unless overridden by
+    // --spec-draft-type-k/-v-{s,m,l,xl,xxl}.
+    struct adaptive_spec_draft_kv {
+        ggml_type type_k = GGML_TYPE_F16;
+        ggml_type type_v = GGML_TYPE_F16;
+        int32_t bits_k = 0;
+        int32_t bits_v = 0;
+        llama_kvarn_params kvarn{};
+    };
+    adaptive_spec_draft_kv adaptive_spec_draft_short;
+    adaptive_spec_draft_kv adaptive_spec_draft_medium;
+    adaptive_spec_draft_kv adaptive_spec_draft_long;
+    adaptive_spec_draft_kv adaptive_spec_draft_xlong;
+    adaptive_spec_draft_kv adaptive_spec_draft_xxlong;
+
     int32_t adaptive_max_ctx() const {
         if (params_base.ctx_size_xxlong > 0) {
             return params_base.ctx_size_xxlong;
@@ -3250,6 +3266,22 @@ private:
             params_base.kvarn = adaptive_kvarn_xxlong;
             params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_xxlong;
             params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_xxlong;
+        }
+        const adaptive_spec_draft_kv * draft_kv = nullptr;
+        switch (profile) {
+            case COMMON_CONTEXT_PROFILE_MTP_SHORT: draft_kv = &adaptive_spec_draft_short; break;
+            case COMMON_CONTEXT_PROFILE_MTP:       draft_kv = &adaptive_spec_draft_medium; break;
+            case COMMON_CONTEXT_PROFILE_LONG:      draft_kv = &adaptive_spec_draft_long; break;
+            case COMMON_CONTEXT_PROFILE_XLONG:     draft_kv = &adaptive_spec_draft_xlong; break;
+            case COMMON_CONTEXT_PROFILE_XXLONG:    draft_kv = &adaptive_spec_draft_xxlong; break;
+            default: break;
+        }
+        if (draft_kv != nullptr) {
+            params_base.speculative.draft.cache_type_k = draft_kv->type_k;
+            params_base.speculative.draft.cache_type_v = draft_kv->type_v;
+            params_base.speculative.draft.cache_kvarn_bits_k = draft_kv->bits_k;
+            params_base.speculative.draft.cache_kvarn_bits_v = draft_kv->bits_v;
+            params_base.speculative.draft.kvarn = draft_kv->kvarn;
         }
         params_base.n_parallel = 1;
         const auto output_limits = server_output_limits(params_base);
@@ -4434,6 +4466,46 @@ private:
                 adaptive_cache_type_v_xxlong = GGML_TYPE_Q4_0;
                 adaptive_kvarn_xxlong.type = llama_kvarn_type_from_name("kvarn_k4v4_g128");
             }
+
+            adaptive_spec_draft_short.type_k = params.spec_draft_type_k_short != GGML_TYPE_COUNT
+                ? params.spec_draft_type_k_short : params.speculative.draft.cache_type_k;
+            adaptive_spec_draft_short.type_v = params.spec_draft_type_v_short != GGML_TYPE_COUNT
+                ? params.spec_draft_type_v_short : params.speculative.draft.cache_type_v;
+            adaptive_spec_draft_short.bits_k = params.spec_draft_kvarn_bits_k_short;
+            adaptive_spec_draft_short.bits_v = params.spec_draft_kvarn_bits_v_short;
+            adaptive_spec_draft_short.kvarn = params.spec_draft_kvarn_short;
+
+            adaptive_spec_draft_medium.type_k = params.spec_draft_type_k_medium != GGML_TYPE_COUNT
+                ? params.spec_draft_type_k_medium : params.speculative.draft.cache_type_k;
+            adaptive_spec_draft_medium.type_v = params.spec_draft_type_v_medium != GGML_TYPE_COUNT
+                ? params.spec_draft_type_v_medium : params.speculative.draft.cache_type_v;
+            adaptive_spec_draft_medium.bits_k = params.spec_draft_kvarn_bits_k_medium;
+            adaptive_spec_draft_medium.bits_v = params.spec_draft_kvarn_bits_v_medium;
+            adaptive_spec_draft_medium.kvarn = params.spec_draft_kvarn_medium;
+
+            adaptive_spec_draft_long.type_k = params.spec_draft_type_k_long != GGML_TYPE_COUNT
+                ? params.spec_draft_type_k_long : params.speculative.draft.cache_type_k;
+            adaptive_spec_draft_long.type_v = params.spec_draft_type_v_long != GGML_TYPE_COUNT
+                ? params.spec_draft_type_v_long : params.speculative.draft.cache_type_v;
+            adaptive_spec_draft_long.bits_k = params.spec_draft_kvarn_bits_k_long;
+            adaptive_spec_draft_long.bits_v = params.spec_draft_kvarn_bits_v_long;
+            adaptive_spec_draft_long.kvarn = params.spec_draft_kvarn_long;
+
+            adaptive_spec_draft_xlong.type_k = params.spec_draft_type_k_xlong != GGML_TYPE_COUNT
+                ? params.spec_draft_type_k_xlong : params.speculative.draft.cache_type_k;
+            adaptive_spec_draft_xlong.type_v = params.spec_draft_type_v_xlong != GGML_TYPE_COUNT
+                ? params.spec_draft_type_v_xlong : params.speculative.draft.cache_type_v;
+            adaptive_spec_draft_xlong.bits_k = params.spec_draft_kvarn_bits_k_xlong;
+            adaptive_spec_draft_xlong.bits_v = params.spec_draft_kvarn_bits_v_xlong;
+            adaptive_spec_draft_xlong.kvarn = params.spec_draft_kvarn_xlong;
+
+            adaptive_spec_draft_xxlong.type_k = params.spec_draft_type_k_xxlong != GGML_TYPE_COUNT
+                ? params.spec_draft_type_k_xxlong : params.speculative.draft.cache_type_k;
+            adaptive_spec_draft_xxlong.type_v = params.spec_draft_type_v_xxlong != GGML_TYPE_COUNT
+                ? params.spec_draft_type_v_xxlong : params.speculative.draft.cache_type_v;
+            adaptive_spec_draft_xxlong.bits_k = params.spec_draft_kvarn_bits_k_xxlong;
+            adaptive_spec_draft_xxlong.bits_v = params.spec_draft_kvarn_bits_v_xxlong;
+            adaptive_spec_draft_xxlong.kvarn = params.spec_draft_kvarn_xxlong;
 
             if (params.ctx_size_mtp_short > 0) {
                 apply_profile_params(COMMON_CONTEXT_PROFILE_MTP_SHORT);
