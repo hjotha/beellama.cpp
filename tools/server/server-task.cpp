@@ -13,6 +13,9 @@
 #define XXH_STATIC_LINKING_ONLY
 #include "hash/xxhash/xxhash.h"
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <unordered_set>
 
@@ -2141,15 +2144,21 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
         restore_invalid = invalid;
         return server_prompt_cache_result::miss;
     };
-    if (state.model != llama_get_model(ctx_tgt) || state.model_instance != info.model_instance ||
-            !common_prompt_cache_layout_reusable(state.layout_tgt, common_prompt_cache_layout(ctx_tgt)) ||
-            (ctx_dft && state.has_draft() &&
+    if (state.model != llama_get_model(ctx_tgt) || state.model_instance != info.model_instance) {
+        return miss("snapshot model differs");
+    }
+    const std::string target_layout = common_prompt_cache_layout(ctx_tgt);
+    const bool converted_mode =
+        !common_prompt_cache_layout_reusable(state.layout_tgt, target_layout) &&
+        common_prompt_cache_layout_convertible(state.layout_tgt, target_layout);
+    if ((!common_prompt_cache_layout_reusable(state.layout_tgt, target_layout) && !converted_mode) ||
+            (!converted_mode && ctx_dft && state.has_draft() &&
              !common_prompt_cache_layout_reusable(state.layout_dft, common_prompt_cache_layout(ctx_dft)))) {
         return miss("snapshot model or attention layout differs");
     }
     if (state.pos_tgt < 0 || state.prompt.tokens.empty() || state.pos_tgt >= (llama_pos) llama_n_ctx_seq(ctx_tgt) ||
             state.prompt.tokens.size() > llama_n_ctx_seq(ctx_tgt) ||
-            (ctx_dft && state.has_draft() && state.pos_dft >= (llama_pos) llama_n_ctx_seq(ctx_dft))) {
+            (!converted_mode && ctx_dft && state.has_draft() && state.pos_dft >= (llama_pos) llama_n_ctx_seq(ctx_dft))) {
         return miss("snapshot does not fit destination context");
     }
     if (state.pos_dft < -1 || state.prompt.tokens.pos_next() != state.pos_tgt + 1 ||
@@ -2169,7 +2178,8 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
         }
     } catch (const std::bad_alloc &) { return miss("snapshot integrity allocation failed"); }
       catch (const std::exception & e) { return miss(e.what(), true); }
-    const bool bootstrap_only = info.managed && ctx_dft && (!state.has_draft() || state.data.spec.empty());
+    const bool bootstrap_only = info.managed && ctx_dft &&
+        (converted_mode || !state.has_draft() || state.data.spec.empty());
     if (bootstrap_only && !allow_bootstrap) {
         last_reason = "target-only snapshot requires MTP bootstrap";
         return server_prompt_cache_result::needs_bootstrap;
@@ -2187,18 +2197,76 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
                 return miss("restore prompt copy exceeds RAM cache budget");
             }
             candidate = state.prompt.clone();
+            if (converted_mode) {
+                candidate.checkpoints.clear();
+            }
         }
     } catch (const std::bad_alloc &) { return miss("restore allocation failed"); }
     prompt_cache_clear(ctx_tgt, ctx_dft, spec, id_slot);
-    const bool target_ok = llama_state_seq_set_data_ext(ctx_tgt, state.data.main.data(), state.data.main.size(), id_slot,
-            LLAMA_STATE_SEQ_FLAGS_NONE) == state.data.main.size() &&
-        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot) == state.pos_tgt;
+    bool target_ok = false;
+    if (converted_mode) {
+        // The cached payload is a q4 sequence state (data form); the destination
+        // needs the KVarN layout. Convert through the streamed q4->KVarN path into
+        // a private file and load it straight into the destination context.
+        try {
+            const auto & tokens = state.prompt.tokens.get_tokens();
+            const auto base = std::filesystem::temp_directory_path();
+            const auto dir = base / (".adaptive-load-convert-" +
+                                     std::to_string(ggml_time_us()));
+            if (!std::filesystem::create_directory(dir)) {
+                throw std::runtime_error("cannot create private conversion directory");
+            }
+            struct cleanup {
+                std::filesystem::path dir;
+                ~cleanup() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+            } guard{dir};
+            std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
+                                         std::filesystem::perm_options::replace);
+            const std::string path = (dir / "state.bin").string();
+            size_t count = 0;
+            std::vector<llama_token> restored(tokens.size());
+            const auto layout = common_json::parse(state.layout_tgt);
+            const size_t written = llama_state_seq_convert_data_rotated(
+                ctx_tgt, state.data.main.data(), state.data.main.size(), 0,
+                tokens.data(), tokens.size(), path.c_str(),
+                restored.data(), restored.size(), &count,
+                layout.at("rotation_k").get<int32_t>(), layout.at("rotation_v").get<int32_t>());
+            if (written && count == tokens.size() && restored == tokens) {
+                XXH64_state_t hash;
+                XXH64_reset(&hash, 0);
+                std::ifstream input(path, std::ios::binary);
+                std::vector<char> buffer(1024 * 1024);
+                for (size_t left = written; left;) {
+                    const size_t n = std::min(left, buffer.size());
+                    if (!input.read(buffer.data(), n)) {
+                        throw std::runtime_error("short converted state read");
+                    }
+                    XXH64_update(&hash, buffer.data(), n);
+                    left -= n;
+                }
+                const size_t loaded = llama_state_seq_load_file_streaming(
+                    ctx_tgt, path.c_str(), id_slot, restored.data(), restored.size(),
+                    &count, written, XXH64_digest(&hash));
+                target_ok = loaded == written && count == tokens.size() && restored == tokens &&
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot) == state.pos_tgt;
+            }
+        } catch (const std::exception &) {
+            target_ok = false;
+        }
+    } else {
+        target_ok = llama_state_seq_set_data_ext(ctx_tgt, state.data.main.data(), state.data.main.size(), id_slot,
+                LLAMA_STATE_SEQ_FLAGS_NONE) == state.data.main.size() &&
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot) == state.pos_tgt;
+    }
+    // A converted load is target-only: the q4 draft/carry cannot cross into the
+    // KVarN draft layout, so it is dropped and bootstrap re-syncs it for MTP
+    // destinations (bootstrap_only above).
     const bool draft_ok = target_ok && (bootstrap_only || !ctx_dft || !state.has_draft() ||
-        (llama_state_seq_set_data_ext(ctx_dft, state.data.drft.data(), state.data.drft.size(), id_slot,
+        (!converted_mode && llama_state_seq_set_data_ext(ctx_dft, state.data.drft.data(), state.data.drft.size(), id_slot,
             LLAMA_STATE_SEQ_FLAGS_NONE) == state.data.drft.size() &&
          llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id_slot) == state.pos_dft));
     const bool carry_ok = draft_ok && (bootstrap_only || !ctx_dft || state.data.spec.empty() ||
-        common_speculative_set_state(spec, id_slot, state.data.spec, state.pos_tgt));
+        (!converted_mode && common_speculative_set_state(spec, id_slot, state.data.spec, state.pos_tgt)));
     if (!target_ok || !draft_ok || !carry_ok) {
         prompt_cache_clear(ctx_tgt, ctx_dft, spec, id_slot);
         prompt.clear();
@@ -2232,9 +2300,15 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
             reject("snapshot quarantined after failed restore");
             continue;
         }
-        if (it->model != llama_get_model(ctx_tgt) || it->model_instance != info.model_instance ||
-                !common_prompt_cache_layout_reusable(it->layout_tgt, target_layout) ||
-                (ctx_dft && it->has_draft() &&
+        if (it->model != llama_get_model(ctx_tgt) || it->model_instance != info.model_instance) {
+            reject("snapshot model differs");
+            continue;
+        }
+        const bool convertible_candidate =
+            !common_prompt_cache_layout_reusable(it->layout_tgt, target_layout) &&
+            common_prompt_cache_layout_convertible(it->layout_tgt, target_layout);
+        if ((!common_prompt_cache_layout_reusable(it->layout_tgt, target_layout) && !convertible_candidate) ||
+                (!convertible_candidate && ctx_dft && it->has_draft() &&
                  !common_prompt_cache_layout_reusable(it->layout_dft, draft_layout))) {
             reject("snapshot model or attention layout differs");
             continue;
@@ -2244,7 +2318,21 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
             continue;
         }
         if (lcp < 0.25*it->prompt.tokens.size()) { continue; }
-        if (info.managed && (lcp < it->prompt.n_tokens() || lcp == (int) tokens_new.size())) {
+        // A convertible snapshot can be restored whole if the entire snapshot is a verified prefix,
+        // or if the destination KVarN context can cleanly truncate the tail beyond lcp.
+        if (convertible_candidate) {
+            bool can_truncate = (lcp == (int) it->prompt.tokens.size());
+            if (!can_truncate && it->pos_tgt >= 0) {
+                const llama_pos group = 128; // KVAR_N_GROUP
+                const llama_pos live_group = it->pos_tgt / group;
+                const llama_pos earliest_exact = std::max<llama_pos>(0, live_group - 1) * group;
+                can_truncate = (lcp >= earliest_exact);
+            }
+            if (!can_truncate) {
+                continue;
+            }
+        }
+        if (!convertible_candidate && info.managed && (lcp < it->prompt.n_tokens() || lcp == (int) tokens_new.size())) {
             const bool can_rewind = std::any_of(it->prompt.checkpoints.begin(), it->prompt.checkpoints.end(),
                 [&](const auto & c) {
                     return c->host_only() && c->n_tokens > 0 && c->n_tokens <= lcp &&
@@ -2282,7 +2370,7 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
         result = restore_impl(prompt, *best, ctx_tgt, ctx_dft, spec, id_slot, info.managed, true);
     }
     if (result == server_prompt_cache_result::miss && restore_invalid) { best->quarantined = true; }
-    if (result == server_prompt_cache_result::hit) {
+    if (result == server_prompt_cache_result::hit || result == server_prompt_cache_result::needs_bootstrap) {
         if (info.managed) { states.splice(states.end(), states, best); }
         else {
             prompt = std::move(best->prompt);

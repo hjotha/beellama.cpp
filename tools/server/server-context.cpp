@@ -3217,7 +3217,12 @@ private:
 
     void apply_profile_params(common_context_profile profile) {
         const int32_t draft_n = adaptive_draft_n_for_profile(profile);
+        const int32_t draft_n_max = std::max({
+            adaptive_draft_n_short, adaptive_draft_n_medium,
+            adaptive_draft_n_long, adaptive_draft_n_xlong, adaptive_draft_n_xxlong
+        });
         params_base.speculative.draft.n_max = draft_n;
+        params_base.speculative.n_rs_seq_target = draft_n_max > 0 ? uint32_t(draft_n_max) : 0u;
         params_base.speculative.types = draft_n > 0
             ? std::vector<enum common_speculative_type>{ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }
             : std::vector<enum common_speculative_type>{};
@@ -5407,6 +5412,10 @@ private:
                     continue;
                 }
                 slot.prompt = std::move(candidate);
+                // The converted prefix is target-only: with an MTP destination the
+                // RAM prompt-cache loader restores it (with q4->KVarN conversion) and
+                // the decode re-syncs the rebuilt draft/carry via bootstrap; a direct
+                // target-only load needs no pending bootstrap.
                 slot.bootstrap_pending = false;
                 SRV_INF("adaptive streaming conversion: restored %zu tokens, %zu bytes directly into target, convert_ms=%.3f, restore_ms=%.3f\n",
                         tokens.size(), written, convert_ms,
@@ -5729,9 +5738,11 @@ if (task.params.cache_prompt) {
                     const auto cache_result = ret->prompt_load_result(*prompt_cache, task.tokens);
                     if (cache_result == server_prompt_cache_result::needs_bootstrap) {
                         ret->bootstrap_pending = true;
+                        ret->just_restored = true;
                         SLT_INF(*ret, "%s", "target-only cache hit requires MTP bootstrap suffix\n");
-                    } else if (cache_result != server_prompt_cache_result::hit &&
-                               cache_result != server_prompt_cache_result::unchanged) {
+                    } else if (cache_result == server_prompt_cache_result::hit) {
+                        ret->just_restored = true;
+                    } else if (cache_result != server_prompt_cache_result::unchanged) {
                         ret->prompt_clear();
                     }
                 }

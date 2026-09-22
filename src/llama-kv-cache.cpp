@@ -4713,7 +4713,11 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_read_manifest(
     } else if (!tail || result.tail_payload_count > tail_slots || record_count > max_records ||
             tail_layer_count != layers.size() ||
             provenance_count != (seq_id == -1 ? result.saved_n_seq_max : 1u)) {
-        throw std::runtime_error("invalid KV tail state manifest dimensions");
+        throw std::runtime_error("invalid KV tail state manifest dimensions: tail=" + std::to_string(bool(tail)) +
+                " payload_count=" + std::to_string(result.tail_payload_count) + " tail_slots=" + std::to_string(tail_slots) +
+                " record_count=" + std::to_string(record_count) + " max_records=" + std::to_string(max_records) +
+                " tail_layer_count=" + std::to_string(tail_layer_count) + " layers=" + std::to_string(layers.size()) +
+                " provenance_count=" + std::to_string(provenance_count) + " expected_provenance=" + std::to_string(seq_id == -1 ? result.saved_n_seq_max : 1u));
     }
 
     result.tail_records.resize(record_count);
@@ -5618,14 +5622,11 @@ void llama_kv_cache::state_read_impl(
                 "KV tail state version predates compact representation metadata");
     }
     if (version >= LLAMA_KV_TAIL_STATE_VERSION_V3 &&
-            (state_storage_kind != uint32_t(tail_plan.kind) ||
-             state_rollback_tokens != tail_plan.compact_layout.rollback_tokens)) {
+            state_storage_kind != uint32_t(tail_plan.kind)) {
         throw std::runtime_error(
                 "KV tail state representation does not match the context: state kind=" +
-                std::to_string(state_storage_kind) + " rollback=" +
-                std::to_string(state_rollback_tokens) + ", context kind=" +
-                std::to_string(uint32_t(tail_plan.kind)) + " rollback=" +
-                std::to_string(tail_plan.compact_layout.rollback_tokens));
+                std::to_string(state_storage_kind) + ", context kind=" +
+                std::to_string(uint32_t(tail_plan.kind)));
     }
     if (body_only && !has_kv_body()) {
         throw std::runtime_error("body-only KV tail state cannot restore into a bodyless context");
