@@ -171,6 +171,7 @@ struct common_speculative_impl {
     size_t n_acc_tokens = 0; // number of tokens accepted by the target model.
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
+    std::vector<size_t> n_gen_tokens_per_pos; // number of tokens proposed per draft position (profiling).
 
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
@@ -4148,6 +4149,13 @@ bool common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+
+                    if (impl->n_gen_tokens_per_pos.size() < result.size()) {
+                        impl->n_gen_tokens_per_pos.resize(result.size(), 0);
+                    }
+                    for (size_t i = 0; i < result.size(); ++i) {
+                        impl->n_gen_tokens_per_pos[i]++;
+                    }
                 }
             }
 
@@ -4454,6 +4462,28 @@ void common_speculative_print_stats(const common_speculative * spec) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(2) << mean;
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
+        }
+
+        if (getenv("GGML_MTP_PROF")) {
+            std::string gen_pos;
+            std::string acc_pos;
+            for (size_t i = 0; i < impl->n_gen_tokens_per_pos.size(); ++i) {
+                if (i > 0) {
+                    gen_pos += ",";
+                }
+                gen_pos += std::to_string(impl->n_gen_tokens_per_pos[i]);
+            }
+            for (size_t i = 0; i < impl->n_acc_tokens_per_pos.size(); ++i) {
+                if (i > 0) {
+                    acc_pos += ",";
+                }
+                acc_pos += std::to_string(impl->n_acc_tokens_per_pos[i]);
+            }
+            fprintf(stderr, "MTPSTATS type=%s steps=%zu gen_drafts=%zu acc_drafts=%zu gen_tokens=%zu acc_tokens=%zu gen_per_pos=[%s] acc_per_pos=[%s]\n",
+                    common_speculative_type_to_str(impl->type).c_str(),
+                    impl->n_call_accept, impl->n_gen_drafts, impl->n_acc_drafts,
+                    impl->n_gen_tokens, impl->n_acc_tokens,
+                    gen_pos.c_str(), acc_pos.c_str());
         }
 
         SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
