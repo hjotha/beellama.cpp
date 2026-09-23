@@ -689,6 +689,10 @@ bool common_sampler_force_reasoning_end(struct common_sampler * gsmpl) {
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
+    if (getenv("GGML_MTP_PROF")) {
+        common_spec_prof_sync_us = ggml_time_us();
+    }
+
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
 

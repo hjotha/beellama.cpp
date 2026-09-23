@@ -8037,6 +8037,10 @@ if (task.params.cache_prompt) {
             for (const auto * slot : drafting) {
                 drafted_tokens_total += slot->spec_draft.size();
             }
+            if (getenv("GGML_MTP_PROF")) {
+                fprintf(stderr, "MTPPHASE phase=draft us=%lld drafted=%zu\n",
+                        (long long) (shared_draft_ms * 1000.0f), drafted_tokens_total);
+            }
             for (auto * slot : drafting) {
                 if (slot->uses_adaptive_dflash() && slot->adaptive_dm.dm_adaptive) {
                     // Upstream drafts the cohort in one batched call. Attribute that
@@ -9059,6 +9063,9 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // timing uses the sync that is already performed right below - no extra sync is added
+        const bool    prof_mtp = getenv("GGML_MTP_PROF") != nullptr;
+        const int64_t prof_t0  = prof_mtp ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0) {
@@ -9067,6 +9074,10 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (prof_mtp && ret == 0) {
+            fprintf(stderr, "MTPTGT n_tokens=%d us=%lld\n",
+                    batch_view.n_tokens, (long long) (ggml_time_us() - prof_t0));
+        }
 
         if (ret != 0) {
             std::string err;
@@ -9455,6 +9466,10 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
             const int64_t t_now = ggml_time_us();
             const float verify_ms = (float) (t_now - t_verify_start) / 1000.0f;
+            if (getenv("GGML_MTP_PROF")) {
+                fprintf(stderr, "MTPPHASE phase=verify us=%lld n_draft=%zu\n",
+                        (long long) (t_now - t_verify_start), n_draft);
+            }
 
             const auto ids = std::move(slot.spec_draft);
 

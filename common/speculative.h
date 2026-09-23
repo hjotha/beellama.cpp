@@ -5,6 +5,10 @@
 
 struct common_speculative;
 
+// profiling hook: host timestamp of the most recent llama_context sync inside common_sampler_sample.
+// Only written when GGML_MTP_PROF is set; used to time MTP draft decodes without adding syncs.
+extern int64_t common_spec_prof_sync_us;
+
 struct common_speculative_token_dist {
     llama_tokens ids;
     std::vector<float> probs;

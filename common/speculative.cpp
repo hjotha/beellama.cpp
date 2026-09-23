@@ -28,6 +28,10 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+int64_t common_spec_prof_sync_us = 0;
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2509,7 +2513,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const bool    prof_mtp = getenv("GGML_MTP_PROF") != nullptr;
+                const int32_t prof_nb  = batch.n_tokens;
+                const int64_t prof_t0  = prof_mtp ? ggml_time_us() : 0;
+
                 const int32_t rc = llama_decode(ctx_dft, batch);
+
+                if (prof_mtp) {
+                    // NOTE: adds one sync per process() call; validated by A/B throughput
+                    llama_synchronize(ctx_dft);
+                    fprintf(stderr, "MTPPROC head=%d n_batch=%d us=%lld\n",
+                            head, prof_nb, (long long) (ggml_time_us() - prof_t0));
+                }
+
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -2657,6 +2673,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const bool    prof_mtp  = getenv("GGML_MTP_PROF") != nullptr;
+            const int32_t prof_nb   = batch.n_tokens;
+            const int64_t prof_dec0 = prof_mtp ? ggml_time_us() : 0;
+
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
@@ -2732,6 +2752,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
+            }
+
+            if (prof_mtp) {
+                const int64_t t_sync = common_spec_prof_sync_us;
+                const int64_t t_end  = ggml_time_us();
+                if (t_sync >= prof_dec0) {
+                    fprintf(stderr, "MTPDRAFT depth=%d n_batch=%d dec_us=%lld smp_us=%lld\n",
+                            i, prof_nb, (long long) (t_sync - prof_dec0), (long long) (t_end - t_sync));
+                } else {
+                    fprintf(stderr, "MTPDRAFT depth=%d n_batch=%d dec_us=NA smp_us=%lld\n",
+                            i, prof_nb, (long long) (t_end - prof_dec0));
+                }
             }
 
             if (batch.n_tokens == 0) {
