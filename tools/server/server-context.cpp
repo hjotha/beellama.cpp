@@ -3085,13 +3085,21 @@ private:
     int32_t adaptive_draft_n_medium = 2;
     int32_t adaptive_draft_n_short  = 4;
     int32_t adaptive_draft_n_long   = 0;
-    int32_t adaptive_batch_normal   = 256;
-    int32_t adaptive_ubatch_normal  = 256;
-    ggml_type adaptive_cache_type_k_normal = GGML_TYPE_Q4_0;
-    ggml_type adaptive_cache_type_v_normal = GGML_TYPE_Q4_0;
-    llama_kvarn_params adaptive_kvarn_normal{};
-    int32_t adaptive_cache_kvarn_bits_k_normal = 0;
-    int32_t adaptive_cache_kvarn_bits_v_normal = 0;
+    int32_t adaptive_batch_short    = 256;
+    int32_t adaptive_ubatch_short   = 256;
+    ggml_type adaptive_cache_type_k_short = GGML_TYPE_Q4_0;
+    ggml_type adaptive_cache_type_v_short = GGML_TYPE_Q4_0;
+    llama_kvarn_params adaptive_kvarn_short{};
+    int32_t adaptive_cache_kvarn_bits_k_short = 0;
+    int32_t adaptive_cache_kvarn_bits_v_short = 0;
+
+    int32_t adaptive_batch_medium   = 256;
+    int32_t adaptive_ubatch_medium  = 256;
+    ggml_type adaptive_cache_type_k_medium = GGML_TYPE_Q4_0;
+    ggml_type adaptive_cache_type_v_medium = GGML_TYPE_Q4_0;
+    llama_kvarn_params adaptive_kvarn_medium{};
+    int32_t adaptive_cache_kvarn_bits_k_medium = 0;
+    int32_t adaptive_cache_kvarn_bits_v_medium = 0;
 
     int32_t adaptive_batch_long     = 256;
     int32_t adaptive_ubatch_long    = 256;
@@ -3234,22 +3242,22 @@ private:
             : std::vector<enum common_speculative_type>{};
         if (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
             params_base.n_ctx = params_base.ctx_size_mtp_short;
-            params_base.n_batch = adaptive_batch_normal;
-            params_base.n_ubatch = adaptive_ubatch_normal;
-            params_base.cache_type_k = adaptive_cache_type_k_normal;
-            params_base.cache_type_v = adaptive_cache_type_v_normal;
-            params_base.kvarn = adaptive_kvarn_normal;
-            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_normal;
-            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
+            params_base.n_batch = adaptive_batch_short;
+            params_base.n_ubatch = adaptive_ubatch_short;
+            params_base.cache_type_k = adaptive_cache_type_k_short;
+            params_base.cache_type_v = adaptive_cache_type_v_short;
+            params_base.kvarn = adaptive_kvarn_short;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_short;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_short;
         } else if (profile == COMMON_CONTEXT_PROFILE_MTP) {
             params_base.n_ctx = params_base.ctx_size_mtp;
-            params_base.n_batch = adaptive_batch_normal;
-            params_base.n_ubatch = adaptive_ubatch_normal;
-            params_base.cache_type_k = adaptive_cache_type_k_normal;
-            params_base.cache_type_v = adaptive_cache_type_v_normal;
-            params_base.kvarn = adaptive_kvarn_normal;
-            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_normal;
-            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_normal;
+            params_base.n_batch = adaptive_batch_medium;
+            params_base.n_ubatch = adaptive_ubatch_medium;
+            params_base.cache_type_k = adaptive_cache_type_k_medium;
+            params_base.cache_type_v = adaptive_cache_type_v_medium;
+            params_base.kvarn = adaptive_kvarn_medium;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_medium;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_medium;
         } else if (profile == COMMON_CONTEXT_PROFILE_LONG) {
             params_base.n_ctx = adaptive_long_ctx;
             params_base.n_batch = adaptive_batch_long;
@@ -4422,13 +4430,21 @@ private:
             adaptive_draft_n_medium = params.speculative.draft.n_max;
             adaptive_draft_n_short  = params.spec_draft_n_max_short;
             adaptive_draft_n_long   = params.spec_draft_n_max_long;
-            adaptive_batch_normal   = params.n_batch;
-            adaptive_ubatch_normal  = params.n_ubatch;
-            adaptive_cache_type_k_normal = params.cache_type_k;
-            adaptive_cache_type_v_normal = params.cache_type_v;
-            adaptive_kvarn_normal   = params.kvarn;
-            adaptive_cache_kvarn_bits_k_normal = params.cache_kvarn_bits_k;
-            adaptive_cache_kvarn_bits_v_normal = params.cache_kvarn_bits_v;
+            adaptive_batch_short    = params.batch_size_short > 0 ? params.batch_size_short : params.n_batch;
+            adaptive_ubatch_short   = params.ubatch_size_short > 0 ? params.ubatch_size_short : params.n_ubatch;
+            adaptive_cache_type_k_short = params.cache_type_k_short;
+            adaptive_cache_type_v_short = params.cache_type_v_short;
+            adaptive_kvarn_short    = params.kvarn_short;
+            adaptive_cache_kvarn_bits_k_short = params.cache_kvarn_bits_k_short;
+            adaptive_cache_kvarn_bits_v_short = params.cache_kvarn_bits_v_short;
+
+            adaptive_batch_medium   = params.batch_size_medium > 0 ? params.batch_size_medium : params.n_batch;
+            adaptive_ubatch_medium  = params.ubatch_size_medium > 0 ? params.ubatch_size_medium : params.n_ubatch;
+            adaptive_cache_type_k_medium = params.cache_type_k_medium;
+            adaptive_cache_type_v_medium = params.cache_type_v_medium;
+            adaptive_kvarn_medium   = params.kvarn_medium;
+            adaptive_cache_kvarn_bits_k_medium = params.cache_kvarn_bits_k_medium;
+            adaptive_cache_kvarn_bits_v_medium = params.cache_kvarn_bits_v_medium;
 
             adaptive_batch_long     = params.batch_size_long > 0 ? params.batch_size_long : 256;
             adaptive_ubatch_long    = params.ubatch_size_long > 0 ? params.ubatch_size_long : 256;

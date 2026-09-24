@@ -797,6 +797,14 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(ista_profile.ctx_size_mtp == 40960);
         assert(ista_profile.spec_draft_n_max_short == 6);
         assert(ista_profile.speculative.draft.n_max == 4);
+        assert(ista_profile.batch_size_short == 0);
+        assert(ista_profile.ubatch_size_short == 0);
+        assert(ista_profile.batch_size_medium == 0);
+        assert(ista_profile.ubatch_size_medium == 0);
+        assert(ista_profile.cache_type_k_short == ista_profile.cache_type_k);
+        assert(ista_profile.cache_type_v_short == ista_profile.cache_type_v);
+        assert(ista_profile.cache_type_k_medium == ista_profile.cache_type_k);
+        assert(ista_profile.cache_type_v_medium == ista_profile.cache_type_v);
         assert(ista_profile.spec_draft_n_max_long == 2);
         assert(ista_profile.cache_type_k_long == GGML_TYPE_Q4_0);
         assert(ista_profile.cache_type_v_long == GGML_TYPE_Q4_0);
@@ -905,6 +913,10 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
             "binary_name", "--ctx-size-l", "1000", "--ctx-size-m", "600",
             "--m-max-tokens", "500", "--ctx-size-s", "300",
             "--s-max-tokens", "250", "--spec-draft-n-max-s", "4",
+            "--batch-size-s", "64", "--ubatch-size-s", "32",
+            "--cache-type-k-s", "q8_0", "--cache-type-v-s", "q8_0",
+            "--batch-size-m", "96", "--ubatch-size-m", "64",
+            "--cache-type-k-m", "kvarn3", "--cache-type-v-m", "kvarn3",
             "--spec-draft-n-max-m", "2", "--spec-draft-n-max-l", "0",
             "--ctx-size-xl", "1200", "--batch-size-xl", "64", "--ubatch-size-xl", "64",
             "--spec-draft-n-max-xl", "0",
@@ -920,6 +932,15 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(five_profile_shorthand.mtp_max_tokens == 500);
         assert(five_profile_shorthand.ctx_size_mtp_short == 300);
         assert(five_profile_shorthand.mtp_short_max_tokens == 250);
+        assert(five_profile_shorthand.batch_size_short == 64);
+        assert(five_profile_shorthand.ubatch_size_short == 32);
+        assert(five_profile_shorthand.cache_type_k_short == GGML_TYPE_Q8_0);
+        assert(five_profile_shorthand.cache_type_v_short == GGML_TYPE_Q8_0);
+        assert(five_profile_shorthand.batch_size_medium == 96);
+        assert(five_profile_shorthand.ubatch_size_medium == 64);
+        assert(five_profile_shorthand.cache_kvarn_bits_k_medium == 3);
+        assert(five_profile_shorthand.cache_kvarn_bits_v_medium == 3);
+        assert(five_profile_shorthand.kvarn_medium.type != LLAMA_KVARN_TYPE_DISABLED);
         assert(five_profile_shorthand.spec_draft_n_max_short == 4);
         assert(five_profile_shorthand.speculative.draft.n_max == 2);
         assert(five_profile_shorthand.spec_draft_n_max_long == 0);

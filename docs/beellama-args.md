@@ -41,6 +41,13 @@ remain unqualified until backend runtime tests pass. N-gram modes do not own a
 KV context and reject explicit KVarN `--spec-draft-type-k/v` selections during
 argument validation.
 
+Adaptive S/M/L/XL/XXL profiles expose the same batch and cache override shape:
+`--batch-size-{s,m,l,xl,xxl}`, `--ubatch-size-{s,m,l,xl,xxl}`,
+`--cache-type-k/v-{s,m,l,xl,xxl}`, and
+`--spec-draft-type-k/v-{s,m,l,xl,xxl}`. Omitted overrides inherit the shared
+target or draft setting. The XXL draft cache selection is accepted for preset
+symmetry but remains inactive while `--spec-draft-n-max-xxl=0`.
+
 CUDA multi-token KVarN prefill uses transient F16 K/V materialization windows.
 D64 uses this tiled route when a query batch exceeds the backend's native
 rotated-query limit. Decode remains record-native at every KV length.

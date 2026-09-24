@@ -519,7 +519,15 @@ def test_router_unloaded_adaptive_model_advertises_widest_context(tmp_path):
         "hf-repo = ggml-org/test-model-stories260K\n"
         "ctx-size = 65536\n"
         "ctx-size-mtp-short = 24576\n"
+        "batch-size-s = 256\n"
+        "ubatch-size-s = 128\n"
+        "cache-type-k-s = kvarn4\n"
+        "cache-type-v-s = kvarn4\n"
         "ctx-size-mtp = 49152\n"
+        "batch-size-m = 128\n"
+        "ubatch-size-m = 64\n"
+        "cache-type-k-m = kvarn3\n"
+        "cache-type-v-m = kvarn3\n"
         "ctx-size-xlong = 131072\n"
         "ctx-size-xxlong = 204800\n"
         "load-on-startup = false\n",
@@ -535,6 +543,19 @@ def test_router_unloaded_adaptive_model_advertises_widest_context(tmp_path):
     advertised = {item["name"]: item for item in res.body.get("models", [])}
     assert advertised["adaptive-context"]["context_window"] == 204800
     assert advertised["adaptive-context"]["max_context_window"] == 204800
+    data = {item["id"]: item for item in res.body.get("data", [])}
+    args = data["adaptive-context"]["status"]["args"]
+    for option, value in {
+        "--batch-size-short": "256",
+        "--ubatch-size-short": "128",
+        "--cache-type-k-short": "kvarn4",
+        "--cache-type-v-short": "kvarn4",
+        "--batch-size-medium": "128",
+        "--ubatch-size-medium": "64",
+        "--cache-type-k-medium": "kvarn3",
+        "--cache-type-v-medium": "kvarn3",
+    }.items():
+        assert args[args.index(option) + 1] == value
 
 
 @pytest.mark.parametrize("fail_target_load", [False, True])

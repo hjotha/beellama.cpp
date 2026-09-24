@@ -524,8 +524,22 @@ struct common_params {
     int32_t ctx_size_long         =     0; // original long context size, preserved across adaptive profile switches
     int32_t ctx_size_mtp          =     0; // adaptive context medium profile, 0 = disabled
     int32_t mtp_max_tokens        =     0; // adaptive context medium threshold, 0 = ctx_size_mtp
+    int32_t batch_size_medium     =     0; // logical batch size for medium profile, 0 = inherit global
+    int32_t ubatch_size_medium    =     0; // physical batch size for medium profile, 0 = inherit global
+    enum ggml_type cache_type_k_medium = GGML_TYPE_COUNT;
+    enum ggml_type cache_type_v_medium = GGML_TYPE_COUNT;
+    int32_t cache_kvarn_bits_k_medium = 0;
+    int32_t cache_kvarn_bits_v_medium = 0;
+    llama_kvarn_params kvarn_medium{};
     int32_t ctx_size_mtp_short    =     0; // adaptive context short profile, 0 = disabled
     int32_t mtp_short_max_tokens  =     0; // adaptive context short threshold, 0 = ctx_size_mtp_short
+    int32_t batch_size_short      =     0; // logical batch size for short profile, 0 = inherit global
+    int32_t ubatch_size_short     =     0; // physical batch size for short profile, 0 = inherit global
+    enum ggml_type cache_type_k_short = GGML_TYPE_COUNT;
+    enum ggml_type cache_type_v_short = GGML_TYPE_COUNT;
+    int32_t cache_kvarn_bits_k_short = 0;
+    int32_t cache_kvarn_bits_v_short = 0;
+    llama_kvarn_params kvarn_short{};
     int32_t spec_draft_n_max_short =     4; // draft N for short MTP profile
     int32_t spec_draft_n_max_long  =     0; // draft N for long profile (0 = target-only)
     int32_t ctx_size_xlong        =     0; // adaptive context xlong profile, 0 = disabled
