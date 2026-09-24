@@ -3224,6 +3224,19 @@ private:
         return std::max<int32_t>(16, adaptive_draft_n_for_profile(profile) + 2);
     }
 
+    int32_t adaptive_normal_ubatch_for_profile(common_context_profile profile) const {
+        const bool kvarn_normal = adaptive_cache_kvarn_bits_k_normal > 0 &&
+            adaptive_cache_kvarn_bits_v_normal > 0;
+        if (kvarn_normal && (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT ||
+                profile == COMMON_CONTEXT_PROFILE_MTP)) {
+            // KVarN MTP short/medium contexts have little transient VRAM headroom
+            // after the target and draft caches are resident. Keep prefill
+            // workspace bounded so a context switch cannot abort the child.
+            return std::min(adaptive_ubatch_normal, 128);
+        }
+        return adaptive_ubatch_normal;
+    }
+
     void apply_profile_params(common_context_profile profile) {
         const int32_t draft_n = adaptive_draft_n_for_profile(profile);
         const int32_t draft_n_max = std::max({
@@ -3238,7 +3251,7 @@ private:
         if (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
             params_base.n_ctx = params_base.ctx_size_mtp_short;
             params_base.n_batch = adaptive_batch_normal;
-            params_base.n_ubatch = adaptive_ubatch_normal;
+            params_base.n_ubatch = adaptive_normal_ubatch_for_profile(profile);
             params_base.cache_type_k = adaptive_cache_type_k_normal;
             params_base.cache_type_v = adaptive_cache_type_v_normal;
             params_base.kvarn = adaptive_kvarn_normal;
@@ -3247,7 +3260,7 @@ private:
         } else if (profile == COMMON_CONTEXT_PROFILE_MTP) {
             params_base.n_ctx = params_base.ctx_size_mtp;
             params_base.n_batch = adaptive_batch_normal;
-            params_base.n_ubatch = adaptive_ubatch_normal;
+            params_base.n_ubatch = adaptive_normal_ubatch_for_profile(profile);
             params_base.cache_type_k = adaptive_cache_type_k_normal;
             params_base.cache_type_v = adaptive_cache_type_v_normal;
             params_base.kvarn = adaptive_kvarn_normal;
