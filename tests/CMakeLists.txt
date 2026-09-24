@@ -567,6 +567,7 @@ set_tests_properties(test-save-load-state-archs PROPERTIES FIXTURES_REQUIRED gen
         LABEL main
         ARGS --context-lifecycle mtp-bootstrap -m "${MODEL_DIR}/qwen35-mtp.gguf"
              -c 256 -b 16 -ub 16 -n 8 -t 2 --backend-sampling --fit off --load-mode none --no-repack
+             --device none -ngl 0
     )
     set_tests_properties(test-mtp-target-only-bootstrap PROPERTIES FIXTURES_REQUIRED generate-models)
     llama_test(
@@ -575,6 +576,7 @@ set_tests_properties(test-save-load-state-archs PROPERTIES FIXTURES_REQUIRED gen
         LABEL main
         ARGS --context-lifecycle mtp-bootstrap-multi -m "${MODEL_DIR}/qwen35-mtp.gguf"
              -c 256 -b 16 -ub 16 -n 8 -t 2 --backend-sampling --fit off --load-mode none --no-repack
+             --device none -ngl 0
     )
     set_tests_properties(test-mtp-bootstrap-native-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
     llama_build(test-fusion.cpp)

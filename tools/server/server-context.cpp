@@ -1267,6 +1267,9 @@ struct server_slot {
     bool clear_context_on_release = false;
     // Target-only adaptive snapshots need one real target suffix decode before MTP can resume.
     bool bootstrap_pending = false;
+    // A rejected MTP bootstrap retries this request from an empty context and
+    // must not immediately restore the same target-only snapshot again.
+    bool bootstrap_cold_fallback = false;
 
     size_t last_nl_pos = 0;
 
@@ -1328,13 +1331,15 @@ struct server_slot {
             prompt_cache.last_reason = "outgoing task disabled prompt caching";
             return false;
         }
-        const bool saved = prompt_cache.save(prompt, ctx_tgt, ctx_dft, spec, id);
+        llama_context * ctx_dft_state = draft_owns_state ? ctx_dft : nullptr;
+        const bool saved = prompt_cache.save(prompt, ctx_tgt, ctx_dft_state, spec, id);
         if (!saved) { SLT_TRC(*this, "prompt cache save miss: %s\n", prompt_cache.last_reason.c_str()); }
         return saved;
     }
 
     server_prompt_cache_result prompt_load_result(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        const auto result = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, spec, id);
+        llama_context * ctx_dft_state = draft_owns_state ? ctx_dft : nullptr;
+        const auto result = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft_state, spec, id);
         SLT_TRC(*this, "prompt cache load: %s\n", prompt_cache.last_reason.c_str());
         return result;
     }
@@ -1403,6 +1408,7 @@ prompt_reset_after_memory_clear();
         prompt_cache_source = "none";
         prompt_cache_reason = "none";
         bootstrap_pending = false;
+        bootstrap_cold_fallback = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -3094,8 +3100,8 @@ private:
     llama_kvarn_params adaptive_kvarn_long{};
     int32_t adaptive_cache_kvarn_bits_k_long = 0;
     int32_t adaptive_cache_kvarn_bits_v_long = 0;
-    int32_t adaptive_batch_xlong    = 64;
-    int32_t adaptive_ubatch_xlong   = 64;
+    int32_t adaptive_batch_xlong    = 0;
+    int32_t adaptive_ubatch_xlong   = 0;
     int32_t adaptive_draft_n_xlong  = 0;
     ggml_type adaptive_cache_type_k_xlong = GGML_TYPE_Q4_0;
     ggml_type adaptive_cache_type_v_xlong = GGML_TYPE_Q4_0;
@@ -3103,8 +3109,8 @@ private:
     int32_t adaptive_cache_kvarn_bits_k_xlong = 0;
     int32_t adaptive_cache_kvarn_bits_v_xlong = 0;
 
-    int32_t adaptive_batch_xxlong   = 64;
-    int32_t adaptive_ubatch_xxlong  = 64;
+    int32_t adaptive_batch_xxlong   = 0;
+    int32_t adaptive_ubatch_xxlong  = 0;
     int32_t adaptive_draft_n_xxlong = 0;
     ggml_type adaptive_cache_type_k_xxlong = GGML_TYPE_Q4_0;
     ggml_type adaptive_cache_type_v_xxlong = GGML_TYPE_Q4_0;
@@ -3215,28 +3221,6 @@ private:
         }
     }
 
-    // The adaptive MTP draft context never processes more than draft_n+1 tokens
-    // per speculative step, but its catch-up mirrors the target batch, so the
-    // batch capacity must stay at the target size. Only the ubatch (which sizes
-    // the GPU compute buffers) is capped to a small window; llama_decode splits
-    // the catch-up batch into these ubatches internally.
-    int32_t adaptive_draft_ubatch_for_profile(common_context_profile profile) const {
-        return std::max<int32_t>(16, adaptive_draft_n_for_profile(profile) + 2);
-    }
-
-    int32_t adaptive_normal_ubatch_for_profile(common_context_profile profile) const {
-        const bool kvarn_normal = adaptive_cache_kvarn_bits_k_normal > 0 &&
-            adaptive_cache_kvarn_bits_v_normal > 0;
-        if (kvarn_normal && (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT ||
-                profile == COMMON_CONTEXT_PROFILE_MTP)) {
-            // KVarN MTP short/medium contexts have little transient VRAM headroom
-            // after the target and draft caches are resident. Keep prefill
-            // workspace bounded so a context switch cannot abort the child.
-            return std::min(adaptive_ubatch_normal, 128);
-        }
-        return adaptive_ubatch_normal;
-    }
-
     void apply_profile_params(common_context_profile profile) {
         const int32_t draft_n = adaptive_draft_n_for_profile(profile);
         const int32_t draft_n_max = std::max({
@@ -3251,7 +3235,7 @@ private:
         if (profile == COMMON_CONTEXT_PROFILE_MTP_SHORT) {
             params_base.n_ctx = params_base.ctx_size_mtp_short;
             params_base.n_batch = adaptive_batch_normal;
-            params_base.n_ubatch = adaptive_normal_ubatch_for_profile(profile);
+            params_base.n_ubatch = adaptive_ubatch_normal;
             params_base.cache_type_k = adaptive_cache_type_k_normal;
             params_base.cache_type_v = adaptive_cache_type_v_normal;
             params_base.kvarn = adaptive_kvarn_normal;
@@ -3260,7 +3244,7 @@ private:
         } else if (profile == COMMON_CONTEXT_PROFILE_MTP) {
             params_base.n_ctx = params_base.ctx_size_mtp;
             params_base.n_batch = adaptive_batch_normal;
-            params_base.n_ubatch = adaptive_normal_ubatch_for_profile(profile);
+            params_base.n_ubatch = adaptive_ubatch_normal;
             params_base.cache_type_k = adaptive_cache_type_k_normal;
             params_base.cache_type_v = adaptive_cache_type_v_normal;
             params_base.kvarn = adaptive_kvarn_normal;
@@ -4458,8 +4442,8 @@ private:
                 ? params.cache_kvarn_bits_k_long : params.cache_kvarn_bits_k;
             adaptive_cache_kvarn_bits_v_long = params.cache_type_v_long != GGML_TYPE_COUNT
                 ? params.cache_kvarn_bits_v_long : params.cache_kvarn_bits_v;
-            adaptive_batch_xlong    = params.batch_size_xlong > 0 ? params.batch_size_xlong : 64;
-            adaptive_ubatch_xlong   = params.ubatch_size_xlong > 0 ? params.ubatch_size_xlong : 64;
+            adaptive_batch_xlong    = params.batch_size_xlong > 0 ? params.batch_size_xlong : params.n_batch;
+            adaptive_ubatch_xlong   = params.ubatch_size_xlong > 0 ? params.ubatch_size_xlong : params.n_ubatch;
             adaptive_draft_n_xlong  = params.spec_draft_n_max_xlong;
             adaptive_cache_type_k_xlong = params.cache_type_k_xlong != GGML_TYPE_COUNT
                 ? params.cache_type_k_xlong : params.cache_type_k;
@@ -4472,8 +4456,8 @@ private:
             adaptive_cache_kvarn_bits_v_xlong = params.cache_type_v_xlong != GGML_TYPE_COUNT
                 ? params.cache_kvarn_bits_v_xlong : params.cache_kvarn_bits_v;
 
-            adaptive_batch_xxlong   = params.batch_size_xxlong > 0 ? params.batch_size_xxlong : 64;
-            adaptive_ubatch_xxlong  = params.ubatch_size_xxlong > 0 ? params.ubatch_size_xxlong : 64;
+            adaptive_batch_xxlong   = params.batch_size_xxlong > 0 ? params.batch_size_xxlong : params.n_batch;
+            adaptive_ubatch_xxlong  = params.ubatch_size_xxlong > 0 ? params.ubatch_size_xxlong : params.n_ubatch;
             adaptive_draft_n_xxlong = params.spec_draft_n_max_xxlong;
             adaptive_cache_type_k_xxlong = params.cache_type_k_xxlong != GGML_TYPE_COUNT
                 ? params.cache_type_k_xxlong : params.cache_type_k;
@@ -4702,10 +4686,6 @@ private:
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
-
-                if (common_context_is_adaptive(params_base)) {
-                    params_dft.n_ubatch = adaptive_draft_ubatch_for_profile(active_context_profile);
-                }
 
                 spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
                 model_dft = spec_init->model();
@@ -5303,7 +5283,8 @@ private:
         for (auto & slot : slots) {
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
-            slot.mem.init(ctx_tgt, ctx_dft);
+            slot.draft_owns_state = draft_owns_state;
+            slot.mem.init(ctx_tgt, slot.draft_owns_state ? ctx_dft : nullptr);
             slot.spec = spec.get();
             slot.n_ctx = slot_ctx;
             slot.bootstrap_pending = false;
@@ -5334,7 +5315,6 @@ private:
 
         try {
             common_params params_dft = common_base_params_to_speculative(params_base);
-            params_dft.n_ubatch = adaptive_draft_ubatch_for_profile(profile);
             spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
             model_dft = spec_init->model();
             ctx_dft = spec_init->context();
@@ -7850,7 +7830,12 @@ if (task.params.cache_prompt) {
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view);
+                bool retry_cold = false;
+                bool ok = decode(n_batch, off, batch_view, retry_cold);
+                if (retry_cold) {
+                    batch.clear();
+                    return;
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -7953,11 +7938,25 @@ if (task.params.cache_prompt) {
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
+        // A target-only restore has no draft carry yet. Decode its first real
+        // suffix alone so a rejected bootstrap can discard that decode and
+        // cold-prefill only its owner without skipping post-decode for peers.
+        server_slot * bootstrap_slot = nullptr;
+        for (auto & slot : slots) {
+            if (slot.bootstrap_pending && slot.is_processing()) {
+                bootstrap_slot = &slot;
+                break;
+            }
+        }
+
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
+            if (bootstrap_slot && &slot != bootstrap_slot) {
+                return;
+            }
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -8186,6 +8185,9 @@ if (task.params.cache_prompt) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
+                if (bootstrap_slot && &slot != bootstrap_slot) {
+                    return;
+                }
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -8314,6 +8316,7 @@ if (task.params.cache_prompt) {
                                 // and falls back to a normal prefill on any mismatch/failure (invariants 2/3/4).
                                 // media-prefix caching intentionally unsupported: token-ids cannot identify image content.
                                 if (auto_cache_enabled()
+                                        && !slot.bootstrap_cold_fallback
                                         && slot.task->need_sampling()        // generative only (not embed/rerank)
                                         && !input_tokens.has_media()         // no media in this request
                                         && slot.alora_invocation_start <= 0      // aLoRA caching bound (mirror below)
@@ -9041,8 +9044,10 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
     }
 
     // returns true = success ; false = retry with smaller batch size
+    // retry_cold asks the caller to discard this decoded batch and re-prefill the task.
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
+    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view, bool & retry_cold) {
+        retry_cold = false;
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -9093,13 +9098,37 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
         }
 
         if (ret != 0) {
-            std::string err;
-
             if (n_batch == 1 && ret == 1) {
-                // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                //       need to remove the tokens from the current batch too
-                err = "Context size has been exceeded.";
+                GGML_ASSERT(batch_view.n_tokens == 1);
+                const std::string err = "Unable to allocate KV cache for this request.";
+                for (int32_t j = 0; j < batch_view.n_seq_id[0]; ++j) {
+                    const llama_seq_id owner = batch_view.seq_id[0][j];
+                    for (auto & slot : slots) {
+                        if (!slot.is_processing() || slot.id != owner) {
+                            continue;
+                        }
+                        SLT_ERR(slot, "%s off = %d, n_batch = %d, ret = %d\n",
+                                err.c_str(), off, n_batch, ret);
+                        send_error(slot, err, ERROR_TYPE_SERVER);
+                        const bool target_cleared = llama_memory_seq_rm(
+                                llama_get_memory(slot.ctx_tgt), slot.id, -1, -1);
+                        const bool draft_cleared = !slot.draft_owns_state || llama_memory_seq_rm(
+                                llama_get_memory(slot.ctx_dft), slot.id, -1, -1);
+                        if (target_cleared && draft_cleared) {
+                            slot.prompt_reset_after_memory_clear();
+                        } else {
+                            SLT_ERR(slot,
+                                    "failed to clear owner after KV allocation refusal (target = %s, draft = %s)\n",
+                                    target_cleared ? "cleared" : "refused",
+                                    draft_cleared ? "cleared" : "refused");
+                        }
+                        slot.release();
+                    }
+                }
+                return true;
             }
+
+            std::string err;
 
             if (ret == -1) {
                 err = "Invalid input batch.";
@@ -9163,10 +9192,20 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 }
                 const uint64_t decode_id = llama_get_nextn_decode_id(ctx_tgt);
                 if (!common_speculative_bootstrap(spec.get(), batch_view, decode_id)) {
-                    SLT_ERR(slot, "%s", "target-only cache hit could not bootstrap MTP from the decoded suffix\n");
-                    slot.bootstrap_pending = false;
+                    const llama_pos pos_last = batch_view.pos && batch_view.n_tokens > 0
+                        ? batch_view.pos[batch_view.n_tokens - 1] : -1;
+                    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    SLT_WRN(slot,
+                            "target-only MTP bootstrap rejected (decode_id=%llu, decoded_suffix=%d, pos_last=%d, pos_max=%d, ubatch=%u); retrying with cold prefill\n",
+                            (unsigned long long) decode_id, batch_view.n_tokens, pos_last, pos_max,
+                            llama_n_ubatch(ctx_tgt));
                     slot.prompt_clear();
-                    throw std::runtime_error("failed to bootstrap MTP from target-only prompt cache");
+                    slot.bootstrap_cold_fallback = true;
+                    slot.prompt_cache_reason = "mtp_bootstrap_cold_fallback";
+                    slot.state = SLOT_STATE_STARTED;
+                    slot.i_batch = -1;
+                    retry_cold = true;
+                    return true;
                 }
                 slot.bootstrap_pending = false;
                 slot.just_restored = false;
@@ -9256,6 +9295,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                slot.bootstrap_cold_fallback = false;
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);

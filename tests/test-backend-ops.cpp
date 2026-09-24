@@ -5202,8 +5202,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    auto rng = make_test_rng();
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
             continue;

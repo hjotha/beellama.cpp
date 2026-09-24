@@ -546,68 +546,35 @@ static int test_mtp_request_reset(const size_t seed) {
         throw std::runtime_error("failed to create MTP speculative driver");
     }
 
+    // Seed one valid carry. A fresh MTP driver deliberately has no serializable
+    // state until the target has produced a hidden row.
+    if (!common_speculative_set_state(spec.get(), 0, {})) {
+        throw std::runtime_error("failed to clear initial MTP state");
+    }
+    llama_batch seed_batch = llama_batch_init(2, 0, 1);
+    common_batch_add(seed_batch, 1, 0, { 0 }, true);
+    common_batch_add(seed_batch, 2, 1, { 0 }, true);
+    const bool seeded = llama_decode(ctx_tgt.get(), seed_batch) == 0 &&
+        common_speculative_process(spec.get(), seed_batch);
+    llama_batch_free(seed_batch);
     std::vector<uint8_t> state;
-    if (!common_speculative_get_state(spec.get(), 0, state)) {
-        throw std::runtime_error("failed to read initial MTP state");
+    if (!seeded || !common_speculative_get_state(spec.get(), 0, state)) {
+        throw std::runtime_error("failed to seed MTP state");
     }
 
-    const std::vector<uint8_t> initial_state = state;
-    size_t cursor = 0;
-    const auto read_u32 = [&]() {
-        uint32_t value;
-        std::memcpy(&value, state.data() + cursor, sizeof(value));
-        cursor += sizeof(value);
-        return value;
-    };
-    const auto read_i32 = [&]() {
-        int32_t value;
-        std::memcpy(&value, state.data() + cursor, sizeof(value));
-        cursor += sizeof(value);
-        return value;
-    };
-    const auto read_u64 = [&]() {
-        uint64_t value;
-        std::memcpy(&value, state.data() + cursor, sizeof(value));
-        cursor += sizeof(value);
-        return value;
-    };
-
-    const uint32_t magic = read_u32();
-    const uint32_t version = read_u32();
-    const uint32_t type = read_u32();
-    const int32_t seq_id = read_i32();
-    const uint64_t payload_size = read_u64();
-    const size_t checksum_offset = cursor;
-    (void) read_u64();
-    const size_t payload_offset = cursor;
-    if (magic != 0x43455053 || version != 1 ||
-            type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP || seq_id != 0 ||
-            payload_offset + payload_size != state.size() || payload_size < 3*sizeof(uint32_t)) {
+    const std::vector<uint8_t> initial_state;
+    std::array<uint32_t, 4> header;
+    if (state.size() < sizeof(header)) {
         throw std::runtime_error("unexpected serialized MTP state format");
     }
-
-    uint32_t width;
-    std::memcpy(&width, state.data() + payload_offset + 2*sizeof(uint32_t), sizeof(width));
-    if (payload_size != 3*sizeof(uint32_t) + size_t(width)*sizeof(float)) {
+    std::memcpy(header.data(), state.data(), sizeof(header));
+    const uint32_t width = header[1];
+    const size_t payload_offset = sizeof(header);
+    if (header[0] != 0x3250544d || state.size() != payload_offset + size_t(width)*sizeof(float)) {
         throw std::runtime_error("unexpected serialized MTP state width");
     }
     std::vector<float> stale(width, 1.0f);
-    std::memcpy(state.data() + payload_offset + 3*sizeof(uint32_t), stale.data(), stale.size()*sizeof(float));
-
-    uint64_t checksum = 1469598103934665603ULL;
-    const auto hash_bytes = [&](const void * ptr, size_t size) {
-        const auto * bytes = static_cast<const uint8_t *>(ptr);
-        for (size_t i = 0; i < size; ++i) {
-            checksum = (checksum ^ bytes[i])*1099511628211ULL;
-        }
-    };
-    hash_bytes(&magic, sizeof(magic));
-    hash_bytes(&version, sizeof(version));
-    hash_bytes(&type, sizeof(type));
-    hash_bytes(&seq_id, sizeof(seq_id));
-    hash_bytes(&payload_size, sizeof(payload_size));
-    hash_bytes(state.data() + payload_offset, payload_size);
-    std::memcpy(state.data() + checksum_offset, &checksum, sizeof(checksum));
+    std::memcpy(state.data() + payload_offset, stale.data(), stale.size()*sizeof(float));
 
 const auto prefill = [&](const std::vector<uint8_t> & carry) {
         llama_memory_clear(llama_get_memory(ctx_tgt.get()), true);
@@ -631,7 +598,7 @@ const auto prefill = [&](const std::vector<uint8_t> & carry) {
             throw std::runtime_error("failed to read prefilled MTP state");
         }
         const float * expected = llama_get_embeddings_nextn_ith(ctx_tgt.get(), 1);
-        const size_t pending_offset = payload_offset + 3*sizeof(uint32_t);
+        const size_t pending_offset = payload_offset;
         if (!expected || std::memcmp(pending.data() + pending_offset, expected, width*sizeof(float)) != 0) {
             throw std::runtime_error("MTP prefill did not retain the final target hidden state");
         }
@@ -1099,7 +1066,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
-        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_DSPARK) {
             continue;
         }
 

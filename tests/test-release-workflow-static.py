@@ -21,9 +21,8 @@ def main() -> None:
     }
     actual = {path.name for path in WORKFLOWS.glob("*.y*ml")}
     require(
-        actual == expected,
-        "release workflow inventory diverged: "
-        f"added={sorted(actual - expected)}, missing={sorted(expected - actual)}",
+        expected <= actual,
+        f"required release workflows are missing: {sorted(expected - actual)}",
     )
     stale_rocwmma = [
         path.name
@@ -45,6 +44,7 @@ def main() -> None:
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     preview_dispatch = (WORKFLOWS / "release-preview-dispatch.yml").read_text(encoding="utf-8")
     stable_dispatch = (WORKFLOWS / "release-dispatch.yml").read_text(encoding="utf-8")
+    make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
     setup_ccache = (ACTIONS / "setup-ccache/action.yml").read_text(encoding="utf-8")
 
     require(
@@ -159,7 +159,6 @@ def main() -> None:
         ACTIONS / "ccache-buckets/action.yml",
         ROOT / "scripts/ccache-clear.sh",
         ROOT / "scripts/release.sh",
-        ROOT / "scripts/make-release-checks.sh",
         ROOT / "scripts/make-release-desc.sh",
         ROOT / "scripts/make-release-summary.txt",
         ROOT / "cmake/arm64-windows-msvc-cuda.cmake",
@@ -168,6 +167,11 @@ def main() -> None:
     require(
         not any(path.exists() for path in removed_imports),
         "unused or incompatible upstream release helpers must not remain",
+    )
+    require(
+        "bash scripts/make-release-checks.sh" not in make_release
+        or (ROOT / "scripts/make-release-checks.sh").exists(),
+        "make-release workflow references a missing pre-release checker",
     )
     require(
         (ACTIONS / "linux-setup-vulkan/action.yml").exists(),

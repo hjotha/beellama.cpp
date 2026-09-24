@@ -530,8 +530,8 @@ struct common_params {
     int32_t spec_draft_n_max_long  =     0; // draft N for long profile (0 = target-only)
     int32_t ctx_size_xlong        =     0; // adaptive context xlong profile, 0 = disabled
     int32_t xlong_max_tokens      =     0; // adaptive context xlong threshold, 0 = ctx_size_xlong
-    int32_t batch_size_xlong      =    64; // logical batch size for xlong profile
-    int32_t ubatch_size_xlong     =    64; // physical batch size for xlong profile
+    int32_t batch_size_xlong      =     0; // logical batch size for xlong profile, 0 = inherit global
+    int32_t ubatch_size_xlong     =     0; // physical batch size for xlong profile, 0 = inherit global
     int32_t batch_size_long       =   256; // logical batch size for long profile
     int32_t ubatch_size_long      =   256; // physical batch size for long profile
     int32_t spec_draft_n_max_xlong =     0; // draft N for xlong profile (0 = target-only)
@@ -548,8 +548,8 @@ struct common_params {
     struct llama_kvarn_params kvarn_xlong{};
     int32_t ctx_size_xxlong       =     0; // adaptive context xxlong profile, 0 = disabled
     int32_t xxlong_max_tokens     =     0; // adaptive context xxlong threshold, 0 = ctx_size_xxlong
-    int32_t batch_size_xxlong     =    64; // logical batch size for xxlong profile
-    int32_t ubatch_size_xxlong    =    64; // physical batch size for xxlong profile
+    int32_t batch_size_xxlong     =     0; // logical batch size for xxlong profile, 0 = inherit global
+    int32_t ubatch_size_xxlong    =     0; // physical batch size for xxlong profile, 0 = inherit global
     int32_t spec_draft_n_max_xxlong =    0; // draft N for xxlong profile (fixed at 0: MTP disabled)
     enum ggml_type cache_type_k_xxlong = GGML_TYPE_COUNT;
     enum ggml_type cache_type_v_xxlong = GGML_TYPE_COUNT;

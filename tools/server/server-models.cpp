@@ -2784,17 +2784,28 @@ void server_models_routes::init_routes() {
         // the router must produce it too, for names it has not loaded yet
         json codex_json  = json::array();
         auto all_models = models.get_all_meta();
-        // configured --ctx-size of a model, 0 if it does not declare one
+        // Widest configured adaptive tier, or 0 if the preset declares none.
+        // Unloaded children cannot report their runtime metadata yet.
         auto preset_n_ctx = [](const server_model_meta & m) {
-            std::string ctx_size;
-            if (m.preset.get_option("LLAMA_ARG_CTX_SIZE", ctx_size)) {
+            int64_t result = 0;
+            for (const char * option : {
+                    "LLAMA_ARG_CTX_SIZE",
+                    "LLAMA_ARG_CTX_SIZE_MTP_SHORT",
+                    "LLAMA_ARG_CTX_SIZE_MTP",
+                    "LLAMA_ARG_CTX_SIZE_XLONG",
+                    "LLAMA_ARG_CTX_SIZE_XXLONG"}) {
+                std::string ctx_size;
+                if (!m.preset.get_option(option, ctx_size)) {
+                    continue;
+                }
                 try {
-                    return std::stoll(ctx_size);
+                    result = std::max<int64_t>(result, std::stoll(ctx_size));
                 } catch (...) {
-                    // not a number we can use; fall through
+                    // Ignore malformed optional metadata; argument parsing will
+                    // still reject it if this preset is loaded.
                 }
             }
-            return 0LL;
+            return result;
         };
         std::time_t t = std::time(0);
         for (const auto & meta : all_models) {

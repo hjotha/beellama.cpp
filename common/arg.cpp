@@ -2244,20 +2244,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_XLONG_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--batch-size-xl", "--batch-size-xlong"}, "N",
-        string_format("logical batch size for adaptive xlong profile (default: %d)", params.batch_size_xlong),
+        string_format("logical batch size for adaptive xlong profile (default: %d, 0 = shared --batch-size)", params.batch_size_xlong),
         [](common_params & params, int value) {
-            if (value <= 0) {
-                throw std::invalid_argument("--batch-size-xlong must be positive");
+            if (value < 0) {
+                throw std::invalid_argument("--batch-size-xlong must be non-negative");
             }
             params.batch_size_xlong = value;
         }
     ).set_env("LLAMA_ARG_BATCH_SIZE_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--ubatch-size-xl", "--ubatch-size-xlong"}, "N",
-        string_format("physical batch size for adaptive xlong profile (default: %d)", params.ubatch_size_xlong),
+        string_format("physical batch size for adaptive xlong profile (default: %d, 0 = shared --ubatch-size)", params.ubatch_size_xlong),
         [](common_params & params, int value) {
-            if (value <= 0) {
-                throw std::invalid_argument("--ubatch-size-xlong must be positive");
+            if (value < 0) {
+                throw std::invalid_argument("--ubatch-size-xlong must be non-negative");
             }
             params.ubatch_size_xlong = value;
         }
@@ -2328,20 +2328,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_XXLONG_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--batch-size-xxl", "--batch-size-xxlong"}, "N",
-        string_format("logical batch size for adaptive xxlong profile (default: %d)", params.batch_size_xxlong),
+        string_format("logical batch size for adaptive xxlong profile (default: %d, 0 = shared --batch-size)", params.batch_size_xxlong),
         [](common_params & params, int value) {
-            if (value <= 0) {
-                throw std::invalid_argument("--batch-size-xxlong must be positive");
+            if (value < 0) {
+                throw std::invalid_argument("--batch-size-xxlong must be non-negative");
             }
             params.batch_size_xxlong = value;
         }
     ).set_env("LLAMA_ARG_BATCH_SIZE_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--ubatch-size-xxl", "--ubatch-size-xxlong"}, "N",
-        string_format("physical batch size for adaptive xxlong profile (default: %d)", params.ubatch_size_xxlong),
+        string_format("physical batch size for adaptive xxlong profile (default: %d, 0 = shared --ubatch-size)", params.ubatch_size_xxlong),
         [](common_params & params, int value) {
-            if (value <= 0) {
-                throw std::invalid_argument("--ubatch-size-xxlong must be positive");
+            if (value < 0) {
+                throw std::invalid_argument("--ubatch-size-xxlong must be non-negative");
             }
             params.ubatch_size_xxlong = value;
         }

@@ -144,7 +144,7 @@ def main() -> None:
 
     common_source = (ROOT / "common/common.cpp").read_text(encoding="utf-8")
     fit_callsite = common_source.split(
-        "if (params.fit_params) {", 1
+        "if (params.fit_params", 1
     )[1].split("llama_model * model = llama_model_load_from_file", 1)[0]
     if "common_fit_params(" not in fit_callsite:
         raise AssertionError("common init no longer invokes upstream parameter fitting")
@@ -158,7 +158,7 @@ def main() -> None:
     for regression in (
         "server_unsupported_removal_falls_back_to_full_reprocess",
         "server_post_preflight_mutation_failure_clears_both_contexts",
-        "prompt_cache_load_target_success_draft_failure_is_atomic",
+        "restore_transaction_draft_failure_commits_nothing",
     ):
         if regression not in server_tests:
             raise AssertionError(f"server checkpoint tests lack {regression}")
@@ -307,6 +307,9 @@ def main() -> None:
     )[0]
     if "llama_synchronize(ctx_tgt);" not in decode_body:
         raise AssertionError("server exposes asynchronous target KV updates")
+
+    if server_context.count("bootstrap_slot && &slot != bootstrap_slot") < 2:
+        raise AssertionError("target-only MTP bootstrap is not isolated from peer slots")
 
     context_source = (ROOT / "src/llama-context.cpp").read_text(encoding="utf-8")
     context_decode = context_source.split("llama_context::decode(const llama_batch & batch_inp)", 1)[1].split(

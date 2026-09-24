@@ -939,9 +939,17 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
             "--mtp-max-tokens", "500", "--ctx-size-mtp-short", "300",
             "--mtp-short-max-tokens", "250", "--spec-draft-n-max-short", "4",
             "--ctx-size-xl", "1200", "--xl-max-tokens", "1200",
+            "--ctx-size-xxl", "1400", "--xxl-max-tokens", "1400",
+            "--batch-size", "192", "--ubatch-size", "160",
             "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
         };
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), xlong_inherit, LLAMA_EXAMPLE_SERVER));
+        assert(xlong_inherit.n_batch == 192);
+        assert(xlong_inherit.n_ubatch == 160);
+        assert(xlong_inherit.batch_size_xlong == 0);
+        assert(xlong_inherit.ubatch_size_xlong == 0);
+        assert(xlong_inherit.batch_size_xxlong == 0);
+        assert(xlong_inherit.ubatch_size_xxlong == 0);
         assert(xlong_inherit.cache_type_k_xlong == xlong_inherit.cache_type_k);
         assert(xlong_inherit.cache_type_v_xlong == xlong_inherit.cache_type_v);
         assert(xlong_inherit.cache_kvarn_bits_k_xlong == xlong_inherit.cache_kvarn_bits_k);

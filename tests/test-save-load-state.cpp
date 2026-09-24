@@ -1277,6 +1277,10 @@ static bool test_state_load(struct llama_model * model, const struct common_para
 // - migrate KV cache from seq 0 to seq 1 via the CPU path
 // - generate n_predict tokens on seq 1 and compare against expected result
 static bool test_seq_cp_host(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
+    if (llama_model_is_diffusion(model)) {
+        LOG("\n=== Test 4: seq copy (host) (SKIP: diffusion model) ===\n");
+        return true;
+    }
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
@@ -1363,6 +1367,10 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
 // - migrate KV cache from seq 0 to seq 1 via the on-device path
 // - generate n_predict tokens on seq 1 and compare against expected result
 static bool test_seq_cp_device(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
+    if (llama_model_is_diffusion(model)) {
+        LOG("\n=== Test 5: seq copy (device) (SKIP: diffusion model) ===\n");
+        return true;
+    }
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
@@ -1551,6 +1559,11 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
 
     LOG("\n=== Test 8: state blob round-trip ===\n");
+
+    if (!llama_get_memory(ctx.get())) {
+        LOG("SKIP: model has no persistent sequence memory\n");
+        return true;
+    }
 
     if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
         LOG_ERR("\n%s: failed to decode prompt\n", __func__);

@@ -211,7 +211,10 @@ def main() -> None:
     )
 
     recurrent = (ROOT / "src/llama-memory-recurrent.cpp").read_text(encoding="utf-8")
-    ple_restore = recurrent.split("if (p_l[il] != nullptr)", 2)[2].split("if (!s_trans)", 1)[0]
+    recurrent_restore = recurrent.split(
+        "bool llama_memory_recurrent::state_read_data(", 1
+    )[1]
+    ple_restore = recurrent_restore.split("if (p_l[il] != nullptr)", 1)[1].split("if (!s_trans)", 1)[0]
     require(
         ple_restore,
         "io.read_tensor(p_l[il], restore_head * p_size_row",

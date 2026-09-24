@@ -510,6 +510,33 @@ def test_router_models_status_args_preset():
         os.remove(preset_path)
 
 
+def test_router_unloaded_adaptive_model_advertises_widest_context(tmp_path):
+    global server
+
+    preset_path = tmp_path / "adaptive-context.ini"
+    preset_path.write_text(
+        "[adaptive-context]\n"
+        "hf-repo = ggml-org/test-model-stories260K\n"
+        "ctx-size = 65536\n"
+        "ctx-size-mtp-short = 24576\n"
+        "ctx-size-mtp = 49152\n"
+        "ctx-size-xlong = 131072\n"
+        "ctx-size-xxlong = 204800\n"
+        "load-on-startup = false\n",
+        encoding="utf-8",
+    )
+
+    server.models_preset = str(preset_path)
+    server.no_models_autoload = True
+    server.start()
+
+    res = server.make_request("GET", "/models")
+    assert res.status_code == 200
+    advertised = {item["name"]: item for item in res.body.get("models", [])}
+    assert advertised["adaptive-context"]["context_window"] == 204800
+    assert advertised["adaptive-context"]["max_context_window"] == 204800
+
+
 @pytest.mark.parametrize("fail_target_load", [False, True])
 def test_router_route_group_restores_slot_state(tmp_path, fail_target_load):
     """a route-group migration restores or discards the outgoing child's prompt cache"""

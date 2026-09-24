@@ -524,7 +524,6 @@ jobs:
             -DGPU_TARGETS="${{ matrix.gpu_targets }}" \
             -DGGML_HIP=ON \
             -DHIP_PLATFORM=amd \
-            -DGGML_HIP_ROCWMMA_FATTN=ON \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j $(nproc)
 
@@ -625,7 +624,6 @@ jobs:
             -DGGML_NATIVE=OFF `
             -DGGML_OPENMP=OFF `
             -DGPU_TARGETS="${{ matrix.gpu_targets }}" `
-            -DGGML_HIP_ROCWMMA_FATTN=ON `
             -DGGML_HIP=ON `
             -DLLAMA_BUILD_BORINGSSL=ON
           # Full self-contained bundle (CPU backend + HIP), not just the ggml-hip.dll add-on.
