@@ -2753,8 +2753,9 @@ static void ggml_cuda_graph_debug_log(ggml_backend_cuda_context * cuda_ctx,
 
     if (status == cudaSuccess) {
         fprintf(stderr,
-                "CUDA graph %s: key=%p entries=%zu captures=%zu updates=%zu stable=%d free=%.2f MiB total=%.2f MiB\n",
-                event, graph_key, cuda_ctx->cuda_graphs.size(), graph->capture_count, graph->update_count,
+                "CUDA graph %s: context=%p pressure_disabled=%d key=%p entries=%zu captures=%zu updates=%zu stable=%d free=%.2f MiB total=%.2f MiB\n",
+                event, (void *) cuda_ctx, (int) cuda_ctx->disable_cuda_graphs_due_to_memory_pressure,
+                graph_key, cuda_ctx->cuda_graphs.size(), graph->capture_count, graph->update_count,
                 graph->warmup_stable_calls, free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
     } else {
         fprintf(stderr, "CUDA graph %s: key=%p entries=%zu captures=%zu updates=%zu stable=%d memory_status=%s\n",
@@ -4932,7 +4933,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+    const bool graphs_disabled_by_pressure = cuda_ctx->disable_cuda_graphs_due_to_memory_pressure;
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    if (graphs_disabled_by_pressure && !cuda_ctx->disable_cuda_graphs_due_to_memory_pressure) {
+        GGML_LOG_WARN("%s: CUDA graphs re-enabled after VRAM headroom recovered (context=%p)\n",
+                      __func__, (void *) cuda_ctx);
+    }
 
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
@@ -4962,7 +4968,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (!cuda_ctx->check_memory_pressure_before_graph()) {
+    const bool graph_memory_pressure_ok = cuda_ctx->check_memory_pressure_before_graph();
+    if (ggml_cuda_graph_debug_enabled()) {
+        fprintf(stderr,
+                "CUDA graph memory-pressure check: context=%p pressure_disabled=%d safe=%d\n",
+                (void *) cuda_ctx, (int) cuda_ctx->disable_cuda_graphs_due_to_memory_pressure,
+                (int) graph_memory_pressure_ok);
+    }
+    if (!graph_memory_pressure_ok) {
         GGML_LOG_ERROR("%s: CUDA graph memory-pressure cleanup failed; refusing to continue with stale graph resources\n", __func__);
         return GGML_STATUS_FAILED;
     }

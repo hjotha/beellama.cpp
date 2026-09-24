@@ -1573,6 +1573,7 @@ struct ggml_backend_cuda_context {
     bool disable_cuda_graphs_due_to_memory_pressure = false;
     bool cuda_graphs_memory_cleanup_failed = false;
     bool cuda_graphs_memory_check_failed = false;
+    bool cuda_graphs_recovery_wait_logged = false;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1606,6 +1607,7 @@ struct ggml_backend_cuda_context {
 
         if (free_bytes >= safe_headroom) {
             disable_cuda_graphs_due_to_memory_pressure = false;
+            cuda_graphs_recovery_wait_logged = false;
             for (auto & pair : cuda_graphs) {
                 if (pair.second) {
                     pair.second->disable_due_to_memory_pressure = false;
@@ -1614,6 +1616,10 @@ struct ggml_backend_cuda_context {
                 }
             }
             GGML_LOG_INFO("%s: CUDA graphs re-enabled after VRAM headroom recovered (%.2f MiB free >= %.2f MiB headroom)\n",
+                          __func__, free_bytes / (1024.0 * 1024.0), safe_headroom / (1024.0 * 1024.0));
+        } else if (!cuda_graphs_recovery_wait_logged) {
+            cuda_graphs_recovery_wait_logged = true;
+            GGML_LOG_WARN("%s: CUDA graphs remain disabled; VRAM recovery headroom is low (%.2f MiB free < %.2f MiB headroom)\n",
                           __func__, free_bytes / (1024.0 * 1024.0), safe_headroom / (1024.0 * 1024.0));
         }
     }
@@ -1676,6 +1682,7 @@ struct ggml_backend_cuda_context {
         }
 
         disable_cuda_graphs_due_to_memory_pressure = true;
+        cuda_graphs_recovery_wait_logged = false;
         GGML_LOG_WARN("%s: released %zu CUDA graph executables and %zu captures under VRAM pressure\n",
                       __func__, destroyed_instances, destroyed_graphs);
         return true;
