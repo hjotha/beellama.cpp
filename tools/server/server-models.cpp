@@ -1937,7 +1937,6 @@ void server_models::request_stop(const std::string & name, bool send_exit) {
 void server_models::on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code) {
     {
         std::lock_guard<std::mutex> lk(mutex);
-        stopping_models.erase(name);
         auto it = mapping.find(name);
         if (it == mapping.end() || it->second.subproc != proc) {
             return; // entry erased, or a newer instance took the name
@@ -1946,6 +1945,7 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
     if (mode == SERVER_CHILD_MODE_DOWNLOAD) {
         // instance will be cleaned up on next load_models() call
         std::lock_guard<std::mutex> lk(mutex);
+        stopping_models.erase(name);
         cv.notify_all();
     } else {
         update_status(name, {
@@ -2021,6 +2021,9 @@ void server_models::update_status(const std::string & name, const update_status_
         }
         if (!args.progress.is_null()) {
             meta.progress = args.progress;
+        }
+        if (args.status == SERVER_MODEL_STATUS_UNLOADED) {
+            stopping_models.erase(name);
         }
         // a model that comes up idle or goes down changes the slot count for queued requests
         sched->tick(lk);
@@ -2150,15 +2153,8 @@ void server_models::wait(std::unique_lock<std::mutex> & lk, const std::string & 
 }
 
 bool server_models::ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop) {
-    auto meta = get_meta(name);
-    if (!meta.has_value()) {
+    if (!get_meta(name).has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
-    }
-    if (meta->is_ready()) {
-        return false; // ready for taking requests
-    }
-    if (meta->status == SERVER_MODEL_STATUS_SLEEPING) {
-        return false; // child is sleeping but still running; new request will wake it up
     }
 
     bool queued   = false;
@@ -2166,7 +2162,11 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     {
         std::unique_lock<std::mutex> lk(mutex);
         auto it = mapping.find(name);
-        if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
+        const bool stopping = stopping_models.count(name) != 0;
+        if (it != mapping.end() && !stopping && it->second.meta.is_ready_or_sleep()) {
+            return false; // ready for taking requests
+        }
+        if (it != mapping.end() && (it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED || stopping)) {
             sched->join(lk, name);
             sched->tick(lk);
             queued = true;
@@ -2191,8 +2191,9 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                 break; // removed by another code path, nothing to wait for
             }
             const server_model_status status = it->second.meta.status;
+            const bool stopping = stopping_models.count(name) != 0;
 
-            if (status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_SLEEPING) {
+            if (!stopping && (status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_SLEEPING)) {
                 break;
             }
             if (status == SERVER_MODEL_STATUS_DOWNLOADING || status == SERVER_MODEL_STATUS_DOWNLOADED) {
