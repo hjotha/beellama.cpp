@@ -254,7 +254,7 @@ static bool test_tail_copy_is_immediately_saveable(
     }
 
     auto context_params = common_context_params_to_llama(params);
-    context_params.n_seq_max = 2;
+    context_params.n_seq_max = 3;
     context_params.kv_unified = unified;
     auto source = llama_context_ptr{llama_init_from_model(model, context_params)};
     auto restored = llama_context_ptr{llama_init_from_model(model, context_params)};
@@ -293,6 +293,7 @@ static bool test_tail_copy_is_immediately_saveable(
                 llama_memory_seq_pos_max(memory, 0), llama_memory_seq_pos_max(memory, 1));
         return false;
     }
+    llama_memory_seq_cp(memory, 0, 2, 0, -1);
 
     const size_t state_size = llama_state_seq_get_size(source.get(), 1);
     if (state_size == 0 || state_size != llama_state_seq_get_size(source.get(), 1)) {
@@ -451,22 +452,28 @@ static bool test_tail_copy_is_immediately_saveable(
     const float * expected = llama_get_logits_ith(source.get(), -1);
     const float * actual = llama_get_logits_ith(restored.get(), -1);
     const float * guarded = llama_get_logits_ith(corruption_guard.get(), -1);
-    double squared_error = 0.0;
+    double restored_squared_error = 0.0;
+    double guard_squared_error = 0.0;
     double squared_reference = 0.0;
-    double max_abs_error = 0.0;
+    double restored_max_abs_error = 0.0;
+    double guard_max_abs_error = 0.0;
     for (int32_t i = 0; i < n_vocab; ++i) {
         const double diff = double(expected[i]) - double(actual[i]);
         const double guard_diff = double(expected[i]) - double(guarded[i]);
-        squared_error += diff*diff;
-        squared_error += guard_diff*guard_diff;
+        restored_squared_error += diff*diff;
+        guard_squared_error += guard_diff*guard_diff;
         squared_reference += double(expected[i])*double(expected[i]);
-        max_abs_error = std::max(max_abs_error, std::fabs(diff));
-        max_abs_error = std::max(max_abs_error, std::fabs(guard_diff));
+        restored_max_abs_error = std::max(restored_max_abs_error, std::fabs(diff));
+        guard_max_abs_error = std::max(guard_max_abs_error, std::fabs(guard_diff));
     }
-    const double nmse = squared_error/std::max(squared_reference, 1e-30);
-    if (!std::isfinite(nmse) || nmse > 1e-10 || max_abs_error > 1e-4) {
-        LOG_ERR("%s: immediate copied-sequence continuation changed logits (nmse=%g max_abs=%g)\n",
-                __func__, nmse, max_abs_error);
+    const double denominator = std::max(squared_reference, 1e-30);
+    const double restored_nmse = restored_squared_error/denominator;
+    const double guard_nmse = guard_squared_error/denominator;
+    if (!std::isfinite(restored_nmse) || restored_nmse > 1e-10 || restored_max_abs_error > 1e-4 ||
+            !std::isfinite(guard_nmse) || guard_nmse > 1e-10 || guard_max_abs_error > 1e-4) {
+        LOG_ERR("%s: immediate copied-sequence continuation changed logits "
+                "(restored nmse=%g max_abs=%g, guard nmse=%g max_abs=%g)\n",
+                __func__, restored_nmse, restored_max_abs_error, guard_nmse, guard_max_abs_error);
         return false;
     }
     LOG("\nPASS: standard tail copy is immediately saveable (%s)\n", unified ? "unified" : "non-unified");

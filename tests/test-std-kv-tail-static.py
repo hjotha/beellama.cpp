@@ -281,8 +281,23 @@ def main() -> None:
     seq_cp_body = cache_source.split("void llama_kv_cache::seq_cp(", 1)[1].split(
         "bool llama_kv_cache::seq_keep", 1
     )[0]
-    if seq_cp_body.count("materialize_pending_copies();") < 3:
-        raise AssertionError("same-stream sequence copy leaves a pending tail transaction")
+    materialize_body = cache_source.split("void llama_kv_cache::materialize_pending_copies()", 1)[1].split(
+        "void llama_kv_cache::seq_cp(", 1
+    )[0]
+    if "llama_synchronize(owner_lctx);" not in materialize_body:
+        raise AssertionError("pending tail copies can race an asynchronous decode")
+    update_body = cache_source.split("llama_memory_context_ptr llama_kv_cache::init_update(", 1)[1].split(
+        "llama_kv_cache_context::llama_kv_cache_context(", 1
+    )[0]
+    if "owner_lctx = lctx;" not in update_body:
+        raise AssertionError("KV cache does not retain the context needed to synchronize pending copies")
+    if seq_cp_body.count("materialize_pending_copies();") < 2:
+        raise AssertionError("sequence copy no longer drains prior or self-copy tail transactions")
+    same_stream_tail = seq_cp_body.split("rebuild_allocation_head(seq_id_dst);", 1)[1].split(
+        "return;", 1
+    )[0]
+    if "materialize_pending_copies();" in same_stream_tail:
+        raise AssertionError("same-stream sequence copy bypasses the synchronized update path")
 
     speculative_restore = server_context.split(
         "// speculative decoding - main model sample and accept", 1

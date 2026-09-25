@@ -554,6 +554,7 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+    llama_context * owner_lctx = nullptr;
 
     std::vector<kv_layer> layers;
 

@@ -1618,6 +1618,9 @@ void llama_kv_cache::materialize_pending_copies() {
     if (sc_info.empty()) {
         return;
     }
+    if (owner_lctx) {
+        llama_synchronize(owner_lctx);
+    }
     for (size_t i = 0; i < sc_info.ssrc.size(); ++i) {
         const uint32_t src = sc_info.ssrc[i];
         const uint32_t dst = sc_info.sdst[i];
@@ -1713,7 +1716,6 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         }
 
         rebuild_allocation_head(seq_id_dst);
-        materialize_pending_copies();
 
         return;
     }
@@ -2015,6 +2017,7 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
+    owner_lctx = lctx;
     bool do_shift = get_has_shift();
 
     auto pending = std::move(sc_info);
