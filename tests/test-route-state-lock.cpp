@@ -1,5 +1,6 @@
 #include "server-route-state.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -60,10 +61,13 @@ int main() {
     try {
         const char * root_raw = std::getenv("TMPDIR");
         require_lock_test(root_raw && *root_raw, "TMPDIR must be an explicit disk directory");
-        const std::filesystem::path root = std::filesystem::path(root_raw) / "route-state-lock-test";
+        const auto run_id = std::chrono::steady_clock::now().time_since_epoch().count();
+        const std::filesystem::path root = std::filesystem::path(root_raw) /
+                ("route-state-lock-test-" + std::to_string(run_id));
         std::error_code ec;
         std::filesystem::remove_all(root, ec);
-        std::filesystem::create_directories(root);
+        require_lock_test(!ec && std::filesystem::create_directories(root, ec) && !ec,
+                "lock test directory creation failed");
 
         const std::string live_path = (root / "live.bin").string();
         std::ofstream(live_path).put('x');
@@ -176,12 +180,16 @@ int main() {
         }
         require_lock_test(lock_files <= 64, "per-snapshot lock identities were not striped");
 #else
-        std::cout << "PASS: Windows build gate; kernel lock process assertions are POSIX-only\n";
-        return 0;
+        const char * pass_message = "PASS: Windows build gate; kernel lock process assertions are POSIX-only\n";
 #endif
 
-        std::cout << "PASS: live-reader eviction block, dead-reader recovery, CLOEXEC exec recovery, "
+#ifndef _WIN32
+        const char * pass_message = "PASS: live-reader eviction block, dead-reader recovery, CLOEXEC exec recovery, "
                       "saturated protected candidates, and bounded striped lock identities\n";
+#endif
+        std::filesystem::remove_all(root, ec);
+        require_lock_test(!ec, "lock test directory cleanup failed");
+        std::cout << pass_message;
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "FAIL: " << error.what() << '\n';
