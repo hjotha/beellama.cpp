@@ -2609,8 +2609,8 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
     if (params.spec_draft_n_max_xlong < 0) {
         return "--spec-draft-n-max-xlong must be non-negative";
     }
-    if (params.spec_draft_n_max_xxlong != 0) {
-        return "--spec-draft-n-max-xxlong must be 0: MTP is disabled on the xxlong profile";
+    if (params.spec_draft_n_max_xxlong < 0) {
+        return "--spec-draft-n-max-xxlong must be non-negative";
     }
     if (!common_context_is_adaptive(params)) {
         if (params.mtp_max_tokens != 0) {
@@ -2662,9 +2662,6 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
         }
         if (short_limit > mtp_limit) {
             return "--mtp-short-max-tokens must not exceed --mtp-max-tokens";
-        }
-        if (params.spec_draft_n_max_short == 0) {
-            return "--spec-draft-n-max-short must be positive";
         }
     }
 

@@ -564,7 +564,7 @@ struct common_params {
     int32_t xxlong_max_tokens     =     0; // adaptive context xxlong threshold, 0 = ctx_size_xxlong
     int32_t batch_size_xxlong     =     0; // logical batch size for xxlong profile, 0 = inherit global
     int32_t ubatch_size_xxlong    =     0; // physical batch size for xxlong profile, 0 = inherit global
-    int32_t spec_draft_n_max_xxlong =    0; // draft N for xxlong profile (fixed at 0: MTP disabled)
+    int32_t spec_draft_n_max_xxlong =    0; // draft N for xxlong profile, 0 = target-only
     enum ggml_type cache_type_k_xxlong = GGML_TYPE_COUNT;
     enum ggml_type cache_type_v_xxlong = GGML_TYPE_COUNT;
     int32_t cache_kvarn_bits_k_xxlong = 0;

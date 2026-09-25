@@ -845,7 +845,7 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(),
                                     ista_parse_invalid, LLAMA_EXAMPLE_SERVER));
 
-        // XLONG may now carry resident MTP (73k tier); XXLONG remains target-only.
+        // Every adaptive profile may independently enable or disable resident MTP.
         common_params ista_xl_mtp = ista_profile;
         ista_xl_mtp.spec_draft_n_max_xlong = 2;
         assert(common_context_adaptive_error(ista_xl_mtp).empty());
@@ -877,8 +877,13 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
             "--spec-draft-n-max-xxl", "2",
             "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
         };
-        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(),
-                                            ista_parse_xxl_mtp, LLAMA_EXAMPLE_SERVER));
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(),
+                                           ista_parse_xxl_mtp, LLAMA_EXAMPLE_SERVER));
+        assert(ista_parse_xxl_mtp.spec_draft_n_max_xxlong == 2);
+        common_params ista_xxl_invalid = ista_profile;
+        ista_xxl_invalid.spec_draft_n_max_xxlong = -1;
+        assert(common_context_adaptive_error(ista_xxl_invalid) ==
+               "--spec-draft-n-max-xxlong must be non-negative");
 
         // Per-tier draft KV types: explicit overrides and global inheritance.
         common_params ista_draft_tiers = ista_profile;
@@ -993,14 +998,15 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(xlong_kvarn.cache_kvarn_bits_v_xlong == 4);
         assert(xlong_kvarn.kvarn_xlong.type != LLAMA_KVARN_TYPE_DISABLED);
 
-        common_params wide_mtp_rejected = tri_profile;
+        common_params wide_mtp = tri_profile;
         argv = {
             "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
             "--ctx-size-xl", "1200", "--ctx-size-xxl", "1400",
             "--spec-draft-n-max-xxl", "2",
             "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
         };
-        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), wide_mtp_rejected, LLAMA_EXAMPLE_SERVER));
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), wide_mtp, LLAMA_EXAMPLE_SERVER));
+        assert(wide_mtp.spec_draft_n_max_xxlong == 2);
     }
 
     {
@@ -1067,7 +1073,7 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         adaptive = make_adaptive();
         adaptive.ctx_size_mtp_short = 400;
         adaptive.spec_draft_n_max_short = 0;
-        expect_error(adaptive, "--spec-draft-n-max-short must be positive");
+        assert(common_context_adaptive_error(adaptive).empty());
         adaptive = make_adaptive();
         adaptive.n_ctx = 500;
         expect_error(adaptive, "--ctx-size-mtp must not exceed the long context size");
