@@ -25,6 +25,8 @@ static void require(bool cond, const char * msg) {
     }
 }
 
+static size_t g_test_cuda_pressure_free_mib = 0;
+
 static void test_type_table() {
     const int supported_bits[] = { 2, 3, 4, 5, 6, 8 };
 
@@ -2555,6 +2557,18 @@ static std::vector<float> test_native_flash_attention_output(
         ggml_backend_tensor_set(sinks, sink_data.data(), 0, ggml_nbytes(sinks));
     }
 
+    ggml_backend_buffer_t pressure = nullptr;
+    if (g_test_cuda_pressure_free_mib != 0) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total_bytes);
+        const size_t keep_bytes = (g_test_cuda_pressure_free_mib + 16) * 1024 * 1024;
+        require(free_bytes > keep_bytes, "native FA: insufficient VRAM for pressure test");
+        pressure = ggml_backend_alloc_buffer(backend, free_bytes - keep_bytes);
+        require(pressure != nullptr, "native FA: failed to reserve VRAM for pressure test");
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total_bytes);
+        std::fprintf(stderr, "test-kvarn: free VRAM before FA: %.2f MiB\n", free_bytes / 1048576.0);
+    }
+
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             native_view ? "native FA: native-view graph compute failed" : "native FA: reference graph compute failed");
     ggml_backend_synchronize(backend);
@@ -2567,6 +2581,10 @@ static std::vector<float> test_native_flash_attention_output(
         ggml_backend_tensor_get(body_meta, body_meta_output->data(), 0, ggml_nbytes(body_meta));
     }
     ggml_backend_synchronize(backend);
+
+    if (pressure != nullptr) {
+        ggml_backend_buffer_free(pressure);
+    }
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -5613,6 +5631,20 @@ static void test_meta_kvarn_zero_head_shard() {
 
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_VRAM_PRESSURE_ONLY") != nullptr) {
+        ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+        require(backend != nullptr, "VRAM pressure test requires a GPU backend");
+        g_test_cuda_pressure_free_mib = 64;
+        const auto output = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, 192, 24, 4, 21952, 3,
+                false, nullptr, false, 0, true);
+        require(std::all_of(output.begin(), output.end(), [](float value) { return std::isfinite(value); }),
+                "VRAM pressure test produced non-finite output");
+        ggml_backend_free(backend);
+        std::printf("test-kvarn: VRAM pressure attention OK\n");
+        return 0;
+    }
 
     if (std::getenv("GGML_KVARN_BENCH_RECORD_SEAL") != nullptr) {
         benchmark_record_sealer();

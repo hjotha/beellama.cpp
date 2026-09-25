@@ -347,32 +347,39 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
     const int nwarps = nthreads / warp_size_host;
+    const int gqa_ratio = Q->ne[2] / plan.n_kv_heads;
+    const int ntiles_x = (Q->ne[1] + ncols1 - 1) / ncols1;
+    const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
+    const int ntiles_dst = ntiles_x * ntiles_z_gqa * plan.n_kv_heads * Q->ne[3];
+    const int n_rows = (int) ((size_t) Q->ne[1] * Q->ne[2] * Q->ne[3]);
+    const size_t partial_fixup_f2 = (size_t) ntiles_dst * (2 * ncols + ncols * (DV / 2));
     int window_chunk = ggml_cuda_fattn_kvarn_window_chunk(plan.n_kv);
 
-    // The transient K/V scratch below is sized by window_chunk. When the KV
-    // pool leaves little free VRAM, a full-window dequant can OOM-abort the
-    // whole server (4070 ub64 repro at ctx 221184). Cap the chunk to the free
-    // memory, accounting for the pool alloc look-ahead and keeping a headroom
-    // on large cards so CUDA-graph recovery still has room.
+    // K/V scratch and the partial merge buffer must fit at the same time.
+    // Keep graph recovery headroom and a little space for pool descriptors.
     {
         size_t free_bytes = 0, total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
-            // k_f16 + v_f16 per token, plus the pool's 1.05x look-ahead.
+            const size_t partial_bytes = partial_fixup_f2 * sizeof(float2);
+            size_t safety_bytes = 2ull * 1024 * 1024;
+#ifdef USE_CUDA_GRAPH
+            safety_bytes += ctx.cuda_graph_memory_headroom_bytes();
+#endif
+            if (free_bytes > (1ull << 30)) {
+                safety_bytes = std::max<size_t>(safety_bytes, 130ull * 1024 * 1024);
+            }
+            const size_t reserve_bytes = partial_bytes + safety_bytes;
             const size_t scratch_per_token =
                 (size_t) 2 * plan.n_kv_heads * plan.n_stream * std::max(DKQ, DV) * sizeof(half);
             const size_t alloc_per_token = scratch_per_token * 105 / 100 + 64;
-            size_t max_chunk = alloc_per_token > 0 ? free_bytes / alloc_per_token : 0;
-            if (max_chunk > 0 && free_bytes > (1ull << 30)) {
-                // preserve ~128 MiB for graph recovery on cards with room to spare
-                const size_t with_headroom =
-                    (free_bytes - (size_t) 128 * 1024 * 1024) / alloc_per_token;
-                max_chunk = std::min(max_chunk, with_headroom);
+            const size_t max_chunk = free_bytes > reserve_bytes && alloc_per_token > 0 ?
+                (free_bytes - reserve_bytes) / alloc_per_token : 0;
+            if (max_chunk < 256) {
+                return false;
             }
-            if (max_chunk > 0 && max_chunk < (size_t) window_chunk) {
-                // The chunked-merge dequant path requires the window to stay a
-                // multiple of the kernel tile (256). Snap down so the partial
-                // merge stays aligned, with a hard floor of one tile.
-                const size_t aligned = std::max<size_t>((max_chunk / 256) * 256, 256);
+            if (max_chunk < (size_t) window_chunk) {
+                // The chunked-merge path requires a multiple of the 256-token tile.
+                const size_t aligned = (max_chunk / 256) * 256;
                 GGML_LOG_DEBUG("%s: capping KVARN window chunk %d -> %zu (free %.0f MiB, scratch %zu B/token)\n",
                         __func__, window_chunk, aligned, free_bytes / 1024.0 / 1024.0, scratch_per_token);
                 window_chunk = (int) aligned;
@@ -403,13 +410,6 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const int chunk_cap = window_chunk;
     ggml_cuda_pool_alloc<half> k_f16(pool, (size_t) chunk_cap * plan.n_kv_heads * plan.n_stream * DKQ);
     ggml_cuda_pool_alloc<half> v_f16(pool, (size_t) chunk_cap * plan.n_kv_heads * plan.n_stream * DV);
-
-    const int gqa_ratio = Q->ne[2] / plan.n_kv_heads;
-    const int ntiles_x = (Q->ne[1] + ncols1 - 1) / ncols1;
-    const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
-    const int ntiles_dst = ntiles_x * ntiles_z_gqa * plan.n_kv_heads * Q->ne[3];
-    const int n_rows = (int) ((size_t) Q->ne[1] * Q->ne[2] * Q->ne[3]);
-    const size_t partial_fixup_f2 = (size_t) ntiles_dst * (2 * ncols + ncols * (DV / 2));
 
     float scale = 1.0f;
     float max_bias = 0.0f;
