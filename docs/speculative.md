@@ -74,6 +74,29 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+For plain DFlash2 on a local second GPU, `--spec-draft-local-split` keeps the
+transformer and its KV cache on the draft device. The target's output head and
+DFlash2 selector stay with the target. Target features, anchor/MASK embeddings,
+and draft hidden rows cross devices; no RPC server is involved. The mode
+currently requires `--parallel 1`. `--spec-draft-local-prefetch` may prepare
+the next block after the target features are available. It backs off when the
+target rarely accepts exactly one draft token.
+
+```bash
+llama-server -m target.gguf --device CUDA0 \
+    --spec-type draft-dflash -md dflash2.gguf \
+    --spec-draft-device Vulkan0 --spec-draft-ngl all \
+    --spec-draft-local-split --spec-draft-local-prefetch \
+    --spec-draft-n-max 6 --parallel 1
+```
+
+On the GOKAYA RTX 4070 eGPU and Radeon 780M, a Qwen3.8-27B DFlash2 Q4_K_M
+canary at APU 20 W used `--gpu-power-backend amdgpu --apu-tdp 20`. With the
+same 4K context and two short prompts, `n_max=6` reached 64.88 tok/s on
+repetition and 59.55 tok/s on code, compared with 41.82 and 39.64 tok/s at
+`n_max=2`. These numbers describe those prompts; tune draft depth with the
+actual workload and compare end-to-end decode speed and acceptance.
+
 See:
 
 - #22105

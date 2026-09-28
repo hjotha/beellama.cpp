@@ -5666,6 +5666,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-draft-local-split"},
+        {"--no-spec-draft-local-split"},
+        "run plain DFlash2 with explicit host feature exchange instead of sharing target tensors across devices (default: disabled)",
+        [](common_params & params, bool value) {
+            params.speculative.draft.local_split = value;
+            if (!value) {
+                params.speculative.draft.local_prefetch = false;
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_LOCAL_SPLIT"));
+    add_opt(common_arg(
+        {"--spec-draft-local-prefetch"},
+        {"--no-spec-draft-local-prefetch"},
+        "prepare the next explicit DFlash2 block after target features are available; backs off when one-token acceptance is rare (default: disabled)",
+        [](common_params & params, bool value) {
+            params.speculative.draft.local_prefetch = value;
+            if (value) {
+                params.speculative.draft.local_split = true;
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_LOCAL_PREFETCH"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",

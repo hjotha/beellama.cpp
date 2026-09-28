@@ -37,6 +37,7 @@ int64_t common_spec_prof_sync_us = 0;
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <map>
 #include <limits>
@@ -1712,6 +1713,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
 
+    bool local_split = false;
+    bool local_prefetch = false;
+
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
 
@@ -1723,6 +1727,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_dec = 0;  // draft context row width (n_embd_out: per-layer for DFly)
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
+    int32_t n_embd_dft = 0;  // explicit split input/hidden row width
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
@@ -1758,6 +1763,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool remote_draft_pending = false;
     bool remote_trimmed = false;
     bool remote_fused_sync = false;
+    bool remote_fused_draft = false;
+    std::vector<uint8_t> remote_sync_payload;
+    uint32_t remote_sync_tokens = 0;
+    bool remote_sync_has_trim = false;
+    int32_t remote_sync_last_pos = -1;
     uint64_t remote_trim_us = 0;
     int32_t remote_draft_pos0 = -1;
     int32_t remote_n_proposed = 0;
@@ -1770,6 +1780,519 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::chrono::steady_clock::time_point remote_proposal_done;
     std::chrono::steady_clock::time_point remote_draft_start;
     std::chrono::steady_clock::time_point remote_draft_done;
+
+    // DFlash2 Xbox speculative pipeline.  The request runs on the same
+    // persistent RPC connection, but on a worker so the target can verify the
+    // current block while the Xbox prepares the next one.  Target-side SYNC
+    // rows are held until accept() decides whether the bonus-token hypothesis won.
+    struct remote_pipeline_sync {
+        dflash_remote::op operation = dflash_remote::sync;
+        uint32_t n_tokens = 0;
+        std::vector<uint8_t> payload;
+        int32_t last_pos = -1;
+    };
+    struct remote_pipeline_result {
+        dflash_remote::timing timing{};
+        std::vector<uint8_t> output;
+        std::chrono::steady_clock::time_point done;
+    };
+
+    std::future<remote_pipeline_result> remote_pipeline_future;
+    std::vector<remote_pipeline_sync> remote_pipeline_syncs;
+    std::vector<float> remote_pipeline_seed_features;
+    std::vector<uint8_t> remote_pipeline_output;
+    dflash_remote::timing remote_pipeline_timing{};
+    std::chrono::steady_clock::time_point remote_pipeline_start;
+    std::chrono::steady_clock::time_point remote_pipeline_done;
+    int32_t remote_pipeline_pos0 = -1;
+    int32_t remote_pipeline_id_last = -1;
+    int32_t remote_pipeline_n_max = 0;
+    int32_t remote_draft_n_max = 0;
+    llama_token remote_next_hypothesis = -1;
+    float remote_next_hypothesis_confidence = 0.0f;
+    bool remote_pipeline_enabled = false;
+    bool remote_pipeline_inflight = false;
+    bool remote_pipeline_ready = false;
+    bool remote_pipeline_state_synced = false;
+    bool remote_pipeline_used = false;
+    bool remote_pipeline_discarded = false;
+    uint32_t remote_pipeline_attempts = 0;
+    uint32_t remote_pipeline_hits = 0;
+    uint32_t remote_pipeline_match_mask = 0;
+    int32_t remote_pipeline_actual_pos = -1;
+    llama_token remote_pipeline_actual_id = -1;
+    uint64_t remote_pipeline_wait_us = 0;
+
+    // Explicit local DFlash2 split.  The draft transformer owns the context on
+    // the selected draft device; the target-side selector consumes only the
+    // normalized hidden rows returned by that context.  This is the in-process
+    // equivalent of the compact RPC payload, without a socket or a shared target
+    // embedding/output tensor.
+    struct local_pipeline_sync {
+        std::vector<float> features;
+        std::vector<llama_pos> positions;
+    };
+    struct local_pipeline_result {
+        std::vector<float> hidden;
+    };
+
+    std::future<local_pipeline_result> local_pipeline_future;
+    std::vector<local_pipeline_sync> local_pipeline_syncs;
+    std::vector<float> local_pipeline_output;
+    std::chrono::steady_clock::time_point local_pipeline_start;
+    int32_t local_pipeline_pos0 = -1;
+    int32_t local_pipeline_id_last = -1;
+    int32_t local_pipeline_n_max = 0;
+    bool local_pipeline_inflight = false;
+    bool local_pipeline_ready = false;
+    bool local_pipeline_used = false;
+    bool local_pipeline_discarded = false;
+    bool local_draft_pending = false;
+    int32_t local_draft_pos0 = -1;
+    int32_t local_n_proposed = 0;
+    llama_token local_next_hypothesis = -1;
+    float local_one_accept_rate = 0.5f;
+    uint32_t local_pipeline_attempts = 0;
+    uint32_t local_pipeline_hits = 0;
+    uint32_t local_pipeline_discards = 0;
+
+    bool remote_pipeline_active() const {
+        return remote_pipeline_inflight || remote_pipeline_ready;
+    }
+
+    bool local_pipeline_active() const {
+        return local_pipeline_inflight || local_pipeline_ready;
+    }
+
+    bool trim_local_context(llama_pos requested_p0) {
+        auto * mem = llama_get_memory(params.ctx_dft);
+        const bool exact = llama_memory_seq_rm(mem, 0, requested_p0, -1);
+        if (exact) {
+            const llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
+            if (pos_max < requested_p0) {
+                return true;
+            }
+        }
+
+        llama_pos planned_p0 = requested_p0;
+        llama_pos planned_p1 = -1;
+        const bool planned = llama_memory_seq_rm_plan(mem, 0, requested_p0, -1, &planned_p0, &planned_p1);
+        if (planned &&
+                planned_p0 >= 0 && planned_p1 < 0 && planned_p0 < requested_p0) {
+            if (llama_memory_seq_rm(mem, 0, planned_p0, planned_p1) &&
+                    llama_memory_seq_pos_max(mem, 0) < requested_p0) {
+                return true;
+            }
+        }
+
+        LOG_WRN("DFlash2 local trim could not remove suffix: requested=%d exact=%s planned=%s planned_p0=%d planned_p1=%d pos_max=%d\n",
+                (int) requested_p0, exact ? "true" : "false", planned ? "true" : "false",
+                (int) planned_p0, (int) planned_p1, (int) llama_memory_seq_pos_max(mem, 0));
+
+        return false;
+    }
+
+    bool wait_local_pipeline() {
+        if (!local_pipeline_future.valid()) {
+            local_pipeline_inflight = false;
+            return true;
+        }
+
+        try {
+            local_pipeline_result result = local_pipeline_future.get();
+            local_pipeline_output = std::move(result.hidden);
+        } catch (const std::exception & error) {
+            LOG_ERR("DFlash2 local pre-draft failed: %s\n", error.what());
+            local_pipeline_inflight = false;
+            local_pipeline_ready = false;
+            local_pipeline_output.clear();
+            return false;
+        }
+
+        local_pipeline_inflight = false;
+        return true;
+    }
+
+    bool apply_local_pipeline_syncs() {
+        auto * ctx_dft = params.ctx_dft;
+        try {
+            for (const auto & request : local_pipeline_syncs) {
+                if (request.positions.empty()) {
+                    continue;
+                }
+
+                llama_batch sync = llama_batch_init((int32_t) request.positions.size(), n_embd_enc, 1);
+                if (!sync.embd) {
+                    llama_batch_free(sync);
+                    throw std::runtime_error("DFlash2 local SYNC batch has no embedding buffer");
+                }
+                sync.n_tokens = (int32_t) request.positions.size();
+                std::memcpy(sync.embd, request.features.data(), request.features.size() * sizeof(float));
+                for (int32_t i = 0; i < sync.n_tokens; ++i) {
+                    sync.pos[i] = request.positions[(size_t) i];
+                    sync.n_seq_id[i] = 1;
+                    sync.seq_id[i][0] = 0;
+                    sync.logits[i] = true;
+                }
+
+                const int rc = llama_decode(ctx_dft, sync);
+                llama_batch_free(sync);
+                if (rc != 0) {
+                    throw std::runtime_error("DFlash2 local SYNC decode failed");
+                }
+            }
+            local_pipeline_syncs.clear();
+            return true;
+        } catch (const std::exception & error) {
+            LOG_ERR("DFlash2 local deferred SYNC failed: %s\n", error.what());
+            local_pipeline_syncs.clear();
+            return false;
+        }
+    }
+
+    bool discard_local_pipeline() {
+        if (!local_pipeline_active()) {
+            local_pipeline_syncs.clear();
+            return true;
+        }
+        if (!wait_local_pipeline()) {
+            local_pipeline_syncs.clear();
+            return false;
+        }
+
+        // Deferred verification rows may start before the speculative seed.
+        // Replay from the earliest row to avoid decoding duplicate positions.
+        llama_pos replay_pos = local_pipeline_pos0 - 1;
+        for (const auto & request : local_pipeline_syncs) {
+            if (!request.positions.empty()) {
+                replay_pos = std::min(replay_pos, request.positions.front());
+            }
+        }
+        if (!trim_local_context(replay_pos)) {
+            local_pipeline_syncs.clear();
+            return false;
+        }
+        const bool ok = apply_local_pipeline_syncs();
+        local_pipeline_output.clear();
+        local_pipeline_ready = false;
+        local_pipeline_discarded = true;
+        ++local_pipeline_discards;
+        return ok;
+    }
+
+    bool promote_local_pipeline() {
+        if (!local_pipeline_active() || !wait_local_pipeline()) {
+            return false;
+        }
+        if (local_pipeline_output.empty()) {
+            return false;
+        }
+
+        local_pipeline_syncs.clear();
+        local_pipeline_ready = true;
+        local_pipeline_used = false;
+        return true;
+    }
+
+    bool launch_local_pipeline(llama_pos pos0, llama_token hypothesis,
+                               const float * seed_features) {
+        if (!local_split || !local_prefetch || local_pipeline_active() ||
+                local_draft_pos0 < 0 || hypothesis < 0 || seed_features == nullptr) {
+            return false;
+        }
+
+        const int32_t n_rows = local_pipeline_n_max + 1;
+        if (n_rows < 2 || n_rows > block_size || n_embd_dft <= 0) {
+            return false;
+        }
+
+        std::vector<float> seed(seed_features, seed_features + n_embd_enc);
+        std::vector<float> mask = mask_embedding;
+        auto * ctx_dft = params.ctx_dft;
+        const auto * model_tgt = llama_get_model(params.ctx_tgt);
+        const llama_token mask_token = mask_token_id;
+        const int32_t embd_width = n_embd_dft;
+        const int32_t enc_width = n_embd_enc;
+
+        local_pipeline_pos0 = pos0;
+        local_pipeline_id_last = hypothesis;
+        local_pipeline_start = std::chrono::steady_clock::now();
+        try {
+            local_pipeline_future = std::async(std::launch::async,
+                    [this, ctx_dft, model_tgt, pos0, hypothesis, mask_token, n_rows,
+                     embd_width, enc_width, seed = std::move(seed), mask = std::move(mask)]() mutable {
+                        local_pipeline_result result;
+                        llama_batch inject{};
+                        llama_batch draft{};
+                        try {
+                            const llama_pos seed_pos = pos0 - 1;
+                            if (seed_pos < 0 || !this->trim_local_context(seed_pos)) {
+                                throw std::runtime_error("DFlash2 local pre-draft trim failed");
+                            }
+
+                            inject = llama_batch_init(1, enc_width, 1);
+                            if (!inject.embd) {
+                                throw std::runtime_error("DFlash2 local pre-draft feature buffer unavailable");
+                            }
+                            inject.n_tokens = 1;
+                            std::memcpy(inject.embd, seed.data(), seed.size() * sizeof(float));
+                            inject.pos[0] = seed_pos;
+                            inject.n_seq_id[0] = 1;
+                            inject.seq_id[0][0] = 0;
+                            inject.logits[0] = true;
+                            if (llama_decode(ctx_dft, inject) != 0) {
+                                throw std::runtime_error("DFlash2 local pre-draft feature decode failed");
+                            }
+
+                            draft = llama_batch_init(n_rows, embd_width, 1);
+                            if (!draft.embd) {
+                                throw std::runtime_error("DFlash2 local pre-draft embedding buffer unavailable");
+                            }
+                            draft.token = (llama_token *) std::malloc((size_t) n_rows * sizeof(llama_token));
+                            if (!draft.token) {
+                                throw std::bad_alloc();
+                            }
+                            draft.n_tokens = n_rows;
+                            std::vector<float> anchor((size_t) embd_width);
+                            if (!llama_model_get_token_embedding_row(model_tgt, hypothesis,
+                                    anchor.data(), (size_t) embd_width)) {
+                                throw std::runtime_error("DFlash2 local pre-draft anchor embedding lookup failed");
+                            }
+                            for (int32_t i = 0; i < n_rows; ++i) {
+                                draft.token[i] = i == 0 ? hypothesis : mask_token;
+                                draft.pos[i] = pos0 + i;
+                                draft.n_seq_id[i] = 1;
+                                draft.seq_id[i][0] = 0;
+                                draft.logits[i] = true;
+                                const float * row = i == 0 ? anchor.data() : mask.data();
+                                std::memcpy(draft.embd + (size_t) i * embd_width,
+                                        row, (size_t) embd_width * sizeof(float));
+                            }
+                            if (llama_decode(ctx_dft, draft) != 0) {
+                                throw std::runtime_error("DFlash2 local pre-draft block decode failed");
+                            }
+
+                            float * hidden = llama_get_embeddings(ctx_dft);
+                            if (!hidden) {
+                                throw std::runtime_error("DFlash2 local pre-draft hidden output unavailable");
+                            }
+                            result.hidden.assign(hidden, hidden + (size_t) n_rows * embd_width);
+                            llama_batch_free(draft);
+                            llama_batch_free(inject);
+                            return result;
+                        } catch (...) {
+                            llama_batch_free(draft);
+                            llama_batch_free(inject);
+                            throw;
+                        }
+                    });
+            local_pipeline_inflight = true;
+            ++local_pipeline_attempts;
+            return true;
+        } catch (const std::exception & error) {
+            LOG_WRN("DFlash2 local pre-draft launch failed: %s; continuing synchronously\n", error.what());
+            local_pipeline_inflight = false;
+            return false;
+        }
+    }
+
+    bool wait_remote_pipeline() {
+        if (!remote_pipeline_future.valid()) {
+            remote_pipeline_inflight = false;
+            return !remote_failed;
+        }
+
+        const auto wait_start = std::chrono::steady_clock::now();
+        try {
+            remote_pipeline_result result = remote_pipeline_future.get();
+            remote_pipeline_timing = result.timing;
+            remote_pipeline_output = std::move(result.output);
+            remote_pipeline_done = result.done;
+        } catch (const std::exception & err) {
+            LOG_ERR("DFlash2 Xbox pre-draft failed: %s; disabling remote pipeline\n", err.what());
+            remote_pipeline_inflight = false;
+            remote_pipeline_ready = false;
+            remote_pipeline_output.clear();
+            remote_failed = true;
+            remote_pipeline_wait_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+            return false;
+        }
+
+        remote_pipeline_inflight = false;
+        remote_pipeline_wait_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start).count();
+        return true;
+    }
+
+    void queue_remote_pipeline_sync(dflash_remote::op operation, uint32_t n_tokens,
+                                    std::vector<uint8_t> payload, int32_t last_pos) {
+        remote_pipeline_syncs.push_back({operation, n_tokens, std::move(payload), last_pos});
+    }
+
+    bool apply_remote_pipeline_syncs() {
+        try {
+            for (auto & request : remote_pipeline_syncs) {
+                if (profile_mode != remote_profile_mode::mock_local) {
+                    const auto timing = remote->call(request.operation, ++rpc_request_id,
+                            request.n_tokens, request.payload.data(),
+                            (uint32_t) request.payload.size(), rpc_bytes, 0);
+                    rpc_sync_us += timing.roundtrip_us;
+                    rpc_sync_send_us += timing.send_us;
+                    rpc_sync_wait_us += timing.header_wait_us + timing.payload_read_us;
+                    rpc_sync_xbox_prepare_us += timing.server.xbox_prepare_us;
+                    rpc_sync_xbox_compute_us += timing.server.xbox_compute_us;
+                }
+                remote_last_sync_pos = request.last_pos;
+            }
+            remote_pipeline_syncs.clear();
+            return true;
+        } catch (const std::exception & err) {
+            LOG_ERR("DFlash2 Xbox deferred SYNC failed: %s; remote drafting disabled for this run\n", err.what());
+            remote_failed = true;
+            remote_pipeline_syncs.clear();
+            return false;
+        }
+    }
+
+    bool discard_remote_pipeline() {
+        if (!remote_pipeline_active()) {
+            remote_pipeline_syncs.clear();
+            return true;
+        }
+        if (!wait_remote_pipeline()) {
+            return false;
+        }
+
+        try {
+            if (remote_pipeline_state_synced) {
+                // The real target features were committed at accept().  A
+                // later anchor mismatch only invalidates the saved output.
+            } else if (remote_pipeline_syncs.empty()) {
+                if (profile_mode != remote_profile_mode::mock_local) {
+                    const dflash_remote::trim_data request{remote_draft_pos0};
+                    remote->call(dflash_remote::trim, ++rpc_request_id, 0,
+                            &request, sizeof(request), rpc_bytes, 0);
+                }
+                remote_last_sync_pos = remote_draft_pos0 - 1;
+            } else if (!apply_remote_pipeline_syncs()) {
+                return false;
+            }
+        } catch (const std::exception & err) {
+            LOG_ERR("DFlash2 Xbox pre-draft rollback failed: %s; remote drafting disabled for this run\n", err.what());
+            remote_failed = true;
+            return false;
+        }
+
+        remote_pipeline_output.clear();
+        remote_pipeline_ready = false;
+        remote_pipeline_state_synced = false;
+        remote_pipeline_discarded = true;
+        if (remote_pipeline_attempts >= 2 && remote_pipeline_hits * 4 < remote_pipeline_attempts) {
+            remote_pipeline_enabled = false;
+            LOG_INF("DFlash2 Xbox pre-draft disabled after %u attempts and %u reused drafts\n",
+                    remote_pipeline_attempts, remote_pipeline_hits);
+        }
+        return !remote_failed;
+    }
+
+    bool promote_remote_pipeline() {
+        if (!remote_pipeline_active() || !wait_remote_pipeline()) {
+            return false;
+        }
+        if (remote_pipeline_output.empty()) {
+            remote_failed = true;
+            return false;
+        }
+
+        // The speculative output can be verified as a proposal, but its KV was
+        // built with approximate features.  Commit the real target features
+        // before the next cycle; only the proposal bytes may be reused.
+        if (remote_pipeline_syncs.empty()) {
+            discard_remote_pipeline();
+            return false;
+        }
+        if (!apply_remote_pipeline_syncs()) {
+            return false;
+        }
+        remote_draft_pending = false;
+        remote_trimmed = true;
+        remote_pipeline_state_synced = true;
+        remote_pipeline_ready = true;
+        return true;
+    }
+
+    bool launch_remote_pipeline(llama_token hypothesis) {
+        if (!remote || !remote_pipeline_enabled || remote_failed ||
+                remote_pipeline_active() || remote_n_proposed <= 0 ||
+                remote_draft_n_max < 1 || remote_draft_pos0 < 0) {
+            return false;
+        }
+
+        // A one-token acceptance also commits the target's bonus token.  The
+        // next draft therefore starts two positions after this round's
+        // anchor: accepted Top-1 plus the sampled target token.
+        const int32_t pos0 = remote_draft_pos0 + 2;
+        if (pos0 <= remote_draft_pos0 || hypothesis < 0) {
+            return false;
+        }
+
+        const auto * model_tgt = llama_get_model(params.ctx_tgt);
+        std::vector<float> embeddings((size_t) (remote_draft_n_max + 1) * n_embd_dec);
+        if (!llama_model_get_token_embedding_row(model_tgt, hypothesis,
+                embeddings.data(), (size_t) n_embd_dec)) {
+            LOG_WRN("DFlash2 Xbox pre-draft disabled: next-token hypothesis embedding lookup failed\n");
+            return false;
+        }
+        for (int32_t i = 1; i <= remote_draft_n_max; ++i) {
+            std::memcpy(embeddings.data() + (size_t) i * n_embd_dec,
+                    mask_embedding.data(), (size_t) n_embd_dec * sizeof(float));
+        }
+
+        if (remote_pipeline_seed_features.size() != (size_t) n_embd_enc) {
+            return false;
+        }
+
+        const size_t sync_row_bytes = sizeof(int32_t) + (size_t) n_embd_enc * sizeof(float);
+        const dflash_remote::sync_trim_data trim{pos0, 0};
+        const dflash_remote::draft_data draft{pos0, hypothesis, remote_draft_n_max};
+        std::vector<uint8_t> payload(sizeof(trim) + sync_row_bytes + sizeof(draft) +
+                embeddings.size() * sizeof(float));
+        std::memcpy(payload.data(), &trim, sizeof(trim));
+        std::memcpy(payload.data() + sizeof(trim), &pos0, sizeof(pos0));
+        std::memcpy(payload.data() + sizeof(trim) + sizeof(pos0), remote_pipeline_seed_features.data(),
+                (size_t) n_embd_enc * sizeof(float));
+        std::memcpy(payload.data() + sizeof(trim) + sync_row_bytes, &draft, sizeof(draft));
+        std::memcpy(payload.data() + sizeof(trim) + sync_row_bytes + sizeof(draft), embeddings.data(),
+                embeddings.size() * sizeof(float));
+
+        const uint32_t expected_bytes = (uint32_t) (embeddings.size() * sizeof(float));
+        const uint64_t cycle_id = ++rpc_request_id;
+        dflash_remote::client * client = remote.get();
+        remote_pipeline_pos0 = pos0;
+        remote_pipeline_id_last = hypothesis;
+        remote_pipeline_n_max = remote_draft_n_max;
+        remote_pipeline_state_synced = false;
+        remote_pipeline_start = std::chrono::steady_clock::now();
+        try {
+            remote_pipeline_future = std::async(std::launch::async,
+                    [client, cycle_id, payload = std::move(payload), expected_bytes]() mutable {
+                        remote_pipeline_result result;
+                        result.timing = client->call(dflash_remote::sync_and_draft, cycle_id, 1,
+                                payload.data(), (uint32_t) payload.size(), result.output,
+                                expected_bytes);
+                        result.done = std::chrono::steady_clock::now();
+                        return result;
+                    });
+            remote_pipeline_inflight = true;
+            ++remote_pipeline_attempts;
+            return true;
+        } catch (const std::exception & err) {
+            LOG_WRN("DFlash2 Xbox pre-draft launch failed: %s; continuing synchronously\n", err.what());
+            remote_pipeline_inflight = false;
+            return false;
+        }
+    }
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     bool is_dspark;
@@ -1788,6 +2311,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         : common_speculative_impl(type, n_seq, params.draft.n_max)
         , params(params.draft)
     {
+        local_split    = this->params.local_split;
+        local_prefetch = this->params.local_prefetch;
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "DFlash requires ctx_tgt and ctx_dft to be set");
@@ -1814,6 +2340,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd_out(model_dft);
+        n_embd_dft    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
         // read the trained block size from the dflash.block_size metadata key
@@ -1863,7 +2390,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
+        if (local_split && (!is_dflash2 || is_dspark || n_seq != 1 || n_embd_dft != n_embd_tgt ||
+                n_embd_dec != n_embd_tgt || block_size < 2 || block_size > 64)) {
+            throw std::invalid_argument(
+                    "DFlash2 local split requires one plain DFlash2 sequence with matching target/draft widths");
+        }
+        if (local_prefetch && !local_split) {
+            throw std::invalid_argument("DFlash2 local prefetch requires local split mode");
+        }
+
+        batch        = llama_batch_init(llama_n_batch(ctx_dft), local_split ? n_embd_dft : 0, n_seq);
+        if (local_split) {
+            batch.token = (llama_token *) std::malloc((size_t) llama_n_batch(ctx_dft) * sizeof(llama_token));
+            if (!batch.token) {
+                llama_batch_free(batch);
+                batch = {};
+                throw std::bad_alloc();
+            }
+        }
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
         // embd batches on an M-RoPE draft need 4 position rows per token
@@ -1923,6 +2467,42 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
 
         const char * remote_endpoint = std::getenv("DFLASH_XBOX_RPC");
+        if (local_split && remote_endpoint && *remote_endpoint) {
+            throw std::invalid_argument("DFlash2 local split cannot be combined with DFLASH_XBOX_RPC");
+        }
+
+        if (local_split) {
+            auto selector_params = llama_context_default_params();
+            selector_params.n_ctx = block_size;
+            selector_params.n_batch = block_size;
+            selector_params.n_ubatch = block_size;
+            selector_params.n_seq_max = 1;
+            selector_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+            selector_params.ctx_other = ctx_tgt;
+            selector_params.dflash_selector_only = true;
+            selector_owned.reset(llama_init_from_model(const_cast<llama_model *>(model_dft), selector_params));
+            if (!selector_owned) {
+                throw std::runtime_error("failed to initialize local DFlash2 selector-only context");
+            }
+            selector_ctx = selector_owned.get();
+
+            mask_embedding.resize(n_embd_dft);
+            if (!llama_model_get_token_embedding_row(model_tgt, mask_token_id,
+                    mask_embedding.data(), mask_embedding.size())) {
+                throw std::runtime_error("target MASK embedding is unavailable for local DFlash2 split");
+            }
+            selector_batch = llama_batch_init(block_size, n_embd_dft, 1);
+            selector_batch.token = (llama_token *) std::malloc((size_t) block_size * sizeof(llama_token));
+            if (!selector_batch.token) {
+                llama_batch_free(selector_batch);
+                selector_batch = {};
+                throw std::bad_alloc();
+            }
+            local_pipeline_n_max = this->params.n_max;
+            LOG_INF("%s: DFlash2 explicit local split enabled%s\n", __func__,
+                    local_prefetch ? " with local prefetch" : "");
+        }
+
         if (remote_endpoint && *remote_endpoint) {
             const char * mode = std::getenv("DFLASH_XBOX_MOCK_MODE");
             if (mode && std::strcmp(mode, "xbox") == 0) profile_mode = remote_profile_mode::mock_xbox;
@@ -1975,6 +2555,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
             LOG_INF("DFlash2 Xbox fused TRIM/SYNC: %s\n", remote_fused_sync ? "enabled" : "legacy");
+            const char * separate = std::getenv("DFLASH_XBOX_SEPARATE_DRAFT");
+            if (remote_fused_sync && (!separate || std::strcmp(separate, "1") != 0)) {
+                try {
+                    remote->call(dflash_remote::sync_and_draft, ++rpc_request_id, 0,
+                            nullptr, 0, rpc_bytes, 0);
+                    remote_fused_draft = true;
+                } catch (const dflash_remote::server_error & err) {
+                    if (err.status != -1) throw;
+                }
+            }
+            LOG_INF("DFlash2 Xbox fused SYNC/DRAFT: %s\n", remote_fused_draft ? "enabled" : "legacy");
+            const char * pipeline = std::getenv("DFLASH_XBOX_PIPELINE");
+            remote_pipeline_enabled = remote_fused_draft && profile_mode != remote_profile_mode::mock_local &&
+                    pipeline && std::strcmp(pipeline, "1") == 0;
+            LOG_INF("DFlash2 Xbox async pre-draft pipeline: %s\n",
+                    remote_pipeline_enabled ? "enabled" : "disabled");
 
             auto selector_params = llama_context_default_params();
             selector_params.n_ctx = block_size;
@@ -2025,6 +2621,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        if (local_pipeline_inflight) {
+            wait_local_pipeline();
+        }
+        if (local_split && local_prefetch) {
+            LOG_INF("DFlash2 local prefetch: attempts=%u hits=%u discards=%u\n",
+                    local_pipeline_attempts, local_pipeline_hits, local_pipeline_discards);
+        }
+        // The worker holds the persistent RPC client.  Join it before any
+        // context or client-owned buffers are destroyed.
+        if (remote_pipeline_inflight) {
+            wait_remote_pipeline();
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -2047,6 +2655,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (local_split) {
+            if (local_pipeline_active()) {
+                discard_local_pipeline();
+            }
+            local_pipeline_syncs.clear();
+            local_draft_pending = false;
+            local_draft_pos0 = -1;
+            local_n_proposed = 0;
+            local_next_hypothesis = -1;
+            local_one_accept_rate = 0.5f;
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -2164,13 +2784,83 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     batch_inject.n_seq_id[i]  = 1;
                     batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
+                    batch_inject.logits[i]    = local_split;
+                }
+                if (local_split) {
+                    bool pipeline_active = local_pipeline_active();
+                    if (local_prefetch && local_draft_pending && local_next_hypothesis >= 0 &&
+                            local_one_accept_rate >= 0.4f && !pipeline_active) {
+                        const llama_pos next_pos = local_draft_pos0 + 2;
+                        const llama_pos seed_pos = next_pos - 1;
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            if (batch_inject.pos[i] == seed_pos) {
+                                pipeline_active = launch_local_pipeline(next_pos, local_next_hypothesis,
+                                        batch_inject.embd + (size_t) i * n_embd_enc);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (pipeline_active) {
+                        local_pipeline_sync request;
+                        request.features.resize((size_t) n_chunk * n_embd_enc);
+                        request.positions.resize((size_t) n_chunk);
+                        std::memcpy(request.features.data(), batch_inject.embd,
+                                request.features.size() * sizeof(float));
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            request.positions[(size_t) i] = batch_inject.pos[i];
+                        }
+                        local_pipeline_syncs.push_back(std::move(request));
+                        continue;
+                    }
+
+                    const llama_pos first_pos = batch_inject.pos[0];
+                    if (llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) >= first_pos &&
+                            !trim_local_context(first_pos)) {
+                        LOG_ERR("DFlash2 local split cannot replace draft KV from position %d\n", (int) first_pos);
+                        return false;
+                    }
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    continue;
+                }
+                if (remote && remote_pipeline_enabled) {
+                    remote_pipeline_seed_features.resize((size_t) n_embd_enc);
+                    std::memcpy(remote_pipeline_seed_features.data(),
+                            batch_inject.embd + (size_t) (n_chunk - 1) * n_embd_enc,
+                            (size_t) n_embd_enc * sizeof(float));
                 }
                 if (remote) {
                     try {
+                        const bool pipeline_active = remote_pipeline_active();
                         const auto capture_done = std::chrono::steady_clock::now();
                         rpc_capture_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                 capture_done - capture_start).count();
+                        // Keep only the last SYNC chunk for the next DRAFT. Flush
+                        // older chunks before applying any later rewind/trim.
+                        if (remote_sync_tokens) {
+                            if (pipeline_active) {
+                                queue_remote_pipeline_sync(
+                                        remote_sync_has_trim ? dflash_remote::sync_trim : dflash_remote::sync,
+                                        remote_sync_tokens, std::move(remote_sync_payload), remote_sync_last_pos);
+                            } else if (profile_mode != remote_profile_mode::mock_local) {
+                                const auto timing = remote->call(remote_sync_has_trim ? dflash_remote::sync_trim : dflash_remote::sync,
+                                        ++rpc_request_id, remote_sync_tokens, remote_sync_payload.data(),
+                                        (uint32_t) remote_sync_payload.size(), rpc_bytes, 0);
+                                rpc_sync_us += timing.roundtrip_us;
+                                rpc_sync_send_us += timing.send_us;
+                                rpc_sync_wait_us += timing.header_wait_us + timing.payload_read_us;
+                                rpc_sync_xbox_prepare_us += timing.server.xbox_prepare_us;
+                                rpc_sync_xbox_compute_us += timing.server.xbox_compute_us;
+                            }
+                            remote_sync_tokens = 0;
+                            remote_sync_payload.clear();
+                            remote_sync_last_pos = -1;
+                        }
                         const int32_t first_pos = batch_inject.pos[0];
                         const bool rewind = first_pos <= remote_last_sync_pos;
                         const bool trim_pending = remote_draft_pending && !remote_trimmed;
@@ -2205,7 +2895,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         rpc_sync_serialize_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - sync_serialize_start).count();
-                        if (profile_mode != remote_profile_mode::mock_local) {
+                        if (pipeline_active) {
+                            queue_remote_pipeline_sync(fused ? dflash_remote::sync_trim : dflash_remote::sync,
+                                    (uint32_t) n_chunk, std::move(payload), batch_inject.pos[n_chunk - 1]);
+                        } else if (remote_fused_draft) {
+                            remote_sync_payload = std::move(payload);
+                            remote_sync_tokens = (uint32_t) n_chunk;
+                            remote_sync_has_trim = fused;
+                            remote_sync_last_pos = batch_inject.pos[n_chunk - 1];
+                        } else if (profile_mode != remote_profile_mode::mock_local) {
                             const auto timing = remote->call(fused ? dflash_remote::sync_trim : dflash_remote::sync, ++rpc_request_id,
                                     (uint32_t) n_chunk, payload.data(), (uint32_t) payload.size(), rpc_bytes, 0);
                             rpc_sync_us += timing.roundtrip_us;
@@ -2276,56 +2974,97 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // transformer on Xbox and the original output-head/selector on this host.
         if (remote) {
             try {
-                remote_draft_start = std::chrono::steady_clock::now();
                 const int32_t n_rows = batch.n_tokens;
-                const auto * model_tgt = llama_get_model(params.ctx_tgt);
-                std::vector<float> embeddings((size_t) n_rows * n_embd_dec);
-                if (!llama_model_get_token_embedding_row(model_tgt, batch.token[0],
-                        embeddings.data(), (size_t) n_embd_dec)) {
-                    throw std::runtime_error("target anchor embedding lookup failed");
-                }
-                for (int32_t i = 1; i < n_rows; ++i) {
-                    std::memcpy(embeddings.data() + (size_t) i * n_embd_dec,
-                            mask_embedding.data(), (size_t) n_embd_dec * sizeof(float));
-                }
-                remote_prepare_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - remote_draft_start).count();
-                const dflash_remote::draft_data draft_request{
-                    batch.pos[0], batch.token[0], n_rows - 1};
-                const auto serialize_start = std::chrono::steady_clock::now();
-                std::vector<uint8_t> payload(sizeof(draft_request) + embeddings.size() * sizeof(float));
-                std::memcpy(payload.data(), &draft_request, sizeof(draft_request));
-                std::memcpy(payload.data() + sizeof(draft_request), embeddings.data(),
-                        embeddings.size() * sizeof(float));
-                remote_serialize_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - serialize_start).count();
-                struct replay_header { int32_t pos0; int32_t id_last; int32_t n_max; uint32_t bytes; };
-                const uint32_t expected_bytes = (uint32_t) (embeddings.size() * sizeof(float));
-                if (profile_mode == remote_profile_mode::mock_local) {
-                    replay_header saved{};
-                    rpc_replay.read(reinterpret_cast<char *>(&saved), sizeof(saved));
-                    if (!rpc_replay || saved.pos0 != draft_request.pos0 ||
-                            saved.id_last != draft_request.id_last || saved.n_max != draft_request.n_max ||
-                            saved.bytes != expected_bytes) {
-                        throw std::runtime_error("local DFlash replay trajectory mismatch");
-                    }
-                    rpc_bytes.resize(saved.bytes);
-                    rpc_replay.read(reinterpret_cast<char *>(rpc_bytes.data()), saved.bytes);
-                    if (!rpc_replay) throw std::runtime_error("local DFlash replay truncated");
-                    remote_draft_timing = {};
-                    remote_draft_timing.server.cycle_id = ++rpc_request_id;
-                } else {
-                    remote_draft_timing = remote->call(dflash_remote::draft, ++rpc_request_id,
-                            (uint32_t) n_rows, payload.data(), (uint32_t) payload.size(), rpc_bytes,
-                            expected_bytes);
-                    if (rpc_capture) {
-                        const replay_header saved{draft_request.pos0, draft_request.id_last,
-                                                  draft_request.n_max, expected_bytes};
-                        rpc_capture.write(reinterpret_cast<const char *>(&saved), sizeof(saved));
-                        rpc_capture.write(reinterpret_cast<const char *>(rpc_bytes.data()), rpc_bytes.size());
+                const uint32_t expected_bytes = (uint32_t) ((size_t) n_rows * n_embd_dec * sizeof(float));
+                bool used_pipeline_output = false;
+                if (remote_pipeline_ready) {
+                    remote_pipeline_actual_pos = batch.pos[0];
+                    remote_pipeline_actual_id = batch.token[0];
+                    remote_pipeline_match_mask =
+                            (batch.pos[0] == remote_pipeline_pos0 ? 1u : 0u) |
+                            (batch.token[0] == remote_pipeline_id_last ? 2u : 0u) |
+                            (n_rows == remote_pipeline_n_max + 1 ? 4u : 0u) |
+                            (remote_pipeline_output.size() == expected_bytes ? 8u : 0u);
+                    if (remote_pipeline_match_mask == 15u) {
+                        remote_draft_start = remote_pipeline_start;
+                        remote_draft_done = remote_pipeline_done;
+                        remote_draft_timing = remote_pipeline_timing;
+                        rpc_bytes = std::move(remote_pipeline_output);
+                        remote_pipeline_ready = false;
+                        remote_pipeline_state_synced = false;
+                        remote_pipeline_used = true;
+                        ++remote_pipeline_hits;
+                        remote_pipeline_syncs.clear();
+                        used_pipeline_output = true;
+                    } else if (!discard_remote_pipeline()) {
+                        throw std::runtime_error("DFlash2 Xbox pre-draft state could not be discarded");
                     }
                 }
 
+                dflash_remote::draft_data draft_request{};
+                if (!used_pipeline_output) {
+                    remote_draft_start = std::chrono::steady_clock::now();
+                    const auto * model_tgt = llama_get_model(params.ctx_tgt);
+                    std::vector<float> embeddings((size_t) n_rows * n_embd_dec);
+                    if (!llama_model_get_token_embedding_row(model_tgt, batch.token[0],
+                            embeddings.data(), (size_t) n_embd_dec)) {
+                        throw std::runtime_error("target anchor embedding lookup failed");
+                    }
+                    for (int32_t i = 1; i < n_rows; ++i) {
+                        std::memcpy(embeddings.data() + (size_t) i * n_embd_dec,
+                                mask_embedding.data(), (size_t) n_embd_dec * sizeof(float));
+                    }
+                    remote_prepare_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - remote_draft_start).count();
+                    draft_request = {batch.pos[0], batch.token[0], n_rows - 1};
+                    const auto serialize_start = std::chrono::steady_clock::now();
+                    std::vector<uint8_t> payload;
+                    if (remote_fused_draft) {
+                        if (!remote_sync_tokens || !remote_sync_has_trim) {
+                            const dflash_remote::sync_trim_data cut{-1, 0};
+                            payload.resize(sizeof(cut));
+                            std::memcpy(payload.data(), &cut, sizeof(cut));
+                        }
+                        payload.insert(payload.end(), remote_sync_payload.begin(), remote_sync_payload.end());
+                    }
+                    const size_t draft_offset = payload.size();
+                    payload.resize(draft_offset + sizeof(draft_request) + embeddings.size() * sizeof(float));
+                    std::memcpy(payload.data() + draft_offset, &draft_request, sizeof(draft_request));
+                    std::memcpy(payload.data() + draft_offset + sizeof(draft_request), embeddings.data(),
+                            embeddings.size() * sizeof(float));
+                    remote_serialize_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - serialize_start).count();
+                    struct replay_header { int32_t pos0; int32_t id_last; int32_t n_max; uint32_t bytes; };
+                    if (profile_mode == remote_profile_mode::mock_local) {
+                        replay_header saved{};
+                        rpc_replay.read(reinterpret_cast<char *>(&saved), sizeof(saved));
+                        if (!rpc_replay || saved.pos0 != draft_request.pos0 ||
+                                saved.id_last != draft_request.id_last || saved.n_max != draft_request.n_max ||
+                                saved.bytes != expected_bytes) {
+                            throw std::runtime_error("local DFlash replay trajectory mismatch");
+                        }
+                        rpc_bytes.resize(saved.bytes);
+                        rpc_replay.read(reinterpret_cast<char *>(rpc_bytes.data()), saved.bytes);
+                        if (!rpc_replay) throw std::runtime_error("local DFlash replay truncated");
+                        remote_draft_timing = {};
+                        remote_draft_timing.server.cycle_id = ++rpc_request_id;
+                    } else {
+                        remote_draft_timing = remote->call(remote_fused_draft ? dflash_remote::sync_and_draft : dflash_remote::draft, ++rpc_request_id,
+                                remote_fused_draft ? remote_sync_tokens : (uint32_t) n_rows,
+                                payload.data(), (uint32_t) payload.size(), rpc_bytes,
+                                expected_bytes);
+                        if (rpc_capture) {
+                            const replay_header saved{draft_request.pos0, draft_request.id_last,
+                                                      draft_request.n_max, expected_bytes};
+                            rpc_capture.write(reinterpret_cast<const char *>(&saved), sizeof(saved));
+                            rpc_capture.write(reinterpret_cast<const char *>(rpc_bytes.data()), rpc_bytes.size());
+                        }
+                    }
+                }
+
+                remote_sync_tokens = 0;
+                remote_sync_payload.clear();
+                remote_sync_last_pos = -1;
                 const auto selector_copy_start = std::chrono::steady_clock::now();
                 selector_batch.n_tokens = n_rows;
                 for (int32_t i = 0; i < n_rows; ++i) {
@@ -2333,7 +3072,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     selector_batch.pos[i] = i;
                     selector_batch.n_seq_id[i] = 1;
                     selector_batch.seq_id[i][0] = 0;
-                    selector_batch.logits[i] = false;
+                    selector_batch.logits[i] = true;
                 }
                 std::memcpy(selector_batch.embd, rpc_bytes.data(), rpc_bytes.size());
                 remote_selector_copy_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2347,12 +3086,81 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         std::chrono::steady_clock::now() - selector_start).count();
                 remote_draft_done = std::chrono::steady_clock::now();
                 remote_draft_pending = true;
-                remote_trimmed = false;
+                remote_trimmed = used_pipeline_output;
                 remote_trim_us = 0;
-                remote_draft_pos0 = draft_request.pos0;
+                remote_draft_pos0 = used_pipeline_output ? remote_pipeline_pos0 : draft_request.pos0;
+                remote_draft_n_max = n_rows - 1;
             } catch (const std::exception & err) {
                 LOG_ERR("DFlash2 Xbox DRAFT failed: %s; remote drafting disabled for this run\n", err.what());
                 remote_failed = true;
+                return;
+            }
+        } else if (local_split) {
+            const int32_t n_rows = batch.n_tokens;
+            const uint32_t expected_hidden = (uint32_t) ((size_t) n_rows * n_embd_dft);
+            const float * hidden = nullptr;
+            bool used_pipeline_output = false;
+
+            if (local_pipeline_ready) {
+                const bool match = batch.pos[0] == local_pipeline_pos0 &&
+                        batch.token[0] == local_pipeline_id_last &&
+                        n_rows == local_pipeline_n_max + 1 &&
+                        local_pipeline_output.size() == expected_hidden;
+                if (match) {
+                    hidden = local_pipeline_output.data();
+                    local_pipeline_ready = false;
+                    local_pipeline_used = true;
+                    ++local_pipeline_hits;
+                    used_pipeline_output = true;
+                } else if (!discard_local_pipeline()) {
+                    LOG_WRN("DFlash2 local pre-draft state did not match the next block; disabling local prefetch\n");
+                    local_prefetch = false;
+                }
+            }
+
+            if (!used_pipeline_output) {
+                const auto * model_tgt = llama_get_model(params.ctx_tgt);
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    batch.pos[i] = batch.pos[0] + i;
+                    batch.n_seq_id[i] = 1;
+                    batch.seq_id[i][0] = 0;
+                    batch.logits[i] = true;
+                }
+                if (!llama_model_get_token_embedding_row(model_tgt, batch.token[0],
+                        batch.embd, (size_t) n_embd_dft)) {
+                    LOG_WRN("DFlash2 local split anchor embedding lookup failed\n");
+                    return;
+                }
+                for (int32_t i = 1; i < n_rows; ++i) {
+                    std::memcpy(batch.embd + (size_t) i * n_embd_dft,
+                            mask_embedding.data(), (size_t) n_embd_dft * sizeof(float));
+                }
+
+                const int ret = llama_decode(ctx_dft, batch);
+                if (ret != 0) {
+                    LOG_WRN("DFlash2 local split decode returned %d\n", ret);
+                    return;
+                }
+                hidden = llama_get_embeddings(ctx_dft);
+                if (!hidden) {
+                    LOG_WRN("DFlash2 local split hidden output is unavailable\n");
+                    return;
+                }
+            }
+
+            selector_batch.n_tokens = n_rows;
+            for (int32_t i = 0; i < n_rows; ++i) {
+                selector_batch.token[i] = batch.token[i];
+                selector_batch.pos[i] = i;
+                selector_batch.n_seq_id[i] = 1;
+                selector_batch.seq_id[i][0] = 0;
+                selector_batch.logits[i] = true;
+            }
+            std::memcpy(selector_batch.embd, hidden,
+                    (size_t) n_rows * n_embd_dft * sizeof(float));
+            if (llama_encode(selector_ctx, selector_batch) != 0 ||
+                    !llama_get_embeddings_nextn(selector_ctx)) {
+                LOG_WRN("DFlash2 local selector encode failed\n");
                 return;
             }
         } else {
@@ -2382,8 +3190,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dflash2) {
                 GGML_ASSERT(dp.temperature <= 0.0f || dp.dists);
-                const float * lattice = llama_get_embeddings_nextn(remote ? selector_ctx : ctx_dft);
+                const float * lattice = llama_get_embeddings_nextn(remote || local_split ? selector_ctx : ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+                if (remote) {
+                    remote_next_hypothesis_confidence = 0.0f;
+                }
 
                 if (selector_reset[seq_id]) {
                     uint32_t seed = dp.seed;
@@ -2413,23 +3224,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         for (float & p : dist.probs) {
                             p /= sum;
                         }
-                        std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
-                        predecessor = sample(selector_rng[seq_id]);
-                        if (dist.probs[predecessor] < params.p_min) {
+                        predecessor = common_speculative_dflash_sample(dist.probs, params.p_min, selector_rng[seq_id]);
+                        if (predecessor < 0) {
                             break;
+                        }
+                        if (remote && i == 2) {
+                            remote_next_hypothesis_confidence = dist.probs[predecessor];
                         }
                         result.push_back(dist.ids[predecessor]);
                         dp.dists->push_back(std::move(dist));
                     } else {
                         predecessor = (int32_t) std::distance(scores,
                                 std::max_element(scores, scores + selector_top_k));
-                        if (params.p_min > 0.0f) {
+                        if (params.p_min > 0.0f || (remote && remote_pipeline_enabled && i == 2)) {
                             // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                             float sum = 0.0f;
                             for (int32_t k = 0; k < selector_top_k; ++k) {
                                 sum += std::exp(scores[k] - scores[predecessor]);
                             }
-                            if (1.0f / sum < params.p_min) {
+                            const float confidence = 1.0f / sum;
+                            if (remote && i == 2) {
+                                remote_next_hypothesis_confidence = confidence;
+                            }
+                            if (confidence < params.p_min) {
                                 break;
                             }
                         }
@@ -2445,9 +3262,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 if (remote) {
                     remote_n_proposed = (int32_t) result.size();
+                    // A one-token acceptance commits the target's bonus token
+                    // next.  Use the selector's second hypothesis as the
+                    // speculative anchor for that bonus position.
+                    remote_next_hypothesis = result.size() > 1 ? result[1] : -1;
                     remote_proposal_done = std::chrono::steady_clock::now();
                     remote_proposal_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             remote_proposal_done - remote_draft_done).count();
+                }
+                if (local_split) {
+                    local_draft_pending = true;
+                    local_draft_pos0 = batch.pos[0];
+                    local_n_proposed = (int32_t) result.size();
+                    local_next_hypothesis = result.size() > 1 ? result[1] : -1;
                 }
                 continue;
             }
@@ -2509,15 +3336,80 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 result.clear();
             }
         }
+        if (remote && remote_pipeline_enabled && remote_draft_pending &&
+                remote_n_proposed > 1 && remote_next_hypothesis >= 0 &&
+                remote_next_hypothesis_confidence >= 0.95f) {
+            launch_remote_pipeline(remote_next_hypothesis);
+        }
         if (remote && remote_draft_pending && remote_n_proposed == 0) {
             // No target verification follows an empty draft, so accept() will not run.
             // Discard the speculative Xbox KV before the next target feature SYNC.
             accept(0, 0, false);
         }
+        if (local_split && local_draft_pending && local_n_proposed == 0) {
+            // No target verification follows an empty draft. Roll back the
+            // explicit local KV immediately because the server will not call
+            // common_speculative_accept() for this round.
+            accept(0, 0, false);
+        }
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted, bool is_other) override {
-        if (!remote || !remote_draft_pending) {
+        if (local_split) {
+            if (is_other) {
+                return;
+            }
+
+            local_one_accept_rate = 0.75f * local_one_accept_rate +
+                    0.25f * (n_accepted == 1 ? 1.0f : 0.0f);
+
+            bool promoted = false;
+            if (local_pipeline_active()) {
+                promoted = n_accepted == 1 && local_n_proposed > 0 && promote_local_pipeline();
+                if (!promoted && !discard_local_pipeline()) {
+                    local_prefetch = false;
+                }
+            }
+
+            if (!promoted && local_draft_pos0 >= 0) {
+                // Target features through the last accepted draft are committed.
+                // Keep those rows for the next round's DFlash KV cache.
+                const llama_pos trim_pos = local_draft_pos0 + (llama_pos) n_accepted + 1;
+                if (!trim_local_context(trim_pos)) {
+                    LOG_WRN("DFlash2 local split draft rollback failed at position %d\n", (int) trim_pos);
+                }
+            }
+
+            local_draft_pending = false;
+            local_draft_pos0 = -1;
+            local_n_proposed = 0;
+            local_next_hypothesis = -1;
+            return;
+        }
+
+        if (!remote) {
+            return;
+        }
+
+        if (remote_pipeline_active()) {
+            // process() may have queued target rows while the pre-draft was in
+            // flight.  Only a one-token acceptance can leave the predicted
+            // bonus anchor at the next position; draft() still checks its ID.
+            const bool promote = !is_other && n_accepted == 1 && remote_n_proposed > 0;
+            if (promote) {
+                if (!promote_remote_pipeline()) {
+                    remote_draft_pending = false;
+                    remote_trimmed = true;
+                }
+            } else if (!discard_remote_pipeline()) {
+                remote_draft_pending = false;
+                remote_trimmed = true;
+            }
+            remote_draft_pending = false;
+            remote_trimmed = true;
+        }
+
+        if (!remote_draft_pending && remote_failed) {
             return;
         }
         const auto verify_done = std::chrono::steady_clock::now();
@@ -2567,6 +3459,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         << ",\"proposal_us\":" << remote_proposal_us
                         << ",\"rewind_rpc_us\":" << rpc_rewind_us
                         << ",\"fused_sync\":" << (remote_fused_sync ? "true" : "false")
+                        << ",\"fused_draft\":" << (remote_fused_draft ? "true" : "false")
                         << ",\"send_us\":" << remote_draft_timing.send_us
                         << ",\"header_send_us\":" << remote_draft_timing.header_send_us
                         << ",\"payload_send_us\":" << remote_draft_timing.payload_send_us
@@ -2586,6 +3479,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         << ",\"target_verify_us\":" << target_verify_us
                         << ",\"trim_rpc_us\":" << remote_trim_us
                         << ",\"total_cycle_us\":" << cycle_us
+                        << ",\"pipeline_enabled\":" << (remote_pipeline_enabled ? "true" : "false")
+                        << ",\"pipeline_attempts\":" << remote_pipeline_attempts
+                        << ",\"pipeline_hits\":" << remote_pipeline_hits
+                        << ",\"pipeline_used\":" << (remote_pipeline_used ? "true" : "false")
+                        << ",\"pipeline_discarded\":" << (remote_pipeline_discarded ? "true" : "false")
+                        << ",\"pipeline_match_mask\":" << remote_pipeline_match_mask
+                        << ",\"pipeline_hypothesis_pos\":" << remote_pipeline_pos0
+                        << ",\"pipeline_hypothesis_id\":" << remote_pipeline_id_last
+                        << ",\"pipeline_actual_pos\":" << remote_pipeline_actual_pos
+                        << ",\"pipeline_actual_id\":" << remote_pipeline_actual_id
+                        << ",\"pipeline_wait_us\":" << remote_pipeline_wait_us
+                        << ",\"pipeline_xbox_compute_us\":" << remote_pipeline_timing.server.xbox_compute_us
                         << ",\"rpc_failed\":" << (remote_failed ? "true" : "false") << "}\n";
             rpc_metrics.flush();
         }
@@ -2598,10 +3503,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         rpc_sync_xbox_compute_us = 0;
         rpc_rewind_us = 0;
         remote_draft_pending = false;
+        remote_pipeline_used = false;
+        remote_pipeline_discarded = false;
+        remote_pipeline_match_mask = 0;
+        remote_pipeline_actual_pos = -1;
+        remote_pipeline_actual_id = -1;
+        remote_pipeline_wait_us = 0;
     }
 
     bool adaptive_dm_supported() const override {
         return common_speculative_dflash_adaptive_dm_supported(selector_top_k);
+    }
+
+    bool draft_memory_is_shared() const override {
+        // The explicit split context deliberately has no ctx_other and its KV
+        // lifetime is managed by this implementation, like the remote DFlash
+        // sidecar.  The server must not trim it through the target memory path.
+        return local_split;
     }
 };
 
@@ -4186,6 +5104,13 @@ common_speculative_init_result::common_speculative_init_result(
                    type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
+    if (params.speculative.draft.local_prefetch && !params.speculative.draft.local_split) {
+        throw std::invalid_argument("DFlash2 local prefetch requires local split mode");
+    }
+    if (params.speculative.draft.local_split && (!has_draft || !spec_dflash || spec_mtp)) {
+        throw std::invalid_argument("DFlash2 local split requires a DFlash draft model");
+    }
+
     common_params params_dft = common_base_params_to_speculative(params);
     auto mparams = common_model_params_to_llama(params_dft);
     auto cparams = common_context_params_to_llama(params_dft);
@@ -4198,7 +5123,13 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
     // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
-    cparams.ctx_other = ctx_tgt;
+    if (spec_dflash && params.speculative.draft.local_split) {
+        cparams.ctx_other = nullptr;
+        cparams.dflash_split = true;
+        cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    } else {
+        cparams.ctx_other = ctx_tgt;
+    }
     cparams.kv_tail_tokens = 0;
     cparams.kv_tail_type   = GGML_TYPE_F16;
 

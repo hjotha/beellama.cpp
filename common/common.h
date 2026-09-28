@@ -336,6 +336,11 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // DFlash2 explicit local split: keep the transformer on the draft device and
+    // exchange only host-owned feature/hidden rows with the target-side selector.
+    bool local_split = false;
+    bool local_prefetch = false;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include <random>
 
 struct common_speculative;
 
@@ -13,6 +14,14 @@ struct common_speculative_token_dist {
     llama_tokens ids;
     std::vector<float> probs;
 };
+
+// Gate the whole step before drawing so the proposal still follows the full q
+// passed to the target rejection sampler. -1 means skip this draft step.
+inline int32_t common_speculative_dflash_sample(const std::vector<float> & probs,
+                                                float p_min, std::mt19937 & rng) {
+    if (probs.empty() || *std::max_element(probs.begin(), probs.end()) < p_min) return -1;
+    return std::discrete_distribution<int32_t>(probs.begin(), probs.end())(rng);
+}
 
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
