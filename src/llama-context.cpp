@@ -411,8 +411,10 @@ llama_context::llama_context(
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
-    cparams.embeddings              = params.embeddings;
-    cparams.embeddings_nextn        = false;
+    cparams.embeddings              = params.embeddings || params.dflash_split;
+    cparams.dflash_split            = params.dflash_split;
+    cparams.dflash_selector_only    = params.dflash_selector_only;
+    cparams.embeddings_nextn        = params.dflash_selector_only;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
@@ -632,6 +634,22 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
+    if (cparams.dflash_split &&
+            (model.arch != LLM_ARCH_DFLASH || hparams.dflash_selector_rank == 0 ||
+             params.ctx_other != nullptr || params.dflash_selector_only ||
+             model.dfly_layer_fusion != nullptr ||
+             model.dspark_markov_w1 != nullptr ||
+             cparams.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+        throw std::invalid_argument("dflash_split requires plain DFlash2, no ctx_other, and pooling_type NONE");
+    }
+    if (cparams.dflash_selector_only &&
+            (model.arch != LLM_ARCH_DFLASH || hparams.dflash_selector_rank == 0 ||
+             params.ctx_other == nullptr || model.dfly_layer_fusion != nullptr ||
+             model.dspark_markov_w1 != nullptr ||
+             cparams.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+        throw std::invalid_argument("dflash_selector_only requires plain DFlash2, ctx_other, and pooling_type NONE");
+    }
+
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
@@ -643,8 +661,8 @@ llama_context::llama_context(
     }
 
     if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
-        if (model.tok_embd == nullptr || model.output == nullptr) {
-            if (params.ctx_other == nullptr) {
+        if (cparams.dflash_selector_only || model.tok_embd == nullptr || model.output == nullptr) {
+            if (params.ctx_other == nullptr && !cparams.dflash_split) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
@@ -831,6 +849,7 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+    // The selector-only graph still needs the target head's device and a CPU backend.
     if (!hparams.vocab_only) {
         // GPU backends
         std::vector<ggml_backend_dev_t> initialized_devices;
@@ -1892,6 +1911,10 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
 }
 
 void llama_context::set_embeddings(bool value) {
+    if (cparams.dflash_split && !value) {
+        LLAMA_LOG_ERROR("%s: DFlash2 split execution requires embeddings output\n", __func__);
+        return;
+    }
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     cparams.embeddings = value;
@@ -2238,6 +2261,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+static bool dflash2_split_block_fits(const llama_batch & batch, uint32_t n_seq_max, uint32_t block_size) {
+    std::array<uint32_t, LLAMA_MAX_SEQ> rows = {};
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id && batch.n_seq_id[i] != 1) {
+            return false;
+        }
+        const llama_seq_id seq_id = batch.seq_id ? batch.seq_id[i][0] : 0;
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || ++rows[seq_id] > block_size) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int llama_context::encode(const llama_batch & batch_inp) {
     nextn_decode_id = 0;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
@@ -2252,7 +2289,17 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
-    const int64_t n_embd = hparams.n_embd_inp_enc();
+    if (cparams.dflash_selector_only && (!batch_inp.token || !batch_inp.embd)) {
+        LLAMA_LOG_ERROR("%s: DFlash2 selector batches require token IDs and normalized hidden rows\n", __func__);
+        return -1;
+    }
+    if (cparams.dflash_selector_only &&
+            !dflash2_split_block_fits(batch_inp, cparams.n_seq_max, hparams.dflash_block_size)) {
+        LLAMA_LOG_ERROR("%s: DFlash2 selector block exceeds trained block_size=%u (anchor counts as one row)\n",
+                __func__, hparams.dflash_block_size);
+        return -1;
+    }
+    const int64_t n_embd = cparams.dflash_selector_only ? hparams.n_embd : hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
@@ -2514,7 +2561,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_vocab = vocab.n_tokens();
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
     // DFlash embd batches carry the fused target features at the encoder input width
-    const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
+    // Split draft blocks carry both IDs and precomputed noise embeddings. Feature
+    // injection remains an embeddings-only batch at the encoder input width.
+    const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd && !batch_inp.token;
+    if (cparams.dflash_split && batch_inp.token && !batch_inp.embd) {
+        LLAMA_LOG_ERROR("%s: DFlash2 split draft batches require token IDs and embeddings\n", __func__);
+        return -1;
+    }
+    if (cparams.dflash_split && batch_inp.token &&
+            !dflash2_split_block_fits(batch_inp, cparams.n_seq_max, hparams.dflash_block_size)) {
+        LLAMA_LOG_ERROR("%s: DFlash2 split block exceeds trained block_size=%u (anchor counts as one row)\n",
+                __func__, hparams.dflash_block_size);
+        return -1;
+    }
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
@@ -2968,7 +3027,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    bool has_logits     = !cparams.dflash_split && !cparams.dflash_selector_only;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
     bool has_embd_capture = cparams.n_capture_layers > 0;
@@ -5320,6 +5379,8 @@ llama_context_params llama_context_default_params() {
         /*.kv_tail_type                =*/ GGML_TYPE_COUNT,
         /*.kv_tail_config              =*/ nullptr,
         /*.kv_tail_request             =*/ nullptr,
+        /*.dflash_split                =*/ false,
+        /*.dflash_selector_only        =*/ false,
     };
 
     return result;

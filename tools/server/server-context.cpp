@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <exception>
@@ -71,6 +72,19 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static int64_t dflash_trace_tick_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void dflash_trace(const char * stage, int64_t start_us, int64_t end_us, int n = 0) {
+    static const bool enabled = std::getenv("DFLASH_XBOX_TRACE") != nullptr;
+    if (enabled) {
+        std::fprintf(stderr, "DFTRACE stage=%s start_us=%lld end_us=%lld n=%d\n",
+                stage, (long long) start_us, (long long) end_us, n);
+    }
+}
 
 static bool server_reasoning_budget_state_is_reasoning(common_reasoning_budget_state state) {
     return state == REASONING_BUDGET_COUNTING ||
@@ -8057,9 +8071,11 @@ if (task.params.cache_prompt) {
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t t_draft_start = ggml_time_us();
+            const int64_t trace_draft_start = dflash_trace_tick_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            dflash_trace("draft_call", trace_draft_start, dflash_trace_tick_us(), (int) drafting.size());
             const float shared_draft_ms = (ggml_time_us() - t_draft_start) / 1000.0f;
             size_t drafted_tokens_total = 0;
             for (const auto * slot : drafting) {
@@ -8178,9 +8194,11 @@ if (task.params.cache_prompt) {
         });
 
         // update the batch with the sampled/drafted tokens
+        const int64_t trace_batch_start = dflash_trace_tick_us();
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        dflash_trace("batch_from_sample", trace_batch_start, dflash_trace_tick_us(), (int) generating.size());
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -9100,14 +9118,20 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
         // timing uses the sync that is already performed right below - no extra sync is added
         const bool    prof_mtp = getenv("GGML_MTP_PROF") != nullptr;
         const int64_t prof_t0  = prof_mtp ? ggml_time_us() : 0;
+        const int64_t trace_decode_start = dflash_trace_tick_us();
         queue_tasks.yield_to_queue([&]() {
+            const int64_t trace_compute_start = dflash_trace_tick_us();
             ret = llama_decode(ctx_tgt, batch_view);
+            const int64_t trace_compute_done = dflash_trace_tick_us();
+            dflash_trace("target_submit", trace_compute_start, trace_compute_done, batch_view.n_tokens);
             if (ret == 0) {
                 // Server KV/state and speculative scheduling inspect this memory
                 // immediately after decode, including prompt-only sub-batches.
                 llama_synchronize(ctx_tgt);
+                dflash_trace("target_sync", trace_compute_done, dflash_trace_tick_us(), batch_view.n_tokens);
             }
         });
+        dflash_trace("target_decode_total", trace_decode_start, dflash_trace_tick_us(), batch_view.n_tokens);
         if (prof_mtp && ret == 0) {
             fprintf(stderr, "MTPTGT n_tokens=%d us=%lld\n",
                     batch_view.n_tokens, (long long) (ggml_time_us() - prof_t0));
@@ -9233,9 +9257,16 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
         if (spec && !bootstrapped) {
             bool ok = true;
+            const int64_t trace_process_start = dflash_trace_tick_us();
+            const int64_t t_sync_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            dflash_trace("sync_process", trace_process_start, dflash_trace_tick_us(), batch_view.n_tokens);
+            if (getenv("GGML_MTP_PROF")) {
+                fprintf(stderr, "MTPPHASE phase=sync us=%lld n_tokens=%d\n",
+                        (long long) (ggml_time_us() - t_sync_start), batch_view.n_tokens);
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -9463,6 +9494,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 const bool can_rollback =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                const int64_t trace_sample_start = dflash_trace_tick_us();
                 auto accepted = synth_probs.empty()
                     ? (can_rollback && slot.task->params.sampling.temp > 0.0f &&
                        slot.spec_dists.size() == slot.spec_draft.size() && !on_accept
@@ -9471,6 +9503,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay, on_accept);
+                dflash_trace("sample_accept", trace_sample_start, dflash_trace_tick_us(), (int) n_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -9527,7 +9560,9 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                const int64_t trace_remote_trim_start = dflash_trace_tick_us();
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                dflash_trace("remote_trim", trace_remote_trim_start, dflash_trace_tick_us(), (int) n_draft);
 
                 slot.spec_draft = std::move(accepted);
                 slot.spec_dists.clear();
@@ -9581,14 +9616,19 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             }
 
             // add accepted tokens to the prompt
+            const int64_t trace_commit_start = dflash_trace_tick_us();
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
             slot.sampled = ids.back(); // last accepted token
+            dflash_trace("commit_prompt", trace_commit_start, dflash_trace_tick_us(), (int) n_accepted);
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            const int64_t trace_kv_start = dflash_trace_tick_us();
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            dflash_trace("kv_remove", trace_kv_start, dflash_trace_tick_us(), (int) n_draft);
 
+            const int64_t trace_emit_start = dflash_trace_tick_us();
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -9609,6 +9649,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                     return;
                 }
             }
+            dflash_trace("emit_tokens", trace_emit_start, dflash_trace_tick_us(), (int) ids.size());
 
             slot.print_timings_tg();
 

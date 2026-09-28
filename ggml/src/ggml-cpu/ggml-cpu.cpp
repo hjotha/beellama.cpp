@@ -318,7 +318,7 @@ struct ggml_backend_cpu_device_context {
             }
             fclose(f);
         }
-#elif defined(_WIN32)
+#elif defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP))
         HKEY hKey;
         if (RegOpenKeyEx(HKEY_LOCAL_MACHINE,
                         TEXT("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0"),

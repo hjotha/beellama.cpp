@@ -561,6 +561,20 @@ extern "C" {
         enum ggml_type kv_tail_type;
         const struct llama_kv_tail_config * kv_tail_config; // borrowed only during context creation
         const struct llama_kv_tail_request * kv_tail_request; // model-independent; borrowed during context creation
+
+        // DFlash2 split execution: the draft model has no target context, token embedding
+        // table, or output head. Feature-injection batches use embd alone (encoder width).
+        // Draft blocks use token and embd together: token IDs for block metadata, and
+        // unrotated, unscaled F32 anchor/MASK embeddings [n_tokens, model_n_embd].
+        // llama_get_embeddings() returns the final normalized hidden rows; the caller
+        // projects them through the target output head and runs the selector on the host.
+        bool dflash_split;
+
+        // Stateless host half of the split: ctx_other owns the target output head.
+        // Pass token IDs and the split context's normalized hidden F32 rows together
+        // in llama_batch, then read the selector lattice from llama_get_embeddings_nextn().
+        // No draft KV or target decode is performed by this context.
+        bool dflash_selector_only;
     };
 
     struct llama_model_tensor_override {
@@ -769,6 +783,14 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
+
+    // Read one token-embedding row into out[n_embd] as logical, unscaled F32.
+    // Dequantizes the resident row and undoes any model Hadamard lookup rotation.
+    // The caller must keep the model alive and apply the draft model's embedding
+    // scale when reproducing a DFlash input. Returns false for invalid input or
+    // unsupported tensor types. Active embedding LoRA is not included.
+    LLAMA_API bool llama_model_get_token_embedding_row(
+            const struct llama_model * model, llama_token token, float * out, size_t out_count);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);

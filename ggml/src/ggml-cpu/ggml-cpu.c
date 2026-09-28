@@ -2635,9 +2635,18 @@ static bool ggml_thread_apply_affinity(bool * mask) {
 
     DWORD_PTR m = (DWORD_PTR)bitmask;
 
+#if defined(WINAPI_FAMILY) && !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+    // AppContainer (UWP/Xbox): SetThreadAffinityMask is desktop-only. UWP builds
+    // set WINAPI_FAMILY=APP (MSVC and uwp-crossbuild --uwp); the partition gates
+    // the API the same way the headers do.
+    (void) h;
+    (void) m;
+    return true;
+#else
     m = SetThreadAffinityMask(h, m);
 
     return m != 0;
+#endif
 }
 
 static bool ggml_thread_apply_priority(int32_t prio) {
@@ -2657,7 +2666,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
         // Newer Windows 11 versions aggressively park (offline) CPU cores and often place
         // all our threads onto the first 4 cores which results in terrible performance with
         // n_threads > 4
-        #if _WIN32_WINNT >= 0x0602
+        #if _WIN32_WINNT >= 0x0602 && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP))
         THREAD_POWER_THROTTLING_STATE t;
         ZeroMemory(&t, sizeof(t));
         t.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;

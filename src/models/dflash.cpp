@@ -349,6 +349,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
+    if (params.cparams.dflash_selector_only) {
+        return std::make_unique<graph<false>>(*this, params);
+    }
     switch (params.gtype) {
         case LLM_GRAPH_TYPE_ENCODER:
             return std::make_unique<graph<true>>(*this, params);
@@ -715,6 +718,51 @@ static void build_dflash2_selector(
     res->t_h_nextn = packed;
     ggml_build_forward_expand(g.gf, packed);
 }
+
+static ggml_tensor * build_dflash_output(
+        llm_graph_context & g, const llama_model & model, ggml_tensor * hidden,
+        ggml_tensor *& output_projection) {
+    ggml_context * ctx0 = g.ctx0;
+    output_projection = model.output;
+    auto * output_s   = model.output_s;
+    if (g.cparams.dflash_selector_only || output_projection == nullptr) {
+        GGML_ASSERT(g.cparams.ctx_other != nullptr);
+        const auto * target = llama_get_model(g.cparams.ctx_other);
+        GGML_ASSERT(target->output != nullptr && "DFlash decoder requires the target model's output projection");
+        output_projection = target->output;
+        output_s          = target->output_s;
+    }
+
+    ggml_tensor * cur = g.build_lora_mm(output_projection, hidden, output_s);
+    // DFlash2's selector reads projected logits, including target output transforms.
+    if (model.dflash_selector_hidden) {
+        if (g.hparams.f_logit_scale != 0.0f) {
+            cur = ggml_scale(ctx0, cur, g.hparams.f_logit_scale);
+        }
+        if (g.hparams.f_final_logit_softcapping > 0.0f) {
+            cur = ggml_scale(ctx0, cur, 1.0f / g.hparams.f_final_logit_softcapping);
+            cur = ggml_tanh(ctx0, cur);
+            cur = ggml_scale(ctx0, cur, g.hparams.f_final_logit_softcapping);
+        }
+    }
+
+    if (model.d2t) {
+        const int64_t n_draft_vocab = cur->ne[0];
+        const int64_t n_outputs     = cur->ne[1];
+        const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
+        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+        cur = ggml_set_rows(ctx0, logits,
+                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+    }
+    g.cb(cur, "result_output", -1);
+    g.res->t_logits = cur;
+    ggml_build_forward_expand(g.gf, cur);
+    return cur;
+}
 // DFly (AngelSpec): TreeFlash predecessor correction chained across a block.
 //
 // Position i's logits come from the draft hidden state at row i corrected by the embedding
@@ -854,11 +902,30 @@ template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     // Shared Bonsai embeddings/head are stored in a rotated basis. The draft's
     // own tensors are unrotated, so only shared target tensor pointers match.
-    if (cparams.ctx_other && (!model.tok_embd || !model.output)) {
+    if (cparams.ctx_other && (cparams.dflash_selector_only || !model.tok_embd || !model.output)) {
         const auto * target = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model.hadamard_rotations.empty() && model.hadamard_inverses.empty());
         hadamard_rotations = &target->hadamard_rotations;
         hadamard_inverses = &target->hadamard_inverses;
+    }
+    if (cparams.dflash_selector_only) {
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        inp->embd   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->tokens);
+        ggml_set_input(inp->embd);
+        res->t_inp_tokens = inp->tokens;
+        res->t_embd       = inp->embd;
+        ggml_tensor * tokens = inp->tokens;
+        ggml_tensor * hidden = inp->embd;
+        res->add_input(std::move(inp));
+
+        ggml_tensor * output = nullptr;
+        build_dflash_output(*this, model, hidden, output);
+        build_dflash2_selector(*this, model, tokens, output);
+        res->t_logits = nullptr;
+        res->t_embd   = nullptr;
+        return;
     }
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -895,7 +962,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     };
 
     // KV cache injection
-    if (ubatch.embd) {
+    if (ubatch.embd && !ubatch.token) {
         // DFly ships one fused context per draft layer, so the incoming row is n_layer wide
         const bool    is_dfly      = model.dfly_layer_fusion != nullptr;
         const int64_t n_embd_batch = is_dfly ? (int64_t) hparams.n_embd_out() : (int64_t) hparams.n_embd_inp_enc();
@@ -975,16 +1042,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
-    // tok_embd from the target model (shared via ctx_other)
-    auto * tok_embd = model.tok_embd;
-    if (tok_embd == nullptr) {
-        GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
-
-        GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
-    }
-
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -993,12 +1050,30 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
-    if (hadamard_inverses) {
-        const auto it = hadamard_inverses->find(tok_embd);
-        if (it != hadamard_inverses->end()) {
-            inpL = llama_mul_mat_hadamard(ctx0, inpL, it->second.rot);
-            if (it->second.signs) inpL = ggml_mul(ctx0, inpL, it->second.signs);
+    ggml_tensor * inpL = nullptr;
+    if (cparams.dflash_split) {
+        // The host supplies the same logical embedding rows that get_rows would
+        // produce after undoing any target-side weight rotation. Keep the draft's
+        // embedding scale below, so the host sends unscaled rows.
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+        inpL = inp->embd;
+    } else {
+        // tok_embd from the target model (shared via ctx_other)
+        auto * tok_embd = model.tok_embd;
+        if (tok_embd == nullptr) {
+            GGML_ASSERT(cparams.ctx_other != nullptr);
+            const auto * model_other = llama_get_model(cparams.ctx_other);
+            GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
+            tok_embd = model_other->tok_embd;
+        }
+        inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        if (hadamard_inverses) {
+            const auto it = hadamard_inverses->find(tok_embd);
+            if (it != hadamard_inverses->end()) {
+                inpL = llama_mul_mat_hadamard(ctx0, inpL, it->second.rot);
+                if (it->second.signs) inpL = ggml_mul(ctx0, inpL, it->second.signs);
+            }
         }
     }
     if (hparams.f_embedding_scale != 0.0f) {
@@ -1145,51 +1220,19 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     res->t_embd = cur;
 
-    // lm_head from the target model (shared via ctx_other)
-    auto * output   = model.output;
-    auto * output_s = model.output_s;
-    if (output == nullptr) {
-        GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
-        GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        output   = model_other->output;
-        output_s = model_other->output_s;
+    if (cparams.dflash_split) {
+        // Projecting through the target head and building the DFlash2 selector
+        // are host operations in the split topology. Return every normalized
+        // hidden row without allocating or transferring vocabulary logits.
+        // The mixed token+embedding batch still uploads token IDs via set_inputs;
+        // keep that input in the graph so the scheduler allocates its buffer.
+        ggml_build_forward_expand(gf, inp_tokens);
+        ggml_build_forward_expand(gf, cur);
+        return;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
-
-    // DFlash2 feeds these logits to the selector, so they need the target's output
-    // transforms; DFlash1 and DSpark read them through the sampler instead
-    if (model.dflash_selector_hidden) {
-        if (hparams.f_logit_scale != 0.0f) {
-            cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
-        }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
-            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-            cur = ggml_tanh(ctx0, cur);
-            cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
-        }
-    }
-
-    // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
-    if (model.d2t) {
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs     = cur->ne[1];
-        const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
-
-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
-        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
-
-        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
-    }
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
+    ggml_tensor * output = nullptr;
+    build_dflash_output(*this, model, cur, output);
 
     // DSpark: bias the draft logits with the Markov head
     if (model.dspark_markov_w1) {

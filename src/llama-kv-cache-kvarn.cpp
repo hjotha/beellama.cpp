@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <process.h>
+#include <windows.h>
 #endif
 
 // ggml/src is not on this target's include path; only the q4_0 dequantizer is
@@ -3404,7 +3405,7 @@ std::string create_conversion_temp_path(const std::string & destination) {
 #else
     static std::atomic<uint64_t> nonce{0};
     for (int attempt = 0; attempt < 32; ++attempt) {
-        const std::string path = destination + ".tmp-convert-" + std::to_string((long) _getpid()) + "-" +
+        const std::string path = destination + ".tmp-convert-" + std::to_string((unsigned long) GetCurrentProcessId()) + "-" +
             std::to_string(nonce.fetch_add(1, std::memory_order_relaxed));
         const int fd = _open(path.c_str(), _O_CREAT | _O_EXCL | _O_BINARY | _O_RDWR,
                 _S_IREAD | _S_IWRITE);

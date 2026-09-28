@@ -4184,3 +4184,76 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+bool llama_model_get_token_embedding_row(
+        const llama_model * model, llama_token token, float * out, size_t out_count) {
+    if (!model || !model->tok_embd || !out || token < 0) {
+        return false;
+    }
+    const ggml_tensor * tensor = model->tok_embd;
+    const int64_t width = tensor->ne[0];
+    if (width <= 0 || (int64_t) token >= tensor->ne[1] || out_count < (size_t) width || !tensor->buffer) {
+        return false;
+    }
+
+    const size_t row_bytes = ggml_row_size(tensor->type, width);
+    const size_t offset    = (size_t) token * tensor->nb[1];
+    if (offset > ggml_nbytes(tensor) || row_bytes > ggml_nbytes(tensor) - offset) {
+        return false;
+    }
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(tensor, out, offset, row_bytes);
+    } else {
+        std::vector<uint8_t> raw(row_bytes);
+        ggml_backend_tensor_get(tensor, raw.data(), offset, row_bytes);
+        if (tensor->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), out, width);
+        } else if (tensor->type == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), out, width);
+        } else {
+            const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+            if (!ggml_is_quantized(tensor->type) || !traits || !traits->to_float) {
+                return false;
+            }
+            traits->to_float(raw.data(), out, width);
+        }
+    }
+
+    const auto it = model->hadamard_inverses.find(tensor);
+    if (it == model->hadamard_inverses.end()) {
+        return true;
+    }
+    const auto & transform = it->second;
+    const int64_t block = transform.rot->ne[0];
+    if (block <= 0 || (block & (block - 1)) != 0 || width % block != 0 || transform.perm_rep != 0) {
+        return false;
+    }
+    // The persistent rotation tensor is the normalized Sylvester Hadamard
+    // matrix. A blockwise FWHT computes its action without a dense matrix copy.
+    const float scale = 1.0f / sqrtf((float) block);
+    for (int64_t base = 0; base < width; base += block) {
+        for (int64_t span = 1; span < block; span *= 2) {
+            for (int64_t j = 0; j < block; j += 2 * span) {
+                for (int64_t k = 0; k < span; ++k) {
+                    const float a = out[base + j + k];
+                    const float b = out[base + j + k + span];
+                    out[base + j + k]        = a + b;
+                    out[base + j + k + span] = a - b;
+                }
+            }
+        }
+        for (int64_t j = 0; j < block; ++j) {
+            out[base + j] *= scale;
+        }
+    }
+    if (transform.signs) {
+        const auto signs = model->hadamard_sign_data.find((uint32_t) width);
+        if (signs == model->hadamard_sign_data.end() || signs->second.size() != (size_t) width) {
+            return false;
+        }
+        for (int64_t i = 0; i < width; ++i) {
+            out[i] *= (float) signs->second[i];
+        }
+    }
+    return true;
+}

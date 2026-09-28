@@ -108,4 +108,6 @@ bool kv_unified;
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+    bool dflash_split = false;
+    bool dflash_selector_only = false;
 };

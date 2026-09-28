@@ -35,6 +35,11 @@
         #define PATH_MAX MAX_PATH
     #endif
     #include <io.h>
+    #if !defined(WINAPI_FAMILY)
+        #define LLAMA_WINDOWS_DESKTOP 1
+    #elif WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+        #define LLAMA_WINDOWS_DESKTOP 1
+    #endif
 #endif
 
 #if defined(__APPLE__)
@@ -582,7 +587,7 @@ struct llama_mmap::impl {
             }
         }
     }
-#elif defined(_WIN32)
+#elif defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP))
     HANDLE hMapping = nullptr;
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
@@ -684,7 +689,7 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
-#if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+#if defined(_POSIX_MEMLOCK_RANGE) || defined(LLAMA_WINDOWS_DESKTOP)
 const bool llama_mmap::SUPPORTED  = true;
 #else
 const bool llama_mmap::SUPPORTED  = false;
@@ -738,7 +743,7 @@ struct llama_mlock::impl {
             LLAMA_LOG_WARN("warning: failed to munlock buffer: %s\n", std::strerror(errno));
         }
     }
-#elif defined(_WIN32)
+#elif defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP))
     static size_t lock_granularity() {
         SYSTEM_INFO si;
         GetSystemInfo(&si);
@@ -827,7 +832,7 @@ llama_mlock::~llama_mlock() = default;
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
 
-#if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+#if defined(_POSIX_MEMLOCK_RANGE) || defined(LLAMA_WINDOWS_DESKTOP)
 const bool llama_mlock::SUPPORTED = true;
 #else
 const bool llama_mlock::SUPPORTED = false;
