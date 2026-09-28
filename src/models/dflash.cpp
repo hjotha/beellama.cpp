@@ -1192,6 +1192,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * ffn_dynamic = nullptr;
         if (layer.dflash_ffn_conv_proj) {
             ffn_dynamic = build_lora_mm(layer.dflash_ffn_conv_proj, cur);
+            cb(ffn_dynamic, "ffn_conv_coeff", il);
             cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 0);
             cb(cur, "ffn_conv_in", il);
         }
