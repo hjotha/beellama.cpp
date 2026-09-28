@@ -24,6 +24,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "dflash-pipeline-candidate.h"
 
 #include <algorithm>
 #include <array>
@@ -1808,8 +1809,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t remote_pipeline_id_last = -1;
     int32_t remote_pipeline_n_max = 0;
     int32_t remote_draft_n_max = 0;
-    llama_token remote_next_hypothesis = -1;
-    float remote_next_hypothesis_confidence = 0.0f;
+    dflash_pipeline_candidate remote_next_candidate;
+    int32_t remote_pipeline_accept_k = -1;
+    llama_token remote_current_anchor_id = -1;
     bool remote_pipeline_enabled = false;
     bool remote_pipeline_inflight = false;
     bool remote_pipeline_ready = false;
@@ -2166,8 +2168,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         try {
             if (remote_pipeline_state_synced) {
-                // The real target features were committed at accept().  A
-                // later anchor mismatch only invalidates the saved output.
+                // A new prompt may have queued SYNC rows after the prior
+                // promotion. Never drop those rows with the saved output.
+                if (!remote_pipeline_syncs.empty() && !apply_remote_pipeline_syncs()) {
+                    return false;
+                }
             } else if (remote_pipeline_syncs.empty()) {
                 if (profile_mode != remote_profile_mode::mock_local) {
                     const dflash_remote::trim_data request{remote_draft_pos0};
@@ -2196,6 +2201,43 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return !remote_failed;
     }
 
+    bool remote_pipeline_has_real_prefix() const {
+        if (remote_pipeline_pos0 <= remote_draft_pos0 || remote_pipeline_syncs.empty()) {
+            return false;
+        }
+        const size_t rows_needed = size_t(remote_pipeline_pos0 - remote_draft_pos0);
+        std::vector<bool> covered(rows_needed, false);
+        const size_t row_bytes = sizeof(int32_t) + size_t(n_embd_enc) * sizeof(float);
+        bool trimmed = false;
+        for (const auto & request : remote_pipeline_syncs) {
+            const size_t prefix = request.operation == dflash_remote::sync_trim ?
+                sizeof(dflash_remote::sync_trim_data) : 0;
+            if (request.payload.size() != prefix + size_t(request.n_tokens) * row_bytes) {
+                return false;
+            }
+            if (prefix) {
+                dflash_remote::sync_trim_data cut{};
+                std::memcpy(&cut, request.payload.data(), sizeof(cut));
+                trimmed |= cut.reset || (cut.pos0 >= 0 && cut.pos0 <= remote_draft_pos0);
+                if (cut.reset || (cut.pos0 >= 0 && cut.pos0 <= remote_draft_pos0)) {
+                    std::fill(covered.begin(), covered.end(), false);
+                } else if (cut.pos0 > remote_draft_pos0 && cut.pos0 < remote_pipeline_pos0) {
+                    std::fill(covered.begin() + (cut.pos0 - remote_draft_pos0),
+                              covered.end(), false);
+                }
+            }
+            for (uint32_t i = 0; i < request.n_tokens; ++i) {
+                int32_t pos = -1;
+                std::memcpy(&pos, request.payload.data() + prefix + size_t(i) * row_bytes,
+                            sizeof(pos));
+                if (pos >= remote_draft_pos0 && pos < remote_pipeline_pos0) {
+                    covered[size_t(pos - remote_draft_pos0)] = true;
+                }
+            }
+        }
+        return trimmed && std::all_of(covered.begin(), covered.end(), [](bool value) { return value; });
+    }
+
     bool promote_remote_pipeline() {
         if (!remote_pipeline_active() || !wait_remote_pipeline()) {
             return false;
@@ -2208,8 +2250,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // The speculative output can be verified as a proposal, but its KV was
         // built with approximate features.  Commit the real target features
         // before the next cycle; only the proposal bytes may be reused.
-        if (remote_pipeline_syncs.empty()) {
+        if (!remote_pipeline_has_real_prefix()) {
+            LOG_ERR("DFlash2 Xbox pre-draft has incomplete real target SYNC; disabling remote drafting\n");
             discard_remote_pipeline();
+            remote_failed = true;
             return false;
         }
         if (!apply_remote_pipeline_syncs()) {
@@ -2222,17 +2266,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
-    bool launch_remote_pipeline(llama_token hypothesis) {
+    bool launch_remote_pipeline(llama_token hypothesis, int32_t accepted) {
         if (!remote || !remote_pipeline_enabled || remote_failed ||
-                remote_pipeline_active() || remote_n_proposed <= 0 ||
+                remote_pipeline_active() || remote_pipeline_used ||
+                accepted < 0 || accepted >= remote_n_proposed ||
                 remote_draft_n_max < 1 || remote_draft_pos0 < 0) {
             return false;
         }
 
-        // A one-token acceptance also commits the target's bonus token.  The
-        // next draft therefore starts two positions after this round's
-        // anchor: accepted Top-1 plus the sampled target token.
-        const int32_t pos0 = remote_draft_pos0 + 2;
+        // The candidate replaces the first rejected draft token after
+        // 'accepted' accepted tokens; it is never the rejected top choice.
+        const int32_t pos0 = remote_draft_pos0 + accepted + 1;
         if (pos0 <= remote_draft_pos0 || hypothesis < 0) {
             return false;
         }
@@ -2271,6 +2315,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         dflash_remote::client * client = remote.get();
         remote_pipeline_pos0 = pos0;
         remote_pipeline_id_last = hypothesis;
+        remote_pipeline_accept_k = accepted;
         remote_pipeline_n_max = remote_draft_n_max;
         remote_pipeline_state_synced = false;
         remote_pipeline_start = std::chrono::steady_clock::now();
@@ -2570,7 +2615,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             remote_pipeline_enabled = remote_fused_draft && profile_mode != remote_profile_mode::mock_local &&
                     pipeline && std::strcmp(pipeline, "1") == 0;
             LOG_INF("DFlash2 Xbox async pre-draft pipeline: %s\n",
-                    remote_pipeline_enabled ? "enabled" : "disabled");
+                    remote_pipeline_enabled ? "enabled (greedy only)" : "disabled");
 
             auto selector_params = llama_context_default_params();
             selector_params.n_ctx = block_size;
@@ -2655,6 +2700,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        // begin() can run after process() has already queued prompt features.
+        // Drain the old worker and apply those rows before starting a new draft.
+        if (remote && remote_pipeline_active() && !discard_remote_pipeline()) {
+            remote_failed = true;
         }
 
         if (local_split) {
@@ -2969,6 +3020,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (batch.n_tokens == 0) {
             return;
         }
+        if (remote) {
+            remote_current_anchor_id = batch.token[0];
+        }
 
         // decode all sequences' noise blocks locally, or run only the DFlash
         // transformer on Xbox and the original output-head/selector on this host.
@@ -3193,7 +3247,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(remote || local_split ? selector_ctx : ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
                 if (remote) {
-                    remote_next_hypothesis_confidence = 0.0f;
+                    remote_next_candidate = {};
                 }
 
                 if (selector_reset[seq_id]) {
@@ -3206,6 +3260,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
 
                 int32_t predecessor = 0;
+                double pipeline_prefix = 1.0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
@@ -3228,29 +3283,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         if (predecessor < 0) {
                             break;
                         }
-                        if (remote && i == 2) {
-                            remote_next_hypothesis_confidence = dist.probs[predecessor];
-                        }
                         result.push_back(dist.ids[predecessor]);
                         dp.dists->push_back(std::move(dist));
                     } else {
                         predecessor = (int32_t) std::distance(scores,
                                 std::max_element(scores, scores + selector_top_k));
-                        if (params.p_min > 0.0f || (remote && remote_pipeline_enabled && i == 2)) {
+                        if (params.p_min > 0.0f) {
                             // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                             float sum = 0.0f;
                             for (int32_t k = 0; k < selector_top_k; ++k) {
                                 sum += std::exp(scores[k] - scores[predecessor]);
                             }
                             const float confidence = 1.0f / sum;
-                            if (remote && i == 2) {
-                                remote_next_hypothesis_confidence = confidence;
-                            }
                             if (confidence < params.p_min) {
                                 break;
                             }
                         }
                         result.push_back((llama_token) row[predecessor]);
+                        if (remote && (remote_pipeline_enabled || rpc_metrics.is_open())) {
+                            remote_next_candidate = dflash_pipeline_rank2_step(
+                                    row, scores, selector_top_k, predecessor, i - 1,
+                                    pipeline_prefix, remote_next_candidate);
+                        }
                     }
                 }
 
@@ -3262,10 +3316,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 if (remote) {
                     remote_n_proposed = (int32_t) result.size();
-                    // A one-token acceptance commits the target's bonus token
-                    // next.  Use the selector's second hypothesis as the
-                    // speculative anchor for that bonus position.
-                    remote_next_hypothesis = result.size() > 1 ? result[1] : -1;
+                    if (result.empty()) remote_next_candidate = {};
                     remote_proposal_done = std::chrono::steady_clock::now();
                     remote_proposal_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             remote_proposal_done - remote_draft_done).count();
@@ -3337,9 +3388,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
         if (remote && remote_pipeline_enabled && remote_draft_pending &&
-                remote_n_proposed > 1 && remote_next_hypothesis >= 0 &&
-                remote_next_hypothesis_confidence >= 0.95f) {
-            launch_remote_pipeline(remote_next_hypothesis);
+                remote_next_candidate.accepted >= 0 &&
+                remote_next_candidate.accepted < remote_n_proposed &&
+                remote_next_candidate.token >= 0 &&
+                remote_next_candidate.score >= 0.25f) {
+            launch_remote_pipeline(remote_next_candidate.token,
+                                   remote_next_candidate.accepted);
         }
         if (remote && remote_draft_pending && remote_n_proposed == 0) {
             // No target verification follows an empty draft, so accept() will not run.
@@ -3391,11 +3445,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        const auto verify_done = std::chrono::steady_clock::now();
         if (remote_pipeline_active()) {
             // process() may have queued target rows while the pre-draft was in
-            // flight.  Only a one-token acceptance can leave the predicted
-            // bonus anchor at the next position; draft() still checks its ID.
-            const bool promote = !is_other && n_accepted == 1 && remote_n_proposed > 0;
+            // flight. Only the predicted rejection point has the expected
+            // bonus position; draft() still checks the actual bonus token ID.
+            const bool promote = !is_other &&
+                n_accepted == remote_pipeline_accept_k && remote_n_proposed > 0;
             if (promote) {
                 if (!promote_remote_pipeline()) {
                     remote_draft_pending = false;
@@ -3408,11 +3464,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             remote_draft_pending = false;
             remote_trimmed = true;
         }
+        const auto pipeline_accept_done = std::chrono::steady_clock::now();
+        const auto pipeline_accept_overhead_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                pipeline_accept_done - verify_done).count();
 
         if (!remote_draft_pending && remote_failed) {
             return;
         }
-        const auto verify_done = std::chrono::steady_clock::now();
         const auto target_verify_us = remote_n_proposed == 0 ? 0 :
                 std::chrono::duration_cast<std::chrono::microseconds>(
                         verify_done - remote_draft_done).count();
@@ -3431,7 +3490,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
         const auto cycle_done = std::chrono::steady_clock::now();
-        if (rpc_metrics) {
+        if (rpc_metrics.is_open()) {
             const auto & xbox = remote_draft_timing.server;
             const auto tick_us = [](auto point) -> int64_t {
                 return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3448,8 +3507,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         << ",\"accept_entry_tick_us\":" << tick_us(verify_done)
                         << ",\"accept_done_tick_us\":" << tick_us(cycle_done)
                         << ",\"target_position\":" << remote_draft_pos0
+                        << ",\"anchor_id_real\":" << remote_current_anchor_id
                         << ",\"n_proposed\":" << remote_n_proposed
                         << ",\"n_accepted\":" << n_accepted
+                        << ",\"pipeline_candidate_k\":" << remote_next_candidate.accepted
+                        << ",\"pipeline_candidate_id\":" << remote_next_candidate.token
+                        << ",\"pipeline_candidate_score\":" << remote_next_candidate.score
                         << ",\"is_other\":" << (is_other ? "true" : "false")
                         << ",\"capture_hidden_us\":" << rpc_capture_us
                         << ",\"sync_serialize_us\":" << rpc_sync_serialize_us
@@ -3477,6 +3540,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         << ",\"xbox_response_us_prior\":" << xbox.xbox_response_us
                         << ",\"selector_us\":" << remote_selector_us
                         << ",\"target_verify_us\":" << target_verify_us
+                        << ",\"pipeline_accept_overhead_us\":" << pipeline_accept_overhead_us
                         << ",\"trim_rpc_us\":" << remote_trim_us
                         << ",\"total_cycle_us\":" << cycle_us
                         << ",\"pipeline_enabled\":" << (remote_pipeline_enabled ? "true" : "false")
