@@ -22,7 +22,7 @@ namespace dflash_remote {
 // Must match xllama/uwp/dflash-rpc/dedicated_protocol.h, version 2.
 constexpr uint32_t magic = 0x324c4644;
 constexpr uint16_t version = 2;
-enum op : uint16_t { hello = 1, reset = 2, sync = 3, draft = 4, trim = 5, mock = 6, sync_trim = 7 };
+enum op : uint16_t { hello = 1, reset = 2, sync = 3, draft = 4, trim = 5, mock = 6, sync_trim = 7, sync_and_draft = 18 };
 
 #pragma pack(push, 1)
 struct request {

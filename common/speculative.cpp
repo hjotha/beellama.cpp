@@ -1758,6 +1758,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool remote_draft_pending = false;
     bool remote_trimmed = false;
     bool remote_fused_sync = false;
+    bool remote_fused_draft = false;
+    std::vector<uint8_t> remote_sync_payload;
+    uint32_t remote_sync_tokens = 0;
+    bool remote_sync_has_trim = false;
     uint64_t remote_trim_us = 0;
     int32_t remote_draft_pos0 = -1;
     int32_t remote_n_proposed = 0;
@@ -1975,6 +1979,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
             LOG_INF("DFlash2 Xbox fused TRIM/SYNC: %s\n", remote_fused_sync ? "enabled" : "legacy");
+            const char * separate = std::getenv("DFLASH_XBOX_SEPARATE_DRAFT");
+            if (remote_fused_sync && (!separate || std::strcmp(separate, "1") != 0)) {
+                try {
+                    remote->call(dflash_remote::sync_and_draft, ++rpc_request_id, 0,
+                            nullptr, 0, rpc_bytes, 0);
+                    remote_fused_draft = true;
+                } catch (const dflash_remote::server_error & err) {
+                    if (err.status != -1) throw;
+                }
+            }
+            LOG_INF("DFlash2 Xbox fused SYNC/DRAFT: %s\n", remote_fused_draft ? "enabled" : "legacy");
 
             auto selector_params = llama_context_default_params();
             selector_params.n_ctx = block_size;
@@ -2171,6 +2186,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         const auto capture_done = std::chrono::steady_clock::now();
                         rpc_capture_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                 capture_done - capture_start).count();
+                        // Keep only the last SYNC chunk for the next DRAFT. Flush
+                        // older chunks before applying any later rewind/trim.
+                        if (remote_sync_tokens) {
+                            if (profile_mode != remote_profile_mode::mock_local) {
+                                const auto timing = remote->call(remote_sync_has_trim ? dflash_remote::sync_trim : dflash_remote::sync,
+                                        ++rpc_request_id, remote_sync_tokens, remote_sync_payload.data(),
+                                        (uint32_t) remote_sync_payload.size(), rpc_bytes, 0);
+                                rpc_sync_us += timing.roundtrip_us;
+                                rpc_sync_send_us += timing.send_us;
+                                rpc_sync_wait_us += timing.header_wait_us + timing.payload_read_us;
+                                rpc_sync_xbox_prepare_us += timing.server.xbox_prepare_us;
+                                rpc_sync_xbox_compute_us += timing.server.xbox_compute_us;
+                            }
+                            remote_sync_tokens = 0;
+                            remote_sync_payload.clear();
+                        }
                         const int32_t first_pos = batch_inject.pos[0];
                         const bool rewind = first_pos <= remote_last_sync_pos;
                         const bool trim_pending = remote_draft_pending && !remote_trimmed;
@@ -2205,7 +2236,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         rpc_sync_serialize_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - sync_serialize_start).count();
-                        if (profile_mode != remote_profile_mode::mock_local) {
+                        if (remote_fused_draft) {
+                            remote_sync_payload = std::move(payload);
+                            remote_sync_tokens = (uint32_t) n_chunk;
+                            remote_sync_has_trim = fused;
+                        } else if (profile_mode != remote_profile_mode::mock_local) {
                             const auto timing = remote->call(fused ? dflash_remote::sync_trim : dflash_remote::sync, ++rpc_request_id,
                                     (uint32_t) n_chunk, payload.data(), (uint32_t) payload.size(), rpc_bytes, 0);
                             rpc_sync_us += timing.roundtrip_us;
@@ -2293,9 +2328,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const dflash_remote::draft_data draft_request{
                     batch.pos[0], batch.token[0], n_rows - 1};
                 const auto serialize_start = std::chrono::steady_clock::now();
-                std::vector<uint8_t> payload(sizeof(draft_request) + embeddings.size() * sizeof(float));
-                std::memcpy(payload.data(), &draft_request, sizeof(draft_request));
-                std::memcpy(payload.data() + sizeof(draft_request), embeddings.data(),
+                std::vector<uint8_t> payload;
+                if (remote_fused_draft) {
+                    if (!remote_sync_tokens || !remote_sync_has_trim) {
+                        const dflash_remote::sync_trim_data cut{-1, 0};
+                        payload.resize(sizeof(cut));
+                        std::memcpy(payload.data(), &cut, sizeof(cut));
+                    }
+                    payload.insert(payload.end(), remote_sync_payload.begin(), remote_sync_payload.end());
+                }
+                const size_t draft_offset = payload.size();
+                payload.resize(draft_offset + sizeof(draft_request) + embeddings.size() * sizeof(float));
+                std::memcpy(payload.data() + draft_offset, &draft_request, sizeof(draft_request));
+                std::memcpy(payload.data() + draft_offset + sizeof(draft_request), embeddings.data(),
                         embeddings.size() * sizeof(float));
                 remote_serialize_us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - serialize_start).count();
@@ -2315,8 +2360,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     remote_draft_timing = {};
                     remote_draft_timing.server.cycle_id = ++rpc_request_id;
                 } else {
-                    remote_draft_timing = remote->call(dflash_remote::draft, ++rpc_request_id,
-                            (uint32_t) n_rows, payload.data(), (uint32_t) payload.size(), rpc_bytes,
+                    remote_draft_timing = remote->call(remote_fused_draft ? dflash_remote::sync_and_draft : dflash_remote::draft, ++rpc_request_id,
+                            remote_fused_draft ? remote_sync_tokens : (uint32_t) n_rows,
+                            payload.data(), (uint32_t) payload.size(), rpc_bytes,
                             expected_bytes);
                     if (rpc_capture) {
                         const replay_header saved{draft_request.pos0, draft_request.id_last,
@@ -2326,6 +2372,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                remote_sync_tokens = 0;
+                remote_sync_payload.clear();
                 const auto selector_copy_start = std::chrono::steady_clock::now();
                 selector_batch.n_tokens = n_rows;
                 for (int32_t i = 0; i < n_rows; ++i) {
@@ -2413,9 +2461,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         for (float & p : dist.probs) {
                             p /= sum;
                         }
-                        std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
-                        predecessor = sample(selector_rng[seq_id]);
-                        if (dist.probs[predecessor] < params.p_min) {
+                        predecessor = common_speculative_dflash_sample(dist.probs, params.p_min, selector_rng[seq_id]);
+                        if (predecessor < 0) {
                             break;
                         }
                         result.push_back(dist.ids[predecessor]);
@@ -2567,6 +2614,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         << ",\"proposal_us\":" << remote_proposal_us
                         << ",\"rewind_rpc_us\":" << rpc_rewind_us
                         << ",\"fused_sync\":" << (remote_fused_sync ? "true" : "false")
+                        << ",\"fused_draft\":" << (remote_fused_draft ? "true" : "false")
                         << ",\"send_us\":" << remote_draft_timing.send_us
                         << ",\"header_send_us\":" << remote_draft_timing.header_send_us
                         << ",\"payload_send_us\":" << remote_draft_timing.payload_send_us
