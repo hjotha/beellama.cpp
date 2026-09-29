@@ -5688,6 +5688,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_LOCAL_PREFETCH"));
     add_opt(common_arg(
+        {"--spec-draft-shadow-model"}, "FNAME",
+        "observation-only auxiliary draft model loaded next to the primary drafter; its proposals are recorded but never used in the response (experimental, requires --spec-type draft-mtp)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.shadow.mparams.path = value;
+            params.speculative.shadow.mparams.hf_file = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SHADOW_MODEL"));
+    add_opt(common_arg(
+        {"--spec-draft-shadow-device"}, "<dev1,dev2,..>",
+        "comma-separated list of devices to use for the shadow auxiliary draft model (default: inherited device list)\n"
+        "use --list-devices to see a list of available devices",
+        [](common_params & params, const std::string & value) {
+            params.speculative.shadow.devices = parse_device_list(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-draft-shadow-ngl"}, "N",
+        string_format("max. number of shadow auxiliary model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)",
+            params.speculative.shadow.n_gpu_layers == -1 ? "auto" : "all"),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.speculative.shadow.n_gpu_layers = -1;
+            } else if (value == "all") {
+                params.speculative.shadow.n_gpu_layers = -2;
+            } else {
+                params.speculative.shadow.n_gpu_layers = std::stoi(value);
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SHADOW_NGL"));
+    add_opt(common_arg(
+        {"--spec-draft-shadow-n-max"}, "N",
+        string_format("maximum number of proposals per shadow auxiliary block (default: %d)", params.speculative.shadow.n_max),
+        [](common_params & params, const std::string & value) {
+            params.speculative.shadow.n_max = std::stoi(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SHADOW_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-shadow-p-min"}, "P",
+        string_format("minimum greedy proposal probability for the shadow auxiliary model (default: %.2f)", (double)params.speculative.shadow.p_min),
+        [](common_params & params, const std::string & value) {
+            params.speculative.shadow.p_min = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SHADOW_P_MIN"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",

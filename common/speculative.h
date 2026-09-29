@@ -137,6 +137,13 @@ bool common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// Server-owned shadow lifecycle: begin before prompt/cache processing and
+// publish only the final accepted sequence, including its actual bonus token.
+void common_speculative_shadow_new_request(common_speculative * spec, llama_seq_id seq_id, int64_t request_id);
+void common_speculative_shadow_commit(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & accepted);
+void common_speculative_shadow_cancel_primary(common_speculative * spec, llama_seq_id seq_id);
+void common_speculative_shadow_end_request(common_speculative * spec, llama_seq_id seq_id);
+
 // Optional host-owned internal state. These hooks do not save or restore KV.
 // The owner must quiesce decode/draft operations and restore matching target/draft state,
 // and may require a checkpoint position. No borrowed device state escapes these hooks.
@@ -191,6 +198,11 @@ struct common_speculative_init_result {
 
     llama_model   * model();
     llama_context * context();
+
+    // Observation-only auxiliary draft context (null unless shadow is enabled).
+    // Owned by this result together with its model; the caller must not free it
+    // and must keep this result alive while the auxiliary context is used.
+    llama_context * context_aux();
 
 private:
     struct impl;

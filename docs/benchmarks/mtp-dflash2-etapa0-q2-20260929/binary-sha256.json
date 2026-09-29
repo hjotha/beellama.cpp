@@ -1,0 +1,7 @@
+{
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/llama-server": "bda17a8cb9beee2bb7de875d11401374f3cff538fc8bf7b1ecbac2b5388d3585",
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7": "7695238cbc1416d1fa11d86ed10705e7cda0142d089d2422ef1806daf71d0955",
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7": "7deeb148bb8a52a07fd833688d273da8b9ab6c21ea7be3d8cf810a1d32ec472d",
+  "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so": "f5e5c2fca6d929249a080e44145876e94715673d67a4fd0bdcc2d937681e1639",
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+}

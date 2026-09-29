@@ -375,6 +375,30 @@ struct common_params_speculative_draft {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };
 
+// Observation-only auxiliary drafter. The auxiliary model and context are
+// loaded and owned separately from the primary draft; its proposals are meant
+// to be recorded for analysis and never enter the response. This struct only
+// establishes the configuration and ownership contract; the observation
+// pipeline that consumes ctx_dft is wired separately.
+struct common_params_speculative_shadow {
+    common_params_model mparams;       // auxiliary model (empty: disabled)
+    std::vector<ggml_backend_dev_t> devices; // devices for the auxiliary model
+    int32_t n_gpu_layers = -1;         // number of auxiliary model layers in VRAM (-1: default)
+
+    int32_t n_max = 7;                 // maximum proposals per auxiliary block
+    float   p_min = 0.0f;              // minimum greedy proposal probability
+
+    // the observation pipeline requires the explicit local split path
+    bool local_split = true;
+
+    llama_context * ctx_tgt = nullptr; // non-owning, set by the owner before init
+    llama_context * ctx_dft = nullptr; // non-owning, set from the init result
+
+    bool enabled() const {
+        return !mparams.empty();
+    }
+};
+
 struct common_params_speculative_ngram_mod {
     int32_t n_match = 24;
 
@@ -409,6 +433,9 @@ struct common_params_speculative {
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
+
+    // observation-only concurrent auxiliary drafter (experimental)
+    common_params_speculative_shadow shadow;
 
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;

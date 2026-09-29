@@ -1,10 +1,11 @@
 # Plano: MTP e DFlash2 concorrentes com reaproveitamento de sufixo
 
-Data: 2026-09-29. Estado: proposta para decisão; modo híbrido ainda não implementado.
+Data: 2026-09-29. Estado: proposta para decisão; Etapa 0 executada; modo híbrido ainda não implementado.
 
 Base examinada na elaboração: branch `fix/dflash-xbox-pipeline`, commit `12231b55e`,
 com as correções locais de split/prefetch pendentes naquele levantamento, depois
-registradas em `47af27df0`. Este documento consolida a
+registradas em `47af27df0` e publicadas em `6281c6b56`. A Etapa 0 foi executada em
+2026-09-29 com a referência renovada na seção 2.1. Este documento consolida a
 discussão e propõe a primeira validação; não aprova automaticamente a implementação
 das etapas seguintes nem muda a produção.
 
@@ -40,11 +41,13 @@ Decisões propostas para o primeiro protótipo:
 
 ## 2. O que já foi medido
 
-Os [dados de referência preservados](benchmarks/mtp-dflash2-hybrid-baselines-20260929.json)
+Os [dados de referência históricos](benchmarks/mtp-dflash2-hybrid-baselines-20260929.json)
 incluem resultados, comandos executados, prompts completos, configurações e hashes
-dos binários disponíveis. Os logs integrais continuam nos diretórios temporários
-indicados nesse arquivo. Resultados históricos devem ser repetidos antes de uma
-decisão de implementação baseada em desempenho.
+dos binários disponíveis. Os logs integrais desses ensaios históricos continuam nos
+diretórios temporários indicados nesse arquivo. A referência renovada da Etapa 0
+está preservada no repositório, com logs e telemetria, em
+[benchmarks/mtp-dflash2-etapa0-20260929-122824](benchmarks/mtp-dflash2-etapa0-20260929-122824/README.md).
+Ela prevalece sobre os resultados históricos para a decisão de implementação.
 
 Ambiente: GOKAYA, Ryzen Z1 Extreme com Radeon integrada, RTX 4070 em eGPU;
 alvo `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`; draft
@@ -75,11 +78,181 @@ KV `q4_0`; 192 tokens gerados. O prompt longo tinha 13850 tokens de entrada.
 - O prefetch local corrigido teve 16 tentativas e zero reaproveitamentos no
   conjunto da revisão. Ele prevê outro ponto/âncora; esse resultado **não mede** a
   proposta de dois drafts partindo do mesmo prefixo descrita aqui.
-- Os ensaios acima usaram DFlash com limite 6. O bloco com 7 propostas precisa
-  ser medido: mudar o tamanho do bloco de difusão pode mudar as próprias previsões.
+- Os ensaios acima usaram DFlash com limite 6. O bloco com 7 propostas foi medido
+  na Etapa 0 (seção 2.1): mudar o tamanho do bloco de difusão muda as previsões e
+  o desempenho de forma não uniforme.
 
 O fato de DFlash sozinho ser mais lento que MTP não decide o resultado híbrido.
 O ganho depende do trabalho útil sobreposto e do custo adicional imposto ao alvo.
+
+### 2.1 Etapa 0 executada (2026-09-29, referência renovada)
+
+Mesmo binário e ambiente do futuro protótipo (`main` em `6281c6b56`; hashes dos
+binários idênticos aos registrados). Contexto 16384, batch/ubatch 64, um slot, KV
+`q4_0`, temperature 0, seed 42, 192 tokens; 3 execuções por prompt curto e 2 por
+longo, mediana. MTP na 4070 com p_min 0,70; DFlash2 Q4_K_M na Radeon com split
+local, prefetch desligado, APU 20 W, SCLK 2700 MHz e CPU na política original.
+
+| Modo | Repetição, tok/s | Código, tok/s | Longo, tok/s | Prefill longo, tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| MTP n=2 | 67,06 | 57,45 | 51,10 | 676 |
+| MTP n=3 | 74,95 | 57,65 | 54,17 | 670 |
+| MTP n=4 | 84,50 | 59,08 | 57,41 | 666 |
+| DFlash n=6 | 70,05 | 47,40 | 49,69 | 649 |
+| DFlash n=7 | 73,85 | 44,53 | 47,98 | 646 |
+
+- MTP n=4 segue como a melhor referência isolada nos três cenários e é a meta a
+  superar na Etapa 2.
+- DFlash n=7 supera n=6 apenas em repetição (+5,4%); perde em código (−6,1%) e no
+  longo (−3,4%). O bloco de difusão maior não é ganho uniforme e o n=7 entra como
+  caso próprio na comparação.
+- Hashes de saída por modo (prefixos; valores completos na evidência): na
+  repetição, MTP n=2 = n=3 (`55b20c7c`) e MTP n=4 = DFlash n=6 = n=7
+  (`031bf5c6`); no código há três trajetórias (`f582cdd9`, `bd1a517e`,
+  `19f387f9`); no longo, todos os MTP coincidem (`1e9b0179`) e o DFlash diverge
+  (`8508b88d`). A trajetória gulosa do MTP muda com o `n_max` e a coincidência
+  MTP×DFlash não pode ser presumida; são dados diretos para a validação da
+  seção 10.
+- DFlash n=6 de hoje (70,05/47,40/49,69) confere com o registro de mesmo binário
+  (71,43/48,26/49,72) dentro da dispersão; MTP n=4 ficou 3–4% abaixo do registro
+  de 2026-09-28 de execução única, com o longo praticamente igual.
+
+Comandos exatos, prompts, respostas, telemetria de potência/clocks e hashes de
+modelo/binário estão em
+[benchmarks/mtp-dflash2-etapa0-20260929-122824](benchmarks/mtp-dflash2-etapa0-20260929-122824/README.md).
+
+### 2.2 Quantização do auxiliar DFlash2: Q2_K contra Q4_K_M (2026-09-29)
+
+Mesmo binário e ambiente da seção 2.1; só o arquivo do draft mudou
+(`Qwen3.8-27B-DFlash2-Q2_K.gguf`, sha256 `e3eb7705` como prefixo; valor completo
+na evidência). Mediana de 3 execuções curtas e 2 longas por modo.
+
+| Auxiliar DFlash2 | Repetição, tok/s | Código, tok/s | Longo, tok/s | Prefill longo, tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K_M n=6 | 70,05 | 47,40 | 49,69 | 649 |
+| Q2_K n=6 | 67,78 | 45,97 | 40,81 | 653 |
+| Q4_K_M n=7 | 73,85 | 44,53 | 47,98 | 646 |
+| Q2_K n=7 | 71,33 | 44,52 | 38,23 | 650 |
+
+- Q2_K ficou 3–4% mais lento nos prompts curtos e 18–20% mais lento no longo
+  nessa execução isolada. A economia de memória (~0,7 GB contra ~1,1 GB) não
+  trouxe ganho nesse teste; a referência inicial do auxiliar segue Q4_K_M.
+- As saídas finais do Q2_K coincidiram com as do Q4_K_M nos três cenários
+  (`031bf5c6`, `19f387f9`, `8508b88d`). A revisão encontrou os contadores de
+  aceitação nos logs: no longo, n=7 caiu de 61,11% em Q4 para 44,72% em Q2;
+  n=6 caiu de 67,40% para 51,80%. Isso apoia manter Q4 como referência.
+  O custo por bloco e a utilidade do Q2 como auxiliar concorrente ainda não
+  foram isolados; desempenho isolado não encerra essa questão.
+- Comandos, telemetria e hashes em
+  [benchmarks/mtp-dflash2-etapa0-q2-20260929](benchmarks/mtp-dflash2-etapa0-q2-20260929/README.md).
+
+### 2.3 Custo de manter o auxiliar sincronizado (2026-09-29)
+
+Caso 2 da matriz da seção 9: MTP n=4 como primário e auxiliar DFlash2 Q4_K_M
+carregado na Radeon, recebendo `begin/process/accept` no mesmo prefixo, **sem
+gerar blocos** (o `draft()` do auxiliar não é chamado). Mesmo ambiente e prompts
+da Etapa 0; mediana de 3 execuções curtas e 2 longas.
+
+| Configuração | Repetição, tok/s | Código, tok/s | Longo, tok/s | Prefill longo, tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| MTP n=4 isolado (Etapa 0) | 84,50 | 59,08 | 57,41 | 666 |
+| MTP n=4 + auxiliar sincronizado | 81,65 | 56,61 | 54,76 | 631 |
+| Diferença | −3,4% | −4,2% | −4,6% | −5,2% |
+
+- Hashes idênticos ao MTP isolado (`031bf5c6`, `19f387f9`, `1e9b0179`): o
+  auxiliar não alterou a resposta.
+- Este é o piso de custo do modo de observação (injeção de features na KV da
+  Radeon por ciclo); o benefício da Etapa 2 precisa superá-lo.
+- Evidência em
+  [benchmarks/mtp-dflash2-shadow-sync-cost-20260929](benchmarks/mtp-dflash2-shadow-sync-cost-20260929/README.md).
+
+### 2.4 Observação paralela assíncrona (2026-09-29)
+
+> **Resultados históricos com limitações identificadas:** a revisão posterior
+> encontrou bônus obtido da entrada da verificação, descarte de propostas antes
+> do commit, KV auxiliar com linhas rejeitadas e prontidão avaliada após executar
+> o MTP. Assim, 99% de prontidão e 3,6% de coincidência não são medidas válidas
+> para decidir a Etapa 2. Os timers de etapas também excluíam as sincronizações
+> dos getters. Os valores abaixo ficam como histórico da implementação anterior;
+> a remedição corrigida é registrada na seção 2.5.
+
+O bloco auxiliar passou a rodar em um worker a partir do mesmo prefixo/âncora do
+MTP, com um trabalho em voo, join apenas quando o future já está pronto e
+descarte contado quando o ciclo avança. A sequência confirmada (incluindo bônus,
+`c = n_accepted + 1`) é cruzada com a proposta pela âncora do draft verificado.
+Mesma bateria da Etapa 0 (3 curtas + 3 de código + 2 longas).
+
+| Configuração | Repetição, tok/s | Código, tok/s | Longo, tok/s |
+| --- | ---: | ---: | ---: |
+| MTP n=4 isolado (Etapa 0) | 84,50 | 59,08 | 57,41 |
+| + auxiliar sincronizado, sem blocos (2.3) | 81,65 | 56,61 | 54,76 |
+| + observação assíncrona | 57,3–58,4 | 43,3–44,5 | 38,7–42,4 |
+
+- Prontidão na decisão: 407 de 411 blocos prontos (~99%); atraso não é o
+  problema.
+- Coincidência completa do prefixo, **incluindo o bônus**: 7 de 193 observações
+  (~3,6%), 33 tokens de sufixo utilizável em ~1600 gerados. Na maioria dos
+  casos o auxiliar acerta os tokens aceitos do MTP e diverge no bônus (distância
+  típica de 3 tokens até a coincidência completa).
+- Custo do MVP: ~30% de queda na geração; o caso 3 da matriz da seção 9 cabe no
+  prazo, mas hoje custa mais do que o valor medido.
+- Throttle: com um bloco a cada 4 drafts primários (`GGML_DFLASH_SHADOW_EVERY=4`)
+  a geração volta a 80,3/55,6/54,2 tok/s (−1,6% sobre o piso síncrono), mantendo
+  a amostragem de observações.
+- Estágios por bloco: worker ~55 ms (Radeon ~16 ms, seletor na 4070 ~5 ms,
+  preparo/amostragem ~34 ms), injeção ~2,2 ms e cópia ~1,1 ms no thread
+  principal. A perda com *every=1* vem do orçamento compartilhado da APU (clock
+  efetivo da CPU ~2,8 → ~1,4 GHz; PPT ~8 → ~18 W), não do CUDA em si; o thread
+  principal responde por ~4% do ciclo.
+- Hashes de saída idênticos ao MTP isolado em todos os runs; nenhuma falha do
+  worker.
+- Evidência (runs 1–3, correções e ressalvas de política de CPU) em
+  [benchmarks/mtp-dflash2-shadow-async-20260929](benchmarks/mtp-dflash2-shadow-async-20260929/README.md).
+
+### 2.5 Observador corrigido e nova medição (2026-09-29)
+
+A revisão encontrou erros de captura do bônus, pareamento, fronteira da KV e
+prazo. Eles foram corrigidos com eventos de commit definitivo, resultado mantido
+até a decisão, identidade de request/epoch/job e corte das features rejeitadas.
+Timers passaram a incluir os getters que sincronizam as GPUs. Falhas, cancelamentos
+e jobs pendentes agora têm contabilização explícita e reconciliada.
+
+Nova bateria no mesmo binário, CPU powersave/EPP power limitada a 3,3 GHz com
+readback por requisição, APU 20 W e SCLK solicitado em 2700 MHz em todos os modos:
+
+| Modo | Repetição tok/s | Código tok/s | Longo tok/s |
+| --- | ---: | ---: | ---: |
+| mtp-n4 | 87.80 | 61.03 | 59.06 |
+| shadow-sync | 85.05 | 58.89 | 56.99 |
+| shadow-every1 | 60.94 | 43.18 | 43.47 |
+| shadow-every4 | 82.38 | 56.80 | 55.37 |
+
+Medianas de três execuções curtas e duas longas. Todas as 38 respostas medidas,
+incluindo a repetição final do baseline, coincidiram por cenário.
+
+- EVERY=1: 414 lançamentos = 405 observações + 9 cancelamentos. Prefixo correto
+  em 285/405 (70,37%); pronto no prazo em 383/405 (94,57%); 273 blocos com
+  oportunidade de sufixo, totalizando 736 tokens candidatos limitados pela
+  capacidade existente. Esses tokens ainda não foram usados/verificados no híbrido.
+- EVERY=4: 104 lançamentos = 102 observações + 2 cancelamentos. Prefixo correto
+  em 69/102 (67,65%); pronto em 78/102 (76,47%); 53 blocos com oportunidade,
+  130 tokens candidatos. A queda de geração ainda é de aproximadamente 6–7%
+  sobre o MTP isolado. Contadores incluem aquecimento; pending=0 e errors=0.
+- Worker médio: 55,30 ms em EVERY=1 (51,67 ms de decode/retorno e 3,30 ms de
+  seletor/retorno) e 41,64 ms em EVERY=4 (37,90 + 3,60 ms). São latências das
+  operações, não tempos de kernel puros. O residual é <0,4 ms; a atribuição
+  anterior de ~35 ms a preparo/amostragem estava incorreta.
+- Canário adicional: batch 64/ubatch 32, restore/reuse de prompt com apenas 4
+  tokens reprocessados, hash preservado, cancelamento de stream e próxima
+  requisição sem contaminação. O auxiliar é suspenso se não possuir o prefixo
+  restaurado, até novo prefill frio.
+
+Os 3,6% anteriores não sustentam mais uma decisão sobre a ideia. A oportunidade
+existe, mas ainda precisa superar o custo do auxiliar e o custo de verificar
+sufixos menores. Não há ganho híbrido ativo medido.
+
+Evidências, scripts, ambiente e interpretação em
+[benchmarks/mtp-dflash2-shadow-corrected-20260929](benchmarks/mtp-dflash2-shadow-corrected-20260929/README.md).
 
 ## 3. Alternativas discutidas
 
@@ -236,12 +409,14 @@ um sufixo maior será uma configuração separada, com sua memória e custo medi
 
 ## 7. Ordem de implementação e experimentos
 
-### Etapa 0 — renovar a referência
+### Etapa 0 — renovar a referência — **concluída em 2026-09-29**
 
 Repetir MTP isolado no mesmo binário e ambiente do futuro protótipo, com limites
 2, 3 e 4. Confirmar o DFlash de sete propostas isoladamente. Preservar comandos,
 prompts, hashes do modelo/binário, logs de potência/clocks e memória utilizada.
 
+Resultados na seção 2.1; evidência completa em
+[benchmarks/mtp-dflash2-etapa0-20260929-122824](benchmarks/mtp-dflash2-etapa0-20260929-122824/README.md).
 Os resultados históricos servem para orientar o experimento, não para declarar
 que um protótipo novo venceu uma referência de outro dia.
 
@@ -258,6 +433,25 @@ Entregas:
 4. Observar a sequência confirmada, incluindo bônus, e avaliar prontidão,
    coincidência e comprimento útil. Nenhum token auxiliar altera a resposta.
 5. Registrar custo do auxiliar e motivos de descarte; comparar com MTP isolado.
+
+**Progresso em 2026-09-29 (branch `feat/dflash2-shadow-observation`):**
+
+- Contexto e modelo auxiliares independentes, flags de configuração e execução
+  em worker único implementados.
+- A primeira observação foi revisada: seus índices de prontidão/coincidência
+  foram invalidados pelos erros descritos na seção 2.4.
+- O observador corrigido recebe o bônus real e conserva resultados até o commit
+  e o prazo; usa IDs de request/epoch/job e timestamps de conclusão/decisão.
+- Features e KV são cortadas pela aceitação definitiva. Replay preserva o job;
+  restore de outro prefixo suspende o auxiliar até reconstrução fria. Erros e
+  cancelamentos não entram como coincidências normais.
+- Medição corrigida e canários de ciclo de vida aprovados (seção 2.5), incluindo
+  reconciliação de todos os lançamentos. `GGML_DFLASH_SHADOW_EVERY=0` permite
+  medir apenas sincronização no mesmo binário; 1 e 4 foram comparados.
+- O início do auxiliar ainda ocorre depois do draft MTP atual; antecipá-lo é
+  uma otimização a medir separadamente. Prontidão já é avaliada antes do próximo
+  MTP, independentemente do throttle.
+- Etapa 2 permanece pendente: tokens candidatos ainda não alimentam a resposta.
 
 Registrar também se a demora veio da Radeon, das cópias ou do seletor esperando
 vez na 4070. Não somar tempos de execuções isoladas para alegar sobreposição.
@@ -387,16 +581,17 @@ Critérios de decisão propostos, ainda negociáveis:
 
 | Decisão | Recomendação | Consequência |
 | --- | --- | --- |
-| Primeiro código | Observação paralela | Valida a hipótese de aceitação/prontidão antes de mudar a origem dos drafts entregues ao alvo. |
+| Próximo experimento | Observação corrigida e custo de sufixo | A coincidência está demonstrada; medir benefício líquido, janela de lançamento e limites antes de promover o modo ativo. |
 | Começar diretamente ativo? | Somente como alternativa deliberada | Requer desde o início sincronização de ambos os estados, roteamento de aceitação e toda a validação de fallback. |
 | Árvore de propostas já? | Adiar | É uma mudança maior no verificador; usar primeiro as medidas de complementaridade. |
-| Profundidade inicial | DFlash 7; MTP 2/3/4 | Encontra o equilíbrio entre avanço do MTP, prazo e sufixo restante. |
+| Profundidade inicial | DFlash 7; MTP 2/3/4 | Medido na Etapa 0: o DFlash n=7 só ganha em repetição; nos demais cenários n=6 rende mais. MTP n=4 é a melhor referência isolada. |
 | Hardware inicial | APU 20 W, Radeon 2700 MHz, CPU econômica | Os testes anteriores não sustentam aumento permanente de TDP/CPU como principal fonte de ganho. |
 | Temperatura maior que zero | Etapa posterior | Exige uma regra explícita para propostas, distribuições e rejeição. |
 
-A escolha da primeira implementação permanece aberta. A recomendação é
-**etapa 0 + etapa 1**, usando o reaproveitamento ativo de sufixo como próximo passo
-condicionado às medidas, sem começar pela árvore de verificação.
+As Etapas 0 e 1 têm medições preservadas (seções 2.1 e 2.5). O próximo passo é
+validar se a oportunidade de sufixo paga seu custo e definir um experimento ativo
+limitado da Etapa 2. A árvore de verificação segue adiada; nenhuma taxa antiga
+do observador defeituoso deve ser usada como portão de decisão.
 
 ## 12. Referências e limites de comparação
 
@@ -410,5 +605,5 @@ condicionado às medidas, sem começar pela árvore de verificação.
   existentes, incluindo split local e prefetch que já foram implementados.
 
 Os ganhos dos artigos não são previsões para a 4070 em eGPU e a Radeon desta
-máquina. O híbrido proposto ainda não tem taxa de reaproveitamento nem velocidade
-medidas.
+máquina. O uso ativo de sufixos ainda não tem velocidade medida; observações
+de compatibilidade não substituem a verificação real da Etapa 2.

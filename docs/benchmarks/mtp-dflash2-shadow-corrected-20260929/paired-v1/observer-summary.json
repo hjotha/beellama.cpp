@@ -1,0 +1,235 @@
+{
+  "shadow-every1.server": {
+    "counts": {
+      "launched": 414,
+      "skipped_busy": 1,
+      "skipped_throttle": 0,
+      "ready": 383,
+      "late": 22,
+      "prefix_match": 285,
+      "prefix_mismatch": 120,
+      "usable_blocks": 273,
+      "usable_tokens": 736,
+      "errors": 0
+    },
+    "accounting": {
+      "observed": 405,
+      "cancelled": 9,
+      "pending": 0,
+      "skipped_invalid": 0,
+      "epoch": 28
+    },
+    "mean_worker_stage_ms": {
+      "worker_us": 55.298,
+      "decode_us": 51.665,
+      "selector_us": 3.299,
+      "other_worker_us": 0.335
+    },
+    "main_thread_totals_ms": {
+      "inject_submit_us": 1702.072,
+      "stage_us": 566.564
+    },
+    "matched_percent": 70.37,
+    "ready_percent": 94.57,
+    "usable_percent": 67.41,
+    "by_request": {
+      "0": {
+        "observed": 17,
+        "ready": 15,
+        "prefix_match": 10,
+        "usable": 10,
+        "usable_tokens": 30
+      },
+      "26": {
+        "observed": 40,
+        "ready": 40,
+        "prefix_match": 37,
+        "usable": 37,
+        "usable_tokens": 83
+      },
+      "73": {
+        "observed": 56,
+        "ready": 50,
+        "prefix_match": 34,
+        "usable": 29,
+        "usable_tokens": 85
+      },
+      "143": {
+        "observed": 40,
+        "ready": 40,
+        "prefix_match": 37,
+        "usable": 37,
+        "usable_tokens": 83
+      },
+      "189": {
+        "observed": 56,
+        "ready": 52,
+        "prefix_match": 34,
+        "usable": 33,
+        "usable_tokens": 101
+      },
+      "259": {
+        "observed": 40,
+        "ready": 40,
+        "prefix_match": 37,
+        "usable": 37,
+        "usable_tokens": 83
+      },
+      "306": {
+        "observed": 56,
+        "ready": 51,
+        "prefix_match": 34,
+        "usable": 32,
+        "usable_tokens": 97
+      },
+      "376": {
+        "observed": 50,
+        "ready": 47,
+        "prefix_match": 31,
+        "usable": 28,
+        "usable_tokens": 83
+      },
+      "663": {
+        "observed": 50,
+        "ready": 48,
+        "prefix_match": 31,
+        "usable": 30,
+        "usable_tokens": 91
+      }
+    }
+  },
+  "shadow-every4.server": {
+    "counts": {
+      "launched": 104,
+      "skipped_busy": 0,
+      "skipped_throttle": 311,
+      "ready": 78,
+      "late": 24,
+      "prefix_match": 69,
+      "prefix_mismatch": 33,
+      "usable_blocks": 53,
+      "usable_tokens": 130,
+      "errors": 0
+    },
+    "accounting": {
+      "observed": 102,
+      "cancelled": 2,
+      "pending": 0,
+      "skipped_invalid": 0,
+      "epoch": 28
+    },
+    "mean_worker_stage_ms": {
+      "worker_us": 41.635,
+      "decode_us": 37.896,
+      "selector_us": 3.598,
+      "other_worker_us": 0.141
+    },
+    "main_thread_totals_ms": {
+      "inject_submit_us": 1420.022,
+      "stage_us": 360.902
+    },
+    "matched_percent": 67.65,
+    "ready_percent": 76.47,
+    "usable_percent": 51.96,
+    "by_request": {
+      "1": {
+        "observed": 5,
+        "ready": 3,
+        "prefix_match": 2,
+        "usable": 1,
+        "usable_tokens": 2
+      },
+      "27": {
+        "observed": 10,
+        "ready": 4,
+        "prefix_match": 10,
+        "usable": 4,
+        "usable_tokens": 9
+      },
+      "73": {
+        "observed": 14,
+        "ready": 9,
+        "prefix_match": 7,
+        "usable": 4,
+        "usable_tokens": 8
+      },
+      "143": {
+        "observed": 10,
+        "ready": 10,
+        "prefix_match": 10,
+        "usable": 10,
+        "usable_tokens": 22
+      },
+      "190": {
+        "observed": 14,
+        "ready": 13,
+        "prefix_match": 8,
+        "usable": 7,
+        "usable_tokens": 20
+      },
+      "259": {
+        "observed": 10,
+        "ready": 10,
+        "prefix_match": 10,
+        "usable": 10,
+        "usable_tokens": 25
+      },
+      "306": {
+        "observed": 14,
+        "ready": 13,
+        "prefix_match": 7,
+        "usable": 6,
+        "usable_tokens": 16
+      },
+      "376": {
+        "observed": 12,
+        "ready": 7,
+        "prefix_match": 6,
+        "usable": 3,
+        "usable_tokens": 8
+      },
+      "663": {
+        "observed": 13,
+        "ready": 9,
+        "prefix_match": 9,
+        "usable": 8,
+        "usable_tokens": 20
+      }
+    }
+  },
+  "shadow-sync.server": {
+    "counts": {
+      "launched": 0,
+      "skipped_busy": 0,
+      "skipped_throttle": 415,
+      "ready": 0,
+      "late": 0,
+      "prefix_match": 0,
+      "prefix_mismatch": 0,
+      "usable_blocks": 0,
+      "usable_tokens": 0,
+      "errors": 0
+    },
+    "accounting": {
+      "observed": 0,
+      "cancelled": 0,
+      "pending": 0,
+      "skipped_invalid": 0,
+      "epoch": 28
+    },
+    "mean_worker_stage_ms": {
+      "worker_us": null,
+      "decode_us": null,
+      "selector_us": null,
+      "other_worker_us": null
+    },
+    "main_thread_totals_ms": {
+      "inject_submit_us": 1273.507,
+      "stage_us": 365.337
+    },
+    "matched_percent": 0.0,
+    "ready_percent": 0.0,
+    "usable_percent": 0.0,
+    "by_request": {}
+  }
+}

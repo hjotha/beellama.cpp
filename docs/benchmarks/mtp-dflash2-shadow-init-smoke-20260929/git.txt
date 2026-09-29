@@ -1,0 +1,8 @@
+6281c6b5685d21ab1260308ebe4b0e4bc6f0ab1a
+ M common/arg.cpp
+ M common/common.h
+ M common/speculative.cpp
+ M common/speculative.h
+ M docs/mtp-dflash2-hybrid-plan.md
+?? docs/benchmarks/mtp-dflash2-etapa0-20260929-122824/
+?? docs/benchmarks/mtp-dflash2-shadow-init-smoke-20260929/

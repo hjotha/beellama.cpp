@@ -1,0 +1,2 @@
+0.12.816.640 I common_speculative_init_result: loading shadow auxiliary model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf'
+0.14.112.368 I common_speculative_init_result: shadow auxiliary context ready (model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf', n_max 7); observation pipeline pending

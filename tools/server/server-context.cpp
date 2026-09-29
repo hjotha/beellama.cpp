@@ -4733,6 +4733,16 @@ private:
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+
+                if (params_base.speculative.shadow.enabled()) {
+                    llama_context * ctx_aux = spec_init->context_aux();
+                    if (ctx_aux == nullptr) {
+                        SRV_ERR("%s", "failed to create shadow auxiliary context\n");
+                        return false;
+                    }
+                    params_base.speculative.shadow.ctx_tgt = ctx_tgt;
+                    params_base.speculative.shadow.ctx_dft = ctx_aux;
+                }
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -4904,6 +4914,7 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                common_speculative_shadow_end_request(spec.get(), id_slot);
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -4996,6 +5007,8 @@ private:
             params.n_ctx = adaptive_max_ctx();
             params.speculative.draft.ctx_tgt = nullptr;
             params.speculative.draft.ctx_dft = nullptr;
+            params.speculative.shadow.ctx_tgt = nullptr;
+            params.speculative.shadow.ctx_dft = nullptr;
         }
 
         // AUTO disk prompt/KV cache (invariant 1): compute the model fingerprint and build the
@@ -5291,6 +5304,8 @@ private:
         spec_init.reset();
         params_base.speculative.draft.ctx_tgt = nullptr;
         params_base.speculative.draft.ctx_dft = nullptr;
+        params_base.speculative.shadow.ctx_tgt = nullptr;
+        params_base.speculative.shadow.ctx_dft = nullptr;
         ctx_dft = nullptr;
         model_dft = nullptr;
         if (llama_init && llama_init->context()) {
@@ -5327,6 +5342,8 @@ private:
         spec_init.reset();
         params_base.speculative.draft.ctx_tgt = nullptr;
         params_base.speculative.draft.ctx_dft = nullptr;
+        params_base.speculative.shadow.ctx_tgt = nullptr;
+        params_base.speculative.shadow.ctx_dft = nullptr;
         ctx_dft = nullptr;
         model_dft = nullptr;
 
@@ -5353,6 +5370,17 @@ private:
             }
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft;
+
+            if (params_base.speculative.shadow.enabled()) {
+                llama_context * ctx_aux = spec_init->context_aux();
+                if (ctx_aux == nullptr) {
+                    SRV_ERR("%s", "failed to create shadow auxiliary context\n");
+                    return false;
+                }
+                params_base.speculative.shadow.ctx_tgt = ctx_tgt;
+                params_base.speculative.shadow.ctx_dft = ctx_aux;
+            }
+
             spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             if (!spec) {
                 return false;
@@ -5495,6 +5523,8 @@ private:
         common_params old_params = params_base;
         old_params.speculative.draft.ctx_tgt = nullptr;
         old_params.speculative.draft.ctx_dft = nullptr;
+        old_params.speculative.shadow.ctx_tgt = nullptr;
+        old_params.speculative.shadow.ctx_dft = nullptr;
 
         // Publish every reusable idle state before destroying either context.
         if (prompt_cache) {
@@ -5515,6 +5545,8 @@ private:
             spec_init.reset();
             params_base.speculative.draft.ctx_tgt = nullptr;
             params_base.speculative.draft.ctx_dft = nullptr;
+            params_base.speculative.shadow.ctx_tgt = nullptr;
+            params_base.speculative.shadow.ctx_dft = nullptr;
             ctx_dft = nullptr;
             model_dft = nullptr;
             if (llama_init && llama_init->context()) {
@@ -5529,6 +5561,8 @@ private:
             params_base = old_params;
             params_base.speculative.draft.ctx_tgt = nullptr;
             params_base.speculative.draft.ctx_dft = nullptr;
+            params_base.speculative.shadow.ctx_tgt = nullptr;
+            params_base.speculative.shadow.ctx_dft = nullptr;
             apply_profile_params(old_profile);
             const bool old_resident = adaptive_draft_n_for_profile(old_profile) > 0;
             if (!llama_model_mtp_weights_set_resident(model_tgt,
@@ -6036,6 +6070,7 @@ if (task.params.cache_prompt) {
         slot.n_ctx_reservation = elastic_paged_context ? get_context_reservation(task) : 0;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        common_speculative_shadow_new_request(spec.get(), slot.id, slot.task->id);
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -8113,6 +8148,7 @@ if (task.params.cache_prompt) {
                                 slot, ckpt, nullptr, ctx_dft,
                                 false, true, false)) {
                         draft.clear();
+                        common_speculative_shadow_cancel_primary(spec.get(), slot.id);
                         return;
                     }
                 }
@@ -8141,11 +8177,13 @@ if (task.params.cache_prompt) {
                     SLT_WRN(slot, "draft rollback widened: [%d, -1) -> [%d, -1)\n",
                             rm_p0, applied_p0);
                     draft.clear();
+                    common_speculative_shadow_cancel_primary(spec.get(), slot.id);
                     return;
                 }
                 if (rollback == SERVER_SPECULATIVE_DRAFT_ROLLBACK_CLEARED) {
                     SLT_WRN(slot, "draft rollback from %d refused, draft sequence cleared\n", rm_p0);
                     draft.clear();
+                    common_speculative_shadow_cancel_primary(spec.get(), slot.id);
                     return;
                 }
             }
@@ -8167,6 +8205,7 @@ if (task.params.cache_prompt) {
                                 int(capture.status), capture.bytes);
                         ckpt.clear();
                         draft.clear();
+                        common_speculative_shadow_cancel_primary(spec.get(), slot.id);
                         return;
                     }
 
@@ -8187,6 +8226,7 @@ if (task.params.cache_prompt) {
                                 int(capture.status), capture.bytes);
                         ckpt.clear();
                         draft.clear();
+                        common_speculative_shadow_cancel_primary(spec.get(), slot.id);
                         return;
                     }
                 }
@@ -9562,6 +9602,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
                 const int64_t trace_remote_trim_start = dflash_trace_tick_us();
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_shadow_commit(spec.get(), slot.id, accepted);
                 dflash_trace("remote_trim", trace_remote_trim_start, dflash_trace_tick_us(), (int) n_draft);
 
                 slot.spec_draft = std::move(accepted);

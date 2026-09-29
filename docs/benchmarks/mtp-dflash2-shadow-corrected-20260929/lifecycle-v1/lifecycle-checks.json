@@ -1,0 +1,9 @@
+{
+  "ubatch": 32,
+  "batch": 64,
+  "cold_prompt_n": 13850,
+  "cached_prompt_n": 4,
+  "cached_hash_matches": true,
+  "cancelled_stream_events": 4,
+  "post_cancel_hash_matches": true
+}

@@ -1,0 +1,42 @@
+[
+  {
+    "mode": "shadow-every1",
+    "tdp_w": 20,
+    "scenario": "repeticao-0",
+    "context_size": 16384,
+    "prompt_n": 25,
+    "prompt_ms": 183.429,
+    "prompt_tps": 136.29251645050672,
+    "predicted_n": 192,
+    "decode_tps": 60.72535321648842,
+    "decode_ms": 3145.309,
+    "wall_s": 3.341,
+    "content_sha256": "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8",
+    "decode_ppt_w": 17.73,
+    "active_gpu_clock_mhz": 2700.0,
+    "peak_temp_c": 61.0,
+    "telemetry_samples": 32,
+    "cpu_busy_mhz": 1166.09,
+    "cpu_util_pct": 13.09
+  },
+  {
+    "mode": "shadow-every1",
+    "tdp_w": 20,
+    "scenario": "codigo-0",
+    "context_size": 16384,
+    "prompt_n": 28,
+    "prompt_ms": 180.796,
+    "prompt_tps": 154.87068297971194,
+    "predicted_n": 192,
+    "decode_tps": 45.113510079090354,
+    "decode_ms": 4233.765,
+    "wall_s": 4.429,
+    "content_sha256": "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1",
+    "decode_ppt_w": 19.08,
+    "active_gpu_clock_mhz": 2700.0,
+    "peak_temp_c": 63.0,
+    "telemetry_samples": 42,
+    "cpu_busy_mhz": 1382.21,
+    "cpu_util_pct": 10.54
+  }
+]

@@ -25,6 +25,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 #include "dflash-pipeline-candidate.h"
+#include "dflash-shadow-observation.h"
 
 #include <algorithm>
 #include <array>
@@ -1899,6 +1900,141 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return false;
     }
 
+    // ---- observation-only shadow helpers ----
+    //
+    // The shadow observer stages target feature rows here (main thread, no
+    // ctx_dft access) and injects them later, when no shadow worker is running.
+    // Keeping the copies outside process()/draft() lets the auxiliary block run
+    // on a worker while the primary drafter and the target continue.
+    struct shadow_row {
+        std::vector<float> features;      // [n_rows * n_embd_enc]
+        std::vector<llama_pos> positions; // [n_rows]
+    };
+
+    std::vector<shadow_row> shadow_rows;
+    size_t shadow_staged_tokens = 0;
+    llama_pos shadow_trim_pos = -1;
+
+    // Main-thread staging only. Drop provisional rows on rejection/replay;
+    // the worker owns ctx_dft until its future completes.
+    void shadow_clip(llama_pos end) {
+        for (auto & row : shadow_rows) {
+            const auto it = std::lower_bound(row.positions.begin(), row.positions.end(), end);
+            row.positions.resize((size_t) (it - row.positions.begin()));
+            row.features.resize(row.positions.size() * (size_t) n_embd_enc);
+        }
+        shadow_rows.erase(std::remove_if(shadow_rows.begin(), shadow_rows.end(),
+                    [](const shadow_row & row) { return row.positions.empty(); }), shadow_rows.end());
+        shadow_staged_tokens = 0;
+        for (const auto & row : shadow_rows) shadow_staged_tokens += row.positions.size();
+    }
+
+    // per-stage counters for the observation worker (shadow mode only)
+    bool     shadow_observer      = false;
+    bool     shadow_draft_failed  = false; // worker-owned, published through its future
+    uint64_t shadow_stage_decode_us   = 0; // DFlash transformer on the draft device
+    uint64_t shadow_stage_selector_us = 0; // selector encode on the target device
+
+    // Copy target-layer features for rows [offset, offset + n_rows) of seq 0.
+    // Only reads ctx_tgt extraction buffers; never touches ctx_dft.
+    bool shadow_stage(const llama_batch & batch_in, int32_t offset, int32_t n_rows) {
+        if (!local_split || batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return false;
+        }
+        if (n_rows <= 0) {
+            return true;
+        }
+
+        shadow_clip(batch_in.pos[offset]); // replay replaces previously staged rows
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+
+        shadow_row row;
+        row.features.resize((size_t) n_rows * n_embd_enc);
+        row.positions.resize((size_t) n_rows);
+
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+            if (!layer) {
+                return false;
+            }
+            for (int32_t i = 0; i < n_rows; ++i) {
+                float * dst = row.features.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                const float * src = layer + (size_t) (offset + i) * n_embd_tgt;
+                std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+            }
+        }
+        for (int32_t i = 0; i < n_rows; ++i) {
+            row.positions[(size_t) i] = batch_in.pos[offset + i];
+        }
+
+        shadow_staged_tokens += (size_t) n_rows;
+        shadow_rows.push_back(std::move(row));
+        return true;
+    }
+
+    // Inject staged rows into ctx_dft. The caller guarantees that no shadow
+    // worker is running and that local_split is active.
+    bool shadow_inject() {
+        auto * ctx_dft = params.ctx_dft;
+
+        if (shadow_trim_pos >= 0) {
+            if (!trim_local_context(shadow_trim_pos)) return false;
+            shadow_trim_pos = -1;
+        }
+
+        // remove the speculative noise tail of the previous shadow block first
+        if (local_draft_pending) {
+            const llama_pos tail0 = local_draft_pos0;
+            local_draft_pending = false;
+            local_draft_pos0 = -1;
+            local_n_proposed = 0;
+            local_next_candidate = {};
+            if (tail0 >= 0 && llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) >= tail0 &&
+                    !trim_local_context(tail0)) {
+                return false;
+            }
+        }
+
+        for (auto & row : shadow_rows) {
+            if (row.positions.empty()) {
+                continue;
+            }
+            if (row.positions.size() > llama_n_ubatch(ctx_dft)) {
+                return false;
+            }
+
+            const llama_pos first_pos = row.positions.front();
+            if (llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) >= first_pos &&
+                    !trim_local_context(first_pos)) {
+                return false;
+            }
+
+            llama_batch sync = batch_inject;
+            sync.n_tokens = (int32_t) row.positions.size();
+            std::memcpy(sync.embd, row.features.data(), row.features.size() * sizeof(float));
+            for (int32_t i = 0; i < sync.n_tokens; ++i) {
+                sync.pos[i] = row.positions[(size_t) i];
+                if (is_mrope) {
+                    sync.pos[sync.n_tokens + i] = sync.pos[i];
+                    sync.pos[2 * sync.n_tokens + i] = sync.pos[i];
+                    sync.pos[3 * sync.n_tokens + i] = 0;
+                }
+                sync.n_seq_id[i] = 1;
+                sync.seq_id[i][0] = 0;
+                sync.logits[i] = true;
+            }
+
+            if (llama_decode(ctx_dft, sync) != 0) {
+                return false;
+            }
+        }
+
+        shadow_rows.clear();
+        shadow_staged_tokens = 0;
+        return true;
+    }
+
     bool wait_local_pipeline() {
         if (!local_pipeline_future.valid()) {
             local_pipeline_inflight = false;
@@ -3057,7 +3193,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        shadow_draft_failed = false;
         if ((remote && remote_failed) || (local_split && local_failed)) {
+            shadow_draft_failed = true;
             return;
         }
         common_batch_clear(batch);
@@ -3259,6 +3397,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (!llama_model_get_token_embedding_row(model_tgt, batch.token[0],
                         batch.embd, (size_t) n_embd_dft)) {
                     LOG_WRN("DFlash2 local split anchor embedding lookup failed\n");
+                    shadow_draft_failed = true;
                     return;
                 }
                 for (int32_t i = 1; i < n_rows; ++i) {
@@ -3266,13 +3405,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             mask_embedding.data(), (size_t) n_embd_dft * sizeof(float));
                 }
 
+                const int64_t stage_decode_start = shadow_observer ? ggml_time_us() : 0;
                 const int ret = llama_decode(ctx_dft, batch);
                 if (ret != 0) {
+                    if (shadow_observer) shadow_stage_decode_us += (uint64_t) (ggml_time_us() - stage_decode_start);
+                    shadow_draft_failed = true;
                     LOG_WRN("DFlash2 local split decode returned %d\n", ret);
                     return;
                 }
                 hidden = llama_get_embeddings(ctx_dft);
+                if (shadow_observer) {
+                    // The getter already synchronizes; include that wait and
+                    // readback without introducing another GPU barrier.
+                    shadow_stage_decode_us += (uint64_t) (ggml_time_us() - stage_decode_start);
+                }
                 if (!hidden) {
+                    shadow_draft_failed = true;
                     LOG_WRN("DFlash2 local split hidden output is unavailable\n");
                     return;
                 }
@@ -3289,10 +3437,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             std::memcpy(selector_batch.embd, hidden,
                     (size_t) n_rows * n_embd_dft * sizeof(float));
-            if (llama_encode(selector_ctx, selector_batch) != 0 ||
-                    !llama_get_embeddings_nextn(selector_ctx)) {
+            const int64_t stage_selector_start = shadow_observer ? ggml_time_us() : 0;
+            const int selector_rc = llama_encode(selector_ctx, selector_batch);
+            if (selector_rc != 0 || !llama_get_embeddings_nextn(selector_ctx)) {
+                if (shadow_observer) shadow_stage_selector_us += (uint64_t) (ggml_time_us() - stage_selector_start);
+                shadow_draft_failed = true;
                 LOG_WRN("DFlash2 local selector encode failed\n");
                 return;
+            }
+            if (shadow_observer) {
+                shadow_stage_selector_us += (uint64_t) (ggml_time_us() - stage_selector_start);
             }
             if (profile_local) {
                 LOG_INF("DFLOCAL rows=%d draft_us=%lld selector_us=%lld reused=%d\n", n_rows,
@@ -4801,6 +4955,57 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // observation-only auxiliary drafter. It receives the same lifecycle calls
+    // as the primary implementations so its KV follows the confirmed prefix,
+    // but it is never selected to produce a response draft. Its proposals are
+    // consumed by the shadow observation pipeline only.
+    std::unique_ptr<common_speculative_impl> shadow;
+    bool shadow_failed = false;
+
+    // A completed proposal remains owned until both commit and deadline arrive.
+    struct shadow_work_result {
+        llama_tokens tokens;
+        bool success = true;
+        int64_t done_us = 0;
+        uint64_t worker_us = 0;
+        uint64_t decode_us = 0;
+        uint64_t selector_us = 0;
+    };
+    std::future<shadow_work_result> shadow_future;
+    dflash_shadow_observation shadow_observation;
+    uint64_t shadow_epoch = 0;
+    int64_t shadow_request_id = -1;
+    bool shadow_verifying = false;
+    bool shadow_prefix_valid = false;
+    int32_t shadow_primary_pos0 = -1;
+
+    uint64_t shadow_worker_us = 0;
+    uint64_t shadow_decode_us = 0;   // decode through synchronized hidden readback
+    uint64_t shadow_selector_us = 0; // encode through synchronized lattice readback
+    uint64_t shadow_inject_us = 0;  // host submission; may enqueue asynchronous work
+    uint64_t shadow_stage_us = 0;
+    uint64_t shadow_late_us = 0;
+    uint64_t shadow_late_max_us = 0;
+    uint64_t shadow_last_worker_us = 0;
+    uint64_t shadow_last_decode_us = 0;
+    uint64_t shadow_last_selector_us = 0;
+    uint64_t shadow_observed = 0;
+    uint64_t shadow_cancelled = 0;
+    uint64_t shadow_skipped_invalid = 0;
+    // observation counters
+    uint64_t shadow_launched = 0;
+    uint64_t shadow_skipped_busy = 0;
+    uint64_t shadow_skipped_throttle = 0;
+    uint64_t shadow_launch_counter = 0;
+    int32_t  shadow_every = 1; // launch one block every N primary drafts
+    uint64_t shadow_ready = 0;
+    uint64_t shadow_late = 0;
+    uint64_t shadow_match = 0;
+    uint64_t shadow_mismatch = 0;
+    uint64_t shadow_usable = 0;
+    uint64_t shadow_usable_tokens = 0;
+    uint64_t shadow_errors = 0;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -5240,6 +5445,11 @@ struct common_speculative_init_result::impl {
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
     llama_model_ptr   model;
     llama_context_ptr context;
+
+    // shadow auxiliary ownership: an independent model + context, freed before
+    // the primary pair above
+    llama_model_ptr   model_aux;
+    llama_context_ptr context_aux;
 };
 
 common_speculative_init_result::common_speculative_init_result(
@@ -5263,6 +5473,16 @@ common_speculative_init_result::common_speculative_init_result(
     }
     if (params.speculative.draft.local_split && (!has_draft || !spec_dflash || spec_mtp)) {
         throw std::invalid_argument("DFlash2 local split requires a DFlash draft model");
+    }
+
+    const bool has_shadow = params.speculative.shadow.enabled();
+    if (has_shadow) {
+        if (!spec_mtp || spec_dflash) {
+            throw std::invalid_argument("shadow auxiliary drafting requires --spec-type draft-mtp as the primary speculative mode");
+        }
+        if (params.speculative.shadow.n_max < 1) {
+            throw std::invalid_argument("--spec-draft-shadow-n-max must be positive");
+        }
     }
 
     common_params params_dft = common_base_params_to_speculative(params);
@@ -5351,6 +5571,92 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->context.reset(ctx_dft);
     }
+
+    if (has_shadow) {
+        const common_params_speculative_shadow & shadow = params.speculative.shadow;
+
+        common_params params_aux = common_base_params_to_speculative(params);
+        params_aux.model        = shadow.mparams;
+        params_aux.n_gpu_layers = shadow.n_gpu_layers;
+        if (!shadow.devices.empty()) {
+            params_aux.devices = shadow.devices;
+        } else {
+            LOG_WRN("%s: shadow auxiliary has no explicit devices; inheriting the target device list\n", __func__);
+        }
+
+        // the auxiliary block owns one anchor plus n_max noise positions
+        const int32_t aux_per_seq = std::max(1, shadow.n_max + 1);
+        params_aux.n_outputs_max         = params.n_parallel * aux_per_seq;
+        params_aux.n_batch               = std::max(params_aux.n_batch,  params_aux.n_outputs_max);
+        params_aux.n_ubatch              = std::max(params_aux.n_ubatch, params_aux.n_outputs_max);
+        params_aux.n_outputs_max_per_seq = params.speculative.draft.backend_sampling ? aux_per_seq : 1;
+
+        auto mparams_aux = common_model_params_to_llama(params_aux);
+        auto cparams_aux = common_context_params_to_llama(params_aux);
+
+        // keep the auxiliary selector beside the borrowed target head, same
+        // rule as the primary local split path; explicit user overrides first
+        std::vector<llama_model_tensor_buft_override> aux_selector_overrides;
+        {
+            auto * device = llama_model_get_output_device(model_tgt);
+            if (device && !ggml_backend_dev_is_meta(device)) {
+                if (mparams_aux.tensor_buft_overrides) {
+                    for (auto * entry = mparams_aux.tensor_buft_overrides; entry->pattern; ++entry) {
+                        aux_selector_overrides.push_back(*entry);
+                    }
+                }
+                aux_selector_overrides.push_back({
+                    "^selector_(predecessor|successor|hidden)\\.weight$",
+                    ggml_backend_dev_buffer_type(device),
+                });
+                aux_selector_overrides.push_back({nullptr, nullptr});
+                mparams_aux.tensor_buft_overrides = aux_selector_overrides.data();
+            }
+        }
+
+        // the auxiliary context is a standalone DFlash context with explicit
+        // host feature exchange; it never shares the target KV or tensors
+        cparams_aux.n_ctx          = llama_n_ctx(ctx_tgt);
+        cparams_aux.ctx_type       = LLAMA_CONTEXT_TYPE_DEFAULT;
+        cparams_aux.ctx_other      = nullptr;
+        cparams_aux.dflash_split   = true;
+        cparams_aux.pooling_type   = LLAMA_POOLING_TYPE_NONE;
+        cparams_aux.kv_tail_tokens = 0;
+        cparams_aux.kv_tail_type   = GGML_TYPE_F16;
+
+        LOG_INF("%s: loading shadow auxiliary model '%s'\n", __func__, shadow.mparams.path.c_str());
+
+        llama_model * model_aux = llama_model_load_from_file(shadow.mparams.path.c_str(), mparams_aux);
+        if (model_aux == nullptr) {
+            throw std::runtime_error(string_format("failed to load shadow auxiliary model, '%s'",
+                    shadow.mparams.path.c_str()));
+        }
+
+        if (!common_speculative_are_compatible(model_tgt, model_aux)) {
+            llama_model_free(model_aux);
+            throw std::runtime_error(string_format("shadow auxiliary model '%s' is not vocab-compatible with the target model",
+                    shadow.mparams.path.c_str()));
+        }
+
+        cparams_aux.attention_type = common_speculative_dflash_causal_attn(model_aux)
+            ? LLAMA_ATTENTION_TYPE_CAUSAL
+            : LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+
+        llama_context * ctx_aux = llama_init_from_model(model_aux, cparams_aux);
+        if (ctx_aux == nullptr) {
+            llama_model_free(model_aux);
+            throw std::runtime_error("failed to create shadow auxiliary context");
+        }
+
+        LOG_INF("%s: shadow auxiliary context ready (model '%s', n_max %d); observation pipeline pending\n",
+                __func__, shadow.mparams.path.c_str(), shadow.n_max);
+
+        pimpl->model_aux.reset(model_aux);
+        pimpl->context_aux.reset(ctx_aux);
+
+        params.speculative.shadow.ctx_tgt = ctx_tgt;
+        params.speculative.shadow.ctx_dft = ctx_aux;
+    }
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;
@@ -5361,6 +5667,10 @@ llama_model * common_speculative_init_result::model() {
 
 llama_context * common_speculative_init_result::context() {
     return pimpl->context.get();
+}
+
+llama_context * common_speculative_init_result::context_aux() {
+    return pimpl->context_aux.get();
 }
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
@@ -5504,6 +5814,34 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .synth_probs = */ {},
     });
 
+    if (params.shadow.ctx_dft != nullptr) {
+        common_params_speculative aux_params = params;
+        common_params_speculative_draft & aux = aux_params.draft;
+
+        aux.mparams        = params.shadow.mparams;
+        aux.devices        = params.shadow.devices;
+        aux.n_gpu_layers   = params.shadow.n_gpu_layers;
+        aux.n_max          = params.shadow.n_max;
+        aux.n_min          = 0;
+        aux.p_min          = params.shadow.p_min;
+        aux.local_split    = params.shadow.local_split;
+        aux.local_prefetch = false;
+        aux.ctx_tgt        = params.shadow.ctx_tgt != nullptr ? params.shadow.ctx_tgt : params.draft.ctx_tgt;
+        aux.ctx_dft        = params.shadow.ctx_dft;
+
+        result->shadow = std::make_unique<common_speculative_impl_draft_dflash>(aux_params, n_seq);
+        result->shadow->n_call_begin = 0;
+        static_cast<common_speculative_impl_draft_dflash *>(result->shadow.get())->shadow_observer = true;
+
+        const char * shadow_every_env = getenv("GGML_DFLASH_SHADOW_EVERY");
+        if (shadow_every_env != nullptr) {
+            result->shadow_every = std::max(0, std::atoi(shadow_every_env));
+        }
+
+        LOG_INF("%s: shadow auxiliary drafter registered (observation only; proposals are never selected, every=%d)\n",
+                __func__, result->shadow_every);
+    }
+
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
@@ -5532,11 +5870,306 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     return result.release();
 }
 
-void common_speculative_free(common_speculative * spec) {
-    if (spec == nullptr) {
+static void common_speculative_shadow_record(common_speculative * spec) {
+    auto & job = spec->shadow_observation;
+    if (!job.id || !job.resolved()) return;
+    const auto result = job.evaluate();
+    ++spec->shadow_observed;
+    if (result.ready) ++spec->shadow_ready;
+    else ++spec->shadow_late;
+    if (result.prefix_match) ++spec->shadow_match;
+    else ++spec->shadow_mismatch;
+    if (result.usable) {
+        ++spec->shadow_usable;
+        spec->shadow_usable_tokens += result.usable_tokens;
+    }
+    const uint64_t late_us = job.done_us > job.decision_us ? job.done_us - job.decision_us : 0;
+    spec->shadow_late_us += late_us;
+    spec->shadow_late_max_us = std::max(spec->shadow_late_max_us, late_us);
+    if (getenv("GGML_DFLASH_SHADOW_PROF")) {
+        const auto ids = [](const std::vector<int32_t> & tokens) {
+            std::string text;
+            for (int32_t id : tokens) {
+                if (!text.empty()) text += ',';
+                text += std::to_string(id);
+            }
+            return text;
+        };
+        fprintf(stderr, "SHADOWv2 job=%llu epoch=%llu request=%lld pos0=%d anchor=%d c=%zu d=%zu matched=%d prefix_ok=%d position_ok=%d ready=%d remaining=%d usable=%d usable_tokens=%d done_us=%lld decision_us=%lld work_us=%llu dec_us=%llu sel_us=%llu confirmed=[%s] proposed=[%s]\n",
+                (unsigned long long) job.id, (unsigned long long) job.epoch,
+                (long long) spec->shadow_request_id, job.pos0, job.anchor,
+                job.confirmed.size(), job.proposed.size(), result.matched,
+                (int) result.prefix_match, (int) result.position_match, (int) result.ready,
+                result.remaining, (int) result.usable, result.usable_tokens,
+                (long long) job.done_us, (long long) job.decision_us,
+                (unsigned long long) spec->shadow_last_worker_us,
+                (unsigned long long) spec->shadow_last_decode_us,
+                (unsigned long long) spec->shadow_last_selector_us,
+                ids(job.confirmed).c_str(), ids(job.proposed).c_str());
+    }
+    job = {};
+}
+
+// Polling a future never discards a completed-but-unpaired result and never
+// grants a later deadline. The worker reports its own completion timestamp.
+static void common_speculative_shadow_collect(common_speculative * spec) {
+    if (spec->shadow_future.valid() &&
+            spec->shadow_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+            auto result = spec->shadow_future.get();
+            spec->shadow_last_worker_us = result.worker_us;
+            spec->shadow_last_decode_us = result.decode_us;
+            spec->shadow_last_selector_us = result.selector_us;
+            spec->shadow_worker_us += result.worker_us;
+            spec->shadow_decode_us += result.decode_us;
+            spec->shadow_selector_us += result.selector_us;
+            if (!result.success) {
+                LOG_ERR("shadow auxiliary decode/selector failed; auxiliary disabled\n");
+                ++spec->shadow_errors;
+                spec->shadow_failed = true;
+                if (spec->shadow_observation.id) ++spec->shadow_cancelled;
+                spec->shadow_observation = {};
+            } else if (spec->shadow_observation.id) {
+                spec->shadow_observation.finish(std::move(result.tokens), result.done_us);
+            }
+        } catch (const std::exception & error) {
+            LOG_ERR("shadow auxiliary worker failed: %s; auxiliary disabled\n", error.what());
+            ++spec->shadow_errors;
+            spec->shadow_failed = true;
+            if (spec->shadow_observation.id) ++spec->shadow_cancelled;
+            spec->shadow_observation = {};
+        }
+    }
+    common_speculative_shadow_record(spec);
+}
+
+static bool common_speculative_shadow_flush(common_speculative * spec) {
+    if (spec->shadow_failed || spec->shadow_future.valid() || spec->shadow_verifying) return false;
+    auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->shadow.get());
+    const int64_t start = ggml_time_us();
+    const bool ok = impl->shadow_inject();
+    spec->shadow_inject_us += (uint64_t) (ggml_time_us() - start);
+    if (!ok) {
+        LOG_ERR("shadow auxiliary injection/trim failed; auxiliary disabled\n");
+        ++spec->shadow_errors;
+        spec->shadow_failed = true;
+    }
+    return ok;
+}
+
+// Only request/restore/free boundaries may join a live worker. Cached target
+// state is not evidence that the independent auxiliary KV has that prefix.
+static void common_speculative_shadow_reset(common_speculative * spec) {
+    if (spec->shadow_future.valid()) spec->shadow_future.wait();
+    common_speculative_shadow_collect(spec);
+    if (spec->shadow_observation.id) {
+        ++spec->shadow_cancelled;
+        if (getenv("GGML_DFLASH_SHADOW_PROF")) {
+            fprintf(stderr, "SHADOWv2 cancel job=%llu epoch=%llu reason=context_reset\n",
+                    (unsigned long long) spec->shadow_observation.id,
+                    (unsigned long long) spec->shadow_observation.epoch);
+        }
+    }
+    spec->shadow_observation = {};
+    spec->shadow_verifying = false;
+    spec->shadow_primary_pos0 = -1;
+    spec->shadow_prefix_valid = false;
+    ++spec->shadow_epoch;
+    auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->shadow.get());
+    impl->shadow_rows.clear();
+    impl->shadow_staged_tokens = 0;
+    impl->shadow_trim_pos = -1;
+    impl->local_draft_pending = false;
+    impl->local_draft_pos0 = -1;
+    llama_synchronize(impl->params.ctx_dft);
+    if (!impl->trim_local_context(0)) {
+        spec->shadow_failed = true;
+        ++spec->shadow_errors;
+    }
+}
+
+void common_speculative_shadow_new_request(common_speculative * spec, llama_seq_id seq_id, int64_t request_id) {
+    if (!spec || !spec->shadow || seq_id != 0) return;
+    common_speculative_shadow_reset(spec);
+    spec->shadow_request_id = request_id;
+}
+
+void common_speculative_shadow_end_request(common_speculative * spec, llama_seq_id seq_id) {
+    if (!spec || !spec->shadow || seq_id != 0) return;
+    common_speculative_shadow_reset(spec);
+    common_speculative_print_stats(spec);
+}
+
+void common_speculative_shadow_cancel_primary(common_speculative * spec, llama_seq_id seq_id) {
+    if (!spec || !spec->shadow || seq_id != 0) return;
+    if (spec->shadow_observation.id && spec->shadow_observation.pos0 == spec->shadow_primary_pos0) {
+        ++spec->shadow_cancelled;
+        spec->shadow_observation = {};
+    }
+    spec->shadow_verifying = false;
+    spec->shadow_primary_pos0 = -1;
+    // The worker still owns ctx_dft; its eventual result is collected but not
+    // classified as an observation. The normal fallback never joins it.
+}
+
+// Called only after the server's final acceptance decision, including replay.
+// accepted contains the real bonus ID, which is absent from verification input.
+void common_speculative_shadow_commit(common_speculative * spec, llama_seq_id seq_id,
+                                      const llama_tokens & accepted) {
+    if (!spec || !spec->shadow || spec->shadow_failed || seq_id != 0 ||
+            !spec->shadow_verifying || spec->shadow_primary_pos0 < 0 || accepted.empty()) return;
+    const llama_pos pos0 = spec->shadow_primary_pos0;
+    const llama_pos bonus_pos = pos0 + (llama_pos) accepted.size();
+    auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->shadow.get());
+    // The bonus has not been decoded yet: only features strictly before it
+    // belong to the committed prefix. Discard rejected feature rows now.
+    impl->shadow_clip(bonus_pos);
+    impl->shadow_trim_pos = impl->shadow_trim_pos < 0 ? bonus_pos :
+            std::min(impl->shadow_trim_pos, bonus_pos);
+    spec->shadow_verifying = false;
+    if (spec->shadow_observation.id && spec->shadow_observation.pos0 == pos0 &&
+            spec->shadow_observation.epoch == spec->shadow_epoch) {
+        spec->shadow_observation.commit(accepted);
+    }
+    common_speculative_shadow_collect(spec);
+    common_speculative_shadow_flush(spec);
+}
+
+static void common_speculative_shadow_restore(common_speculative * spec, bool clear_all = false) {
+    if (!spec || !spec->shadow) return;
+    if (!clear_all && spec->shadow_verifying && spec->shadow_primary_pos0 >= 0) {
+        // Replay of the same verification: retain the proposal/identity, remove
+        // provisional rows, and let the re-decoded real prefix replace them.
+        auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->shadow.get());
+        const llama_pos pos0 = spec->shadow_primary_pos0;
+        impl->shadow_clip(pos0);
+        impl->shadow_trim_pos = impl->shadow_trim_pos < 0 ? pos0 : std::min(impl->shadow_trim_pos, pos0);
+    } else {
+        common_speculative_shadow_reset(spec);
+    }
+}
+
+static void common_speculative_shadow_process(common_speculative * spec, const llama_batch & batch) {
+    common_speculative_shadow_collect(spec);
+    if (spec->shadow_failed || batch.n_tokens == 0) return;
+    auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->shadow.get());
+    // After restore, only a complete cold prefix can re-enable the auxiliary.
+    if (batch.pos && batch.pos[0] == 0) spec->shadow_prefix_valid = true;
+    if (!spec->shadow_prefix_valid) return;
+    const int64_t start = ggml_time_us();
+    const int32_t chunk = std::min<int32_t>(64, llama_n_ubatch(impl->params.ctx_dft));
+    for (int32_t off = 0; off < batch.n_tokens; off += chunk) {
+        if (!impl->shadow_stage(batch, off, std::min<int32_t>(chunk, batch.n_tokens - off))) {
+            spec->shadow_failed = true;
+            ++spec->shadow_errors;
+            LOG_ERR("shadow auxiliary feature staging failed; auxiliary disabled\n");
+            return;
+        }
+    }
+    spec->shadow_stage_us += (uint64_t) (ggml_time_us() - start);
+    common_speculative_shadow_flush(spec);
+    if (impl->shadow_staged_tokens > 256) {
+        spec->shadow_failed = true;
+        ++spec->shadow_errors;
+        LOG_ERR("shadow auxiliary staging backlog exceeded; auxiliary disabled\n");
+    }
+}
+
+// This is the actual replacement deadline: before any primary draft executes,
+// on every eligible cycle, independently of how often new jobs are launched.
+static void common_speculative_shadow_decision(common_speculative * spec) {
+    const int64_t deadline = ggml_time_us();
+    if (spec->dparams.size() != 1 || !spec->dparams[0].drafting) return;
+    auto & job = spec->shadow_observation;
+    const auto & dp = spec->dparams[0];
+    if (job.id && job.committed && !job.decided) {
+        const int32_t configured = common_speculative_n_max(spec);
+        const int32_t capacity = dp.n_max >= 0 ? std::min(dp.n_max, configured) : configured;
+        job.decide(dp.pos0, dp.id_last, capacity, deadline);
+    }
+    common_speculative_shadow_collect(spec);
+    common_speculative_shadow_flush(spec);
+}
+
+static void common_speculative_shadow_launch(common_speculative * spec) {
+    if (spec->dparams.size() != 1) return;
+    const auto & dp = spec->dparams[0];
+    if (!dp.result || dp.result->empty() || dp.pos0 < 0 || dp.id_last < 0) return;
+    if (!spec->shadow_prefix_valid || dp.temperature > 0.0f) {
+        ++spec->shadow_skipped_invalid;
         return;
     }
+    if (spec->shadow_every == 0 ||
+            (spec->shadow_launch_counter++ % (uint64_t) spec->shadow_every) != 0) {
+        ++spec->shadow_skipped_throttle;
+        return;
+    }
+    common_speculative_shadow_collect(spec);
+    if (spec->shadow_future.valid() || spec->shadow_observation.id) {
+        ++spec->shadow_skipped_busy;
+        return;
+    }
+    if (!common_speculative_shadow_flush(spec)) return;
+    auto * impl = static_cast<common_speculative_impl_draft_dflash *>(spec->shadow.get());
+    // Committed rows were flushed at the decision boundary. No rejected token
+    // feature is allowed at or beyond the new anchor.
+    if (llama_memory_seq_pos_max(llama_get_memory(impl->params.ctx_dft), 0) != dp.pos0 - 1) {
+        ++spec->shadow_skipped_invalid;
+        spec->shadow_prefix_valid = false;
+        LOG_WRN("shadow auxiliary prefix not aligned at pos0=%d; waiting for cold prefill\n", dp.pos0);
+        return;
+    }
+    auto & job = spec->shadow_observation;
+    job = {};
+    job.id = spec->shadow_launched + 1;
+    job.epoch = spec->shadow_epoch;
+    job.pos0 = dp.pos0;
+    job.anchor = dp.id_last;
+    const int32_t pos0 = dp.pos0;
+    const llama_token anchor = dp.id_last;
+    try {
+        spec->shadow_future = std::async(std::launch::async, [impl, pos0, anchor]() {
+            common_speculative::shadow_work_result result;
+            common_speculative_draft_params_vec params(1);
+            auto & draft = params[0];
+            draft.drafting = true;
+            draft.pos0 = pos0;
+            draft.id_last = anchor;
+            draft.result = &result.tokens;
+            draft.temperature = 0.0f;
+            draft.seed = 0;
+            const uint64_t decode_before = impl->shadow_stage_decode_us;
+            const uint64_t selector_before = impl->shadow_stage_selector_us;
+            const int64_t start = ggml_time_us();
+            impl->draft(params);
+            result.success = !impl->shadow_draft_failed && !impl->local_failed;
+            result.done_us = ggml_time_us();
+            result.worker_us = (uint64_t) (result.done_us - start);
+            result.decode_us = impl->shadow_stage_decode_us - decode_before;
+            result.selector_us = impl->shadow_stage_selector_us - selector_before;
+            return result;
+        });
+        ++spec->shadow_launched;
+    } catch (const std::exception & error) {
+        spec->shadow_observation = {};
+        spec->shadow_failed = true;
+        ++spec->shadow_errors;
+        LOG_ERR("shadow auxiliary launch failed: %s\n", error.what());
+        return;
+    }
+    if (getenv("GGML_DFLASH_SHADOW_PROF")) {
+        fprintf(stderr, "SHADOWv2 launch job=%llu epoch=%llu request=%lld pos0=%d anchor=%d n_max=%d\n",
+                (unsigned long long) job.id, (unsigned long long) job.epoch,
+                (long long) spec->shadow_request_id, pos0, anchor, impl->n_max);
+    }
+}
 
+void common_speculative_free(common_speculative * spec) {
+    if (!spec) return;
+    if (spec->shadow) {
+        common_speculative_shadow_reset(spec);
+        common_speculative_print_stats(spec); // final accounting includes cancellations
+    }
     delete spec;
 }
 
@@ -5559,6 +6192,12 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
     }
+
+    if (spec->shadow) {
+        common_time_meas tm(spec->shadow->t_begin_us, !spec->shadow->gen_perf);
+        spec->shadow->begin(seq_id, prompt);
+        spec->shadow->n_call_begin++;
+    }
 }
 
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
@@ -5570,6 +6209,10 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
+    }
+
+    if (spec->shadow && !spec->shadow_failed) {
+        common_speculative_shadow_process(spec, batch);
     }
 
     return result;
@@ -5616,6 +6259,10 @@ bool common_speculative_draft(common_speculative * spec) {
             dparams[seq_id].drafting = false;
             return false;
         }
+    }
+
+    if (spec->shadow && !spec->shadow_failed) {
+        common_speculative_shadow_decision(spec);
     }
 
     for (auto & impl : spec->impls) {
@@ -5685,6 +6332,14 @@ bool common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+
+    // observation-only auxiliary block from the same anchor
+    if (spec->shadow && !spec->shadow_failed) {
+        spec->shadow_primary_pos0 = dparams.size() == 1 ? dparams[0].pos0 : -1;
+        common_speculative_shadow_launch(spec);
+        spec->shadow_verifying = dparams.size() == 1 && dparams[0].result && !dparams[0].result->empty();
+    }
+
     return true;
 }
 
@@ -5722,6 +6377,8 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+
+
 }
 
 // TODO: support the case of more than one speculative implementations having a state
@@ -5898,6 +6555,7 @@ void common_speculative_state_restore_plan_commit(common_speculative_state_resto
     if (plan->spec == nullptr) {
         return;
     }
+    common_speculative_shadow_restore(plan->spec, plan->clear_all);
     if (plan->clear_all) {
         const std::vector<uint8_t> empty;
         for (auto & impl : plan->spec->impls) {
@@ -5935,6 +6593,11 @@ bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     for (auto & impl : spec->impls) {
         restored = impl->set_state(seq_id, data, expected_pos) || restored;
     }
+
+    if (restored && seq_id == 0) {
+        common_speculative_shadow_restore(spec, data.empty() && expected_pos < 0);
+    }
+
     return restored;
 }
 
@@ -5943,7 +6606,16 @@ void common_speculative_print_stats(const common_speculative * spec) {
         return;
     }
 
+    std::vector<const common_speculative_impl *> stats_impls;
+    stats_impls.reserve(spec->impls.size() + (spec->shadow ? 1 : 0));
     for (const auto & impl : spec->impls) {
+        stats_impls.push_back(impl.get());
+    }
+    if (spec->shadow) {
+        stats_impls.push_back(spec->shadow.get());
+    }
+
+    for (const common_speculative_impl * impl : stats_impls) {
         std::string str_perf;
         if (impl->gen_perf) {
             std::ostringstream oss;
@@ -6004,6 +6676,26 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_stats.c_str(),
                 str_perf.c_str());
     }
+
+    if (spec->shadow) {
+        LOG_INF("shadow auxiliary: launched=%llu skipped_busy=%llu skipped_throttle=%llu ready=%llu late=%llu prefix_match=%llu prefix_mismatch=%llu usable_blocks=%llu usable_tokens=%llu errors=%llu\n",
+                (unsigned long long) spec->shadow_launched, (unsigned long long) spec->shadow_skipped_busy,
+                (unsigned long long) spec->shadow_skipped_throttle,
+                (unsigned long long) spec->shadow_ready, (unsigned long long) spec->shadow_late,
+                (unsigned long long) spec->shadow_match, (unsigned long long) spec->shadow_mismatch,
+                (unsigned long long) spec->shadow_usable, (unsigned long long) spec->shadow_usable_tokens,
+                (unsigned long long) spec->shadow_errors);
+        LOG_INF("shadow accounting: observed=%llu cancelled=%llu pending=%llu skipped_invalid=%llu epoch=%llu\n",
+                (unsigned long long) spec->shadow_observed,
+                (unsigned long long) spec->shadow_cancelled,
+                (unsigned long long) (spec->shadow_launched - spec->shadow_observed - spec->shadow_cancelled),
+                (unsigned long long) spec->shadow_skipped_invalid, (unsigned long long) spec->shadow_epoch);
+        LOG_INF("shadow stages: worker_us=%llu decode_us=%llu selector_us=%llu inject_submit_us=%llu stage_us=%llu late_total_ms=%.1f late_max_ms=%.1f\n",
+                (unsigned long long) spec->shadow_worker_us, (unsigned long long) spec->shadow_decode_us,
+                (unsigned long long) spec->shadow_selector_us, (unsigned long long) spec->shadow_inject_us,
+                (unsigned long long) spec->shadow_stage_us,
+                (double) spec->shadow_late_us / 1000.0, (double) spec->shadow_late_max_us / 1000.0);
+    }
 }
 
 bool common_speculative_need_embd_capture(common_speculative * spec) {
@@ -6015,6 +6707,10 @@ bool common_speculative_need_embd_capture(common_speculative * spec) {
         if (impl->need_embd_capture()) {
             return true;
         }
+    }
+
+    if (spec->shadow && spec->shadow->need_embd_capture()) {
+        return true;
     }
 
     return false;

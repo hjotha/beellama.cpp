@@ -1,0 +1,12 @@
+6281c6b5685d21ab1260308ebe4b0e4bc6f0ab1a
+ M common/arg.cpp
+ M common/common.h
+ M common/speculative.cpp
+ M common/speculative.h
+ M docs/mtp-dflash2-hybrid-plan.md
+ M tools/server/server-context.cpp
+?? docs/benchmarks/mtp-dflash2-etapa0-20260929-122824/
+?? docs/benchmarks/mtp-dflash2-etapa0-q2-20260929/
+?? docs/benchmarks/mtp-dflash2-shadow-async-20260929/
+?? docs/benchmarks/mtp-dflash2-shadow-init-smoke-20260929/
+?? docs/benchmarks/mtp-dflash2-shadow-sync-cost-20260929/

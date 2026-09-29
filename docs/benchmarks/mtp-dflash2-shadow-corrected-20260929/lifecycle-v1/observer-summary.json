@@ -1,0 +1,73 @@
+{
+  "shadow-ub32-lifecycle.server": {
+    "counts": {
+      "launched": 71,
+      "skipped_busy": 1,
+      "skipped_throttle": 0,
+      "ready": 63,
+      "late": 3,
+      "prefix_match": 44,
+      "prefix_mismatch": 22,
+      "usable_blocks": 43,
+      "usable_tokens": 120,
+      "errors": 0
+    },
+    "accounting": {
+      "observed": 66,
+      "cancelled": 5,
+      "pending": 0,
+      "skipped_invalid": 18,
+      "epoch": 19
+    },
+    "mean_worker_stage_ms": {
+      "worker_us": 50.58,
+      "decode_us": 46.14,
+      "selector_us": 4.172,
+      "other_worker_us": 0.268
+    },
+    "main_thread_totals_ms": {
+      "inject_submit_us": 3503.387,
+      "stage_us": 171.993
+    },
+    "matched_percent": 66.67,
+    "ready_percent": 95.45,
+    "usable_percent": 65.15,
+    "by_request": {
+      "0": {
+        "observed": 17,
+        "ready": 15,
+        "prefix_match": 10,
+        "usable": 10,
+        "usable_tokens": 30
+      },
+      "27": {
+        "observed": 17,
+        "ready": 17,
+        "prefix_match": 9,
+        "usable": 9,
+        "usable_tokens": 28
+      },
+      "299": {
+        "observed": 15,
+        "ready": 15,
+        "prefix_match": 12,
+        "usable": 12,
+        "usable_tokens": 31
+      },
+      "320": {
+        "observed": 2,
+        "ready": 2,
+        "prefix_match": 1,
+        "usable": 1,
+        "usable_tokens": 4
+      },
+      "326": {
+        "observed": 15,
+        "ready": 14,
+        "prefix_match": 12,
+        "usable": 11,
+        "usable_tokens": 27
+      }
+    }
+  }
+}
