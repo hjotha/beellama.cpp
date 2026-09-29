@@ -13,6 +13,7 @@
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
+#include "ggml-remote-attn.h"
 
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -1057,6 +1058,85 @@ std::vector<ggml_backend_t> layer_backends;
             backend_kvarn_workspace_split_k_size.push_back(0);
         }
 
+        // Remote KV+attention accelerator (Xbox RKVA). Created after the local
+        // backends so it joins backend_ptrs/backend_buft for the scheduler, but
+        // it only ever claims GGML_OP_REMOTE_ATTN (which we also pin explicitly).
+        if (cparams.remote_attn_enabled) {
+            if (model.arch != LLM_ARCH_QWEN35) {
+                throw std::runtime_error(format(
+                    "%s: --remote-attn currently supports only the qwen35 arch (this model arch id: %d)",
+                    __func__, (int) model.arch));
+            }
+            if (cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+                throw std::runtime_error(format(
+                    "%s: --remote-attn requires a KVarN cache type (--cache-type-k/-v kvarnN)", __func__));
+            }
+
+            // count the full-attention layers that will be offloaded
+            int n_remote = 0;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (model.hparams.has_kv(il) && !model.hparams.is_recr(il)) {
+                    ++n_remote;
+                }
+            }
+            cparams.remote_attn_layers = n_remote;
+
+            backend_remote = ggml_backend_remote_attn_init(params.remote_attn_host, params.remote_attn_port);
+            if (backend_remote == nullptr) {
+                throw std::runtime_error(format(
+                    "%s: failed to create remote-attn backend for %s:%u",
+                    __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+            }
+
+            ggml_remote_attn_geometry geo {};
+            geo.n_layer_remote = (uint32_t) n_remote;
+            geo.n_head         = model.hparams.n_head();
+            geo.n_head_kv      = model.hparams.n_head_kv();
+            geo.head_dim       = model.hparams.n_embd_head_k();
+            geo.max_ctx        = (uint32_t) cparams.n_ctx;
+            geo.cache_bits_k   = (uint32_t) cparams.kvarn.key_bits;
+            geo.cache_bits_v   = (uint32_t) cparams.kvarn.value_bits;
+            geo.group_tokens   = 128;
+            geo.sinkhorn_iters = (uint32_t) cparams.kvarn.sinkhorn_iters;
+            geo.tail_tokens    = cparams.kv_tail_tokens;
+            geo.tail_groups    = 2;
+            geo.tail_type      = (cparams.kv_tail_type == GGML_TYPE_BF16) ? 1u : 0u;
+            geo.domain         = GGML_REMOTE_ATTN_DOMAIN_AUTO;  // server mirrors the KVarN rotated-domain plan
+            geo.has_sinks      = 0;
+            geo.swa            = 0;
+            geo.kq_scale       = model.hparams.f_attention_scale == 0.0f ?
+                                 1.0f / sqrtf((float) geo.head_dim) : model.hparams.f_attention_scale;
+
+            ggml_backend_remote_attn_set_geometry(backend_remote, &geo);
+            if (!ggml_backend_remote_attn_connect(backend_remote)) {
+                ggml_backend_free(backend_remote);
+                backend_remote = nullptr;
+                throw std::runtime_error(format(
+                    "%s: failed to connect/handshake with remote-attn server %s:%u",
+                    __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+            }
+
+            // MVP: a single session (slot 0). Multi-slot isolation lands with
+            // the server-side session manager.
+            remote_attn_session = 0;
+            if (!ggml_backend_remote_attn_create_session(
+                    backend_remote, remote_attn_session, /*seq_id=*/0, (uint32_t) cparams.n_ctx)) {
+                ggml_backend_free(backend_remote);
+                backend_remote = nullptr;
+                throw std::runtime_error(format("%s: remote-attn CREATE_SESSION failed", __func__));
+            }
+            ggml_backend_remote_attn_set_active_session(backend_remote, remote_attn_session);
+
+            LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
+                    __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
+
+            backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_remote));
+            backend_ptrs.push_back(backend_remote);
+            backend_buf_exp_size.push_back(0);
+            backend_kvarn_workspace_y_size.push_back(0);
+            backend_kvarn_workspace_split_k_size.push_back(0);
+        }
+
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
@@ -1136,6 +1216,19 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // Release the remote KV+attention backend after the scheduler that
+    // references it. sched.reset() runs before any member destructor, so the
+    // local backends (unique_ptrs) and buffers are still intact for it.
+    if (backend_remote != nullptr) {
+        if (cparams.remote_attn_stats) {
+            LLAMA_LOG_INFO("%s: remote_attn stats %s\n", __func__,
+                    ggml_backend_remote_attn_stats_json(backend_remote));
+        }
+        sched.reset();
+        ggml_backend_free(backend_remote);
+        backend_remote = nullptr;
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -3513,6 +3606,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/gtype,
         /*.sched       =*/sched.get(),
         /*.backend_cpu =*/backend_cpu,
+        /*.backend_remote =*/backend_remote,
         /*.cvec        =*/cvec.get(),
         /*.loras       =*/loras.get(),
         /*.mctx        =*/mctx,

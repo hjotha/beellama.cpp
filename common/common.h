@@ -797,6 +797,13 @@ struct common_params {
     std::string kv_tail_tokens = "0";
     ggml_type   kv_tail_type   = GGML_TYPE_COUNT;
 
+    // Remote KV+attention accelerator (Xbox RKVA). Empty host = disabled.
+    std::string remote_attn_host    = "";
+    uint16_t    remote_attn_port    = 0;
+    std::string remote_attn_layers  = "full";   // only "full" is supported today
+    std::string remote_attn_prefill = "remote"; // "remote" | "migrate" (reserved)
+    bool        remote_attn_stats   = false;
+
     // KVarN is selected by its pseudo cache-type names in the argument parser.
     // The backing ggml types remain the matching standard q formats for layers
     // that are not eligible for structured KVarN storage.

@@ -2941,6 +2941,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // at least as long as it takes to call llama_init_from_model() with the returned cparams
     cparams.path_kv_mean_center = params.kv_mean_center_path.empty() ? nullptr : params.kv_mean_center_path.c_str();
 
+    // Remote KV+attention accelerator (Xbox RKVA). params.remote_attn_host is
+    // kept alive by the caller through llama_init_from_model(), where the
+    // backend connects during context construction.
+    cparams.remote_attn_host    = params.remote_attn_host.empty() ? nullptr : params.remote_attn_host.c_str();
+    cparams.remote_attn_port    = params.remote_attn_port;
+    cparams.remote_attn_prefill = (params.remote_attn_prefill == "migrate") ? 1 : 0;
+    cparams.remote_attn_stats   = params.remote_attn_stats ? 1 : 0;
+
     return cparams;
 }
 

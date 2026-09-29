@@ -17,6 +17,15 @@
 extern "C" {
 #endif
 
+// KVarN attention domain negotiated in HELLO. Values mirror rkva_domain and
+// GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_*; AUTO lets the server reproduce the host
+// KVarN rotated-domain plan for the configured cache type.
+enum ggml_remote_attn_domain {
+    GGML_REMOTE_ATTN_DOMAIN_AUTO       = 0,
+    GGML_REMOTE_ATTN_DOMAIN_ROTATED    = 1,
+    GGML_REMOTE_ATTN_DOMAIN_ORIGINAL_V = 2,
+};
+
 // Geometry negotiated in RKVA HELLO. Values come from the live hparams/cparams
 // and the --cache-type/--kv-tail flags; the server must reproduce the host
 // KVarN semantics for these parameters.

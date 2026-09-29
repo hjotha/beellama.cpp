@@ -3620,6 +3620,59 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_TAIL_TYPE"));
     add_opt(common_arg(
+        {"--remote-attn"}, "HOST:PORT",
+        "offload the full-attention KV cache + attention core of supported archs\n"
+        "(qwen35) to a remote RKVA server (e.g. an Xbox Series X). Target weights,\n"
+        "DeltaNet state, projections, RoPE, gate and FFN stay local. Requires a\n"
+        "KVarN cache type (--cache-type-k/-v kvarnN). Disabled when omitted.",
+        [](common_params & params, const std::string & value) {
+            const auto colon = value.rfind(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 >= value.size()) {
+                throw std::invalid_argument(string_format(
+                    "invalid --remote-attn '%s', expected HOST:PORT", value.c_str()));
+            }
+            params.remote_attn_host = value.substr(0, colon);
+            const int port = std::stoi(value.substr(colon + 1));
+            if (port <= 0 || port > 65535) {
+                throw std::invalid_argument(string_format(
+                    "invalid --remote-attn port in '%s'", value.c_str()));
+            }
+            params.remote_attn_port = (uint16_t) port;
+        }
+    ).set_env("LLAMA_ARG_REMOTE_ATTN"));
+    add_opt(common_arg(
+        {"--remote-attn-layers"}, "SET",
+        "which attention layers to offload to the remote server (only 'full' today)\n"
+        "(default: full)",
+        [](common_params & params, const std::string & value) {
+            if (value != "full") {
+                throw std::invalid_argument(string_format(
+                    "invalid --remote-attn-layers '%s', only 'full' is supported", value.c_str()));
+            }
+            params.remote_attn_layers = value;
+        }
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_LAYERS"));
+    add_opt(common_arg(
+        {"--remote-attn-prefill"}, "MODE",
+        "remote prefill mode: 'remote' (send Q/K/V, server builds KV) or 'migrate'\n"
+        "(reserved: build/quantize locally then migrate compressed records)\n"
+        "(default: remote)",
+        [](common_params & params, const std::string & value) {
+            if (value != "remote" && value != "migrate") {
+                throw std::invalid_argument(string_format(
+                    "invalid --remote-attn-prefill '%s', expected remote|migrate", value.c_str()));
+            }
+            params.remote_attn_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_PREFILL"));
+    add_opt(common_arg(
+        {"--remote-attn-stats"},
+        "log remote-attention profiling counters (calls, bytes, rpc/kernel ms, p50/p95)",
+        [](common_params & params) {
+            params.remote_attn_stats = true;
+        }
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_STATS"));
+    add_opt(common_arg(
         {"--cache-type-k-swa"}, "TYPE",
         "SWA-layer KVarN cache type override for K\n"
         "allowed values: kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8\n"

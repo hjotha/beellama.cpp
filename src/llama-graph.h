@@ -989,6 +989,7 @@ struct llm_graph_params {
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
+    ggml_backend_t backend_remote = nullptr;  // remote KV+attention accelerator (RKVA), optional
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
@@ -1253,6 +1254,8 @@ struct llm_graph_context {
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+
+    ggml_backend_t backend_remote = nullptr; // remote KV+attention accelerator (RKVA), optional
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;

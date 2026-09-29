@@ -422,6 +422,11 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // Remote KV+attention accelerator (RKVA). Owned by this context; created
+    // when cparams.remote_attn_enabled and freed in the destructor after sched.
+    ggml_backend_t backend_remote = nullptr;
+    uint32_t       remote_attn_session = 0;  // active session id (MVP: single slot)
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
