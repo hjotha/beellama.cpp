@@ -254,6 +254,27 @@ sufixos menores. Não há ganho híbrido ativo medido.
 Evidências, scripts, ambiente e interpretação em
 [benchmarks/mtp-dflash2-shadow-corrected-20260929](benchmarks/mtp-dflash2-shadow-corrected-20260929/README.md).
 
+### 2.6 Lançamento antecipado do auxiliar (2026-09-29)
+
+Hipótese da janela: iniciar o bloco auxiliar **antes** do draft MTP primário
+(padrão: depois). Variável experimental `GGML_DFLASH_SHADOW_EARLY=1`; jobs de
+ciclos sem proposta primária são cancelados. `EVERY=4` nos dois modos, mesma
+bateria.
+
+| Métrica | early-off (padrão) | early-on |
+| --- | ---: | ---: |
+| Repetição / Código / Longo (tok/s) | 82,72 / 56,37 / 54,36 | 82,80 / 57,18 / 54,29 |
+| Prontos no prazo | 79 (77,5%) | 96 (95,0%) |
+| Tardios | 23 | 5 |
+| Prefixo coincide | 69 (67,6%) | 76 (75,2%) |
+| Pronto + coincide + sufixo | 55 (53,9%) | 71 (70,3%) |
+| Tokens candidatos | 132 | 186 |
+
+- Ganho claro sem custo no primário e com hashes idênticos; contabilidade
+  fecha (observados + cancelados = lançados).
+- Evidência em
+  [benchmarks/mtp-dflash2-shadow-early-20260929](benchmarks/mtp-dflash2-shadow-early-20260929/README.md).
+
 ## 3. Alternativas discutidas
 
 | Alternativa | Funcionamento | Potencial e custo | Prioridade proposta |

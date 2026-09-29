@@ -4978,6 +4978,7 @@ struct common_speculative {
     int64_t shadow_request_id = -1;
     bool shadow_verifying = false;
     bool shadow_prefix_valid = false;
+    bool shadow_early_launch = false; // experimental: start before the primary draft
     int32_t shadow_primary_pos0 = -1;
 
     uint64_t shadow_worker_us = 0;
@@ -5835,8 +5836,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         const char * shadow_every_env = getenv("GGML_DFLASH_SHADOW_EVERY");
         if (shadow_every_env != nullptr) {
-            result->shadow_every = std::max(0, std::atoi(shadow_every_env));
+            result->shadow_every = std::max(1, std::atoi(shadow_every_env));
         }
+
+        const char * shadow_early_env = getenv("GGML_DFLASH_SHADOW_EARLY");
+        result->shadow_early_launch = shadow_early_env != nullptr && std::atoi(shadow_early_env) != 0;
 
         LOG_INF("%s: shadow auxiliary drafter registered (observation only; proposals are never selected, every=%d)\n",
                 __func__, result->shadow_every);
@@ -6091,10 +6095,17 @@ static void common_speculative_shadow_decision(common_speculative * spec) {
     common_speculative_shadow_flush(spec);
 }
 
-static void common_speculative_shadow_launch(common_speculative * spec) {
+static void common_speculative_shadow_launch(common_speculative * spec, bool early) {
     if (spec->dparams.size() != 1) return;
     const auto & dp = spec->dparams[0];
-    if (!dp.result || dp.result->empty() || dp.pos0 < 0 || dp.id_last < 0) return;
+    if (early) {
+        // the primary proposal is not known yet; a cycle that is drafting will
+        // either verify a proposal (commit) or cancel this job below
+        if (!dp.drafting) return;
+    } else if (!dp.result || dp.result->empty()) {
+        return;
+    }
+    if (dp.pos0 < 0 || dp.id_last < 0) return;
     if (!spec->shadow_prefix_valid || dp.temperature > 0.0f) {
         ++spec->shadow_skipped_invalid;
         return;
@@ -6263,6 +6274,10 @@ bool common_speculative_draft(common_speculative * spec) {
 
     if (spec->shadow && !spec->shadow_failed) {
         common_speculative_shadow_decision(spec);
+        if (spec->shadow_early_launch) {
+            spec->shadow_primary_pos0 = dparams.size() == 1 ? dparams[0].pos0 : -1;
+            common_speculative_shadow_launch(spec, /*early=*/true);
+        }
     }
 
     for (auto & impl : spec->impls) {
@@ -6335,9 +6350,18 @@ bool common_speculative_draft(common_speculative * spec) {
 
     // observation-only auxiliary block from the same anchor
     if (spec->shadow && !spec->shadow_failed) {
-        spec->shadow_primary_pos0 = dparams.size() == 1 ? dparams[0].pos0 : -1;
-        common_speculative_shadow_launch(spec);
-        spec->shadow_verifying = dparams.size() == 1 && dparams[0].result && !dparams[0].result->empty();
+        if (spec->shadow_early_launch) {
+            // the job started before the primary draft; if that draft produced
+            // nothing there is no verification to commit it
+            spec->shadow_verifying = dparams.size() == 1 && dparams[0].result && !dparams[0].result->empty();
+            if (!spec->shadow_verifying) {
+                common_speculative_shadow_cancel_primary(spec, 0);
+            }
+        } else {
+            spec->shadow_primary_pos0 = dparams.size() == 1 ? dparams[0].pos0 : -1;
+            common_speculative_shadow_launch(spec, /*early=*/false);
+            spec->shadow_verifying = dparams.size() == 1 && dparams[0].result && !dparams[0].result->empty();
+        }
     }
 
     return true;
