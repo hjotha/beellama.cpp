@@ -170,6 +170,8 @@ LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+// Device of the resident output weight, including explicit tensor overrides.
+LLAMA_API ggml_backend_dev_t llama_model_get_output_device(const struct llama_model * model);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 LLAMA_API llama_kv_memory_stats llama_get_kv_memory_stats(const struct llama_context * ctx);

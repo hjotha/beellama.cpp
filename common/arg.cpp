@@ -5679,7 +5679,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-local-prefetch"},
         {"--no-spec-draft-local-prefetch"},
-        "prepare the next explicit DFlash2 block after target features are available; backs off when one-token acceptance is rare (default: disabled)",
+        "prepare a predicted next DFlash2 block from real target features during greedy verification; backs off when reuse is rare (default: disabled)",
         [](common_params & params, bool value) {
             params.speculative.draft.local_prefetch = value;
             if (value) {

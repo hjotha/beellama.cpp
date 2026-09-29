@@ -79,8 +79,13 @@ transformer and its KV cache on the draft device. The target's output head and
 DFlash2 selector stay with the target. Target features, anchor/MASK embeddings,
 and draft hidden rows cross devices; no RPC server is involved. The mode
 currently requires `--parallel 1`. `--spec-draft-local-prefetch` may prepare
-the next block after the target features are available. It backs off when the
-target rarely accepts exactly one draft token.
+the next block after the target features are available during greedy decoding.
+It predicts a rejection position and an alternative anchor, retains the full
+real target prefix, and checks the actual position and anchor before reuse.
+It backs off when proposals are rarely reused. Selector weights default to the
+target output device to avoid a vocabulary-sized transfer to the draft device;
+explicit `--spec-draft-override-tensor` settings take priority. For profiling,
+`GGML_DFLASH_LOCAL_PROF=1` reports draft and selector time per block.
 
 ```bash
 llama-server -m target.gguf --device CUDA0 \

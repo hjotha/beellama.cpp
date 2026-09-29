@@ -3982,6 +3982,13 @@ int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }
 
+ggml_backend_dev_t llama_model_get_output_device(const struct llama_model * model) {
+    if (!model || !model->output || !model->output->buffer) {
+        return nullptr;
+    }
+    return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model->output->buffer));
+}
+
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
     if (i < 0 || i >= (int)model->devices.size()) {
         return nullptr;

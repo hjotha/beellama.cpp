@@ -2786,7 +2786,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //}
 
         auto * t_logits  = res->get_logits();
-        auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
+        // Explicit DFlash split injections only update KV. Keep the graph's
+        // embedding tensor for pooling, but do not copy unused feature rows
+        // back to the host. Noise blocks still return all normalized rows.
+        const bool split_injection = cparams.dflash_split && ubatch.embd && !ubatch.token;
+        auto * t_embd    = cparams.embeddings && !split_injection ? res->get_embd() : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {

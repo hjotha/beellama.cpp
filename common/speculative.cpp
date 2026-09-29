@@ -1846,14 +1846,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t local_pipeline_id_last = -1;
     int32_t local_pipeline_n_max = 0;
     bool local_pipeline_inflight = false;
+    bool local_pipeline_pending = false; // worker KV still needs commit or rollback
     bool local_pipeline_ready = false;
+    bool local_pipeline_state_synced = false;
     bool local_pipeline_used = false;
     bool local_pipeline_discarded = false;
     bool local_draft_pending = false;
+    bool local_failed = false;
     int32_t local_draft_pos0 = -1;
     int32_t local_n_proposed = 0;
-    llama_token local_next_hypothesis = -1;
-    float local_one_accept_rate = 0.5f;
+    dflash_pipeline_candidate local_next_candidate;
+    int32_t local_pipeline_accept_k = -1;
+    uint32_t local_request_attempts = 0;
+    uint32_t local_request_hits = 0;
     uint32_t local_pipeline_attempts = 0;
     uint32_t local_pipeline_hits = 0;
     uint32_t local_pipeline_discards = 0;
@@ -1863,7 +1868,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool local_pipeline_active() const {
-        return local_pipeline_inflight || local_pipeline_ready;
+        return local_pipeline_pending || local_pipeline_inflight || local_pipeline_ready;
     }
 
     bool trim_local_context(llama_pos requested_p0) {
@@ -1904,7 +1909,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             local_pipeline_result result = local_pipeline_future.get();
             local_pipeline_output = std::move(result.hidden);
         } catch (const std::exception & error) {
-            LOG_ERR("DFlash2 local pre-draft failed: %s\n", error.what());
+            LOG_ERR("DFlash2 local pre-draft failed: %s; disabling local drafting\n", error.what());
+            local_failed = true;
             local_pipeline_inflight = false;
             local_pipeline_ready = false;
             local_pipeline_output.clear();
@@ -1923,22 +1929,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     continue;
                 }
 
-                llama_batch sync = llama_batch_init((int32_t) request.positions.size(), n_embd_enc, 1);
-                if (!sync.embd) {
-                    llama_batch_free(sync);
-                    throw std::runtime_error("DFlash2 local SYNC batch has no embedding buffer");
+                if (request.positions.size() > llama_n_batch(ctx_dft) ||
+                        request.features.size() != request.positions.size() * (size_t) n_embd_enc) {
+                    throw std::runtime_error("DFlash2 local SYNC has invalid feature dimensions");
                 }
+                // The worker has been joined. Reuse the normal injection
+                // buffers and support overlapping checkpoint replay batches.
+                if (llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0) >= request.positions.front() &&
+                        !trim_local_context(request.positions.front())) {
+                    throw std::runtime_error("DFlash2 local SYNC rewind failed");
+                }
+                llama_batch sync = batch_inject;
                 sync.n_tokens = (int32_t) request.positions.size();
                 std::memcpy(sync.embd, request.features.data(), request.features.size() * sizeof(float));
                 for (int32_t i = 0; i < sync.n_tokens; ++i) {
                     sync.pos[i] = request.positions[(size_t) i];
+                    if (is_mrope) {
+                        sync.pos[sync.n_tokens + i] = sync.pos[i];
+                        sync.pos[2 * sync.n_tokens + i] = sync.pos[i];
+                        sync.pos[3 * sync.n_tokens + i] = 0;
+                    }
                     sync.n_seq_id[i] = 1;
                     sync.seq_id[i][0] = 0;
                     sync.logits[i] = true;
                 }
 
                 const int rc = llama_decode(ctx_dft, sync);
-                llama_batch_free(sync);
                 if (rc != 0) {
                     throw std::runtime_error("DFlash2 local SYNC decode failed");
                 }
@@ -1962,6 +1978,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return false;
         }
 
+        // A promoted result retains only proposal bytes. Its real target KV
+        // was already restored, so an anchor mismatch must not remove it.
+        if (local_pipeline_state_synced) {
+            // A new request can process prompt rows before begin() discards
+            // this proposal. Apply those rows, including any prompt rewind.
+            const bool ok = apply_local_pipeline_syncs();
+            local_pipeline_output.clear();
+            local_pipeline_pending = false;
+            local_pipeline_ready = false;
+            local_pipeline_state_synced = false;
+            ++local_pipeline_discards;
+            local_failed |= !ok;
+            return ok;
+        }
+
         // Deferred verification rows may start before the speculative seed.
         // Replay from the earliest row to avoid decoding duplicate positions.
         llama_pos replay_pos = local_pipeline_pos0 - 1;
@@ -1976,9 +2007,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         const bool ok = apply_local_pipeline_syncs();
         local_pipeline_output.clear();
+        local_pipeline_pending = false;
         local_pipeline_ready = false;
         local_pipeline_discarded = true;
         ++local_pipeline_discards;
+        local_failed |= !ok;
         return ok;
     }
 
@@ -1990,16 +2023,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return false;
         }
 
+        // The worker injected the entire real prefix through the predicted
+        // rejection point. Keep it, but remove all speculative noise KV even
+        // when the proposal is reused in the next draft call.
+        if (!trim_local_context(local_pipeline_pos0)) {
+            return false;
+        }
         local_pipeline_syncs.clear();
+        local_pipeline_pending = false;
+        local_pipeline_state_synced = true;
         local_pipeline_ready = true;
         local_pipeline_used = false;
         return true;
     }
 
-    bool launch_local_pipeline(llama_pos pos0, llama_token hypothesis,
-                               const float * seed_features) {
+    bool launch_local_pipeline(const llama_batch & verified) {
+        const llama_token hypothesis = local_next_candidate.token;
+        const int32_t accepted = local_next_candidate.accepted;
+        const llama_pos pos0 = local_draft_pos0 + accepted + 1;
         if (!local_split || !local_prefetch || local_pipeline_active() ||
-                local_draft_pos0 < 0 || hypothesis < 0 || seed_features == nullptr) {
+                local_draft_pos0 < 0 || hypothesis < 0 || accepted < 0 ||
+                accepted >= local_n_proposed || local_pipeline_used ||
+                (local_request_attempts >= 2 && local_request_hits * 4 < local_request_attempts)) {
             return false;
         }
 
@@ -2008,7 +2053,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return false;
         }
 
-        std::vector<float> seed(seed_features, seed_features + n_embd_enc);
+        // Require the whole real prefix in this verification chunk. Injecting
+        // only the last row leaves the old anchor/noise KV in the draft cache.
+        const int32_t first = dflash_pipeline_prefix_offset(verified.pos, verified.n_tokens,
+                local_draft_pos0, accepted);
+        const int32_t n_prefix = accepted + 1;
+        if (first < 0) {
+            return false;
+        }
+        const float * prefix_features = verified.embd + (size_t) first * n_embd_enc;
+        std::vector<float> seed(prefix_features, prefix_features + (size_t) n_prefix * n_embd_enc);
         std::vector<float> mask = mask_embedding;
         auto * ctx_dft = params.ctx_dft;
         const auto * model_tgt = llama_get_model(params.ctx_tgt);
@@ -2018,30 +2072,46 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         local_pipeline_pos0 = pos0;
         local_pipeline_id_last = hypothesis;
+        local_pipeline_accept_k = accepted;
+        local_pipeline_state_synced = false;
         local_pipeline_start = std::chrono::steady_clock::now();
         try {
             local_pipeline_future = std::async(std::launch::async,
-                    [this, ctx_dft, model_tgt, pos0, hypothesis, mask_token, n_rows,
+                    [this, ctx_dft, model_tgt, pos0, hypothesis, mask_token, n_rows, n_prefix,
                      embd_width, enc_width, seed = std::move(seed), mask = std::move(mask)]() mutable {
                         local_pipeline_result result;
                         llama_batch inject{};
                         llama_batch draft{};
                         try {
-                            const llama_pos seed_pos = pos0 - 1;
+                            const llama_pos seed_pos = pos0 - n_prefix;
                             if (seed_pos < 0 || !this->trim_local_context(seed_pos)) {
                                 throw std::runtime_error("DFlash2 local pre-draft trim failed");
                             }
 
-                            inject = llama_batch_init(1, enc_width, 1);
+                            inject = llama_batch_init(n_prefix, enc_width, 1);
                             if (!inject.embd) {
                                 throw std::runtime_error("DFlash2 local pre-draft feature buffer unavailable");
                             }
-                            inject.n_tokens = 1;
+                            inject.n_tokens = n_prefix;
+                            if (is_mrope) {
+                                free(inject.pos);
+                                inject.pos = (llama_pos *) malloc((size_t) 4 * n_prefix * sizeof(llama_pos));
+                                if (!inject.pos) {
+                                    throw std::bad_alloc();
+                                }
+                            }
                             std::memcpy(inject.embd, seed.data(), seed.size() * sizeof(float));
-                            inject.pos[0] = seed_pos;
-                            inject.n_seq_id[0] = 1;
-                            inject.seq_id[0][0] = 0;
-                            inject.logits[0] = true;
+                            for (int32_t i = 0; i < n_prefix; ++i) {
+                                inject.pos[i] = seed_pos + i;
+                                if (is_mrope) {
+                                    inject.pos[n_prefix + i] = seed_pos + i;
+                                    inject.pos[2 * n_prefix + i] = seed_pos + i;
+                                    inject.pos[3 * n_prefix + i] = 0;
+                                }
+                                inject.n_seq_id[i] = 1;
+                                inject.seq_id[i][0] = 0;
+                                inject.logits[i] = true;
+                            }
                             if (llama_decode(ctx_dft, inject) != 0) {
                                 throw std::runtime_error("DFlash2 local pre-draft feature decode failed");
                             }
@@ -2089,7 +2159,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     });
             local_pipeline_inflight = true;
+            local_pipeline_pending = true;
             ++local_pipeline_attempts;
+            ++local_request_attempts;
             return true;
         } catch (const std::exception & error) {
             LOG_WRN("DFlash2 local pre-draft launch failed: %s; continuing synchronously\n", error.what());
@@ -2710,14 +2782,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         if (local_split) {
             if (local_pipeline_active()) {
-                discard_local_pipeline();
+                local_failed |= !discard_local_pipeline();
             }
             local_pipeline_syncs.clear();
             local_draft_pending = false;
             local_draft_pos0 = -1;
             local_n_proposed = 0;
-            local_next_hypothesis = -1;
-            local_one_accept_rate = 0.5f;
+            local_next_candidate = {};
+            local_request_attempts = 0;
+            local_request_hits = 0;
+            local_pipeline_used = false;
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -2737,6 +2811,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
+            return true;
+        }
+
+        if (local_split && local_failed) {
             return true;
         }
 
@@ -2839,17 +2917,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 if (local_split) {
                     bool pipeline_active = local_pipeline_active();
-                    if (local_prefetch && local_draft_pending && local_next_hypothesis >= 0 &&
-                            local_one_accept_rate >= 0.4f && !pipeline_active) {
-                        const llama_pos next_pos = local_draft_pos0 + 2;
-                        const llama_pos seed_pos = next_pos - 1;
-                        for (int32_t i = 0; i < n_chunk; ++i) {
-                            if (batch_inject.pos[i] == seed_pos) {
-                                pipeline_active = launch_local_pipeline(next_pos, local_next_hypothesis,
-                                        batch_inject.embd + (size_t) i * n_embd_enc);
-                                break;
-                            }
-                        }
+                    if (local_prefetch && local_draft_pending && local_next_candidate.score >= 0.05f &&
+                            !pipeline_active) {
+                        pipeline_active = launch_local_pipeline(batch_inject);
                     }
 
                     if (pipeline_active) {
@@ -2987,7 +3057,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        if (remote && remote_failed) {
+        if ((remote && remote_failed) || (local_split && local_failed)) {
             return;
         }
         common_batch_clear(batch);
@@ -3150,6 +3220,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 return;
             }
         } else if (local_split) {
+            const bool profile_local = std::getenv("GGML_DFLASH_LOCAL_PROF") != nullptr;
+            const int64_t local_start_us = profile_local ? ggml_time_us() : 0;
             const int32_t n_rows = batch.n_tokens;
             const uint32_t expected_hidden = (uint32_t) ((size_t) n_rows * n_embd_dft);
             const float * hidden = nullptr;
@@ -3163,16 +3235,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (match) {
                     hidden = local_pipeline_output.data();
                     local_pipeline_ready = false;
+                    local_pipeline_state_synced = false;
                     local_pipeline_used = true;
                     ++local_pipeline_hits;
+                    ++local_request_hits;
                     used_pipeline_output = true;
                 } else if (!discard_local_pipeline()) {
-                    LOG_WRN("DFlash2 local pre-draft state did not match the next block; disabling local prefetch\n");
-                    local_prefetch = false;
+                    LOG_ERR("DFlash2 local pre-draft recovery failed; disabling local drafting\n");
+                    local_failed = true;
+                    return;
                 }
             }
 
             if (!used_pipeline_output) {
+                local_pipeline_used = false;
                 const auto * model_tgt = llama_get_model(params.ctx_tgt);
                 for (int32_t i = 0; i < n_rows; ++i) {
                     batch.pos[i] = batch.pos[0] + i;
@@ -3202,6 +3278,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
 
+            const int64_t local_hidden_us = profile_local ? ggml_time_us() : 0;
             selector_batch.n_tokens = n_rows;
             for (int32_t i = 0; i < n_rows; ++i) {
                 selector_batch.token[i] = batch.token[i];
@@ -3216,6 +3293,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     !llama_get_embeddings_nextn(selector_ctx)) {
                 LOG_WRN("DFlash2 local selector encode failed\n");
                 return;
+            }
+            if (profile_local) {
+                LOG_INF("DFLOCAL rows=%d draft_us=%lld selector_us=%lld reused=%d\n", n_rows,
+                        (long long) (local_hidden_us - local_start_us),
+                        (long long) (ggml_time_us() - local_hidden_us), (int) used_pipeline_output);
             }
         } else {
             const int ret = llama_decode(ctx_dft, batch);
@@ -3248,6 +3330,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
                 if (remote) {
                     remote_next_candidate = {};
+                }
+                if (local_split) {
+                    local_next_candidate = {};
                 }
 
                 if (selector_reset[seq_id]) {
@@ -3305,6 +3390,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                     row, scores, selector_top_k, predecessor, i - 1,
                                     pipeline_prefix, remote_next_candidate);
                         }
+                        if (local_split && local_prefetch) {
+                            local_next_candidate = dflash_pipeline_rank2_step(
+                                    row, scores, selector_top_k, predecessor, i - 1,
+                                    pipeline_prefix, local_next_candidate);
+                        }
                     }
                 }
 
@@ -3325,7 +3415,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     local_draft_pending = true;
                     local_draft_pos0 = batch.pos[0];
                     local_n_proposed = (int32_t) result.size();
-                    local_next_hypothesis = result.size() > 1 ? result[1] : -1;
+                    if (result.empty()) local_next_candidate = {};
                 }
                 continue;
             }
@@ -3410,18 +3500,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted, bool is_other) override {
         if (local_split) {
-            if (is_other) {
+            if (is_other || local_failed) {
                 return;
             }
 
-            local_one_accept_rate = 0.75f * local_one_accept_rate +
-                    0.25f * (n_accepted == 1 ? 1.0f : 0.0f);
-
             bool promoted = false;
             if (local_pipeline_active()) {
-                promoted = n_accepted == 1 && local_n_proposed > 0 && promote_local_pipeline();
+                promoted = n_accepted == local_pipeline_accept_k && local_n_proposed > 0 && promote_local_pipeline();
                 if (!promoted && !discard_local_pipeline()) {
-                    local_prefetch = false;
+                    LOG_ERR("DFlash2 local pre-draft rollback failed; disabling local drafting\n");
+                    local_failed = true;
+                    return;
                 }
             }
 
@@ -3430,14 +3519,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // Keep those rows for the next round's DFlash KV cache.
                 const llama_pos trim_pos = local_draft_pos0 + (llama_pos) n_accepted + 1;
                 if (!trim_local_context(trim_pos)) {
-                    LOG_WRN("DFlash2 local split draft rollback failed at position %d\n", (int) trim_pos);
+                    LOG_ERR("DFlash2 local split draft rollback failed at position %d; disabling local drafting\n", (int) trim_pos);
+                    local_failed = true;
                 }
             }
 
             local_draft_pending = false;
             local_draft_pos0 = -1;
             local_n_proposed = 0;
-            local_next_hypothesis = -1;
+            local_next_candidate = {};
             return;
         }
 
@@ -5178,6 +5268,28 @@ common_speculative_init_result::common_speculative_init_result(
     common_params params_dft = common_base_params_to_speculative(params);
     auto mparams = common_model_params_to_llama(params_dft);
     auto cparams = common_context_params_to_llama(params_dft);
+
+    // Keep selector math beside the borrowed target head. Otherwise scheduler
+    // propagation can send vocabulary-sized logits to the draft device just
+    // to gather the top-k scores. Explicit user tensor overrides take priority.
+    std::vector<llama_model_tensor_buft_override> local_selector_overrides;
+    if (spec_dflash && params.speculative.draft.local_split) {
+        auto * device = llama_model_get_output_device(model_tgt);
+        if (device && !ggml_backend_dev_is_meta(device)) {
+            if (mparams.tensor_buft_overrides) {
+                for (auto * entry = mparams.tensor_buft_overrides; entry->pattern; ++entry) {
+                    local_selector_overrides.push_back(*entry);
+                }
+            }
+            local_selector_overrides.push_back({
+                "^selector_(predecessor|successor|hidden)\\.weight$",
+                ggml_backend_dev_buffer_type(device),
+            });
+            local_selector_overrides.push_back({nullptr, nullptr});
+            mparams.tensor_buft_overrides = local_selector_overrides.data();
+            LOG_INF("DFlash2 local selector default device: %s\n", ggml_backend_dev_name(device));
+        }
+    }
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
