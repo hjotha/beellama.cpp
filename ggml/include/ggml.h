@@ -623,10 +623,6 @@ extern "C" {
         GGML_OP_KVARN_VIEW,
         GGML_OP_KVARN_MATERIALIZE,
 
-        // Full-attention core executed by a remote KV+attention accelerator
-        // (ggml-remote-attn backend).  Only that backend supports this op.
-        GGML_OP_REMOTE_ATTN,
-
         GGML_OP_UNARY,
 
         GGML_OP_MAP_CUSTOM1,
@@ -643,6 +639,12 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_PAGED_ATTN,
+
+        // Full-attention core executed by a remote KV+attention accelerator
+        // (ggml-remote-attn backend).  Only that backend supports this op.
+        // Kept last so existing op enum values (and prebuilt CUDA objects)
+        // are not shifted.
+        GGML_OP_REMOTE_ATTN,
 
         GGML_OP_COUNT,
     };

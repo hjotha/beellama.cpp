@@ -1152,7 +1152,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "KVARN_STORE",
     "KVARN_VIEW",
     "KVARN_MATERIALIZE",
-    "REMOTE_ATTN",
 
     "UNARY",
 
@@ -1169,6 +1168,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "PAGED_ATTN",
+    "REMOTE_ATTN",
 };
 
 static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
@@ -1273,7 +1273,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "kvarn_store(current, indices, stage, records)",
     "kvarn_view(records, stage, indices)",
     "kvarn_materialize(records, stage, indices)",
-    "remote_attn(q, k, v, pos)",
 
     "unary(x)",
 
@@ -1290,6 +1289,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
     "paged_attn",
+    "remote_attn(q, k, v, pos)",
 };
 
 static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
