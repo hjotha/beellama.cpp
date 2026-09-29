@@ -1,0 +1,32 @@
+{
+  "group": "g000-base-snap",
+  "round": 0,
+  "mode": "base-snap",
+  "requests": [
+    {
+      "case": "warmup64",
+      "repeat": null,
+      "scenario": "warmup64"
+    },
+    {
+      "case": "curto192",
+      "repeat": 0,
+      "scenario": "curto192-r000"
+    },
+    {
+      "case": "codigo192",
+      "repeat": 0,
+      "scenario": "codigo192-r000"
+    },
+    {
+      "case": "prosa192",
+      "repeat": 0,
+      "scenario": "prosa192-r000"
+    },
+    {
+      "case": "long192",
+      "repeat": 0,
+      "scenario": "long192-r000"
+    }
+  ]
+}

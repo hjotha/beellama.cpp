@@ -1,0 +1,3 @@
+{"base-snap":  {"env": {}, "libs": "snapshot", "cuda": "snapshot"},
+ "gdn-gather": {"env": {}, "libs": "live", "cuda": "live"},
+ "gdn-rows":   {"env": {"GGML_GDN_CUDA_ROWS": "1"}, "libs": "live", "cuda": "live"}}

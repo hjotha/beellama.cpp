@@ -1,0 +1,2 @@
+{"base-live": {"env": {}, "libs": "live", "cuda": "live"},
+ "base-snapshot": {"env": {}, "libs": "snapshot", "cuda": "snapshot"}}

@@ -1,0 +1,14 @@
+{
+  "llama-server-root.service": {
+    "state": "active",
+    "health": {
+      "status": "ok"
+    }
+  },
+  "qwen35-4b-mtp-8092.service": {
+    "state": "active",
+    "health": {
+      "status": "ok"
+    }
+  }
+}

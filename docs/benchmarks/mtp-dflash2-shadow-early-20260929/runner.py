@@ -1,4 +1,8 @@
 import hashlib
+import getpass
+import fcntl
+import socket
+import sys
 import json
 import os
 from pathlib import Path
@@ -8,17 +12,23 @@ import threading
 import time
 import urllib.request
 
-root = Path('/home/hjotha/beellama.cpp/docs/benchmarks/mtp-dflash2-shadow-early-20260929')
-root.mkdir(parents=True, exist_ok=True)
+phase = sys.argv[1] if len(sys.argv)>1 else time.strftime('review-%Y%m%d-%H%M%S')
+root = Path(__file__).resolve().parent / phase
+root.mkdir(parents=True, exist_ok=False)
 base = Path('/home/hjotha/beellama.cpp')
 server = base / 'build-dflash-xbox-dl/bin/llama-server'
 model = '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
 draft = '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf'
-port = 59577
+port = 59589
+lease = open('/tmp/beellama-gpu-benchmark.lock', 'a+')
+try:
+    fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit('Another benchmark holds the GPU lease')
+with socket.socket() as probe:
+    probe.bind(('127.0.0.1',port))
 hwmon = next(Path('/sys/class/drm/card1/device/hwmon').glob('hwmon*'))
-password = os.environ.get('SUDO_PASS')
-if not password:
-    raise SystemExit('SUDO_PASS not set')
+password = getpass.getpass('sudo password: ')
 print('RESULT_DIR=' + str(root), flush=True)
 
 
@@ -26,7 +36,7 @@ class CPUController:
     def __init__(self):
         self.log = (root / 'cpu-controller.stderr.log').open('w')
         controller = str(Path(__file__).with_name('cpu-controller.py'))
-        self.process = subprocess.Popen(['sudo', '-k', '-S', '-p', '', 'python3', controller], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1)
+        self.process = subprocess.Popen(['sudo', '-k', '-S', '-p', '', 'python3', controller], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1, start_new_session=True)
         self.lock = threading.Lock()
         self.process.stdin.write(password + '\n')
         self.process.stdin.flush()
@@ -100,7 +110,16 @@ def sensor_snapshot(start):
     return out
 
 
+def check_policy():
+    for command in [['systemctl','is-active','--quiet','llama-server-root.service'],['systemctl','--user','is-active','--quiet','qwen35-4b-mtp-8092.service']]:
+        if subprocess.run(command,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5).returncode==0:
+            raise RuntimeError('Production resumed during benchmark; discard this run')
+    for directory,values in policy_state['policy'].items():
+        actual={k:(Path(directory)/k).read_text().strip() for k in values}
+        if actual!=values:raise RuntimeError('CPU policy changed during benchmark: '+directory)
+
 def request(prompt, n_predict, scenario, mode, tdp):
+    check_policy()
     payload = {'prompt': prompt, 'n_predict': n_predict, 'temperature': 0, 'seed': 42, 'ignore_eos': True, 'cache_prompt': False, 'stream': False}
     req = urllib.request.Request(f'http://127.0.0.1:{port}/completion', data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
     samples = []
@@ -136,7 +155,7 @@ def request(prompt, n_predict, scenario, mode, tdp):
     thread = threading.Thread(target=monitor, daemon=True)
     thread.start()
     try:
-        with urllib.request.urlopen(req, timeout=360) as response:
+        with urllib.request.urlopen(req, timeout=90) as response:
             data = json.load(response)
     finally:
         stop.set()
@@ -144,11 +163,12 @@ def request(prompt, n_predict, scenario, mode, tdp):
     if monitor_errors:
         raise RuntimeError('CPU monitor failed: ' + '; '.join(monitor_errors))
     elapsed = time.monotonic() - t0
+    check_policy()
     timings = data.get('timings', {})
     if data.get('error'):
         raise RuntimeError(data['error'])
-    (root / f'{mode}-{scenario}.response.json').write_text(json.dumps(data, ensure_ascii=False, indent=2))
-    (root / f'{mode}-{scenario}.telemetry.json').write_text(json.dumps(samples, indent=2))
+    (root / f'{mode}-{scenario}.response.json').write_text(json.dumps(data, ensure_ascii=False))
+    (root / f'{mode}-{scenario}.telemetry.json').write_text(json.dumps(samples, separators=(',', ':')))
     decode = [s for s in samples if s['t_s'] > timings.get('prompt_ms', 0) / 1000]
     active = [s for s in decode if s.get('gpu_busy_pct', 0) >= 10]
 
@@ -183,14 +203,23 @@ def mtp_shadow_cmd(n):
     return [str(server), '--model', model, '--device', 'CUDA0', '--n-gpu-layers', '99', '--fit', 'off', '--flash-attn', 'on', '--ctx-size', '16384', '--parallel', '1', '--batch-size', '64', '--ubatch-size', '64', '--cache-type-k', 'q4_0', '--cache-type-v', 'q4_0', '--host', '127.0.0.1', '--port', str(port), '--no-webui', '--spec-type', 'draft-mtp', '--spec-draft-n-max', str(n), '--spec-draft-p-min', '0.70', '--spec-draft-type-k', 'q4_0', '--spec-draft-type-v', 'q4_0', '--spec-draft-shadow-model', draft, '--spec-draft-shadow-device', 'Vulkan0', '--spec-draft-shadow-ngl', 'all', '--spec-draft-shadow-n-max', '7', '--gpu-power-backend', 'amdgpu', '--apu-tdp', '20', '--gpu-mem-clock-prefill', '2700', '--gpu-mem-clock-decode', '2700']
 
 
+primary = mtp_shadow_cmd(4)
+primary = primary[:primary.index('--spec-draft-shadow-model')] + primary[primary.index('--gpu-power-backend'):]
+no_proposal=mtp_shadow_cmd(4)
+no_proposal[no_proposal.index('--spec-draft-p-min')+1]='1.0'
+no_proposal_baseline=primary.copy()
+no_proposal_baseline[no_proposal_baseline.index('--spec-draft-p-min')+1]='1.0'
 modes = [
-    ('shadow-every4-early-off', mtp_shadow_cmd(4), 20, {'GGML_DFLASH_SHADOW_EARLY': '0'}),
-    ('shadow-every4-early-on',  mtp_shadow_cmd(4), 20, {'GGML_DFLASH_SHADOW_EARLY': '1'}),
+    ('sync-only-early-on', mtp_shadow_cmd(4), 20, 0, 1, 1, 0),
+    ('early-off', mtp_shadow_cmd(4), 20, 4, 0, 3, 2),
+    ('early-on', mtp_shadow_cmd(4), 20, 4, 1, 3, 2),
+    ('empty-primary-baseline', no_proposal_baseline, 20, 0, 0, 1, 0),
+    ('empty-primary-early-on', no_proposal, 20, 1, 1, 1, 0),
 ]
 
 env = os.environ.copy()
 for key in list(env):
-    if key.startswith(('DFLASH_XBOX_', 'GGML_MTP_PROF', 'GGML_DFLASH_LOCAL_PROF')):
+    if key.startswith(('DFLASH_XBOX_', 'GGML_MTP_PROF', 'GGML_DFLASH_LOCAL_PROF', 'GGML_DFLASH_SHADOW_')):
         env.pop(key)
     if key == 'SUDO_PASS':
         env.pop(key)
@@ -198,10 +227,10 @@ env['LD_LIBRARY_PATH'] = f'{base}/build/bin:{base}/build-dflash-xbox-dl/bin'
 env['LD_PRELOAD'] = ':'.join(str(base / ('build-dflash-xbox-dl/bin/' + name)) for name in ['libllama.so.0.4.7', 'libllama-common.so.0.4.7', 'libllama-server-impl.so'])
 env['GGML_BACKEND_PATH'] = str(base / 'build/bin/libggml-vulkan.so')
 env['GGML_DFLASH_SHADOW_PROF'] = '1'
-env['GGML_DFLASH_SHADOW_EVERY'] = '4'
 
-(root / 'git.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=base, text=True) + subprocess.check_output(['git', 'status', '--short'], cwd=base, text=True))
-binaries = [server, base / 'build-dflash-xbox-dl/bin/libllama.so.0.4.7', base / 'build-dflash-xbox-dl/bin/libllama-common.so.0.4.7', base / 'build/bin/libggml-vulkan.so', base / 'build/bin/libggml-cuda.so']
+(root / 'git.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=base, text=True) + subprocess.check_output(['git', 'diff'], cwd=base, text=True))
+(root/'observer-header.h').write_text((base/'common/dflash-shadow-observation.h').read_text())
+binaries = [server, base / 'build-dflash-xbox-dl/bin/libllama.so.0.4.7', base / 'build-dflash-xbox-dl/bin/libllama-common.so.0.4.7', base / 'build-dflash-xbox-dl/bin/libllama-server-impl.so', base / 'build/bin/libggml-vulkan.so', base / 'build/bin/libggml-cuda.so']
 (root / 'binary-sha256.json').write_text(json.dumps({str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in binaries if p.exists()}, indent=2))
 (root / 'draft-model-sha256.json').write_text(json.dumps({draft: hashlib.sha256(Path(draft).read_bytes()).hexdigest()}, indent=2))
 
@@ -218,16 +247,16 @@ try:
         rootctl('stop')
         stopped_root = True
         print('root server stopped', flush=True)
-    for mode, cmd, tdp, extra_env in modes:
-        policy_state = cpu.call('original')
+    for mode, cmd, tdp, every, early, short_repeats, long_repeats in modes:
+        env['GGML_DFLASH_SHADOW_EVERY']=str(every)
+        env['GGML_DFLASH_SHADOW_EARLY']=str(early)
+        (root/f'{mode}.environment.json').write_text(json.dumps({k:v for k,v in env.items() if k.startswith(('GGML_', 'LD_', 'DFLASH_'))},indent=2))
+        policy_state = cpu.call('benchmark')
         (root / f'{mode}.cpu-policy.json').write_text(json.dumps(policy_state, indent=2))
         nvidia_brief(root / f'{mode}.nvidia-before.csv')
         (root / f'{mode}.command.json').write_text(json.dumps(cmd, indent=2))
-        (root / f'{mode}.env.json').write_text(json.dumps(extra_env, indent=2))
-        run_env = dict(env)
-        run_env.update(extra_env)
         with (root / f'{mode}.server.log').open('wb') as log:
-            proc = subprocess.Popen(cmd, env=run_env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
             try:
                 health(f'http://127.0.0.1:{port}/health')
                 if proc.poll() is not None:
@@ -235,15 +264,16 @@ try:
                 print(mode + ' loaded', flush=True)
                 request(code, 64, 'warmup', mode, tdp)
                 mode_results = []
-                for i in range(3):
+                for i in range(short_repeats):
                     mode_results.append(request(short, 192, f'repeticao-{i}', mode, tdp))
                     mode_results.append(request(code, 192, f'codigo-{i}', mode, tdp))
-                for i in range(2):
+                for i in range(long_repeats):
                     mode_results.append(request(long, 192, f'longo-{i}', mode, tdp))
-                summary = {'mode': mode, 'tdp_w': tdp}
+                summary = {'mode': mode, 'tdp_w': tdp, 'every': every, 'early': early}
 
                 def scenario_stats(name):
                     rows = [r for r in mode_results if r['scenario'].startswith(name)]
+                    if not rows:return None
                     tps = [r['decode_tps'] for r in rows]
                     hashes = {r['content_sha256'] for r in rows}
                     entry = {'runs': len(rows), 'tps_median': round(statistics.median(tps), 3), 'tps_min': round(min(tps), 3), 'tps_max': round(max(tps), 3), 'hashes_equal': len(hashes) == 1, 'content_sha256': sorted(hashes)[0] if len(hashes) == 1 else None, 'hashes': sorted(hashes)}
@@ -269,6 +299,8 @@ try:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5)
+                log.flush()
+                (root / f'{mode}.server-output.txt').write_bytes((root / f'{mode}.server.log').read_bytes())
 finally:
     failures = []
     try:

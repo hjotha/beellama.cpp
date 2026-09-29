@@ -1,0 +1,32 @@
+{
+  "group": "g010-base-live",
+  "round": 2,
+  "mode": "base-live",
+  "requests": [
+    {
+      "case": "warmup64",
+      "repeat": null,
+      "scenario": "warmup64"
+    },
+    {
+      "case": "curto192",
+      "repeat": 4,
+      "scenario": "curto192-r004"
+    },
+    {
+      "case": "codigo192",
+      "repeat": 4,
+      "scenario": "codigo192-r004"
+    },
+    {
+      "case": "prosa192",
+      "repeat": 4,
+      "scenario": "prosa192-r004"
+    },
+    {
+      "case": "long192",
+      "repeat": 4,
+      "scenario": "long192-r004"
+    }
+  ]
+}

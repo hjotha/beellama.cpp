@@ -1,0 +1,8 @@
+{
+  "CUDA_PATH": "/opt/cuda",
+  "PATH": "/home/hjotha/.bun/bin:/home/hjotha/.opencode/bin:/home/hjotha/.local/bin:/home/hjotha/.bun/bin:/home/hjotha/.opencode/bin:/home/hjotha/.local/bin:/home/hjotha/.local/bin:/opt/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl:/opt/rocm/bin",
+  "LD_LIBRARY_PATH": "/home/hjotha/beellama.cpp/build/bin:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin",
+  "LD_PRELOAD": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-server-impl.so",
+  "GGML_BACKEND_PATH": "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so",
+  "GGML_GDN_CUDA_ROWS": "1"
+}

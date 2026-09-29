@@ -161,7 +161,15 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
         if (is_gpu && strcmp(reg_name, "MTL") != 0) {
-            gdn_state_rows_dev_ok = false;
+            // The rows-indexed state read (src[6]) is now implemented in the CUDA
+            // gated_delta_net kernel. Enable it on CUDA opt-in (GGML_GDN_CUDA_ROWS)
+            // so the gathered path stays the default and the two can be A/B compared
+            // for correctness and speed on the same binary. Other GPU backends still
+            // lack the kernel and must keep the gathered form.
+            static const bool cuda_rows_optin = getenv("GGML_GDN_CUDA_ROWS") != nullptr;
+            if (!(cuda_rows_optin && strcmp(reg_name, "CUDA") == 0)) {
+                gdn_state_rows_dev_ok = false;
+            }
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
             strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {

@@ -1,0 +1,40 @@
+{
+  "mode": "gdn-rows",
+  "group": "g005-gdn-rows",
+  "round": 2,
+  "request_index": 3,
+  "case": "prosa192",
+  "scenario": "prosa192-r004",
+  "repeat": 4,
+  "warmup": false,
+  "n_predict": 192,
+  "config": {
+    "env": {
+      "GGML_GDN_CUDA_ROWS": "1"
+    },
+    "libs": "live",
+    "cuda": "live",
+    "server_args": []
+  },
+  "tdp_w": 20,
+  "context_size": 16384,
+  "prompt_n": 50,
+  "prompt_ms": 204.911,
+  "prompt_tps": 244.00837436740827,
+  "predicted_n": 192,
+  "decode_tps": 56.82017633888862,
+  "decode_ms": 3361.482,
+  "wall_s": 3.575,
+  "token_count": 192,
+  "content_sha256": "f3d327221e1e3f80b0acb9699d4cddcbc114ad62dbdf77ec2d81fa733a399ce6",
+  "tokens_sha256": "7c689d5f78ead06e712330a95e8bd838b8a8844dbb8d2d69781e35e846e6fa3e",
+  "response_file": "groups/g005-gdn-rows/prosa192-r004.response.json",
+  "tokens_file": "groups/g005-gdn-rows/prosa192-r004.tokens.json",
+  "server_output": "groups/g005-gdn-rows/server-output.txt",
+  "decode_ppt_w": 6.753,
+  "active_gpu_clock_mhz": null,
+  "peak_temp_c": 54.0,
+  "cpu_busy_mhz": 3114.623,
+  "cpu_util_pct": 6.872,
+  "telemetry_samples": 35
+}

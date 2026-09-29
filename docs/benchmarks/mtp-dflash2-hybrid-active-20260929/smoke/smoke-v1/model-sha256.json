@@ -1,0 +1,10 @@
+{
+  "/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf": {
+    "size": 10442827840,
+    "sha256": "63f29a2189a6b4cc31f81e093d3856ad293a5583114439f41ae1ed7af4093262"
+  },
+  "/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf": {
+    "size": 1143006816,
+    "sha256": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd"
+  }
+}

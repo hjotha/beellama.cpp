@@ -1,0 +1,61 @@
+0.00.588.343 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.588.982 I srv          init: The UI is disabled
+0.00.588.984 I srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+0.00.589.239 W srv  llama_server: -----------------
+0.00.589.240 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.589.241 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.589.241 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.589.242 W srv  llama_server: -----------------
+0.00.590.722 I srv    load_model: loading model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.09.624.482 I cmn          init: llama threadpool init, n_threads = 8
+0.09.723.219 I common_speculative_init_result: creating MTP draft context against the target model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.09.733.366 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 16384, kv_unified = 'false', elastic_paged_context = false
+0.09.735.796 I AMDGPU governor: card /sys/class/drm/card1, original level auto, SCLK range 800-2700 MHz
+detected compatible ryzen_smu kernel module
+0.09.738.639 I APU TDP: original STAPM/fast/slow limits 8000/20000/15000 mW
+0.09.738.641 I GPU governor enabled
+0.09.738.641 I   device: AMDGPU /sys/class/drm/card1 (sysfs)
+0.09.738.641 I   device index: 0
+0.09.738.642 I   active APU TDP: 20 W
+0.09.738.642 I   decode memory clock: 2700 MHz
+0.09.738.643 I   prefill memory clock: 2700 MHz
+0.09.744.358 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.09.744.406 I srv  llama_server: model loaded
+0.09.744.411 I srv  llama_server: listening on http://127.0.0.1:59589
+0.09.813.267 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+0.09.813.323 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.09.814.080 I APU TDP: active limit 20 W
+0.09.815.171 I GPU memory clock: idle -> prefill, locked 2700 MHz
+0.12.156.869 I slot print_timing: id  0 | task 0 | prompt eval time =     359.39 ms /    28 tokens (   12.84 ms per token,    77.91 tokens per second)
+0.12.156.872 I slot print_timing: id  0 | task 0 |        eval time =    1982.16 ms /    64 tokens (   31.46 ms per token,    31.78 tokens per second)
+0.12.156.873 I slot print_timing: id  0 | task 0 |       total time =    2341.55 ms /    92 tokens
+0.12.156.877 I slot print_timing: id  0 | task 0 |    graphs reused =         62
+0.12.157.325 I slot      release: id  0 | task 0 | stop processing: n_tokens = 91, truncated = 0
+0.12.165.938 I GPU memory clock: decode -> idle, reset (dynamic)
+0.12.167.320 I APU TDP: restored original limits
+0.12.196.927 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 156345027626
+0.12.196.983 I slot launch_slot_: id  0 | task 67 | processing task, is_child = 0
+0.12.197.381 I APU TDP: active limit 20 W
+0.12.198.358 I GPU memory clock: idle -> prefill, locked 2700 MHz
+0.15.438.888 I slot print_timing: id  0 | task 67 | n_gen =    100, tg =  32.43 t/s, tg_3s =  32.76 t/s
+0.18.192.154 I slot print_timing: id  0 | task 67 | prompt eval time =     187.69 ms /    25 tokens (    7.51 ms per token,   133.19 tokens per second)
+0.18.192.159 I slot print_timing: id  0 | task 67 |        eval time =    5806.05 ms /   192 tokens (   30.40 ms per token,    32.90 tokens per second)
+0.18.192.160 I slot print_timing: id  0 | task 67 |       total time =    5993.75 ms /   217 tokens
+0.18.192.161 I slot print_timing: id  0 | task 67 |    graphs reused =        226
+0.18.192.163 I slot print_timing: id  0 | task 67 | draft acceptance = 1.00000 (    9 accepted /     9 generated), mean len =  2.00
+0.18.192.410 I slot      release: id  0 | task 67 | stop processing: n_tokens = 216, truncated = 0
+0.18.201.452 I GPU memory clock: decode -> idle, reset (dynamic)
+0.18.202.279 I APU TDP: restored original limits
+0.18.223.292 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 156351062711
+0.18.223.327 I slot launch_slot_: id  0 | task 253 | processing task, is_child = 0
+0.18.223.628 I APU TDP: active limit 20 W
+0.18.224.548 I GPU memory clock: idle -> prefill, locked 2700 MHz
+0.21.456.157 I slot print_timing: id  0 | task 253 | n_gen =    100, tg =  32.40 t/s, tg_3s =  32.72 t/s
+0.24.286.260 I slot print_timing: id  0 | task 253 | prompt eval time =     175.77 ms /    28 tokens (    6.28 ms per token,   159.30 tokens per second)
+0.24.286.263 I slot print_timing: id  0 | task 253 |        eval time =    5885.88 ms /   192 tokens (   30.82 ms per token,    32.45 tokens per second)
+0.24.286.264 I slot print_timing: id  0 | task 253 |       total time =    6061.65 ms /   220 tokens
+0.24.286.265 I slot print_timing: id  0 | task 253 |    graphs reused =        416
+0.24.286.292 I slot      release: id  0 | task 253 | stop processing: n_tokens = 219, truncated = 0
+0.24.294.892 I GPU memory clock: decode -> idle, reset (dynamic)
+0.24.296.287 I APU TDP: restored original limits
+0.24.305.486 I srv    operator(): operator(): cleaning up before exit...

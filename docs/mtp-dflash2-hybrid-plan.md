@@ -1,6 +1,7 @@
 # Plano: MTP e DFlash2 concorrentes com reaproveitamento de sufixo
 
-Data: 2026-09-29. Estado: proposta para decisão; Etapa 0 executada; modo híbrido ainda não implementado.
+Data: 2026-09-29. Estado: Etapas 0/1 medidas; piloto ativo da Etapa 2 implementado
+e testado, com resultado negativo de desempenho (§2.8). Recomendação atual: MTP n4 isolado.
 
 Base examinada na elaboração: branch `fix/dflash-xbox-pipeline`, commit `12231b55e`,
 com as correções locais de split/prefetch pendentes naquele levantamento, depois
@@ -10,6 +11,11 @@ discussão e propõe a primeira validação; não aprova automaticamente a imple
 das etapas seguintes nem muda a produção.
 
 ## 1. Recomendação para a primeira implementação
+
+**Resultado atual:** o piloto ativo foi executado. A melhor variante híbrida
+ficou aproximadamente 4–7% abaixo do MTP n4 na confirmação com cinco repetições;
+MTP curto + DFlash ficou 13–19% abaixo. O histórico do desenho inicial segue
+abaixo; detalhes e limites da decisão estão na seção 2.8.
 
 **Começar com MTP como referência e DFlash2 em observação paralela, ambos partindo
 do mesmo prefixo confirmado.** O DFlash gera um bloco maior, mas seus tokens ainda
@@ -256,6 +262,11 @@ Evidências, scripts, ambiente e interpretação em
 
 ### 2.6 Lançamento antecipado do auxiliar (2026-09-29)
 
+> A tabela original abaixo é histórica. A revisão do commit `3d4128354`
+> identificou políticas de CPU diferentes e cadência calculada em pontos
+> distintos nos dois modos. Os contadores incluem aquecimento. A repetição
+> controlada, após as correções, está na seção 2.6.1.
+
 Hipótese da janela: iniciar o bloco auxiliar **antes** do draft MTP primário
 (padrão: depois). Variável experimental `GGML_DFLASH_SHADOW_EARLY=1`; jobs de
 ciclos sem proposta primária são cancelados. `EVERY=4` nos dois modos, mesma
@@ -270,10 +281,154 @@ bateria.
 | Pronto + coincide + sufixo | 55 (53,9%) | 71 (70,3%) |
 | Tokens candidatos | 132 | 186 |
 
-- Ganho claro sem custo no primário e com hashes idênticos; contabilidade
-  fecha (observados + cancelados = lançados).
+- Hashes idênticos e contabilidade fechada (observados + cancelados = lançados).
+  As limitações de controle e amostragem impedem inferir custo zero desse ensaio.
 - Evidência em
   [benchmarks/mtp-dflash2-shadow-early-20260929](benchmarks/mtp-dflash2-shadow-early-20260929/README.md).
+
+### 2.6.1 Revisão e repetição controlada do lançamento antecipado
+
+O commit convertia `GGML_DFLASH_SHADOW_EVERY=0` em 1, quebrando o controle de
+sincronização sem blocos. Isso foi corrigido, com validação de valores de ambiente
+e testes. A cadência agora conta tentativas antes do MTP nos dois modos; uma
+tentativa sem proposta não desloca os próximos ciclos amostrados. Cancelamentos
+do primário passam a registrar o ID do trabalho para auditoria.
+
+Nova bateria no mesmo binário, CPU fixada/conferida por requisição, APU 20 W,
+SCLK solicitado 2700 MHz e a configuração 16K anterior. Foram cruzadas as mesmas
+101 âncoras, incluindo aquecimento, com sequências confirmadas idênticas:
+
+| Métrica | early-off | early-on |
+| --- | ---: | ---: |
+| Repetição / Código / Longo (tok/s) | 83,13 / 57,22 / 55,28 | 83,05 / 56,85 / 54,77 |
+| Prontos no prazo | 87 | 97 |
+| Tardios | 14 | 4 |
+| Prefixo coincide | 76 | 76 |
+| Pronto + coincide + sufixo | 67 (66,3%) | 73 (72,3%) |
+| Tokens candidatos | 172 | 194 |
+
+Medições de geração: três repetições curtas e duas longas por modo, com diferença
+inferior a 1% nesta bateria sequencial. Os 22 resultados dos cinco casos
+(A/B e canários) preservaram seus hashes de referência; os grupos com p_min=1
+usam sua própria referência. Não há ganho de geração híbrida ativo medido.
+
+O canário EVERY=0/EARLY=1 lançou zero blocos. O canário de primário sem proposta
+exercitou 221 cancelamentos sem erro, contaminação de saída ou trabalho pendente.
+Build e quatro testes selecionados passaram. Políticas originais e produção
+foram restauradas. Uma rodada interrompida por interferência externa foi excluída.
+
+Evidência auditável em
+[review-v2](benchmarks/mtp-dflash2-shadow-early-20260929/review-v2/README.md),
+com logs em texto preservado, código do analisador, fonte testada e manifestos
+completos dos binários explicitamente precarregados.
+
+### 2.7 Valor do sufixo com continuação densa (2026-09-29)
+
+Evidências, scripts e resultados:
+[`benchmarks/mtp-dflash2-suffix-dense-20260929/`](benchmarks/mtp-dflash2-suffix-dense-20260929/).
+Sete configurações, 35 pedidos medidos mais sete aquecimentos; controles MTP
+n2/n3/n4, observador EVERY=4/EARLY=1 e repetição do controle n4 no final.
+Mesmo alvo, DFlash2 Q4_K_M, contexto 16384, APU 20 W e política CPU controlada.
+
+A análise anterior em `mtp-dflash2-suffix-value-20260929` foi invalidada: misturava
+posições entre pedidos, tratava lacunas como comprimento zero/parcial e comparava
+o sufixo com a rodada MTP de origem. A nova instrumentação `GGML_DFLASH_SHADOW_TRACE`
+registra cada rodada, inclusive sem lançamento auxiliar ou sem proposta MTP.
+Os IDs retornados pelo servidor são conferidos contra a aceitação definitiva;
+a comparação usa a **próxima** rodada MTP, incluindo bônus, e separa fim de resposta
+de rejeição. Aquecimento fica fora das métricas abaixo.
+
+| Limite MTP/verificador | Sufixos comparados | Primeiro token correto | L médio | Diferença de avanço contra a próxima rodada MTP |
+| --- | ---: | ---: | ---: | ---: |
+| 4 | 40 | 90,0% | 1,90 | −1,05 token por oportunidade |
+| 3 | 47 | 93,6% | 2,68 | +0,17 token por oportunidade |
+| 2 | 49 | 87,8% | 1,63 | +0,12 token por oportunidade |
+
+Todos os 136 casos tiveram continuação suficiente para a comparação configurada.
+No n4, 26/40 sufixos oferecem somente dois tokens; nesses casos o MTP seguinte
+avança 4,69 tokens em média. Os 14 sufixos com comprimento ≥3 somam +6 tokens de
+avanço e 130 ms de dispatch potencialmente evitável. Ainda não há aceitação real
+de draft híbrido: `L` mede correspondência com a trajetória posterior de referência.
+
+O observador custa 6,7%/6,8%/7,7% de throughput agregado para n4/n3/n2.
+O MTP n4 continua sendo a melhor referência: 85,8–86,4 tok/s em repetição,
+59,9–60,0 em código e 58,3–58,4 no longo. Descontar o dispatch MTP evitável numa
+estimativa local, mantendo outros tempos/âncoras fixos, ainda deixa as variantes
+atrás de seus próprios controles. Isso orienta a triagem, sem substituir um
+benchmark ativo ou estabelecer um limite matemático de velocidade.
+
+**Ajuste de desenho:** separar limite de geração MTP e capacidade do verificador
+é uma hipótese mais relevante que reduzir os dois juntos. Reavaliando os jobs n2
+com capacidade hipotética de quatro, há 48 comparações completas e uma censurada;
+o avanço offline soma 184 contra 120 do MTP (+1,33 token por oportunidade).
+O custo de verificar esse bloco maior não foi medido. Não ampliar o draft depois
+de o servidor dimensionar os buffers/checkpoints: a capacidade deve ser declarada
+antes da criação dos contextos e a profundidade MTP limitada de fato no loop de
+geração, preservando o tamanho treinado do DFlash.
+
+Todos os 18 pedidos com observador, incluindo aquecimento, coincidiram token por
+token com o controle de mesmo limite. Existe uma diferença prévia entre controles
+n2/n3/n4: repetição diverge no índice de saída 31; código n3 no 117 e n2 no 136;
+o longo coincide. A causa não foi estabelecida. Investigar logits e estado na
+primeira divergência antes de exigir/equivaler trajetórias com comprimentos
+distintos; não atribuir automaticamente a ruído numérico.
+
+Decisão: a medição do valor do sufixo da Etapa 1 está concluída para esta bateria;
+compatibilidade demonstrada, benefício líquido pendente. A substituição simples
+permanece desabilitada. O próximo piloto deve tratar capacidade independente e
+referência gulosa, com fallback imediato e comparação contra MTP n4. A amostra
+atual serve para triagem; promoção continua exigindo a matriz da seção 9.
+
+### 2.8 Etapa 2 ativa: implementação e resposta em tok/s (2026-09-29)
+
+Evidências completas:
+[`benchmarks/mtp-dflash2-hybrid-active-20260929/`](benchmarks/mtp-dflash2-hybrid-active-20260929/).
+Foram implementados o consumo do sufixo no despacho upstream, fallback sem espera,
+origem externa preservada no replay, atualização do MTP via `process/accept` e
+checagens de carry/KV. `GGML_DFLASH_SHADOW_ACTIVE=1` habilita o piloto;
+`GGML_DFLASH_SHADOW_MTP_MAX=2` limita a geração real MTP, preservando capacidade4
+configurada por `--spec-draft-n-max 4`. Padrão continua observação.
+
+Após triagem de seis modos (18 pedidos), foram comparados três modos com cinco
+repetições por cenário, em grupos alternados: 45 pedidos medidos + 9 aquecimentos.
+Mesmo alvo/DFlash2 Q4_K_M, contexto 16384, batch/ubatch64, KV q4_0, APU20 W,
+SCLK observado 2700 MHz, CPU controlada e greedy. Limite de saída 192 tokens.
+
+| Mediana de geração | Repetição | Código | Longo (13850 tokens de prompt) |
+| --- | ---: | ---: | ---: |
+| MTP n4 isolado | **86,221 tok/s** | **60,170 tok/s** | **58,383 tok/s** |
+| Híbrido MTP2/capacidade4, EVERY1 | 74,978 tok/s | 50,861 tok/s | 47,479 tok/s |
+| Híbrido MTP4/capacidade4, EVERY4, sufixo mínimo3 | 82,374 tok/s | 55,862 tok/s | 55,789 tok/s |
+
+**Todos os 30 pares híbrido/MTP n4 foram mais lentos.** As medianas das diferenças
+pareadas foram −13,04%/−15,52%/−19,22% para MTP2 e −4,69%/−7,18%/−4,17% para
+MTP4 seletivo. A soma de tempos completos dos 15 pedidos também piorou:
+147,503 s (MTP) → 163,887 s (híbrido MTP2) / 157,974 s (híbrido MTP4).
+
+O reaproveitamento ocorreu de fato: o híbrido MTP2 verificou 311 blocos e aceitou
+942/1238 tokens DFlash (76,1%); houve 28 aceitações zero, 88 parciais e 195 totais,
+com 305 retomadas MTP observadas. No cenário repetitivo acertou 453/459 tokens
+auxiliares (98,7%), ainda perdendo para MTP n4. O híbrido MTP4 usou 48 blocos e
+aceitou 92/191 tokens. Nenhuma seleção pendente ou erro de worker/carry/KV.
+
+Na triagem repetitiva, reduzir o dispatch de propostas de 427 para 186 ms
+veio acompanhado de 49 verificações especulativas, contra 41 no MTP n4. O total
+de geração aumentou de 2202 para 2530 ms. A economia de draft existe, mas mais
+verificações e o trabalho auxiliar impediram ganho líquido.
+
+**Limite de correção:** todos os tokens foram auditados contra as decisões reais
+do alvo e cada sufixo contra seu job/prefixo/prazo. Isso não estabelece equivalência
+gulosa integral: houve igualdade exata em 13/15 pares do híbrido MTP4 e 7/15 do
+MTP2, com primeiras divergências registradas e causa ainda não determinada.
+Mesmo no subconjunto exatamente igual, todos os pares perderam: MTP4 entre
+−7,66% e −3,24%, MTP2 entre −19,86% e −10,98%. A conclusão negativa não depende
+somente de trajetórias diferentes. O piloto não está aprovado para produção.
+
+Decisão: **usar MTP n4 isolado para mais tok/s nesta máquina/configuração**.
+Etapa 2 concluída como experimento de desempenho, com resultado negativo. Código
+experimental fica desligado por padrão; expansão do mecanismo não se justifica
+por ganho medido neste ensaio. Serviços, políticas CPU e SCLK foram restaurados
+e conferidos. Os resultados não provam impossibilidade para todo hardware/modelo.
 
 ## 3. Alternativas discutidas
 
@@ -469,10 +624,15 @@ Entregas:
 - Medição corrigida e canários de ciclo de vida aprovados (seção 2.5), incluindo
   reconciliação de todos os lançamentos. `GGML_DFLASH_SHADOW_EVERY=0` permite
   medir apenas sincronização no mesmo binário; 1 e 4 foram comparados.
-- O início do auxiliar ainda ocorre depois do draft MTP atual; antecipá-lo é
-  uma otimização a medir separadamente. Prontidão já é avaliada antes do próximo
-  MTP, independentemente do throttle.
-- Etapa 2 permanece pendente: tokens candidatos ainda não alimentam a resposta.
+- O lançamento antecipado está implementado como opção
+  `GGML_DFLASH_SHADOW_EARLY=1` e foi repetido com cadência/âncoras iguais
+  (seção 2.6.1). Prontidão é avaliada antes do próximo MTP, independentemente
+  do throttle.
+- A continuação densa e o valor dos sufixos foram medidos para MTP n2/n3/n4
+  (seção 2.7). A hipótese agora pede separar profundidade MTP de capacidade
+  de verificação; ganho líquido ainda não demonstrado.
+- Etapa 2 implementada em piloto opt-in e medida na seção 2.8: tokens auxiliares
+  entram na verificação do alvo; resultado de throughput foi negativo.
 
 Registrar também se a demora veio da Radeon, das cópias ou do seletor esperando
 vez na 4070. Não somar tempos de execuções isoladas para alegar sobreposição.
@@ -602,17 +762,17 @@ Critérios de decisão propostos, ainda negociáveis:
 
 | Decisão | Recomendação | Consequência |
 | --- | --- | --- |
-| Próximo experimento | Observação corrigida e custo de sufixo | A coincidência está demonstrada; medir benefício líquido, janela de lançamento e limites antes de promover o modo ativo. |
-| Começar diretamente ativo? | Somente como alternativa deliberada | Requer desde o início sincronização de ambos os estados, roteamento de aceitação e toda a validação de fallback. |
+| Uso atual para mais tok/s | MTP n4 isolado | O piloto ativo com capacidades independentes perdeu nos 30 pares medidos (§2.8). |
+| Promover híbrido ativo? | Manter experimental e desligado por padrão | Sem ganho medido; equivalência gulosa integral e matriz de produção ainda não aprovadas. |
 | Árvore de propostas já? | Adiar | É uma mudança maior no verificador; usar primeiro as medidas de complementaridade. |
 | Profundidade inicial | DFlash 7; MTP 2/3/4 | Medido na Etapa 0: o DFlash n=7 só ganha em repetição; nos demais cenários n=6 rende mais. MTP n=4 é a melhor referência isolada. |
 | Hardware inicial | APU 20 W, Radeon 2700 MHz, CPU econômica | Os testes anteriores não sustentam aumento permanente de TDP/CPU como principal fonte de ganho. |
 | Temperatura maior que zero | Etapa posterior | Exige uma regra explícita para propostas, distribuições e rejeição. |
 
-As Etapas 0 e 1 têm medições preservadas (seções 2.1 e 2.5). O próximo passo é
-validar se a oportunidade de sufixo paga seu custo e definir um experimento ativo
-limitado da Etapa 2. A árvore de verificação segue adiada; nenhuma taxa antiga
-do observador defeituoso deve ser usada como portão de decisão.
+As Etapas 0, 1 e o experimento ativo da Etapa 2 têm medições preservadas.
+A continuação densa substituiu a análise esparsa inválida; o piloto com capacidade
+independente testou a hipótese e não superou MTP n4. A árvore de verificação segue
+adiada; as taxas antigas do observador defeituoso não são critério de decisão.
 
 ## 12. Referências e limites de comparação
 
@@ -626,5 +786,5 @@ do observador defeituoso deve ser usada como portão de decisão.
   existentes, incluindo split local e prefetch que já foram implementados.
 
 Os ganhos dos artigos não são previsões para a 4070 em eGPU e a Radeon desta
-máquina. O uso ativo de sufixos ainda não tem velocidade medida; observações
-de compatibilidade não substituem a verificação real da Etapa 2.
+máquina. O uso ativo de sufixos foi medido na seção 2.8 e não trouxe ganho nas
+políticas testadas. Observações de compatibilidade não substituem essa medição.

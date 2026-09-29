@@ -1,0 +1,1121 @@
+0.00.767.582 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.768.197 I srv          init: The UI is disabled
+0.00.768.199 I srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+0.00.768.318 W srv  llama_server: -----------------
+0.00.768.320 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.768.320 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.768.320 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.768.321 W srv  llama_server: -----------------
+0.00.769.942 I srv    load_model: loading model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.11.834.882 I cmn          init: llama threadpool init, n_threads = 8
+0.11.930.163 I common_speculative_init_result: creating MTP draft context against the target model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.11.936.852 I common_speculative_init_result: loading shadow auxiliary model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf'
+0.13.048.107 W llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+0.13.061.484 I common_speculative_init_result: shadow auxiliary context ready (model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf', n_max 7); observation pipeline pending
+0.13.062.551 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 16384, kv_unified = 'false', elastic_paged_context = false
+0.13.063.039 I shadow pilot: active=1 MTP depth=2 verifier capacity=4
+0.13.063.122 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dflash'
+0.13.063.125 I common_speculative_impl_draft_dflash: DFlash2 uses its fixed block limit and selector confidence; Bee adaptive draft-max is disabled
+0.13.063.127 I common_speculative_impl_draft_dflash: - n_max=7, n_min=0, p_min=0.00
+0.13.063.132 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=248070, n_extract=5, sample_from_anchor=true, lineage=dflash
+0.13.063.213 W llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+0.13.063.367 W llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+0.13.065.496 I common_speculative_impl_draft_dflash: DFlash2 explicit local split enabled
+0.13.065.501 I common_speculative_init: shadow auxiliary drafter registered (active experimental suffix reuse, every=1, early=1, min_suffix=1)
+0.13.066.889 I AMDGPU governor: card /sys/class/drm/card1, original level auto, SCLK range 800-2700 MHz
+detected compatible ryzen_smu kernel module
+0.13.082.737 I APU TDP: original STAPM/fast/slow limits 8000/20000/15000 mW
+0.13.082.742 I GPU governor enabled
+0.13.082.743 I   device: AMDGPU /sys/class/drm/card1 (sysfs)
+0.13.082.743 I   device index: 0
+0.13.082.744 I   active APU TDP: 20 W
+0.13.082.744 I   decode memory clock: 2700 MHz
+0.13.082.745 I   prefill memory clock: 2700 MHz
+0.13.090.928 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.13.091.178 I srv  llama_server: model loaded
+0.13.091.204 I srv  llama_server: listening on http://127.0.0.1:59595
+0.13.851.029 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+SHADOWTRACE {"event":"begin","request":0,"slot":0,"temperature":0.0}
+0.13.851.230 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.13.852.184 I APU TDP: active limit 20 W
+0.13.853.148 I GPU memory clock: idle -> prefill, locked 2700 MHz
+SHADOWTRACE {"event":"token","request":0,"slot":0,"pos":28,"token":271,"done_us":159680552854}
+SHADOWv2 launch job=1 epoch=2 request=0 pos0=28 anchor=271 n_max=7
+SHADOWv2 cancel job=1 epoch=2 request=0 pos0=28 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":28,"anchor":271,"proposed":[],"start_us":159680552988,"done_us":159680560842,"cohort":1}
+SHADOWTRACE {"event":"token","request":0,"slot":0,"pos":29,"token":248068,"done_us":159680608228}
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":29,"anchor":248068,"proposed":[198],"start_us":159680608367,"done_us":159680614853,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":29,"anchor":248068,"confirmed":[198,760],"draft_n":1,"replay":false,"done_us":159680661604}
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":31,"anchor":760,"proposed":[1156,6587],"start_us":159680661757,"done_us":159680668251,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":31,"anchor":760,"confirmed":[1156,369],"draft_n":2,"replay":false,"done_us":159680727005}
+SHADOWv2 launch job=2 epoch=2 request=0 pos0=33 anchor=369 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":33,"anchor":369,"proposed":[9859,728],"start_us":159680727695,"done_us":159680734261,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":33,"anchor":369,"confirmed":[9859,728,310],"draft_n":2,"replay":false,"done_us":159680775297}
+SHADOWv2 job=2 epoch=2 request=0 pos0=33 anchor=369 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159680772048 decision_us=159680775526 work_us=44105 dec_us=40806 sel_us=3147 confirmed=[9859,728,310] proposed=[9859,728,310,3165,264,12654,709]
+SHADOWACTIVE select job=2 epoch=2 request=0 pos0=36 anchor=310 n=4
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":36,"anchor":310,"proposed":[3165,264,12654,709],"start_us":159680775519,"done_us":159680775635,"cohort":1}
+SHADOWACTIVE accept job=2 request=0 pos0=36 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":36,"anchor":310,"confirmed":[3165,264,12654,709,2512],"draft_n":4,"replay":false,"done_us":159680835790}
+SHADOWv2 launch job=3 epoch=2 request=0 pos0=41 anchor=2512 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":41,"anchor":2512,"proposed":[1510,18479],"start_us":159680836670,"done_us":159680843457,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":41,"anchor":2512,"confirmed":[1510,18479,17885],"draft_n":2,"replay":false,"done_us":159680889444}
+SHADOWv2 job=3 epoch=2 request=0 pos0=41 anchor=2512 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159680877713 decision_us=159680889877 work_us=40806 dec_us=37099 sel_us=3475 confirmed=[1510,18479,17885] proposed=[1510,18479,17885,63,421,4829,264]
+SHADOWACTIVE select job=3 epoch=2 request=0 pos0=44 anchor=17885 n=4
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":44,"anchor":17885,"proposed":[63,421,4829,264],"start_us":159680889858,"done_us":159680889958,"cohort":1}
+SHADOWACTIVE accept job=3 request=0 pos0=44 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":44,"anchor":17885,"confirmed":[63,421,4829,264,1103],"draft_n":4,"replay":false,"done_us":159680941132}
+SHADOWv2 launch job=4 epoch=2 request=0 pos0=49 anchor=1103 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":49,"anchor":1103,"proposed":[314,24959],"start_us":159680941251,"done_us":159680947932,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":49,"anchor":1103,"confirmed":[314,24959,13],"draft_n":2,"replay":false,"done_us":159680996956}
+SHADOWv2 job=4 epoch=2 request=0 pos0=49 anchor=1103 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159680982855 decision_us=159680997539 work_us=41519 dec_us=37669 sel_us=3504 confirmed=[314,24959,13] proposed=[314,24959,13,2302,1318,25,198]
+SHADOWACTIVE select job=4 epoch=2 request=0 pos0=52 anchor=13 n=4
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":52,"anchor":13,"proposed":[2302,1318,25,198],"start_us":159680997527,"done_us":159680997627,"cohort":1}
+SHADOWACTIVE accept job=4 request=0 pos0=52 proposed=4 accepted=2 confirmed=3
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":52,"anchor":13,"confirmed":[2302,1318,449],"draft_n":4,"replay":false,"done_us":159681047748}
+SHADOWv2 launch job=5 epoch=2 request=0 pos0=55 anchor=449 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":55,"anchor":449,"proposed":[3010],"start_us":159681047906,"done_us":159681055608,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":55,"anchor":449,"confirmed":[3010,321],"draft_n":1,"replay":false,"done_us":159681093603}
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":57,"anchor":321,"proposed":[15673,314],"start_us":159681093794,"done_us":159681101850,"cohort":1}
+SHADOWv2 job=5 epoch=2 request=0 pos0=55 anchor=449 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=159681098675 decision_us=159681093799 work_us=50382 dec_us=45785 sel_us=4313 confirmed=[3010,321] proposed=[3010,321,264,1414,15673,314,279]
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":57,"anchor":321,"confirmed":[449],"draft_n":2,"replay":false,"done_us":159681147164}
+SHADOWv2 launch job=6 epoch=2 request=0 pos0=58 anchor=449 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":58,"anchor":449,"proposed":[15673,314],"start_us":159681147444,"done_us":159681153855,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":58,"anchor":449,"confirmed":[15673,314,279],"draft_n":2,"replay":false,"done_us":159681193280}
+SHADOWv2 job=6 epoch=2 request=0 pos0=58 anchor=449 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159681191743 decision_us=159681193487 work_us=44006 dec_us=41259 sel_us=2574 confirmed=[15673,314,279] proposed=[15673,314,22373,303,40790,13,271]
+SHADOWv2 launch job=7 epoch=2 request=0 pos0=61 anchor=279 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":61,"anchor":279,"proposed":[22373,303],"start_us":159681193483,"done_us":159681200085,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":61,"anchor":279,"confirmed":[22373,303,40790],"draft_n":2,"replay":false,"done_us":159681243569}
+SHADOWv2 job=7 epoch=2 request=0 pos0=61 anchor=279 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159681234804 decision_us=159681244883 work_us=41128 dec_us=38226 sel_us=2731 confirmed=[22373,303,40790] proposed=[22373,303,40790,13,271,9764,728]
+SHADOWACTIVE select job=7 epoch=2 request=0 pos0=64 anchor=40790 n=4
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":64,"anchor":40790,"proposed":[13,271,9764,728],"start_us":159681244867,"done_us":159681244964,"cohort":1}
+SHADOWACTIVE accept job=7 request=0 pos0=64 proposed=4 accepted=1 confirmed=2
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":64,"anchor":40790,"confirmed":[13,6558],"draft_n":4,"replay":false,"done_us":159681296696}
+SHADOWv2 launch job=8 epoch=2 request=0 pos0=66 anchor=6558 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":66,"anchor":6558,"proposed":[728,3165],"start_us":159681296804,"done_us":159681303774,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":66,"anchor":6558,"confirmed":[728,3165,264],"draft_n":2,"replay":false,"done_us":159681345986}
+SHADOWv2 job=8 epoch=2 request=0 pos0=66 anchor=6558 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159681345051 decision_us=159681346149 work_us=47707 dec_us=44946 sel_us=2527 confirmed=[728,3165,264] proposed=[728,3165,264,15352,4087,303,40790]
+SHADOWACTIVE select job=8 epoch=2 request=0 pos0=69 anchor=264 n=4
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":69,"anchor":264,"proposed":[15352,4087,303,40790],"start_us":159681346144,"done_us":159681346176,"cohort":1}
+SHADOWACTIVE accept job=8 request=0 pos0=69 proposed=4 accepted=0 confirmed=1
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":69,"anchor":264,"confirmed":[4101],"draft_n":4,"replay":false,"done_us":159681392804}
+SHADOWv2 launch job=9 epoch=2 request=0 pos0=70 anchor=4101 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":70,"anchor":4101,"proposed":[11,1575],"start_us":159681392912,"done_us":159681399831,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":70,"anchor":4101,"confirmed":[11,1575,1676],"draft_n":2,"replay":false,"done_us":159681442548}
+SHADOWv2 job=9 epoch=2 request=0 pos0=70 anchor=4101 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159681441307 decision_us=159681442726 work_us=48193 dec_us=45498 sel_us=2471 confirmed=[11,1575,1676] proposed=[11,1575,44145,290,10562,3269,7873]
+SHADOWv2 launch job=10 epoch=2 request=0 pos0=73 anchor=1676 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":73,"anchor":1676,"proposed":[35468,7873],"start_us":159681442723,"done_us":159681449197,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":73,"anchor":1676,"confirmed":[35468,10562],"draft_n":2,"replay":false,"done_us":159681489120}
+SHADOWv2 job=10 epoch=2 request=0 pos0=73 anchor=1676 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159681487404 decision_us=159681489510 work_us=44544 dec_us=41757 sel_us=2650 confirmed=[35468,10562] proposed=[35468,10562,3269,7873,321,10033,424]
+SHADOWACTIVE select job=10 epoch=2 request=0 pos0=75 anchor=10562 n=4
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":75,"anchor":10562,"proposed":[3269,7873,321,10033],"start_us":159681489500,"done_us":159681489607,"cohort":1}
+SHADOWACTIVE accept job=10 request=0 pos0=75 proposed=4 accepted=2 confirmed=3
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":75,"anchor":10562,"confirmed":[3269,7873,13],"draft_n":4,"replay":false,"done_us":159681538551}
+SHADOWv2 launch job=11 epoch=2 request=0 pos0=78 anchor=13 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":78,"anchor":13,"proposed":[271,9764],"start_us":159681538683,"done_us":159681545410,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":78,"anchor":13,"confirmed":[271,9764,728],"draft_n":2,"replay":false,"done_us":159681587334}
+SHADOWv2 job=11 epoch=2 request=0 pos0=78 anchor=13 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159681585206 decision_us=159681587499 work_us=46086 dec_us=43231 sel_us=2642 confirmed=[271,9764,728] proposed=[271,9764,728,1683,883,25,198]
+SHADOWACTIVE select job=11 epoch=2 request=0 pos0=81 anchor=728 n=4
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":81,"anchor":728,"proposed":[1683,883,25,198],"start_us":159681587495,"done_us":159681587560,"cohort":1}
+SHADOWACTIVE accept job=11 request=0 pos0=81 proposed=4 accepted=0 confirmed=1
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":81,"anchor":728,"confirmed":[5759],"draft_n":4,"replay":false,"done_us":159681633915}
+SHADOWv2 launch job=12 epoch=2 request=0 pos0=82 anchor=5759 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":82,"anchor":5759,"proposed":[411,25],"start_us":159681634055,"done_us":159681642404,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":82,"anchor":5759,"confirmed":[821],"draft_n":2,"replay":false,"done_us":159681688864}
+SHADOWv2 job=12 epoch=2 request=0 pos0=82 anchor=5759 c=1 d=7 matched=0 prefix_ok=0 position_ok=1 ready=1 remaining=6 usable=0 usable_tokens=0 done_us=159681673987 decision_us=159681689087 work_us=39670 dec_us=34742 sel_us=2800 confirmed=[821] proposed=[411,25,198,16,13,561,10562]
+SHADOWv2 launch job=13 epoch=2 request=0 pos0=83 anchor=821 n_max=7
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":83,"anchor":821,"proposed":[1965,25],"start_us":159681689079,"done_us":159681696406,"cohort":1}
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":83,"anchor":821,"confirmed":[1965,25,198],"draft_n":2,"replay":false,"done_us":159681742597}
+SHADOWv2 job=13 epoch=2 request=0 pos0=83 anchor=821 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159681736602 decision_us=159681743853 work_us=47236 dec_us=43991 sel_us=2966 confirmed=[1965,25,198] proposed=[1965,25,198,16,13,561,10562]
+SHADOWACTIVE select job=13 epoch=2 request=0 pos0=86 anchor=198 n=4
+SHADOWTRACE {"event":"draft","request":0,"slot":0,"pos0":86,"anchor":198,"proposed":[16,13,561,10562],"start_us":159681743835,"done_us":159681743923,"cohort":1}
+SHADOWACTIVE accept job=13 request=0 pos0=86 proposed=4 accepted=3 confirmed=4
+SHADOWTRACE {"event":"commit","request":0,"slot":0,"pos0":86,"anchor":198,"confirmed":[16,13,561,709],"draft_n":4,"replay":false,"done_us":159681796550}
+SHADOWTRACE {"event":"token","request":0,"slot":0,"pos":91,"token":1970,"done_us":159681831614}
+0.15.547.725 I slot print_timing: id  0 | task 0 | prompt eval time =     415.71 ms /    28 tokens (   14.85 ms per token,    67.35 tokens per second)
+0.15.547.730 I slot print_timing: id  0 | task 0 |        eval time =    1278.80 ms /    64 tokens (   20.30 ms per token,    49.26 tokens per second)
+0.15.547.732 I slot print_timing: id  0 | task 0 |       total time =    1694.52 ms /    92 tokens
+0.15.547.744 I slot print_timing: id  0 | task 0 |    graphs reused =          5
+0.15.547.748 I slot print_timing: id  0 | task 0 | draft acceptance = 0.63333 (   38 accepted /    60 generated), mean len =  2.65
+0.15.547.757 I shadow active: selected=8 proposed=32 verified=8 accepted=16 cancelled=0 pending=0
+0.15.547.797 I shadow auxiliary: launched=13 skipped_busy=3 skipped_throttle=0 ready=11 late=1 prefix_match=9 prefix_mismatch=3 usable_blocks=8 usable_tokens=32 errors=0
+0.15.547.798 I shadow accounting: observed=12 cancelled=1 pending=0 skipped_invalid=0 epoch=2
+0.15.547.799 I shadow stages: worker_us=655904 decode_us=540433 selector_us=110738 inject_submit_us=51929 stage_us=2263 late_total_ms=4.9 late_max_ms=4.9
+SHADOWTRACE {"event":"end","request":0,"slot":0,"generated":64,"truncated":false}
+0.15.548.168 I slot      release: id  0 | task 0 | stop processing: n_tokens = 91, truncated = 0
+0.15.549.586 I shadow active: selected=8 proposed=32 verified=8 accepted=16 cancelled=0 pending=0
+0.15.549.610 I shadow auxiliary: launched=13 skipped_busy=3 skipped_throttle=0 ready=11 late=1 prefix_match=9 prefix_mismatch=3 usable_blocks=8 usable_tokens=32 errors=0
+0.15.549.610 I shadow accounting: observed=12 cancelled=1 pending=0 skipped_invalid=0 epoch=3
+0.15.549.611 I shadow stages: worker_us=655904 decode_us=540433 selector_us=110738 inject_submit_us=51929 stage_us=2263 late_total_ms=4.9 late_max_ms=4.9
+0.15.563.259 I GPU memory clock: decode -> idle, reset (dynamic)
+0.15.564.676 I APU TDP: restored original limits
+0.15.577.930 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 159681832191
+SHADOWTRACE {"event":"begin","request":29,"slot":0,"temperature":0.0}
+0.15.578.075 I slot launch_slot_: id  0 | task 29 | processing task, is_child = 0
+0.15.578.931 I APU TDP: active limit 20 W
+0.15.580.936 I GPU memory clock: idle -> prefill, locked 2700 MHz
+SHADOWTRACE {"event":"token","request":29,"slot":0,"pos":25,"token":271,"done_us":159682050682}
+SHADOWv2 launch job=14 epoch=5 request=29 pos0=25 anchor=271 n_max=7
+SHADOWv2 cancel job=14 epoch=5 request=29 pos0=25 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":25,"anchor":271,"proposed":[],"start_us":159682050851,"done_us":159682054522,"cohort":1}
+SHADOWTRACE {"event":"token","request":29,"slot":0,"pos":26,"token":248068,"done_us":159682089448}
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":26,"anchor":248068,"proposed":[198,760],"start_us":159682089519,"done_us":159682096819,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":26,"anchor":248068,"confirmed":[198,760,1156],"draft_n":2,"replay":false,"done_us":159682142299}
+SHADOWv2 launch job=15 epoch=5 request=29 pos0=29 anchor=1156 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":29,"anchor":1156,"proposed":[6587,728],"start_us":159682142497,"done_us":159682148880,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":29,"anchor":1156,"confirmed":[6587,728,310],"draft_n":2,"replay":false,"done_us":159682189079}
+SHADOWv2 job=15 epoch=5 request=29 pos0=29 anchor=1156 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159682185030 decision_us=159682189317 work_us=42302 dec_us=38453 sel_us=3753 confirmed=[6587,728,310] proposed=[6587,728,310,3165,24959,494,220]
+SHADOWACTIVE select job=15 epoch=5 request=29 pos0=32 anchor=310 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":32,"anchor":310,"proposed":[3165,24959,494,220],"start_us":159682189311,"done_us":159682189394,"cohort":1}
+SHADOWACTIVE accept job=15 request=29 pos0=32 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":32,"anchor":310,"confirmed":[3165,24959,494,220,16],"draft_n":4,"replay":false,"done_us":159682238031}
+SHADOWv2 launch job=16 epoch=5 request=29 pos0=37 anchor=16 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":37,"anchor":16,"proposed":[310,220],"start_us":159682238110,"done_us":159682244570,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":37,"anchor":16,"confirmed":[310,220,17],"draft_n":2,"replay":false,"done_us":159682290424}
+SHADOWv2 job=16 epoch=5 request=29 pos0=37 anchor=16 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159682275433 decision_us=159682290667 work_us=37239 dec_us=34305 sel_us=2807 confirmed=[310,220,17] proposed=[310,220,17,15,15,18101,539]
+SHADOWACTIVE select job=16 epoch=5 request=29 pos0=40 anchor=17 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":40,"anchor":17,"proposed":[15,15,18101,539],"start_us":159682290659,"done_us":159682290735,"cohort":1}
+SHADOWACTIVE accept job=16 request=29 pos0=40 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":40,"anchor":17,"confirmed":[15,15,18101,539,73982],"draft_n":4,"replay":false,"done_us":159682341591}
+SHADOWv2 launch job=17 epoch=5 request=29 pos0=45 anchor=73982 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":45,"anchor":73982,"proposed":[11,440],"start_us":159682341744,"done_us":159682348897,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":45,"anchor":73982,"confirmed":[11,1973],"draft_n":2,"replay":false,"done_us":159682390889}
+SHADOWv2 job=17 epoch=5 request=29 pos0=45 anchor=73982 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159682388749 decision_us=159682391116 work_us=46852 dec_us=42762 sel_us=2707 confirmed=[11,1973] proposed=[11,1973,866,5853,13,6558,728]
+SHADOWACTIVE select job=17 epoch=5 request=29 pos0=47 anchor=1973 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":47,"anchor":1973,"proposed":[866,5853,13,6558],"start_us":159682391110,"done_us":159682391204,"cohort":1}
+SHADOWACTIVE accept job=17 request=29 pos0=47 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":47,"anchor":1973,"confirmed":[866,5853,13,6558,728],"draft_n":4,"replay":false,"done_us":159682439363}
+SHADOWv2 launch job=18 epoch=5 request=29 pos0=52 anchor=728 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":52,"anchor":728,"proposed":[1066],"start_us":159682439436,"done_us":159682446154,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":52,"anchor":728,"confirmed":[1066,1103],"draft_n":1,"replay":false,"done_us":159682487936}
+SHADOWv2 job=18 epoch=5 request=29 pos0=52 anchor=728 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=159682476121 decision_us=159682488381 work_us=36527 dec_us=33524 sel_us=2753 confirmed=[1066,1103] proposed=[1066,635,279,4947,13,198,248069]
+SHADOWv2 launch job=19 epoch=5 request=29 pos0=54 anchor=1103 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":54,"anchor":1103,"proposed":[1070],"start_us":159682488368,"done_us":159682496553,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":54,"anchor":1103,"confirmed":[1070,13],"draft_n":1,"replay":false,"done_us":159682546341}
+SHADOWv2 job=19 epoch=5 request=29 pos0=54 anchor=1103 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=159682542865 decision_us=159682546928 work_us=53959 dec_us=50785 sel_us=2771 confirmed=[1070,13] proposed=[1070,220,16,310,220,16,11]
+SHADOWv2 launch job=20 epoch=5 request=29 pos0=56 anchor=13 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":56,"anchor":13,"proposed":[198,248069],"start_us":159682546906,"done_us":159682556765,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":56,"anchor":13,"confirmed":[198,248069,271],"draft_n":2,"replay":false,"done_us":159682645408}
+SHADOWv2 job=20 epoch=5 request=29 pos0=56 anchor=13 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159682608795 decision_us=159682646132 work_us=61275 dec_us=57947 sel_us=3013 confirmed=[198,248069,271] proposed=[198,248069,271,16,11,220,17]
+SHADOWACTIVE select job=20 epoch=5 request=29 pos0=59 anchor=271 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":59,"anchor":271,"proposed":[16,11,220,17],"start_us":159682646116,"done_us":159682646229,"cohort":1}
+SHADOWACTIVE accept job=20 request=29 pos0=59 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":59,"anchor":271,"confirmed":[16,11,220,17,11],"draft_n":4,"replay":false,"done_us":159682695100}
+SHADOWv2 launch job=21 epoch=5 request=29 pos0=64 anchor=11 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":64,"anchor":11,"proposed":[220,18],"start_us":159682695176,"done_us":159682701998,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":64,"anchor":11,"confirmed":[220,18,11],"draft_n":2,"replay":false,"done_us":159682743500}
+SHADOWv2 job=21 epoch=5 request=29 pos0=64 anchor=11 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159682742130 decision_us=159682743665 work_us=46792 dec_us=43977 sel_us=2584 confirmed=[220,18,11] proposed=[220,18,11,220,19,11,220]
+SHADOWACTIVE select job=21 epoch=5 request=29 pos0=67 anchor=11 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":67,"anchor":11,"proposed":[220,19,11,220],"start_us":159682743660,"done_us":159682743726,"cohort":1}
+SHADOWACTIVE accept job=21 request=29 pos0=67 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":67,"anchor":11,"confirmed":[220,19,11,220,20],"draft_n":4,"replay":false,"done_us":159682790468}
+SHADOWv2 launch job=22 epoch=5 request=29 pos0=72 anchor=20 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":72,"anchor":20,"proposed":[11,220],"start_us":159682790671,"done_us":159682797319,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":72,"anchor":20,"confirmed":[11,220,21],"draft_n":2,"replay":false,"done_us":159682841477}
+SHADOWv2 job=22 epoch=5 request=29 pos0=72 anchor=20 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159682838008 decision_us=159682841651 work_us=47063 dec_us=43944 sel_us=2993 confirmed=[11,220,21] proposed=[11,220,21,11,220,22,11]
+SHADOWACTIVE select job=22 epoch=5 request=29 pos0=75 anchor=21 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":75,"anchor":21,"proposed":[11,220,22,11],"start_us":159682841644,"done_us":159682841714,"cohort":1}
+SHADOWACTIVE accept job=22 request=29 pos0=75 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":75,"anchor":21,"confirmed":[11,220,22,11,220],"draft_n":4,"replay":false,"done_us":159682888682}
+SHADOWv2 launch job=23 epoch=5 request=29 pos0=80 anchor=220 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":80,"anchor":220,"proposed":[23,11],"start_us":159682888765,"done_us":159682895327,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":80,"anchor":220,"confirmed":[23,11,220],"draft_n":2,"replay":false,"done_us":159682938128}
+SHADOWv2 job=23 epoch=5 request=29 pos0=80 anchor=220 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159682935517 decision_us=159682938300 work_us=46647 dec_us=44318 sel_us=2236 confirmed=[23,11,220] proposed=[23,11,220,24,11,220,16]
+SHADOWACTIVE select job=23 epoch=5 request=29 pos0=83 anchor=220 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":83,"anchor":220,"proposed":[24,11,220,16],"start_us":159682938295,"done_us":159682938360,"cohort":1}
+SHADOWACTIVE accept job=23 request=29 pos0=83 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":83,"anchor":220,"confirmed":[24,11,220,16,15],"draft_n":4,"replay":false,"done_us":159682986162}
+SHADOWv2 launch job=24 epoch=5 request=29 pos0=88 anchor=15 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":88,"anchor":15,"proposed":[11,220],"start_us":159682986247,"done_us":159682993264,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":88,"anchor":15,"confirmed":[11,220,16],"draft_n":2,"replay":false,"done_us":159683036146}
+SHADOWv2 job=24 epoch=5 request=29 pos0=88 anchor=15 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683033797 decision_us=159683036426 work_us=47359 dec_us=44503 sel_us=2597 confirmed=[11,220,16] proposed=[11,220,16,16,11,220,16]
+SHADOWACTIVE select job=24 epoch=5 request=29 pos0=91 anchor=16 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":91,"anchor":16,"proposed":[16,11,220,16],"start_us":159683036418,"done_us":159683036527,"cohort":1}
+SHADOWACTIVE accept job=24 request=29 pos0=91 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":91,"anchor":16,"confirmed":[16,11,220,16,17],"draft_n":4,"replay":false,"done_us":159683084107}
+SHADOWv2 launch job=25 epoch=5 request=29 pos0=96 anchor=17 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":96,"anchor":17,"proposed":[11,220],"start_us":159683084183,"done_us":159683090945,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":96,"anchor":17,"confirmed":[11,220,16],"draft_n":2,"replay":false,"done_us":159683133698}
+SHADOWv2 job=25 epoch=5 request=29 pos0=96 anchor=17 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683131686 decision_us=159683133919 work_us=47329 dec_us=44585 sel_us=2526 confirmed=[11,220,16] proposed=[11,220,16,18,11,220,16]
+SHADOWACTIVE select job=25 epoch=5 request=29 pos0=99 anchor=16 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":99,"anchor":16,"proposed":[18,11,220,16],"start_us":159683133912,"done_us":159683133962,"cohort":1}
+SHADOWACTIVE accept job=25 request=29 pos0=99 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":99,"anchor":16,"confirmed":[18,11,220,16,19],"draft_n":4,"replay":false,"done_us":159683182796}
+SHADOWv2 launch job=26 epoch=5 request=29 pos0=104 anchor=19 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":104,"anchor":19,"proposed":[11,220],"start_us":159683182870,"done_us":159683190085,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":104,"anchor":19,"confirmed":[11,220,16],"draft_n":2,"replay":false,"done_us":159683233202}
+SHADOWv2 job=26 epoch=5 request=29 pos0=104 anchor=19 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683230265 decision_us=159683233385 work_us=47226 dec_us=44176 sel_us=2827 confirmed=[11,220,16] proposed=[11,220,16,20,11,220,16]
+SHADOWACTIVE select job=26 epoch=5 request=29 pos0=107 anchor=16 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":107,"anchor":16,"proposed":[20,11,220,16],"start_us":159683233378,"done_us":159683233492,"cohort":1}
+SHADOWACTIVE accept job=26 request=29 pos0=107 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":107,"anchor":16,"confirmed":[20,11,220,16,21],"draft_n":4,"replay":false,"done_us":159683281215}
+SHADOWv2 launch job=27 epoch=5 request=29 pos0=112 anchor=21 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":112,"anchor":21,"proposed":[11,220],"start_us":159683281291,"done_us":159683287981,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":112,"anchor":21,"confirmed":[11,220,16],"draft_n":2,"replay":false,"done_us":159683328892}
+SHADOWv2 job=27 epoch=5 request=29 pos0=112 anchor=21 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683328112 decision_us=159683329387 work_us=46729 dec_us=44165 sel_us=2385 confirmed=[11,220,16] proposed=[11,220,16,22,11,220,16]
+SHADOWACTIVE select job=27 epoch=5 request=29 pos0=115 anchor=16 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":115,"anchor":16,"proposed":[22,11,220,16],"start_us":159683329382,"done_us":159683329486,"cohort":1}
+SHADOWACTIVE accept job=27 request=29 pos0=115 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":115,"anchor":16,"confirmed":[22,11,220,16,23],"draft_n":4,"replay":false,"done_us":159683376049}
+SHADOWv2 launch job=28 epoch=5 request=29 pos0=120 anchor=23 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":120,"anchor":23,"proposed":[11,220],"start_us":159683376126,"done_us":159683382881,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":120,"anchor":23,"confirmed":[11,220,16],"draft_n":2,"replay":false,"done_us":159683425330}
+SHADOWv2 job=28 epoch=5 request=29 pos0=120 anchor=23 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683423373 decision_us=159683425521 work_us=47086 dec_us=44219 sel_us=2629 confirmed=[11,220,16] proposed=[11,220,16,24,11,220,17]
+SHADOWACTIVE select job=28 epoch=5 request=29 pos0=123 anchor=16 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":123,"anchor":16,"proposed":[24,11,220,17],"start_us":159683425514,"done_us":159683425602,"cohort":1}
+SHADOWACTIVE accept job=28 request=29 pos0=123 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":123,"anchor":16,"confirmed":[24,11,220,17,15],"draft_n":4,"replay":false,"done_us":159683473276}
+SHADOWv2 launch job=29 epoch=5 request=29 pos0=128 anchor=15 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":128,"anchor":15,"proposed":[11,220],"start_us":159683473359,"done_us":159683480104,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":128,"anchor":15,"confirmed":[11,220,17],"draft_n":2,"replay":false,"done_us":159683522577}
+SHADOWv2 job=29 epoch=5 request=29 pos0=128 anchor=15 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683518476 decision_us=159683522839 work_us=44966 dec_us=41262 sel_us=3518 confirmed=[11,220,17] proposed=[11,220,17,16,11,220,17]
+SHADOWACTIVE select job=29 epoch=5 request=29 pos0=131 anchor=17 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":131,"anchor":17,"proposed":[16,11,220,17],"start_us":159683522831,"done_us":159683522911,"cohort":1}
+SHADOWACTIVE accept job=29 request=29 pos0=131 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":131,"anchor":17,"confirmed":[16,11,220,17,17],"draft_n":4,"replay":false,"done_us":159683571111}
+SHADOWv2 launch job=30 epoch=5 request=29 pos0=136 anchor=17 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":136,"anchor":17,"proposed":[11,220],"start_us":159683571231,"done_us":159683577563,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":136,"anchor":17,"confirmed":[11,220,17],"draft_n":2,"replay":false,"done_us":159683624776}
+SHADOWv2 job=30 epoch=5 request=29 pos0=136 anchor=17 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683614235 decision_us=159683625646 work_us=42862 dec_us=39725 sel_us=2960 confirmed=[11,220,17] proposed=[11,220,17,18,11,220,17]
+SHADOWACTIVE select job=30 epoch=5 request=29 pos0=139 anchor=17 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":139,"anchor":17,"proposed":[18,11,220,17],"start_us":159683625627,"done_us":159683625726,"cohort":1}
+SHADOWACTIVE accept job=30 request=29 pos0=139 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":139,"anchor":17,"confirmed":[18,11,220,17,19],"draft_n":4,"replay":false,"done_us":159683676158}
+SHADOWv2 launch job=31 epoch=5 request=29 pos0=144 anchor=19 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":144,"anchor":19,"proposed":[11,220],"start_us":159683676262,"done_us":159683683139,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":144,"anchor":19,"confirmed":[11,220,17],"draft_n":2,"replay":false,"done_us":159683728465}
+SHADOWv2 job=31 epoch=5 request=29 pos0=144 anchor=19 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683714226 decision_us=159683728766 work_us=37702 dec_us=34712 sel_us=2727 confirmed=[11,220,17] proposed=[11,220,17,20,11,220,17]
+SHADOWACTIVE select job=31 epoch=5 request=29 pos0=147 anchor=17 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":147,"anchor":17,"proposed":[20,11,220,17],"start_us":159683728759,"done_us":159683728812,"cohort":1}
+SHADOWACTIVE accept job=31 request=29 pos0=147 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":147,"anchor":17,"confirmed":[20,11,220,17,21],"draft_n":4,"replay":false,"done_us":159683777680}
+SHADOWv2 launch job=32 epoch=5 request=29 pos0=152 anchor=21 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":152,"anchor":21,"proposed":[11,220],"start_us":159683777753,"done_us":159683784259,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":152,"anchor":21,"confirmed":[11,220,17],"draft_n":2,"replay":false,"done_us":159683829129}
+SHADOWv2 job=32 epoch=5 request=29 pos0=152 anchor=21 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683824371 decision_us=159683829392 work_us=46476 dec_us=41151 sel_us=5207 confirmed=[11,220,17] proposed=[11,220,17,22,11,220,17]
+SHADOWACTIVE select job=32 epoch=5 request=29 pos0=155 anchor=17 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":155,"anchor":17,"proposed":[22,11,220,17],"start_us":159683829384,"done_us":159683829458,"cohort":1}
+SHADOWACTIVE accept job=32 request=29 pos0=155 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":155,"anchor":17,"confirmed":[22,11,220,17,23],"draft_n":4,"replay":false,"done_us":159683878760}
+SHADOWv2 launch job=33 epoch=5 request=29 pos0=160 anchor=23 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":160,"anchor":23,"proposed":[11,220],"start_us":159683878840,"done_us":159683885494,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":160,"anchor":23,"confirmed":[11,220,17],"draft_n":2,"replay":false,"done_us":159683931701}
+SHADOWv2 job=33 epoch=5 request=29 pos0=160 anchor=23 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159683921257 decision_us=159683932129 work_us=42273 dec_us=39101 sel_us=2810 confirmed=[11,220,17] proposed=[11,220,17,24,11,220,18]
+SHADOWACTIVE select job=33 epoch=5 request=29 pos0=163 anchor=17 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":163,"anchor":17,"proposed":[24,11,220,18],"start_us":159683932117,"done_us":159683932202,"cohort":1}
+SHADOWACTIVE accept job=33 request=29 pos0=163 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":163,"anchor":17,"confirmed":[24,11,220,18,15],"draft_n":4,"replay":false,"done_us":159683983785}
+SHADOWv2 launch job=34 epoch=5 request=29 pos0=168 anchor=15 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":168,"anchor":15,"proposed":[11,220],"start_us":159683983865,"done_us":159683990733,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":168,"anchor":15,"confirmed":[11,220,18],"draft_n":2,"replay":false,"done_us":159684033908}
+SHADOWv2 job=34 epoch=5 request=29 pos0=168 anchor=15 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159684032074 decision_us=159684034137 work_us=48037 dec_us=45197 sel_us=2569 confirmed=[11,220,18] proposed=[11,220,18,16,11,220,18]
+SHADOWACTIVE select job=34 epoch=5 request=29 pos0=171 anchor=18 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":171,"anchor":18,"proposed":[16,11,220,18],"start_us":159684034131,"done_us":159684034208,"cohort":1}
+SHADOWACTIVE accept job=34 request=29 pos0=171 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":171,"anchor":18,"confirmed":[16,11,220,18,17],"draft_n":4,"replay":false,"done_us":159684081979}
+SHADOWv2 launch job=35 epoch=5 request=29 pos0=176 anchor=17 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":176,"anchor":17,"proposed":[11,220],"start_us":159684082116,"done_us":159684089389,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":176,"anchor":17,"confirmed":[11,220,18],"draft_n":2,"replay":false,"done_us":159684136546}
+SHADOWv2 job=35 epoch=5 request=29 pos0=176 anchor=17 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159684121812 decision_us=159684137349 work_us=39400 dec_us=36463 sel_us=2688 confirmed=[11,220,18] proposed=[11,220,18,18,11,220,18]
+SHADOWACTIVE select job=35 epoch=5 request=29 pos0=179 anchor=18 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":179,"anchor":18,"proposed":[18,11,220,18],"start_us":159684137334,"done_us":159684137412,"cohort":1}
+SHADOWACTIVE accept job=35 request=29 pos0=179 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":179,"anchor":18,"confirmed":[18,11,220,18,19],"draft_n":4,"replay":false,"done_us":159684187514}
+SHADOWv2 launch job=36 epoch=5 request=29 pos0=184 anchor=19 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":184,"anchor":19,"proposed":[11,220],"start_us":159684187590,"done_us":159684194418,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":184,"anchor":19,"confirmed":[11,220,18],"draft_n":2,"replay":false,"done_us":159684238294}
+SHADOWv2 job=36 epoch=5 request=29 pos0=184 anchor=19 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159684229106 decision_us=159684238506 work_us=41377 dec_us=38615 sel_us=2560 confirmed=[11,220,18] proposed=[11,220,18,20,11,220,18]
+SHADOWACTIVE select job=36 epoch=5 request=29 pos0=187 anchor=18 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":187,"anchor":18,"proposed":[20,11,220,18],"start_us":159684238497,"done_us":159684238570,"cohort":1}
+SHADOWACTIVE accept job=36 request=29 pos0=187 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":187,"anchor":18,"confirmed":[20,11,220,18,21],"draft_n":4,"replay":false,"done_us":159684286987}
+SHADOWv2 launch job=37 epoch=5 request=29 pos0=192 anchor=21 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":192,"anchor":21,"proposed":[11,220],"start_us":159684287077,"done_us":159684293759,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":192,"anchor":21,"confirmed":[11,220,18],"draft_n":2,"replay":false,"done_us":159684335700}
+SHADOWv2 job=37 epoch=5 request=29 pos0=192 anchor=21 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159684334631 decision_us=159684335824 work_us=47359 dec_us=44676 sel_us=2465 confirmed=[11,220,18] proposed=[11,220,18,22,11,220,18]
+SHADOWACTIVE select job=37 epoch=5 request=29 pos0=195 anchor=18 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":195,"anchor":18,"proposed":[22,11,220,18],"start_us":159684335820,"done_us":159684335886,"cohort":1}
+SHADOWACTIVE accept job=37 request=29 pos0=195 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":195,"anchor":18,"confirmed":[22,11,220,18,23],"draft_n":4,"replay":false,"done_us":159684384377}
+SHADOWv2 launch job=38 epoch=5 request=29 pos0=200 anchor=23 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":200,"anchor":23,"proposed":[11,220],"start_us":159684384453,"done_us":159684391352,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":200,"anchor":23,"confirmed":[11,220,18],"draft_n":2,"replay":false,"done_us":159684433948}
+SHADOWv2 job=38 epoch=5 request=29 pos0=200 anchor=23 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159684432066 decision_us=159684434230 work_us=47459 dec_us=44776 sel_us=2497 confirmed=[11,220,18] proposed=[11,220,18,24,11,220,19]
+SHADOWACTIVE select job=38 epoch=5 request=29 pos0=203 anchor=18 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":203,"anchor":18,"proposed":[24,11,220,19],"start_us":159684434222,"done_us":159684434299,"cohort":1}
+SHADOWACTIVE accept job=38 request=29 pos0=203 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":203,"anchor":18,"confirmed":[24,11,220,19,15],"draft_n":4,"replay":false,"done_us":159684482322}
+SHADOWv2 launch job=39 epoch=5 request=29 pos0=208 anchor=15 n_max=7
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":208,"anchor":15,"proposed":[11,220],"start_us":159684482402,"done_us":159684488608,"cohort":1}
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":208,"anchor":15,"confirmed":[11,220,19],"draft_n":2,"replay":false,"done_us":159684531657}
+SHADOWv2 job=39 epoch=5 request=29 pos0=208 anchor=15 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159684530288 decision_us=159684531838 work_us=47783 dec_us=45354 sel_us=2353 confirmed=[11,220,19] proposed=[11,220,19,16,11,220,19]
+SHADOWACTIVE select job=39 epoch=5 request=29 pos0=211 anchor=19 n=4
+SHADOWTRACE {"event":"draft","request":29,"slot":0,"pos0":211,"anchor":19,"proposed":[16,11,220,19],"start_us":159684531831,"done_us":159684531928,"cohort":1}
+SHADOWACTIVE accept job=39 request=29 pos0=211 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":29,"slot":0,"pos0":211,"anchor":19,"confirmed":[16,11,220,19,17],"draft_n":4,"replay":false,"done_us":159684580934}
+0.18.296.997 I slot print_timing: id  0 | task 29 | prompt eval time =     185.82 ms /    25 tokens (    7.43 ms per token,   134.54 tokens per second)
+0.18.297.003 I slot print_timing: id  0 | task 29 |        eval time =    2530.18 ms /   192 tokens (   13.25 ms per token,    75.49 tokens per second)
+0.18.297.004 I slot print_timing: id  0 | task 29 |       total time =    2716.00 ms /   217 tokens
+0.18.297.005 I slot print_timing: id  0 | task 29 |    graphs reused =          7
+0.18.297.010 I slot print_timing: id  0 | task 29 | draft acceptance = 0.99296 (  141 accepted /   142 generated), mean len =  3.88
+0.18.297.011 I shadow active: selected=31 proposed=124 verified=31 accepted=108 cancelled=0 pending=0
+0.18.297.045 I shadow auxiliary: launched=39 skipped_busy=4 skipped_throttle=0 ready=36 late=1 prefix_match=32 prefix_mismatch=5 usable_blocks=31 usable_tokens=124 errors=0
+0.18.297.046 I shadow accounting: observed=37 cancelled=2 pending=0 skipped_invalid=0 epoch=5
+0.18.297.047 I shadow stages: worker_us=1841565 decode_us=1646131 selector_us=184036 inject_submit_us=100327 stage_us=5870 late_total_ms=4.9 late_max_ms=4.9
+SHADOWTRACE {"event":"end","request":29,"slot":0,"generated":192,"truncated":false}
+0.18.297.164 I slot      release: id  0 | task 29 | stop processing: n_tokens = 216, truncated = 0
+0.18.301.687 I shadow active: selected=31 proposed=124 verified=31 accepted=108 cancelled=0 pending=0
+0.18.301.716 I shadow auxiliary: launched=39 skipped_busy=4 skipped_throttle=0 ready=36 late=1 prefix_match=32 prefix_mismatch=5 usable_blocks=31 usable_tokens=124 errors=0
+0.18.301.717 I shadow accounting: observed=37 cancelled=2 pending=0 skipped_invalid=0 epoch=6
+0.18.301.719 I shadow stages: worker_us=1841565 decode_us=1646131 selector_us=184036 inject_submit_us=100327 stage_us=5870 late_total_ms=4.9 late_max_ms=4.9
+0.18.314.953 I GPU memory clock: decode -> idle, reset (dynamic)
+0.18.316.323 I APU TDP: restored original limits
+0.18.325.108 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 159684581182
+SHADOWTRACE {"event":"begin","request":82,"slot":0,"temperature":0.0}
+0.18.325.196 I slot launch_slot_: id  0 | task 82 | processing task, is_child = 0
+0.18.326.019 I APU TDP: active limit 20 W
+0.18.327.949 I GPU memory clock: idle -> prefill, locked 2700 MHz
+SHADOWTRACE {"event":"token","request":82,"slot":0,"pos":28,"token":271,"done_us":159684795405}
+SHADOWv2 launch job=40 epoch=8 request=82 pos0=28 anchor=271 n_max=7
+SHADOWv2 cancel job=40 epoch=8 request=82 pos0=28 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":28,"anchor":271,"proposed":[],"start_us":159684795531,"done_us":159684798776,"cohort":1}
+SHADOWTRACE {"event":"token","request":82,"slot":0,"pos":29,"token":248068,"done_us":159684837236}
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":29,"anchor":248068,"proposed":[198],"start_us":159684837347,"done_us":159684844320,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":29,"anchor":248068,"confirmed":[198,760],"draft_n":1,"replay":false,"done_us":159684889487}
+SHADOWv2 launch job=41 epoch=8 request=82 pos0=31 anchor=760 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":31,"anchor":760,"proposed":[1156,6587],"start_us":159684890080,"done_us":159684897267,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":31,"anchor":760,"confirmed":[1156,369],"draft_n":2,"replay":false,"done_us":159684942065}
+SHADOWv2 job=41 epoch=8 request=82 pos0=31 anchor=760 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159684926393 decision_us=159684942475 work_us=35890 dec_us=32978 sel_us=2678 confirmed=[1156,369] proposed=[1156,369,9859,728,310,3165,264]
+SHADOWACTIVE select job=41 epoch=8 request=82 pos0=33 anchor=369 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":33,"anchor":369,"proposed":[9859,728,310,3165],"start_us":159684942466,"done_us":159684942563,"cohort":1}
+SHADOWACTIVE accept job=41 request=82 pos0=33 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":33,"anchor":369,"confirmed":[9859,728,310,3165,264],"draft_n":4,"replay":false,"done_us":159684992054}
+SHADOWv2 launch job=42 epoch=8 request=82 pos0=38 anchor=264 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":38,"anchor":264,"proposed":[12654,709],"start_us":159684992138,"done_us":159684998832,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":38,"anchor":264,"confirmed":[12654,709,2512],"draft_n":2,"replay":false,"done_us":159685041117}
+SHADOWv2 job=42 epoch=8 request=82 pos0=38 anchor=264 c=3 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159685038916 decision_us=159685041291 work_us=46690 dec_us=43921 sel_us=2582 confirmed=[12654,709,2512] proposed=[12654,10562,17885,709,421,4829,264]
+SHADOWv2 launch job=43 epoch=8 request=82 pos0=41 anchor=2512 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":41,"anchor":2512,"proposed":[1510,18479],"start_us":159685041286,"done_us":159685047270,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":41,"anchor":2512,"confirmed":[1510,18479,17885],"draft_n":2,"replay":false,"done_us":159685091352}
+SHADOWv2 job=43 epoch=8 request=82 pos0=41 anchor=2512 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159685082856 decision_us=159685091783 work_us=41380 dec_us=38284 sel_us=2894 confirmed=[1510,18479,17885] proposed=[1510,18479,17885,63,421,4829,264]
+SHADOWACTIVE select job=43 epoch=8 request=82 pos0=44 anchor=17885 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":44,"anchor":17885,"proposed":[63,421,4829,264],"start_us":159685091767,"done_us":159685091847,"cohort":1}
+SHADOWACTIVE accept job=43 request=82 pos0=44 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":44,"anchor":17885,"confirmed":[63,421,4829,264,1103],"draft_n":4,"replay":false,"done_us":159685144793}
+SHADOWv2 launch job=44 epoch=8 request=82 pos0=49 anchor=1103 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":49,"anchor":1103,"proposed":[314,24959],"start_us":159685144870,"done_us":159685151401,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":49,"anchor":1103,"confirmed":[314,24959,13],"draft_n":2,"replay":false,"done_us":159685197099}
+SHADOWv2 job=44 epoch=8 request=82 pos0=49 anchor=1103 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159685187546 decision_us=159685198188 work_us=42514 dec_us=39436 sel_us=2906 confirmed=[314,24959,13] proposed=[314,24959,13,2302,1318,25,198]
+SHADOWACTIVE select job=44 epoch=8 request=82 pos0=52 anchor=13 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":52,"anchor":13,"proposed":[2302,1318,25,198],"start_us":159685198178,"done_us":159685198254,"cohort":1}
+SHADOWACTIVE accept job=44 request=82 pos0=52 proposed=4 accepted=2 confirmed=3
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":52,"anchor":13,"confirmed":[2302,1318,449],"draft_n":4,"replay":false,"done_us":159685246946}
+SHADOWv2 launch job=45 epoch=8 request=82 pos0=55 anchor=449 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":55,"anchor":449,"proposed":[3010],"start_us":159685247063,"done_us":159685253752,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":55,"anchor":449,"confirmed":[3010,321],"draft_n":1,"replay":false,"done_us":159685295165}
+SHADOWv2 job=45 epoch=8 request=82 pos0=55 anchor=449 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159685288938 decision_us=159685295411 work_us=41805 dec_us=39300 sel_us=2413 confirmed=[3010,321] proposed=[3010,321,449,15673,314,22373,303]
+SHADOWACTIVE select job=45 epoch=8 request=82 pos0=57 anchor=321 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":57,"anchor":321,"proposed":[449,15673,314,22373],"start_us":159685295403,"done_us":159685295456,"cohort":1}
+SHADOWACTIVE accept job=45 request=82 pos0=57 proposed=4 accepted=3 confirmed=4
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":57,"anchor":321,"confirmed":[449,15673,314,279],"draft_n":4,"replay":false,"done_us":159685344324}
+SHADOWv2 launch job=46 epoch=8 request=82 pos0=61 anchor=279 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":61,"anchor":279,"proposed":[22373,303],"start_us":159685344404,"done_us":159685350811,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":61,"anchor":279,"confirmed":[22373,303,40790],"draft_n":2,"replay":false,"done_us":159685395522}
+SHADOWv2 job=46 epoch=8 request=82 pos0=61 anchor=279 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159685387425 decision_us=159685395752 work_us=42864 dec_us=40403 sel_us=2346 confirmed=[22373,303,40790] proposed=[22373,303,40790,13,271,9764,728]
+SHADOWACTIVE select job=46 epoch=8 request=82 pos0=64 anchor=40790 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":64,"anchor":40790,"proposed":[13,271,9764,728],"start_us":159685395743,"done_us":159685395816,"cohort":1}
+SHADOWACTIVE accept job=46 request=82 pos0=64 proposed=4 accepted=1 confirmed=2
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":64,"anchor":40790,"confirmed":[13,6558],"draft_n":4,"replay":false,"done_us":159685442688}
+SHADOWv2 launch job=47 epoch=8 request=82 pos0=66 anchor=6558 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":66,"anchor":6558,"proposed":[728],"start_us":159685442760,"done_us":159685449316,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":66,"anchor":6558,"confirmed":[728,3165],"draft_n":1,"replay":false,"done_us":159685491199}
+SHADOWv2 job=47 epoch=8 request=82 pos0=66 anchor=6558 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159685484428 decision_us=159685491430 work_us=41527 dec_us=38790 sel_us=2576 confirmed=[728,3165] proposed=[728,3165,264,15352,4087,303,40790]
+SHADOWACTIVE select job=47 epoch=8 request=82 pos0=68 anchor=3165 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":68,"anchor":3165,"proposed":[264,15352,4087,303],"start_us":159685491419,"done_us":159685491507,"cohort":1}
+SHADOWACTIVE accept job=47 request=82 pos0=68 proposed=4 accepted=1 confirmed=2
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":68,"anchor":3165,"confirmed":[264,4101],"draft_n":4,"replay":false,"done_us":159685539166}
+SHADOWv2 launch job=48 epoch=8 request=82 pos0=70 anchor=4101 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":70,"anchor":4101,"proposed":[11,1575],"start_us":159685539239,"done_us":159685545934,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":70,"anchor":4101,"confirmed":[11,1575,1676],"draft_n":2,"replay":false,"done_us":159685591391}
+SHADOWv2 job=48 epoch=8 request=82 pos0=70 anchor=4101 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159685574586 decision_us=159685592123 work_us=35199 dec_us=32281 sel_us=2702 confirmed=[11,1575,1676] proposed=[11,1575,44145,290,10562,3269,7873]
+SHADOWv2 launch job=49 epoch=8 request=82 pos0=73 anchor=1676 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":73,"anchor":1676,"proposed":[35468,7873],"start_us":159685592117,"done_us":159685598544,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":73,"anchor":1676,"confirmed":[35468,10562],"draft_n":2,"replay":false,"done_us":159685644383}
+SHADOWv2 job=49 epoch=8 request=82 pos0=73 anchor=1676 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159685638727 decision_us=159685644886 work_us=46316 dec_us=43035 sel_us=2958 confirmed=[35468,10562] proposed=[35468,10562,3269,7873,321,10033,424]
+SHADOWACTIVE select job=49 epoch=8 request=82 pos0=75 anchor=10562 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":75,"anchor":10562,"proposed":[3269,7873,321,10033],"start_us":159685644866,"done_us":159685644974,"cohort":1}
+SHADOWACTIVE accept job=49 request=82 pos0=75 proposed=4 accepted=2 confirmed=3
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":75,"anchor":10562,"confirmed":[3269,7873,13],"draft_n":4,"replay":false,"done_us":159685699712}
+SHADOWv2 launch job=50 epoch=8 request=82 pos0=78 anchor=13 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":78,"anchor":13,"proposed":[271,9764],"start_us":159685699786,"done_us":159685706668,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":78,"anchor":13,"confirmed":[271,9764,728],"draft_n":2,"replay":false,"done_us":159685753105}
+SHADOWv2 job=50 epoch=8 request=82 pos0=78 anchor=13 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159685737896 decision_us=159685753850 work_us=37955 dec_us=34963 sel_us=2722 confirmed=[271,9764,728] proposed=[271,9764,728,1683,883,25,198]
+SHADOWACTIVE select job=50 epoch=8 request=82 pos0=81 anchor=728 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":81,"anchor":728,"proposed":[1683,883,25,198],"start_us":159685753837,"done_us":159685753928,"cohort":1}
+SHADOWACTIVE accept job=50 request=82 pos0=81 proposed=4 accepted=0 confirmed=1
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":81,"anchor":728,"confirmed":[5759],"draft_n":4,"replay":false,"done_us":159685800621}
+SHADOWv2 launch job=51 epoch=8 request=82 pos0=82 anchor=5759 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":82,"anchor":5759,"proposed":[411,25],"start_us":159685800694,"done_us":159685806846,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":82,"anchor":5759,"confirmed":[821],"draft_n":2,"replay":false,"done_us":159685852978}
+SHADOWv2 job=51 epoch=8 request=82 pos0=82 anchor=5759 c=1 d=7 matched=0 prefix_ok=0 position_ok=1 ready=1 remaining=6 usable=0 usable_tokens=0 done_us=159685844115 decision_us=159685853400 work_us=43275 dec_us=40314 sel_us=2817 confirmed=[821] proposed=[411,25,198,16,13,561,10562]
+SHADOWv2 launch job=52 epoch=8 request=82 pos0=83 anchor=821 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":83,"anchor":821,"proposed":[1965,25],"start_us":159685853379,"done_us":159685862922,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":83,"anchor":821,"confirmed":[1965,25,198],"draft_n":2,"replay":false,"done_us":159685913797}
+SHADOWv2 job=52 epoch=8 request=82 pos0=83 anchor=821 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159685907826 decision_us=159685914320 work_us=53884 dec_us=50242 sel_us=3087 confirmed=[1965,25,198] proposed=[1965,25,198,16,13,561,10562]
+SHADOWACTIVE select job=52 epoch=8 request=82 pos0=86 anchor=198 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":86,"anchor":198,"proposed":[16,13,561,10562],"start_us":159685914300,"done_us":159685914397,"cohort":1}
+SHADOWACTIVE accept job=52 request=82 pos0=86 proposed=4 accepted=3 confirmed=4
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":86,"anchor":198,"confirmed":[16,13,561,709],"draft_n":4,"replay":false,"done_us":159685968798}
+SHADOWv2 launch job=53 epoch=8 request=82 pos0=90 anchor=709 n_max=7
+SHADOWv2 cancel job=53 epoch=8 request=82 pos0=90 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":90,"anchor":709,"proposed":[],"start_us":159685968874,"done_us":159685972285,"cohort":1}
+SHADOWTRACE {"event":"token","request":82,"slot":0,"pos":91,"token":1970,"done_us":159686007763}
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":91,"anchor":1970,"proposed":[198,17],"start_us":159686007847,"done_us":159686013633,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":91,"anchor":1970,"confirmed":[198,17,13],"draft_n":2,"replay":false,"done_us":159686062734}
+SHADOWv2 launch job=54 epoch=8 request=82 pos0=94 anchor=13 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":94,"anchor":13,"proposed":[1473,3010],"start_us":159686062886,"done_us":159686068964,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":94,"anchor":13,"confirmed":[1473,3010,314],"draft_n":2,"replay":false,"done_us":159686112743}
+SHADOWv2 job=54 epoch=8 request=82 pos0=94 anchor=13 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159686100083 decision_us=159686113402 work_us=36949 dec_us=33696 sel_us=2984 confirmed=[1473,3010,314] proposed=[1473,3010,198,18,13,68230,15673]
+SHADOWv2 launch job=55 epoch=8 request=82 pos0=97 anchor=314 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":97,"anchor":314,"proposed":[10121,198],"start_us":159686113394,"done_us":159686120517,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":97,"anchor":314,"confirmed":[10121,198,18],"draft_n":2,"replay":false,"done_us":159686178184}
+SHADOWv2 job=55 epoch=8 request=82 pos0=97 anchor=314 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159686172487 decision_us=159686179173 work_us=58802 dec_us=55388 sel_us=3064 confirmed=[10121,198,18] proposed=[10121,198,18,13,357,3874,314]
+SHADOWACTIVE select job=55 epoch=8 request=82 pos0=100 anchor=18 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":100,"anchor":18,"proposed":[13,357,3874,314],"start_us":159686179156,"done_us":159686179270,"cohort":1}
+SHADOWACTIVE accept job=55 request=82 pos0=100 proposed=4 accepted=1 confirmed=2
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":100,"anchor":18,"confirmed":[13,68230],"draft_n":4,"replay":false,"done_us":159686232192}
+SHADOWv2 launch job=56 epoch=8 request=82 pos0=102 anchor=68230 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":102,"anchor":68230,"proposed":[15673,303],"start_us":159686232313,"done_us":159686239645,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":102,"anchor":68230,"confirmed":[15673,303,40790],"draft_n":2,"replay":false,"done_us":159686282684}
+SHADOWv2 job=56 epoch=8 request=82 pos0=102 anchor=68230 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159686279723 decision_us=159686282931 work_us=47228 dec_us=43682 sel_us=2615 confirmed=[15673,303,40790] proposed=[15673,303,40790,271,9764,728,3165]
+SHADOWACTIVE select job=56 epoch=8 request=82 pos0=105 anchor=40790 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":105,"anchor":40790,"proposed":[271,9764,728,3165],"start_us":159686282921,"done_us":159686282998,"cohort":1}
+SHADOWACTIVE accept job=56 request=82 pos0=105 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":105,"anchor":40790,"confirmed":[271,9764,728,3165,279],"draft_n":4,"replay":false,"done_us":159686331890}
+SHADOWv2 launch job=57 epoch=8 request=82 pos0=110 anchor=279 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":110,"anchor":279,"proposed":[10562,3269],"start_us":159686331963,"done_us":159686338927,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":110,"anchor":279,"confirmed":[10562,3269,25],"draft_n":2,"replay":false,"done_us":159686386054}
+SHADOWv2 job=57 epoch=8 request=82 pos0=110 anchor=279 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159686372498 decision_us=159686386297 work_us=40344 dec_us=37156 sel_us=2933 confirmed=[10562,3269,25] proposed=[10562,3269,11767,25,271,71093,198]
+SHADOWv2 launch job=58 epoch=8 request=82 pos0=113 anchor=25 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":113,"anchor":25,"proposed":[198,12],"start_us":159686386289,"done_us":159686392805,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":113,"anchor":25,"confirmed":[198,12,1049],"draft_n":2,"replay":false,"done_us":159686444542}
+SHADOWv2 job=58 epoch=8 request=82 pos0=113 anchor=25 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159686440331 decision_us=159686445391 work_us=53802 dec_us=50054 sel_us=3411 confirmed=[198,12,1049] proposed=[198,12,5183,1105,25,413,264]
+SHADOWv2 launch job=59 epoch=8 request=82 pos0=116 anchor=1049 n_max=7
+SHADOWv2 cancel job=59 epoch=8 request=82 pos0=116 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":116,"anchor":1049,"proposed":[],"start_us":159686445379,"done_us":159686450461,"cohort":1}
+SHADOWTRACE {"event":"token","request":82,"slot":0,"pos":117,"token":579,"done_us":159686532912}
+SHADOWv2 launch job=60 epoch=8 request=82 pos0=117 anchor=579 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":117,"anchor":579,"proposed":[264],"start_us":159686533084,"done_us":159686539954,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":117,"anchor":579,"confirmed":[264,21078],"draft_n":1,"replay":false,"done_us":159686601219}
+SHADOWv2 job=60 epoch=8 request=82 pos0=117 anchor=579 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159686585777 decision_us=159686601877 work_us=52394 dec_us=48274 sel_us=3521 confirmed=[264,21078] proposed=[264,21078,9485,14429,15487,5313,198]
+SHADOWACTIVE select job=60 epoch=8 request=82 pos0=119 anchor=21078 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":119,"anchor":21078,"proposed":[9485,14429,15487,5313],"start_us":159686601859,"done_us":159686601947,"cohort":1}
+SHADOWACTIVE accept job=60 request=82 pos0=119 proposed=4 accepted=0 confirmed=1
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":119,"anchor":21078,"confirmed":[321],"draft_n":4,"replay":false,"done_us":159686656390}
+SHADOWv2 launch job=61 epoch=8 request=82 pos0=120 anchor=321 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":120,"anchor":321,"proposed":[48827],"start_us":159686656464,"done_us":159686664144,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":120,"anchor":321,"confirmed":[48827,11767],"draft_n":1,"replay":false,"done_us":159686703855}
+SHADOWv2 job=61 epoch=8 request=82 pos0=120 anchor=321 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159686702301 decision_us=159686704260 work_us=45714 dec_us=42981 sel_us=2526 confirmed=[48827,11767] proposed=[48827,11767,198,12,26907,279,1103]
+SHADOWACTIVE select job=61 epoch=8 request=82 pos0=122 anchor=11767 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":122,"anchor":11767,"proposed":[198,12,26907,279],"start_us":159686704254,"done_us":159686704323,"cohort":1}
+SHADOWACTIVE accept job=61 request=82 pos0=122 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":122,"anchor":11767,"confirmed":[198,12,26907,279,1103],"draft_n":4,"replay":false,"done_us":159686753788}
+SHADOWv2 launch job=62 epoch=8 request=82 pos0=127 anchor=1103 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":127,"anchor":1103,"proposed":[303,4139],"start_us":159686753889,"done_us":159686760482,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":127,"anchor":1103,"confirmed":[303,4139,198],"draft_n":2,"replay":false,"done_us":159686806116}
+SHADOWv2 job=62 epoch=8 request=82 pos0=127 anchor=1103 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159686796620 decision_us=159686806380 work_us=42605 dec_us=39656 sel_us=2818 confirmed=[303,4139,198] proposed=[303,4139,198,12,3931,76991,3269]
+SHADOWACTIVE select job=62 epoch=8 request=82 pos0=130 anchor=198 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":130,"anchor":198,"proposed":[12,3931,76991,3269],"start_us":159686806372,"done_us":159686806426,"cohort":1}
+SHADOWACTIVE accept job=62 request=82 pos0=130 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":130,"anchor":198,"confirmed":[12,3931,76991,3269,1754],"draft_n":4,"replay":false,"done_us":159686855317}
+SHADOWv2 launch job=63 epoch=8 request=82 pos0=135 anchor=1754 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":135,"anchor":1754,"proposed":[4139,198],"start_us":159686855456,"done_us":159686862243,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":135,"anchor":1754,"confirmed":[4139,198,12],"draft_n":2,"replay":false,"done_us":159686907424}
+SHADOWv2 job=63 epoch=8 request=82 pos0=135 anchor=1754 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159686890880 decision_us=159686907632 work_us=35247 dec_us=32413 sel_us=2541 confirmed=[4139,198,12] proposed=[4139,198,12,38754,279,1330,10300]
+SHADOWACTIVE select job=63 epoch=8 request=82 pos0=138 anchor=12 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":138,"anchor":12,"proposed":[38754,279,1330,10300],"start_us":159686907625,"done_us":159686907718,"cohort":1}
+SHADOWACTIVE accept job=63 request=82 pos0=138 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":138,"anchor":12,"confirmed":[38754,279,1330,10300,71592],"draft_n":4,"replay":false,"done_us":159686957946}
+SHADOWv2 launch job=64 epoch=8 request=82 pos0=143 anchor=71592 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":143,"anchor":71592,"proposed":[271,40],"start_us":159686958138,"done_us":159686965503,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":143,"anchor":71592,"confirmed":[271,1409],"draft_n":2,"replay":false,"done_us":159687008635}
+SHADOWv2 job=64 epoch=8 request=82 pos0=143 anchor=71592 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=159687006151 decision_us=159687008862 work_us=47837 dec_us=43944 sel_us=2494 confirmed=[271,1409] proposed=[271,40,3172,3165,411,303,40790]
+SHADOWv2 launch job=65 epoch=8 request=82 pos0=145 anchor=1409 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":145,"anchor":1409,"proposed":[22373,25],"start_us":159687008858,"done_us":159687014953,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":145,"anchor":1409,"confirmed":[22373,25,496],"draft_n":2,"replay":false,"done_us":159687057663}
+SHADOWv2 job=65 epoch=8 request=82 pos0=145 anchor=1409 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159687053873 decision_us=159687058422 work_us=44786 dec_us=41522 sel_us=2913 confirmed=[22373,25,496] proposed=[22373,25,496,1393,1433,307,8]
+SHADOWACTIVE select job=65 epoch=8 request=82 pos0=148 anchor=496 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":148,"anchor":496,"proposed":[1393,1433,307,8],"start_us":159687058410,"done_us":159687058557,"cohort":1}
+SHADOWACTIVE accept job=65 request=82 pos0=148 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":148,"anchor":496,"confirmed":[1393,1433,307,8,303],"draft_n":4,"replay":false,"done_us":159687110929}
+SHADOWv2 launch job=66 epoch=8 request=82 pos0=153 anchor=303 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":153,"anchor":303,"proposed":[660,4886],"start_us":159687111009,"done_us":159687117638,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":153,"anchor":303,"confirmed":[660,4886,198],"draft_n":2,"replay":false,"done_us":159687161972}
+SHADOWv2 job=66 epoch=8 request=82 pos0=153 anchor=303 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159687153024 decision_us=159687162435 work_us=41865 dec_us=39175 sel_us=2500 confirmed=[660,4886,198] proposed=[660,4886,318,15395,11,5289,8]
+SHADOWv2 launch job=67 epoch=8 request=82 pos0=156 anchor=198 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":156,"anchor":198,"proposed":[9620,22373],"start_us":159687162426,"done_us":159687169632,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":156,"anchor":198,"confirmed":[9620,22373,25],"draft_n":2,"replay":false,"done_us":159687213872}
+SHADOWv2 job=67 epoch=8 request=82 pos0=156 anchor=198 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159687207925 decision_us=159687214375 work_us=45043 dec_us=40442 sel_us=4127 confirmed=[9620,22373,25] proposed=[9620,22373,25,496,1393,8,364]
+SHADOWACTIVE select job=67 epoch=8 request=82 pos0=159 anchor=25 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":159,"anchor":25,"proposed":[496,1393,8,364],"start_us":159687214365,"done_us":159687214459,"cohort":1}
+SHADOWACTIVE accept job=67 request=82 pos0=159 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":159,"anchor":25,"confirmed":[496,1393,8,364,279],"draft_n":4,"replay":false,"done_us":159687267879}
+SHADOWv2 launch job=68 epoch=8 request=82 pos0=164 anchor=279 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":164,"anchor":279,"proposed":[51666],"start_us":159687267958,"done_us":159687276164,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":164,"anchor":279,"confirmed":[51666,17839],"draft_n":1,"replay":false,"done_us":159687317674}
+SHADOWv2 job=68 epoch=8 request=82 pos0=164 anchor=279 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159687309846 decision_us=159687318217 work_us=41778 dec_us=38742 sel_us=2884 confirmed=[51666,17839] proposed=[51666,17839,1429,2261,51586,271,9764]
+SHADOWACTIVE select job=68 epoch=8 request=82 pos0=166 anchor=17839 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":166,"anchor":17839,"proposed":[1429,2261,51586,271],"start_us":159687318208,"done_us":159687318291,"cohort":1}
+SHADOWACTIVE accept job=68 request=82 pos0=166 proposed=4 accepted=0 confirmed=1
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":166,"anchor":17839,"confirmed":[271],"draft_n":4,"replay":false,"done_us":159687365702}
+SHADOWv2 launch job=69 epoch=8 request=82 pos0=167 anchor=271 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":167,"anchor":271,"proposed":[9764,728],"start_us":159687365773,"done_us":159687372366,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":167,"anchor":271,"confirmed":[9764,728,3165],"draft_n":2,"replay":false,"done_us":159687419454}
+SHADOWv2 job=69 epoch=8 request=82 pos0=167 anchor=271 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159687404844 decision_us=159687419843 work_us=38976 dec_us=36105 sel_us=2708 confirmed=[9764,728,3165] proposed=[9764,728,3165,411,303,40790,2394]
+SHADOWACTIVE select job=69 epoch=8 request=82 pos0=170 anchor=3165 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":170,"anchor":3165,"proposed":[411,303,40790,2394],"start_us":159687419830,"done_us":159687419956,"cohort":1}
+SHADOWACTIVE accept job=69 request=82 pos0=170 proposed=4 accepted=1 confirmed=2
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":170,"anchor":3165,"confirmed":[411,9077],"draft_n":4,"replay":false,"done_us":159687470165}
+SHADOWv2 launch job=70 epoch=8 request=82 pos0=172 anchor=9077 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":172,"anchor":9077,"proposed":[303,40790],"start_us":159687470282,"done_us":159687477764,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":172,"anchor":9077,"confirmed":[303,40790,364],"draft_n":2,"replay":false,"done_us":159687524688}
+SHADOWv2 job=70 epoch=8 request=82 pos0=172 anchor=9077 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159687509406 decision_us=159687524944 work_us=38991 dec_us=34116 sel_us=2889 confirmed=[303,40790,364] proposed=[303,40790,13,198,248069,271,2]
+SHADOWv2 launch job=71 epoch=8 request=82 pos0=175 anchor=364 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":175,"anchor":364,"proposed":[279,15673],"start_us":159687524931,"done_us":159687531922,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":175,"anchor":364,"confirmed":[279,15673,5306],"draft_n":2,"replay":false,"done_us":159687585026}
+SHADOWv2 job=71 epoch=8 request=82 pos0=175 anchor=364 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159687580356 decision_us=159687585808 work_us=55106 dec_us=51764 sel_us=2875 confirmed=[279,15673,5306] proposed=[279,15673,13,198,248069,271,2]
+SHADOWv2 launch job=72 epoch=8 request=82 pos0=178 anchor=5306 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":178,"anchor":5306,"proposed":[13,198],"start_us":159687585793,"done_us":159687594614,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":178,"anchor":5306,"confirmed":[13,198,248069],"draft_n":2,"replay":false,"done_us":159687656497}
+SHADOWv2 job=72 epoch=8 request=82 pos0=178 anchor=5306 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159687646793 decision_us=159687657340 work_us=60480 dec_us=56515 sel_us=3475 confirmed=[13,198,248069] proposed=[13,198,248069,271,2,38754,15495]
+SHADOWACTIVE select job=72 epoch=8 request=82 pos0=181 anchor=248069 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":181,"anchor":248069,"proposed":[271,2,38754,15495],"start_us":159687657324,"done_us":159687657480,"cohort":1}
+SHADOWACTIVE accept job=72 request=82 pos0=181 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":181,"anchor":248069,"confirmed":[271,2,38754,15495,945],"draft_n":4,"replay":false,"done_us":159687711266}
+SHADOWv2 launch job=73 epoch=8 request=82 pos0=186 anchor=945 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":186,"anchor":945,"proposed":[12654,271],"start_us":159687711382,"done_us":159687718147,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":186,"anchor":945,"confirmed":[12654,271,550],"draft_n":2,"replay":false,"done_us":159687764057}
+SHADOWv2 job=73 epoch=8 request=82 pos0=186 anchor=945 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159687747614 decision_us=159687764272 work_us=36062 dec_us=33285 sel_us=2505 confirmed=[12654,271,550] proposed=[12654,271,550,17477,173220,271,71093]
+SHADOWACTIVE select job=73 epoch=8 request=82 pos0=189 anchor=550 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":189,"anchor":550,"proposed":[17477,173220,271,71093],"start_us":159687764266,"done_us":159687764340,"cohort":1}
+SHADOWACTIVE accept job=73 request=82 pos0=189 proposed=4 accepted=0 confirmed=1
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":189,"anchor":550,"confirmed":[30057],"draft_n":4,"replay":false,"done_us":159687815454}
+0.21.531.550 I slot print_timing: id  0 | task 82 | n_gen =    163, tg =  53.64 t/s, tg_3s =  53.97 t/s
+SHADOWv2 launch job=74 epoch=8 request=82 pos0=190 anchor=30057 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":190,"anchor":30057,"proposed":[12595,271],"start_us":159687815581,"done_us":159687822739,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":190,"anchor":30057,"confirmed":[12595,271,71093],"draft_n":2,"replay":false,"done_us":159687867053}
+SHADOWv2 job=74 epoch=8 request=82 pos0=190 anchor=30057 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159687864106 decision_us=159687867372 work_us=48384 dec_us=44672 sel_us=2613 confirmed=[12595,271,71093] proposed=[12595,271,71093,12305,198,727,10562]
+SHADOWACTIVE select job=74 epoch=8 request=82 pos0=193 anchor=71093 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":193,"anchor":71093,"proposed":[12305,198,727,10562],"start_us":159687867366,"done_us":159687867402,"cohort":1}
+SHADOWACTIVE accept job=74 request=82 pos0=193 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":193,"anchor":71093,"confirmed":[12305,198,727,10562,17885],"draft_n":4,"replay":false,"done_us":159687914986}
+SHADOWv2 launch job=75 epoch=8 request=82 pos0=198 anchor=17885 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":198,"anchor":17885,"proposed":[10620],"start_us":159687915118,"done_us":159687921436,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":198,"anchor":17885,"confirmed":[10620,1590],"draft_n":1,"replay":false,"done_us":159687967451}
+SHADOWv2 job=75 epoch=8 request=82 pos0=198 anchor=17885 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159687958305 decision_us=159687968372 work_us=43047 dec_us=39961 sel_us=2853 confirmed=[10620,1590] proposed=[10620,1590,198,262,4071,3692,82]
+SHADOWACTIVE select job=75 epoch=8 request=82 pos0=200 anchor=1590 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":200,"anchor":1590,"proposed":[198,262,4071,3692],"start_us":159687968353,"done_us":159687968460,"cohort":1}
+SHADOWACTIVE accept job=75 request=82 pos0=200 proposed=4 accepted=3 confirmed=4
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":200,"anchor":1590,"confirmed":[198,262,4071,198],"draft_n":4,"replay":false,"done_us":159688022323}
+SHADOWv2 launch job=76 epoch=8 request=82 pos0=204 anchor=198 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":204,"anchor":198,"proposed":[262],"start_us":159688022398,"done_us":159688028986,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":204,"anchor":198,"confirmed":[262,93501],"draft_n":1,"replay":false,"done_us":159688071279}
+SHADOWv2 job=76 epoch=8 request=82 pos0=204 anchor=198 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=159688067156 decision_us=159688071921 work_us=44615 dec_us=40936 sel_us=3342 confirmed=[262,93501] proposed=[262,8535,16587,10293,13719,401,67075]
+SHADOWv2 launch job=77 epoch=8 request=82 pos0=206 anchor=93501 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":206,"anchor":93501,"proposed":[64,264],"start_us":159688071904,"done_us":159688080318,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":206,"anchor":93501,"confirmed":[64,10293],"draft_n":2,"replay":false,"done_us":159688164629}
+SHADOWv2 job=77 epoch=8 request=82 pos0=206 anchor=93501 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159688134252 decision_us=159688164864 work_us=61835 dec_us=57833 sel_us=3464 confirmed=[64,10293] proposed=[64,10293,13719,401,21120,55228,264]
+SHADOWACTIVE select job=77 epoch=8 request=82 pos0=208 anchor=10293 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":208,"anchor":10293,"proposed":[13719,401,21120,55228],"start_us":159688164858,"done_us":159688164950,"cohort":1}
+SHADOWACTIVE accept job=77 request=82 pos0=208 proposed=4 accepted=2 confirmed=3
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":208,"anchor":10293,"confirmed":[13719,401,514],"draft_n":4,"replay":false,"done_us":159688214213}
+SHADOWv2 launch job=78 epoch=8 request=82 pos0=211 anchor=514 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":211,"anchor":514,"proposed":[190186],"start_us":159688214289,"done_us":159688220755,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":211,"anchor":514,"confirmed":[190186,55228],"draft_n":1,"replay":false,"done_us":159688261741}
+SHADOWv2 job=78 epoch=8 request=82 pos0=211 anchor=514 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=159688253544 decision_us=159688262128 work_us=39114 dec_us=36627 sel_us=2375 confirmed=[190186,55228] proposed=[190186,55228,264,231846,21078,13,198]
+SHADOWACTIVE select job=78 epoch=8 request=82 pos0=213 anchor=55228 n=4
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":213,"anchor":55228,"proposed":[264,231846,21078,13],"start_us":159688262119,"done_us":159688262208,"cohort":1}
+SHADOWACTIVE accept job=78 request=82 pos0=213 proposed=4 accepted=0 confirmed=1
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":213,"anchor":55228,"confirmed":[296],"draft_n":4,"replay":false,"done_us":159688310800}
+SHADOWv2 launch job=79 epoch=8 request=82 pos0=214 anchor=296 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":214,"anchor":296,"proposed":[191521,6154],"start_us":159688310873,"done_us":159688318201,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":214,"anchor":296,"confirmed":[191521,6154,38754],"draft_n":2,"replay":false,"done_us":159688364711}
+SHADOWv2 job=79 epoch=8 request=82 pos0=214 anchor=296 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159688354236 decision_us=159688365339 work_us=43277 dec_us=40135 sel_us=2915 confirmed=[191521,6154,38754] proposed=[191521,6154,401,38754,15495,13,198]
+SHADOWv2 launch job=80 epoch=8 request=82 pos0=217 anchor=38754 n_max=7
+SHADOWTRACE {"event":"draft","request":82,"slot":0,"pos0":217,"anchor":38754,"proposed":[15495],"start_us":159688365326,"done_us":159688370317,"cohort":1}
+SHADOWTRACE {"event":"commit","request":82,"slot":0,"pos0":217,"anchor":38754,"confirmed":[15495,13],"draft_n":1,"replay":false,"done_us":159688431498}
+0.22.148.050 I slot print_timing: id  0 | task 82 | prompt eval time =     183.53 ms /    28 tokens (    6.55 ms per token,   152.57 tokens per second)
+0.22.148.065 I slot print_timing: id  0 | task 82 |        eval time =    3636.19 ms /   192 tokens (   19.04 ms per token,    52.53 tokens per second)
+0.22.148.068 I slot print_timing: id  0 | task 82 |       total time =    3819.71 ms /   220 tokens
+0.22.148.073 I slot print_timing: id  0 | task 82 |    graphs reused =         17
+0.22.148.084 I slot print_timing: id  0 | task 82 | draft acceptance = 0.72353 (  123 accepted /   170 generated), mean len =  2.89
+0.22.148.092 I shadow active: selected=56 proposed=224 verified=56 accepted=167 cancelled=0 pending=0
+0.22.148.167 I shadow auxiliary: launched=80 skipped_busy=6 skipped_throttle=0 ready=73 late=1 prefix_match=57 prefix_mismatch=17 usable_blocks=56 usable_tokens=224 errors=0
+0.22.148.169 I shadow accounting: observed=74 cancelled=5 pending=1 skipped_invalid=0 epoch=8
+0.22.148.171 I shadow stages: worker_us=3700111 decode_us=3371219 selector_us=301635 inject_submit_us=171804 stage_us=11763 late_total_ms=4.9 late_max_ms=4.9
+SHADOWTRACE {"event":"end","request":82,"slot":0,"generated":192,"truncated":false}
+0.22.148.251 I slot      release: id  0 | task 82 | stop processing: n_tokens = 219, truncated = 0
+SHADOWv2 cancel job=80 epoch=8 reason=context_reset
+0.22.152.697 I shadow active: selected=56 proposed=224 verified=56 accepted=167 cancelled=0 pending=0
+0.22.152.725 I shadow auxiliary: launched=80 skipped_busy=6 skipped_throttle=0 ready=73 late=1 prefix_match=57 prefix_mismatch=17 usable_blocks=56 usable_tokens=224 errors=0
+0.22.152.726 I shadow accounting: observed=74 cancelled=6 pending=0 skipped_invalid=0 epoch=9
+0.22.152.727 I shadow stages: worker_us=3700111 decode_us=3371219 selector_us=301635 inject_submit_us=171804 stage_us=11763 late_total_ms=4.9 late_max_ms=4.9
+0.22.168.052 I GPU memory clock: decode -> idle, reset (dynamic)
+0.22.169.532 I APU TDP: restored original limits
+0.22.197.961 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 159688432281
+SHADOWTRACE {"event":"begin","request":154,"slot":0,"temperature":0.0}
+0.22.198.122 I slot launch_slot_: id  0 | task 154 | processing task, is_child = 0
+0.22.198.480 I APU TDP: active limit 20 W
+0.22.199.436 I GPU memory clock: idle -> prefill, locked 2700 MHz
+0.25.301.260 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2112, progress = 0.15, t =   3.10 s / 682.39 tokens per second
+0.25.394.921 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2176, progress = 0.16, t =   3.19 s / 682.39 tokens per second
+0.25.486.268 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2240, progress = 0.16, t =   3.28 s / 682.89 tokens per second
+0.25.578.908 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2304, progress = 0.17, t =   3.37 s / 683.11 tokens per second
+0.25.675.238 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2368, progress = 0.17, t =   3.47 s / 682.60 tokens per second
+0.25.769.428 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2432, progress = 0.18, t =   3.56 s / 682.78 tokens per second
+0.25.863.681 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2496, progress = 0.18, t =   3.66 s / 682.43 tokens per second
+0.25.957.618 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2560, progress = 0.18, t =   3.75 s / 682.55 tokens per second
+0.26.053.496 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2624, progress = 0.19, t =   3.85 s / 682.13 tokens per second
+0.26.146.752 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2688, progress = 0.19, t =   3.94 s / 682.12 tokens per second
+0.26.239.796 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2752, progress = 0.20, t =   4.03 s / 682.26 tokens per second
+0.26.333.244 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2816, progress = 0.20, t =   4.13 s / 682.41 tokens per second
+0.26.429.573 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2880, progress = 0.21, t =   4.22 s / 681.92 tokens per second
+0.26.524.291 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   2944, progress = 0.21, t =   4.32 s / 681.97 tokens per second
+0.26.617.606 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3008, progress = 0.22, t =   4.41 s / 681.90 tokens per second
+0.26.712.116 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3072, progress = 0.22, t =   4.51 s / 681.87 tokens per second
+0.26.807.964 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3136, progress = 0.23, t =   4.60 s / 681.47 tokens per second
+0.26.901.540 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3200, progress = 0.23, t =   4.70 s / 681.53 tokens per second
+0.26.994.954 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3264, progress = 0.24, t =   4.79 s / 681.58 tokens per second
+0.27.088.617 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3328, progress = 0.24, t =   4.88 s / 681.62 tokens per second
+0.27.185.254 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3392, progress = 0.24, t =   4.98 s / 681.28 tokens per second
+0.27.279.569 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3456, progress = 0.25, t =   5.07 s / 681.28 tokens per second
+0.27.374.239 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3520, progress = 0.25, t =   5.17 s / 681.23 tokens per second
+0.27.468.359 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3584, progress = 0.26, t =   5.26 s / 681.09 tokens per second
+0.27.565.642 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3648, progress = 0.26, t =   5.36 s / 680.76 tokens per second
+0.27.659.795 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3712, progress = 0.27, t =   5.45 s / 680.67 tokens per second
+0.27.753.710 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3776, progress = 0.27, t =   5.55 s / 680.66 tokens per second
+0.27.847.665 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3840, progress = 0.28, t =   5.64 s / 680.65 tokens per second
+0.27.944.762 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3904, progress = 0.28, t =   5.74 s / 680.35 tokens per second
+0.28.039.437 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   3968, progress = 0.29, t =   5.83 s / 680.32 tokens per second
+0.28.134.629 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4032, progress = 0.29, t =   5.93 s / 680.13 tokens per second
+0.28.229.173 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4096, progress = 0.30, t =   6.02 s / 680.08 tokens per second
+0.28.326.350 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4160, progress = 0.30, t =   6.12 s / 679.74 tokens per second
+0.28.420.539 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4224, progress = 0.30, t =   6.21 s / 679.71 tokens per second
+0.28.515.231 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4288, progress = 0.31, t =   6.31 s / 679.67 tokens per second
+0.28.609.853 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4352, progress = 0.31, t =   6.40 s / 679.62 tokens per second
+0.28.708.796 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4416, progress = 0.32, t =   6.50 s / 679.27 tokens per second
+0.28.804.132 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4480, progress = 0.32, t =   6.60 s / 679.09 tokens per second
+0.28.899.025 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4544, progress = 0.33, t =   6.69 s / 678.96 tokens per second
+0.28.993.399 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4608, progress = 0.33, t =   6.79 s / 678.93 tokens per second
+0.29.091.283 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4672, progress = 0.34, t =   6.88 s / 678.59 tokens per second
+0.29.186.096 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4736, progress = 0.34, t =   6.98 s / 678.53 tokens per second
+0.29.281.550 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4800, progress = 0.35, t =   7.07 s / 678.48 tokens per second
+0.29.378.310 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4864, progress = 0.35, t =   7.17 s / 678.32 tokens per second
+0.29.475.775 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4928, progress = 0.36, t =   7.27 s / 677.91 tokens per second
+0.29.571.888 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   4992, progress = 0.36, t =   7.36 s / 677.82 tokens per second
+0.29.667.135 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5056, progress = 0.37, t =   7.46 s / 677.66 tokens per second
+0.29.762.334 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5120, progress = 0.37, t =   7.56 s / 677.62 tokens per second
+0.29.861.481 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5184, progress = 0.37, t =   7.65 s / 677.25 tokens per second
+0.29.956.891 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5248, progress = 0.38, t =   7.75 s / 677.13 tokens per second
+0.30.053.302 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5312, progress = 0.38, t =   7.85 s / 677.00 tokens per second
+0.30.149.131 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5376, progress = 0.39, t =   7.94 s / 676.86 tokens per second
+0.30.248.271 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5440, progress = 0.39, t =   8.04 s / 676.46 tokens per second
+0.30.343.706 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5504, progress = 0.40, t =   8.14 s / 676.39 tokens per second
+0.30.438.977 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5568, progress = 0.40, t =   8.23 s / 676.33 tokens per second
+0.30.536.098 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5632, progress = 0.41, t =   8.33 s / 676.26 tokens per second
+0.30.635.097 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5696, progress = 0.41, t =   8.43 s / 675.83 tokens per second
+0.30.731.419 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5760, progress = 0.42, t =   8.52 s / 675.69 tokens per second
+0.30.827.832 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5824, progress = 0.42, t =   8.62 s / 675.54 tokens per second
+0.30.923.877 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5888, progress = 0.43, t =   8.72 s / 675.45 tokens per second
+0.31.022.730 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   5952, progress = 0.43, t =   8.82 s / 675.13 tokens per second
+0.31.119.532 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6016, progress = 0.43, t =   8.91 s / 675.01 tokens per second
+0.31.215.555 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6080, progress = 0.44, t =   9.01 s / 674.89 tokens per second
+0.31.312.057 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6144, progress = 0.44, t =   9.11 s / 674.77 tokens per second
+0.31.412.493 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6208, progress = 0.45, t =   9.21 s / 674.41 tokens per second
+0.31.508.894 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6272, progress = 0.45, t =   9.30 s / 674.24 tokens per second
+0.31.606.542 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6336, progress = 0.46, t =   9.40 s / 674.12 tokens per second
+0.31.702.657 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6400, progress = 0.46, t =   9.50 s / 673.94 tokens per second
+0.31.803.597 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6464, progress = 0.47, t =   9.60 s / 673.67 tokens per second
+0.31.900.726 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6528, progress = 0.47, t =   9.69 s / 673.43 tokens per second
+0.31.997.231 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6592, progress = 0.48, t =   9.79 s / 673.30 tokens per second
+0.32.094.097 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6656, progress = 0.48, t =   9.89 s / 673.17 tokens per second
+0.32.193.276 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6720, progress = 0.49, t =   9.99 s / 672.89 tokens per second
+0.32.290.098 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6784, progress = 0.49, t =  10.08 s / 672.78 tokens per second
+0.32.387.468 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6848, progress = 0.49, t =  10.18 s / 672.67 tokens per second
+0.32.484.321 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6912, progress = 0.50, t =  10.28 s / 672.54 tokens per second
+0.32.583.816 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   6976, progress = 0.50, t =  10.38 s / 672.24 tokens per second
+0.32.680.463 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7040, progress = 0.51, t =  10.47 s / 672.14 tokens per second
+0.32.777.404 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7104, progress = 0.51, t =  10.57 s / 672.05 tokens per second
+0.32.875.844 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7168, progress = 0.52, t =  10.67 s / 671.85 tokens per second
+0.32.976.156 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7232, progress = 0.52, t =  10.77 s / 671.54 tokens per second
+0.33.073.417 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7296, progress = 0.53, t =  10.87 s / 671.40 tokens per second
+0.33.170.521 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7360, progress = 0.53, t =  10.96 s / 671.28 tokens per second
+0.33.268.667 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7424, progress = 0.54, t =  11.06 s / 671.18 tokens per second
+0.33.368.465 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7488, progress = 0.54, t =  11.16 s / 670.85 tokens per second
+0.33.466.501 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7552, progress = 0.55, t =  11.26 s / 670.74 tokens per second
+0.33.566.222 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7616, progress = 0.55, t =  11.36 s / 670.54 tokens per second
+0.33.664.347 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7680, progress = 0.55, t =  11.46 s / 670.28 tokens per second
+0.33.765.419 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7744, progress = 0.56, t =  11.56 s / 670.04 tokens per second
+0.33.863.255 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7808, progress = 0.56, t =  11.66 s / 669.82 tokens per second
+0.33.961.033 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7872, progress = 0.57, t =  11.75 s / 669.71 tokens per second
+0.34.059.048 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   7936, progress = 0.57, t =  11.85 s / 669.59 tokens per second
+0.34.161.686 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8000, progress = 0.58, t =  11.95 s / 669.21 tokens per second
+0.34.260.873 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8064, progress = 0.58, t =  12.05 s / 668.98 tokens per second
+0.34.358.525 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8128, progress = 0.59, t =  12.15 s / 668.85 tokens per second
+0.34.456.514 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8192, progress = 0.59, t =  12.25 s / 668.75 tokens per second
+0.34.558.209 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8256, progress = 0.60, t =  12.35 s / 668.44 tokens per second
+0.34.656.104 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8320, progress = 0.60, t =  12.45 s / 668.29 tokens per second
+0.34.753.944 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8384, progress = 0.61, t =  12.55 s / 668.18 tokens per second
+0.34.851.845 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8448, progress = 0.61, t =  12.65 s / 668.06 tokens per second
+0.34.952.878 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8512, progress = 0.61, t =  12.75 s / 667.81 tokens per second
+0.35.052.597 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8576, progress = 0.62, t =  12.84 s / 667.67 tokens per second
+0.35.151.780 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8640, progress = 0.62, t =  12.95 s / 667.42 tokens per second
+0.35.249.952 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8704, progress = 0.63, t =  13.04 s / 667.31 tokens per second
+0.35.350.934 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8768, progress = 0.63, t =  13.14 s / 667.06 tokens per second
+0.35.449.238 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8832, progress = 0.64, t =  13.24 s / 666.94 tokens per second
+0.35.548.572 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8896, progress = 0.64, t =  13.34 s / 666.81 tokens per second
+0.35.646.867 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   8960, progress = 0.65, t =  13.44 s / 666.65 tokens per second
+0.35.748.520 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9024, progress = 0.65, t =  13.54 s / 666.38 tokens per second
+0.35.846.935 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9088, progress = 0.66, t =  13.64 s / 666.25 tokens per second
+0.35.946.948 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9152, progress = 0.66, t =  13.74 s / 666.14 tokens per second
+0.36.045.898 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9216, progress = 0.67, t =  13.84 s / 665.94 tokens per second
+0.36.148.232 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9280, progress = 0.67, t =  13.94 s / 665.64 tokens per second
+0.36.247.711 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9344, progress = 0.67, t =  14.04 s / 665.48 tokens per second
+0.36.345.267 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9408, progress = 0.68, t =  14.14 s / 665.41 tokens per second
+0.36.445.070 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9472, progress = 0.68, t =  14.24 s / 665.28 tokens per second
+0.36.550.545 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9536, progress = 0.69, t =  14.34 s / 664.83 tokens per second
+0.36.650.949 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9600, progress = 0.69, t =  14.44 s / 664.66 tokens per second
+0.36.750.390 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9664, progress = 0.70, t =  14.54 s / 664.48 tokens per second
+0.36.849.869 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9728, progress = 0.70, t =  14.64 s / 664.33 tokens per second
+0.36.953.131 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9792, progress = 0.71, t =  14.75 s / 664.04 tokens per second
+0.37.054.281 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9856, progress = 0.71, t =  14.85 s / 663.85 tokens per second
+0.37.154.669 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9920, progress = 0.72, t =  14.95 s / 663.64 tokens per second
+0.37.255.536 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =   9984, progress = 0.72, t =  15.05 s / 663.43 tokens per second
+0.37.359.304 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10048, progress = 0.73, t =  15.15 s / 663.12 tokens per second
+0.37.460.151 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10112, progress = 0.73, t =  15.25 s / 662.93 tokens per second
+0.37.561.139 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10176, progress = 0.73, t =  15.35 s / 662.74 tokens per second
+0.37.663.132 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10240, progress = 0.74, t =  15.46 s / 662.51 tokens per second
+0.37.768.595 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10304, progress = 0.74, t =  15.56 s / 662.14 tokens per second
+0.37.870.116 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10368, progress = 0.75, t =  15.66 s / 661.92 tokens per second
+0.37.971.516 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10432, progress = 0.75, t =  15.76 s / 661.74 tokens per second
+0.38.073.224 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10496, progress = 0.76, t =  15.87 s / 661.53 tokens per second
+0.38.178.207 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10560, progress = 0.76, t =  15.97 s / 661.18 tokens per second
+0.38.280.209 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10624, progress = 0.77, t =  16.07 s / 660.97 tokens per second
+0.38.382.566 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10688, progress = 0.77, t =  16.18 s / 660.75 tokens per second
+0.38.485.063 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10752, progress = 0.78, t =  16.28 s / 660.52 tokens per second
+0.38.591.201 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10816, progress = 0.78, t =  16.38 s / 660.17 tokens per second
+0.38.694.236 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10880, progress = 0.79, t =  16.49 s / 659.89 tokens per second
+0.38.798.515 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  10944, progress = 0.79, t =  16.59 s / 659.60 tokens per second
+0.38.901.868 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11008, progress = 0.79, t =  16.70 s / 659.35 tokens per second
+0.39.007.598 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11072, progress = 0.80, t =  16.80 s / 659.01 tokens per second
+0.39.110.524 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11136, progress = 0.80, t =  16.90 s / 658.78 tokens per second
+0.39.214.675 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11200, progress = 0.81, t =  17.01 s / 658.55 tokens per second
+0.39.318.384 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11264, progress = 0.81, t =  17.11 s / 658.27 tokens per second
+0.39.426.022 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11328, progress = 0.82, t =  17.22 s / 657.89 tokens per second
+0.39.530.442 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11392, progress = 0.82, t =  17.32 s / 657.60 tokens per second
+0.39.635.276 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11456, progress = 0.83, t =  17.43 s / 657.32 tokens per second
+0.39.740.659 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11520, progress = 0.83, t =  17.53 s / 657.04 tokens per second
+0.39.848.911 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11584, progress = 0.84, t =  17.64 s / 656.63 tokens per second
+0.39.954.284 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11648, progress = 0.84, t =  17.75 s / 656.32 tokens per second
+0.40.059.477 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11712, progress = 0.85, t =  17.85 s / 656.04 tokens per second
+0.40.165.090 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11776, progress = 0.85, t =  17.96 s / 655.75 tokens per second
+0.40.274.570 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11840, progress = 0.85, t =  18.07 s / 655.33 tokens per second
+0.40.382.536 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11904, progress = 0.86, t =  18.18 s / 654.95 tokens per second
+0.40.488.636 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  11968, progress = 0.86, t =  18.28 s / 654.64 tokens per second
+0.40.595.108 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12032, progress = 0.87, t =  18.39 s / 654.33 tokens per second
+0.40.704.715 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12096, progress = 0.87, t =  18.50 s / 653.92 tokens per second
+0.40.811.815 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12160, progress = 0.88, t =  18.60 s / 653.61 tokens per second
+0.40.917.859 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12224, progress = 0.88, t =  18.71 s / 653.30 tokens per second
+0.41.025.008 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12288, progress = 0.89, t =  18.82 s / 653.00 tokens per second
+0.41.136.176 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12352, progress = 0.89, t =  18.93 s / 652.56 tokens per second
+0.41.243.166 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12416, progress = 0.90, t =  19.04 s / 652.23 tokens per second
+0.41.350.177 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12480, progress = 0.90, t =  19.14 s / 651.92 tokens per second
+0.41.457.287 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12544, progress = 0.91, t =  19.25 s / 651.63 tokens per second
+0.41.568.419 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12608, progress = 0.91, t =  19.36 s / 651.20 tokens per second
+0.41.676.353 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12672, progress = 0.91, t =  19.47 s / 650.86 tokens per second
+0.41.784.891 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12736, progress = 0.92, t =  19.58 s / 650.55 tokens per second
+0.41.894.039 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12800, progress = 0.92, t =  19.69 s / 650.22 tokens per second
+0.42.004.070 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12864, progress = 0.93, t =  19.80 s / 649.79 tokens per second
+0.42.112.018 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12928, progress = 0.93, t =  19.90 s / 649.49 tokens per second
+0.42.220.060 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  12992, progress = 0.94, t =  20.01 s / 649.21 tokens per second
+0.42.327.701 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13056, progress = 0.94, t =  20.12 s / 648.88 tokens per second
+0.42.438.626 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13120, progress = 0.95, t =  20.23 s / 648.48 tokens per second
+0.42.547.300 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13184, progress = 0.95, t =  20.34 s / 648.17 tokens per second
+0.42.655.664 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13248, progress = 0.96, t =  20.45 s / 647.86 tokens per second
+0.42.764.653 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13312, progress = 0.96, t =  20.56 s / 647.55 tokens per second
+0.42.876.505 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13376, progress = 0.97, t =  20.67 s / 647.15 tokens per second
+0.42.985.489 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13440, progress = 0.97, t =  20.78 s / 646.82 tokens per second
+0.43.095.391 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13504, progress = 0.98, t =  20.89 s / 646.49 tokens per second
+0.43.204.347 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13568, progress = 0.98, t =  21.00 s / 646.17 tokens per second
+0.43.318.076 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13632, progress = 0.98, t =  21.11 s / 645.73 tokens per second
+0.43.427.535 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13696, progress = 0.99, t =  21.22 s / 645.41 tokens per second
+0.43.537.968 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13760, progress = 0.99, t =  21.33 s / 645.10 tokens per second
+0.43.625.121 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13786, progress = 1.00, t =  21.42 s / 643.55 tokens per second
+0.43.815.360 I slot print_timing: id  0 | task 154 | prompt processing, n_tokens =  13846, progress = 1.00, t =  21.61 s / 640.79 tokens per second
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13850,"token":271,"done_us":159710237445}
+SHADOWv2 launch job=81 epoch=11 request=154 pos0=13850 anchor=271 n_max=7
+SHADOWv2 cancel job=81 epoch=11 request=154 pos0=13850 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13850,"anchor":271,"proposed":[],"start_us":159710237659,"done_us":159710244260,"cohort":1}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13851,"token":248068,"done_us":159710279925}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13851,"anchor":248068,"proposed":[198],"start_us":159710279998,"done_us":159710287989,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13851,"anchor":248068,"confirmed":[198,760],"draft_n":1,"replay":false,"done_us":159710339200}
+SHADOWv2 launch job=82 epoch=11 request=154 pos0=13853 anchor=760 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13853,"anchor":760,"proposed":[1156,6587],"start_us":159710339765,"done_us":159710347270,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13853,"anchor":760,"confirmed":[1156,6587,728],"draft_n":2,"replay":false,"done_us":159710398600}
+SHADOWv2 job=82 epoch=11 request=154 pos0=13853 anchor=760 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159710384048 decision_us=159710399673 work_us=44030 dec_us=40375 sel_us=3428 confirmed=[1156,6587,728] proposed=[1156,6587,728,310,22903,279,1822]
+SHADOWACTIVE select job=82 epoch=11 request=154 pos0=13856 anchor=728 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13856,"anchor":728,"proposed":[310,22903,279,1822],"start_us":159710399657,"done_us":159710399759,"cohort":1}
+SHADOWACTIVE accept job=82 request=154 pos0=13856 proposed=4 accepted=1 confirmed=2
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13856,"anchor":728,"confirmed":[310,1301],"draft_n":4,"replay":false,"done_us":159710457080}
+SHADOWv2 launch job=83 epoch=11 request=154 pos0=13858 anchor=1301 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13858,"anchor":1301,"proposed":[279],"start_us":159710457173,"done_us":159710464033,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13858,"anchor":1301,"confirmed":[279,7189],"draft_n":1,"replay":false,"done_us":159710506142}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13860,"anchor":7189,"proposed":[321,10033],"start_us":159710506388,"done_us":159710515762,"cohort":1}
+SHADOWv2 job=83 epoch=11 request=154 pos0=13858 anchor=1301 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=159710515664 decision_us=159710506394 work_us=58366 dec_us=53557 sel_us=4673 confirmed=[279,7189] proposed=[279,7189,321,10229,279,2250,1822]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13860,"anchor":7189,"confirmed":[321,10033,279],"draft_n":2,"replay":false,"done_us":159710568161}
+SHADOWv2 launch job=84 epoch=11 request=154 pos0=13863 anchor=279 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13863,"anchor":279,"proposed":[2250,1822],"start_us":159710568796,"done_us":159710576496,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13863,"anchor":279,"confirmed":[2250,1822,17793],"draft_n":2,"replay":false,"done_us":159710626070}
+SHADOWv2 job=84 epoch=11 request=154 pos0=13863 anchor=279 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159710619605 decision_us=159710626807 work_us=50569 dec_us=46543 sel_us=3656 confirmed=[2250,1822,17793] proposed=[2250,1822,17793,440,13769,9989,13]
+SHADOWACTIVE select job=84 epoch=11 request=154 pos0=13866 anchor=17793 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13866,"anchor":17793,"proposed":[440,13769,9989,13],"start_us":159710626791,"done_us":159710626900,"cohort":1}
+SHADOWACTIVE accept job=84 request=154 pos0=13866 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13866,"anchor":17793,"confirmed":[440,13769,9989,13,271],"draft_n":4,"replay":false,"done_us":159710686771}
+SHADOWv2 launch job=85 epoch=11 request=154 pos0=13871 anchor=271 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13871,"anchor":271,"proposed":[9764,728],"start_us":159710686857,"done_us":159710694328,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13871,"anchor":271,"confirmed":[9764,728,22903],"draft_n":2,"replay":false,"done_us":159710741287}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13874,"anchor":22903,"proposed":[279,795],"start_us":159710741524,"done_us":159710747812,"cohort":1}
+SHADOWv2 job=85 epoch=11 request=154 pos0=13871 anchor=271 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=159710742855 decision_us=159710741529 work_us=55883 dec_us=52644 sel_us=3043 confirmed=[9764,728,22903] proposed=[9764,728,22903,279,7189,25,271]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13874,"anchor":22903,"confirmed":[279,795,25],"draft_n":2,"replay":false,"done_us":159710796600}
+SHADOWv2 launch job=86 epoch=11 request=154 pos0=13877 anchor=25 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13877,"anchor":25,"proposed":[271],"start_us":159710796873,"done_us":159710803685,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13877,"anchor":25,"confirmed":[271,760],"draft_n":1,"replay":false,"done_us":159710845346}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13879,"anchor":760,"proposed":[7189],"start_us":159710845644,"done_us":159710852773,"cohort":1}
+SHADOWv2 job=86 epoch=11 request=154 pos0=13877 anchor=25 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=159710846074 decision_us=159710845652 work_us=48927 dec_us=46464 sel_us=2332 confirmed=[271,760] proposed=[271,21765,506,279,7189,25,198]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13879,"anchor":760,"confirmed":[7189,708],"draft_n":1,"replay":false,"done_us":159710896676}
+SHADOWv2 launch job=87 epoch=11 request=154 pos0=13881 anchor=708 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13881,"anchor":708,"proposed":[494,220],"start_us":159710897334,"done_us":159710904950,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13881,"anchor":708,"confirmed":[494,220,15],"draft_n":2,"replay":false,"done_us":159710956414}
+SHADOWv2 job=87 epoch=11 request=154 pos0=13881 anchor=708 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159710946210 decision_us=159710957515 work_us=48677 dec_us=45527 sel_us=2890 confirmed=[494,220,15] proposed=[494,220,15,310,220,15,310]
+SHADOWACTIVE select job=87 epoch=11 request=154 pos0=13884 anchor=15 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13884,"anchor":15,"proposed":[310,220,15,310],"start_us":159710957500,"done_us":159710957577,"cohort":1}
+SHADOWACTIVE accept job=87 request=154 pos0=13884 proposed=4 accepted=0 confirmed=1
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13884,"anchor":15,"confirmed":[15],"draft_n":4,"replay":false,"done_us":159711014703}
+SHADOWv2 launch job=88 epoch=11 request=154 pos0=13885 anchor=15 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13885,"anchor":15,"proposed":[15,15],"start_us":159711014790,"done_us":159711022112,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13885,"anchor":15,"confirmed":[15,15,310],"draft_n":2,"replay":false,"done_us":159711073707}
+SHADOWv2 job=88 epoch=11 request=154 pos0=13885 anchor=15 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159711064635 decision_us=159711074126 work_us=49706 dec_us=46914 sel_us=2563 confirmed=[15,15,310] proposed=[15,15,310,220,18,18,24]
+SHADOWACTIVE select job=88 epoch=11 request=154 pos0=13888 anchor=310 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13888,"anchor":310,"proposed":[220,18,18,24],"start_us":159711074117,"done_us":159711074203,"cohort":1}
+SHADOWACTIVE accept job=88 request=154 pos0=13888 proposed=4 accepted=1 confirmed=2
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13888,"anchor":310,"confirmed":[220,15],"draft_n":4,"replay":false,"done_us":159711129132}
+SHADOWv2 launch job=89 epoch=11 request=154 pos0=13890 anchor=15 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13890,"anchor":15,"proposed":[18,16],"start_us":159711129221,"done_us":159711136468,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13890,"anchor":15,"confirmed":[18,16,24],"draft_n":2,"replay":false,"done_us":159711183117}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13893,"anchor":24,"proposed":[],"start_us":159711183238,"done_us":159711187406,"cohort":1}
+SHADOWv2 job=89 epoch=11 request=154 pos0=13890 anchor=15 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=159711185390 decision_us=159711183241 work_us=56048 dec_us=53340 sel_us=2557 confirmed=[18,16,24] proposed=[18,16,24,318,18,15,15]
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13894,"token":318,"done_us":159711228278}
+SHADOWv2 launch job=90 epoch=11 request=154 pos0=13894 anchor=318 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13894,"anchor":318,"proposed":[18],"start_us":159711228465,"done_us":159711235123,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13894,"anchor":318,"confirmed":[18,17],"draft_n":1,"replay":false,"done_us":159711276386}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13896,"anchor":17,"proposed":[15,7189],"start_us":159711276546,"done_us":159711284751,"cohort":1}
+SHADOWv2 job=90 epoch=11 request=154 pos0=13894 anchor=318 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=159711281719 decision_us=159711276549 work_us=53034 dec_us=50266 sel_us=2628 confirmed=[18,17] proposed=[18,16,24,7189,553,8618,682]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13896,"anchor":17,"confirmed":[15,7189,553],"draft_n":2,"replay":false,"done_us":159711335725}
+SHADOWv2 launch job=91 epoch=11 request=154 pos0=13899 anchor=553 n_max=7
+SHADOWv2 cancel job=91 epoch=11 request=154 pos0=13899 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13899,"anchor":553,"proposed":[],"start_us":159711335957,"done_us":159711341201,"cohort":1}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13900,"token":8618,"done_us":159711376431}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13900,"anchor":8618,"proposed":[3150,682],"start_us":159711376522,"done_us":159711382755,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13900,"anchor":8618,"confirmed":[3150,682,25],"draft_n":2,"replay":false,"done_us":159711434564}
+SHADOWv2 launch job=92 epoch=11 request=154 pos0=13903 anchor=25 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13903,"anchor":25,"proposed":[198,12],"start_us":159711434939,"done_us":159711441652,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13903,"anchor":25,"confirmed":[198,12,179016],"draft_n":2,"replay":false,"done_us":159711484832}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13906,"anchor":179016,"proposed":[318],"start_us":159711485046,"done_us":159711492890,"cohort":1}
+SHADOWv2 job=92 epoch=11 request=154 pos0=13903 anchor=25 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=159711490061 decision_us=159711485050 work_us=54838 dec_us=50603 sel_us=4097 confirmed=[198,12,179016] proposed=[198,12,179016,318,43268,8,198]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13906,"anchor":179016,"confirmed":[318,43268],"draft_n":1,"replay":false,"done_us":159711537585}
+SHADOWv2 launch job=93 epoch=11 request=154 pos0=13908 anchor=43268 n_max=7
+SHADOWv2 cancel job=93 epoch=11 request=154 pos0=13908 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13908,"anchor":43268,"proposed":[],"start_us":159711537850,"done_us":159711542251,"cohort":1}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13909,"token":1590,"done_us":159711578574}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13909,"anchor":1590,"proposed":[220,15],"start_us":159711578681,"done_us":159711585114,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13909,"anchor":1590,"confirmed":[23709],"draft_n":2,"replay":false,"done_us":159711639162}
+SHADOWv2 launch job=94 epoch=11 request=154 pos0=13910 anchor=23709 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13910,"anchor":23709,"proposed":[220,15],"start_us":159711639595,"done_us":159711646534,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13910,"anchor":23709,"confirmed":[220,15,12],"draft_n":2,"replay":false,"done_us":159711690683}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13913,"anchor":12,"proposed":[17,18],"start_us":159711690851,"done_us":159711698558,"cohort":1}
+SHADOWv2 job=94 epoch=11 request=154 pos0=13910 anchor=23709 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=159711693664 decision_us=159711690856 work_us=53800 dec_us=50256 sel_us=2640 confirmed=[220,15,12] proposed=[220,15,12,17,18,198,12]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13913,"anchor":12,"confirmed":[17,17],"draft_n":2,"replay":false,"done_us":159711746017}
+SHADOWv2 launch job=95 epoch=11 request=154 pos0=13915 anchor=17 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13915,"anchor":17,"proposed":[198,12],"start_us":159711746259,"done_us":159711753006,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13915,"anchor":17,"confirmed":[198,12,214614],"draft_n":2,"replay":false,"done_us":159711796230}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13918,"anchor":214614,"proposed":[318,13646],"start_us":159711796404,"done_us":159711804285,"cohort":1}
+SHADOWv2 job=95 epoch=11 request=154 pos0=13915 anchor=17 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=159711801433 decision_us=159711796408 work_us=54945 dec_us=51108 sel_us=3692 confirmed=[198,12,214614] proposed=[198,12,214614,318,8911,1590,23709]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13918,"anchor":214614,"confirmed":[318,13646,1590],"draft_n":2,"replay":false,"done_us":159711864410}
+SHADOWv2 launch job=96 epoch=11 request=154 pos0=13921 anchor=1590 n_max=7
+SHADOWv2 cancel job=96 epoch=11 request=154 pos0=13921 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13921,"anchor":1590,"proposed":[],"start_us":159711864777,"done_us":159711868651,"cohort":1}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13922,"token":12339,"done_us":159711903775}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13922,"anchor":12339,"proposed":[],"start_us":159711903858,"done_us":159711907136,"cohort":1}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13923,"token":539,"done_us":159711945398}
+SHADOWv2 launch job=97 epoch=11 request=154 pos0=13923 anchor=539 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13923,"anchor":539,"proposed":[220,16],"start_us":159711945547,"done_us":159711952187,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13923,"anchor":539,"confirmed":[220,16,22],"draft_n":2,"replay":false,"done_us":159711997921}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13926,"anchor":22,"proposed":[1754],"start_us":159711998058,"done_us":159712005263,"cohort":1}
+SHADOWv2 job=97 epoch=11 request=154 pos0=13923 anchor=539 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=159712000309 decision_us=159711998063 work_us=54528 dec_us=51629 sel_us=2733 confirmed=[220,16,22] proposed=[220,16,22,791,3150,198,12]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13926,"anchor":22,"confirmed":[1754,854],"draft_n":1,"replay":false,"done_us":159712050493}
+SHADOWv2 launch job=98 epoch=11 request=154 pos0=13928 anchor=854 n_max=7
+SHADOWv2 cancel job=98 epoch=11 request=154 pos0=13928 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13928,"anchor":854,"proposed":[],"start_us":159712050873,"done_us":159712055190,"cohort":1}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13929,"token":198,"done_us":159712090645}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13929,"anchor":198,"proposed":[12,80090],"start_us":159712090767,"done_us":159712097162,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13929,"anchor":198,"confirmed":[12,80090,318],"draft_n":2,"replay":false,"done_us":159712150636}
+SHADOWv2 launch job=99 epoch=11 request=154 pos0=13932 anchor=318 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13932,"anchor":318,"proposed":[33413,1590],"start_us":159712150974,"done_us":159712159988,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13932,"anchor":318,"confirmed":[33413,1590,23709],"draft_n":2,"replay":false,"done_us":159712209384}
+SHADOWv2 job=99 epoch=11 request=154 pos0=13932 anchor=318 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159712203925 decision_us=159712210797 work_us=52687 dec_us=45877 sel_us=6575 confirmed=[33413,1590,23709] proposed=[33413,1590,220,17,15,29922,310]
+SHADOWv2 launch job=100 epoch=11 request=154 pos0=13935 anchor=23709 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13935,"anchor":23709,"proposed":[220,17],"start_us":159712210786,"done_us":159712219150,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13935,"anchor":23709,"confirmed":[220,17,15],"draft_n":2,"replay":false,"done_us":159712277388}
+SHADOWv2 job=100 epoch=11 request=154 pos0=13935 anchor=23709 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159712272865 decision_us=159712277860 work_us=61599 dec_us=57969 sel_us=3302 confirmed=[220,17,15] proposed=[220,17,15,12,18,21,11]
+SHADOWACTIVE select job=100 epoch=11 request=154 pos0=13938 anchor=15 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13938,"anchor":15,"proposed":[12,18,21,11],"start_us":159712277848,"done_us":159712277922,"cohort":1}
+SHADOWACTIVE accept job=100 request=154 pos0=13938 proposed=4 accepted=3 confirmed=4
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13938,"anchor":15,"confirmed":[12,18,21,351],"draft_n":4,"replay":false,"done_us":159712336991}
+SHADOWv2 launch job=101 epoch=11 request=154 pos0=13942 anchor=351 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13942,"anchor":351,"proposed":[198,12],"start_us":159712337087,"done_us":159712343992,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13942,"anchor":351,"confirmed":[198,12,176247],"draft_n":2,"replay":false,"done_us":159712398850}
+SHADOWv2 job=101 epoch=11 request=154 pos0=13942 anchor=351 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159712386369 decision_us=159712399552 work_us=49152 dec_us=45744 sel_us=3234 confirmed=[198,12,176247] proposed=[198,12,176247,318,80068,1590,12339]
+SHADOWACTIVE select job=101 epoch=11 request=154 pos0=13945 anchor=176247 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13945,"anchor":176247,"proposed":[318,80068,1590,12339],"start_us":159712399537,"done_us":159712399632,"cohort":1}
+SHADOWACTIVE accept job=101 request=154 pos0=13945 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13945,"anchor":176247,"confirmed":[318,80068,1590,12339,539],"draft_n":4,"replay":false,"done_us":159712457699}
+SHADOWv2 launch job=102 epoch=11 request=154 pos0=13950 anchor=539 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13950,"anchor":539,"proposed":[220,18],"start_us":159712457780,"done_us":159712464919,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13950,"anchor":539,"confirmed":[220,18,16],"draft_n":2,"replay":false,"done_us":159712513292}
+SHADOWv2 job=102 epoch=11 request=154 pos0=13950 anchor=539 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159712509363 decision_us=159712514008 work_us=51463 dec_us=48199 sel_us=3064 confirmed=[220,18,16] proposed=[220,18,16,1754,854,198,12]
+SHADOWACTIVE select job=102 epoch=11 request=154 pos0=13953 anchor=16 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13953,"anchor":16,"proposed":[1754,854,198,12],"start_us":159712513993,"done_us":159712514081,"cohort":1}
+SHADOWACTIVE accept job=102 request=154 pos0=13953 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13953,"anchor":16,"confirmed":[1754,854,198,12,31456],"draft_n":4,"replay":false,"done_us":159712568293}
+SHADOWv2 launch job=103 epoch=11 request=154 pos0=13958 anchor=31456 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13958,"anchor":31456,"proposed":[25],"start_us":159712568423,"done_us":159712575867,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13958,"anchor":31456,"confirmed":[25,12339],"draft_n":1,"replay":false,"done_us":159712621080}
+SHADOWv2 job=103 epoch=11 request=154 pos0=13958 anchor=31456 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=159712619740 decision_us=159712621508 work_us=51176 dec_us=48053 sel_us=2889 confirmed=[25,12339] proposed=[25,264,31456,271,9764,728,1353]
+SHADOWv2 launch job=104 epoch=11 request=154 pos0=13960 anchor=12339 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13960,"anchor":12339,"proposed":[539,220],"start_us":159712621495,"done_us":159712630172,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13960,"anchor":12339,"confirmed":[539,220,16],"draft_n":2,"replay":false,"done_us":159712720033}
+SHADOWv2 job=104 epoch=11 request=154 pos0=13960 anchor=12339 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159712685972 decision_us=159712720241 work_us=64024 dec_us=60125 sel_us=3523 confirmed=[539,220,16] proposed=[539,220,18,16,1754,854,271]
+SHADOWv2 launch job=105 epoch=11 request=154 pos0=13963 anchor=16 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13963,"anchor":16,"proposed":[18,16],"start_us":159712720235,"done_us":159712727232,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13963,"anchor":16,"confirmed":[18,16,1754],"draft_n":2,"replay":false,"done_us":159712779400}
+SHADOWv2 job=105 epoch=11 request=154 pos0=13963 anchor=16 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159712772680 decision_us=159712779839 work_us=52186 dec_us=47551 sel_us=4248 confirmed=[18,16,1754] proposed=[18,16,1754,854,271,9764,728]
+SHADOWACTIVE select job=105 epoch=11 request=154 pos0=13966 anchor=1754 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13966,"anchor":1754,"proposed":[854,271,9764,728],"start_us":159712779821,"done_us":159712779946,"cohort":1}
+SHADOWACTIVE accept job=105 request=154 pos0=13966 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13966,"anchor":1754,"confirmed":[854,271,9764,728,10229],"draft_n":4,"replay":false,"done_us":159712839461}
+SHADOWv2 launch job=106 epoch=11 request=154 pos0=13971 anchor=10229 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13971,"anchor":10229,"proposed":[279,1822],"start_us":159712839546,"done_us":159712846842,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13971,"anchor":10229,"confirmed":[279,2250],"draft_n":2,"replay":false,"done_us":159712897395}
+SHADOWv2 job=106 epoch=11 request=154 pos0=13971 anchor=10229 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=159712889486 decision_us=159712897724 work_us=49832 dec_us=46930 sel_us=2706 confirmed=[279,2250] proposed=[279,12261,25,271,332,51,9024]
+SHADOWv2 launch job=107 epoch=11 request=154 pos0=13973 anchor=2250 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13973,"anchor":2250,"proposed":[1822,17793],"start_us":159712897714,"done_us":159712906054,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13973,"anchor":2250,"confirmed":[1822,17793,25],"draft_n":2,"replay":false,"done_us":159712959131}
+SHADOWv2 job=107 epoch=11 request=154 pos0=13973 anchor=2250 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159712954436 decision_us=159712959636 work_us=56396 dec_us=52513 sel_us=3465 confirmed=[1822,17793,25] proposed=[1822,17793,25,271,332,51,9024]
+SHADOWACTIVE select job=107 epoch=11 request=154 pos0=13976 anchor=25 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13976,"anchor":25,"proposed":[271,332,51,9024],"start_us":159712959624,"done_us":159712959711,"cohort":1}
+SHADOWACTIVE accept job=107 request=154 pos0=13976 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13976,"anchor":25,"confirmed":[271,332,51,9024,220],"draft_n":4,"replay":false,"done_us":159713018901}
+SHADOWv2 launch job=108 epoch=11 request=154 pos0=13981 anchor=220 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13981,"anchor":220,"proposed":[16,25],"start_us":159713019041,"done_us":159713026885,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13981,"anchor":220,"confirmed":[16,25,35794],"draft_n":2,"replay":false,"done_us":159713076861}
+SHADOWv2 job=108 epoch=11 request=154 pos0=13981 anchor=220 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=159713066046 decision_us=159713077259 work_us=46844 dec_us=44210 sel_us=2513 confirmed=[16,25,35794] proposed=[16,25,351,63098,5215,332,198]
+SHADOWv2 launch job=109 epoch=11 request=154 pos0=13984 anchor=35794 n_max=7
+SHADOWv2 cancel job=109 epoch=11 request=154 pos0=13984 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13984,"anchor":35794,"proposed":[],"start_us":159713077251,"done_us":159713082487,"cohort":1}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13985,"token":23709,"done_us":159713131228}
+SHADOWv2 launch job=110 epoch=11 request=154 pos0=13985 anchor=23709 n_max=7
+SHADOWv2 cancel job=110 epoch=11 request=154 pos0=13985 reason=primary_aborted
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13985,"anchor":23709,"proposed":[],"start_us":159713131406,"done_us":159713138210,"cohort":1}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":13986,"token":494,"done_us":159713209612}
+SHADOWv2 launch job=111 epoch=11 request=154 pos0=13986 anchor=494 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13986,"anchor":494,"proposed":[220,17],"start_us":159713210067,"done_us":159713220445,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13986,"anchor":494,"confirmed":[220,17,15],"draft_n":2,"replay":false,"done_us":159713312427}
+0.47.028.569 I slot print_timing: id  0 | task 154 | n_gen =    140, tg =  45.20 t/s, tg_3s =  45.53 t/s
+SHADOWv2 job=111 epoch=11 request=154 pos0=13986 anchor=494 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159713275285 decision_us=159713312646 work_us=64383 dec_us=60761 sel_us=3147 confirmed=[220,17,15] proposed=[220,17,15,29922,310,220,18]
+SHADOWACTIVE select job=111 epoch=11 request=154 pos0=13989 anchor=15 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13989,"anchor":15,"proposed":[29922,310,220,18],"start_us":159713312641,"done_us":159713312685,"cohort":1}
+SHADOWACTIVE accept job=111 request=154 pos0=13989 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13989,"anchor":15,"confirmed":[29922,310,220,18,21],"draft_n":4,"replay":false,"done_us":159713364943}
+SHADOWv2 launch job=112 epoch=11 request=154 pos0=13994 anchor=21 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13994,"anchor":21,"proposed":[29922],"start_us":159713365079,"done_us":159713371445,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13994,"anchor":21,"confirmed":[29922,332],"draft_n":1,"replay":false,"done_us":159713412246}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13996,"anchor":332,"proposed":[198],"start_us":159713412399,"done_us":159713418930,"cohort":1}
+SHADOWv2 job=112 epoch=11 request=154 pos0=13994 anchor=21 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=159713421425 decision_us=159713412404 work_us=56210 dec_us=53722 sel_us=2378 confirmed=[29922,332] proposed=[29922,332,198,12,220,17,15]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13996,"anchor":332,"confirmed":[198,760],"draft_n":1,"replay":false,"done_us":159713461153}
+SHADOWv2 launch job=113 epoch=11 request=154 pos0=13998 anchor=760 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":13998,"anchor":760,"proposed":[9039],"start_us":159713461487,"done_us":159713468395,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":13998,"anchor":760,"confirmed":[9039,10695],"draft_n":1,"replay":false,"done_us":159713507148}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14000,"anchor":10695,"proposed":[264],"start_us":159713507345,"done_us":159713515565,"cohort":1}
+SHADOWv2 job=113 epoch=11 request=154 pos0=13998 anchor=760 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=159713515632 decision_us=159713507349 work_us=53956 dec_us=51512 sel_us=2281 confirmed=[9039,10695] proposed=[9039,23709,303,264,8097,5215,25]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14000,"anchor":10695,"confirmed":[264,38495],"draft_n":1,"replay":false,"done_us":159713557580}
+SHADOWv2 launch job=114 epoch=11 request=154 pos0=14002 anchor=38495 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14002,"anchor":38495,"proposed":[5215,25],"start_us":159713558093,"done_us":159713566359,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14002,"anchor":38495,"confirmed":[5215,25,220],"draft_n":2,"replay":false,"done_us":159713623206}
+SHADOWv2 job=114 epoch=11 request=154 pos0=14002 anchor=38495 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159713608143 decision_us=159713624506 work_us=49759 dec_us=44301 sel_us=3398 confirmed=[5215,25,220] proposed=[5215,25,220,17,15,11,220]
+SHADOWACTIVE select job=114 epoch=11 request=154 pos0=14005 anchor=220 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14005,"anchor":220,"proposed":[17,15,11,220],"start_us":159713624490,"done_us":159713624586,"cohort":1}
+SHADOWACTIVE accept job=114 request=154 pos0=14005 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14005,"anchor":220,"confirmed":[17,15,11,220,17],"draft_n":4,"replay":false,"done_us":159713682941}
+SHADOWv2 launch job=115 epoch=11 request=154 pos0=14010 anchor=17 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14010,"anchor":17,"proposed":[16,11],"start_us":159713683035,"done_us":159713689977,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14010,"anchor":17,"confirmed":[16,11,220],"draft_n":2,"replay":false,"done_us":159713739976}
+SHADOWv2 job=115 epoch=11 request=154 pos0=14010 anchor=17 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159713732408 decision_us=159713740309 work_us=49230 dec_us=46423 sel_us=2692 confirmed=[16,11,220] proposed=[16,11,220,17,17,11,220]
+SHADOWACTIVE select job=115 epoch=11 request=154 pos0=14013 anchor=220 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14013,"anchor":220,"proposed":[17,17,11,220],"start_us":159713740299,"done_us":159713740381,"cohort":1}
+SHADOWACTIVE accept job=115 request=154 pos0=14013 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14013,"anchor":220,"confirmed":[17,17,11,220,17],"draft_n":4,"replay":false,"done_us":159713795606}
+SHADOWv2 launch job=116 epoch=11 request=154 pos0=14018 anchor=17 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14018,"anchor":17,"proposed":[18,11],"start_us":159713795689,"done_us":159713802871,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14018,"anchor":17,"confirmed":[18,11,220],"draft_n":2,"replay":false,"done_us":159713852301}
+SHADOWv2 job=116 epoch=11 request=154 pos0=14018 anchor=17 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159713847127 decision_us=159713852831 work_us=51295 dec_us=47816 sel_us=3135 confirmed=[18,11,220] proposed=[18,11,220,17,19,11,220]
+SHADOWACTIVE select job=116 epoch=11 request=154 pos0=14021 anchor=220 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14021,"anchor":220,"proposed":[17,19,11,220],"start_us":159713852818,"done_us":159713852935,"cohort":1}
+SHADOWACTIVE accept job=116 request=154 pos0=14021 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14021,"anchor":220,"confirmed":[17,19,11,220,17],"draft_n":4,"replay":false,"done_us":159713910442}
+SHADOWv2 launch job=117 epoch=11 request=154 pos0=14026 anchor=17 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14026,"anchor":17,"proposed":[20,11],"start_us":159713910525,"done_us":159713917867,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14026,"anchor":17,"confirmed":[20,11,220],"draft_n":2,"replay":false,"done_us":159713964708}
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14029,"anchor":220,"proposed":[17,21],"start_us":159713964857,"done_us":159713972500,"cohort":1}
+SHADOWv2 job=117 epoch=11 request=154 pos0=14026 anchor=17 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=159713967590 decision_us=159713964862 work_us=56911 dec_us=54063 sel_us=2609 confirmed=[20,11,220] proposed=[20,11,220,17,21,11,220]
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14029,"anchor":220,"confirmed":[17,21,11],"draft_n":2,"replay":false,"done_us":159714020439}
+SHADOWv2 launch job=118 epoch=11 request=154 pos0=14032 anchor=11 n_max=7
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14032,"anchor":11,"proposed":[220,17],"start_us":159714020638,"done_us":159714027919,"cohort":1}
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14032,"anchor":11,"confirmed":[220,17,22],"draft_n":2,"replay":false,"done_us":159714076888}
+SHADOWv2 job=118 epoch=11 request=154 pos0=14032 anchor=11 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=159714065123 decision_us=159714078493 work_us=44215 dec_us=41103 sel_us=2878 confirmed=[220,17,22] proposed=[220,17,22,11,220,17,23]
+SHADOWACTIVE select job=118 epoch=11 request=154 pos0=14035 anchor=22 n=4
+SHADOWTRACE {"event":"draft","request":154,"slot":0,"pos0":14035,"anchor":22,"proposed":[11,220,17,23],"start_us":159714078479,"done_us":159714078631,"cohort":1}
+SHADOWACTIVE accept job=118 request=154 pos0=14035 proposed=4 accepted=4 confirmed=5
+SHADOWTRACE {"event":"commit","request":154,"slot":0,"pos0":14035,"anchor":22,"confirmed":[11,220,17,23,11],"draft_n":4,"replay":false,"done_us":159714136639}
+SHADOWTRACE {"event":"token","request":154,"slot":0,"pos":14041,"token":220,"done_us":159714176017}
+0.47.892.128 I slot print_timing: id  0 | task 154 | prompt eval time =   21754.09 ms / 13850 tokens (    1.57 ms per token,   636.66 tokens per second)
+0.47.892.133 I slot print_timing: id  0 | task 154 |        eval time =    3938.56 ms /   192 tokens (   20.62 ms per token,    48.49 tokens per second)
+0.47.892.134 I slot print_timing: id  0 | task 154 |       total time =   25692.65 ms / 14042 tokens
+0.47.892.137 I slot print_timing: id  0 | task 154 |    graphs reused =        196
+0.47.892.252 I slot print_timing: id  0 | task 154 | draft acceptance = 0.88971 (  121 accepted /   136 generated), mean len =  3.02
+0.47.892.282 I shadow active: selected=70 proposed=280 verified=70 accepted=212 cancelled=0 pending=0
+0.47.892.317 I shadow auxiliary: launched=118 skipped_busy=23 skipped_throttle=0 ready=92 late=13 prefix_match=80 prefix_mismatch=25 usable_blocks=70 usable_tokens=280 errors=0
+0.47.892.318 I shadow accounting: observed=105 cancelled=13 pending=0 skipped_invalid=0 epoch=11
+0.47.892.319 I shadow stages: worker_us=5729957 decode_us=5269343 selector_us=419637 inject_submit_us=834016 stage_us=206832 late_total_ms=58.3 late_max_ms=9.3
+SHADOWTRACE {"event":"end","request":154,"slot":0,"generated":192,"truncated":false}
+0.47.892.863 I slot      release: id  0 | task 154 | stop processing: n_tokens = 14041, truncated = 0
+0.47.896.014 I shadow active: selected=70 proposed=280 verified=70 accepted=212 cancelled=0 pending=0
+0.47.896.021 I shadow auxiliary: launched=118 skipped_busy=23 skipped_throttle=0 ready=92 late=13 prefix_match=80 prefix_mismatch=25 usable_blocks=70 usable_tokens=280 errors=0
+0.47.896.022 I shadow accounting: observed=105 cancelled=13 pending=0 skipped_invalid=0 epoch=12
+0.47.896.022 I shadow stages: worker_us=5729957 decode_us=5269343 selector_us=419637 inject_submit_us=834016 stage_us=206832 late_total_ms=58.3 late_max_ms=9.3
+0.47.909.550 I GPU memory clock: decode -> idle, reset (dynamic)
+0.47.910.452 I APU TDP: restored original limits
+0.47.920.908 I srv    operator(): operator(): cleaning up before exit...
+0.47.924.650 I shadow active: selected=70 proposed=280 verified=70 accepted=212 cancelled=0 pending=0
+0.47.924.671 I shadow auxiliary: launched=118 skipped_busy=23 skipped_throttle=0 ready=92 late=13 prefix_match=80 prefix_mismatch=25 usable_blocks=70 usable_tokens=280 errors=0
+0.47.924.671 I shadow accounting: observed=105 cancelled=13 pending=0 skipped_invalid=0 epoch=13
+0.47.924.681 I shadow stages: worker_us=5729957 decode_us=5269343 selector_us=419637 inject_submit_us=834016 stage_us=206832 late_total_ms=58.3 late_max_ms=9.3
+0.47.925.467 W ~llama_context: Vulkan_Host compute buffer size of   6.3399 MiB, does not match expectation of   1.6250 MiB

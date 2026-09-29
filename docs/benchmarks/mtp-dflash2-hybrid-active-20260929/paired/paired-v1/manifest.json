@@ -1,0 +1,386 @@
+{
+  "schema_version": 1,
+  "phase": "paired",
+  "run_id": "paired-v1",
+  "modes": {
+    "mtp4-v4": {
+      "mtp_max": 4,
+      "auxiliary": false,
+      "active": 0,
+      "every": 0,
+      "early": 0,
+      "min_suffix": 1,
+      "verifier_max": 4
+    },
+    "active-mtp2-v4-e1": {
+      "mtp_max": 2,
+      "auxiliary": true,
+      "active": 1,
+      "every": 1,
+      "early": 1,
+      "min_suffix": 1,
+      "verifier_max": 4
+    },
+    "active-mtp4-v4-e4-min3": {
+      "mtp_max": 4,
+      "auxiliary": true,
+      "active": 1,
+      "every": 4,
+      "early": 1,
+      "min_suffix": 3,
+      "verifier_max": 4
+    }
+  },
+  "repeats": 5,
+  "long_repeats": 5,
+  "group_size": 2,
+  "port": 59595,
+  "scripts_root": "/home/hjotha/beellama.cpp/docs/benchmarks/mtp-dflash2-hybrid-active-20260929",
+  "groups": [
+    {
+      "group": "g000-mtp4-v4",
+      "round": 0,
+      "mode": "mtp4-v4",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g001-active-mtp2-v4-e1",
+      "round": 0,
+      "mode": "active-mtp2-v4-e1",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g002-active-mtp4-v4-e4-min3",
+      "round": 0,
+      "mode": "active-mtp4-v4-e4-min3",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g003-active-mtp4-v4-e4-min3",
+      "round": 1,
+      "mode": "active-mtp4-v4-e4-min3",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g004-active-mtp2-v4-e1",
+      "round": 1,
+      "mode": "active-mtp2-v4-e1",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g005-mtp4-v4",
+      "round": 1,
+      "mode": "mtp4-v4",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g006-active-mtp2-v4-e1",
+      "round": 2,
+      "mode": "active-mtp2-v4-e1",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    },
+    {
+      "group": "g007-active-mtp4-v4-e4-min3",
+      "round": 2,
+      "mode": "active-mtp4-v4-e4-min3",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    },
+    {
+      "group": "g008-mtp4-v4",
+      "round": 2,
+      "mode": "mtp4-v4",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    }
+  ],
+  "argv": [
+    "docs/benchmarks/mtp-dflash2-hybrid-active-20260929/runner.py",
+    "paired",
+    "--run-id",
+    "paired-v1",
+    "--modes",
+    "mtp4-v4",
+    "active-mtp2-v4-e1",
+    "active-mtp4-v4-e4-min3"
+  ],
+  "created_utc": "2026-09-29T14:36:36.896037+00:00",
+  "comparison_policy": "Report every first token divergence; no equality assertion across depths or modes."
+}

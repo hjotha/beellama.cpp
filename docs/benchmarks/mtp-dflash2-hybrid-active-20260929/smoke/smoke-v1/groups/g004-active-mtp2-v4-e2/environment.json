@@ -1,0 +1,14 @@
+{
+  "CUDA_PATH": "/opt/cuda",
+  "PATH": "/home/hjotha/.bun/bin:/home/hjotha/.codex/packages/app-server-daemon/releases/0.159.0-x86_64-unknown-linux-musl/codex-path:/home/hjotha/.codex/tmp/arg0/codex-arg09wUN8j:/home/hjotha/.codex/tmp/arg0/codex-arg0YA17r8:/home/hjotha/.codex/packages/app-server-daemon/releases/0.158.0-x86_64-unknown-linux-musl/codex-path:/home/hjotha/.codex/tmp/arg0/codex-arg0CMQYqY:/home/hjotha/.codex/packages/standalone/releases/0.158.0-x86_64-unknown-linux-musl/codex-path:/home/hjotha/.bun/bin:/home/hjotha/.opencode/bin:/home/hjotha/.local/bin:/home/hjotha/.local/bin:/opt/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl:/opt/rocm/bin",
+  "LD_LIBRARY_PATH": "/home/hjotha/beellama.cpp/build/bin:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin",
+  "LD_PRELOAD": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-server-impl.so",
+  "GGML_BACKEND_PATH": "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so",
+  "GGML_DFLASH_SHADOW_PROF": "1",
+  "GGML_DFLASH_SHADOW_TRACE": "1",
+  "GGML_DFLASH_SHADOW_ACTIVE": "1",
+  "GGML_DFLASH_SHADOW_MTP_MAX": "2",
+  "GGML_DFLASH_SHADOW_EVERY": "2",
+  "GGML_DFLASH_SHADOW_EARLY": "1",
+  "GGML_DFLASH_SHADOW_MIN_SUFFIX": "1"
+}

@@ -1,0 +1,10 @@
+["python3", "-m", "unittest", "discover", "-s", "docs/benchmarks/mtp-dflash2-hybrid-active-20260929", "-p", "test_analyze_active.py", "-v"]
+test_bad_handoffs_are_rejected (test_analyze_active.ActiveAudit.test_bad_handoffs_are_rejected) ... ok
+test_partial_acceptance_and_primary_resume (test_analyze_active.ActiveAudit.test_partial_acceptance_and_primary_resume) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.011s
+
+OK
+
+exit_code=0

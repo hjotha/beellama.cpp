@@ -1,0 +1,52 @@
+{
+  "group": "g005-opt12",
+  "round": 1,
+  "mode": "opt12",
+  "requests": [
+    {
+      "case": "warmup64",
+      "repeat": null,
+      "scenario": "warmup64"
+    },
+    {
+      "case": "curto192",
+      "repeat": 2,
+      "scenario": "curto192-r002"
+    },
+    {
+      "case": "codigo192",
+      "repeat": 2,
+      "scenario": "codigo192-r002"
+    },
+    {
+      "case": "prosa192",
+      "repeat": 2,
+      "scenario": "prosa192-r002"
+    },
+    {
+      "case": "long192",
+      "repeat": 2,
+      "scenario": "long192-r002"
+    },
+    {
+      "case": "curto192",
+      "repeat": 3,
+      "scenario": "curto192-r003"
+    },
+    {
+      "case": "codigo192",
+      "repeat": 3,
+      "scenario": "codigo192-r003"
+    },
+    {
+      "case": "prosa192",
+      "repeat": 3,
+      "scenario": "prosa192-r003"
+    },
+    {
+      "case": "long192",
+      "repeat": 3,
+      "scenario": "long192-r003"
+    }
+  ]
+}

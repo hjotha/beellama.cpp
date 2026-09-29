@@ -1,0 +1,7 @@
+{
+  "errors": [],
+  "services_requiring_restore": [
+    "llama-server-root.service",
+    "qwen35-4b-mtp-8092.service"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "prompt": "Escreva os numeros inteiros de 1 a 200 separados por virgula, sem comentarios.",
+  "n_predict": 192,
+  "temperature": 0,
+  "seed": 42,
+  "ignore_eos": true,
+  "cache_prompt": false,
+  "stream": false,
+  "return_tokens": true
+}

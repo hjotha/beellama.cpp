@@ -1,0 +1,40 @@
+{
+  "mode": "opt2",
+  "group": "g012-opt2",
+  "round": 2,
+  "request_index": 4,
+  "case": "long192",
+  "scenario": "long192-r004",
+  "repeat": 4,
+  "warmup": false,
+  "n_predict": 192,
+  "config": {
+    "env": {
+      "SPEC_OPT_SINGLE_SYNC": "1"
+    },
+    "libs": "live",
+    "cuda": "live",
+    "server_args": []
+  },
+  "tdp_w": 20,
+  "context_size": 16384,
+  "prompt_n": 13850,
+  "prompt_ms": 20712.609,
+  "prompt_tps": 668.674815422818,
+  "predicted_n": 192,
+  "decode_tps": 59.01537025965218,
+  "decode_ms": 3236.445,
+  "wall_s": 23.964,
+  "token_count": 192,
+  "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+  "tokens_sha256": "351021b39b92631cda852c7d3c0187bf8140ba7f7a0713eae32bbcf3ddd5aac0",
+  "response_file": "groups/g012-opt2/long192-r004.response.json",
+  "tokens_file": "groups/g012-opt2/long192-r004.tokens.json",
+  "server_output": "groups/g012-opt2/server-output.txt",
+  "decode_ppt_w": 6.852,
+  "active_gpu_clock_mhz": null,
+  "peak_temp_c": 58.0,
+  "cpu_busy_mhz": 3109.992,
+  "cpu_util_pct": 7.406,
+  "telemetry_samples": 235
+}

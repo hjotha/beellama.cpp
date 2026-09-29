@@ -1,0 +1,310 @@
+[
+  {
+    "mode": "mtp-n4-before",
+    "tdp_w": 20,
+    "every": 0,
+    "early": 0,
+    "repeticao": {
+      "runs": 2,
+      "tps_median": 86.42,
+      "tps_min": 86.196,
+      "tps_max": 86.644,
+      "hashes_equal": true,
+      "content_sha256": "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8",
+      "hashes": [
+        "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8"
+      ]
+    },
+    "codigo": {
+      "runs": 2,
+      "tps_median": 59.929,
+      "tps_min": 59.806,
+      "tps_max": 60.053,
+      "hashes_equal": true,
+      "content_sha256": "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1",
+      "hashes": [
+        "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1"
+      ]
+    },
+    "longo": {
+      "runs": 1,
+      "tps_median": 58.262,
+      "tps_min": 58.262,
+      "tps_max": 58.262,
+      "hashes_equal": true,
+      "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+      "hashes": [
+        "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3"
+      ],
+      "prefill_tps": 686.28
+    },
+    "mean_decode_ppt_w": 8.15,
+    "mean_active_gpu_clock_mhz": null,
+    "mean_cpu_busy_mhz": 2943.51,
+    "peak_temp_c": 57.0
+  },
+  {
+    "mode": "shadow-n4",
+    "tdp_w": 20,
+    "every": 4,
+    "early": 1,
+    "repeticao": {
+      "runs": 2,
+      "tps_median": 81.246,
+      "tps_min": 81.186,
+      "tps_max": 81.305,
+      "hashes_equal": true,
+      "content_sha256": "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8",
+      "hashes": [
+        "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8"
+      ]
+    },
+    "codigo": {
+      "runs": 2,
+      "tps_median": 55.759,
+      "tps_min": 55.544,
+      "tps_max": 55.975,
+      "hashes_equal": true,
+      "content_sha256": "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1",
+      "hashes": [
+        "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1"
+      ]
+    },
+    "longo": {
+      "runs": 1,
+      "tps_median": 54.178,
+      "tps_min": 54.178,
+      "tps_max": 54.178,
+      "hashes_equal": true,
+      "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+      "hashes": [
+        "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3"
+      ],
+      "prefill_tps": 637.04
+    },
+    "mean_decode_ppt_w": 13.13,
+    "mean_active_gpu_clock_mhz": 2700.0,
+    "mean_cpu_busy_mhz": 2605.04,
+    "peak_temp_c": 67.0
+  },
+  {
+    "mode": "mtp-n3",
+    "tdp_w": 20,
+    "every": 0,
+    "early": 0,
+    "repeticao": {
+      "runs": 2,
+      "tps_median": 76.027,
+      "tps_min": 75.96,
+      "tps_max": 76.095,
+      "hashes_equal": true,
+      "content_sha256": "55b20c7c164130793ea58d03c214123eea80d4ed4def8e3dafd800d4cdc33ff4",
+      "hashes": [
+        "55b20c7c164130793ea58d03c214123eea80d4ed4def8e3dafd800d4cdc33ff4"
+      ]
+    },
+    "codigo": {
+      "runs": 2,
+      "tps_median": 58.113,
+      "tps_min": 57.926,
+      "tps_max": 58.301,
+      "hashes_equal": true,
+      "content_sha256": "bd1a517e481e65fdff0d1d82c528eec591d18ba49105cc97772c91032ee8608c",
+      "hashes": [
+        "bd1a517e481e65fdff0d1d82c528eec591d18ba49105cc97772c91032ee8608c"
+      ]
+    },
+    "longo": {
+      "runs": 1,
+      "tps_median": 54.944,
+      "tps_min": 54.944,
+      "tps_max": 54.944,
+      "hashes_equal": true,
+      "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+      "hashes": [
+        "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3"
+      ],
+      "prefill_tps": 683.99
+    },
+    "mean_decode_ppt_w": 8.2,
+    "mean_active_gpu_clock_mhz": null,
+    "mean_cpu_busy_mhz": 2951.18,
+    "peak_temp_c": 61.0
+  },
+  {
+    "mode": "shadow-n3",
+    "tdp_w": 20,
+    "every": 4,
+    "early": 1,
+    "repeticao": {
+      "runs": 2,
+      "tps_median": 71.807,
+      "tps_min": 71.759,
+      "tps_max": 71.856,
+      "hashes_equal": true,
+      "content_sha256": "55b20c7c164130793ea58d03c214123eea80d4ed4def8e3dafd800d4cdc33ff4",
+      "hashes": [
+        "55b20c7c164130793ea58d03c214123eea80d4ed4def8e3dafd800d4cdc33ff4"
+      ]
+    },
+    "codigo": {
+      "runs": 2,
+      "tps_median": 53.923,
+      "tps_min": 53.414,
+      "tps_max": 54.433,
+      "hashes_equal": true,
+      "content_sha256": "bd1a517e481e65fdff0d1d82c528eec591d18ba49105cc97772c91032ee8608c",
+      "hashes": [
+        "bd1a517e481e65fdff0d1d82c528eec591d18ba49105cc97772c91032ee8608c"
+      ]
+    },
+    "longo": {
+      "runs": 1,
+      "tps_median": 50.743,
+      "tps_min": 50.743,
+      "tps_max": 50.743,
+      "hashes_equal": true,
+      "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+      "hashes": [
+        "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3"
+      ],
+      "prefill_tps": 635.67
+    },
+    "mean_decode_ppt_w": 13.37,
+    "mean_active_gpu_clock_mhz": 2689.44,
+    "mean_cpu_busy_mhz": 2550.48,
+    "peak_temp_c": 68.0
+  },
+  {
+    "mode": "mtp-n2",
+    "tdp_w": 20,
+    "every": 0,
+    "early": 0,
+    "repeticao": {
+      "runs": 2,
+      "tps_median": 67.29,
+      "tps_min": 67.19,
+      "tps_max": 67.391,
+      "hashes_equal": true,
+      "content_sha256": "55b20c7c164130793ea58d03c214123eea80d4ed4def8e3dafd800d4cdc33ff4",
+      "hashes": [
+        "55b20c7c164130793ea58d03c214123eea80d4ed4def8e3dafd800d4cdc33ff4"
+      ]
+    },
+    "codigo": {
+      "runs": 2,
+      "tps_median": 57.358,
+      "tps_min": 57.059,
+      "tps_max": 57.656,
+      "hashes_equal": true,
+      "content_sha256": "f582cdd96564e68e907680072ab2682a54241fcd2b783961a7419f176502010a",
+      "hashes": [
+        "f582cdd96564e68e907680072ab2682a54241fcd2b783961a7419f176502010a"
+      ]
+    },
+    "longo": {
+      "runs": 1,
+      "tps_median": 51.282,
+      "tps_min": 51.282,
+      "tps_max": 51.282,
+      "hashes_equal": true,
+      "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+      "hashes": [
+        "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3"
+      ],
+      "prefill_tps": 682.03
+    },
+    "mean_decode_ppt_w": 8.47,
+    "mean_active_gpu_clock_mhz": null,
+    "mean_cpu_busy_mhz": 2955.79,
+    "peak_temp_c": 63.0
+  },
+  {
+    "mode": "shadow-n2",
+    "tdp_w": 20,
+    "every": 4,
+    "early": 1,
+    "repeticao": {
+      "runs": 2,
+      "tps_median": 62.356,
+      "tps_min": 62.252,
+      "tps_max": 62.46,
+      "hashes_equal": true,
+      "content_sha256": "55b20c7c164130793ea58d03c214123eea80d4ed4def8e3dafd800d4cdc33ff4",
+      "hashes": [
+        "55b20c7c164130793ea58d03c214123eea80d4ed4def8e3dafd800d4cdc33ff4"
+      ]
+    },
+    "codigo": {
+      "runs": 2,
+      "tps_median": 52.799,
+      "tps_min": 52.788,
+      "tps_max": 52.81,
+      "hashes_equal": true,
+      "content_sha256": "f582cdd96564e68e907680072ab2682a54241fcd2b783961a7419f176502010a",
+      "hashes": [
+        "f582cdd96564e68e907680072ab2682a54241fcd2b783961a7419f176502010a"
+      ]
+    },
+    "longo": {
+      "runs": 1,
+      "tps_median": 47.192,
+      "tps_min": 47.192,
+      "tps_max": 47.192,
+      "hashes_equal": true,
+      "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+      "hashes": [
+        "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3"
+      ],
+      "prefill_tps": 637.15
+    },
+    "mean_decode_ppt_w": 14.06,
+    "mean_active_gpu_clock_mhz": 2700.0,
+    "mean_cpu_busy_mhz": 2500.65,
+    "peak_temp_c": 69.0
+  },
+  {
+    "mode": "mtp-n4-after",
+    "tdp_w": 20,
+    "every": 0,
+    "early": 0,
+    "repeticao": {
+      "runs": 2,
+      "tps_median": 85.795,
+      "tps_min": 85.725,
+      "tps_max": 85.864,
+      "hashes_equal": true,
+      "content_sha256": "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8",
+      "hashes": [
+        "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8"
+      ]
+    },
+    "codigo": {
+      "runs": 2,
+      "tps_median": 60.021,
+      "tps_min": 59.999,
+      "tps_max": 60.044,
+      "hashes_equal": true,
+      "content_sha256": "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1",
+      "hashes": [
+        "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1"
+      ]
+    },
+    "longo": {
+      "runs": 1,
+      "tps_median": 58.384,
+      "tps_min": 58.384,
+      "tps_max": 58.384,
+      "hashes_equal": true,
+      "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+      "hashes": [
+        "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3"
+      ],
+      "prefill_tps": 676.79
+    },
+    "mean_decode_ppt_w": 9.09,
+    "mean_active_gpu_clock_mhz": null,
+    "mean_cpu_busy_mhz": 2978.57,
+    "peak_temp_c": 65.0
+  }
+]

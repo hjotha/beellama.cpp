@@ -1,0 +1,11 @@
+["python3", "-m", "unittest", "discover", "-s", "docs/benchmarks/mtp-dflash2-suffix-dense-20260929", "-p", "test_analyze.py", "-v"]
+test_compares_next_round_including_bonus (test_analyze.SuffixAnalysis.test_compares_next_round_including_bonus) ... ok
+test_missing_is_censored (test_analyze.SuffixAnalysis.test_missing_is_censored) ... ok
+test_request_scoping_and_conflicts (test_analyze.SuffixAnalysis.test_request_scoping_and_conflicts) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK
+
+exit_code=0

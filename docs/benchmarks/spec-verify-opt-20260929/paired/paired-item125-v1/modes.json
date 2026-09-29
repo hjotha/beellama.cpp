@@ -1,0 +1,5 @@
+{"base-snap": {"env": {}, "libs": "snapshot", "cuda": "snapshot"},
+ "base-live": {"env": {}, "libs": "live", "cuda": "live"},
+ "opt1":      {"env": {"SPEC_OPT_LAZY_SNAPSHOT": "1"}, "libs": "live", "cuda": "live"},
+ "opt2":      {"env": {"SPEC_OPT_SINGLE_SYNC": "1"}, "libs": "live", "cuda": "live"},
+ "opt12":     {"env": {"SPEC_OPT_LAZY_SNAPSHOT": "1", "SPEC_OPT_SINGLE_SYNC": "1"}, "libs": "live", "cuda": "live"}}

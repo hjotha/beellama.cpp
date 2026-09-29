@@ -50,9 +50,42 @@ def main() -> None:
     require(verify_start >= 0 and verify_end >= 0, "speculative verification block not found")
     verify = source[verify_start:verify_end]
 
+    # The sampler/loop-guard snapshot is now conditional on a checkpoint restore
+    # being reachable. The safety property is unchanged and must hold statically:
+    #   (a) the reachability decision is made with the WORST-CASE rollback (n_draft)
+    #       via server_speculative_rollback_requires_checkpoint, BEFORE the sampler
+    #       is mutated by sampling;
+    #   (b) the snapshot (sampler clone + loop-guard/counter/stop saves) is taken
+    #       exactly when that decision says a restore may be needed;
+    #   (c) the rollback branch asserts the snapshot exists and restores every field.
+    decision = verify.find("server_speculative_rollback_requires_checkpoint(")
+    require(decision >= 0, "checkpoint reachability must be decided in the verify block")
     require(
-        "const server_loop_guard loop_guard_save = slot.loop_guard;" in verify,
+        "may_need_ckpt_restore" in verify,
+        "the snapshot decision must be captured before sampling",
+    )
+    sample_call = verify.find("common_sampler_sample_and_accept_n(")
+    require(sample_call >= 0, "speculative sampling call not found")
+    require(
+        decision < sample_call,
+        "checkpoint reachability must be decided BEFORE the sampler is mutated",
+    )
+
+    clone_gate = verify.find("common_sampler_ptr smpl_save(may_need_ckpt_restore ?")
+    require(clone_gate >= 0, "sampler clone must be gated by may_need_ckpt_restore")
+    require(clone_gate < sample_call, "the sampler snapshot must precede sampling")
+
+    require(
+        "server_loop_guard loop_guard_save;" in verify
+        and "loop_guard_save = slot.loop_guard;" in verify,
         "speculative verification must snapshot loop-guard state before sampler acceptance",
+    )
+    guard_assign = verify.find("loop_guard_save = slot.loop_guard;")
+    require(guard_assign < sample_call, "loop-guard snapshot must precede sampling")
+
+    require(
+        "GGML_ASSERT(may_need_ckpt_restore && smpl_save != nullptr);" in verify,
+        "the rollback branch must assert the conditional snapshot was taken",
     )
     sampler_restore = verify.find("common_sampler_copy(smpl_save.get(), slot.smpl.get());")
     require(sampler_restore >= 0, "speculative checkpoint rollback must restore the sampler")

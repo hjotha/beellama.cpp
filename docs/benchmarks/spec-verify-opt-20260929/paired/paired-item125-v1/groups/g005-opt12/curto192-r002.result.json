@@ -1,0 +1,41 @@
+{
+  "mode": "opt12",
+  "group": "g005-opt12",
+  "round": 1,
+  "request_index": 1,
+  "case": "curto192",
+  "scenario": "curto192-r002",
+  "repeat": 2,
+  "warmup": false,
+  "n_predict": 192,
+  "config": {
+    "env": {
+      "SPEC_OPT_LAZY_SNAPSHOT": "1",
+      "SPEC_OPT_SINGLE_SYNC": "1"
+    },
+    "libs": "live",
+    "cuda": "live",
+    "server_args": []
+  },
+  "tdp_w": 20,
+  "context_size": 16384,
+  "prompt_n": 25,
+  "prompt_ms": 214.126,
+  "prompt_tps": 116.75368708143803,
+  "predicted_n": 192,
+  "decode_tps": 87.55491664405214,
+  "decode_ms": 2181.488,
+  "wall_s": 2.399,
+  "token_count": 192,
+  "content_sha256": "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8",
+  "tokens_sha256": "2a125889f5e21acbfb81de108496696a897e6c27137de0b29549ea4a6239c8f7",
+  "response_file": "groups/g005-opt12/curto192-r002.response.json",
+  "tokens_file": "groups/g005-opt12/curto192-r002.tokens.json",
+  "server_output": "groups/g005-opt12/server-output.txt",
+  "decode_ppt_w": 6.528,
+  "active_gpu_clock_mhz": null,
+  "peak_temp_c": 53.0,
+  "cpu_busy_mhz": 3092.208,
+  "cpu_util_pct": 7.436,
+  "telemetry_samples": 23
+}

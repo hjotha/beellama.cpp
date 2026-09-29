@@ -1,0 +1,38 @@
+{
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7",
+    "sha256": "c25f63ad830276ea6db9b9e5b6ae7c1cba6be2fccf6990ed5ff0da8e19ef5bfe"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-server-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-server-impl.so",
+    "sha256": "ef637e59dc215216a2c7dd0386497417f4b614f4cfbdecd2107ccee84f52c871"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7",
+    "sha256": "7695238cbc1416d1fa11d86ed10705e7cda0142d089d2422ef1806daf71d0955"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-base.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-base.so.0.23.0",
+    "sha256": "5de029414ced287ff59599adf1bb199082f9da822fc329cdf84f31a4ad356c56"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cpu.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cpu.so.0.23.0",
+    "sha256": "e38e474797f49ab9f613b32aef754afd056b2c2bdb24879daed8aa18f53ffb26"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so.0.23.0",
+    "sha256": "f5e5c2fca6d929249a080e44145876e94715673d67a4fd0bdcc2d937681e1639"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml.so.0.23.0",
+    "sha256": "17a1d0ed2a886ec2ce815212dc7537533ed397db16c80b984681f6fcceef79b4"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.7",
+    "sha256": "40099baf2b2a197e1e10c2f5f286395030524188a38b214965a1c36af0293475"
+  }
+}

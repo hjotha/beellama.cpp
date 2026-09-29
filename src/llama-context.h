@@ -466,6 +466,14 @@ private:
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
+    // True when no backend graph has been submitted since the last synchronize()
+    // barrier, i.e. the output tensors are already resident on the host. Reset to
+    // false at the single async submission point (graph_compute) and set back to
+    // true after the barrier, so synchronize() can skip the redundant barrier that
+    // every output getter would otherwise re-trigger within one sampling pass.
+    // Not derived from n_queued_tokens: it tracks the scheduler barrier directly.
+    mutable bool outputs_synced = true;
+
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
 

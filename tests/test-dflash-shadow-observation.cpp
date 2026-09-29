@@ -211,7 +211,82 @@ static void test_capacity_clamp() {
     }
 }
 
+static void test_environment_and_cadence() {
+    const char * every_name = "GGML_DFLASH_SHADOW_EVERY";
+    assert(dflash_shadow_env_integer(every_name, nullptr, 1, 100) == 1);
+    assert(dflash_shadow_env_integer(every_name, "0", 1, 100) == 0);
+    assert(dflash_shadow_env_integer(every_name, "4", 1, 100) == 4);
+    for (const char * value : {"", "-1", "four", "4junk", "101", "9999999999999999999999999"}) {
+        bool rejected = false;
+        try { dflash_shadow_env_integer(every_name, value, 1, 100); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        assert(rejected);
+    }
+    const char * early_name = "GGML_DFLASH_SHADOW_EARLY";
+    assert(dflash_shadow_env_integer(early_name, nullptr, 0, 1) == 0);
+    assert(dflash_shadow_env_integer(early_name, "1", 0, 1) == 1);
+    bool rejected = false;
+    try { dflash_shadow_env_integer(early_name, "2", 0, 1); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    assert(rejected);
+
+    uint64_t disabled = 0;
+    for (int i = 0; i < 16; ++i) assert(!dflash_shadow_schedule_due(0, disabled));
+    assert(disabled == 0); // sync-only never generates a block
+
+    const bool primary_proposed[] = {true, true, false, true, false, true, true, true,
+                                    true, false, true, true, true, true, false, true};
+    uint64_t early_attempt = 0, late_attempt = 0;
+    std::vector<int> early_committed, late_launched;
+    int early_cancelled = 0;
+    for (int i = 0; i < 16; ++i) {
+        const bool early = dflash_shadow_schedule_due(4, early_attempt);
+        const bool late = dflash_shadow_schedule_due(4, late_attempt);
+        assert(early == (i % 4 == 0));
+        if (early && primary_proposed[i]) early_committed.push_back(i);
+        if (early && !primary_proposed[i]) ++early_cancelled;
+        if (late && primary_proposed[i]) late_launched.push_back(i);
+    }
+    assert((late_launched == std::vector<int>{0, 8, 12}));
+    assert(early_committed == late_launched && early_cancelled == 1);
+    assert(early_attempt == 16 && late_attempt == 16);
+}
+
+static void test_active_suffix_selection() {
+    auto obs = observation();
+    assert(obs.suffix(9, 102, 12, 1).empty());
+    obs.finish({11, 12, 13, 14, 15, 16, 17}, 80);
+    obs.commit({11, 12});
+    obs.decide(102, 12, 4, 100); // verifier can accept 4, even with MTP depth 2
+    assert((obs.suffix(9, 102, 12, 3) == std::vector<int32_t>{13, 14, 15, 16}));
+    assert(obs.suffix(10, 102, 12, 1).empty()); // another request/epoch
+    assert(obs.suffix(9, 103, 12, 1).empty());  // later anchor
+    assert(obs.suffix(9, 102, 99, 1).empty());
+    assert(obs.suffix(9, 102, 12, 5).empty());  // minimum applies after capacity clamp
+    assert(obs.suffix(9, 102, 12, 0).empty());
+    auto owned = obs.suffix(9, 102, 12, 1);
+    obs = {}; // the dispatcher retires each observation after its first decision
+    assert(obs.suffix(9, 102, 12, 1).empty());
+    assert((owned == std::vector<int32_t>{13, 14, 15, 16}));
+
+    auto late = observation();
+    late.commit({11, 12});
+    late.decide(102, 12, 4, 100);
+    late.finish({11, 12, 13, 14, 15, 16}, 101);
+    assert(late.suffix(9, 102, 12, 1).empty());
+    late.decide(102, 12, 4, 200);
+    assert(late.suffix(9, 102, 12, 1).empty());
+
+    auto wrong_bonus = observation();
+    wrong_bonus.finish({11, 90, 13, 14, 15, 16}, 80);
+    wrong_bonus.commit({11, 12});
+    wrong_bonus.decide(102, 12, 4, 100);
+    assert(wrong_bonus.suffix(9, 102, 12, 1).empty());
+}
+
 int main() {
+    test_active_suffix_selection();
+    test_environment_and_cadence();
     test_defaults();
     test_full_acceptance_and_bonus();
     test_partial_rejection_and_replacement_bonus();

@@ -1,0 +1,142 @@
+{
+  "schema_version": 2,
+  "phase": "smoke",
+  "run_id": "smoke-item6-v1",
+  "modes": {
+    "base-snap": {
+      "env": {},
+      "libs": "snapshot",
+      "cuda": "snapshot",
+      "server_args": []
+    },
+    "gdn-gather": {
+      "env": {},
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    },
+    "gdn-rows": {
+      "env": {
+        "GGML_GDN_CUDA_ROWS": "1"
+      },
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    }
+  },
+  "repeats": 1,
+  "long_repeats": 1,
+  "group_size": 2,
+  "port": 59595,
+  "scripts_root": "/home/hjotha/beellama.cpp/docs/benchmarks/spec-verify-opt-20260929",
+  "modes_json": "/home/hjotha/beellama.cpp/docs/benchmarks/spec-verify-opt-20260929/modes-item6.json",
+  "snapshot_root": "/home/hjotha/beellama-baseline-spec-verify-20260929",
+  "groups": [
+    {
+      "group": "g000-base-snap",
+      "round": 0,
+      "mode": "base-snap",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        }
+      ]
+    },
+    {
+      "group": "g001-gdn-gather",
+      "round": 0,
+      "mode": "gdn-gather",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        }
+      ]
+    },
+    {
+      "group": "g002-gdn-rows",
+      "round": 0,
+      "mode": "gdn-rows",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        }
+      ]
+    }
+  ],
+  "argv": [
+    "runner.py",
+    "smoke",
+    "--run-id",
+    "smoke-item6-v1",
+    "--modes-json",
+    "modes-item6.json"
+  ],
+  "created_utc": "2026-09-29T17:26:07.577104+00:00",
+  "comparison_policy": "Report every first token divergence; investigate before attributing to noise."
+}

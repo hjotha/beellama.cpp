@@ -1,0 +1,129 @@
+{
+  "modes": {
+    "early-off": {
+      "counts": {
+        "launched": 103,
+        "skipped_busy": 0,
+        "skipped_throttle": 350,
+        "ready": 87,
+        "late": 14,
+        "prefix_match": 76,
+        "prefix_mismatch": 25,
+        "usable_blocks": 67,
+        "usable_tokens": 172,
+        "errors": 0
+      },
+      "accounting": {
+        "observed": 101,
+        "cancelled": 2,
+        "pending": 0,
+        "skipped_invalid": 0,
+        "epoch": 28
+      },
+      "cancelled_primary": 0,
+      "excluding_warmup": {
+        "observed": 96,
+        "ready": 85,
+        "usable": 65
+      }
+    },
+    "early-on": {
+      "counts": {
+        "launched": 117,
+        "skipped_busy": 0,
+        "skipped_throttle": 350,
+        "ready": 97,
+        "late": 4,
+        "prefix_match": 76,
+        "prefix_mismatch": 25,
+        "usable_blocks": 73,
+        "usable_tokens": 194,
+        "errors": 0
+      },
+      "accounting": {
+        "observed": 101,
+        "cancelled": 16,
+        "pending": 0,
+        "skipped_invalid": 0,
+        "epoch": 28
+      },
+      "cancelled_primary": 14,
+      "excluding_warmup": {
+        "observed": 96,
+        "ready": 92,
+        "usable": 70
+      }
+    },
+    "empty-primary-early-on": {
+      "counts": {
+        "launched": 223,
+        "skipped_busy": 211,
+        "skipped_throttle": 0,
+        "ready": 2,
+        "late": 0,
+        "prefix_match": 2,
+        "prefix_mismatch": 0,
+        "usable_blocks": 2,
+        "usable_tokens": 8,
+        "errors": 0
+      },
+      "accounting": {
+        "observed": 2,
+        "cancelled": 221,
+        "pending": 0,
+        "skipped_invalid": 0,
+        "epoch": 10
+      },
+      "cancelled_primary": 221,
+      "excluding_warmup": {
+        "observed": 2,
+        "ready": 2,
+        "usable": 2
+      }
+    },
+    "sync-only-early-on": {
+      "counts": {
+        "launched": 0,
+        "skipped_busy": 0,
+        "skipped_throttle": 129,
+        "ready": 0,
+        "late": 0,
+        "prefix_match": 0,
+        "prefix_mismatch": 0,
+        "usable_blocks": 0,
+        "usable_tokens": 0,
+        "errors": 0
+      },
+      "accounting": {
+        "observed": 0,
+        "cancelled": 0,
+        "pending": 0,
+        "skipped_invalid": 0,
+        "epoch": 10
+      },
+      "cancelled_primary": 0,
+      "excluding_warmup": {
+        "observed": 0,
+        "ready": 0,
+        "usable": 0
+      }
+    }
+  },
+  "paired_comparison": {
+    "paired_anchors": 101,
+    "only_off": 0,
+    "only_on": 0,
+    "off": {
+      "ready": 87,
+      "prefix_ok": 76,
+      "usable": 67,
+      "usable_tokens": 172
+    },
+    "on": {
+      "ready": 97,
+      "prefix_ok": 76,
+      "usable": 73,
+      "usable_tokens": 194
+    }
+  }
+}

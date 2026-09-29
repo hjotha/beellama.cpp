@@ -1,0 +1,95 @@
+0.00.724.148 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.725.604 I srv          init: The UI is disabled
+0.00.725.606 I srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+0.00.726.127 W srv  llama_server: -----------------
+0.00.726.128 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.726.129 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.726.130 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.726.130 W srv  llama_server: -----------------
+0.00.728.186 I srv    load_model: loading model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.11.540.037 I cmn          init: llama threadpool init, n_threads = 8
+0.11.649.452 I common_speculative_init_result: creating MTP draft context against the target model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.11.658.136 I common_speculative_init_result: loading shadow auxiliary model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf'
+0.12.909.190 W llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+0.12.922.283 I common_speculative_init_result: shadow auxiliary context ready (model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf', n_max 7); observation pipeline pending
+0.12.923.655 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 16384, kv_unified = 'false', elastic_paged_context = false
+0.12.924.373 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dflash'
+0.12.924.378 I common_speculative_impl_draft_dflash: DFlash2 uses its fixed block limit and selector confidence; Bee adaptive draft-max is disabled
+0.12.924.381 I common_speculative_impl_draft_dflash: - n_max=7, n_min=0, p_min=0.00
+0.12.924.382 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=248070, n_extract=5, sample_from_anchor=true, lineage=dflash
+0.12.924.442 W llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+0.12.924.622 W llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+0.12.926.464 I common_speculative_impl_draft_dflash: DFlash2 explicit local split enabled
+0.12.926.470 I common_speculative_init: shadow auxiliary drafter registered (observation only; proposals are never selected, every=0, early=1)
+0.12.928.368 I AMDGPU governor: card /sys/class/drm/card1, original level auto, SCLK range 800-2700 MHz
+detected compatible ryzen_smu kernel module
+0.12.941.821 I APU TDP: original STAPM/fast/slow limits 8000/20000/15000 mW
+0.12.941.823 I GPU governor enabled
+0.12.941.823 I   device: AMDGPU /sys/class/drm/card1 (sysfs)
+0.12.941.823 I   device index: 0
+0.12.941.823 I   active APU TDP: 20 W
+0.12.941.824 I   decode memory clock: 2700 MHz
+0.12.941.824 I   prefill memory clock: 2700 MHz
+0.12.949.342 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.12.949.520 I srv  llama_server: model loaded
+0.12.949.525 I srv  llama_server: listening on http://127.0.0.1:59589
+0.13.116.729 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+0.13.116.846 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.13.117.358 I APU TDP: active limit 20 W
+0.13.118.819 I GPU memory clock: idle -> prefill, locked 2700 MHz
+0.14.775.753 I slot print_timing: id  0 | task 0 | prompt eval time =     472.52 ms /    28 tokens (   16.88 ms per token,    59.26 tokens per second)
+0.14.775.762 I slot print_timing: id  0 | task 0 |        eval time =    1184.24 ms /    64 tokens (   18.80 ms per token,    53.20 tokens per second)
+0.14.775.764 I slot print_timing: id  0 | task 0 |       total time =    1656.76 ms /    92 tokens
+0.14.775.812 I slot print_timing: id  0 | task 0 |    graphs reused =          9
+0.14.775.818 I slot print_timing: id  0 | task 0 | draft acceptance = 0.71429 (   40 accepted /    56 generated), mean len =  3.11
+0.14.775.922 I shadow auxiliary: launched=0 skipped_busy=0 skipped_throttle=22 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.14.775.923 I shadow accounting: observed=0 cancelled=0 pending=0 skipped_invalid=0 epoch=2
+0.14.775.923 I shadow stages: worker_us=0 decode_us=0 selector_us=0 inject_submit_us=41957 stage_us=1574 late_total_ms=0.0 late_max_ms=0.0
+0.14.776.425 I slot      release: id  0 | task 0 | stop processing: n_tokens = 91, truncated = 0
+0.14.777.773 I shadow auxiliary: launched=0 skipped_busy=0 skipped_throttle=22 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.14.777.775 I shadow accounting: observed=0 cancelled=0 pending=0 skipped_invalid=0 epoch=3
+0.14.777.776 I shadow stages: worker_us=0 decode_us=0 selector_us=0 inject_submit_us=41957 stage_us=1574 late_total_ms=0.0 late_max_ms=0.0
+0.14.791.515 I GPU memory clock: decode -> idle, reset (dynamic)
+0.14.792.904 I APU TDP: restored original limits
+0.14.819.477 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 156159415600
+0.14.819.551 I slot launch_slot_: id  0 | task 27 | processing task, is_child = 0
+0.14.820.526 I APU TDP: active limit 20 W
+0.14.821.462 I GPU memory clock: idle -> prefill, locked 2700 MHz
+0.17.294.127 I slot print_timing: id  0 | task 27 | prompt eval time =     220.44 ms /    25 tokens (    8.82 ms per token,   113.41 tokens per second)
+0.17.294.136 I slot print_timing: id  0 | task 27 |        eval time =    2252.19 ms /   192 tokens (   11.79 ms per token,    84.81 tokens per second)
+0.17.294.137 I slot print_timing: id  0 | task 27 |       total time =    2472.63 ms /   217 tokens
+0.17.294.140 I slot print_timing: id  0 | task 27 |    graphs reused =         41
+0.17.294.145 I slot print_timing: id  0 | task 27 | draft acceptance = 0.98667 (  148 accepted /   150 generated), mean len =  4.61
+0.17.294.185 I shadow auxiliary: launched=0 skipped_busy=0 skipped_throttle=64 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.17.294.185 I shadow accounting: observed=0 cancelled=0 pending=0 skipped_invalid=0 epoch=5
+0.17.294.185 I shadow stages: worker_us=0 decode_us=0 selector_us=0 inject_submit_us=65847 stage_us=4080 late_total_ms=0.0 late_max_ms=0.0
+0.17.294.572 I slot      release: id  0 | task 27 | stop processing: n_tokens = 216, truncated = 0
+0.17.296.287 I shadow auxiliary: launched=0 skipped_busy=0 skipped_throttle=64 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.17.296.292 I shadow accounting: observed=0 cancelled=0 pending=0 skipped_invalid=0 epoch=6
+0.17.296.293 I shadow stages: worker_us=0 decode_us=0 selector_us=0 inject_submit_us=65847 stage_us=4080 late_total_ms=0.0 late_max_ms=0.0
+0.17.309.452 I GPU memory clock: decode -> idle, reset (dynamic)
+0.17.310.920 I APU TDP: restored original limits
+0.17.328.244 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 156161933747
+0.17.328.338 I slot launch_slot_: id  0 | task 73 | processing task, is_child = 0
+0.17.328.890 I APU TDP: active limit 20 W
+0.17.330.805 I GPU memory clock: idle -> prefill, locked 2700 MHz
+0.20.565.445 I slot print_timing: id  0 | task 73 | n_gen =    180, tg =  59.15 t/s, tg_3s =  59.48 t/s
+0.20.810.621 I slot print_timing: id  0 | task 73 | prompt eval time =     208.50 ms /    28 tokens (    7.45 ms per token,   134.29 tokens per second)
+0.20.810.628 I slot print_timing: id  0 | task 73 |        eval time =    3271.29 ms /   192 tokens (   17.13 ms per token,    58.39 tokens per second)
+0.20.810.629 I slot print_timing: id  0 | task 73 |       total time =    3479.78 ms /   220 tokens
+0.20.810.631 I slot print_timing: id  0 | task 73 |    graphs reused =         64
+0.20.810.636 I slot print_timing: id  0 | task 73 | draft acceptance = 0.78125 (  125 accepted /   160 generated), mean len =  3.19
+0.20.810.741 I shadow auxiliary: launched=0 skipped_busy=0 skipped_throttle=129 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.20.810.742 I shadow accounting: observed=0 cancelled=0 pending=0 skipped_invalid=0 epoch=8
+0.20.810.743 I shadow stages: worker_us=0 decode_us=0 selector_us=0 inject_submit_us=100193 stage_us=7254 late_total_ms=0.0 late_max_ms=0.0
+0.20.810.779 I slot      release: id  0 | task 73 | stop processing: n_tokens = 219, truncated = 0
+0.20.812.363 I shadow auxiliary: launched=0 skipped_busy=0 skipped_throttle=129 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.20.812.364 I shadow accounting: observed=0 cancelled=0 pending=0 skipped_invalid=0 epoch=9
+0.20.812.365 I shadow stages: worker_us=0 decode_us=0 selector_us=0 inject_submit_us=100193 stage_us=7254 late_total_ms=0.0 late_max_ms=0.0
+0.20.825.824 I GPU memory clock: decode -> idle, reset (dynamic)
+0.20.826.635 I APU TDP: restored original limits
+0.20.834.929 I srv    operator(): operator(): cleaning up before exit...
+0.20.839.141 I shadow auxiliary: launched=0 skipped_busy=0 skipped_throttle=129 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.20.839.143 I shadow accounting: observed=0 cancelled=0 pending=0 skipped_invalid=0 epoch=10
+0.20.839.144 I shadow stages: worker_us=0 decode_us=0 selector_us=0 inject_submit_us=100193 stage_us=7254 late_total_ms=0.0 late_max_ms=0.0
+0.20.839.925 W ~llama_context: Vulkan_Host compute buffer size of   2.4336 MiB, does not match expectation of   1.6250 MiB
