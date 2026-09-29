@@ -507,6 +507,16 @@ extern "C" {
         // see tools/kv-mean-center to generate this file and docs/kv-mean-center.md for details.
         const char * path_kv_mean_center;
 
+        // Remote KV+attention accelerator (Xbox RKVA). When remote_attn_host is
+        // non-null, the full-attention layers of supported archs (qwen35) run
+        // their KV cache + attention core on the remote server; target weights
+        // and all other ops stay local. remote_attn_prefill: 0 = remote prefill,
+        // 1 = migrate (reserved). remote_attn_stats: 1 = log profiling counters.
+        const char * remote_attn_host;
+        uint16_t     remote_attn_port;
+        int          remote_attn_prefill;
+        int          remote_attn_stats;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

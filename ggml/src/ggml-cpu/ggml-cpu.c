@@ -2179,6 +2179,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_kvarn_materialize(params, tensor);
             } break;
+        case GGML_OP_REMOTE_ATTN:
+            {
+                // Remote attention is only ever scheduled on the
+                // ggml-remote-attn backend; reaching the CPU path is a wiring bug.
+                GGML_ABORT("%s: GGML_OP_REMOTE_ATTN must not run on the CPU backend\n", __func__);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2369,6 +2375,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_KVARN_STORE:
         case GGML_OP_KVARN_VIEW:
+        case GGML_OP_REMOTE_ATTN:
             {
                 n_tasks = 1;
             } break;

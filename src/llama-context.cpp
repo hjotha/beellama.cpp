@@ -439,6 +439,10 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.kvarn             = params.kvarn;
+    cparams.remote_attn_enabled = (params.remote_attn_host != nullptr && params.remote_attn_host[0] != '\0');
+    cparams.remote_attn_prefill = params.remote_attn_prefill;
+    cparams.remote_attn_stats   = (params.remote_attn_stats != 0);
+    cparams.remote_attn_layers  = 0;
     cparams.kv_tail_tokens    = std::min(params.kv_tail_tokens, cparams.n_ctx);
     cparams.kv_tail_tokens_swa = std::min(params.kv_tail_tokens,
             std::min(cparams.n_ctx, hparams.n_swa > 0 ? hparams.n_swa : cparams.n_ctx));
@@ -5372,6 +5376,10 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kvarn                       =*/ llama_kvarn_default_params(),
         /*.path_kv_mean_center         =*/ nullptr,
+        /*.remote_attn_host            =*/ nullptr,
+        /*.remote_attn_port            =*/ 0,
+        /*.remote_attn_prefill         =*/ 0,
+        /*.remote_attn_stats           =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
