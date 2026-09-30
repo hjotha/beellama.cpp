@@ -192,34 +192,38 @@ Router swaps unload/load child processes; adaptive mode instead rebuilds context
 | CUDA allocator recovery | Restores recoverable VMM-pool OOM handling and bounds retries/allocation behavior. |
 | IQ1_M workspace and kernels | Bounds full-dequantization workspace via MMVQ, adds MMQ/tensor-core support and initializes only the selected MMQ variant. |
 | KVarN prefill workspace | CUDA materialization windows are chunked according to free VRAM, avoiding an oversized temporary buffer during prompt processing. |
-| Backend isolation | Presence of `GGML_DISABLE_VULKAN` disables Vulkan registration/initialization, even when its value is `0`. Omit it for Vulkan workloads. |
+| Backend isolation | Presence of `GGML_DISABLE_VULKAN` disables Vulkan registration/initialization, even when its value is `0`. Omit it for Vulkan / hybrid remote-attn workloads. |
 
-The phase-aware governor runs inside the server, deduplicates unchanged settings, and restores controls on supported idle/shutdown paths. Backend selection is explicit: **`auto` currently selects NVML; it does not discover AMD automatically.**
+The phase-aware governor runs inside the server, deduplicates unchanged settings, and restores controls on supported idle/shutdown paths. Backend selection is explicit: **`nvml` for NVIDIA, `amdgpu` for Linux sysfs/Ryzen, and `dual` for concurrent multi-GPU governance (NVIDIA eGPU + AMD APU/iGPU).**
 
 | Parameter | Environment variable | Meaning |
 | --- | --- | --- |
-| `--gpu-power-backend auto\|nvml\|amdgpu` | `LLAMA_ARG_GPU_POWER_BACKEND` | NVML for NVIDIA; select `amdgpu` for Linux sysfs/Ryzen controls. |
-| `--gpu-power-device N` | `LLAMA_ARG_GPU_POWER_DEVICE` | NVML index, or index in the sorted list of AMD DRM cards; default `0`. Independent of the inference `--device` selector. |
+| `--gpu-power-backend auto\|nvml\|amdgpu\|dual` | `LLAMA_ARG_GPU_POWER_BACKEND` | NVML for NVIDIA, `amdgpu` for AMD, or `dual` for concurrent NVIDIA NVML + AMD sysfs/Ryzen SMU governance. |
+| `--gpu-power-device N` | `LLAMA_ARG_GPU_POWER_DEVICE` | NVML index, or primary GPU index; default `0`. Independent of inference `--device`. |
+| `--gpu-power-amd-device N` | `LLAMA_ARG_GPU_POWER_AMD_DEVICE` | Dedicated AMD DRM card index for `dual` backend mode; default `0`. |
 | `--gpu-power-prefill W` | `LLAMA_ARG_GPU_POWER_PREFILL` | NVIDIA power limit during prompt processing; requires the decode option. |
 | `--gpu-power-decode W` | `LLAMA_ARG_GPU_POWER_DECODE` | NVIDIA power limit during generation; requires the prefill option. |
-| `--gpu-mem-clock-prefill MHz` | `LLAMA_ARG_GPU_MEM_CLOCK_PREFILL` | NVIDIA **memory** clock or AMDGPU **graphics SCLK** during prompt processing. |
-| `--gpu-mem-clock-decode MHz` | `LLAMA_ARG_GPU_MEM_CLOCK_DECODE` | NVIDIA **memory** clock or AMDGPU **graphics SCLK** during generation. |
+| `--gpu-mem-clock-prefill MHz` | `LLAMA_ARG_GPU_MEM_CLOCK_PREFILL` | NVIDIA **memory** clock during prompt processing (or legacy AMD SCLK in standalone `amdgpu` mode). |
+| `--gpu-mem-clock-decode MHz` | `LLAMA_ARG_GPU_MEM_CLOCK_DECODE` | NVIDIA **memory** clock during generation (or legacy AMD SCLK in standalone `amdgpu` mode). |
+| `--amd-sclk-prefill MHz` | `LLAMA_ARG_AMD_SCLK_PREFILL` | Dedicated AMDGPU **graphics SCLK** clock target during prompt processing. |
+| `--amd-sclk-decode MHz` | `LLAMA_ARG_AMD_SCLK_DECODE` | Dedicated AMDGPU **graphics SCLK** clock target during generation. |
 | `--gpu-fabric-state N` | `LLAMA_ARG_GPU_FABRIC_STATE` | AMD raw fabric DPM state index `0..31` during prefill/decode; omit to leave automatic. |
-| `--apu-tdp W` | `LLAMA_ARG_APU_TDP` | Ryzen APU STAPM, fast and slow limits, each set to W while active; restores each original value at idle. |
+| `--apu-tdp W` | `LLAMA_ARG_APU_TDP` | Ryzen APU STAPM, fast and slow limits, each set to W while active; restores original values at idle. |
 
-**NVIDIA:** power options must be positive and supplied together. Idle retains the last power limit; shutdown/sleep restore the original. Memory-clock options can operate independently; idle and phases without a target release the applied lock/offset. Above-stock targets use supported locks plus a bounded offset where the driver allows it. Core/SM clocks are not controlled by these NVIDIA server flags; an external `nvidia-smi --lock-gpu-clocks` is a separate driver control. GPU/driver permissions and supported ranges still apply.
+**Dual GPU Mode (`--gpu-power-backend dual`):** Concurrently manages NVIDIA discrete/eGPU (NVML power limits + memory clocks) and AMD APU/iGPU (Ryzen SMU TDP + sysfs graphics SCLK). Perfect for hybrid inference pipelines (e.g. CUDA0 compute + Vulkan:0 remote-attention offloading).
 
-**AMD graphics and fabric:** despite their historical names, the `--gpu-mem-clock-*` options write SCLK through `pp_od_clk_voltage`, not a standalone VRAM/MCLK target. The backend checks OD ranges, commits writes and restores the saved SCLK range/performance level. `--gpu-fabric-state` writes `pp_dpm_fclk`, which controls coupled fabric/memory states; raw kernel indices can differ from the displayed list. Fabric control requires an original non-manual performance level so it can be restored. Write failures trigger rollback attempts; restoration failures are logged. Generic GPU power caps and NVIDIA-style clock offsets are unsupported by the AMD backend.
+**NVIDIA:** power options must be positive and supplied together. Idle retains the last power limit; shutdown/sleep restore the original. Memory-clock options operate independently; idle and phases without a target release the applied lock/offset. GPU/driver permissions and supported ranges still apply.
 
-**Ryzen APU TDP:** requires Linux, `libryzenadj.so`, Ryzen SMU access and explicit `--gpu-power-backend amdgpu`. It cannot be combined with `--gpu-power-prefill` or `--gpu-power-decode`. It can be used without graphics/fabric locks, as in the verified Qwen3.5 deployment:
+**AMD graphics and fabric:** `--amd-sclk-prefill` / `--amd-sclk-decode` (or `--gpu-mem-clock-*` in standalone `amdgpu` mode) write SCLK through `pp_od_clk_voltage`. The backend checks OD ranges, commits writes and restores the saved SCLK range/performance level. `--gpu-fabric-state` writes `pp_dpm_fclk`, controlling coupled fabric/memory states.
+
+**Ryzen APU TDP:** requires Linux, `libryzenadj.so`, Ryzen SMU access and `--gpu-power-backend amdgpu` or `--gpu-power-backend dual`. Programmed power limits are firmware settings, dynamically engaged during prefill/decode and restored to base power profiles at idle.
 
 ```sh
-# Append to a compatible Vulkan Qwen3.5 server command:
-# --gpu-power-backend amdgpu --apu-tdp 20
-# Optional graphics targets, only after checking the device's OD range:
-# --gpu-mem-clock-prefill 2700 --gpu-mem-clock-decode 2700
-# Optional coupled fabric/memory state, after checking raw kernel indices:
-# --gpu-fabric-state 0
+# Example Dual-GPU launch with concurrent NVIDIA + AMD power and clock governance:
+# --gpu-power-backend dual \
+# --gpu-power-device 0 --gpu-power-prefill 200 --gpu-power-decode 170 \
+# --gpu-mem-clock-prefill 10501 --gpu-mem-clock-decode 10501 \
+# --apu-tdp 20 --amd-sclk-prefill 2700 --amd-sclk-decode 2700
 ```
 
 Programmed power limits are firmware settings, not a guarantee that instantaneous measured package power stays below the same number. A fixed clock is not a demonstrated speedup for every workload. Normal idle/shutdown restoration cannot run after an uncatchable kill or power loss.
