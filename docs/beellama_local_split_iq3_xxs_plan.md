@@ -192,12 +192,16 @@ do tratamento do tail antes de mudar essa política.
 - **Fase 6 — cache em disco:** existe no código atual como `--slot-save-auto`,
   com fingerprint de modelo/KV/RoPE e verificação byte a byte dos tokens antes
   de restaurar (`tools/server/server-context.cpp`, bloco Auto disk prompt/KV
-  cache). Falta nesta investigação validar um restore depois de reiniciar o
-  servidor com o preset Qwen atualizado.
+  cache). Validado em 2026-10-01 com o preset Qwen de produção: após salvar um
+  prefixo de 6.846 tokens, reiniciar `llama-server-root.service` restaurou
+  6.846 tokens do disco e reprocessou 1 token (`cache_source=disk`). Os dois
+  snapshots de teste foram removidos depois da validação.
 - **Fase 7 — batch remoto/DFlash:** o protocolo RKVA já distingue prefill
   batched (`n_tokens >= 1`) de decode (`n_tokens == 1`) e o caminho DFlash tem
-  contexto/draft model separado. Isso não torna a Fase 5 existente e ainda falta
-  uma medição válida MTP/DFlash com a atenção Vulkan local corrigida.
+  contexto/draft model separado. O MTP do Qwen de produção completou o smoke
+  (21/24 tokens propostos aceitos); com uma camada e handoff Vulkan, duas
+  requests manuais aceitaram 4/4. Falta medir DFlash remoto. Isso não torna a
+  Fase 5 existente.
 - **Fase 8 — IQ3_S:** o arquivo de modelo de 12.120.016.896 bytes existe, mas a
   caracterização no hardware atual ainda não foi feita. Não há baseline validada
   de placement, contexto, prefill, decode ou MTP/DFlash para esse modelo.
@@ -224,8 +228,8 @@ resultado aprovado.
 | **Fase 3** | Placement variável (Curva TPS × N layers) | ❌ **Medições invalidadas** | Curva antiga não representa custo de atenção válido. Instrumentação atual identificou atenção Vulkan como o maior custo medido. |
 | **Fase 4** | Auto placement baseado em VRAM | 🟡 **Parcialmente revalidada** | Estimativa agora inclui records, staging e tail por camada. Contexto de 102.4K foi validado com 16 camadas locais e reserva de 350M; placement remoto não é recomendado para throughput. |
 | **Fase 5** | Prefill migration assíncrona | 🟡 **Protótipo opt-in** | Prefill CUDA, cópia em background por grupo KVarN de 128 tokens e handoff para decode Vulkan. MTP standalone e `auto` com fallback remoto foram testados. Ainda duplica records CUDA/Vulkan e não aumenta o teto de contexto; não ativado no preset de produção. |
-| **Fase 6** | Prompt cache & Session lifecycle | 🟡 **Código existente; restore pendente de validação** | `--slot-save-auto` e o lifecycle existem; falta validar restauração após reiniciar com o preset atualizado. |
-| **Fase 7** | MTP / Multi-Token Batching ($N > 1$) | 🟡 **Código existente; caminho atual pendente de revalidação** | RKVA e contexto draft separado existem; falta medição MTP/DFlash válida com a atenção Vulkan corrigida. |
+| **Fase 6** | Prompt cache & Session lifecycle | ✅ **Round-trip validado** | O preset Qwen de produção salvou e, após reiniciar a unit, restaurou 6.846 tokens do disco e reprocessou 1 (`cache_source=disk`). |
+| **Fase 7** | MTP / Multi-Token Batching ($N > 1$) | 🟡 **MTP validado; DFlash remoto pendente** | A geração Qwen de produção aceitou 21/24 tokens propostos; duas requests manuais com uma camada e handoff Vulkan aceitaram 4/4. Falta medir DFlash remoto. |
 | **Fase 8** | Caracterização e Validação | 🟡 **Parcialmente concluída** | IQ3_XXS foi validado até 102.4K no caminho atual; IQ3_S permanece sem caracterização. |
 
 **Objetivo:** usar a RTX 4070 como GPU principal do modelo e a Radeon 780M como acelerador auxiliar de KV cache + attention, mantendo o máximo possível de attention local na 4070 e enviando para a 780M apenas o overflow necessário.
