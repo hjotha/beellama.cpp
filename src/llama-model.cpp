@@ -3126,8 +3126,24 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        const bool remote_enabled = cparams.remote_attn_enabled;
+                        const int remote_layers = cparams.remote_attn_layers;
+                        filter_attn = [this, remote_enabled, remote_layers](uint32_t il) {
+                            if (il >= hparams.n_layer() || hparams.is_recr(il)) {
+                                return false;
+                            }
+                            if (remote_enabled && remote_layers > 0) {
+                                int full_idx = 0;
+                                for (uint32_t l = 0; l < il; ++l) {
+                                    if (hparams.has_kv(l) && !hparams.is_recr(l)) {
+                                        ++full_idx;
+                                    }
+                                }
+                                if (full_idx < remote_layers) {
+                                    return false; // offloaded to remote/local-split backend, do not allocate on CUDA
+                                }
+                            }
+                            return true;
                         };
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);

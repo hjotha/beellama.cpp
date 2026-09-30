@@ -1777,86 +1777,88 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             });
         }
 
-        for (const auto & route : tail_routes) {
-            LLAMA_LOG_INFO("KV tail: group=%s layer=%u dev=%s route=%s body=kvarn/%s exact=%s/%s "
-                    "presence=%s current=%s execution_rows=%u requested=%u effective=%u\n",
-                    swa ? "swa" : "full", route.layer_id, route.backend.c_str(),
-                    route.capability.route == LLAMA_KV_TAIL_ROUTE_NATIVE ? "native" : "generic",
-                    "kvarn", ggml_type_name(route.exact_type_k), ggml_type_name(route.exact_type_v),
-                    route.has_body ? "body" : "bodyless", route.has_current ? "current" : "no-current",
-                    route.body_execution_rows, exact_tail_tokens_requested, exact_tail_tokens);
-        }
-        metadata->set_tail_routes(std::move(tail_routes));
-        metadata->finalize_tail_overlay_metadata();
-        exact_slots = metadata->get_tail_slots();
-        if (exact_slots == 0) {
-            throw std::logic_error("KVarN exact-tail metadata finalized without storage slots");
-        }
-
-        std::map<ggml_backend_buffer_type_t, ggml_context_ptr, buft_comparator> tail_ctx_map;
-        const auto tail_ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-            const auto it = tail_ctx_map.find(buft);
-            if (it != tail_ctx_map.end()) {
-                return it->second.get();
+        if (!layers.empty()) {
+            for (const auto & route : tail_routes) {
+                LLAMA_LOG_INFO("KV tail: group=%s layer=%u dev=%s route=%s body=kvarn/%s exact=%s/%s "
+                        "presence=%s current=%s execution_rows=%u requested=%u effective=%u\n",
+                        swa ? "swa" : "full", route.layer_id, route.backend.c_str(),
+                        route.capability.route == LLAMA_KV_TAIL_ROUTE_NATIVE ? "native" : "generic",
+                        "kvarn", ggml_type_name(route.exact_type_k), ggml_type_name(route.exact_type_v),
+                        route.has_body ? "body" : "bodyless", route.has_current ? "current" : "no-current",
+                        route.body_execution_rows, exact_tail_tokens_requested, exact_tail_tokens);
             }
-            ggml_init_params ctx_params = {
-                /*.mem_size   =*/ size_t(2u*hparams.n_layer_kv()*ggml_tensor_overhead()),
-                /*.mem_buffer =*/ nullptr,
-                /*.no_alloc   =*/ true,
-            };
-            ggml_context_ptr ctx { ggml_init(ctx_params) };
-            if (!ctx) {
-                return nullptr;
+            metadata->set_tail_routes(std::move(tail_routes));
+            metadata->finalize_tail_overlay_metadata();
+            exact_slots = metadata->get_tail_slots();
+            if (exact_slots == 0) {
+                throw std::logic_error("KVarN exact-tail metadata finalized without storage slots");
             }
-            auto * result = ctx.get();
-            tail_ctx_map.emplace(buft, std::move(ctx));
-            return result;
-        };
 
-        for (auto & layer : layers) {
-            auto * buft = tensor_buft(layer.k_records);
-            auto * ctx = tail_ctx_for_buft(buft);
-            if (!ctx) {
-                throw std::runtime_error("failed to create KVarN exact-tail tensor context");
-            }
-            layer.k_tail = ggml_new_tensor_2d(
-                    ctx, exact_tail_type, uint64_t(layer.head_dim_k)*layer.n_head_kv, exact_slots);
-            layer.v_tail = ggml_new_tensor_2d(
-                    ctx, exact_tail_type, uint64_t(layer.head_dim_v)*layer.n_head_kv, exact_slots);
-            ggml_format_name(layer.k_tail, "cache_kvarn_k_tail_l%d", layer.il);
-            ggml_format_name(layer.v_tail, "cache_kvarn_v_tail_l%d", layer.il);
-        }
-
-        for (auto & [buft, ctx] : tail_ctx_map) {
-            ggml_backend_buffer_t buf;
-            if (hparams.no_alloc) {
-                buf = ggml_backend_buft_alloc_buffer(buft, 0);
-                for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
-                    tensor->buffer = buf;
+            std::map<ggml_backend_buffer_type_t, ggml_context_ptr, buft_comparator> tail_ctx_map;
+            const auto tail_ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+                const auto it = tail_ctx_map.find(buft);
+                if (it != tail_ctx_map.end()) {
+                    return it->second.get();
                 }
-            } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-            }
-            if (!buf) {
-                throw std::runtime_error("failed to allocate KVarN exact-tail buffer");
-            }
-            ggml_backend_buffer_clear(buf, 0);
-            total_bytes += ggml_backend_buffer_get_size(buf);
-            LLAMA_LOG_INFO("%s: %10s KVarN tail buffer size = %8.2f MiB\n",
-                    __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-            ctxs_bufs.emplace_back(std::move(ctx), buf);
-        }
+                ggml_init_params ctx_params = {
+                    /*.mem_size   =*/ size_t(2u*hparams.n_layer_kv()*ggml_tensor_overhead()),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context_ptr ctx { ggml_init(ctx_params) };
+                if (!ctx) {
+                    return nullptr;
+                }
+                auto * result = ctx.get();
+                tail_ctx_map.emplace(buft, std::move(ctx));
+                return result;
+            };
 
-        for (const auto & layer : layers) {
-            const uintptr_t owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k_records));
-            auto ownership = llama_kv_tail_plan_layer_ownership(
-                    layer.il, owner, owner, true, true);
-            ownership.shadow_k_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k_tail));
-            ownership.shadow_v_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.v_tail));
-            const auto error = llama_kv_tail_validate_layer_ownership(ownership);
-            if (error != LLAMA_KV_TAIL_OWNERSHIP_OK) {
-                throw std::runtime_error(format("KVarN exact-tail ownership validation failed for layer %u (error %d)",
-                        layer.il, int(error)));
+            for (auto & layer : layers) {
+                auto * buft = tensor_buft(layer.k_records);
+                auto * ctx = tail_ctx_for_buft(buft);
+                if (!ctx) {
+                    throw std::runtime_error("failed to create KVarN exact-tail tensor context");
+                }
+                layer.k_tail = ggml_new_tensor_2d(
+                        ctx, exact_tail_type, uint64_t(layer.head_dim_k)*layer.n_head_kv, exact_slots);
+                layer.v_tail = ggml_new_tensor_2d(
+                        ctx, exact_tail_type, uint64_t(layer.head_dim_v)*layer.n_head_kv, exact_slots);
+                ggml_format_name(layer.k_tail, "cache_kvarn_k_tail_l%d", layer.il);
+                ggml_format_name(layer.v_tail, "cache_kvarn_v_tail_l%d", layer.il);
+            }
+
+            for (auto & [buft, ctx] : tail_ctx_map) {
+                ggml_backend_buffer_t buf;
+                if (hparams.no_alloc) {
+                    buf = ggml_backend_buft_alloc_buffer(buft, 0);
+                    for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+                        tensor->buffer = buf;
+                    }
+                } else {
+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+                }
+                if (!buf) {
+                    throw std::runtime_error("failed to allocate KVarN exact-tail buffer");
+                }
+                ggml_backend_buffer_clear(buf, 0);
+                total_bytes += ggml_backend_buffer_get_size(buf);
+                LLAMA_LOG_INFO("%s: %10s KVarN tail buffer size = %8.2f MiB\n",
+                        __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+                ctxs_bufs.emplace_back(std::move(ctx), buf);
+            }
+
+            for (const auto & layer : layers) {
+                const uintptr_t owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k_records));
+                auto ownership = llama_kv_tail_plan_layer_ownership(
+                        layer.il, owner, owner, true, true);
+                ownership.shadow_k_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k_tail));
+                ownership.shadow_v_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.v_tail));
+                const auto error = llama_kv_tail_validate_layer_ownership(ownership);
+                if (error != LLAMA_KV_TAIL_OWNERSHIP_OK) {
+                    throw std::runtime_error(format("KVarN exact-tail ownership validation failed for layer %u (error %d)",
+                            layer.il, int(error)));
+                }
             }
         }
     } else {

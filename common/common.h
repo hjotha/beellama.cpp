@@ -803,7 +803,7 @@ struct common_params {
     std::string remote_attn_layers       = "auto";   // "auto" | "full" | integer N
     std::string remote_attn_prefill      = "remote"; // "remote" | "migrate" (reserved)
     bool        remote_attn_stats        = false;
-    size_t      remote_attn_cuda_reserve = 350 * 1024 * 1024; // 350 MiB default safety reserve
+    size_t      remote_attn_cuda_reserve = 650 * 1024 * 1024; // 650 MiB default safety reserve (covers compute graph & allocator headroom)
 
     // KVarN is selected by its pseudo cache-type names in the argument parser.
     // The backing ggml types remain the matching standard q formats for layers

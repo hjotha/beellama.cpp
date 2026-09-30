@@ -1013,6 +1013,60 @@ std::vector<ggml_backend_t> layer_backends;
             }
         }
 
+        if (cparams.remote_attn_enabled) {
+            int n_full_attn = 0;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (model.hparams.has_kv(il) && !model.hparams.is_recr(il)) {
+                    ++n_full_attn;
+                }
+            }
+            int n_remote = n_full_attn;
+            if (params.remote_attn_n_layers == -1) {
+                size_t cuda_free = 0, cuda_total = 0;
+                ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_name("CUDA0");
+                if (!cuda_dev) cuda_dev = ggml_backend_dev_by_name("CUDA");
+                if (cuda_dev) {
+                    ggml_backend_dev_memory(cuda_dev, &cuda_free, &cuda_total);
+                }
+                const size_t reserve = params.remote_attn_cuda_reserve > 0 ?
+                    params.remote_attn_cuda_reserve : (600 * 1024 * 1024);
+
+                // Account for recurrent state (RS cache) that will be allocated on CUDA for hybrid architectures
+                size_t recr_bytes = 0;
+                const uint32_t n_rs_rows = std::max((uint32_t) 1, cparams.n_seq_max) * (1 + cparams.n_rs_seq);
+                for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                    if (model.hparams.is_recr(il) && cparams.offload_kqv) {
+                        recr_bytes += (model.hparams.n_embd_r() + model.hparams.n_embd_s()) * sizeof(float) * n_rs_rows;
+                        if (model.hparams.ple_conv_state() > 0 && model.hparams.is_ple(il)) {
+                            recr_bytes += model.hparams.ple_conv_state() * sizeof(float) * n_rs_rows;
+                        }
+                    }
+                }
+
+                const size_t n_head_kv = model.hparams.n_head_kv();
+                const size_t head_dim  = model.hparams.n_embd_head_k();
+                const size_t bits_k    = cparams.kvarn.key_bits ? cparams.kvarn.key_bits : 4;
+                const size_t bits_v    = cparams.kvarn.value_bits ? cparams.kvarn.value_bits : 4;
+                const size_t bytes_per_token_layer = (n_head_kv * head_dim * (bits_k + bits_v)) / 8 + 64;
+                const size_t bytes_per_layer = bytes_per_token_layer * (size_t) cparams.n_ctx;
+
+                const size_t total_deduction = reserve + recr_bytes;
+                const size_t usable_cuda_kv = (cuda_free > total_deduction) ? (cuda_free - total_deduction) : 0;
+                int n_local_fit = bytes_per_layer > 0 ? (int) (usable_cuda_kv / bytes_per_layer) : 0;
+                n_local_fit = std::clamp(n_local_fit, 0, n_full_attn);
+
+                n_remote = n_full_attn - n_local_fit;
+                LLAMA_LOG_INFO("%s: auto-placement: CUDA free=%.1f MiB, reserve=%.1f MiB, rs_cache=%.1f MiB, usable=%.1f MiB, "
+                               "layer_kv=%.1f MiB -> %d local full-attn layers on 4070, %d offloaded to %s\n",
+                               __func__, cuda_free / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0,
+                               recr_bytes / 1024.0 / 1024.0, usable_cuda_kv / 1024.0 / 1024.0,
+                               bytes_per_layer / 1024.0 / 1024.0, n_local_fit, n_remote, params.remote_attn_host);
+            } else if (params.remote_attn_n_layers > 0 && params.remote_attn_n_layers <= n_full_attn) {
+                n_remote = params.remote_attn_n_layers;
+            }
+            cparams.remote_attn_layers = n_remote;
+        }
+
         memory.reset(model.create_memory(params_mem, cparams, layer_backends, kv_backends, backend_cpu));
         if (memory) {
             const ggml_type actual_tail_type = memory->get_kv_tail_type();
@@ -1075,46 +1129,7 @@ std::vector<ggml_backend_t> layer_backends;
                     "or the F16 bring-up path (--cache-type-k/-v f16)", __func__));
             }
 
-            // count the full-attention layers that will be offloaded
-            int n_full_attn = 0;
-            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
-                if (model.hparams.has_kv(il) && !model.hparams.is_recr(il)) {
-                    ++n_full_attn;
-                }
-            }
-            int n_remote = n_full_attn;
-            if (params.remote_attn_n_layers == -1) {
-                // Auto-placement based on CUDA VRAM headroom
-                size_t cuda_free = 0, cuda_total = 0;
-                ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_name("CUDA0");
-                if (!cuda_dev) cuda_dev = ggml_backend_dev_by_name("CUDA");
-                if (cuda_dev) {
-                    ggml_backend_dev_memory(cuda_dev, &cuda_free, &cuda_total);
-                }
-                const size_t reserve = params.remote_attn_cuda_reserve > 0 ?
-                    params.remote_attn_cuda_reserve : (350 * 1024 * 1024);
-
-                const size_t n_head_kv = model.hparams.n_head_kv();
-                const size_t head_dim  = model.hparams.n_embd_head_k();
-                const size_t bits_k    = cparams.kvarn.key_bits ? cparams.kvarn.key_bits : 4;
-                const size_t bits_v    = cparams.kvarn.value_bits ? cparams.kvarn.value_bits : 4;
-                const size_t bytes_per_token_layer = (n_head_kv * head_dim * (bits_k + bits_v)) / 8 + 64;
-                const size_t bytes_per_layer = bytes_per_token_layer * (size_t) cparams.n_ctx;
-
-                const size_t usable_cuda_kv = (cuda_free > reserve) ? (cuda_free - reserve) : 0;
-                int n_local_fit = bytes_per_layer > 0 ? (int) (usable_cuda_kv / bytes_per_layer) : 0;
-                n_local_fit = std::clamp(n_local_fit, 0, n_full_attn);
-
-                n_remote = n_full_attn - n_local_fit;
-                LLAMA_LOG_INFO("%s: auto-placement: CUDA free=%.1f MiB, reserve=%.1f MiB, usable=%.1f MiB, "
-                               "layer_kv=%.1f MiB -> %d local full-attn layers on 4070, %d offloaded to %s\n",
-                               __func__, cuda_free / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0,
-                               usable_cuda_kv / 1024.0 / 1024.0, bytes_per_layer / 1024.0 / 1024.0,
-                               n_local_fit, n_remote, params.remote_attn_host);
-            } else if (params.remote_attn_n_layers > 0 && params.remote_attn_n_layers <= n_full_attn) {
-                n_remote = params.remote_attn_n_layers;
-            }
-            cparams.remote_attn_layers = n_remote;
+            const int n_remote = cparams.remote_attn_layers;
 
             ggml_remote_attn_geometry geo {};
             geo.n_layer_remote = (uint32_t) n_remote;

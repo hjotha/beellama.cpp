@@ -1107,7 +1107,7 @@ const  layer_reuse_cb & reuse,
         }
     }
 
-    if (has_tail_overlay() && !tail_metadata_only && !uses_shared_tail()) {
+    if (has_tail_overlay() && !tail_metadata_only && !uses_shared_tail() && n_layer_kv > 0) {
         finalize_tail_overlay_metadata();
 
         std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> tail_ctx_map;
@@ -3359,7 +3359,10 @@ bool llama_kv_cache::get_kv_tail_coverage(
     if (!tail_plan.graph_consumes_exact_tail) {
         return false;
     }
-    GGML_ASSERT(tail);
+    if (!tail) {
+        out = { LLAMA_KV_TAIL_COVERAGE_NONE, 0, 0, 0 };
+        return true;
+    }
     const auto coverage = tail->coverage(seq_id, available);
     out = { coverage.state, coverage.requested, coverage.exact, coverage.degradation_flags };
     return true;
@@ -4462,11 +4465,10 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_collect(
         }
     }
 
-    if (body_only || !has_tail_overlay()) {
+    if (body_only || !has_tail_overlay() || !tail) {
         return result;
     }
 
-    GGML_ASSERT(tail);
     result.tail_ordinal = tail_ordinal;
     result.tail_payload_slots = state_tail_payload_slots(seq_id);
     result.tail_payload_count = uint32_t(result.tail_payload_slots.size());
@@ -5987,7 +5989,9 @@ std::vector<int32_t> llama_kv_cache::state_tail_cell_ordinals(
 }
 
 std::vector<int32_t> llama_kv_cache::state_tail_payload_slots(llama_seq_id seq_id) const {
-    GGML_ASSERT(tail);
+    if (!tail) {
+        return {};
+    }
 
     std::vector<int32_t> result;
     std::unordered_map<int32_t, uint32_t> payload_by_slot;
@@ -6317,7 +6321,9 @@ void llama_kv_cache::swap_logical_state_from(llama_kv_cache & source) {
 }
 
 void llama_kv_cache::state_write_tail(llama_io_write_i & io, llama_seq_id seq_id) const {
-    GGML_ASSERT(tail);
+    if (!tail) {
+        return;
+    }
 
     struct record {
         llama_seq_id seq_id;
@@ -6403,7 +6409,9 @@ void llama_kv_cache::state_read_tail(
         llama_seq_id seq_id,
         const std::vector<std::vector<uint32_t>> & restored_cells,
         llama_state_seq_flags flags) {
-    GGML_ASSERT(tail);
+    if (!tail) {
+        return;
+    }
 
     struct record {
         llama_seq_id seq_id;
