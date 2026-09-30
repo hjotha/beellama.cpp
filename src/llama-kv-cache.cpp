@@ -4716,7 +4716,12 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_read_manifest(
                 tail_layer_count != 0 || provenance_count != 0) {
             throw std::runtime_error("body-only KV tail state contains exact-tail metadata");
         }
-    } else if (!tail || result.tail_payload_count > tail_slots || record_count > max_records ||
+    } else if (!has_tail_overlay() || !tail || layers.empty()) {
+        if (record_count != 0 || result.tail_payload_count != 0 ||
+                tail_layer_count != 0 || provenance_count != 0) {
+            throw std::runtime_error("KV tail state contains metadata for non-tail cache");
+        }
+    } else if (result.tail_payload_count > tail_slots || record_count > max_records ||
             tail_layer_count != layers.size() ||
             provenance_count != (seq_id == -1 ? result.saved_n_seq_max : 1u)) {
         throw std::runtime_error("invalid KV tail state manifest dimensions: tail=" + std::to_string(bool(tail)) +
@@ -5281,7 +5286,7 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
     }
 
     restored_tail_payload_slots.clear();
-    if (manifest.body_only) {
+    if (manifest.body_only || !tail || !has_tail_overlay() || layers.empty()) {
         if (tail) {
             if (seq_id == -1) {
                 tail->clear();
@@ -5575,7 +5580,7 @@ void llama_kv_cache::state_read_impl(
                     "legacy KV state lacks compact-tail representation metadata");
         }
         state_read_body(io, seq_id, marker, sinfos_out, sinfos_in);
-        if (has_tail_overlay()) {
+        if (has_tail_overlay() && tail) {
             if (seq_id == -1) {
                 tail->clear();
             } else {
@@ -5690,9 +5695,11 @@ void llama_kv_cache::state_read_impl(
     const size_t tail_begin = io.n_bytes();
     if (tail_size > 0) {
         state_read_tail(io, seq_id, restored_cells, flags);
-        tail->mark_degraded(seq_id, LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE);
+        if (tail) {
+            tail->mark_degraded(seq_id, LLAMA_KV_TAIL_DEGRADED_STATE_RESTORE);
+        }
         LLAMA_LOG_WARN("%s: loaded KV tail state v1 without coverage provenance; exact coverage is conservatively degraded until refilled\n", __func__);
-    } else if (has_tail_overlay()) {
+    } else if (has_tail_overlay() && tail) {
         if (seq_id == -1) {
             tail->clear();
         } else {
