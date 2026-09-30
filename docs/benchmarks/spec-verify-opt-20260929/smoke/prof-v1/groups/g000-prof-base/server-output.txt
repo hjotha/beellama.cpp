@@ -1,0 +1,3028 @@
+0.00.291.844 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.293.760 I srv          init: The UI is disabled
+0.00.293.764 I srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+0.00.294.210 W srv  llama_server: -----------------
+0.00.294.211 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.294.212 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.294.212 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.294.213 W srv  llama_server: -----------------
+0.00.295.775 I srv    load_model: loading model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.12.635.632 I cmn          init: llama threadpool init, n_threads = 8
+0.12.738.574 I common_speculative_init_result: creating MTP draft context against the target model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.12.747.362 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 16384, kv_unified = 'false', elastic_paged_context = false
+0.12.749.732 I AMDGPU governor: card /sys/class/drm/card1, original level auto, SCLK range 800-2700 MHz
+detected compatible ryzen_smu kernel module
+0.12.762.934 I APU TDP: original STAPM/fast/slow limits 8000/20000/15000 mW
+0.12.762.935 I GPU governor enabled
+0.12.762.936 I   device: AMDGPU /sys/class/drm/card1 (sysfs)
+0.12.762.936 I   device index: 0
+0.12.762.936 I   active APU TDP: 20 W
+0.12.762.937 I   decode memory clock: 2700 MHz
+0.12.762.937 I   prefill memory clock: 2700 MHz
+0.12.768.612 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.12.768.839 I srv  llama_server: model loaded
+0.12.768.844 I srv  llama_server: listening on http://127.0.0.1:59595
+0.13.830.344 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+0.13.830.402 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.13.830.844 I APU TDP: active limit 20 W
+0.13.832.334 I GPU memory clock: idle -> prefill, locked 2700 MHz
+MTPTGT n_tokens=24 us=198067
+MTPPROC head=0 n_batch=24 us=17510
+MTPPHASE phase=sync us=17945 n_tokens=24
+MTPTGT n_tokens=4 us=45921
+MTPPROC head=0 n_batch=4 us=1783
+MTPPHASE phase=sync us=1927 n_tokens=4
+MTPDRAFT depth=0 n_batch=1 dec_us=5812 smp_us=20
+MTPPHASE phase=draft us=5981 drafted=0
+MTPTGT n_tokens=1 us=40885
+MTPPROC head=0 n_batch=1 us=1509
+MTPPHASE phase=sync us=1640 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2830 smp_us=16
+MTPDRAFT depth=1 n_batch=1 dec_us=3319 smp_us=9
+MTPPHASE phase=draft us=6316 drafted=1
+MTPTGT n_tokens=2 us=36375
+MTPPROC head=0 n_batch=2 us=1627
+MTPPHASE phase=sync us=1761 n_tokens=2
+MTPPHASE phase=verify us=1482 sample_accept_us=705 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2892 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=3341 smp_us=13
+MTPDRAFT depth=2 n_batch=1 dec_us=3262 smp_us=13
+MTPDRAFT depth=3 n_batch=1 dec_us=2719 smp_us=6
+MTPPHASE phase=draft us=12426 drafted=4
+MTPTGT n_tokens=5 us=46075
+MTPPROC head=0 n_batch=5 us=1783
+MTPPHASE phase=sync us=1926 n_tokens=5
+MTPPHASE phase=verify us=960 sample_accept_us=673 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2879 smp_us=15
+MTPDRAFT depth=1 n_batch=1 dec_us=3447 smp_us=15
+MTPDRAFT depth=2 n_batch=1 dec_us=2703 smp_us=10
+MTPDRAFT depth=3 n_batch=1 dec_us=2644 smp_us=8
+MTPPHASE phase=draft us=11896 drafted=4
+MTPTGT n_tokens=5 us=40184
+MTPPROC head=0 n_batch=5 us=1577
+MTPPHASE phase=sync us=1671 n_tokens=5
+MTPPHASE phase=verify us=1698 sample_accept_us=1423 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2795 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2611 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2607 smp_us=5
+MTPPHASE phase=draft us=8126 drafted=2
+MTPTGT n_tokens=3 us=38636
+MTPPROC head=0 n_batch=3 us=1664
+MTPPHASE phase=sync us=1797 n_tokens=3
+MTPPHASE phase=verify us=1183 sample_accept_us=827 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2855 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2637 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=3322 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2620 smp_us=7
+MTPPHASE phase=draft us=11588 drafted=4
+MTPTGT n_tokens=5 us=42253
+MTPPROC head=0 n_batch=5 us=1677
+MTPPHASE phase=sync us=1813 n_tokens=5
+MTPPHASE phase=verify us=1574 sample_accept_us=1280 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2818 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=3428 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2605 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2594 smp_us=5
+MTPPHASE phase=draft us=11600 drafted=4
+MTPTGT n_tokens=5 us=39438
+MTPPROC head=0 n_batch=5 us=2025
+MTPPHASE phase=sync us=2181 n_tokens=5
+MTPPHASE phase=verify us=1684 sample_accept_us=1298 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3906 smp_us=19
+MTPDRAFT depth=1 n_batch=1 dec_us=2702 smp_us=7
+MTPPHASE phase=draft us=6803 drafted=1
+MTPTGT n_tokens=2 us=34188
+MTPPROC head=0 n_batch=2 us=1517
+MTPPHASE phase=sync us=1686 n_tokens=2
+MTPPHASE phase=verify us=1015 sample_accept_us=727 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2831 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=3148 smp_us=7
+MTPPHASE phase=draft us=6143 drafted=1
+MTPTGT n_tokens=2 us=32056
+MTPPROC head=0 n_batch=2 us=1719
+MTPPHASE phase=sync us=1856 n_tokens=2
+MTPPHASE phase=verify us=843 sample_accept_us=526 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2935 smp_us=16
+MTPDRAFT depth=1 n_batch=1 dec_us=2705 smp_us=10
+MTPPHASE phase=draft us=5756 drafted=1
+MTPTGT n_tokens=2 us=31876
+MTPPROC head=0 n_batch=2 us=1603
+MTPPHASE phase=sync us=1744 n_tokens=2
+MTPPHASE phase=verify us=916 sample_accept_us=538 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2881 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=3340 smp_us=10
+MTPDRAFT depth=2 n_batch=1 dec_us=2615 smp_us=18
+MTPPHASE phase=draft us=9051 drafted=2
+MTPTGT n_tokens=3 us=36944
+MTPPROC head=0 n_batch=3 us=1402
+MTPPHASE phase=sync us=1520 n_tokens=3
+MTPPHASE phase=verify us=553 sample_accept_us=268 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2758 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2612 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2586 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2585 smp_us=5
+MTPPHASE phase=draft us=10687 drafted=4
+MTPTGT n_tokens=5 us=42323
+MTPPROC head=0 n_batch=5 us=1722
+MTPPHASE phase=sync us=1862 n_tokens=5
+MTPPHASE phase=verify us=1584 sample_accept_us=1307 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2819 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=3426 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2602 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2608 smp_us=6
+MTPPHASE phase=draft us=11631 drafted=4
+MTPTGT n_tokens=5 us=39535
+MTPPROC head=0 n_batch=5 us=1661
+MTPPHASE phase=sync us=1794 n_tokens=5
+MTPPHASE phase=verify us=1567 sample_accept_us=1301 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2823 smp_us=7
+MTPPHASE phase=draft us=2944 drafted=0
+MTPTGT n_tokens=1 us=30339
+MTPPROC head=0 n_batch=1 us=1458
+MTPPHASE phase=sync us=1583 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2845 smp_us=16
+MTPPHASE phase=draft us=3000 drafted=0
+MTPTGT n_tokens=1 us=28309
+MTPPROC head=0 n_batch=1 us=1523
+MTPPHASE phase=sync us=1610 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2727 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2617 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2607 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2574 smp_us=5
+MTPPHASE phase=draft us=10654 drafted=4
+MTPTGT n_tokens=5 us=47732
+MTPPROC head=0 n_batch=5 us=1710
+MTPPHASE phase=sync us=1851 n_tokens=5
+MTPPHASE phase=verify us=1061 sample_accept_us=780 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2855 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=3507 smp_us=12
+MTPDRAFT depth=2 n_batch=1 dec_us=3189 smp_us=12
+MTPDRAFT depth=3 n_batch=1 dec_us=2642 smp_us=7
+MTPPHASE phase=draft us=12395 drafted=4
+MTPTGT n_tokens=5 us=39834
+MTPPROC head=0 n_batch=5 us=1577
+MTPPHASE phase=sync us=1706 n_tokens=5
+MTPPHASE phase=verify us=760 sample_accept_us=505 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2775 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2611 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2594 smp_us=5
+MTPPHASE phase=draft us=8116 drafted=2
+MTPTGT n_tokens=3 us=37233
+MTPPROC head=0 n_batch=3 us=1569
+MTPPHASE phase=sync us=1698 n_tokens=3
+MTPPHASE phase=verify us=1103 sample_accept_us=817 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2878 smp_us=21
+MTPDRAFT depth=1 n_batch=1 dec_us=2715 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2648 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2597 smp_us=5
+MTPPHASE phase=draft us=11033 drafted=4
+MTPTGT n_tokens=5 us=42061
+MTPPROC head=0 n_batch=5 us=1685
+MTPPHASE phase=sync us=1818 n_tokens=5
+MTPPHASE phase=verify us=1375 sample_accept_us=1111 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=4604 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2604 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2586 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=4
+MTPPHASE phase=draft us=12529 drafted=4
+MTPTGT n_tokens=5 us=39777
+MTPPROC head=0 n_batch=5 us=1972
+MTPPHASE phase=sync us=2120 n_tokens=5
+MTPPHASE phase=verify us=533 sample_accept_us=261 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2809 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=3389 smp_us=10
+MTPDRAFT depth=2 n_batch=1 dec_us=2638 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2629 smp_us=8
+MTPPHASE phase=draft us=11621 drafted=4
+MTPTGT n_tokens=5 us=39722
+MTPPROC head=0 n_batch=5 us=1624
+MTPPHASE phase=sync us=1749 n_tokens=5
+MTPPHASE phase=verify us=1556 sample_accept_us=1272 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2795 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=3110 smp_us=5
+MTPPHASE phase=draft us=6029 drafted=2
+MTPTGT n_tokens=3 us=37333
+MTPPROC head=0 n_batch=3 us=1494
+MTPPHASE phase=sync us=1585 n_tokens=3
+MTPPHASE phase=verify us=800 sample_accept_us=525 n_draft=2
+MTPTGT n_tokens=1 us=30403
+MTPPROC head=0 n_batch=1 us=1431
+MTPPHASE phase=sync us=1544 n_tokens=1
+MTPSTATS type=draft-mtp steps=19 gen_drafts=19 acc_drafts=17 gen_tokens=56 acc_tokens=40 gen_per_pos=[19,15,11,11] acc_per_pos=[17,10,7,6]
+0.15.309.763 I slot print_timing: id  0 | task 0 | prompt eval time =     339.33 ms /    28 tokens (   12.12 ms per token,    82.52 tokens per second)
+0.15.309.767 I slot print_timing: id  0 | task 0 |        eval time =    1138.06 ms /    64 tokens (   18.06 ms per token,    55.36 tokens per second)
+0.15.309.768 I slot print_timing: id  0 | task 0 |       total time =    1477.39 ms /    92 tokens
+0.15.309.772 I slot print_timing: id  0 | task 0 |    graphs reused =          9
+0.15.309.776 I slot print_timing: id  0 | task 0 | draft acceptance = 0.71429 (   40 accepted /    56 generated), mean len =  3.11
+0.15.310.221 I slot      release: id  0 | task 0 | stop processing: n_tokens = 91, truncated = 0
+0.15.318.901 I GPU memory clock: decode -> idle, reset (dynamic)
+0.15.319.725 I APU TDP: restored original limits
+0.15.337.234 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 164718844163
+0.15.337.284 I slot launch_slot_: id  0 | task 26 | processing task, is_child = 0
+0.15.338.251 I APU TDP: active limit 20 W
+0.15.339.168 I GPU memory clock: idle -> prefill, locked 2700 MHz
+MTPTGT n_tokens=21 us=61477
+MTPPROC head=0 n_batch=21 us=2660
+MTPPHASE phase=sync us=2884 n_tokens=21
+MTPTGT n_tokens=4 us=42559
+MTPPROC head=0 n_batch=4 us=1749
+MTPPHASE phase=sync us=1816 n_tokens=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2727 smp_us=7
+MTPPHASE phase=draft us=2772 drafted=0
+MTPTGT n_tokens=1 us=30473
+MTPPROC head=0 n_batch=1 us=1341
+MTPPHASE phase=sync us=1380 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2708 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2602 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2582 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=4
+MTPPHASE phase=draft us=10561 drafted=4
+MTPTGT n_tokens=5 us=41627
+MTPPROC head=0 n_batch=5 us=1765
+MTPPHASE phase=sync us=1928 n_tokens=5
+MTPPHASE phase=verify us=1630 sample_accept_us=1319 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2997 smp_us=20
+MTPDRAFT depth=1 n_batch=1 dec_us=2699 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2603 smp_us=4
+MTPPHASE phase=draft us=8480 drafted=2
+MTPTGT n_tokens=3 us=37019
+MTPPROC head=0 n_batch=3 us=1534
+MTPPHASE phase=sync us=1622 n_tokens=3
+MTPPHASE phase=verify us=1100 sample_accept_us=794 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2793 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2610 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2595 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2585 smp_us=4
+MTPPHASE phase=draft us=10709 drafted=4
+MTPTGT n_tokens=5 us=41518
+MTPPROC head=0 n_batch=5 us=1747
+MTPPHASE phase=sync us=1855 n_tokens=5
+MTPPHASE phase=verify us=1640 sample_accept_us=1331 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2884 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2621 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2613 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2593 smp_us=6
+MTPPHASE phase=draft us=10845 drafted=4
+MTPTGT n_tokens=5 us=41392
+MTPPROC head=0 n_batch=5 us=1662
+MTPPHASE phase=sync us=1789 n_tokens=5
+MTPPHASE phase=verify us=1551 sample_accept_us=1301 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2814 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=3440 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2604 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=5
+MTPPHASE phase=draft us=11599 drafted=4
+MTPTGT n_tokens=5 us=39843
+MTPPROC head=0 n_batch=5 us=1710
+MTPPHASE phase=sync us=1814 n_tokens=5
+MTPPHASE phase=verify us=1543 sample_accept_us=1252 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2857 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2633 smp_us=6
+MTPPHASE phase=draft us=5633 drafted=1
+MTPTGT n_tokens=2 us=34409
+MTPPROC head=0 n_batch=2 us=1476
+MTPPHASE phase=sync us=1594 n_tokens=2
+MTPPHASE phase=verify us=825 sample_accept_us=581 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2790 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2596 smp_us=4
+MTPPHASE phase=draft us=5515 drafted=1
+MTPTGT n_tokens=2 us=31784
+MTPPROC head=0 n_batch=2 us=1453
+MTPPHASE phase=sync us=1572 n_tokens=2
+MTPPHASE phase=verify us=889 sample_accept_us=558 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2902 smp_us=25
+MTPDRAFT depth=1 n_batch=1 dec_us=2693 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2625 smp_us=5
+MTPPHASE phase=draft us=8406 drafted=2
+MTPTGT n_tokens=3 us=37099
+MTPPROC head=0 n_batch=3 us=1420
+MTPPHASE phase=sync us=1535 n_tokens=3
+MTPPHASE phase=verify us=548 sample_accept_us=271 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2769 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2619 smp_us=4
+MTPPHASE phase=draft us=5516 drafted=1
+MTPTGT n_tokens=2 us=34175
+MTPPROC head=0 n_batch=2 us=1330
+MTPPHASE phase=sync us=1437 n_tokens=2
+MTPPHASE phase=verify us=765 sample_accept_us=532 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2744 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2627 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2597 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2590 smp_us=5
+MTPPHASE phase=draft us=10728 drafted=4
+MTPTGT n_tokens=5 us=42121
+MTPPROC head=0 n_batch=5 us=1700
+MTPPHASE phase=sync us=1833 n_tokens=5
+MTPPHASE phase=verify us=1709 sample_accept_us=1306 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2829 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2601 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2592 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2578 smp_us=4
+MTPPHASE phase=draft us=10745 drafted=4
+MTPTGT n_tokens=5 us=39649
+MTPPROC head=0 n_batch=5 us=1707
+MTPPHASE phase=sync us=1806 n_tokens=5
+MTPPHASE phase=verify us=1649 sample_accept_us=1293 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2833 smp_us=18
+MTPDRAFT depth=1 n_batch=1 dec_us=2720 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2626 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2600 smp_us=5
+MTPPHASE phase=draft us=10932 drafted=4
+MTPTGT n_tokens=5 us=39656
+MTPPROC head=0 n_batch=5 us=1502
+MTPPHASE phase=sync us=1584 n_tokens=5
+MTPPHASE phase=verify us=1555 sample_accept_us=1215 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2764 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2604 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2582 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2574 smp_us=4
+MTPPHASE phase=draft us=10640 drafted=4
+MTPTGT n_tokens=5 us=39646
+MTPPROC head=0 n_batch=5 us=1779
+MTPPHASE phase=sync us=1921 n_tokens=5
+MTPPHASE phase=verify us=1671 sample_accept_us=1372 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2969 smp_us=15
+MTPDRAFT depth=1 n_batch=1 dec_us=2684 smp_us=27
+MTPDRAFT depth=2 n_batch=1 dec_us=2609 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2615 smp_us=6
+MTPPHASE phase=draft us=11084 drafted=4
+MTPTGT n_tokens=5 us=49812
+MTPPROC head=0 n_batch=5 us=1713
+MTPPHASE phase=sync us=1833 n_tokens=5
+MTPPHASE phase=verify us=1756 sample_accept_us=1251 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2865 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2648 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2615 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2604 smp_us=7
+MTPPHASE phase=draft us=10910 drafted=4
+MTPTGT n_tokens=5 us=38309
+MTPPROC head=0 n_batch=5 us=1718
+MTPPHASE phase=sync us=1856 n_tokens=5
+MTPPHASE phase=verify us=1570 sample_accept_us=1271 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2822 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2608 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2586 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2588 smp_us=5
+MTPPHASE phase=draft us=10751 drafted=4
+MTPTGT n_tokens=5 us=38340
+MTPPROC head=0 n_batch=5 us=1575
+MTPPHASE phase=sync us=1694 n_tokens=5
+MTPPHASE phase=verify us=1505 sample_accept_us=1268 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2811 smp_us=17
+MTPDRAFT depth=1 n_batch=1 dec_us=2654 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2641 smp_us=12
+MTPDRAFT depth=3 n_batch=1 dec_us=2655 smp_us=5
+MTPPHASE phase=draft us=10961 drafted=4
+MTPTGT n_tokens=5 us=38311
+MTPPROC head=0 n_batch=5 us=1718
+MTPPHASE phase=sync us=1857 n_tokens=5
+MTPPHASE phase=verify us=1531 sample_accept_us=1228 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2821 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2607 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2586 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2592 smp_us=4
+MTPPHASE phase=draft us=10755 drafted=4
+MTPTGT n_tokens=5 us=38185
+MTPPROC head=0 n_batch=5 us=1572
+MTPPHASE phase=sync us=1690 n_tokens=5
+MTPPHASE phase=verify us=1538 sample_accept_us=1287 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2828 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2625 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2617 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2648 smp_us=11
+MTPPHASE phase=draft us=10843 drafted=4
+MTPTGT n_tokens=5 us=38413
+MTPPROC head=0 n_batch=5 us=1702
+MTPPHASE phase=sync us=1806 n_tokens=5
+MTPPHASE phase=verify us=1571 sample_accept_us=1253 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2804 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2609 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2583 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=5
+MTPPHASE phase=draft us=10660 drafted=4
+MTPTGT n_tokens=5 us=38122
+MTPPROC head=0 n_batch=5 us=1722
+MTPPHASE phase=sync us=1824 n_tokens=5
+MTPPHASE phase=verify us=1658 sample_accept_us=1294 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2821 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2602 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2613 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=4
+MTPPHASE phase=draft us=10742 drafted=4
+MTPTGT n_tokens=5 us=38320
+MTPPROC head=0 n_batch=5 us=1736
+MTPPHASE phase=sync us=1874 n_tokens=5
+MTPPHASE phase=verify us=1561 sample_accept_us=1248 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2824 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2627 smp_us=15
+MTPDRAFT depth=2 n_batch=1 dec_us=2605 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2590 smp_us=4
+MTPPHASE phase=draft us=10745 drafted=4
+MTPTGT n_tokens=5 us=38415
+MTPPROC head=0 n_batch=5 us=1692
+MTPPHASE phase=sync us=1821 n_tokens=5
+MTPPHASE phase=verify us=1560 sample_accept_us=1235 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2867 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2600 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2596 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=5
+MTPPHASE phase=draft us=10767 drafted=4
+MTPTGT n_tokens=5 us=38206
+MTPPROC head=0 n_batch=5 us=1655
+MTPPHASE phase=sync us=1748 n_tokens=5
+MTPPHASE phase=verify us=1573 sample_accept_us=1220 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2794 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2605 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2587 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2584 smp_us=4
+MTPPHASE phase=draft us=10692 drafted=4
+MTPTGT n_tokens=5 us=38360
+MTPPROC head=0 n_batch=5 us=1428
+MTPPHASE phase=sync us=1506 n_tokens=5
+MTPPHASE phase=verify us=1404 sample_accept_us=1230 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2734 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2605 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2583 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2584 smp_us=5
+MTPPHASE phase=draft us=10621 drafted=4
+MTPTGT n_tokens=5 us=38342
+MTPPROC head=0 n_batch=5 us=1661
+MTPPHASE phase=sync us=1757 n_tokens=5
+MTPPHASE phase=verify us=1664 sample_accept_us=1312 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2866 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2620 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2593 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2590 smp_us=6
+MTPPHASE phase=draft us=10796 drafted=4
+MTPTGT n_tokens=5 us=38168
+MTPPROC head=0 n_batch=5 us=1650
+MTPPHASE phase=sync us=1745 n_tokens=5
+MTPPHASE phase=verify us=1549 sample_accept_us=1238 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2813 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2612 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2592 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2596 smp_us=6
+MTPPHASE phase=draft us=10749 drafted=4
+MTPTGT n_tokens=5 us=38514
+MTPPROC head=0 n_batch=5 us=1646
+MTPPHASE phase=sync us=1807 n_tokens=5
+MTPPHASE phase=verify us=2132 sample_accept_us=1817 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2829 smp_us=8
+MTPDRAFT depth=1 n_batch=1 dec_us=2606 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2586 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2587 smp_us=5
+MTPPHASE phase=draft us=10749 drafted=4
+MTPTGT n_tokens=5 us=38272
+MTPPROC head=0 n_batch=5 us=1981
+MTPPHASE phase=sync us=2119 n_tokens=5
+MTPPHASE phase=verify us=1598 sample_accept_us=1311 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2799 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2614 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2643 smp_us=10
+MTPDRAFT depth=3 n_batch=1 dec_us=2623 smp_us=17
+MTPPHASE phase=draft us=10889 drafted=4
+MTPTGT n_tokens=5 us=38266
+MTPPROC head=0 n_batch=5 us=1659
+MTPPHASE phase=sync us=1791 n_tokens=5
+MTPPHASE phase=verify us=1534 sample_accept_us=1258 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2851 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2642 smp_us=20
+MTPDRAFT depth=2 n_batch=1 dec_us=2648 smp_us=10
+MTPDRAFT depth=3 n_batch=1 dec_us=2631 smp_us=9
+MTPPHASE phase=draft us=10987 drafted=4
+MTPTGT n_tokens=5 us=38700
+MTPPROC head=0 n_batch=5 us=1769
+MTPPHASE phase=sync us=1930 n_tokens=5
+MTPPHASE phase=verify us=1566 sample_accept_us=1280 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2991 smp_us=20
+MTPDRAFT depth=1 n_batch=1 dec_us=2721 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2604 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2607 smp_us=5
+MTPPHASE phase=draft us=11120 drafted=4
+MTPTGT n_tokens=5 us=38286
+MTPPROC head=0 n_batch=5 us=1718
+MTPPHASE phase=sync us=1852 n_tokens=5
+MTPPHASE phase=verify us=1550 sample_accept_us=1263 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2829 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2604 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2587 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2581 smp_us=5
+MTPPHASE phase=draft us=10722 drafted=4
+MTPTGT n_tokens=5 us=38267
+MTPPROC head=0 n_batch=5 us=1698
+MTPPHASE phase=sync us=1811 n_tokens=5
+MTPPHASE phase=verify us=1643 sample_accept_us=1275 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2923 smp_us=17
+MTPDRAFT depth=1 n_batch=1 dec_us=2691 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2644 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2593 smp_us=5
+MTPPHASE phase=draft us=11007 drafted=4
+MTPTGT n_tokens=5 us=38453
+MTPPROC head=0 n_batch=5 us=1498
+MTPPHASE phase=sync us=1584 n_tokens=5
+MTPPHASE phase=verify us=1563 sample_accept_us=1281 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2782 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2600 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2585 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2578 smp_us=5
+MTPPHASE phase=draft us=10663 drafted=4
+MTPTGT n_tokens=5 us=38236
+MTPPROC head=0 n_batch=5 us=1736
+MTPPHASE phase=sync us=1891 n_tokens=5
+MTPPHASE phase=verify us=1669 sample_accept_us=1273 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2996 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2644 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2616 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2590 smp_us=5
+MTPPHASE phase=draft us=10992 drafted=4
+MTPTGT n_tokens=5 us=38283
+MTPPROC head=0 n_batch=5 us=1471
+MTPPHASE phase=sync us=1555 n_tokens=5
+MTPPHASE phase=verify us=1549 sample_accept_us=1279 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2746 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2589 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2585 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2579 smp_us=5
+MTPPHASE phase=draft us=10645 drafted=4
+MTPTGT n_tokens=5 us=38348
+MTPPROC head=0 n_batch=5 us=1805
+MTPPHASE phase=sync us=1974 n_tokens=5
+MTPPHASE phase=verify us=1679 sample_accept_us=1301 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2953 smp_us=18
+MTPDRAFT depth=1 n_batch=1 dec_us=2701 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2605 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2585 smp_us=5
+MTPPHASE phase=draft us=10994 drafted=4
+MTPTGT n_tokens=5 us=38176
+MTPPROC head=0 n_batch=5 us=1537
+MTPPHASE phase=sync us=1656 n_tokens=5
+MTPPHASE phase=verify us=1561 sample_accept_us=1290 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2788 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2607 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2585 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2579 smp_us=4
+MTPPHASE phase=draft us=10704 drafted=3
+MTPTGT n_tokens=4 us=41473
+MTPPROC head=0 n_batch=4 us=1664
+MTPPHASE phase=sync us=1800 n_tokens=4
+MTPPHASE phase=verify us=1324 sample_accept_us=1035 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2878 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2608 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2607 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2606 smp_us=6
+MTPPHASE phase=draft us=10877 drafted=4
+MTPTGT n_tokens=5 us=42382
+MTPPROC head=0 n_batch=5 us=1807
+MTPPHASE phase=sync us=1957 n_tokens=5
+MTPPHASE phase=verify us=1587 sample_accept_us=1282 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2889 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2629 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2598 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2605 smp_us=6
+MTPPHASE phase=draft us=10894 drafted=4
+MTPTGT n_tokens=5 us=39858
+MTPPROC head=0 n_batch=5 us=1717
+MTPPHASE phase=sync us=1855 n_tokens=5
+MTPPHASE phase=verify us=1579 sample_accept_us=1287 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2811 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2606 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2584 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2580 smp_us=5
+MTPPHASE phase=draft us=10727 drafted=4
+MTPTGT n_tokens=5 us=39728
+MTPPROC head=0 n_batch=5 us=1478
+MTPPHASE phase=sync us=1595 n_tokens=5
+MTPPHASE phase=verify us=1455 sample_accept_us=1273 n_draft=4
+MTPTGT n_tokens=1 us=30482
+MTPPROC head=0 n_batch=1 us=1462
+MTPPHASE phase=sync us=1588 n_tokens=1
+MTPSTATS type=draft-mtp steps=60 gen_drafts=60 acc_drafts=57 gen_tokens=206 acc_tokens=188 gen_per_pos=[60,53,47,46] acc_per_pos=[57,47,43,41]
+0.17.742.362 I slot print_timing: id  0 | task 26 | prompt eval time =     179.18 ms /    25 tokens (    7.17 ms per token,   139.52 tokens per second)
+0.17.742.366 I slot print_timing: id  0 | task 26 |        eval time =    2223.99 ms /   192 tokens (   11.64 ms per token,    85.88 tokens per second)
+0.17.742.367 I slot print_timing: id  0 | task 26 |       total time =    2403.17 ms /   217 tokens
+0.17.742.368 I slot print_timing: id  0 | task 26 |    graphs reused =         41
+0.17.742.372 I slot print_timing: id  0 | task 26 | draft acceptance = 0.98667 (  148 accepted /   150 generated), mean len =  4.61
+0.17.742.625 I slot      release: id  0 | task 26 | stop processing: n_tokens = 216, truncated = 0
+0.17.751.521 I GPU memory clock: decode -> idle, reset (dynamic)
+0.17.752.887 I APU TDP: restored original limits
+0.17.763.214 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 164721276570
+0.17.763.262 I slot launch_slot_: id  0 | task 73 | processing task, is_child = 0
+0.17.763.720 I APU TDP: active limit 20 W
+0.17.764.620 I GPU memory clock: idle -> prefill, locked 2700 MHz
+MTPTGT n_tokens=24 us=60921
+MTPPROC head=0 n_batch=24 us=2874
+MTPPHASE phase=sync us=3071 n_tokens=24
+MTPTGT n_tokens=4 us=40531
+MTPPROC head=0 n_batch=4 us=1567
+MTPPHASE phase=sync us=1694 n_tokens=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2769 smp_us=19
+MTPPHASE phase=draft us=2920 drafted=0
+MTPTGT n_tokens=1 us=30982
+MTPPROC head=0 n_batch=1 us=1514
+MTPPHASE phase=sync us=1612 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2818 smp_us=16
+MTPDRAFT depth=1 n_batch=1 dec_us=2645 smp_us=6
+MTPPHASE phase=draft us=5585 drafted=1
+MTPTGT n_tokens=2 us=33743
+MTPPROC head=0 n_batch=2 us=1331
+MTPPHASE phase=sync us=1405 n_tokens=2
+MTPPHASE phase=verify us=894 sample_accept_us=535 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2747 smp_us=15
+MTPDRAFT depth=1 n_batch=1 dec_us=2589 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2579 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2575 smp_us=5
+MTPPHASE phase=draft us=10612 drafted=4
+MTPTGT n_tokens=5 us=41413
+MTPPROC head=0 n_batch=5 us=1662
+MTPPHASE phase=sync us=1796 n_tokens=5
+MTPPHASE phase=verify us=1411 sample_accept_us=514 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2784 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2607 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2582 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=5
+MTPPHASE phase=draft us=10711 drafted=4
+MTPTGT n_tokens=5 us=39837
+MTPPROC head=0 n_batch=5 us=1686
+MTPPHASE phase=sync us=1814 n_tokens=5
+MTPPHASE phase=verify us=1519 sample_accept_us=1238 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2805 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2608 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2587 smp_us=5
+MTPPHASE phase=draft us=8142 drafted=2
+MTPTGT n_tokens=3 us=37290
+MTPPROC head=0 n_batch=3 us=1557
+MTPPHASE phase=sync us=1684 n_tokens=3
+MTPPHASE phase=verify us=1056 sample_accept_us=784 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2822 smp_us=14
+MTPDRAFT depth=1 n_batch=1 dec_us=2660 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2673 smp_us=10
+MTPDRAFT depth=3 n_batch=1 dec_us=2612 smp_us=5
+MTPPHASE phase=draft us=10962 drafted=4
+MTPTGT n_tokens=5 us=41754
+MTPPROC head=0 n_batch=5 us=1562
+MTPPHASE phase=sync us=1695 n_tokens=5
+MTPPHASE phase=verify us=1602 sample_accept_us=1320 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2803 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2611 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2602 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2606 smp_us=8
+MTPPHASE phase=draft us=10789 drafted=4
+MTPTGT n_tokens=5 us=39949
+MTPPROC head=0 n_batch=5 us=1662
+MTPPHASE phase=sync us=1803 n_tokens=5
+MTPPHASE phase=verify us=1548 sample_accept_us=1288 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2846 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2626 smp_us=6
+MTPPHASE phase=draft us=5616 drafted=1
+MTPTGT n_tokens=2 us=34709
+MTPPROC head=0 n_batch=2 us=1505
+MTPPHASE phase=sync us=1627 n_tokens=2
+MTPPHASE phase=verify us=880 sample_accept_us=600 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2780 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2598 smp_us=5
+MTPPHASE phase=draft us=5507 drafted=1
+MTPTGT n_tokens=2 us=31839
+MTPPROC head=0 n_batch=2 us=1479
+MTPPHASE phase=sync us=1602 n_tokens=2
+MTPPHASE phase=verify us=799 sample_accept_us=529 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2797 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2600 smp_us=5
+MTPPHASE phase=draft us=5497 drafted=1
+MTPTGT n_tokens=2 us=31745
+MTPPROC head=0 n_batch=2 us=1286
+MTPPHASE phase=sync us=1357 n_tokens=2
+MTPPHASE phase=verify us=677 sample_accept_us=489 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2848 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2626 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2604 smp_us=5
+MTPPHASE phase=draft us=8221 drafted=2
+MTPTGT n_tokens=3 us=37025
+MTPPROC head=0 n_batch=3 us=1558
+MTPPHASE phase=sync us=1683 n_tokens=3
+MTPPHASE phase=verify us=544 sample_accept_us=261 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2798 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2598 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2591 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2587 smp_us=4
+MTPPHASE phase=draft us=10718 drafted=4
+MTPTGT n_tokens=5 us=41856
+MTPPROC head=0 n_batch=5 us=1685
+MTPPHASE phase=sync us=1818 n_tokens=5
+MTPPHASE phase=verify us=1549 sample_accept_us=1268 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2822 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2597 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2586 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2588 smp_us=5
+MTPPHASE phase=draft us=10742 drafted=4
+MTPTGT n_tokens=5 us=39829
+MTPPROC head=0 n_batch=5 us=1755
+MTPPHASE phase=sync us=1861 n_tokens=5
+MTPPHASE phase=verify us=1642 sample_accept_us=1313 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2844 smp_us=8
+MTPPHASE phase=draft us=2936 drafted=0
+MTPTGT n_tokens=1 us=30559
+MTPPROC head=0 n_batch=1 us=1478
+MTPPHASE phase=sync us=1569 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2820 smp_us=9
+MTPPHASE phase=draft us=2916 drafted=0
+MTPTGT n_tokens=1 us=28273
+MTPPROC head=0 n_batch=1 us=1619
+MTPPHASE phase=sync us=1745 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2750 smp_us=17
+MTPDRAFT depth=1 n_batch=1 dec_us=2687 smp_us=18
+MTPDRAFT depth=2 n_batch=1 dec_us=2649 smp_us=13
+MTPDRAFT depth=3 n_batch=1 dec_us=2655 smp_us=6
+MTPPHASE phase=draft us=10956 drafted=4
+MTPTGT n_tokens=5 us=41812
+MTPPROC head=0 n_batch=5 us=1776
+MTPPHASE phase=sync us=1916 n_tokens=5
+MTPPHASE phase=verify us=1675 sample_accept_us=1260 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3010 smp_us=19
+MTPDRAFT depth=1 n_batch=1 dec_us=2658 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2613 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2594 smp_us=5
+MTPPHASE phase=draft us=11060 drafted=4
+MTPTGT n_tokens=5 us=39900
+MTPPROC head=0 n_batch=5 us=1537
+MTPPHASE phase=sync us=1656 n_tokens=5
+MTPPHASE phase=verify us=785 sample_accept_us=518 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2766 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2647 smp_us=10
+MTPDRAFT depth=2 n_batch=1 dec_us=2621 smp_us=4
+MTPPHASE phase=draft us=8189 drafted=2
+MTPTGT n_tokens=3 us=37345
+MTPPROC head=0 n_batch=3 us=1594
+MTPPHASE phase=sync us=1727 n_tokens=3
+MTPPHASE phase=verify us=1064 sample_accept_us=771 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2851 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2621 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2604 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2604 smp_us=7
+MTPPHASE phase=draft us=10824 drafted=4
+MTPTGT n_tokens=5 us=42323
+MTPPROC head=0 n_batch=5 us=1668
+MTPPHASE phase=sync us=1795 n_tokens=5
+MTPPHASE phase=verify us=2544 sample_accept_us=1748 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2818 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2617 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2596 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2608 smp_us=5
+MTPPHASE phase=draft us=10807 drafted=4
+MTPTGT n_tokens=5 us=39955
+MTPPROC head=0 n_batch=5 us=1766
+MTPPHASE phase=sync us=1924 n_tokens=5
+MTPPHASE phase=verify us=592 sample_accept_us=270 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2941 smp_us=17
+MTPDRAFT depth=1 n_batch=1 dec_us=2692 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2606 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2584 smp_us=5
+MTPPHASE phase=draft us=11011 drafted=4
+MTPTGT n_tokens=5 us=40002
+MTPPROC head=0 n_batch=5 us=1533
+MTPPHASE phase=sync us=1653 n_tokens=5
+MTPPHASE phase=verify us=1576 sample_accept_us=1285 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2774 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2600 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2585 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2581 smp_us=5
+MTPPHASE phase=draft us=10687 drafted=4
+MTPTGT n_tokens=5 us=39699
+MTPPROC head=0 n_batch=5 us=1698
+MTPPHASE phase=sync us=1806 n_tokens=5
+MTPPHASE phase=verify us=975 sample_accept_us=533 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2841 smp_us=8
+MTPPHASE phase=draft us=2930 drafted=0
+MTPTGT n_tokens=1 us=30458
+MTPPROC head=0 n_batch=1 us=1270
+MTPPHASE phase=sync us=1341 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2703 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2596 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2823 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2594 smp_us=4
+MTPPHASE phase=draft us=10869 drafted=3
+MTPTGT n_tokens=4 us=41140
+MTPPROC head=0 n_batch=4 us=1693
+MTPPHASE phase=sync us=1826 n_tokens=4
+MTPPHASE phase=verify us=1525 sample_accept_us=1066 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2927 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2628 smp_us=5
+MTPPHASE phase=draft us=5668 drafted=1
+MTPTGT n_tokens=2 us=34059
+MTPPROC head=0 n_batch=2 us=1525
+MTPPHASE phase=sync us=1659 n_tokens=2
+MTPPHASE phase=verify us=864 sample_accept_us=563 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2812 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=3211 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2602 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2631 smp_us=8
+MTPPHASE phase=draft us=11422 drafted=4
+MTPTGT n_tokens=5 us=42484
+MTPPROC head=0 n_batch=5 us=1549
+MTPPHASE phase=sync us=1638 n_tokens=5
+MTPPHASE phase=verify us=1561 sample_accept_us=1279 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3480 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2615 smp_us=10
+MTPDRAFT depth=2 n_batch=1 dec_us=2598 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2599 smp_us=5
+MTPPHASE phase=draft us=11467 drafted=4
+MTPTGT n_tokens=5 us=39948
+MTPPROC head=0 n_batch=5 us=1690
+MTPPHASE phase=sync us=1854 n_tokens=5
+MTPPHASE phase=verify us=1786 sample_accept_us=1487 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3089 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2631 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2623 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2633 smp_us=8
+MTPPHASE phase=draft us=11132 drafted=3
+MTPTGT n_tokens=4 us=41730
+MTPPROC head=0 n_batch=4 us=1586
+MTPPHASE phase=sync us=1679 n_tokens=4
+MTPPHASE phase=verify us=1127 sample_accept_us=815 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2825 smp_us=15
+MTPPHASE phase=draft us=2973 drafted=0
+MTPTGT n_tokens=1 us=31100
+MTPPROC head=0 n_batch=1 us=1438
+MTPPHASE phase=sync us=1531 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=4356 smp_us=20
+MTPDRAFT depth=1 n_batch=1 dec_us=2679 smp_us=14
+MTPDRAFT depth=2 n_batch=1 dec_us=2709 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2615 smp_us=5
+MTPPHASE phase=draft us=12567 drafted=3
+MTPTGT n_tokens=4 us=41206
+MTPPROC head=0 n_batch=4 us=1652
+MTPPHASE phase=sync us=1784 n_tokens=4
+MTPPHASE phase=verify us=1074 sample_accept_us=795 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2833 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2623 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2607 smp_us=4
+MTPPHASE phase=draft us=8215 drafted=2
+MTPTGT n_tokens=3 us=37847
+MTPPROC head=0 n_batch=3 us=1553
+MTPPHASE phase=sync us=1677 n_tokens=3
+MTPPHASE phase=verify us=1085 sample_accept_us=787 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=5016 smp_us=24
+MTPDRAFT depth=1 n_batch=1 dec_us=2675 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2615 smp_us=22
+MTPDRAFT depth=3 n_batch=1 dec_us=2781 smp_us=4
+MTPPHASE phase=draft us=13303 drafted=3
+MTPTGT n_tokens=4 us=41047
+MTPPROC head=0 n_batch=4 us=1552
+MTPPHASE phase=sync us=1677 n_tokens=4
+MTPPHASE phase=verify us=1089 sample_accept_us=799 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2816 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2650 smp_us=15
+MTPDRAFT depth=2 n_batch=1 dec_us=2686 smp_us=12
+MTPDRAFT depth=3 n_batch=1 dec_us=2654 smp_us=6
+MTPPHASE phase=draft us=11011 drafted=4
+MTPTGT n_tokens=5 us=42733
+MTPPROC head=0 n_batch=5 us=1608
+MTPPHASE phase=sync us=1734 n_tokens=5
+MTPPHASE phase=verify us=1574 sample_accept_us=1310 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2811 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2605 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2595 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2587 smp_us=5
+MTPPHASE phase=draft us=10713 drafted=4
+MTPTGT n_tokens=5 us=39815
+MTPPROC head=0 n_batch=5 us=1715
+MTPPHASE phase=sync us=1859 n_tokens=5
+MTPPHASE phase=verify us=1585 sample_accept_us=1254 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3011 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=3605 smp_us=22
+MTPDRAFT depth=2 n_batch=1 dec_us=2658 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2584 smp_us=4
+MTPPHASE phase=draft us=12063 drafted=4
+MTPTGT n_tokens=5 us=40545
+MTPPROC head=0 n_batch=5 us=1583
+MTPPHASE phase=sync us=1714 n_tokens=5
+MTPPHASE phase=verify us=1223 sample_accept_us=1001 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2799 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2603 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2586 smp_us=4
+MTPPHASE phase=draft us=8137 drafted=2
+MTPTGT n_tokens=3 us=37069
+MTPPROC head=0 n_batch=3 us=1596
+MTPPHASE phase=sync us=1720 n_tokens=3
+MTPPHASE phase=verify us=1124 sample_accept_us=808 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2848 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2623 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2679 smp_us=6
+MTPPHASE phase=draft us=8310 drafted=2
+MTPTGT n_tokens=3 us=35145
+MTPPROC head=0 n_batch=3 us=1530
+MTPPHASE phase=sync us=1651 n_tokens=3
+MTPPHASE phase=verify us=777 sample_accept_us=525 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2792 smp_us=7
+MTPPHASE phase=draft us=2909 drafted=0
+MTPTGT n_tokens=1 us=30356
+MTPPROC head=0 n_batch=1 us=1424
+MTPPHASE phase=sync us=1535 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2733 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2624 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2603 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2601 smp_us=9
+MTPPHASE phase=draft us=10722 drafted=4
+MTPTGT n_tokens=5 us=42295
+MTPPROC head=0 n_batch=5 us=1703
+MTPPHASE phase=sync us=1832 n_tokens=5
+MTPPHASE phase=verify us=2059 sample_accept_us=1776 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2805 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2598 smp_us=5
+MTPPHASE phase=draft us=5533 drafted=1
+MTPTGT n_tokens=2 us=34574
+MTPPROC head=0 n_batch=2 us=1371
+MTPPHASE phase=sync us=1489 n_tokens=2
+MTPPHASE phase=verify us=765 sample_accept_us=506 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2787 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2609 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2602 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2606 smp_us=7
+MTPPHASE phase=draft us=10788 drafted=3
+MTPTGT n_tokens=4 us=41912
+MTPPROC head=0 n_batch=4 us=1657
+MTPPHASE phase=sync us=1795 n_tokens=4
+MTPPHASE phase=verify us=560 sample_accept_us=279 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2807 smp_us=14
+MTPDRAFT depth=1 n_batch=1 dec_us=2644 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2586 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=4
+MTPPHASE phase=draft us=10763 drafted=3
+MTPTGT n_tokens=4 us=39215
+MTPPROC head=0 n_batch=4 us=1648
+MTPPHASE phase=sync us=1781 n_tokens=4
+MTPPHASE phase=verify us=1371 sample_accept_us=1071 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=4661 smp_us=37
+MTPDRAFT depth=1 n_batch=1 dec_us=2731 smp_us=10
+MTPDRAFT depth=2 n_batch=1 dec_us=2636 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2605 smp_us=5
+MTPPHASE phase=draft us=12857 drafted=4
+MTPTGT n_tokens=5 us=42143
+MTPPROC head=0 n_batch=5 us=1656
+MTPPHASE phase=sync us=1757 n_tokens=5
+MTPPHASE phase=verify us=1534 sample_accept_us=1255 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2798 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2611 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=3025 smp_us=5
+MTPPHASE phase=draft us=8580 drafted=2
+MTPTGT n_tokens=3 us=37245
+MTPPROC head=0 n_batch=3 us=1586
+MTPPHASE phase=sync us=1653 n_tokens=3
+MTPPHASE phase=verify us=1272 sample_accept_us=836 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2887 smp_us=14
+MTPDRAFT depth=1 n_batch=1 dec_us=3361 smp_us=7
+MTPPHASE phase=draft us=6373 drafted=1
+MTPTGT n_tokens=2 us=34096
+MTPPROC head=0 n_batch=2 us=1449
+MTPPHASE phase=sync us=1535 n_tokens=2
+MTPPHASE phase=verify us=827 sample_accept_us=536 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2786 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2606 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2599 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2586 smp_us=6
+MTPPHASE phase=draft us=10707 drafted=3
+MTPTGT n_tokens=4 us=41741
+MTPPROC head=0 n_batch=4 us=1711
+MTPPHASE phase=sync us=1881 n_tokens=4
+MTPPHASE phase=verify us=1458 sample_accept_us=1054 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2946 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2616 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2591 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=4998 smp_us=16
+MTPPHASE phase=draft us=13320 drafted=4
+MTPTGT n_tokens=5 us=42489
+MTPPROC head=0 n_batch=5 us=1632
+MTPPHASE phase=sync us=1761 n_tokens=5
+MTPPHASE phase=verify us=1530 sample_accept_us=1248 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2839 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2607 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2588 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2582 smp_us=4
+MTPPHASE phase=draft us=10776 drafted=3
+MTPTGT n_tokens=4 us=41522
+MTPPROC head=0 n_batch=4 us=1681
+MTPPHASE phase=sync us=1789 n_tokens=4
+MTPPHASE phase=verify us=1329 sample_accept_us=1028 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2850 smp_us=8
+MTPPHASE phase=draft us=2941 drafted=0
+MTPTGT n_tokens=1 us=30390
+MTPPROC head=0 n_batch=1 us=1419
+MTPPHASE phase=sync us=1576 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2947 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2592 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2607 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2579 smp_us=5
+MTPPHASE phase=draft us=10857 drafted=4
+MTPTGT n_tokens=5 us=41643
+MTPPROC head=0 n_batch=5 us=1717
+MTPPHASE phase=sync us=1851 n_tokens=5
+MTPPHASE phase=verify us=1595 sample_accept_us=1303 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2786 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2595 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2598 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2582 smp_us=5
+MTPPHASE phase=draft us=10711 drafted=4
+MTPTGT n_tokens=5 us=39567
+MTPPROC head=0 n_batch=5 us=1725
+MTPPHASE phase=sync us=1828 n_tokens=5
+MTPPHASE phase=verify us=1618 sample_accept_us=1313 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2814 smp_us=7
+MTPPHASE phase=draft us=2900 drafted=0
+MTPTGT n_tokens=1 us=30427
+MTPPROC head=0 n_batch=1 us=1553
+MTPPHASE phase=sync us=1672 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2852 smp_us=22
+MTPDRAFT depth=1 n_batch=1 dec_us=2881 smp_us=12
+MTPPHASE phase=draft us=5919 drafted=1
+MTPTGT n_tokens=2 us=34368
+MTPPROC head=0 n_batch=2 us=1536
+MTPPHASE phase=sync us=1630 n_tokens=2
+MTPPHASE phase=verify us=845 sample_accept_us=541 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2802 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2613 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2588 smp_us=4
+MTPPHASE phase=draft us=8108 drafted=2
+MTPTGT n_tokens=3 us=36922
+MTPPROC head=0 n_batch=3 us=1550
+MTPPHASE phase=sync us=1671 n_tokens=3
+MTPPHASE phase=verify us=801 sample_accept_us=515 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2831 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2628 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2605 smp_us=5
+MTPPHASE phase=draft us=8179 drafted=2
+MTPTGT n_tokens=3 us=35198
+MTPPROC head=0 n_batch=3 us=1506
+MTPPHASE phase=sync us=1624 n_tokens=3
+MTPPHASE phase=verify us=1065 sample_accept_us=786 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2811 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2600 smp_us=4
+MTPPHASE phase=draft us=5550 drafted=1
+MTPTGT n_tokens=2 us=34006
+MTPPROC head=0 n_batch=2 us=1366
+MTPPHASE phase=sync us=1476 n_tokens=2
+MTPPHASE phase=verify us=759 sample_accept_us=522 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=5199 smp_us=21
+MTPDRAFT depth=1 n_batch=1 dec_us=2655 smp_us=17
+MTPPHASE phase=draft us=8038 drafted=1
+MTPTGT n_tokens=2 us=32053
+MTPPROC head=0 n_batch=2 us=1607
+MTPPHASE phase=sync us=1691 n_tokens=2
+MTPPHASE phase=verify us=925 sample_accept_us=566 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3542 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2634 smp_us=5
+MTPPHASE phase=draft us=6327 drafted=1
+MTPTGT n_tokens=2 us=31758
+MTPPROC head=0 n_batch=2 us=1463
+MTPPHASE phase=sync us=1546 n_tokens=2
+MTPPHASE phase=verify us=1013 sample_accept_us=677 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2793 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2602 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2578 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2583 smp_us=4
+MTPPHASE phase=draft us=10674 drafted=4
+MTPTGT n_tokens=5 us=41656
+MTPPROC head=0 n_batch=5 us=1690
+MTPPHASE phase=sync us=1786 n_tokens=5
+MTPPHASE phase=verify us=1522 sample_accept_us=1226 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3607 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2614 smp_us=5
+MTPPHASE phase=draft us=6362 drafted=1
+MTPTGT n_tokens=2 us=34119
+MTPPROC head=0 n_batch=2 us=1500
+MTPPHASE phase=sync us=1620 n_tokens=2
+MTPPHASE phase=verify us=824 sample_accept_us=533 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3628 smp_us=14
+MTPDRAFT depth=1 n_batch=1 dec_us=2635 smp_us=5
+MTPPHASE phase=draft us=6382 drafted=1
+MTPTGT n_tokens=2 us=31725
+MTPPROC head=0 n_batch=2 us=1464
+MTPPHASE phase=sync us=1545 n_tokens=2
+MTPPHASE phase=verify us=829 sample_accept_us=559 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3613 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2613 smp_us=5
+MTPPHASE phase=draft us=6360 drafted=1
+MTPTGT n_tokens=2 us=31806
+MTPPROC head=0 n_batch=2 us=1520
+MTPPHASE phase=sync us=1649 n_tokens=2
+MTPPHASE phase=verify us=820 sample_accept_us=516 n_draft=1
+0.20.962.282 I slot print_timing: id  0 | task 73 | n_gen =    182, tg =  59.91 t/s, tg_3s =  60.24 t/s
+MTPDRAFT depth=0 n_batch=1 dec_us=2865 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=3469 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=3110 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2613 smp_us=6
+MTPPHASE phase=draft us=12244 drafted=4
+MTPTGT n_tokens=5 us=42356
+MTPPROC head=0 n_batch=5 us=1711
+MTPPHASE phase=sync us=1809 n_tokens=5
+MTPPHASE phase=verify us=809 sample_accept_us=536 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3483 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2604 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2596 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2590 smp_us=4
+MTPPHASE phase=draft us=11394 drafted=4
+MTPTGT n_tokens=5 us=39807
+MTPPROC head=0 n_batch=5 us=1695
+MTPPHASE phase=sync us=1799 n_tokens=5
+MTPPHASE phase=verify us=968 sample_accept_us=635 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2965 smp_us=18
+MTPDRAFT depth=1 n_batch=1 dec_us=2704 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2649 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2643 smp_us=5
+MTPPHASE phase=draft us=11119 drafted=4
+MTPTGT n_tokens=5 us=39952
+MTPPROC head=0 n_batch=5 us=1690
+MTPPHASE phase=sync us=1782 n_tokens=5
+MTPPHASE phase=verify us=1552 sample_accept_us=1265 n_draft=4
+MTPTGT n_tokens=1 us=30496
+MTPPROC head=0 n_batch=1 us=1460
+MTPPHASE phase=sync us=1574 n_tokens=1
+MTPSTATS type=draft-mtp steps=117 gen_drafts=117 acc_drafts=111 gen_tokens=366 acc_tokens=313 gen_per_pos=[117,96,81,72] acc_per_pos=[111,80,65,57]
+0.21.160.808 I slot print_timing: id  0 | task 73 | prompt eval time =     176.44 ms /    28 tokens (    6.30 ms per token,   158.69 tokens per second)
+0.21.160.812 I slot print_timing: id  0 | task 73 |        eval time =    3219.72 ms /   192 tokens (   16.86 ms per token,    59.32 tokens per second)
+0.21.160.812 I slot print_timing: id  0 | task 73 |       total time =    3396.16 ms /   220 tokens
+0.21.160.814 I slot print_timing: id  0 | task 73 |    graphs reused =         64
+0.21.160.817 I slot print_timing: id  0 | task 73 | draft acceptance = 0.78125 (  125 accepted /   160 generated), mean len =  3.19
+0.21.160.851 I slot      release: id  0 | task 73 | stop processing: n_tokens = 219, truncated = 0
+0.21.169.859 I GPU memory clock: decode -> idle, reset (dynamic)
+0.21.171.147 I APU TDP: restored original limits
+0.21.188.886 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 164724694793
+0.21.188.923 I slot launch_slot_: id  0 | task 143 | processing task, is_child = 0
+0.21.189.241 I APU TDP: active limit 20 W
+0.21.190.174 I GPU memory clock: idle -> prefill, locked 2700 MHz
+MTPTGT n_tokens=46 us=83728
+MTPPROC head=0 n_batch=46 us=3838
+MTPPHASE phase=sync us=4134 n_tokens=46
+MTPTGT n_tokens=4 us=42962
+MTPPROC head=0 n_batch=4 us=1639
+MTPPHASE phase=sync us=1691 n_tokens=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2711 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2605 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2584 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2609 smp_us=5
+MTPPHASE phase=draft us=10666 drafted=4
+MTPTGT n_tokens=5 us=42285
+MTPPROC head=0 n_batch=5 us=1941
+MTPPHASE phase=sync us=2090 n_tokens=5
+MTPPHASE phase=verify us=1567 sample_accept_us=1287 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2870 smp_us=28
+MTPDRAFT depth=1 n_batch=1 dec_us=2764 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2672 smp_us=16
+MTPDRAFT depth=3 n_batch=1 dec_us=2675 smp_us=5
+MTPPHASE phase=draft us=11214 drafted=4
+MTPTGT n_tokens=5 us=40030
+MTPPROC head=0 n_batch=5 us=1724
+MTPPHASE phase=sync us=1907 n_tokens=5
+MTPPHASE phase=verify us=1757 sample_accept_us=1327 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2972 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2641 smp_us=6
+MTPPHASE phase=draft us=5763 drafted=1
+MTPTGT n_tokens=2 us=34055
+MTPPROC head=0 n_batch=2 us=1446
+MTPPHASE phase=sync us=1564 n_tokens=2
+MTPPHASE phase=verify us=799 sample_accept_us=515 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2787 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2617 smp_us=12
+MTPDRAFT depth=2 n_batch=1 dec_us=2650 smp_us=16
+MTPDRAFT depth=3 n_batch=1 dec_us=2614 smp_us=6
+MTPPHASE phase=draft us=10878 drafted=4
+MTPTGT n_tokens=5 us=41694
+MTPPROC head=0 n_batch=5 us=1727
+MTPPHASE phase=sync us=1837 n_tokens=5
+MTPPHASE phase=verify us=1756 sample_accept_us=1326 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2987 smp_us=17
+MTPDRAFT depth=1 n_batch=1 dec_us=2691 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2605 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2601 smp_us=5
+MTPPHASE phase=draft us=11040 drafted=4
+MTPTGT n_tokens=5 us=39819
+MTPPROC head=0 n_batch=5 us=1662
+MTPPHASE phase=sync us=1757 n_tokens=5
+MTPPHASE phase=verify us=1584 sample_accept_us=1267 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2830 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2612 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2588 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2602 smp_us=5
+MTPPHASE phase=draft us=10793 drafted=4
+MTPTGT n_tokens=5 us=39753
+MTPPROC head=0 n_batch=5 us=1681
+MTPPHASE phase=sync us=1809 n_tokens=5
+MTPPHASE phase=verify us=1541 sample_accept_us=1266 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=5112 smp_us=21
+MTPDRAFT depth=1 n_batch=1 dec_us=2649 smp_us=5
+MTPPHASE phase=draft us=7935 drafted=1
+MTPTGT n_tokens=2 us=33868
+MTPPROC head=0 n_batch=2 us=1566
+MTPPHASE phase=sync us=1702 n_tokens=2
+MTPPHASE phase=verify us=922 sample_accept_us=553 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3004 smp_us=23
+MTPDRAFT depth=1 n_batch=1 dec_us=3549 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2618 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2585 smp_us=5
+MTPPHASE phase=draft us=11952 drafted=4
+MTPTGT n_tokens=5 us=41704
+MTPPROC head=0 n_batch=5 us=1541
+MTPPHASE phase=sync us=1661 n_tokens=5
+MTPPHASE phase=verify us=1511 sample_accept_us=1237 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2791 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2607 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2599 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2589 smp_us=4
+MTPPHASE phase=draft us=10734 drafted=3
+MTPTGT n_tokens=4 us=41341
+MTPPROC head=0 n_batch=4 us=1636
+MTPPHASE phase=sync us=1770 n_tokens=4
+MTPPHASE phase=verify us=1298 sample_accept_us=1020 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2841 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2601 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=4888 smp_us=20
+MTPDRAFT depth=3 n_batch=1 dec_us=2650 smp_us=5
+MTPPHASE phase=draft us=13172 drafted=3
+MTPTGT n_tokens=4 us=39495
+MTPPROC head=0 n_batch=4 us=1581
+MTPPHASE phase=sync us=1702 n_tokens=4
+MTPPHASE phase=verify us=1402 sample_accept_us=1110 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2823 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2636 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2599 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2587 smp_us=5
+MTPPHASE phase=draft us=10811 drafted=3
+MTPTGT n_tokens=4 us=39291
+MTPPROC head=0 n_batch=4 us=1641
+MTPPHASE phase=sync us=1768 n_tokens=4
+MTPPHASE phase=verify us=1448 sample_accept_us=1104 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=3468 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2600 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=3064 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2595 smp_us=5
+MTPPHASE phase=draft us=11879 drafted=4
+MTPTGT n_tokens=5 us=41643
+MTPPROC head=0 n_batch=5 us=1542
+MTPPHASE phase=sync us=1662 n_tokens=5
+MTPPHASE phase=verify us=1278 sample_accept_us=1015 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2774 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2604 smp_us=5
+MTPPHASE phase=draft us=5508 drafted=1
+MTPTGT n_tokens=2 us=34005
+MTPPROC head=0 n_batch=2 us=1520
+MTPPHASE phase=sync us=1643 n_tokens=2
+MTPPHASE phase=verify us=823 sample_accept_us=536 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2805 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2611 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2583 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2596 smp_us=4
+MTPPHASE phase=draft us=10756 drafted=3
+MTPTGT n_tokens=4 us=41236
+MTPPROC head=0 n_batch=4 us=1579
+MTPPHASE phase=sync us=1757 n_tokens=4
+MTPPHASE phase=verify us=1130 sample_accept_us=831 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2801 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=4867 smp_us=20
+MTPDRAFT depth=2 n_batch=1 dec_us=2659 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2604 smp_us=5
+MTPPHASE phase=draft us=13116 drafted=3
+MTPTGT n_tokens=4 us=39379
+MTPPROC head=0 n_batch=4 us=1698
+MTPPHASE phase=sync us=1846 n_tokens=4
+MTPPHASE phase=verify us=1538 sample_accept_us=1154 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=3028 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2632 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2585 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2583 smp_us=5
+MTPPHASE phase=draft us=10992 drafted=4
+MTPTGT n_tokens=5 us=42632
+MTPPROC head=0 n_batch=5 us=1542
+MTPPHASE phase=sync us=1631 n_tokens=5
+MTPPHASE phase=verify us=1549 sample_accept_us=1243 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2766 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2600 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2595 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2592 smp_us=5
+MTPPHASE phase=draft us=10676 drafted=4
+MTPTGT n_tokens=5 us=39824
+MTPPROC head=0 n_batch=5 us=1665
+MTPPHASE phase=sync us=1794 n_tokens=5
+MTPPHASE phase=verify us=1555 sample_accept_us=1286 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=4813 smp_us=22
+MTPDRAFT depth=1 n_batch=1 dec_us=2670 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2595 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2582 smp_us=4
+MTPPHASE phase=draft us=12781 drafted=3
+MTPTGT n_tokens=4 us=41364
+MTPPROC head=0 n_batch=4 us=1579
+MTPPHASE phase=sync us=1703 n_tokens=4
+MTPPHASE phase=verify us=1292 sample_accept_us=1005 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=3561 smp_us=19
+MTPDRAFT depth=1 n_batch=1 dec_us=2694 smp_us=12
+MTPDRAFT depth=2 n_batch=1 dec_us=2644 smp_us=15
+MTPDRAFT depth=3 n_batch=1 dec_us=2659 smp_us=5
+MTPPHASE phase=draft us=11764 drafted=4
+MTPTGT n_tokens=5 us=42815
+MTPPROC head=0 n_batch=5 us=1787
+MTPPHASE phase=sync us=1871 n_tokens=5
+MTPPHASE phase=verify us=1669 sample_accept_us=1325 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3634 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2610 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2588 smp_us=5
+MTPPHASE phase=draft us=8979 drafted=2
+MTPTGT n_tokens=3 us=37250
+MTPPROC head=0 n_batch=3 us=1620
+MTPPHASE phase=sync us=1775 n_tokens=3
+MTPPHASE phase=verify us=1053 sample_accept_us=610 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2944 smp_us=9
+MTPPHASE phase=draft us=3073 drafted=0
+MTPTGT n_tokens=1 us=30430
+MTPPROC head=0 n_batch=1 us=1455
+MTPPHASE phase=sync us=1508 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2721 smp_us=7
+MTPPHASE phase=draft us=2767 drafted=0
+MTPTGT n_tokens=1 us=28067
+MTPPROC head=0 n_batch=1 us=1232
+MTPPHASE phase=sync us=1299 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2689 smp_us=7
+MTPPHASE phase=draft us=2772 drafted=0
+MTPTGT n_tokens=1 us=28103
+MTPPROC head=0 n_batch=1 us=1535
+MTPPHASE phase=sync us=1627 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2880 smp_us=15
+MTPDRAFT depth=1 n_batch=1 dec_us=2622 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=4423 smp_us=6
+MTPPHASE phase=draft us=10090 drafted=2
+MTPTGT n_tokens=3 us=37129
+MTPPROC head=0 n_batch=3 us=1532
+MTPPHASE phase=sync us=1631 n_tokens=3
+MTPPHASE phase=verify us=1173 sample_accept_us=793 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2847 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2599 smp_us=5
+MTPPHASE phase=draft us=5545 drafted=1
+MTPTGT n_tokens=2 us=34005
+MTPPROC head=0 n_batch=2 us=1430
+MTPPHASE phase=sync us=1517 n_tokens=2
+MTPPHASE phase=verify us=848 sample_accept_us=543 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2794 smp_us=8
+MTPPHASE phase=draft us=2883 drafted=0
+MTPTGT n_tokens=1 us=30903
+MTPPROC head=0 n_batch=1 us=1495
+MTPPHASE phase=sync us=1630 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2756 smp_us=7
+MTPPHASE phase=draft us=2875 drafted=0
+MTPTGT n_tokens=1 us=28341
+MTPPROC head=0 n_batch=1 us=1252
+MTPPHASE phase=sync us=1356 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2715 smp_us=7
+MTPPHASE phase=draft us=2833 drafted=0
+MTPTGT n_tokens=1 us=28245
+MTPPROC head=0 n_batch=1 us=1342
+MTPPHASE phase=sync us=1420 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2735 smp_us=14
+MTPDRAFT depth=1 n_batch=1 dec_us=2636 smp_us=12
+MTPDRAFT depth=2 n_batch=1 dec_us=4604 smp_us=12
+MTPDRAFT depth=3 n_batch=1 dec_us=2633 smp_us=5
+MTPPHASE phase=draft us=12820 drafted=3
+MTPTGT n_tokens=4 us=41271
+MTPPROC head=0 n_batch=4 us=1640
+MTPPHASE phase=sync us=1773 n_tokens=4
+MTPPHASE phase=verify us=1276 sample_accept_us=993 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2817 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2608 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2585 smp_us=4
+MTPPHASE phase=draft us=8156 drafted=2
+MTPTGT n_tokens=3 us=37099
+MTPPROC head=0 n_batch=3 us=1631
+MTPPHASE phase=sync us=1761 n_tokens=3
+MTPPHASE phase=verify us=991 sample_accept_us=589 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2929 smp_us=11
+MTPPHASE phase=draft us=3070 drafted=0
+MTPTGT n_tokens=1 us=30490
+MTPPROC head=0 n_batch=1 us=1461
+MTPPHASE phase=sync us=1577 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2730 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2605 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2587 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=4944 smp_us=6
+MTPPHASE phase=draft us=13014 drafted=4
+MTPTGT n_tokens=5 us=41853
+MTPPROC head=0 n_batch=5 us=1634
+MTPPHASE phase=sync us=1764 n_tokens=5
+MTPPHASE phase=verify us=1324 sample_accept_us=1042 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2828 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2662 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2654 smp_us=9
+MTPPHASE phase=draft us=8283 drafted=2
+MTPTGT n_tokens=3 us=37682
+MTPPROC head=0 n_batch=3 us=1543
+MTPPHASE phase=sync us=1665 n_tokens=3
+MTPPHASE phase=verify us=1084 sample_accept_us=807 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2836 smp_us=16
+MTPPHASE phase=draft us=2965 drafted=0
+MTPTGT n_tokens=1 us=31958
+MTPPROC head=0 n_batch=1 us=1391
+MTPPHASE phase=sync us=1506 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2757 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2609 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2592 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2588 smp_us=4
+MTPPHASE phase=draft us=10658 drafted=4
+MTPTGT n_tokens=5 us=41842
+MTPPROC head=0 n_batch=5 us=1757
+MTPPHASE phase=sync us=1900 n_tokens=5
+MTPPHASE phase=verify us=1654 sample_accept_us=1319 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2860 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2611 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2602 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2618 smp_us=5
+MTPPHASE phase=draft us=10824 drafted=4
+MTPTGT n_tokens=5 us=39862
+MTPPROC head=0 n_batch=5 us=1642
+MTPPHASE phase=sync us=1746 n_tokens=5
+MTPPHASE phase=verify us=1061 sample_accept_us=766 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2800 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2617 smp_us=7
+MTPPHASE phase=draft us=5530 drafted=1
+MTPTGT n_tokens=2 us=34722
+MTPPROC head=0 n_batch=2 us=1479
+MTPPHASE phase=sync us=1597 n_tokens=2
+MTPPHASE phase=verify us=813 sample_accept_us=531 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2789 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2600 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2599 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2592 smp_us=5
+MTPPHASE phase=draft us=10745 drafted=4
+MTPTGT n_tokens=5 us=41856
+MTPPROC head=0 n_batch=5 us=1671
+MTPPHASE phase=sync us=1801 n_tokens=5
+MTPPHASE phase=verify us=1496 sample_accept_us=1230 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2815 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2602 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2589 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2585 smp_us=5
+MTPPHASE phase=draft us=10739 drafted=4
+MTPTGT n_tokens=5 us=39985
+MTPPROC head=0 n_batch=5 us=1675
+MTPPHASE phase=sync us=1803 n_tokens=5
+MTPPHASE phase=verify us=1626 sample_accept_us=1346 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2858 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2629 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2617 smp_us=15
+MTPDRAFT depth=3 n_batch=1 dec_us=2671 smp_us=9
+MTPPHASE phase=draft us=10980 drafted=3
+MTPTGT n_tokens=4 us=42019
+MTPPROC head=0 n_batch=4 us=1540
+MTPPHASE phase=sync us=1645 n_tokens=4
+MTPPHASE phase=verify us=1343 sample_accept_us=1033 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2782 smp_us=7
+MTPPHASE phase=draft us=2902 drafted=0
+MTPTGT n_tokens=1 us=30350
+MTPPROC head=0 n_batch=1 us=1435
+MTPPHASE phase=sync us=1552 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2754 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2593 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2585 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2581 smp_us=5
+MTPPHASE phase=draft us=10619 drafted=3
+MTPTGT n_tokens=4 us=41123
+MTPPROC head=0 n_batch=4 us=1447
+MTPPHASE phase=sync us=1531 n_tokens=4
+MTPPHASE phase=verify us=806 sample_accept_us=544 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2748 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2591 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2589 smp_us=5
+MTPPHASE phase=draft us=8034 drafted=2
+MTPTGT n_tokens=3 us=37131
+MTPPROC head=0 n_batch=3 us=1494
+MTPPHASE phase=sync us=1607 n_tokens=3
+MTPPHASE phase=verify us=1053 sample_accept_us=810 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2817 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2611 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2590 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2605 smp_us=5
+MTPPHASE phase=draft us=10780 drafted=3
+MTPTGT n_tokens=4 us=41403
+MTPPROC head=0 n_batch=4 us=1613
+MTPPHASE phase=sync us=1746 n_tokens=4
+MTPPHASE phase=verify us=784 sample_accept_us=512 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2819 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2623 smp_us=16
+MTPDRAFT depth=2 n_batch=1 dec_us=2678 smp_us=13
+MTPDRAFT depth=3 n_batch=1 dec_us=2677 smp_us=14
+MTPPHASE phase=draft us=11025 drafted=4
+MTPTGT n_tokens=5 us=41939
+MTPPROC head=0 n_batch=5 us=1702
+MTPPHASE phase=sync us=1834 n_tokens=5
+MTPPHASE phase=verify us=1622 sample_accept_us=1287 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2960 smp_us=18
+MTPDRAFT depth=1 n_batch=1 dec_us=2710 smp_us=9
+MTPPHASE phase=draft us=5870 drafted=1
+MTPTGT n_tokens=2 us=34286
+MTPPROC head=0 n_batch=2 us=1397
+MTPPHASE phase=sync us=1508 n_tokens=2
+MTPPHASE phase=verify us=780 sample_accept_us=503 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2783 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2595 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2578 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2581 smp_us=5
+MTPPHASE phase=draft us=10685 drafted=3
+MTPTGT n_tokens=4 us=41138
+MTPPROC head=0 n_batch=4 us=1670
+MTPPHASE phase=sync us=1817 n_tokens=4
+MTPPHASE phase=verify us=1283 sample_accept_us=989 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2832 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2605 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2602 smp_us=9
+MTPDRAFT depth=3 n_batch=1 dec_us=2579 smp_us=5
+MTPPHASE phase=draft us=10769 drafted=4
+MTPTGT n_tokens=5 us=42081
+MTPPROC head=0 n_batch=5 us=1553
+MTPPHASE phase=sync us=1679 n_tokens=5
+MTPPHASE phase=verify us=1534 sample_accept_us=1281 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2776 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2605 smp_us=6
+MTPPHASE phase=draft us=5518 drafted=1
+MTPTGT n_tokens=2 us=34177
+MTPPROC head=0 n_batch=2 us=1506
+MTPPHASE phase=sync us=1629 n_tokens=2
+MTPPHASE phase=verify us=790 sample_accept_us=507 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2782 smp_us=7
+MTPPHASE phase=draft us=2900 drafted=0
+MTPTGT n_tokens=1 us=30277
+MTPPROC head=0 n_batch=1 us=1476
+MTPPHASE phase=sync us=1604 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2728 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2591 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2585 smp_us=5
+MTPPHASE phase=draft us=8045 drafted=2
+MTPTGT n_tokens=3 us=37138
+MTPPROC head=0 n_batch=3 us=1592
+MTPPHASE phase=sync us=1718 n_tokens=3
+MTPPHASE phase=verify us=1106 sample_accept_us=793 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2782 smp_us=7
+MTPPHASE phase=draft us=2909 drafted=0
+MTPTGT n_tokens=1 us=30305
+MTPPROC head=0 n_batch=1 us=1465
+MTPPHASE phase=sync us=1584 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2772 smp_us=9
+MTPPHASE phase=draft us=2895 drafted=0
+MTPTGT n_tokens=1 us=28169
+MTPPROC head=0 n_batch=1 us=1402
+MTPPHASE phase=sync us=1516 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2740 smp_us=7
+MTPPHASE phase=draft us=2858 drafted=0
+MTPTGT n_tokens=1 us=28109
+MTPPROC head=0 n_batch=1 us=1465
+MTPPHASE phase=sync us=1584 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2730 smp_us=7
+MTPPHASE phase=draft us=2849 drafted=0
+MTPTGT n_tokens=1 us=28308
+MTPPROC head=0 n_batch=1 us=1231
+MTPPHASE phase=sync us=1331 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2700 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2598 smp_us=4
+MTPPHASE phase=draft us=5422 drafted=1
+MTPTGT n_tokens=2 us=34042
+MTPPROC head=0 n_batch=2 us=1353
+MTPPHASE phase=sync us=1464 n_tokens=2
+MTPPHASE phase=verify us=799 sample_accept_us=555 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2762 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2610 smp_us=6
+MTPPHASE phase=draft us=5507 drafted=1
+MTPTGT n_tokens=2 us=31878
+MTPPROC head=0 n_batch=2 us=1507
+MTPPHASE phase=sync us=1628 n_tokens=2
+MTPPHASE phase=verify us=553 sample_accept_us=265 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=4539 smp_us=12
+MTPPHASE phase=draft us=4615 drafted=0
+MTPTGT n_tokens=1 us=31097
+MTPPROC head=0 n_batch=1 us=1431
+MTPPHASE phase=sync us=1546 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2746 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2606 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2594 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2589 smp_us=5
+MTPPHASE phase=draft us=10696 drafted=4
+MTPTGT n_tokens=5 us=41924
+MTPPROC head=0 n_batch=5 us=1692
+MTPPHASE phase=sync us=1789 n_tokens=5
+MTPPHASE phase=verify us=606 sample_accept_us=269 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3503 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2603 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2582 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2583 smp_us=5
+MTPPHASE phase=draft us=11421 drafted=4
+MTPTGT n_tokens=5 us=39883
+MTPPROC head=0 n_batch=5 us=1493
+MTPPHASE phase=sync us=1607 n_tokens=5
+MTPPHASE phase=verify us=1201 sample_accept_us=1022 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=2995 smp_us=6
+MTPPHASE phase=draft us=3124 drafted=0
+MTPTGT n_tokens=1 us=30419
+MTPPROC head=0 n_batch=1 us=1466
+MTPPHASE phase=sync us=1581 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2731 smp_us=7
+MTPPHASE phase=draft us=2853 drafted=0
+MTPTGT n_tokens=1 us=28326
+MTPPROC head=0 n_batch=1 us=1295
+MTPPHASE phase=sync us=1368 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2697 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2601 smp_us=5
+MTPPHASE phase=draft us=5393 drafted=1
+MTPTGT n_tokens=2 us=33813
+MTPPROC head=0 n_batch=2 us=1366
+MTPPHASE phase=sync us=1443 n_tokens=2
+MTPPHASE phase=verify us=824 sample_accept_us=553 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2754 smp_us=7
+MTPPHASE phase=draft us=2866 drafted=0
+MTPTGT n_tokens=1 us=30238
+MTPPROC head=0 n_batch=1 us=1472
+MTPPHASE phase=sync us=1592 n_tokens=1
+0.24.398.313 I slot print_timing: id  0 | task 143 | n_gen =    179, tg =  59.23 t/s, tg_3s =  59.56 t/s
+MTPDRAFT depth=0 n_batch=1 dec_us=2799 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2615 smp_us=6
+MTPPHASE phase=draft us=5553 drafted=1
+MTPTGT n_tokens=2 us=33931
+MTPPROC head=0 n_batch=2 us=1509
+MTPPHASE phase=sync us=1631 n_tokens=2
+MTPPHASE phase=verify us=897 sample_accept_us=612 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2791 smp_us=7
+MTPPHASE phase=draft us=2909 drafted=0
+MTPTGT n_tokens=1 us=30202
+MTPPROC head=0 n_batch=1 us=1351
+MTPPHASE phase=sync us=1468 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2738 smp_us=8
+MTPPHASE phase=draft us=2861 drafted=0
+MTPTGT n_tokens=1 us=28123
+MTPPROC head=0 n_batch=1 us=1464
+MTPPHASE phase=sync us=1584 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2735 smp_us=7
+MTPPHASE phase=draft us=2852 drafted=0
+MTPTGT n_tokens=1 us=28271
+MTPPROC head=0 n_batch=1 us=1235
+MTPPHASE phase=sync us=1333 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=4429 smp_us=7
+MTPPHASE phase=draft us=4498 drafted=0
+MTPTGT n_tokens=1 us=28044
+MTPPROC head=0 n_batch=1 us=1314
+MTPPHASE phase=sync us=1383 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2701 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2608 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2604 smp_us=7
+MTPPHASE phase=draft us=8024 drafted=2
+MTPTGT n_tokens=3 us=37686
+MTPPROC head=0 n_batch=3 us=1540
+MTPPHASE phase=sync us=1625 n_tokens=3
+MTPPHASE phase=verify us=1081 sample_accept_us=792 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=2850 smp_us=7
+MTPPHASE phase=draft us=2937 drafted=0
+MTPTGT n_tokens=1 us=30263
+MTPPROC head=0 n_batch=1 us=1422
+MTPPHASE phase=sync us=1506 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2717 smp_us=7
+MTPPHASE phase=draft us=2841 drafted=0
+MTPTGT n_tokens=1 us=28141
+MTPPROC head=0 n_batch=1 us=1465
+MTPPHASE phase=sync us=1582 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2737 smp_us=7
+MTPPHASE phase=draft us=2862 drafted=0
+MTPTGT n_tokens=1 us=28280
+MTPPROC head=0 n_batch=1 us=1445
+MTPPHASE phase=sync us=1568 n_tokens=1
+MTPTGT n_tokens=1 us=28316
+MTPPROC head=0 n_batch=1 us=1279
+MTPPHASE phase=sync us=1405 n_tokens=1
+MTPSTATS type=draft-mtp steps=165 gen_drafts=165 acc_drafts=157 gen_tokens=500 acc_tokens=430 gen_per_pos=[165,133,111,91] acc_per_pos=[157,112,90,71]
+0.24.755.273 I slot print_timing: id  0 | task 143 | prompt eval time =     202.93 ms /    50 tokens (    4.06 ms per token,   246.39 tokens per second)
+0.24.755.276 I slot print_timing: id  0 | task 143 |        eval time =    3362.11 ms /   192 tokens (   17.60 ms per token,    56.81 tokens per second)
+0.24.755.277 I slot print_timing: id  0 | task 143 |       total time =    3565.05 ms /   242 tokens
+0.24.755.278 I slot print_timing: id  0 | task 143 |    graphs reused =         89
+0.24.755.282 I slot print_timing: id  0 | task 143 | draft acceptance = 0.87313 (  117 accepted /   134 generated), mean len =  3.44
+0.24.755.759 I slot      release: id  0 | task 143 | stop processing: n_tokens = 241, truncated = 0
+0.24.764.647 I GPU memory clock: decode -> idle, reset (dynamic)
+0.24.765.964 I APU TDP: restored original limits
+0.24.791.862 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 164728289701
+0.24.791.937 I slot launch_slot_: id  0 | task 220 | processing task, is_child = 0
+0.24.792.437 I APU TDP: active limit 20 W
+0.24.793.446 I GPU memory clock: idle -> prefill, locked 2700 MHz
+MTPTGT n_tokens=64 us=93249
+MTPPROC head=0 n_batch=64 us=4366
+MTPPHASE phase=sync us=4788 n_tokens=64
+MTPTGT n_tokens=64 us=82954
+MTPPROC head=0 n_batch=64 us=4042
+MTPPHASE phase=sync us=4347 n_tokens=64
+MTPTGT n_tokens=64 us=80045
+MTPPROC head=0 n_batch=64 us=4069
+MTPPHASE phase=sync us=4389 n_tokens=64
+MTPTGT n_tokens=64 us=79605
+MTPPROC head=0 n_batch=64 us=4148
+MTPPHASE phase=sync us=4539 n_tokens=64
+MTPTGT n_tokens=64 us=82221
+MTPPROC head=0 n_batch=64 us=4227
+MTPPHASE phase=sync us=4596 n_tokens=64
+MTPTGT n_tokens=64 us=80032
+MTPPROC head=0 n_batch=64 us=4582
+MTPPHASE phase=sync us=5037 n_tokens=64
+MTPTGT n_tokens=64 us=80043
+MTPPROC head=0 n_batch=64 us=4523
+MTPPHASE phase=sync us=4928 n_tokens=64
+MTPTGT n_tokens=64 us=79912
+MTPPROC head=0 n_batch=64 us=4145
+MTPPHASE phase=sync us=4500 n_tokens=64
+MTPTGT n_tokens=64 us=83653
+MTPPROC head=0 n_batch=64 us=4318
+MTPPHASE phase=sync us=4677 n_tokens=64
+MTPTGT n_tokens=64 us=80413
+MTPPROC head=0 n_batch=64 us=4111
+MTPPHASE phase=sync us=4505 n_tokens=64
+MTPTGT n_tokens=64 us=80355
+MTPPROC head=0 n_batch=64 us=4223
+MTPPHASE phase=sync us=4562 n_tokens=64
+MTPTGT n_tokens=64 us=80496
+MTPPROC head=0 n_batch=64 us=4283
+MTPPHASE phase=sync us=4786 n_tokens=64
+MTPTGT n_tokens=64 us=83054
+MTPPROC head=0 n_batch=64 us=4391
+MTPPHASE phase=sync us=4771 n_tokens=64
+MTPTGT n_tokens=64 us=80318
+MTPPROC head=0 n_batch=64 us=4146
+MTPPHASE phase=sync us=4490 n_tokens=64
+MTPTGT n_tokens=64 us=80668
+MTPPROC head=0 n_batch=64 us=4292
+MTPPHASE phase=sync us=4761 n_tokens=64
+MTPTGT n_tokens=64 us=80820
+MTPPROC head=0 n_batch=64 us=4190
+MTPPHASE phase=sync us=4667 n_tokens=64
+MTPTGT n_tokens=64 us=83637
+MTPPROC head=0 n_batch=64 us=4499
+MTPPHASE phase=sync us=5018 n_tokens=64
+MTPTGT n_tokens=64 us=80312
+MTPPROC head=0 n_batch=64 us=4222
+MTPPHASE phase=sync us=4588 n_tokens=64
+MTPTGT n_tokens=64 us=81230
+MTPPROC head=0 n_batch=64 us=4326
+MTPPHASE phase=sync us=4700 n_tokens=64
+MTPTGT n_tokens=64 us=81200
+MTPPROC head=0 n_batch=64 us=4319
+MTPPHASE phase=sync us=4672 n_tokens=64
+MTPTGT n_tokens=64 us=83061
+MTPPROC head=0 n_batch=64 us=4399
+MTPPHASE phase=sync us=4747 n_tokens=64
+MTPTGT n_tokens=64 us=81317
+MTPPROC head=0 n_batch=64 us=4327
+MTPPHASE phase=sync us=4668 n_tokens=64
+MTPTGT n_tokens=64 us=81160
+MTPPROC head=0 n_batch=64 us=4529
+MTPPHASE phase=sync us=5041 n_tokens=64
+MTPTGT n_tokens=64 us=81178
+MTPPROC head=0 n_batch=64 us=4275
+MTPPHASE phase=sync us=4624 n_tokens=64
+MTPTGT n_tokens=64 us=83609
+MTPPROC head=0 n_batch=64 us=4543
+MTPPHASE phase=sync us=4935 n_tokens=64
+MTPTGT n_tokens=64 us=81572
+MTPPROC head=0 n_batch=64 us=4802
+MTPPHASE phase=sync us=5167 n_tokens=64
+MTPTGT n_tokens=64 us=81313
+MTPPROC head=0 n_batch=64 us=4383
+MTPPHASE phase=sync us=4779 n_tokens=64
+MTPTGT n_tokens=64 us=81404
+MTPPROC head=0 n_batch=64 us=4343
+MTPPHASE phase=sync us=4762 n_tokens=64
+MTPTGT n_tokens=64 us=83779
+MTPPROC head=0 n_batch=64 us=4971
+MTPPHASE phase=sync us=5544 n_tokens=64
+MTPTGT n_tokens=64 us=81784
+MTPPROC head=0 n_batch=64 us=4633
+MTPPHASE phase=sync us=5047 n_tokens=64
+MTPTGT n_tokens=64 us=81637
+MTPPROC head=0 n_batch=64 us=4358
+MTPPHASE phase=sync us=4739 n_tokens=64
+MTPTGT n_tokens=64 us=81472
+MTPPROC head=0 n_batch=64 us=4346
+MTPPHASE phase=sync us=4734 n_tokens=64
+MTPTGT n_tokens=64 us=83784
+MTPPROC head=0 n_batch=64 us=4610
+MTPPHASE phase=sync us=5080 n_tokens=64
+MTPTGT n_tokens=64 us=81880
+MTPPROC head=0 n_batch=64 us=4444
+MTPPHASE phase=sync us=4812 n_tokens=64
+MTPTGT n_tokens=64 us=81682
+MTPPROC head=0 n_batch=64 us=4496
+MTPPHASE phase=sync us=4967 n_tokens=64
+0.27.829.625 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2240, progress = 0.16, t =   3.03 s / 738.99 tokens per second
+MTPTGT n_tokens=64 us=82060
+MTPPROC head=0 n_batch=64 us=4371
+MTPPHASE phase=sync us=4746 n_tokens=64
+0.27.916.518 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2304, progress = 0.17, t =   3.12 s / 738.87 tokens per second
+MTPTGT n_tokens=64 us=84294
+MTPPROC head=0 n_batch=64 us=4593
+MTPPHASE phase=sync us=4975 n_tokens=64
+0.28.005.875 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2368, progress = 0.17, t =   3.21 s / 738.29 tokens per second
+MTPTGT n_tokens=64 us=81938
+MTPPROC head=0 n_batch=64 us=4385
+MTPPHASE phase=sync us=4746 n_tokens=64
+0.28.092.688 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2432, progress = 0.18, t =   3.29 s / 738.22 tokens per second
+MTPTGT n_tokens=64 us=81922
+MTPPROC head=0 n_batch=64 us=4438
+MTPPHASE phase=sync us=4817 n_tokens=64
+0.28.179.514 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2496, progress = 0.18, t =   3.38 s / 738.20 tokens per second
+MTPTGT n_tokens=64 us=82071
+MTPPROC head=0 n_batch=64 us=4577
+MTPPHASE phase=sync us=5083 n_tokens=64
+0.28.266.763 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2560, progress = 0.18, t =   3.47 s / 738.14 tokens per second
+MTPTGT n_tokens=64 us=84413
+MTPPROC head=0 n_batch=64 us=4594
+MTPPHASE phase=sync us=5024 n_tokens=64
+0.28.356.300 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2624, progress = 0.19, t =   3.56 s / 737.54 tokens per second
+MTPTGT n_tokens=64 us=82375
+MTPPROC head=0 n_batch=64 us=4723
+MTPPHASE phase=sync us=5138 n_tokens=64
+0.28.443.938 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2688, progress = 0.19, t =   3.65 s / 737.39 tokens per second
+MTPTGT n_tokens=64 us=82089
+MTPPROC head=0 n_batch=64 us=4896
+MTPPHASE phase=sync us=5532 n_tokens=64
+0.28.531.676 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2752, progress = 0.20, t =   3.73 s / 737.28 tokens per second
+MTPTGT n_tokens=64 us=82459
+MTPPROC head=0 n_batch=64 us=4505
+MTPPHASE phase=sync us=4915 n_tokens=64
+0.28.619.195 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2816, progress = 0.20, t =   3.82 s / 737.02 tokens per second
+MTPTGT n_tokens=64 us=84523
+MTPPROC head=0 n_batch=64 us=4578
+MTPPHASE phase=sync us=4976 n_tokens=64
+0.28.708.781 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2880, progress = 0.21, t =   3.91 s / 736.51 tokens per second
+MTPTGT n_tokens=64 us=82349
+MTPPROC head=0 n_batch=64 us=4499
+MTPPHASE phase=sync us=4834 n_tokens=64
+0.28.796.057 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   2944, progress = 0.21, t =   4.00 s / 736.42 tokens per second
+MTPTGT n_tokens=64 us=82311
+MTPPROC head=0 n_batch=64 us=4462
+MTPPHASE phase=sync us=4809 n_tokens=64
+0.28.883.405 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3008, progress = 0.22, t =   4.09 s / 736.33 tokens per second
+MTPTGT n_tokens=64 us=82049
+MTPPROC head=0 n_batch=64 us=4462
+MTPPHASE phase=sync us=4892 n_tokens=64
+0.28.970.537 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3072, progress = 0.22, t =   4.17 s / 736.31 tokens per second
+MTPTGT n_tokens=64 us=85122
+MTPPROC head=0 n_batch=64 us=4595
+MTPPHASE phase=sync us=4989 n_tokens=64
+0.29.060.741 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3136, progress = 0.23, t =   4.26 s / 735.76 tokens per second
+MTPTGT n_tokens=64 us=82641
+MTPPROC head=0 n_batch=64 us=4556
+MTPPHASE phase=sync us=4974 n_tokens=64
+0.29.148.446 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3200, progress = 0.23, t =   4.35 s / 735.64 tokens per second
+MTPTGT n_tokens=64 us=82693
+MTPPROC head=0 n_batch=64 us=4494
+MTPPHASE phase=sync us=4897 n_tokens=64
+0.29.236.131 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3264, progress = 0.24, t =   4.44 s / 735.51 tokens per second
+MTPTGT n_tokens=64 us=82700
+MTPPROC head=0 n_batch=64 us=4662
+MTPPHASE phase=sync us=5073 n_tokens=64
+0.29.323.992 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3328, progress = 0.24, t =   4.53 s / 735.40 tokens per second
+MTPTGT n_tokens=64 us=85318
+MTPPROC head=0 n_batch=64 us=4622
+MTPPHASE phase=sync us=5016 n_tokens=64
+0.29.414.418 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3392, progress = 0.24, t =   4.62 s / 734.85 tokens per second
+MTPTGT n_tokens=64 us=82924
+MTPPROC head=0 n_batch=64 us=4545
+MTPPHASE phase=sync us=4921 n_tokens=64
+0.29.502.381 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3456, progress = 0.25, t =   4.70 s / 734.70 tokens per second
+MTPTGT n_tokens=64 us=82532
+MTPPROC head=0 n_batch=64 us=4476
+MTPPHASE phase=sync us=4864 n_tokens=64
+0.29.589.865 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3520, progress = 0.25, t =   4.79 s / 734.63 tokens per second
+MTPTGT n_tokens=64 us=82705
+MTPPROC head=0 n_batch=64 us=4678
+MTPPHASE phase=sync us=5080 n_tokens=64
+0.29.677.745 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3584, progress = 0.26, t =   4.88 s / 734.55 tokens per second
+MTPTGT n_tokens=64 us=85220
+MTPPROC head=0 n_batch=64 us=4813
+MTPPHASE phase=sync us=5314 n_tokens=64
+0.29.768.377 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3648, progress = 0.26, t =   4.97 s / 734.07 tokens per second
+MTPTGT n_tokens=64 us=82966
+MTPPROC head=0 n_batch=64 us=4530
+MTPPHASE phase=sync us=4905 n_tokens=64
+0.29.856.343 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3712, progress = 0.27, t =   5.06 s / 733.90 tokens per second
+MTPTGT n_tokens=64 us=82891
+MTPPROC head=0 n_batch=64 us=4598
+MTPPHASE phase=sync us=5011 n_tokens=64
+0.29.944.437 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3776, progress = 0.27, t =   5.15 s / 733.78 tokens per second
+MTPTGT n_tokens=64 us=83009
+MTPPROC head=0 n_batch=64 us=4583
+MTPPHASE phase=sync us=5134 n_tokens=64
+0.30.032.684 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3840, progress = 0.28, t =   5.23 s / 733.66 tokens per second
+MTPTGT n_tokens=64 us=85785
+MTPPROC head=0 n_batch=64 us=4777
+MTPPHASE phase=sync us=5199 n_tokens=64
+0.30.123.765 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3904, progress = 0.28, t =   5.33 s / 733.14 tokens per second
+MTPTGT n_tokens=64 us=82982
+MTPPROC head=0 n_batch=64 us=4591
+MTPPHASE phase=sync us=4975 n_tokens=64
+0.30.211.812 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   3968, progress = 0.29, t =   5.41 s / 733.00 tokens per second
+MTPTGT n_tokens=64 us=83262
+MTPPROC head=0 n_batch=64 us=4635
+MTPPHASE phase=sync us=4989 n_tokens=64
+0.30.300.158 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4032, progress = 0.29, t =   5.50 s / 732.87 tokens per second
+MTPTGT n_tokens=64 us=83142
+MTPPROC head=0 n_batch=64 us=4595
+MTPPHASE phase=sync us=4964 n_tokens=64
+0.30.388.367 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4096, progress = 0.30, t =   5.59 s / 732.75 tokens per second
+MTPTGT n_tokens=64 us=85458
+MTPPROC head=0 n_batch=64 us=4769
+MTPPHASE phase=sync us=5123 n_tokens=64
+0.30.479.067 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4160, progress = 0.30, t =   5.68 s / 732.34 tokens per second
+MTPTGT n_tokens=64 us=83353
+MTPPROC head=0 n_batch=64 us=4680
+MTPPHASE phase=sync us=5098 n_tokens=64
+0.30.567.743 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4224, progress = 0.30, t =   5.77 s / 732.17 tokens per second
+MTPTGT n_tokens=64 us=83295
+MTPPROC head=0 n_batch=64 us=4676
+MTPPHASE phase=sync us=5201 n_tokens=64
+0.30.656.357 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4288, progress = 0.31, t =   5.86 s / 732.03 tokens per second
+MTPTGT n_tokens=64 us=84183
+MTPPROC head=0 n_batch=64 us=4661
+MTPPHASE phase=sync us=5079 n_tokens=64
+0.30.745.714 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4352, progress = 0.31, t =   5.95 s / 731.78 tokens per second
+MTPTGT n_tokens=64 us=85669
+MTPPROC head=0 n_batch=64 us=4898
+MTPPHASE phase=sync us=5289 n_tokens=64
+0.30.836.795 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4416, progress = 0.32, t =   6.04 s / 731.37 tokens per second
+MTPTGT n_tokens=64 us=83776
+MTPPROC head=0 n_batch=64 us=4525
+MTPPHASE phase=sync us=4837 n_tokens=64
+0.30.925.510 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4480, progress = 0.32, t =   6.13 s / 731.17 tokens per second
+MTPTGT n_tokens=64 us=83677
+MTPPROC head=0 n_batch=64 us=4642
+MTPPHASE phase=sync us=4981 n_tokens=64
+0.31.014.284 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4544, progress = 0.33, t =   6.22 s / 731.04 tokens per second
+MTPTGT n_tokens=64 us=83539
+MTPPROC head=0 n_batch=64 us=4568
+MTPPHASE phase=sync us=4923 n_tokens=64
+0.31.102.958 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4608, progress = 0.33, t =   6.30 s / 730.90 tokens per second
+MTPTGT n_tokens=64 us=85542
+MTPPROC head=0 n_batch=64 us=4944
+MTPPHASE phase=sync us=5327 n_tokens=64
+0.31.193.923 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4672, progress = 0.34, t =   6.40 s / 730.56 tokens per second
+MTPTGT n_tokens=64 us=83519
+MTPPROC head=0 n_batch=64 us=4657
+MTPPHASE phase=sync us=5092 n_tokens=64
+0.31.282.629 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4736, progress = 0.34, t =   6.48 s / 730.41 tokens per second
+MTPTGT n_tokens=64 us=83446
+MTPPROC head=0 n_batch=64 us=4599
+MTPPHASE phase=sync us=5052 n_tokens=64
+0.31.371.242 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4800, progress = 0.35, t =   6.57 s / 730.29 tokens per second
+MTPTGT n_tokens=64 us=83688
+MTPPROC head=0 n_batch=64 us=4642
+MTPPHASE phase=sync us=5091 n_tokens=64
+0.31.460.127 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4864, progress = 0.35, t =   6.66 s / 730.16 tokens per second
+MTPTGT n_tokens=64 us=86198
+MTPPROC head=0 n_batch=64 us=4817
+MTPPHASE phase=sync us=5247 n_tokens=64
+0.31.551.718 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4928, progress = 0.36, t =   6.75 s / 729.76 tokens per second
+MTPTGT n_tokens=64 us=83928
+MTPPROC head=0 n_batch=64 us=4768
+MTPPHASE phase=sync us=5173 n_tokens=64
+0.31.640.912 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   4992, progress = 0.36, t =   6.84 s / 729.58 tokens per second
+MTPTGT n_tokens=64 us=83848
+MTPPROC head=0 n_batch=64 us=4770
+MTPPHASE phase=sync us=5168 n_tokens=64
+0.31.730.018 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5056, progress = 0.37, t =   6.93 s / 729.44 tokens per second
+MTPTGT n_tokens=64 us=83896
+MTPPROC head=0 n_batch=64 us=4777
+MTPPHASE phase=sync us=5164 n_tokens=64
+0.31.819.174 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5120, progress = 0.37, t =   7.02 s / 729.29 tokens per second
+MTPTGT n_tokens=64 us=86109
+MTPPROC head=0 n_batch=64 us=4896
+MTPPHASE phase=sync us=5251 n_tokens=64
+0.31.910.622 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5184, progress = 0.37, t =   7.11 s / 728.92 tokens per second
+MTPTGT n_tokens=64 us=84044
+MTPPROC head=0 n_batch=64 us=4853
+MTPPHASE phase=sync us=5423 n_tokens=64
+0.32.000.187 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5248, progress = 0.38, t =   7.20 s / 728.76 tokens per second
+MTPTGT n_tokens=64 us=84102
+MTPPROC head=0 n_batch=64 us=4769
+MTPPHASE phase=sync us=5194 n_tokens=64
+0.32.089.583 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5312, progress = 0.38, t =   7.29 s / 728.58 tokens per second
+MTPTGT n_tokens=64 us=84167
+MTPPROC head=0 n_batch=64 us=4841
+MTPPHASE phase=sync us=5200 n_tokens=64
+0.32.179.082 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5376, progress = 0.39, t =   7.38 s / 728.42 tokens per second
+MTPTGT n_tokens=64 us=86625
+MTPPROC head=0 n_batch=64 us=4817
+MTPPHASE phase=sync us=5150 n_tokens=64
+0.32.270.960 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5440, progress = 0.39, t =   7.47 s / 728.02 tokens per second
+MTPTGT n_tokens=64 us=84284
+MTPPROC head=0 n_batch=64 us=4870
+MTPPHASE phase=sync us=5260 n_tokens=64
+0.32.360.680 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5504, progress = 0.40, t =   7.56 s / 727.86 tokens per second
+MTPTGT n_tokens=64 us=84261
+MTPPROC head=0 n_batch=64 us=4705
+MTPPHASE phase=sync us=5077 n_tokens=64
+0.32.450.113 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5568, progress = 0.40, t =   7.65 s / 727.70 tokens per second
+MTPTGT n_tokens=64 us=84296
+MTPPROC head=0 n_batch=64 us=4944
+MTPPHASE phase=sync us=5410 n_tokens=64
+0.32.539.911 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5632, progress = 0.41, t =   7.74 s / 727.55 tokens per second
+MTPTGT n_tokens=64 us=86562
+MTPPROC head=0 n_batch=64 us=5008
+MTPPHASE phase=sync us=5481 n_tokens=64
+0.32.632.062 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5696, progress = 0.41, t =   7.83 s / 727.17 tokens per second
+MTPTGT n_tokens=64 us=84701
+MTPPROC head=0 n_batch=64 us=4855
+MTPPHASE phase=sync us=5215 n_tokens=64
+0.32.722.072 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5760, progress = 0.42, t =   7.92 s / 726.96 tokens per second
+MTPTGT n_tokens=64 us=84308
+MTPPROC head=0 n_batch=64 us=4743
+MTPPHASE phase=sync us=5068 n_tokens=64
+0.32.811.545 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5824, progress = 0.42, t =   8.01 s / 726.82 tokens per second
+MTPTGT n_tokens=64 us=84585
+MTPPROC head=0 n_batch=64 us=4825
+MTPPHASE phase=sync us=5165 n_tokens=64
+0.32.901.466 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5888, progress = 0.43, t =   8.10 s / 726.66 tokens per second
+MTPTGT n_tokens=64 us=86757
+MTPPROC head=0 n_batch=64 us=5105
+MTPPHASE phase=sync us=5593 n_tokens=64
+0.32.993.927 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   5952, progress = 0.43, t =   8.19 s / 726.31 tokens per second
+MTPTGT n_tokens=64 us=84662
+MTPPROC head=0 n_batch=64 us=4839
+MTPPHASE phase=sync us=5198 n_tokens=64
+0.33.084.041 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6016, progress = 0.43, t =   8.29 s / 726.10 tokens per second
+MTPTGT n_tokens=64 us=84374
+MTPPROC head=0 n_batch=64 us=4773
+MTPPHASE phase=sync us=5151 n_tokens=64
+0.33.173.673 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6080, progress = 0.44, t =   8.38 s / 725.97 tokens per second
+MTPTGT n_tokens=64 us=84642
+MTPPROC head=0 n_batch=64 us=4788
+MTPPHASE phase=sync us=5163 n_tokens=64
+0.33.263.579 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6144, progress = 0.44, t =   8.46 s / 725.82 tokens per second
+MTPTGT n_tokens=64 us=86885
+MTPPROC head=0 n_batch=64 us=5355
+MTPPHASE phase=sync us=5865 n_tokens=64
+0.33.356.433 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6208, progress = 0.45, t =   8.56 s / 725.48 tokens per second
+MTPTGT n_tokens=64 us=85240
+MTPPROC head=0 n_batch=64 us=5196
+MTPPHASE phase=sync us=5713 n_tokens=64
+0.33.447.495 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6272, progress = 0.45, t =   8.65 s / 725.23 tokens per second
+MTPTGT n_tokens=64 us=85059
+MTPPROC head=0 n_batch=64 us=4764
+MTPPHASE phase=sync us=5155 n_tokens=64
+0.33.537.839 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6336, progress = 0.46, t =   8.74 s / 725.01 tokens per second
+MTPTGT n_tokens=64 us=85201
+MTPPROC head=0 n_batch=64 us=4825
+MTPPHASE phase=sync us=5202 n_tokens=64
+0.33.628.333 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6400, progress = 0.46, t =   8.83 s / 724.83 tokens per second
+MTPTGT n_tokens=64 us=87185
+MTPPROC head=0 n_batch=64 us=5126
+MTPPHASE phase=sync us=5569 n_tokens=64
+0.33.721.181 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6464, progress = 0.47, t =   8.92 s / 724.49 tokens per second
+MTPTGT n_tokens=64 us=85147
+MTPPROC head=0 n_batch=64 us=4856
+MTPPHASE phase=sync us=5200 n_tokens=64
+0.33.811.622 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6528, progress = 0.47, t =   9.01 s / 724.29 tokens per second
+MTPTGT n_tokens=64 us=85107
+MTPPROC head=0 n_batch=64 us=4854
+MTPPHASE phase=sync us=5200 n_tokens=64
+0.33.902.023 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6592, progress = 0.48, t =   9.10 s / 724.13 tokens per second
+MTPTGT n_tokens=64 us=84990
+MTPPROC head=0 n_batch=64 us=4843
+MTPPHASE phase=sync us=5197 n_tokens=64
+0.33.992.319 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6656, progress = 0.48, t =   9.19 s / 723.98 tokens per second
+MTPTGT n_tokens=64 us=87283
+MTPPROC head=0 n_batch=64 us=4998
+MTPPHASE phase=sync us=5406 n_tokens=64
+0.34.085.098 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6720, progress = 0.49, t =   9.29 s / 723.65 tokens per second
+MTPTGT n_tokens=64 us=84967
+MTPPROC head=0 n_batch=64 us=4879
+MTPPHASE phase=sync us=5282 n_tokens=64
+0.34.175.438 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6784, progress = 0.49, t =   9.38 s / 723.50 tokens per second
+MTPTGT n_tokens=64 us=85339
+MTPPROC head=0 n_batch=64 us=5037
+MTPPHASE phase=sync us=5535 n_tokens=64
+0.34.266.408 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6848, progress = 0.49, t =   9.47 s / 723.33 tokens per second
+MTPTGT n_tokens=64 us=85165
+MTPPROC head=0 n_batch=64 us=5296
+MTPPHASE phase=sync us=5860 n_tokens=64
+0.34.357.530 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6912, progress = 0.50, t =   9.56 s / 723.15 tokens per second
+MTPTGT n_tokens=64 us=87767
+MTPPROC head=0 n_batch=64 us=5120
+MTPPHASE phase=sync us=5478 n_tokens=64
+0.34.450.870 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   6976, progress = 0.50, t =   9.65 s / 722.76 tokens per second
+MTPTGT n_tokens=64 us=85590
+MTPPROC head=0 n_batch=64 us=4812
+MTPPHASE phase=sync us=5128 n_tokens=64
+0.34.541.688 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7040, progress = 0.51, t =   9.74 s / 722.57 tokens per second
+MTPTGT n_tokens=64 us=85450
+MTPPROC head=0 n_batch=64 us=4949
+MTPPHASE phase=sync us=5283 n_tokens=64
+0.34.632.639 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7104, progress = 0.51, t =   9.83 s / 722.40 tokens per second
+MTPTGT n_tokens=64 us=85487
+MTPPROC head=0 n_batch=64 us=4939
+MTPPHASE phase=sync us=5343 n_tokens=64
+0.34.723.564 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7168, progress = 0.52, t =   9.92 s / 722.24 tokens per second
+MTPTGT n_tokens=64 us=87975
+MTPPROC head=0 n_batch=64 us=5288
+MTPPHASE phase=sync us=5703 n_tokens=64
+0.34.817.333 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7232, progress = 0.52, t =  10.02 s / 721.89 tokens per second
+MTPTGT n_tokens=64 us=85764
+MTPPROC head=0 n_batch=64 us=4987
+MTPPHASE phase=sync us=5358 n_tokens=64
+0.34.908.579 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7296, progress = 0.53, t =  10.11 s / 721.68 tokens per second
+MTPTGT n_tokens=64 us=85510
+MTPPROC head=0 n_batch=64 us=5018
+MTPPHASE phase=sync us=5404 n_tokens=64
+0.34.999.584 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7360, progress = 0.53, t =  10.20 s / 721.52 tokens per second
+MTPTGT n_tokens=64 us=85611
+MTPPROC head=0 n_batch=64 us=5323
+MTPPHASE phase=sync us=5814 n_tokens=64
+0.35.091.116 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7424, progress = 0.54, t =  10.29 s / 721.35 tokens per second
+MTPTGT n_tokens=64 us=87979
+MTPPROC head=0 n_batch=64 us=5234
+MTPPHASE phase=sync us=5712 n_tokens=64
+0.35.184.903 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7488, progress = 0.54, t =  10.39 s / 720.99 tokens per second
+MTPTGT n_tokens=64 us=85646
+MTPPROC head=0 n_batch=64 us=4979
+MTPPHASE phase=sync us=5385 n_tokens=64
+0.35.276.029 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7552, progress = 0.55, t =  10.48 s / 720.81 tokens per second
+MTPTGT n_tokens=64 us=85846
+MTPPROC head=0 n_batch=64 us=5128
+MTPPHASE phase=sync us=5564 n_tokens=64
+0.35.367.547 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7616, progress = 0.55, t =  10.57 s / 720.63 tokens per second
+MTPTGT n_tokens=64 us=85974
+MTPPROC head=0 n_batch=64 us=4978
+MTPPHASE phase=sync us=5321 n_tokens=64
+0.35.459.183 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7680, progress = 0.55, t =  10.66 s / 720.43 tokens per second
+MTPTGT n_tokens=64 us=88177
+MTPPROC head=0 n_batch=64 us=5171
+MTPPHASE phase=sync us=5486 n_tokens=64
+0.35.552.932 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7744, progress = 0.56, t =  10.75 s / 720.11 tokens per second
+MTPTGT n_tokens=64 us=86065
+MTPPROC head=0 n_batch=64 us=4980
+MTPPHASE phase=sync us=5390 n_tokens=64
+0.35.644.474 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7808, progress = 0.56, t =  10.85 s / 719.92 tokens per second
+MTPTGT n_tokens=64 us=85958
+MTPPROC head=0 n_batch=64 us=5235
+MTPPHASE phase=sync us=5793 n_tokens=64
+0.35.736.354 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7872, progress = 0.57, t =  10.94 s / 719.76 tokens per second
+MTPTGT n_tokens=64 us=86452
+MTPPROC head=0 n_batch=64 us=5040
+MTPPHASE phase=sync us=5523 n_tokens=64
+0.35.828.462 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   7936, progress = 0.57, t =  11.03 s / 719.53 tokens per second
+MTPTGT n_tokens=64 us=89703
+MTPPROC head=0 n_batch=64 us=5223
+MTPPHASE phase=sync us=5617 n_tokens=64
+0.35.923.889 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8000, progress = 0.58, t =  11.12 s / 719.12 tokens per second
+MTPTGT n_tokens=64 us=86215
+MTPPROC head=0 n_batch=64 us=5146
+MTPPHASE phase=sync us=5620 n_tokens=64
+0.36.015.844 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8064, progress = 0.58, t =  11.22 s / 718.93 tokens per second
+MTPTGT n_tokens=64 us=86274
+MTPPROC head=0 n_batch=64 us=5012
+MTPPHASE phase=sync us=5351 n_tokens=64
+0.36.107.642 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8128, progress = 0.59, t =  11.31 s / 718.73 tokens per second
+MTPTGT n_tokens=64 us=85991
+MTPPROC head=0 n_batch=64 us=5163
+MTPPHASE phase=sync us=5641 n_tokens=64
+0.36.199.373 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8192, progress = 0.59, t =  11.40 s / 718.58 tokens per second
+MTPTGT n_tokens=64 us=88508
+MTPPROC head=0 n_batch=64 us=5214
+MTPPHASE phase=sync us=5614 n_tokens=64
+0.36.293.622 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8256, progress = 0.60, t =  11.49 s / 718.26 tokens per second
+MTPTGT n_tokens=64 us=86371
+MTPPROC head=0 n_batch=64 us=5077
+MTPPHASE phase=sync us=5461 n_tokens=64
+0.36.385.547 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8320, progress = 0.60, t =  11.59 s / 718.07 tokens per second
+MTPTGT n_tokens=64 us=86183
+MTPPROC head=0 n_batch=64 us=5069
+MTPPHASE phase=sync us=5453 n_tokens=64
+0.36.477.272 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8384, progress = 0.61, t =  11.68 s / 717.91 tokens per second
+MTPTGT n_tokens=64 us=86387
+MTPPROC head=0 n_batch=64 us=5072
+MTPPHASE phase=sync us=5459 n_tokens=64
+0.36.569.227 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8448, progress = 0.61, t =  11.77 s / 717.74 tokens per second
+MTPTGT n_tokens=64 us=88461
+MTPPROC head=0 n_batch=64 us=5207
+MTPPHASE phase=sync us=5582 n_tokens=64
+0.36.663.373 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8512, progress = 0.61, t =  11.86 s / 717.45 tokens per second
+MTPTGT n_tokens=64 us=86568
+MTPPROC head=0 n_batch=64 us=5779
+MTPPHASE phase=sync us=6297 n_tokens=64
+0.36.756.393 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8576, progress = 0.62, t =  11.96 s / 717.26 tokens per second
+MTPTGT n_tokens=64 us=86864
+MTPPROC head=0 n_batch=64 us=5073
+MTPPHASE phase=sync us=5451 n_tokens=64
+0.36.848.804 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8640, progress = 0.62, t =  12.05 s / 717.02 tokens per second
+MTPTGT n_tokens=64 us=86491
+MTPPROC head=0 n_batch=64 us=5120
+MTPPHASE phase=sync us=5590 n_tokens=64
+0.36.940.984 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8704, progress = 0.63, t =  12.14 s / 716.86 tokens per second
+MTPTGT n_tokens=64 us=89331
+MTPPROC head=0 n_batch=64 us=5279
+MTPPHASE phase=sync us=5715 n_tokens=64
+0.37.036.141 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8768, progress = 0.63, t =  12.24 s / 716.52 tokens per second
+MTPTGT n_tokens=64 us=87430
+MTPPROC head=0 n_batch=64 us=5134
+MTPPHASE phase=sync us=5515 n_tokens=64
+0.37.129.189 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8832, progress = 0.64, t =  12.33 s / 716.29 tokens per second
+MTPTGT n_tokens=64 us=86891
+MTPPROC head=0 n_batch=64 us=5570
+MTPPHASE phase=sync us=6078 n_tokens=64
+0.37.222.269 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8896, progress = 0.64, t =  12.42 s / 716.11 tokens per second
+MTPTGT n_tokens=64 us=87403
+MTPPROC head=0 n_batch=64 us=5091
+MTPPHASE phase=sync us=5474 n_tokens=64
+0.37.315.239 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   8960, progress = 0.65, t =  12.52 s / 715.87 tokens per second
+MTPTGT n_tokens=64 us=89385
+MTPPROC head=0 n_batch=64 us=5313
+MTPPHASE phase=sync us=5707 n_tokens=64
+0.37.410.417 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9024, progress = 0.65, t =  12.61 s / 715.55 tokens per second
+MTPTGT n_tokens=64 us=87430
+MTPPROC head=0 n_batch=64 us=5268
+MTPPHASE phase=sync us=5682 n_tokens=64
+0.37.503.618 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9088, progress = 0.66, t =  12.70 s / 715.34 tokens per second
+MTPTGT n_tokens=64 us=86922
+MTPPROC head=0 n_batch=64 us=5229
+MTPPHASE phase=sync us=5574 n_tokens=64
+0.37.596.221 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9152, progress = 0.66, t =  12.80 s / 715.16 tokens per second
+MTPTGT n_tokens=64 us=87292
+MTPPROC head=0 n_batch=64 us=5094
+MTPPHASE phase=sync us=5470 n_tokens=64
+0.37.689.234 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9216, progress = 0.67, t =  12.89 s / 714.96 tokens per second
+MTPTGT n_tokens=64 us=89638
+MTPPROC head=0 n_batch=64 us=5464
+MTPPHASE phase=sync us=5932 n_tokens=64
+0.37.784.907 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9280, progress = 0.67, t =  12.99 s / 714.64 tokens per second
+MTPTGT n_tokens=64 us=87683
+MTPPROC head=0 n_batch=64 us=5214
+MTPPHASE phase=sync us=5698 n_tokens=64
+0.37.878.416 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9344, progress = 0.67, t =  13.08 s / 714.42 tokens per second
+MTPTGT n_tokens=64 us=87801
+MTPPROC head=0 n_batch=64 us=5599
+MTPPHASE phase=sync us=6059 n_tokens=64
+0.37.972.373 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9408, progress = 0.68, t =  13.17 s / 714.20 tokens per second
+MTPTGT n_tokens=64 us=87707
+MTPPROC head=0 n_batch=64 us=5164
+MTPPHASE phase=sync us=5546 n_tokens=64
+0.38.065.719 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9472, progress = 0.68, t =  13.27 s / 713.97 tokens per second
+MTPTGT n_tokens=64 us=90195
+MTPPROC head=0 n_batch=64 us=5344
+MTPPHASE phase=sync us=5766 n_tokens=64
+0.38.161.777 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9536, progress = 0.69, t =  13.36 s / 713.64 tokens per second
+MTPTGT n_tokens=64 us=88327
+MTPPROC head=0 n_batch=64 us=5417
+MTPPHASE phase=sync us=5964 n_tokens=64
+0.38.256.193 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9600, progress = 0.69, t =  13.46 s / 713.40 tokens per second
+MTPTGT n_tokens=64 us=88324
+MTPPROC head=0 n_batch=64 us=5337
+MTPPHASE phase=sync us=5751 n_tokens=64
+0.38.350.362 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9664, progress = 0.70, t =  13.55 s / 713.15 tokens per second
+MTPTGT n_tokens=64 us=88173
+MTPPROC head=0 n_batch=64 us=5123
+MTPPHASE phase=sync us=5484 n_tokens=64
+0.38.444.124 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9728, progress = 0.70, t =  13.65 s / 712.93 tokens per second
+MTPTGT n_tokens=64 us=90778
+MTPPROC head=0 n_batch=64 us=5403
+MTPPHASE phase=sync us=5746 n_tokens=64
+0.38.540.750 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9792, progress = 0.71, t =  13.74 s / 712.59 tokens per second
+MTPTGT n_tokens=64 us=88596
+MTPPROC head=0 n_batch=64 us=5268
+MTPPHASE phase=sync us=5608 n_tokens=64
+0.38.635.184 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9856, progress = 0.71, t =  13.84 s / 712.34 tokens per second
+MTPTGT n_tokens=64 us=88700
+MTPPROC head=0 n_batch=64 us=5289
+MTPPHASE phase=sync us=5687 n_tokens=64
+0.38.729.731 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9920, progress = 0.72, t =  13.93 s / 712.10 tokens per second
+MTPTGT n_tokens=64 us=88414
+MTPPROC head=0 n_batch=64 us=5249
+MTPPHASE phase=sync us=5669 n_tokens=64
+0.38.823.908 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =   9984, progress = 0.72, t =  14.02 s / 711.88 tokens per second
+MTPTGT n_tokens=64 us=91195
+MTPPROC head=0 n_batch=64 us=5531
+MTPPHASE phase=sync us=5991 n_tokens=64
+0.38.921.287 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10048, progress = 0.73, t =  14.12 s / 711.52 tokens per second
+MTPTGT n_tokens=64 us=89169
+MTPPROC head=0 n_batch=64 us=5438
+MTPPHASE phase=sync us=5897 n_tokens=64
+0.39.016.479 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10112, progress = 0.73, t =  14.22 s / 711.26 tokens per second
+MTPTGT n_tokens=64 us=89299
+MTPPROC head=0 n_batch=64 us=5457
+MTPPHASE phase=sync us=5897 n_tokens=64
+0.39.111.815 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10176, progress = 0.73, t =  14.31 s / 710.99 tokens per second
+MTPTGT n_tokens=64 us=89336
+MTPPROC head=0 n_batch=64 us=5692
+MTPPHASE phase=sync us=6338 n_tokens=64
+0.39.207.605 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10240, progress = 0.74, t =  14.41 s / 710.73 tokens per second
+MTPTGT n_tokens=64 us=92125
+MTPPROC head=0 n_batch=64 us=5606
+MTPPHASE phase=sync us=6138 n_tokens=64
+0.39.306.024 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10304, progress = 0.74, t =  14.51 s / 710.31 tokens per second
+MTPTGT n_tokens=64 us=90562
+MTPPROC head=0 n_batch=64 us=5390
+MTPPHASE phase=sync us=5815 n_tokens=64
+0.39.402.543 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10368, progress = 0.75, t =  14.60 s / 709.98 tokens per second
+MTPTGT n_tokens=64 us=89711
+MTPPROC head=0 n_batch=64 us=5290
+MTPPHASE phase=sync us=5667 n_tokens=64
+0.39.498.063 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10432, progress = 0.75, t =  14.70 s / 709.71 tokens per second
+MTPTGT n_tokens=64 us=89760
+MTPPROC head=0 n_batch=64 us=5260
+MTPPHASE phase=sync us=5629 n_tokens=64
+0.39.593.543 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10496, progress = 0.76, t =  14.79 s / 709.46 tokens per second
+MTPTGT n_tokens=64 us=93738
+MTPPROC head=0 n_batch=64 us=5538
+MTPPHASE phase=sync us=5924 n_tokens=64
+0.39.693.297 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10560, progress = 0.76, t =  14.89 s / 709.02 tokens per second
+MTPTGT n_tokens=64 us=90611
+MTPPROC head=0 n_batch=64 us=5457
+MTPPHASE phase=sync us=5923 n_tokens=64
+0.39.789.924 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10624, progress = 0.77, t =  14.99 s / 708.72 tokens per second
+MTPTGT n_tokens=64 us=90535
+MTPPROC head=0 n_batch=64 us=5498
+MTPPHASE phase=sync us=5919 n_tokens=64
+0.39.886.488 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10688, progress = 0.77, t =  15.09 s / 708.42 tokens per second
+MTPTGT n_tokens=64 us=90693
+MTPPROC head=0 n_batch=64 us=5296
+MTPPHASE phase=sync us=5630 n_tokens=64
+0.39.982.903 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10752, progress = 0.78, t =  15.18 s / 708.12 tokens per second
+MTPTGT n_tokens=64 us=93760
+MTPPROC head=0 n_batch=64 us=5722
+MTPPHASE phase=sync us=6187 n_tokens=64
+0.40.082.957 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10816, progress = 0.78, t =  15.28 s / 707.70 tokens per second
+MTPTGT n_tokens=64 us=91516
+MTPPROC head=0 n_batch=64 us=5399
+MTPPHASE phase=sync us=5729 n_tokens=64
+0.40.180.304 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10880, progress = 0.79, t =  15.38 s / 707.36 tokens per second
+MTPTGT n_tokens=64 us=91445
+MTPPROC head=0 n_batch=64 us=5561
+MTPPHASE phase=sync us=5976 n_tokens=64
+0.40.277.922 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  10944, progress = 0.79, t =  15.48 s / 707.05 tokens per second
+MTPTGT n_tokens=64 us=91483
+MTPPROC head=0 n_batch=64 us=5527
+MTPPHASE phase=sync us=5940 n_tokens=64
+0.40.375.452 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11008, progress = 0.79, t =  15.58 s / 706.73 tokens per second
+MTPTGT n_tokens=64 us=93940
+MTPPROC head=0 n_batch=64 us=5672
+MTPPHASE phase=sync us=6056 n_tokens=64
+0.40.475.595 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11072, progress = 0.80, t =  15.68 s / 706.30 tokens per second
+MTPTGT n_tokens=64 us=91925
+MTPPROC head=0 n_batch=64 us=5620
+MTPPHASE phase=sync us=6012 n_tokens=64
+0.40.573.648 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11136, progress = 0.80, t =  15.77 s / 705.97 tokens per second
+MTPTGT n_tokens=64 us=91880
+MTPPROC head=0 n_batch=64 us=5536
+MTPPHASE phase=sync us=5940 n_tokens=64
+0.40.671.573 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11200, progress = 0.81, t =  15.87 s / 705.64 tokens per second
+MTPTGT n_tokens=64 us=91712
+MTPPROC head=0 n_batch=64 us=5563
+MTPPHASE phase=sync us=5942 n_tokens=64
+0.40.769.331 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11264, progress = 0.81, t =  15.97 s / 705.33 tokens per second
+MTPTGT n_tokens=64 us=94654
+MTPPROC head=0 n_batch=64 us=5751
+MTPPHASE phase=sync us=6171 n_tokens=64
+0.40.870.246 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11328, progress = 0.82, t =  16.07 s / 704.89 tokens per second
+MTPTGT n_tokens=64 us=92824
+MTPPROC head=0 n_batch=64 us=5606
+MTPPHASE phase=sync us=6049 n_tokens=64
+0.40.969.215 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11392, progress = 0.82, t =  16.17 s / 704.53 tokens per second
+MTPTGT n_tokens=64 us=92935
+MTPPROC head=0 n_batch=64 us=5651
+MTPPHASE phase=sync us=6028 n_tokens=64
+0.41.068.277 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11456, progress = 0.83, t =  16.27 s / 704.17 tokens per second
+MTPTGT n_tokens=64 us=92677
+MTPPROC head=0 n_batch=64 us=5589
+MTPPHASE phase=sync us=5941 n_tokens=64
+0.41.166.989 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11520, progress = 0.83, t =  16.37 s / 703.83 tokens per second
+MTPTGT n_tokens=64 us=95744
+MTPPROC head=0 n_batch=64 us=5816
+MTPPHASE phase=sync us=6188 n_tokens=64
+0.41.269.070 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11584, progress = 0.84, t =  16.47 s / 703.37 tokens per second
+MTPTGT n_tokens=64 us=93855
+MTPPROC head=0 n_batch=64 us=5734
+MTPPHASE phase=sync us=6165 n_tokens=64
+0.41.369.207 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11648, progress = 0.84, t =  16.57 s / 702.98 tokens per second
+MTPTGT n_tokens=64 us=93371
+MTPPROC head=0 n_batch=64 us=5750
+MTPPHASE phase=sync us=6174 n_tokens=64
+0.41.468.845 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11712, progress = 0.85, t =  16.67 s / 702.61 tokens per second
+MTPTGT n_tokens=64 us=93676
+MTPPROC head=0 n_batch=64 us=5780
+MTPPHASE phase=sync us=6241 n_tokens=64
+0.41.568.853 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11776, progress = 0.85, t =  16.77 s / 702.24 tokens per second
+MTPTGT n_tokens=64 us=96803
+MTPPROC head=0 n_batch=64 us=5975
+MTPPHASE phase=sync us=6411 n_tokens=64
+0.41.672.166 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11840, progress = 0.85, t =  16.87 s / 701.74 tokens per second
+MTPTGT n_tokens=64 us=94695
+MTPPROC head=0 n_batch=64 us=5772
+MTPPHASE phase=sync us=6223 n_tokens=64
+0.41.773.178 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11904, progress = 0.86, t =  16.97 s / 701.33 tokens per second
+MTPTGT n_tokens=64 us=94568
+MTPPROC head=0 n_batch=64 us=5703
+MTPPHASE phase=sync us=6102 n_tokens=64
+0.41.873.938 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  11968, progress = 0.86, t =  17.07 s / 700.93 tokens per second
+MTPTGT n_tokens=64 us=94382
+MTPPROC head=0 n_batch=64 us=5779
+MTPPHASE phase=sync us=6128 n_tokens=64
+0.41.974.546 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12032, progress = 0.87, t =  17.17 s / 700.56 tokens per second
+MTPTGT n_tokens=64 us=97762
+MTPPROC head=0 n_batch=64 us=5976
+MTPPHASE phase=sync us=6391 n_tokens=64
+0.42.078.967 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12096, progress = 0.87, t =  17.28 s / 700.04 tokens per second
+MTPTGT n_tokens=64 us=94642
+MTPPROC head=0 n_batch=64 us=5761
+MTPPHASE phase=sync us=6204 n_tokens=64
+0.42.179.978 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12160, progress = 0.88, t =  17.38 s / 699.64 tokens per second
+MTPTGT n_tokens=64 us=94852
+MTPPROC head=0 n_batch=64 us=5788
+MTPPHASE phase=sync us=6198 n_tokens=64
+0.42.281.124 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12224, progress = 0.88, t =  17.48 s / 699.26 tokens per second
+MTPTGT n_tokens=64 us=94882
+MTPPROC head=0 n_batch=64 us=5765
+MTPPHASE phase=sync us=6189 n_tokens=64
+0.42.382.297 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12288, progress = 0.89, t =  17.58 s / 698.87 tokens per second
+MTPTGT n_tokens=64 us=97689
+MTPPROC head=0 n_batch=64 us=5927
+MTPPHASE phase=sync us=6409 n_tokens=64
+0.42.486.492 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12352, progress = 0.89, t =  17.69 s / 698.38 tokens per second
+MTPTGT n_tokens=64 us=95339
+MTPPROC head=0 n_batch=64 us=5865
+MTPPHASE phase=sync us=6316 n_tokens=64
+0.42.588.258 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12416, progress = 0.90, t =  17.79 s / 697.98 tokens per second
+MTPTGT n_tokens=64 us=95151
+MTPPROC head=0 n_batch=64 us=5861
+MTPPHASE phase=sync us=6313 n_tokens=64
+0.42.689.917 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12480, progress = 0.90, t =  17.89 s / 697.59 tokens per second
+MTPTGT n_tokens=64 us=95262
+MTPPROC head=0 n_batch=64 us=6135
+MTPPHASE phase=sync us=6596 n_tokens=64
+0.42.791.880 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12544, progress = 0.91, t =  17.99 s / 697.21 tokens per second
+MTPTGT n_tokens=64 us=97783
+MTPPROC head=0 n_batch=64 us=6184
+MTPPHASE phase=sync us=6647 n_tokens=64
+0.42.896.419 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12608, progress = 0.91, t =  18.10 s / 696.72 tokens per second
+MTPTGT n_tokens=64 us=95856
+MTPPROC head=0 n_batch=64 us=5934
+MTPPHASE phase=sync us=6376 n_tokens=64
+0.42.998.752 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12672, progress = 0.91, t =  18.20 s / 696.31 tokens per second
+MTPTGT n_tokens=64 us=95998
+MTPPROC head=0 n_batch=64 us=6010
+MTPPHASE phase=sync us=6432 n_tokens=64
+0.43.101.282 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12736, progress = 0.92, t =  18.30 s / 695.90 tokens per second
+MTPTGT n_tokens=64 us=96084
+MTPPROC head=0 n_batch=64 us=5957
+MTPPHASE phase=sync us=6316 n_tokens=64
+0.43.203.795 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12800, progress = 0.92, t =  18.40 s / 695.50 tokens per second
+MTPTGT n_tokens=64 us=97942
+MTPPROC head=0 n_batch=64 us=6009
+MTPPHASE phase=sync us=6394 n_tokens=64
+0.43.308.337 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12864, progress = 0.93, t =  18.51 s / 695.03 tokens per second
+MTPTGT n_tokens=64 us=95878
+MTPPROC head=0 n_batch=64 us=5928
+MTPPHASE phase=sync us=6330 n_tokens=64
+0.43.410.631 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12928, progress = 0.93, t =  18.61 s / 694.65 tokens per second
+MTPTGT n_tokens=64 us=95908
+MTPPROC head=0 n_batch=64 us=6493
+MTPPHASE phase=sync us=7216 n_tokens=64
+0.43.513.883 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  12992, progress = 0.94, t =  18.71 s / 694.27 tokens per second
+MTPTGT n_tokens=64 us=96066
+MTPPROC head=0 n_batch=64 us=5823
+MTPPHASE phase=sync us=6276 n_tokens=64
+0.43.616.601 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13056, progress = 0.94, t =  18.82 s / 693.85 tokens per second
+MTPTGT n_tokens=64 us=99405
+MTPPROC head=0 n_batch=64 us=6050
+MTPPHASE phase=sync us=6441 n_tokens=64
+0.43.722.578 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13120, progress = 0.95, t =  18.92 s / 693.35 tokens per second
+MTPTGT n_tokens=64 us=96609
+MTPPROC head=0 n_batch=64 us=5981
+MTPPHASE phase=sync us=6381 n_tokens=64
+0.43.825.656 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13184, progress = 0.95, t =  19.03 s / 692.95 tokens per second
+MTPTGT n_tokens=64 us=96709
+MTPPROC head=0 n_batch=64 us=5964
+MTPPHASE phase=sync us=6330 n_tokens=64
+0.43.928.787 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13248, progress = 0.96, t =  19.13 s / 692.56 tokens per second
+MTPTGT n_tokens=64 us=96435
+MTPPROC head=0 n_batch=64 us=6124
+MTPPHASE phase=sync us=6650 n_tokens=64
+0.44.031.971 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13312, progress = 0.96, t =  19.23 s / 692.19 tokens per second
+MTPTGT n_tokens=64 us=99570
+MTPPROC head=0 n_batch=64 us=6109
+MTPPHASE phase=sync us=6621 n_tokens=64
+0.44.138.268 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13376, progress = 0.97, t =  19.34 s / 691.69 tokens per second
+MTPTGT n_tokens=64 us=97297
+MTPPROC head=0 n_batch=64 us=6001
+MTPPHASE phase=sync us=6375 n_tokens=64
+0.44.242.037 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13440, progress = 0.97, t =  19.44 s / 691.28 tokens per second
+MTPTGT n_tokens=64 us=97387
+MTPPROC head=0 n_batch=64 us=6063
+MTPPHASE phase=sync us=6510 n_tokens=64
+0.44.346.038 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13504, progress = 0.98, t =  19.55 s / 690.88 tokens per second
+MTPTGT n_tokens=64 us=97168
+MTPPROC head=0 n_batch=64 us=5962
+MTPPHASE phase=sync us=6391 n_tokens=64
+0.44.449.701 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13568, progress = 0.98, t =  19.65 s / 690.49 tokens per second
+MTPTGT n_tokens=64 us=100259
+MTPPROC head=0 n_batch=64 us=6219
+MTPPHASE phase=sync us=6644 n_tokens=64
+0.44.556.701 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13632, progress = 0.98, t =  19.76 s / 690.00 tokens per second
+MTPTGT n_tokens=64 us=97924
+MTPPROC head=0 n_batch=64 us=6045
+MTPPHASE phase=sync us=6481 n_tokens=64
+0.44.661.197 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13696, progress = 0.99, t =  19.86 s / 689.58 tokens per second
+MTPTGT n_tokens=64 us=97830
+MTPPROC head=0 n_batch=64 us=6193
+MTPPHASE phase=sync us=6671 n_tokens=64
+0.44.765.798 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13760, progress = 0.99, t =  19.97 s / 689.18 tokens per second
+MTPTGT n_tokens=26 us=79012
+MTPPROC head=0 n_batch=26 us=4008
+MTPPHASE phase=sync us=4268 n_tokens=26
+0.44.849.250 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13786, progress = 1.00, t =  20.05 s / 687.53 tokens per second
+MTPTGT n_tokens=60 us=99435
+MTPPROC head=0 n_batch=60 us=6133
+MTPPHASE phase=sync us=6590 n_tokens=60
+0.45.031.413 I slot print_timing: id  0 | task 220 | prompt processing, n_tokens =  13846, progress = 1.00, t =  20.23 s / 684.38 tokens per second
+MTPTGT n_tokens=4 us=48355
+MTPPROC head=0 n_batch=4 us=2078
+MTPPHASE phase=sync us=2179 n_tokens=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3854 smp_us=23
+MTPPHASE phase=draft us=4037 drafted=0
+MTPTGT n_tokens=1 us=34137
+MTPPROC head=0 n_batch=1 us=1590
+MTPPHASE phase=sync us=1704 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2967 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2800 smp_us=4
+MTPPHASE phase=draft us=5899 drafted=1
+MTPTGT n_tokens=2 us=38969
+MTPPROC head=0 n_batch=2 us=1870
+MTPPHASE phase=sync us=2003 n_tokens=2
+MTPPHASE phase=verify us=1609 sample_accept_us=506 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3069 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2831 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2818 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2805 smp_us=5
+MTPPHASE phase=draft us=11661 drafted=4
+MTPTGT n_tokens=5 us=47699
+MTPPROC head=0 n_batch=5 us=2093
+MTPPHASE phase=sync us=2195 n_tokens=5
+MTPPHASE phase=verify us=1605 sample_accept_us=1284 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3033 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2818 smp_us=5
+MTPPHASE phase=draft us=5950 drafted=1
+MTPTGT n_tokens=2 us=37389
+MTPPROC head=0 n_batch=2 us=1757
+MTPPHASE phase=sync us=1876 n_tokens=2
+MTPPHASE phase=verify us=839 sample_accept_us=544 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3029 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2809 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2799 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2797 smp_us=4
+MTPPHASE phase=draft us=11586 drafted=4
+MTPTGT n_tokens=5 us=46973
+MTPPROC head=0 n_batch=5 us=2046
+MTPPHASE phase=sync us=2170 n_tokens=5
+MTPPHASE phase=verify us=1090 sample_accept_us=800 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3014 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2819 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2800 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2824 smp_us=5
+MTPPHASE phase=draft us=11615 drafted=4
+MTPTGT n_tokens=5 us=45124
+MTPPROC head=0 n_batch=5 us=2119
+MTPPHASE phase=sync us=2248 n_tokens=5
+MTPPHASE phase=verify us=1550 sample_accept_us=1281 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3055 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2939 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2846 smp_us=21
+MTPDRAFT depth=3 n_batch=1 dec_us=3024 smp_us=5
+MTPPHASE phase=draft us=12047 drafted=4
+MTPTGT n_tokens=5 us=44970
+MTPPROC head=0 n_batch=5 us=2249
+MTPPHASE phase=sync us=2328 n_tokens=5
+MTPPHASE phase=verify us=1618 sample_accept_us=1267 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3121 smp_us=14
+MTPDRAFT depth=1 n_batch=1 dec_us=2881 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2831 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2816 smp_us=9
+MTPPHASE phase=draft us=11778 drafted=3
+MTPTGT n_tokens=4 us=47156
+MTPPROC head=0 n_batch=4 us=2123
+MTPPHASE phase=sync us=2261 n_tokens=4
+MTPPHASE phase=verify us=1415 sample_accept_us=1096 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=3043 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2814 smp_us=4
+MTPPHASE phase=draft us=5991 drafted=1
+MTPTGT n_tokens=2 us=37442
+MTPPROC head=0 n_batch=2 us=1752
+MTPPHASE phase=sync us=1873 n_tokens=2
+MTPPHASE phase=verify us=800 sample_accept_us=507 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3065 smp_us=18
+MTPDRAFT depth=1 n_batch=1 dec_us=2952 smp_us=7
+MTPPHASE phase=draft us=6134 drafted=1
+MTPTGT n_tokens=2 us=35482
+MTPPROC head=0 n_batch=2 us=1695
+MTPPHASE phase=sync us=1810 n_tokens=2
+MTPPHASE phase=verify us=807 sample_accept_us=542 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2999 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2815 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2803 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2802 smp_us=5
+MTPPHASE phase=draft us=11568 drafted=4
+MTPTGT n_tokens=5 us=46901
+MTPPROC head=0 n_batch=5 us=2264
+MTPPHASE phase=sync us=2444 n_tokens=5
+MTPPHASE phase=verify us=1632 sample_accept_us=1291 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3241 smp_us=16
+MTPDRAFT depth=1 n_batch=1 dec_us=2879 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2825 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2814 smp_us=4
+MTPPHASE phase=draft us=11907 drafted=4
+MTPTGT n_tokens=5 us=44854
+MTPPROC head=0 n_batch=5 us=2087
+MTPPHASE phase=sync us=2179 n_tokens=5
+MTPPHASE phase=verify us=1545 sample_accept_us=1246 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3022 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2816 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2811 smp_us=4
+MTPPHASE phase=draft us=8755 drafted=2
+MTPTGT n_tokens=3 us=42205
+MTPPROC head=0 n_batch=3 us=1951
+MTPPHASE phase=sync us=2072 n_tokens=3
+MTPPHASE phase=verify us=1086 sample_accept_us=791 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=3128 smp_us=23
+MTPDRAFT depth=1 n_batch=1 dec_us=2966 smp_us=8
+MTPPHASE phase=draft us=6283 drafted=1
+MTPTGT n_tokens=2 us=37782
+MTPPROC head=0 n_batch=2 us=1800
+MTPPHASE phase=sync us=1922 n_tokens=2
+MTPPHASE phase=verify us=817 sample_accept_us=524 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3024 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2810 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2808 smp_us=4
+MTPPHASE phase=draft us=8784 drafted=2
+MTPTGT n_tokens=3 us=42029
+MTPPROC head=0 n_batch=3 us=1967
+MTPPHASE phase=sync us=2105 n_tokens=3
+MTPPHASE phase=verify us=1189 sample_accept_us=789 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=3157 smp_us=14
+MTPPHASE phase=draft us=3308 drafted=0
+MTPTGT n_tokens=1 us=33478
+MTPPROC head=0 n_batch=1 us=1670
+MTPPHASE phase=sync us=1785 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2945 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2819 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2798 smp_us=4
+MTPPHASE phase=draft us=8708 drafted=2
+MTPTGT n_tokens=3 us=42262
+MTPPROC head=0 n_batch=3 us=1935
+MTPPHASE phase=sync us=2061 n_tokens=3
+MTPPHASE phase=verify us=1053 sample_accept_us=771 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=3037 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2834 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=2847 smp_us=10
+MTPPHASE phase=draft us=8898 drafted=2
+MTPTGT n_tokens=3 us=40328
+MTPPROC head=0 n_batch=3 us=1992
+MTPPHASE phase=sync us=2118 n_tokens=3
+MTPPHASE phase=verify us=1045 sample_accept_us=760 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=3069 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2877 smp_us=10
+MTPPHASE phase=draft us=6121 drafted=1
+MTPTGT n_tokens=2 us=37802
+MTPPROC head=0 n_batch=2 us=1748
+MTPPHASE phase=sync us=1868 n_tokens=2
+MTPPHASE phase=verify us=821 sample_accept_us=526 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=5025 smp_us=10
+MTPPHASE phase=draft us=5186 drafted=0
+MTPTGT n_tokens=1 us=33664
+MTPPROC head=0 n_batch=1 us=1640
+MTPPHASE phase=sync us=1754 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2978 smp_us=8
+MTPPHASE phase=draft us=3102 drafted=0
+MTPTGT n_tokens=1 us=31062
+MTPPROC head=0 n_batch=1 us=1430
+MTPPHASE phase=sync us=1539 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2961 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2810 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2801 smp_us=5
+MTPPHASE phase=draft us=8678 drafted=2
+MTPTGT n_tokens=3 us=42135
+MTPPROC head=0 n_batch=3 us=2069
+MTPPHASE phase=sync us=2212 n_tokens=3
+MTPPHASE phase=verify us=1238 sample_accept_us=829 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=3108 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2865 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2801 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2813 smp_us=5
+MTPPHASE phase=draft us=11712 drafted=4
+MTPTGT n_tokens=5 us=46933
+MTPPROC head=0 n_batch=5 us=2244
+MTPPHASE phase=sync us=2383 n_tokens=5
+MTPPHASE phase=verify us=843 sample_accept_us=527 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3116 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2843 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2809 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2804 smp_us=5
+MTPPHASE phase=draft us=11723 drafted=4
+MTPTGT n_tokens=5 us=45040
+MTPPROC head=0 n_batch=5 us=2188
+MTPPHASE phase=sync us=2321 n_tokens=5
+MTPPHASE phase=verify us=1609 sample_accept_us=1320 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3133 smp_us=8
+MTPPHASE phase=draft us=3256 drafted=0
+MTPTGT n_tokens=1 us=33260
+MTPPROC head=0 n_batch=1 us=1830
+MTPPHASE phase=sync us=1947 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2953 smp_us=7
+MTPPHASE phase=draft us=3070 drafted=0
+MTPTGT n_tokens=1 us=30895
+MTPPROC head=0 n_batch=1 us=1688
+MTPPHASE phase=sync us=1825 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3010 smp_us=9
+MTPPHASE phase=draft us=3172 drafted=0
+MTPTGT n_tokens=1 us=31338
+MTPPROC head=0 n_batch=1 us=1656
+MTPPHASE phase=sync us=1781 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2969 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2810 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2804 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2797 smp_us=5
+MTPPHASE phase=draft us=11535 drafted=3
+MTPTGT n_tokens=4 us=46356
+MTPPROC head=0 n_batch=4 us=2059
+MTPPHASE phase=sync us=2189 n_tokens=4
+MTPPHASE phase=verify us=1323 sample_accept_us=1006 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=3081 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=3309 smp_us=19
+MTPPHASE phase=draft us=6569 drafted=1
+MTPTGT n_tokens=2 us=38340
+MTPPROC head=0 n_batch=2 us=1763
+MTPPHASE phase=sync us=1848 n_tokens=2
+MTPPHASE phase=verify us=836 sample_accept_us=502 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2997 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2809 smp_us=4
+MTPPHASE phase=draft us=5904 drafted=1
+MTPTGT n_tokens=2 us=35219
+MTPPROC head=0 n_batch=2 us=1917
+MTPPHASE phase=sync us=2033 n_tokens=2
+MTPPHASE phase=verify us=688 sample_accept_us=516 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2947 smp_us=24
+MTPDRAFT depth=1 n_batch=1 dec_us=3031 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=4948 smp_us=20
+MTPDRAFT depth=3 n_batch=1 dec_us=2870 smp_us=6
+MTPPHASE phase=draft us=14018 drafted=3
+MTPTGT n_tokens=4 us=47513
+MTPPROC head=0 n_batch=4 us=2040
+MTPPHASE phase=sync us=2174 n_tokens=4
+MTPPHASE phase=verify us=1284 sample_accept_us=1020 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=3079 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2815 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2806 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2801 smp_us=5
+MTPPHASE phase=draft us=11642 drafted=4
+MTPTGT n_tokens=5 us=47159
+MTPPROC head=0 n_batch=5 us=2165
+MTPPHASE phase=sync us=2294 n_tokens=5
+MTPPHASE phase=verify us=1532 sample_accept_us=1268 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3047 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2817 smp_us=5
+MTPPHASE phase=draft us=6010 drafted=1
+MTPTGT n_tokens=2 us=37661
+MTPPROC head=0 n_batch=2 us=1773
+MTPPHASE phase=sync us=1900 n_tokens=2
+MTPPHASE phase=verify us=813 sample_accept_us=519 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3031 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2835 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2819 smp_us=7
+MTPDRAFT depth=3 n_batch=1 dec_us=2807 smp_us=6
+MTPPHASE phase=draft us=11632 drafted=4
+MTPTGT n_tokens=5 us=47349
+MTPPROC head=0 n_batch=5 us=2206
+MTPPHASE phase=sync us=2348 n_tokens=5
+MTPPHASE phase=verify us=1541 sample_accept_us=1251 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3102 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2808 smp_us=4
+MTPPHASE phase=draft us=6043 drafted=1
+MTPTGT n_tokens=2 us=37409
+MTPPROC head=0 n_batch=2 us=1625
+MTPPHASE phase=sync us=1735 n_tokens=2
+MTPPHASE phase=verify us=799 sample_accept_us=520 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2984 smp_us=8
+MTPPHASE phase=draft us=3071 drafted=0
+MTPTGT n_tokens=1 us=33049
+MTPPROC head=0 n_batch=1 us=1850
+MTPPHASE phase=sync us=1957 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2984 smp_us=24
+MTPDRAFT depth=1 n_batch=1 dec_us=2889 smp_us=12
+MTPDRAFT depth=2 n_batch=1 dec_us=2862 smp_us=11
+MTPDRAFT depth=3 n_batch=1 dec_us=2839 smp_us=5
+MTPPHASE phase=draft us=11747 drafted=3
+MTPTGT n_tokens=4 us=46545
+MTPPROC head=0 n_batch=4 us=1936
+MTPPHASE phase=sync us=1999 n_tokens=4
+MTPPHASE phase=verify us=1305 sample_accept_us=993 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=2996 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2808 smp_us=4
+MTPPHASE phase=draft us=5903 drafted=1
+MTPTGT n_tokens=2 us=37476
+MTPPROC head=0 n_batch=2 us=1929
+MTPPHASE phase=sync us=2072 n_tokens=2
+MTPPHASE phase=verify us=839 sample_accept_us=504 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3070 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2815 smp_us=5
+MTPPHASE phase=draft us=6027 drafted=1
+MTPTGT n_tokens=2 us=35457
+MTPPROC head=0 n_batch=2 us=1591
+MTPPHASE phase=sync us=1724 n_tokens=2
+MTPPHASE phase=verify us=1383 sample_accept_us=1122 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3025 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2835 smp_us=5
+MTPPHASE phase=draft us=6005 drafted=1
+MTPTGT n_tokens=2 us=35442
+MTPPROC head=0 n_batch=2 us=1794
+MTPPHASE phase=sync us=1917 n_tokens=2
+MTPPHASE phase=verify us=813 sample_accept_us=524 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3418 smp_us=25
+MTPDRAFT depth=1 n_batch=1 dec_us=2917 smp_us=11
+MTPDRAFT depth=2 n_batch=1 dec_us=2858 smp_us=11
+MTPDRAFT depth=3 n_batch=1 dec_us=2884 smp_us=10
+MTPPHASE phase=draft us=12306 drafted=4
+MTPTGT n_tokens=5 us=47418
+MTPPROC head=0 n_batch=5 us=2178
+MTPPHASE phase=sync us=2310 n_tokens=5
+MTPPHASE phase=verify us=1094 sample_accept_us=764 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3063 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2851 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2816 smp_us=6
+MTPPHASE phase=draft us=8900 drafted=2
+MTPTGT n_tokens=3 us=42791
+MTPPROC head=0 n_batch=3 us=1951
+MTPPHASE phase=sync us=2082 n_tokens=3
+MTPPHASE phase=verify us=1075 sample_accept_us=786 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=3068 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2852 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2829 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2815 smp_us=7
+MTPPHASE phase=draft us=11711 drafted=4
+MTPTGT n_tokens=5 us=47663
+MTPPROC head=0 n_batch=5 us=2141
+MTPPHASE phase=sync us=2276 n_tokens=5
+MTPPHASE phase=verify us=1541 sample_accept_us=1259 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3118 smp_us=19
+MTPDRAFT depth=1 n_batch=1 dec_us=2960 smp_us=15
+MTPDRAFT depth=2 n_batch=1 dec_us=2967 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2829 smp_us=4
+MTPPHASE phase=draft us=12094 drafted=4
+MTPTGT n_tokens=5 us=45388
+MTPPROC head=0 n_batch=5 us=2143
+MTPPHASE phase=sync us=2281 n_tokens=5
+MTPPHASE phase=verify us=790 sample_accept_us=520 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3060 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2834 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2841 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2816 smp_us=5
+MTPPHASE phase=draft us=11699 drafted=4
+MTPTGT n_tokens=5 us=45368
+MTPPROC head=0 n_batch=5 us=1962
+MTPPHASE phase=sync us=2094 n_tokens=5
+MTPPHASE phase=verify us=1534 sample_accept_us=1258 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3068 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2845 smp_us=9
+MTPDRAFT depth=2 n_batch=1 dec_us=3353 smp_us=31
+MTPDRAFT depth=3 n_batch=1 dec_us=3045 smp_us=26
+MTPPHASE phase=draft us=12547 drafted=4
+MTPTGT n_tokens=5 us=45387
+MTPPROC head=0 n_batch=5 us=2041
+MTPPHASE phase=sync us=2094 n_tokens=5
+MTPPHASE phase=verify us=1546 sample_accept_us=1251 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3029 smp_us=7
+MTPPHASE phase=draft us=3153 drafted=0
+MTPTGT n_tokens=1 us=33215
+MTPPROC head=0 n_batch=1 us=1547
+MTPPHASE phase=sync us=1658 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3002 smp_us=10
+MTPPHASE phase=draft us=3129 drafted=0
+MTPTGT n_tokens=1 us=31189
+MTPPROC head=0 n_batch=1 us=1697
+MTPPHASE phase=sync us=1778 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2938 smp_us=7
+MTPPHASE phase=draft us=3026 drafted=0
+MTPTGT n_tokens=1 us=31071
+MTPPROC head=0 n_batch=1 us=1431
+MTPPHASE phase=sync us=1498 n_tokens=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2895 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2808 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2797 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2800 smp_us=4
+MTPPHASE phase=draft us=11413 drafted=3
+MTPTGT n_tokens=4 us=46333
+MTPPROC head=0 n_batch=4 us=2044
+MTPPHASE phase=sync us=2167 n_tokens=4
+MTPPHASE phase=verify us=1322 sample_accept_us=1009 n_draft=3
+MTPDRAFT depth=0 n_batch=1 dec_us=3047 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2828 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2805 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2799 smp_us=5
+MTPPHASE phase=draft us=11627 drafted=4
+MTPTGT n_tokens=5 us=47175
+MTPPROC head=0 n_batch=5 us=2247
+MTPPHASE phase=sync us=2395 n_tokens=5
+MTPPHASE phase=verify us=1622 sample_accept_us=1295 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3184 smp_us=12
+MTPDRAFT depth=1 n_batch=1 dec_us=2863 smp_us=8
+MTPDRAFT depth=2 n_batch=1 dec_us=2820 smp_us=5
+MTPPHASE phase=draft us=9028 drafted=2
+MTPTGT n_tokens=3 us=42403
+MTPPROC head=0 n_batch=3 us=1962
+MTPPHASE phase=sync us=2089 n_tokens=3
+MTPPHASE phase=verify us=1065 sample_accept_us=784 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=3014 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2816 smp_us=4
+MTPPHASE phase=draft us=5958 drafted=1
+MTPTGT n_tokens=2 us=37384
+MTPPROC head=0 n_batch=2 us=1642
+MTPPHASE phase=sync us=1753 n_tokens=2
+MTPPHASE phase=verify us=781 sample_accept_us=516 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=2996 smp_us=11
+MTPDRAFT depth=1 n_batch=1 dec_us=2843 smp_us=5
+MTPPHASE phase=draft us=5974 drafted=1
+MTPTGT n_tokens=2 us=35505
+MTPPROC head=0 n_batch=2 us=1837
+MTPPHASE phase=sync us=1940 n_tokens=2
+MTPPHASE phase=verify us=808 sample_accept_us=517 n_draft=1
+MTPDRAFT depth=0 n_batch=1 dec_us=3609 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2852 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2800 smp_us=5
+MTPPHASE phase=draft us=9379 drafted=2
+MTPTGT n_tokens=3 us=42296
+MTPPROC head=0 n_batch=3 us=1991
+MTPPHASE phase=sync us=2091 n_tokens=3
+MTPPHASE phase=verify us=1029 sample_accept_us=752 n_draft=2
+MTPDRAFT depth=0 n_batch=1 dec_us=3139 smp_us=18
+MTPDRAFT depth=1 n_batch=1 dec_us=2906 smp_us=15
+MTPDRAFT depth=2 n_batch=1 dec_us=2909 smp_us=15
+MTPDRAFT depth=3 n_batch=1 dec_us=2915 smp_us=13
+MTPPHASE phase=draft us=12078 drafted=4
+MTPTGT n_tokens=5 us=47411
+MTPPROC head=0 n_batch=5 us=2126
+MTPPHASE phase=sync us=2262 n_tokens=5
+MTPPHASE phase=verify us=1480 sample_accept_us=1245 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3037 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2821 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2888 smp_us=12
+MTPDRAFT depth=3 n_batch=1 dec_us=2888 smp_us=10
+MTPPHASE phase=draft us=11837 drafted=4
+MTPTGT n_tokens=5 us=45738
+MTPPROC head=0 n_batch=5 us=2116
+MTPPHASE phase=sync us=2244 n_tokens=5
+MTPPHASE phase=verify us=1523 sample_accept_us=1251 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3043 smp_us=10
+MTPDRAFT depth=1 n_batch=1 dec_us=2820 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2806 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2794 smp_us=5
+MTPPHASE phase=draft us=11614 drafted=4
+MTPTGT n_tokens=5 us=45288
+MTPPROC head=0 n_batch=5 us=2167
+MTPPHASE phase=sync us=2300 n_tokens=5
+MTPPHASE phase=verify us=1557 sample_accept_us=1259 n_draft=4
+0.48.197.591 I slot print_timing: id  0 | task 220 | n_gen =    171, tg =  56.08 t/s, tg_3s =  56.41 t/s
+MTPDRAFT depth=0 n_batch=1 dec_us=3101 smp_us=16
+MTPDRAFT depth=1 n_batch=1 dec_us=2938 smp_us=16
+MTPDRAFT depth=2 n_batch=1 dec_us=2921 smp_us=13
+MTPDRAFT depth=3 n_batch=1 dec_us=2871 smp_us=5
+MTPPHASE phase=draft us=11999 drafted=4
+MTPTGT n_tokens=5 us=45093
+MTPPROC head=0 n_batch=5 us=2024
+MTPPHASE phase=sync us=2113 n_tokens=5
+MTPPHASE phase=verify us=1530 sample_accept_us=1235 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3059 smp_us=13
+MTPDRAFT depth=1 n_batch=1 dec_us=2857 smp_us=12
+MTPDRAFT depth=2 n_batch=1 dec_us=2873 smp_us=14
+MTPDRAFT depth=3 n_batch=1 dec_us=2890 smp_us=8
+MTPPHASE phase=draft us=11852 drafted=4
+MTPTGT n_tokens=5 us=49050
+MTPPROC head=0 n_batch=5 us=2265
+MTPPHASE phase=sync us=2393 n_tokens=5
+MTPPHASE phase=verify us=2669 sample_accept_us=1510 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3230 smp_us=15
+MTPDRAFT depth=1 n_batch=1 dec_us=2881 smp_us=6
+MTPDRAFT depth=2 n_batch=1 dec_us=2819 smp_us=6
+MTPDRAFT depth=3 n_batch=1 dec_us=2805 smp_us=5
+MTPPHASE phase=draft us=11935 drafted=4
+MTPTGT n_tokens=5 us=43952
+MTPPROC head=0 n_batch=5 us=2195
+MTPPHASE phase=sync us=2333 n_tokens=5
+MTPPHASE phase=verify us=1507 sample_accept_us=1216 n_draft=4
+MTPDRAFT depth=0 n_batch=1 dec_us=3058 smp_us=9
+MTPDRAFT depth=1 n_batch=1 dec_us=2817 smp_us=7
+MTPDRAFT depth=2 n_batch=1 dec_us=2810 smp_us=8
+MTPDRAFT depth=3 n_batch=1 dec_us=2820 smp_us=6
+MTPPHASE phase=draft us=11666 drafted=4
+MTPTGT n_tokens=5 us=43692
+MTPPROC head=0 n_batch=5 us=2174
+MTPPHASE phase=sync us=2313 n_tokens=5
+MTPPHASE phase=verify us=1523 sample_accept_us=1248 n_draft=4
+MTPTGT n_tokens=1 us=33448
+MTPPROC head=0 n_batch=1 us=1605
+MTPPHASE phase=sync us=1686 n_tokens=1
+MTPSTATS type=draft-mtp steps=216 gen_drafts=216 acc_drafts=208 gen_tokens=638 acc_tokens=558 gen_per_pos=[216,169,139,114] acc_per_pos=[208,146,114,90]
+0.48.479.291 I slot print_timing: id  0 | task 220 | prompt eval time =   20372.68 ms / 13850 tokens (    1.47 ms per token,   679.83 tokens per second)
+0.48.479.294 I slot print_timing: id  0 | task 220 |        eval time =    3313.10 ms /   192 tokens (   17.35 ms per token,    57.65 tokens per second)
+0.48.479.295 I slot print_timing: id  0 | task 220 |       total time =   23685.78 ms / 14042 tokens
+0.48.479.296 I slot print_timing: id  0 | task 220 |    graphs reused =        273
+0.48.479.300 I slot print_timing: id  0 | task 220 | draft acceptance = 0.92754 (  128 accepted /   138 generated), mean len =  3.51
+0.48.479.868 I slot      release: id  0 | task 220 | stop processing: n_tokens = 14041, truncated = 0
+0.48.489.090 I GPU memory clock: decode -> idle, reset (dynamic)
+0.48.490.455 I APU TDP: restored original limits
+0.48.501.769 I srv    operator(): operator(): cleaning up before exit...

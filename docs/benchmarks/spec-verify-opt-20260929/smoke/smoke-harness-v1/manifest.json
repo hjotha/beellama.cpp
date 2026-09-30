@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "phase": "smoke",
+  "run_id": "smoke-harness-v1",
+  "modes": {
+    "base-live": {
+      "env": {},
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    },
+    "base-snapshot": {
+      "env": {},
+      "libs": "snapshot",
+      "cuda": "snapshot",
+      "server_args": []
+    }
+  },
+  "repeats": 1,
+  "long_repeats": 1,
+  "group_size": 2,
+  "port": 59595,
+  "scripts_root": "/home/hjotha/beellama.cpp/docs/benchmarks/spec-verify-opt-20260929",
+  "modes_json": "/home/hjotha/beellama.cpp/docs/benchmarks/spec-verify-opt-20260929/modes-smoke.json",
+  "snapshot_root": "/home/hjotha/beellama-baseline-spec-verify-20260929",
+  "groups": [
+    {
+      "group": "g000-base-live",
+      "round": 0,
+      "mode": "base-live",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        }
+      ]
+    },
+    {
+      "group": "g001-base-snapshot",
+      "round": 0,
+      "mode": "base-snapshot",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        }
+      ]
+    }
+  ],
+  "argv": [
+    "runner.py",
+    "smoke",
+    "--run-id",
+    "smoke-harness-v1",
+    "--modes-json",
+    "modes-smoke.json"
+  ],
+  "created_utc": "2026-09-29T15:30:49.643323+00:00",
+  "comparison_policy": "Report every first token divergence; investigate before attributing to noise."
+}

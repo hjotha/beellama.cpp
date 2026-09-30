@@ -13,6 +13,7 @@
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
+#include "ggml-remote-attn.h"
 
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -439,6 +440,10 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.kvarn             = params.kvarn;
+    cparams.remote_attn_enabled = (params.remote_attn_host != nullptr && params.remote_attn_host[0] != '\0');
+    cparams.remote_attn_prefill = params.remote_attn_prefill;
+    cparams.remote_attn_stats   = (params.remote_attn_stats != 0);
+    cparams.remote_attn_layers  = 0;
     cparams.kv_tail_tokens    = std::min(params.kv_tail_tokens, cparams.n_ctx);
     cparams.kv_tail_tokens_swa = std::min(params.kv_tail_tokens,
             std::min(cparams.n_ctx, hparams.n_swa > 0 ? hparams.n_swa : cparams.n_ctx));
@@ -1053,6 +1058,100 @@ std::vector<ggml_backend_t> layer_backends;
             backend_kvarn_workspace_split_k_size.push_back(0);
         }
 
+        // Remote KV+attention accelerator (Xbox RKVA). Created after the local
+        // backends so it joins backend_ptrs/backend_buft for the scheduler, but
+        // it only ever claims GGML_OP_REMOTE_ATTN (which we also pin explicitly).
+        if (cparams.remote_attn_enabled) {
+            if (model.arch != LLM_ARCH_QWEN35) {
+                throw std::runtime_error(format(
+                    "%s: --remote-attn currently supports only the qwen35 arch (this model arch id: %d)",
+                    __func__, (int) model.arch));
+            }
+            if (cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED &&
+                    params.type_k != GGML_TYPE_F16) {
+                throw std::runtime_error(format(
+                    "%s: --remote-attn requires a KVarN cache type (--cache-type-k/-v kvarnN) "
+                    "or the F16 bring-up path (--cache-type-k/-v f16)", __func__));
+            }
+
+            // count the full-attention layers that will be offloaded
+            int n_remote = 0;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (model.hparams.has_kv(il) && !model.hparams.is_recr(il)) {
+                    ++n_remote;
+                }
+            }
+            cparams.remote_attn_layers = n_remote;
+
+            backend_remote = ggml_backend_remote_attn_init(params.remote_attn_host, params.remote_attn_port);
+            if (backend_remote == nullptr) {
+                throw std::runtime_error(format(
+                    "%s: failed to create remote-attn backend for %s:%u",
+                    __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+            }
+
+            ggml_remote_attn_geometry geo {};
+            geo.n_layer_remote = (uint32_t) n_remote;
+            geo.n_head         = model.hparams.n_head();
+            geo.n_head_kv      = model.hparams.n_head_kv();
+            geo.head_dim       = model.hparams.n_embd_head_k();
+            geo.max_ctx        = (uint32_t) cparams.n_ctx;
+            geo.cache_bits_k   = (uint32_t) cparams.kvarn.key_bits;
+            geo.cache_bits_v   = (uint32_t) cparams.kvarn.value_bits;
+            geo.group_tokens   = 128;
+            geo.sinkhorn_iters = (uint32_t) cparams.kvarn.sinkhorn_iters;
+            geo.tail_tokens    = cparams.kv_tail_tokens;
+            geo.tail_groups    = 2;
+            geo.tail_type      = (cparams.kv_tail_type == GGML_TYPE_BF16) ? 1u : 0u;
+            geo.domain         = GGML_REMOTE_ATTN_DOMAIN_AUTO;  // server mirrors the KVarN rotated-domain plan
+            geo.has_sinks      = 0;
+            geo.swa            = 0;
+            geo.kq_scale       = model.hparams.f_attention_scale == 0.0f ?
+                                 1.0f / sqrtf((float) geo.head_dim) : model.hparams.f_attention_scale;
+
+            ggml_backend_remote_attn_set_geometry(backend_remote, &geo);
+            if (!ggml_backend_remote_attn_connect(backend_remote)) {
+                ggml_backend_free(backend_remote);
+                backend_remote = nullptr;
+                throw std::runtime_error(format(
+                    "%s: failed to connect/handshake with remote-attn server %s:%u",
+                    __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+            }
+
+            // MVP: a single session (slot 0). Multi-slot isolation lands with
+            // the server-side session manager.
+            remote_attn_session = 0;
+            if (!ggml_backend_remote_attn_create_session(
+                    backend_remote, remote_attn_session, /*seq_id=*/0, (uint32_t) cparams.n_ctx)) {
+                ggml_backend_free(backend_remote);
+                backend_remote = nullptr;
+                throw std::runtime_error(format("%s: remote-attn CREATE_SESSION failed", __func__));
+            }
+            ggml_backend_remote_attn_set_active_session(backend_remote, remote_attn_session);
+
+            LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
+                    __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
+
+            // PATH B: the remote op is computed on the CPU backend (pinned in
+            // qwen35), so the scheduler uses its proven CUDA<->CPU copies and we
+            // do NOT register backend_remote with the scheduler (a minimal custom
+            // backend in the split/copy machinery corrupted tensor backend ids).
+            // backend_remote only owns the RPC connection; ggml_remote_attn_exec
+            // (called from the CPU compute) uses it via this active registration.
+            ggml_remote_attn_set_active(backend_remote);
+
+            // RESET-on-clear: a full local cache clear (warmup, /v1/chat/completions
+            // reset, slot reuse) must reset the remote session so both sides stay in
+            // lockstep; otherwise the next generation starts over stale records.
+            if (memory) {
+                memory->set_on_clear([this]() {
+                    if (backend_remote != nullptr) {
+                        ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
+                    }
+                });
+            }
+        }
+
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
@@ -1132,6 +1231,20 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // Release the remote KV+attention backend after the scheduler that
+    // references it. sched.reset() runs before any member destructor, so the
+    // local backends (unique_ptrs) and buffers are still intact for it.
+    if (backend_remote != nullptr) {
+        if (cparams.remote_attn_stats) {
+            LLAMA_LOG_INFO("%s: remote_attn stats %s\n", __func__,
+                    ggml_backend_remote_attn_stats_json(backend_remote));
+        }
+        ggml_remote_attn_set_active(nullptr);
+        sched.reset();
+        ggml_backend_free(backend_remote);
+        backend_remote = nullptr;
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -1411,7 +1524,23 @@ void llama_context::synchronize() {
         return;
     }
 
+    // Item 2: within one sampling pass, every output getter (logits/probs/ids/
+    // embeddings) re-enters synchronize(). After the first barrier the outputs are
+    // host-resident and graph_compute has not submitted anything new, so the extra
+    // barriers are redundant. outputs_synced is cleared only at the single async
+    // submission point, so this never skips a barrier that real pending work needs.
+    // Gated by env so a single binary can be A/B benchmarked with the change isolated.
+    static const bool single_sync = [] {
+        const char * v = std::getenv("SPEC_OPT_SINGLE_SYNC");
+        return v != nullptr && (std::string(v) == "1" || std::string(v) == "true" ||
+                                std::string(v) == "yes" || std::string(v) == "on");
+    }();
+    if (single_sync && outputs_synced) {
+        return;
+    }
+
     ggml_backend_sched_synchronize(sched.get());
+    outputs_synced = true;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -3493,6 +3622,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/gtype,
         /*.sched       =*/sched.get(),
         /*.backend_cpu =*/backend_cpu,
+        /*.backend_remote =*/backend_remote,
         /*.cvec        =*/cvec.get(),
         /*.loras       =*/loras.get(),
         /*.mctx        =*/mctx,
@@ -3533,6 +3663,8 @@ ggml_status llama_context::graph_compute(
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+    // New backend work is now in flight; the next synchronize() must run the barrier.
+    outputs_synced = false;
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
@@ -5354,6 +5486,10 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kvarn                       =*/ llama_kvarn_default_params(),
         /*.path_kv_mean_center         =*/ nullptr,
+        /*.remote_attn_host            =*/ nullptr,
+        /*.remote_attn_port            =*/ 0,
+        /*.remote_attn_prefill         =*/ 0,
+        /*.remote_attn_stats           =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

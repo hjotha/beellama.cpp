@@ -1,0 +1,42 @@
+{
+  "group": "g004-active-mtp2-v4-e1",
+  "round": 1,
+  "mode": "active-mtp2-v4-e1",
+  "requests": [
+    {
+      "case": "warmup64",
+      "repeat": null,
+      "scenario": "warmup64"
+    },
+    {
+      "case": "curto192",
+      "repeat": 2,
+      "scenario": "curto192-r002"
+    },
+    {
+      "case": "codigo192",
+      "repeat": 2,
+      "scenario": "codigo192-r002"
+    },
+    {
+      "case": "long192",
+      "repeat": 2,
+      "scenario": "long192-r002"
+    },
+    {
+      "case": "curto192",
+      "repeat": 3,
+      "scenario": "curto192-r003"
+    },
+    {
+      "case": "codigo192",
+      "repeat": 3,
+      "scenario": "codigo192-r003"
+    },
+    {
+      "case": "long192",
+      "repeat": 3,
+      "scenario": "long192-r003"
+    }
+  ]
+}

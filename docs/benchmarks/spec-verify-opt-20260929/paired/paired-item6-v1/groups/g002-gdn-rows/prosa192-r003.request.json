@@ -1,0 +1,10 @@
+{
+  "prompt": "Explique em portugues, com suas palavras, por que o ceu e azul durante o dia e avermelhado no por do sol. Inclua dois exemplos do cotidiano e uma analogia simples. Nao use listas nem repeticao de frases.",
+  "n_predict": 192,
+  "temperature": 0,
+  "seed": 42,
+  "ignore_eos": true,
+  "cache_prompt": false,
+  "stream": false,
+  "return_tokens": true
+}

@@ -640,6 +640,12 @@ extern "C" {
 
         GGML_OP_PAGED_ATTN,
 
+        // Full-attention core executed by a remote KV+attention accelerator
+        // (ggml-remote-attn backend).  Only that backend supports this op.
+        // Kept last so existing op enum values (and prebuilt CUDA objects)
+        // are not shifted.
+        GGML_OP_REMOTE_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -2816,6 +2822,35 @@ extern "C" {
             int                   bits,
             bool                  value,
             int                   stage_groups);
+
+    // Remote full-attention core (ggml-remote-attn backend).
+    // q: [n_embd_head, n_head,    n_tokens] F32, post-RoPE, pre-WHT
+    // k: [n_embd_head, n_head_kv, n_tokens] F32, post-norm/RoPE, pre-WHT
+    // v: [n_embd_head, n_head_kv, n_tokens] F32
+    // pos: [n_tokens] I32 absolute positions within the remote session
+    // Returns [n_embd_head*n_head, n_tokens] F32 in the same domain contract
+    // as the local KVarN attention output (inverse WHT applied remotely when
+    // the negotiated domain requires it). The remote server owns the KVarN
+    // rotation, record compression, precision tail, causal masking per
+    // session, trim/rewind/reset.
+    enum ggml_remote_attn_op_param {
+        GGML_REMOTE_ATTN_PARAM_LAYER_ID    = 0,
+        GGML_REMOTE_ATTN_PARAM_DOMAIN      = 1,
+        GGML_REMOTE_ATTN_PARAM_N_HEAD      = 2,
+        GGML_REMOTE_ATTN_PARAM_N_HEAD_KV   = 3,
+        GGML_REMOTE_ATTN_PARAM_N_EMBD_HEAD = 4,
+        GGML_REMOTE_ATTN_PARAM_KQ_SCALE    = 5,
+    };
+
+    GGML_API struct ggml_tensor * ggml_remote_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * pos,
+            int                   layer_id,
+            float                 kq_scale,
+            int                   domain);
 
     // rows-indexed state read: instead of a gathered [S_v, S_v, H_v, n_seqs]
     // scratch, the op reads each sequence's live state directly from `states`

@@ -1,0 +1,155 @@
+[1/81] Provisioning UI assets
+-- UI: HF stamp matches 'ggml-org/llama-ui|b12308', skipping HF fetch
+-- UI: assets unchanged, skipping embedding
+[2/79] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/cmake_pch.hxx.gch
+[3/79] Building CXX object tools/server/CMakeFiles/server-context.dir/cmake_pch.hxx.gch
+[4/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-model-identity.cpp.o
+[5/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-route-state.cpp.o
+/home/hjotha/beellama.cpp/tools/server/server-route-state.cpp: In function ‘size_t server_route_state_save(llama_context*, llama_seq_id, const llama_tokens&, const server_model_identity&, const std::string&, uint64_t, uint32_t, const std::vector<float>*, const std::function<bool(long unsigned int)>&, const std::function<bool()>&, server_route_state_store_lock*, server_route_state_lease*)’:
+/home/hjotha/beellama.cpp/tools/server/server-route-state.cpp:223:53: warning: ignoring attributes on template argument ‘int (*)(FILE*)’ [-Wignored-attributes]
+  223 |         std::unique_ptr<FILE, decltype(&std::fclose)> file(ggml_fopen(temporary.path.c_str(), "ab"), &std::fclose);
+      |                                                     ^
+/home/hjotha/beellama.cpp/tools/server/server-route-state.cpp: In function ‘bool server_route_state_adopt_native(const std::string&, const std::string&, const std::string&, const std::string&, const llama_tokens&, uint32_t, uint32_t, uint64_t, const std::string*)’:
+/home/hjotha/beellama.cpp/tools/server/server-route-state.cpp:542:57: warning: ignoring attributes on template argument ‘int (*)(FILE*)’ [-Wignored-attributes]
+  542 |             std::unique_ptr<FILE, decltype(&std::fclose)> file(ggml_fopen(temporary.path.c_str(), "ab"), &std::fclose);
+      |                                                         ^
+[6/79] Building CXX object common/CMakeFiles/llama-common.dir/cmake_pch.hxx.gch
+[7/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-loop-guard.cpp.o
+[8/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/parsers.cpp.o
+[9/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-queue.cpp.o
+[10/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-chat.cpp.o
+[11/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/cohere2moe.cpp.o
+[12/79] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/server-http.cpp.o
+[13/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/functionary-v3-2.cpp.o
+[14/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/deepseek.cpp.o
+[15/79] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/server.cpp.o
+[16/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/gigachat-v3.cpp.o
+[17/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-common.cpp.o
+[18/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/gemma4.cpp.o
+[19/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/gpt-oss.cpp.o
+[20/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/kimi-k2.cpp.o
+[21/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/lfm2.cpp.o
+[22/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/kimi-k3.cpp.o
+[23/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/minicpm5.cpp.o
+[24/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/ministral3.cpp.o
+[25/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/muse-glimmer.cpp.o
+[26/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/minimax-m3.cpp.o
+[27/79] Building CXX object common/CMakeFiles/llama-common.dir/parsers/qwen3-coder.cpp.o
+[28/79] Building CXX object common/CMakeFiles/llama-common.dir/chat-auto-parser-helpers.cpp.o
+[29/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-task.cpp.o
+[30/79] Building CXX object common/CMakeFiles/llama-common.dir/chat-auto-parser-generator.cpp.o
+[31/79] Building CXX object common/CMakeFiles/llama-common.dir/console.cpp.o
+[32/79] Building CXX object common/CMakeFiles/llama-common.dir/chat-peg-parser.cpp.o
+[33/79] Building CXX object common/CMakeFiles/llama-common.dir/fit-kvarn-tail.cpp.o
+[34/79] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/server-models.cpp.o
+[35/79] Building CXX object common/CMakeFiles/llama-common.dir/chat-diff-analyzer.cpp.o
+[36/79] Building CXX object common/CMakeFiles/llama-common.dir/chat.cpp.o
+[37/79] Building CXX object common/CMakeFiles/llama-common.dir/debug.cpp.o
+[38/79] Building CXX object common/CMakeFiles/llama-common.dir/imatrix-loader.cpp.o
+[39/79] Building CXX object common/CMakeFiles/llama-common.dir/kv-mean-center.cpp.o
+[40/79] Building CXX object common/CMakeFiles/llama-common.dir/llguidance.cpp.o
+[41/79] Building CXX object common/CMakeFiles/llama-common.dir/hf-cache.cpp.o
+[42/79] Building CXX object common/CMakeFiles/llama-common.dir/json-schema.cpp.o
+[43/79] Building CXX object common/CMakeFiles/llama-common.dir/fit.cpp.o
+[44/79] Building CXX object common/CMakeFiles/llama-common.dir/log.cpp.o
+[45/79] Building CXX object common/CMakeFiles/llama-common.dir/ngram-map.cpp.o
+[46/79] Building CXX object common/CMakeFiles/llama-common.dir/ngram-cache.cpp.o
+[47/79] Building CXX object common/CMakeFiles/llama-common.dir/download.cpp.o
+[48/79] Building CXX object common/CMakeFiles/llama-common.dir/ngram-mod.cpp.o
+[49/79] Building CXX object common/CMakeFiles/llama-common.dir/reasoning-budget.cpp.o
+[50/79] Building CXX object common/CMakeFiles/llama-common.dir/common.cpp.o
+[51/79] Building CXX object common/CMakeFiles/llama-common.dir/subproc.cpp.o
+[52/79] Building CXX object common/CMakeFiles/llama-common.dir/trie.cpp.o
+[53/79] Building CXX object common/CMakeFiles/llama-common.dir/unicode.cpp.o
+[54/79] Building CXX object common/CMakeFiles/llama-common.dir/json.cpp.o
+[55/79] Building CXX object common/CMakeFiles/llama-common.dir/json-schema-to-grammar.cpp.o
+[56/79] Building CXX object common/CMakeFiles/llama-common.dir/sampling.cpp.o
+[57/79] Building CXX object common/CMakeFiles/llama-common.dir/jinja/lexer.cpp.o
+[58/79] Building CXX object common/CMakeFiles/llama-common.dir/jinja/string.cpp.o
+[59/79] Building CXX object common/CMakeFiles/llama-common.dir/jinja/parser.cpp.o
+[60/79] Building CXX object common/CMakeFiles/llama-common.dir/preset.cpp.o
+[61/79] Building CXX object common/CMakeFiles/llama-common.dir/jinja/caps.cpp.o
+[62/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-gpu-power.cpp.o
+[63/79] Building CXX object common/CMakeFiles/llama-common.dir/jinja/runtime.cpp.o
+[64/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-context.cpp.o
+[65/79] Building CXX object common/CMakeFiles/llama-common.dir/peg-parser.cpp.o
+[66/79] Building CXX object common/CMakeFiles/llama-common.dir/arg.cpp.o
+[67/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-stream.cpp.o
+[68/79] Building CXX object common/CMakeFiles/llama-common.dir/jinja/value.cpp.o
+[69/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-mcp.cpp.o
+[70/79] Building CXX object common/CMakeFiles/llama-common.dir/speculative.cpp.o
+/home/hjotha/beellama.cpp/common/speculative.cpp: In constructor ‘common_speculative_impl_draft_dspark::common_speculative_impl_draft_dspark(const common_params_speculative&, uint32_t)’:
+/home/hjotha/beellama.cpp/common/speculative.cpp:338:87: warning: possibly dangling reference to a temporary [-Wdangling-reference]
+  338 |                            std::make_pair("DSPARK_CORRECTION_ROWS", &correction_rows) }) {
+      |                                                                                       ^
+/home/hjotha/beellama.cpp/common/speculative.cpp:337:66: note: ‘int*’ temporary created here
+  337 |         for (auto item : { std::make_pair("DSPARK_FORWARD_ROWS", &draft_rows),
+      |                                                                  ^~~~~~~~~~~
+/home/hjotha/beellama.cpp/common/speculative.cpp:338:87: warning: possibly dangling reference to a temporary [-Wdangling-reference]
+  338 |                            std::make_pair("DSPARK_CORRECTION_ROWS", &correction_rows) }) {
+      |                                                                                       ^
+/home/hjotha/beellama.cpp/common/speculative.cpp:338:69: note: ‘int*’ temporary created here
+  338 |                            std::make_pair("DSPARK_CORRECTION_ROWS", &correction_rows) }) {
+      |                                                                     ^~~~~~~~~~~~~~~~
+/home/hjotha/beellama.cpp/common/speculative.cpp: In function ‘common_speculative* common_speculative_init(common_params_speculative&, uint32_t)’:
+/home/hjotha/beellama.cpp/common/speculative.cpp:5829:5: warning: missing initializer for member ‘common_speculative::shadow’ [-Wmissing-field-initializers]
+ 5829 |     });
+      |     ^
+/home/hjotha/beellama.cpp/common/speculative.cpp:5829:5: warning: missing initializer for member ‘common_speculative::shadow_future’ [-Wmissing-field-initializers]
+/home/hjotha/beellama.cpp/common/speculative.cpp:5829:5: warning: missing initializer for member ‘common_speculative::shadow_observation’ [-Wmissing-field-initializers]
+/home/hjotha/beellama.cpp/common/speculative.cpp: At global scope:
+/home/hjotha/beellama.cpp/common/speculative.cpp:6743:6: warning: no previous declaration for ‘bool common_speculative_set_state(common_speculative*, llama_seq_id, const std::vector<unsigned char>&)’ [-Wmissing-declarations]
+ 6743 | bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+      |      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/hjotha/beellama.cpp/common/speculative.cpp:6874:6: warning: no previous declaration for ‘bool common_speculative_need_embd_capture(common_speculative*)’ [-Wmissing-declarations]
+ 6874 | bool common_speculative_need_embd_capture(common_speculative * spec) {
+      |      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/c++/16/memory:71,
+                 from /home/hjotha/beellama.cpp/src/../include/llama-cpp.h:7,
+                 from /home/hjotha/beellama.cpp/common/common.h:5,
+                 from /home/hjotha/beellama.cpp/build-dflash-xbox-dl/common/CMakeFiles/llama-common.dir/cmake_pch.hxx:5,
+                 from <command-line>:
+In function ‘_ForwardIterator std::uninitialized_copy(_InputIterator, _InputIterator, _ForwardIterator) [with _InputIterator = const common_sampler_type*; _ForwardIterator = common_sampler_type*]’,
+    inlined from ‘constexpr _ForwardIterator std::__uninitialized_copy_a(_InputIterator, _Sentinel, _ForwardIterator, allocator<_Tp>&) [with _InputIterator = const common_sampler_type*; _Sentinel = const common_sampler_type*; _ForwardIterator = common_sampler_type*; _Tp = common_sampler_type]’ at /usr/include/c++/16/bits/stl_uninitialized.h:659:32,
+    inlined from ‘constexpr void std::vector<_Tp, _Alloc>::_M_assign_aux(_ForwardIterator, _ForwardIterator, std::forward_iterator_tag) [with _ForwardIterator = const common_sampler_type*; _Tp = common_sampler_type; _Alloc = std::allocator<common_sampler_type>]’ at /usr/include/c++/16/bits/vector.tcc:356:35,
+    inlined from ‘constexpr std::vector<_Tp, _Alloc>& std::vector<_Tp, _Alloc>::operator=(std::initializer_list<_Tp>) [with _Tp = common_sampler_type; _Alloc = std::allocator<common_sampler_type>]’ at /usr/include/c++/16/bits/stl_vector.h:847:21,
+    inlined from ‘common_speculative_impl_draft_dflash::common_speculative_impl_draft_dflash(const common_params_speculative&, uint32_t, common_speculative_type)’ at /home/hjotha/beellama.cpp/common/speculative.cpp:2678:60:
+/usr/include/c++/16/bits/stl_uninitialized.h:294:31: warning: ‘void* __builtin_memcpy(void*, const void*, long unsigned int)’ writing 4 bytes into a region of size 0 overflows the destination [-Wstringop-overflow=]
+  294 |               __builtin_memcpy(std::__niter_base(__result),
+      |               ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  295 |                                std::__niter_base(__first),
+      |                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  296 |                                __n * sizeof(_ValT));
+      |                                ~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/c++/16/x86_64-pc-linux-gnu/bits/c++allocator.h:33,
+                 from /usr/include/c++/16/bits/allocator.h:46,
+                 from /usr/include/c++/16/memory:67:
+In member function ‘constexpr _Tp* std::__new_allocator<_Tp>::allocate(size_type, const void*) [with _Tp = common_sampler_type]’,
+    inlined from ‘constexpr _Tp* std::allocator< <template-parameter-1-1> >::allocate(std::size_t) [with _Tp = common_sampler_type]’ at /usr/include/c++/16/bits/allocator.h:206:40,
+    inlined from ‘static constexpr _Tp* std::allocator_traits<std::allocator<_Up> >::allocate(allocator_type&, size_type) [with _Tp = common_sampler_type]’ at /usr/include/c++/16/bits/alloc_traits.h:638:28,
+    inlined from ‘constexpr std::_Vector_base<_Tp, _Alloc>::pointer std::_Vector_base<_Tp, _Alloc>::_M_allocate(std::size_t) [with _Tp = common_sampler_type; _Alloc = std::allocator<common_sampler_type>]’ at /usr/include/c++/16/bits/stl_vector.h:389:33,
+    inlined from ‘constexpr void std::vector<_Tp, _Alloc>::_M_range_initialize_n(_Iterator, _Sentinel, size_type) [with _Iterator = const common_sampler_type*; _Sentinel = const common_sampler_type*; _Tp = common_sampler_type; _Alloc = std::allocator<common_sampler_type>]’ at /usr/include/c++/16/bits/stl_vector.h:1975:23,
+    inlined from ‘constexpr std::vector<_Tp, _Alloc>::vector(std::initializer_list<_Tp>, const allocator_type&) [with _Tp = common_sampler_type; _Alloc = std::allocator<common_sampler_type>]’ at /usr/include/c++/16/bits/stl_vector.h:702:23,
+    inlined from ‘common_params_sampling::common_params_sampling()’ at /home/hjotha/beellama.cpp/common/common.h:228:8,
+    inlined from ‘common_speculative_impl_draft_dflash::common_speculative_impl_draft_dflash(const common_params_speculative&, uint32_t, common_speculative_type)’ at /home/hjotha/beellama.cpp/common/speculative.cpp:2675:36:
+/usr/include/c++/16/bits/new_allocator.h:162:75: note: at offset 36 into destination object of size 36 allocated by ‘operator new’
+  162 |           return static_cast<_Tp*>(_GLIBCXX_OPERATOR_NEW(__n * sizeof(_Tp)));
+      |                                                                           ^
+[71/79] Linking CXX shared library bin/libllama-common.so.0.4.7
+[72/79] Creating library symlink bin/libllama-common.so.0 bin/libllama-common.so
+[73/79] Linking CXX executable bin/test-dflash-pipeline-candidate
+[74/79] Linking CXX executable bin/test-dflash-shadow-observation
+[75/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-schema.cpp.o
+[76/79] Building CXX object tools/server/CMakeFiles/server-context.dir/server-tools.cpp.o
+/home/hjotha/beellama.cpp/tools/server/server-tools.cpp: In function ‘std::filesystem::__cxx11::path path_from_utf8(const std::string&)’:
+/home/hjotha/beellama.cpp/tools/server/server-tools.cpp:102:22: warning: ‘std::filesystem::__cxx11::path std::filesystem::__cxx11::u8path(const _Source&) [with _Source = std::__cxx11::basic_string<char>; _Require = path; _CharT = char]’ is deprecated: use 'path((const char8_t*)&*source)' instead [-Wdeprecated-declarations]
+  102 |     return fs::u8path(s);
+      |            ~~~~~~~~~~^~~
+In file included from /usr/include/c++/16/filesystem:55,
+                 from /home/hjotha/beellama.cpp/tools/server/server-tools.cpp:6:
+/usr/include/c++/16/bits/fs_path.h:847:5: note: declared here
+  847 |     u8path(const _Source& __source)
+      |     ^~~~~~
+[77/79] Linking CXX static library tools/server/libserver-context.a
+[78/79] Linking CXX shared library bin/libllama-server-impl.so
+[79/79] Linking CXX executable bin/llama-server

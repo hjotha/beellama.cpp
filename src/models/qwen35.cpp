@@ -1,6 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 #include "llama-ext.h"
+#include "ggml-remote-attn.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -161,7 +162,15 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
         if (is_gpu && strcmp(reg_name, "MTL") != 0) {
-            gdn_state_rows_dev_ok = false;
+            // The rows-indexed state read (src[6]) is now implemented in the CUDA
+            // gated_delta_net kernel. Enable it on CUDA opt-in (GGML_GDN_CUDA_ROWS)
+            // so the gathered path stays the default and the two can be A/B compared
+            // for correctness and speed on the same binary. Other GPU backends still
+            // lack the kernel and must keep the gathered form.
+            static const bool cuda_rows_optin = getenv("GGML_GDN_CUDA_ROWS") != nullptr;
+            if (!(cuda_rows_optin && strcmp(reg_name, "CUDA") == 0)) {
+                gdn_state_rows_dev_ok = false;
+            }
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
             strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
@@ -387,10 +396,31 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "attn_pregate", il);
+    if (cparams.remote_attn_enabled && backend_remote != nullptr) {
+        // Offload the full-attention core to the remote KV+attention server.
+        // Qcur/Kcur/Vcur are post-norm, post-MRoPE and pre-WHT; the server owns
+        // the KVarN rotation, record compression, precision tail, causal masking
+        // and (for the rotated domain) the inverse WHT, returning the attention
+        // output in the same domain as the local KVarN path. The gate sigmoid
+        // and the wo projection below stay local on the CUDA device.
+        // Scalar absolute position per token == first M-RoPE dimension. Pass
+        // inp_pos directly (an INPUT tensor, not a VIEW) so the scheduler copies
+        // it into the remote host buffer without creating a VIEW op the remote
+        // backend would have to claim. The backend reads the first n_tokens i32
+        // (M-RoPE layout is [dim][token], so dim 0 == ubatch.pos).
+        cur = ggml_remote_attn(ctx0, Qcur, Kcur, Vcur, inp_pos, il, kq_scale,
+                GGML_REMOTE_ATTN_DOMAIN_AUTO);
+        // Pin to the CPU backend (PATH B): the op's compute runs the RPC there,
+        // and the scheduler feeds/drains it with the proven CUDA<->CPU copies
+        // (same mechanism as offload_kqv). backend_remote only owns the socket.
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        cb(cur, "attn_remote", il);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(cur, "attn_pregate", il);
+    }
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);

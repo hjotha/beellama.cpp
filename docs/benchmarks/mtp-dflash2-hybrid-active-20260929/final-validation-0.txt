@@ -1,0 +1,19 @@
+["ctest", "--test-dir", "build-dflash-xbox-dl", "-R", "test-(dflash-shadow-observation|dflash-pipeline-candidate|upstream-dflash-only-static|dflash2-selector-placement-static)$", "--output-on-failure"]
+Test project /home/hjotha/beellama.cpp/build-dflash-xbox-dl
+    Start 16: test-upstream-dflash-only-static
+1/4 Test #16: test-upstream-dflash-only-static .........   Passed    1.69 sec
+    Start 24: test-dflash2-selector-placement-static
+2/4 Test #24: test-dflash2-selector-placement-static ...   Passed    0.05 sec
+    Start 56: test-dflash-pipeline-candidate
+3/4 Test #56: test-dflash-pipeline-candidate ...........   Passed    0.02 sec
+    Start 57: test-dflash-shadow-observation
+4/4 Test #57: test-dflash-shadow-observation ...........   Passed    0.01 sec
+
+100% tests passed out of 4
+
+Label Time Summary:
+main    =   1.76 sec*proc (4 tests)
+
+Total Test time (real) =   1.78 sec
+
+exit_code=0

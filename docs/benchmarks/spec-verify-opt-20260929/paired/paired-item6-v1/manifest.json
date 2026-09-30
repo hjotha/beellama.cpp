@@ -1,0 +1,315 @@
+{
+  "schema_version": 2,
+  "phase": "paired",
+  "run_id": "paired-item6-v1",
+  "modes": {
+    "gdn-gather": {
+      "env": {},
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    },
+    "gdn-rows": {
+      "env": {
+        "GGML_GDN_CUDA_ROWS": "1"
+      },
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    }
+  },
+  "repeats": 5,
+  "long_repeats": 5,
+  "group_size": 2,
+  "port": 59595,
+  "scripts_root": "/home/hjotha/beellama.cpp/docs/benchmarks/spec-verify-opt-20260929",
+  "modes_json": "/home/hjotha/beellama.cpp/docs/benchmarks/spec-verify-opt-20260929/modes-item6.json",
+  "snapshot_root": "/home/hjotha/beellama-baseline-spec-verify-20260929",
+  "groups": [
+    {
+      "group": "g000-gdn-gather",
+      "round": 0,
+      "mode": "gdn-gather",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 1,
+          "scenario": "prosa192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g001-gdn-rows",
+      "round": 0,
+      "mode": "gdn-rows",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 1,
+          "scenario": "prosa192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g002-gdn-rows",
+      "round": 1,
+      "mode": "gdn-rows",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 2,
+          "scenario": "prosa192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 3,
+          "scenario": "prosa192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g003-gdn-gather",
+      "round": 1,
+      "mode": "gdn-gather",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 2,
+          "scenario": "prosa192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 3,
+          "scenario": "prosa192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g004-gdn-gather",
+      "round": 2,
+      "mode": "gdn-gather",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 4,
+          "scenario": "prosa192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    },
+    {
+      "group": "g005-gdn-rows",
+      "round": 2,
+      "mode": "gdn-rows",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 4,
+          "scenario": "prosa192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    }
+  ],
+  "argv": [
+    "runner.py",
+    "paired",
+    "--run-id",
+    "paired-item6-v1",
+    "--modes-json",
+    "modes-item6.json",
+    "--modes",
+    "gdn-gather",
+    "gdn-rows"
+  ],
+  "created_utc": "2026-09-29T17:30:43.690415+00:00",
+  "comparison_policy": "Report every first token divergence; investigate before attributing to noise."
+}

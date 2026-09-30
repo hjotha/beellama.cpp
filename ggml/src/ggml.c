@@ -1168,9 +1168,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "PAGED_ATTN",
+    "REMOTE_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1288,9 +1289,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
     "paged_attn",
+    "remote_attn(q, k, v, pos)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7047,6 +7049,50 @@ struct ggml_tensor * ggml_kvarn_materialize(
             tail_groups > 0 ? tail_groups : stage_groups - 1);
     ggml_set_op_params_i32(result, GGML_KVARN_OP_PARAM_EAGER_RECORDS,
             ggml_get_op_params_i32(stage_after_store, GGML_KVARN_OP_PARAM_EAGER_RECORDS));
+    return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+// ggml_remote_attn
+
+struct ggml_tensor * ggml_remote_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * pos,
+        int                   layer_id,
+        float                 kq_scale,
+        int                   domain) {
+    GGML_ASSERT(q && k && v && pos);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[2] == k->ne[2] && q->ne[2] == v->ne[2]);
+    // pos may be the full M-RoPE position input ([n_pos_per_embd*n_tokens]); the
+    // backend reads the first n_tokens entries (dim 0 == scalar position).
+    GGML_ASSERT(pos->ne[0] >= q->ne[2]);
+    GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(q->ne[1] % k->ne[1] == 0);
+
+    const int64_t n_embd_head = q->ne[0];
+    const int64_t n_head      = q->ne[1];
+    const int64_t n_head_kv   = k->ne[1];
+    const int64_t n_tokens    = q->ne[2];
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_head * n_head, n_tokens);
+    result->op = GGML_OP_REMOTE_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = pos;
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_LAYER_ID, layer_id);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_DOMAIN, domain);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_HEAD, (int) n_head);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_HEAD_KV, (int) n_head_kv);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_EMBD_HEAD, (int) n_embd_head);
+    ggml_set_op_params_f32(result, GGML_REMOTE_ATTN_PARAM_KQ_SCALE, kq_scale);
     return result;
 }
 

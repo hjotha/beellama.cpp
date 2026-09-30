@@ -1,0 +1,44 @@
+[
+  {
+    "mode": "mtp-n4-shadow-sync",
+    "tdp_w": 20,
+    "repeticao": {
+      "runs": 3,
+      "tps_median": 81.65,
+      "tps_min": 81.603,
+      "tps_max": 81.812,
+      "hashes_equal": true,
+      "content_sha256": "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8",
+      "hashes": [
+        "031bf5c616d5b0a473d97b785404aede9b8a3a6714ea6b55e9908f560c0e80b8"
+      ]
+    },
+    "codigo": {
+      "runs": 3,
+      "tps_median": 56.61,
+      "tps_min": 56.332,
+      "tps_max": 56.772,
+      "hashes_equal": true,
+      "content_sha256": "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1",
+      "hashes": [
+        "19f387f9afe793a3b596ffa3c20b74bd0699d9b958b23d94c062c7ac63129ee1"
+      ]
+    },
+    "longo": {
+      "runs": 2,
+      "tps_median": 54.763,
+      "tps_min": 54.709,
+      "tps_max": 54.816,
+      "hashes_equal": true,
+      "content_sha256": "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3",
+      "hashes": [
+        "1e9b01799ebeb4bed51316361963a31f0253da9c3283e1116b88f590fdc284b3"
+      ],
+      "prefill_tps": 631.46
+    },
+    "mean_decode_ppt_w": 10.11,
+    "mean_active_gpu_clock_mhz": 2700.0,
+    "mean_cpu_busy_mhz": 2763.14,
+    "peak_temp_c": 58.0
+  }
+]

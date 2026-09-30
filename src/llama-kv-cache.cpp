@@ -1402,8 +1402,9 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
-
     }
+
+    run_on_clear();
 }
 
 llama_memory_i::seq_rm_capability llama_kv_cache::get_seq_rm_capability() const {

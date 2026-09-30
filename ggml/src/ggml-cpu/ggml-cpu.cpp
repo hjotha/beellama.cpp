@@ -445,6 +445,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // Remote attention is computed on the CPU backend (pinned like offload_kqv):
+    // the RPC to the remote KV+attention server runs inside compute_forward.
+    if (op->op == GGML_OP_REMOTE_ATTN) {
+        return true;
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {

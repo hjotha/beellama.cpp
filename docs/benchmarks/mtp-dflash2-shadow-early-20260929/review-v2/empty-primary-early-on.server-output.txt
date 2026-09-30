@@ -1,0 +1,542 @@
+0.00.349.174 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.349.837 I srv          init: The UI is disabled
+0.00.349.838 I srv          init: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+0.00.350.101 W srv  llama_server: -----------------
+0.00.350.102 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.350.103 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.350.103 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.350.104 W srv  llama_server: -----------------
+0.00.351.520 I srv    load_model: loading model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.05.542.421 I cmn          init: llama threadpool init, n_threads = 8
+0.05.614.024 I common_speculative_init_result: creating MTP draft context against the target model '/home/hjotha/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+0.05.622.325 I common_speculative_init_result: loading shadow auxiliary model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf'
+0.08.170.012 W llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+0.08.181.411 I common_speculative_init_result: shadow auxiliary context ready (model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf', n_max 7); observation pipeline pending
+0.08.181.765 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 16384, kv_unified = 'false', elastic_paged_context = false
+0.08.182.118 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dflash'
+0.08.182.121 I common_speculative_impl_draft_dflash: DFlash2 uses its fixed block limit and selector confidence; Bee adaptive draft-max is disabled
+0.08.182.122 I common_speculative_impl_draft_dflash: - n_max=7, n_min=0, p_min=0.00
+0.08.182.123 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=248070, n_extract=5, sample_from_anchor=true, lineage=dflash
+0.08.182.175 W llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+0.08.182.334 W llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+0.08.184.249 I common_speculative_impl_draft_dflash: DFlash2 explicit local split enabled
+0.08.184.256 I common_speculative_init: shadow auxiliary drafter registered (observation only; proposals are never selected, every=1, early=1)
+0.08.185.383 I AMDGPU governor: card /sys/class/drm/card1, original level auto, SCLK range 800-2700 MHz
+detected compatible ryzen_smu kernel module
+0.08.189.058 I APU TDP: original STAPM/fast/slow limits 8000/20000/15000 mW
+0.08.189.060 I GPU governor enabled
+0.08.189.060 I   device: AMDGPU /sys/class/drm/card1 (sysfs)
+0.08.189.060 I   device index: 0
+0.08.189.061 I   active APU TDP: 20 W
+0.08.189.061 I   decode memory clock: 2700 MHz
+0.08.189.062 I   prefill memory clock: 2700 MHz
+0.08.194.701 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.08.194.748 I srv  llama_server: model loaded
+0.08.194.753 I srv  llama_server: listening on http://127.0.0.1:59589
+0.08.818.788 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+0.08.818.897 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.08.819.499 I APU TDP: active limit 20 W
+0.08.820.568 I GPU memory clock: idle -> prefill, locked 2700 MHz
+SHADOWv2 launch job=1 epoch=2 request=0 pos0=28 anchor=271 n_max=7
+SHADOWv2 cancel job=1 epoch=2 request=0 pos0=28 reason=primary_aborted
+SHADOWv2 launch job=2 epoch=2 request=0 pos0=31 anchor=760 n_max=7
+SHADOWv2 cancel job=2 epoch=2 request=0 pos0=31 reason=primary_aborted
+SHADOWv2 launch job=3 epoch=2 request=0 pos0=33 anchor=369 n_max=7
+SHADOWv2 cancel job=3 epoch=2 request=0 pos0=33 reason=primary_aborted
+SHADOWv2 launch job=4 epoch=2 request=0 pos0=35 anchor=728 n_max=7
+SHADOWv2 cancel job=4 epoch=2 request=0 pos0=35 reason=primary_aborted
+SHADOWv2 launch job=5 epoch=2 request=0 pos0=37 anchor=3165 n_max=7
+SHADOWv2 cancel job=5 epoch=2 request=0 pos0=37 reason=primary_aborted
+SHADOWv2 launch job=6 epoch=2 request=0 pos0=39 anchor=12654 n_max=7
+SHADOWv2 cancel job=6 epoch=2 request=0 pos0=39 reason=primary_aborted
+SHADOWv2 launch job=7 epoch=2 request=0 pos0=41 anchor=2512 n_max=7
+SHADOWv2 cancel job=7 epoch=2 request=0 pos0=41 reason=primary_aborted
+SHADOWv2 launch job=8 epoch=2 request=0 pos0=43 anchor=18479 n_max=7
+SHADOWv2 cancel job=8 epoch=2 request=0 pos0=43 reason=primary_aborted
+SHADOWv2 launch job=9 epoch=2 request=0 pos0=45 anchor=63 n_max=7
+SHADOWv2 cancel job=9 epoch=2 request=0 pos0=45 reason=primary_aborted
+SHADOWv2 launch job=10 epoch=2 request=0 pos0=47 anchor=4829 n_max=7
+SHADOWv2 cancel job=10 epoch=2 request=0 pos0=47 reason=primary_aborted
+SHADOWv2 launch job=11 epoch=2 request=0 pos0=49 anchor=1103 n_max=7
+SHADOWv2 cancel job=11 epoch=2 request=0 pos0=49 reason=primary_aborted
+SHADOWv2 launch job=12 epoch=2 request=0 pos0=51 anchor=24959 n_max=7
+SHADOWv2 cancel job=12 epoch=2 request=0 pos0=51 reason=primary_aborted
+SHADOWv2 launch job=13 epoch=2 request=0 pos0=53 anchor=2302 n_max=7
+SHADOWv2 cancel job=13 epoch=2 request=0 pos0=53 reason=primary_aborted
+SHADOWv2 launch job=14 epoch=2 request=0 pos0=55 anchor=449 n_max=7
+SHADOWv2 cancel job=14 epoch=2 request=0 pos0=55 reason=primary_aborted
+SHADOWv2 launch job=15 epoch=2 request=0 pos0=57 anchor=321 n_max=7
+SHADOWv2 cancel job=15 epoch=2 request=0 pos0=57 reason=primary_aborted
+SHADOWv2 launch job=16 epoch=2 request=0 pos0=59 anchor=15673 n_max=7
+SHADOWv2 cancel job=16 epoch=2 request=0 pos0=59 reason=primary_aborted
+SHADOWv2 launch job=17 epoch=2 request=0 pos0=61 anchor=279 n_max=7
+SHADOWv2 cancel job=17 epoch=2 request=0 pos0=61 reason=primary_aborted
+SHADOWv2 launch job=18 epoch=2 request=0 pos0=63 anchor=303 n_max=7
+SHADOWv2 cancel job=18 epoch=2 request=0 pos0=63 reason=primary_aborted
+SHADOWv2 launch job=19 epoch=2 request=0 pos0=65 anchor=13 n_max=7
+SHADOWv2 cancel job=19 epoch=2 request=0 pos0=65 reason=primary_aborted
+SHADOWv2 launch job=20 epoch=2 request=0 pos0=67 anchor=728 n_max=7
+SHADOWv2 cancel job=20 epoch=2 request=0 pos0=67 reason=primary_aborted
+SHADOWv2 launch job=21 epoch=2 request=0 pos0=69 anchor=264 n_max=7
+SHADOWv2 cancel job=21 epoch=2 request=0 pos0=69 reason=primary_aborted
+SHADOWv2 launch job=22 epoch=2 request=0 pos0=71 anchor=11 n_max=7
+SHADOWv2 cancel job=22 epoch=2 request=0 pos0=71 reason=primary_aborted
+SHADOWv2 launch job=23 epoch=2 request=0 pos0=73 anchor=1676 n_max=7
+SHADOWv2 cancel job=23 epoch=2 request=0 pos0=73 reason=primary_aborted
+SHADOWv2 launch job=24 epoch=2 request=0 pos0=75 anchor=10562 n_max=7
+SHADOWv2 cancel job=24 epoch=2 request=0 pos0=75 reason=primary_aborted
+SHADOWv2 launch job=25 epoch=2 request=0 pos0=77 anchor=7873 n_max=7
+SHADOWv2 cancel job=25 epoch=2 request=0 pos0=77 reason=primary_aborted
+SHADOWv2 launch job=26 epoch=2 request=0 pos0=79 anchor=271 n_max=7
+SHADOWv2 cancel job=26 epoch=2 request=0 pos0=79 reason=primary_aborted
+SHADOWv2 launch job=27 epoch=2 request=0 pos0=81 anchor=728 n_max=7
+SHADOWv2 cancel job=27 epoch=2 request=0 pos0=81 reason=primary_aborted
+SHADOWv2 launch job=28 epoch=2 request=0 pos0=83 anchor=821 n_max=7
+SHADOWv2 cancel job=28 epoch=2 request=0 pos0=83 reason=primary_aborted
+SHADOWv2 launch job=29 epoch=2 request=0 pos0=85 anchor=25 n_max=7
+SHADOWv2 cancel job=29 epoch=2 request=0 pos0=85 reason=primary_aborted
+SHADOWv2 launch job=30 epoch=2 request=0 pos0=87 anchor=16 n_max=7
+SHADOWv2 cancel job=30 epoch=2 request=0 pos0=87 reason=primary_aborted
+SHADOWv2 launch job=31 epoch=2 request=0 pos0=89 anchor=561 n_max=7
+SHADOWv2 cancel job=31 epoch=2 request=0 pos0=89 reason=primary_aborted
+0.11.584.422 I slot print_timing: id  0 | task 0 | prompt eval time =     437.19 ms /    28 tokens (   15.61 ms per token,    64.04 tokens per second)
+0.11.584.428 I slot print_timing: id  0 | task 0 |        eval time =    2326.59 ms /    64 tokens (   36.93 ms per token,    27.08 tokens per second)
+0.11.584.430 I slot print_timing: id  0 | task 0 |       total time =    2763.79 ms /    92 tokens
+0.11.584.442 I slot print_timing: id  0 | task 0 |    graphs reused =         62
+0.11.584.495 I shadow auxiliary: launched=31 skipped_busy=31 skipped_throttle=0 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.11.584.496 I shadow accounting: observed=0 cancelled=31 pending=0 skipped_invalid=0 epoch=2
+0.11.584.497 I shadow stages: worker_us=1304815 decode_us=1119853 selector_us=177042 inject_submit_us=136914 stage_us=5466 late_total_ms=0.0 late_max_ms=0.0
+0.11.584.914 I slot      release: id  0 | task 0 | stop processing: n_tokens = 91, truncated = 0
+0.11.586.239 I shadow auxiliary: launched=31 skipped_busy=31 skipped_throttle=0 ready=0 late=0 prefix_match=0 prefix_mismatch=0 usable_blocks=0 usable_tokens=0 errors=0
+0.11.586.242 I shadow accounting: observed=0 cancelled=31 pending=0 skipped_invalid=0 epoch=3
+0.11.586.243 I shadow stages: worker_us=1304815 decode_us=1119853 selector_us=177042 inject_submit_us=136914 stage_us=5466 late_total_ms=0.0 late_max_ms=0.0
+0.11.601.025 I GPU memory clock: decode -> idle, reset (dynamic)
+0.11.602.416 I APU TDP: restored original limits
+0.11.622.582 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 156369687304
+0.11.622.697 I slot launch_slot_: id  0 | task 67 | processing task, is_child = 0
+0.11.623.033 I APU TDP: active limit 20 W
+0.11.625.016 I GPU memory clock: idle -> prefill, locked 2700 MHz
+SHADOWv2 launch job=32 epoch=5 request=67 pos0=25 anchor=271 n_max=7
+SHADOWv2 cancel job=32 epoch=5 request=67 pos0=25 reason=primary_aborted
+SHADOWv2 launch job=33 epoch=5 request=67 pos0=26 anchor=248068 n_max=7
+SHADOWv2 cancel job=33 epoch=5 request=67 pos0=26 reason=primary_aborted
+SHADOWv2 launch job=34 epoch=5 request=67 pos0=28 anchor=760 n_max=7
+SHADOWv2 cancel job=34 epoch=5 request=67 pos0=28 reason=primary_aborted
+SHADOWv2 launch job=35 epoch=5 request=67 pos0=30 anchor=6587 n_max=7
+SHADOWv2 cancel job=35 epoch=5 request=67 pos0=30 reason=primary_aborted
+SHADOWv2 launch job=36 epoch=5 request=67 pos0=32 anchor=310 n_max=7
+SHADOWv2 cancel job=36 epoch=5 request=67 pos0=32 reason=primary_aborted
+SHADOWv2 launch job=37 epoch=5 request=67 pos0=34 anchor=24959 n_max=7
+SHADOWv2 cancel job=37 epoch=5 request=67 pos0=34 reason=primary_aborted
+SHADOWv2 launch job=38 epoch=5 request=67 pos0=36 anchor=220 n_max=7
+SHADOWv2 cancel job=38 epoch=5 request=67 pos0=36 reason=primary_aborted
+SHADOWv2 launch job=39 epoch=5 request=67 pos0=38 anchor=310 n_max=7
+SHADOWv2 job=39 epoch=5 request=67 pos0=38 anchor=310 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=156370478849 decision_us=156370514384 work_us=41587 dec_us=38532 sel_us=2780 confirmed=[220,17] proposed=[220,17,15,15,18101,539,73982]
+SHADOWv2 launch job=40 epoch=5 request=67 pos0=40 anchor=17 n_max=7
+SHADOWv2 cancel job=40 epoch=5 request=67 pos0=40 reason=primary_aborted
+SHADOWv2 launch job=41 epoch=5 request=67 pos0=41 anchor=15 n_max=7
+SHADOWv2 cancel job=41 epoch=5 request=67 pos0=41 reason=primary_aborted
+SHADOWv2 launch job=42 epoch=5 request=67 pos0=43 anchor=18101 n_max=7
+SHADOWv2 cancel job=42 epoch=5 request=67 pos0=43 reason=primary_aborted
+SHADOWv2 launch job=43 epoch=5 request=67 pos0=45 anchor=73982 n_max=7
+SHADOWv2 cancel job=43 epoch=5 request=67 pos0=45 reason=primary_aborted
+SHADOWv2 launch job=44 epoch=5 request=67 pos0=47 anchor=1973 n_max=7
+SHADOWv2 cancel job=44 epoch=5 request=67 pos0=47 reason=primary_aborted
+SHADOWv2 launch job=45 epoch=5 request=67 pos0=49 anchor=5853 n_max=7
+SHADOWv2 cancel job=45 epoch=5 request=67 pos0=49 reason=primary_aborted
+SHADOWv2 launch job=46 epoch=5 request=67 pos0=51 anchor=6558 n_max=7
+SHADOWv2 cancel job=46 epoch=5 request=67 pos0=51 reason=primary_aborted
+SHADOWv2 launch job=47 epoch=5 request=67 pos0=53 anchor=1066 n_max=7
+SHADOWv2 cancel job=47 epoch=5 request=67 pos0=53 reason=primary_aborted
+SHADOWv2 launch job=48 epoch=5 request=67 pos0=55 anchor=1070 n_max=7
+SHADOWv2 cancel job=48 epoch=5 request=67 pos0=55 reason=primary_aborted
+SHADOWv2 launch job=49 epoch=5 request=67 pos0=57 anchor=13 n_max=7
+SHADOWv2 cancel job=49 epoch=5 request=67 pos0=57 reason=primary_aborted
+SHADOWv2 launch job=50 epoch=5 request=67 pos0=59 anchor=248069 n_max=7
+SHADOWv2 cancel job=50 epoch=5 request=67 pos0=59 reason=primary_aborted
+SHADOWv2 launch job=51 epoch=5 request=67 pos0=61 anchor=16 n_max=7
+SHADOWv2 cancel job=51 epoch=5 request=67 pos0=61 reason=primary_aborted
+SHADOWv2 launch job=52 epoch=5 request=67 pos0=63 anchor=220 n_max=7
+SHADOWv2 cancel job=52 epoch=5 request=67 pos0=63 reason=primary_aborted
+SHADOWv2 launch job=53 epoch=5 request=67 pos0=65 anchor=11 n_max=7
+SHADOWv2 cancel job=53 epoch=5 request=67 pos0=65 reason=primary_aborted
+SHADOWv2 launch job=54 epoch=5 request=67 pos0=67 anchor=18 n_max=7
+SHADOWv2 cancel job=54 epoch=5 request=67 pos0=67 reason=primary_aborted
+SHADOWv2 launch job=55 epoch=5 request=67 pos0=69 anchor=220 n_max=7
+SHADOWv2 cancel job=55 epoch=5 request=67 pos0=69 reason=primary_aborted
+SHADOWv2 launch job=56 epoch=5 request=67 pos0=71 anchor=11 n_max=7
+SHADOWv2 cancel job=56 epoch=5 request=67 pos0=71 reason=primary_aborted
+SHADOWv2 launch job=57 epoch=5 request=67 pos0=73 anchor=20 n_max=7
+SHADOWv2 cancel job=57 epoch=5 request=67 pos0=73 reason=primary_aborted
+SHADOWv2 launch job=58 epoch=5 request=67 pos0=75 anchor=220 n_max=7
+SHADOWv2 cancel job=58 epoch=5 request=67 pos0=75 reason=primary_aborted
+SHADOWv2 launch job=59 epoch=5 request=67 pos0=77 anchor=11 n_max=7
+SHADOWv2 cancel job=59 epoch=5 request=67 pos0=77 reason=primary_aborted
+SHADOWv2 launch job=60 epoch=5 request=67 pos0=79 anchor=22 n_max=7
+SHADOWv2 cancel job=60 epoch=5 request=67 pos0=79 reason=primary_aborted
+SHADOWv2 launch job=61 epoch=5 request=67 pos0=81 anchor=220 n_max=7
+SHADOWv2 cancel job=61 epoch=5 request=67 pos0=81 reason=primary_aborted
+SHADOWv2 launch job=62 epoch=5 request=67 pos0=83 anchor=11 n_max=7
+SHADOWv2 cancel job=62 epoch=5 request=67 pos0=83 reason=primary_aborted
+SHADOWv2 launch job=63 epoch=5 request=67 pos0=85 anchor=24 n_max=7
+SHADOWv2 cancel job=63 epoch=5 request=67 pos0=85 reason=primary_aborted
+SHADOWv2 launch job=64 epoch=5 request=67 pos0=87 anchor=220 n_max=7
+SHADOWv2 cancel job=64 epoch=5 request=67 pos0=87 reason=primary_aborted
+SHADOWv2 launch job=65 epoch=5 request=67 pos0=89 anchor=15 n_max=7
+SHADOWv2 cancel job=65 epoch=5 request=67 pos0=89 reason=primary_aborted
+SHADOWv2 launch job=66 epoch=5 request=67 pos0=91 anchor=220 n_max=7
+SHADOWv2 cancel job=66 epoch=5 request=67 pos0=91 reason=primary_aborted
+SHADOWv2 launch job=67 epoch=5 request=67 pos0=93 anchor=16 n_max=7
+SHADOWv2 cancel job=67 epoch=5 request=67 pos0=93 reason=primary_aborted
+SHADOWv2 launch job=68 epoch=5 request=67 pos0=95 anchor=220 n_max=7
+SHADOWv2 cancel job=68 epoch=5 request=67 pos0=95 reason=primary_aborted
+SHADOWv2 launch job=69 epoch=5 request=67 pos0=97 anchor=17 n_max=7
+SHADOWv2 cancel job=69 epoch=5 request=67 pos0=97 reason=primary_aborted
+SHADOWv2 launch job=70 epoch=5 request=67 pos0=99 anchor=220 n_max=7
+SHADOWv2 cancel job=70 epoch=5 request=67 pos0=99 reason=primary_aborted
+SHADOWv2 launch job=71 epoch=5 request=67 pos0=101 anchor=18 n_max=7
+SHADOWv2 cancel job=71 epoch=5 request=67 pos0=101 reason=primary_aborted
+SHADOWv2 launch job=72 epoch=5 request=67 pos0=103 anchor=220 n_max=7
+SHADOWv2 cancel job=72 epoch=5 request=67 pos0=103 reason=primary_aborted
+SHADOWv2 launch job=73 epoch=5 request=67 pos0=105 anchor=19 n_max=7
+SHADOWv2 cancel job=73 epoch=5 request=67 pos0=105 reason=primary_aborted
+SHADOWv2 launch job=74 epoch=5 request=67 pos0=108 anchor=16 n_max=7
+SHADOWv2 cancel job=74 epoch=5 request=67 pos0=108 reason=primary_aborted
+SHADOWv2 launch job=75 epoch=5 request=67 pos0=110 anchor=11 n_max=7
+SHADOWv2 cancel job=75 epoch=5 request=67 pos0=110 reason=primary_aborted
+SHADOWv2 launch job=76 epoch=5 request=67 pos0=111 anchor=220 n_max=7
+SHADOWv2 cancel job=76 epoch=5 request=67 pos0=111 reason=primary_aborted
+SHADOWv2 launch job=77 epoch=5 request=67 pos0=113 anchor=21 n_max=7
+SHADOWv2 cancel job=77 epoch=5 request=67 pos0=113 reason=primary_aborted
+SHADOWv2 launch job=78 epoch=5 request=67 pos0=115 anchor=220 n_max=7
+SHADOWv2 cancel job=78 epoch=5 request=67 pos0=115 reason=primary_aborted
+SHADOWv2 launch job=79 epoch=5 request=67 pos0=117 anchor=22 n_max=7
+SHADOWv2 cancel job=79 epoch=5 request=67 pos0=117 reason=primary_aborted
+SHADOWv2 launch job=80 epoch=5 request=67 pos0=119 anchor=220 n_max=7
+SHADOWv2 cancel job=80 epoch=5 request=67 pos0=119 reason=primary_aborted
+SHADOWv2 launch job=81 epoch=5 request=67 pos0=121 anchor=23 n_max=7
+SHADOWv2 cancel job=81 epoch=5 request=67 pos0=121 reason=primary_aborted
+SHADOWv2 launch job=82 epoch=5 request=67 pos0=123 anchor=220 n_max=7
+SHADOWv2 cancel job=82 epoch=5 request=67 pos0=123 reason=primary_aborted
+0.15.516.477 I slot print_timing: id  0 | task 67 | n_gen =    100, tg =  26.90 t/s, tg_3s =  27.17 t/s
+SHADOWv2 launch job=83 epoch=5 request=67 pos0=125 anchor=24 n_max=7
+SHADOWv2 cancel job=83 epoch=5 request=67 pos0=125 reason=primary_aborted
+SHADOWv2 launch job=84 epoch=5 request=67 pos0=127 anchor=220 n_max=7
+SHADOWv2 cancel job=84 epoch=5 request=67 pos0=127 reason=primary_aborted
+SHADOWv2 launch job=85 epoch=5 request=67 pos0=129 anchor=15 n_max=7
+SHADOWv2 cancel job=85 epoch=5 request=67 pos0=129 reason=primary_aborted
+SHADOWv2 launch job=86 epoch=5 request=67 pos0=131 anchor=220 n_max=7
+SHADOWv2 cancel job=86 epoch=5 request=67 pos0=131 reason=primary_aborted
+SHADOWv2 launch job=87 epoch=5 request=67 pos0=133 anchor=16 n_max=7
+SHADOWv2 cancel job=87 epoch=5 request=67 pos0=133 reason=primary_aborted
+SHADOWv2 launch job=88 epoch=5 request=67 pos0=135 anchor=220 n_max=7
+SHADOWv2 cancel job=88 epoch=5 request=67 pos0=135 reason=primary_aborted
+SHADOWv2 launch job=89 epoch=5 request=67 pos0=137 anchor=17 n_max=7
+SHADOWv2 cancel job=89 epoch=5 request=67 pos0=137 reason=primary_aborted
+SHADOWv2 launch job=90 epoch=5 request=67 pos0=139 anchor=220 n_max=7
+SHADOWv2 cancel job=90 epoch=5 request=67 pos0=139 reason=primary_aborted
+SHADOWv2 launch job=91 epoch=5 request=67 pos0=141 anchor=18 n_max=7
+SHADOWv2 cancel job=91 epoch=5 request=67 pos0=141 reason=primary_aborted
+SHADOWv2 launch job=92 epoch=5 request=67 pos0=143 anchor=220 n_max=7
+SHADOWv2 cancel job=92 epoch=5 request=67 pos0=143 reason=primary_aborted
+SHADOWv2 launch job=93 epoch=5 request=67 pos0=145 anchor=19 n_max=7
+SHADOWv2 cancel job=93 epoch=5 request=67 pos0=145 reason=primary_aborted
+SHADOWv2 launch job=94 epoch=5 request=67 pos0=148 anchor=17 n_max=7
+SHADOWv2 cancel job=94 epoch=5 request=67 pos0=148 reason=primary_aborted
+SHADOWv2 launch job=95 epoch=5 request=67 pos0=149 anchor=20 n_max=7
+SHADOWv2 cancel job=95 epoch=5 request=67 pos0=149 reason=primary_aborted
+SHADOWv2 launch job=96 epoch=5 request=67 pos0=151 anchor=220 n_max=7
+SHADOWv2 cancel job=96 epoch=5 request=67 pos0=151 reason=primary_aborted
+SHADOWv2 launch job=97 epoch=5 request=67 pos0=153 anchor=21 n_max=7
+SHADOWv2 cancel job=97 epoch=5 request=67 pos0=153 reason=primary_aborted
+SHADOWv2 launch job=98 epoch=5 request=67 pos0=156 anchor=17 n_max=7
+SHADOWv2 cancel job=98 epoch=5 request=67 pos0=156 reason=primary_aborted
+SHADOWv2 launch job=99 epoch=5 request=67 pos0=157 anchor=22 n_max=7
+SHADOWv2 cancel job=99 epoch=5 request=67 pos0=157 reason=primary_aborted
+SHADOWv2 launch job=100 epoch=5 request=67 pos0=160 anchor=17 n_max=7
+SHADOWv2 cancel job=100 epoch=5 request=67 pos0=160 reason=primary_aborted
+SHADOWv2 launch job=101 epoch=5 request=67 pos0=161 anchor=23 n_max=7
+SHADOWv2 cancel job=101 epoch=5 request=67 pos0=161 reason=primary_aborted
+SHADOWv2 launch job=102 epoch=5 request=67 pos0=163 anchor=220 n_max=7
+SHADOWv2 cancel job=102 epoch=5 request=67 pos0=163 reason=primary_aborted
+SHADOWv2 launch job=103 epoch=5 request=67 pos0=165 anchor=24 n_max=7
+SHADOWv2 cancel job=103 epoch=5 request=67 pos0=165 reason=primary_aborted
+SHADOWv2 launch job=104 epoch=5 request=67 pos0=167 anchor=220 n_max=7
+SHADOWv2 cancel job=104 epoch=5 request=67 pos0=167 reason=primary_aborted
+SHADOWv2 launch job=105 epoch=5 request=67 pos0=169 anchor=15 n_max=7
+SHADOWv2 cancel job=105 epoch=5 request=67 pos0=169 reason=primary_aborted
+SHADOWv2 launch job=106 epoch=5 request=67 pos0=171 anchor=220 n_max=7
+SHADOWv2 cancel job=106 epoch=5 request=67 pos0=171 reason=primary_aborted
+SHADOWv2 launch job=107 epoch=5 request=67 pos0=173 anchor=16 n_max=7
+SHADOWv2 cancel job=107 epoch=5 request=67 pos0=173 reason=primary_aborted
+SHADOWv2 launch job=108 epoch=5 request=67 pos0=175 anchor=220 n_max=7
+SHADOWv2 cancel job=108 epoch=5 request=67 pos0=175 reason=primary_aborted
+SHADOWv2 launch job=109 epoch=5 request=67 pos0=177 anchor=17 n_max=7
+SHADOWv2 cancel job=109 epoch=5 request=67 pos0=177 reason=primary_aborted
+SHADOWv2 launch job=110 epoch=5 request=67 pos0=179 anchor=220 n_max=7
+SHADOWv2 cancel job=110 epoch=5 request=67 pos0=179 reason=primary_aborted
+SHADOWv2 launch job=111 epoch=5 request=67 pos0=181 anchor=18 n_max=7
+SHADOWv2 cancel job=111 epoch=5 request=67 pos0=181 reason=primary_aborted
+SHADOWv2 launch job=112 epoch=5 request=67 pos0=183 anchor=220 n_max=7
+SHADOWv2 cancel job=112 epoch=5 request=67 pos0=183 reason=primary_aborted
+SHADOWv2 launch job=113 epoch=5 request=67 pos0=185 anchor=19 n_max=7
+SHADOWv2 cancel job=113 epoch=5 request=67 pos0=185 reason=primary_aborted
+SHADOWv2 launch job=114 epoch=5 request=67 pos0=188 anchor=18 n_max=7
+SHADOWv2 cancel job=114 epoch=5 request=67 pos0=188 reason=primary_aborted
+SHADOWv2 launch job=115 epoch=5 request=67 pos0=190 anchor=11 n_max=7
+SHADOWv2 cancel job=115 epoch=5 request=67 pos0=190 reason=primary_aborted
+SHADOWv2 launch job=116 epoch=5 request=67 pos0=192 anchor=18 n_max=7
+SHADOWv2 cancel job=116 epoch=5 request=67 pos0=192 reason=primary_aborted
+SHADOWv2 launch job=117 epoch=5 request=67 pos0=193 anchor=21 n_max=7
+SHADOWv2 cancel job=117 epoch=5 request=67 pos0=193 reason=primary_aborted
+SHADOWv2 launch job=118 epoch=5 request=67 pos0=196 anchor=18 n_max=7
+SHADOWv2 cancel job=118 epoch=5 request=67 pos0=196 reason=primary_aborted
+SHADOWv2 launch job=119 epoch=5 request=67 pos0=198 anchor=11 n_max=7
+SHADOWv2 job=119 epoch=5 request=67 pos0=198 anchor=11 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=156376449786 decision_us=156376462442 work_us=38900 dec_us=35940 sel_us=2791 confirmed=[220,18] proposed=[220,18,23,11,220,18,24]
+SHADOWv2 launch job=120 epoch=5 request=67 pos0=200 anchor=18 n_max=7
+SHADOWv2 cancel job=120 epoch=5 request=67 pos0=200 reason=primary_aborted
+SHADOWv2 launch job=121 epoch=5 request=67 pos0=201 anchor=23 n_max=7
+SHADOWv2 cancel job=121 epoch=5 request=67 pos0=201 reason=primary_aborted
+0.18.530.943 I slot print_timing: id  0 | task 67 | n_gen =    179, tg =  26.59 t/s, tg_3s =  26.21 t/s
+SHADOWv2 launch job=122 epoch=5 request=67 pos0=203 anchor=220 n_max=7
+SHADOWv2 cancel job=122 epoch=5 request=67 pos0=203 reason=primary_aborted
+SHADOWv2 launch job=123 epoch=5 request=67 pos0=205 anchor=24 n_max=7
+SHADOWv2 cancel job=123 epoch=5 request=67 pos0=205 reason=primary_aborted
+SHADOWv2 launch job=124 epoch=5 request=67 pos0=207 anchor=220 n_max=7
+SHADOWv2 cancel job=124 epoch=5 request=67 pos0=207 reason=primary_aborted
+SHADOWv2 launch job=125 epoch=5 request=67 pos0=209 anchor=15 n_max=7
+SHADOWv2 cancel job=125 epoch=5 request=67 pos0=209 reason=primary_aborted
+SHADOWv2 launch job=126 epoch=5 request=67 pos0=211 anchor=220 n_max=7
+SHADOWv2 cancel job=126 epoch=5 request=67 pos0=211 reason=primary_aborted
+SHADOWv2 launch job=127 epoch=5 request=67 pos0=213 anchor=16 n_max=7
+SHADOWv2 cancel job=127 epoch=5 request=67 pos0=213 reason=primary_aborted
+0.19.018.055 I slot print_timing: id  0 | task 67 | prompt eval time =     211.53 ms /    25 tokens (    8.46 ms per token,   118.19 tokens per second)
+0.19.018.066 I slot print_timing: id  0 | task 67 |        eval time =    7181.40 ms /   192 tokens (   37.60 ms per token,    26.60 tokens per second)
+0.19.018.067 I slot print_timing: id  0 | task 67 |       total time =    7392.93 ms /   217 tokens
+0.19.018.071 I slot print_timing: id  0 | task 67 |    graphs reused =        226
+0.19.018.076 I slot print_timing: id  0 | task 67 | draft acceptance = 1.00000 (    9 accepted /     9 generated), mean len =  2.00
+0.19.018.115 I shadow auxiliary: launched=127 skipped_busy=117 skipped_throttle=0 ready=2 late=0 prefix_match=2 prefix_mismatch=0 usable_blocks=2 usable_tokens=8 errors=0
+0.19.018.116 I shadow accounting: observed=2 cancelled=125 pending=0 skipped_invalid=0 epoch=5
+0.19.018.117 I shadow stages: worker_us=5346567 decode_us=4843187 selector_us=469799 inject_submit_us=467768 stage_us=24493 late_total_ms=0.0 late_max_ms=0.0
+0.19.018.495 I slot      release: id  0 | task 67 | stop processing: n_tokens = 216, truncated = 0
+0.19.023.019 I shadow auxiliary: launched=127 skipped_busy=117 skipped_throttle=0 ready=2 late=0 prefix_match=2 prefix_mismatch=0 usable_blocks=2 usable_tokens=8 errors=0
+0.19.023.026 I shadow accounting: observed=2 cancelled=125 pending=0 skipped_invalid=0 epoch=6
+0.19.023.028 I shadow stages: worker_us=5346567 decode_us=4843187 selector_us=469799 inject_submit_us=467768 stage_us=24493 late_total_ms=0.0 late_max_ms=0.0
+0.19.036.899 I GPU memory clock: decode -> idle, reset (dynamic)
+0.19.038.365 I APU TDP: restored original limits
+0.19.051.820 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 156377120885
+0.19.051.891 I slot launch_slot_: id  0 | task 253 | processing task, is_child = 0
+0.19.052.571 I APU TDP: active limit 20 W
+0.19.054.488 I GPU memory clock: idle -> prefill, locked 2700 MHz
+SHADOWv2 launch job=128 epoch=8 request=253 pos0=28 anchor=271 n_max=7
+SHADOWv2 cancel job=128 epoch=8 request=253 pos0=28 reason=primary_aborted
+SHADOWv2 launch job=129 epoch=8 request=253 pos0=30 anchor=198 n_max=7
+SHADOWv2 cancel job=129 epoch=8 request=253 pos0=30 reason=primary_aborted
+SHADOWv2 launch job=130 epoch=8 request=253 pos0=32 anchor=1156 n_max=7
+SHADOWv2 cancel job=130 epoch=8 request=253 pos0=32 reason=primary_aborted
+SHADOWv2 launch job=131 epoch=8 request=253 pos0=33 anchor=369 n_max=7
+SHADOWv2 cancel job=131 epoch=8 request=253 pos0=33 reason=primary_aborted
+SHADOWv2 launch job=132 epoch=8 request=253 pos0=35 anchor=728 n_max=7
+SHADOWv2 cancel job=132 epoch=8 request=253 pos0=35 reason=primary_aborted
+SHADOWv2 launch job=133 epoch=8 request=253 pos0=37 anchor=3165 n_max=7
+SHADOWv2 cancel job=133 epoch=8 request=253 pos0=37 reason=primary_aborted
+SHADOWv2 launch job=134 epoch=8 request=253 pos0=39 anchor=12654 n_max=7
+SHADOWv2 cancel job=134 epoch=8 request=253 pos0=39 reason=primary_aborted
+SHADOWv2 launch job=135 epoch=8 request=253 pos0=41 anchor=2512 n_max=7
+SHADOWv2 cancel job=135 epoch=8 request=253 pos0=41 reason=primary_aborted
+SHADOWv2 launch job=136 epoch=8 request=253 pos0=43 anchor=18479 n_max=7
+SHADOWv2 cancel job=136 epoch=8 request=253 pos0=43 reason=primary_aborted
+SHADOWv2 launch job=137 epoch=8 request=253 pos0=45 anchor=63 n_max=7
+SHADOWv2 cancel job=137 epoch=8 request=253 pos0=45 reason=primary_aborted
+SHADOWv2 launch job=138 epoch=8 request=253 pos0=47 anchor=4829 n_max=7
+SHADOWv2 cancel job=138 epoch=8 request=253 pos0=47 reason=primary_aborted
+SHADOWv2 launch job=139 epoch=8 request=253 pos0=49 anchor=1103 n_max=7
+SHADOWv2 cancel job=139 epoch=8 request=253 pos0=49 reason=primary_aborted
+SHADOWv2 launch job=140 epoch=8 request=253 pos0=51 anchor=24959 n_max=7
+SHADOWv2 cancel job=140 epoch=8 request=253 pos0=51 reason=primary_aborted
+SHADOWv2 launch job=141 epoch=8 request=253 pos0=53 anchor=2302 n_max=7
+SHADOWv2 cancel job=141 epoch=8 request=253 pos0=53 reason=primary_aborted
+SHADOWv2 launch job=142 epoch=8 request=253 pos0=55 anchor=449 n_max=7
+SHADOWv2 cancel job=142 epoch=8 request=253 pos0=55 reason=primary_aborted
+SHADOWv2 launch job=143 epoch=8 request=253 pos0=57 anchor=321 n_max=7
+SHADOWv2 cancel job=143 epoch=8 request=253 pos0=57 reason=primary_aborted
+SHADOWv2 launch job=144 epoch=8 request=253 pos0=59 anchor=15673 n_max=7
+SHADOWv2 cancel job=144 epoch=8 request=253 pos0=59 reason=primary_aborted
+SHADOWv2 launch job=145 epoch=8 request=253 pos0=61 anchor=279 n_max=7
+SHADOWv2 cancel job=145 epoch=8 request=253 pos0=61 reason=primary_aborted
+SHADOWv2 launch job=146 epoch=8 request=253 pos0=63 anchor=303 n_max=7
+SHADOWv2 cancel job=146 epoch=8 request=253 pos0=63 reason=primary_aborted
+SHADOWv2 launch job=147 epoch=8 request=253 pos0=65 anchor=13 n_max=7
+SHADOWv2 cancel job=147 epoch=8 request=253 pos0=65 reason=primary_aborted
+SHADOWv2 launch job=148 epoch=8 request=253 pos0=67 anchor=728 n_max=7
+SHADOWv2 cancel job=148 epoch=8 request=253 pos0=67 reason=primary_aborted
+SHADOWv2 launch job=149 epoch=8 request=253 pos0=69 anchor=264 n_max=7
+SHADOWv2 cancel job=149 epoch=8 request=253 pos0=69 reason=primary_aborted
+SHADOWv2 launch job=150 epoch=8 request=253 pos0=71 anchor=11 n_max=7
+SHADOWv2 cancel job=150 epoch=8 request=253 pos0=71 reason=primary_aborted
+SHADOWv2 launch job=151 epoch=8 request=253 pos0=73 anchor=1676 n_max=7
+SHADOWv2 cancel job=151 epoch=8 request=253 pos0=73 reason=primary_aborted
+SHADOWv2 launch job=152 epoch=8 request=253 pos0=75 anchor=10562 n_max=7
+SHADOWv2 cancel job=152 epoch=8 request=253 pos0=75 reason=primary_aborted
+SHADOWv2 launch job=153 epoch=8 request=253 pos0=77 anchor=7873 n_max=7
+SHADOWv2 cancel job=153 epoch=8 request=253 pos0=77 reason=primary_aborted
+SHADOWv2 launch job=154 epoch=8 request=253 pos0=79 anchor=271 n_max=7
+SHADOWv2 cancel job=154 epoch=8 request=253 pos0=79 reason=primary_aborted
+SHADOWv2 launch job=155 epoch=8 request=253 pos0=81 anchor=728 n_max=7
+SHADOWv2 cancel job=155 epoch=8 request=253 pos0=81 reason=primary_aborted
+SHADOWv2 launch job=156 epoch=8 request=253 pos0=83 anchor=821 n_max=7
+SHADOWv2 cancel job=156 epoch=8 request=253 pos0=83 reason=primary_aborted
+SHADOWv2 launch job=157 epoch=8 request=253 pos0=85 anchor=25 n_max=7
+SHADOWv2 cancel job=157 epoch=8 request=253 pos0=85 reason=primary_aborted
+SHADOWv2 launch job=158 epoch=8 request=253 pos0=87 anchor=16 n_max=7
+SHADOWv2 cancel job=158 epoch=8 request=253 pos0=87 reason=primary_aborted
+SHADOWv2 launch job=159 epoch=8 request=253 pos0=89 anchor=561 n_max=7
+SHADOWv2 cancel job=159 epoch=8 request=253 pos0=89 reason=primary_aborted
+SHADOWv2 launch job=160 epoch=8 request=253 pos0=91 anchor=1970 n_max=7
+SHADOWv2 cancel job=160 epoch=8 request=253 pos0=91 reason=primary_aborted
+SHADOWv2 launch job=161 epoch=8 request=253 pos0=93 anchor=17 n_max=7
+SHADOWv2 cancel job=161 epoch=8 request=253 pos0=93 reason=primary_aborted
+SHADOWv2 launch job=162 epoch=8 request=253 pos0=95 anchor=1473 n_max=7
+SHADOWv2 cancel job=162 epoch=8 request=253 pos0=95 reason=primary_aborted
+SHADOWv2 launch job=163 epoch=8 request=253 pos0=97 anchor=314 n_max=7
+SHADOWv2 cancel job=163 epoch=8 request=253 pos0=97 reason=primary_aborted
+SHADOWv2 launch job=164 epoch=8 request=253 pos0=99 anchor=198 n_max=7
+SHADOWv2 cancel job=164 epoch=8 request=253 pos0=99 reason=primary_aborted
+SHADOWv2 launch job=165 epoch=8 request=253 pos0=101 anchor=13 n_max=7
+SHADOWv2 cancel job=165 epoch=8 request=253 pos0=101 reason=primary_aborted
+SHADOWv2 launch job=166 epoch=8 request=253 pos0=103 anchor=15673 n_max=7
+SHADOWv2 cancel job=166 epoch=8 request=253 pos0=103 reason=primary_aborted
+SHADOWv2 launch job=167 epoch=8 request=253 pos0=105 anchor=40790 n_max=7
+SHADOWv2 cancel job=167 epoch=8 request=253 pos0=105 reason=primary_aborted
+SHADOWv2 launch job=168 epoch=8 request=253 pos0=107 anchor=9764 n_max=7
+SHADOWv2 cancel job=168 epoch=8 request=253 pos0=107 reason=primary_aborted
+SHADOWv2 launch job=169 epoch=8 request=253 pos0=109 anchor=3165 n_max=7
+SHADOWv2 cancel job=169 epoch=8 request=253 pos0=109 reason=primary_aborted
+SHADOWv2 launch job=170 epoch=8 request=253 pos0=111 anchor=5976 n_max=7
+SHADOWv2 cancel job=170 epoch=8 request=253 pos0=111 reason=primary_aborted
+SHADOWv2 launch job=171 epoch=8 request=253 pos0=113 anchor=3269 n_max=7
+SHADOWv2 cancel job=171 epoch=8 request=253 pos0=113 reason=primary_aborted
+SHADOWv2 launch job=172 epoch=8 request=253 pos0=115 anchor=198 n_max=7
+SHADOWv2 cancel job=172 epoch=8 request=253 pos0=115 reason=primary_aborted
+SHADOWv2 launch job=173 epoch=8 request=253 pos0=117 anchor=60783 n_max=7
+SHADOWv2 cancel job=173 epoch=8 request=253 pos0=117 reason=primary_aborted
+SHADOWv2 launch job=174 epoch=8 request=253 pos0=119 anchor=1103 n_max=7
+SHADOWv2 cancel job=174 epoch=8 request=253 pos0=119 reason=primary_aborted
+SHADOWv2 launch job=175 epoch=8 request=253 pos0=121 anchor=4139 n_max=7
+SHADOWv2 cancel job=175 epoch=8 request=253 pos0=121 reason=primary_aborted
+SHADOWv2 launch job=176 epoch=8 request=253 pos0=123 anchor=12 n_max=7
+SHADOWv2 cancel job=176 epoch=8 request=253 pos0=123 reason=primary_aborted
+SHADOWv2 launch job=177 epoch=8 request=253 pos0=125 anchor=76991 n_max=7
+SHADOWv2 cancel job=177 epoch=8 request=253 pos0=125 reason=primary_aborted
+0.24.507.128 I slot print_timing: id  0 | task 253 | n_gen =    100, tg =  25.06 t/s, tg_3s =  25.31 t/s
+SHADOWv2 launch job=178 epoch=8 request=253 pos0=127 anchor=1754 n_max=7
+SHADOWv2 cancel job=178 epoch=8 request=253 pos0=127 reason=primary_aborted
+SHADOWv2 launch job=179 epoch=8 request=253 pos0=129 anchor=198 n_max=7
+SHADOWv2 cancel job=179 epoch=8 request=253 pos0=129 reason=primary_aborted
+SHADOWv2 launch job=180 epoch=8 request=253 pos0=131 anchor=38754 n_max=7
+SHADOWv2 cancel job=180 epoch=8 request=253 pos0=131 reason=primary_aborted
+SHADOWv2 launch job=181 epoch=8 request=253 pos0=133 anchor=1330 n_max=7
+SHADOWv2 cancel job=181 epoch=8 request=253 pos0=133 reason=primary_aborted
+SHADOWv2 launch job=182 epoch=8 request=253 pos0=135 anchor=71592 n_max=7
+SHADOWv2 cancel job=182 epoch=8 request=253 pos0=135 reason=primary_aborted
+SHADOWv2 launch job=183 epoch=8 request=253 pos0=137 anchor=40 n_max=7
+SHADOWv2 cancel job=183 epoch=8 request=253 pos0=137 reason=primary_aborted
+SHADOWv2 launch job=184 epoch=8 request=253 pos0=139 anchor=3165 n_max=7
+SHADOWv2 cancel job=184 epoch=8 request=253 pos0=139 reason=primary_aborted
+SHADOWv2 launch job=185 epoch=8 request=253 pos0=141 anchor=303 n_max=7
+SHADOWv2 cancel job=185 epoch=8 request=253 pos0=141 reason=primary_aborted
+SHADOWv2 launch job=186 epoch=8 request=253 pos0=143 anchor=364 n_max=7
+SHADOWv2 cancel job=186 epoch=8 request=253 pos0=143 reason=primary_aborted
+SHADOWv2 launch job=187 epoch=8 request=253 pos0=145 anchor=15673 n_max=7
+SHADOWv2 cancel job=187 epoch=8 request=253 pos0=145 reason=primary_aborted
+SHADOWv2 launch job=188 epoch=8 request=253 pos0=147 anchor=2394 n_max=7
+SHADOWv2 cancel job=188 epoch=8 request=253 pos0=147 reason=primary_aborted
+SHADOWv2 launch job=189 epoch=8 request=253 pos0=149 anchor=1156 n_max=7
+SHADOWv2 cancel job=189 epoch=8 request=253 pos0=149 reason=primary_aborted
+SHADOWv2 launch job=190 epoch=8 request=253 pos0=151 anchor=303 n_max=7
+SHADOWv2 cancel job=190 epoch=8 request=253 pos0=151 reason=primary_aborted
+SHADOWv2 launch job=191 epoch=8 request=253 pos0=153 anchor=13 n_max=7
+SHADOWv2 cancel job=191 epoch=8 request=253 pos0=153 reason=primary_aborted
+SHADOWv2 launch job=192 epoch=8 request=253 pos0=155 anchor=248069 n_max=7
+SHADOWv2 cancel job=192 epoch=8 request=253 pos0=155 reason=primary_aborted
+SHADOWv2 launch job=193 epoch=8 request=253 pos0=157 anchor=2 n_max=7
+SHADOWv2 cancel job=193 epoch=8 request=253 pos0=157 reason=primary_aborted
+SHADOWv2 launch job=194 epoch=8 request=253 pos0=159 anchor=15495 n_max=7
+SHADOWv2 cancel job=194 epoch=8 request=253 pos0=159 reason=primary_aborted
+SHADOWv2 launch job=195 epoch=8 request=253 pos0=161 anchor=12654 n_max=7
+SHADOWv2 cancel job=195 epoch=8 request=253 pos0=161 reason=primary_aborted
+SHADOWv2 launch job=196 epoch=8 request=253 pos0=163 anchor=550 n_max=7
+SHADOWv2 cancel job=196 epoch=8 request=253 pos0=163 reason=primary_aborted
+SHADOWv2 launch job=197 epoch=8 request=253 pos0=165 anchor=5720 n_max=7
+SHADOWv2 cancel job=197 epoch=8 request=253 pos0=165 reason=primary_aborted
+SHADOWv2 launch job=198 epoch=8 request=253 pos0=167 anchor=71093 n_max=7
+SHADOWv2 cancel job=198 epoch=8 request=253 pos0=167 reason=primary_aborted
+SHADOWv2 launch job=199 epoch=8 request=253 pos0=169 anchor=198 n_max=7
+SHADOWv2 cancel job=199 epoch=8 request=253 pos0=169 reason=primary_aborted
+SHADOWv2 launch job=200 epoch=8 request=253 pos0=171 anchor=10562 n_max=7
+SHADOWv2 cancel job=200 epoch=8 request=253 pos0=171 reason=primary_aborted
+SHADOWv2 launch job=201 epoch=8 request=253 pos0=173 anchor=51022 n_max=7
+SHADOWv2 cancel job=201 epoch=8 request=253 pos0=173 reason=primary_aborted
+SHADOWv2 launch job=202 epoch=8 request=253 pos0=175 anchor=198 n_max=7
+SHADOWv2 cancel job=202 epoch=8 request=253 pos0=175 reason=primary_aborted
+SHADOWv2 launch job=203 epoch=8 request=253 pos0=177 anchor=4071 n_max=7
+SHADOWv2 cancel job=203 epoch=8 request=253 pos0=177 reason=primary_aborted
+SHADOWv2 launch job=204 epoch=8 request=253 pos0=179 anchor=262 n_max=7
+SHADOWv2 cancel job=204 epoch=8 request=253 pos0=179 reason=primary_aborted
+SHADOWv2 launch job=205 epoch=8 request=253 pos0=181 anchor=64 n_max=7
+SHADOWv2 cancel job=205 epoch=8 request=253 pos0=181 reason=primary_aborted
+SHADOWv2 launch job=206 epoch=8 request=253 pos0=183 anchor=13719 n_max=7
+SHADOWv2 cancel job=206 epoch=8 request=253 pos0=183 reason=primary_aborted
+SHADOWv2 launch job=207 epoch=8 request=253 pos0=185 anchor=514 n_max=7
+SHADOWv2 cancel job=207 epoch=8 request=253 pos0=185 reason=primary_aborted
+SHADOWv2 launch job=208 epoch=8 request=253 pos0=187 anchor=55228 n_max=7
+SHADOWv2 cancel job=208 epoch=8 request=253 pos0=187 reason=primary_aborted
+SHADOWv2 launch job=209 epoch=8 request=253 pos0=189 anchor=191521 n_max=7
+SHADOWv2 cancel job=209 epoch=8 request=253 pos0=189 reason=primary_aborted
+SHADOWv2 launch job=210 epoch=8 request=253 pos0=191 anchor=38754 n_max=7
+SHADOWv2 cancel job=210 epoch=8 request=253 pos0=191 reason=primary_aborted
+SHADOWv2 launch job=211 epoch=8 request=253 pos0=193 anchor=13 n_max=7
+SHADOWv2 cancel job=211 epoch=8 request=253 pos0=193 reason=primary_aborted
+SHADOWv2 launch job=212 epoch=8 request=253 pos0=195 anchor=1031 n_max=7
+SHADOWv2 cancel job=212 epoch=8 request=253 pos0=195 reason=primary_aborted
+SHADOWv2 launch job=213 epoch=8 request=253 pos0=197 anchor=4130 n_max=7
+SHADOWv2 cancel job=213 epoch=8 request=253 pos0=197 reason=primary_aborted
+SHADOWv2 launch job=214 epoch=8 request=253 pos0=199 anchor=64848 n_max=7
+SHADOWv2 cancel job=214 epoch=8 request=253 pos0=199 reason=primary_aborted
+0.27.518.472 I slot print_timing: id  0 | task 253 | n_gen =    173, tg =  24.70 t/s, tg_3s =  24.24 t/s
+SHADOWv2 launch job=215 epoch=8 request=253 pos0=201 anchor=198 n_max=7
+SHADOWv2 cancel job=215 epoch=8 request=253 pos0=201 reason=primary_aborted
+SHADOWv2 launch job=216 epoch=8 request=253 pos0=203 anchor=13719 n_max=7
+SHADOWv2 cancel job=216 epoch=8 request=253 pos0=203 reason=primary_aborted
+SHADOWv2 launch job=217 epoch=8 request=253 pos0=205 anchor=13719 n_max=7
+SHADOWv2 cancel job=217 epoch=8 request=253 pos0=205 reason=primary_aborted
+SHADOWv2 launch job=218 epoch=8 request=253 pos0=207 anchor=514 n_max=7
+SHADOWv2 cancel job=218 epoch=8 request=253 pos0=207 reason=primary_aborted
+SHADOWv2 launch job=219 epoch=8 request=253 pos0=209 anchor=198 n_max=7
+SHADOWv2 cancel job=219 epoch=8 request=253 pos0=209 reason=primary_aborted
+SHADOWv2 launch job=220 epoch=8 request=253 pos0=211 anchor=90864 n_max=7
+SHADOWv2 cancel job=220 epoch=8 request=253 pos0=211 reason=primary_aborted
+SHADOWv2 launch job=221 epoch=8 request=253 pos0=213 anchor=198 n_max=7
+SHADOWv2 cancel job=221 epoch=8 request=253 pos0=213 reason=primary_aborted
+SHADOWv2 launch job=222 epoch=8 request=253 pos0=215 anchor=13719 n_max=7
+SHADOWv2 cancel job=222 epoch=8 request=253 pos0=215 reason=primary_aborted
+SHADOWv2 launch job=223 epoch=8 request=253 pos0=217 anchor=2499 n_max=7
+SHADOWv2 cancel job=223 epoch=8 request=253 pos0=217 reason=primary_aborted
+0.28.300.618 I slot print_timing: id  0 | task 253 | prompt eval time =     211.92 ms /    28 tokens (    7.57 ms per token,   132.13 tokens per second)
+0.28.300.625 I slot print_timing: id  0 | task 253 |        eval time =    7744.39 ms /   192 tokens (   40.55 ms per token,    24.66 tokens per second)
+0.28.300.626 I slot print_timing: id  0 | task 253 |       total time =    7956.31 ms /   220 tokens
+0.28.300.628 I slot print_timing: id  0 | task 253 |    graphs reused =        416
+0.28.300.675 I shadow auxiliary: launched=223 skipped_busy=211 skipped_throttle=0 ready=2 late=0 prefix_match=2 prefix_mismatch=0 usable_blocks=2 usable_tokens=8 errors=0
+0.28.300.677 I shadow accounting: observed=2 cancelled=221 pending=0 skipped_invalid=0 epoch=8
+0.28.300.678 I shadow stages: worker_us=9652239 decode_us=8834530 selector_us=753557 inject_submit_us=811256 stage_us=59086 late_total_ms=0.0 late_max_ms=0.0
+0.28.300.703 I slot      release: id  0 | task 253 | stop processing: n_tokens = 219, truncated = 0
+0.28.300.979 I shadow auxiliary: launched=223 skipped_busy=211 skipped_throttle=0 ready=2 late=0 prefix_match=2 prefix_mismatch=0 usable_blocks=2 usable_tokens=8 errors=0
+0.28.300.981 I shadow accounting: observed=2 cancelled=221 pending=0 skipped_invalid=0 epoch=9
+0.28.300.982 I shadow stages: worker_us=9652239 decode_us=8834530 selector_us=753557 inject_submit_us=811256 stage_us=59086 late_total_ms=0.0 late_max_ms=0.0
+0.28.315.937 I GPU memory clock: decode -> idle, reset (dynamic)
+0.28.318.108 I APU TDP: restored original limits
+0.28.324.657 I srv    operator(): operator(): cleaning up before exit...
+0.28.332.291 I shadow auxiliary: launched=223 skipped_busy=211 skipped_throttle=0 ready=2 late=0 prefix_match=2 prefix_mismatch=0 usable_blocks=2 usable_tokens=8 errors=0
+0.28.332.293 I shadow accounting: observed=2 cancelled=221 pending=0 skipped_invalid=0 epoch=10
+0.28.332.294 I shadow stages: worker_us=9652239 decode_us=8834530 selector_us=753557 inject_submit_us=811256 stage_us=59086 late_total_ms=0.0 late_max_ms=0.0
+0.28.333.254 W ~llama_context: Vulkan_Host compute buffer size of   2.4336 MiB, does not match expectation of   1.6250 MiB

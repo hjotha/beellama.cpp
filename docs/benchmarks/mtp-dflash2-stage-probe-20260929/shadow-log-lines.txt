@@ -1,0 +1,74 @@
+0.12.942.960 I common_speculative_init_result: loading shadow auxiliary model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf'
+0.14.122.765 I common_speculative_init_result: shadow auxiliary context ready (model '/home/hjotha/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf', n_max 7); observation pipeline pending
+0.14.125.669 I common_speculative_init: shadow auxiliary drafter registered (observation only; proposals are never selected, every=1)
+SHADOW launch pos0=26 id_last=248068 n_max=7
+SHADOW pos0=26 id_last=248068 c=5 d=7 matched=1 prefix_ok=0 late=1 work_us=126173 dec_us=31275 sel_us=80552 late_ms=55.4
+SHADOW launch pos0=34 id_last=24959 n_max=7
+SHADOW launch pos0=39 id_last=220 n_max=7
+SHADOW launch pos0=44 id_last=539 n_max=7
+SHADOW launch pos0=49 id_last=5853 n_max=7
+SHADOW pos0=49 id_last=5853 c=2 d=7 matched=1 prefix_ok=0 late=0 work_us=51520 dec_us=12390 sel_us=5239 late_ms=0.0
+SHADOW launch pos0=51 id_last=6558 n_max=7
+SHADOW pos0=51 id_last=6558 c=2 d=7 matched=1 prefix_ok=0 late=0 work_us=60469 dec_us=24960 sel_us=3012 late_ms=0.0
+SHADOW launch pos0=53 id_last=1066 n_max=7
+SHADOW launch pos0=54 id_last=1103 n_max=7
+SHADOW launch pos0=56 id_last=13 n_max=7
+SHADOW launch pos0=61 id_last=11 n_max=7
+SHADOW launch pos0=66 id_last=18 n_max=7
+SHADOW pos0=66 id_last=18 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=49396 dec_us=10509 sel_us=3350 late_ms=0.0
+SHADOW launch pos0=71 id_last=220 n_max=7
+SHADOW pos0=71 id_last=220 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=59020 dec_us=17010 sel_us=2806 late_ms=0.0
+SHADOW launch pos0=76 id_last=11 n_max=7
+SHADOW launch pos0=81 id_last=23 n_max=7
+SHADOW launch pos0=86 id_last=220 n_max=7
+SHADOW pos0=86 id_last=220 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=41063 dec_us=9469 sel_us=3056 late_ms=0.0
+SHADOW launch pos0=91 id_last=16 n_max=7
+SHADOW pos0=91 id_last=16 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=55712 dec_us=13411 sel_us=3051 late_ms=0.0
+SHADOW launch pos0=96 id_last=17 n_max=7
+SHADOW pos0=96 id_last=17 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=57540 dec_us=14620 sel_us=2879 late_ms=0.0
+SHADOW launch pos0=101 id_last=11 n_max=7
+SHADOW pos0=101 id_last=11 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=55854 dec_us=13170 sel_us=2894 late_ms=0.0
+SHADOW launch pos0=106 id_last=220 n_max=7
+SHADOW pos0=106 id_last=220 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=58002 dec_us=15507 sel_us=2900 late_ms=0.0
+SHADOW launch pos0=111 id_last=16 n_max=7
+SHADOW pos0=111 id_last=16 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60235 dec_us=18010 sel_us=2828 late_ms=0.0
+SHADOW launch pos0=116 id_last=22 n_max=7
+SHADOW pos0=116 id_last=22 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60524 dec_us=17861 sel_us=2950 late_ms=0.0
+SHADOW launch pos0=121 id_last=11 n_max=7
+SHADOW pos0=121 id_last=11 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=59887 dec_us=17709 sel_us=2771 late_ms=0.0
+SHADOW launch pos0=126 id_last=220 n_max=7
+SHADOW pos0=126 id_last=220 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60184 dec_us=17942 sel_us=2972 late_ms=0.0
+SHADOW launch pos0=131 id_last=17 n_max=7
+SHADOW pos0=131 id_last=17 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=56045 dec_us=13729 sel_us=3027 late_ms=0.0
+SHADOW launch pos0=136 id_last=17 n_max=7
+SHADOW pos0=136 id_last=17 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=57500 dec_us=15217 sel_us=2835 late_ms=0.0
+SHADOW launch pos0=141 id_last=11 n_max=7
+SHADOW pos0=141 id_last=11 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60351 dec_us=17865 sel_us=3009 late_ms=0.0
+SHADOW launch pos0=146 id_last=220 n_max=7
+SHADOW pos0=146 id_last=220 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60435 dec_us=17582 sel_us=2938 late_ms=0.0
+SHADOW launch pos0=151 id_last=17 n_max=7
+SHADOW pos0=151 id_last=17 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60256 dec_us=17942 sel_us=2819 late_ms=0.0
+SHADOW launch pos0=156 id_last=22 n_max=7
+SHADOW pos0=156 id_last=22 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60409 dec_us=18206 sel_us=2840 late_ms=0.0
+SHADOW launch pos0=161 id_last=11 n_max=7
+SHADOW pos0=161 id_last=11 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60840 dec_us=18009 sel_us=2804 late_ms=0.0
+SHADOW launch pos0=166 id_last=220 n_max=7
+SHADOW pos0=166 id_last=220 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=61111 dec_us=18445 sel_us=2990 late_ms=0.0
+SHADOW launch pos0=171 id_last=18 n_max=7
+SHADOW pos0=171 id_last=18 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60476 dec_us=18180 sel_us=2977 late_ms=0.0
+SHADOW launch pos0=176 id_last=17 n_max=7
+SHADOW pos0=176 id_last=17 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60490 dec_us=18116 sel_us=2791 late_ms=0.0
+SHADOW launch pos0=181 id_last=11 n_max=7
+SHADOW pos0=181 id_last=11 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60159 dec_us=18012 sel_us=2727 late_ms=0.0
+SHADOW launch pos0=186 id_last=220 n_max=7
+SHADOW pos0=186 id_last=220 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=56600 dec_us=13899 sel_us=2846 late_ms=0.0
+SHADOW launch pos0=191 id_last=18 n_max=7
+SHADOW pos0=191 id_last=18 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=58648 dec_us=15933 sel_us=2974 late_ms=0.0
+SHADOW launch pos0=196 id_last=22 n_max=7
+SHADOW launch pos0=200 id_last=23 n_max=7
+SHADOW launch pos0=205 id_last=11 n_max=7
+SHADOW pos0=205 id_last=11 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=53121 dec_us=10076 sel_us=3232 late_ms=0.0
+SHADOW launch pos0=210 id_last=220 n_max=7
+SHADOW pos0=210 id_last=220 c=5 d=7 matched=4 prefix_ok=0 late=0 work_us=60972 dec_us=18354 sel_us=3020 late_ms=0.0
+0.18.738.219 I shadow auxiliary: launched=40 skipped_busy=1 skipped_throttle=0 ready=39 late=1 prefix_match=0 prefix_mismatch=29 usable_blocks=0 usable_tokens=0 errors=0
+0.18.738.221 I shadow stages: worker_us=2213664 decode_us=627050 selector_us=196475 inject_us=89780 stage_us=43477 late_total_ms=55.4 late_max_ms=55.4

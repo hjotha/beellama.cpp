@@ -1,0 +1,10 @@
+{
+  "prompt": "Escreva uma funcao Python merge_sort que recebe lista de inteiros. Inclua um exemplo e explique a complexidade em portugues.",
+  "n_predict": 64,
+  "temperature": 0,
+  "seed": 42,
+  "ignore_eos": true,
+  "cache_prompt": false,
+  "stream": false,
+  "return_tokens": true
+}

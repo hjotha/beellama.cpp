@@ -1,0 +1,274 @@
+0.14.883.478 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+SHADOWv2 launch job=1 epoch=2 request=0 pos0=29 anchor=248068 n_max=7
+SHADOWv2 job=1 epoch=2 request=0 pos0=29 anchor=248068 c=2 d=7 matched=0 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154802897598 decision_us=154802826838 work_us=116538 dec_us=46896 sel_us=69527 confirmed=[198,760] proposed=[11,3655,11,1042,579,3165,264]
+SHADOWv2 launch job=2 epoch=2 request=0 pos0=41 anchor=2512 n_max=7
+SHADOWv2 job=2 epoch=2 request=0 pos0=41 anchor=2512 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154803081493 decision_us=154803089709 work_us=46849 dec_us=43789 sel_us=2964 confirmed=[1510,18479,17885,63,421] proposed=[1510,18479,17885,63,421,4829,264]
+SHADOWv2 launch job=3 epoch=2 request=0 pos0=55 anchor=449 n_max=7
+SHADOWv2 job=3 epoch=2 request=0 pos0=55 anchor=449 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154803279055 decision_us=154803272804 work_us=40889 dec_us=37519 sel_us=3296 confirmed=[3010,321] proposed=[3010,321,264,1414,15673,314,22373]
+SHADOWv2 launch job=4 epoch=2 request=0 pos0=70 anchor=4101 n_max=7
+SHADOWv2 job=4 epoch=2 request=0 pos0=70 anchor=4101 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154803568929 decision_us=154803575229 work_us=44213 dec_us=40977 sel_us=3102 confirmed=[11,1575,1676] proposed=[11,1575,44145,290,10562,3269,7873]
+SHADOWv2 launch job=5 epoch=2 request=0 pos0=82 anchor=5759 n_max=7
+SHADOWv2 job=5 epoch=2 request=0 pos0=82 anchor=5759 c=1 d=7 matched=0 prefix_ok=0 position_ok=1 ready=0 remaining=6 usable=0 usable_tokens=0 done_us=154803795782 decision_us=154803792934 work_us=45558 dec_us=42217 sel_us=3203 confirmed=[821] proposed=[411,25,198,16,13,561,10562]
+0.16.603.273 I shadow auxiliary: launched=5 skipped_busy=0 skipped_throttle=14 ready=2 late=3 prefix_match=2 prefix_mismatch=3 usable_blocks=1 usable_tokens=2 errors=0
+0.16.603.274 I shadow accounting: observed=5 cancelled=0 pending=0 skipped_invalid=0 epoch=2
+0.16.603.275 I shadow stages: worker_us=294047 decode_us=211398 selector_us=82092 inject_submit_us=60952 stage_us=2163 late_total_ms=79.9 late_max_ms=70.8
+0.16.605.173 I shadow auxiliary: launched=5 skipped_busy=0 skipped_throttle=14 ready=2 late=3 prefix_match=2 prefix_mismatch=3 usable_blocks=1 usable_tokens=2 errors=0
+0.16.605.174 I shadow accounting: observed=5 cancelled=0 pending=0 skipped_invalid=0 epoch=3
+0.16.605.175 I shadow stages: worker_us=294047 decode_us=211398 selector_us=82092 inject_submit_us=60952 stage_us=2163 late_total_ms=79.9 late_max_ms=70.8
+0.16.619.581 I slot launch_slot_: id  0 | task 26 | processing task, is_child = 0
+SHADOWv2 launch job=6 epoch=5 request=26 pos0=31 anchor=728 n_max=7
+SHADOWv2 job=6 epoch=5 request=26 pos0=31 anchor=728 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=154804329246 decision_us=154804332462 work_us=41387 dec_us=38234 sel_us=3020 confirmed=[310,3165,24959] proposed=[310,3165,24959,494,220,16,310]
+SHADOWv2 launch job=7 epoch=5 request=26 pos0=49 anchor=5853 n_max=7
+SHADOWv2 job=7 epoch=5 request=26 pos0=49 anchor=5853 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=154804548232 decision_us=154804550153 work_us=40148 dec_us=37438 sel_us=2580 confirmed=[13,6558] proposed=[13,6558,728,1066,6707,279,4947]
+SHADOWv2 launch job=8 epoch=5 request=26 pos0=56 anchor=13 n_max=7
+SHADOWv2 job=8 epoch=5 request=26 pos0=56 anchor=13 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154804729988 decision_us=154804745645 work_us=35286 dec_us=32504 sel_us=2669 confirmed=[198,248069,271,16,11] proposed=[198,248069,271,16,11,220,17]
+SHADOWv2 launch job=9 epoch=5 request=26 pos0=76 anchor=11 n_max=7
+SHADOWv2 job=9 epoch=5 request=26 pos0=76 anchor=11 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154804959195 decision_us=154804980573 work_us=36961 dec_us=34297 sel_us=2522 confirmed=[220,22,11,220,23] proposed=[220,22,11,220,23,11,220]
+SHADOWv2 launch job=10 epoch=5 request=26 pos0=96 anchor=17 n_max=7
+SHADOWv2 job=10 epoch=5 request=26 pos0=96 anchor=17 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154805191666 decision_us=154805199271 work_us=38854 dec_us=36100 sel_us=2616 confirmed=[11,220,16,18,11] proposed=[11,220,16,18,11,220,16]
+SHADOWv2 launch job=11 epoch=5 request=26 pos0=116 anchor=22 n_max=7
+SHADOWv2 job=11 epoch=5 request=26 pos0=116 anchor=22 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154805409761 decision_us=154805415499 work_us=38917 dec_us=34967 sel_us=3814 confirmed=[11,220,16,23,11] proposed=[11,220,16,23,11,220,16]
+SHADOWv2 launch job=12 epoch=5 request=26 pos0=136 anchor=17 n_max=7
+SHADOWv2 job=12 epoch=5 request=26 pos0=136 anchor=17 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154805622609 decision_us=154805632638 work_us=36898 dec_us=34154 sel_us=2672 confirmed=[11,220,17,18,11] proposed=[11,220,17,18,11,220,17]
+SHADOWv2 launch job=13 epoch=5 request=26 pos0=156 anchor=22 n_max=7
+SHADOWv2 job=13 epoch=5 request=26 pos0=156 anchor=22 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154805848483 decision_us=154805851466 work_us=42099 dec_us=39326 sel_us=2638 confirmed=[11,220,17,23,11] proposed=[11,220,17,23,11,220,17]
+SHADOWv2 launch job=14 epoch=5 request=26 pos0=176 anchor=17 n_max=7
+SHADOWv2 job=14 epoch=5 request=26 pos0=176 anchor=17 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154806061152 decision_us=154806072455 work_us=36695 dec_us=33635 sel_us=2922 confirmed=[11,220,18,18,11] proposed=[11,220,18,18,11,220,18]
+SHADOWv2 launch job=15 epoch=5 request=26 pos0=196 anchor=22 n_max=7
+SHADOWv2 job=15 epoch=5 request=26 pos0=196 anchor=22 c=4 d=7 matched=4 prefix_ok=1 position_ok=1 ready=1 remaining=3 usable=1 usable_tokens=3 done_us=154806289854 decision_us=154806291377 work_us=45036 dec_us=42306 sel_us=2616 confirmed=[11,220,18,23] proposed=[11,220,18,23,11,220,18]
+0.19.153.677 I shadow auxiliary: launched=15 skipped_busy=0 skipped_throttle=45 ready=12 late=3 prefix_match=12 prefix_mismatch=3 usable_blocks=11 usable_tokens=27 errors=0
+0.19.153.678 I shadow accounting: observed=15 cancelled=0 pending=0 skipped_invalid=0 epoch=5
+0.19.153.679 I shadow stages: worker_us=686328 decode_us=574359 selector_us=110161 inject_submit_us=89355 stage_us=5200 late_total_ms=79.9 late_max_ms=70.8
+0.19.155.781 I shadow auxiliary: launched=15 skipped_busy=0 skipped_throttle=45 ready=12 late=3 prefix_match=12 prefix_mismatch=3 usable_blocks=11 usable_tokens=27 errors=0
+0.19.155.783 I shadow accounting: observed=15 cancelled=0 pending=0 skipped_invalid=0 epoch=6
+0.19.155.784 I shadow stages: worker_us=686328 decode_us=574359 selector_us=110161 inject_submit_us=89355 stage_us=5200 late_total_ms=79.9 late_max_ms=70.8
+0.19.169.758 I slot launch_slot_: id  0 | task 73 | processing task, is_child = 0
+SHADOWv2 launch job=16 epoch=8 request=73 pos0=29 anchor=248068 n_max=7
+SHADOWv2 job=16 epoch=8 request=73 pos0=29 anchor=248068 c=2 d=7 matched=0 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154806814742 decision_us=154806814724 work_us=38420 dec_us=35652 sel_us=2640 confirmed=[198,760] proposed=[11,3655,11,1042,579,3165,264]
+SHADOWv2 launch job=17 epoch=8 request=73 pos0=41 anchor=2512 n_max=7
+SHADOWv2 job=17 epoch=8 request=73 pos0=41 anchor=2512 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154807030482 decision_us=154807045854 work_us=35079 dec_us=32050 sel_us=2892 confirmed=[1510,18479,17885,63,421] proposed=[1510,18479,17885,63,421,4829,264]
+SHADOWv2 launch job=18 epoch=8 request=73 pos0=55 anchor=449 n_max=7
+SHADOWv2 job=18 epoch=8 request=73 pos0=55 anchor=449 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154807231800 decision_us=154807224379 work_us=41689 dec_us=37861 sel_us=3728 confirmed=[3010,321] proposed=[3010,321,264,15673,314,22373,303]
+SHADOWv2 launch job=19 epoch=8 request=73 pos0=70 anchor=4101 n_max=7
+SHADOWv2 job=19 epoch=8 request=73 pos0=70 anchor=4101 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154807518766 decision_us=154807522912 work_us=43844 dec_us=41307 sel_us=2405 confirmed=[11,1575,1676] proposed=[11,1575,44145,290,10562,3269,7873]
+SHADOWv2 launch job=20 epoch=8 request=73 pos0=82 anchor=5759 n_max=7
+SHADOWv2 job=20 epoch=8 request=73 pos0=82 anchor=5759 c=1 d=7 matched=0 prefix_ok=0 position_ok=1 ready=1 remaining=6 usable=0 usable_tokens=0 done_us=154807736798 decision_us=154807740066 work_us=40369 dec_us=37027 sel_us=3255 confirmed=[821] proposed=[411,25,198,16,13,561,10562]
+SHADOWv2 launch job=21 epoch=8 request=73 pos0=95 anchor=1473 n_max=7
+SHADOWv2 job=21 epoch=8 request=73 pos0=95 anchor=1473 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=154807986167 decision_us=154807993727 work_us=36866 dec_us=33871 sel_us=2839 confirmed=[3010,314] proposed=[3010,198,18,13,68230,15673,314]
+SHADOWv2 launch job=22 epoch=8 request=73 pos0=111 anchor=5976 n_max=7
+SHADOWv2 job=22 epoch=8 request=73 pos0=111 anchor=5976 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154808264013 decision_us=154808265680 work_us=45089 dec_us=42497 sel_us=2468 confirmed=[10562,3269,25] proposed=[10562,3269,7873,25,198,12,5183]
+SHADOWv2 launch job=23 epoch=8 request=73 pos0=125 anchor=76991 n_max=7
+SHADOWv2 job=23 epoch=8 request=73 pos0=125 anchor=76991 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154808476768 decision_us=154808492207 work_us=34303 dec_us=31505 sel_us=2646 confirmed=[3269,1754,4139,198,12] proposed=[3269,1754,4139,198,12,38754,279]
+SHADOWv2 launch job=24 epoch=8 request=73 pos0=140 anchor=424 n_max=7
+SHADOWv2 job=24 epoch=8 request=73 pos0=140 anchor=424 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154808739841 decision_us=154808747239 work_us=41434 dec_us=38463 sel_us=2841 confirmed=[303,40790,364] proposed=[303,40790,2394,279,1156,4439,364]
+SHADOWv2 launch job=25 epoch=8 request=73 pos0=150 anchor=4439 n_max=7
+SHADOWv2 job=25 epoch=8 request=73 pos0=150 anchor=4439 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154808955520 decision_us=154808969377 work_us=40941 dec_us=37728 sel_us=3036 confirmed=[303,40790,13,198,248069] proposed=[303,40790,13,198,248069,271,2]
+SHADOWv2 launch job=26 epoch=8 request=73 pos0=164 anchor=15598 n_max=7
+SHADOWv2 job=26 epoch=8 request=73 pos0=164 anchor=15598 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154809176322 decision_us=154809186154 work_us=40566 dec_us=37822 sel_us=2616 confirmed=[5720,271,71093,12305,198] proposed=[5720,271,71093,12305,198,727,10562]
+SHADOWv2 launch job=27 epoch=8 request=73 pos0=185 anchor=198 n_max=7
+SHADOWv2 job=27 epoch=8 request=73 pos0=185 anchor=198 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=154809474759 decision_us=154809479045 work_us=37318 dec_us=32522 sel_us=4708 confirmed=[262,93501] proposed=[262,8535,16587,10293,13719,401,67075]
+SHADOWv2 launch job=28 epoch=8 request=73 pos0=194 anchor=55228 n_max=7
+SHADOWv2 job=28 epoch=8 request=73 pos0=194 anchor=55228 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154809667152 decision_us=154809664371 work_us=38131 dec_us=35426 sel_us=2586 confirmed=[296,191521] proposed=[296,191521,6154,38754,15495,13,198]
+SHADOWv2 launch job=29 epoch=8 request=73 pos0=205 anchor=39196 n_max=7
+SHADOWv2 job=29 epoch=8 request=73 pos0=205 anchor=39196 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154809855751 decision_us=154809855553 work_us=36790 dec_us=34202 sel_us=2471 confirmed=[13719,37114] proposed=[13719,37114,2499,13,198,262,4071]
+SHADOWv2 launch job=30 epoch=8 request=73 pos0=213 anchor=3889 n_max=7
+0.22.773.567 SHADOWv2 cancel job=30 epoch=8 reason=context_reset
+0.22.773.704 I shadow auxiliary: launched=30 skipped_busy=0 skipped_throttle=87 ready=22 late=7 prefix_match=19 prefix_mismatch=10 usable_blocks=15 usable_tokens=35 errors=0
+0.22.773.705 I shadow accounting: observed=29 cancelled=0 pending=1 skipped_invalid=0 epoch=8
+0.22.773.706 I shadow stages: worker_us=1276840 decode_us=1118679 selector_us=154296 inject_submit_us=146510 stage_us=8826 late_total_ms=90.3 late_max_ms=70.8
+0.22.775.550 I shadow auxiliary: launched=30 skipped_busy=0 skipped_throttle=87 ready=22 late=7 prefix_match=19 prefix_mismatch=10 usable_blocks=15 usable_tokens=35 errors=0
+0.22.775.552 I shadow accounting: observed=29 cancelled=1 pending=0 skipped_invalid=0 epoch=9
+0.22.775.553 I shadow stages: worker_us=1276840 decode_us=1118679 selector_us=154296 inject_submit_us=146510 stage_us=8826 late_total_ms=90.3 late_max_ms=70.8
+0.22.789.796 I slot launch_slot_: id  0 | task 142 | processing task, is_child = 0
+SHADOWv2 launch job=31 epoch=11 request=142 pos0=39 anchor=220 n_max=7
+SHADOWv2 job=31 epoch=11 request=142 pos0=39 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154810606026 decision_us=154810618421 work_us=38415 dec_us=35439 sel_us=2734 confirmed=[17,15,15,18101,539] proposed=[17,15,15,18101,539,73982,11]
+SHADOWv2 launch job=32 epoch=11 request=142 pos0=53 anchor=1066 n_max=7
+SHADOWv2 job=32 epoch=11 request=142 pos0=53 anchor=1066 c=1 d=7 matched=1 prefix_ok=1 position_ok=1 ready=1 remaining=6 usable=1 usable_tokens=4 done_us=154810802844 decision_us=154810811168 work_us=35907 dec_us=32856 sel_us=2888 confirmed=[1103] proposed=[1103,1070,680,430,220,16,11]
+SHADOWv2 launch job=33 epoch=11 request=142 pos0=66 anchor=18 n_max=7
+SHADOWv2 job=33 epoch=11 request=142 pos0=66 anchor=18 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154811023444 decision_us=154811025173 work_us=43582 dec_us=41122 sel_us=2347 confirmed=[11,220,19,11,220] proposed=[11,220,19,11,220,20,11]
+SHADOWv2 launch job=34 epoch=11 request=142 pos0=86 anchor=220 n_max=7
+SHADOWv2 job=34 epoch=11 request=142 pos0=86 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154811246025 decision_us=154811247745 work_us=42531 dec_us=39868 sel_us=2563 confirmed=[16,15,11,220,16] proposed=[16,15,11,220,16,16,11]
+SHADOWv2 launch job=35 epoch=11 request=142 pos0=106 anchor=220 n_max=7
+SHADOWv2 job=35 epoch=11 request=142 pos0=106 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154811462607 decision_us=154811464375 work_us=42937 dec_us=40154 sel_us=2649 confirmed=[16,20,11,220,16] proposed=[16,20,11,220,16,21,11]
+SHADOWv2 launch job=36 epoch=11 request=142 pos0=126 anchor=220 n_max=7
+SHADOWv2 job=36 epoch=11 request=142 pos0=126 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=0 remaining=2 usable=0 usable_tokens=0 done_us=154811684491 decision_us=154811679648 work_us=46312 dec_us=42370 sel_us=3826 confirmed=[17,15,11,220,17] proposed=[17,15,11,220,17,16,11]
+SHADOWv2 launch job=37 epoch=11 request=142 pos0=146 anchor=220 n_max=7
+SHADOWv2 job=37 epoch=11 request=142 pos0=146 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154811902484 decision_us=154811902587 work_us=43444 dec_us=41148 sel_us=2210 confirmed=[17,20,11,220,17] proposed=[17,20,11,220,17,21,11]
+SHADOWv2 launch job=38 epoch=11 request=142 pos0=166 anchor=220 n_max=7
+SHADOWv2 job=38 epoch=11 request=142 pos0=166 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154812118502 decision_us=154812120615 work_us=43246 dec_us=40839 sel_us=2274 confirmed=[18,15,11,220,18] proposed=[18,15,11,220,18,16,11]
+SHADOWv2 launch job=39 epoch=11 request=142 pos0=186 anchor=220 n_max=7
+SHADOWv2 job=39 epoch=11 request=142 pos0=186 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154812335551 decision_us=154812340048 work_us=40790 dec_us=37963 sel_us=2700 confirmed=[18,20,11,220,18] proposed=[18,20,11,220,18,21,11]
+SHADOWv2 launch job=40 epoch=11 request=142 pos0=205 anchor=11 n_max=7
+SHADOWv2 job=40 epoch=11 request=142 pos0=205 anchor=11 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154812555778 decision_us=154812570112 work_us=35388 dec_us=32619 sel_us=2630 confirmed=[220,19,15,11,220] proposed=[220,19,15,11,220,19,16]
+0.25.319.371 I shadow auxiliary: launched=40 skipped_busy=0 skipped_throttle=118 ready=31 late=8 prefix_match=29 prefix_mismatch=10 usable_blocks=24 usable_tokens=55 errors=0
+0.25.319.371 I shadow accounting: observed=39 cancelled=1 pending=0 skipped_invalid=0 epoch=11
+0.25.319.373 I shadow stages: worker_us=1689392 decode_us=1503057 selector_us=181117 inject_submit_us=179272 stage_us=11719 late_total_ms=95.1 late_max_ms=70.8
+0.25.321.340 I shadow auxiliary: launched=40 skipped_busy=0 skipped_throttle=118 ready=31 late=8 prefix_match=29 prefix_mismatch=10 usable_blocks=24 usable_tokens=55 errors=0
+0.25.321.345 I shadow accounting: observed=39 cancelled=1 pending=0 skipped_invalid=0 epoch=12
+0.25.321.347 I shadow stages: worker_us=1689392 decode_us=1503057 selector_us=181117 inject_submit_us=179272 stage_us=11719 late_total_ms=95.1 late_max_ms=70.8
+0.25.336.850 I slot launch_slot_: id  0 | task 189 | processing task, is_child = 0
+SHADOWv2 launch job=41 epoch=14 request=189 pos0=33 anchor=369 n_max=7
+SHADOWv2 job=41 epoch=14 request=189 pos0=33 anchor=369 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154813087845 decision_us=154813093642 work_us=40362 dec_us=37146 sel_us=3098 confirmed=[9859,728,310,3165,264] proposed=[9859,728,310,3165,264,12654,709]
+SHADOWv2 launch job=42 epoch=14 request=189 pos0=51 anchor=24959 n_max=7
+SHADOWv2 job=42 epoch=14 request=189 pos0=51 anchor=24959 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154813305430 decision_us=154813300662 work_us=43253 dec_us=40698 sel_us=2480 confirmed=[13,2302] proposed=[13,2302,1318,25,198,16,13]
+SHADOWv2 launch job=43 epoch=14 request=189 pos0=58 anchor=449 n_max=7
+SHADOWv2 job=43 epoch=14 request=189 pos0=58 anchor=449 c=5 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=2 usable=0 usable_tokens=0 done_us=154813482687 decision_us=154813501481 work_us=35323 dec_us=32600 sel_us=2610 confirmed=[15673,314,279,22373,303] proposed=[15673,314,22373,303,22510,13,271]
+SHADOWv2 launch job=44 epoch=14 request=189 pos0=75 anchor=10562 n_max=7
+SHADOWv2 job=44 epoch=14 request=189 pos0=75 anchor=10562 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=154813783639 decision_us=154813796252 work_us=33969 dec_us=30906 sel_us=2915 confirmed=[3269,7873,13] proposed=[3269,7873,13,271,9764,728,5759]
+SHADOWv2 launch job=45 epoch=14 request=189 pos0=88 anchor=13 n_max=7
+SHADOWv2 job=45 epoch=14 request=189 pos0=88 anchor=13 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=154814019342 decision_us=154814023426 work_us=43391 dec_us=36133 sel_us=7099 confirmed=[561,709] proposed=[561,10562,17885,709,198,17,13]
+SHADOWv2 launch job=46 epoch=14 request=189 pos0=102 anchor=68230 n_max=7
+SHADOWv2 job=46 epoch=14 request=189 pos0=102 anchor=68230 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154814267478 decision_us=154814281507 work_us=34445 dec_us=31885 sel_us=2441 confirmed=[15673,303,40790,271,9764] proposed=[15673,303,40790,271,9764,728,3165]
+SHADOWv2 launch job=47 epoch=14 request=189 pos0=117 anchor=60783 n_max=7
+SHADOWv2 job=47 epoch=14 request=189 pos0=117 anchor=60783 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154814530427 decision_us=154814547941 work_us=37010 dec_us=33948 sel_us=2876 confirmed=[279,1103,303] proposed=[279,1103,1083,1330,71592,198,12]
+SHADOWv2 launch job=48 epoch=14 request=189 pos0=134 anchor=10300 n_max=7
+SHADOWv2 job=48 epoch=14 request=189 pos0=134 anchor=10300 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=154814759265 decision_us=154814771143 work_us=34028 dec_us=31019 sel_us=2870 confirmed=[71592,271,40] proposed=[71592,271,40,3172,3165,411,303]
+SHADOWv2 launch job=49 epoch=14 request=189 pos0=145 anchor=15673 n_max=7
+SHADOWv2 job=49 epoch=14 request=189 pos0=145 anchor=15673 c=1 d=7 matched=0 prefix_ok=0 position_ok=1 ready=1 remaining=6 usable=0 usable_tokens=0 done_us=154815008202 decision_us=154815021200 work_us=37008 dec_us=34131 sel_us=2717 confirmed=[5306] proposed=[2394,279,1156,4439,364,279,1156]
+SHADOWv2 launch job=50 epoch=14 request=189 pos0=158 anchor=38754 n_max=7
+SHADOWv2 job=50 epoch=14 request=189 pos0=158 anchor=38754 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154815237670 decision_us=154815230034 work_us=44841 dec_us=41367 sel_us=3386 confirmed=[15495,945] proposed=[15495,1892,12654,271,71093,12305,198]
+SHADOWv2 launch job=51 epoch=14 request=189 pos0=174 anchor=25 n_max=7
+SHADOWv2 job=51 epoch=14 request=189 pos0=174 anchor=25 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154815493929 decision_us=154815510883 work_us=36455 dec_us=33412 sel_us=2906 confirmed=[1103,18078,2387,1411,1103] proposed=[1103,18078,2387,1411,1103,18078,5491]
+SHADOWv2 launch job=52 epoch=14 request=189 pos0=189 anchor=10293 n_max=7
+SHADOWv2 job=52 epoch=14 request=189 pos0=189 anchor=10293 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=154815747068 decision_us=154815752887 work_us=37980 dec_us=32700 sel_us=5132 confirmed=[13719,401,514] proposed=[13719,401,514,190186,55228,264,10562]
+SHADOWv2 launch job=53 epoch=14 request=189 pos0=198 anchor=38754 n_max=7
+SHADOWv2 job=53 epoch=14 request=189 pos0=198 anchor=38754 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154815937141 decision_us=154815951041 work_us=43493 dec_us=39991 sel_us=3145 confirmed=[15495,13,198,262,90864] proposed=[15495,13,198,262,90864,264,13719]
+SHADOWv2 launch job=54 epoch=14 request=189 pos0=209 anchor=318 n_max=7
+SHADOWv2 job=54 epoch=14 request=189 pos0=209 anchor=318 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=154816132329 decision_us=154816144761 work_us=41428 dec_us=38067 sel_us=3056 confirmed=[192484,182785] proposed=[192484,5041,64,13719,553,198,262]
+0.28.952.630 I shadow auxiliary: launched=54 skipped_busy=0 skipped_throttle=161 ready=43 late=10 prefix_match=37 prefix_mismatch=16 usable_blocks=31 usable_tokens=75 errors=0
+0.28.952.631 I shadow accounting: observed=53 cancelled=1 pending=0 skipped_invalid=0 epoch=14
+0.28.952.721 I shadow stages: worker_us=2232378 decode_us=1997060 selector_us=227848 inject_submit_us=231621 stage_us=15566 late_total_ms=107.5 late_max_ms=70.8
+0.28.954.798 I shadow auxiliary: launched=54 skipped_busy=0 skipped_throttle=161 ready=43 late=10 prefix_match=37 prefix_mismatch=16 usable_blocks=31 usable_tokens=75 errors=0
+0.28.954.799 I shadow accounting: observed=53 cancelled=1 pending=0 skipped_invalid=0 epoch=15
+0.28.954.800 I shadow stages: worker_us=2232378 decode_us=1997060 selector_us=227848 inject_submit_us=231621 stage_us=15566 late_total_ms=107.5 late_max_ms=70.8
+0.28.969.301 I slot launch_slot_: id  0 | task 259 | processing task, is_child = 0
+SHADOWv2 launch job=55 epoch=17 request=259 pos0=31 anchor=728 n_max=7
+SHADOWv2 job=55 epoch=17 request=259 pos0=31 anchor=728 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=154816673277 decision_us=154816686013 work_us=35764 dec_us=33064 sel_us=2531 confirmed=[310,3165,24959] proposed=[310,3165,24959,494,220,16,310]
+SHADOWv2 launch job=56 epoch=17 request=259 pos0=49 anchor=5853 n_max=7
+SHADOWv2 job=56 epoch=17 request=259 pos0=49 anchor=5853 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=1 remaining=5 usable=1 usable_tokens=4 done_us=154816898627 decision_us=154816900729 work_us=37842 dec_us=35241 sel_us=2501 confirmed=[13,6558] proposed=[13,6558,728,1066,6707,279,4947]
+SHADOWv2 launch job=57 epoch=17 request=259 pos0=56 anchor=13 n_max=7
+SHADOWv2 job=57 epoch=17 request=259 pos0=56 anchor=13 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154817083543 decision_us=154817097233 work_us=37295 dec_us=34735 sel_us=2442 confirmed=[198,248069,271,16,11] proposed=[198,248069,271,16,11,220,17]
+SHADOWv2 launch job=58 epoch=17 request=259 pos0=76 anchor=11 n_max=7
+SHADOWv2 job=58 epoch=17 request=259 pos0=76 anchor=11 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154817314189 decision_us=154817329161 work_us=38075 dec_us=35275 sel_us=2679 confirmed=[220,22,11,220,23] proposed=[220,22,11,220,23,11,220]
+SHADOWv2 launch job=59 epoch=17 request=259 pos0=96 anchor=17 n_max=7
+SHADOWv2 job=59 epoch=17 request=259 pos0=96 anchor=17 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154817544386 decision_us=154817551362 work_us=40931 dec_us=34943 sel_us=5853 confirmed=[11,220,16,18,11] proposed=[11,220,16,18,11,220,16]
+SHADOWv2 launch job=60 epoch=17 request=259 pos0=116 anchor=22 n_max=7
+SHADOWv2 job=60 epoch=17 request=259 pos0=116 anchor=22 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154817766417 decision_us=154817772552 work_us=39510 dec_us=37049 sel_us=2349 confirmed=[11,220,16,23,11] proposed=[11,220,16,23,11,220,16]
+SHADOWv2 launch job=61 epoch=17 request=259 pos0=136 anchor=17 n_max=7
+SHADOWv2 job=61 epoch=17 request=259 pos0=136 anchor=17 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154817981993 decision_us=154817993619 work_us=36186 dec_us=33160 sel_us=2939 confirmed=[11,220,17,18,11] proposed=[11,220,17,18,11,220,17]
+SHADOWv2 launch job=62 epoch=17 request=259 pos0=156 anchor=22 n_max=7
+SHADOWv2 job=62 epoch=17 request=259 pos0=156 anchor=22 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154818201671 decision_us=154818214362 work_us=34700 dec_us=31908 sel_us=2642 confirmed=[11,220,17,23,11] proposed=[11,220,17,23,11,220,17]
+SHADOWv2 launch job=63 epoch=17 request=259 pos0=176 anchor=17 n_max=7
+SHADOWv2 job=63 epoch=17 request=259 pos0=176 anchor=17 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154818427051 decision_us=154818433082 work_us=38962 dec_us=36249 sel_us=2642 confirmed=[11,220,18,18,11] proposed=[11,220,18,18,11,220,18]
+SHADOWv2 launch job=64 epoch=17 request=259 pos0=196 anchor=22 n_max=7
+SHADOWv2 job=64 epoch=17 request=259 pos0=196 anchor=22 c=4 d=7 matched=4 prefix_ok=1 position_ok=1 ready=1 remaining=3 usable=1 usable_tokens=3 done_us=154818642539 decision_us=154818659455 work_us=36021 dec_us=33420 sel_us=2462 confirmed=[11,220,18,23] proposed=[11,220,18,23,11,220,18]
+0.31.522.799 I shadow auxiliary: launched=64 skipped_busy=0 skipped_throttle=192 ready=53 late=10 prefix_match=47 prefix_mismatch=16 usable_blocks=41 usable_tokens=100 errors=0
+0.31.522.800 I shadow accounting: observed=63 cancelled=1 pending=0 skipped_invalid=0 epoch=17
+0.31.522.802 I shadow stages: worker_us=2607664 decode_us=2342104 selector_us=256888 inject_submit_us=261357 stage_us=18526 late_total_ms=107.5 late_max_ms=70.8
+0.31.524.828 I shadow auxiliary: launched=64 skipped_busy=0 skipped_throttle=192 ready=53 late=10 prefix_match=47 prefix_mismatch=16 usable_blocks=41 usable_tokens=100 errors=0
+0.31.524.830 I shadow accounting: observed=63 cancelled=1 pending=0 skipped_invalid=0 epoch=18
+0.31.524.866 I shadow stages: worker_us=2607664 decode_us=2342104 selector_us=256888 inject_submit_us=261357 stage_us=18526 late_total_ms=107.5 late_max_ms=70.8
+0.31.539.354 I slot launch_slot_: id  0 | task 305 | processing task, is_child = 0
+SHADOWv2 launch job=65 epoch=20 request=305 pos0=29 anchor=248068 n_max=7
+SHADOWv2 job=65 epoch=20 request=305 pos0=29 anchor=248068 c=2 d=7 matched=0 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=154819187657 decision_us=154819192091 work_us=37537 dec_us=32523 sel_us=4880 confirmed=[198,760] proposed=[11,3655,11,1042,579,3165,264]
+SHADOWv2 launch job=66 epoch=20 request=305 pos0=41 anchor=2512 n_max=7
+SHADOWv2 job=66 epoch=20 request=305 pos0=41 anchor=2512 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154819404773 decision_us=154819422025 work_us=36377 dec_us=33424 sel_us=2799 confirmed=[1510,18479,17885,63,421] proposed=[1510,18479,17885,63,421,4829,264]
+SHADOWv2 launch job=67 epoch=20 request=305 pos0=55 anchor=449 n_max=7
+SHADOWv2 job=67 epoch=20 request=305 pos0=55 anchor=449 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154819607628 decision_us=154819602699 work_us=40547 dec_us=36698 sel_us=3715 confirmed=[3010,321] proposed=[3010,321,264,15673,314,22373,303]
+SHADOWv2 launch job=68 epoch=20 request=305 pos0=70 anchor=4101 n_max=7
+SHADOWv2 job=68 epoch=20 request=305 pos0=70 anchor=4101 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154819891952 decision_us=154819908041 work_us=37229 dec_us=34336 sel_us=2753 confirmed=[11,1575,1676] proposed=[11,1575,44145,290,10562,3269,7873]
+SHADOWv2 launch job=69 epoch=20 request=305 pos0=82 anchor=5759 n_max=7
+SHADOWv2 job=69 epoch=20 request=305 pos0=82 anchor=5759 c=1 d=7 matched=0 prefix_ok=0 position_ok=1 ready=1 remaining=6 usable=0 usable_tokens=0 done_us=154820118800 decision_us=154820128502 work_us=36381 dec_us=33704 sel_us=2539 confirmed=[821] proposed=[411,25,198,16,13,561,10562]
+SHADOWv2 launch job=70 epoch=20 request=305 pos0=95 anchor=1473 n_max=7
+SHADOWv2 job=70 epoch=20 request=305 pos0=95 anchor=1473 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=154820380289 decision_us=154820382724 work_us=41371 dec_us=38677 sel_us=2552 confirmed=[3010,314] proposed=[3010,198,18,13,68230,15673,314]
+SHADOWv2 launch job=71 epoch=20 request=305 pos0=111 anchor=5976 n_max=7
+SHADOWv2 job=71 epoch=20 request=305 pos0=111 anchor=5976 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154820640645 decision_us=154820656235 work_us=37366 dec_us=34351 sel_us=2860 confirmed=[10562,3269,25] proposed=[10562,3269,7873,25,198,12,5183]
+SHADOWv2 launch job=72 epoch=20 request=305 pos0=125 anchor=76991 n_max=7
+SHADOWv2 job=72 epoch=20 request=305 pos0=125 anchor=76991 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154820872493 decision_us=154820885499 work_us=37394 dec_us=34346 sel_us=2877 confirmed=[3269,1754,4139,198,12] proposed=[3269,1754,4139,198,12,38754,279]
+SHADOWv2 launch job=73 epoch=20 request=305 pos0=140 anchor=424 n_max=7
+SHADOWv2 job=73 epoch=20 request=305 pos0=140 anchor=424 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154821122155 decision_us=154821137658 work_us=35950 dec_us=33075 sel_us=2746 confirmed=[303,40790,364] proposed=[303,40790,2394,279,1156,4439,364]
+SHADOWv2 launch job=74 epoch=20 request=305 pos0=150 anchor=4439 n_max=7
+SHADOWv2 job=74 epoch=20 request=305 pos0=150 anchor=4439 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154821338829 decision_us=154821358094 work_us=36006 dec_us=32988 sel_us=2858 confirmed=[303,40790,13,198,248069] proposed=[303,40790,13,198,248069,271,2]
+SHADOWv2 launch job=75 epoch=20 request=305 pos0=164 anchor=15598 n_max=7
+SHADOWv2 job=75 epoch=20 request=305 pos0=164 anchor=15598 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154821556250 decision_us=154821573878 work_us=36378 dec_us=33321 sel_us=2931 confirmed=[5720,271,71093,12305,198] proposed=[5720,271,71093,12305,198,727,10562]
+SHADOWv2 launch job=76 epoch=20 request=305 pos0=185 anchor=198 n_max=7
+SHADOWv2 job=76 epoch=20 request=305 pos0=185 anchor=198 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=154821863961 decision_us=154821866247 work_us=38173 dec_us=35401 sel_us=2639 confirmed=[262,93501] proposed=[262,8535,16587,10293,13719,401,67075]
+SHADOWv2 launch job=77 epoch=20 request=305 pos0=194 anchor=55228 n_max=7
+SHADOWv2 job=77 epoch=20 request=305 pos0=194 anchor=55228 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154822058569 decision_us=154822053066 work_us=39923 dec_us=37362 sel_us=2487 confirmed=[296,191521] proposed=[296,191521,6154,38754,15495,13,198]
+SHADOWv2 launch job=78 epoch=20 request=305 pos0=205 anchor=39196 n_max=7
+SHADOWv2 job=78 epoch=20 request=305 pos0=205 anchor=39196 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154822250828 decision_us=154822242175 work_us=43382 dec_us=40891 sel_us=2372 confirmed=[13719,37114] proposed=[13719,37114,2499,13,198,262,4071]
+SHADOWv2 launch job=79 epoch=20 request=305 pos0=213 anchor=3889 n_max=7
+0.35.154.334 I shadow auxiliary: launched=79 skipped_busy=0 skipped_throttle=234 ready=64 late=13 prefix_match=54 prefix_mismatch=23 usable_blocks=45 usable_tokens=108 errors=0
+0.35.154.334 I shadow accounting: observed=77 cancelled=1 pending=1 skipped_invalid=0 epoch=20
+0.35.154.404 I shadow stages: worker_us=3184059 decode_us=2872798 selector_us=300537 inject_submit_us=314747 stage_us=22278 late_total_ms=126.6 late_max_ms=70.8
+SHADOWv2 cancel job=79 epoch=20 reason=context_reset
+0.35.156.316 I shadow auxiliary: launched=79 skipped_busy=0 skipped_throttle=234 ready=64 late=13 prefix_match=54 prefix_mismatch=23 usable_blocks=45 usable_tokens=108 errors=0
+0.35.156.317 I shadow accounting: observed=77 cancelled=2 pending=0 skipped_invalid=0 epoch=21
+0.35.156.318 I shadow stages: worker_us=3184059 decode_us=2872798 selector_us=300537 inject_submit_us=314747 stage_us=22278 late_total_ms=126.6 late_max_ms=70.8
+0.35.175.190 I slot launch_slot_: id  0 | task 375 | processing task, is_child = 0
+SHADOWv2 launch job=80 epoch=23 request=375 pos0=13860 anchor=7189 n_max=7
+SHADOWv2 job=80 epoch=23 request=375 pos0=13860 anchor=7189 c=3 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154844521354 decision_us=154844535652 work_us=45289 dec_us=41442 sel_us=3632 confirmed=[321,10033,279] proposed=[321,10229,279,1822,17793,321,1822]
+SHADOWv2 launch job=81 epoch=23 request=375 pos0=13877 anchor=25 n_max=7
+SHADOWv2 job=81 epoch=23 request=375 pos0=13877 anchor=25 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154844778868 decision_us=154844770945 work_us=48914 dec_us=46006 sel_us=2782 confirmed=[271,760] proposed=[271,21765,506,279,7189,25,198]
+SHADOWv2 launch job=82 epoch=23 request=375 pos0=13891 anchor=18 n_max=7
+SHADOWv2 job=82 epoch=23 request=375 pos0=13891 anchor=18 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=154845012624 decision_us=154845004562 work_us=57118 dec_us=52446 sel_us=4534 confirmed=[16,24,318] proposed=[16,24,318,18,15,15,7189]
+SHADOWv2 launch job=83 epoch=23 request=375 pos0=13903 anchor=25 n_max=7
+SHADOWv2 job=83 epoch=23 request=375 pos0=13903 anchor=25 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=154845275283 decision_us=154845266176 work_us=53060 dec_us=50695 sel_us=2267 confirmed=[198,12,179016] proposed=[198,12,179016,318,43268,8,198]
+SHADOWv2 launch job=84 epoch=23 request=375 pos0=13915 anchor=17 n_max=7
+SHADOWv2 job=84 epoch=23 request=375 pos0=13915 anchor=17 c=5 d=7 matched=4 prefix_ok=0 position_ok=1 ready=1 remaining=2 usable=0 usable_tokens=0 done_us=154845579150 decision_us=154845587554 work_us=46907 dec_us=42624 sel_us=4051 confirmed=[198,12,214614,318,13646] proposed=[198,12,214614,318,8911,1590,23709]
+SHADOWv2 launch job=85 epoch=23 request=375 pos0=13931 anchor=80090 n_max=7
+SHADOWv2 job=85 epoch=23 request=375 pos0=13931 anchor=80090 c=4 d=7 matched=3 prefix_ok=0 position_ok=1 ready=1 remaining=3 usable=0 usable_tokens=0 done_us=154845925144 decision_us=154845936034 work_us=46190 dec_us=42805 sel_us=3219 confirmed=[318,33413,1590,23709] proposed=[318,33413,1590,220,17,15,12]
+SHADOWv2 launch job=86 epoch=23 request=375 pos0=13947 anchor=80068 n_max=7
+SHADOWv2 job=86 epoch=23 request=375 pos0=13947 anchor=80068 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154846173403 decision_us=154846173336 work_us=47626 dec_us=44801 sel_us=2603 confirmed=[1590,12339] proposed=[1590,12339,539,220,18,15,198]
+SHADOWv2 launch job=87 epoch=23 request=375 pos0=13958 anchor=31456 n_max=7
+SHADOWv2 job=87 epoch=23 request=375 pos0=13958 anchor=31456 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154846435061 decision_us=154846423993 work_us=48920 dec_us=45730 sel_us=3059 confirmed=[25,12339] proposed=[25,2610,539,264,31456,271,9764]
+SHADOWv2 launch job=88 epoch=23 request=375 pos0=13971 anchor=10229 n_max=7
+SHADOWv2 job=88 epoch=23 request=375 pos0=13971 anchor=10229 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=1 remaining=5 usable=0 usable_tokens=0 done_us=154846676437 decision_us=154846682589 work_us=48088 dec_us=42107 sel_us=5809 confirmed=[279,2250] proposed=[279,12261,25,271,332,51,9024]
+SHADOWv2 launch job=89 epoch=23 request=375 pos0=13990 anchor=29922 n_max=7
+SHADOWv2 job=89 epoch=23 request=375 pos0=13990 anchor=29922 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154847055030 decision_us=154847061231 work_us=49996 dec_us=47256 sel_us=2602 confirmed=[310,220,18,21,29922] proposed=[310,220,18,21,29922,332,198]
+SHADOWv2 launch job=90 epoch=23 request=375 pos0=14002 anchor=38495 n_max=7
+SHADOWv2 job=90 epoch=23 request=375 pos0=14002 anchor=38495 c=3 d=7 matched=3 prefix_ok=1 position_ok=1 ready=1 remaining=4 usable=1 usable_tokens=4 done_us=154847268978 decision_us=154847275310 work_us=44499 dec_us=40927 sel_us=3415 confirmed=[5215,25,220] proposed=[5215,25,220,17,15,11,220]
+SHADOWv2 launch job=91 epoch=23 request=375 pos0=14020 anchor=11 n_max=7
+SHADOWv2 job=91 epoch=23 request=375 pos0=14020 anchor=11 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154847525435 decision_us=154847533837 work_us=45914 dec_us=41992 sel_us=3794 confirmed=[220,17,19,11,220] proposed=[220,17,19,11,220,17,20]
+1.00.423.908 I shadow auxiliary: launched=91 skipped_busy=0 skipped_throttle=273 ready=71 late=18 prefix_match=60 prefix_mismatch=29 usable_blocks=48 usable_tokens=116 errors=0
+1.00.423.909 I shadow accounting: observed=89 cancelled=2 pending=0 skipped_invalid=0 epoch=23
+1.00.423.910 I shadow stages: worker_us=3766580 decode_us=3411629 selector_us=342304 inject_submit_us=917238 stage_us=199497 late_total_ms=162.8 late_max_ms=70.8
+1.00.428.048 I shadow auxiliary: launched=91 skipped_busy=0 skipped_throttle=273 ready=71 late=18 prefix_match=60 prefix_mismatch=29 usable_blocks=48 usable_tokens=116 errors=0
+1.00.428.051 I shadow accounting: observed=89 cancelled=2 pending=0 skipped_invalid=0 epoch=24
+1.00.428.052 I shadow stages: worker_us=3766580 decode_us=3411629 selector_us=342304 inject_submit_us=917238 stage_us=199497 late_total_ms=162.8 late_max_ms=70.8
+1.00.444.871 I slot launch_slot_: id  0 | task 662 | processing task, is_child = 0
+SHADOWv2 launch job=92 epoch=26 request=662 pos0=13851 anchor=248068 n_max=7
+SHADOWv2 job=92 epoch=26 request=662 pos0=13851 anchor=248068 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154869646919 decision_us=154869635441 work_us=57604 dec_us=53104 sel_us=4371 confirmed=[198,760] proposed=[198,16,13,220,178719,78718,178719]
+SHADOWv2 launch job=93 epoch=26 request=662 pos0=13863 anchor=279 n_max=7
+SHADOWv2 job=93 epoch=26 request=662 pos0=13863 anchor=279 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154869881449 decision_us=154869884874 work_us=50603 dec_us=47629 sel_us=2813 confirmed=[2250,1822,17793,440,13769] proposed=[2250,1822,17793,440,13769,9989,13]
+SHADOWv2 launch job=94 epoch=26 request=662 pos0=13879 anchor=760 n_max=7
+SHADOWv2 job=94 epoch=26 request=662 pos0=13879 anchor=760 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154870111817 decision_us=154870111601 work_us=45563 dec_us=42209 sel_us=3158 confirmed=[7189,708] proposed=[7189,708,1472,25,198,12,220]
+SHADOWv2 launch job=95 epoch=26 request=662 pos0=13894 anchor=318 n_max=7
+SHADOWv2 job=95 epoch=26 request=662 pos0=13894 anchor=318 c=2 d=7 matched=1 prefix_ok=0 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154870362747 decision_us=154870349736 work_us=53976 dec_us=51489 sel_us=2368 confirmed=[18,17] proposed=[18,16,24,7189,553,8618,682]
+SHADOWv2 launch job=96 epoch=26 request=662 pos0=13906 anchor=179016 n_max=7
+SHADOWv2 job=96 epoch=26 request=662 pos0=13906 anchor=179016 c=2 d=7 matched=2 prefix_ok=1 position_ok=1 ready=0 remaining=5 usable=0 usable_tokens=0 done_us=154870621070 decision_us=154870610308 work_us=51085 dec_us=47747 sel_us=3239 confirmed=[318,43268] proposed=[318,43268,8,198,12,214614,318]
+SHADOWv2 launch job=97 epoch=26 request=662 pos0=13923 anchor=539 n_max=7
+SHADOWv2 job=97 epoch=26 request=662 pos0=13923 anchor=539 c=4 d=7 matched=4 prefix_ok=1 position_ok=1 ready=1 remaining=3 usable=1 usable_tokens=3 done_us=154871055742 decision_us=154871068696 work_us=49169 dec_us=45381 sel_us=3448 confirmed=[220,16,22,1754] proposed=[220,16,22,1754,3150,198,12]
+SHADOWv2 launch job=98 epoch=26 request=662 pos0=13935 anchor=23709 n_max=7
+SHADOWv2 job=98 epoch=26 request=662 pos0=13935 anchor=23709 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154871292272 decision_us=154871305682 work_us=46795 dec_us=43618 sel_us=2992 confirmed=[220,17,15,12,18] proposed=[220,17,15,12,18,21,198]
+SHADOWv2 launch job=99 epoch=26 request=662 pos0=13950 anchor=539 n_max=7
+SHADOWv2 job=99 epoch=26 request=662 pos0=13950 anchor=539 c=4 d=7 matched=4 prefix_ok=1 position_ok=1 ready=1 remaining=3 usable=1 usable_tokens=3 done_us=154871571886 decision_us=154871582331 work_us=46586 dec_us=43463 sel_us=2973 confirmed=[220,18,16,1754] proposed=[220,18,16,1754,854,198,12]
+SHADOWv2 launch job=100 epoch=26 request=662 pos0=13960 anchor=12339 n_max=7
+SHADOWv2 job=100 epoch=26 request=662 pos0=13960 anchor=12339 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=0 remaining=4 usable=0 usable_tokens=0 done_us=154871791670 decision_us=154871791166 work_us=52700 dec_us=49900 sel_us=2693 confirmed=[539,220,16] proposed=[539,220,18,16,1754,854,271]
+SHADOWv2 launch job=101 epoch=26 request=662 pos0=13973 anchor=2250 n_max=7
+SHADOWv2 job=101 epoch=26 request=662 pos0=13973 anchor=2250 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154872039742 decision_us=154872048043 work_us=48067 dec_us=41665 sel_us=6270 confirmed=[1822,17793,25,271,332] proposed=[1822,17793,25,271,332,51,9024]
+SHADOWv2 launch job=102 epoch=26 request=662 pos0=13995 anchor=29922 n_max=7
+SHADOWv2 job=102 epoch=26 request=662 pos0=13995 anchor=29922 c=3 d=7 matched=2 prefix_ok=0 position_ok=1 ready=1 remaining=4 usable=0 usable_tokens=0 done_us=154872412651 decision_us=154872416699 work_us=47450 dec_us=44059 sel_us=3100 confirmed=[332,198,760] proposed=[332,198,12,351,25,198,12]
+SHADOWv2 launch job=103 epoch=26 request=662 pos0=14005 anchor=220 n_max=7
+SHADOWv2 job=103 epoch=26 request=662 pos0=14005 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154872634149 decision_us=154872640820 work_us=48333 dec_us=45676 sel_us=2537 confirmed=[17,15,11,220,17] proposed=[17,15,11,220,17,16,11]
+SHADOWv2 launch job=104 epoch=26 request=662 pos0=14025 anchor=220 n_max=7
+SHADOWv2 job=104 epoch=26 request=662 pos0=14025 anchor=220 c=5 d=7 matched=5 prefix_ok=1 position_ok=1 ready=1 remaining=2 usable=1 usable_tokens=2 done_us=154872886211 decision_us=154872902075 work_us=47332 dec_us=43884 sel_us=3170 confirmed=[17,20,11,220,17] proposed=[17,20,11,220,17,21,11]
+1.24.994.469 I shadow auxiliary: launched=104 skipped_busy=0 skipped_throttle=311 ready=79 late=23 prefix_match=69 prefix_mismatch=33 usable_blocks=55 usable_tokens=132 errors=0
+1.24.994.469 I shadow accounting: observed=102 cancelled=2 pending=0 skipped_invalid=0 epoch=26
+1.24.994.470 I shadow stages: worker_us=4411843 decode_us=4011453 selector_us=385436 inject_submit_us=1528713 stage_us=378941 late_total_ms=198.8 late_max_ms=70.8
+1.24.998.055 I shadow auxiliary: launched=104 skipped_busy=0 skipped_throttle=311 ready=79 late=23 prefix_match=69 prefix_mismatch=33 usable_blocks=55 usable_tokens=132 errors=0
+1.24.998.056 I shadow accounting: observed=102 cancelled=2 pending=0 skipped_invalid=0 epoch=27
+1.24.998.057 I shadow stages: worker_us=4411843 decode_us=4011453 selector_us=385436 inject_submit_us=1528713 stage_us=378941 late_total_ms=198.8 late_max_ms=70.8
+1.25.021.419 I shadow auxiliary: launched=104 skipped_busy=0 skipped_throttle=311 ready=79 late=23 prefix_match=69 prefix_mismatch=33 usable_blocks=55 usable_tokens=132 errors=0
+1.25.021.422 I shadow accounting: observed=102 cancelled=2 pending=0 skipped_invalid=0 epoch=28
+1.25.021.423 I shadow stages: worker_us=4411843 decode_us=4011453 selector_us=385436 inject_submit_us=1528713 stage_us=378941 late_total_ms=198.8 late_max_ms=70.8

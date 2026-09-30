@@ -1,0 +1,402 @@
+{
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-base.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-base.so.0.23.0",
+    "sha256": "5de029414ced287ff59599adf1bb199082f9da822fc329cdf84f31a4ad356c56"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-base.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-base.so.0.23.0",
+    "sha256": "5de029414ced287ff59599adf1bb199082f9da822fc329cdf84f31a4ad356c56"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-base.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-base.so.0.23.0",
+    "sha256": "5de029414ced287ff59599adf1bb199082f9da822fc329cdf84f31a4ad356c56"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cpu.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cpu.so.0.23.0",
+    "sha256": "e38e474797f49ab9f613b32aef754afd056b2c2bdb24879daed8aa18f53ffb26"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cpu.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cpu.so.0.23.0",
+    "sha256": "e38e474797f49ab9f613b32aef754afd056b2c2bdb24879daed8aa18f53ffb26"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cpu.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cpu.so.0.23.0",
+    "sha256": "e38e474797f49ab9f613b32aef754afd056b2c2bdb24879daed8aa18f53ffb26"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cuda.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cuda.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cuda.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cuda.so.0.pre-kvarn-20260925": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-cuda.so.0.pre-kvarn-20260925",
+    "sha256": "a746aff45c10d33cefe391db2d979c49ef8d9186949ce2dbf4cf2504db623765"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-vulkan.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-vulkan.so.0.23.0",
+    "sha256": "f5e5c2fca6d929249a080e44145876e94715673d67a4fd0bdcc2d937681e1639"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-vulkan.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-vulkan.so.0.23.0",
+    "sha256": "f5e5c2fca6d929249a080e44145876e94715673d67a4fd0bdcc2d937681e1639"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-vulkan.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml-vulkan.so.0.23.0",
+    "sha256": "f5e5c2fca6d929249a080e44145876e94715673d67a4fd0bdcc2d937681e1639"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml.so.0.23.0",
+    "sha256": "17a1d0ed2a886ec2ce815212dc7537533ed397db16c80b984681f6fcceef79b4"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml.so.0.23.0",
+    "sha256": "17a1d0ed2a886ec2ce815212dc7537533ed397db16c80b984681f6fcceef79b4"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/build-bin/libggml.so.0.23.0",
+    "sha256": "17a1d0ed2a886ec2ce815212dc7537533ed397db16c80b984681f6fcceef79b4"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-base.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-base.so.0.23.0",
+    "sha256": "2c71ef57e82e8b3454aa86b35aa4653b4040dbb5d490a23edc2c5215e7c924bd"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-base.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-base.so.0.23.0",
+    "sha256": "2c71ef57e82e8b3454aa86b35aa4653b4040dbb5d490a23edc2c5215e7c924bd"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-base.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-base.so.0.23.0",
+    "sha256": "2c71ef57e82e8b3454aa86b35aa4653b4040dbb5d490a23edc2c5215e7c924bd"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-cpu.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-cpu.so",
+    "sha256": "e01dc244ba1141526b6f5dae07012a5cf1efbe734ac00353564d86042a349980"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-cuda.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-cuda.so",
+    "sha256": "d6569280fdddf41a27562eea02c5e235d60566ee51e8e2aa10801b3e5f66bce2"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-cuda.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-cuda.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-rpc.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml-rpc.so",
+    "sha256": "55a6d7f75a36c42e984b1ca13da855201c585ef0b508708461e892f7edb88a55"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml.so.0.23.0",
+    "sha256": "e6c3def4a97f24383be53acc1b90f9dec527eb69569dc4a4f146719855795f59"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml.so.0.23.0",
+    "sha256": "e6c3def4a97f24383be53acc1b90f9dec527eb69569dc4a4f146719855795f59"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libggml.so.0.23.0",
+    "sha256": "e6c3def4a97f24383be53acc1b90f9dec527eb69569dc4a4f146719855795f59"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama-common.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama-common.so.0.4.7",
+    "sha256": "c25f63ad830276ea6db9b9e5b6ae7c1cba6be2fccf6990ed5ff0da8e19ef5bfe"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama-common.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama-common.so.0.4.7",
+    "sha256": "c25f63ad830276ea6db9b9e5b6ae7c1cba6be2fccf6990ed5ff0da8e19ef5bfe"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama-common.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama-common.so.0.4.7",
+    "sha256": "c25f63ad830276ea6db9b9e5b6ae7c1cba6be2fccf6990ed5ff0da8e19ef5bfe"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama-server-impl.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama-server-impl.so",
+    "sha256": "ef637e59dc215216a2c7dd0386497417f4b614f4cfbdecd2107ccee84f52c871"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama.so.0.4.7",
+    "sha256": "7695238cbc1416d1fa11d86ed10705e7cda0142d089d2422ef1806daf71d0955"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama.so.0.4.7",
+    "sha256": "7695238cbc1416d1fa11d86ed10705e7cda0142d089d2422ef1806daf71d0955"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libllama.so.0.4.7",
+    "sha256": "7695238cbc1416d1fa11d86ed10705e7cda0142d089d2422ef1806daf71d0955"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libmtmd.so": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libmtmd.so.0.4.7",
+    "sha256": "8c697d1e8112fdce76db6b92450c7d664d82f8fbe989d911046f1fa70536a803"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libmtmd.so.0": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libmtmd.so.0.4.7",
+    "sha256": "8c697d1e8112fdce76db6b92450c7d664d82f8fbe989d911046f1fa70536a803"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libmtmd.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/libmtmd.so.0.4.7",
+    "sha256": "8c697d1e8112fdce76db6b92450c7d664d82f8fbe989d911046f1fa70536a803"
+  },
+  "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/llama-server": {
+    "resolved": "/home/hjotha/beellama-baseline-spec-verify-20260929/dl-bin/llama-server",
+    "sha256": "bda17a8cb9beee2bb7de875d11401374f3cff538fc8bf7b1ecbac2b5388d3585"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-base.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-base.so.0.23.0",
+    "sha256": "5de029414ced287ff59599adf1bb199082f9da822fc329cdf84f31a4ad356c56"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-base.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-base.so.0.23.0",
+    "sha256": "5de029414ced287ff59599adf1bb199082f9da822fc329cdf84f31a4ad356c56"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-base.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-base.so.0.23.0",
+    "sha256": "5de029414ced287ff59599adf1bb199082f9da822fc329cdf84f31a4ad356c56"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cpu.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cpu.so.0.23.0",
+    "sha256": "e38e474797f49ab9f613b32aef754afd056b2c2bdb24879daed8aa18f53ffb26"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cpu.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cpu.so.0.23.0",
+    "sha256": "e38e474797f49ab9f613b32aef754afd056b2c2bdb24879daed8aa18f53ffb26"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cpu.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cpu.so.0.23.0",
+    "sha256": "e38e474797f49ab9f613b32aef754afd056b2c2bdb24879daed8aa18f53ffb26"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0.pre-kvarn-20260925": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-cuda.so.0.pre-kvarn-20260925",
+    "sha256": "a746aff45c10d33cefe391db2d979c49ef8d9186949ce2dbf4cf2504db623765"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so.0.23.0",
+    "sha256": "f5e5c2fca6d929249a080e44145876e94715673d67a4fd0bdcc2d937681e1639"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so.0.23.0",
+    "sha256": "f5e5c2fca6d929249a080e44145876e94715673d67a4fd0bdcc2d937681e1639"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so.0.23.0",
+    "sha256": "f5e5c2fca6d929249a080e44145876e94715673d67a4fd0bdcc2d937681e1639"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml.so.0.23.0",
+    "sha256": "17a1d0ed2a886ec2ce815212dc7537533ed397db16c80b984681f6fcceef79b4"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml.so.0.23.0",
+    "sha256": "17a1d0ed2a886ec2ce815212dc7537533ed397db16c80b984681f6fcceef79b4"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libggml.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libggml.so.0.23.0",
+    "sha256": "17a1d0ed2a886ec2ce815212dc7537533ed397db16c80b984681f6fcceef79b4"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-batched-bench-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-batched-bench-impl.so",
+    "sha256": "06e0896f088be6dd5ea1843a86284215ea2fa38e6c86aba8fbd8ba5f40618508"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-bench-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-bench-impl.so",
+    "sha256": "1e4662ba91e5b3330464a03618f98c33453e5998769fbb312d8a18261e24c48a"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-cli-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-cli-impl.so",
+    "sha256": "87de8f644b584561a225f87c1f4fac3fd3cc972b3b3763a4ee0a54f0e055af1e"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-common.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0.4.7",
+    "sha256": "2de25bab96381c153aa34e945ec0597b4517fe7b2bd7543df0d2eacf7aa58f1b"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0.4.7",
+    "sha256": "2de25bab96381c153aa34e945ec0597b4517fe7b2bd7543df0d2eacf7aa58f1b"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0.4.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0.4.0",
+    "sha256": "9edc27aa6fe22f2a1e5f51942b0ec2e6f9d02a3a92082335526767bba53e261a"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0.4.6": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0.4.6",
+    "sha256": "5272fddc308fe0c5b35c21e482c51409481bab97dc4561e6f2e9c95b47b9177c"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-common.so.0.4.7",
+    "sha256": "2de25bab96381c153aa34e945ec0597b4517fe7b2bd7543df0d2eacf7aa58f1b"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-completion-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-completion-impl.so",
+    "sha256": "0ce6afc3534424fdd1f8bd58ea7265ddc73931877fb5554a604a9aabad465f55"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-fit-params-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-fit-params-impl.so",
+    "sha256": "127fc0fe8515130d070ecd8f20fccd948133c17580efd91644c0e170858c0462"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-perplexity-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-perplexity-impl.so",
+    "sha256": "0773b7c9c7408725f0ff1efce62204c9ae14407c7869f8a2ffa27bd6bbb4f52c"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-quantize-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-quantize-impl.so",
+    "sha256": "7463d7f789efb93f53f94630e1bd6585d8e46b09973d75f8411fcf605c888977"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama-server-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama-server-impl.so",
+    "sha256": "44e1f0790fcd50229b96cf21945e3d78483c45e054595cd814410df77a8706d3"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama.so.0.4.7",
+    "sha256": "e27ccc45936529fe1806d2d37f1aed802a5c849e80eea5220f4e68fef74293d5"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama.so.0.4.7",
+    "sha256": "e27ccc45936529fe1806d2d37f1aed802a5c849e80eea5220f4e68fef74293d5"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama.so.0.4.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama.so.0.4.0",
+    "sha256": "dd40048393091c15403deb4b8735ece0e6cada18d12d37861b899e257d0b1446"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama.so.0.4.6": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama.so.0.4.6",
+    "sha256": "9a93d78a13a4c18fd81c0e159d166b5bc2bb41c1aa57d6c0ce6b4a709bcfc4bc"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libllama.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libllama.so.0.4.7",
+    "sha256": "e27ccc45936529fe1806d2d37f1aed802a5c849e80eea5220f4e68fef74293d5"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libmtmd.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.7",
+    "sha256": "40099baf2b2a197e1e10c2f5f286395030524188a38b214965a1c36af0293475"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.7",
+    "sha256": "40099baf2b2a197e1e10c2f5f286395030524188a38b214965a1c36af0293475"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.0",
+    "sha256": "1fc5576a17f5fdd30cc382cad8fd7e913d0b2dd2027a6d756812d9978f913df1"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.6": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.6",
+    "sha256": "b7a28349a28e3bdad51ab4e18c5202670d212512f71665c3483c5f2c73f0b4cb"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/libmtmd.so.0.4.7",
+    "sha256": "40099baf2b2a197e1e10c2f5f286395030524188a38b214965a1c36af0293475"
+  },
+  "/home/hjotha/beellama.cpp/build/bin/llama-server": {
+    "resolved": "/home/hjotha/beellama.cpp/build/bin/llama-server",
+    "sha256": "f69816f7dfd1c832d4423ba3a7a4951eca893aabaac463ff3e2d824455627205"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-base.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-base.so.0.23.0",
+    "sha256": "2c71ef57e82e8b3454aa86b35aa4653b4040dbb5d490a23edc2c5215e7c924bd"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-base.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-base.so.0.23.0",
+    "sha256": "2c71ef57e82e8b3454aa86b35aa4653b4040dbb5d490a23edc2c5215e7c924bd"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-base.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-base.so.0.23.0",
+    "sha256": "2c71ef57e82e8b3454aa86b35aa4653b4040dbb5d490a23edc2c5215e7c924bd"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-cpu.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-cpu.so",
+    "sha256": "e01dc244ba1141526b6f5dae07012a5cf1efbe734ac00353564d86042a349980"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-cuda.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-cuda.so",
+    "sha256": "d6569280fdddf41a27562eea02c5e235d60566ee51e8e2aa10801b3e5f66bce2"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-cuda.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-cuda.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-cuda.so.0.23.0",
+    "sha256": "625f2b0d4af7bcf92b0f2e741a6ca677ae78bf677edb1dbac926500c8c53a9ff"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-rpc.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml-rpc.so",
+    "sha256": "55a6d7f75a36c42e984b1ca13da855201c585ef0b508708461e892f7edb88a55"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml.so.0.23.0",
+    "sha256": "e6c3def4a97f24383be53acc1b90f9dec527eb69569dc4a4f146719855795f59"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml.so.0.23.0",
+    "sha256": "e6c3def4a97f24383be53acc1b90f9dec527eb69569dc4a4f146719855795f59"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml.so.0.23.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libggml.so.0.23.0",
+    "sha256": "e6c3def4a97f24383be53acc1b90f9dec527eb69569dc4a4f146719855795f59"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7",
+    "sha256": "f6d97e864a4394e715e546333137ad690f7bf2c5f4775a89dfb188782df003c4"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7",
+    "sha256": "f6d97e864a4394e715e546333137ad690f7bf2c5f4775a89dfb188782df003c4"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7",
+    "sha256": "f6d97e864a4394e715e546333137ad690f7bf2c5f4775a89dfb188782df003c4"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-server-impl.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-server-impl.so",
+    "sha256": "40b7bf7216b3a8d9180df6d18048402536ebc02e8956380dc185d2e3df8188db"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7",
+    "sha256": "da63773d4d3fe06853841b42b180043505b3a7b7b190ea3107158bf7a343bfa2"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7",
+    "sha256": "da63773d4d3fe06853841b42b180043505b3a7b7b190ea3107158bf7a343bfa2"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7",
+    "sha256": "da63773d4d3fe06853841b42b180043505b3a7b7b190ea3107158bf7a343bfa2"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libmtmd.so": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libmtmd.so.0.4.7",
+    "sha256": "8c697d1e8112fdce76db6b92450c7d664d82f8fbe989d911046f1fa70536a803"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libmtmd.so.0": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libmtmd.so.0.4.7",
+    "sha256": "8c697d1e8112fdce76db6b92450c7d664d82f8fbe989d911046f1fa70536a803"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libmtmd.so.0.4.7": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libmtmd.so.0.4.7",
+    "sha256": "8c697d1e8112fdce76db6b92450c7d664d82f8fbe989d911046f1fa70536a803"
+  },
+  "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/llama-server": {
+    "resolved": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/llama-server",
+    "sha256": "bda17a8cb9beee2bb7de875d11401374f3cff538fc8bf7b1ecbac2b5388d3585"
+  }
+}

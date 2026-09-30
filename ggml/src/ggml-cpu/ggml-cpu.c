@@ -1790,6 +1790,9 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+// Remote KV+attention execution (ggml-remote-attn, ggml-base). C linkage.
+extern bool ggml_remote_attn_exec(struct ggml_tensor * node);
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2179,6 +2182,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_kvarn_materialize(params, tensor);
             } break;
+        case GGML_OP_REMOTE_ATTN:
+            {
+                // Remote KV+attention: the RPC runs here (CPU backend, pinned
+                // like offload_kqv). Sources are host tensors; output is written
+                // back to this node's host buffer for the scheduler to copy.
+                if (!ggml_remote_attn_exec(tensor)) {
+                    GGML_ABORT("%s: GGML_OP_REMOTE_ATTN remote execution failed\n", __func__);
+                }
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2369,6 +2381,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_KVARN_STORE:
         case GGML_OP_KVARN_VIEW:
+        case GGML_OP_REMOTE_ATTN:
             {
                 n_tasks = 1;
             } break;

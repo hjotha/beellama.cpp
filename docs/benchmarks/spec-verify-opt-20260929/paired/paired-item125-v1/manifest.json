@@ -1,0 +1,743 @@
+{
+  "schema_version": 2,
+  "phase": "paired",
+  "run_id": "paired-item125-v1",
+  "modes": {
+    "base-snap": {
+      "env": {},
+      "libs": "snapshot",
+      "cuda": "snapshot",
+      "server_args": []
+    },
+    "base-live": {
+      "env": {},
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    },
+    "opt1": {
+      "env": {
+        "SPEC_OPT_LAZY_SNAPSHOT": "1"
+      },
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    },
+    "opt2": {
+      "env": {
+        "SPEC_OPT_SINGLE_SYNC": "1"
+      },
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    },
+    "opt12": {
+      "env": {
+        "SPEC_OPT_LAZY_SNAPSHOT": "1",
+        "SPEC_OPT_SINGLE_SYNC": "1"
+      },
+      "libs": "live",
+      "cuda": "live",
+      "server_args": []
+    }
+  },
+  "repeats": 5,
+  "long_repeats": 5,
+  "group_size": 2,
+  "port": 59595,
+  "scripts_root": "/home/hjotha/beellama.cpp/docs/benchmarks/spec-verify-opt-20260929",
+  "modes_json": "/home/hjotha/beellama.cpp/docs/benchmarks/spec-verify-opt-20260929/modes-item125.json",
+  "snapshot_root": "/home/hjotha/beellama-baseline-spec-verify-20260929",
+  "groups": [
+    {
+      "group": "g000-base-snap",
+      "round": 0,
+      "mode": "base-snap",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 1,
+          "scenario": "prosa192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g001-base-live",
+      "round": 0,
+      "mode": "base-live",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 1,
+          "scenario": "prosa192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g002-opt1",
+      "round": 0,
+      "mode": "opt1",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 1,
+          "scenario": "prosa192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g003-opt2",
+      "round": 0,
+      "mode": "opt2",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 1,
+          "scenario": "prosa192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g004-opt12",
+      "round": 0,
+      "mode": "opt12",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 0,
+          "scenario": "curto192-r000"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 0,
+          "scenario": "codigo192-r000"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 0,
+          "scenario": "prosa192-r000"
+        },
+        {
+          "case": "long192",
+          "repeat": 0,
+          "scenario": "long192-r000"
+        },
+        {
+          "case": "curto192",
+          "repeat": 1,
+          "scenario": "curto192-r001"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 1,
+          "scenario": "codigo192-r001"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 1,
+          "scenario": "prosa192-r001"
+        },
+        {
+          "case": "long192",
+          "repeat": 1,
+          "scenario": "long192-r001"
+        }
+      ]
+    },
+    {
+      "group": "g005-opt12",
+      "round": 1,
+      "mode": "opt12",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 2,
+          "scenario": "prosa192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 3,
+          "scenario": "prosa192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g006-opt2",
+      "round": 1,
+      "mode": "opt2",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 2,
+          "scenario": "prosa192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 3,
+          "scenario": "prosa192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g007-opt1",
+      "round": 1,
+      "mode": "opt1",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 2,
+          "scenario": "prosa192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 3,
+          "scenario": "prosa192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g008-base-live",
+      "round": 1,
+      "mode": "base-live",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 2,
+          "scenario": "prosa192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 3,
+          "scenario": "prosa192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g009-base-snap",
+      "round": 1,
+      "mode": "base-snap",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 2,
+          "scenario": "curto192-r002"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 2,
+          "scenario": "codigo192-r002"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 2,
+          "scenario": "prosa192-r002"
+        },
+        {
+          "case": "long192",
+          "repeat": 2,
+          "scenario": "long192-r002"
+        },
+        {
+          "case": "curto192",
+          "repeat": 3,
+          "scenario": "curto192-r003"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 3,
+          "scenario": "codigo192-r003"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 3,
+          "scenario": "prosa192-r003"
+        },
+        {
+          "case": "long192",
+          "repeat": 3,
+          "scenario": "long192-r003"
+        }
+      ]
+    },
+    {
+      "group": "g010-base-live",
+      "round": 2,
+      "mode": "base-live",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 4,
+          "scenario": "prosa192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    },
+    {
+      "group": "g011-opt1",
+      "round": 2,
+      "mode": "opt1",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 4,
+          "scenario": "prosa192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    },
+    {
+      "group": "g012-opt2",
+      "round": 2,
+      "mode": "opt2",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 4,
+          "scenario": "prosa192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    },
+    {
+      "group": "g013-opt12",
+      "round": 2,
+      "mode": "opt12",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 4,
+          "scenario": "prosa192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    },
+    {
+      "group": "g014-base-snap",
+      "round": 2,
+      "mode": "base-snap",
+      "requests": [
+        {
+          "case": "warmup64",
+          "repeat": null,
+          "scenario": "warmup64"
+        },
+        {
+          "case": "curto192",
+          "repeat": 4,
+          "scenario": "curto192-r004"
+        },
+        {
+          "case": "codigo192",
+          "repeat": 4,
+          "scenario": "codigo192-r004"
+        },
+        {
+          "case": "prosa192",
+          "repeat": 4,
+          "scenario": "prosa192-r004"
+        },
+        {
+          "case": "long192",
+          "repeat": 4,
+          "scenario": "long192-r004"
+        }
+      ]
+    }
+  ],
+  "argv": [
+    "runner.py",
+    "paired",
+    "--run-id",
+    "paired-item125-v1",
+    "--modes-json",
+    "modes-item125.json"
+  ],
+  "created_utc": "2026-09-29T16:02:32.029202+00:00",
+  "comparison_policy": "Report every first token divergence; investigate before attributing to noise."
+}

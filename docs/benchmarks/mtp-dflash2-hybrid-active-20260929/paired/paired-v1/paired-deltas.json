@@ -1,0 +1,212 @@
+[
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "curto192",
+    "repeat": 0,
+    "delta_pct": -16.99025274001318,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "codigo192",
+    "repeat": 0,
+    "delta_pct": -13.855751447315544,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "long192",
+    "repeat": 0,
+    "delta_pct": -16.43085360772474,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "curto192",
+    "repeat": 1,
+    "delta_pct": -12.210806821061936,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "codigo192",
+    "repeat": 1,
+    "delta_pct": -15.520842708926386,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "long192",
+    "repeat": 1,
+    "delta_pct": -19.215016963039268,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "curto192",
+    "repeat": 0,
+    "delta_pct": -3.235698761266914,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "codigo192",
+    "repeat": 0,
+    "delta_pct": -6.873932849641385,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "long192",
+    "repeat": 0,
+    "delta_pct": -4.096718244044128,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "curto192",
+    "repeat": 1,
+    "delta_pct": -4.692234640196446,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "codigo192",
+    "repeat": 1,
+    "delta_pct": -7.500443186933914,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "long192",
+    "repeat": 1,
+    "delta_pct": -4.1409803377912,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "curto192",
+    "repeat": 2,
+    "delta_pct": -3.300387803315108,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "codigo192",
+    "repeat": 2,
+    "delta_pct": -7.175296434711253,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "long192",
+    "repeat": 2,
+    "delta_pct": -4.173990677794559,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "curto192",
+    "repeat": 3,
+    "delta_pct": -4.936378010990328,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "codigo192",
+    "repeat": 3,
+    "delta_pct": -7.659445111086849,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "long192",
+    "repeat": 3,
+    "delta_pct": -5.611438767686305,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "curto192",
+    "repeat": 2,
+    "delta_pct": -13.039800206012043,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "codigo192",
+    "repeat": 2,
+    "delta_pct": -12.619893628561163,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "long192",
+    "repeat": 2,
+    "delta_pct": -19.86184830013493,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "curto192",
+    "repeat": 3,
+    "delta_pct": -15.532574181581015,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "codigo192",
+    "repeat": 3,
+    "delta_pct": -17.71232357188722,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "long192",
+    "repeat": 3,
+    "delta_pct": -17.207025026256773,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "curto192",
+    "repeat": 4,
+    "delta_pct": -10.98059500713603,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "codigo192",
+    "repeat": 4,
+    "delta_pct": -16.887382788374804,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp2-v4-e1",
+    "case": "long192",
+    "repeat": 4,
+    "delta_pct": -21.66484289585472,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "curto192",
+    "repeat": 4,
+    "delta_pct": -4.731291577736663,
+    "same_tokens": true
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "codigo192",
+    "repeat": 4,
+    "delta_pct": -3.248022485981983,
+    "same_tokens": false
+  },
+  {
+    "mode": "active-mtp4-v4-e4-min3",
+    "case": "long192",
+    "repeat": 4,
+    "delta_pct": -4.633771363543337,
+    "same_tokens": true
+  }
+]

@@ -92,6 +92,16 @@ bool kv_unified;
     // memory creation does not need to depend on the public params object.
     llama_kvarn_params kvarn;
 
+    // Remote KV+attention accelerator (Xbox RKVA). When enabled, the
+    // full-attention layers of the qwen35 arch offload their KV cache and
+    // attention core to a remote D3D12 server; the target weights, DeltaNet
+    // state, projections, RoPE, gate and FFN all stay local. The host sends
+    // post-RoPE Q/K/V + positions and receives only the attention output.
+    bool        remote_attn_enabled = false;
+    int         remote_attn_layers  = 0;   // count of full-attention layers offloaded (0 = none)
+    int         remote_attn_prefill = 0;   // 0 = remote, 1 = migrate (reserved)
+    bool        remote_attn_stats   = false;
+
     // Prism: per-channel K-cache mean-centering bias file (requires type_k == Q4_0).
     const char * path_kv_mean_center = nullptr;
 

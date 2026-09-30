@@ -1,0 +1,9 @@
+{
+  "LD_LIBRARY_PATH": "/home/hjotha/beellama.cpp/build/bin:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin",
+  "LD_PRELOAD": "/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama.so.0.4.7:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-common.so.0.4.7:/home/hjotha/beellama.cpp/build-dflash-xbox-dl/bin/libllama-server-impl.so",
+  "GGML_BACKEND_PATH": "/home/hjotha/beellama.cpp/build/bin/libggml-vulkan.so",
+  "GGML_DFLASH_SHADOW_PROF": "1",
+  "GGML_DFLASH_SHADOW_TRACE": "1",
+  "GGML_DFLASH_SHADOW_EVERY": "4",
+  "GGML_DFLASH_SHADOW_EARLY": "1"
+}

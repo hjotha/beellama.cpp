@@ -6282,11 +6282,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // rows-indexed state read (src[6]) not implemented on CUDA yet;
-            // reject so it falls back instead of silently reading src[5] as a scratch
-            if (op->src[6] != NULL) {
-                return false;
-            }
+            // rows-indexed state read (src[6]) is implemented in the gated_delta_net
+            // CUDA kernel: when src[6] is set, src[5] is a 2D cache view and each
+            // sequence reads its live state at row src[6][seq] instead of a gathered
+            // dense scratch. The per-head block layout and the output write are
+            // identical to the gathered form, so both paths are supported here.
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
 #ifdef GGML_USE_MUSA
             return false;
