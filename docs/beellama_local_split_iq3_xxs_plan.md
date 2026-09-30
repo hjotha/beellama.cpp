@@ -17,7 +17,7 @@
 | **Fase 4** | Auto placement baseado em VRAM | ✅ **Concluída** | Auto-placement dinâmico via `--remote-attn-layers auto` e `--remote-attn-cuda-reserve`. Validado: 4K = 16 locais / 0 remotas; 102.4K = 2 locais / 14 remotas (176 t/s prefill, 30.6 tok/s decode, zero VRAM thrashing) |
 | **Fase 5** | Prefill migration assíncrona | ⏳ Planejada | Pipeline assíncrona chunk 512 |
 | **Fase 6** | Prompt cache awareness | ⏳ Planejada | Direct KV placement no cache |
-| **Fase 7** | MTP / DFlash2 batching ($N > 1$) | ⏳ Planejada | Testes com Qwen3.8-27B MTP / DFlash |
+| **Fase 7** | MTP / DFlash2 batching ($N > 1$) | ✅ **Concluída** | MTP validado com sucesso (`Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`). 4K: **47.7 tok/s** (83.3% acceptance rate, speedup de +47% vs autoregressivo); 56.3K: **33.9 tok/s** com 13L offloaded no target e 16L no draft context |
 | **Fase 8** | Migração e validação IQ3_S | ⏳ Planejada | Alvo após caracterização do IQ3_XXS |
 
 **Objetivo:** usar a RTX 4070 como GPU principal do modelo e a Radeon 780M como acelerador auxiliar de KV cache + attention, mantendo o máximo possível de attention local na 4070 e enviando para a 780M apenas o overflow necessário.
