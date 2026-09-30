@@ -5388,6 +5388,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+    result.remote_attn_host.clear();
+    result.remote_attn_port = 0;
+    result.remote_attn_layers = "0";
 
     if (has_draft) {
         // default to global devices value
