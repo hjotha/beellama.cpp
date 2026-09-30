@@ -7068,7 +7068,10 @@ struct ggml_tensor * ggml_remote_attn(
     GGML_ASSERT(q && k && v && pos);
     GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
     GGML_ASSERT(pos->type == GGML_TYPE_I32);
-    GGML_ASSERT(q->ne[2] == k->ne[2] && q->ne[2] == v->ne[2] && q->ne[2] == pos->ne[0]);
+    GGML_ASSERT(q->ne[2] == k->ne[2] && q->ne[2] == v->ne[2]);
+    // pos may be the full M-RoPE position input ([n_pos_per_embd*n_tokens]); the
+    // backend reads the first n_tokens entries (dim 0 == scalar position).
+    GGML_ASSERT(pos->ne[0] >= q->ne[2]);
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
     GGML_ASSERT(q->ne[1] % k->ne[1] == 0);

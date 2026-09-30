@@ -403,9 +403,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         // and (for the rotated domain) the inverse WHT, returning the attention
         // output in the same domain as the local KVarN path. The gate sigmoid
         // and the wo projection below stay local on the CUDA device.
-        // Scalar absolute position per token == first M-RoPE dimension.
-        ggml_tensor * pos_i32 = ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
-        cur = ggml_remote_attn(ctx0, Qcur, Kcur, Vcur, pos_i32, il, kq_scale,
+        // Scalar absolute position per token == first M-RoPE dimension. Pass
+        // inp_pos directly (an INPUT tensor, not a VIEW) so the scheduler copies
+        // it into the remote host buffer without creating a VIEW op the remote
+        // backend would have to claim. The backend reads the first n_tokens i32
+        // (M-RoPE layout is [dim][token], so dim 0 == ubatch.pos).
+        cur = ggml_remote_attn(ctx0, Qcur, Kcur, Vcur, inp_pos, il, kq_scale,
                 GGML_REMOTE_ATTN_DOMAIN_AUTO);
         ggml_backend_sched_set_tensor_backend(sched, cur, backend_remote);
         cb(cur, "attn_remote", il);

@@ -161,6 +161,10 @@ struct ggml_backend_remote_attn_context {
 
     // scratch for the last positions block (int32)
     std::vector<int32_t> pos_scratch;
+    // reusable host staging for reading Q/K/V out of their backend buffer
+    // (they may live in CUDA or be views of CUDA tensors co-located by the
+    // scheduler, so we must read via ggml_backend_tensor_get, never ->data).
+    std::vector<float> f32_scratch;
 };
 
 static uint64_t now_us() {
@@ -263,13 +267,8 @@ static bool rkva_run_attn(
     const bool wire_f16 = (ctx->ack.chosen_wire == RKVA_WIRE_F16);
     const size_t esz = wire_f16 ? 2 : 4;
 
-    // positions
-    ctx->pos_scratch.resize(n_tokens);
-    if (pos->type == GGML_TYPE_I32) {
-        std::memcpy(ctx->pos_scratch.data(), pos->data, sizeof(int32_t) * n_tokens);
-    } else {
-        // defensive: pos contract is I32
-        return false;
+    if (pos->type != GGML_TYPE_I32) {
+        return false;  // defensive: pos contract is I32
     }
 
     const size_t q_elems = (size_t) n_tokens * n_head * n_embd_head;
@@ -283,28 +282,37 @@ static bool rkva_run_attn(
 
     rkva_attn_req areq { (uint32_t) ctx->ack.chosen_wire, 0, 0, 0 };
     std::memcpy(p, &areq, sizeof(areq)); p += sizeof(areq);
-    std::memcpy(p, ctx->pos_scratch.data(), sizeof(int32_t) * n_tokens); p += sizeof(int32_t) * n_tokens;
 
-    auto emit = [&](const ggml_tensor * t, int heads) {
-        const float * src = (const float *) t->data;
-        // ggml layout is [n_embd_head, heads, n_tokens] column-major-ish:
-        // element (d, h, tok) at ((tok*heads + h)*n_embd_head + d)
-        // wire layout is [n_tokens][heads][n_embd_head] — identical ordering.
-        const size_t total = (size_t) n_tokens * heads * n_embd_head;
-        if (wire_f16) {
+    // Positions: read the first n_tokens i32 (M-RoPE dim 0 == scalar position).
+    // IMPORTANT: read every source through ggml_backend_tensor_get, never via
+    // ->data: the scheduler may co-locate a view/reshape of a CUDA tensor in
+    // this (host) backend's split, so ->data can be a device pointer. tensor_get
+    // dispatches to the source buffer's backend (cudaMemcpy D2H when needed).
+    ctx->pos_scratch.resize(n_tokens);
+    ggml_backend_tensor_get(pos, ctx->pos_scratch.data(), 0, sizeof(int32_t) * n_tokens);
+    std::memcpy(p, ctx->pos_scratch.data(), sizeof(int32_t) * n_tokens);
+    p += sizeof(int32_t) * n_tokens;
+
+    // Q/K/V: ggml tensors are contiguous [n_embd_head, heads, n_tokens] whose
+    // linear order equals the wire [n_tokens][heads][n_embd_head] layout.
+    if (!wire_f16) {
+        ggml_backend_tensor_get(q, p, 0, q_elems * 4);  p += q_elems * 4;
+        ggml_backend_tensor_get(k, p, 0, kv_elems * 4); p += kv_elems * 4;
+        ggml_backend_tensor_get(v, p, 0, kv_elems * 4); p += kv_elems * 4;
+    } else {
+        ctx->f32_scratch.resize(std::max(q_elems, kv_elems));
+        auto emit16 = [&](const ggml_tensor * t, size_t elems) {
+            ggml_backend_tensor_get(t, ctx->f32_scratch.data(), 0, elems * 4);
             uint16_t * dst = (uint16_t *) p;
-            for (size_t i = 0; i < total; i++) {
-                dst[i] = f32_to_f16_bits(src[i]);
+            for (size_t i = 0; i < elems; i++) {
+                dst[i] = f32_to_f16_bits(ctx->f32_scratch[i]);
             }
-            p += total * 2;
-        } else {
-            std::memcpy(p, src, total * 4);
-            p += total * 4;
-        }
-    };
-    emit(q, n_head);
-    emit(k, n_head_kv);
-    emit(v, n_head_kv);
+            p += elems * 2;
+        };
+        emit16(q, q_elems);
+        emit16(k, kv_elems);
+        emit16(v, kv_elems);
+    }
 
     const uint32_t out_elems = (uint32_t) q_elems;
     const uint32_t expected_bytes = out_elems * (uint32_t) esz;
@@ -526,12 +534,25 @@ static enum ggml_status ggml_backend_remote_attn_graph_compute(
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (node->op != GGML_OP_REMOTE_ATTN) {
-            // This backend only ever receives its own op (the scheduler splits
-            // by backend). Anything else is a wiring bug: fail loudly.
-            GGML_LOG_ERROR("%s: unexpected op %s in remote graph\n",
-                           GGML_REMOTE_ATTN_NAME, ggml_op_name(node->op));
-            return GGML_STATUS_FAILED;
+
+        // The scheduler may co-locate pure layout ops (views/reshapes of the
+        // Q/K/V/pos inputs) in this backend's split. On a host buffer these are
+        // no-ops: ggml-alloc already set their data pointers from the source.
+        switch (node->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                continue;
+            case GGML_OP_REMOTE_ATTN:
+                break;
+            default:
+                // Anything else is a wiring bug: this backend only computes the
+                // remote attention op. Fail loudly rather than silently skip.
+                GGML_LOG_ERROR("%s: unexpected op %s in remote graph\n",
+                               GGML_REMOTE_ATTN_NAME, ggml_op_name(node->op));
+                return GGML_STATUS_FAILED;
         }
 
         std::lock_guard<std::mutex> lock(ctx->mutex);
@@ -632,7 +653,20 @@ static ggml_backend_buffer_type_t ggml_backend_remote_attn_dev_get_buffer_type(g
 static bool ggml_backend_remote_attn_dev_supports_op(
         ggml_backend_dev_t dev, const ggml_tensor * op) {
     (void) dev;
-    return op->op == GGML_OP_REMOTE_ATTN;
+    switch (op->op) {
+        case GGML_OP_REMOTE_ATTN:
+            return true;
+        // Pure layout ops the scheduler co-locates with the pinned remote node
+        // (views/reshapes of Q/K/V/pos). No-ops on a host buffer.
+        case GGML_OP_NONE:
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
 }
 
 static bool ggml_backend_remote_attn_dev_supports_buft(
