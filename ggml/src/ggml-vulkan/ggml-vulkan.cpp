@@ -10848,9 +10848,14 @@ static ggml_vk_kvarn_store_workspace_plan ggml_vk_kvarn_store_workspace_plan_for
         n_tokens % tokens_per_stream_hint == 0;
     const int active_streams =
         hint_well_formed ? n_tokens / tokens_per_stream_hint : 0;
+    // The workspace path has enough independent flush candidates with two
+    // complete KVarN groups plus the stage ring. Keeping the minimum at three
+    // groups forced production ubatch=256 through monolithic_store(), which
+    // serially performs WHT/store work for every token in one workgroup.
+    constexpr int min_workspace_tokens_per_stream = 2 * KVAR_N_GROUP;
     const bool runtime_workspace =
         hint_well_formed &&
-        tokens_per_stream_hint >= 3 * KVAR_N_GROUP &&
+        tokens_per_stream_hint >= min_workspace_tokens_per_stream &&
         active_streams > 0 && active_streams <= n_stream &&
         (!swa || (n_stream == 1 &&
                   tokens_per_stream_hint <= groups_per_stream * KVAR_N_GROUP));
@@ -10861,7 +10866,7 @@ static ggml_vk_kvarn_store_workspace_plan ggml_vk_kvarn_store_workspace_plan_for
     // remains shared with the runtime planner below.
     const bool reserve_workspace =
         reserve_worst_case &&
-        n_tokens >= 3 * KVAR_N_GROUP &&
+        n_tokens >= min_workspace_tokens_per_stream &&
         (!swa || (n_stream == 1 &&
                   n_tokens <= groups_per_stream * KVAR_N_GROUP));
     const bool use_workspace = runtime_workspace || reserve_workspace;
@@ -12234,6 +12239,13 @@ static bool ggml_vk_kvarn_attn_tail_sources_supported(const ggml_tensor * dst) {
     const bool current_is_contiguous =
         ggml_is_contiguous(k_current) && ggml_is_contiguous(v_current) &&
         k_current->ne[1] == q->ne[1] && v_current->ne[1] == q->ne[1];
+    const bool current_contiguous_q_layout = current_is_contiguous &&
+        ggml_is_contiguous(q) && q->ne[3] == 1 &&
+        k_current->ne[0] == q->ne[0] && v_current->ne[0] == q->ne[0] &&
+        q->nb[0] == sizeof(float) &&
+        q->nb[1] / sizeof(float) == size_t(q->ne[0]) &&
+        q->nb[2] / sizeof(float) == size_t(q->ne[0]) * size_t(q->ne[1]) &&
+        q->nb[2] / sizeof(float) < (1u << 31u);
     const bool supported = history_slots > 0 && history_slots <= max_encoded_history_slots &&
         history_slots <= k_tail->ne[1] &&
         history_slots <= v_tail->ne[1] &&
@@ -12249,7 +12261,7 @@ static bool ggml_vk_kvarn_attn_tail_sources_supported(const ggml_tensor * dst) {
         v_current->ne[3] == 1 &&
         k_current->nb[0] == sizeof(uint16_t) &&
         v_current->nb[0] == sizeof(uint16_t) &&
-        (current_matches_history_layout || current_is_contiguous) &&
+        (current_matches_history_layout || current_contiguous_q_layout) &&
         history_slots + k_current->ne[1] >= tail_mask->ne[0] &&
         history_slots + v_current->ne[1] >= tail_mask->ne[0];
     const char * debug_routes = getenv("GGML_KVARN_DEBUG_ROUTES");
@@ -12437,6 +12449,15 @@ static bool ggml_vk_flash_attn_kvarn(
         return uint64_t(subbuffer.buffer->bda_addr + subbuffer.offset);
     };
 
+    const bool current_contiguous_layout = has_tail_current &&
+        (k_tail_current->nb[1] != k_tail->nb[1] ||
+         k_tail_current->nb[2] != k_tail->nb[2] ||
+         v_tail_current->nb[1] != v_tail->nb[1] ||
+         v_tail_current->nb[2] != v_tail->nb[2]);
+    constexpr uint32_t q_nb2_current_tail_contiguous = 1u << 31u;
+    const uint32_t q_nb2 = uint32_t(q->nb[2] / sizeof(float));
+    GGML_ASSERT(!current_contiguous_layout || q_nb2 < q_nb2_current_tail_contiguous);
+
     vk_op_kvarn_flash_attn_push_constants pc = {
         uint32_t(k_side.view->ne[1]),
         uint32_t(k->ne[1]),
@@ -12465,7 +12486,7 @@ static bool ggml_vk_flash_attn_kvarn(
         logit_softcap,
         uint32_t(q->ne[1]) | (gqa << 16u),
         uint32_t(q->nb[1] / sizeof(float)),
-        uint32_t(q->nb[2] / sizeof(float)),
+        q_nb2 | (current_contiguous_layout ? q_nb2_current_tail_contiguous : 0u),
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_kvarn_flash_attn;

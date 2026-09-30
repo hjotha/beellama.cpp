@@ -251,6 +251,19 @@ static void test(void) {
         assert(preset.to_ini().find(canary) == std::string::npos);
     }
 
+    {
+        common_params rs_params;
+        argv = {"binary_name", "--no-offload-rs"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), rs_params, LLAMA_EXAMPLE_SERVER));
+        assert(rs_params.no_offload_rs);
+        assert(common_context_params_to_llama(rs_params).no_offload_rs);
+
+        argv = {"binary_name", "--offload-rs"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), rs_params, LLAMA_EXAMPLE_SERVER));
+        assert(!rs_params.no_offload_rs);
+        assert(!common_context_params_to_llama(rs_params).no_offload_rs);
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     // missing value
@@ -1359,6 +1372,7 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
             assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_fabric, LLAMA_EXAMPLE_SERVER));
         }
         common_params wrong_backend;
+        wrong_backend.gpu_power_backend = "nvml";
         argv = {"binary_name", "--gpu-fabric-state", "0"};
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), wrong_backend, LLAMA_EXAMPLE_SERVER));
 
@@ -1372,10 +1386,11 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
             assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_tdp, LLAMA_EXAMPLE_SERVER));
         }
         common_params tdp_wrong_backend;
+        tdp_wrong_backend.gpu_power_backend = "nvml";
         argv = {"binary_name", "--apu-tdp", "20"};
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), tdp_wrong_backend, LLAMA_EXAMPLE_SERVER));
         common_params conflicting_tdp;
-        argv = {"binary_name", "--gpu-power-backend", "amdgpu", "--apu-tdp", "20", "--gpu-power-prefill", "15", "--gpu-power-decode", "10"};
+        argv = {"binary_name", "--gpu-power-backend", "nvml", "--apu-tdp", "20"};
         assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), conflicting_tdp, LLAMA_EXAMPLE_SERVER));
 
         common_params incomplete_power_params;

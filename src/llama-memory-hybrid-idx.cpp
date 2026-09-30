@@ -34,7 +34,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                  uint32_t   n_ubatch,
-                     bool   offload,
+                     bool   offload_kv,
+                     bool   offload_rs,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -48,7 +49,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
-        n_seq_max, n_rs_seq, offload, unified,
+        n_seq_max, n_rs_seq, offload_kv, offload_rs, unified,
         filter_attn, filter_recr, n_ubatch,
         tail_tokens, tail_type, tail_tokens_requested, tail_rollback_tokens),
     hparams_idx(model.hparams),
@@ -68,7 +69,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_k, type_v, v_trans, offload_kv, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_", 0, 0, GGML_TYPE_F16,
             UINT32_MAX, false, 0, 0);

@@ -26,7 +26,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
+                     bool   offload_kv,
+                     bool   offload_rs,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -44,7 +45,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         type_k,
         type_v,
         v_trans,
-        offload,
+        offload_kv,
         unified,
         kv_size,
         n_seq_max,
@@ -70,7 +71,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         model,
         type_r,
         type_s,
-        offload,
+        offload_rs,
         rs_size,
         n_seq_max,
         n_rs_seq,

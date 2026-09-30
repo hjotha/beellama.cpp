@@ -3565,6 +3565,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--offload-rs"},
+        {"--no-offload-rs"},
+        string_format("whether to offload recurrent state to the accelerator with K/V (default: %s)", params.no_offload_rs ? "disabled" : "enabled"),
+        [](common_params & params, bool value) {
+            params.no_offload_rs = !value;
+        }
+    ).set_env("LLAMA_ARG_OFFLOAD_RS"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),
@@ -3673,7 +3681,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_LAYERS"));
     add_opt(common_arg(
-        {"--remote-attn-cuda-reserve", "--split-attn-cuda-reserve"}, "SIZE",
+        {"--split-attn-cuda-reserve", "--remote-attn-cuda-reserve"}, "SIZE",
         "CUDA VRAM safety margin to preserve during auto-placement (e.g. 350M, 500M, 1G, default: 350M)",
         [](common_params & params, const std::string & value) {
             if (value.empty()) return;

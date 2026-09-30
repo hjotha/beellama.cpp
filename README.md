@@ -210,6 +210,8 @@ The phase-aware governor runs inside the server, deduplicates unchanged settings
 | `--gpu-fabric-state N` | `LLAMA_ARG_GPU_FABRIC_STATE` | AMD raw fabric DPM state index `0..31` during prefill/decode; omit to leave automatic. |
 | `--apu-tdp W` | `LLAMA_ARG_APU_TDP` | Ryzen APU STAPM, fast and slow limits, each set to W while active; restores original values at idle. |
 
+**Recurrent-state placement:** `--no-offload-rs` keeps the recurrent SSM state in host RAM while attention KV remains on the selected accelerator. This can release VRAM for local KVarN layers, but recurrent-state transfers may reduce decode speed; compare with and without the flag on the intended model and context. The default keeps recurrent state on the model device.
+
 **Local Vulkan attention:** `--remote-attn vulkan:0 --remote-attn-layers 16`
 keeps Qwen3.5/3.8 target weights, Q/K/V projections and recurrent state on the model
 GPU and places the selected full-attention KV caches and attention operations on

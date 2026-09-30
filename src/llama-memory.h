@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <exception>
 #include <map>
 #include <memory>
 #include <functional>
@@ -91,6 +93,45 @@ struct llama_memory_context_i {
     virtual void graph_compute_start() {}
     virtual void graph_compute_finish(ggml_status /* status */) {}
 
+};
+
+// Completes a prepared memory batch if graph construction, input upload, or
+// backend submission throws before process_ubatch reaches its normal finish.
+// The guard must be created before apply(): hybrid apply() can prepare attention
+// state and then fail while applying recurrent state.
+class llama_memory_context_finish_guard {
+public:
+    explicit llama_memory_context_finish_guard(llama_memory_context_i * context) : context(context) {}
+
+    llama_memory_context_finish_guard(const llama_memory_context_finish_guard &) = delete;
+    llama_memory_context_finish_guard & operator=(const llama_memory_context_finish_guard &) = delete;
+
+    ~llama_memory_context_finish_guard() noexcept {
+        if (!context) {
+            return;
+        }
+        auto * pending = context;
+        context = nullptr;
+        try {
+            pending->graph_compute_finish(GGML_STATUS_FAILED);
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "llama_memory_context_finish_guard: cleanup failed: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "llama_memory_context_finish_guard: cleanup failed with an unknown exception\n");
+        }
+    }
+
+    void finish(ggml_status status) {
+        if (!context) {
+            return;
+        }
+        auto * pending = context;
+        context = nullptr;
+        pending->graph_compute_finish(status);
+    }
+
+private:
+    llama_memory_context_i * context;
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

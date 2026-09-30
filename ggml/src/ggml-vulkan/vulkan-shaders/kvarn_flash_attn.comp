@@ -121,7 +121,11 @@ uint q_nb1() {
 }
 
 uint q_nb2() {
-    return p.q_nb2;
+    return p.q_nb2 & 0x7fffffffu;
+}
+
+bool tail_current_contiguous() {
+    return (p.q_nb2 & 0x80000000u) != 0u;
 }
 
 uint stream_start() {
@@ -345,9 +349,11 @@ float load_tail(bool value, uint slot, uint head, uint dim) {
     const bool from_current =
         (p.flags & FLAG_TAIL_CURRENT) != 0u && slot >= history_slots;
     const uint source_slot = from_current ? slot - history_slots : slot;
-    const uint half_index = value ?
-        source_slot * p.v_tail_nb1 + head * p.v_tail_nb2 + dim :
-        source_slot * p.k_tail_nb1 + head * p.k_tail_nb2 + dim;
+    const uint half_index = from_current && tail_current_contiguous() ?
+        source_slot * q_nb1() + head * q_nb2() + dim :
+        (value ?
+            source_slot * p.v_tail_nb1 + head * p.v_tail_nb2 + dim :
+            source_slot * p.k_tail_nb1 + head * p.k_tail_nb2 + dim);
     uint word;
     if (from_current) {
         TailCurrentRef current = TailCurrentRef(

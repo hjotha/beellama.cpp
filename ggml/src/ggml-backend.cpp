@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -1891,13 +1893,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     const bool async_ok = split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
                     if (!async_ok) {
+                        static const bool profile_backend_copies = [] {
+                            const char * value = std::getenv("GGML_BACKEND_COPY_PROFILE");
+                            return value != nullptr && std::strcmp(value, "1") == 0;
+                        }();
+                        const int64_t src_sync_start = profile_backend_copies ? ggml_time_us() : 0;
                         ggml_backend_synchronize(input_backend);
+                        const int64_t src_sync_us = profile_backend_copies ? ggml_time_us() - src_sync_start : 0;
+                        const int64_t dst_sync_start = profile_backend_copies ? ggml_time_us() : 0;
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+                        const int64_t dst_sync_us = profile_backend_copies ? ggml_time_us() - dst_sync_start : 0;
+                        const int64_t copy_start = profile_backend_copies ? ggml_time_us() : 0;
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (profile_backend_copies) {
+                            GGML_LOG_INFO("backend copy profile: %s -> %s tensor=%s bytes=%zu src_sync=%.3f ms dst_sync=%.3f ms copy=%.3f ms\n",
+                                    ggml_backend_dev_name(ggml_backend_get_device(input_backend)),
+                                    ggml_backend_dev_name(ggml_backend_get_device(split_backend)),
+                                    input->name, ggml_nbytes(input),
+                                    src_sync_us / 1000.0, dst_sync_us / 1000.0,
+                                    (ggml_time_us() - copy_start) / 1000.0);
+                        }
                     }
                 }
             }

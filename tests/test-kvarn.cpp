@@ -215,6 +215,7 @@ static void test_vulkan_decode_route_policy() {
     });
     require(populated.split_k == 1,
             "well-populated Vulkan verification must avoid unnecessary split reduction");
+
 }
 
 static void set_test_env(const char * name, const char * value) {
@@ -1796,7 +1797,9 @@ static std::vector<ggml_fp16_t> test_store_reference_output(
         int            head_slices = 1,
         int            striped_group_stride = 0,
         bool           eager_records = false,
-        bool           explicit_stage_slots = false) {
+        bool           explicit_stage_slots = false,
+        bool           require_workspace = false,
+        int            workspace_tokens_hint = -1) {
     ggml_init_params params = {
         /*.mem_size   =*/ 16 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -1820,9 +1823,17 @@ static std::vector<ggml_fp16_t> test_store_reference_output(
     ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
 
     ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value, stage_groups);
-    stored->op_params[3] = n_tokens_per_stream;
+    stored->op_params[3] = workspace_tokens_hint >= 0 ? workspace_tokens_hint : n_tokens_per_stream;
     stored->op_params[5] = head_slices;
     stored->op_params[9] = eager_records ? 1 : 0;
+    if (require_workspace) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto * workspace_y = reg ? reinterpret_cast<size_t (*)(ggml_backend_dev_t, const ggml_tensor *)>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_workspace_y_size")) : nullptr;
+        require(workspace_y != nullptr && workspace_y(dev, stored) > 0,
+                "expected the KVarN workspace-parallel store route");
+    }
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, stored);
@@ -2168,7 +2179,8 @@ static std::vector<float> test_native_flash_attention_output(
         bool           eager_records = false,
         bool           non_causal_mask = false,
         bool           materialized_graph = false,
-        int            indirect_offset = 0) {
+        int            indirect_offset = 0,
+        bool           contiguous_current_tail = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2328,6 +2340,10 @@ static std::vector<float> test_native_flash_attention_output(
                 apply_kvarn_wht_head(ctx, v_tail_current_storage, head_dim) : v_tail_current_storage;
             k_tail_current = ggml_permute(ctx, k_current_source, 0, 2, 1, 3);
             v_tail_current = ggml_permute(ctx, v_current_source, 0, 2, 1, 3);
+            if (contiguous_current_tail) {
+                k_tail_current = ggml_cont(ctx, k_tail_current);
+                v_tail_current = ggml_cont(ctx, v_tail_current);
+            }
         }
         tail_mask = ggml_new_tensor_4d(
                 ctx, GGML_TYPE_F16, exact_tail_tokens, n_q, 1, n_stream);
@@ -4514,6 +4530,50 @@ static void test_native_flash_attention_portable_original_v() {
     ggml_backend_free(gpu_backend);
 }
 
+static void test_native_flash_attention_contiguous_current_tail() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    const std::vector<float> expected = test_native_flash_attention_output(
+            cpu_backend, false, false, 256, 4, 4, 4,
+            8, 2, 512, 3, false, nullptr, false, 128, false,
+            GGML_TYPE_F16, 4, false, false, -1, false);
+    const std::vector<float> actual = test_native_flash_attention_output(
+            gpu_backend, true, true, 256, 4, 4, 4,
+            8, 2, 512, 3, false, nullptr, false, 128, false,
+            GGML_TYPE_F16, 4, false, false, -1, false,
+            false, false, 0, true);
+    require_close_f32_rmse(actual, expected, 1e-2f,
+            "contiguous current-tail KVarN strides differ from materialized attention");
+    std::printf("test-kvarn: contiguous current-tail strides OK\n");
+    std::fflush(stdout);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
+static void test_vulkan_ubatch256_workspace_store() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, true);
+    require(std::strncmp(ggml_backend_dev_name(ggml_backend_get_device(gpu_backend)), "Vulkan", 6) == 0,
+            "ubatch256 workspace store test requires Vulkan0");
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    for (bool value : { false, true }) {
+        const std::vector<ggml_fp16_t> workspace = test_store_reference_output(
+                gpu_backend, 4, value, 1, 2, 256, 0, false, true, 3, 1, 0, false, false, true);
+        const std::vector<ggml_fp16_t> monolithic = test_store_reference_output(
+                gpu_backend, 4, value, 1, 2, 256, 0, false, true, 3, 1, 0, false, false, false, 0);
+        const std::vector<ggml_fp16_t> reference = test_store_reference_output(
+                cpu_backend, 4, value, 1, 2, 256, 0);
+        require_close_f16_rmse(workspace, reference, 1e-1f,
+                "KVarN Vulkan 256-token workspace store output differs from CPU reference");
+        require(workspace == monolithic,
+                "KVarN Vulkan 256-token workspace and monolithic stores differ");
+    }
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
 // Unsupported compact-tail KVarN body routes must degrade to the existing
 // materialized attention path instead of aborting the process. The force knob
 // makes this otherwise hardware/geometry-dependent boundary deterministic.
@@ -4573,6 +4633,17 @@ static void test_store_paths_gpu() {
             const std::vector<ggml_fp16_t> cpu_output = test_store_reference_output(
                     cpu_backend, bits, value, 2, 2, 385, 64);
             require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA store output differs from CPU reference");
+        }
+    }
+
+    if (std::strncmp(ggml_backend_dev_name(ggml_backend_get_device(gpu_backend)), "Vulkan", 6) == 0) {
+        for (bool value : { false, true }) {
+            const std::vector<ggml_fp16_t> ubatch256_workspace = test_store_reference_output(
+                    gpu_backend, 4, value, 1, 2, 256, 0, false, true, 3, 1, 0, false, false, true);
+            const std::vector<ggml_fp16_t> ubatch256_reference = test_store_reference_output(
+                    cpu_backend, 4, value, 1, 2, 256, 0);
+            require_close_f16_rmse(ubatch256_workspace, ubatch256_reference, 1e-1f,
+                    "KVarN Vulkan 256-token workspace store output differs from CPU reference");
         }
     }
 
@@ -5632,6 +5703,18 @@ static void test_meta_kvarn_zero_head_shard() {
 int main() {
     ggml_backend_load_all();
 
+    if (std::getenv("GGML_KVARN_TEST_CONTIGUOUS_CURRENT_TAIL_ONLY") != nullptr) {
+        test_native_flash_attention_contiguous_current_tail();
+        std::printf("test-kvarn: contiguous current-tail stride parity OK\n");
+        return 0;
+    }
+
+    if (std::getenv("GGML_KVARN_TEST_VULKAN_UBATCH256_STORE_ONLY") != nullptr) {
+        test_vulkan_ubatch256_workspace_store();
+        std::printf("test-kvarn: Vulkan ubatch256 workspace store parity OK\n");
+        return 0;
+    }
+
     if (std::getenv("GGML_KVARN_TEST_VRAM_PRESSURE_ONLY") != nullptr) {
         ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
         require(backend != nullptr, "VRAM pressure test requires a GPU backend");
@@ -5812,6 +5895,7 @@ int main() {
     // regression cases must execute on every qualified CUDA/HIP backend.
     test_kvarn_d256_prompt_tail_regression();
     test_native_flash_attention_portable_original_v();
+    test_native_flash_attention_contiguous_current_tail();
     test_native_flash_attention_tail_materialize_fallback();
     test_store_paths_gpu();
     test_native_flash_attention_support_gates();

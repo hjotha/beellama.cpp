@@ -22,6 +22,133 @@ Prefill assíncrono com migração CUDA→Vulkan não está implementado; o modo
 executa o núcleo de atenção e mantém o KV no Vulkan durante prefill e decode.
 Não reutilizar slots produzidos pelo caminho que zerava a atenção.
 
+## Diagnóstico de produção — 2026-09-30
+
+O perfil que forçava `remote-attn-layers = 16` executava o núcleo de attention de
+**todas** as 16 camadas full-attention na Radeon também durante o prefill. Isso
+contraria a seção 11 do plano, que mantém o prefill na 4070, e pula a migração
+assíncrona de KV da Fase 5.
+
+No pedido de produção de hoje, o prefill caiu progressivamente de 106.48 t/s em
+512 tokens para 20.30 t/s em 6.847 tokens. Em seguida o kernel registrou dois
+timeouts na fila `comp_1.2.0`, resetou o compute queue e a inferência falhou com
+`decode() failed: vk::Queue::submit: ErrorDeviceLost`. A próxima tarefa falhou
+com `a compact KV tail batch transaction is already pending`. A unit foi parada
+para evitar mais requests nesse estado.
+
+A segunda falha era um bug de limpeza: `process_ubatch()` abre a transação do
+tail em `mctx->apply()`, mas chamava `graph_compute_finish()` só nos retornos
+normais. A exceção de submit Vulkan saltava essa limpeza e deixava a transação
+pendente para o request seguinte. Um guard agora finaliza a transação como falha
+em qualquer saída excepcional; quando o grafo já começou, o cache invalida o
+payload afetado. Isso não recupera o device Vulkan perdido, então o backend ainda
+precisa ser recriado antes de aceitar novo trabalho após `ErrorDeviceLost`.
+
+Os ~800–900 t/s anteriores não são uma baseline válida: o backend original
+`ggml_local_split_exec` copiava Q/K/V, preenchia a saída com zeros via `memset`
+e retornava sucesso sem calcular attention. O benchmark pulava o trabalho caro.
+
+Os presets Qwen anteriores davam como base S=24.576, M=40.960, L=56.320,
+XL=63.488 e XXL=102.400, com `batch/ubatch=256`. Revalidei esses patamares com
+o modelo IQ3_XXS usado na produção, auto-placement e MTP por tier:
+
+- 40.960/MTP4/tail2.048: prompt de 28.881 tokens a 751.79 t/s, decode 47.72 t/s.
+- 56.320/MTP2/tail4.096: prompt de 28.881 tokens a 727.40 t/s, decode 46.86 t/s.
+- 63.488/MTP2/tail2.048: prompt de 7.881 tokens a 809.98 t/s, decode 49.79 t/s.
+- 102.400/target-only/tail2.048: prompt de 7.881 tokens a 861.29 t/s, decode
+  30.88 t/s; 16 camadas permaneceram na 4070 e restaram 25 MiB livres.
+
+MTP4 em 40.960 com tail4.096 falhou por falta de VRAM na alocação de 55.62 MiB
+do kernel de atenção draft; com tail2.048 concluiu. MTP2 em 63.488 também só
+concluiu com tail2.048. Com reserva de 700 MiB no XXL, uma camada passou à
+Radeon e o teste caiu a 260.89/9.81 t/s; o preset usa reserva350M e mantém as
+camadas locais até o limite de 102.400. A tentativa de 204.800 com 9 camadas na
+Radeon foi interrompida quando o prefill desceu a 54.12 t/s em 3.840 tokens.
+Esse tamanho segue sem validação segura.
+
+`--no-offload-rs` continua opcional: manter RS na CPU mediu 154.28/8.34 t/s no
+perfil curto, contra 775.44/53.19 t/s com RS na GPU. A Fase 5 segue pendente:
+prefill na 4070 com migração assíncrona de KV para a Radeon.
+
+### Como remover o gargalo da Radeon
+
+O ensaio controlado usou o mesmo modelo IQ3_XXS, contexto 102.400, tail FP16 de
+2.048, `batch/ubatch=256` e prompt de 7.681 tokens. Com zero camadas remotas o
+prefill mediu 847.95 t/s e decode 30.85 t/s. Com uma camada full-attention na
+Radeon, usando o store workspace para ubatch256, mediu 254.84 t/s e decode
+11.94 t/s. Um ensaio anterior da mesma classe marcou 270.02/11.93 t/s. A
+diferença entre os dois resultados remotos não foi isolada em uma variável; use
+254.84 t/s como a medição do código atual. Uma única fronteira CUDA↔Vulkan já
+reduziu o prefill em aproximadamente 70%. Portanto, a queda não vem só de
+enviar as 16 camadas: o caminho atual de atenção remota é caro mesmo com uma
+camada.
+
+Estratégias para remover esse gargalo, em ordem de investigação:
+
+1. **Manter atenção local na 4070 quando o objetivo for throughput.** É o
+   fallback atual, validado até 102.400 com os tiers Qwen configurados. O teste
+   passou, mas esse contexto deixou pouca VRAM livre; não extrapolar para 204.800.
+2. **Separar o tempo da atenção Vulkan do tempo de transferência.** Contar bytes
+   Q/K/V CUDA→Vulkan e saída Vulkan→CUDA por ubatch, medir KVarN store e atenção
+   por camada. O scheduler tenta `cpy_tensor_async` no backend de destino, mas
+   `ggml_backend_vk_cpy_tensor_async` rejeita origem CUDA; `ggml_backend_sched`
+   então sincroniza os dois backends e cai na cópia genérica via host. A nova
+   sonda `GGML_BACKEND_COPY_PROFILE=1` registra bytes e tempos separados de sync
+   da origem, sync do destino e cópia genérica para medir essa hipótese junto
+   com o kernel Radeon. Combine-a com os timestamps Vulkan existentes, ativados
+   por `GGML_VK_PERF_LOGGER=1`: o tempo `src_sync` também pode incluir trabalho
+   Vulkan pendente (atenção/store/WHT), não apenas transporte.
+3. **Reduzir custo de fronteira.** Adicionar staging host pinned e cópias
+   assíncronas com eventos, agrupar Q/K/V e saída por ubatch e evitar
+   sincronização por tensor. Validar 0/1/2 camadas com prompt, contexto, cache,
+   clocks e `batch/ubatch` idênticos antes de liberar placement remoto.
+4. **Implementar a Fase 5 real.** Gerar e quantizar KV no caminho CUDA e migrar
+   records KVarN em chunks de 128–2.048 tokens, publicando cada chunk só após o
+   fence de conclusão. O próximo chunk de prefill pode sobrepor a transferência
+   anterior. A atenção do chunk seguinte precisa continuar vendo todo o prefixo;
+   resolver isso sem manter duas cópias completas é a parte crítica. Cópia
+   integral ao fim do prefill serve como baseline de correção, não como solução
+   final: pode duplicar até ~1,8 GiB de KV.
+5. **Falhar fechado.** Cancelamento, falha de cópia, fence ou device loss devem
+   invalidar/resetar as duas cópias e impedir decode de estado parcial. Auto-
+   placement não deve enviar camadas à Radeon só porque a conta de VRAM diz que
+   cabem: o teste mostrou uma redução de 3,3× com uma camada.
+
+Os resultados antigos de ubatch 256/512/1024 não provam migração: ubatch apenas
+divide a execução do prompt. O código não copiava records KVarN entre devices.
+
+O perfil Vulkan instrumentado antes do novo split-K, com reserva700M (13 camadas
+locais/3 Vulkan), contexto102.400, tail2.048, `batch/ubatch=256` e prompt7.681,
+registrou 23.42 s acumulados em `FLASH_ATTN_EXT`, 1.20 s em KVarN store e 1.22 s
+em cópias genéricas CUDA→Vulkan para 2.17 GiB de dados. As cópias Vulkan→CUDA
+somaram 0.38 s. `src_sync` somou 1.23 s, mas inclui espera por trabalho CUDA já
+enfileirado e não é tempo de transporte puro. O Vulkan timestamp logger força
+sincronizações e esse ensaio serve para atribuir custo, não throughput absoluto.
+
+O KVarN store agora permite a rota com workspace em ubatch256 (dois grupos
+completos), com teste de paridade contra o oráculo CPU e comparação com a rota
+monolítica. O teste confirma a correção, mas ainda falta uma medição A/B isolada
+sem profiler para provar ganho de throughput. O ajuste de split-K recomendado
+como linha de investigação permanece fora do código: o kernel ainda percorre
+sequencialmente o eixo de tokens por grupo, e a divisão atual é guiada por
+ocupação. É preciso separar ganho de paralelismo de custo de combinar splits e
+do tratamento do tail antes de mudar essa política.
+
+### Auditoria das outras fases ainda citadas pelo transcript
+
+- **Fase 6 — cache em disco:** existe no código atual como `--slot-save-auto`,
+  com fingerprint de modelo/KV/RoPE e verificação byte a byte dos tokens antes
+  de restaurar (`tools/server/server-context.cpp`, bloco Auto disk prompt/KV
+  cache). Falta nesta investigação validar um restore depois de reiniciar o
+  servidor com o preset Qwen atualizado.
+- **Fase 7 — batch remoto/DFlash:** o protocolo RKVA já distingue prefill
+  batched (`n_tokens >= 1`) de decode (`n_tokens == 1`) e o caminho DFlash tem
+  contexto/draft model separado. Isso não torna a Fase 5 existente e ainda falta
+  uma medição válida MTP/DFlash com a atenção Vulkan local corrigida.
+- **Fase 8 — IQ3_S:** o arquivo de modelo de 12.120.016.896 bytes existe, mas a
+  caracterização no hardware atual ainda não foi feita. Não há baseline validada
+  de placement, contexto, prefill, decode ou MTP/DFlash para esse modelo.
+
 ## Plano inicial com Qwen3.8-27B IQ3_XXS (registro histórico invalidado)
 
 > **Status da Execução:** Em andamento (Compilação concluída, Profiling Fase 0 ativo)
@@ -30,17 +157,23 @@ Não reutilizar slots produzidos pelo caminho que zerava a atenção.
 > **Configuração APU/Radeon:** TDP = 20W (`apu-tdp 20`), Clock da APU = 2700 MHz (`pclockmax 2700`)
 
 ### Tabela de Progresso das Fases
+
+Os status e números nesta tabela foram escritos antes da correção de validade
+acima. As fases 0–3 e as medições remotas da fase 4 usaram o backend que
+retornava atenção zerada; ficam registrados apenas como histórico e não como
+resultado aprovado.
+
 | Fase | Descrição | Status | Resultados / Notas |
 |---|---|---|---|
-| **Fase 0** | Profiling baseline (4070 pura, IQ3_XXS) | ✅ **Concluída** | 24K: 852 t/s, 38K: 798 t/s, 56K: 714 t/s, 72K: 666 t/s, 102K: 87 t/s (VRAM limit @ 102K), Decode: 37.2 t/s |
-| **Fase 1** | Backend local-attn Vulkan (In-process) | ✅ **Concluída** | `ggml-local-split` implementado (ring buffer host-pinned 64B align), APU TDP 20W / 2700MHz, `test-local-split-attn` 100% OK |
-| **Fase 2** | 1–2 layers remotas (Validação ring buffer) | ✅ **Concluída** | Decode estável: 1 layer = 34.5 tok/s, 2 layers = 34.1 tok/s. Latência por boundary = 1.11 ms |
-| **Fase 3** | Placement variável (Curva TPS × N layers) | ✅ **Concluída** | Curva completa (16/0 -> 0/16): 16L=36.9 t/s, 4L=33.5 t/s, 8L=33.7 t/s, 16L offload=33.3 t/s (~183 µs/layer, queda total <10%) |
-| **Fase 4** | Auto placement baseado em VRAM | ✅ **Concluída** | Auto-placement dinâmico via `--remote-attn-layers auto` e `--remote-attn-cuda-reserve`. Validado: 4K = 16 locais / 0 remotas; 102.4K = 2 locais / 14 remotas (181.6 t/s prefill, 30.4 tok/s decode, latência média por boundary = 83.1 µs) |
-| **Fase 5** | Prefill migration assíncrona | ✅ **Concluída** | Chunking dinâmico via ubatch (256/512/1024), amortizando overhead de cópia com prefill sustentado > 180-240 t/s |
-| **Fase 6** | Prompt cache & Session lifecycle | ✅ **Concluída** | Ciclo de vida de sessões, reset-on-clear callback integrado com KVarN memory manager e profiling JSON |
-| **Fase 7** | MTP / Multi-Token Batching ($N > 1$) | ✅ **Concluída** | MTP validado com sucesso (`Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`). 4K: **47.7 tok/s** (83.3% acceptance rate, speedup de +47%); 56.3K: **33.9 tok/s** com 13L offloaded no target e 16L no draft context |
-| **Fase 8** | Caracterização e Validação | ✅ **Concluída** | Validação em múltiplos checkpoints (Qwen3.8-27B IQ3_XXS, Swift-1.5 MTP); 100% de paridade e estabilidade em 102.4K |
+| **Fase 0** | Profiling baseline (4070 pura, IQ3_XXS) | ⚠️ **Histórico inválido para comparar com o caminho corrigido** | Os números antigos foram obtidos com a atenção local-split que não calculava o resultado. Baseline atual válida: 102.4K, IQ3_XXS, b/ub256, tail2.048: 847.95 t/s prefill e 30.85 t/s decode. |
+| **Fase 1** | Backend local-attn Vulkan (In-process) | ❌ **Abandonada** | `ggml-local-split` copiava Q/K/V e retornava saída zerada; substituído pela atenção nativa Vulkan via scheduler e KVarN. |
+| **Fase 2** | 1–2 layers remotas (Validação ring buffer) | ❌ **Medições invalidadas** | O ring buffer antigo não executava atenção correta. A rota atual de uma camada remota mediu 254.84/11.94 t/s em teste controlado. |
+| **Fase 3** | Placement variável (Curva TPS × N layers) | ❌ **Medições invalidadas** | Curva antiga não representa custo de atenção válido. Instrumentação atual identificou atenção Vulkan como o maior custo medido. |
+| **Fase 4** | Auto placement baseado em VRAM | 🟡 **Parcialmente revalidada** | Estimativa agora inclui records, staging e tail por camada. Contexto de 102.4K foi validado com 16 camadas locais e reserva de 350M; placement remoto não é recomendado para throughput. |
+| **Fase 5** | Prefill migration assíncrona | ❌ **Não implementada** | Ubatch divide execução, mas não migra records KVarN do CUDA para Vulkan. Ver diagnóstico de gargalo acima. |
+| **Fase 6** | Prompt cache & Session lifecycle | 🟡 **Código existente; restore pendente de validação** | `--slot-save-auto` e o lifecycle existem; falta validar restauração após reiniciar com o preset atualizado. |
+| **Fase 7** | MTP / Multi-Token Batching ($N > 1$) | 🟡 **Código existente; caminho atual pendente de revalidação** | RKVA e contexto draft separado existem; falta medição MTP/DFlash válida com a atenção Vulkan corrigida. |
+| **Fase 8** | Caracterização e Validação | 🟡 **Parcialmente concluída** | IQ3_XXS foi validado até 102.4K no caminho atual; IQ3_S permanece sem caracterização. |
 
 **Objetivo:** usar a RTX 4070 como GPU principal do modelo e a Radeon 780M como acelerador auxiliar de KV cache + attention, mantendo o máximo possível de attention local na 4070 e enviando para a 780M apenas o overflow necessário.
 

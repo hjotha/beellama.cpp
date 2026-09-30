@@ -450,6 +450,10 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = params.dflash_selector_only;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.offload_rs              = params.offload_kqv && !params.no_offload_rs;
+    if (params.no_offload_rs && params.offload_kqv) {
+        LLAMA_LOG_INFO("%s: recurrent state cache uses host memory (--no-offload-rs); attention KV remains offloaded\n", __func__);
+    }
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -1092,7 +1096,7 @@ std::vector<ggml_backend_t> layer_backends;
                 size_t recr_bytes = 0;
                 const uint32_t n_rs_rows = std::max((uint32_t) 1, cparams.n_seq_max) * (1 + cparams.n_rs_seq);
                 for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
-                    if (model.hparams.is_recr(il) && cparams.offload_kqv) {
+                    if (model.hparams.is_recr(il) && cparams.offload_rs) {
                         recr_bytes += (model.hparams.n_embd_r() + model.hparams.n_embd_s()) * sizeof(float) * n_rs_rows;
                         if (model.hparams.ple_conv_state() > 0 && model.hparams.is_ple(il)) {
                             recr_bytes += model.hparams.ple_conv_state() * sizeof(float) * n_rs_rows;
@@ -1100,24 +1104,86 @@ std::vector<ggml_backend_t> layer_backends;
                     }
                 }
 
-                const size_t n_head_kv = model.hparams.n_head_kv();
-                const size_t head_dim  = model.hparams.n_embd_head_k();
-                const size_t bits_k    = cparams.kvarn.key_bits ? cparams.kvarn.key_bits : 4;
-                const size_t bits_v    = cparams.kvarn.value_bits ? cparams.kvarn.value_bits : 4;
-                const size_t bytes_per_token_layer = (n_head_kv * head_dim * (bits_k + bits_v)) / 8 + 64;
-                const size_t bytes_per_layer = bytes_per_token_layer * (size_t) cparams.n_ctx;
-
                 const size_t total_deduction = reserve + recr_bytes;
                 const size_t usable_cuda_kv = (cuda_free > total_deduction) ? (cuda_free - total_deduction) : 0;
-                int n_local_fit = bytes_per_layer > 0 ? (int) (usable_cuda_kv / bytes_per_layer) : 0;
+                std::vector<size_t> full_attn_layer_bytes;
+                full_attn_layer_bytes.reserve(n_full_attn);
+                size_t max_layer_bytes = 0;
+                const bool use_kvarn = cparams.kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
+                const size_t n_streams = cparams.kv_unified ? 1u :
+                    std::max((uint32_t) 1, cparams.n_seq_max);
+                const uint32_t record_groups =
+                    (cparams.n_ctx_seq + KVAR_N_GROUP - 1) / KVAR_N_GROUP;
+                const uint32_t stage_tail_groups = use_kvarn ?
+                    llama_kvarn_non_swa_tail_groups(cparams.n_batch, cparams.n_ubatch) *
+                        (cparams.kv_unified ? std::max((uint32_t) 1, cparams.n_seq_max) : 1u) : 0u;
+                const uint32_t stage_groups = stage_tail_groups + (use_kvarn ? 1u : 0u);
+                const size_t bits_k = cparams.kvarn.key_bits ? cparams.kvarn.key_bits : 4;
+                const size_t bits_v = cparams.kvarn.value_bits ? cparams.kvarn.value_bits : 4;
+                const ggml_type exact_tail_type = cparams.kv_tail_type != GGML_TYPE_COUNT ?
+                    cparams.kv_tail_type : (use_kvarn ? GGML_TYPE_F16 : GGML_TYPE_BF16);
+
+                for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                    if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
+                        continue;
+                    }
+                    const size_t n_head_kv = model.hparams.n_head_kv(il);
+                    const size_t k_dim = model.hparams.n_embd_k_gqa(il);
+                    const size_t v_dim = model.hparams.n_embd_v_gqa(il);
+                    size_t layer_bytes = 0;
+                    if (use_kvarn) {
+                        llama_kvarn_geometry k_geometry = {};
+                        llama_kvarn_geometry v_geometry = {};
+                        if (!llama_kvarn_geometry_for(model.hparams.n_embd_head_k(il), k_geometry) ||
+                                !llama_kvarn_geometry_for(model.hparams.n_embd_head_v(il), v_geometry)) {
+                            throw std::runtime_error(format(
+                                "auto-placement cannot size KVarN layer %u", il));
+                        }
+                        const size_t k_records_per_group =
+                            llama_kvarn_make_record_layout(k_geometry.record_dim, bits_k, false).record_bytes *
+                            n_head_kv * k_geometry.head_slices;
+                        const size_t v_records_per_group =
+                            llama_kvarn_make_record_layout(v_geometry.record_dim, bits_v, true).record_bytes *
+                            n_head_kv * v_geometry.head_slices;
+                        layer_bytes += (k_records_per_group + v_records_per_group) *
+                            record_groups * n_streams;
+                        layer_bytes += (k_dim + v_dim) * sizeof(ggml_fp16_t) *
+                            KVAR_N_GROUP * stage_groups * n_streams;
+                    } else {
+                        layer_bytes += ggml_row_size(params.type_k, k_dim) * cparams.n_ctx_seq * n_streams;
+                        layer_bytes += ggml_row_size(params.type_v, v_dim) * cparams.n_ctx_seq * n_streams;
+                    }
+                    if (cparams.kv_tail_tokens > 0) {
+                        const size_t tail_k_row = ggml_row_size(exact_tail_type, k_dim);
+                        const size_t tail_v_row = ggml_row_size(exact_tail_type, v_dim);
+                        layer_bytes += (tail_k_row + tail_v_row) * cparams.kv_tail_tokens * n_streams;
+                    }
+                    full_attn_layer_bytes.push_back(layer_bytes);
+                    max_layer_bytes = std::max(max_layer_bytes, layer_bytes);
+                }
+
+                // Placement selects a suffix of layers for CUDA (the first N
+                // full-attention layers are the remote prefix). Fit exact layer
+                // sizes from the end so variable GQA/head geometries are safe.
+                int n_local_fit = 0;
+                size_t local_bytes = 0;
+                for (auto it = full_attn_layer_bytes.rbegin(); it != full_attn_layer_bytes.rend(); ++it) {
+                    if (*it > usable_cuda_kv - std::min(usable_cuda_kv, local_bytes)) {
+                        break;
+                    }
+                    local_bytes += *it;
+                    ++n_local_fit;
+                }
                 n_local_fit = std::clamp(n_local_fit, 0, n_full_attn);
 
                 n_remote = n_full_attn - n_local_fit;
                 LLAMA_LOG_INFO("%s: auto-placement: CUDA free=%.1f MiB, reserve=%.1f MiB, rs_cache=%.1f MiB, usable=%.1f MiB, "
-                               "layer_kv=%.1f MiB -> %d local full-attn layers on 4070, %d offloaded to %s\n",
+                               "layer_kv_max=%.1f MiB (records+stage+tail), local_kv=%.1f MiB -> %d local full-attn layers on 4070, %d offloaded to %s\n",
                                __func__, cuda_free / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0,
                                recr_bytes / 1024.0 / 1024.0, usable_cuda_kv / 1024.0 / 1024.0,
-                               bytes_per_layer / 1024.0 / 1024.0, n_local_fit, n_remote, params.remote_attn_host);
+                               max_layer_bytes / 1024.0 / 1024.0,
+                               local_bytes / 1024.0 / 1024.0,
+                               n_local_fit, n_remote, params.remote_attn_host);
             } else if (params.remote_attn_n_layers > 0 && params.remote_attn_n_layers <= n_full_attn) {
                 n_remote = params.remote_attn_n_layers;
             }
@@ -2452,9 +2518,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    llama_memory_context_finish_guard memory_finish_guard(mctx);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
+        memory_finish_guard.finish(ret);
         return nullptr;
     }
 
@@ -2491,18 +2559,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
-            if (mctx) {
-                mctx->graph_compute_finish(ret);
-            }
+            memory_finish_guard.finish(ret);
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
-            if (mctx) {
-                mctx->graph_compute_finish(ret);
-            }
+            memory_finish_guard.finish(ret);
             return nullptr;
         }
     }
@@ -2521,9 +2585,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         mctx->graph_compute_start();
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (mctx) {
-        mctx->graph_compute_finish(status);
-    }
+    memory_finish_guard.finish(status);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -5668,6 +5730,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_tail_request             =*/ nullptr,
         /*.dflash_split                =*/ false,
         /*.dflash_selector_only        =*/ false,
+        /*.no_offload_rs               =*/ false,
     };
 
     return result;

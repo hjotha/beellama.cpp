@@ -1,6 +1,8 @@
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-cache-state.h"
 #include "llama-kv-cells.h"
+#include "llama-memory.h"
+#include "llama-batch.h"
 
 #include <cmath>
 #include <chrono>
@@ -23,7 +25,43 @@ static llama_kv_tail_identity id(uint32_t cell, uint64_t generation = 1) {
     return { 0, cell, generation };
 }
 
+struct test_memory_context final : llama_memory_context_i {
+    llama_ubatch ubatch = {};
+    int finish_count = 0;
+    ggml_status finish_status = GGML_STATUS_SUCCESS;
+
+    bool next() override { return false; }
+    bool apply() override { return true; }
+    const llama_ubatch & get_ubatch() const override { return ubatch; }
+    llama_memory_status get_status() const override { return LLAMA_MEMORY_STATUS_SUCCESS; }
+    void graph_compute_finish(ggml_status status) override {
+        ++finish_count;
+        finish_status = status;
+    }
+};
+
+static void test_memory_context_finish_guard() {
+    test_memory_context failed;
+    try {
+        llama_memory_context_finish_guard guard(&failed);
+        throw std::runtime_error("injected graph submission failure");
+    } catch (const std::runtime_error &) {
+    }
+    CHECK(failed.finish_count == 1);
+    CHECK(failed.finish_status == GGML_STATUS_FAILED);
+
+    test_memory_context completed;
+    {
+        llama_memory_context_finish_guard guard(&completed);
+        guard.finish(GGML_STATUS_SUCCESS);
+    }
+    CHECK(completed.finish_count == 1);
+    CHECK(completed.finish_status == GGML_STATUS_SUCCESS);
+}
+
 int main() {
+    test_memory_context_finish_guard();
+
     int ordinal_visits = 0;
     const auto ordinals = llama_kv_cache_state_cell_ordinals(8, [&](uint32_t cell) {
         ++ordinal_visits;

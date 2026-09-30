@@ -32,7 +32,8 @@ public:
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                  uint32_t   n_ubatch,
-                     bool   offload,
+                     bool   offload_kv,
+                     bool   offload_rs,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,

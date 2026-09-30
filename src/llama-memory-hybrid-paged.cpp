@@ -26,7 +26,7 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
+                     bool   offload_rs,
                             /* backends */
     const std::vector<ggml_backend_t> & layer_backends,
     const std::vector<ggml_backend_t> & kv_backends,
@@ -52,7 +52,7 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
         model,
         type_r,
         type_s,
-        offload,
+        offload_rs,
         rs_size,
         n_seq_max,
         n_rs_seq,

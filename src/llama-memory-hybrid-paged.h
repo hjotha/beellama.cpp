@@ -40,7 +40,7 @@ public:
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
+                     bool   offload_rs,
                             /* backends */
     const std::vector<ggml_backend_t> & layer_backends,
     const std::vector<ggml_backend_t> & kv_backends,
