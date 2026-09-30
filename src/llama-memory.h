@@ -138,6 +138,20 @@ struct llama_memory_i {
     // if data == true, the data buffers will also be cleared together with the metadata
     virtual void clear(bool data) = 0;
 
+    // Optional hook invoked after a full cache clear, so a remote attention
+    // accelerator (RKVA) can reset its session in lockstep with the local cache.
+    // Set by llama_context when remote attention is enabled; defaults to no-op.
+    virtual void set_on_clear(const std::function<void()> & cb) {
+        on_clear_ = cb;
+    }
+
+    // invoke the registered clear hook (called by cache implementations)
+    void run_on_clear() const {
+        if (on_clear_) {
+            on_clear_();
+        }
+    }
+
     virtual bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
         GGML_UNUSED(seq_id);
         GGML_UNUSED(p0);
@@ -267,6 +281,11 @@ struct llama_memory_i {
     virtual uint32_t get_kv_n_stream() const { return 0; }
     virtual uint32_t get_kv_size() const { return 0; }
     virtual llama_memory_context_ptr init_kv_batch(const std::vector<llama_ubatch> & /* ubatches */) { return nullptr; }
+
+    // Registered by llama_context when a remote attention accelerator (RKVA)
+    // is active; llama_kv_cache::clear invokes run_on_clear() so the remote
+    // session resets in lockstep with the local cache. Plain struct member.
+    std::function<void()> on_clear_;
 };
 
 inline llama_memory_i::seq_rm_capability llama_memory_suffix_rollback_capability(

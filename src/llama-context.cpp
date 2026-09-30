@@ -1139,6 +1139,17 @@ std::vector<ggml_backend_t> layer_backends;
             // backend_remote only owns the RPC connection; ggml_remote_attn_exec
             // (called from the CPU compute) uses it via this active registration.
             ggml_remote_attn_set_active(backend_remote);
+
+            // RESET-on-clear: a full local cache clear (warmup, /v1/chat/completions
+            // reset, slot reuse) must reset the remote session so both sides stay in
+            // lockstep; otherwise the next generation starts over stale records.
+            if (memory) {
+                memory->set_on_clear([this]() {
+                    if (backend_remote != nullptr) {
+                        ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
+                    }
+                });
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
