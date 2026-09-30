@@ -14,7 +14,7 @@
 | **Fase 1** | Backend local-attn Vulkan (In-process) | ✅ **Concluída** | `ggml-local-split` implementado (ring buffer host-pinned 64B align), APU TDP 20W / 2700MHz, `test-local-split-attn` 100% OK |
 | **Fase 2** | 1–2 layers remotas (Validação ring buffer) | ✅ **Concluída** | Decode estável: 1 layer = 34.5 tok/s, 2 layers = 34.1 tok/s. Latência por boundary = 1.11 ms |
 | **Fase 3** | Placement variável (Curva TPS × N layers) | ✅ **Concluída** | Curva completa (16/0 -> 0/16): 16L=36.9 t/s, 4L=33.5 t/s, 8L=33.7 t/s, 16L offload=33.3 t/s (~183 µs/layer, queda total <10%) |
-| **Fase 4** | Auto placement baseado em VRAM | ⏳ Planejada | Cálculo dinâmico de $N$ layers para evitar VRAM cliff de 102K |
+| **Fase 4** | Auto placement baseado em VRAM | ✅ **Concluída** | Auto-placement dinâmico via `--remote-attn-layers auto` e `--remote-attn-cuda-reserve`. Validado: 4K = 16 locais / 0 remotas; 102.4K = 2 locais / 14 remotas (176 t/s prefill, 30.6 tok/s decode, zero VRAM thrashing) |
 | **Fase 5** | Prefill migration assíncrona | ⏳ Planejada | Pipeline assíncrona chunk 512 |
 | **Fase 6** | Prompt cache awareness | ⏳ Planejada | Direct KV placement no cache |
 | **Fase 7** | MTP / DFlash2 batching ($N > 1$) | ⏳ Planejada | Testes com Qwen3.8-27B MTP / DFlash |
