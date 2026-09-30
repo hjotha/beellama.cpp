@@ -24,11 +24,14 @@ do decode. O caminho nativo continua executando atenção Vulkan com KV Vulkan
 durante decode; não reutilizar slots produzidos pelo caminho antigo que zerava
 a atenção.
 
-O protótipo requer KVarN, uma sequência, placement remoto explícito e nenhuma
-SWA ou MTP. Ele mantém a alocação CUDA original e um espelho completo dos
-records remotos em Vulkan; portanto não libera VRAM CUDA nem aumenta por si só o
-limite de contexto. Ainda não é o desenho final de migração sem duplicação nem
-está ativado no preset de produção.
+O protótipo requer KVarN, uma sequência e nenhuma SWA. Suporta MTP standalone:
+somente o cache alvo migra e o contexto draft mantém a própria rota estática.
+Com `remote-attn-layers=auto`, migra uma layer se o KV alvo completo cabe no
+orçamento seguro da CUDA; quando não cabe, mantém o placement remoto estático
+para o perfil. Shadow e outros modos especulativos são recusados. O espelho
+Vulkan continua duplicando os records durante o prefill, então a feature não
+libera VRAM CUDA nem aumenta por si só o limite de contexto; ainda não está
+habilitada no preset de produção.
 
 ## Diagnóstico de produção — 2026-09-30
 
@@ -134,13 +137,16 @@ handoff final sincroniza a fila e copia stage/tail. Ao voltar do decode Vulkan
 para um novo prefill CUDA, sincroniza o contexto e atualiza o espelho antes de
 trocar o owner. Uma falha invalida o espelho e mantém o owner ativo; não tenta
 decodificar de um mirror parcial. A fila permanece desabilitada até recriar o
-contexto depois de um erro de transferência.
+contexto depois de um erro de transferência. No placement `auto`, se a estimativa
+da cache completa excede o orçamento seguro, o contexto volta ao placement
+remoto estático em vez de falhar durante a transição adaptativa.
 
 Esse primeiro corte ainda conserva as duas alocações dos records e exige que o
-KV usado no prefill caiba na CUDA. Não habilitar junto de MTP, placement
-automático, múltiplas sequências ou SWA. Para liberar VRAM e suportar contextos
-maiores, falta migrar ownership sem manter buffers completos duplicados,
-incluindo records, stage, tail e os caminhos de restore/rollback.
+KV usado no prefill caiba na CUDA. O placement `auto` apenas ativa a migração
+quando essa condição é satisfeita; o fallback estático conserva os tiers maiores.
+Para liberar VRAM e suportar contextos maiores, falta migrar ownership sem
+manter buffers completos duplicados, incluindo records, stage, tail e os
+caminhos de restore/rollback.
 
 Na mesma revisão, a atenção Vulkan KVarN foi otimizada e medida isoladamente na
 Radeon: prefill256 caiu de 536.94 para 497.04 ms (7.4%), decode1 de 16.913 para
@@ -157,10 +163,12 @@ consecutivas com 4.216 tokens, ctx40960, KVarN4, tail2048 e batch/ubatch256
 completaram; cada handoff de prompt registrou `prefill-migrate decode handoff
 result=0`. O prefill mediu 825.31 e 847.77 t/s; o decode Vulkan, 16.05 e 17.16
 t/s. Isso valida ida e volta entre requests no smoke test sem MTP, mas não
-qualifica o preset de produção. A compatibilidade que Astra High encontrou no
-modo estático também foi testada: `remote-attn-prefill=remote`, uma layer
-Vulkan, MTP4, ctx40960 e tail2048 iniciaram e completaram uma request de 1.355
-tokens, com 4/4 drafts aceitos.
+qualifica o preset de produção. Com MTP4 e uma layer explícita, duas requests
+de 1.355 tokens completaram com 4/4 drafts aceitos e handoff `result=0`
+(prefill 644.19/677.86 t/s; decode 28.73/38.35 t/s). Com `auto`, ctx24576
+completou duas requests em migração (prefill 653.61/733.58 t/s; decode
+34.21/42.41 t/s). Em ctx40960, a estimativa foi 852.0 MiB contra orçamento
+767.5 MiB e o placement remoto estático foi usado com MTP ativo.
 
 O perfil Vulkan instrumentado antes do novo split-K, com reserva700M (13 camadas
 locais/3 Vulkan), contexto102.400, tail2.048, `batch/ubatch=256` e prompt7.681,
@@ -215,7 +223,7 @@ resultado aprovado.
 | **Fase 2** | 1–2 layers remotas (Validação ring buffer) | ❌ **Medições invalidadas** | O ring buffer antigo não executava atenção correta. A rota atual de uma camada remota mediu 254.84/11.94 t/s em teste controlado. |
 | **Fase 3** | Placement variável (Curva TPS × N layers) | ❌ **Medições invalidadas** | Curva antiga não representa custo de atenção válido. Instrumentação atual identificou atenção Vulkan como o maior custo medido. |
 | **Fase 4** | Auto placement baseado em VRAM | 🟡 **Parcialmente revalidada** | Estimativa agora inclui records, staging e tail por camada. Contexto de 102.4K foi validado com 16 camadas locais e reserva de 350M; placement remoto não é recomendado para throughput. |
-| **Fase 5** | Prefill migration assíncrona | 🟡 **Protótipo opt-in** | Prefill CUDA, cópia em background por grupo KVarN de 128 tokens e handoff para decode Vulkan. Ainda duplica records CUDA/Vulkan, exige cache caber na CUDA e não suporta MTP/auto placement/SWA/multi-slot; não habilitar em produção. |
+| **Fase 5** | Prefill migration assíncrona | 🟡 **Protótipo opt-in** | Prefill CUDA, cópia em background por grupo KVarN de 128 tokens e handoff para decode Vulkan. MTP standalone e `auto` com fallback remoto foram testados. Ainda duplica records CUDA/Vulkan e não aumenta o teto de contexto; não ativado no preset de produção. |
 | **Fase 6** | Prompt cache & Session lifecycle | 🟡 **Código existente; restore pendente de validação** | `--slot-save-auto` e o lifecycle existem; falta validar restauração após reiniciar com o preset atualizado. |
 | **Fase 7** | MTP / Multi-Token Batching ($N > 1$) | 🟡 **Código existente; caminho atual pendente de revalidação** | RKVA e contexto draft separado existem; falta medição MTP/DFlash válida com a atenção Vulkan corrigida. |
 | **Fase 8** | Caracterização e Validação | 🟡 **Parcialmente concluída** | IQ3_XXS foi validado até 102.4K no caminho atual; IQ3_S permanece sem caracterização. |

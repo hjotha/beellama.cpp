@@ -5391,6 +5391,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.remote_attn_host.clear();
     result.remote_attn_port = 0;
     result.remote_attn_layers = "0";
+    // Prefill migration belongs to the target cache only. The auxiliary MTP
+    // context owns its nextn-layer KV and must not inherit the migration mode.
+    result.remote_attn_prefill = "remote";
 
     if (has_draft) {
         // default to global devices value

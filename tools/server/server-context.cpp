@@ -4926,9 +4926,18 @@ private:
             model_dft = nullptr;
         }
 
+        const bool migrate_mtp_only = spec != nullptr &&
+                std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() &&
+                std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                        [](common_speculative_type type) {
+                            return type == COMMON_SPECULATIVE_TYPE_NONE ||
+                                   type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                        }) &&
+                !params_base.speculative.shadow.enabled();
         if (params_base.remote_attn_prefill == "migrate" &&
-                (params_base.n_parallel != 1 || spec != nullptr)) {
-            SRV_ERR("%s", "remote-attn-prefill=migrate currently requires one slot and speculative decoding disabled\n");
+                (params_base.n_parallel != 1 || (spec != nullptr && !migrate_mtp_only))) {
+            SRV_ERR("%s", "remote-attn-prefill=migrate requires one slot and supports only standalone MTP drafting\n");
             return false;
         }
 
@@ -8674,7 +8683,9 @@ if (task.params.cache_prompt) {
                                             slot.release();
                                             return;
                                         }
-                                        if (handoff_status != LLAMA_PREFILL_MIGRATION_OK) {
+                                        if (handoff_status == LLAMA_PREFILL_MIGRATION_STATIC_REMOTE) {
+                                            SRV_INF("%s", "restored prompt uses static remote placement for this profile\n");
+                                        } else if (handoff_status == LLAMA_PREFILL_MIGRATION_OWNER_UNCHANGED) {
                                             SRV_WRN("%s", "could not move restored KVarN cache to Vulkan; continuing on its current owner\n");
                                         }
                                     }
@@ -9226,7 +9237,9 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                         handoff_status == LLAMA_PREFILL_MIGRATION_ERROR) {
                     throw std::runtime_error("KVarN handoff could not reserve a usable graph scheduler");
                 }
-                if (handoff_status != LLAMA_PREFILL_MIGRATION_OK) {
+                if (handoff_status == LLAMA_PREFILL_MIGRATION_STATIC_REMOTE) {
+                    SRV_DBG("%s", "prefill uses static remote placement for this profile\n");
+                } else if (handoff_status == LLAMA_PREFILL_MIGRATION_OWNER_UNCHANGED) {
                     SRV_WRN("%s", "could not move KVarN cache to CUDA; prefill will use its current owner\n");
                 }
             }
@@ -9861,7 +9874,9 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                     handoff_status == LLAMA_PREFILL_MIGRATION_ERROR) {
                 throw std::runtime_error("KVarN handoff could not reserve a usable graph scheduler");
             }
-            if (handoff_status != LLAMA_PREFILL_MIGRATION_OK) {
+            if (handoff_status == LLAMA_PREFILL_MIGRATION_STATIC_REMOTE) {
+                SRV_INF("%s", "decode uses static remote placement for this profile\n");
+            } else if (handoff_status == LLAMA_PREFILL_MIGRATION_OWNER_UNCHANGED) {
                 SRV_WRN("%s", "could not move completed prompt KVarN cache to Vulkan; decode will use its current owner\n");
             }
         }

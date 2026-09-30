@@ -104,9 +104,10 @@ bool kv_unified;
     ggml_backend_t local_attn_migration_backend = nullptr;
     ggml_backend_t local_attn_prefill_backend = nullptr;
     bool        local_attn_migration = false;
+    bool        local_attn_migration_fallback = false;
     bool        remote_attn_enabled = false;
     int         remote_attn_layers  = 0;   // count of full-attention layers offloaded (0 = none)
-    int         remote_attn_prefill = 0;   // 0 = remote, 1 = migrate (reserved)
+    int         remote_attn_prefill = 0;   // 0 = static remote attention, 1 = prefill migration
     bool        remote_attn_stats   = false;
 
     // Prism: per-channel K-cache mean-centering bias file (requires type_k == Q4_0).

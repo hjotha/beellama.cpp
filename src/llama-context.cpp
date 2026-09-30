@@ -1224,6 +1224,32 @@ std::vector<ggml_backend_t> layer_backends;
                 n_local_fit = std::clamp(n_local_fit, 0, n_full_attn);
 
                 n_remote = n_full_attn - n_local_fit;
+                if (cparams.local_attn_migration) {
+                    const size_t full_prefill_kv = std::accumulate(
+                            full_attn_layer_bytes.begin(), full_attn_layer_bytes.end(), size_t(0));
+                    if (full_prefill_kv > usable_cuda_kv) {
+                        // CUDA prefill needs the complete target cache resident.
+                        // If it cannot fit within the safety budget, preserve the
+                        // ordinary auto-placement route rather than failing an
+                        // adaptive profile or attempting a partial migration.
+                        cparams.local_attn_migration = false;
+                        cparams.local_attn_migration_fallback = true;
+                        cparams.local_attn_backend = cparams.local_attn_migration_backend;
+                        LLAMA_LOG_WARN("%s: automatic prefill migration does not fit CUDA (need %.1f MiB, budget %.1f MiB); "
+                                       "falling back to static remote attention with %d layer(s)\n",
+                                __func__, full_prefill_kv / 1024.0 / 1024.0,
+                                usable_cuda_kv / 1024.0 / 1024.0, n_remote);
+                    } else {
+                        // The existing auto policy returns zero remote layers when
+                        // the complete cache fits. Migration mode uses one layer
+                        // as its decode destination while keeping prefill local.
+                        n_remote = n_full_attn > 0 ? 1 : 0;
+                        LLAMA_LOG_INFO("%s: migration auto-placement keeps full target KV on CUDA (%.1f/%.1f MiB) "
+                                       "and selects %d Vulkan decode layer(s)\n",
+                                __func__, full_prefill_kv / 1024.0 / 1024.0,
+                                usable_cuda_kv / 1024.0 / 1024.0, n_remote);
+                    }
+                }
                 LLAMA_LOG_INFO("%s: auto-placement: CUDA free=%.1f MiB, reserve=%.1f MiB, rs_cache=%.1f MiB, usable=%.1f MiB, "
                                "layer_kv_max=%.1f MiB (records+stage+tail), local_kv=%.1f MiB -> %d local full-attn layers on 4070, %d offloaded to %s\n",
                                __func__, cuda_free / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0,
@@ -1235,11 +1261,9 @@ std::vector<ggml_backend_t> layer_backends;
                 n_remote = params.remote_attn_n_layers;
             }
             cparams.remote_attn_layers = n_remote;
-            if (cparams.local_attn_migration &&
-                    (params.remote_attn_n_layers == -1 || n_remote <= 0)) {
+            if (cparams.local_attn_migration && n_remote <= 0) {
                 throw std::invalid_argument(
-                    "--remote-attn-prefill=migrate requires an explicit positive --remote-attn-layers count; "
-                    "automatic overflow placement cannot prefill a cache that exceeds CUDA capacity");
+                    "--remote-attn-prefill=migrate requires at least one full-attention layer for Vulkan decode");
             }
         }
 
@@ -1744,6 +1768,9 @@ void llama_context::sched_reserve() {
 }
 
 int32_t llama_context::prefill_migration_handoff(bool to_remote) {
+    if (cparams.local_attn_migration_fallback) {
+        return LLAMA_PREFILL_MIGRATION_STATIC_REMOTE;
+    }
     if (!cparams.local_attn_migration || !memory ||
             !memory->supports_prefill_migration() ||
             cparams.local_attn_migration_backend == nullptr ||

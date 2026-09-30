@@ -1411,6 +1411,8 @@ extern "C" {
         LLAMA_PREFILL_MIGRATION_OWNER_UNCHANGED = 1,
         // Scheduler reservation failed; the current request must stop.
         LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED = 2,
+        // Auto-placement selected the safe static remote route for this profile.
+        LLAMA_PREFILL_MIGRATION_STATIC_REMOTE = 3,
         // Invalid context or an unexpected exception.
         LLAMA_PREFILL_MIGRATION_ERROR = -1,
     };
