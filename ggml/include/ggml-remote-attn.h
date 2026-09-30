@@ -84,6 +84,21 @@ GGML_API bool ggml_backend_remote_attn_failed(ggml_backend_t backend);
 GGML_API const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend);
 GGML_API void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend);
 
+// --- CPU-pinned execution path -------------------------------------------
+// The remote attention op is computed on the CPU backend (pinned like the
+// offload_kqv path) so the scheduler's proven CUDA<->CPU copies feed Q/K/V/pos
+// and drain the output; the RPC runs inside the CPU compute. The backend object
+// still owns the connection but is NOT registered with the scheduler.
+//
+// Registers the backend whose connection ggml_remote_attn_exec() should use
+// (MVP: one active remote connection per process). Pass NULL to clear.
+GGML_API void ggml_remote_attn_set_active(ggml_backend_t backend);
+
+// Executes one GGML_OP_REMOTE_ATTN node over the active connection. Called from
+// the CPU backend's compute_forward. The node's sources are host tensors (CPU
+// buffer), read via ggml_backend_tensor_get. Returns false on RPC/GPU failure.
+GGML_API bool ggml_remote_attn_exec(struct ggml_tensor * node);
+
 #ifdef __cplusplus
 }
 #endif

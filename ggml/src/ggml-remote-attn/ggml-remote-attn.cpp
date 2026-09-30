@@ -941,3 +941,36 @@ void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend) {
     std::lock_guard<std::mutex> lock(ctx->mutex);
     ctx->stats = rkva_stats {};
 }
+
+// ---------------------------------------------------------------------------
+// CPU-pinned execution path (PATH B): the op is computed on the CPU backend and
+// calls into the active connection here. One active connection per process (MVP).
+// ---------------------------------------------------------------------------
+
+static ggml_backend_t g_remote_attn_active = nullptr;
+
+void ggml_remote_attn_set_active(ggml_backend_t backend) {
+    g_remote_attn_active = backend;
+}
+
+bool ggml_remote_attn_exec(struct ggml_tensor * node) {
+    ggml_backend_t backend = g_remote_attn_active;
+    if (backend == nullptr) {
+        GGML_LOG_ERROR("%s: exec with no active remote connection\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->failed || !ctx->connected) {
+        GGML_LOG_ERROR("%s: exec while not connected (failed=%d)\n",
+                       GGML_REMOTE_ATTN_NAME, (int) ctx->failed);
+        return false;
+    }
+    if (!rkva_run_attn(ctx, node)) {
+        ctx->failed = true;
+        ctx->connected = false;
+        ctx->sock.close();
+        return false;
+    }
+    return true;
+}

@@ -1132,17 +1132,13 @@ std::vector<ggml_backend_t> layer_backends;
             LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
                     __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
 
-            // ggml_backend_sched_new requires the LAST backend to be the CPU.
-            // Insert the remote backend just before it (it only ever claims
-            // GGML_OP_REMOTE_ATTN, which we also pin explicitly, so its position
-            // among the compute backends does not affect other op placement).
-            const size_t ins = backend_ptrs.empty() ? 0 : backend_ptrs.size() - 1;
-            backend_ptrs.insert(backend_ptrs.begin() + ins, backend_remote);
-            backend_buft.insert(backend_buft.begin() + ins,
-                    ggml_backend_get_default_buffer_type(backend_remote));
-            backend_buf_exp_size.insert(backend_buf_exp_size.begin() + ins, 0);
-            backend_kvarn_workspace_y_size.insert(backend_kvarn_workspace_y_size.begin() + ins, 0);
-            backend_kvarn_workspace_split_k_size.insert(backend_kvarn_workspace_split_k_size.begin() + ins, 0);
+            // PATH B: the remote op is computed on the CPU backend (pinned in
+            // qwen35), so the scheduler uses its proven CUDA<->CPU copies and we
+            // do NOT register backend_remote with the scheduler (a minimal custom
+            // backend in the split/copy machinery corrupted tensor backend ids).
+            // backend_remote only owns the RPC connection; ggml_remote_attn_exec
+            // (called from the CPU compute) uses it via this active registration.
+            ggml_remote_attn_set_active(backend_remote);
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
@@ -1233,6 +1229,7 @@ llama_context::~llama_context() {
             LLAMA_LOG_INFO("%s: remote_attn stats %s\n", __func__,
                     ggml_backend_remote_attn_stats_json(backend_remote));
         }
+        ggml_remote_attn_set_active(nullptr);
         sched.reset();
         ggml_backend_free(backend_remote);
         backend_remote = nullptr;

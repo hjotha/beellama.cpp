@@ -410,7 +410,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         // (M-RoPE layout is [dim][token], so dim 0 == ubatch.pos).
         cur = ggml_remote_attn(ctx0, Qcur, Kcur, Vcur, inp_pos, il, kq_scale,
                 GGML_REMOTE_ATTN_DOMAIN_AUTO);
-        ggml_backend_sched_set_tensor_backend(sched, cur, backend_remote);
+        // Pin to the CPU backend (PATH B): the op's compute runs the RPC there,
+        // and the scheduler feeds/drains it with the proven CUDA<->CPU copies
+        // (same mechanism as offload_kqv). backend_remote only owns the socket.
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         cb(cur, "attn_remote", il);
     } else {
         cur = build_attn(inp,

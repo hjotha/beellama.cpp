@@ -1790,6 +1790,9 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+// Remote KV+attention execution (ggml-remote-attn, ggml-base). C linkage.
+extern bool ggml_remote_attn_exec(struct ggml_tensor * node);
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2181,9 +2184,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_REMOTE_ATTN:
             {
-                // Remote attention is only ever scheduled on the
-                // ggml-remote-attn backend; reaching the CPU path is a wiring bug.
-                GGML_ABORT("%s: GGML_OP_REMOTE_ATTN must not run on the CPU backend\n", __func__);
+                // Remote KV+attention: the RPC runs here (CPU backend, pinned
+                // like offload_kqv). Sources are host tensors; output is written
+                // back to this node's host buffer for the scheduler to copy.
+                if (!ggml_remote_attn_exec(tensor)) {
+                    GGML_ABORT("%s: GGML_OP_REMOTE_ATTN remote execution failed\n", __func__);
+                }
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
