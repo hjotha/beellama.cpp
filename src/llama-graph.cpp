@@ -1662,8 +1662,10 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    inp_attn->mctx = mctx->get_attn();
-    inp_attn->set_input(ubatch);
+    if (inp_attn) {
+        inp_attn->mctx = mctx->get_attn();
+        inp_attn->set_input(ubatch);
+    }
 
     inp_rs->set_input_rs(mctx->get_recr(), ubatch);
 }
@@ -1672,39 +1674,44 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
     this->mctx = mctx;
-    inp_attn->mctx = mctx->get_attn();
 
     bool res = true;
 
-    const auto [tail_q_max, tail_n_active] = tail_query_plan_shape(params.ubatch);
-    res &= inp_attn->self_tail_query_order == nullptr ||
-            (inp_attn->self_tail_query_order->ne[0] == tail_q_max &&
-             inp_attn->self_tail_query_order->ne[1] == tail_n_active);
-    const uint32_t tail_attention_stride = mctx->get_attn()->get_tail_attention_stride(uint32_t(tail_q_max));
-    const int64_t tail_desc_stride = 6 + tail_attention_stride +
-            (mctx->get_attn()->can_pack_tail_body(params.ubatch) ?
-                    mctx->get_attn()->get_tail_body_execution_stride() : 0);
-    res &= inp_attn->self_tail_run_desc == nullptr ||
-            (inp_attn->self_tail_run_desc->ne[0] == tail_desc_stride &&
-             inp_attn->self_tail_run_desc->ne[1] == tail_n_active);
+    // inp_attn is null when the full-attention layers are offloaded to the
+    // remote RKVA backend (no local attention KV input is built).
+    if (inp_attn) {
+        inp_attn->mctx = mctx->get_attn();
 
-    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
-  //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+        const auto [tail_q_max, tail_n_active] = tail_query_plan_shape(params.ubatch);
+        res &= inp_attn->self_tail_query_order == nullptr ||
+                (inp_attn->self_tail_query_order->ne[0] == tail_q_max &&
+                 inp_attn->self_tail_query_order->ne[1] == tail_n_active);
+        const uint32_t tail_attention_stride = mctx->get_attn()->get_tail_attention_stride(uint32_t(tail_q_max));
+        const int64_t tail_desc_stride = 6 + tail_attention_stride +
+                (mctx->get_attn()->can_pack_tail_body(params.ubatch) ?
+                        mctx->get_attn()->get_tail_body_execution_stride() : 0);
+        res &= inp_attn->self_tail_run_desc == nullptr ||
+                (inp_attn->self_tail_run_desc->ne[0] == tail_desc_stride &&
+                 inp_attn->self_tail_run_desc->ne[1] == tail_n_active);
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
-    res &= inp_attn->self_tail_read_idxs == nullptr ||
-            (inp_attn->self_tail_read_idxs->ne[0] == tail_attention_stride &&
-             inp_attn->self_tail_read_idxs->ne[1] == params.ubatch.n_tokens);
-    res &= inp_attn->self_tail_body_read_idxs == nullptr ||
-            (inp_attn->self_tail_body_read_idxs->ne[0] == tail_attention_stride &&
-             inp_attn->self_tail_body_read_idxs->ne[1] == params.ubatch.n_tokens);
-    res &= inp_attn->self_tail_bias_read_idxs == nullptr ||
-            (inp_attn->self_tail_bias_read_idxs->ne[0] == tail_attention_stride &&
-             inp_attn->self_tail_bias_read_idxs->ne[1] == params.ubatch.n_tokens);
-    res &= inp_attn->self_kq_mask_tail == nullptr ||
-            (inp_attn->self_kq_mask_tail->ne[0] == tail_attention_stride &&
-             inp_attn->self_kq_mask_tail->ne[1] == inp_attn->self_kq_mask->ne[1] &&
-             inp_attn->self_kq_mask_tail->ne[3] == inp_attn->self_kq_mask->ne[3]);
+        res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+      //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+        res &= inp_attn->self_tail_read_idxs == nullptr ||
+                (inp_attn->self_tail_read_idxs->ne[0] == tail_attention_stride &&
+                 inp_attn->self_tail_read_idxs->ne[1] == params.ubatch.n_tokens);
+        res &= inp_attn->self_tail_body_read_idxs == nullptr ||
+                (inp_attn->self_tail_body_read_idxs->ne[0] == tail_attention_stride &&
+                 inp_attn->self_tail_body_read_idxs->ne[1] == params.ubatch.n_tokens);
+        res &= inp_attn->self_tail_bias_read_idxs == nullptr ||
+                (inp_attn->self_tail_bias_read_idxs->ne[0] == tail_attention_stride &&
+                 inp_attn->self_tail_bias_read_idxs->ne[1] == params.ubatch.n_tokens);
+        res &= inp_attn->self_kq_mask_tail == nullptr ||
+                (inp_attn->self_kq_mask_tail->ne[0] == tail_attention_stride &&
+                 inp_attn->self_kq_mask_tail->ne[1] == inp_attn->self_kq_mask->ne[1] &&
+                 inp_attn->self_kq_mask_tail->ne[3] == inp_attn->self_kq_mask->ne[3]);
+    }
 
     res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
@@ -5214,7 +5221,15 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn_kv_context());
+    // When the full-attention layers are offloaded to the remote RKVA backend,
+    // the local attention KV input (k_idxs/v_idxs/mask/tail) is built but never
+    // consumed, so the scheduler leaves those tensors unallocated and their
+    // set_input would deref a NULL buffer. Skip building it entirely; the remote
+    // node uses inp_pos directly and the server owns the KV.
+    std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
+    if (!cparams.remote_attn_enabled) {
+        inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn_kv_context());
+    }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

@@ -1067,9 +1067,11 @@ std::vector<ggml_backend_t> layer_backends;
                     "%s: --remote-attn currently supports only the qwen35 arch (this model arch id: %d)",
                     __func__, (int) model.arch));
             }
-            if (cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+            if (cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED &&
+                    params.type_k != GGML_TYPE_F16) {
                 throw std::runtime_error(format(
-                    "%s: --remote-attn requires a KVarN cache type (--cache-type-k/-v kvarnN)", __func__));
+                    "%s: --remote-attn requires a KVarN cache type (--cache-type-k/-v kvarnN) "
+                    "or the F16 bring-up path (--cache-type-k/-v f16)", __func__));
             }
 
             // count the full-attention layers that will be offloaded
@@ -1130,11 +1132,17 @@ std::vector<ggml_backend_t> layer_backends;
             LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
                     __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
 
-            backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_remote));
-            backend_ptrs.push_back(backend_remote);
-            backend_buf_exp_size.push_back(0);
-            backend_kvarn_workspace_y_size.push_back(0);
-            backend_kvarn_workspace_split_k_size.push_back(0);
+            // ggml_backend_sched_new requires the LAST backend to be the CPU.
+            // Insert the remote backend just before it (it only ever claims
+            // GGML_OP_REMOTE_ATTN, which we also pin explicitly, so its position
+            // among the compute backends does not affect other op placement).
+            const size_t ins = backend_ptrs.empty() ? 0 : backend_ptrs.size() - 1;
+            backend_ptrs.insert(backend_ptrs.begin() + ins, backend_remote);
+            backend_buft.insert(backend_buft.begin() + ins,
+                    ggml_backend_get_default_buffer_type(backend_remote));
+            backend_buf_exp_size.insert(backend_buf_exp_size.begin() + ins, 0);
+            backend_kvarn_workspace_y_size.insert(backend_kvarn_workspace_y_size.begin() + ins, 0);
+            backend_kvarn_workspace_split_k_size.insert(backend_kvarn_workspace_split_k_size.begin() + ins, 0);
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
