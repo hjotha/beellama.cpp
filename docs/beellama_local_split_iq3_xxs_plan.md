@@ -1,6 +1,28 @@
 # BeeLLaMA — Local-Split Attention 4070 + Radeon 780M
 
-## Plano inicial com Qwen3.8-27B IQ3_XXS
+## Correção de validade — 2026-09-30
+
+Os resultados e marcações de conclusão abaixo são históricos e **não validam a
+implementação local-split original** (`49f273af9`). O operador local copiava Q/K/V,
+zerava a saída com `memset` e retornava sucesso sem computar atenção no Vulkan.
+Um teste isolado da biblioteca utilizada pela produção confirmou a falha: com um
+único token Q=K=0 e V=1, todos os 6144 elementos de saída foram 0 em vez de 1.
+O teste anterior exercitava apenas inicialização e não conferia os valores.
+Consequentemente, medições de throughput, aceitação MTP, memória e persistência
+feitas com aquele caminho não demonstram inferência correta.
+
+A correção utiliza os caches nativos `llama_kv_cache`/`llama_kv_cache_kvarn` com
+placement por camada e o scheduler GGML para executar a atenção no backend Vulkan.
+Pesos, projeções Q/K/V, RoPE, gate, FFN e estado recorrente permanecem no dispositivo
+do modelo. O próprio cache gerencia records, staging, tail, rollback e save/restore.
+O antigo operador de transporte local falha explicitamente se for chamado.
+O protocolo TCP RKVA do Xbox continua separado desse caminho local.
+
+Prefill assíncrono com migração CUDA→Vulkan não está implementado; o modo nativo
+executa o núcleo de atenção e mantém o KV no Vulkan durante prefill e decode.
+Não reutilizar slots produzidos pelo caminho que zerava a atenção.
+
+## Plano inicial com Qwen3.8-27B IQ3_XXS (registro histórico invalidado)
 
 > **Status da Execução:** Em andamento (Compilação concluída, Profiling Fase 0 ativo)
 > **Branch:** `integrate-pending-dflash-and-adaptive-mtp`

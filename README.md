@@ -210,6 +210,19 @@ The phase-aware governor runs inside the server, deduplicates unchanged settings
 | `--gpu-fabric-state N` | `LLAMA_ARG_GPU_FABRIC_STATE` | AMD raw fabric DPM state index `0..31` during prefill/decode; omit to leave automatic. |
 | `--apu-tdp W` | `LLAMA_ARG_APU_TDP` | Ryzen APU STAPM, fast and slow limits, each set to W while active; restores original values at idle. |
 
+**Local Vulkan attention:** `--remote-attn vulkan:0 --remote-attn-layers 16`
+keeps Qwen3.5/3.8 target weights, Q/K/V projections and recurrent state on the model
+GPU and places the selected full-attention KV caches and attention operations on
+Vulkan. It uses the native GGML scheduler and ordinary KV/KVarN memory managers,
+including precision tails, speculative rollback and slot state. The attention
+core runs on Vulkan during both prefill and decode; asynchronous prefill migration
+is not implemented. The TCP Xbox RKVA path remains a separate transport.
+
+The earlier local transport implementation returned zeros instead of computing
+attention. Its performance and quality claims are invalid; see the correction in
+[the local-split plan](docs/beellama_local_split_iq3_xxs_plan.md). Start with a clean
+slot-cache directory when upgrading from that implementation.
+
 **Dual GPU Mode (`--gpu-power-backend dual`):** Concurrently manages NVIDIA discrete/eGPU (NVML power limits + memory clocks) and AMD APU/iGPU (Ryzen SMU TDP + sysfs graphics SCLK). Perfect for hybrid inference pipelines (e.g. CUDA0 compute + Vulkan:0 remote-attention offloading).
 
 **NVIDIA:** power options must be positive and supplied together. Idle retains the last power limit; shutdown/sleep restore the original. Memory-clock options operate independently; idle and phases without a target release the applied lock/offset. GPU/driver permissions and supported ranges still apply.

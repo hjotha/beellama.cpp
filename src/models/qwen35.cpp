@@ -403,7 +403,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         }
     }
 
-    const bool is_remote = (cparams.remote_attn_enabled && backend_remote != nullptr &&
+    const bool is_remote = (cparams.remote_attn_enabled && !cparams.local_attn_backend && backend_remote != nullptr &&
                             full_attn_idx < cparams.remote_attn_layers);
 
     if (is_remote) {
@@ -426,9 +426,34 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         cb(cur, "attn_remote", il);
     } else {
+        const bool local_split = cparams.local_attn_backend && full_attn_idx < cparams.remote_attn_layers;
+        if (local_split) {
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
+        }
+        const int first_attn_node = ggml_graph_n_nodes(gf);
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        if (local_split) {
+            ggml_build_forward_expand(gf, cur);
+            auto * dev = ggml_backend_get_device(cparams.local_attn_backend);
+            for (int i = first_attn_node; i < ggml_graph_n_nodes(gf); ++i) {
+                auto * node = ggml_graph_node(gf, i);
+                if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+                        node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE ||
+                        node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_KVARN_VIEW) {
+                    continue;
+                }
+                if (!ggml_backend_dev_supports_op(dev, node)) {
+                    throw std::runtime_error(format("local attention layer %d: %s does not support %s",
+                        il, ggml_backend_dev_name(dev), ggml_op_name(node->op)));
+                }
+                ggml_backend_sched_set_tensor_backend(sched, node, cparams.local_attn_backend);
+            }
+            ggml_backend_sched_set_tensor_backend(sched, cur, cparams.local_attn_backend);
+        }
         cb(cur, "attn_pregate", il);
     }
 

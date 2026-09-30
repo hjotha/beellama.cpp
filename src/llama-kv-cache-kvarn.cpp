@@ -1390,7 +1390,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         uint32_t tail_tokens,
         ggml_type tail_type_requested,
         uint32_t tail_tokens_requested,
-        uint32_t tail_rollback_tokens) :
+        uint32_t tail_rollback_tokens,
+        const layer_device_cb & device_for_layer) :
     model(model),
     hparams(hparams),
     params(params),
@@ -1511,7 +1512,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             continue;
         }
 
-        auto * dev = offload ? model.dev_layer(il) : nullptr;
+        auto * dev = offload ? (device_for_layer ? device_for_layer(il) : model.dev_layer(il)) : nullptr;
         auto * buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {

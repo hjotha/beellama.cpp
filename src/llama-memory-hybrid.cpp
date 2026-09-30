@@ -35,7 +35,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
                  uint32_t   tail_tokens_requested,
-                 uint32_t   tail_rollback_tokens) :
+                 uint32_t   tail_rollback_tokens,
+    const layer_device_cb & device_for_layer) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -62,7 +63,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         tail_type,
         tail_tokens_requested,
         false,
-        tail_rollback_tokens
+        tail_rollback_tokens,
+        0, false, device_for_layer
     )),
     mem_recr(new llama_memory_recurrent(
         model,

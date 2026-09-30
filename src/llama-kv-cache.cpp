@@ -390,7 +390,8 @@ const  layer_reuse_cb & reuse,
          const      bool   tail_metadata_only,
          const  uint32_t   tail_rollback_tokens,
          const  uint32_t   tail_visibility_window,
-                     bool   disable_attn_rot) :
+                     bool   disable_attn_rot,
+    const layer_device_cb & device_for_layer) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
@@ -541,7 +542,7 @@ const  layer_reuse_cb & reuse,
                 GGML_ASSERT(source_k && source_k->buffer);
                 route_buft = ggml_backend_buffer_get_type(source_k->buffer);
             } else if (offload) {
-                route_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+                route_buft = ggml_backend_dev_buffer_type(device_for_layer ? device_for_layer(il) : model.dev_layer(il));
             } else {
                 route_buft = ggml_backend_cpu_buffer_type();
             }
@@ -888,7 +889,7 @@ const  layer_reuse_cb & reuse,
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            auto * dev = device_for_layer ? device_for_layer(il) : model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
@@ -4716,7 +4717,7 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_read_manifest(
                 tail_layer_count != 0 || provenance_count != 0) {
             throw std::runtime_error("body-only KV tail state contains exact-tail metadata");
         }
-    } else if (!has_tail_overlay() || !tail || layers.empty()) {
+    } else if (!has_tail_overlay() || !tail || (layers.empty() && !tail_metadata_only)) {
         if (record_count != 0 || result.tail_payload_count != 0 ||
                 tail_layer_count != 0 || provenance_count != 0) {
             throw std::runtime_error("KV tail state contains metadata for non-tail cache");
@@ -5286,7 +5287,7 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
     }
 
     restored_tail_payload_slots.clear();
-    if (manifest.body_only || !tail || !has_tail_overlay() || layers.empty()) {
+    if (manifest.body_only || !tail || !has_tail_overlay() || (layers.empty() && !tail_metadata_only)) {
         if (tail) {
             if (seq_id == -1) {
                 tail->clear();

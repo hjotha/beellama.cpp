@@ -100,6 +100,8 @@ using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
 struct llama_memory_i {
     // this callback is used to filter out layers that should not be included in the cache
     using layer_filter_cb = std::function<bool(int32_t il)>;
+    // Per-context KV placement, independent of the model weight device.
+    using layer_device_cb = std::function<ggml_backend_dev_t(int32_t il)>;
 
     // this callback is used to specify which layers should reuse memory from other layers
     // return negative value to indicate that the layer il should not reuse memory

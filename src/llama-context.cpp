@@ -377,6 +377,36 @@ static bool kv_tail_device_has_native_attention(ggml_backend_dev_t dev) {
            ggml_backend_reg_get_proc_address(
                    reg, "ggml_backend_kvarn_tail_attention_supported") != nullptr;
 }
+// Resolve within the Vulkan registry; device indices from other registries are unrelated.
+static ggml_backend_dev_t local_attention_device(const char * endpoint) {
+    if (!endpoint) return nullptr;
+    const std::string value(endpoint);
+    if (value != "local" && value != "vulkan" && value.rfind("vulkan:", 0) != 0 &&
+            value.rfind("local:", 0) != 0) return nullptr;
+    const auto colon = value.find(':');
+    const std::string suffix = colon == std::string::npos ? "0" : value.substr(colon + 1);
+    if (suffix.empty() || suffix.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::runtime_error("local attention device must be vulkan:<index>");
+    }
+    const auto index = std::stoul(suffix);
+    auto * reg = ggml_backend_reg_by_name("Vulkan");
+    if (!reg || index >= ggml_backend_reg_dev_count(reg)) {
+        throw std::runtime_error("local attention device unavailable: " + value);
+    }
+    return ggml_backend_reg_dev_get(reg, index);
+}
+
+static bool selected_attention_layer(const llama_hparams & hparams, int32_t il, int count) {
+    if (il < 0 || il >= (int32_t) hparams.n_layer() || !hparams.has_kv(il) || hparams.is_recr(il)) {
+        return false;
+    }
+    int index = 0;
+    for (int32_t l = 0; l < il; ++l) {
+        if (hparams.has_kv(l) && !hparams.is_recr(l)) ++index;
+    }
+    return index < count;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -393,6 +423,7 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+    auto * local_attn_dev = local_attention_device(params.remote_attn_host);
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -571,8 +602,10 @@ llama_context::llama_context(
                 if (!hparams.has_kv(il)) {
                     continue;
                 }
-                if (kv_tail_device_has_native_attention(
-                            cparams.offload_kqv ? model.dev_layer(il) : nullptr)) {
+                const int early_count = params.remote_attn_n_layers <= 0 ? INT32_MAX : params.remote_attn_n_layers;
+                auto * kv_dev = local_attn_dev && selected_attention_layer(hparams, il, early_count) ?
+                        local_attn_dev : model.dev_layer(il);
+                if (kv_tail_device_has_native_attention(cparams.offload_kqv ? kv_dev : nullptr)) {
                     any_native = true;
                     break;
                 }
@@ -914,6 +947,30 @@ llama_context::llama_context(
             }
         }
 
+        if (local_attn_dev) {
+            if (model.arch != LLM_ARCH_QWEN35 || cparams.kv_paged || !cparams.offload_kqv ||
+                    cparams.remote_attn_prefill != 0) {
+                throw std::runtime_error("local attention requires qwen35, non-paged GPU KV and remote prefill mode");
+            }
+            auto * dev = local_attn_dev;
+            const std::string name = ggml_backend_dev_name(dev);
+            for (auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev) {
+                    cparams.local_attn_backend = backend.get();
+                    break;
+                }
+            }
+            if (!cparams.local_attn_backend) {
+                auto * backend = ggml_backend_dev_init(dev, nullptr);
+                if (!backend) {
+                    throw std::runtime_error("failed to initialize local attention device: " + name);
+                }
+                backends.emplace_back(backend);
+                cparams.local_attn_backend = backend;
+            }
+            LLAMA_LOG_INFO("%s: native local attention and KV backend: %s\n", __func__, name.c_str());
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -1116,7 +1173,7 @@ std::vector<ggml_backend_t> layer_backends;
         // Remote KV+attention accelerator (Xbox RKVA). Created after the local
         // backends so it joins backend_ptrs/backend_buft for the scheduler, but
         // it only ever claims GGML_OP_REMOTE_ATTN (which we also pin explicitly).
-        if (cparams.remote_attn_enabled) {
+        if (cparams.remote_attn_enabled && !cparams.local_attn_backend) {
             if (model.arch != LLM_ARCH_QWEN35) {
                 throw std::runtime_error(format(
                     "%s: --remote-attn currently supports only the qwen35 arch (this model arch id: %d)",
@@ -1359,6 +1416,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            if (probe.op == LLM_FUSED_OP_FLASH_ATTN && cparams.local_attn_backend &&
+                    selected_attention_layer(model.hparams, node.il, cparams.remote_attn_layers)) {
+                device_layer = ggml_backend_get_device(cparams.local_attn_backend);
+            }
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -5673,7 +5734,17 @@ const llama_kvarn_context_route route = llama_kvarn_context_route_for({
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_k(il)) &&
                     llama_kvarn_head_dim_supported(model->hparams.n_embd_head_v(il));
 
-                auto * kvarn_dev = params.offload_kqv ? model->dev_layer(il) : nullptr;
+                ggml_backend_dev_t requested_local = nullptr;
+                try {
+                    requested_local = local_attention_device(params.remote_attn_host);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+                    return nullptr;
+                }
+                const int early_count = params.remote_attn_n_layers <= 0 ? INT32_MAX : params.remote_attn_n_layers;
+                auto * kv_dev = requested_local && selected_attention_layer(model->hparams, il, early_count) ?
+                        requested_local : model->dev_layer(il);
+                auto * kvarn_dev = params.offload_kqv ? kv_dev : nullptr;
                 backend_ops_supported = backend_ops_supported &&
                     llama_kvarn_backend_supports_ops(kvarn_dev, model->hparams.n_embd_head_k(il)) &&
                     llama_kvarn_backend_supports_ops(kvarn_dev, model->hparams.n_embd_head_v(il));

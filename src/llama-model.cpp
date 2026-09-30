@@ -2808,6 +2808,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                             const std::vector<ggml_backend_t> & kv_backends,
                                             ggml_backend_t backend_cpu) const {
     llama_memory_i * res;
+    llama_memory_i::layer_device_cb attention_device;
+    if (cparams.local_attn_backend) {
+        const auto dev = ggml_backend_get_device(cparams.local_attn_backend);
+        const int n_remote = cparams.remote_attn_layers;
+        attention_device = [this, dev, n_remote](int32_t il) {
+            int full_idx = 0;
+            for (int32_t l = 0; l < il; ++l) {
+                if (hparams.has_kv(l) && !hparams.is_recr(l)) {
+                    ++full_idx;
+                }
+            }
+            return full_idx < n_remote ? dev : dev_layer(il);
+        };
+    }
     const ggml_type kvarn_tail_type = params.kv_tail_type == GGML_TYPE_COUNT ?
             GGML_TYPE_F16 : params.kv_tail_type;
 
@@ -3126,7 +3140,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        const bool remote_enabled = cparams.remote_attn_enabled;
+                        const bool remote_enabled = cparams.remote_attn_enabled && !cparams.local_attn_backend;
                         const int remote_layers = cparams.remote_attn_layers;
                         filter_attn = [this, remote_enabled, remote_layers](uint32_t il) {
                             if (il >= hparams.n_layer() || hparams.is_recr(il)) {
@@ -3247,7 +3261,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         hparams.n_swa, hparams.swa_type, nullptr, filter_attn,
                                         nullptr, nullptr, "", cparams.n_ubatch, 0,
                                         kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
-                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0, false, attention_device);
                             } else {
                                 auto kvarn_attn = std::make_unique<llama_kv_cache_kvarn>(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
@@ -3255,7 +3269,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter_attn, nullptr, params.kv_tail_tokens,
                                         kvarn_tail_type, params.kv_tail_tokens_requested,
-                                        params.kv_tail_rollback_tokens);
+                                        params.kv_tail_rollback_tokens, attention_device);
                                 // QSA's index cache mirrors the attention cells cell for cell,
                                 // which the compact read plan's reordered rows cannot represent.
                                 if (needs_mem_idx && filter_idx) {
@@ -3305,7 +3319,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* tail_tokens       */ params.kv_tail_tokens,
                                 /* tail_type         */ params.kv_tail_type,
                                 /* tail requested    */ params.kv_tail_tokens_requested,
-                                /* rollback reserve  */ params.kv_tail_rollback_tokens);
+                                /* rollback reserve  */ params.kv_tail_rollback_tokens,
+                                /* device override   */ attention_device);
                         }
                     }
                 } else {
@@ -3419,7 +3434,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         hparams.n_swa, hparams.swa_type, nullptr, filter,
                                         reuse, nullptr, "", cparams.n_ubatch, 0,
                                         kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
-                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0, false, attention_device);
                         } else {
                             // MTP uses only the appended nextn layers.  It can use the
                             // paged cache too, but must pass its layer filter and size

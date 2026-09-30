@@ -5232,7 +5232,8 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
             ++n_full_attn;
         }
     }
-    const bool all_remote = (cparams.remote_attn_enabled && cparams.remote_attn_layers >= n_full_attn);
+    const bool all_remote = (cparams.remote_attn_enabled && !cparams.local_attn_backend &&
+                             cparams.remote_attn_layers >= n_full_attn);
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
     if (!all_remote) {
         inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn_kv_context());

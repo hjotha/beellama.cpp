@@ -132,7 +132,8 @@ public:
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
                  uint32_t   tail_visibility_window = 0,
-                     bool   disable_attn_rot = false);
+                     bool   disable_attn_rot = false,
+    const layer_device_cb & device_for_layer = nullptr);
 
     ~llama_kv_cache() = default;
 

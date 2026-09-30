@@ -97,6 +97,8 @@ bool kv_unified;
     // attention core to a remote D3D12 server; the target weights, DeltaNet
     // state, projections, RoPE, gate and FFN all stay local. The host sends
     // post-RoPE Q/K/V + positions and receives only the attention output.
+    // Native in-process attention backend; nullptr for the TCP RKVA path.
+    ggml_backend_t local_attn_backend = nullptr;
     bool        remote_attn_enabled = false;
     int         remote_attn_layers  = 0;   // count of full-attention layers offloaded (0 = none)
     int         remote_attn_prefill = 0;   // 0 = remote, 1 = migrate (reserved)

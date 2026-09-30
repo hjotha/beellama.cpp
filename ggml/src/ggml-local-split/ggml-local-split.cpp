@@ -378,64 +378,7 @@ void ggml_backend_local_split_reset_stats(ggml_backend_t backend) {
 }
 
 bool ggml_local_split_exec(struct ggml_tensor * node) {
-    if (!node) return false;
-    ggml_backend_t backend = g_local_split_active;
-    if (!backend || !backend->context) {
-        return true;
-    }
-    auto * ctx = (ggml_backend_local_split_context *) backend->context;
-    uint64_t t0 = get_time_us();
-
-    ggml_tensor * q   = node->src[0];
-    ggml_tensor * k   = node->src[1];
-    ggml_tensor * v   = node->src[2];
-
-    const size_t q_bytes   = q ? ggml_nbytes(q) : 0;
-    const size_t k_bytes   = k ? ggml_nbytes(k) : 0;
-    const size_t v_bytes   = v ? ggml_nbytes(v) : 0;
-    const size_t out_bytes = ggml_nbytes(node);
-
-    size_t slot_idx = (ctx->ring_head++) % ctx->n_ring_slots;
-    auto & slot = ctx->ring[slot_idx];
-    slot->ensure_capacity(q_bytes, k_bytes, v_bytes, out_bytes);
-
-    // 1. CUDA -> Host ring buffer transfer
-    uint64_t t_c2h_0 = get_time_us();
-    if (slot->host_q && q && q_bytes > 0) {
-        ggml_backend_tensor_get(q, slot->host_q, 0, q_bytes);
-    }
-    if (slot->host_k && k && k_bytes > 0) {
-        ggml_backend_tensor_get(k, slot->host_k, 0, k_bytes);
-    }
-    if (slot->host_v && v && v_bytes > 0) {
-        ggml_backend_tensor_get(v, slot->host_v, 0, v_bytes);
-    }
-    uint64_t t_c2h_1 = get_time_us();
-
-    // 2. Vulkan / Local-Split Attention Compute
-    uint64_t t_vk_0 = get_time_us();
-    if (node->data && out_bytes > 0) {
-        std::memset(node->data, 0, out_bytes);
-    }
-    uint64_t t_vk_1 = get_time_us();
-
-    // 3. Host -> CUDA transfer
-    uint64_t t_h2c_0 = get_time_us();
-    uint64_t t_h2c_1 = get_time_us();
-
-    // High resolution profiling
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    ctx->stats.calls++;
-    ctx->stats.bytes_tx += (q_bytes + k_bytes + v_bytes);
-    ctx->stats.bytes_rx += out_bytes;
-    ctx->stats.cuda_to_host_us_sum += (t_c2h_1 - t_c2h_0);
-    ctx->stats.vulkan_attn_us_sum  += (t_vk_1 - t_vk_0);
-    ctx->stats.host_to_cuda_us_sum += (t_h2c_1 - t_h2c_0);
-    uint64_t total_us = (t_h2c_1 - t0);
-    ctx->stats.total_boundary_us_sum += total_us;
-    if (total_us > ctx->stats.max_boundary_us) {
-        ctx->stats.max_boundary_us = total_us;
-    }
-
-    return true;
+    GGML_UNUSED(node);
+    GGML_LOG_ERROR("LocalSplitAttn: legacy transport cannot execute attention; use native Vulkan KV placement\n");
+    return false;
 }
