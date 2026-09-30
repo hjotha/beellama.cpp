@@ -1209,7 +1209,11 @@ std::vector<ggml_backend_t> layer_backends;
             if (memory) {
                 memory->set_on_clear([this]() {
                     if (backend_remote != nullptr) {
-                        ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
+                        if (ggml_backend_is_local_split(backend_remote)) {
+                            ggml_backend_local_split_reset(backend_remote, remote_attn_session);
+                        } else {
+                            ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
+                        }
                     }
                 });
             }
@@ -1300,8 +1304,10 @@ llama_context::~llama_context() {
     // local backends (unique_ptrs) and buffers are still intact for it.
     if (backend_remote != nullptr) {
         if (cparams.remote_attn_stats) {
-            LLAMA_LOG_INFO("%s: remote_attn stats %s\n", __func__,
-                    ggml_backend_remote_attn_stats_json(backend_remote));
+            const char * stats = ggml_backend_is_local_split(backend_remote) ?
+                ggml_backend_local_split_stats_json(backend_remote) :
+                ggml_backend_remote_attn_stats_json(backend_remote);
+            LLAMA_LOG_INFO("%s: remote_attn stats %s\n", __func__, stats);
         }
         ggml_remote_attn_set_active(nullptr);
         sched.reset();
