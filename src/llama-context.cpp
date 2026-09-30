@@ -14,6 +14,7 @@
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
 #include "ggml-remote-attn.h"
+#include "ggml-local-split.h"
 
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -1075,20 +1076,17 @@ std::vector<ggml_backend_t> layer_backends;
             }
 
             // count the full-attention layers that will be offloaded
-            int n_remote = 0;
+            int n_full_attn = 0;
             for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
                 if (model.hparams.has_kv(il) && !model.hparams.is_recr(il)) {
-                    ++n_remote;
+                    ++n_full_attn;
                 }
             }
-            cparams.remote_attn_layers = n_remote;
-
-            backend_remote = ggml_backend_remote_attn_init(params.remote_attn_host, params.remote_attn_port);
-            if (backend_remote == nullptr) {
-                throw std::runtime_error(format(
-                    "%s: failed to create remote-attn backend for %s:%u",
-                    __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+            int n_remote = n_full_attn;
+            if (params.remote_attn_n_layers > 0 && params.remote_attn_n_layers < n_full_attn) {
+                n_remote = params.remote_attn_n_layers;
             }
+            cparams.remote_attn_layers = n_remote;
 
             ggml_remote_attn_geometry geo {};
             geo.n_layer_remote = (uint32_t) n_remote;
@@ -1109,28 +1107,65 @@ std::vector<ggml_backend_t> layer_backends;
             geo.kq_scale       = model.hparams.f_attention_scale == 0.0f ?
                                  1.0f / sqrtf((float) geo.head_dim) : model.hparams.f_attention_scale;
 
-            ggml_backend_remote_attn_set_geometry(backend_remote, &geo);
-            if (!ggml_backend_remote_attn_connect(backend_remote)) {
-                ggml_backend_free(backend_remote);
-                backend_remote = nullptr;
-                throw std::runtime_error(format(
-                    "%s: failed to connect/handshake with remote-attn server %s:%u",
-                    __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
-            }
+            const bool is_local_vulkan = (params.remote_attn_host != nullptr &&
+                (std::strncmp(params.remote_attn_host, "vulkan", 6) == 0 ||
+                 std::strcmp(params.remote_attn_host, "local") == 0));
 
-            // MVP: a single session (slot 0). Multi-slot isolation lands with
-            // the server-side session manager.
-            remote_attn_session = 0;
-            if (!ggml_backend_remote_attn_create_session(
-                    backend_remote, remote_attn_session, /*seq_id=*/0, (uint32_t) cparams.n_ctx)) {
-                ggml_backend_free(backend_remote);
-                backend_remote = nullptr;
-                throw std::runtime_error(format("%s: remote-attn CREATE_SESSION failed", __func__));
+            if (is_local_vulkan) {
+                uint32_t vulkan_dev = 0;
+                if (std::strncmp(params.remote_attn_host, "vulkan:", 7) == 0) {
+                    vulkan_dev = (uint32_t) std::atoi(params.remote_attn_host + 7);
+                }
+                backend_remote = ggml_backend_local_split_init(vulkan_dev, 3);
+                if (backend_remote == nullptr) {
+                    throw std::runtime_error(format(
+                        "%s: failed to create local-split backend for %s",
+                        __func__, params.remote_attn_host));
+                }
+                ggml_backend_local_split_set_geometry(backend_remote, &geo);
+                if (!ggml_backend_local_split_setup(backend_remote)) {
+                    ggml_backend_free(backend_remote);
+                    backend_remote = nullptr;
+                    throw std::runtime_error(format(
+                        "%s: failed to setup local-split Vulkan pipelines for %s",
+                        __func__, params.remote_attn_host));
+                }
+                remote_attn_session = 0;
+                if (!ggml_backend_local_split_create_session(
+                        backend_remote, remote_attn_session, /*seq_id=*/0, (uint32_t) cparams.n_ctx)) {
+                    ggml_backend_free(backend_remote);
+                    backend_remote = nullptr;
+                    throw std::runtime_error(format("%s: local-split CREATE_SESSION failed", __func__));
+                }
+                ggml_backend_local_split_set_active_session(backend_remote, remote_attn_session);
+                LLAMA_LOG_INFO("%s: local-split attention enabled — %d full-attn layers offloaded to %s\n",
+                        __func__, n_remote, params.remote_attn_host);
+            } else {
+                backend_remote = ggml_backend_remote_attn_init(params.remote_attn_host, params.remote_attn_port);
+                if (backend_remote == nullptr) {
+                    throw std::runtime_error(format(
+                        "%s: failed to create remote-attn backend for %s:%u",
+                        __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+                }
+                ggml_backend_remote_attn_set_geometry(backend_remote, &geo);
+                if (!ggml_backend_remote_attn_connect(backend_remote)) {
+                    ggml_backend_free(backend_remote);
+                    backend_remote = nullptr;
+                    throw std::runtime_error(format(
+                        "%s: failed to connect/handshake with remote-attn server %s:%u",
+                        __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+                }
+                remote_attn_session = 0;
+                if (!ggml_backend_remote_attn_create_session(
+                        backend_remote, remote_attn_session, /*seq_id=*/0, (uint32_t) cparams.n_ctx)) {
+                    ggml_backend_free(backend_remote);
+                    backend_remote = nullptr;
+                    throw std::runtime_error(format("%s: remote-attn CREATE_SESSION failed", __func__));
+                }
+                ggml_backend_remote_attn_set_active_session(backend_remote, remote_attn_session);
+                LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
+                        __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
             }
-            ggml_backend_remote_attn_set_active_session(backend_remote, remote_attn_session);
-
-            LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
-                    __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
 
             // PATH B: the remote op is computed on the CPU backend (pinned in
             // qwen35), so the scheduler uses its proven CUDA<->CPU copies and we
@@ -5490,6 +5525,7 @@ llama_context_params llama_context_default_params() {
         /*.remote_attn_port            =*/ 0,
         /*.remote_attn_prefill         =*/ 0,
         /*.remote_attn_stats           =*/ 0,
+        /*.remote_attn_n_layers        =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

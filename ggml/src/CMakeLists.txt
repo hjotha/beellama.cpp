@@ -194,7 +194,8 @@ add_library(ggml-base
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
             ../include/ggml-cpp.h
-            ../include/ggml-opt.h
+            ../include/ggml-remote-attn.h
+            ../include/ggml-local-split.h
             ../include/gguf.h
             ggml.c
             ggml.cpp
@@ -202,6 +203,7 @@ add_library(ggml-base
             ggml-backend.cpp
             ggml-backend-meta.cpp
             ggml-remote-attn/ggml-remote-attn.cpp
+            ggml-local-split/ggml-local-split.cpp
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h

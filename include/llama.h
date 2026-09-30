@@ -516,6 +516,7 @@ extern "C" {
         uint16_t     remote_attn_port;
         int          remote_attn_prefill;
         int          remote_attn_stats;
+        int          remote_attn_n_layers; // 0 = all full-attention layers, >0 = first N full-attention layers
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

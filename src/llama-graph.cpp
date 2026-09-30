@@ -5221,13 +5221,20 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    // When the full-attention layers are offloaded to the remote RKVA backend,
+    // When ALL full-attention layers are offloaded to the remote RKVA backend,
     // the local attention KV input (k_idxs/v_idxs/mask/tail) is built but never
     // consumed, so the scheduler leaves those tensors unallocated and their
-    // set_input would deref a NULL buffer. Skip building it entirely; the remote
-    // node uses inp_pos directly and the server owns the KV.
+    // set_input would deref a NULL buffer. Only skip building it when ALL full-attn
+    // layers are offloaded.
+    int n_full_attn = 0;
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (hparams.has_kv(il) && !hparams.is_recr(il)) {
+            ++n_full_attn;
+        }
+    }
+    const bool all_remote = (cparams.remote_attn_enabled && cparams.remote_attn_layers >= n_full_attn);
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
-    if (!cparams.remote_attn_enabled) {
+    if (!all_remote) {
         inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn_kv_context());
     }
 

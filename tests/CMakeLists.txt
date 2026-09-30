@@ -660,6 +660,13 @@ endif()
 add_test(NAME test-kvarn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
 set_property(TEST test-kvarn PROPERTY LABELS main)
 
+add_executable(test-local-split-attn test-local-split-attn.cpp)
+target_include_directories(test-local-split-attn PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(test-local-split-attn PRIVATE cxx_std_17)
+target_link_libraries(test-local-split-attn PRIVATE ggml)
+add_test(NAME test-local-split-attn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-local-split-attn>)
+set_property(TEST test-local-split-attn PROPERTY LABELS main)
+
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})

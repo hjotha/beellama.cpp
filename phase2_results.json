@@ -1,0 +1,62 @@
+[
+  {
+    "remote_layers": 0,
+    "pp_tps": 0.0,
+    "gen_tps": 0.0,
+    "stats": {},
+    "vram_mb": 1.0,
+    "vram_delta_mb": 0.0,
+    "elapsed_s": 14.988592624664307,
+    "status": "OK"
+  },
+  {
+    "remote_layers": 1,
+    "pp_tps": 0.0,
+    "gen_tps": 0.0,
+    "stats": {},
+    "vram_mb": 1.0,
+    "vram_delta_mb": 0.0,
+    "elapsed_s": 14.962769746780396,
+    "status": "OK"
+  },
+  {
+    "remote_layers": 2,
+    "pp_tps": 0.0,
+    "gen_tps": 0.0,
+    "stats": {},
+    "vram_mb": 1.0,
+    "vram_delta_mb": 0.0,
+    "elapsed_s": 14.904307842254639,
+    "status": "OK"
+  },
+  {
+    "remote_layers": 4,
+    "pp_tps": 0.0,
+    "gen_tps": 0.0,
+    "stats": {},
+    "vram_mb": 1.0,
+    "vram_delta_mb": 0.0,
+    "elapsed_s": 15.977245330810547,
+    "status": "OK"
+  },
+  {
+    "remote_layers": 8,
+    "pp_tps": 0.0,
+    "gen_tps": 0.0,
+    "stats": {},
+    "vram_mb": 1.0,
+    "vram_delta_mb": 0.0,
+    "elapsed_s": 24.760523557662964,
+    "status": "OK"
+  },
+  {
+    "remote_layers": 16,
+    "pp_tps": 0.0,
+    "gen_tps": 0.0,
+    "stats": {},
+    "vram_mb": 1.0,
+    "vram_delta_mb": 0.0,
+    "elapsed_s": 22.402875423431396,
+    "status": "OK"
+  }
+]

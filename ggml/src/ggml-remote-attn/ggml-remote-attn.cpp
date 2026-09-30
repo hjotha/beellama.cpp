@@ -10,6 +10,7 @@
 // disabled, leaving the local baseline untouched.
 
 #include "ggml-remote-attn.h"
+#include "ggml-local-split.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -849,12 +850,20 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
 }
 
 bool ggml_backend_remote_attn_connected(ggml_backend_t backend) {
+    if (!backend) return false;
+    if (ggml_backend_is_local_split(backend)) {
+        return ggml_backend_local_split_is_ready(backend);
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     return ctx->connected && !ctx->failed;
 }
 
 bool ggml_backend_remote_attn_create_session(
         ggml_backend_t backend, uint32_t session_id, uint32_t seq_id, uint32_t capacity) {
+    if (!backend) return false;
+    if (ggml_backend_is_local_split(backend)) {
+        return ggml_backend_local_split_create_session(backend, session_id, seq_id, capacity);
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
     if (!ctx->connected || ctx->failed) {
@@ -867,6 +876,10 @@ bool ggml_backend_remote_attn_create_session(
 }
 
 bool ggml_backend_remote_attn_destroy_session(ggml_backend_t backend, uint32_t session_id) {
+    if (!backend) return false;
+    if (ggml_backend_is_local_split(backend)) {
+        return ggml_backend_local_split_destroy_session(backend, session_id);
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
     if (!ctx->connected || ctx->failed) {
@@ -877,6 +890,10 @@ bool ggml_backend_remote_attn_destroy_session(ggml_backend_t backend, uint32_t s
 }
 
 bool ggml_backend_remote_attn_reset(ggml_backend_t backend, uint32_t session_id) {
+    if (!backend) return false;
+    if (ggml_backend_is_local_split(backend)) {
+        return ggml_backend_local_split_reset(backend, session_id);
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
     if (!ctx->connected || ctx->failed) {
@@ -887,6 +904,10 @@ bool ggml_backend_remote_attn_reset(ggml_backend_t backend, uint32_t session_id)
 }
 
 bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, int32_t pos0) {
+    if (!backend) return false;
+    if (ggml_backend_is_local_split(backend)) {
+        return ggml_backend_local_split_trim(backend, session_id, pos0);
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
     if (!ctx->connected || ctx->failed) {
@@ -898,16 +919,29 @@ bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, 
 }
 
 void ggml_backend_remote_attn_set_active_session(ggml_backend_t backend, uint32_t session_id) {
+    if (!backend) return;
+    if (ggml_backend_is_local_split(backend)) {
+        ggml_backend_local_split_set_active_session(backend, session_id);
+        return;
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     ctx->active_session = session_id;
 }
 
 bool ggml_backend_remote_attn_failed(ggml_backend_t backend) {
+    if (!backend) return true;
+    if (ggml_backend_is_local_split(backend)) {
+        return ggml_backend_local_split_failed(backend);
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     return ctx->failed;
 }
 
 const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
+    if (!backend) return "{}";
+    if (ggml_backend_is_local_split(backend)) {
+        return ggml_backend_local_split_stats_json(backend);
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
     auto & s = ctx->stats;
@@ -937,6 +971,11 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
 }
 
 void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend) {
+    if (!backend) return;
+    if (ggml_backend_is_local_split(backend)) {
+        ggml_backend_local_split_reset_stats(backend);
+        return;
+    }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
     ctx->stats = rkva_stats {};
@@ -951,6 +990,9 @@ static ggml_backend_t g_remote_attn_active = nullptr;
 
 void ggml_remote_attn_set_active(ggml_backend_t backend) {
     g_remote_attn_active = backend;
+    if (ggml_backend_is_local_split(backend)) {
+        ggml_backend_local_split_set_active(backend);
+    }
 }
 
 bool ggml_remote_attn_exec(struct ggml_tensor * node) {
@@ -958,6 +1000,9 @@ bool ggml_remote_attn_exec(struct ggml_tensor * node) {
     if (backend == nullptr) {
         GGML_LOG_ERROR("%s: exec with no active remote connection\n", GGML_REMOTE_ATTN_NAME);
         return false;
+    }
+    if (ggml_backend_is_local_split(backend)) {
+        return ggml_local_split_exec(node);
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);

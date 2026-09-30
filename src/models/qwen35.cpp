@@ -396,8 +396,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (cparams.remote_attn_enabled && backend_remote != nullptr) {
-        // Offload the full-attention core to the remote KV+attention server.
+    int full_attn_idx = 0;
+    for (int l = 0; l < il; ++l) {
+        if (model.hparams.has_kv(l) && !model.hparams.is_recr(l)) {
+            ++full_attn_idx;
+        }
+    }
+
+    const bool is_remote = (cparams.remote_attn_enabled && backend_remote != nullptr &&
+                            full_attn_idx < cparams.remote_attn_layers);
+
+    if (is_remote) {
+        // Offload the full-attention core to the remote KV+attention server or local-split accelerator.
         // Qcur/Kcur/Vcur are post-norm, post-MRoPE and pre-WHT; the server owns
         // the KVarN rotation, record compression, precision tail, causal masking
         // and (for the rotated domain) the inverse WHT, returning the attention
@@ -408,11 +418,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         // it into the remote host buffer without creating a VIEW op the remote
         // backend would have to claim. The backend reads the first n_tokens i32
         // (M-RoPE layout is [dim][token], so dim 0 == ubatch.pos).
-        cur = ggml_remote_attn(ctx0, Qcur, Kcur, Vcur, inp_pos, il, kq_scale,
+        cur = ggml_remote_attn(ctx0, Qcur, Kcur, Vcur, inp_pos, full_attn_idx, kq_scale,
                 GGML_REMOTE_ATTN_DOMAIN_AUTO);
-        // Pin to the CPU backend (PATH B): the op's compute runs the RPC there,
+        // Pin to the CPU backend (PATH B): the op's compute runs the RPC/local dispatch there,
         // and the scheduler feeds/drains it with the proven CUDA<->CPU copies
-        // (same mechanism as offload_kqv). backend_remote only owns the socket.
+        // (same mechanism as offload_kqv). backend_remote only owns the backend context.
         ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         cb(cur, "attn_remote", il);
     } else {

@@ -3620,16 +3620,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_TAIL_TYPE"));
     add_opt(common_arg(
-        {"--remote-attn"}, "HOST:PORT",
+        {"--remote-attn"}, "HOST:PORT|vulkan[:DEV]|local",
         "offload the full-attention KV cache + attention core of supported archs\n"
-        "(qwen35) to a remote RKVA server (e.g. an Xbox Series X). Target weights,\n"
+        "(qwen35) to a remote RKVA server or in-process Vulkan device (e.g. vulkan:0). Target weights,\n"
         "DeltaNet state, projections, RoPE, gate and FFN stay local. Requires a\n"
         "KVarN cache type (--cache-type-k/-v kvarnN). Disabled when omitted.",
         [](common_params & params, const std::string & value) {
+            if (value == "vulkan" || value == "local") {
+                params.remote_attn_host = value;
+                params.remote_attn_port = 0;
+                return;
+            }
+            if (value.rfind("vulkan:", 0) == 0 || value.rfind("local:", 0) == 0) {
+                params.remote_attn_host = value;
+                params.remote_attn_port = 0;
+                return;
+            }
             const auto colon = value.rfind(':');
             if (colon == std::string::npos || colon == 0 || colon + 1 >= value.size()) {
                 throw std::invalid_argument(string_format(
-                    "invalid --remote-attn '%s', expected HOST:PORT", value.c_str()));
+                    "invalid --remote-attn '%s', expected HOST:PORT, vulkan[:DEV], or local", value.c_str()));
             }
             params.remote_attn_host = value.substr(0, colon);
             const int port = std::stoi(value.substr(colon + 1));
@@ -3642,12 +3652,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN"));
     add_opt(common_arg(
         {"--remote-attn-layers"}, "SET",
-        "which attention layers to offload to the remote server (only 'full' today)\n"
-        "(default: full)",
+        "which attention layers to offload to the remote server: 'full' (all full-attn layers)\n"
+        "or a number N (e.g. 1, 2, 4, 8) to offload the first N full-attn layers (default: full)",
         [](common_params & params, const std::string & value) {
-            if (value != "full") {
-                throw std::invalid_argument(string_format(
-                    "invalid --remote-attn-layers '%s', only 'full' is supported", value.c_str()));
+            if (value != "full" && value != "all") {
+                try {
+                    int n = std::stoi(value);
+                    if (n <= 0) {
+                        throw std::invalid_argument("number must be positive");
+                    }
+                } catch (...) {
+                    throw std::invalid_argument(string_format(
+                        "invalid --remote-attn-layers '%s', expected 'full' or integer count", value.c_str()));
+                }
             }
             params.remote_attn_layers = value;
         }
