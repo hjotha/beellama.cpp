@@ -18,9 +18,17 @@ do modelo. O próprio cache gerencia records, staging, tail, rollback e save/res
 O antigo operador de transporte local falha explicitamente se for chamado.
 O protocolo TCP RKVA do Xbox continua separado desse caminho local.
 
-Prefill assíncrono com migração CUDA→Vulkan não está implementado; o modo nativo
-executa o núcleo de atenção e mantém o KV no Vulkan durante prefill e decode.
-Não reutilizar slots produzidos pelo caminho que zerava a atenção.
+O protótipo opt-in da Fase 5 agora mantém o prefill na CUDA e espelha records
+KVarN selados para Vulkan em background, com handoff explícito do cache antes
+do decode. O caminho nativo continua executando atenção Vulkan com KV Vulkan
+durante decode; não reutilizar slots produzidos pelo caminho antigo que zerava
+a atenção.
+
+O protótipo requer KVarN, uma sequência, placement remoto explícito e nenhuma
+SWA ou MTP. Ele mantém a alocação CUDA original e um espelho completo dos
+records remotos em Vulkan; portanto não libera VRAM CUDA nem aumenta por si só o
+limite de contexto. Ainda não é o desenho final de migração sem duplicação nem
+está ativado no preset de produção.
 
 ## Diagnóstico de produção — 2026-09-30
 
@@ -67,8 +75,10 @@ Radeon foi interrompida quando o prefill desceu a 54.12 t/s em 3.840 tokens.
 Esse tamanho segue sem validação segura.
 
 `--no-offload-rs` continua opcional: manter RS na CPU mediu 154.28/8.34 t/s no
-perfil curto, contra 775.44/53.19 t/s com RS na GPU. A Fase 5 segue pendente:
-prefill na 4070 com migração assíncrona de KV para a Radeon.
+perfil curto, contra 775.44/53.19 t/s com RS na GPU. A Fase 5 tem agora um
+protótipo experimental: prefill CUDA, cópia assíncrona dos records KVarN
+selados e handoff do payload/tail para decode Vulkan. Sua validação de
+throughput e os limites atuais estão registrados abaixo.
 
 ### Como remover o gargalo da Radeon
 
@@ -116,6 +126,41 @@ Estratégias para remover esse gargalo, em ordem de investigação:
 
 Os resultados antigos de ubatch 256/512/1024 não provam migração: ubatch apenas
 divide a execução do prompt. O código não copiava records KVarN entre devices.
+
+O protótipo da Fase 5 usa cada grupo eager de 128 tokens como unidade de cópia,
+uma fila assíncrona limitada a quatro jobs e staging host pinned de 4 MiB por
+device. A próxima cópia pode sobrepor a computação CUDA do ubatch seguinte; o
+handoff final sincroniza a fila e copia stage/tail. Ao voltar do decode Vulkan
+para um novo prefill CUDA, sincroniza o contexto e atualiza o espelho antes de
+trocar o owner. Uma falha invalida o espelho e mantém o owner ativo; não tenta
+decodificar de um mirror parcial. A fila permanece desabilitada até recriar o
+contexto depois de um erro de transferência.
+
+Esse primeiro corte ainda conserva as duas alocações dos records e exige que o
+KV usado no prefill caiba na CUDA. Não habilitar junto de MTP, placement
+automático, múltiplas sequências ou SWA. Para liberar VRAM e suportar contextos
+maiores, falta migrar ownership sem manter buffers completos duplicados,
+incluindo records, stage, tail e os caminhos de restore/rollback.
+
+Na mesma revisão, a atenção Vulkan KVarN foi otimizada e medida isoladamente na
+Radeon: prefill256 caiu de 536.94 para 497.04 ms (7.4%), decode1 de 16.913 para
+10.153 ms (40.0%) e verify4 de 38.312 para 32.106 ms (16.2%). O shader agrupa
+reduções GQA, mantém Q em registradores, ignora tokens mascarados antes da
+descompressão e distribui o tail entre splits. A variante wave64 dedicada foi
+descartada por regressão. Isso reduz custo de atenção; não remove o custo de
+fronteira CUDA↔Vulkan nem substitui placement conservador.
+
+Validação integrada em 2026-09-30: build de `llama-server` e `test-kvarn`,
+suíte KVarN completa em CUDA, 13 casos de paridade da atenção em Vulkan0/RADV e
+Vulkan1/NVIDIA e paridade do store Vulkan com ubatch256 passaram. Duas requests
+consecutivas com 4.216 tokens, ctx40960, KVarN4, tail2048 e batch/ubatch256
+completaram; cada handoff de prompt registrou `prefill-migrate decode handoff
+result=0`. O prefill mediu 825.31 e 847.77 t/s; o decode Vulkan, 16.05 e 17.16
+t/s. Isso valida ida e volta entre requests no smoke test sem MTP, mas não
+qualifica o preset de produção. A compatibilidade que Astra High encontrou no
+modo estático também foi testada: `remote-attn-prefill=remote`, uma layer
+Vulkan, MTP4, ctx40960 e tail2048 iniciaram e completaram uma request de 1.355
+tokens, com 4/4 drafts aceitos.
 
 O perfil Vulkan instrumentado antes do novo split-K, com reserva700M (13 camadas
 locais/3 Vulkan), contexto102.400, tail2.048, `batch/ubatch=256` e prompt7.681,
@@ -170,7 +215,7 @@ resultado aprovado.
 | **Fase 2** | 1–2 layers remotas (Validação ring buffer) | ❌ **Medições invalidadas** | O ring buffer antigo não executava atenção correta. A rota atual de uma camada remota mediu 254.84/11.94 t/s em teste controlado. |
 | **Fase 3** | Placement variável (Curva TPS × N layers) | ❌ **Medições invalidadas** | Curva antiga não representa custo de atenção válido. Instrumentação atual identificou atenção Vulkan como o maior custo medido. |
 | **Fase 4** | Auto placement baseado em VRAM | 🟡 **Parcialmente revalidada** | Estimativa agora inclui records, staging e tail por camada. Contexto de 102.4K foi validado com 16 camadas locais e reserva de 350M; placement remoto não é recomendado para throughput. |
-| **Fase 5** | Prefill migration assíncrona | ❌ **Não implementada** | Ubatch divide execução, mas não migra records KVarN do CUDA para Vulkan. Ver diagnóstico de gargalo acima. |
+| **Fase 5** | Prefill migration assíncrona | 🟡 **Protótipo opt-in** | Prefill CUDA, cópia em background por grupo KVarN de 128 tokens e handoff para decode Vulkan. Ainda duplica records CUDA/Vulkan, exige cache caber na CUDA e não suporta MTP/auto placement/SWA/multi-slot; não habilitar em produção. |
 | **Fase 6** | Prompt cache & Session lifecycle | 🟡 **Código existente; restore pendente de validação** | `--slot-save-auto` e o lifecycle existem; falta validar restauração após reiniciar com o preset atualizado. |
 | **Fase 7** | MTP / Multi-Token Batching ($N > 1$) | 🟡 **Código existente; caminho atual pendente de revalidação** | RKVA e contexto draft separado existem; falta medição MTP/DFlash válida com a atenção Vulkan corrigida. |
 | **Fase 8** | Caracterização e Validação | 🟡 **Parcialmente concluída** | IQ3_XXS foi validado até 102.4K no caminho atual; IQ3_S permanece sem caracterização. |

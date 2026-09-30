@@ -511,7 +511,8 @@ extern "C" {
         // non-null, the full-attention layers of supported archs (qwen35) run
         // their KV cache + attention core on the remote server; target weights
         // and all other ops stay local. remote_attn_prefill: 0 = remote prefill,
-        // 1 = migrate (reserved). remote_attn_stats: 1 = log profiling counters.
+        // 1 = CUDA prefill with KVarN mirroring and explicit Vulkan handoff.
+        // remote_attn_stats: 1 = log profiling counters.
         const char * remote_attn_host;
         uint16_t     remote_attn_port;
         int          remote_attn_prefill;
@@ -1403,6 +1404,21 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    enum llama_prefill_migration_status {
+        LLAMA_PREFILL_MIGRATION_OK = 0,
+        // The active cache owner and scheduler are still valid; keep using them.
+        LLAMA_PREFILL_MIGRATION_OWNER_UNCHANGED = 1,
+        // Scheduler reservation failed; the current request must stop.
+        LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED = 2,
+        // Invalid context or an unexpected exception.
+        LLAMA_PREFILL_MIGRATION_ERROR = -1,
+    };
+
+    // Switch the authoritative KVarN payload at a CUDA-prefill/Vulkan-decode
+    // boundary. See llama_prefill_migration_status for recoverable/fatal results.
+    LLAMA_API int32_t llama_context_prefill_migration_handoff(
+            struct llama_context * ctx, bool to_remote);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

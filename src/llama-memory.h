@@ -92,6 +92,7 @@ struct llama_memory_context_i {
     // participating child contexts.
     virtual void graph_compute_start() {}
     virtual void graph_compute_finish(ggml_status /* status */) {}
+    virtual void graph_compute_complete(ggml_backend_sched_t /* sched */, ggml_status /* status */) {}
 
 };
 
@@ -166,6 +167,15 @@ struct llama_memory_i {
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
+
+    // Optional ownership transition for the explicit CUDA-prefill/KVarN mirror
+    // route. Unsupported memory implementations fail closed.
+    virtual bool supports_prefill_migration() const { return false; }
+    virtual bool handoff_prefill_migration(bool /* to_remote */) { return false; }
+    // Wait for background mirror transfers while the owning context backends
+    // are still alive. A stale mirror is recoverable; the active cache remains
+    // authoritative if this returns false.
+    virtual bool drain_prefill_migration() { return true; }
 
     // getters
     virtual bool get_can_shift() const = 0;

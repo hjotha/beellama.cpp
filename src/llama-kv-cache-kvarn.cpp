@@ -8,6 +8,7 @@
 #include "llama-io-file.h"
 #include "llama-model.h"
 #include "llama-state-q4.h"
+#include "ggml-cpp.h"
 
 #include <algorithm>
 #include <atomic>
@@ -764,6 +765,16 @@ void llama_kv_cache_kvarn_context::graph_compute_finish(ggml_status compute_stat
     base()->graph_compute_finish(compute_status);
 }
 
+void llama_kv_cache_kvarn_context::graph_compute_complete(
+        ggml_backend_sched_t sched, ggml_status compute_status) {
+    if (compute_status == GGML_STATUS_SUCCESS && !shared_graph_layers.empty()) {
+        return;
+    }
+    if (compute_status == GGML_STATUS_SUCCESS) {
+        cache->enqueue_prefill_migration(current_sinfo(), sched);
+    }
+}
+
 llama_memory_status llama_kv_cache_kvarn_context::get_status() const {
     const auto status = base_ctx ? base_ctx->get_status() : LLAMA_MEMORY_STATUS_FAILED_PREPARE;
     if (status == LLAMA_MEMORY_STATUS_NO_UPDATE && cache->has_pending_stream_copies()) {
@@ -1372,6 +1383,197 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_rot(ggml_tensor * dst) const 
     memcpy(dst->data, data.data(), ggml_nbytes(dst));
 }
 
+struct llama_kv_cache_kvarn::migration_queue {
+    struct span {
+        ggml_tensor * src;
+        ggml_tensor * dst;
+        size_t src_offset;
+        size_t dst_offset;
+        size_t size;
+    };
+
+    struct job {
+        bool source_cuda = true;
+        ggml_backend_event_ptr producer_event;
+        std::vector<span> spans;
+    };
+
+    migration_queue(ggml_backend_dev_t cuda_dev, ggml_backend_dev_t vulkan_dev) :
+        cuda_dev(cuda_dev),
+        vulkan_dev(vulkan_dev),
+        cuda_backend(ggml_backend_dev_init(cuda_dev, nullptr)),
+        vulkan_backend(ggml_backend_dev_init(vulkan_dev, nullptr)) {
+        if (!cuda_backend || !vulkan_backend) {
+            throw std::runtime_error("failed to initialize KVarN migration transfer backends");
+        }
+        constexpr size_t staging_bytes = 4u * 1024u * 1024u;
+        cuda_host.reset(ggml_backend_buft_alloc_buffer(
+                ggml_backend_dev_host_buffer_type(cuda_dev), staging_bytes));
+        vulkan_host.reset(ggml_backend_buft_alloc_buffer(
+                ggml_backend_dev_host_buffer_type(vulkan_dev), staging_bytes));
+        if (!cuda_host || !vulkan_host) {
+            throw std::runtime_error("failed to allocate pinned KVarN migration staging buffers");
+        }
+        cuda_host_ptr = ggml_backend_buffer_get_base(cuda_host.get());
+        vulkan_host_ptr = ggml_backend_buffer_get_base(vulkan_host.get());
+        staging_size = staging_bytes;
+        worker = std::thread([this] { worker_loop(); });
+    }
+
+    migration_queue(const migration_queue &) = delete;
+    migration_queue & operator=(const migration_queue &) = delete;
+
+    ~migration_queue() {
+        if (!drain()) {
+            LLAMA_LOG_ERROR("KVarN migration drain failed during destruction; active cache remains authoritative\n");
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        work.notify_all();
+        if (worker.joinable()) worker.join();
+    }
+
+    bool enqueue(ggml_backend_t producer, bool source_cuda, std::vector<span> spans) {
+        if (spans.empty()) return true;
+        job next;
+        next.source_cuda = source_cuda;
+        next.spans = std::move(spans);
+        if (producer != nullptr) {
+            auto * dev = ggml_backend_get_device(producer);
+            // Incremental mirroring is intentionally CUDA -> Vulkan only.
+            // Vulkan event synchronization mutates its producer command pool,
+            // so a scheduler-produced Vulkan event cannot be waited by worker.
+            if (!source_cuda || dev != cuda_dev) {
+                return false;
+            }
+        }
+
+        std::unique_lock<std::mutex> lock(mutex);
+        slots_available.wait(lock, [this] { return pending < max_pending || error || stopping; });
+        if (error || stopping) return false;
+        if (producer != nullptr) {
+            next.producer_event.reset(ggml_backend_event_new(cuda_dev));
+            if (!next.producer_event) return false;
+            ggml_backend_event_record(next.producer_event.get(), producer);
+        }
+        try {
+            queue.push_back(std::move(next));
+        } catch (...) {
+            lock.unlock();
+            // The event may already be recorded when deque growth fails.
+            // Complete the producer before its RAII wrapper releases it.
+            if (producer != nullptr) ggml_backend_synchronize(producer);
+            throw;
+        }
+        ++pending;
+        lock.unlock();
+        work.notify_one();
+        return true;
+    }
+
+    bool drain() {
+        std::unique_lock<std::mutex> lock(mutex);
+        finished.wait(lock, [this] { return pending == 0; });
+        return !error;
+    }
+
+    uint64_t copied_bytes() const {
+        return bytes_copied.load(std::memory_order_relaxed);
+    }
+
+private:
+    void copy_span(
+            ggml_backend_t source_backend,
+            ggml_backend_t destination_backend,
+            bool source_cuda,
+            const span & item) {
+        void * source_host = source_cuda ? cuda_host_ptr : vulkan_host_ptr;
+        void * destination_host = source_cuda ? vulkan_host_ptr : cuda_host_ptr;
+        for (size_t done = 0; done < item.size;) {
+            const size_t chunk = std::min(staging_size, item.size - done);
+            ggml_backend_tensor_get_async(
+                    source_backend, item.src, source_host,
+                    item.src_offset + done, chunk);
+            ggml_backend_synchronize(source_backend);
+            std::memcpy(destination_host, source_host, chunk);
+            ggml_backend_tensor_set_async(
+                    destination_backend, item.dst, destination_host,
+                    item.dst_offset + done, chunk);
+            ggml_backend_synchronize(destination_backend);
+            done += chunk;
+        }
+        bytes_copied.fetch_add(item.size, std::memory_order_relaxed);
+    }
+
+    void worker_loop() {
+        while (true) {
+            job current;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                work.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (stopping && queue.empty()) return;
+                current = std::move(queue.front());
+                queue.pop_front();
+            }
+
+            try {
+                if (!current.spans.empty()) {
+                    ggml_backend_t source_backend = current.source_cuda ? cuda_backend.get() : vulkan_backend.get();
+                    ggml_backend_t destination_backend = current.source_cuda ? vulkan_backend.get() : cuda_backend.get();
+                    if (current.producer_event) {
+                        // Wait on the worker, not the inference thread. This
+                        // ensures the producer has committed the record before
+                        // the transfer reads it, while later compute can run
+                        // concurrently on its independent backend stream. The
+                        // only producer events here are from CUDA.
+                        ggml_backend_event_synchronize(current.producer_event.get());
+                        current.producer_event.reset();
+                    }
+                    for (const auto & item : current.spans) {
+                        copy_span(source_backend, destination_backend, current.source_cuda, item);
+                    }
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!error) error = std::current_exception();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                GGML_ASSERT(pending > 0);
+                --pending;
+                if (pending == 0) finished.notify_all();
+                slots_available.notify_one();
+            }
+        }
+    }
+
+    static constexpr size_t max_pending = 4;
+    ggml_backend_dev_t cuda_dev;
+    ggml_backend_dev_t vulkan_dev;
+    ggml_backend_ptr cuda_backend;
+    ggml_backend_ptr vulkan_backend;
+    ggml_backend_buffer_ptr cuda_host;
+    ggml_backend_buffer_ptr vulkan_host;
+    void * cuda_host_ptr = nullptr;
+    void * vulkan_host_ptr = nullptr;
+    size_t staging_size = 0;
+    std::mutex mutex;
+    std::condition_variable work;
+    std::condition_variable finished;
+    std::condition_variable slots_available;
+    std::deque<job> queue;
+    std::thread worker;
+    size_t pending = 0;
+    bool stopping = false;
+    std::exception_ptr error;
+    std::atomic<uint64_t> bytes_copied { 0 };
+};
+
+llama_kv_cache_kvarn::~llama_kv_cache_kvarn() = default;
+
 llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -1391,7 +1593,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         ggml_type tail_type_requested,
         uint32_t tail_tokens_requested,
         uint32_t tail_rollback_tokens,
-        const layer_device_cb & device_for_layer) :
+        const layer_device_cb & device_for_layer,
+        const layer_device_cb & migration_device_for_layer) :
     model(model),
     hparams(hparams),
     params(params),
@@ -1440,9 +1643,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         n_ubatch,
         tail_tokens,
         tail_type_requested,
-        tail_tokens_requested,
+            tail_tokens_requested,
             true,
-        tail_rollback_tokens)) {
+        tail_rollback_tokens)),
+    migration_enabled(bool(migration_device_for_layer)) {
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
     GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2");
@@ -1482,7 +1686,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
 
         ggml_init_params ctx_params = {
-            /*.mem_size   =*/ size_t((6u + 4u * n_stream) * hparams.n_layer_kv() * ggml_tensor_overhead()),
+            /*.mem_size   =*/ size_t((12u + 8u * n_stream) * hparams.n_layer_kv() * ggml_tensor_overhead()),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -1513,6 +1717,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
 
         auto * dev = offload ? (device_for_layer ? device_for_layer(il) : model.dev_layer(il)) : nullptr;
+        auto * mirror_dev = migration_device_for_layer ? migration_device_for_layer(il) : nullptr;
+        if (mirror_dev != nullptr && (!offload || dev == nullptr || mirror_dev == dev || swa || n_stream != 1)) {
+            throw std::runtime_error(format(
+                "KVarN prefill migration layer %u requires distinct device buffers, non-SWA, and one stream",
+                il));
+        }
         auto * buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -1633,7 +1843,83 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             std::move(v_records_stream),
             std::move(k_stage_stream),
             std::move(v_stage_stream),
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            {}, {}, {}, {},
+            false, false, false, 0, nullptr,
         });
+
+        auto & layer = layers.back();
+        layer.mirror_dev = mirror_dev;
+        if (mirror_dev != nullptr) {
+            if (!llama_kvarn_backend_supports_ops(mirror_dev, head_dim_k) ||
+                    !llama_kvarn_backend_supports_ops(mirror_dev, head_dim_v)) {
+                throw std::runtime_error(format(
+                    "KVarN migration mirror layer %u backend %s cannot store/attend its head dimensions",
+                    il, ggml_backend_dev_name(mirror_dev)));
+            }
+            auto * mirror_buft = ggml_backend_dev_buffer_type(mirror_dev);
+            auto * mirror_ctx = ctx_for_buft(mirror_buft);
+            if (!mirror_ctx) {
+                throw std::runtime_error("failed to create KVarN migration mirror tensor context");
+            }
+            layer.mirror_k_records = ggml_new_tensor_3d(
+                mirror_ctx, GGML_TYPE_I8, k_record_size, n_head_k_sliced, n_record_groups);
+            layer.mirror_v_records = ggml_new_tensor_3d(
+                mirror_ctx, GGML_TYPE_I8, v_record_size, n_head_v_sliced, n_record_groups);
+            layer.mirror_k_stage = ggml_new_tensor_3d(
+                mirror_ctx, GGML_TYPE_F16, k_record_dim, n_head_k_sliced, n_stage_tokens);
+            layer.mirror_v_stage = ggml_new_tensor_3d(
+                mirror_ctx, GGML_TYPE_F16, v_record_dim, n_head_v_sliced, n_stage_tokens);
+            ggml_format_name(layer.mirror_k_records, "cache_kvarn_k_records_mirror_l%d", il);
+            ggml_format_name(layer.mirror_v_records, "cache_kvarn_v_records_mirror_l%d", il);
+            ggml_format_name(layer.mirror_k_stage, "cache_kvarn_k_stage_mirror_l%d", il);
+            ggml_format_name(layer.mirror_v_stage, "cache_kvarn_v_stage_mirror_l%d", il);
+            layer.mirror_k_records_stream.reserve(n_stream);
+            layer.mirror_v_records_stream.reserve(n_stream);
+            layer.mirror_k_stage_stream.reserve(n_stream);
+            layer.mirror_v_stage_stream.reserve(n_stream);
+            for (uint32_t stream = 0; stream < n_stream; ++stream) {
+                auto * kr = ggml_view_3d(
+                    mirror_ctx, layer.mirror_k_records, k_record_size, n_head_k_sliced,
+                    n_groups_per_stream, layer.mirror_k_records->nb[1],
+                    layer.mirror_k_records->nb[2],
+                    size_t(stream) * n_groups_per_stream * layer.mirror_k_records->nb[2]);
+                auto * vr = ggml_view_3d(
+                    mirror_ctx, layer.mirror_v_records, v_record_size, n_head_v_sliced,
+                    n_groups_per_stream, layer.mirror_v_records->nb[1],
+                    layer.mirror_v_records->nb[2],
+                    size_t(stream) * n_groups_per_stream * layer.mirror_v_records->nb[2]);
+                auto * ks = ggml_view_3d(
+                    mirror_ctx, layer.mirror_k_stage, k_record_dim, n_head_k_sliced,
+                    KVAR_N_GROUP * stage_groups, layer.mirror_k_stage->nb[1],
+                    layer.mirror_k_stage->nb[2],
+                    size_t(stream) * KVAR_N_GROUP * stage_groups * layer.mirror_k_stage->nb[2]);
+                auto * vs = ggml_view_3d(
+                    mirror_ctx, layer.mirror_v_stage, v_record_dim, n_head_v_sliced,
+                    KVAR_N_GROUP * stage_groups, layer.mirror_v_stage->nb[1],
+                    layer.mirror_v_stage->nb[2],
+                    size_t(stream) * KVAR_N_GROUP * stage_groups * layer.mirror_v_stage->nb[2]);
+                ggml_format_name(kr, "cache_kvarn_k_records_mirror_l%d_s%d", il, stream);
+                ggml_format_name(vr, "cache_kvarn_v_records_mirror_l%d_s%d", il, stream);
+                ggml_format_name(ks, "cache_kvarn_k_stage_mirror_l%d_s%d", il, stream);
+                ggml_format_name(vs, "cache_kvarn_v_stage_mirror_l%d_s%d", il, stream);
+                layer.mirror_k_records_stream.push_back(kr);
+                layer.mirror_v_records_stream.push_back(vr);
+                layer.mirror_k_stage_stream.push_back(ks);
+                layer.mirror_v_stage_stream.push_back(vs);
+            }
+            const bool mirror_native_tail = exact_tail_tokens == 0 ||
+                (!explicit_bias && kvarn_backend_supports_native_tail(
+                    mirror_dev, exact_tail_type, head_dim_k, head_dim_v));
+            layer.mirror_native_attention =
+                llama_kvarn_backend_supports_native_ops(mirror_dev) && mirror_native_tail;
+            layer.mirror_mixed_tail_native = layer.mirror_native_attention &&
+                llama_kvarn_backend_mixed_tail_native_preferred(mirror_dev);
+            layer.mirror_native_original_v = layer.mirror_native_attention &&
+                llama_kvarn_backend_native_attention_uses_original_v(mirror_dev);
+            layer.mirror_native_rotated_max_query_tokens = layer.mirror_native_attention ?
+                llama_kvarn_backend_native_rotated_max_query_tokens(mirror_dev) : 0;
+        }
 
         raw_bytes += size_t(kv_size) * n_stream * n_head_kv * (head_dim_k + head_dim_v) * sizeof(ggml_fp16_t);
     }
@@ -1790,6 +2076,25 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             }
             metadata->set_tail_routes(std::move(tail_routes));
             metadata->finalize_tail_overlay_metadata();
+            if (migration_enabled) {
+                migration_local_tail_routes = metadata->get_tail_layer_routes();
+                migration_remote_tail_routes = migration_local_tail_routes;
+                for (auto & route : migration_remote_tail_routes) {
+                    const auto & layer = layer_for(route.layer_id);
+                    if (layer.mirror_dev == nullptr) {
+                        continue;
+                    }
+                    route.backend = ggml_backend_dev_name(layer.mirror_dev);
+                    route.owner = layer.mirror_dev;
+                    route.capability = {
+                        true,
+                        layer.mirror_native_attention && !route.explicit_bias
+                            ? LLAMA_KV_TAIL_ROUTE_NATIVE
+                            : LLAMA_KV_TAIL_ROUTE_GENERIC,
+                        LLAMA_KV_TAIL_OP_NONE,
+                    };
+                }
+            }
             exact_slots = metadata->get_tail_slots();
             if (exact_slots == 0) {
                 throw std::logic_error("KVarN exact-tail metadata finalized without storage slots");
@@ -1827,6 +2132,21 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                         ctx, exact_tail_type, uint64_t(layer.head_dim_v)*layer.n_head_kv, exact_slots);
                 ggml_format_name(layer.k_tail, "cache_kvarn_k_tail_l%d", layer.il);
                 ggml_format_name(layer.v_tail, "cache_kvarn_v_tail_l%d", layer.il);
+                if (layer.mirror_dev != nullptr) {
+                    auto * mirror_ctx = tail_ctx_for_buft(
+                            ggml_backend_dev_buffer_type(layer.mirror_dev));
+                    if (!mirror_ctx) {
+                        throw std::runtime_error("failed to create KVarN migration mirror tail context");
+                    }
+                    layer.mirror_k_tail = ggml_new_tensor_2d(
+                            mirror_ctx, exact_tail_type,
+                            uint64_t(layer.head_dim_k)*layer.n_head_kv, exact_slots);
+                    layer.mirror_v_tail = ggml_new_tensor_2d(
+                            mirror_ctx, exact_tail_type,
+                            uint64_t(layer.head_dim_v)*layer.n_head_kv, exact_slots);
+                    ggml_format_name(layer.mirror_k_tail, "cache_kvarn_k_tail_mirror_l%d", layer.il);
+                    ggml_format_name(layer.mirror_v_tail, "cache_kvarn_v_tail_mirror_l%d", layer.il);
+                }
             }
 
             for (auto & [buft, ctx] : tail_ctx_map) {
@@ -1866,9 +2186,228 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         metadata->set_tail_routes({});
     }
 
+    if (migration_enabled) {
+        ggml_backend_dev_t prefill_dev = nullptr;
+        ggml_backend_dev_t mirror_dev = nullptr;
+        for (const auto & layer : layers) {
+            if (layer.mirror_dev == nullptr) continue;
+            auto * layer_prefill_dev = ggml_backend_buft_get_device(
+                    ggml_backend_buffer_get_type(layer.k_records->buffer));
+            if (prefill_dev == nullptr) {
+                prefill_dev = layer_prefill_dev;
+                mirror_dev = layer.mirror_dev;
+            } else if (prefill_dev != layer_prefill_dev || mirror_dev != layer.mirror_dev) {
+                throw std::runtime_error("KVarN prefill migration currently requires one CUDA/Vulkan device pair");
+            }
+        }
+        if (hparams.no_alloc || prefill_dev == nullptr || mirror_dev == nullptr ||
+                strncmp(ggml_backend_dev_name(prefill_dev), "CUDA", 4) != 0 ||
+                strncmp(ggml_backend_dev_name(mirror_dev), "Vulkan", 6) != 0) {
+            throw std::runtime_error(
+                "KVarN prefill migration requires allocated CUDA payloads and a Vulkan mirror");
+        }
+        migration_copies = std::make_unique<migration_queue>(prefill_dev, mirror_dev);
+        migration_mirror_stale = false;
+        LLAMA_LOG_INFO("KVarN prefill migration enabled: CUDA owner with Vulkan mirror; "
+                "ownership changes only at explicit request boundaries\n");
+    }
+
     LLAMA_LOG_INFO("%s: type = %s, layers = %zu, groups/stream = %u, streams = %u, KVarN = %.2f MiB, equivalent F16 = %.2f MiB\n",
             __func__, llama_kvarn_type_name(this->params.type), layers.size(), n_groups_per_stream, n_stream,
             total_bytes / 1024.0 / 1024.0, raw_bytes / 1024.0 / 1024.0);
+}
+
+void llama_kv_cache_kvarn::enqueue_prefill_migration(const llama_kv_cache::slot_info & sinfo,
+                                                     ggml_backend_sched_t              sched) {
+    if (!migration_enabled || !migration_copies || sinfo.empty()) {
+        return;
+    }
+    // Once Vulkan owns the live payload, the CUDA mirror is deliberately left
+    // untouched. In particular, never wait on a Vulkan scheduler event from
+    // this transfer worker: Vulkan event synchronization recycles producer
+    // command buffers and races the inference thread.
+    if (migration_remote_active) {
+        migration_mirror_stale = true;
+        return;
+    }
+
+    try {
+        if (swa || n_stream != 1 || sinfo.n_stream() != 1) {
+            throw std::runtime_error("KVarN prefill migration does not support SWA or multiple streams");
+        }
+
+        std::set<uint32_t> sealed_groups;
+        for (const uint32_t cell : sinfo.idxs[0]) {
+            if (cell % KVAR_N_GROUP == KVAR_N_GROUP - 1u) {
+                const uint32_t group = cell / KVAR_N_GROUP;
+                // Group zero is the permanent sink and remains in the F16 stage.
+                if (group > 0 && group < n_groups_per_stream) {
+                    sealed_groups.insert(group);
+                }
+            }
+        }
+        if (sealed_groups.empty()) {
+            return;
+        }
+
+        std::vector<migration_queue::span> spans;
+        ggml_backend_t                     producer = nullptr;
+        for (const auto & layer : layers) {
+            if (layer.mirror_dev == nullptr) {
+                continue;
+            }
+            ggml_tensor *  source_probe   = layer.k_records;
+            ggml_backend_t layer_producer = ggml_backend_sched_get_tensor_backend(sched, source_probe);
+            if (layer_producer == nullptr) {
+                layer_producer = ggml_backend_sched_get_tensor_backend(sched, layer.k_stage);
+            }
+            if (layer_producer == nullptr ||
+                ggml_backend_get_device(layer_producer) !=
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(source_probe->buffer))) {
+                throw std::runtime_error(
+                    format("KVarN migration cannot resolve the producer backend for layer %u", layer.il));
+            }
+            if (producer == nullptr) {
+                producer = layer_producer;
+            } else if (ggml_backend_get_device(producer) != ggml_backend_get_device(layer_producer)) {
+                throw std::runtime_error("KVarN migration spans more than one producer device");
+            }
+            const auto append_records = [&](ggml_tensor * src, ggml_tensor * dst) {
+                const size_t group_bytes = src->nb[2];
+                auto         it          = sealed_groups.begin();
+                while (it != sealed_groups.end()) {
+                    const uint32_t begin = *it;
+                    uint32_t       end   = begin + 1;
+                    ++it;
+                    while (it != sealed_groups.end() && *it == end) {
+                        ++end;
+                        ++it;
+                    }
+                    spans.push_back({
+                        src,
+                        dst,
+                        size_t(begin) * group_bytes,
+                        size_t(begin) * dst->nb[2],
+                        size_t(end - begin) * group_bytes,
+                    });
+                }
+            };
+            append_records(layer.k_records_stream[0], layer.mirror_k_records_stream[0]);
+            append_records(layer.v_records_stream[0], layer.mirror_v_records_stream[0]);
+        }
+        // One CUDA producer event orders the newly sealed records behind this
+        // ubatch's cache stores while keeping the transfer queue bounded.
+        if (!spans.empty() && !migration_copies->enqueue(producer, true, std::move(spans))) {
+            migration_mirror_stale = true;
+            LLAMA_LOG_WARN("%s: CUDA-to-Vulkan cache mirror queue is unavailable; retaining CUDA ownership\n",
+                           __func__);
+        }
+    } catch (const std::exception & e) {
+        migration_mirror_stale = true;
+        LLAMA_LOG_ERROR("%s: cache mirror copy was skipped: %s; retaining CUDA ownership\n", __func__, e.what());
+    } catch (...) {
+        migration_mirror_stale = true;
+        LLAMA_LOG_ERROR("%s: cache mirror copy was skipped; retaining CUDA ownership\n", __func__);
+    }
+}
+
+bool llama_kv_cache_kvarn::handoff_prefill_migration(bool to_remote) {
+    if (!migration_enabled || !migration_copies) return false;
+    if (migration_remote_active == to_remote) return true;
+    if (swa || n_stream != 1) return false;
+
+    const int64_t migration_start_us = ggml_time_us();
+    const uint64_t copied_before = migration_copies->copied_bytes();
+    try {
+        if (!migration_copies->drain()) {
+            migration_mirror_stale = true;
+            LLAMA_LOG_WARN("%s: migration queue failed; keeping current %s cache owner\n",
+                    __func__, migration_remote_active ? "Vulkan" : "CUDA");
+            return false;
+        }
+        std::vector<migration_queue::span> spans;
+        for (const auto & layer : layers) {
+            if (layer.mirror_dev == nullptr) continue;
+            if (migration_mirror_stale) {
+                spans.push_back({
+                    layer.k_records, layer.mirror_k_records, 0, 0,
+                    size_t(ggml_nbytes(layer.k_records)),
+                });
+                spans.push_back({
+                    layer.v_records, layer.mirror_v_records, 0, 0,
+                    size_t(ggml_nbytes(layer.v_records)),
+                });
+            }
+            // The sink, partial records, rollback window, and exact FP16 tail
+            // are mutable during prefill/decode. Snapshot them at the boundary.
+            spans.push_back({
+                layer.k_stage, layer.mirror_k_stage, 0, 0,
+                size_t(ggml_nbytes(layer.k_stage)),
+            });
+            spans.push_back({
+                layer.v_stage, layer.mirror_v_stage, 0, 0,
+                size_t(ggml_nbytes(layer.v_stage)),
+            });
+            if (layer.k_tail != nullptr) {
+                spans.push_back({
+                    layer.k_tail, layer.mirror_k_tail, 0, 0,
+                    size_t(ggml_nbytes(layer.k_tail)),
+                });
+                spans.push_back({
+                    layer.v_tail, layer.mirror_v_tail, 0, 0,
+                    size_t(ggml_nbytes(layer.v_tail)),
+                });
+            }
+        }
+        if (!migration_copies->enqueue(nullptr, !migration_remote_active, std::move(spans)) ||
+                !migration_copies->drain()) {
+            migration_mirror_stale = true;
+            LLAMA_LOG_WARN("%s: payload copy failed; keeping current %s cache owner\n",
+                    __func__, migration_remote_active ? "Vulkan" : "CUDA");
+            return false;
+        }
+
+        metadata->rebind_tail_routes(to_remote
+                ? migration_remote_tail_routes
+                : migration_local_tail_routes);
+        for (auto & layer : layers) {
+            if (layer.mirror_dev == nullptr) continue;
+            std::swap(layer.k_records, layer.mirror_k_records);
+            std::swap(layer.v_records, layer.mirror_v_records);
+            std::swap(layer.k_stage, layer.mirror_k_stage);
+            std::swap(layer.v_stage, layer.mirror_v_stage);
+            std::swap(layer.k_tail, layer.mirror_k_tail);
+            std::swap(layer.v_tail, layer.mirror_v_tail);
+            std::swap(layer.k_records_stream, layer.mirror_k_records_stream);
+            std::swap(layer.v_records_stream, layer.mirror_v_records_stream);
+            std::swap(layer.k_stage_stream, layer.mirror_k_stage_stream);
+            std::swap(layer.v_stage_stream, layer.mirror_v_stage_stream);
+            std::swap(layer.native_attention, layer.mirror_native_attention);
+            std::swap(layer.mixed_tail_native, layer.mirror_mixed_tail_native);
+            std::swap(layer.native_original_v, layer.mirror_native_original_v);
+            std::swap(layer.native_rotated_max_query_tokens,
+                    layer.mirror_native_rotated_max_query_tokens);
+        }
+        migration_remote_active = to_remote;
+        migration_mirror_stale = false;
+        const uint64_t copied_after = migration_copies->copied_bytes();
+        LLAMA_LOG_INFO("%s: KVarN migration handoff complete: owner=%s, bytes=%llu, elapsed=%.2f ms\n",
+                __func__, to_remote ? "Vulkan" : "CUDA",
+                (unsigned long long) (copied_after - copied_before),
+                (ggml_time_us() - migration_start_us) / 1000.0);
+        return true;
+    } catch (const std::exception & e) {
+        migration_mirror_stale = true;
+        LLAMA_LOG_ERROR("KVarN prefill migration handoff failed: %s\n", e.what());
+        return false;
+    }
+}
+
+bool llama_kv_cache_kvarn::drain_prefill_migration() {
+    if (!migration_copies) return true;
+    const bool ok = migration_copies->drain();
+    if (!ok) migration_mirror_stale = true;
+    return ok;
 }
 
 std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() const {
@@ -1956,6 +2495,7 @@ llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() 
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {
+    drain_prefill_migration();
     pending_stream_copies = {};
     metadata->clear(false);
     if (data) {
@@ -1963,6 +2503,7 @@ void llama_kv_cache_kvarn::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+    migration_mirror_stale = !data;
 }
 
 bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
@@ -2033,6 +2574,7 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
 }
 
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    drain_prefill_migration();
     apply_pending_stream_copies(nullptr);
     if (!can_seq_rm(seq_id, p0, p1)) {
         const bool valid_seq = seq_id >= 0 && uint32_t(seq_id) < n_seq_max;
@@ -2049,14 +2591,19 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
                        int(metadata->can_seq_rm(seq_id, p0, p1)));
         return false;
     }
-    return metadata->seq_rm(seq_id, p0, p1);
+    const bool removed = metadata->seq_rm(seq_id, p0, p1);
+    if (removed && migration_enabled) migration_mirror_stale = true;
+    return removed;
 }
 
 bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    drain_prefill_migration();
     apply_pending_stream_copies(nullptr);
     if (swa) {
         // SWA ring: the metadata cache manages window eviction; records follow the ring.
-        return metadata->seq_rm_cell(seq_id, cell_idx);
+        const bool removed = metadata->seq_rm_cell(seq_id, cell_idx);
+        if (removed && migration_enabled) migration_mirror_stale = true;
+        return removed;
     }
     const llama_pos pos_max = metadata->seq_pos_max(seq_id);
     if (pos_max >= 0) {
@@ -2065,7 +2612,9 @@ bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
             return false;
         }
     }
-    return metadata->seq_rm_cell(seq_id, cell_idx);
+    const bool removed = metadata->seq_rm_cell(seq_id, cell_idx);
+    if (removed && migration_enabled) migration_mirror_stale = true;
+    return removed;
 }
 
 int llama_kv_cache_kvarn::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) {
@@ -2073,6 +2622,7 @@ int llama_kv_cache_kvarn::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint3
 }
 
 void llama_kv_cache_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    drain_prefill_migration();
     apply_pending_stream_copies(nullptr);
     const uint32_t stream_src = metadata->get_stream_for_seq(seq_id_src);
     const uint32_t stream_dst = metadata->get_stream_for_seq(seq_id_dst);
@@ -2104,11 +2654,14 @@ void llama_kv_cache_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_d
             tail_copies.tail_dst_slots.begin(), tail_copies.tail_dst_slots.end());
     pending_stream_copies.tail_transaction =
             pending_stream_copies.tail_transaction || tail_copies.tail_transaction;
+    if (migration_enabled) migration_mirror_stale = true;
 }
 
 void llama_kv_cache_kvarn::seq_keep(llama_seq_id seq_id) {
+    drain_prefill_migration();
     apply_pending_stream_copies(nullptr);
     metadata->seq_keep(seq_id);
+    if (migration_enabled) migration_mirror_stale = true;
 }
 
 GGML_NORETURN void llama_kv_cache_kvarn::seq_add(llama_seq_id, llama_pos, llama_pos, llama_pos) {
@@ -2320,6 +2873,7 @@ uint64_t llama_kv_cache_kvarn::get_kv_tail_planner_timing_ns() const {
 }
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (migration_copies && !migration_copies->drain()) migration_mirror_stale = true;
     // Unlike the dense cache, a sliding ring overwrites its historical body.
     // A partial checkpoint must own that ring, not reference its live records.
     if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0) {
@@ -2611,6 +3165,8 @@ void llama_kv_cache_kvarn::state_read_sinfo(
     if (has_pending_stream_copies()) {
         throw std::runtime_error("cannot restore KVarN state while a stream copy is pending");
     }
+    drain_prefill_migration();
+    if (migration_enabled) migration_mirror_stale = true;
 
     if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0) {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 || !stream_is_exclusive_for(seq_id)) {
@@ -3620,7 +4176,7 @@ bool llama_kv_cache_kvarn::state_streaming_restore_supported() const {
     // travels through indexed tensor reads: records, full stage images and
     // row-sized exact-tail payloads. SWA ring remapping still materializes
     // whole record vectors, and a pending stream copy owns the destination.
-    return !swa && !has_pending_stream_copies();
+    return !migration_enabled && !swa && !has_pending_stream_copies();
 }
 
 bool llama_kv_cache_kvarn::state_parse_q4(

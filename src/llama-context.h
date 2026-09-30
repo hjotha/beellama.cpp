@@ -58,6 +58,8 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+
+    int32_t prefill_migration_handoff(bool to_remote);
     void record_backend_private_workspace(ggml_cgraph * gf);
 
     void synchronize();

@@ -2809,6 +2809,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                             ggml_backend_t backend_cpu) const {
     llama_memory_i * res;
     llama_memory_i::layer_device_cb attention_device;
+    llama_memory_i::layer_device_cb migration_device;
     if (cparams.local_attn_backend) {
         const auto dev = ggml_backend_get_device(cparams.local_attn_backend);
         const int n_remote = cparams.remote_attn_layers;
@@ -2821,6 +2822,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             }
             return full_idx < n_remote ? dev : dev_layer(il);
         };
+        if (cparams.local_attn_migration && cparams.local_attn_migration_backend != nullptr) {
+            const auto mirror_dev = ggml_backend_get_device(cparams.local_attn_migration_backend);
+            migration_device = [this, mirror_dev, n_remote](int32_t il) {
+                int full_idx = 0;
+                for (int32_t l = 0; l < il; ++l) {
+                    if (hparams.has_kv(l) && !hparams.is_recr(l)) ++full_idx;
+                }
+                return full_idx < n_remote ? mirror_dev : nullptr;
+            };
+        }
     }
     const ggml_type kvarn_tail_type = params.kv_tail_type == GGML_TYPE_COUNT ?
             GGML_TYPE_F16 : params.kv_tail_type;
@@ -3270,7 +3281,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter_attn, nullptr, params.kv_tail_tokens,
                                         kvarn_tail_type, params.kv_tail_tokens_requested,
-                                        params.kv_tail_rollback_tokens, attention_device);
+                                        params.kv_tail_rollback_tokens, attention_device, migration_device);
                                 // QSA's index cache mirrors the attention cells cell for cell,
                                 // which the compact read plan's reordered rows cannot represent.
                                 if (needs_mem_idx && filter_idx) {

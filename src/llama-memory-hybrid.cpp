@@ -155,6 +155,18 @@ llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, 
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
 
+bool llama_memory_hybrid::supports_prefill_migration() const {
+    return mem_attn->supports_prefill_migration();
+}
+
+bool llama_memory_hybrid::handoff_prefill_migration(bool to_remote) {
+    return mem_attn->handoff_prefill_migration(to_remote);
+}
+
+bool llama_memory_hybrid::drain_prefill_migration() {
+    return mem_attn->drain_prefill_migration();
+}
+
 bool llama_memory_hybrid::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();
@@ -437,6 +449,12 @@ void llama_memory_hybrid_context::graph_compute_start() {
 void llama_memory_hybrid_context::graph_compute_finish(ggml_status compute_status) {
     ctx_attn->graph_compute_finish(compute_status);
     ctx_recr->graph_compute_finish(compute_status);
+}
+
+void llama_memory_hybrid_context::graph_compute_complete(
+        ggml_backend_sched_t sched, ggml_status compute_status) {
+    ctx_attn->graph_compute_complete(sched, compute_status);
+    ctx_recr->graph_compute_complete(sched, compute_status);
 }
 
 llama_memory_status llama_memory_hybrid_context::get_status() const {

@@ -3699,8 +3699,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CUDA_RESERVE"));
     add_opt(common_arg(
         {"--remote-attn-prefill"}, "MODE",
-        "remote prefill mode: 'remote' (send Q/K/V, server builds KV) or 'migrate'\n"
-        "(reserved: build/quantize locally then migrate compressed records)\n"
+        "remote prefill mode: 'remote' (send Q/K/V, backend builds KV) or 'migrate'\n"
+        "(CUDA prefill with asynchronous KVarN record mirroring and an explicit decode handoff; "
+        "currently single-slot, target-only, non-SWA, and requires the full prefill cache to fit CUDA)\n"
         "(default: remote)",
         [](common_params & params, const std::string & value) {
             if (value != "remote" && value != "migrate") {

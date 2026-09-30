@@ -953,26 +953,73 @@ llama_context::llama_context(
 
         if (local_attn_dev) {
             if (model.arch != LLM_ARCH_QWEN35 || cparams.kv_paged || !cparams.offload_kqv ||
-                    cparams.remote_attn_prefill != 0) {
-                throw std::runtime_error("local attention requires qwen35, non-paged GPU KV and remote prefill mode");
+                    cparams.remote_attn_prefill < 0 || cparams.remote_attn_prefill > 1) {
+                throw std::runtime_error(
+                    "local attention requires Qwen35, non-paged KV, and --offload-kqv");
+            }
+            if (params.remote_attn_prefill == 1 &&
+                    (cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
+                     cparams.n_seq_max != 1 || cparams.kv_unified ||
+                     hparams.swa_type != LLAMA_SWA_TYPE_NONE || params.ctx_other != nullptr ||
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP)) {
+                throw std::runtime_error(
+                    "prefill migration requires single-stream non-unified KVarN without SWA or draft contexts");
             }
             auto * dev = local_attn_dev;
             const std::string name = ggml_backend_dev_name(dev);
+            ggml_backend_t remote_backend = nullptr;
             for (auto & backend : backends) {
                 if (ggml_backend_get_device(backend.get()) == dev) {
-                    cparams.local_attn_backend = backend.get();
+                    remote_backend = backend.get();
                     break;
                 }
             }
-            if (!cparams.local_attn_backend) {
+            if (!remote_backend) {
                 auto * backend = ggml_backend_dev_init(dev, nullptr);
                 if (!backend) {
                     throw std::runtime_error("failed to initialize local attention device: " + name);
                 }
                 backends.emplace_back(backend);
-                cparams.local_attn_backend = backend;
+                remote_backend = backend;
+            }
+            cparams.local_attn_migration = params.remote_attn_prefill == 1;
+            if (cparams.local_attn_migration) {
+                cparams.local_attn_migration_backend = remote_backend;
+                ggml_backend_dev_t prefill_dev = nullptr;
+                for (const auto & dev_layer : model.devices) {
+                    if (dev_layer.dev != nullptr &&
+                            ggml_backend_dev_type(dev_layer.dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                            std::strncmp(ggml_backend_dev_name(dev_layer.dev), "CUDA", 4) == 0) {
+                        prefill_dev = dev_layer.dev;
+                        break;
+                    }
+                }
+                if (prefill_dev == nullptr) {
+                    throw std::runtime_error("prefill migration requires CUDA model weights");
+                }
+                for (auto & backend : backends) {
+                    if (ggml_backend_get_device(backend.get()) == prefill_dev) {
+                        cparams.local_attn_prefill_backend = backend.get();
+                        break;
+                    }
+                }
+                if (cparams.local_attn_prefill_backend == nullptr) {
+                    auto * backend = ggml_backend_dev_init(prefill_dev, nullptr);
+                    if (backend == nullptr) {
+                        throw std::runtime_error("failed to initialize CUDA prefill backend");
+                    }
+                    backends.emplace_back(backend);
+                    cparams.local_attn_prefill_backend = backend;
+                }
+                cparams.local_attn_backend = cparams.local_attn_prefill_backend;
+                LLAMA_LOG_INFO("%s: prefill migration enabled: attention starts on %s and mirrors KVarN to %s\n",
+                        __func__, ggml_backend_dev_name(prefill_dev), name.c_str());
+            } else {
+                cparams.local_attn_backend = remote_backend;
             }
             LLAMA_LOG_INFO("%s: native local attention and KV backend: %s\n", __func__, name.c_str());
+        } else if (params.remote_attn_prefill != 0) {
+            throw std::runtime_error("--remote-attn-prefill=migrate requires an in-process Vulkan attention backend");
         }
 
         // add ACCEL backends (such as BLAS)
@@ -1188,6 +1235,12 @@ std::vector<ggml_backend_t> layer_backends;
                 n_remote = params.remote_attn_n_layers;
             }
             cparams.remote_attn_layers = n_remote;
+            if (cparams.local_attn_migration &&
+                    (params.remote_attn_n_layers == -1 || n_remote <= 0)) {
+                throw std::invalid_argument(
+                    "--remote-attn-prefill=migrate requires an explicit positive --remote-attn-layers count; "
+                    "automatic overflow placement cannot prefill a cache that exceeds CUDA capacity");
+            }
         }
 
         memory.reset(model.create_memory(params_mem, cparams, layer_backends, kv_backends, backend_cpu));
@@ -1417,6 +1470,11 @@ std::vector<ggml_backend_t> layer_backends;
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    // KVarN's transfer worker can hold CUDA producer events and live tensor
+    // pointers. Drain it before scheduler/model backends begin destruction.
+    if (memory && !memory->drain_prefill_migration()) {
+        LLAMA_LOG_WARN("%s: KVarN mirror worker stopped with a stale mirror; active cache remains authoritative\n", __func__);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1437,9 +1495,7 @@ llama_context::~llama_context() {
     }
     ggml_opt_free(opt_ctx);
 
-    // Release the remote KV+attention backend after the scheduler that
-    // references it. sched.reset() runs before any member destructor, so the
-    // local backends (unique_ptrs) and buffers are still intact for it.
+    // Release the scheduler before the backends it references.
     if (backend_remote != nullptr) {
         if (cparams.remote_attn_stats) {
             const char * stats = ggml_backend_is_local_split(backend_remote) ?
@@ -1448,7 +1504,9 @@ llama_context::~llama_context() {
             LLAMA_LOG_INFO("%s: remote_attn stats %s\n", __func__, stats);
         }
         ggml_remote_attn_set_active(nullptr);
-        sched.reset();
+    }
+    sched.reset();
+    if (backend_remote != nullptr) {
         ggml_backend_free(backend_remote);
         backend_remote = nullptr;
     }
@@ -1539,8 +1597,6 @@ void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
     }
-
-    sched_need_reserve = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -1683,6 +1739,72 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    // Keep the reservation pending if any allocation/build step above throws.
+    sched_need_reserve = false;
+}
+
+int32_t llama_context::prefill_migration_handoff(bool to_remote) {
+    if (!cparams.local_attn_migration || !memory ||
+            !memory->supports_prefill_migration() ||
+            cparams.local_attn_migration_backend == nullptr ||
+            cparams.local_attn_prefill_backend == nullptr) {
+        return LLAMA_PREFILL_MIGRATION_ERROR;
+    }
+
+    const ggml_backend_t next_backend = to_remote
+        ? cparams.local_attn_migration_backend
+        : cparams.local_attn_prefill_backend;
+    const ggml_backend_t current_backend = cparams.local_attn_backend;
+    if (current_backend == next_backend) {
+        try {
+            sched_reserve();
+            return LLAMA_PREFILL_MIGRATION_OK;
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: graph reservation failed for current KV owner: %s\n", __func__, e.what());
+            sched_need_reserve = true;
+            return LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED;
+        }
+    }
+
+    synchronize();
+    if (!memory->handoff_prefill_migration(to_remote)) {
+        return LLAMA_PREFILL_MIGRATION_OWNER_UNCHANGED;
+    }
+
+    cparams.local_attn_backend = next_backend;
+    if (gf_res_prev) gf_res_prev->reset();
+    if (gf_res_reserve) gf_res_reserve->reset();
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: graph reservation failed after KV handoff: %s\n", __func__, e.what());
+        cparams.local_attn_backend = current_backend;
+        if (!memory->handoff_prefill_migration(!to_remote)) {
+            // The transfer failed before swapping cache tensors, so the target
+            // remains authoritative. Keep backend selection aligned with it;
+            // the caller can continue on that owner or report decode failure.
+            cparams.local_attn_backend = next_backend;
+            sched_need_reserve = true;
+            LLAMA_LOG_ERROR("%s: KV handoff rollback failed; retaining target backend as cache owner\n", __func__);
+            return LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED;
+        }
+        if (gf_res_prev) gf_res_prev->reset();
+        if (gf_res_reserve) gf_res_reserve->reset();
+        sched_need_reserve = true;
+        try {
+            sched_reserve();
+        } catch (const std::exception & rollback_error) {
+            LLAMA_LOG_ERROR("%s: graph reservation also failed after restoring the previous KV owner: %s\n",
+                    __func__, rollback_error.what());
+            sched_need_reserve = true;
+            return LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED;
+        }
+        return LLAMA_PREFILL_MIGRATION_OWNER_UNCHANGED;
+    }
+    LLAMA_LOG_INFO("%s: KVarN payload owner changed to %s\n",
+            __func__, ggml_backend_dev_name(ggml_backend_get_device(next_backend)));
+    return LLAMA_PREFILL_MIGRATION_OK;
 }
 
 void llama_context::record_backend_private_workspace(ggml_cgraph * gf) {
@@ -2586,6 +2708,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     memory_finish_guard.finish(status);
+    if (mctx) {
+        mctx->graph_compute_complete(sched.get(), status);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -6063,6 +6188,16 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+int32_t llama_context_prefill_migration_handoff(llama_context * ctx, bool to_remote) {
+    if (ctx == nullptr) return LLAMA_PREFILL_MIGRATION_ERROR;
+    try {
+        return ctx->prefill_migration_handoff(to_remote);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return LLAMA_PREFILL_MIGRATION_ERROR;
+    }
 }
 
 float * llama_get_logits(llama_context * ctx) {

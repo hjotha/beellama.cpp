@@ -4926,6 +4926,12 @@ private:
             model_dft = nullptr;
         }
 
+        if (params_base.remote_attn_prefill == "migrate" &&
+                (params_base.n_parallel != 1 || spec != nullptr)) {
+            SRV_ERR("%s", "remote-attn-prefill=migrate currently requires one slot and speculative decoding disabled\n");
+            return false;
+        }
+
         draft_owns_state = server_draft_context_owns_state(
                 ctx_dft != nullptr, common_speculative_draft_memory_is_shared(spec.get()));
         ctx_dft_seq_rm_type = draft_owns_state ?
@@ -8650,11 +8656,27 @@ if (task.params.cache_prompt) {
                                         populate_token_probs(slot, result, /*post_sampling=*/true, params_base.special, /*idx=*/-1);
                                     }
 
-                                    if (!process_token(result, slot)) {
+                                    const bool continue_generation = process_token(result, slot);
+                                    if (!continue_generation) {
                                         slot.print_timings();
                                         send_final_response(slot);
                                         auto_save_on_completion(slot);
                                         slot.release();
+                                    } else if (params_base.remote_attn_prefill == "migrate") {
+                                        const int32_t handoff_status =
+                                                llama_context_prefill_migration_handoff(ctx_tgt, true);
+                                        SRV_INF("prefill-migrate restored-prompt handoff result=%d\n",
+                                                handoff_status);
+                                        if (handoff_status == LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED ||
+                                                handoff_status == LLAMA_PREFILL_MIGRATION_ERROR) {
+                                            send_error(slot, "prefill migration could not reserve a usable scheduler",
+                                                    ERROR_TYPE_SERVER);
+                                            slot.release();
+                                            return;
+                                        }
+                                        if (handoff_status != LLAMA_PREFILL_MIGRATION_OK) {
+                                            SRV_WRN("%s", "could not move restored KVarN cache to Vulkan; continuing on its current owner\n");
+                                        }
                                     }
 
                                     SLT_INF(slot, "%s", "restore-continue: emitted first token from saved logits (prompt_n=0)\n");
@@ -9194,6 +9216,22 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             n_empty_consecutive = 0;
         }
 
+        if (params_base.remote_attn_prefill == "migrate") {
+            const bool prompt_batch = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                return slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT;
+            });
+            if (prompt_batch) {
+                const int32_t handoff_status = llama_context_prefill_migration_handoff(ctx_tgt, false);
+                if (handoff_status == LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED ||
+                        handoff_status == LLAMA_PREFILL_MIGRATION_ERROR) {
+                    throw std::runtime_error("KVarN handoff could not reserve a usable graph scheduler");
+                }
+                if (handoff_status != LLAMA_PREFILL_MIGRATION_OK) {
+                    SRV_WRN("%s", "could not move KVarN cache to CUDA; prefill will use its current owner\n");
+                }
+            }
+        }
+
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
         if (spec && batch.has_embd) {
@@ -9404,6 +9442,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        bool migration_handoff_after_prompt = false;
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -9437,7 +9476,8 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 return;
             }
 
-            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+            const bool just_finished_prompt = slot.state == SLOT_STATE_DONE_PROMPT;
+            if (just_finished_prompt) {
                 slot.bootstrap_cold_fallback = false;
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
@@ -9556,6 +9596,9 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
                 return;
             }
+
+            migration_handoff_after_prompt = migration_handoff_after_prompt ||
+                    (just_finished_prompt && params_base.remote_attn_prefill == "migrate");
 
             slot.print_timings_tg();
         });
@@ -9810,6 +9853,18 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        if (migration_handoff_after_prompt) {
+            const int32_t handoff_status = llama_context_prefill_migration_handoff(ctx_tgt, true);
+            SRV_INF("prefill-migrate decode handoff result=%d\n", handoff_status);
+            if (handoff_status == LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED ||
+                    handoff_status == LLAMA_PREFILL_MIGRATION_ERROR) {
+                throw std::runtime_error("KVarN handoff could not reserve a usable graph scheduler");
+            }
+            if (handoff_status != LLAMA_PREFILL_MIGRATION_OK) {
+                SRV_WRN("%s", "could not move completed prompt KVarN cache to Vulkan; decode will use its current owner\n");
+            }
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model

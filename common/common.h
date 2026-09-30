@@ -802,7 +802,7 @@ struct common_params {
     std::string remote_attn_host         = "";
     uint16_t    remote_attn_port         = 0;
     std::string remote_attn_layers       = "auto";   // "auto" | "full" | integer N
-    std::string remote_attn_prefill      = "remote"; // "remote" | "migrate" (reserved)
+    std::string remote_attn_prefill      = "remote"; // "remote" | "migrate" (CUDA prefill + mirrored KVarN handoff)
     bool        remote_attn_stats        = false;
     size_t      remote_attn_cuda_reserve = 650 * 1024 * 1024; // 650 MiB default safety reserve (covers compute graph & allocator headroom)
 

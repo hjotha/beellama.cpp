@@ -97,6 +97,7 @@ public:
     bool apply() override;
     void graph_compute_start() override;
     void graph_compute_finish(ggml_status compute_status) override;
+    void graph_compute_complete(ggml_backend_sched_t sched, ggml_status compute_status) override;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -233,7 +234,9 @@ public:
             ggml_type tail_type = GGML_TYPE_F16,
             uint32_t tail_tokens_requested = UINT32_MAX,
             uint32_t tail_rollback_tokens = 0,
-            const layer_device_cb & device_for_layer = nullptr);
+            const layer_device_cb & device_for_layer = nullptr,
+            const layer_device_cb & migration_device_for_layer = nullptr);
+    ~llama_kv_cache_kvarn() override;
 
     llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,
@@ -274,6 +277,13 @@ public:
             llama_kv_tail_coverage_info & out) const override;
     void reset_kv_tail_planner_timing() override;
     uint64_t get_kv_tail_planner_timing_ns() const override;
+
+    bool supports_prefill_migration() const override { return migration_enabled; }
+    bool handoff_prefill_migration(bool to_remote) override;
+    bool drain_prefill_migration() override;
+    void enqueue_prefill_migration(
+            const llama_kv_cache::slot_info & sinfo,
+            ggml_backend_sched_t sched);
 
     bool requires_state_for_partial_restore() const override;
     bool state_seq_can_save(llama_seq_id seq_id) const override;
@@ -388,6 +398,21 @@ private:
         std::vector<ggml_tensor *> v_records_stream;
         std::vector<ggml_tensor *> k_stage_stream;
         std::vector<ggml_tensor *> v_stage_stream;
+        ggml_tensor * mirror_k_records = nullptr;
+        ggml_tensor * mirror_v_records = nullptr;
+        ggml_tensor * mirror_k_stage = nullptr;
+        ggml_tensor * mirror_v_stage = nullptr;
+        ggml_tensor * mirror_k_tail = nullptr;
+        ggml_tensor * mirror_v_tail = nullptr;
+        std::vector<ggml_tensor *> mirror_k_records_stream;
+        std::vector<ggml_tensor *> mirror_v_records_stream;
+        std::vector<ggml_tensor *> mirror_k_stage_stream;
+        std::vector<ggml_tensor *> mirror_v_stage_stream;
+        bool mirror_native_attention = false;
+        bool mirror_mixed_tail_native = false;
+        bool mirror_native_original_v = false;
+        uint32_t mirror_native_rotated_max_query_tokens = 0;
+        ggml_backend_dev_t mirror_dev = nullptr;
     };
 
     const layer & layer_for(int32_t il) const;
@@ -422,4 +447,11 @@ private:
     std::unordered_map<int32_t, int32_t> map_layer_ids;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
     llama_kv_cache::stream_copy_info pending_stream_copies;
+    const bool migration_enabled;
+    bool migration_remote_active = false;
+    mutable bool migration_mirror_stale = false;
+    std::vector<llama_kv_tail_layer_route> migration_local_tail_routes;
+    std::vector<llama_kv_tail_layer_route> migration_remote_tail_routes;
+    struct migration_queue;
+    std::unique_ptr<migration_queue> migration_copies;
 };

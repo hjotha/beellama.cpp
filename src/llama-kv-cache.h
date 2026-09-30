@@ -276,6 +276,7 @@ bool requires_state_for_partial_restore() const override;
     bool get_tail_explicit_bias(int32_t il) const;
     const std::vector<llama_kv_tail_layer_route> & get_tail_layer_routes() const;
     void set_tail_routes(std::vector<llama_kv_tail_layer_route> routes);
+    void rebind_tail_routes(std::vector<llama_kv_tail_layer_route> routes);
     // Structured caches construct their ordinary body before committing any
     // exact-tail metadata. Finalization is idempotent for the owning standard
     // cache and explicit for metadata-only caches.

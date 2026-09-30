@@ -136,7 +136,9 @@ uint groups_per_stream() {
     return p.stream_group_packed >> 16u;
 }
 
-shared float sh_reduce[128];
+// Keep every GQA head's subgroup sums until one workgroup-wide reduction.
+// Serializing heads here would require two barriers per head and KV token.
+shared float sh_reduce[GQA_GROUP_MAX * 128u];
 shared uint sh_live_group[128];
 shared uint sh_live_pos[128];
 shared float sh_maximum[GQA_GROUP_MAX];
@@ -248,6 +250,8 @@ void compute_live(
     }
     live_group = sh_live_group[0];
     live_pos = sh_live_pos[0];
+    // A separate V-index scan reuses this scratch immediately after return.
+    barrier();
 }
 
 float load_kvarn(
@@ -376,6 +380,60 @@ float load_tail_mask(uint token, uint query, uint stream) {
         tail_mask.data[half_index >> 1u], half_index, false);
 }
 
+void accumulate_token(
+        uint lane,
+        uint active_heads,
+        float mask_value,
+        float slopes[GQA_GROUP_MAX],
+        float query_values[GQA_GROUP_MAX * 4u],
+        float k_values[4],
+        float v_values[4],
+        inout float accumulator[GQA_GROUP_MAX * 4u]) {
+    for (uint gi = 0u; gi < active_heads; ++gi) {
+        float partial = 0.0;
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            partial += query_values[gi * 4u + slice] * k_values[slice];
+        }
+        partial = subgroupAdd(partial);
+        if (gl_SubgroupInvocationID == 0u) {
+            sh_reduce[gi * 128u + gl_SubgroupID] = partial;
+        }
+    }
+    barrier();
+
+    // Each head has independent online-softmax state. A different invocation
+    // can reduce/update each head after all subgroup sums are visible.
+    if (lane < active_heads) {
+        const uint gi = lane;
+        float total = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+            total += sh_reduce[gi * 128u + subgroup];
+        }
+        float score = total * p.scale;
+        if (p.logit_softcap != 0.0) {
+            score = p.logit_softcap * tanh(score);
+        }
+        score += slopes[gi] * mask_value;
+        const float next_maximum = max(sh_maximum[gi], score);
+        const float old_scale = sh_maximum[gi] < -3.0e38 ?
+            0.0 : exp(sh_maximum[gi] - next_maximum);
+        const float weight = exp(score - next_maximum);
+        sh_maximum[gi] = next_maximum;
+        sh_denominator[gi] = sh_denominator[gi] * old_scale + weight;
+        sh_old_scale[gi] = old_scale;
+        sh_weight[gi] = weight;
+    }
+    barrier();
+
+    for (uint gi = 0u; gi < active_heads; ++gi) {
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            const uint acc = gi * 4u + slice;
+            accumulator[acc] = accumulator[acc] * sh_old_scale[gi] +
+                v_values[slice] * sh_weight[gi];
+        }
+    }
+}
+
 void main() {
     const uint lane = gl_LocalInvocationID.x;
     const uint split_k = gl_NumWorkGroups.x / n_query();
@@ -394,7 +452,6 @@ void main() {
         gqa_group_size, gqa() - gqa_group * gqa_group_size);
     const bool has_tail = (p.flags & FLAG_TAIL) != 0u;
     const bool bodyless = (p.flags & FLAG_TAIL_BODYLESS) != 0u;
-    const bool process_tail = has_tail && split_index + 1u == split_k;
 
     if (lane == 0u) {
         sh_active = -1;
@@ -418,7 +475,9 @@ void main() {
     uint k_live_pos = 0u;
     uint v_live_group = 0u;
     uint v_live_pos = 0u;
-    if (!bodyless) {
+    // Indirect non-SWA views explicitly identify staged cells; load_kvarn()
+    // never consults the live-group scan for them.
+    if (!bodyless && (!read_indirect() || (p.flags & FLAG_SWA) != 0u)) {
         compute_live(false, stream, lane, k_live_group, k_live_pos);
         if ((p.flags & FLAG_SHARED_INDICES) != 0u) {
             v_live_group = k_live_group;
@@ -448,16 +507,20 @@ void main() {
     const float m1 = exp2(-(p.max_bias / 2.0) / float(n_head_log2));
     const uint head_dim = head_slices() * KVAR_N_DIM;
     float slopes[GQA_GROUP_MAX];
-    uint q_bases[GQA_GROUP_MAX];
+    float query_values[GQA_GROUP_MAX * 4u];
     for (uint gi = 0u; gi < active_heads; ++gi) {
         const uint query_head = query_head_first + gi;
         slopes[gi] = p.max_bias > 0.0 ?
             (query_head < n_head_log2 ?
                 pow(m0, float(query_head + 1u)) :
                 pow(m1, float(2u * (query_head - n_head_log2) + 1u))) : 1.0;
-        q_bases[gi] = query * q_nb1() +
+        const uint q_base = query * q_nb1() +
             query_head * q_nb2() +
             out_stream * head_dim * n_query() * n_query_heads;
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            query_values[gi * 4u + slice] = uintBitsToFloat(
+                data_q[q_base + slice * KVAR_N_DIM + lane]);
+        }
     }
 
     const uint body_tokens = bodyless ? 0u : p.n_kv;
@@ -465,68 +528,41 @@ void main() {
     const uint token_end = body_tokens * (split_index + 1u) / split_k;
 
     for (uint token = token_begin; token < token_end; ++token) {
+        const float mask_value = (p.flags & FLAG_MASK) != 0u ?
+            load_mask(token, query, out_stream) : 0.0;
+        // The mask is identical across every invocation/head in the workgroup.
+        // Reject hidden cells before loading/dequantizing records or entering
+        // the dot-product barriers, including padded/causally masked prefixes.
+        if (isinf(mask_value) && mask_value < 0.0) {
+            continue;
+        }
         float k_values[4];
         float v_values[4];
         for (uint slice = 0u; slice < head_slices(); ++slice) {
-            const uint dim = slice * KVAR_N_DIM + lane;
             k_values[slice] = load_kvarn(false, logical_head, token, stream,
                 k_live_group, k_live_pos, slice, lane);
             v_values[slice] = load_kvarn(true, logical_head, token, stream,
                 v_live_group, v_live_pos, slice, lane);
         }
 
-        for (uint gi = 0u; gi < active_heads; ++gi) {
-            float partial = 0.0;
-            for (uint slice = 0u; slice < head_slices(); ++slice) {
-                const uint dim = slice * KVAR_N_DIM + lane;
-                partial += uintBitsToFloat(data_q[q_bases[gi] + dim]) * k_values[slice];
-            }
-            partial = subgroupAdd(partial);
-            if (gl_SubgroupInvocationID == 0u) {
-                sh_reduce[gl_SubgroupID] = partial;
-            }
-            barrier();
-            if (lane == 0u) {
-                float total = 0.0;
-                for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
-                    total += sh_reduce[subgroup];
-                }
-                const float mask_value = (p.flags & FLAG_MASK) != 0u ?
-                    slopes[gi] * load_mask(token, query, out_stream) : 0.0;
-                float score = total * p.scale;
-                if (p.logit_softcap != 0.0) {
-                    score = p.logit_softcap * tanh(score);
-                }
-                score += mask_value;
-                if (isinf(mask_value) && mask_value < 0.0) {
-                    sh_old_scale[gi] = 1.0;
-                    sh_weight[gi] = 0.0;
-                } else {
-                    const float next_maximum = max(sh_maximum[gi], score);
-                    const float old_scale = sh_maximum[gi] < -3.0e38 ?
-                        0.0 : exp(sh_maximum[gi] - next_maximum);
-                    const float weight = exp(score - next_maximum);
-                    sh_maximum[gi] = next_maximum;
-                    sh_denominator[gi] = sh_denominator[gi] * old_scale + weight;
-                    sh_old_scale[gi] = old_scale;
-                    sh_weight[gi] = weight;
-                }
-            }
-            barrier();
-
-            for (uint slice = 0u; slice < head_slices(); ++slice) {
-                const uint acc = gi * 4u + slice;
-                accumulator[acc] = accumulator[acc] * sh_old_scale[gi] +
-                    v_values[slice] * sh_weight[gi];
-            }
-        }
+        accumulate_token(lane, active_heads, mask_value, slopes,
+            query_values, k_values, v_values, accumulator);
     }
 
-    if (process_tail) {
+    if (has_tail) {
         RunDescRef run_desc = RunDescRef(p.run_desc_addr);
         const uint desc_base = uint(sh_active) * p.run_desc_ne0;
         const uint n_tail = uint(max(run_desc.data[desc_base + 4u], 0));
-        for (uint token = 0u; token < n_tail; ++token) {
+        // Tail rows participate in the same split-K softmax merge as body rows.
+        // Assigning the complete exact tail to the last split serializes decode
+        // on that workgroup even when the body is distributed across the GPU.
+        const uint tail_begin = n_tail * split_index / split_k;
+        const uint tail_end = n_tail * (split_index + 1u) / split_k;
+        for (uint token = tail_begin; token < tail_end; ++token) {
+            const float mask_value = load_tail_mask(token, query, out_stream);
+            if (isinf(mask_value) && mask_value < 0.0) {
+                continue;
+            }
             const uint slot = uint(run_desc.data[desc_base + 6u + token]);
             float k_values[4];
             float v_values[4];
@@ -536,51 +572,8 @@ void main() {
                 v_values[slice] = load_tail(true, slot, logical_head, dim);
             }
 
-            for (uint gi = 0u; gi < active_heads; ++gi) {
-                float partial = 0.0;
-                for (uint slice = 0u; slice < head_slices(); ++slice) {
-                    const uint dim = slice * KVAR_N_DIM + lane;
-                    partial += uintBitsToFloat(data_q[q_bases[gi] + dim]) * k_values[slice];
-                }
-                partial = subgroupAdd(partial);
-                if (gl_SubgroupInvocationID == 0u) {
-                    sh_reduce[gl_SubgroupID] = partial;
-                }
-                barrier();
-                if (lane == 0u) {
-                    float total = 0.0;
-                    for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
-                        total += sh_reduce[subgroup];
-                    }
-                    const float mask_value =
-                        slopes[gi] * load_tail_mask(token, query, out_stream);
-                    float score = total * p.scale;
-                    if (p.logit_softcap != 0.0) {
-                        score = p.logit_softcap * tanh(score);
-                    }
-                    score += mask_value;
-                    if (isinf(mask_value) && mask_value < 0.0) {
-                        sh_old_scale[gi] = 1.0;
-                        sh_weight[gi] = 0.0;
-                    } else {
-                        const float next_maximum = max(sh_maximum[gi], score);
-                        const float old_scale = sh_maximum[gi] < -3.0e38 ?
-                            0.0 : exp(sh_maximum[gi] - next_maximum);
-                        const float weight = exp(score - next_maximum);
-                        sh_maximum[gi] = next_maximum;
-                        sh_denominator[gi] = sh_denominator[gi] * old_scale + weight;
-                        sh_old_scale[gi] = old_scale;
-                        sh_weight[gi] = weight;
-                    }
-                }
-                barrier();
-
-                for (uint slice = 0u; slice < head_slices(); ++slice) {
-                    const uint acc = gi * 4u + slice;
-                    accumulator[acc] = accumulator[acc] * sh_old_scale[gi] +
-                        v_values[slice] * sh_weight[gi];
-                }
-            }
+            accumulate_token(lane, active_heads, mask_value, slopes,
+                query_values, k_values, v_values, accumulator);
         }
     }
 
@@ -606,6 +599,9 @@ void main() {
         return;
     }
 
+    // Every invocation must finish consuming the last token's scales before
+    // lane zero repurposes them for sinks and final normalization.
+    barrier();
     if (lane == 0u) {
         for (uint gi = 0u; gi < active_heads; ++gi) {
             const uint query_head = query_head_first + gi;

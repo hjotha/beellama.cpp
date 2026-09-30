@@ -7239,6 +7239,35 @@ void llama_kv_cache::set_tail_routes(std::vector<llama_kv_tail_layer_route> rout
     tail_plan.layer_routes = std::move(routes);
 }
 
+void llama_kv_cache::rebind_tail_routes(std::vector<llama_kv_tail_layer_route> routes) {
+    if (!has_tail_overlay()) {
+        if (!routes.empty()) {
+            throw std::invalid_argument("cannot rebind routes for a non-overlay KV tail plan");
+        }
+        return;
+    }
+    if (routes.size() != tail_plan.layer_routes.size()) {
+        throw std::invalid_argument("KV tail route rebind changed the layer set");
+    }
+    for (const auto & route : routes) {
+        if (!route.capability.supported || route.capability.route == LLAMA_KV_TAIL_ROUTE_NONE) {
+            throw std::invalid_argument("cannot rebind an incomplete KV tail route");
+        }
+        const auto old = std::find_if(tail_plan.layer_routes.begin(), tail_plan.layer_routes.end(),
+                [&](const llama_kv_tail_layer_route & entry) { return entry.layer_id == route.layer_id; });
+        if (old == tail_plan.layer_routes.end() ||
+                old->body_type_k != route.body_type_k || old->body_type_v != route.body_type_v ||
+                old->exact_type_k != route.exact_type_k || old->exact_type_v != route.exact_type_v ||
+                old->v_transposed != route.v_transposed || old->causal_attn != route.causal_attn ||
+                old->swa != route.swa || old->explicit_bias != route.explicit_bias ||
+                old->has_body != route.has_body || old->has_current != route.has_current ||
+                old->body_execution_rows != route.body_execution_rows) {
+            throw std::invalid_argument(format("KV tail route rebind changed the layout for layer %u", route.layer_id));
+        }
+    }
+    tail_plan.layer_routes = std::move(routes);
+}
+
 void llama_kv_cache::finalize_tail_overlay_metadata() {
     if (!has_tail_overlay() || tail) {
         return;

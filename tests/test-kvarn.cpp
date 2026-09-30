@@ -3,6 +3,7 @@
 #include "llama-memory.h"
 
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-vulkan/fattn-kvarn-route-policy.h"
 
 #include <algorithm>
@@ -2154,6 +2155,17 @@ static ggml_tensor * apply_kvarn_wht_head(ggml_context * ctx, ggml_tensor * cur,
     return ggml_kvarn_wht(ctx, cur, head_dim);
 }
 
+struct test_native_attention_options {
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    float sink_score = -INFINITY;
+    float mask_bias = 0.0f;
+    bool all_masked = false;
+    bool omit_mask = false;
+    bool separate_value_indices = false;
+    std::vector<double> * attention_times_us = nullptr;
+};
+
 static std::vector<float> test_native_flash_attention_output(
         ggml_backend_t backend,
         bool           native_view,
@@ -2180,7 +2192,8 @@ static std::vector<float> test_native_flash_attention_output(
         bool           non_causal_mask = false,
         bool           materialized_graph = false,
         int            indirect_offset = 0,
-        bool           contiguous_current_tail = false) {
+        bool           contiguous_current_tail = false,
+        const test_native_attention_options & options = {}) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2209,6 +2222,8 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream);
     ggml_tensor * read_indices = explicit_stage_slot >= 0 || indirect_offset != 0 ?
         ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream) : indices;
+    ggml_tensor * v_read_indices = options.separate_value_indices ?
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv * n_stream) : read_indices;
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, record_dim, record_heads, n_kv * n_stream);
     ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, record_dim, record_heads, n_kv * n_stream);
     ggml_tensor * k_stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, record_dim, record_heads, 128 * stage_groups * n_stream);
@@ -2250,7 +2265,7 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_tensor * k = native_view ?
         ggml_kvarn_view(ctx, k_records, stored_k, read_indices, n_kv, 0, n_stream, bits_k, false, stage_groups) : k_ref;
     ggml_tensor * v = native_view ?
-        ggml_kvarn_view(ctx, v_records, stored_v, read_indices, n_kv, 0, n_stream, bits_v, true,  stage_groups) : v_ref;
+        ggml_kvarn_view(ctx, v_records, stored_v, v_read_indices, n_kv, 0, n_stream, bits_v, true,  stage_groups) : v_ref;
 
     if (native_view && swa) {
         k->op_params[6] = 1;
@@ -2283,7 +2298,9 @@ static std::vector<float> test_native_flash_attention_output(
 
     ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
     ggml_tensor * sinks = force_generic ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_q_heads) : nullptr;
-    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / std::sqrt(float(head_dim)), 0.0f, 0.0f);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v,
+            options.omit_mask ? nullptr : mask, 1.0f / std::sqrt(float(head_dim)),
+            options.max_bias, options.logit_softcap);
     ggml_flash_attn_ext_add_sinks(out, sinks);
     if (native_view) {
         out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
@@ -2451,7 +2468,8 @@ static std::vector<float> test_native_flash_attention_output(
                 ? dflash_visible
                 : ikv <= iq + n_kv - n_q;
             mask_data[(size_t) iq * n_kv + ikv] = ggml_fp32_to_fp16(
-                    !exact_tail_bodyless && visible ? 0.0f : -INFINITY);
+                    !options.all_masked && !exact_tail_bodyless && visible ?
+                    options.mask_bias * float(n_kv - ikv) : -INFINITY);
         }
     }
 
@@ -2464,6 +2482,10 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
     if (read_indices != indices) {
         ggml_backend_tensor_set(read_indices, read_idx.data(), 0, ggml_nbytes(read_indices));
+    }
+    if (v_read_indices != read_indices) {
+        const auto & v_idx = read_indices == indices ? idx : read_idx;
+        ggml_backend_tensor_set(v_read_indices, v_idx.data(), 0, ggml_nbytes(v_read_indices));
     }
     ggml_backend_tensor_set(current_k, k_data.data(), 0, ggml_nbytes(current_k));
     ggml_backend_tensor_set(current_v, v_data.data(), 0, ggml_nbytes(current_v));
@@ -2508,11 +2530,12 @@ static std::vector<float> test_native_flash_attention_output(
                 ? exact_tail_tokens - 1
                 : exact_tail_tokens - n_q + iq;
             for (int t = 0; t < exact_tail_tokens; ++t) {
-                if (t <= last_visible &&
+                if (!options.all_masked && t <= last_visible &&
                         (exact_tail_bodyless ||
                          exact_tail_current_tokens == 0 ||
                          t >= history_tail_tokens)) {
-                    tail_mask_data[(size_t) iq * exact_tail_tokens + t] = ggml_fp32_to_fp16(0.0f);
+                    tail_mask_data[(size_t) iq * exact_tail_tokens + t] = ggml_fp32_to_fp16(
+                            options.mask_bias * float(exact_tail_tokens - t));
                 }
             }
         }
@@ -2569,7 +2592,7 @@ static std::vector<float> test_native_flash_attention_output(
     }
 
     if (sinks != nullptr) {
-        std::vector<float> sink_data(size_t(n_q_heads), -INFINITY);
+        std::vector<float> sink_data(size_t(n_q_heads), options.sink_score);
         ggml_backend_tensor_set(sinks, sink_data.data(), 0, ggml_nbytes(sinks));
     }
 
@@ -2588,6 +2611,55 @@ static std::vector<float> test_native_flash_attention_output(
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             native_view ? "native FA: native-view graph compute failed" : "native FA: reference graph compute failed");
     ggml_backend_synchronize(backend);
+
+    if (options.attention_times_us != nullptr) {
+        require(native_view, "attention timing requires a native view");
+        int attn_node = -1;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            if (ggml_graph_node(graph, i)->op == GGML_OP_FLASH_ATTN_EXT) {
+                require(attn_node < 0, "attention timing requires exactly one attention node");
+                attn_node = i;
+            }
+        }
+        require(attn_node >= 0, "attention timing did not find an attention node");
+        // ggml_graph_view is internal and is not exported by the Windows DLL.
+        // Construct the same non-owning forward-only slice locally.
+        const auto graph_slice = [&](int begin, int end) {
+            ggml_cgraph slice = *graph;
+            slice.size = 0;
+            slice.n_nodes = end - begin;
+            slice.n_leafs = 0;
+            slice.nodes = graph->nodes + begin;
+            slice.grads = nullptr;
+            slice.grad_accs = nullptr;
+            slice.leafs = nullptr;
+            slice.uid = 0;
+            return slice;
+        };
+        ggml_cgraph attention_graph = graph_slice(attn_node, attn_node + 1);
+        // Records, Q and the rotated tail were populated by the first graph.
+        // Only time native attention and its backend-owned split-K reduction;
+        // exclude store, WHT, allocations, and pipeline compilation.
+        require(ggml_backend_graph_compute(backend, &attention_graph) == GGML_STATUS_SUCCESS,
+                "attention timing warmup failed");
+        ggml_backend_synchronize(backend);
+        options.attention_times_us->clear();
+        for (int repeat = 0; repeat < 7; ++repeat) {
+            const auto start = std::chrono::steady_clock::now();
+            require(ggml_backend_graph_compute(backend, &attention_graph) == GGML_STATUS_SUCCESS,
+                    "attention timing graph failed");
+            ggml_backend_synchronize(backend);
+            const auto stop = std::chrono::steady_clock::now();
+            options.attention_times_us->push_back(
+                    std::chrono::duration<double, std::micro>(stop - start).count());
+        }
+        if (attn_node + 1 < ggml_graph_n_nodes(graph)) {
+            ggml_cgraph output_graph = graph_slice(attn_node + 1, ggml_graph_n_nodes(graph));
+            require(ggml_backend_graph_compute(backend, &output_graph) == GGML_STATUS_SUCCESS,
+                    "attention timing output transform failed");
+            ggml_backend_synchronize(backend);
+        }
+    }
 
     std::vector<float> output(ggml_nelements(out));
     ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
@@ -4530,6 +4602,103 @@ static void test_native_flash_attention_portable_original_v() {
     ggml_backend_free(gpu_backend);
 }
 
+static void test_vulkan_attention_optimizations(bool benchmark = false) {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, true);
+    require(std::strncmp(ggml_backend_dev_name(ggml_backend_get_device(gpu_backend)), "Vulkan", 6) == 0,
+            "Vulkan attention optimization test requires a Vulkan backend");
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    struct test_case {
+        const char * name;
+        int dim, nq, gqa, nkv;
+        int tail = 0;
+        int current = 0;
+        bool bodyless = false;
+        ggml_type tail_type = GGML_TYPE_F16;
+        int explicit_slot = -1;
+        int indirect_offset = 0;
+        bool non_causal = false;
+        bool all_masked = false;
+        bool omit_mask = false;
+        int kv_heads = 1;
+    };
+    const std::vector<test_case> cases = benchmark ? std::vector<test_case> {
+        { "prefill-256", 256, 256, 6, 4096, 2048, 0, false, GGML_TYPE_F16, -1, 0, false, false, false, 4 },
+        { "decode-1",    256,   1, 6, 8192, 2048, 0, false, GGML_TYPE_F16, -1, 0, false, false, false, 4 },
+        { "verify-4",    256,   4, 6, 8192, 2048, 0, false, GGML_TYPE_F16, -1, 0, false, false, false, 4 },
+    } : std::vector<test_case> {
+        { "gqa1-d128", 128, 1, 1, 512 },
+        { "gqa2-d256", 256, 4, 2, 512 },
+        { "gqa4-d512", 512, 1, 4, 1024 },
+        { "gqa6-current", 256, 4, 6, 512, 128, 4 },
+        { "gqa6-prefill", 256, 256, 6, 512, 512, 256 },
+        { "split-tail2048", 256, 1, 6, 4096, 2048 },
+        { "bodyless-f16", 256, 1, 6, 512, 513, 1, true },
+        { "bodyless-bf16", 128, 4, 3, 512, 128, 4, true, GGML_TYPE_BF16 },
+        { "gqa8-d512", 512, 4, 8, 512, 128, 4 },
+        { "indirect-stage", 256, 4, 6, 350, 0, 0, false, GGML_TYPE_F16, 17 },
+        { "non-causal", 256, 32, 6, 512, 128, 0, false, GGML_TYPE_F16, -1, 0, true },
+        { "all-masked", 256, 4, 6, 512, 128, 4, false, GGML_TYPE_F16, -1, 0, false, true },
+        { "no-mask", 256, 4, 4, 512, 0, 0, false, GGML_TYPE_F16, -1, 0, false, false, true },
+    };
+    auto [route_reset, route_get] = get_kvarn_route_stats_fns(gpu_backend);
+    require(route_reset != nullptr && route_get != nullptr,
+            "Vulkan attention test requires native route telemetry");
+    for (const test_case & tc : cases) {
+        test_native_attention_options options;
+        // Exercise the per-head score path as well as its usual zero-bias case.
+        options.max_bias = benchmark || tc.omit_mask ? 0.0f : 4.0f;
+        options.logit_softcap = benchmark ? 0.0f : 0.05f;
+        options.mask_bias = benchmark ? 0.0f : -0.002f;
+        options.sink_score = 0.125f;
+        options.all_masked = tc.all_masked;
+        options.omit_mask = tc.omit_mask;
+        // Separate descriptors exercise the shared-scratch handoff between
+        // the K and V live-group scans, even though their cell values agree.
+        options.separate_value_indices = !benchmark && tc.gqa == 2;
+        const int stage_groups = tc.explicit_slot >= 0 ? 20 : 3;
+        const std::vector<float> expected = test_native_flash_attention_output(
+                cpu_backend, false, false, tc.dim, 4, 4, tc.nq,
+                tc.gqa * tc.kv_heads, tc.kv_heads, tc.nkv, stage_groups,
+                false, nullptr, !benchmark, tc.tail, false, tc.tail_type, tc.current,
+                tc.bodyless, true, -1, true, tc.non_causal, false, tc.indirect_offset,
+                false, options);
+        std::vector<double> times_us;
+        if (benchmark) {
+            options.attention_times_us = &times_us;
+        }
+        route_reset();
+        const std::vector<float> actual = test_native_flash_attention_output(
+                gpu_backend, true, true, tc.dim, 4, 4, tc.nq,
+                tc.gqa * tc.kv_heads, tc.kv_heads, tc.nkv, stage_groups,
+                false, nullptr, !benchmark, tc.tail, false, tc.tail_type, tc.current,
+                tc.bodyless, true, tc.explicit_slot, true, tc.non_causal, false, tc.indirect_offset,
+                false, options);
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats(1);
+        route_get(&stats);
+        require(stats.portable_native > 0 && stats.materialize_fallback == 0,
+                "Vulkan attention test did not use the native attention shader");
+        if (tc.nq == 1 && tc.tail > 0) {
+            require(stats.split_reduce > 0,
+                    "Vulkan split-tail test did not exercise split-K reduction");
+        }
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "optimized Vulkan attention differs from materialized CPU reference");
+        if (benchmark) {
+            std::sort(times_us.begin(), times_us.end());
+            std::printf("vulkan-attention: %s D=%d nq=%d heads=%d/%d nkv=%d tail=%d median_us=%.3f min_us=%.3f native=%llu split=%llu\n",
+                    tc.name, tc.dim, tc.nq, tc.gqa * tc.kv_heads, tc.kv_heads, tc.nkv, tc.tail,
+                    times_us[times_us.size() / 2], times_us.front(),
+                    (unsigned long long) stats.portable_native, (unsigned long long) stats.split_reduce);
+        } else {
+            std::printf("vulkan-attention: %s parity OK (native=%llu split=%llu)\n", tc.name,
+                    (unsigned long long) stats.portable_native, (unsigned long long) stats.split_reduce);
+        }
+        std::fflush(stdout);
+    }
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
 static void test_native_flash_attention_contiguous_current_tail() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr) {
@@ -5702,6 +5871,12 @@ static void test_meta_kvarn_zero_head_shard() {
 
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_VULKAN_ATTN_OPT_ONLY") != nullptr ||
+            std::getenv("GGML_KVARN_BENCH_VULKAN_ATTN") != nullptr) {
+        test_vulkan_attention_optimizations(std::getenv("GGML_KVARN_BENCH_VULKAN_ATTN") != nullptr);
+        return 0;
+    }
 
     if (std::getenv("GGML_KVARN_TEST_CONTIGUOUS_CURRENT_TAIL_ONLY") != nullptr) {
         test_native_flash_attention_contiguous_current_tail();

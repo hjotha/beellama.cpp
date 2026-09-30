@@ -100,6 +100,10 @@ bool kv_unified;
     // post-RoPE Q/K/V + positions and receives only the attention output.
     // Native in-process attention backend; nullptr for the TCP RKVA path.
     ggml_backend_t local_attn_backend = nullptr;
+    // Optional remote mirror backend for the explicit prefill-migration mode.
+    ggml_backend_t local_attn_migration_backend = nullptr;
+    ggml_backend_t local_attn_prefill_backend = nullptr;
+    bool        local_attn_migration = false;
     bool        remote_attn_enabled = false;
     int         remote_attn_layers  = 0;   // count of full-attention layers offloaded (0 = none)
     int         remote_attn_prefill = 0;   // 0 = remote, 1 = migrate (reserved)

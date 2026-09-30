@@ -68,6 +68,10 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    bool supports_prefill_migration() const override;
+    bool handoff_prefill_migration(bool to_remote) override;
+    bool drain_prefill_migration() override;
+
     bool get_can_shift() const override;
     seq_rm_capability get_seq_rm_capability() const override;
 
@@ -171,6 +175,7 @@ public:
     bool apply() override;
     void graph_compute_start() override;
     void graph_compute_finish(ggml_status status) override;
+    void graph_compute_complete(ggml_backend_sched_t sched, ggml_status status) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
