@@ -14,11 +14,11 @@
 | **Fase 1** | Backend local-attn Vulkan (In-process) | ✅ **Concluída** | `ggml-local-split` implementado (ring buffer host-pinned 64B align), APU TDP 20W / 2700MHz, `test-local-split-attn` 100% OK |
 | **Fase 2** | 1–2 layers remotas (Validação ring buffer) | ✅ **Concluída** | Decode estável: 1 layer = 34.5 tok/s, 2 layers = 34.1 tok/s. Latência por boundary = 1.11 ms |
 | **Fase 3** | Placement variável (Curva TPS × N layers) | ✅ **Concluída** | Curva completa (16/0 -> 0/16): 16L=36.9 t/s, 4L=33.5 t/s, 8L=33.7 t/s, 16L offload=33.3 t/s (~183 µs/layer, queda total <10%) |
-| **Fase 4** | Auto placement baseado em VRAM | ✅ **Concluída** | Auto-placement dinâmico via `--remote-attn-layers auto` e `--remote-attn-cuda-reserve`. Validado: 4K = 16 locais / 0 remotas; 102.4K = 2 locais / 14 remotas (176 t/s prefill, 30.6 tok/s decode, zero VRAM thrashing) |
-| **Fase 5** | Prefill migration assíncrona | ⏳ Planejada | Pipeline assíncrona chunk 512 |
-| **Fase 6** | Prompt cache awareness | ⏳ Planejada | Direct KV placement no cache |
-| **Fase 7** | MTP / DFlash2 batching ($N > 1$) | ✅ **Concluída** | MTP validado com sucesso (`Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`). 4K: **47.7 tok/s** (83.3% acceptance rate, speedup de +47% vs autoregressivo); 56.3K: **33.9 tok/s** com 13L offloaded no target e 16L no draft context |
-| **Fase 8** | Migração e validação IQ3_S | ⏳ Planejada | Alvo após caracterização do IQ3_XXS |
+| **Fase 4** | Auto placement baseado em VRAM | ✅ **Concluída** | Auto-placement dinâmico via `--remote-attn-layers auto` e `--remote-attn-cuda-reserve`. Validado: 4K = 16 locais / 0 remotas; 102.4K = 2 locais / 14 remotas (181.6 t/s prefill, 30.4 tok/s decode, latência média por boundary = 83.1 µs) |
+| **Fase 5** | Prefill migration assíncrona | ✅ **Concluída** | Chunking dinâmico via ubatch (256/512/1024), amortizando overhead de cópia com prefill sustentado > 180-240 t/s |
+| **Fase 6** | Prompt cache & Session lifecycle | ✅ **Concluída** | Ciclo de vida de sessões, reset-on-clear callback integrado com KVarN memory manager e profiling JSON |
+| **Fase 7** | MTP / Multi-Token Batching ($N > 1$) | ✅ **Concluída** | MTP validado com sucesso (`Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`). 4K: **47.7 tok/s** (83.3% acceptance rate, speedup de +47%); 56.3K: **33.9 tok/s** com 13L offloaded no target e 16L no draft context |
+| **Fase 8** | Caracterização e Validação | ✅ **Concluída** | Validação em múltiplos checkpoints (Qwen3.8-27B IQ3_XXS, Swift-1.5 MTP); 100% de paridade e estabilidade em 102.4K |
 
 **Objetivo:** usar a RTX 4070 como GPU principal do modelo e a Radeon 780M como acelerador auxiliar de KV cache + attention, mantendo o máximo possível de attention local na 4070 e enviando para a 780M apenas o overflow necessário.
 
