@@ -2944,12 +2944,18 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // Remote KV+attention accelerator (Xbox RKVA). params.remote_attn_host is
     // kept alive by the caller through llama_init_from_model(), where the
     // backend connects during context construction.
-    cparams.remote_attn_host     = params.remote_attn_host.empty() ? nullptr : params.remote_attn_host.c_str();
-    cparams.remote_attn_port     = params.remote_attn_port;
-    cparams.remote_attn_prefill  = (params.remote_attn_prefill == "migrate") ? 1 : 0;
-    cparams.remote_attn_stats    = params.remote_attn_stats ? 1 : 0;
-    cparams.remote_attn_n_layers = (params.remote_attn_layers == "full" || params.remote_attn_layers == "all" || params.remote_attn_layers.empty())
-                                     ? 0 : std::atoi(params.remote_attn_layers.c_str());
+    cparams.remote_attn_host         = params.remote_attn_host.empty() ? nullptr : params.remote_attn_host.c_str();
+    cparams.remote_attn_port         = params.remote_attn_port;
+    cparams.remote_attn_prefill      = (params.remote_attn_prefill == "migrate") ? 1 : 0;
+    cparams.remote_attn_stats        = params.remote_attn_stats ? 1 : 0;
+    if (params.remote_attn_layers == "auto") {
+        cparams.remote_attn_n_layers = -1;
+    } else if (params.remote_attn_layers == "full" || params.remote_attn_layers == "all" || params.remote_attn_layers.empty()) {
+        cparams.remote_attn_n_layers = 0;
+    } else {
+        cparams.remote_attn_n_layers = std::atoi(params.remote_attn_layers.c_str());
+    }
+    cparams.remote_attn_cuda_reserve = params.remote_attn_cuda_reserve;
 
     return cparams;
 }

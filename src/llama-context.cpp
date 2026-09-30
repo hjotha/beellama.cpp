@@ -1083,7 +1083,35 @@ std::vector<ggml_backend_t> layer_backends;
                 }
             }
             int n_remote = n_full_attn;
-            if (params.remote_attn_n_layers > 0 && params.remote_attn_n_layers < n_full_attn) {
+            if (params.remote_attn_n_layers == -1) {
+                // Auto-placement based on CUDA VRAM headroom
+                size_t cuda_free = 0, cuda_total = 0;
+                ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_name("CUDA0");
+                if (!cuda_dev) cuda_dev = ggml_backend_dev_by_name("CUDA");
+                if (cuda_dev) {
+                    ggml_backend_dev_memory(cuda_dev, &cuda_free, &cuda_total);
+                }
+                const size_t reserve = params.remote_attn_cuda_reserve > 0 ?
+                    params.remote_attn_cuda_reserve : (350 * 1024 * 1024);
+
+                const size_t n_head_kv = model.hparams.n_head_kv();
+                const size_t head_dim  = model.hparams.n_embd_head_k();
+                const size_t bits_k    = cparams.kvarn.key_bits ? cparams.kvarn.key_bits : 4;
+                const size_t bits_v    = cparams.kvarn.value_bits ? cparams.kvarn.value_bits : 4;
+                const size_t bytes_per_token_layer = (n_head_kv * head_dim * (bits_k + bits_v)) / 8 + 64;
+                const size_t bytes_per_layer = bytes_per_token_layer * (size_t) cparams.n_ctx;
+
+                const size_t usable_cuda_kv = (cuda_free > reserve) ? (cuda_free - reserve) : 0;
+                int n_local_fit = bytes_per_layer > 0 ? (int) (usable_cuda_kv / bytes_per_layer) : 0;
+                n_local_fit = std::clamp(n_local_fit, 0, n_full_attn);
+
+                n_remote = n_full_attn - n_local_fit;
+                LLAMA_LOG_INFO("%s: auto-placement: CUDA free=%.1f MiB, reserve=%.1f MiB, usable=%.1f MiB, "
+                               "layer_kv=%.1f MiB -> %d local full-attn layers on 4070, %d offloaded to %s\n",
+                               __func__, cuda_free / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0,
+                               usable_cuda_kv / 1024.0 / 1024.0, bytes_per_layer / 1024.0 / 1024.0,
+                               n_local_fit, n_remote, params.remote_attn_host);
+            } else if (params.remote_attn_n_layers > 0 && params.remote_attn_n_layers <= n_full_attn) {
                 n_remote = params.remote_attn_n_layers;
             }
             cparams.remote_attn_layers = n_remote;
@@ -5525,7 +5553,8 @@ llama_context_params llama_context_default_params() {
         /*.remote_attn_port            =*/ 0,
         /*.remote_attn_prefill         =*/ 0,
         /*.remote_attn_stats           =*/ 0,
-        /*.remote_attn_n_layers        =*/ 0,
+        /*.remote_attn_n_layers        =*/ -1,
+        /*.remote_attn_cuda_reserve    =*/ 350 * 1024 * 1024,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

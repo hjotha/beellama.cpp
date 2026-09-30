@@ -3652,10 +3652,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN"));
     add_opt(common_arg(
         {"--remote-attn-layers"}, "SET",
-        "which attention layers to offload to the remote server: 'full' (all full-attn layers)\n"
-        "or a number N (e.g. 1, 2, 4, 8) to offload the first N full-attn layers (default: full)",
+        "which attention layers to offload: 'auto' (automatic VRAM-based placement),\n"
+        "'full' (all full-attn layers), or an integer N (first N full-attn layers) (default: auto)",
         [](common_params & params, const std::string & value) {
-            if (value != "full" && value != "all") {
+            if (value != "auto" && value != "full" && value != "all") {
                 try {
                     int n = std::stoi(value);
                     if (n <= 0) {
@@ -3663,12 +3663,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     }
                 } catch (...) {
                     throw std::invalid_argument(string_format(
-                        "invalid --remote-attn-layers '%s', expected 'full' or integer count", value.c_str()));
+                        "invalid --remote-attn-layers '%s', expected 'auto', 'full' or integer count", value.c_str()));
                 }
             }
             params.remote_attn_layers = value;
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_LAYERS"));
+    add_opt(common_arg(
+        {"--remote-attn-cuda-reserve", "--split-attn-cuda-reserve"}, "SIZE",
+        "CUDA VRAM safety margin to preserve during auto-placement (e.g. 350M, 500M, 1G, default: 350M)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) return;
+            char suffix = value.back();
+            if (suffix == 'M' || suffix == 'm') {
+                params.remote_attn_cuda_reserve = (size_t) (std::stod(value.substr(0, value.size() - 1)) * 1024 * 1024);
+            } else if (suffix == 'G' || suffix == 'g') {
+                params.remote_attn_cuda_reserve = (size_t) (std::stod(value.substr(0, value.size() - 1)) * 1024 * 1024 * 1024);
+            } else if (suffix == 'K' || suffix == 'k') {
+                params.remote_attn_cuda_reserve = (size_t) (std::stod(value.substr(0, value.size() - 1)) * 1024);
+            } else {
+                params.remote_attn_cuda_reserve = (size_t) std::stoull(value);
+            }
+        }
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_CUDA_RESERVE"));
     add_opt(common_arg(
         {"--remote-attn-prefill"}, "MODE",
         "remote prefill mode: 'remote' (send Q/K/V, server builds KV) or 'migrate'\n"

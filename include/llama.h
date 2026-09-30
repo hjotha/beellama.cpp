@@ -516,7 +516,8 @@ extern "C" {
         uint16_t     remote_attn_port;
         int          remote_attn_prefill;
         int          remote_attn_stats;
-        int          remote_attn_n_layers; // 0 = all full-attention layers, >0 = first N full-attention layers
+        int          remote_attn_n_layers;     // -1 = auto, 0 = all full-attention layers, >0 = first N full-attention layers
+        size_t       remote_attn_cuda_reserve; // CUDA VRAM safety reserve in bytes for auto-placement (default: 350 MiB)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
