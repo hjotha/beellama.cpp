@@ -1036,13 +1036,16 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
 
     if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER) {
-        if (params.apu_tdp > 0 && (params.gpu_power_backend != "amdgpu" ||
-                                  params.gpu_power_prefill != -1 || params.gpu_power_decode != -1)) {
-            throw std::invalid_argument("--apu-tdp requires --gpu-power-backend amdgpu and cannot be combined with --gpu-power-prefill/decode");
+        if (params.apu_tdp > 0 && (params.gpu_power_backend != "auto" &&
+                                  params.gpu_power_backend != "amdgpu" &&
+                                  params.gpu_power_backend != "dual")) {
+            throw std::invalid_argument("--apu-tdp requires --gpu-power-backend amdgpu, dual, or auto");
         }
 
-        if (params.gpu_fabric_state >= 0 && params.gpu_power_backend != "amdgpu") {
-            throw std::invalid_argument("--gpu-fabric-state requires --gpu-power-backend amdgpu");
+        if (params.gpu_fabric_state >= 0 && (params.gpu_power_backend != "auto" &&
+                                             params.gpu_power_backend != "amdgpu" &&
+                                             params.gpu_power_backend != "dual")) {
+            throw std::invalid_argument("--gpu-fabric-state requires --gpu-power-backend amdgpu, dual, or auto");
         }
 
         const bool has_prefill_power = params.gpu_power_prefill != -1;
@@ -4890,6 +4893,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_POWER_DEVICE"));
     add_opt(common_arg(
+        {"--gpu-power-amd-device"}, "N",
+        "AMDGPU drm card index used by the AMD GPU power governor (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--gpu-power-amd-device must be non-negative");
+            }
+            params.gpu_power_amd_device = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_POWER_AMD_DEVICE"));
+    add_opt(common_arg(
         {"--gpu-mem-clock-decode"}, "MHz",
         "GPU clock locked during token generation: NVIDIA memory or AMDGPU graphics (SCLK), in MHz",
         [](common_params & params, int value) {
@@ -4910,9 +4923,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_MEM_CLOCK_PREFILL"));
     add_opt(common_arg(
+        {"--amd-sclk-decode", "--gpu-sclk-decode"}, "MHz",
+        "AMDGPU graphics clock (SCLK) locked during token generation, in MHz",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--amd-sclk-decode must be positive");
+            }
+            params.amd_sclk_decode = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_AMD_SCLK_DECODE"));
+    add_opt(common_arg(
+        {"--amd-sclk-prefill", "--gpu-sclk-prefill"}, "MHz",
+        "AMDGPU graphics clock (SCLK) locked during prompt processing, in MHz",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--amd-sclk-prefill must be positive");
+            }
+            params.amd_sclk_prefill = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_AMD_SCLK_PREFILL"));
+    add_opt(common_arg(
         {"--apu-tdp"}, "W",
         "Ryzen APU STAPM/fast/slow power limits in watts during prefill/decode; restores each original limit when idle. "
-        "Requires --gpu-power-backend amdgpu, libryzenadj and Ryzen SMU access",
+        "Requires --gpu-power-backend amdgpu, dual or auto, libryzenadj and Ryzen SMU access",
         [](common_params & params, int value) {
             if (value <= 0) {
                 throw std::invalid_argument("--apu-tdp must be positive");
@@ -4923,7 +4956,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--gpu-fabric-state"}, "N",
         "AMDGPU raw fabric DPM state (0-31) during prefill/decode; restored when idle. "
-        "Requires --gpu-power-backend amdgpu and writable pp_dpm_fclk. "
+        "Requires writable pp_dpm_fclk. "
         "Controls coupled fabric/memory states, not independent MCLK; kernel indices may differ from displayed indices",
         [](common_params & params, int value) {
             if (value < 0 || value > 31) {
@@ -4934,12 +4967,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_FABRIC_STATE"));
     add_opt(common_arg(
         {"--gpu-power-backend"}, "TYPE",
-        "GPU power governor backend: auto, nvml or amdgpu (sysfs). "
-        "auto uses NVML; select amdgpu explicitly for AMD sysfs. "
-        "amdgpu drives power_dpm_force_performance_level / pp_od_clk_voltage directly",
+        "GPU power governor backend: auto, nvml, amdgpu or dual. "
+        "auto uses NVML and/or AMDGPU based on provided flags; dual explicitly drives both.",
         [](common_params & params, const std::string & value) {
-            if (value != "auto" && value != "nvml" && value != "amdgpu") {
-                throw std::invalid_argument("--gpu-power-backend must be one of: auto, nvml, amdgpu");
+            if (value != "auto" && value != "nvml" && value != "amdgpu" && value != "dual") {
+                throw std::invalid_argument("--gpu-power-backend must be one of: auto, nvml, amdgpu, dual");
             }
             params.gpu_power_backend = value;
         }

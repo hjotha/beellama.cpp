@@ -307,7 +307,7 @@ static void test_apu_tdp() {
         assert(!governor.init({-1, -1, -1, -1, 0, amd, -1, watts}));
         assert(sys.writes.empty());
     }
-    for (auto backend : {server_gpu_power_backend_type::auto_detect, server_gpu_power_backend_type::nvml}) {
+    for (auto backend : {server_gpu_power_backend_type::nvml}) {
         fake_amdgpu_sysfs sys;
         server_gpu_power governor(sys.backend());
         assert(!governor.init({-1, -1, -1, -1, 0, backend, -1, 20}));
@@ -429,7 +429,7 @@ static void test_amdgpu() {
         assert(!governor.init({-1, -1, -1, -1, 0, amd, state}));
         assert(sys.writes.empty());
     }
-    for (auto backend : {server_gpu_power_backend_type::auto_detect, server_gpu_power_backend_type::nvml}) {
+    for (auto backend : {server_gpu_power_backend_type::nvml}) {
         fake_amdgpu_sysfs sys;
         server_gpu_power governor(sys.backend());
         assert(!governor.init({-1, -1, -1, -1, 0, backend, 0}));
@@ -739,6 +739,24 @@ int main() {
         assert(!governor.init({ -1, -1, scenario == 4 ? 12501 : 11001, -1, 0 }));
         assert(ptr->memory_ops.empty());
         assert(ptr->shutdown_calls == 1);
+    }
+
+    // Test dual backend with AMD SCLK and NVIDIA memory clocks
+    {
+        fake_amdgpu_sysfs sys("auto", false);
+        server_gpu_power governor(sys.backend());
+        // Configure with dual backend and AMD SCLK 2700 MHz
+        assert(governor.init({-1, -1, -1, -1, 0, server_gpu_power_backend_type::dual, -1, -1, 2700, 2700, 0}));
+        assert(governor.enabled());
+        governor.update(server_gpu_power_phase::prefill);
+        assert(sys.writes == std::vector<std::string>({
+            "power_dpm_force_performance_level:manual\n",
+            "pp_od_clk_voltage:s 0 2700\n",
+            "pp_od_clk_voltage:s 1 2700\n",
+            "pp_od_clk_voltage:c\n"
+        }));
+        governor.update(server_gpu_power_phase::idle);
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
     }
 
     return 0;

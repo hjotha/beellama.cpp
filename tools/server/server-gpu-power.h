@@ -36,6 +36,7 @@ enum class server_gpu_power_backend_type {
     auto_detect,
     nvml,
     amdgpu,
+    dual,
 };
 
 struct server_gpu_power_config {
@@ -49,9 +50,14 @@ struct server_gpu_power_config {
     int32_t fabric_state = -1;
     int32_t apu_tdp_w = -1;
 
+    int32_t amd_sclk_decode   = -1;
+    int32_t amd_sclk_prefill  = -1;
+    int32_t amd_device        = 0;
+
     bool enabled() const;
     bool power_enabled() const;
     bool mem_clock_enabled() const;
+    bool amd_sclk_enabled() const;
 };
 
 struct server_gpu_power_device_info {
@@ -132,14 +138,19 @@ class server_gpu_power {
     bool                                 enabled() const;
     uint64_t                             transition_count() const;
     const server_gpu_power_device_info & device_info() const;
+    const server_gpu_power_device_info & amd_device_info() const;
 
   private:
     bool restore_original();
     void disable_after_error(const std::string & error);
 
-    std::unique_ptr<server_gpu_power_backend> backend_;
+    std::unique_ptr<server_gpu_power_backend> injected_backend_;
+    std::unique_ptr<server_gpu_power_backend> nvml_backend_;
+    std::unique_ptr<server_gpu_power_backend> amdgpu_backend_;
+
     server_gpu_power_config                   config_;
     server_gpu_power_device_info              device_info_;
+    server_gpu_power_device_info              amd_device_info_;
 
     uint32_t prefill_power_limit_mw_      = 0;
     uint32_t decode_power_limit_mw_       = 0;
@@ -153,13 +164,22 @@ class server_gpu_power {
     int32_t  last_applied_mem_offset_mhz_ = 0;
     bool     mem_clock_locked_            = false;
     bool     mem_offset_applied_          = false;
+    bool     power_limit_changed_         = false;
+
+    uint32_t decode_amd_sclk_mhz_         = 0;
+    uint32_t prefill_amd_sclk_mhz_        = 0;
+    uint32_t last_applied_amd_sclk_mhz_   = 0;
+    bool     amd_sclk_locked_             = false;
     bool     fabric_state_applied_        = false;
     bool     apu_tdp_applied_             = false;
     uint32_t apu_tdp_mw_                  = 0;
+
+    bool     power_limit_supported_      = true;
+    bool     mem_clock_supported_        = true;
+    bool     amd_sclk_supported_         = true;
 
     server_gpu_power_phase phase_               = server_gpu_power_phase::idle;
     uint64_t               transition_count_    = 0;
     bool                   backend_initialized_ = false;
     bool                   enabled_             = false;
-    bool                   power_limit_changed_ = false;
 };

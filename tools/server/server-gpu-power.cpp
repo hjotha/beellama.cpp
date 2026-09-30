@@ -90,7 +90,7 @@ server_gpu_power_phase server_gpu_power_phase_arbitrator::phase() const {
 }
 
 bool server_gpu_power_config::enabled() const {
-    return power_enabled() || mem_clock_enabled() || fabric_state != -1 || apu_tdp_w != -1;
+    return power_enabled() || mem_clock_enabled() || amd_sclk_enabled() || fabric_state != -1 || apu_tdp_w != -1;
 }
 
 bool server_gpu_power_config::power_enabled() const {
@@ -99,6 +99,10 @@ bool server_gpu_power_config::power_enabled() const {
 
 bool server_gpu_power_config::mem_clock_enabled() const {
     return mem_clock_decode > 0 || mem_clock_prefill > 0;
+}
+
+bool server_gpu_power_config::amd_sclk_enabled() const {
+    return amd_sclk_decode > 0 || amd_sclk_prefill > 0;
 }
 
 namespace {
@@ -928,10 +932,14 @@ server_gpu_power_backend_type server_gpu_power_backend_from_string(const std::st
     if (backend == "nvml") {
         return server_gpu_power_backend_type::nvml;
     }
+    if (backend == "dual") {
+        return server_gpu_power_backend_type::dual;
+    }
     return server_gpu_power_backend_type::auto_detect;
 }
 
-server_gpu_power::server_gpu_power(std::unique_ptr<server_gpu_power_backend> backend) : backend_(std::move(backend)) {}
+server_gpu_power::server_gpu_power(std::unique_ptr<server_gpu_power_backend> backend)
+    : injected_backend_(std::move(backend)) {}
 
 server_gpu_power::~server_gpu_power() {
     shutdown();
@@ -945,21 +953,21 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
         return true;
     }
 
+    if (config_.device < 0 || config_.amd_device < 0) {
+        LOG_ERR("GPU governor device index must be non-negative\n");
+        return false;
+    }
+
     if (config_.fabric_state < -1 || config_.fabric_state > 31 ||
-        (config_.fabric_state >= 0 && config_.backend != server_gpu_power_backend_type::amdgpu)) {
-        LOG_ERR("GPU fabric state requires --gpu-power-backend amdgpu and a raw state index 0..31\n");
+        (config_.fabric_state >= 0 && config_.backend == server_gpu_power_backend_type::nvml)) {
+        LOG_ERR("GPU fabric state requires amdgpu, dual, or auto backend and a raw state index 0..31\n");
         return false;
     }
 
     if (config_.apu_tdp_w != -1 &&
-        (config_.backend != server_gpu_power_backend_type::amdgpu || config_.power_enabled() ||
+        (config_.backend == server_gpu_power_backend_type::nvml ||
          !server_gpu_power_w_to_mw(config_.apu_tdp_w, apu_tdp_mw_))) {
-        LOG_ERR("APU TDP requires positive watts, explicit amdgpu backend, and no GPU power-limit options\n");
-        return false;
-    }
-
-    if (config_.device < 0) {
-        LOG_ERR("GPU governor device index must be non-negative\n");
+        LOG_ERR("APU TDP requires positive watts and cannot be used with nvml-only backend\n");
         return false;
     }
 
@@ -986,122 +994,269 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
         mem_offset_applied_          = false;
     }
 
-    if (!backend_) {
-        if (config_.backend == server_gpu_power_backend_type::amdgpu) {
-            backend_ = server_gpu_power_create_amdgpu_backend();
-        } else if (config_.backend == server_gpu_power_backend_type::nvml) {
-            backend_ = server_gpu_power_create_nvml_backend();
-        } else {
-            // auto uses NVML; AMDGPU sysfs requires an explicit backend.
-            backend_ = server_gpu_power_create_nvml_backend();
+    if (config_.amd_sclk_enabled()) {
+        decode_amd_sclk_mhz_        = config_.amd_sclk_decode > 0 ? static_cast<uint32_t>(config_.amd_sclk_decode) : 0;
+        prefill_amd_sclk_mhz_       = config_.amd_sclk_prefill > 0 ? static_cast<uint32_t>(config_.amd_sclk_prefill) : 0;
+        last_applied_amd_sclk_mhz_  = 0;
+        amd_sclk_locked_            = false;
+    }
+
+    if (injected_backend_) {
+        std::string error;
+        if (!injected_backend_->init(config_.device, device_info_, error)) {
+            LOG_ERR("GPU governor initialization failed: %s\n", error.c_str());
+            return false;
         }
-    }
+        backend_initialized_ = true;
 
-    std::string error;
-    if (!backend_->init(config_.device, device_info_, error)) {
-        LOG_ERR("GPU governor initialization failed: %s\n", error.c_str());
-        return false;
-    }
-    backend_initialized_ = true;
+        if (config_.fabric_state >= 0 && !device_info_.fabric_state_supported) {
+            LOG_ERR("GPU fabric state requires readable pp_dpm_fclk and a non-manual original performance level\n");
+            injected_backend_->shutdown();
+            backend_initialized_ = false;
+            return false;
+        }
 
-    if (config_.fabric_state >= 0 && !device_info_.fabric_state_supported) {
-        LOG_ERR("GPU fabric state requires readable pp_dpm_fclk and a non-manual original performance level\n");
-        backend_->shutdown();
-        backend_initialized_ = false;
-        return false;
-    }
+        if (config_.power_enabled()) {
+            const auto validate_limit = [&](uint32_t power_mw, const char * profile) {
+                if (power_mw < device_info_.min_power_limit_mw || power_mw > device_info_.max_power_limit_mw) {
+                    LOG_ERR("GPU power governor %s limit %s W is outside the allowed range %s-%s W\n", profile,
+                            server_gpu_power_mw_to_string(power_mw).c_str(),
+                            server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
+                            server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
+                    return false;
+                }
+                return true;
+            };
 
-    if (config_.power_enabled()) {
-        const auto validate_limit = [&](uint32_t power_mw, const char * profile) {
-            if (power_mw < device_info_.min_power_limit_mw || power_mw > device_info_.max_power_limit_mw) {
-                LOG_ERR("GPU power governor %s limit %s W is outside the allowed range %s-%s W\n", profile,
-                        server_gpu_power_mw_to_string(power_mw).c_str(),
-                        server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
-                        server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
+            if (!validate_limit(prefill_power_limit_mw_, "prefill") || !validate_limit(decode_power_limit_mw_, "decode")) {
+                injected_backend_->shutdown();
+                backend_initialized_ = false;
                 return false;
             }
-            return true;
-        };
-
-        if (!validate_limit(prefill_power_limit_mw_, "prefill") || !validate_limit(decode_power_limit_mw_, "decode")) {
-            backend_->shutdown();
-            backend_initialized_ = false;
-            return false;
         }
-    }
 
-    if (config_.mem_clock_enabled()) {
-        if (device_info_.supported_mem_clocks_mhz.empty()) {
-            LOG_ERR("GPU memory clock governor: supported memory clocks are unavailable\n");
-            backend_->shutdown();
-            backend_initialized_ = false;
-            return false;
-        }
-        std::sort(device_info_.supported_mem_clocks_mhz.rbegin(), device_info_.supported_mem_clocks_mhz.rend());
-        const uint32_t max_stock_mhz = device_info_.supported_mem_clocks_mhz.front();
-
-        const auto setup_clock_target = [&](uint32_t & clock_mhz, int32_t & offset_mhz, const char * phase_label) {
-            if (clock_mhz == 0) {
-                return true;
+        if (config_.mem_clock_enabled()) {
+            if (device_info_.supported_mem_clocks_mhz.empty()) {
+                LOG_ERR("GPU memory clock governor: supported memory clocks are unavailable\n");
+                injected_backend_->shutdown();
+                backend_initialized_ = false;
+                return false;
             }
+            std::sort(device_info_.supported_mem_clocks_mhz.rbegin(), device_info_.supported_mem_clocks_mhz.rend());
+            const uint32_t max_stock_mhz = device_info_.supported_mem_clocks_mhz.front();
 
-            for (uint32_t c : device_info_.supported_mem_clocks_mhz) {
-                if (c == clock_mhz) {
-                    offset_mhz = 0;
+            const auto setup_clock_target = [&](uint32_t & clock_mhz, int32_t & offset_mhz, const char * phase_label) {
+                if (clock_mhz == 0) {
                     return true;
                 }
+
+                for (uint32_t c : device_info_.supported_mem_clocks_mhz) {
+                    if (c == clock_mhz) {
+                        offset_mhz = 0;
+                        return true;
+                    }
+                }
+
+                if (clock_mhz > max_stock_mhz) {
+                    if (clock_mhz > MAX_REQUESTED_MEM_CLOCK_MHZ) {
+                        LOG_WRN("GPU memory clock governor: %s target %u MHz exceeds configured ceiling (%u MHz), clamping\n",
+                                phase_label, clock_mhz, MAX_REQUESTED_MEM_CLOCK_MHZ);
+                        clock_mhz = MAX_REQUESTED_MEM_CLOCK_MHZ;
+                    }
+
+                    if (!device_info_.memory_clock_offset_supported || clock_mhz <= max_stock_mhz ||
+                        device_info_.memory_clock_p2_mhz == 0 || clock_mhz <= device_info_.memory_clock_p2_mhz) {
+                        LOG_ERR("GPU memory clock governor: %s overclock is unsupported or exceeds the configured ceiling\n",
+                                phase_label);
+                        return false;
+                    }
+                    const int64_t offset = (int64_t(clock_mhz) - device_info_.memory_clock_p2_mhz) * 2;
+                    if (offset < device_info_.min_memory_clock_offset_mhz || offset > device_info_.max_memory_clock_offset_mhz) {
+                        LOG_ERR("GPU memory clock governor: %s offset is outside the driver limits\n", phase_label);
+                        return false;
+                    }
+                    offset_mhz = static_cast<int32_t>(offset);
+                    LOG_INF("GPU memory clock governor: %s overclock target %u MHz -> lock %u MHz + offset %+d MHz\n",
+                            phase_label, clock_mhz, max_stock_mhz, offset_mhz);
+                    return true;
+                }
+
+                LOG_ERR("GPU memory clock governor: %s clock %u MHz is not supported (max stock %u MHz)\n",
+                        phase_label, clock_mhz, max_stock_mhz);
+                return false;
+            };
+
+            if (decode_mem_clock_mhz_ > 0 && !setup_clock_target(decode_mem_clock_mhz_, decode_mem_offset_mhz_, "decode")) {
+                injected_backend_->shutdown();
+                backend_initialized_ = false;
+                return false;
             }
 
-            if (clock_mhz > max_stock_mhz) {
-                if (clock_mhz > MAX_REQUESTED_MEM_CLOCK_MHZ) {
-                    LOG_WRN("GPU memory clock governor: %s target %u MHz exceeds configured ceiling (%u MHz), clamping\n",
-                            phase_label, clock_mhz, MAX_REQUESTED_MEM_CLOCK_MHZ);
-                    clock_mhz = MAX_REQUESTED_MEM_CLOCK_MHZ;
-                }
+            if (prefill_mem_clock_mhz_ > 0 && !setup_clock_target(prefill_mem_clock_mhz_, prefill_mem_offset_mhz_, "prefill")) {
+                injected_backend_->shutdown();
+                backend_initialized_ = false;
+                return false;
+            }
+        }
 
-                if (!device_info_.memory_clock_offset_supported || clock_mhz <= max_stock_mhz ||
-                    device_info_.memory_clock_p2_mhz == 0 || clock_mhz <= device_info_.memory_clock_p2_mhz) {
-                    LOG_ERR("GPU memory clock governor: %s overclock is unsupported or exceeds the configured ceiling\n",
-                            phase_label);
-                    return false;
-                }
-                const int64_t offset = (int64_t(clock_mhz) - device_info_.memory_clock_p2_mhz) * 2;
-                if (offset < device_info_.min_memory_clock_offset_mhz || offset > device_info_.max_memory_clock_offset_mhz) {
-                    LOG_ERR("GPU memory clock governor: %s offset is outside the driver limits\n", phase_label);
-                    return false;
-                }
-                offset_mhz = static_cast<int32_t>(offset);
-                LOG_INF("GPU memory clock governor: %s overclock target %u MHz -> lock %u MHz + offset %+d MHz\n",
-                        phase_label, clock_mhz, max_stock_mhz, offset_mhz);
-                return true;
+        if (config_.apu_tdp_w != -1) {
+            std::string error;
+            if (!injected_backend_->init_apu_tdp(error)) {
+                LOG_ERR("APU TDP initialization failed: %s\n", error.c_str());
+                injected_backend_->shutdown();
+                backend_initialized_ = false;
+                return false;
+            }
+        }
+    } else {
+        bool want_nvml = false;
+        bool want_amdgpu = false;
+
+        if (config_.backend == server_gpu_power_backend_type::nvml) {
+            want_nvml = true;
+        } else if (config_.backend == server_gpu_power_backend_type::amdgpu) {
+            want_amdgpu = true;
+        } else if (config_.backend == server_gpu_power_backend_type::dual) {
+            want_nvml = true;
+            want_amdgpu = true;
+        } else { // auto_detect
+            if (config_.power_enabled() || config_.mem_clock_enabled()) {
+                want_nvml = true;
+            }
+            if (config_.apu_tdp_w != -1 || config_.fabric_state >= 0 || config_.amd_sclk_enabled()) {
+                want_amdgpu = true;
+            }
+            if (!want_nvml && !want_amdgpu) {
+                want_nvml = true;
+            }
+        }
+
+        if (want_nvml) {
+            nvml_backend_ = server_gpu_power_create_nvml_backend();
+            std::string error;
+            if (!nvml_backend_->init(config_.device, device_info_, error)) {
+                LOG_ERR("NVIDIA GPU governor initialization failed: %s\n", error.c_str());
+                return false;
             }
 
-            LOG_ERR("GPU memory clock governor: %s clock %u MHz is not supported (max stock %u MHz)\n",
-                    phase_label, clock_mhz, max_stock_mhz);
-            return false;
-        };
+            if (config_.power_enabled()) {
+                const auto validate_limit = [&](uint32_t power_mw, const char * profile) {
+                    if (power_mw < device_info_.min_power_limit_mw || power_mw > device_info_.max_power_limit_mw) {
+                        LOG_ERR("GPU power governor %s limit %s W is outside the allowed range %s-%s W\n", profile,
+                                server_gpu_power_mw_to_string(power_mw).c_str(),
+                                server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
+                                server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
+                        return false;
+                    }
+                    return true;
+                };
 
-        if (decode_mem_clock_mhz_ > 0 && !setup_clock_target(decode_mem_clock_mhz_, decode_mem_offset_mhz_, "decode")) {
-            backend_->shutdown();
-            backend_initialized_ = false;
-            return false;
+                if (!validate_limit(prefill_power_limit_mw_, "prefill") || !validate_limit(decode_power_limit_mw_, "decode")) {
+                    nvml_backend_->shutdown();
+                    return false;
+                }
+            }
+
+            if (config_.mem_clock_enabled()) {
+                if (device_info_.supported_mem_clocks_mhz.empty()) {
+                    LOG_ERR("GPU memory clock governor: supported memory clocks are unavailable\n");
+                    nvml_backend_->shutdown();
+                    return false;
+                }
+                std::sort(device_info_.supported_mem_clocks_mhz.rbegin(), device_info_.supported_mem_clocks_mhz.rend());
+                const uint32_t max_stock_mhz = device_info_.supported_mem_clocks_mhz.front();
+
+                const auto setup_clock_target = [&](uint32_t & clock_mhz, int32_t & offset_mhz, const char * phase_label) {
+                    if (clock_mhz == 0) {
+                        return true;
+                    }
+
+                    for (uint32_t c : device_info_.supported_mem_clocks_mhz) {
+                        if (c == clock_mhz) {
+                            offset_mhz = 0;
+                            return true;
+                        }
+                    }
+
+                    if (clock_mhz > max_stock_mhz) {
+                        if (clock_mhz > MAX_REQUESTED_MEM_CLOCK_MHZ) {
+                            LOG_WRN("GPU memory clock governor: %s target %u MHz exceeds configured ceiling (%u MHz), clamping\n",
+                                    phase_label, clock_mhz, MAX_REQUESTED_MEM_CLOCK_MHZ);
+                            clock_mhz = MAX_REQUESTED_MEM_CLOCK_MHZ;
+                        }
+
+                        if (!device_info_.memory_clock_offset_supported || clock_mhz <= max_stock_mhz ||
+                            device_info_.memory_clock_p2_mhz == 0 || clock_mhz <= device_info_.memory_clock_p2_mhz) {
+                            LOG_ERR("GPU memory clock governor: %s overclock is unsupported or exceeds the configured ceiling\n",
+                                    phase_label);
+                            return false;
+                        }
+                        const int64_t offset = (int64_t(clock_mhz) - device_info_.memory_clock_p2_mhz) * 2;
+                        if (offset < device_info_.min_memory_clock_offset_mhz || offset > device_info_.max_memory_clock_offset_mhz) {
+                            LOG_ERR("GPU memory clock governor: %s offset is outside the driver limits\n", phase_label);
+                            return false;
+                        }
+                        offset_mhz = static_cast<int32_t>(offset);
+                        LOG_INF("GPU memory clock governor: %s overclock target %u MHz -> lock %u MHz + offset %+d MHz\n",
+                                phase_label, clock_mhz, max_stock_mhz, offset_mhz);
+                        return true;
+                    }
+
+                    LOG_ERR("GPU memory clock governor: %s clock %u MHz is not supported (max stock %u MHz)\n",
+                            phase_label, clock_mhz, max_stock_mhz);
+                    return false;
+                };
+
+                if (decode_mem_clock_mhz_ > 0 && !setup_clock_target(decode_mem_clock_mhz_, decode_mem_offset_mhz_, "decode")) {
+                    nvml_backend_->shutdown();
+                    return false;
+                }
+
+                if (prefill_mem_clock_mhz_ > 0 && !setup_clock_target(prefill_mem_clock_mhz_, prefill_mem_offset_mhz_, "prefill")) {
+                    nvml_backend_->shutdown();
+                    return false;
+                }
+            }
         }
 
-        if (prefill_mem_clock_mhz_ > 0 && !setup_clock_target(prefill_mem_clock_mhz_, prefill_mem_offset_mhz_, "prefill")) {
-            backend_->shutdown();
-            backend_initialized_ = false;
-            return false;
-        }
-    }
+        if (want_amdgpu) {
+            amdgpu_backend_ = server_gpu_power_create_amdgpu_backend();
+            std::string error;
+            if (!amdgpu_backend_->init(config_.amd_device, amd_device_info_, error)) {
+                LOG_ERR("AMDGPU governor initialization failed: %s\n", error.c_str());
+                if (nvml_backend_) {
+                    nvml_backend_->shutdown();
+                }
+                return false;
+            }
 
-    if (config_.apu_tdp_w != -1) {
-        std::string error;
-        if (!backend_->init_apu_tdp(error)) {
-            LOG_ERR("APU TDP initialization failed: %s\n", error.c_str());
-            backend_->shutdown();
-            backend_initialized_ = false;
-            return false;
+            if (config_.fabric_state >= 0 && !amd_device_info_.fabric_state_supported) {
+                LOG_ERR("GPU fabric state requires readable pp_dpm_fclk and a non-manual original performance level\n");
+                amdgpu_backend_->shutdown();
+                if (nvml_backend_) {
+                    nvml_backend_->shutdown();
+                }
+                return false;
+            }
+
+            if (config_.apu_tdp_w != -1) {
+                if (!amdgpu_backend_->init_apu_tdp(error)) {
+                    LOG_ERR("APU TDP initialization failed: %s\n", error.c_str());
+                    amdgpu_backend_->shutdown();
+                    if (nvml_backend_) {
+                        nvml_backend_->shutdown();
+                    }
+                    return false;
+                }
+            }
+
+            if (config_.backend == server_gpu_power_backend_type::amdgpu && !config_.amd_sclk_enabled() && config_.mem_clock_enabled()) {
+                decode_amd_sclk_mhz_  = config_.mem_clock_decode > 0 ? static_cast<uint32_t>(config_.mem_clock_decode) : 0;
+                prefill_amd_sclk_mhz_ = config_.mem_clock_prefill > 0 ? static_cast<uint32_t>(config_.mem_clock_prefill) : 0;
+            }
         }
+
+        backend_initialized_ = true;
     }
 
     phase_                       = server_gpu_power_phase::idle;
@@ -1109,30 +1264,41 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
     last_applied_power_limit_mw_ = device_info_.original_power_limit_mw;
     last_applied_mem_clock_mhz_  = 0;
     last_applied_mem_offset_mhz_ = 0;
+    last_applied_amd_sclk_mhz_   = 0;
     mem_clock_locked_            = false;
     mem_offset_applied_          = false;
+    amd_sclk_locked_             = false;
     power_limit_changed_         = false;
     enabled_                     = true;
 
     LOG_INF("GPU governor enabled\n");
-    LOG_INF("  device: %s\n", device_info_.name.c_str());
-    LOG_INF("  device index: %d\n", device_info_.device);
-    if (config_.fabric_state >= 0) LOG_INF("  fabric raw state: %d\n", config_.fabric_state);
-    if (config_.apu_tdp_w != -1) LOG_INF("  active APU TDP: %d W\n", config_.apu_tdp_w);
-    if (config_.power_enabled()) {
-        LOG_INF("  original PL: %s W\n", server_gpu_power_mw_to_string(device_info_.original_power_limit_mw).c_str());
-        LOG_INF("  allowed range: %s-%s W\n", server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
-                server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
-        LOG_INF("  prefill PL: %s W\n", server_gpu_power_mw_to_string(prefill_power_limit_mw_).c_str());
-        LOG_INF("  decode PL: %s W\n", server_gpu_power_mw_to_string(decode_power_limit_mw_).c_str());
+    if (injected_backend_ || nvml_backend_) {
+        LOG_INF("  NVIDIA device: %s (index %d)\n", device_info_.name.c_str(), device_info_.device);
+        if (config_.power_enabled()) {
+            LOG_INF("    original PL: %s W\n", server_gpu_power_mw_to_string(device_info_.original_power_limit_mw).c_str());
+            LOG_INF("    allowed range: %s-%s W\n", server_gpu_power_mw_to_string(device_info_.min_power_limit_mw).c_str(),
+                    server_gpu_power_mw_to_string(device_info_.max_power_limit_mw).c_str());
+            LOG_INF("    prefill PL: %s W\n", server_gpu_power_mw_to_string(prefill_power_limit_mw_).c_str());
+            LOG_INF("    decode PL: %s W\n", server_gpu_power_mw_to_string(decode_power_limit_mw_).c_str());
+        }
+        if (config_.mem_clock_enabled()) {
+            if (decode_mem_clock_mhz_ > 0) {
+                LOG_INF("    decode memory clock: %u MHz\n", decode_mem_clock_mhz_);
+            }
+            if (prefill_mem_clock_mhz_ > 0) {
+                LOG_INF("    prefill memory clock: %u MHz\n", prefill_mem_clock_mhz_);
+            }
+        }
     }
-    if (config_.mem_clock_enabled()) {
-        if (decode_mem_clock_mhz_ > 0) {
-            LOG_INF("  decode memory clock: %u MHz\n", decode_mem_clock_mhz_);
-        }
-        if (prefill_mem_clock_mhz_ > 0) {
-            LOG_INF("  prefill memory clock: %u MHz\n", prefill_mem_clock_mhz_);
-        }
+    if (amdgpu_backend_) {
+        LOG_INF("  AMDGPU device: %s (index %d)\n", amd_device_info_.name.c_str(), amd_device_info_.device);
+        if (config_.fabric_state >= 0) LOG_INF("    fabric raw state: %d\n", config_.fabric_state);
+        if (config_.apu_tdp_w != -1) LOG_INF("    active APU TDP: %d W\n", config_.apu_tdp_w);
+        if (decode_amd_sclk_mhz_ > 0) LOG_INF("    decode graphics SCLK: %u MHz\n", decode_amd_sclk_mhz_);
+        if (prefill_amd_sclk_mhz_ > 0) LOG_INF("    prefill graphics SCLK: %u MHz\n", prefill_amd_sclk_mhz_);
+    } else if (injected_backend_) {
+        if (config_.fabric_state >= 0) LOG_INF("  fabric raw state: %d\n", config_.fabric_state);
+        if (config_.apu_tdp_w != -1) LOG_INF("  active APU TDP: %d W\n", config_.apu_tdp_w);
     }
     return true;
 }
@@ -1146,38 +1312,57 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
     phase_                                = phase;
     transition_count_++;
 
-    if (config_.apu_tdp_w != -1 && phase != server_gpu_power_phase::idle && !apu_tdp_applied_) {
-        std::string error;
-        // Also retry cleanup from the governor if the backend's local rollback fails.
-        apu_tdp_applied_ = true;
-        if (!backend_->set_apu_tdp(apu_tdp_mw_, error)) {
-            disable_after_error(error);
-            return;
+    server_gpu_power_backend * nv = injected_backend_ ? injected_backend_.get() : nvml_backend_.get();
+    server_gpu_power_backend * amd = injected_backend_ ? injected_backend_.get() : amdgpu_backend_.get();
+
+    // 1. AMD APU TDP
+    if (amd && config_.apu_tdp_w != -1) {
+        if (phase != server_gpu_power_phase::idle && !apu_tdp_applied_) {
+            std::string error;
+            apu_tdp_applied_ = true;
+            if (!amd->set_apu_tdp(apu_tdp_mw_, error)) {
+                disable_after_error(error);
+                return;
+            }
+            LOG_INF("APU TDP: active limit %d W\n", config_.apu_tdp_w);
+        } else if (phase == server_gpu_power_phase::idle && apu_tdp_applied_) {
+            std::string error;
+            if (!amd->reset_apu_tdp(error)) {
+                disable_after_error(error);
+                return;
+            }
+            apu_tdp_applied_ = false;
+            LOG_INF("APU TDP: restored original limits\n");
         }
-        LOG_INF("APU TDP: active limit %d W\n", config_.apu_tdp_w);
     }
 
-    if (config_.power_enabled()) {
+    // 2. NVIDIA Power Limit
+    if (nv && config_.power_enabled() && power_limit_supported_) {
         if (phase == server_gpu_power_phase::idle) {
             LOG_INF("GPU power: %s -> idle\n", server_gpu_power_phase_name(previous));
         } else {
             const uint32_t target = phase == server_gpu_power_phase::prefill ? prefill_power_limit_mw_ : decode_power_limit_mw_;
             if (target != last_applied_power_limit_mw_) {
                 std::string error;
-                if (!backend_->set_power_limit(target, error)) {
-                    disable_after_error(error);
-                    return;
+                if (!nv->set_power_limit(target, error)) {
+                    if (injected_backend_) {
+                        disable_after_error(error);
+                        return;
+                    }
+                    LOG_WRN("NVIDIA GPU power limit: %s (requires elevated privilege), skipping dynamic power limit\n", error.c_str());
+                    power_limit_supported_ = false;
+                } else {
+                    last_applied_power_limit_mw_ = target;
+                    power_limit_changed_         = target != device_info_.original_power_limit_mw;
+                    LOG_INF("GPU power: %s -> %s, limit %s W\n", server_gpu_power_phase_name(previous),
+                            server_gpu_power_phase_name(phase), server_gpu_power_mw_to_string(target).c_str());
                 }
-
-                last_applied_power_limit_mw_ = target;
-                power_limit_changed_         = target != device_info_.original_power_limit_mw;
-                LOG_INF("GPU power: %s -> %s, limit %s W\n", server_gpu_power_phase_name(previous),
-                        server_gpu_power_phase_name(phase), server_gpu_power_mw_to_string(target).c_str());
             }
         }
     }
 
-    if (config_.mem_clock_enabled()) {
+    // 3. NVIDIA Memory Clock / Offset
+    if (nv && config_.mem_clock_enabled() && mem_clock_supported_) {
         uint32_t target_mem    = 0;
         int32_t  target_offset = 0;
 
@@ -1194,13 +1379,15 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
                                            : 0;
         const uint32_t target_lock_mhz = target_offset != 0 ? max_stock_mhz : target_mem;
 
-        // Restore the offset before changing the lock or returning to dynamic clocks.
         if (mem_offset_applied_ && (target_offset != last_applied_mem_offset_mhz_ ||
                                     target_lock_mhz != last_applied_mem_clock_mhz_)) {
             std::string error;
-            if (!backend_->reset_memory_clock_offset(error)) {
-                disable_after_error(error);
-                return;
+            if (!nv->reset_memory_clock_offset(error)) {
+                if (injected_backend_) {
+                    disable_after_error(error);
+                    return;
+                }
+                LOG_WRN("NVIDIA GPU memory offset: %s\n", error.c_str());
             }
             mem_offset_applied_ = false;
             last_applied_mem_offset_mhz_ = 0;
@@ -1211,18 +1398,26 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
         if (target_lock_mhz != last_applied_mem_clock_mhz_) {
             std::string error;
             if (target_lock_mhz > 0) {
-                if (!backend_->set_memory_locked_clocks(target_lock_mhz, target_lock_mhz, error)) {
-                    disable_after_error(error);
-                    return;
-                }
-                mem_clock_locked_ = true;
-                LOG_INF("GPU memory clock: %s -> %s, locked %u MHz\n", server_gpu_power_phase_name(previous),
-                        server_gpu_power_phase_name(phase), target_lock_mhz);
-            } else {
-                if (mem_clock_locked_) {
-                    if (!backend_->reset_memory_locked_clocks(error)) {
+                if (!nv->set_memory_locked_clocks(target_lock_mhz, target_lock_mhz, error)) {
+                    if (injected_backend_) {
                         disable_after_error(error);
                         return;
+                    }
+                    LOG_WRN("NVIDIA GPU memory clock lock: %s (requires elevated privilege), skipping dynamic memory lock\n", error.c_str());
+                    mem_clock_supported_ = false;
+                } else {
+                    mem_clock_locked_ = true;
+                    LOG_INF("GPU memory clock: %s -> %s, locked %u MHz\n", server_gpu_power_phase_name(previous),
+                            server_gpu_power_phase_name(phase), target_lock_mhz);
+                }
+            } else {
+                if (mem_clock_locked_) {
+                    if (!nv->reset_memory_locked_clocks(error)) {
+                        if (injected_backend_) {
+                            disable_after_error(error);
+                            return;
+                        }
+                        LOG_WRN("NVIDIA GPU memory clock reset: %s\n", error.c_str());
                     }
                     mem_clock_locked_ = false;
                     LOG_INF("GPU memory clock: %s -> %s, reset (dynamic)\n", server_gpu_power_phase_name(previous),
@@ -1232,46 +1427,76 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
             last_applied_mem_clock_mhz_ = target_lock_mhz;
         }
 
-        if (target_offset != last_applied_mem_offset_mhz_) {
+        if (target_offset != last_applied_mem_offset_mhz_ && mem_clock_supported_) {
             std::string error;
             if (target_offset != 0) {
-                if (!backend_->set_memory_clock_offset(target_offset, error)) {
-                    disable_after_error(error);
-                    return;
+                if (!nv->set_memory_clock_offset(target_offset, error)) {
+                    if (injected_backend_) {
+                        disable_after_error(error);
+                        return;
+                    }
+                    LOG_WRN("NVIDIA GPU memory offset: %s\n", error.c_str());
+                } else {
+                    mem_offset_applied_ = true;
+                    LOG_INF("GPU memory offset: %s -> %s, offset %+d MHz (target %u MHz)\n",
+                            server_gpu_power_phase_name(previous), server_gpu_power_phase_name(phase), target_offset, target_mem);
                 }
-                mem_offset_applied_ = true;
-                LOG_INF("GPU memory offset: %s -> %s, offset %+d MHz (target %u MHz)\n",
-                        server_gpu_power_phase_name(previous), server_gpu_power_phase_name(phase), target_offset, target_mem);
             }
             last_applied_mem_offset_mhz_ = target_offset;
         }
     }
 
-    if (config_.fabric_state >= 0) {
+    // 4. AMD Fabric State
+    if (amd && config_.fabric_state >= 0) {
         const bool active = phase != server_gpu_power_phase::idle;
         std::string error;
         if (active && !fabric_state_applied_) {
-            if (!backend_->set_fabric_state(config_.fabric_state, error)) {
+            if (!amd->set_fabric_state(config_.fabric_state, error)) {
                 disable_after_error(error);
                 return;
             }
             fabric_state_applied_ = true;
         } else if (!active && fabric_state_applied_) {
-            if (!backend_->reset_fabric_state(error)) {
+            if (!amd->reset_fabric_state(error)) {
                 disable_after_error(error);
                 return;
             }
             fabric_state_applied_ = false;
         }
     }
-    if (phase == server_gpu_power_phase::idle && apu_tdp_applied_) {
-        std::string error;
-        if (!backend_->reset_apu_tdp(error)) {
-            disable_after_error(error);
-            return;
+
+    // 5. AMD Graphics (SCLK) Clocks
+    if (amd && (decode_amd_sclk_mhz_ > 0 || prefill_amd_sclk_mhz_ > 0)) {
+        uint32_t target_sclk = 0;
+        if (phase == server_gpu_power_phase::decode) {
+            target_sclk = decode_amd_sclk_mhz_;
+        } else if (phase == server_gpu_power_phase::prefill) {
+            target_sclk = prefill_amd_sclk_mhz_;
         }
-        apu_tdp_applied_ = false;
-        LOG_INF("APU TDP: restored original limits\n");
+
+        if (target_sclk != last_applied_amd_sclk_mhz_) {
+            std::string error;
+            if (target_sclk > 0) {
+                if (!amd->set_memory_locked_clocks(target_sclk, target_sclk, error)) {
+                    disable_after_error(error);
+                    return;
+                }
+                amd_sclk_locked_ = true;
+                LOG_INF("AMD graphics SCLK: %s -> %s, locked %u MHz\n", server_gpu_power_phase_name(previous),
+                        server_gpu_power_phase_name(phase), target_sclk);
+            } else {
+                if (amd_sclk_locked_) {
+                    if (!amd->reset_memory_locked_clocks(error)) {
+                        disable_after_error(error);
+                        return;
+                    }
+                    amd_sclk_locked_ = false;
+                    LOG_INF("AMD graphics SCLK: %s -> %s, reset (dynamic)\n", server_gpu_power_phase_name(previous),
+                            server_gpu_power_phase_name(phase));
+                }
+            }
+            last_applied_amd_sclk_mhz_ = target_sclk;
+        }
     }
 }
 
@@ -1294,12 +1519,25 @@ void server_gpu_power::on_sleeping(bool sleeping) {
     if (!mem_offset_applied_) {
         last_applied_mem_offset_mhz_ = 0;
     }
+    if (!amd_sclk_locked_) {
+        last_applied_amd_sclk_mhz_ = 0;
+    }
 }
 
 void server_gpu_power::shutdown() {
     if (backend_initialized_) {
         restore_original();
-        backend_->shutdown();
+        if (injected_backend_) {
+            injected_backend_->shutdown();
+        }
+        if (nvml_backend_) {
+            nvml_backend_->shutdown();
+            nvml_backend_.reset();
+        }
+        if (amdgpu_backend_) {
+            amdgpu_backend_->shutdown();
+            amdgpu_backend_.reset();
+        }
         backend_initialized_ = false;
     }
 
@@ -1310,8 +1548,11 @@ void server_gpu_power::shutdown() {
     power_limit_changed_         = false;
     mem_clock_locked_            = false;
     mem_offset_applied_          = false;
+    amd_sclk_locked_             = false;
+    last_applied_power_limit_mw_ = 0;
     last_applied_mem_clock_mhz_  = 0;
     last_applied_mem_offset_mhz_ = 0;
+    last_applied_amd_sclk_mhz_   = 0;
 }
 
 bool server_gpu_power::enabled() const {
@@ -1326,15 +1567,22 @@ const server_gpu_power_device_info & server_gpu_power::device_info() const {
     return device_info_;
 }
 
+const server_gpu_power_device_info & server_gpu_power::amd_device_info() const {
+    return amd_device_info_;
+}
+
 bool server_gpu_power::restore_original() {
     if (!backend_initialized_) {
         return true;
     }
 
     bool success = true;
-    if (power_limit_changed_) {
+    server_gpu_power_backend * nv = injected_backend_ ? injected_backend_.get() : nvml_backend_.get();
+    server_gpu_power_backend * amd = injected_backend_ ? injected_backend_.get() : amdgpu_backend_.get();
+
+    if (nv && power_limit_changed_) {
         std::string error;
-        if (!backend_->set_power_limit(device_info_.original_power_limit_mw, error)) {
+        if (!nv->set_power_limit(device_info_.original_power_limit_mw, error)) {
             LOG_WRN("GPU power: failed to restore original limit %s W: %s\n",
                     server_gpu_power_mw_to_string(device_info_.original_power_limit_mw).c_str(), error.c_str());
             success = false;
@@ -1344,9 +1592,9 @@ bool server_gpu_power::restore_original() {
         }
     }
 
-    if (mem_offset_applied_) {
+    if (nv && mem_offset_applied_) {
         std::string error;
-        if (!backend_->reset_memory_clock_offset(error)) {
+        if (!nv->reset_memory_clock_offset(error)) {
             LOG_WRN("GPU memory offset: failed to reset memory clock offset: %s\n", error.c_str());
             success = false;
         } else {
@@ -1355,9 +1603,9 @@ bool server_gpu_power::restore_original() {
         }
     }
 
-    if (mem_clock_locked_) {
+    if (nv && mem_clock_locked_) {
         std::string error;
-        if (!backend_->reset_memory_locked_clocks(error)) {
+        if (!nv->reset_memory_locked_clocks(error)) {
             LOG_WRN("GPU memory clock: failed to reset memory locked clocks: %s\n", error.c_str());
             success = false;
         } else {
@@ -1366,9 +1614,9 @@ bool server_gpu_power::restore_original() {
         }
     }
 
-    if (fabric_state_applied_) {
+    if (amd && fabric_state_applied_) {
         std::string error;
-        if (!backend_->reset_fabric_state(error)) {
+        if (!amd->reset_fabric_state(error)) {
             LOG_WRN("GPU fabric: failed to restore original profile: %s\n", error.c_str());
             success = false;
         } else {
@@ -1376,13 +1624,24 @@ bool server_gpu_power::restore_original() {
         }
     }
 
-    if (apu_tdp_applied_) {
+    if (amd && apu_tdp_applied_) {
         std::string error;
-        if (!backend_->reset_apu_tdp(error)) {
+        if (!amd->reset_apu_tdp(error)) {
             LOG_WRN("APU TDP: failed to restore original limits: %s\n", error.c_str());
             success = false;
         } else {
             apu_tdp_applied_ = false;
+        }
+    }
+
+    if (amd && amd_sclk_locked_) {
+        std::string error;
+        if (!amd->reset_memory_locked_clocks(error)) {
+            LOG_WRN("AMD graphics SCLK: failed to reset graphics SCLK: %s\n", error.c_str());
+            success = false;
+        } else {
+            amd_sclk_locked_           = false;
+            last_applied_amd_sclk_mhz_ = 0;
         }
     }
 
