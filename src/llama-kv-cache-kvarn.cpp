@@ -1671,16 +1671,20 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     LLAMA_LOG_INFO("KVarN cache: stage_groups=%u tail_groups=%u n_batch=%u n_ubatch=%u%s\n",
             stage_groups, tail_groups, n_batch, n_ubatch, swa ? " (SWA ring)" : "");
 
-    struct buft_comparator {
-        bool operator()(ggml_backend_buffer_type_t lhs, ggml_backend_buffer_type_t rhs) const {
-            return std::strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+    using ctx_key = std::pair<ggml_backend_buffer_type_t, int32_t>;
+    struct ctx_key_comparator {
+        bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
+            const int by_buft = std::strcmp(
+                    ggml_backend_buft_name(lhs.first), ggml_backend_buft_name(rhs.first));
+            return by_buft != 0 ? by_buft < 0 : lhs.second < rhs.second;
         }
     };
 
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, buft_comparator> ctx_map;
+    std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const auto it = ctx_map.find(buft);
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int32_t migration_layer = -1) -> ggml_context * {
+        const ctx_key key { buft, migration_layer };
+        const auto it = ctx_map.find(key);
         if (it != ctx_map.end()) {
             return it->second.get();
         }
@@ -1696,7 +1700,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
 
         auto * result = ctx.get();
-        ctx_map.emplace(buft, std::move(ctx));
+        ctx_map.emplace(key, std::move(ctx));
         return result;
     };
 
@@ -1724,7 +1728,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 il));
         }
         auto * buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
-        auto * ctx = ctx_for_buft(buft);
+        auto * ctx = ctx_for_buft(buft, mirror_dev != nullptr ? int32_t(il) : -1);
         if (!ctx) {
             throw std::runtime_error("failed to create KVarN cache tensor context");
         }
@@ -1858,7 +1862,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                     il, ggml_backend_dev_name(mirror_dev)));
             }
             auto * mirror_buft = ggml_backend_dev_buffer_type(mirror_dev);
-            auto * mirror_ctx = ctx_for_buft(mirror_buft);
+            auto * mirror_ctx = ctx_for_buft(mirror_buft, int32_t(il));
             if (!mirror_ctx) {
                 throw std::runtime_error("failed to create KVarN migration mirror tensor context");
             }
@@ -1952,7 +1956,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     }
 
     size_t total_bytes = 0;
-    for (auto & [buft, ctx] : ctx_map) {
+    for (auto & [key, ctx] : ctx_map) {
+        const auto buft = key.first;
         ggml_backend_buffer_t buf;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, 0);
@@ -1970,7 +1975,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         total_bytes += ggml_backend_buffer_get_size(buf);
         LLAMA_LOG_INFO("%s: %10s KVarN buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
+        ctxs_bufs.push_back({ key.second, buft, std::move(ctx), ggml_backend_buffer_ptr(buf) });
     }
 
     const auto tensor_buft = [](const ggml_tensor * tensor) -> ggml_backend_buffer_type_t {
@@ -2100,9 +2105,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 throw std::logic_error("KVarN exact-tail metadata finalized without storage slots");
             }
 
-            std::map<ggml_backend_buffer_type_t, ggml_context_ptr, buft_comparator> tail_ctx_map;
-            const auto tail_ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-                const auto it = tail_ctx_map.find(buft);
+            std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> tail_ctx_map;
+            const auto tail_ctx_for_buft = [&](ggml_backend_buffer_type_t buft,
+                                               int32_t migration_layer = -1) -> ggml_context * {
+                const ctx_key key { buft, migration_layer };
+                const auto it = tail_ctx_map.find(key);
                 if (it != tail_ctx_map.end()) {
                     return it->second.get();
                 }
@@ -2116,13 +2123,14 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                     return nullptr;
                 }
                 auto * result = ctx.get();
-                tail_ctx_map.emplace(buft, std::move(ctx));
+                tail_ctx_map.emplace(key, std::move(ctx));
                 return result;
             };
 
             for (auto & layer : layers) {
                 auto * buft = tensor_buft(layer.k_records);
-                auto * ctx = tail_ctx_for_buft(buft);
+                const int32_t migration_layer = layer.mirror_dev != nullptr ? int32_t(layer.il) : -1;
+                auto * ctx = tail_ctx_for_buft(buft, migration_layer);
                 if (!ctx) {
                     throw std::runtime_error("failed to create KVarN exact-tail tensor context");
                 }
@@ -2134,7 +2142,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 ggml_format_name(layer.v_tail, "cache_kvarn_v_tail_l%d", layer.il);
                 if (layer.mirror_dev != nullptr) {
                     auto * mirror_ctx = tail_ctx_for_buft(
-                            ggml_backend_dev_buffer_type(layer.mirror_dev));
+                            ggml_backend_dev_buffer_type(layer.mirror_dev), int32_t(layer.il));
                     if (!mirror_ctx) {
                         throw std::runtime_error("failed to create KVarN migration mirror tail context");
                     }
@@ -2149,7 +2157,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 }
             }
 
-            for (auto & [buft, ctx] : tail_ctx_map) {
+            for (auto & [key, ctx] : tail_ctx_map) {
+                const auto buft = key.first;
                 ggml_backend_buffer_t buf;
                 if (hparams.no_alloc) {
                     buf = ggml_backend_buft_alloc_buffer(buft, 0);
@@ -2166,7 +2175,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 total_bytes += ggml_backend_buffer_get_size(buf);
                 LLAMA_LOG_INFO("%s: %10s KVarN tail buffer size = %8.2f MiB\n",
                         __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-                ctxs_bufs.emplace_back(std::move(ctx), buf);
+                ctxs_bufs.push_back({ key.second, buft, std::move(ctx), ggml_backend_buffer_ptr(buf) });
             }
 
             for (const auto & layer : layers) {
@@ -2206,6 +2215,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             throw std::runtime_error(
                 "KVarN prefill migration requires allocated CUDA payloads and a Vulkan mirror");
         }
+        migration_prefill_dev = prefill_dev;
+        migration_remote_dev = mirror_dev;
         migration_copies = std::make_unique<migration_queue>(prefill_dev, mirror_dev);
         migration_mirror_stale = false;
         LLAMA_LOG_INFO("KVarN prefill migration enabled: CUDA owner with Vulkan mirror; "
@@ -2215,6 +2226,109 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     LLAMA_LOG_INFO("%s: type = %s, layers = %zu, groups/stream = %u, streams = %u, KVarN = %.2f MiB, equivalent F16 = %.2f MiB\n",
             __func__, llama_kvarn_type_name(this->params.type), layers.size(), n_groups_per_stream, n_stream,
             total_bytes / 1024.0 / 1024.0, raw_bytes / 1024.0 / 1024.0);
+}
+
+void llama_kv_cache_kvarn::ensure_migration_mirror_storage(layer & cache_layer) {
+    GGML_ASSERT(migration_enabled && migration_prefill_dev != nullptr && migration_remote_dev != nullptr);
+    const auto target_dev = migration_remote_active ? migration_prefill_dev : migration_remote_dev;
+    const auto target_buft = ggml_backend_dev_buffer_type(target_dev);
+    bool found = false;
+    bool allocated = false;
+
+    for (auto & storage : ctxs_bufs) {
+        if (storage.migration_layer != int32_t(cache_layer.il) ||
+                ggml_backend_buft_get_device(storage.buft) != target_dev) {
+            continue;
+        }
+        found = true;
+        if (storage.buffer) {
+            continue;
+        }
+        if (storage.buft != target_buft) {
+            throw std::runtime_error(format(
+                    "KVarN migration layer %u has a detached buffer on an unexpected owner",
+                    cache_layer.il));
+        }
+        const auto detach_tensors = [&]() {
+            for (auto * tensor = ggml_get_first_tensor(storage.ctx.get());
+                    tensor != nullptr; tensor = ggml_get_next_tensor(storage.ctx.get(), tensor)) {
+                tensor->data = nullptr;
+                tensor->buffer = nullptr;
+            }
+        };
+        // A failed GGML allocation can free partially-created backend buffers
+        // without detaching the tensors it already initialized. Reset the
+        // descriptor bundle before every retry and again on failure.
+        detach_tensors();
+        auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(storage.ctx.get(), storage.buft);
+        if (buffer == nullptr) {
+            detach_tensors();
+            throw std::runtime_error(format(
+                    "failed to reallocate KVarN migration storage for layer %u on %s",
+                    cache_layer.il, ggml_backend_dev_name(target_dev)));
+        }
+        storage.buffer.reset(buffer);
+        ggml_backend_buffer_clear(storage.buffer.get(), 0);
+        allocated = true;
+    }
+
+    if (!found) {
+        throw std::runtime_error(format(
+                "KVarN migration layer %u has no allocation bundle for %s",
+                cache_layer.il, ggml_backend_dev_name(target_dev)));
+    }
+    if (allocated) {
+        // A newly allocated target has no complete cache image. The handoff
+        // must copy all records, not only groups copied during this prefill.
+        migration_mirror_stale = true;
+    }
+}
+
+void llama_kv_cache_kvarn::release_migration_layer_storage(
+        layer & cache_layer, ggml_backend_dev_t device) noexcept {
+    for (auto & storage : ctxs_bufs) {
+        if (storage.migration_layer != int32_t(cache_layer.il) ||
+                ggml_backend_buft_get_device(storage.buft) != device || !storage.buffer) {
+            continue;
+        }
+        // Keep tensor descriptors and their view relationships so the same
+        // context can be reallocated on the next reverse handoff. The GGML
+        // allocator skips tensors with non-null data, so detach every base and
+        // view before freeing the backing buffer.
+        for (auto * tensor = ggml_get_first_tensor(storage.ctx.get());
+                tensor != nullptr; tensor = ggml_get_next_tensor(storage.ctx.get(), tensor)) {
+            tensor->data = nullptr;
+            tensor->buffer = nullptr;
+        }
+        storage.buffer.reset();
+    }
+}
+
+void llama_kv_cache_kvarn::release_prefill_migration_inactive_buffers() noexcept {
+    if (!migration_enabled) {
+        return;
+    }
+    if (migration_copies && !migration_copies->drain()) {
+        migration_mirror_stale = true;
+    }
+    const auto inactive_dev = migration_remote_active ? migration_prefill_dev : migration_remote_dev;
+    size_t released_bytes = 0;
+    for (auto & storage : ctxs_bufs) {
+        if (storage.migration_layer >= 0 && storage.buffer &&
+                ggml_backend_buft_get_device(storage.buft) == inactive_dev) {
+            released_bytes += ggml_backend_buffer_get_size(storage.buffer.get());
+        }
+    }
+    for (auto & cache_layer : layers) {
+        if (cache_layer.mirror_dev != nullptr) {
+            release_migration_layer_storage(cache_layer, inactive_dev);
+        }
+    }
+    migration_mirror_stale = true;
+    if (released_bytes > 0) {
+        LLAMA_LOG_INFO("KVarN migration released inactive %s cache buffers: %.2f MiB\n",
+                ggml_backend_dev_name(inactive_dev), released_bytes / 1024.0 / 1024.0);
+    }
 }
 
 void llama_kv_cache_kvarn::enqueue_prefill_migration(const llama_kv_cache::slot_info & sinfo,
@@ -2232,6 +2346,11 @@ void llama_kv_cache_kvarn::enqueue_prefill_migration(const llama_kv_cache::slot_
     }
 
     try {
+        for (auto & layer : layers) {
+            if (layer.mirror_dev != nullptr) {
+                ensure_migration_mirror_storage(layer);
+            }
+        }
         if (swa || n_stream != 1 || sinfo.n_stream() != 1) {
             throw std::runtime_error("KVarN prefill migration does not support SWA or multiple streams");
         }
@@ -2304,9 +2423,11 @@ void llama_kv_cache_kvarn::enqueue_prefill_migration(const llama_kv_cache::slot_
         }
     } catch (const std::exception & e) {
         migration_mirror_stale = true;
+        release_prefill_migration_inactive_buffers();
         LLAMA_LOG_ERROR("%s: cache mirror copy was skipped: %s; retaining CUDA ownership\n", __func__, e.what());
     } catch (...) {
         migration_mirror_stale = true;
+        release_prefill_migration_inactive_buffers();
         LLAMA_LOG_ERROR("%s: cache mirror copy was skipped; retaining CUDA ownership\n", __func__);
     }
 }
@@ -2324,6 +2445,11 @@ bool llama_kv_cache_kvarn::handoff_prefill_migration(bool to_remote) {
             LLAMA_LOG_WARN("%s: migration queue failed; keeping current %s cache owner\n",
                     __func__, migration_remote_active ? "Vulkan" : "CUDA");
             return false;
+        }
+        for (auto & layer : layers) {
+            if (layer.mirror_dev != nullptr) {
+                ensure_migration_mirror_storage(layer);
+            }
         }
         std::vector<migration_queue::span> spans;
         for (const auto & layer : layers) {
@@ -2398,7 +2524,13 @@ bool llama_kv_cache_kvarn::handoff_prefill_migration(bool to_remote) {
         return true;
     } catch (const std::exception & e) {
         migration_mirror_stale = true;
+        release_prefill_migration_inactive_buffers();
         LLAMA_LOG_ERROR("KVarN prefill migration handoff failed: %s\n", e.what());
+        return false;
+    } catch (...) {
+        migration_mirror_stale = true;
+        release_prefill_migration_inactive_buffers();
+        LLAMA_LOG_ERROR("KVarN prefill migration handoff failed with an unknown error\n");
         return false;
     }
 }
@@ -2499,8 +2631,10 @@ void llama_kv_cache_kvarn::clear(bool data) {
     pending_stream_copies = {};
     metadata->clear(false);
     if (data) {
-        for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+        for (auto & storage : ctxs_bufs) {
+            if (storage.buffer) {
+                ggml_backend_buffer_clear(storage.buffer.get(), 0);
+            }
         }
     }
     migration_mirror_stale = !data;
@@ -2682,11 +2816,14 @@ llama_pos llama_kv_cache_kvarn::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> result;
-    for (const auto & [ctx, buf] : ctxs_bufs) {
-        auto * buft = ggml_backend_buffer_get_type(buf.get());
+    for (const auto & storage : ctxs_bufs) {
+        if (!storage.buffer) {
+            continue;
+        }
+        auto * buft = storage.buft;
         result[buft] += hparams.no_alloc
-            ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft)
-            : ggml_backend_buffer_get_size(buf.get());
+            ? ggml_backend_alloc_ctx_tensors_from_buft_size(storage.ctx.get(), buft)
+            : ggml_backend_buffer_get_size(storage.buffer.get());
     }
     return result;
 }

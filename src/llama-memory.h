@@ -172,6 +172,10 @@ struct llama_memory_i {
     // route. Unsupported memory implementations fail closed.
     virtual bool supports_prefill_migration() const { return false; }
     virtual bool handoff_prefill_migration(bool /* to_remote */) { return false; }
+    // Release the inactive side after its graph references and pending copies
+    // are gone, before reserving workspace for the new owner. Implementations
+    // may retain tensor descriptors for a later reallocation.
+    virtual void release_prefill_migration_inactive_buffers() noexcept {}
     // Wait for background mirror transfers while the owning context backends
     // are still alive. A stale mirror is recoverable; the active cache remains
     // authoritative if this returns false.

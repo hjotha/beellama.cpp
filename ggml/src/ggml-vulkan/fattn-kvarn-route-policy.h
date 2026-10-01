@@ -26,7 +26,9 @@ inline ggml_vk_fattn_kvarn_plan_result ggml_vk_fattn_kvarn_plan(
     const uint32_t workgroups_y = input.n_kv_heads * gqa_groups;
     const uint32_t workgroups = std::max(
         1u, input.n_query * workgroups_y * input.n_stream);
-    const uint32_t target_workgroups = std::max(1u, input.shader_core_count) * 2u;
+    const uint32_t workgroups_per_core = input.n_query <= 8 ? 16u : 8u;
+    const uint32_t target_workgroups =
+        std::max(1u, input.shader_core_count) * workgroups_per_core;
     uint32_t split_k = std::max(1u,
         (target_workgroups + workgroups - 1) / workgroups);
     const uint32_t record_groups = std::max(1u, (input.n_kv + 127u) / 128u);

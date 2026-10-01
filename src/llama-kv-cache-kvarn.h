@@ -280,6 +280,7 @@ public:
 
     bool supports_prefill_migration() const override { return migration_enabled; }
     bool handoff_prefill_migration(bool to_remote) override;
+    void release_prefill_migration_inactive_buffers() noexcept override;
     bool drain_prefill_migration() override;
     void enqueue_prefill_migration(
             const llama_kv_cache::slot_info & sinfo,
@@ -418,7 +419,16 @@ private:
     const layer & layer_for(int32_t il) const;
     std::unique_ptr<llama_kv_cache> make_metadata_cache() const;
     bool can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    void ensure_migration_mirror_storage(layer & layer);
+    void release_migration_layer_storage(layer & layer, ggml_backend_dev_t device) noexcept;
     void copy_kvarn_stream(uint32_t stream_src, uint32_t stream_dst);
+
+    struct cache_buffer {
+        int32_t migration_layer; // -1 for shared per-device storage
+        ggml_backend_buffer_type_t buft;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+    };
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -445,9 +455,11 @@ private:
     std::unique_ptr<llama_kv_cache> metadata;
     std::vector<layer> layers;
     std::unordered_map<int32_t, int32_t> map_layer_ids;
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    std::vector<cache_buffer> ctxs_bufs;
     llama_kv_cache::stream_copy_info pending_stream_copies;
     const bool migration_enabled;
+    ggml_backend_dev_t migration_prefill_dev = nullptr;
+    ggml_backend_dev_t migration_remote_dev = nullptr;
     bool migration_remote_active = false;
     mutable bool migration_mirror_stale = false;
     std::vector<llama_kv_tail_layer_route> migration_local_tail_routes;

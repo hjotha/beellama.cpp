@@ -1783,6 +1783,9 @@ int32_t llama_context::prefill_migration_handoff(bool to_remote) {
         : cparams.local_attn_prefill_backend;
     const ggml_backend_t current_backend = cparams.local_attn_backend;
     if (current_backend == next_backend) {
+        // The server reaches this path for every prompt ubatch. Keep the
+        // inactive destination allocated while its asynchronous mirror queue
+        // may still target it; release only after an actual owner transition.
         try {
             sched_reserve();
             return LLAMA_PREFILL_MIGRATION_OK;
@@ -1794,19 +1797,44 @@ int32_t llama_context::prefill_migration_handoff(bool to_remote) {
     }
 
     synchronize();
+    // A backend scheduler keeps its last CUDA graph workspace allocated. Free
+    // that workspace before allocating the destination KVarN owner; on the
+    // remote->CUDA transition it can otherwise consume the VRAM needed to
+    // recreate the inactive cache bundle.
+    if (gf_res_prev) gf_res_prev->reset();
+    if (gf_res_reserve) gf_res_reserve->reset();
+    sched.reset();
+    sched_need_reserve = true;
+
     if (!memory->handoff_prefill_migration(to_remote)) {
+        // The cache owner stayed where it was. Rebuild a scheduler for that
+        // owner so the caller can safely continue after a rejected handoff.
+        try {
+            sched_reserve();
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: graph reservation failed after rejected KV handoff: %s\n",
+                    __func__, e.what());
+            sched_need_reserve = true;
+            return LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED;
+        }
         return LLAMA_PREFILL_MIGRATION_OWNER_UNCHANGED;
     }
 
     cparams.local_attn_backend = next_backend;
-    if (gf_res_prev) gf_res_prev->reset();
-    if (gf_res_reserve) gf_res_reserve->reset();
-    sched_need_reserve = true;
+    // Drop only the old owner's per-migrated-layer buffers after all prior
+    // graph work has synchronized and before reserving workspace for the new
+    // attention placement. If reservation fails, the rollback re-allocates
+    // this owner and copies its KVarN payload back from the still-live target.
+    memory->release_prefill_migration_inactive_buffers();
     try {
         sched_reserve();
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: graph reservation failed after KV handoff: %s\n", __func__, e.what());
         cparams.local_attn_backend = current_backend;
+        if (gf_res_prev) gf_res_prev->reset();
+        if (gf_res_reserve) gf_res_reserve->reset();
+        sched.reset();
+        sched_need_reserve = true;
         if (!memory->handoff_prefill_migration(!to_remote)) {
             // The transfer failed before swapping cache tensors, so the target
             // remains authoritative. Keep backend selection aligned with it;
@@ -1816,9 +1844,7 @@ int32_t llama_context::prefill_migration_handoff(bool to_remote) {
             LLAMA_LOG_ERROR("%s: KV handoff rollback failed; retaining target backend as cache owner\n", __func__);
             return LLAMA_PREFILL_MIGRATION_SCHEDULER_FAILED;
         }
-        if (gf_res_prev) gf_res_prev->reset();
-        if (gf_res_reserve) gf_res_reserve->reset();
-        sched_need_reserve = true;
+        memory->release_prefill_migration_inactive_buffers();
         try {
             sched_reserve();
         } catch (const std::exception & rollback_error) {

@@ -5869,8 +5869,66 @@ static void test_meta_kvarn_zero_head_shard() {
     ggml_backend_free(backend);
 }
 
+static void test_backend_buffer_detach_and_reallocate_views() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "buffer reallocation: failed to create tensor context");
+
+    ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 16, 4);
+    ggml_tensor * view = ggml_view_2d(ctx, base, 8, 4, 8 * sizeof(int32_t), 4 * sizeof(int32_t));
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    require(buffer != nullptr, "buffer reallocation: failed initial tensor allocation");
+
+    std::vector<int32_t> values(64);
+    for (size_t i = 0; i < values.size(); ++i) values[i] = int32_t(i);
+    ggml_backend_tensor_set(base, values.data(), 0, values.size() * sizeof(int32_t));
+
+    const auto detach = [&]() {
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
+                tensor != nullptr; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            tensor->data = nullptr;
+            tensor->buffer = nullptr;
+        }
+    };
+    detach();
+    ggml_backend_buffer_free(buffer);
+
+    buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    require(buffer != nullptr, "buffer reallocation: failed to restore detached base/views");
+    require(view->data == (char *) base->data + view->view_offs,
+            "buffer reallocation: view was not rebound to the recreated base tensor");
+    for (size_t i = 0; i < values.size(); ++i) values[i] = int32_t(1000 + i);
+    ggml_backend_tensor_set(base, values.data(), 0, values.size() * sizeof(int32_t));
+
+    std::vector<int32_t> view_values(32);
+    ggml_backend_tensor_get(view, view_values.data(), 0, view_values.size() * sizeof(int32_t));
+    for (size_t i = 0; i < view_values.size(); ++i) {
+        if (view_values[i] != values[i + 4]) {
+            std::fprintf(stderr, "buffer reallocation mismatch index=%zu got=%d expected=%d view_offs=%zu\n",
+                    i, view_values[i], values[i + 4], view->view_offs);
+            require(false, "buffer reallocation: restored view has an invalid source or offset");
+        }
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    std::printf("test-kvarn: detached backend buffers reallocate base tensors and views OK\n");
+}
+
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_BUFFER_REALLOCATE_ONLY") != nullptr) {
+        test_backend_buffer_detach_and_reallocate_views();
+        return 0;
+    }
+
+    test_backend_buffer_detach_and_reallocate_views();
 
     if (std::getenv("GGML_KVARN_TEST_VULKAN_ATTN_OPT_ONLY") != nullptr ||
             std::getenv("GGML_KVARN_BENCH_VULKAN_ATTN") != nullptr) {

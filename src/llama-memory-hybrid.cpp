@@ -163,6 +163,10 @@ bool llama_memory_hybrid::handoff_prefill_migration(bool to_remote) {
     return mem_attn->handoff_prefill_migration(to_remote);
 }
 
+void llama_memory_hybrid::release_prefill_migration_inactive_buffers() noexcept {
+    mem_attn->release_prefill_migration_inactive_buffers();
+}
+
 bool llama_memory_hybrid::drain_prefill_migration() {
     return mem_attn->drain_prefill_migration();
 }

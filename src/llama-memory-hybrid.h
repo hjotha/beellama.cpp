@@ -70,6 +70,7 @@ public:
 
     bool supports_prefill_migration() const override;
     bool handoff_prefill_migration(bool to_remote) override;
+    void release_prefill_migration_inactive_buffers() noexcept override;
     bool drain_prefill_migration() override;
 
     bool get_can_shift() const override;
