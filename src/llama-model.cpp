@@ -2813,9 +2813,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     if (cparams.local_attn_backend) {
         const auto dev = ggml_backend_get_device(cparams.local_attn_backend);
         const int n_remote = cparams.remote_attn_layers;
-        attention_device = [this, dev, n_remote](int32_t il) {
+        const int32_t layer_begin = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+                (int32_t) hparams.n_layer() : 0;
+        attention_device = [this, dev, n_remote, layer_begin](int32_t il) {
             int full_idx = 0;
-            for (int32_t l = 0; l < il; ++l) {
+            for (int32_t l = layer_begin; l < il; ++l) {
                 if (hparams.has_kv(l) && !hparams.is_recr(l)) {
                     ++full_idx;
                 }
@@ -2824,9 +2826,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         };
         if (cparams.local_attn_migration && cparams.local_attn_migration_backend != nullptr) {
             const auto mirror_dev = ggml_backend_get_device(cparams.local_attn_migration_backend);
-            migration_device = [this, mirror_dev, n_remote](int32_t il) {
+            migration_device = [this, mirror_dev, n_remote, layer_begin](int32_t il) {
                 int full_idx = 0;
-                for (int32_t l = 0; l < il; ++l) {
+                for (int32_t l = layer_begin; l < il; ++l) {
                     if (hparams.has_kv(l) && !hparams.is_recr(l)) ++full_idx;
                 }
                 return full_idx < n_remote ? mirror_dev : nullptr;
@@ -3514,7 +3516,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter, reuse, params.kv_tail_tokens,
                                         kvarn_tail_type, params.kv_tail_tokens_requested,
-                                        params.kv_tail_rollback_tokens);
+                                        params.kv_tail_rollback_tokens, attention_device, migration_device);
                             }
                         }
                         } else {

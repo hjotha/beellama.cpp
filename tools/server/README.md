@@ -341,6 +341,15 @@ request uses the long context. The complete formatted prompt is counted even
 when a prompt-cache hit is available, and an explicit budget above the long
 context is rejected before a transition.
 
+`--remote-attn-min-context N` can keep a configured remote attention backend
+disabled in smaller adaptive profiles. It compares `N` with the active profile's
+context capacity, not the request's prompt length; configure the local profile
+through the desired prompt-plus-output limit and set the threshold just above
+that capacity. The option requires adaptive context and a configured
+local Vulkan `--remote-attn` backend. External `HOST:PORT` sessions are not
+eligible because adaptive profile changes create a new remote session. Adaptive
+context rejects external `HOST:PORT` backends even without this threshold.
+
 The first request starts in the short profile. A transition saves compatible
 slot state and checkpoints, destroys the active contexts, and releases the
 GPU-only MTP group only for a target-only profile. LONG can remain an MTP

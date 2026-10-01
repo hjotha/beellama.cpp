@@ -1337,3 +1337,154 @@ O objetivo é maximizar simultaneamente:
 Primeiro provar tudo com **IQ3_XXS**.
 
 Depois migrar para **IQ3_S** usando os números medidos para decidir exatamente quanto KV precisa ficar na 780M.
+
+---
+
+# 30. Qwen 3.8 IQ3_XXS: tier único 204.8K com cache incremental (2026-10-01)
+
+O uso esperado não é uma única prefill fria de 100–200K tokens. Em uma conversa
+ativa, o slot já contém o prefixo e cada turno acrescenta poucos tokens. Com
+`cache-prompt=true`, o servidor reutiliza o prefixo target; as novas queries
+ainda atendem ao histórico KV inteiro. Por isso, TPS fria e latência de sufixo
+cacheado precisam ser medidas separadamente.
+
+## MTP-owned KVarN no Vulkan
+
+O Qwen3.8 MTP mantém uma cache KVarN própria nas camadas `nextn`. O caminho
+KVarN Qwen MTP não recebia os callbacks de dispositivo que o caminho híbrido já
+usava. Mesmo com `remote-attn=vulkan:0`, ele alocava a cache MTP de 220,25 MiB
+na 4070 e falhava no fallback estático de 204.8K. O factory agora encaminha os
+callbacks de placement ao cache KVarN, e a faixa `n_layer..n_layer_all` participa
+da seleção e da estimativa de camadas MTP. Para local Vulkan, o contexto MTP usa
+`remote-attn-layers=auto` com prefill estático; o orçamento que sobra decide se
+a cache MTP fica na CUDA ou na Radeon. A prefill target e o catch-up MTP contam
+para o tempo de prefill.
+
+## Placement testado
+
+Com target `ctx=204800`, KVarN4, tail F16 4096, batch/ubatch 256, MTP N=2 e
+`remote-attn-cuda-reserve=1250M`, a migração completa calcula 3.780 MiB de KV
+target contra 455,2 MiB de orçamento CUDA e não é possível. A configuração
+final usa `remote-attn-prefill=remote` e `remote-attn-layers=auto`: o auto
+placement divide o KV por camada entre CUDA e Vulkan. No teste equivalente com
+migração habilitada, o fallback selecionou 15/16 camadas target na Radeon; a
+variante final sem tentativa de migração carregou e executou com o mesmo perfil
+de memória. O contexto MTP também selecionou `vulkan:0` quando a reserva CUDA
+não comportou sua camada KV.
+
+Essa divisão é por camada. No placement de 15/16, Q/K/V e FFN continuam no CUDA,
+15 das 16 atenções target usam a Radeon e uma camada target permanece no CUDA;
+o MTP usa a Radeon quando seu auto placement não encontra margem para ficar no
+CUDA. O mesmo placement vale para prefill incremental e decode. Não há uma
+atenção individual repartida entre os dois dispositivos, nem um handoff que
+coloque todas as camadas na Radeon após o prefill.
+
+## Medições de cache-hit
+
+Teste integrado com a cópia isolada do INI final, `cache-prompt=true`, 571
+tokens de prompt e até 64 tokens de saída:
+
+| Request | Prompt reutilizado | Prefill medido | Decode | MTP |
+| --- | ---: | ---: | ---: | ---: |
+| Frio | 0 | 195,09 tok/s (571 tokens) | 33,58 tok/s | 40/41 aceitos |
+| Prefixo repetido | 512 tokens; 59 novos | 100,37 tok/s (59 tokens) | 34,13 tok/s | 40/41 aceitos |
+
+O slot permaneceu vivo entre os requests. O log registra
+`target-only checkpoint restored; unmanaged MTP uses legacy draft catch-up`;
+esse caminho funcionou no smoke, mas ainda deve ser medido com um prefixo longo
+persistido em disco. Um teste frio que estendia o prompt de 571 para 7.648 tokens
+foi cancelado: após 3.840 tokens processados, o prefill acumulava 51,29 s e
+74,87 tok/s. Esse resultado descreve milhares de tokens novos e não representa
+um turno curto sobre um prefixo de 100K já residente.
+
+Os arquivos de slot encontrados nesta máquina chegam a 12.455 tokens; não há
+um slot de 100K disponível para medir a latência incremental nesse tamanho. A
+capacidade de 204.800 carregou sem OOM e o smoke MTP2 passou, mas decode e
+prefill com histórico realmente próximo de 100K/200K ainda não foram medidos.
+
+# 31. Placement remoto só acima do contexto local
+
+O perfil estático de 204.800K enviava 15/16 camadas target à Radeon desde o
+primeiro token; isso reduz o prefill até em prompts curtos. Para manter o
+prefill CUDA antes do limite, foi adicionado `--remote-attn-min-context N`:
+durante a seleção de um perfil adaptativo, o servidor guarda a rota Vulkan
+configurada, remove-a dos perfis menores que `N` e a restaura ao entrar num
+perfil de maior capacidade. A seleção do perfil continua usando prompt mais
+reserva de saída, e o cache de slots compatível é salvo antes da transição e
+restaurado depois. O perfil local fica em 106.496 tokens para cobrir um prompt
+de 102.400 mais a reserva padrão de 4.096 tokens; `--remote-attn-min-context 106497`
+mantém esse perfil sem backend local-split e ativa o split no perfil 204.800.
+Se uma requisição reservar mais de 4.096 tokens de saída, o limite local precisa
+cobrir essa reserva adicional. O parâmetro só aceita Vulkan local; adaptive
+context com `HOST:PORT` foi fechado porque uma troca de perfil abre uma nova
+sessão remota sem restaurar o KV daquela sessão.
+
+## Memória do perfil local
+
+Na RTX 4070, o perfil local KVarN4/4, tail F16 4096 e MTP2 falhou ao reservar
+448,88 MiB para o estado recorrente CUDA. KVarN3/3 com tail1024 também falhou
+ao reservar 87,20 MiB de buffers de compute. A combinação KVarN2/2, tail F16
+1024, batch/ubatch256 e MTP2 carregou com o perfil local 106.496 e deixou
+198 MiB livres; o teste não registrou desativação de CUDA graphs. Com a cauda
+2048, sobraram 127,62 MiB e o servidor desativou graphs por ficar abaixo do
+headroom configurado de128 MiB. Por isso, o INI candidato usa KVarN2/2 e
+tail1024. Essa redução de bits muda a precisão da cache e ainda precisa de uma
+avaliação de qualidade KLD/perplexidade antes de promover a configuração.
+
+## Medições locais e transição
+
+Com o perfil local 106.496, RTX 4070, KVarN2/2, tail1024, MTP2, prompt de
+2.850 tokens e geração de 32 tokens:
+
+| Request | Tokens reaproveitados | Prefill | Decode | MTP |
+| --- | ---: | ---: | ---: | ---: |
+| Frio | 0 | 769,53 tok/s | 58,01 tok/s | 20/20 aceitos, média 3,00 |
+| Repetido | 2.816; 34 novos | 495,29 ms para 34 novos | 44,09 tok/s | 15/30 aceitos, média 2,00 |
+
+Dois smoke PPL curtos em `ctx=2048`, b/ub256, tail1024 deram diferenças menores
+que a incerteza desses corpora:
+
+| Texto | KVarN4 PPL | KVarN2 PPL | Diferença |
+| --- | ---: | ---: | ---: |
+| `README.md`, 6 chunks | 5,9773 ± 0,19586 | 5,9984 ± 0,19664 | +0,0211 |
+| `docs/beellama-features.md`, 4 chunks | 11,1063 ± 0,50155 | 11,1828 ± 0,50639 | +0,0765 |
+
+Esses textos do repositório não substituem um corpus geral de avaliação, mas
+não mostraram uma queda mensurável acima do erro do próprio smoke.
+
+O cache-hit acima foi medido no mesmo perfil vivo. Um teste separado com
+Qwen3.5-4B, `ctx-checkpoints=1` e perfis de teste 512/1024 validou as duas
+trocas. O primeiro pedido fez 300 tokens no perfil local; o segundo fez 700 e
+cruzou o limiar. No perfil remoto estático, o log confirma 8/8 camadas target
+Vulkan e `snapshot restored`; 256 tokens vieram do prefixo e 444 foram
+reavaliados a partir do último checkpoint recorrente. No teste de migração, o
+servidor manteve o KV target na CUDA e escolheu uma camada Vulkan para decode;
+o snapshot também foi restaurado. Os testes usaram um contexto pequeno para
+validar o caminho de estado, não mediram latência perto de 100K.
+
+O mesmo teste de transição no Qwen3.8-27B usou perfis de teste 512/1024,
+KVarN2 explícito nos dois perfis e `ctx-checkpoints=1`. O prompt local de 300
+tokens rodou sem Vulkan; o prompt de 700 cruzou o limiar, restaurou o snapshot,
+reaproveitou 256 tokens e processou 444. O target usou Vulkan em 16/16 camadas,
+enquanto a MTP K/V permaneceu CUDA com a reserva de 650 MiB. A prefill desse
+sufixo foi 4.973 ms (89,28 tok/s) e decode 12,88 tok/s; são medições de smoke
+em contexto pequeno. Com o auto-placement real a 200K (13/16 target Vulkan e
+MTP local), um prompt curto mediu 31,75 tok/s de decode, não de histórico real
+de 200K.
+
+O perfil alto KVarN2/2, `ctx=204800`, Vulkan local e `remote-attn-layers=auto`
+carregou no Qwen3.8-27B. O target colocou 13/16 camadas na Radeon e 3/16 na
+4070; com a reserva MTP de 650 MiB, a camada MTP K/V ficou na CUDA. Depois de
+um smoke de decode, o relatório de memória mostrou 751 MiB livres na 4070. Ainda não há uma
+medição de prefill/decode com histórico real de 100K/200K: os arquivos de slot
+disponíveis chegam a 12.455 tokens. A produção continua parada. O INI atual é
+um candidato não promovido; a variante anterior KVarN4/4 foi preservada em
+`/home/hjotha/router-production.ini.backup-kvarn4-threshold-20261001`.
+
+Para não aplicar a reserva CUDA do target uma segunda vez à cache MTP, o
+contexto MTP local Vulkan agora limita sua própria reserva a 650 MiB. No teste
+KVarN2/2 a 200K, o target manteve a reserva de 1.250 MiB (3 camadas CUDA,
+13 Vulkan), enquanto a única camada K/V MTP coube na CUDA com 650 MiB de
+headroom. Um smoke de 570 tokens nesse perfil estático mediu 31,75 tok/s de
+decode, com 20/20 propostas MTP aceitas; esse número é decode de prompt curto,
+não de histórico real de 200K.

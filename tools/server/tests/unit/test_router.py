@@ -530,6 +530,12 @@ def test_router_unloaded_adaptive_model_advertises_widest_context(tmp_path):
         "cache-type-v-m = kvarn3\n"
         "ctx-size-xlong = 131072\n"
         "ctx-size-xxlong = 204800\n"
+        "cache-type-k-xxlong = kvarn2\n"
+        "cache-type-v-xxlong = kvarn2\n"
+        "spec-draft-type-k-xxlong = kvarn2\n"
+        "spec-draft-type-v-xxlong = kvarn2\n"
+        "remote-attn = vulkan:0\n"
+        "remote-attn-min-context = 106497\n"
         "load-on-startup = false\n",
         encoding="utf-8",
     )
@@ -545,6 +551,11 @@ def test_router_unloaded_adaptive_model_advertises_widest_context(tmp_path):
     assert advertised["adaptive-context"]["max_context_window"] == 204800
     data = {item["id"]: item for item in res.body.get("data", [])}
     args = data["adaptive-context"]["status"]["args"]
+    assert args[args.index("--remote-attn") + 1] == "vulkan:0"
+    assert args[args.index("--remote-attn-min-context") + 1] == "106497"
+    for option in ("--cache-type-k-xxlong", "--cache-type-v-xxlong",
+                   "--spec-draft-type-k-xxlong", "--spec-draft-type-v-xxlong"):
+        assert args[args.index(option) + 1] == "kvarn2"
     for option, value in {
         "--batch-size-short": "256",
         "--ubatch-size-short": "128",

@@ -804,6 +804,7 @@ struct common_params {
     std::string remote_attn_layers       = "auto";   // "auto" | "full" | integer N
     std::string remote_attn_prefill      = "remote"; // "remote" | "migrate" (CUDA prefill + mirrored KVarN handoff)
     bool        remote_attn_stats        = false;
+    int32_t     remote_attn_min_ctx_size = 0; // minimum adaptive profile context size before enabling remote attention
     size_t      remote_attn_cuda_reserve = 650 * 1024 * 1024; // 650 MiB default safety reserve (covers compute graph & allocator headroom)
 
     // KVarN is selected by its pseudo cache-type names in the argument parser.
@@ -1253,6 +1254,8 @@ common_context_budget common_context_budget_for_task(
         const common_params & params, int64_t prompt_tokens, int32_t request_n_predict, bool generates_output);
 common_context_profile common_context_profile_for_budget(
         const common_params & params, int64_t budget);
+bool common_context_remote_attn_enabled(const common_params & params, int32_t active_ctx_size);
+bool common_remote_attn_is_local_vulkan(const std::string & host);
 
 // Returns an empty string when valid. effective_long_ctx is optional when n_ctx is unset.
 std::string common_context_adaptive_error(

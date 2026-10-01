@@ -396,12 +396,17 @@ static ggml_backend_dev_t local_attention_device(const char * endpoint) {
     return ggml_backend_reg_dev_get(reg, index);
 }
 
-static bool selected_attention_layer(const llama_hparams & hparams, int32_t il, int count) {
-    if (il < 0 || il >= (int32_t) hparams.n_layer() || !hparams.has_kv(il) || hparams.is_recr(il)) {
+static bool selected_attention_layer(
+        const llama_hparams & hparams, int32_t il, int count,
+        llama_context_type ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT) {
+    const int32_t layer_begin = ctx_type == LLAMA_CONTEXT_TYPE_MTP ? (int32_t) hparams.n_layer() : 0;
+    const int32_t layer_end = ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+            (int32_t) hparams.n_layer_all : (int32_t) hparams.n_layer();
+    if (il < layer_begin || il >= layer_end || !hparams.has_kv(il) || hparams.is_recr(il)) {
         return false;
     }
     int index = 0;
-    for (int32_t l = 0; l < il; ++l) {
+    for (int32_t l = layer_begin; l < il; ++l) {
         if (hparams.has_kv(l) && !hparams.is_recr(l)) ++index;
     }
     return index < count;
@@ -607,7 +612,7 @@ llama_context::llama_context(
                     continue;
                 }
                 const int early_count = params.remote_attn_n_layers <= 0 ? INT32_MAX : params.remote_attn_n_layers;
-                auto * kv_dev = local_attn_dev && selected_attention_layer(hparams, il, early_count) ?
+                auto * kv_dev = local_attn_dev && selected_attention_layer(hparams, il, early_count, params.ctx_type) ?
                         local_attn_dev : model.dev_layer(il);
                 if (kv_tail_device_has_native_attention(cparams.offload_kqv ? kv_dev : nullptr)) {
                     any_native = true;
@@ -1122,8 +1127,12 @@ std::vector<ggml_backend_t> layer_backends;
         }
 
         if (cparams.remote_attn_enabled) {
+            const uint32_t attention_layer_begin = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+                    model.hparams.n_layer() : 0;
+            const uint32_t attention_layer_end = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+                    model.hparams.n_layer_all : model.hparams.n_layer();
             int n_full_attn = 0;
-            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
                 if (model.hparams.has_kv(il) && !model.hparams.is_recr(il)) {
                     ++n_full_attn;
                 }
@@ -1142,7 +1151,7 @@ std::vector<ggml_backend_t> layer_backends;
                 // Account for recurrent state (RS cache) that will be allocated on CUDA for hybrid architectures
                 size_t recr_bytes = 0;
                 const uint32_t n_rs_rows = std::max((uint32_t) 1, cparams.n_seq_max) * (1 + cparams.n_rs_seq);
-                for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
                     if (model.hparams.is_recr(il) && cparams.offload_rs) {
                         recr_bytes += (model.hparams.n_embd_r() + model.hparams.n_embd_s()) * sizeof(float) * n_rs_rows;
                         if (model.hparams.ple_conv_state() > 0 && model.hparams.is_ple(il)) {
@@ -1170,7 +1179,7 @@ std::vector<ggml_backend_t> layer_backends;
                 const ggml_type exact_tail_type = cparams.kv_tail_type != GGML_TYPE_COUNT ?
                     cparams.kv_tail_type : (use_kvarn ? GGML_TYPE_F16 : GGML_TYPE_BF16);
 
-                for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
                     if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
                         continue;
                     }
@@ -1261,6 +1270,12 @@ std::vector<ggml_backend_t> layer_backends;
                 n_remote = params.remote_attn_n_layers;
             }
             cparams.remote_attn_layers = n_remote;
+            if (local_attn_dev != nullptr) {
+                LLAMA_LOG_INFO("%s: local attention placement: context=%s Vulkan-layers=%d/%d mode=%s\n",
+                        __func__, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "MTP" : "target",
+                        n_remote, n_full_attn,
+                        cparams.local_attn_migration ? "CUDA-prefill/mirrored" : "static-split");
+            }
             if (cparams.local_attn_migration && n_remote <= 0) {
                 throw std::invalid_argument(
                     "--remote-attn-prefill=migrate requires at least one full-attention layer for Vulkan decode");
@@ -1565,7 +1580,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
             if (probe.op == LLM_FUSED_OP_FLASH_ATTN && cparams.local_attn_backend &&
-                    selected_attention_layer(model.hparams, node.il, cparams.remote_attn_layers)) {
+                    selected_attention_layer(model.hparams, node.il, cparams.remote_attn_layers, cparams.ctx_type)) {
                 device_layer = ggml_backend_get_device(cparams.local_attn_backend);
             }
 
@@ -5983,7 +5998,8 @@ const llama_kvarn_context_route route = llama_kvarn_context_route_for({
                     return nullptr;
                 }
                 const int early_count = params.remote_attn_n_layers <= 0 ? INT32_MAX : params.remote_attn_n_layers;
-                auto * kv_dev = requested_local && selected_attention_layer(model->hparams, il, early_count) ?
+                auto * kv_dev = requested_local && selected_attention_layer(
+                        model->hparams, il, early_count, params.ctx_type) ?
                         requested_local : model->dev_layer(il);
                 auto * kvarn_dev = params.offload_kqv ? kv_dev : nullptr;
                 backend_ops_supported = backend_ops_supported &&

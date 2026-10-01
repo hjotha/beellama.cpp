@@ -2575,7 +2575,32 @@ common_context_profile common_context_profile_for_budget(
     return COMMON_CONTEXT_PROFILE_LONG;
 }
 
+bool common_context_remote_attn_enabled(const common_params & params, int32_t active_ctx_size) {
+    return params.remote_attn_min_ctx_size <= 0 || active_ctx_size >= params.remote_attn_min_ctx_size;
+}
+
+bool common_remote_attn_is_local_vulkan(const std::string & host) {
+    return host == "local" || host == "vulkan" ||
+        host.rfind("vulkan:", 0) == 0 || host.rfind("local:", 0) == 0;
+}
+
 std::string common_context_adaptive_error(const common_params & params, int32_t effective_long_ctx) {
+    if (params.remote_attn_min_ctx_size < 0) {
+        return "--remote-attn-min-context must be non-negative";
+    }
+    if (params.remote_attn_min_ctx_size > 0 && params.remote_attn_host.empty()) {
+        return "--remote-attn-min-context requires --remote-attn";
+    }
+    if (params.remote_attn_min_ctx_size > 0 && !common_remote_attn_is_local_vulkan(params.remote_attn_host)) {
+        return "--remote-attn-min-context requires a local Vulkan --remote-attn backend";
+    }
+    if (params.remote_attn_min_ctx_size > 0 && !common_context_is_adaptive(params)) {
+        return "--remote-attn-min-context requires adaptive context";
+    }
+    if (common_context_is_adaptive(params) && !params.remote_attn_host.empty() &&
+            !common_remote_attn_is_local_vulkan(params.remote_attn_host)) {
+        return "adaptive context does not support external --remote-attn HOST:PORT sessions";
+    }
     if (params.ctx_size_mtp < 0) {
         return "--ctx-size-mtp must be non-negative";
     }
@@ -2696,6 +2721,12 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
         if (prev_ceiling > 0 && xxlong_limit < prev_ceiling) {
             return "--xxlong-max-tokens must not be smaller than the preceding context size";
         }
+    }
+    const int32_t max_adaptive_ctx = params.ctx_size_xxlong > 0 ? params.ctx_size_xxlong :
+        (params.ctx_size_xlong > 0 ? params.ctx_size_xlong : (int32_t) long_ctx);
+    if (params.remote_attn_min_ctx_size > 0 && max_adaptive_ctx > 0 &&
+            params.remote_attn_min_ctx_size > max_adaptive_ctx) {
+        return "--remote-attn-min-context exceeds the maximum adaptive context size";
     }
     if (params.n_parallel > 1) {
         return "adaptive context requires --parallel 1";

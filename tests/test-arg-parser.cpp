@@ -707,6 +707,15 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(common_context_profile_for_budget(adaptive, 499) == COMMON_CONTEXT_PROFILE_MTP);
         assert(common_context_profile_for_budget(adaptive, 500) == COMMON_CONTEXT_PROFILE_MTP);
         assert(common_context_profile_for_budget(adaptive, 501) == COMMON_CONTEXT_PROFILE_LONG);
+        common_params threshold_profile = adaptive;
+        threshold_profile.remote_attn_host = "vulkan:0";
+        threshold_profile.remote_attn_min_ctx_size = 102401;
+        threshold_profile.ctx_size_xxlong = 204800;
+        threshold_profile.xxlong_max_tokens = 204800;
+        assert(!common_context_remote_attn_enabled(threshold_profile, 102400));
+        assert(common_context_remote_attn_enabled(threshold_profile, 102401));
+        assert(common_context_remote_attn_enabled(threshold_profile, 204800));
+        assert(common_context_adaptive_error(threshold_profile).empty());
         assert(common_context_output_reserve(adaptive, 0, true) == 0);
         assert(common_context_output_reserve(adaptive, -1, false) == 0);
         assert(common_context_output_reserve(adaptive, 7, true) == 7);
@@ -1034,7 +1043,11 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
             return value;
         };
         auto expect_error = [&](const common_params & value, const char * expected) {
-            assert(common_context_adaptive_error(value) == expected);
+            const std::string actual = common_context_adaptive_error(value);
+            if (actual != expected) {
+                fprintf(stderr, "expected adaptive error [%s], got [%s]\n", expected, actual.c_str());
+            }
+            assert(actual == expected);
         };
 
         common_params disabled;
@@ -1049,6 +1062,9 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         disabled.ctx_size_mtp_short = 0;
         disabled.mtp_short_max_tokens = 200;
         expect_error(disabled, "--mtp-short-max-tokens requires --ctx-size-mtp-short");
+        disabled.remote_attn_host = "vulkan:0";
+        disabled.remote_attn_min_ctx_size = 1;
+        expect_error(disabled, "--remote-attn-min-context requires adaptive context");
 
         auto adaptive = make_adaptive();
         adaptive.split_mtp_weights = false;
@@ -1059,6 +1075,32 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         adaptive = make_adaptive();
         adaptive.mtp_max_tokens = -1;
         expect_error(adaptive, "--mtp-max-tokens must be non-negative");
+        adaptive.remote_attn_host = "vulkan:0";
+        adaptive.remote_attn_min_ctx_size = -1;
+        expect_error(adaptive, "--remote-attn-min-context must be non-negative");
+        adaptive = make_adaptive();
+        adaptive.remote_attn_min_ctx_size = 10;
+        expect_error(adaptive, "--remote-attn-min-context requires --remote-attn");
+        adaptive = make_adaptive();
+        adaptive.remote_attn_host = "127.0.0.1";
+        adaptive.remote_attn_min_ctx_size = 10;
+        expect_error(adaptive, "--remote-attn-min-context requires a local Vulkan --remote-attn backend");
+        adaptive = make_adaptive();
+        adaptive.remote_attn_host = "127.0.0.1";
+        expect_error(adaptive, "adaptive context does not support external --remote-attn HOST:PORT sessions");
+        adaptive = make_adaptive();
+        adaptive.remote_attn_host = "vulkan:0";
+        adaptive.remote_attn_min_ctx_size = 1001;
+        expect_error(adaptive, "--remote-attn-min-context exceeds the maximum adaptive context size");
+        adaptive = make_adaptive();
+        adaptive.n_ctx = 0; // model training context resolves the long ceiling after load
+        adaptive.remote_attn_host = "vulkan:0";
+        adaptive.remote_attn_min_ctx_size = 500;
+        assert(common_context_adaptive_error(adaptive).empty());
+        assert(common_context_adaptive_error(adaptive, 1024).empty());
+        adaptive.remote_attn_min_ctx_size = 1025;
+        assert(common_context_adaptive_error(adaptive, 1024) ==
+               "--remote-attn-min-context exceeds the maximum adaptive context size");
         adaptive = make_adaptive();
         adaptive.mtp_max_tokens = 601;
         expect_error(adaptive, "--mtp-max-tokens must satisfy 0 < limit <= --ctx-size-mtp");
@@ -1173,6 +1215,31 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
 
         argv = {"binary_name", "--mtp-max-tokens", "-1"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
+
+        common_params parse_remote_threshold;
+        argv = {
+            "binary_name", "--ctx-size", "106496", "--ctx-size-mtp", "106496",
+            "--mtp-max-tokens", "106496", "--ctx-size-xxlong", "204800",
+            "--xxlong-max-tokens", "204800", "--remote-attn", "vulkan:0",
+            "--cache-type-k-xxlong", "kvarn2", "--cache-type-v-xxlong", "kvarn2",
+            "--spec-draft-type-k-xxlong", "kvarn2", "--spec-draft-type-v-xxlong", "kvarn2",
+            "--remote-attn-min-context", "106497", "--fit", "off", "--parallel", "1",
+            "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(), parse_remote_threshold, LLAMA_EXAMPLE_SERVER));
+        assert(parse_remote_threshold.remote_attn_min_ctx_size == 106497);
+        assert(parse_remote_threshold.cache_kvarn_bits_k_xxlong == 2);
+        assert(parse_remote_threshold.cache_kvarn_bits_v_xxlong == 2);
+        assert(parse_remote_threshold.spec_draft_kvarn_bits_k_xxlong == 2);
+        assert(parse_remote_threshold.spec_draft_kvarn_bits_v_xxlong == 2);
+        assert(common_context_profile_for_budget(parse_remote_threshold, 106496) == COMMON_CONTEXT_PROFILE_MTP);
+        assert(common_context_profile_for_budget(parse_remote_threshold, 106497) == COMMON_CONTEXT_PROFILE_XXLONG);
+        assert(common_context_remote_attn_enabled(parse_remote_threshold, 106496) == false);
+        assert(common_context_remote_attn_enabled(parse_remote_threshold, 204800) == true);
+
+        argv = {"binary_name", "--remote-attn-min-context", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_remote_threshold, LLAMA_EXAMPLE_SERVER));
 
         common_params parse_external_draft;
         argv = {"binary_name", "--model", "model.gguf", "--ctx-size", "1000", "--ctx-size-mtp", "600",
@@ -1636,6 +1703,24 @@ static void test_draft_cache_configuration_is_independent() {
         assert(draft.kv_tail_tokens == "0");
         assert(draft.kv_tail_type == GGML_TYPE_F16);
     }
+
+    independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    independent.remote_attn_cuda_reserve = 1250 * 1024 * 1024;
+    for (const char * endpoint : { "local", "vulkan", "vulkan:0", "local:0" }) {
+        independent.remote_attn_host = endpoint;
+        draft = common_base_params_to_speculative(independent);
+        assert(draft.remote_attn_host == endpoint);
+        assert(draft.remote_attn_layers == "auto");
+        assert(draft.remote_attn_prefill == "remote");
+        assert(draft.remote_attn_cuda_reserve == 650 * 1024 * 1024);
+    }
+    independent.remote_attn_cuda_reserve = 300 * 1024 * 1024;
+    draft = common_base_params_to_speculative(independent);
+    assert(draft.remote_attn_cuda_reserve == 300 * 1024 * 1024);
+    independent.remote_attn_host = "127.0.0.1";
+    independent.remote_attn_cuda_reserve = 1250 * 1024 * 1024;
+    draft = common_base_params_to_speculative(independent);
+    assert(draft.remote_attn_host.empty());
 
     independent.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };
     draft = common_base_params_to_speculative(independent);

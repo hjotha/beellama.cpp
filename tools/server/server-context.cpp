@@ -3268,6 +3268,9 @@ private:
     }
 
     int64_t t_last_load_progress_ms = 0;
+    std::string adaptive_remote_attn_host;
+    uint16_t adaptive_remote_attn_port = 0;
+    std::string adaptive_remote_attn_prefill = "remote";
 
     int32_t adaptive_draft_n_for_profile(common_context_profile profile) const {
         switch (profile) {
@@ -3336,6 +3339,17 @@ private:
             params_base.kvarn = adaptive_kvarn_xxlong;
             params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_xxlong;
             params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_xxlong;
+        }
+        if (params_base.remote_attn_min_ctx_size > 0) {
+            const bool enable_remote_attn = common_context_remote_attn_enabled(params_base, params_base.n_ctx);
+            params_base.remote_attn_host = enable_remote_attn ? adaptive_remote_attn_host : "";
+            params_base.remote_attn_port = enable_remote_attn ? adaptive_remote_attn_port : 0;
+            params_base.remote_attn_prefill = enable_remote_attn ? adaptive_remote_attn_prefill : "remote";
+            SRV_INF("adaptive remote attention: profile=%s, ctx=%d, threshold=%d, backend=%s, prefill=%s\n",
+                    adaptive_status_profile_name((int) profile).c_str(), params_base.n_ctx,
+                    params_base.remote_attn_min_ctx_size,
+                    enable_remote_attn ? params_base.remote_attn_host.c_str() : "off",
+                    params_base.remote_attn_prefill.c_str());
         }
         const adaptive_spec_draft_kv * draft_kv = nullptr;
         switch (profile) {
@@ -4442,6 +4456,15 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        const bool is_resume = sleeping;
+        if (is_resume && params.remote_attn_min_ctx_size > 0) {
+            // params_base holds the active profile's route, which is intentionally
+            // empty in low-context profiles. Rehydrate the configured route before
+            // validation; apply_profile_params will disable it again if needed.
+            params.remote_attn_host = adaptive_remote_attn_host;
+            params.remote_attn_port = adaptive_remote_attn_port;
+            params.remote_attn_prefill = adaptive_remote_attn_prefill;
+        }
         if (const std::string error = common_context_adaptive_normalize(params); !error.empty()) {
             SRV_ERR("invalid adaptive context configuration: %s\n", error.c_str());
             return false;
@@ -4455,7 +4478,6 @@ private:
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
-        const bool is_resume = sleeping;
         const bool adaptive = common_context_is_adaptive(params);
         const int32_t requested_long_ctx = adaptive_long_ctx > 0 ? adaptive_long_ctx : params.n_ctx;
 
@@ -4473,6 +4495,11 @@ private:
         }
 
         params_base = params;
+        if (!is_resume) {
+            adaptive_remote_attn_host = params.remote_attn_host;
+            adaptive_remote_attn_port = params.remote_attn_port;
+            adaptive_remote_attn_prefill = params.remote_attn_prefill;
+        }
         if (!common_speculative_resolve_dflash_draft_n_max(
                     params_base.speculative,
                     params_base.speculative.draft.mparams.path)) {
@@ -4732,7 +4759,9 @@ private:
             SRV_ERR("%s", "adaptive context requires a positive long context size\n");
             return false;
         }
-        if (const std::string error = common_context_adaptive_error(params_base, adaptive_long_ctx); !error.empty()) {
+        // Validate the original shared options: params_base may already have
+        // the low-context remote backend disabled by apply_profile_params().
+        if (const std::string error = common_context_adaptive_error(params, adaptive_long_ctx); !error.empty()) {
             SRV_ERR("invalid effective adaptive context configuration: %s\n", error.c_str());
             return false;
         }

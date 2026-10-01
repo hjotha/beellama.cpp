@@ -5380,6 +5380,9 @@ void common_validate_draft_kvarn_mode(const common_params_speculative & params) 
 
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool local_vulkan_attention = common_remote_attn_is_local_vulkan(params.remote_attn_host);
 
     common_validate_draft_kvarn_mode(params.speculative);
 
@@ -5391,9 +5394,20 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.remote_attn_host.clear();
     result.remote_attn_port = 0;
     result.remote_attn_layers = "0";
-    // Prefill migration belongs to the target cache only. The auxiliary MTP
-    // context owns its nextn-layer KV and must not inherit the migration mode.
+    // A local Vulkan MTP cache is independent of the target cache and can live
+    // on the same device. This keeps its full-context K/V allocation off CUDA;
+    // prefill migration itself remains target-only.
     result.remote_attn_prefill = "remote";
+    if (spec_mtp && local_vulkan_attention) {
+        result.remote_attn_host = params.remote_attn_host;
+        result.remote_attn_layers = "auto";
+        // The target context has already applied its reserve while placing its
+        // own KV. Reapplying the full target reserve to MTP can force even its
+        // single nextn-layer cache onto Vulkan. Keep the standard 650 MiB graph
+        // headroom for this second context instead.
+        constexpr size_t mtp_cuda_reserve = 650 * 1024 * 1024;
+        result.remote_attn_cuda_reserve = std::min(params.remote_attn_cuda_reserve, mtp_cuda_reserve);
+    }
 
     if (has_draft) {
         // default to global devices value
@@ -5533,6 +5547,10 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        LOG_INF("MTP K/V placement: local_attention=%s, layers=%s, prefill=%s, cuda_reserve=%.0f MiB\n",
+                params_dft.remote_attn_host.empty() ? "off" : params_dft.remote_attn_host.c_str(),
+                params_dft.remote_attn_layers.c_str(), params_dft.remote_attn_prefill.c_str(),
+                params_dft.remote_attn_cuda_reserve / 1024.0 / 1024.0);
     }
 
     // the draft context holds as many tokens per sequence as the target context

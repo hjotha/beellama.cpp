@@ -3662,6 +3662,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN"));
     add_opt(common_arg(
+        {"--remote-attn-min-context"}, "N",
+        "minimum adaptive profile context size before enabling remote attention (default: 0, always enabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--remote-attn-min-context must be non-negative");
+            }
+            params.remote_attn_min_ctx_size = value;
+        }
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_MIN_CONTEXT"));
+    add_opt(common_arg(
         {"--remote-attn-layers"}, "SET",
         "which attention layers to offload: 'auto' (automatic VRAM-based placement),\n"
         "'full' (all full-attn layers), or an integer N (first N full-attn layers) (default: auto)",
