@@ -519,6 +519,11 @@ extern "C" {
         int          remote_attn_stats;
         int          remote_attn_n_layers;     // -1 = auto, 0 = all full-attention layers, >0 = first N full-attention layers
         size_t       remote_attn_cuda_reserve; // CUDA VRAM safety reserve in bytes for auto-placement (default: 350 MiB)
+        size_t       remote_attn_vulkan_reserve; // Vulkan compute/workspace reserve for mixed-cache placement (default: 512 MiB)
+        // Optional per-layer K/V formats for locally remote-attended Vulkan
+        // layers. GGML_TYPE_COUNT keeps the existing global cache behavior.
+        enum ggml_type remote_attn_cache_type_k;
+        enum ggml_type remote_attn_cache_type_v;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -592,6 +597,26 @@ extern "C" {
         // Keep recurrent state in host RAM even when attention K/V is offloaded.
         // Appended to preserve offsets of the existing public context parameters.
         bool no_offload_rs;
+
+        // Planned draft-MTP KV reservation contract (internal; no user CLI
+        // flags). The target mixed auto-placement planner reserves the
+        // independent draft-MTP cache explicitly - with the DRAFT cache
+        // representation (KVarN bits or standard types), the resolved target
+        // capacity (cparams.n_ctx_seq at runtime; the MTP context overrides
+        // n_ctx to llama_n_ctx(target)) and the MTP tail policy (init forces
+        // tail 0 / F16; KVarN keeps its intrinsic 128-token tail) - instead
+        // of guessing the target format for every model that merely has an
+        // MTP head (phantom reservation). The full set of model MTP
+        // full-attention layers is reserved. Active only when a real
+        // draft-MTP context with n_max > 0 is present in the resolved
+        // speculative profile; the plain C API default keeps it inactive, so
+        // no phantom MTP reservation.
+        bool    mtp_reserve_enabled;
+        enum llama_kvarn_type mtp_reserve_kvarn; // LLAMA_KVARN_TYPE_DISABLED -> standard cache types
+        uint32_t mtp_reserve_kvarn_bits;     // packed key_bits | (value_bits << 16); 0 = derive from mtp_reserve_kvarn; nonzero must match the type
+        enum ggml_type mtp_reserve_type_k;   // standard K type when kvarn disabled
+        enum ggml_type mtp_reserve_type_v;   // standard V type when kvarn disabled
+        uint32_t mtp_reserve_rollback_tokens; // resolved draft KV tail rollback depth (max(n_rs_seq, kv_tail_rollback_tokens), KVarN minimum 1)
     };
 
     struct llama_model_tensor_override {

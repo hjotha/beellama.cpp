@@ -15,6 +15,7 @@
 #include <vector>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <unordered_set>
 #include <vector>
 
@@ -162,10 +163,14 @@ static void test(void) {
         common_params base;
         base.n_parallel = 4;
         base.n_outputs_max_per_seq = 8;
+        base.remote_attn_cache_type_k = GGML_TYPE_Q4_0;
+        base.remote_attn_cache_type_v = GGML_TYPE_Q8_0;
 
         const auto draft = common_base_params_to_speculative(base);
         assert(draft.n_outputs_max == 4);
         assert(draft.n_outputs_max_per_seq == 1);
+        assert(draft.remote_attn_cache_type_k == GGML_TYPE_COUNT);
+        assert(draft.remote_attn_cache_type_v == GGML_TYPE_COUNT);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -415,6 +420,127 @@ params = common_params();
 
     const llama_context_params context_defaults = llama_context_default_params();
     assert(context_defaults.kv_tail_type == GGML_TYPE_COUNT);
+    assert(context_defaults.remote_attn_cache_type_k == GGML_TYPE_COUNT);
+    assert(context_defaults.remote_attn_cache_type_v == GGML_TYPE_COUNT);
+    assert(context_defaults.remote_attn_vulkan_reserve == 512u * 1024u * 1024u);
+
+    {
+        const std::vector<std::pair<const char *, ggml_type>> supported_remote_types = {
+            { "q4_0", GGML_TYPE_Q4_0 },
+            { "q5_0", GGML_TYPE_Q5_0 },
+            { "q6_0", GGML_TYPE_Q6_0 },
+            { "q8_0", GGML_TYPE_Q8_0 },
+        };
+        for (const auto & [name, type] : supported_remote_types) {
+            common_params mixed;
+            std::vector<std::string> mixed_argv = {
+                "binary_name", "-m", "model_file.gguf",
+                "--cache-type-k", "kvarn4", "--cache-type-v", "kvarn4",
+                "--remote-attn", "vulkan:0",
+                "--remote-attn-cache-type-k", name,
+                "--remote-attn-cache-type-v", name,
+                "--remote-attn-vulkan-reserve", "640M",
+            };
+            assert(common_params_parse(
+                    mixed_argv.size(), list_str_to_char(mixed_argv).data(), mixed, LLAMA_EXAMPLE_SERVER));
+            mixed.n_parallel = 1;
+            const auto context = common_context_params_to_llama(mixed);
+            assert(context.remote_attn_cache_type_k == type);
+            assert(context.remote_attn_cache_type_v == type);
+            assert(context.remote_attn_vulkan_reserve == 640u * 1024u * 1024u);
+        }
+
+        auto invalid_mixed_context = [](common_params & mixed) {
+            try {
+                (void) common_context_params_to_llama(mixed);
+                return false;
+            } catch (const std::invalid_argument &) {
+                return true;
+            }
+        };
+
+        common_params missing_v;
+        std::vector<std::string> missing_v_argv = {
+            "binary_name", "-m", "model_file.gguf",
+            "--remote-attn-cache-type-k", "q4_0",
+        };
+        assert(common_params_parse(
+                missing_v_argv.size(), list_str_to_char(missing_v_argv).data(), missing_v,
+                LLAMA_EXAMPLE_SERVER));
+        assert(invalid_mixed_context(missing_v));
+
+        common_params no_kvarn;
+        std::vector<std::string> no_kvarn_argv = {
+            "binary_name", "-m", "model_file.gguf",
+            "--remote-attn", "vulkan:0",
+            "--remote-attn-cache-type-k", "q4_0",
+            "--remote-attn-cache-type-v", "q4_0",
+        };
+        assert(common_params_parse(
+                no_kvarn_argv.size(), list_str_to_char(no_kvarn_argv).data(), no_kvarn,
+                LLAMA_EXAMPLE_SERVER));
+        no_kvarn.n_parallel = 1;
+        assert(invalid_mixed_context(no_kvarn));
+
+        common_params remote_endpoint;
+        std::vector<std::string> remote_endpoint_argv = {
+            "binary_name", "-m", "model_file.gguf",
+            "--cache-type-k", "kvarn4", "--cache-type-v", "kvarn4",
+            "--remote-attn", "127.0.0.1:18090",
+            "--remote-attn-cache-type-k", "q4_0",
+            "--remote-attn-cache-type-v", "q4_0",
+        };
+        assert(common_params_parse(
+                remote_endpoint_argv.size(), list_str_to_char(remote_endpoint_argv).data(), remote_endpoint,
+                LLAMA_EXAMPLE_SERVER));
+        remote_endpoint.n_parallel = 1;
+        assert(invalid_mixed_context(remote_endpoint));
+
+        common_params extra_tail;
+        std::vector<std::string> extra_tail_argv = {
+            "binary_name", "-m", "model_file.gguf",
+            "--cache-type-k", "kvarn4", "--cache-type-v", "kvarn4",
+            "--remote-attn", "vulkan:0",
+            "--remote-attn-cache-type-k", "q4_0",
+            "--remote-attn-cache-type-v", "q4_0",
+            "--kv-tail-tokens", "1",
+        };
+        assert(common_params_parse(
+                extra_tail_argv.size(), list_str_to_char(extra_tail_argv).data(), extra_tail,
+                LLAMA_EXAMPLE_SERVER));
+        extra_tail.n_parallel = 1;
+        assert(invalid_mixed_context(extra_tail));
+
+        common_params flash_off;
+        std::vector<std::string> flash_off_argv = {
+            "binary_name", "-m", "model_file.gguf",
+            "--cache-type-k", "kvarn4", "--cache-type-v", "kvarn4",
+            "--remote-attn", "vulkan:0",
+            "--remote-attn-cache-type-k", "q4_0",
+            "--remote-attn-cache-type-v", "q4_0",
+            "--flash-attn", "off",
+        };
+        assert(common_params_parse(
+                flash_off_argv.size(), list_str_to_char(flash_off_argv).data(), flash_off,
+                LLAMA_EXAMPLE_SERVER));
+        flash_off.n_parallel = 1;
+        assert(invalid_mixed_context(flash_off));
+
+        common_params no_kv_offload;
+        std::vector<std::string> no_kv_offload_argv = {
+            "binary_name", "-m", "model_file.gguf",
+            "--cache-type-k", "kvarn4", "--cache-type-v", "kvarn4",
+            "--remote-attn", "vulkan:0",
+            "--remote-attn-cache-type-k", "q4_0",
+            "--remote-attn-cache-type-v", "q4_0",
+            "--no-kv-offload",
+        };
+        assert(common_params_parse(
+                no_kv_offload_argv.size(), list_str_to_char(no_kv_offload_argv).data(), no_kv_offload,
+                LLAMA_EXAMPLE_SERVER));
+        no_kv_offload.n_parallel = 1;
+        assert(invalid_mixed_context(no_kv_offload));
+    }
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",

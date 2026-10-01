@@ -24,6 +24,15 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache.cpp
     llama-kvarn.cpp
     llama-kv-cache-kvarn.cpp
+    llama-kv-qx-convert.cpp
+    llama-kv-kvarn-materializer.cpp
+    llama-kv-mixed-handoff.cpp
+    llama-kv-cache-kvarn-handoff.cpp
+    llama-kv-mixed-placement.cpp
+    llama-kv-mixed-mtp-budget.cpp
+    llama-kv-mixed-state.cpp
+    llama-kv-mixed-state-stream.cpp
+    llama-kv-mixed-io.cpp
     llama-kv-cache-tail.cpp
     llama-kv-tail-request.cpp
     llama-kv-cache-placement.cpp

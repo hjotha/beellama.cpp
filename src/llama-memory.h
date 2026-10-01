@@ -37,6 +37,11 @@ struct llama_memory_params {
     // fork-specific structured KVarN cache; disabled leaves upstream memory selection unchanged
     llama_kvarn_params kvarn;
 
+    // Optional standard K/V format for selected native local-split attention
+    // layers. GGML_TYPE_COUNT leaves the existing representation unchanged.
+    ggml_type remote_attn_cache_type_k = GGML_TYPE_COUNT;
+    ggml_type remote_attn_cache_type_v = GGML_TYPE_COUNT;
+
     uint32_t  kv_tail_tokens;
     uint32_t  kv_tail_tokens_swa;
     uint32_t  kv_tail_tokens_requested;

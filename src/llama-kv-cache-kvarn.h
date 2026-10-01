@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -14,11 +16,64 @@ struct llama_model;
 struct llama_state_q4_source;
 struct llama_state_q4_info;
 
+struct llama_kv_cache_standard_layer_layout {
+    uint32_t layer_id = 0;
+    ggml_type type_k = GGML_TYPE_COUNT;
+    ggml_type type_v = GGML_TYPE_COUNT;
+    uint32_t rotation_k = 0;
+    uint32_t rotation_v = 0;
+    bool v_transposed = false;
+    uint32_t head_dim_k = 0;
+    uint32_t head_dim_v = 0;
+    uint32_t n_head_kv = 0;
+    uint64_t row_stride_k = 0;
+    uint64_t row_stride_v = 0;
+    std::string device;
+};
+
+struct llama_kv_cache_kvarn_layer_layout {
+    uint32_t layer_id = 0;
+    uint16_t kvarn_type = 0;
+    uint8_t key_bits = 0;
+    uint8_t value_bits = 0;
+    uint32_t record_dim_k = 0;
+    uint32_t record_dim_v = 0;
+    uint32_t head_dim_k = 0;
+    uint32_t head_dim_v = 0;
+    uint32_t head_slices_k = 0;
+    uint32_t head_slices_v = 0;
+    uint32_t n_head_kv = 0;
+    uint64_t record_stride_k = 0;
+    uint64_t record_stride_v = 0;
+    ggml_type tail_type = GGML_TYPE_COUNT;
+};
+
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev, int head_dim);
 bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev);
 uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev);
+
+// Additive handoff accessor (one-way pure->mixed prefix reuse). Exposes the
+// authoritative per-layer compressed tensors and geometry for stream 0
+// without exposing the private layer struct. Non-virtual; implemented in
+// llama-kv-cache-kvarn-handoff.cpp.
+struct llama_kvarn_handoff_layer_view {
+    uint32_t il = 0;
+    uint32_t n_head_kv = 0;
+    uint32_t head_dim_k = 0;
+    uint32_t head_dim_v = 0;
+    uint32_t k_slices = 0;
+    uint32_t v_slices = 0;
+    uint32_t record_dim_k = 0;
+    uint32_t record_dim_v = 0;
+    ggml_tensor * k_records = nullptr; // stream 0 (single-stream handoff)
+    ggml_tensor * v_records = nullptr;
+    ggml_tensor * k_stage = nullptr;
+    ggml_tensor * v_stage = nullptr;
+    ggml_tensor * k_tail = nullptr;
+    ggml_tensor * v_tail = nullptr;
+};
 
 struct llama_kvarn_tail_policy {
     uint32_t raw_requested_tokens;
@@ -118,11 +173,13 @@ public:
     uint32_t get_tail_slots() const override;
     ggml_type get_tail_type() const override;
     uint32_t get_tail_tokens() const override;
+    uint32_t get_tail_tokens(int32_t il) const override;
     uint32_t get_tail_arena_stride() const override;
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const override;
     uint32_t get_tail_body_execution_stride() const override;
     uint32_t get_tail_body_execution_rows(int32_t il) const override;
     bool has_compact_tail() const override;
+    bool has_compact_tail(int32_t il) const override;
     bool has_kv_body() const override;
     bool has_kv_body(int32_t il) const override;
     bool has_tail_current(int32_t il) const override;
@@ -138,6 +195,9 @@ public:
     ggml_tensor * get_k_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
     ggml_tensor * get_v_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
     bool uses_native_attention(int32_t il) const;
+    bool uses_kvarn_layer(int32_t il) const;
+    bool uses_standard_layer(int32_t il) const;
+    bool has_standard_cache() const;
     bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
@@ -147,6 +207,7 @@ public:
     // SWA sliding-window ring: per-cell absolute positions for KVarN reads.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
     ggml_tensor * build_input_kvarn_rot(ggml_context * ctx, int n_rot) const;
+    void set_standard_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_kvarn_rot(ggml_tensor * dst) const;
     ggml_tensor * build_input_kvarn_mat_idxs(ggml_context * ctx) const;
     void set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -235,7 +296,12 @@ public:
             uint32_t tail_tokens_requested = UINT32_MAX,
             uint32_t tail_rollback_tokens = 0,
             const layer_device_cb & device_for_layer = nullptr,
-            const layer_device_cb & migration_device_for_layer = nullptr);
+            const layer_device_cb & migration_device_for_layer = nullptr,
+            const layer_filter_cb & standard_layer_filter = nullptr,
+            ggml_type standard_type_k = GGML_TYPE_COUNT,
+            ggml_type standard_type_v = GGML_TYPE_COUNT,
+            bool standard_v_trans = false,
+            const layer_device_cb & standard_device_for_layer = nullptr);
     ~llama_kv_cache_kvarn() override;
 
     llama_memory_context_ptr init_batch(
@@ -319,6 +385,36 @@ public:
     ggml_tensor * get_materialization_source(int32_t il, bool value) const;
     std::unique_ptr<llama_kv_cache> make_shared_metadata_cache(const llama_model & model_view) const;
     int32_t mapped_layer_id(int32_t il) const;
+    bool uses_kvarn_layer(int32_t il) const;
+    bool uses_standard_layer(int32_t il) const;
+    bool has_kvarn_layers() const { return !layers.empty(); }
+    bool has_standard_cache() const { return bool(standard_cache); }
+    // Additive handoff accessor: raw standard-cache storage for remote layers
+    // (rawstorage token rows; the attention views are permuted).
+    llama_kv_cache * get_standard_cache() const { return standard_cache.get(); }
+    // Additive handoff accessor: authoritative per-layer compressed tensors.
+    bool handoff_layer_view(int32_t il, llama_kvarn_handoff_layer_view & out) const;
+    std::vector<llama_kv_cache_standard_layer_layout> standard_layer_layout() const;
+    std::vector<llama_kv_cache_kvarn_layer_layout> kvarn_layer_layout() const;
+    uint64_t mixed_state_owner_id() const { return state_owner_id; }
+    uint64_t mixed_state_owner_epoch() const { return state_owner_epoch; }
+    ggml_tensor * standard_get_k(ggml_context * ctx, int32_t il, uint32_t n_kv,
+            const llama_kv_cache::slot_info & sinfo) const;
+    ggml_tensor * standard_get_v(ggml_context * ctx, int32_t il, uint32_t n_kv,
+            const llama_kv_cache::slot_info & sinfo) const;
+    ggml_tensor * standard_cpy_k(ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+            int32_t il, const llama_kv_cache::slot_info & sinfo) const;
+    ggml_tensor * standard_cpy_v(ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+            int32_t il, const llama_kv_cache::slot_info & sinfo) const;
+    ggml_tensor * standard_build_input_k_rot(ggml_context * ctx) const;
+    ggml_tensor * standard_build_input_v_rot(ggml_context * ctx) const;
+    void standard_set_input_k_rot(ggml_tensor * tensor) const;
+    void standard_set_input_v_rot(ggml_tensor * tensor) const;
+    void standard_set_input_k_rot_backend(ggml_tensor * tensor) const;
+    void standard_set_input_v_rot_backend(ggml_tensor * tensor) const;
+    void standard_cache_set_input_kq_mask(ggml_tensor * tensor,
+            const llama_ubatch * ubatch, bool causal_attn) const;
+    std::vector<uint32_t> standard_layer_ids() const;
     llama_kv_tail_route get_tail_route(int32_t il) const;
     bool get_tail_explicit_bias(int32_t il) const;
     ggml_type get_tail_type() const { return exact_tail_type; }
@@ -347,6 +443,11 @@ public:
     // older window groups after later rows advance the ring.
     uint32_t get_stage_groups() const { return stage_groups; }
     uint32_t get_tail_groups()  const { return tail_groups; }
+    // Additive handoff accessors (one-way pure->mixed prefix reuse).
+    uint32_t get_exact_tail_tokens() const { return exact_tail_tokens; }
+    int32_t params_key_bits() const { return params.key_bits; }
+    int32_t params_value_bits() const { return params.value_bits; }
+    int32_t params_kvarn_type() const { return (int32_t) params.type; }
 
     ggml_tensor * store(
             ggml_context * ctx,
@@ -417,6 +518,18 @@ private:
     };
 
     const layer & layer_for(int32_t il) const;
+    void state_write_kvarn_body(llama_io_write_i & io, llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+    void state_read_kvarn_body(llama_io_read_i & io, llama_seq_id seq_id,
+            llama_state_seq_flags flags, llama_kv_cache::slot_info_vec_t * sinfos_out,
+            const llama_kv_cache::slot_info_vec_t * sinfos_in,
+            const std::function<void(const llama_kv_cache &,
+                    const std::unordered_map<uint32_t, uint32_t> &)> & validate_prepared = {});
+    void state_write_mixed(llama_io_write_i & io, llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+    void state_read_mixed(llama_io_read_i & io, llama_seq_id seq_id,
+            llama_state_seq_flags flags, llama_kv_cache::slot_info_vec_t * sinfos_out,
+            const llama_kv_cache::slot_info_vec_t * sinfos_in);
     std::unique_ptr<llama_kv_cache> make_metadata_cache() const;
     bool can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void ensure_migration_mirror_storage(layer & layer);
@@ -451,8 +564,13 @@ private:
     const uint32_t exact_tail_tokens_requested;
     const ggml_type exact_tail_type_requested;
     ggml_type exact_tail_type;
+    const uint64_t state_owner_id;
+    uint64_t state_owner_epoch = 1;
 
     std::unique_ptr<llama_kv_cache> metadata;
+    // Optional ordinary Qx payloads for selected remote layers. This cache
+    // shares only metadata/cells with `metadata`; its K/V buffers remain owned.
+    std::unique_ptr<llama_kv_cache> standard_cache;
     std::vector<layer> layers;
     std::unordered_map<int32_t, int32_t> map_layer_ids;
     std::vector<cache_buffer> ctxs_bufs;

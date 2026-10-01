@@ -437,6 +437,7 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_standard_kq_mask() const { return self_kq_mask_standard_cnv; }
     ggml_tensor * get_kq_mask_tail() const { return self_kq_mask_tail; }
     ggml_tensor * get_tail_read_idxs() const { return self_tail_read_idxs; }
     ggml_tensor * get_tail_bias_read_idxs() const { return self_tail_bias_read_idxs; }
@@ -456,6 +457,8 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_standard = nullptr; // Qx layers: shared cells, no KVarN tail masking
+    ggml_tensor * self_kq_mask_standard_cnv = nullptr;
     ggml_tensor * self_kq_mask_tail = nullptr; // F32/F16 [tail_tokens, n_batch/n_stream, 1, n_stream]
 
     // note: assumes v_rot^2 == I

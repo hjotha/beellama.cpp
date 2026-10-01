@@ -8,6 +8,9 @@
 #include "llama-io-file.h"
 #include "llama-model.h"
 #include "llama-state-q4.h"
+#include "llama-kv-mixed-io.h"
+#include "llama-kv-mixed-state.h"
+#include "llama-kv-mixed-state-stream.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -23,21 +26,27 @@
 #include <limits>
 #include <map>
 #include <deque>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-#ifndef _WIN32
+#if defined(__linux__)
 #include <fcntl.h>
+#include <sys/vfs.h>
 #include <unistd.h>
-#else
+#elif defined(_WIN32)
 #include <fcntl.h>
 #include <io.h>
 #include <process.h>
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 // ggml/src is not on this target's include path; only the q4_0 dequantizer is
@@ -48,6 +57,241 @@ GGML_API void dequantize_row_q4_0(const block_q4_0 * x, float * y, int64_t k);
 }
 
 namespace {
+
+constexpr uint32_t MIXED_KV_STATE_ENVELOPE_MAGIC = 0x4D4B5351u; // "QSKM"
+constexpr uint32_t MIXED_KV_STATE_ENVELOPE_VERSION = 1;
+constexpr uint32_t MIXED_KV_STATE_METADATA_VERSION = 1;
+constexpr uint64_t MIXED_KV_STATE_MAX_FRAME_BYTES = 4ull << 40;
+// split_writer metadata is capped at 64 MiB; the serialized event table can
+// add up to 37 MiB (2^20 events x 37 bytes), plus layer/header bookkeeping.
+constexpr uint64_t MIXED_KV_STATE_MAX_MANIFEST_BYTES = 102ull << 20;
+constexpr uint64_t MIXED_KV_STATE_FRAME_MARGIN_BYTES = 128ull << 20;
+
+std::string create_conversion_temp_path(const std::string & destination);
+
+struct mixed_state_frame_backing {
+    std::string path;
+    std::shared_ptr<llama_kv_mixed::kv_mixed_file_backing> mapping;
+
+    ~mixed_state_frame_backing() {
+        mapping.reset();
+        if (!path.empty()) {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+        }
+    }
+};
+
+std::shared_ptr<mixed_state_frame_backing> spool_mixed_state_frame(
+        llama_io_read_i & io, uint64_t frame_bytes, uint64_t frame_limit) {
+    if (frame_bytes < 104 || frame_bytes > frame_limit ||
+            frame_bytes > MIXED_KV_STATE_MAX_FRAME_BYTES ||
+            frame_bytes > uint64_t(std::numeric_limits<size_t>::max())) {
+        throw std::runtime_error("mixed state frame length is outside the supported range");
+    }
+#ifdef _WIN32
+    const char * configured_dir = std::getenv("TMPDIR");
+#else
+    const char * configured_dir = std::getenv("TMPDIR");
+#endif
+    const auto temp_dir = configured_dir && configured_dir[0]
+            ? std::filesystem::absolute(std::filesystem::path(configured_dir))
+            : std::filesystem::temp_directory_path();
+    std::error_code fs_error;
+    if (!std::filesystem::is_directory(temp_dir, fs_error) || fs_error) {
+        throw std::runtime_error("mixed state spool directory is unavailable; set TMPDIR to a disk-backed directory");
+    }
+#if defined(__linux__)
+    struct statfs fs_info = {};
+    if (::statfs(temp_dir.c_str(), &fs_info) != 0) {
+        throw std::runtime_error("cannot inspect mixed state spool filesystem");
+    }
+    // /tmp is commonly tmpfs. Spooling a multi-gigabyte prompt snapshot there
+    // would create another anonymous-RAM-sized copy while looking like disk IO.
+    constexpr long TMPFS_MAGIC_VALUE = 0x01021994;
+    constexpr long RAMFS_MAGIC_VALUE = 0x858458f6;
+    if (long(fs_info.f_type) == TMPFS_MAGIC_VALUE || long(fs_info.f_type) == RAMFS_MAGIC_VALUE) {
+        throw std::runtime_error("mixed state spool directory is tmpfs/ramfs; set TMPDIR to a disk-backed directory");
+    }
+#endif
+    const std::string destination = (temp_dir / "beellama-mixed-state").string();
+    auto result = std::make_shared<mixed_state_frame_backing>();
+    result->path = create_conversion_temp_path(destination);
+    {
+        llama_file file(result->path.c_str(), "wb");
+        std::vector<uint8_t> buffer(1u << 20);
+        uint64_t remaining = frame_bytes;
+        while (remaining != 0) {
+            const size_t chunk = size_t(std::min<uint64_t>(remaining, buffer.size()));
+            io.read(buffer.data(), chunk);
+            file.write_raw(buffer.data(), chunk);
+            remaining -= chunk;
+        }
+        file.close();
+    }
+    result->mapping = std::make_shared<llama_kv_mixed::kv_mixed_file_backing>(result->path);
+    return result;
+}
+
+uint64_t next_mixed_state_owner_id() {
+    static const uint64_t process_nonce = [] {
+        std::random_device random;
+        uint64_t value = (uint64_t(random()) << 32) ^ uint64_t(random());
+        if (value == 0) {
+            value = uint64_t(random()) | 1u;
+        }
+        return value;
+    }();
+    static std::atomic<uint64_t> next{1};
+    uint64_t id = next.load(std::memory_order_relaxed);
+    for (;;) {
+        if (id == 0 || id == UINT64_MAX) {
+            throw std::overflow_error("mixed KV state owner id exhausted");
+        }
+        if (next.compare_exchange_weak(id, id + 1,
+                std::memory_order_relaxed, std::memory_order_relaxed)) {
+            // The odd multiplier is invertible modulo 2^64, so the sequence
+            // is unique within this process; the random nonce separates cache
+            // owners across processes that might otherwise both start at 1.
+            uint64_t owner = process_nonce + id * 0x9e3779b97f4a7c15ull;
+            if (owner == 0) {
+                owner = process_nonce;
+            }
+            return owner;
+        }
+    }
+}
+
+std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
+        const llama_kv_cache_kvarn & cache,
+        const std::unordered_map<uint32_t, uint64_t> & payload_sizes,
+        bool partial,
+        uint32_t payload_cells,
+        uint64_t payload_rows) {
+    using namespace llama_kv_mixed;
+    std::vector<layer_desc> result;
+    const auto payload_size = [&](uint32_t layer_id) {
+        const auto it = payload_sizes.find(layer_id);
+        return it == payload_sizes.end() ? uint64_t(0) : it->second;
+    };
+
+    for (const auto & layer : cache.kvarn_layer_layout()) {
+        if (layer.record_dim_k != layer.record_dim_v ||
+                layer.head_slices_k != layer.head_slices_v) {
+            throw kv_mixed_error(format(
+                    "mixed state layer %u has incompatible K/V KVarN record geometry", layer.layer_id));
+        }
+        layer_desc desc = {};
+        desc.layer_id = layer.layer_id;
+        desc.kind = cache_kind::kvarn;
+        desc.k_type = layer.kvarn_type;
+        desc.v_type = layer.kvarn_type;
+        desc.k_bits = layer.key_bits;
+        desc.v_bits = layer.value_bits;
+        desc.kvarn_domain = uint8_t(kvarn_domain::rotated);
+        desc.layout = layout_kvarn_records_stage_tail;
+        desc.owner = owner_target;
+        desc.tail_type = layer.tail_type == GGML_TYPE_COUNT ? 0 : uint16_t(layer.tail_type);
+        desc.token_group = KVAR_N_GROUP;
+        desc.record_dim = layer.record_dim_k;
+        desc.head_dim_k = layer.head_dim_k;
+        desc.head_dim_v = layer.head_dim_v;
+        desc.head_slices = layer.head_slices_k;
+        desc.n_head_kv = layer.n_head_kv;
+        desc.n_stream = 1;
+        desc.k_stride = layer.record_stride_k;
+        desc.v_stride = layer.record_stride_v;
+        desc.payload_mode = partial ? mode_partial_overlay : mode_full;
+        desc.payload_cells = payload_cells;
+        desc.payload_rows = payload_rows;
+        desc.payload_bytes = payload_size(layer.layer_id);
+        if (partial && desc.payload_bytes == 0) {
+            desc.payload_mode = mode_resident_reference;
+        }
+        result.push_back(desc);
+    }
+
+    for (const auto & layer : cache.standard_layer_layout()) {
+        layer_desc desc = {};
+        desc.layer_id = layer.layer_id;
+        desc.kind = cache_kind::standard_qx;
+        desc.k_type = uint16_t(layer.type_k);
+        desc.v_type = uint16_t(layer.type_v);
+        desc.k_rot = layer.rotation_k == 0 ? uint8_t(rotation::none) : uint8_t(rotation::hadamard);
+        desc.v_rot = layer.rotation_v == 0 ? uint8_t(rotation::none) : uint8_t(rotation::hadamard);
+        desc.k_rot_width = layer.rotation_k;
+        desc.v_rot_width = layer.rotation_v;
+        desc.layout = layout_standard_qx_rows;
+        desc.owner = owner_target;
+        desc.v_trans = layer.v_transposed ? 1 : 0;
+        desc.token_group = uint32_t(std::max<int64_t>(1, ggml_blck_size(layer.type_k)));
+        desc.head_dim_k = layer.head_dim_k;
+        desc.head_dim_v = layer.head_dim_v;
+        desc.n_head_kv = layer.n_head_kv;
+        desc.n_stream = 1;
+        desc.k_stride = layer.row_stride_k;
+        desc.v_stride = layer.row_stride_v;
+        desc.payload_mode = partial ? mode_resident_reference : mode_full;
+        desc.payload_cells = payload_cells;
+        desc.payload_rows = payload_rows;
+        desc.payload_bytes = partial ? 0 : payload_size(layer.layer_id);
+        if (partial && payload_size(layer.layer_id) != 0) {
+            throw kv_mixed_error(format(
+                    "mixed partial Qx layer %u unexpectedly has serialized payload bytes", layer.layer_id));
+        }
+        result.push_back(desc);
+    }
+
+    std::sort(result.begin(), result.end(), [](const layer_desc & a, const layer_desc & b) {
+        return a.layer_id < b.layer_id;
+    });
+    for (size_t i = 1; i < result.size(); ++i) {
+        if (result[i - 1].layer_id == result[i].layer_id) {
+            throw kv_mixed_error("mixed state has duplicate layer ownership");
+        }
+    }
+    return result;
+}
+
+std::vector<llama_kv_mixed::cell_entry> mixed_state_cells(
+        const llama_kv_cache * metadata, llama_seq_id seq_id, uint32_t & row_count) {
+    using namespace llama_kv_mixed;
+    if (!metadata || metadata->get_n_stream() != 1) {
+        throw kv_mixed_error("mixed state requires one shared metadata stream");
+    }
+    if (seq_id < -1 || (seq_id >= 0 && uint32_t(seq_id) >= LLAMA_MAX_SEQ)) {
+        throw kv_mixed_error("mixed state sequence id is out of range");
+    }
+    const auto & cells = metadata->get_cells(0);
+    uint32_t used_end = 0;
+    row_count = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        const bool include = !cells.is_empty(cell) &&
+                (seq_id < 0 || cells.seq_has(cell, seq_id));
+        if (include) {
+            used_end = cell + 1;
+            ++row_count;
+        }
+    }
+    std::vector<cell_entry> result(used_end);
+    for (uint32_t cell = 0; cell < used_end; ++cell) {
+        auto & entry = result[cell];
+        if (cells.is_empty(cell) || (seq_id >= 0 && !cells.seq_has(cell, seq_id))) {
+            continue;
+        }
+        entry.pos = int32_t(cells.pos_get(cell));
+        const auto & ext = cells.ext_get(cell);
+        entry.x = int32_t(ext.x);
+        entry.y = int32_t(ext.y);
+        entry.tok = int32_t(ext.tok);
+        for (llama_seq_id seq = 0; uint32_t(seq) < LLAMA_MAX_SEQ; ++seq) {
+            if (cells.seq_has(cell, seq) && (seq_id < 0 || seq == seq_id)) {
+                entry.seq_ids.push_back(int32_t(seq));
+            }
+        }
+    }
+    return result;
+}
 
 using backend_kvarn_capabilities_t = bool (*)(
         ggml_backend_dev_t,
@@ -180,6 +424,8 @@ bool kvarn_backend_supports_tail_write(
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
+constexpr uint32_t KVAR_N_MIXED_STATE_MAGIC = 0x584d564b; // "KVMX"
+constexpr uint32_t KVAR_N_MIXED_STATE_VERSION = 1;
 // Version 16 stores full unified non-SWA stages as source-cell rows so state
 // can remap across contexts with different sequence-dependent stage depths.
 // Version 15 adds self-contained selective record groups with cell remapping.
@@ -897,6 +1143,9 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k(ggml_context * ctx, int32_t il
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_attention(
         ggml_context * ctx, int32_t il, bool native_attention) const {
+    if (uses_standard_layer(il)) {
+        return cache->standard_get_k(ctx, il, get_n_kv(), current_sinfo());
+    }
     const int32_t shared_il = graph_layer_for(il);
     const auto it = stored_k.find(cache->mapped_layer_id(shared_il));
     ggml_tensor * stored = it != stored_k.end() ? it->second :
@@ -913,6 +1162,9 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
         ggml_context * ctx, int32_t il, bool native_attention) const {
+    if (uses_standard_layer(il)) {
+        return cache->standard_get_v(ctx, il, get_n_kv(), current_sinfo());
+    }
     const int32_t shared_il = graph_layer_for(il);
     const auto it = stored_v.find(cache->mapped_layer_id(shared_il));
     ggml_tensor * stored = it != stored_v.end() ? it->second :
@@ -924,10 +1176,18 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_tail(ggml_context * ctx, int32_t il) const {
+    if (uses_standard_layer(il)) {
+        GGML_UNUSED(ctx);
+        return nullptr;
+    }
     return shared_graph_layers.empty() ? cache->get_tail(ctx, il, false) : nullptr;
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_tail(ggml_context * ctx, int32_t il) const {
+    if (uses_standard_layer(il)) {
+        GGML_UNUSED(ctx);
+        return nullptr;
+    }
     return shared_graph_layers.empty() ? cache->get_tail(ctx, il, true) : nullptr;
 }
 
@@ -943,6 +1203,10 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_tokens() const {
     return base()->get_tail_tokens();
 }
 
+uint32_t llama_kv_cache_kvarn_context::get_tail_tokens(int32_t il) const {
+    return cache->uses_kvarn_layer(graph_layer_for(il)) ? base()->get_tail_tokens() : 0;
+}
+
 uint32_t llama_kv_cache_kvarn_context::get_tail_arena_stride() const {
     return base()->get_tail_arena_stride();
 }
@@ -956,6 +1220,7 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_body_execution_stride() const {
 }
 
 uint32_t llama_kv_cache_kvarn_context::get_tail_body_execution_rows(int32_t il) const {
+    if (cache->uses_standard_layer(graph_layer_for(il))) return 0;
     return shared_graph_layers.empty() ?
             cache->get_metadata_cache()->get_tail_body_execution_rows(il) : 0;
 }
@@ -964,19 +1229,39 @@ bool llama_kv_cache_kvarn_context::has_compact_tail() const {
     return shared_graph_layers.empty() && base()->has_compact_tail();
 }
 
+bool llama_kv_cache_kvarn_context::has_compact_tail(int32_t il) const {
+    if (uses_standard_layer(il)) return false;
+    return shared_graph_layers.empty() && base()->has_compact_tail();
+}
+
 bool llama_kv_cache_kvarn_context::has_kv_body() const {
     return !shared_graph_layers.empty() || base()->has_kv_body();
 }
 
 bool llama_kv_cache_kvarn_context::has_kv_body(int32_t il) const {
+    if (uses_standard_layer(il)) return true;
     return !shared_graph_layers.empty() || cache->get_metadata_cache()->has_kv_body(il);
 }
 
+bool llama_kv_cache_kvarn_context::uses_kvarn_layer(int32_t il) const {
+    return cache->uses_kvarn_layer(graph_layer_for(il));
+}
+
+bool llama_kv_cache_kvarn_context::uses_standard_layer(int32_t il) const {
+    return shared_graph_layers.empty() && cache->uses_standard_layer(graph_layer_for(il));
+}
+
+bool llama_kv_cache_kvarn_context::has_standard_cache() const {
+    return shared_graph_layers.empty() && cache->has_standard_cache();
+}
+
 bool llama_kv_cache_kvarn_context::has_tail_current(int32_t il) const {
+    if (uses_standard_layer(il)) return false;
     return shared_graph_layers.empty() && cache->get_metadata_cache()->has_tail_current(il);
 }
 
 ggml_backend_dev_t llama_kv_cache_kvarn_context::get_tail_backend(int32_t il) const {
+    if (uses_standard_layer(il)) return nullptr;
     return shared_graph_layers.empty() ? cache->get_metadata_cache()->get_tail_backend(il) : nullptr;
 }
 
@@ -989,14 +1274,17 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_rollback_tokens() const {
 }
 
 llama_kv_tail_route llama_kv_cache_kvarn_context::get_tail_route(int32_t il) const {
+    if (uses_standard_layer(il)) return LLAMA_KV_TAIL_ROUTE_NONE;
     return shared_graph_layers.empty() ? cache->get_tail_route(il) : LLAMA_KV_TAIL_ROUTE_NONE;
 }
 
 const llama_kv_tail_layer_route * llama_kv_cache_kvarn_context::get_tail_layer_route(int32_t il) const {
+    if (uses_standard_layer(il)) return nullptr;
     return shared_graph_layers.empty() ? cache->get_metadata_cache()->get_tail_layer_route(il) : nullptr;
 }
 
 bool llama_kv_cache_kvarn_context::get_tail_explicit_bias(int32_t il) const {
+    if (uses_standard_layer(il)) return false;
     return shared_graph_layers.empty() && cache->get_tail_explicit_bias(il);
 }
 
@@ -1042,6 +1330,9 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
         return nullptr;
     }
     const int32_t shared_il = graph_layer_for(il);
+    if (cache->uses_standard_layer(shared_il)) {
+        return cache->standard_cpy_k(ctx, k_cur, k_idxs, shared_il, current_sinfo());
+    }
     auto * result = cache->store(ctx, k_cur, k_idxs, shared_il, current_sinfo(), false);
     stored_k[cache->mapped_layer_id(shared_il)] = result;
     return result;
@@ -1056,6 +1347,9 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
         return nullptr;
     }
     const int32_t shared_il = graph_layer_for(il);
+    if (cache->uses_standard_layer(shared_il)) {
+        return cache->standard_cpy_v(ctx, v_cur, v_idxs, shared_il, current_sinfo());
+    }
     auto * result = cache->store(ctx, v_cur, v_idxs, shared_il, current_sinfo(), true);
     stored_v[cache->mapped_layer_id(shared_il)] = result;
     return result;
@@ -1074,6 +1368,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_with_tail(
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_tail(
         ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
         int32_t il, ggml_tensor * dependency) const {
+    if (uses_standard_layer(il)) return nullptr;
     if (!shared_graph_layers.empty() || !k_cur || !tail_idxs) {
         return nullptr;
     }
@@ -1083,6 +1378,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_tail(
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_tail(
         ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
         int32_t il, ggml_tensor * dependency) const {
+    if (uses_standard_layer(il)) return nullptr;
     if (!shared_graph_layers.empty() || !v_cur || !tail_idxs) {
         return nullptr;
     }
@@ -1107,10 +1403,12 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_tail_body_idxs(ggml_cont
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_k_rot(ggml_context * ctx) const {
+    if (has_standard_cache()) return cache->standard_build_input_k_rot(ctx);
     return base()->build_input_k_rot(ctx);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_v_rot(ggml_context * ctx) const {
+    if (has_standard_cache()) return cache->standard_build_input_v_rot(ctx);
     return base()->build_input_v_rot(ctx);
 }
 
@@ -1334,6 +1632,15 @@ void llama_kv_cache_kvarn_context::set_input_kq_mask(
     }
 }
 
+void llama_kv_cache_kvarn_context::set_standard_input_kq_mask(
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (shared_graph_layers.empty() && cache->has_standard_cache()) {
+        cache->standard_cache_set_input_kq_mask(dst, ubatch, causal_attn);
+        return;
+    }
+    throw std::logic_error("standard KV mask requested without a target mixed cache");
+}
+
 void llama_kv_cache_kvarn_context::set_input_kq_mask_tail(
         ggml_tensor * body, ggml_tensor * exact,
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
@@ -1359,18 +1666,34 @@ void llama_kv_cache_kvarn_context::set_input_pos_bucket(ggml_tensor * dst, const
 }
 
 void llama_kv_cache_kvarn_context::set_input_k_rot(ggml_tensor * dst) const {
+    if (has_standard_cache()) {
+        cache->standard_set_input_k_rot(dst);
+        return;
+    }
     base()->set_input_k_rot(dst);
 }
 
 void llama_kv_cache_kvarn_context::set_input_v_rot(ggml_tensor * dst) const {
+    if (has_standard_cache()) {
+        cache->standard_set_input_v_rot(dst);
+        return;
+    }
     base()->set_input_v_rot(dst);
 }
 
 void llama_kv_cache_kvarn_context::set_input_k_rot_backend(ggml_tensor * dst) const {
+    if (has_standard_cache()) {
+        cache->standard_set_input_k_rot_backend(dst);
+        return;
+    }
     base()->set_input_k_rot_backend(dst);
 }
 
 void llama_kv_cache_kvarn_context::set_input_v_rot_backend(ggml_tensor * dst) const {
+    if (has_standard_cache()) {
+        cache->standard_set_input_v_rot_backend(dst);
+        return;
+    }
     base()->set_input_v_rot_backend(dst);
 }
 
@@ -1594,7 +1917,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         uint32_t tail_tokens_requested,
         uint32_t tail_rollback_tokens,
         const layer_device_cb & device_for_layer,
-        const layer_device_cb & migration_device_for_layer) :
+        const layer_device_cb & migration_device_for_layer,
+        const layer_filter_cb & standard_layer_filter,
+        ggml_type standard_type_k,
+        ggml_type standard_type_v,
+        bool standard_v_trans,
+        const layer_device_cb & standard_device_for_layer) :
     model(model),
     hparams(hparams),
     params(params),
@@ -1622,6 +1950,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     exact_tail_tokens_requested(tail_tokens_requested),
     exact_tail_type_requested(tail_type_requested),
     exact_tail_type(tail_type_requested),
+    state_owner_id(next_mixed_state_owner_id()),
     metadata(std::make_unique<llama_kv_cache>(
         model,
         hparams,
@@ -1655,6 +1984,43 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     exact_tail_type = metadata->get_tail_type();
     if (!swa) {
         metadata->set_allocation_group_size(KVAR_N_GROUP, n_stream == 1 ? tail_groups : 1u);
+    }
+    if (standard_type_k != GGML_TYPE_COUNT || standard_type_v != GGML_TYPE_COUNT) {
+        if (standard_type_k == GGML_TYPE_COUNT || standard_type_v == GGML_TYPE_COUNT ||
+                !standard_layer_filter || !standard_device_for_layer) {
+            throw std::invalid_argument("mixed KVarN/standard KV requires paired types and remote layer/device filters");
+        }
+        if (swa || n_seq_max != 1 || n_stream != 1) {
+            throw std::invalid_argument("mixed KVarN/standard KV currently requires non-SWA and one sequence");
+        }
+        standard_cache = std::make_unique<llama_kv_cache>(
+                model, hparams, standard_type_k, standard_type_v, standard_v_trans,
+                offload, unified, kv_size, n_seq_max, n_pad, n_swa, swa_type,
+                metadata.get(), standard_layer_filter, nullptr, nullptr, "remote_",
+                n_ubatch, 0, exact_tail_type_requested, 0, false, 0, 0, false,
+                standard_device_for_layer, false, true);
+        for (const uint32_t il : standard_cache->get_layer_ids()) {
+            const ggml_tensor * key = standard_cache->get_k_storage(int32_t(il));
+            const ggml_tensor * value = standard_cache->get_v_storage(int32_t(il));
+            if (!key || !value || !key->buffer || !value->buffer) {
+                throw std::runtime_error(format("mixed standard KV layer %u has no allocated K/V payload", il));
+            }
+            const auto key_buft = ggml_backend_buffer_get_type(key->buffer);
+            const auto value_buft = ggml_backend_buffer_get_type(value->buffer);
+            const auto key_dev = key_buft ? ggml_backend_buft_get_device(key_buft) : nullptr;
+            const auto value_dev = value_buft ? ggml_backend_buft_get_device(value_buft) : nullptr;
+            if (key_dev != value_dev) {
+                throw std::runtime_error(format("mixed standard KV layer %u places K/V on different devices", il));
+            }
+            const bool rotated = standard_cache->uses_attn_rot_k() || standard_cache->uses_attn_rot_v();
+            LLAMA_LOG_INFO("mixed KV layer=%u device=%s type_k=%s type_v=%s domain=%s\n",
+                    il, key_dev ? ggml_backend_dev_name(key_dev) : "CPU",
+                    ggml_type_name(key->type), ggml_type_name(value->type),
+                    rotated ? "standard-hadamard" : "standard-original");
+        }
+        if (standard_cache->get_layer_ids().empty()) {
+            throw std::runtime_error("mixed KV override selected no remote standard-cache layers");
+        }
     }
     if (swa) {
         const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
@@ -2629,6 +2995,13 @@ llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() 
 void llama_kv_cache_kvarn::clear(bool data) {
     drain_prefill_migration();
     pending_stream_copies = {};
+    if (standard_cache) {
+        if (state_owner_epoch == UINT64_MAX) {
+            throw std::overflow_error("mixed KV state owner epoch exhausted");
+        }
+        ++state_owner_epoch;
+    }
+    if (standard_cache) standard_cache->clear(data);
     metadata->clear(false);
     if (data) {
         for (auto & storage : ctxs_bufs) {
@@ -2825,6 +3198,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
             ? ggml_backend_alloc_ctx_tensors_from_buft_size(storage.ctx.get(), buft)
             : ggml_backend_buffer_get_size(storage.buffer.get());
     }
+    if (standard_cache) {
+        for (const auto & [buft, bytes] : standard_cache->memory_breakdown()) {
+            result[buft] += bytes;
+        }
+    }
     return result;
 }
 
@@ -2851,6 +3229,13 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
     if (seq_id < 0) {
         return false;
     }
+    constexpr uint32_t supported = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+    if ((uint32_t(flags) & ~supported) != 0 ||
+            ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
+             (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
+        return false;
+    }
     const bool selective = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
                                      LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED)) != 0;
     if (swa && !stream_is_exclusive_for(seq_id)) {
@@ -2862,6 +3247,13 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
 bool llama_kv_cache_kvarn::state_seq_can_restore(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (seq_id < 0) {
+        return false;
+    }
+    constexpr uint32_t supported = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+    if ((uint32_t(flags) & ~supported) != 0 ||
+            ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
+             (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
         return false;
     }
     const bool selective = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
@@ -2984,15 +3376,20 @@ llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
         account_tail(layer.v_tail);
     }
 
-    uint64_t allocated = 0;
-    for (const auto & [buft, size] : memory_breakdown()) {
-        GGML_UNUSED(buft);
-        allocated += size;
+    uint64_t allocated_kvarn = 0;
+    for (const auto & storage : ctxs_bufs) {
+        if (!storage.buffer) {
+            continue;
+        }
+        allocated_kvarn += hparams.no_alloc
+            ? ggml_backend_alloc_ctx_tensors_from_buft_size(storage.ctx.get(), storage.buft)
+            : ggml_backend_buffer_get_size(storage.buffer.get());
     }
     const uint64_t accounted = component.k_payload_bytes + component.v_payload_bytes +
             component.exact_tail_bytes + component.rollback_reserve_bytes + component.staging_bytes;
-    component.padding_bytes = allocated > accounted ? allocated - accounted : 0;
+    component.padding_bytes = allocated_kvarn > accounted ? allocated_kvarn - accounted : 0;
     component.allocated_capacity_tokens = kv_size;
+    if (standard_cache) result.add(standard_cache->kv_memory_stats());
     return result;
 }
 
@@ -3010,6 +3407,15 @@ uint64_t llama_kv_cache_kvarn::get_kv_tail_planner_timing_ns() const {
 }
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (standard_cache) {
+        state_write_mixed(io, seq_id, flags);
+        return;
+    }
+    state_write_kvarn_body(io, seq_id, flags);
+}
+
+void llama_kv_cache_kvarn::state_write_kvarn_body(
+        llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (migration_copies && !migration_copies->drain()) migration_mirror_stale = true;
     // Unlike the dense cache, a sliding ring overwrites its historical body.
     // A partial checkpoint must own that ring, not reference its live records.
@@ -3275,8 +3681,422 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
             on_device ? "true" : "false");
 }
 
+void llama_kv_cache_kvarn::state_write_mixed(
+        llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (!standard_cache || migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
+        throw std::runtime_error("mixed state currently requires static non-SWA one-stream KV ownership");
+    }
+    constexpr uint32_t supported_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+    if ((uint32_t(flags) & ~supported_flags) != 0 ||
+            ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
+             (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
+        throw std::invalid_argument("mixed state supports host full, partial-only, or self-contained snapshots only");
+    }
+    const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
+    const bool self_contained = (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0;
+    if (seq_id < -1 || (partial && seq_id < 0) ||
+            (self_contained && seq_id < 0) ||
+            (seq_id >= 0 && uint32_t(seq_id) >= n_seq_max)) {
+        throw std::invalid_argument("invalid sequence ID for mixed state save");
+    }
+    if (has_pending_stream_copies() || (migration_copies && !migration_copies->drain())) {
+        throw std::runtime_error("mixed KV state cannot be saved while a stream copy is pending");
+    }
+
+    std::unordered_map<const ggml_tensor *, uint32_t> tensor_layers;
+    const auto add_tensor = [&](const ggml_tensor * tensor, uint32_t layer_id) {
+        while (tensor && tensor->view_src) {
+            tensor = tensor->view_src;
+        }
+        if (!tensor) {
+            return;
+        }
+        const auto [it, inserted] = tensor_layers.emplace(tensor, layer_id);
+        if (!inserted && it->second != layer_id) {
+            throw std::runtime_error("mixed state tensor is shared across different layer IDs");
+        }
+    };
+    for (const auto & layer : layers) {
+        for (ggml_tensor * tensor : { layer.k_records, layer.v_records,
+                layer.k_stage, layer.v_stage, layer.k_tail, layer.v_tail }) {
+            add_tensor(tensor, layer.il);
+        }
+        for (ggml_tensor * tensor : layer.k_records_stream) add_tensor(tensor, layer.il);
+        for (ggml_tensor * tensor : layer.v_records_stream) add_tensor(tensor, layer.il);
+        for (ggml_tensor * tensor : layer.k_stage_stream) add_tensor(tensor, layer.il);
+        for (ggml_tensor * tensor : layer.v_stage_stream) add_tensor(tensor, layer.il);
+    }
+    for (const uint32_t il : standard_cache->get_layer_ids()) {
+        add_tensor(standard_cache->get_k_storage(int32_t(il)), il);
+        add_tensor(standard_cache->get_v_storage(int32_t(il)), il);
+    }
+
+    llama_kv_mixed::split_writer split([&](const ggml_tensor * tensor) -> uint32_t {
+        while (tensor && tensor->view_src) {
+            tensor = tensor->view_src;
+        }
+        const auto it = tensor_layers.find(tensor);
+        if (it == tensor_layers.end()) {
+            throw llama_kv_mixed::kv_mixed_error(
+                    "mixed state writer received a tensor without a layer descriptor");
+        }
+        return it->second;
+    });
+    state_write_kvarn_body(split, seq_id, flags);
+    standard_cache->state_write_shared_payload(split, seq_id, partial);
+
+    uint32_t payload_rows = 0;
+    auto cells = mixed_state_cells(metadata.get(), seq_id, payload_rows);
+    const uint32_t payload_cells = uint32_t(cells.size());
+    std::unordered_map<uint32_t, uint64_t> payload_sizes;
+    for (const auto & entry : split.manifest().layer_payload_sizes) {
+        payload_sizes.emplace(entry.first, entry.second);
+    }
+    auto layer_descs = mixed_state_layer_descs(*this, payload_sizes, partial,
+            payload_cells, payload_rows);
+
+    std::string manifest_error;
+    const auto manifest = llama_kv_mixed::mixed_manifest_serialize(
+            split.manifest(), &manifest_error);
+    if (manifest.empty()) {
+        throw llama_kv_mixed::kv_mixed_error(
+                manifest_error.empty() ? "failed to encode mixed state manifest" : manifest_error);
+    }
+
+    llama_kv_mixed::stream_input input = {};
+    input.layers = std::move(layer_descs);
+    input.cells = std::move(cells);
+    input.metadata_version = MIXED_KV_STATE_METADATA_VERSION;
+    input.metadata = manifest.data();
+    input.metadata_size = manifest.size();
+    input.flags = partial ? llama_kv_mixed::snapshot_flags::partial : llama_kv_mixed::snapshot_flags::full;
+    input.owner_epoch = partial ? state_owner_epoch : 0;
+    input.owner_id = partial ? state_owner_id : 0;
+
+    const uint64_t frame_size = llama_kv_mixed::stream_serialized_size(input);
+    if (frame_size > MIXED_KV_STATE_MAX_FRAME_BYTES || frame_size > size_t(-1)) {
+        throw std::overflow_error("mixed KV state frame exceeds the supported size");
+    }
+    const uint32_t magic = MIXED_KV_STATE_ENVELOPE_MAGIC;
+    const uint32_t version = MIXED_KV_STATE_ENVELOPE_VERSION;
+    io.write(&magic, sizeof(magic));
+    io.write(&version, sizeof(version));
+    io.write(&frame_size, sizeof(frame_size));
+    if (io.counts_only()) {
+        io.write(nullptr, size_t(frame_size));
+        return;
+    }
+
+    llama_kv_mixed::stream_read_callbacks reads;
+    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
+        return split.read_payload(layer_id, offset, dst, count);
+    };
+    llama_kv_mixed::stream_write_callbacks writes;
+    writes.write_bytes = [&](const uint8_t * bytes, size_t count) {
+        io.write(bytes, count);
+        return true;
+    };
+    if (!llama_kv_mixed::stream_serialize(input, reads, writes)) {
+        throw llama_kv_mixed::kv_mixed_error("failed to serialize mixed KV state");
+    }
+}
+
+void llama_kv_cache_kvarn::state_read_mixed(
+        llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+        llama_kv_cache::slot_info_vec_t * sinfos_out,
+        const llama_kv_cache::slot_info_vec_t * sinfos_in) {
+    using namespace llama_kv_mixed;
+    if (!standard_cache || migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
+        throw std::runtime_error("mixed state currently requires static non-SWA one-stream KV ownership");
+    }
+    constexpr uint32_t supported_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+    if ((uint32_t(flags) & ~supported_flags) != 0 ||
+            ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
+             (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
+        throw std::invalid_argument("mixed state restore supports host full, partial-only, or self-contained snapshots only");
+    }
+    const bool requested_partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
+    if (seq_id < -1 || (requested_partial && seq_id < 0) ||
+            ((flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && seq_id < 0) ||
+            (seq_id >= 0 && uint32_t(seq_id) >= n_seq_max)) {
+        throw std::invalid_argument("invalid sequence ID for mixed state restore");
+    }
+    if (has_pending_stream_copies() || (migration_copies && !migration_copies->drain())) {
+        throw std::runtime_error("mixed KV state cannot be restored while a stream copy is pending");
+    }
+    if (!requested_partial && state_owner_epoch == UINT64_MAX) {
+        throw std::overflow_error("mixed KV state owner epoch exhausted");
+    }
+
+    // Bound the incoming frame by the actual persistent K/V allocations plus a
+    // bounded allowance for the legacy metadata stream, codec descriptors,
+    // cell summaries, and split-I/O event table. This rejects attacker-sized
+    // lengths before creating a spool file or mapping any bytes.
+    uint64_t kv_payload_capacity = 0;
+    std::unordered_set<const ggml_tensor *> counted_tensors;
+    const auto add_tensor_capacity = [&](const ggml_tensor * tensor) {
+        while (tensor && tensor->view_src) {
+            tensor = tensor->view_src;
+        }
+        if (!tensor || !counted_tensors.insert(tensor).second) {
+            return;
+        }
+        const uint64_t bytes = ggml_nbytes(tensor);
+        if (bytes > UINT64_MAX - kv_payload_capacity) {
+            throw std::overflow_error("mixed KV allocation size overflows uint64_t");
+        }
+        kv_payload_capacity += bytes;
+    };
+    for (const auto & layer : layers) {
+        for (const ggml_tensor * tensor : { layer.k_records, layer.v_records,
+                layer.k_stage, layer.v_stage, layer.k_tail, layer.v_tail }) {
+            add_tensor_capacity(tensor);
+        }
+        for (const ggml_tensor * tensor : layer.k_records_stream) add_tensor_capacity(tensor);
+        for (const ggml_tensor * tensor : layer.v_records_stream) add_tensor_capacity(tensor);
+        for (const ggml_tensor * tensor : layer.k_stage_stream) add_tensor_capacity(tensor);
+        for (const ggml_tensor * tensor : layer.v_stage_stream) add_tensor_capacity(tensor);
+    }
+    for (const uint32_t il : standard_cache->get_layer_ids()) {
+        add_tensor_capacity(standard_cache->get_k_storage(int32_t(il)));
+        add_tensor_capacity(standard_cache->get_v_storage(int32_t(il)));
+    }
+    const uint64_t cell_margin = uint64_t(metadata->get_size()) * 32u;
+    const uint64_t fixed_margin = MIXED_KV_STATE_FRAME_MARGIN_BYTES + cell_margin;
+    const uint64_t frame_limit = kv_payload_capacity >= MIXED_KV_STATE_MAX_FRAME_BYTES - fixed_margin
+            ? MIXED_KV_STATE_MAX_FRAME_BYTES
+            : kv_payload_capacity + fixed_margin;
+
+    uint32_t envelope_magic = 0;
+    uint32_t envelope_version = 0;
+    uint64_t frame_bytes = 0;
+    io.read(&envelope_magic, sizeof(envelope_magic));
+    io.read(&envelope_version, sizeof(envelope_version));
+    io.read(&frame_bytes, sizeof(frame_bytes));
+    if (envelope_magic != MIXED_KV_STATE_ENVELOPE_MAGIC ||
+            envelope_version != MIXED_KV_STATE_ENVELOPE_VERSION) {
+        throw std::runtime_error("incompatible mixed KV state envelope");
+    }
+    if (frame_bytes > frame_limit) {
+        throw std::runtime_error(format(
+                "mixed KV state frame (%llu bytes) exceeds the cache-derived limit (%llu bytes)",
+                (unsigned long long) frame_bytes, (unsigned long long) frame_limit));
+    }
+
+    auto frame = spool_mixed_state_frame(io, frame_bytes, frame_limit);
+    parse_options parse_opts;
+    parse_opts.max_total_bytes = frame_bytes;
+    parse_opts.max_payload_bytes = kv_payload_capacity;
+    parse_opts.max_metadata_bytes = MIXED_KV_STATE_MAX_MANIFEST_BYTES;
+    auto parsed = snapshot::parse_view(
+            frame->mapping->data(), frame->mapping->size(),
+            std::static_pointer_cast<const void>(frame), parse_opts);
+    if (parsed.metadata_version() != MIXED_KV_STATE_METADATA_VERSION) {
+        throw kv_mixed_error("unsupported mixed KV state metadata version");
+    }
+    const uint32_t snapshot_flags_value = uint32_t(parsed.flags());
+    if ((snapshot_flags_value & ~uint32_t(snapshot_flags::partial)) != 0) {
+        throw kv_mixed_error("mixed KV state BODY_ONLY and unknown snapshot flags are unsupported");
+    }
+    const bool partial = (snapshot_flags_value & uint32_t(snapshot_flags::partial)) != 0;
+    if (partial != requested_partial) {
+        throw kv_mixed_error("mixed KV snapshot partial/full kind does not match restore flags");
+    }
+    if (partial && (seq_id < 0 || (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
+        throw kv_mixed_error("mixed partial snapshot requires an owner-bound ordinary sequence restore");
+    }
+    if (!partial && seq_id < 0 && (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0) {
+        throw kv_mixed_error("self-contained mixed state restore requires a destination sequence");
+    }
+
+    mixed_manifest manifest;
+    std::string manifest_error;
+    if (!mixed_manifest_parse(parsed.metadata_blob(), parsed.metadata_size(), manifest, &manifest_error)) {
+        throw kv_mixed_error(manifest_error.empty() ? "invalid mixed state I/O manifest" : manifest_error);
+    }
+
+    std::unordered_map<uint32_t, uint64_t> payload_sizes;
+    payload_sizes.reserve(manifest.layer_payload_sizes.size());
+    for (const auto & entry : manifest.layer_payload_sizes) {
+        payload_sizes.emplace(entry.first, entry.second);
+    }
+    uint64_t payload_rows = 0;
+    for (const cell_entry & cell : parsed.cells()) {
+        if (cell.pos >= 0) {
+            ++payload_rows;
+        }
+    }
+    if (parsed.n_used() != parsed.cells().size()) {
+        throw kv_mixed_error("mixed state cell count is inconsistent");
+    }
+    auto expected_descs = mixed_state_layer_descs(
+            *this, payload_sizes, partial, uint32_t(parsed.cells().size()), payload_rows);
+    std::unordered_set<uint32_t> expected_layer_ids;
+    expected_layer_ids.reserve(expected_descs.size());
+    expected_snapshot expected;
+    expected.layers.reserve(expected_descs.size());
+    for (const layer_desc & desc : expected_descs) {
+        expected_layer_ids.insert(desc.layer_id);
+        expected.layers.push_back(expected_layer::from_desc(desc));
+    }
+    for (const auto & entry : manifest.layer_payload_sizes) {
+        if (expected_layer_ids.count(entry.first) == 0) {
+            throw kv_mixed_error("mixed state I/O manifest names a layer not owned by this cache");
+        }
+    }
+    for (const layer_desc & desc : parsed.layers()) {
+        const auto it = payload_sizes.find(desc.layer_id);
+        const uint64_t manifest_bytes = it == payload_sizes.end() ? 0 : it->second;
+        if (desc.payload_bytes != manifest_bytes) {
+            throw kv_mixed_error("mixed state descriptor and I/O manifest payload sizes differ");
+        }
+    }
+    expected.capacity_cells = metadata->get_size();
+    expected.metadata_version = MIXED_KV_STATE_METADATA_VERSION;
+    if (partial) {
+        expected.owner_epoch = state_owner_epoch;
+        expected.owner_id = state_owner_id;
+    }
+    parsed.validate_expected_snapshot(expected, parse_opts);
+
+    if (partial) {
+        // Qx payloads in a partial snapshot are resident references. The
+        // physical cell identities must still name the same live rows; an
+        // append beyond this prefix remains valid, while slot reuse or a
+        // changed prefix fails closed.
+        const auto & current_cells = metadata->get_cells(0);
+        for (uint32_t cell_index = 0; cell_index < parsed.cells().size(); ++cell_index) {
+            const cell_entry & saved = parsed.cells()[cell_index];
+            if (saved.pos < 0) {
+                continue;
+            }
+            if (cell_index >= current_cells.size() || current_cells.is_empty(cell_index) ||
+                    current_cells.pos_get(cell_index) != saved.pos) {
+                throw kv_mixed_error("mixed partial snapshot references a missing or changed KV cell");
+            }
+            const auto & ext = current_cells.ext_get(cell_index);
+            if (int32_t(ext.x) != saved.x || int32_t(ext.y) != saved.y || int32_t(ext.tok) != saved.tok) {
+                throw kv_mixed_error("mixed partial snapshot references a changed KV cell identity");
+            }
+            std::vector<int32_t> current_seq_ids;
+            for (llama_seq_id current_seq = 0; uint32_t(current_seq) < n_seq_max; ++current_seq) {
+                if (current_cells.seq_has(cell_index, current_seq)) {
+                    current_seq_ids.push_back(int32_t(current_seq));
+                }
+            }
+            if (current_seq_ids != saved.seq_ids ||
+                    std::find(saved.seq_ids.begin(), saved.seq_ids.end(), int32_t(seq_id)) == saved.seq_ids.end()) {
+                throw kv_mixed_error("mixed partial snapshot sequence membership no longer matches its owner");
+            }
+        }
+    }
+
+    std::vector<split_reader::payload_span> spans;
+    spans.reserve(manifest.layer_payload_sizes.size());
+    for (const auto & entry : manifest.layer_payload_sizes) {
+        const uint32_t layer_id = entry.first;
+        const auto desc_it = std::find_if(parsed.layers().begin(), parsed.layers().end(),
+                [layer_id](const layer_desc & desc) { return desc.layer_id == layer_id; });
+        if (desc_it == parsed.layers().end()) {
+            throw kv_mixed_error("mixed state payload has no layer descriptor");
+        }
+        const size_t layer_index = size_t(desc_it - parsed.layers().begin());
+        const size_t size = parsed.payload_size(layer_index);
+        if (entry.second != size) {
+            throw kv_mixed_error("mixed state payload span size differs from its I/O manifest");
+        }
+        if (size != 0) {
+            const uint8_t * data = parsed.payload(layer_index);
+            if (data == nullptr) {
+                throw kv_mixed_error("mixed state payload has no mapped backing data");
+            }
+            spans.push_back({ layer_id, data, size, parsed.backing() });
+        }
+    }
+
+    split_reader_limits reader_limits;
+    reader_limits.max_fixup_staging = 64u << 20;
+    reader_limits.hash_borrowed = true;
+    split_reader reader(std::move(manifest), std::move(spans), reader_limits);
+    llama_kv_cache::slot_info_vec_t restored_sinfos;
+    const auto validate_prepared_cells = [&](const llama_kv_cache & prepared,
+            const std::unordered_map<uint32_t, uint32_t> & cell_remap) {
+        const auto & prepared_cells = prepared.get_cells(0);
+        for (uint32_t source_cell = 0; source_cell < parsed.cells().size(); ++source_cell) {
+            const cell_entry & saved = parsed.cells()[source_cell];
+            if (saved.pos < 0) {
+                continue;
+            }
+            uint32_t destination_cell = source_cell;
+            const auto remapped = cell_remap.find(source_cell);
+            if (remapped != cell_remap.end()) {
+                destination_cell = remapped->second;
+            }
+            if (destination_cell >= prepared_cells.size() || prepared_cells.is_empty(destination_cell) ||
+                    prepared_cells.pos_get(destination_cell) != saved.pos) {
+                throw kv_mixed_error("mixed snapshot cell summary does not match parsed KVarN metadata");
+            }
+            const auto & ext = prepared_cells.ext_get(destination_cell);
+            if (int32_t(ext.x) != saved.x || int32_t(ext.y) != saved.y || int32_t(ext.tok) != saved.tok) {
+                throw kv_mixed_error("mixed snapshot cell identity differs from parsed KVarN metadata");
+            }
+            std::vector<int32_t> actual_seq_ids;
+            for (llama_seq_id current_seq = 0; uint32_t(current_seq) < n_seq_max; ++current_seq) {
+                if (prepared_cells.seq_has(destination_cell, current_seq)) {
+                    actual_seq_ids.push_back(int32_t(current_seq));
+                }
+            }
+            std::vector<int32_t> expected_seq_ids = saved.seq_ids;
+            if (seq_id >= 0) {
+                for (int32_t & saved_seq : expected_seq_ids) {
+                    saved_seq = int32_t(seq_id);
+                }
+                std::sort(expected_seq_ids.begin(), expected_seq_ids.end());
+                expected_seq_ids.erase(std::unique(expected_seq_ids.begin(), expected_seq_ids.end()),
+                        expected_seq_ids.end());
+            }
+            if (actual_seq_ids != expected_seq_ids) {
+                throw kv_mixed_error("mixed snapshot sequence membership differs from parsed KVarN metadata");
+            }
+        }
+    };
+    state_read_kvarn_body(reader, seq_id, flags, &restored_sinfos, sinfos_in, validate_prepared_cells);
+    uint64_t restored_rows = 0;
+    if (restored_sinfos.size() != 1) {
+        throw kv_mixed_error("mixed KVarN metadata restored an unexpected stream count");
+    }
+    for (const auto & sinfo : restored_sinfos) {
+        if (!sinfo.empty()) {
+            if (sinfo.n_stream() != 1 || sinfo.idxs.size() != 1 || sinfo.strm.size() != 1 ||
+                    sinfo.strm[0] < 0 || uint32_t(sinfo.strm[0]) >= n_stream) {
+                throw kv_mixed_error("mixed KVarN metadata returned an invalid slot map");
+            }
+            restored_rows += sinfo.idxs[0].size();
+        }
+    }
+    if (restored_rows != payload_rows) {
+        throw kv_mixed_error("mixed snapshot cell summary does not match the restored KVarN rows");
+    }
+    standard_cache->state_read_shared_payload(reader, seq_id, partial, restored_sinfos);
+    if (reader.remaining() != 0) {
+        throw kv_mixed_error("mixed state I/O manifest contains trailing legacy bytes");
+    }
+    if (!partial) {
+        reader.on_commit([this]() {
+            ++state_owner_epoch;
+        });
+    }
+    reader.defer_to(io);
+    if (sinfos_out) {
+        *sinfos_out = std::move(restored_sinfos);
+    }
+}
+
 bool llama_kv_cache_kvarn_context::uses_native_attention(int32_t il) const {
-    return shared_graph_layers.empty() && cache->uses_native_attention(graph_layer_for(il));
+    return shared_graph_layers.empty() && cache->uses_kvarn_layer(graph_layer_for(il)) &&
+            cache->uses_native_attention(graph_layer_for(il));
 }
 
 bool llama_kv_cache_kvarn_context::mixed_tail_native_preferred(int32_t il) const {
@@ -3299,6 +4119,19 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
         llama_kv_cache::slot_info_vec_t * sinfos_out,
         const llama_kv_cache::slot_info_vec_t * sinfos_in) {
+    if (standard_cache) {
+        state_read_mixed(io, seq_id, flags, sinfos_out, sinfos_in);
+        return;
+    }
+    state_read_kvarn_body(io, seq_id, flags, sinfos_out, sinfos_in);
+}
+
+void llama_kv_cache_kvarn::state_read_kvarn_body(
+        llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+        llama_kv_cache::slot_info_vec_t * sinfos_out,
+        const llama_kv_cache::slot_info_vec_t * sinfos_in,
+        const std::function<void(const llama_kv_cache &,
+                const std::unordered_map<uint32_t, uint32_t> &)> & validate_prepared) {
     if (has_pending_stream_copies()) {
         throw std::runtime_error("cannot restore KVarN state while a stream copy is pending");
     }
@@ -3327,6 +4160,9 @@ void llama_kv_cache_kvarn::state_read_sinfo(
     const auto & state_cell_remap_pairs = metadata_prepared->get_state_cell_remap();
     std::unordered_map<uint32_t, uint32_t> state_cell_remap(
             state_cell_remap_pairs.begin(), state_cell_remap_pairs.end());
+    if (validate_prepared) {
+        validate_prepared(*metadata_prepared, state_cell_remap);
+    }
     std::vector<std::vector<int32_t>> exact_destinations = metadata_prepared->take_restored_tail_payload_slots();
     const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
 
@@ -3741,6 +4577,143 @@ void llama_kv_cache_kvarn::state_read_sinfo(
 
 llama_kv_cache * llama_kv_cache_kvarn::get_metadata_cache() const {
     return metadata.get();
+}
+
+bool llama_kv_cache_kvarn::uses_kvarn_layer(int32_t il) const {
+    return map_layer_ids.find(il) != map_layer_ids.end();
+}
+
+bool llama_kv_cache_kvarn::uses_standard_layer(int32_t il) const {
+    return standard_cache && standard_cache->has_layer(il);
+}
+
+ggml_tensor * llama_kv_cache_kvarn::standard_get_k(
+        ggml_context * ctx, int32_t il, uint32_t n_kv,
+        const llama_kv_cache::slot_info & sinfo) const {
+    return uses_standard_layer(il) ? standard_cache->get_k(ctx, il, n_kv, sinfo) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::standard_get_v(
+        ggml_context * ctx, int32_t il, uint32_t n_kv,
+        const llama_kv_cache::slot_info & sinfo) const {
+    return uses_standard_layer(il) ? standard_cache->get_v(ctx, il, n_kv, sinfo) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::standard_cpy_k(
+        ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+        int32_t il, const llama_kv_cache::slot_info & sinfo) const {
+    return uses_standard_layer(il) ? standard_cache->cpy_k(ctx, current, indices, il, sinfo) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::standard_cpy_v(
+        ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+        int32_t il, const llama_kv_cache::slot_info & sinfo) const {
+    return uses_standard_layer(il) ? standard_cache->cpy_v(ctx, current, indices, il, sinfo) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::standard_build_input_k_rot(ggml_context * ctx) const {
+    return standard_cache ? standard_cache->build_input_k_rot(ctx) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::standard_build_input_v_rot(ggml_context * ctx) const {
+    return standard_cache ? standard_cache->build_input_v_rot(ctx) : nullptr;
+}
+
+void llama_kv_cache_kvarn::standard_set_input_k_rot(ggml_tensor * tensor) const {
+    if (standard_cache && tensor) standard_cache->set_input_k_rot(tensor);
+}
+
+void llama_kv_cache_kvarn::standard_set_input_v_rot(ggml_tensor * tensor) const {
+    if (standard_cache && tensor) standard_cache->set_input_v_rot(tensor);
+}
+
+void llama_kv_cache_kvarn::standard_set_input_k_rot_backend(ggml_tensor * tensor) const {
+    if (standard_cache && tensor) standard_cache->set_input_k_rot_backend(tensor);
+}
+
+void llama_kv_cache_kvarn::standard_set_input_v_rot_backend(ggml_tensor * tensor) const {
+    if (standard_cache && tensor) standard_cache->set_input_v_rot_backend(tensor);
+}
+
+void llama_kv_cache_kvarn::standard_cache_set_input_kq_mask(
+        ggml_tensor * tensor, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (standard_cache && tensor) standard_cache->set_input_kq_mask(tensor, ubatch, causal_attn);
+}
+
+std::vector<uint32_t> llama_kv_cache_kvarn::standard_layer_ids() const {
+    return standard_cache ? standard_cache->get_layer_ids() : std::vector<uint32_t>{};
+}
+
+std::vector<llama_kv_cache_standard_layer_layout> llama_kv_cache_kvarn::standard_layer_layout() const {
+    std::vector<llama_kv_cache_standard_layer_layout> result;
+    if (!standard_cache) {
+        return result;
+    }
+    const uint32_t rotation_k = uint32_t(std::max(0, standard_cache->rotation_k()));
+    const uint32_t rotation_v = uint32_t(std::max(0, standard_cache->rotation_v()));
+    for (const uint32_t il : standard_cache->get_layer_ids()) {
+        const ggml_tensor * key = standard_cache->get_k_storage(int32_t(il));
+        const ggml_tensor * value = standard_cache->get_v_storage(int32_t(il));
+        if (!key || !value) {
+            throw std::runtime_error(format("mixed standard KV layer %u is missing a K/V tensor", il));
+        }
+        std::string device = "CPU";
+        if (key->buffer) {
+            const auto buft = ggml_backend_buffer_get_type(key->buffer);
+            const auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+            if (dev) {
+                device = ggml_backend_dev_name(dev);
+            }
+        }
+        result.push_back({
+            il,
+            key->type,
+            value->type,
+            rotation_k,
+            rotation_v,
+            standard_cache->v_transposed(),
+            hparams.n_embd_head_k(il),
+            hparams.n_embd_head_v(il),
+            hparams.n_head_kv(il),
+            ggml_row_size(key->type, hparams.n_embd_k_gqa(il)),
+            ggml_row_size(value->type, hparams.n_embd_v_gqa(il)),
+            std::move(device),
+        });
+    }
+    return result;
+}
+
+std::vector<llama_kv_cache_kvarn_layer_layout> llama_kv_cache_kvarn::kvarn_layer_layout() const {
+    std::vector<llama_kv_cache_kvarn_layer_layout> result;
+    result.reserve(layers.size());
+    for (const auto & layer : layers) {
+        if (!layer.k_records || !layer.v_records) {
+            throw std::runtime_error(format("KVarN layer %u is missing record tensors", layer.il));
+        }
+        llama_kvarn_geometry k_geometry = {};
+        llama_kvarn_geometry v_geometry = {};
+        if (!llama_kvarn_geometry_for(layer.head_dim_k, k_geometry) ||
+                !llama_kvarn_geometry_for(layer.head_dim_v, v_geometry)) {
+            throw std::runtime_error(format("KVarN layer %u has unsupported geometry", layer.il));
+        }
+        result.push_back({
+            layer.il,
+            uint16_t(params.type),
+            uint8_t(params.key_bits),
+            uint8_t(params.value_bits),
+            k_geometry.record_dim,
+            v_geometry.record_dim,
+            layer.head_dim_k,
+            layer.head_dim_v,
+            layer.k_slices,
+            layer.v_slices,
+            layer.n_head_kv,
+            layer.k_records->nb[1],
+            layer.v_records->nb[1],
+            exact_tail_tokens > 0 ? exact_tail_type : GGML_TYPE_COUNT,
+        });
+    }
+    return result;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::get_materialization_source(int32_t il, bool value) const {
@@ -4321,6 +5294,10 @@ bool llama_kv_cache_kvarn::state_parse_q4(
         const llama_hparams & hparams_ref,
         llama_state_q4_info & info,
         std::string & error) {
+    if (standard_cache) {
+        error = "Q4 state conversion is not supported for mixed per-layer KV layouts";
+        return false;
+    }
     std::vector<uint32_t> attn_layers;
     attn_layers.reserve(layers.size());
     for (const auto & layer : layers) {
@@ -4334,6 +5311,9 @@ size_t llama_kv_cache_kvarn::state_convert_q4(
         const llama_state_q4_info & info,
         const char * dst_path,
         std::vector<uint8_t> * out_mem) {
+    if (standard_cache) {
+        throw std::runtime_error("Q4 conversion is not supported for mixed per-layer KV layouts");
+    }
     if ((dst_path == nullptr && out_mem == nullptr) || info.n_tokens == 0) {
         return 0;
     }

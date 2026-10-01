@@ -27,6 +27,8 @@ add_library(${TARGET} STATIC
     server-route-state.h
     server-context.cpp
     server-context.h
+    server-mixed-kv-handoff.cpp
+    server-mixed-kv-handoff.h
 server-loop-guard.cpp
     server-loop-guard.h
     server-gpu-power.cpp

@@ -11,6 +11,8 @@
 #include "server-gpu-power.h"
 #include "server-model-identity.h"
 #include "server-route-state.h"
+#include "server-mixed-kv-handoff.h"
+#include "src/llama-kv-mixed-handoff.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -3271,6 +3273,14 @@ private:
     std::string adaptive_remote_attn_host;
     uint16_t adaptive_remote_attn_port = 0;
     std::string adaptive_remote_attn_prefill = "remote";
+    ggml_type adaptive_remote_attn_cache_type_k = GGML_TYPE_COUNT;
+    ggml_type adaptive_remote_attn_cache_type_v = GGML_TYPE_COUNT;
+    // One-way PURE KVarN -> MIXED handoff: source descriptor captured before
+    // the old context is destroyed (same resident model, no weight reload).
+    server_mixed_kv_handoff::source_capture mixed_handoff_source_;
+    void mixed_handoff_capture() {
+        mixed_handoff_source_ = server_mixed_kv_handoff::capture_source(ctx_tgt);
+    }
 
     int32_t adaptive_draft_n_for_profile(common_context_profile profile) const {
         switch (profile) {
@@ -3345,6 +3355,8 @@ private:
             params_base.remote_attn_host = enable_remote_attn ? adaptive_remote_attn_host : "";
             params_base.remote_attn_port = enable_remote_attn ? adaptive_remote_attn_port : 0;
             params_base.remote_attn_prefill = enable_remote_attn ? adaptive_remote_attn_prefill : "remote";
+            params_base.remote_attn_cache_type_k = enable_remote_attn ? adaptive_remote_attn_cache_type_k : GGML_TYPE_COUNT;
+            params_base.remote_attn_cache_type_v = enable_remote_attn ? adaptive_remote_attn_cache_type_v : GGML_TYPE_COUNT;
             SRV_INF("adaptive remote attention: profile=%s, ctx=%d, threshold=%d, backend=%s, prefill=%s\n",
                     adaptive_status_profile_name((int) profile).c_str(), params_base.n_ctx,
                     params_base.remote_attn_min_ctx_size,
@@ -4464,6 +4476,8 @@ private:
             params.remote_attn_host = adaptive_remote_attn_host;
             params.remote_attn_port = adaptive_remote_attn_port;
             params.remote_attn_prefill = adaptive_remote_attn_prefill;
+            params.remote_attn_cache_type_k = adaptive_remote_attn_cache_type_k;
+            params.remote_attn_cache_type_v = adaptive_remote_attn_cache_type_v;
         }
         if (const std::string error = common_context_adaptive_normalize(params); !error.empty()) {
             SRV_ERR("invalid adaptive context configuration: %s\n", error.c_str());
@@ -4499,6 +4513,8 @@ private:
             adaptive_remote_attn_host = params.remote_attn_host;
             adaptive_remote_attn_port = params.remote_attn_port;
             adaptive_remote_attn_prefill = params.remote_attn_prefill;
+            adaptive_remote_attn_cache_type_k = params.remote_attn_cache_type_k;
+            adaptive_remote_attn_cache_type_v = params.remote_attn_cache_type_v;
         }
         if (!common_speculative_resolve_dflash_draft_n_max(
                     params_base.speculative,
@@ -5627,6 +5643,10 @@ private:
             slot.reset();
         }
 
+        // Mixed KV handoff: record the PURE KVarN source descriptor while the
+        // old context still exists.
+        mixed_handoff_capture();
+
         const auto discard_context = [&]() {
             spec.reset();
             spec_init.reset();
@@ -5894,7 +5914,76 @@ private:
 
 if (task.params.cache_prompt) {
                     const auto cache_result = ret->prompt_load_result(*prompt_cache, task.tokens);
-                    if (cache_result == server_prompt_cache_result::needs_bootstrap) {
+                    if (mixed_handoff_source_.valid &&
+                            (cache_result == server_prompt_cache_result::miss ||
+                             (cache_result == server_prompt_cache_result::unchanged && ret->prompt.tokens.empty()))) {
+                        // A rejected cache entry leaves no reusable slot state.
+                        // Handoff installs only into an empty private candidate.
+                        ret->prompt_clear();
+                        // One-way PURE KVarN -> MIXED handoff: the prompt-cache
+                        // load rejected the pure snapshot for the mixed target;
+                        // attempt bounded prefix reuse before the cold path.
+                        const auto mtp_info = llama_model_mtp_weights_get_info(model_tgt);
+                        std::vector<const server_prompt_cache_state *> pure_candidates;
+                        for (const auto & state : prompt_cache->states) {
+                            bool pure = false;
+                            try {
+                                const common_json layout = common_json::parse(state.layout_tgt);
+                                pure = layout.is_object() &&
+                                        !layout.value("kv_layout_known", true) &&
+                                        !layout.value("mixed_kv", false);
+                            } catch (const std::exception &) {
+                                pure = false;
+                            }
+                            if (pure && state.model == model_tgt &&
+                                    state.model_instance == mtp_info.model_instance &&
+                                    !state.prompt.tokens.empty()) {
+                                pure_candidates.push_back(&state);
+                            }
+                        }
+                        std::sort(pure_candidates.begin(), pure_candidates.end(),
+                                [&](const server_prompt_cache_state * x,
+                                    const server_prompt_cache_state * y) {
+                                    return x->prompt.tokens.get_common_prefix(task.tokens) >
+                                        y->prompt.tokens.get_common_prefix(task.tokens);
+                                });
+                        bool handoff_attempted = false;
+                        for (const auto * state : pure_candidates) {
+                            if (state->prompt.tokens.get_common_prefix(task.tokens) == 0) {
+                                break;
+                            }
+                            server_mixed_kv_handoff::input hi;
+                            hi.ctx_tgt = ret->ctx_tgt;
+                            hi.ctx_dft = ret->ctx_dft;
+                            hi.spec = ret->spec;
+                            hi.model = model_tgt;
+                            hi.seq_id = ret->id;
+                            hi.has_mtmd = ret->mctx != nullptr;
+                            hi.source = &mixed_handoff_source_;
+                            hi.state = state;
+                            hi.tokens_new = &task.tokens;
+                            const auto hres = server_mixed_kv_handoff::try_handoff(hi);
+                            handoff_attempted = true;
+                            if (hres.committed) {
+                                ret->prompt.tokens = server_tokens(hres.prefix_tokens,
+                                        ret->mctx != nullptr);
+                                ret->prompt.checkpoints.clear();
+                                ret->bootstrap_pending = hres.mtp_bootstrap &&
+                                        ret->can_speculate();
+                                ret->just_restored = true;
+                                ret->prompt_cache_source = "mixed_handoff";
+                                ret->prompt_cache_reason = hres.mtp_bootstrap
+                                        ? "handoff_prefix_bootstrap" : "handoff_prefix";
+                                SRV_INF("%s\n", hres.marker.c_str());
+                                break;
+                            }
+                            SRV_WRN("mixed KV handoff candidate rejected: %s\n",
+                                    hres.reason.c_str());
+                        }
+                        if (!handoff_attempted) {
+                            SRV_INF("%s\n", llama_kv_handoff::handoff_marker_no_source().c_str());
+                        }
+                    } else if (cache_result == server_prompt_cache_result::needs_bootstrap) {
                         ret->bootstrap_pending = true;
                         ret->just_restored = true;
                         SLT_INF(*ret, "%s", "target-only cache hit requires MTP bootstrap suffix\n");

@@ -5383,6 +5383,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     const bool local_vulkan_attention = common_remote_attn_is_local_vulkan(params.remote_attn_host);
+    // MIXED TARGET contract: per-layer remote Qx formats mean the target
+    // planner reserves the independent MTP cache (llama_context_params::
+    // mtp_reserve_*). Re-enabling a local Vulkan MTP cache would let KVarN
+    // draft KV spill onto the slow Radeon native KVarN path and destroy TPS,
+    // so the mixed path keeps the MTP cache local CUDA instead. Captured
+    // BEFORE the overrides are cleared below; the pre-existing non-mixed
+    // Vulkan MTP behavior is preserved.
+    const bool mixed_target = params.remote_attn_cache_type_k != GGML_TYPE_COUNT ||
+            params.remote_attn_cache_type_v != GGML_TYPE_COUNT;
 
     common_validate_draft_kvarn_mode(params.speculative);
 
@@ -5394,11 +5403,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.remote_attn_host.clear();
     result.remote_attn_port = 0;
     result.remote_attn_layers = "0";
+    // Per-layer target mixed formats do not alter the independent MTP cache
+    // representation; the draft context retains its existing cache contract.
+    result.remote_attn_cache_type_k = GGML_TYPE_COUNT;
+    result.remote_attn_cache_type_v = GGML_TYPE_COUNT;
     // A local Vulkan MTP cache is independent of the target cache and can live
     // on the same device. This keeps its full-context K/V allocation off CUDA;
-    // prefill migration itself remains target-only.
+    // prefill migration itself remains target-only. Under the mixed-target
+    // contract the MTP cache stays local CUDA (see above) - never re-enabled
+    // here, with no silent CPU fallback.
     result.remote_attn_prefill = "remote";
-    if (spec_mtp && local_vulkan_attention) {
+    if (spec_mtp && local_vulkan_attention && !mixed_target) {
         result.remote_attn_host = params.remote_attn_host;
         result.remote_attn_layers = "auto";
         // The target context has already applied its reserve while placing its

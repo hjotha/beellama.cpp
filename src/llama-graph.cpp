@@ -794,6 +794,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
                 ubatch, cparams.causal_attn);
     }
 
+    if (self_kq_mask_standard && self_kq_mask_standard->buffer) {
+        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+        GGML_ASSERT(kvarn && kvarn->has_standard_cache());
+        kvarn->set_standard_input_kq_mask(self_kq_mask_standard, ubatch, cparams.causal_attn);
+    }
+
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -844,6 +850,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= self_kq_mask_standard == nullptr ||
+            can_reuse_kq_mask(self_kq_mask_standard, mctx, params.ubatch, params.cparams);
     res &= self_kq_mask_tail == nullptr ||
             (self_kq_mask_tail->ne[0] == tail_attention_stride &&
              self_kq_mask_tail->ne[1] == self_kq_mask->ne[1] &&
@@ -3835,6 +3843,14 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
     if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur)) {
+        if (kvarn->has_standard_cache()) {
+            inp->self_kq_mask_standard = ggml_new_tensor_4d(ctx0, inp->self_kq_mask->type,
+                    inp->self_kq_mask->ne[0], inp->self_kq_mask->ne[1],
+                    inp->self_kq_mask->ne[2], inp->self_kq_mask->ne[3]);
+            ggml_set_input(inp->self_kq_mask_standard);
+            ggml_set_name(inp->self_kq_mask_standard, "attn_inp_kq_mask_standard_qx");
+            inp->self_kq_mask_standard_cnv = inp->self_kq_mask_standard;
+        }
         inp->self_kvarn_rot_64  = kvarn->build_input_kvarn_rot(ctx0, 64);
         inp->self_kvarn_rot_128 = kvarn->build_input_kvarn_rot(ctx0, 128);
         inp->self_kvarn_rot_256 = kvarn->build_input_kvarn_rot(ctx0, 256);
@@ -3878,7 +3894,7 @@ void llm_graph_context::build_kv_store(
     GGML_ASSERT(k_cur != nullptr && v_cur != nullptr);
     GGML_ASSERT(k_idxs != nullptr && v_idxs != nullptr);
 
-    const bool has_exact_tail = mctx_cur->get_tail_tokens() > 0;
+    const bool has_exact_tail = mctx_cur->get_tail_tokens(il) > 0;
     bool k_tail_scheduled = false;
     bool v_tail_scheduled = false;
 
@@ -3941,7 +3957,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn = kvarn_ctx != nullptr;
+    const bool use_kvarn = kvarn_ctx && kvarn_ctx->uses_kvarn_layer(il);
     // Backend preferences choose an implementation inside the final operation;
     // they must not veto direct KVarN attention and force full materialization.
     // validate_native_tail_operation() proves the actual attached-tail shape.
@@ -3968,19 +3984,19 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (use_kvarn) {
         GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
-        GGML_ASSERT(inp->self_k_rot == nullptr);
-        GGML_ASSERT(inp->self_v_rot == nullptr);
+        GGML_ASSERT(!inp->self_k_rot || kvarn_ctx->has_standard_cache());
+        GGML_ASSERT(!inp->self_v_rot || kvarn_ctx->has_standard_cache());
         GGML_ASSERT(!use_kvarn_q_rot || llm_kvarn_rot_for_dim(
                 inp->self_kvarn_rot_64, inp->self_kvarn_rot_128,
                 inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q_cur->ne[0]) != nullptr);
     }
 
-    if (inp->self_k_rot) {
+    if (!use_kvarn && inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
     }
 
-    if (inp->self_v_rot) {
+    if (!use_kvarn && inp->self_v_rot) {
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
@@ -3993,7 +4009,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * k_tail_written = nullptr;
     ggml_tensor * v_tail_written = nullptr;
-    const bool compact_tail = mctx_cur->has_compact_tail();
+    const bool compact_tail = mctx_cur->has_compact_tail(il);
 
     // store to KV cache
     {
@@ -4037,7 +4053,9 @@ ggml_tensor * llm_graph_context::build_attn(
 
     }
 
-    ggml_tensor * kq_mask = kq_mask_override ? kq_mask_override : inp->get_kq_mask();
+    ggml_tensor * kq_mask = kq_mask_override ? kq_mask_override :
+            (kvarn_ctx && kvarn_ctx->uses_standard_layer(il) ?
+                inp->get_standard_kq_mask() : inp->get_kq_mask());
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kvarn ?
@@ -4091,7 +4109,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     const bool use_indexed_tail = gather_k_tail && gather_v_tail && tail_read_idxs &&
             tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE;
-    if (!use_indexed_tail && !use_kvarn && mctx_cur->get_tail_tokens() > 0) {
+    if (!use_indexed_tail && !use_kvarn && mctx_cur->get_tail_tokens(il) > 0) {
         if (!k_tail) {
             k_tail = mctx_cur->get_k_tail_fallback(ctx0, il, inp->self_tail_body_read_idxs);
         }
@@ -4176,7 +4194,7 @@ k_tail, v_tail, kq_mask_tail, kq_b_tail,
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         GGML_ASSERT(kvarn_rot != nullptr);
         cur = ggml_kvarn_wht_aux(ctx0, cur, kvarn_rot->ne[0]);
-    } else if (inp->self_v_rot) {
+    } else if (!use_kvarn && inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
 
@@ -4428,7 +4446,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn = kvarn_ctx != nullptr;
+    const bool use_kvarn = kvarn_ctx && kvarn_ctx->uses_kvarn_layer(il);
     const bool kvarn_native_attention = use_kvarn &&
         kvarn_ctx->uses_native_attention(il) &&
         llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
@@ -4452,20 +4470,20 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (use_kvarn) {
         GGML_ASSERT(llama_kvarn_head_dim_supported((int) q_cur->ne[0]));
-        GGML_ASSERT(k_rot == nullptr);
-        GGML_ASSERT(v_rot == nullptr);
+        GGML_ASSERT(k_rot == nullptr || kvarn_ctx->has_standard_cache());
+        GGML_ASSERT(v_rot == nullptr || kvarn_ctx->has_standard_cache());
         GGML_ASSERT(!use_kvarn_q_rot || llm_kvarn_rot_for_dim(
                 inp->self_kvarn_rot_64, inp->self_kvarn_rot_128,
                 inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q_cur->ne[0]) != nullptr);
     }
 
-    if (k_rot) {
+    if (!use_kvarn && k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
             k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
         }
     }
-    if (v_rot) {
+    if (!use_kvarn && v_rot) {
         if (v_cur) {
             v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
         }
@@ -4485,7 +4503,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * k_tail_written = nullptr;
     ggml_tensor * v_tail_written = nullptr;
-    const bool compact_tail = mctx_cur->has_compact_tail();
+    const bool compact_tail = mctx_cur->has_compact_tail(il);
 
     // optionally store to KV cache
     if (k_cur) {
@@ -4583,7 +4601,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     const bool use_indexed_tail = gather_k_tail && gather_v_tail && tail_read_idxs &&
             tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE;
-    if (!use_indexed_tail && !use_kvarn && mctx_cur->get_tail_tokens() > 0) {
+    if (!use_indexed_tail && !use_kvarn && mctx_cur->get_tail_tokens(il) > 0) {
         if (!k_tail) {
             k_tail = mctx_cur->get_k_tail_fallback(ctx0, il, inp->get_tail_body_read_idxs(is_swa));
         }
@@ -4668,7 +4686,7 @@ k_tail, v_tail, kq_mask_tail, kq_b_tail,
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         GGML_ASSERT(kvarn_rot != nullptr);
         cur = ggml_kvarn_wht_aux(ctx0, cur, kvarn_rot->ne[0]);
-    } else if (v_rot) {
+    } else if (!use_kvarn && v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 

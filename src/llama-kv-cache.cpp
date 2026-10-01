@@ -388,16 +388,19 @@ const  layer_reuse_cb & reuse,
          const ggml_type   tail_type_requested,
                uint32_t   tail_tokens_requested,
          const      bool   tail_metadata_only,
-         const  uint32_t   tail_rollback_tokens,
-         const  uint32_t   tail_visibility_window,
+                     const  uint32_t   tail_rollback_tokens,
+                     const  uint32_t   tail_visibility_window,
                      bool   disable_attn_rot,
-    const layer_device_cb & device_for_layer) :
+        const layer_device_cb & device_for_layer,
+                     bool   inherit_attn_rotations,
+                     bool   own_payload_with_shared_cells) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
     tail_metadata_only(tail_metadata_only),
     tail_type(tail_type_requested), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
+    own_payload_with_shared_cells(own_payload_with_shared_cells),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
@@ -1318,10 +1321,9 @@ const  layer_reuse_cb & reuse,
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
-    if (other) {
+    if (other && inherit_attn_rotations) {
         n_embd_head_k_all = other->n_embd_head_k_all;
         n_embd_head_v_all = other->n_embd_head_v_all;
-
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
     } else {
@@ -1382,6 +1384,16 @@ const  layer_reuse_cb & reuse,
 }
 
 void llama_kv_cache::clear(bool data) {
+    if (other && own_payload_with_shared_cells) {
+        if (data) {
+            for (auto & [_, buf] : ctxs_bufs) {
+                if (buf) {
+                    ggml_backend_buffer_clear(buf.get(), 0);
+                }
+            }
+        }
+        return;
+    }
     sc_info = {};
     if (tail) {
         tail->clear();
@@ -3070,6 +3082,11 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].k;
+}
+
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    return layers[ikv].v;
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
@@ -5980,6 +5997,113 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         }
     }
 
+}
+
+void llama_kv_cache::state_write_shared_payload(
+        llama_io_write_i & io, llama_seq_id seq_id, bool partial_reference) const {
+    if (!other || !own_payload_with_shared_cells) {
+        throw std::logic_error("shared-cell payload save requires an owning companion cache");
+    }
+    if (n_stream != 1) {
+        throw std::runtime_error("mixed Qx payload snapshots currently require one stream");
+    }
+    if (seq_id < -1 || (seq_id >= 0 && uint32_t(seq_id) >= n_seq_max)) {
+        throw std::invalid_argument("invalid mixed Qx state sequence ID");
+    }
+    if (partial_reference && seq_id < 0) {
+        throw std::invalid_argument("mixed Qx partial state requires a sequence ID");
+    }
+    const uint32_t kind = partial_reference ? 0u : 1u;
+    io.write(&kind, sizeof(kind));
+    io.write(&n_stream, sizeof(n_stream));
+    if (partial_reference) {
+        return;
+    }
+    for (uint32_t stream = 0; stream < n_stream; ++stream) {
+        cell_ranges_t ranges { stream, {} };
+        const auto & cells = v_cells[stream];
+        uint32_t count = 0;
+        uint32_t begin = cells.size();
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            bool include = !cells.is_empty(cell) &&
+                    (seq_id < 0 || cells.seq_has(cell, seq_id));
+            if (include && seq_id >= 0) {
+                include = !llama_hparams::is_masked_swa(
+                        n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
+            }
+            if (include) {
+                ++count;
+                if (begin == cells.size()) begin = cell;
+            } else if (begin != cells.size()) {
+                ranges.data.emplace_back(begin, cell);
+                begin = cells.size();
+            }
+        }
+        if (begin != cells.size()) ranges.data.emplace_back(begin, cells.size());
+        io.write(&count, sizeof(count));
+        if (count > 0) state_write_data(io, ranges);
+    }
+}
+
+void llama_kv_cache::state_read_shared_payload(
+        llama_io_read_i & io, llama_seq_id seq_id, bool partial_reference,
+        const slot_info_vec_t & sinfos) {
+    if (!other || !own_payload_with_shared_cells) {
+        throw std::logic_error("shared-cell payload restore requires an owning companion cache");
+    }
+    uint32_t kind = 0;
+    uint32_t streams = 0;
+    io.read(&kind, sizeof(kind));
+    io.read(&streams, sizeof(streams));
+    if (streams != n_stream || sinfos.size() != n_stream || n_stream != 1) {
+        throw std::runtime_error("mixed Qx payload stream count mismatch");
+    }
+    if (seq_id < -1 || (seq_id >= 0 && uint32_t(seq_id) >= n_seq_max)) {
+        throw std::runtime_error("invalid mixed Qx state sequence ID");
+    }
+    if (partial_reference && seq_id < 0) {
+        throw std::runtime_error("mixed Qx partial state requires a sequence ID");
+    }
+    if (partial_reference) {
+        if (kind != 0) {
+            throw std::runtime_error("mixed Qx partial snapshot does not contain a resident reference");
+        }
+        return;
+    }
+    if (kind != 1) {
+        throw std::runtime_error("invalid mixed Qx payload kind or sequence ID");
+    }
+    for (uint32_t stream = 0; stream < n_stream; ++stream) {
+        uint32_t count = 0;
+        io.read(&count, sizeof(count));
+        const auto & sinfo = sinfos[stream];
+        if (count == 0) {
+            if (!sinfo.empty()) {
+                throw std::runtime_error("mixed Qx payload omitted cells present in KVarN metadata");
+            }
+            continue;
+        }
+        if (sinfo.empty() || sinfo.n_stream() != 1 || sinfo.idxs.size() != 1 ||
+                sinfo.idxs[0].size() != count || sinfo.strm.size() != 1 ||
+                sinfo.strm[0] < 0 || uint32_t(sinfo.strm[0]) >= n_stream ||
+                count > get_size()) {
+            throw std::runtime_error("mixed Qx payload rows do not match restored KVarN cell metadata");
+        }
+        const uint32_t dst_stream = seq_id < 0 ? stream : get_stream_for_seq(seq_id);
+        if (uint32_t(sinfo.strm[0]) != dst_stream) {
+            throw std::runtime_error("mixed Qx payload destination stream differs from KVarN metadata");
+        }
+        std::unordered_set<uint32_t> unique_cells;
+        unique_cells.reserve(count);
+        for (const uint32_t cell : sinfo.idxs[0]) {
+            if (cell >= get_size() || !unique_cells.insert(cell).second) {
+                throw std::runtime_error("mixed Qx payload contains an invalid or duplicate destination cell");
+            }
+        }
+        if (!state_read_data(io, dst_stream, count, sinfo)) {
+            throw std::runtime_error("failed to restore mixed Qx payload");
+        }
+    }
 }
 
 std::vector<int32_t> llama_kv_cache::state_tail_cell_ordinals(

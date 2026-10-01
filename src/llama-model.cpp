@@ -3266,8 +3266,40 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             params.kv_tail_tokens_requested, params.kv_tail_rollback_tokens);
                     } else {
                         if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                            llama_kv_cache::layer_filter_cb filter_kvarn = filter_attn;
+                            llama_kv_cache::layer_filter_cb filter_remote_standard;
+                            const bool mixed_remote_selected =
+                                    params.remote_attn_cache_type_k != GGML_TYPE_COUNT &&
+                                    params.remote_attn_cache_type_v != GGML_TYPE_COUNT &&
+                                    cparams.local_attn_backend != nullptr &&
+                                    cparams.remote_attn_layers > 0 &&
+                                    params.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+                            if (mixed_remote_selected) {
+                                const int n_remote = cparams.remote_attn_layers;
+                                filter_remote_standard = [this, n_remote](int32_t il) {
+                                    if (il < 0 || uint32_t(il) >= hparams.n_layer() ||
+                                            !hparams.has_kv(uint32_t(il)) || hparams.is_recr(uint32_t(il))) {
+                                        return false;
+                                    }
+                                    int full_idx = 0;
+                                    for (int32_t layer = 0; layer < il; ++layer) {
+                                        if (hparams.has_kv(uint32_t(layer)) && !hparams.is_recr(uint32_t(layer))) {
+                                            ++full_idx;
+                                        }
+                                    }
+                                    return full_idx < n_remote;
+                                };
+                                const auto local_filter = filter_attn;
+                                filter_kvarn = [local_filter, filter_remote_standard](int32_t il) {
+                                    return (!local_filter || local_filter(il)) && !filter_remote_standard(il);
+                                };
+                            }
                             std::unique_ptr<llama_memory_i> mem_attn;
                             if (params.kv_tail_native_exact) {
+                                if (filter_remote_standard) {
+                                    throw std::invalid_argument(
+                                            "mixed remote KV does not support an additional exact tail");
+                                }
                                 mem_attn = std::make_unique<llama_kv_cache>(
                                         *this, hparams, kvarn_tail_type, kvarn_tail_type,
                                         !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
@@ -3281,9 +3313,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
                                         cparams.kv_unified, cparams.n_ctx_seq, cparams.n_seq_max,
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
-                                        hparams.swa_type, filter_attn, nullptr, params.kv_tail_tokens,
+                                        hparams.swa_type, filter_kvarn, nullptr, params.kv_tail_tokens,
                                         kvarn_tail_type, params.kv_tail_tokens_requested,
-                                        params.kv_tail_rollback_tokens, attention_device, migration_device);
+                                        params.kv_tail_rollback_tokens, attention_device, migration_device,
+                                        filter_remote_standard,
+                                        mixed_remote_selected ? params.remote_attn_cache_type_k : GGML_TYPE_COUNT,
+                                        mixed_remote_selected ? params.remote_attn_cache_type_v : GGML_TYPE_COUNT,
+                                        !cparams.flash_attn, attention_device);
                                 // QSA's index cache mirrors the attention cells cell for cell,
                                 // which the compact read plan's reordered rows cannot represent.
                                 if (needs_mem_idx && filter_idx) {

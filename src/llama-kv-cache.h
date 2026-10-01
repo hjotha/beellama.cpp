@@ -131,9 +131,11 @@ public:
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   tail_visibility_window = 0,
+                     uint32_t   tail_visibility_window = 0,
                      bool   disable_attn_rot = false,
-    const layer_device_cb & device_for_layer = nullptr);
+    const layer_device_cb & device_for_layer = nullptr,
+                     bool   inherit_attn_rotations = true,
+                     bool   own_payload_with_shared_cells = false);
 
     ~llama_kv_cache() = default;
 
@@ -200,6 +202,12 @@ bool requires_state_for_partial_restore() const override;
     void state_read_sinfo(
             llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
             slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
+    // Serialize/restore only this companion's Qx payload. Shared cell metadata
+    // is owned by `other` and travels once through the enclosing KVarN state.
+    void state_write_shared_payload(llama_io_write_i & io, llama_seq_id seq_id,
+            bool partial_reference) const;
+    void state_read_shared_payload(llama_io_read_i & io, llama_seq_id seq_id,
+            bool partial_reference, const slot_info_vec_t & sinfos);
 
     //
     // llama_kv_cache specific API
@@ -216,9 +224,14 @@ bool requires_state_for_partial_restore() const override;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+    bool uses_attn_rot_k() const { return attn_rot_k; }
+    bool uses_attn_rot_v() const { return attn_rot_v; }
+    bool v_transposed() const { return v_trans; }
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
+    bool has_layer(int32_t il) const { return map_layer_ids.find(il) != map_layer_ids.end(); }
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -546,6 +559,7 @@ private:
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
+    const bool own_payload_with_shared_cells;
 
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 
@@ -706,11 +720,13 @@ public:
     virtual uint32_t get_tail_slots() const;
     virtual ggml_type get_tail_type() const;
     virtual uint32_t get_tail_tokens() const;
+    virtual uint32_t get_tail_tokens(int32_t il) const { GGML_UNUSED(il); return get_tail_tokens(); }
     virtual uint32_t get_tail_arena_stride() const;
     virtual uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
     virtual uint32_t get_tail_body_execution_stride() const;
     virtual uint32_t get_tail_body_execution_rows(int32_t il) const;
     virtual bool has_compact_tail() const;
+    virtual bool has_compact_tail(int32_t il) const { GGML_UNUSED(il); return has_compact_tail(); }
     virtual bool has_kv_body() const;
     virtual bool has_kv_body(int32_t il) const;
     virtual bool has_tail_current(int32_t il) const;

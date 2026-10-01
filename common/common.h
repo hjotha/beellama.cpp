@@ -804,8 +804,11 @@ struct common_params {
     std::string remote_attn_layers       = "auto";   // "auto" | "full" | integer N
     std::string remote_attn_prefill      = "remote"; // "remote" | "migrate" (CUDA prefill + mirrored KVarN handoff)
     bool        remote_attn_stats        = false;
+    ggml_type   remote_attn_cache_type_k = GGML_TYPE_COUNT; // opt-in Qx override on local Vulkan layers
+    ggml_type   remote_attn_cache_type_v = GGML_TYPE_COUNT;
     int32_t     remote_attn_min_ctx_size = 0; // minimum adaptive profile context size before enabling remote attention
     size_t      remote_attn_cuda_reserve = 650 * 1024 * 1024; // 650 MiB default safety reserve (covers compute graph & allocator headroom)
+    size_t      remote_attn_vulkan_reserve = 512 * 1024 * 1024; // Vulkan FA graph/workspace headroom for Qx placement
 
     // KVarN is selected by its pseudo cache-type names in the argument parser.
     // The backing ggml types remain the matching standard q formats for layers

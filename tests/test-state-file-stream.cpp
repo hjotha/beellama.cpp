@@ -151,6 +151,47 @@ int main(int argc, char ** argv) {
             decode(source.get(), {token}, tokens.size());
             tokens.push_back(token);
         }
+
+        // The legacy sequence-file reader must reject short headers, token
+        // payloads, and a truncated state body before it commits any cache
+        // writes. In particular, the final-byte case guards the buffered file
+        // reader against treating a short fread as a successful oversized
+        // state request.
+        const std::string legacy_seq_path = dir + "/legacy-sequence.bin";
+        const size_t legacy_seq_size = llama_state_seq_save_file(source.get(), legacy_seq_path.c_str(), 0,
+                tokens.data(), tokens.size());
+        require(legacy_seq_size > 3*sizeof(uint32_t) + tokens.size()*sizeof(llama_token),
+                "legacy sequence fixture save failed");
+        const std::string short_header_path = dir + "/legacy-short-header.bin";
+        std::filesystem::copy_file(legacy_seq_path, short_header_path);
+        std::filesystem::resize_file(short_header_path, sizeof(uint32_t)*2 - 1);
+        size_t legacy_count = 99;
+        require(llama_state_seq_load_file(source.get(), short_header_path.c_str(), 0, nullptr, 0,
+                    &legacy_count) == 0 && legacy_count == 0,
+                "truncated sequence header was accepted");
+
+        const std::string short_tokens_path = dir + "/legacy-short-tokens.bin";
+        std::filesystem::copy_file(legacy_seq_path, short_tokens_path);
+        const size_t token_end = 3*sizeof(uint32_t) + tokens.size()*sizeof(llama_token);
+        std::filesystem::resize_file(short_tokens_path, token_end - 1);
+        legacy_count = 99;
+        require(llama_state_seq_load_file(source.get(), short_tokens_path.c_str(), 0, nullptr, 0,
+                    &legacy_count) == 0 && legacy_count == 0,
+                "truncated sequence token payload was accepted");
+
+        const std::string short_state_path = dir + "/legacy-short-state.bin";
+        std::filesystem::copy_file(legacy_seq_path, short_state_path);
+        std::filesystem::resize_file(short_state_path, legacy_seq_size - 1);
+        llama_context_ptr legacy_truncated(llama_init_from_model(model.get(), params));
+        require(bool(legacy_truncated), "legacy truncation guard context failed");
+        llama_tokens legacy_tokens(tokens.size());
+        legacy_count = 99;
+        require(llama_state_seq_load_file(legacy_truncated.get(), short_state_path.c_str(), 0,
+                    legacy_tokens.data(), legacy_tokens.size(), &legacy_count) == 0 && legacy_count == 0 &&
+                llama_memory_seq_pos_max(llama_get_memory(legacy_truncated.get()), 0) == -1,
+                "truncated sequence state committed or asserted instead of returning failure");
+        std::cout << "PASS: legacy sequence file rejects truncated header, tokens, and state before commit\n";
+
         const auto identity = server_model_identity::prepare(argv[1], {});
         const std::string path = dir + "/route.bin";
         const size_t written = server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX);
@@ -159,10 +200,11 @@ int main(int argc, char ** argv) {
 
         // The managed-MTP auto-cache path persists the evaluated prefix at
         // N-1, not a full N state that would later need an unpersisted
-        // recurrent rewind plan. Compare a cold full decode against
-        // restore(N-1)+decode(last), including logits and the recurrent state
-        // bytes after the one-token suffix. The inputs are deliberately
-        // non-degenerate so row/carry selection is exercised.
+        // recurrent rewind plan. Compare the live 183+1 cadence against
+        // restore(183)+decode(last); a cold 184-token batch is kept as a
+        // cadence diagnostic because batching can change recurrent logits.
+        // The inputs are deliberately non-degenerate so row/carry selection
+        // is exercised.
         const llama_token last_prompt_token = tokens.back();
         llama_tokens prefix_tokens = tokens;
         prefix_tokens.pop_back();
@@ -195,31 +237,36 @@ int main(int argc, char ** argv) {
                 prefix_file.state_bytes, prefix_file.state_checksum) == prefix_file.state_bytes &&
                 restored_count == prefix_tokens.size() && restored_tokens == prefix_tokens,
                 "pre-last prefix streaming restore failed");
+        decode(prefix_source.get(), {last_prompt_token}, prefix_tokens.size());
         decode(restored_prefix.get(), {last_prompt_token}, prefix_tokens.size());
-        require(llama_memory_seq_pos_max(llama_get_memory(cold_full.get()), 0) ==
+        require(llama_memory_seq_pos_max(llama_get_memory(prefix_source.get()), 0) ==
                 llama_memory_seq_pos_max(llama_get_memory(restored_prefix.get()), 0),
-                "pre-last restore position differs from cold");
+                "pre-last restore position differs from live same-cadence decode");
         const float * cold_logits = llama_get_logits_ith(cold_full.get(), -1);
+        const float * live_logits = llama_get_logits_ith(prefix_source.get(), -1);
         const float * restored_logits = llama_get_logits_ith(restored_prefix.get(), -1);
-        require(cold_logits && restored_logits, "pre-last comparison logits missing");
+        require(cold_logits && live_logits && restored_logits, "pre-last comparison logits missing");
+        float cold_live_max_abs = 0.0f;
         for (int i = 0; i < n_vocab; ++i) {
-            require(std::isfinite(cold_logits[i]) && std::isfinite(restored_logits[i]) &&
-                    std::abs(cold_logits[i] - restored_logits[i]) < 0.002f,
-                    "pre-last restore logits differ from cold");
+            require(std::isfinite(cold_logits[i]) && std::isfinite(live_logits[i]) &&
+                    std::isfinite(restored_logits[i]), "pre-last comparison logits are non-finite");
+            cold_live_max_abs = std::max(cold_live_max_abs, std::abs(cold_logits[i] - live_logits[i]));
+            require(std::abs(live_logits[i] - restored_logits[i]) < 0.002f,
+                    "pre-last restore logits differ from live same-cadence decode");
         }
-        const size_t cold_state_size = llama_state_seq_get_size_ext(cold_full.get(), 0,
+        const size_t live_state_size = llama_state_seq_get_size_ext(prefix_source.get(), 0,
                 LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t restored_state_size = llama_state_seq_get_size_ext(restored_prefix.get(), 0,
                 LLAMA_STATE_SEQ_FLAGS_NONE);
-        require(cold_state_size == restored_state_size && cold_state_size > 0,
-                "pre-last recurrent state size differs from cold");
-        std::vector<uint8_t> cold_state(cold_state_size), restored_state(restored_state_size);
-        require(llama_state_seq_get_data_ext(cold_full.get(), cold_state.data(), cold_state.size(), 0,
-                    LLAMA_STATE_SEQ_FLAGS_NONE) == cold_state.size() &&
+        require(live_state_size == restored_state_size && live_state_size > 0,
+                "pre-last recurrent state size differs from live same-cadence decode");
+        std::vector<uint8_t> live_state(live_state_size), restored_state(restored_state_size);
+        require(llama_state_seq_get_data_ext(prefix_source.get(), live_state.data(), live_state.size(), 0,
+                    LLAMA_STATE_SEQ_FLAGS_NONE) == live_state.size() &&
                 llama_state_seq_get_data_ext(restored_prefix.get(), restored_state.data(), restored_state.size(), 0,
                     LLAMA_STATE_SEQ_FLAGS_NONE) == restored_state.size(),
                 "pre-last recurrent state extraction failed");
-        const bool physical_state_equal = cold_state == restored_state;
+        const bool physical_state_equal = live_state == restored_state;
         // The recurrent serializer writes the logical row selected by its
         // current rollback index, while state_read restores that row at a
         // fresh head and resets the index. Therefore physical state bytes are
@@ -228,22 +275,23 @@ int main(int argc, char ** argv) {
         // several non-degenerate suffixes; this is the acceptance criterion
         // for the pre-last snapshot, not an unsafe rewind assumption.
         for (int step = 0; step < 8; ++step) {
-            const float * cold_next = llama_get_logits_ith(cold_full.get(), -1);
+            const float * live_next = llama_get_logits_ith(prefix_source.get(), -1);
             const float * restored_next = llama_get_logits_ith(restored_prefix.get(), -1);
-            require(cold_next && restored_next, "semantic recurrent probe logits missing");
+            require(live_next && restored_next, "semantic recurrent probe logits missing");
             for (int i = 0; i < n_vocab; ++i) {
-                require(std::isfinite(cold_next[i]) && std::isfinite(restored_next[i]) &&
-                        std::abs(cold_next[i] - restored_next[i]) < 0.002f,
+                require(std::isfinite(live_next[i]) && std::isfinite(restored_next[i]) &&
+                        std::abs(live_next[i] - restored_next[i]) < 0.002f,
                         "semantic recurrent probe logits diverged");
             }
-            const llama_token next = greedy(cold_full.get());
+            const llama_token next = greedy(prefix_source.get());
             require(next == greedy(restored_prefix.get()), "semantic recurrent probe token diverged");
-            const llama_pos next_pos = llama_memory_seq_pos_max(llama_get_memory(cold_full.get()), 0) + 1;
-            decode(cold_full.get(), {next}, next_pos);
+            const llama_pos next_pos = llama_memory_seq_pos_max(llama_get_memory(prefix_source.get()), 0) + 1;
+            decode(prefix_source.get(), {next}, next_pos);
             decode(restored_prefix.get(), {next}, next_pos);
         }
-        std::cout << "PASS: pre-last N-1 snapshot + one-token suffix matches cold logits and "
-                     "8-step recurrent semantics (physical_bytes_equal="
+        std::cout << "PASS: pre-last N-1 snapshot + one-token suffix matches live same-cadence logits and "
+                     "8-step recurrent semantics (cold batch cadence maxabs=" << cold_live_max_abs
+                  << ", physical_bytes_equal="
                   << (physical_state_equal ? "true" : "false") << ")\n";
         params.n_ctx = 1024; params.n_batch = params.n_ubatch = 64;
         llama_context_ptr dest(llama_init_from_model(model.get(), params));

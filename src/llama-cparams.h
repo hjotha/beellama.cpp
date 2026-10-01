@@ -109,6 +109,8 @@ bool kv_unified;
     int         remote_attn_layers  = 0;   // count of full-attention layers offloaded (0 = none)
     int         remote_attn_prefill = 0;   // 0 = static remote attention, 1 = prefill migration
     bool        remote_attn_stats   = false;
+    ggml_type   remote_attn_cache_type_k = GGML_TYPE_COUNT;
+    ggml_type   remote_attn_cache_type_v = GGML_TYPE_COUNT;
 
     // Prism: per-channel K-cache mean-centering bias file (requires type_k == Q4_0).
     const char * path_kv_mean_center = nullptr;

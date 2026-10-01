@@ -11,6 +11,8 @@
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-tail.h"
+#include "llama-kv-mixed-mtp-budget.h"
+#include "llama-kv-mixed-placement.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
 #include "ggml-remote-attn.h"
@@ -28,8 +30,10 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -484,6 +488,31 @@ llama_context::llama_context(
     cparams.remote_attn_enabled = (params.remote_attn_host != nullptr && params.remote_attn_host[0] != '\0');
     cparams.remote_attn_prefill = params.remote_attn_prefill;
     cparams.remote_attn_stats   = (params.remote_attn_stats != 0);
+    cparams.remote_attn_cache_type_k = params.remote_attn_cache_type_k;
+    cparams.remote_attn_cache_type_v = params.remote_attn_cache_type_v;
+    const bool remote_type_k = cparams.remote_attn_cache_type_k != GGML_TYPE_COUNT;
+    const bool remote_type_v = cparams.remote_attn_cache_type_v != GGML_TYPE_COUNT;
+    if (remote_type_k != remote_type_v) {
+        throw std::invalid_argument("mixed remote KV requires both K and V cache types");
+    }
+    if (remote_type_k) {
+        const auto is_qx = [](ggml_type type) {
+            return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
+                    type == GGML_TYPE_Q6_0 || type == GGML_TYPE_Q8_0;
+        };
+        if (!local_attn_dev || !cparams.remote_attn_enabled || model.arch != LLM_ARCH_QWEN35 ||
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+                cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
+                cparams.n_seq_max != 1 || params.kv_unified || params.kv_paged ||
+                !params.offload_kqv || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
+                cparams.remote_attn_prefill != 0 || !is_qx(cparams.remote_attn_cache_type_k) ||
+                !is_qx(cparams.remote_attn_cache_type_v)) {
+            throw std::invalid_argument(
+                    "per-layer remote KV formats require Qwen35 target context, native Vulkan, "
+                    "KVarN local cache, Q4/Q5/Q6/Q8 remote K/V, Flash Attention, KV offload, "
+                    "one non-unified slot, and static prefill");
+        }
+    }
     cparams.remote_attn_layers  = 0;
     cparams.kv_tail_tokens    = std::min(params.kv_tail_tokens, cparams.n_ctx);
     cparams.kv_tail_tokens_swa = std::min(params.kv_tail_tokens,
@@ -496,6 +525,7 @@ llama_context::llama_context(
     }
     cparams.kv_tail_type = params.kv_tail_type;
     bool tail_request_resolved = false;
+    bool mixed_additional_tail_requested = params.kv_tail_tokens > 0 || params.kv_tail_config != nullptr;
     if (params.kv_tail_request && params.kv_tail_config) {
         throw std::invalid_argument("KV tail request and model-bound config are mutually exclusive");
     }
@@ -523,6 +553,7 @@ llama_context::llama_context(
         cparams.kv_tail_tokens_requested = 0;
         cparams.kv_tail_tokens_swa_requested = 0;
         for (const auto & group : resolution.groups) {
+            mixed_additional_tail_requested = mixed_additional_tail_requested || group.raw_requested_tokens > 0;
             if (group.role == "swa") {
                 cparams.kv_tail_tokens_swa_requested = group.requested_tokens;
                 cparams.kv_tail_tokens_swa = group.effective_tokens;
@@ -679,6 +710,9 @@ llama_context::llama_context(
         // the active ubatch as accidental rollback storage.
         cparams.kv_tail_rollback_tokens = 1;
     }
+    if (remote_type_k && (mixed_additional_tail_requested || hparams.n_swa > 0)) {
+        throw std::invalid_argument("mixed remote KV currently requires no additional tail and no SWA layers");
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -784,6 +818,9 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+    if (remote_type_k && (!cparams.flash_attn || !cparams.offload_kqv)) {
+        throw std::invalid_argument("per-layer remote Qx KV requires Flash Attention with KV offload enabled");
+    }
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -1080,6 +1117,8 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.kvarn     =*/ cparams.kvarn,
+            /*.remote_attn_cache_type_k =*/ cparams.remote_attn_cache_type_k,
+            /*.remote_attn_cache_type_v =*/ cparams.remote_attn_cache_type_v,
             /*.kv_tail_tokens =*/ cparams.kv_tail_tokens,
             /*.kv_tail_tokens_swa =*/ cparams.kv_tail_tokens_swa,
             /*.kv_tail_tokens_requested =*/ cparams.kv_tail_tokens_requested,
@@ -1137,8 +1176,242 @@ std::vector<ggml_backend_t> layer_backends;
                     ++n_full_attn;
                 }
             }
+            uint64_t mixed_host_ram_cap_bytes = 0;
+            if (remote_type_k && n_full_attn > 0 &&
+                    params.remote_attn_n_layers == -1) {
+#if defined(__linux__)
+                std::ifstream meminfo("/proc/meminfo");
+                if (!meminfo) {
+                    throw std::runtime_error("mixed KV placement cannot read /proc/meminfo MemAvailable");
+                }
+                uint64_t host_mem_available_bytes = 0;
+                bool found_mem_available = false;
+                std::string memline;
+                while (std::getline(meminfo, memline)) {
+                    if (memline.compare(0, 13, "MemAvailable:") != 0) {
+                        continue;
+                    }
+                    std::istringstream value(memline.substr(13));
+                    uint64_t kib = 0;
+                    std::string unit;
+                    if (!(value >> kib >> unit) || unit != "kB" || kib > UINT64_MAX/1024u) {
+                        throw std::runtime_error("mixed KV placement parsed an invalid MemAvailable value");
+                    }
+                    host_mem_available_bytes = kib*1024u;
+                    found_mem_available = true;
+                    break;
+                }
+                if (!found_mem_available) {
+                    throw std::runtime_error("mixed KV placement did not find MemAvailable in /proc/meminfo");
+                }
+                constexpr uint64_t mixed_host_headroom_bytes = 512ull << 20;
+                // Keep N=0 (ordinary CUDA/KVarN placement) valid even when
+                // the host is under headroom. A one-byte cap makes every
+                // positive remote footprint fail the planner closed.
+                mixed_host_ram_cap_bytes = host_mem_available_bytes > mixed_host_headroom_bytes
+                        ? host_mem_available_bytes - mixed_host_headroom_bytes
+                        : 1;
+                LLAMA_LOG_INFO("%s: mixed KV UMA RAM budget: MemAvailable=%.1f MiB, headroom=512.0 MiB, "
+                               "cap=%.3f MiB; Vulkan/GTT is not added a second time\n",
+                        __func__, host_mem_available_bytes / 1024.0 / 1024.0,
+                        mixed_host_ram_cap_bytes / 1024.0 / 1024.0);
+#else
+                throw std::runtime_error(
+                        "mixed KV remote placement requires Linux MemAvailable for a global shared-RAM budget");
+#endif
+            }
             int n_remote = n_full_attn;
-            if (params.remote_attn_n_layers == -1) {
+            if (params.remote_attn_n_layers == -1 && remote_type_k) {
+                ggml_backend_dev_t cuda_dev = nullptr;
+                uint32_t cuda_owner_layer = UINT32_MAX;
+                for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
+                    if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
+                        continue;
+                    }
+                    ggml_backend_dev_t layer_dev = model.dev_layer(int32_t(il));
+                    const char * layer_name = layer_dev ? ggml_backend_dev_name(layer_dev) : nullptr;
+                    if (!layer_dev || ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            !layer_name || std::strncmp(layer_name, "CUDA", 4) != 0) {
+                        throw std::runtime_error(format(
+                                "mixed KV auto-placement requires a CUDA owner for local KVarN; "
+                                "model layer %u is on %s",
+                                il, layer_name ? layer_name : "an unknown device"));
+                    }
+                    if (cuda_dev && cuda_dev != layer_dev) {
+                        const char * first_name = ggml_backend_dev_name(cuda_dev);
+                        throw std::runtime_error(format(
+                                "mixed KV auto-placement cannot budget multiple CUDA K/V owners: "
+                                "layer %u uses %s and layer %u uses %s",
+                                cuda_owner_layer, first_name ? first_name : "CUDA device", il, layer_name));
+                    }
+                    cuda_dev = layer_dev;
+                    cuda_owner_layer = il;
+                }
+                if (!cuda_dev || !local_attn_dev) {
+                    throw std::runtime_error(
+                            "mixed KV auto-placement requires a model-layer CUDA owner and native Vulkan budget");
+                }
+                size_t cuda_free = 0, cuda_total = 0;
+                size_t vulkan_free = 0, vulkan_total = 0;
+                ggml_backend_dev_memory(cuda_dev, &cuda_free, &cuda_total);
+                ggml_backend_dev_memory(local_attn_dev, &vulkan_free, &vulkan_total);
+                if ((cuda_free == 0 && cuda_total == 0) ||
+                        (vulkan_free == 0 && vulkan_total == 0)) {
+                    throw std::runtime_error("mixed KV auto-placement cannot query CUDA/Vulkan free memory");
+                }
+
+                llama_kv_mixed_sizing sizing = {};
+                sizing.capacity_tokens = cparams.n_ctx_seq;
+                sizing.n_seq_max = cparams.n_seq_max;
+                sizing.kv_unified = cparams.kv_unified;
+                sizing.stage_tail_groups = llama_kvarn_non_swa_tail_groups(
+                        cparams.n_batch, cparams.n_ubatch) *
+                    (cparams.kv_unified ? std::max(1u, cparams.n_seq_max) : 1u);
+                sizing.stage_reserve_groups = 1;
+                sizing.tail_exact_tokens = cparams.kv_tail_tokens;
+                sizing.tail_rollback_tokens = cparams.kv_tail_rollback_tokens;
+                sizing.tail_type = cparams.kv_tail_type == GGML_TYPE_COUNT ?
+                        GGML_TYPE_F16 : cparams.kv_tail_type;
+
+                std::vector<llama_kv_mixed_layer_cost> costs;
+                costs.reserve(n_full_attn);
+                const auto layer_params_for = [&](uint32_t il) {
+                    llama_kv_mixed_layer_params layer = {};
+                    layer.layer = il;
+                    layer.head_dim_k = model.hparams.n_embd_head_k(il);
+                    layer.head_dim_v = model.hparams.n_embd_head_v(il);
+                    layer.n_head_kv = model.hparams.n_head_kv(il);
+                    layer.n_embd_k_gqa = model.hparams.n_embd_k_gqa(il);
+                    layer.n_embd_v_gqa = model.hparams.n_embd_v_gqa(il);
+                    layer.kvarn_bits_k = cparams.kvarn.key_bits;
+                    layer.kvarn_bits_v = cparams.kvarn.value_bits;
+                    layer.qx_type_k = cparams.remote_attn_cache_type_k;
+                    layer.qx_type_v = cparams.remote_attn_cache_type_v;
+                    return layer;
+                };
+                for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
+                    if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
+                        continue;
+                    }
+                    llama_kv_mixed_layer_cost cost = {};
+                    char cost_error[256] = {};
+                    const auto cost_status = llama_kv_mixed_estimate_layer_cost(
+                            layer_params_for(il), sizing, cost, cost_error, sizeof(cost_error));
+                    if (cost_status != LLAMA_KV_MIXED_OK) {
+                        throw std::runtime_error(format(
+                                "mixed KV auto-placement cannot size layer %u: %s",
+                                il, cost_error[0] ? cost_error : llama_kv_mixed_status_name(cost_status)));
+                    }
+                    costs.push_back(cost);
+                }
+                if (costs.size() != size_t(n_full_attn)) {
+                    throw std::runtime_error("mixed KV auto-placement layer geometry count changed during sizing");
+                }
+
+                llama_kv_mixed_budget budget = {};
+                budget.cuda_free_bytes = cuda_free;
+                uint64_t recurrent_reserve = 0;
+                if (cparams.offload_rs) {
+                    const uint64_t rs_rows = uint64_t(std::max(1u, cparams.n_seq_max)) *
+                            (1u + cparams.n_rs_seq);
+                    for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
+                        if (!model.hparams.is_recr(il)) {
+                            continue;
+                        }
+                        recurrent_reserve += uint64_t(model.hparams.n_embd_r() + model.hparams.n_embd_s()) *
+                                sizeof(float) * rs_rows;
+                        if (model.hparams.ple_conv_state() > 0 && model.hparams.is_ple(il)) {
+                            recurrent_reserve += uint64_t(model.hparams.ple_conv_state()) * sizeof(float) * rs_rows;
+                        }
+                    }
+                }
+                uint64_t mtp_reserve = 0;
+                // Planned draft-MTP KV reservation contract (see
+                // llama_context_params::mtp_reserve_*). Reserve the independent
+                // draft cache with the DRAFT representation (KVarN bits or
+                // standard types), the resolved target capacity and the MTP
+                // tail policy (init forces tail 0 / F16; KVarN keeps its
+                // intrinsic 128-token tail). Inactive by default, so a model
+                // that merely has an MTP head does not phantom-reserve
+                // target-format KVarN (which could push an extra layer onto
+                // the Radeon at 204800).
+                if (params.mtp_reserve_enabled) {
+                    llama_kv_mixed_mtp_input mtp_input = {};
+                    mtp_input.n_ctx = cparams.n_ctx_seq;
+                    mtp_input.n_seq_max = cparams.n_seq_max;
+                    mtp_input.kv_unified = cparams.kv_unified;
+                    mtp_input.n_batch = cparams.n_batch;
+                    mtp_input.n_ubatch = cparams.n_ubatch;
+                    mtp_input.kvarn = params.mtp_reserve_kvarn;
+                    mtp_input.kvarn_bits = params.mtp_reserve_kvarn_bits;
+                    mtp_input.type_k = params.mtp_reserve_type_k;
+                    mtp_input.type_v = params.mtp_reserve_type_v;
+                    mtp_input.tail_tokens = 0; // MTP init forces tail 0 / F16
+                    mtp_input.tail_type = GGML_TYPE_F16;
+                    mtp_input.tail_rollback_tokens = params.mtp_reserve_rollback_tokens;
+                    const uint32_t mtp_layer_begin = model.hparams.n_layer();
+                    const uint32_t mtp_layer_end = model.hparams.n_layer_all;
+                    for (uint32_t il = mtp_layer_begin; il < mtp_layer_end; ++il) {
+                        if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
+                            continue;
+                        }
+                        llama_kv_mixed_mtp_layer layer = {};
+                        layer.layer = il;
+                        layer.head_dim_k = model.hparams.n_embd_head_k(il);
+                        layer.head_dim_v = model.hparams.n_embd_head_v(il);
+                        layer.n_head_kv = model.hparams.n_head_kv(il);
+                        layer.n_embd_k_gqa = model.hparams.n_embd_k_gqa(il);
+                        layer.n_embd_v_gqa = model.hparams.n_embd_v_gqa(il);
+                        mtp_input.layers.push_back(layer);
+                    }
+                    llama_kv_mixed_mtp_budget mtp_budget = {};
+                    const auto mtp_status = llama_kv_mixed_mtp_budget_estimate(mtp_input, mtp_budget);
+                    if (mtp_status != LLAMA_KV_MIXED_OK) {
+                        throw std::runtime_error(format(
+                                "mixed KV auto-placement cannot reserve the planned draft-MTP cache: %s",
+                                mtp_budget.error[0] ? mtp_budget.error :
+                                        llama_kv_mixed_status_name(mtp_status)));
+                    }
+                    mtp_reserve = mtp_budget.total_bytes;
+                }
+                budget.cuda_reserve_bytes = params.remote_attn_cuda_reserve;
+                if (recurrent_reserve > UINT64_MAX - budget.cuda_reserve_bytes ||
+                        mtp_reserve > UINT64_MAX - budget.cuda_reserve_bytes - recurrent_reserve) {
+                    throw std::runtime_error("mixed KV CUDA reserve sizing overflow");
+                }
+                budget.cuda_reserve_bytes += recurrent_reserve + mtp_reserve;
+                budget.vulkan_free_bytes = vulkan_free;
+                budget.vulkan_reserve_bytes = params.remote_attn_vulkan_reserve;
+                budget.ram_cap_bytes = mixed_host_ram_cap_bytes;
+                budget.handoff_chunk_tokens = 1024;
+                budget.handoff_concurrency = 1;
+
+                llama_kv_mixed_placement placement = {};
+                const auto placement_status = llama_kv_mixed_choose_placement(
+                        costs, sizing, budget, placement);
+                if (placement_status != LLAMA_KV_MIXED_OK) {
+                    throw std::runtime_error(format(
+                            "mixed KV auto-placement failed: %s",
+                            placement.error[0] ? placement.error : llama_kv_mixed_status_name(placement_status)));
+                }
+                n_remote = int(placement.n_remote);
+                LLAMA_LOG_INFO("%s: mixed KV auto-placement: CUDA owner=%s CUDA=%0.1f/%0.1f MiB reserve=%0.1f MiB "
+                               "(RS=%0.1f, MTP=%0.1f), Vulkan=%0.1f/%0.1f MiB reserve=%0.1f MiB, "
+                               "host handoff=%0.1f MiB "
+                               "chunk=%llu tokens -> Vulkan Qx layers=%d, CUDA KVarN layers=%d\n",
+                        __func__, ggml_backend_dev_name(cuda_dev),
+                        placement.cuda_used_bytes / 1024.0 / 1024.0,
+                        placement.cuda_available_bytes / 1024.0 / 1024.0,
+                        budget.cuda_reserve_bytes / 1024.0 / 1024.0,
+                        recurrent_reserve / 1024.0 / 1024.0,
+                        mtp_reserve / 1024.0 / 1024.0,
+                        placement.vulkan_used_bytes / 1024.0 / 1024.0,
+                        placement.vulkan_available_bytes / 1024.0 / 1024.0,
+                        budget.vulkan_reserve_bytes / 1024.0 / 1024.0,
+                        placement.ram_temp_bytes / 1024.0 / 1024.0,
+                        (unsigned long long) placement.effective_chunk_tokens,
+                        n_remote, n_full_attn - n_remote);
+            } else if (params.remote_attn_n_layers == -1) {
                 size_t cuda_free = 0, cuda_total = 0;
                 ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_name("CUDA0");
                 if (!cuda_dev) cuda_dev = ggml_backend_dev_by_name("CUDA");
@@ -1270,6 +1543,25 @@ std::vector<ggml_backend_t> layer_backends;
                 n_remote = params.remote_attn_n_layers;
             }
             cparams.remote_attn_layers = n_remote;
+            if (remote_type_k) {
+                int full_idx = 0;
+                for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
+                    if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
+                        continue;
+                    }
+                    if (full_idx >= n_remote) {
+                        auto * local_dev = model.dev_layer(il);
+                        const char * local_name = local_dev ? ggml_backend_dev_name(local_dev) : nullptr;
+                        if (!local_name || ggml_backend_dev_type(local_dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                                std::strncmp(local_name, "CUDA", 4) != 0) {
+                            throw std::invalid_argument(format(
+                                    "mixed KV layer %u remains KVarN but its local model layer is not on CUDA",
+                                    il));
+                        }
+                    }
+                    ++full_idx;
+                }
+            }
             if (local_attn_dev != nullptr) {
                 LLAMA_LOG_INFO("%s: local attention placement: context=%s Vulkan-layers=%d/%d mode=%s\n",
                         __func__, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "MTP" : "target",
@@ -4119,6 +4411,8 @@ class llama_io_write_dummy : public llama_io_write_i {
 public:
     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
 
+    bool counts_only() const override { return true; }
+
     void write(const void * /* src */, size_t size) override {
         size_written += size;
     }
@@ -4412,11 +4706,17 @@ public:
     }
 
     void read(void * dst, size_t size) override {
+        check_file_remaining(size);
+        if (size != 0 && dst == nullptr) {
+            throw std::runtime_error("invalid null destination for sequence state read");
+        }
         file->read_raw(dst, size);
         size_read += size;
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        check_tensor_span(tensor, offset, size);
+        check_file_remaining(size);
         read_info info { tensor, {}, size, offset, false };
         info.data.resize(size);
         read(info.data.data(), size);
@@ -4424,13 +4724,20 @@ public:
     }
 
     void stage_tensor_set(ggml_tensor * tensor, const void * src, size_t offset, size_t size) override {
+        check_tensor_span(tensor, offset, size);
+        if (size != 0 && src == nullptr) {
+            throw std::runtime_error("invalid null source for sequence state tensor staging");
+        }
         read_info info { tensor, {}, size, offset, false };
         info.data.resize(size);
-        memcpy(info.data.data(), src, size);
+        if (size != 0) {
+            memcpy(info.data.data(), src, size);
+        }
         rinfos.push_back(std::move(info));
     }
 
     void stage_tensor_clear(ggml_tensor * tensor, size_t offset, size_t size) override {
+        check_tensor_span(tensor, offset, size);
         rinfos.push_back({ tensor, {}, size, offset, true });
     }
 
@@ -4462,6 +4769,20 @@ public:
     }
 
 private:
+    void check_file_remaining(size_t size) const {
+        const size_t position = file->tell();
+        const size_t end = file->size();
+        if (position > end || size > end - position) {
+            throw std::runtime_error("truncated sequence state file");
+        }
+    }
+
+    static void check_tensor_span(ggml_tensor * tensor, size_t offset, size_t size) {
+        if (!tensor || offset > ggml_nbytes(tensor) || size > ggml_nbytes(tensor) - offset) {
+            throw std::runtime_error("sequence state tensor range is outside the destination");
+        }
+    }
+
     llama_file * file;
     size_t size_read = 0;
 
@@ -5079,6 +5400,17 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
+    if (!n_token_count_out) {
+        LLAMA_LOG_ERROR("%s: token count output is required\n", __func__);
+        return 0;
+    }
+    *n_token_count_out = 0;
+
+    constexpr size_t sequence_header_size = 3*sizeof(uint32_t);
+    if (file.size() < sequence_header_size) {
+        LLAMA_LOG_ERROR("%s: truncated sequence state header\n", __func__);
+        return 0;
+    }
 
     // version checks
     {
@@ -5092,16 +5424,26 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     }
 
     // load the prompt
+    uint32_t loaded_token_count = 0;
     {
         const uint32_t n_token_count = file.read_u32();
+        loaded_token_count = n_token_count;
+        const size_t token_begin = file.tell();
+        const size_t file_size = file.size();
+        if (token_begin > file_size ||
+                uint64_t(n_token_count) > uint64_t(std::numeric_limits<size_t>::max())/sizeof(llama_token)) {
+            LLAMA_LOG_ERROR("%s: invalid token count in sequence state file\n", __func__);
+            return 0;
+        }
+        const size_t remaining = file_size - token_begin;
+        const size_t token_bytes = size_t(n_token_count)*sizeof(llama_token);
+        if (token_bytes > remaining) {
+            LLAMA_LOG_ERROR("%s: token payload is truncated (%zu bytes required, %zu remain)\n",
+                    __func__, token_bytes, remaining);
+            return 0;
+        }
 
         if (tokens_out == nullptr) {
-            const size_t n_token_max = (file.size() - file.tell()) / sizeof(llama_token);
-            if (n_token_count > n_token_max) {
-                LLAMA_LOG_ERROR("%s: token count in sequence state file exceeds the file size! %u > %zu\n", __func__, n_token_count, n_token_max);
-                return 0;
-            }
-
             *n_token_count_out = n_token_count;
             return file.tell();
         }
@@ -5111,24 +5453,25 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
             return 0;
         }
 
-        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
-        *n_token_count_out = n_token_count;
+        file.read_raw(tokens_out, token_bytes);
     }
 
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
+        const size_t state_begin = file.tell();
         llama_io_read_file io(&file);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
-        if (!nread) {
-            LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
+        const size_t state_end = file.tell();
+        if (!nread || nread > state_size || state_end < state_begin || state_end - state_begin != nread) {
+            LLAMA_LOG_ERROR("%s: failed to restore sequence state (read %zu of %zu bytes)\n",
+                    __func__, nread, state_size);
             return 0;
         }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
         io.commit();
     }
 
+    *n_token_count_out = loaded_token_count;
     return file.tell();
 }
 
@@ -5892,6 +6235,9 @@ llama_context_params llama_context_default_params() {
         /*.remote_attn_stats           =*/ 0,
         /*.remote_attn_n_layers        =*/ -1,
         /*.remote_attn_cuda_reserve    =*/ 350 * 1024 * 1024,
+        /*.remote_attn_vulkan_reserve =*/ 512 * 1024 * 1024,
+        /*.remote_attn_cache_type_k   =*/ GGML_TYPE_COUNT,
+        /*.remote_attn_cache_type_v   =*/ GGML_TYPE_COUNT,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -5924,6 +6270,12 @@ llama_context_params llama_context_default_params() {
         /*.dflash_split                =*/ false,
         /*.dflash_selector_only        =*/ false,
         /*.no_offload_rs               =*/ false,
+        /*.mtp_reserve_enabled         =*/ false,
+        /*.mtp_reserve_kvarn           =*/ LLAMA_KVARN_TYPE_DISABLED,
+        /*.mtp_reserve_kvarn_bits      =*/ 0,
+        /*.mtp_reserve_type_k          =*/ GGML_TYPE_F16,
+        /*.mtp_reserve_type_v          =*/ GGML_TYPE_F16,
+        /*.mtp_reserve_rollback_tokens =*/ 0,
     };
 
     return result;

@@ -647,6 +647,46 @@ llama_test(test-meta-graph-reuse NAME test-meta-cuda-graph-reuse LABEL cuda ARGS
 llama_test(test-meta-graph-reuse NAME test-meta-kvarn-cuda-graph-reuse LABEL cuda ARGS kvarn-cuda)
 llama_build_and_test(test-kv-cache-placement.cpp ../src/llama-kv-cache-placement.cpp)
 target_include_directories(test-kv-cache-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-mixed-placement.cpp)
+target_include_directories(test-kv-mixed-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-mixed-mtp-budget.cpp)
+target_include_directories(test-kv-mixed-mtp-budget PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+llama_build_and_test(test-kv-mixed-mtp-params.cpp)
+target_include_directories(test-kv-mixed-mtp-params PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+llama_build_and_test(test-kv-qx-convert.cpp)
+target_include_directories(test-kv-qx-convert PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-kvarn-materializer.cpp)
+target_include_directories(test-kv-kvarn-materializer PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build_and_test(test-kv-mixed-state.cpp)
+target_include_directories(test-kv-mixed-state PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-mixed-state-stream.cpp)
+target_include_directories(test-kv-mixed-state-stream PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# The IO adapter's no-read/no-write assertions must interpose calls from the
+# adapter translation units themselves. GNU ld/lld --wrap is available for
+# Linux GCC/Clang only; unsupported platforms skip this instrumentation target
+# instead of building a test whose central assertions would be meaningless.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
+        AND NOT GGML_BACKEND_DL AND GGML_CPU)
+    add_executable(test-kv-mixed-io
+        test-kv-mixed-io.cpp
+        ../src/llama-kv-mixed-io.cpp
+        ../src/llama-kv-mixed-state.cpp
+        ../src/llama-kv-mixed-state-stream.cpp)
+    target_include_directories(test-kv-mixed-io PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(test-kv-mixed-io PRIVATE cxx_std_17)
+    target_link_libraries(test-kv-mixed-io PRIVATE ggml ggml-cpu)
+    target_link_options(test-kv-mixed-io PRIVATE
+        "-Wl,--wrap=ggml_backend_tensor_get"
+        "-Wl,--wrap=ggml_backend_tensor_set"
+        "-Wl,--wrap=ggml_backend_tensor_memset")
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-kv-mixed-io RUNTIME)
+    endif()
+    add_test(NAME test-kv-mixed-io WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kv-mixed-io>)
+    set_property(TEST test-kv-mixed-io PROPERTY LABELS main)
+else()
+    message(STATUS "Skipping test-kv-mixed-io: requires GNU/Linux --wrap and a linked CPU backend")
+endif()
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-std-kv-tail-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
@@ -816,3 +856,9 @@ target_include_directories(test-ggml-op-coverage PRIVATE ${PROJECT_SOURCE_DIR}/g
 target_link_libraries(test-ggml-op-coverage PRIVATE ggml)
 add_test(NAME test-ggml-op-coverage COMMAND $<TARGET_FILE:test-ggml-op-coverage>)
 set_property(TEST test-ggml-op-coverage PROPERTY LABELS main)
+
+llama_build_and_test(test-kv-mixed-handoff.cpp)
+target_include_directories(test-kv-mixed-handoff PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build_and_test(test-fit-mixed-kv.cpp)
+target_include_directories(test-fit-mixed-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)

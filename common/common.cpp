@@ -10,6 +10,10 @@
 #include "../src/llama-model.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-context.h"
+#include "../src/llama-kv-cache-kvarn.h"
+#include "../src/llama-kv-mixed-placement.h"
+#include "../src/llama-kv-mixed-mtp-budget.h"
+#include "../src/llama-memory-hybrid.h"
 #include "../src/llama-memory-hybrid-paged.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1457,6 +1461,68 @@ static ggml_backend_dev_t common_fit_selected_device(const common_params & param
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
 }
 
+static ggml_backend_dev_t common_fit_remote_vulkan_device(const common_params & params) {
+    if (!common_remote_attn_is_local_vulkan(params.remote_attn_host)) {
+        return nullptr;
+    }
+    uint32_t index = 0;
+    const auto colon = params.remote_attn_host.find(':');
+    if (colon != std::string::npos && colon + 1 < params.remote_attn_host.size()) {
+        try {
+            index = uint32_t(std::stoul(params.remote_attn_host.substr(colon + 1)));
+        } catch (...) {
+            return nullptr;
+        }
+    }
+    const std::string name = "Vulkan" + std::to_string(index);
+    if (ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str())) {
+        return dev;
+    }
+    return nullptr;
+}
+
+static llama_kv_mixed_sizing common_fit_mixed_kv_sizing(
+        const common_params & params, uint64_t capacity_tokens) {
+    llama_kv_mixed_sizing sizing = {};
+    sizing.capacity_tokens = capacity_tokens;
+    sizing.n_seq_max = std::max<uint32_t>(1, uint32_t(params.n_parallel));
+    sizing.kv_unified = params.kv_unified;
+    const uint32_t n_batch = uint32_t(std::min<uint64_t>(
+            std::max(1, params.n_batch), capacity_tokens));
+    const uint32_t n_ubatch = params.n_ubatch <= 0 ? n_batch :
+            std::min(n_batch, uint32_t(params.n_ubatch));
+    sizing.stage_tail_groups = llama_kvarn_non_swa_tail_groups(n_batch, n_ubatch) *
+            (sizing.kv_unified ? sizing.n_seq_max : 1u);
+    sizing.stage_reserve_groups = 1;
+    sizing.tail_exact_tokens = std::min<uint64_t>(128, capacity_tokens);
+    sizing.tail_rollback_tokens = std::max<uint32_t>(1, std::max(
+            params.speculative.n_rs_seq_target, params.speculative.need_n_rs_seq()));
+    sizing.tail_type = params.kv_tail_type == GGML_TYPE_COUNT ? GGML_TYPE_F16 : params.kv_tail_type;
+    return sizing;
+}
+
+static bool common_fit_mixed_kv_layer_cost(
+        const llama_model * model,
+        const common_params & params,
+        const llama_kv_mixed_sizing & sizing,
+        uint32_t il,
+        llama_kv_mixed_layer_cost & cost,
+        char * error,
+        size_t error_size) {
+    llama_kv_mixed_layer_params layer = {};
+    layer.layer = il;
+    layer.head_dim_k = model->hparams.n_embd_head_k(il);
+    layer.head_dim_v = model->hparams.n_embd_head_v(il);
+    layer.n_head_kv = model->hparams.n_head_kv(il);
+    layer.n_embd_k_gqa = model->hparams.n_embd_k_gqa(il);
+    layer.n_embd_v_gqa = model->hparams.n_embd_v_gqa(il);
+    layer.kvarn_bits_k = params.kvarn.key_bits;
+    layer.kvarn_bits_v = params.kvarn.value_bits;
+    layer.qx_type_k = params.remote_attn_cache_type_k;
+    layer.qx_type_v = params.remote_attn_cache_type_v;
+    return llama_kv_mixed_estimate_layer_cost(layer, sizing, cost, error, error_size) == LLAMA_KV_MIXED_OK;
+}
+
 static size_t common_context_memory_on_device(const llama_context * ctx, ggml_backend_dev_t dev) {
     size_t total = 0;
 
@@ -1681,6 +1747,393 @@ static void common_fit_normal_kv_context(common_params & params, llama_model * m
             free_vram / 1024.0f / 1024.0f, margin / 1024.0f / 1024.0f,
             compute_overhead / 1024.0f / 1024.0f, params.n_batch, params.n_ubatch,
             spec_mtp ? "yes" : "no");
+}
+
+static bool common_fit_mixed_kv_active(const common_params & params) {
+    // Mixed (KVarN local + standard Qx local-Vulkan remote) cache configured:
+    // both Qx types opted in, a local Vulkan remote host, structured KVarN
+    // enabled, and the auto-context fit path (n_ctx == 0, not paged).
+    return params.n_ctx == 0 && !params.kv_paged &&
+        params.remote_attn_cache_type_k != GGML_TYPE_COUNT &&
+        params.remote_attn_cache_type_v != GGML_TYPE_COUNT &&
+        common_remote_attn_is_local_vulkan(params.remote_attn_host) &&
+        params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
+}
+
+// Recurrent-state capacity reserve, mirroring the runtime planner exactly:
+// resolved cparams decide offload_rs and n_rs_seq; rows are
+// (n_embd_r + n_embd_s) F32 per (1 + n_rs_seq) snapshot over the recurrent
+// layers, plus the PLE conv state rows.
+static bool common_fit_mixed_rs_reserve(const llama_model * model,
+        const llama_context_params & resolved, uint64_t & reserve_out) {
+    reserve_out = 0;
+    if (resolved.no_offload_rs) {
+        return true; // RS stays in host RAM; no CUDA reserve
+    }
+    const uint64_t rs_rows = uint64_t(std::max<uint32_t>(1, resolved.n_seq_max)) *
+            (1u + resolved.n_rs_seq);
+    const uint64_t max_u64 = std::numeric_limits<uint64_t>::max();
+    uint64_t reserve = 0;
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        if (!model->hparams.is_recr(il)) {
+            continue;
+        }
+        const uint64_t row = uint64_t(model->hparams.n_embd_r() +
+                model->hparams.n_embd_s()) * sizeof(float) * rs_rows;
+        if (reserve > max_u64 - row) {
+            return false;
+        }
+        reserve += row;
+        if (model->hparams.ple_conv_state() > 0 && model->hparams.is_ple(il)) {
+            const uint64_t ple = uint64_t(model->hparams.ple_conv_state()) *
+                    sizeof(float) * rs_rows;
+            if (reserve > max_u64 - ple) {
+                return false;
+            }
+            reserve += ple;
+        }
+    }
+    reserve_out = reserve;
+    return true;
+}
+
+// Active draft-MTP cache reserve, mirroring the runtime planner exactly: the
+// resolved cparams' mtp_reserve_* (DRAFT representation: kvarn bits or
+// standard draft types, resolved tail rollback) at the candidate capacity,
+// skipping recurrent appended layers. Zero when the resolved profile has no
+// active draft-MTP context (mtp_reserve_enabled).
+static bool common_fit_mixed_mtp_reserve(const llama_model * model,
+        const common_params & params, const llama_context_params & resolved,
+        uint64_t capacity, uint64_t & reserve_out) {
+    reserve_out = 0;
+    if (!resolved.mtp_reserve_enabled) {
+        return true;
+    }
+    llama_kv_mixed_mtp_input mtp = {};
+    mtp.n_ctx = uint32_t(std::min<uint64_t>(capacity, UINT32_MAX));
+    mtp.n_seq_max = std::max<uint32_t>(1, resolved.n_seq_max);
+    mtp.kv_unified = resolved.kv_unified;
+    mtp.n_batch = uint32_t(std::min<uint64_t>(std::max(1, params.n_batch), capacity));
+    mtp.n_ubatch = params.n_ubatch <= 0 ? mtp.n_batch :
+            std::min(mtp.n_batch, uint32_t(params.n_ubatch));
+    mtp.kvarn = resolved.mtp_reserve_kvarn;
+    mtp.kvarn_bits = resolved.mtp_reserve_kvarn_bits;
+    mtp.type_k = resolved.mtp_reserve_type_k;
+    mtp.type_v = resolved.mtp_reserve_type_v;
+    mtp.tail_tokens = 0;
+    mtp.tail_type = GGML_TYPE_F16; // MTP initialization forces its own exact tail type.
+    mtp.tail_rollback_tokens = resolved.mtp_reserve_rollback_tokens;
+    for (uint32_t il = model->hparams.n_layer(); il < model->hparams.n_layer_all; ++il) {
+        if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
+            continue; // recurrent appended layers carry no KV rows
+        }
+        llama_kv_mixed_mtp_layer l = {};
+        l.layer = il;
+        l.head_dim_k = model->hparams.n_embd_head_k(il);
+        l.head_dim_v = model->hparams.n_embd_head_v(il);
+        l.n_head_kv = model->hparams.n_head_kv(il);
+        l.n_embd_k_gqa = model->hparams.n_embd_k_gqa(il);
+        l.n_embd_v_gqa = model->hparams.n_embd_v_gqa(il);
+        mtp.layers.push_back(l);
+    }
+    llama_kv_mixed_mtp_budget mtp_budget = {};
+    const auto status = llama_kv_mixed_mtp_budget_estimate(mtp, mtp_budget);
+    if (status != LLAMA_KV_MIXED_OK) {
+        LOG_WRN("%s: MTP draft budget rejected at ctx=%llu: %s\n",
+                __func__, (unsigned long long) capacity, mtp_budget.error);
+        return false;
+    }
+    reserve_out = mtp_budget.total_bytes;
+    return true;
+}
+
+// Fit the auto context size against the MIXED per-layer capacity model
+// (KVarN local + standard Qx remote on the local Vulkan accelerator) instead
+// of the F16 metadata bytes-per-token estimate. Supports the single-slot
+// non-unified non-SWA Qwen35-style target contract. Auto uses
+// llama_kv_mixed_choose_placement (minimum remote N subject to both budgets,
+// matching the runtime auto-placement); "full"/explicit N are verified by
+// exact sums and never silently changed. Unsupported configurations return
+// false with a clear log reason; the caller aborts init instead of silently
+// defaulting to the training capacity.
+static bool common_fit_mixed_kv_context(common_params & params, llama_model * model) {
+    GGML_ASSERT(model && "model must be loaded before fitting mixed KV context.");
+
+    // Contract guards (reject/explain unsupported; never silently estimate).
+    if (params.n_parallel != 1) {
+        LOG_ERR("%s: mixed KV auto-fit supports a single slot (n_parallel=1); got %d\n",
+                __func__, params.n_parallel);
+        return false;
+    }
+    if (params.kv_unified) {
+        LOG_ERR("%s: mixed KV auto-fit requires non-unified storage; kv_unified is set\n",
+                __func__);
+        return false;
+    }
+    if (model->hparams.n_swa > 0 || model->hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        LOG_ERR("%s: mixed KV auto-fit requires a non-SWA model\n", __func__);
+        return false;
+    }
+    if (model->arch != LLM_ARCH_QWEN35) {
+        LOG_ERR("%s: mixed KV auto-fit contract currently covers Qwen35 targets; arch=%s\n",
+                __func__, llm_arch_name(model->arch));
+        return false;
+    }
+
+    // Local device: the model's attention backend, and it must be a CUDA
+    // backend (not any GPU, not Vulkan). Multiple distinct GPU owners among
+    // the attention layers are rejected (unsupported).
+    ggml_backend_dev_t local_dev = nullptr;
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
+            continue;
+        }
+        ggml_backend_dev_t dev = model->dev_layer(il);
+        if (dev == nullptr) {
+            continue;
+        }
+        if (local_dev == nullptr) {
+            local_dev = dev;
+        } else if (dev != local_dev) {
+            LOG_ERR("%s: multiple CUDA owners among attention layers are unsupported\n",
+                    __func__);
+            return false;
+        }
+    }
+    const char * local_name = local_dev ? ggml_backend_dev_name(local_dev) : nullptr;
+    if (local_dev == nullptr || ggml_backend_dev_type(local_dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+            !local_name || std::strncmp(local_name, "CUDA", 4) != 0) {
+        LOG_ERR("%s: mixed KV auto-fit requires a single CUDA attention backend (got %s)\n",
+                __func__, local_name ? local_name : "none");
+        return false;
+    }
+    ggml_backend_dev_t remote_dev = common_fit_remote_vulkan_device(params);
+    if (remote_dev == nullptr) {
+        LOG_ERR("%s: mixed KV auto-fit requires a local Vulkan remote host\n", __func__);
+        return false;
+    }
+
+    // Budgets AFTER the resident model weights (never subtract weights again).
+    size_t cuda_free = 0, cuda_total = 0, vulkan_free = 0, vulkan_total = 0;
+    ggml_backend_dev_memory(local_dev, &cuda_free, &cuda_total);
+    ggml_backend_dev_memory(remote_dev, &vulkan_free, &vulkan_total);
+    const size_t sane_budget = (size_t) 1 << 50;
+    if (cuda_free == 0 || cuda_free > sane_budget ||
+            (vulkan_free == 0 && vulkan_total == 0) || vulkan_free > sane_budget) {
+        LOG_ERR("%s: invalid device budgets (cuda free=%zu, vulkan free=%zu)\n",
+                __func__, cuda_free, vulkan_free);
+        return false;
+    }
+    // Linux MemAvailable caps the shared UMA budget once. Unreadable or
+    // below the 512 MiB host headroom is a hard failure (never unlimited).
+    uint64_t ram_cap = 0;
+#if defined(__linux__)
+    {
+        FILE * f = std::fopen("/proc/meminfo", "r");
+        bool found = false;
+        if (f) {
+            char line[256];
+            while (std::fgets(line, sizeof(line), f)) {
+                unsigned long long kb = 0;
+                if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                    const uint64_t headroom = 512ull << 20;
+                    if (kb > (std::numeric_limits<uint64_t>::max() >> 10)) {
+                        LOG_ERR("%s: MemAvailable overflows the RAM cap\n", __func__);
+                        std::fclose(f);
+                        return false;
+                    }
+                    const uint64_t available = kb * 1024ull;
+                    if (available <= headroom) {
+                        LOG_ERR("%s: MemAvailable %llu MiB below the 512 MiB host headroom\n",
+                                __func__, (unsigned long long) (available >> 20));
+                        std::fclose(f);
+                        return false;
+                    }
+                    ram_cap = available - headroom;
+                    found = true;
+                    break;
+                }
+            }
+            std::fclose(f);
+        }
+        if (!found) {
+            LOG_ERR("%s: cannot read MemAvailable from /proc/meminfo\n", __func__);
+            return false;
+        }
+    }
+#endif
+    if (ram_cap > 0 && uint64_t(vulkan_free) > ram_cap) {
+        vulkan_free = size_t(ram_cap);
+    }
+
+    // Resolved context params mirror the runtime exactly (n_rs_seq,
+    // offload_rs, mtp_reserve_*): derive once, never guess from raw flags.
+    const llama_context_params resolved = common_context_params_to_llama(params);
+
+    uint64_t rs_reserve = 0;
+    if (!common_fit_mixed_rs_reserve(model, resolved, rs_reserve)) {
+        LOG_ERR("%s: recurrent reserve overflow\n", __func__);
+        return false;
+    }
+
+    // Remote policy: "auto" uses llama_kv_mixed_choose_placement; "full"/"all"
+    // requires ALL attention layers remote; an integer N requires exactly N.
+    int remote_policy = -1;
+    if (params.remote_attn_layers == "auto") {
+        remote_policy = -1;
+    } else if (params.remote_attn_layers == "full" || params.remote_attn_layers == "all" ||
+            params.remote_attn_layers.empty()) {
+        remote_policy = 0;
+    } else {
+        remote_policy = std::atoi(params.remote_attn_layers.c_str());
+    }
+
+    const uint32_t n_seq = std::max<uint32_t>(1, params.n_parallel);
+    const uint64_t train_ctx = uint64_t(model->hparams.n_ctx_train) * n_seq;
+    const uint32_t align = 256 * n_seq;
+
+    // Feasibility of capacity C under the mixed per-layer model.
+    uint64_t best_mtp_reserve = 0;
+    const auto feasible = [&](uint64_t C, uint32_t & n_remote_out,
+            uint64_t & mtp_reserve_out) -> bool {
+        llama_kv_mixed_sizing sizing = common_fit_mixed_kv_sizing(params, C);
+        sizing.tail_rollback_tokens = std::max<uint32_t>(1,
+                std::max(resolved.n_rs_seq, resolved.kv_tail_rollback_tokens));
+        std::vector<llama_kv_mixed_layer_cost> costs;
+        costs.reserve(model->hparams.n_layer());
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
+                continue;
+            }
+            llama_kv_mixed_layer_cost cost = {};
+            char cost_error[256] = {};
+            if (!common_fit_mixed_kv_layer_cost(model, params, sizing, il, cost,
+                    cost_error, sizeof(cost_error))) {
+                LOG_WRN("%s: mixed layer cost rejected at ctx=%llu layer=%u: %s\n",
+                        __func__, (unsigned long long) C, il, cost_error);
+                return false;
+            }
+            costs.push_back(cost);
+        }
+        if (costs.empty()) {
+            return false;
+        }
+        const uint32_t n_attn = uint32_t(costs.size());
+        if (remote_policy > int(n_attn)) {
+            LOG_ERR("%s: explicit remote layer count %d exceeds the %u attention layers\n",
+                    __func__, remote_policy, n_attn);
+            return false;
+        }
+
+        uint64_t mtp_reserve = 0;
+        if (!common_fit_mixed_mtp_reserve(model, params, resolved, C, mtp_reserve)) {
+            return false;
+        }
+        mtp_reserve_out = mtp_reserve;
+
+        const uint64_t max_u64 = std::numeric_limits<uint64_t>::max();
+        if (rs_reserve > max_u64 - mtp_reserve ||
+                uint64_t(params.remote_attn_cuda_reserve) > max_u64 - rs_reserve - mtp_reserve) {
+            return false;
+        }
+        const uint64_t cuda_reserve = rs_reserve + mtp_reserve +
+                uint64_t(params.remote_attn_cuda_reserve);
+        const uint64_t vulkan_reserve = uint64_t(params.remote_attn_vulkan_reserve);
+        if (cuda_reserve > cuda_free) {
+            return false;
+        }
+
+        if (remote_policy < 0) {
+            // Auto: the placement chooser is the authority (minimum remote N
+            // subject to BOTH budgets and the global RAM cap; the reserves
+            // are passed raw and applied by the chooser, which rejects a
+            // reserve above the free budget).
+            llama_kv_mixed_budget budget = {};
+            budget.cuda_free_bytes = cuda_free;
+            budget.cuda_reserve_bytes = cuda_reserve;
+            budget.vulkan_free_bytes = vulkan_free;
+            budget.vulkan_reserve_bytes = vulkan_reserve;
+            budget.ram_cap_bytes = ram_cap;
+            budget.handoff_chunk_tokens = 1024;
+            budget.handoff_concurrency = 1;
+            llama_kv_mixed_placement placement = {};
+            if (llama_kv_mixed_choose_placement(costs, sizing, budget, placement)
+                    != LLAMA_KV_MIXED_OK) {
+                return false;
+            }
+            n_remote_out = placement.n_remote;
+            return true;
+        }
+
+        // Explicit/full always includes remote layers, unlike auto N=0.
+        if (vulkan_reserve > vulkan_free) {
+            return false;
+        }
+        // Exact sums; never a silently different count.
+        const uint32_t n_remote = remote_policy == 0 ? n_attn : uint32_t(remote_policy);
+        uint64_t local_suffix = 0;
+        uint64_t remote_prefix = 0;
+        for (uint32_t i = 0; i < n_attn; ++i) {
+            const bool is_remote = i < n_remote;
+            const uint64_t bytes = is_remote ? costs[i].remote_bytes : costs[i].local_bytes;
+            if (bytes > max_u64 - (is_remote ? remote_prefix : local_suffix)) {
+                return false;
+            }
+            (is_remote ? remote_prefix : local_suffix) += bytes;
+        }
+        if (local_suffix > cuda_free - cuda_reserve) {
+            return false;
+        }
+        if (remote_prefix > vulkan_free - vulkan_reserve) {
+            return false;
+        }
+        if (ram_cap > 0 && (vulkan_reserve > ram_cap ||
+                remote_prefix > ram_cap - vulkan_reserve)) {
+            return false;
+        }
+        n_remote_out = n_remote;
+        return true;
+    };
+
+    // Search the largest aligned capacity <= train_ctx that fits.
+    uint64_t lo = align;
+    uint64_t hi = (train_ctx / align) * align;
+    uint64_t best = 0;
+    uint32_t best_remote = 0;
+    while (lo <= hi) {
+        const uint64_t mid = lo + (hi - lo) / 2;
+        const uint64_t mid_aligned = (mid / align) * align;
+        uint32_t n_remote = 0;
+        uint64_t mtp_reserve = 0;
+        if (mid_aligned >= align && feasible(mid_aligned, n_remote, mtp_reserve)) {
+            best = mid_aligned;
+            best_remote = n_remote;
+            best_mtp_reserve = mtp_reserve;
+            lo = mid_aligned + align;
+        } else {
+            hi = mid_aligned >= align ? mid_aligned - align : 0;
+        }
+    }
+    if (best < align) {
+        LOG_ERR("%s: no mixed KV context fits the selected device budgets "
+                "(cuda free=%.1f MiB, vulkan free=%.1f MiB, ram cap=%.1f MiB)\n",
+                __func__, cuda_free / 1024.0f / 1024.0f,
+                vulkan_free / 1024.0f / 1024.0f, ram_cap / 1024.0f / 1024.0f);
+        return false;
+    }
+
+    params.n_ctx = (uint32_t) best;
+    LOG_INF("%s: ctx0 mixed KV candidate: ctx=%u, ctx_per_slot=%u, remote_layers=%u, "
+            "local_vulkan=%s, cuda_free=%.1f MiB, vulkan_free=%.1f MiB, ram_cap=%.1f MiB, "
+            "rs_reserve=%.1f MiB, mtp_reserve=%.1f MiB (conservative estimate; "
+            "validate on GPU later)\n",
+            __func__, params.n_ctx, params.n_ctx / n_seq, best_remote,
+            ggml_backend_dev_name(remote_dev),
+            cuda_free / 1024.0f / 1024.0f, vulkan_free / 1024.0f / 1024.0f,
+            ram_cap / 1024.0f / 1024.0f,
+            rs_reserve / 1024.0f / 1024.0f,
+            best_mtp_reserve / 1024.0f / 1024.0f);
+    return true;
 }
 
 static void common_fit_paged_kv_blocks(common_params& params, llama_model * model) {
@@ -1959,7 +2412,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     if (!params.kv_paged && params.n_ctx == 0) {
-        common_fit_normal_kv_context(params, pimpl->model.get());
+        if (common_fit_mixed_kv_active(params)) {
+            if (!common_fit_mixed_kv_context(params, pimpl->model.get())) {
+                // Match the constructor's normal initialization-failure
+                // contract: return a model with no context so server/CLI
+                // callers can shut down cleanly, rather than throw across
+                // the standalone server's unguarded load_model call.
+                COM_ERR("%s", "mixed KV auto-fit failed (see log); refusing to default to the training capacity\n");
+                return;
+            }
+        } else {
+            common_fit_normal_kv_context(params, pimpl->model.get());
+        }
         cparams = common_context_params_to_llama(params);
     }
 
@@ -2898,6 +3362,21 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
+    const bool remote_cache_k = params.remote_attn_cache_type_k != GGML_TYPE_COUNT;
+    const bool remote_cache_v = params.remote_attn_cache_type_v != GGML_TYPE_COUNT;
+    if (remote_cache_k != remote_cache_v) {
+        throw std::invalid_argument("--remote-attn-cache-type-k and -v must be supplied together");
+    }
+    if (remote_cache_k && (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
+            !common_remote_attn_is_local_vulkan(params.remote_attn_host) ||
+            params.remote_attn_prefill != "remote" || params.n_parallel != 1 ||
+            params.kv_tail_tokens != "0" || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
+            params.no_kv_offload)) {
+        throw std::invalid_argument(
+                "per-layer remote KV formats require a global KVarN cache, native Vulkan attention, "
+                "Flash Attention, KV offload, one slot, remote prefill, and kv-tail-tokens=0");
+    }
+
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -2988,6 +3467,45 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         cparams.remote_attn_n_layers = std::atoi(params.remote_attn_layers.c_str());
     }
     cparams.remote_attn_cuda_reserve = params.remote_attn_cuda_reserve;
+    cparams.remote_attn_vulkan_reserve = params.remote_attn_vulkan_reserve;
+    cparams.remote_attn_cache_type_k = params.remote_attn_cache_type_k;
+    cparams.remote_attn_cache_type_v = params.remote_attn_cache_type_v;
+
+    // Planned draft-MTP KV reservation (internal contract, no user CLI flags):
+    // active only when a real draft-MTP context with n_max > 0 is present in
+    // the resolved speculative profile. The target mixed auto-placement
+    // planner reserves the independent draft cache with the DRAFT
+    // representation (KVarN bits or standard types), the resolved target
+    // capacity and the MTP tail policy, instead of guessing the target format
+    // for every model that merely has an MTP head. Derivation mirrors the
+    // draft-context settings produced by common_base_params_to_speculative;
+    // there is no recursion through it here.
+    {
+        const bool spec_mtp = std::find(params.speculative.types.begin(),
+                params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (spec_mtp && params.speculative.draft.n_max > 0) {
+            const auto & draft = params.speculative.draft;
+            cparams.mtp_reserve_enabled = true;
+            cparams.mtp_reserve_kvarn = draft.kvarn.type;
+            cparams.mtp_reserve_kvarn_bits = uint32_t(draft.kvarn.value_bits) << 16 |
+                    uint32_t(draft.kvarn.key_bits);
+            cparams.mtp_reserve_type_k = draft.cache_type_k;
+            cparams.mtp_reserve_type_v = draft.cache_type_v;
+            // Resolved draft KV tail rollback depth: the MTP context applies
+            // the same clamp/max as this function did above (cparams.n_rs_seq
+            // is already the post-clamp value), so the maximum of the
+            // recurrent-state rollback and the explicit attention-KV tail
+            // rollback is the truthful allocation input. The KVarN canonical
+            // minimum of 1 applies when both are zero (the intrinsic exact
+            // tail needs one rollback row).
+            cparams.mtp_reserve_rollback_tokens =
+                    std::max(cparams.n_rs_seq, cparams.kv_tail_rollback_tokens);
+            if (cparams.mtp_reserve_rollback_tokens == 0) {
+                cparams.mtp_reserve_rollback_tokens = 1;
+            }
+        }
+    }
 
     return cparams;
 }
@@ -3513,6 +4031,15 @@ bool common_prompt_batch_decode(
 // Cross-context state must agree on the effective attention semantics, not the allocation size.
 std::string common_prompt_cache_layout(llama_context * ctx) {
     const auto p = llama_get_prompt_cache_profile(ctx);
+    const llama_memory_i * memory = ctx ? ctx->get_memory() : nullptr;
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory)) {
+        // get_mem_attn() unwraps KVarN to its metadata-only standard cache.
+        // Inspect the actual owner to preserve mixed representation identity.
+        memory = hybrid->get_mem_attn_base();
+    }
+    const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn *>(memory);
+    const bool mixed_kv = kvarn && kvarn->has_standard_cache();
+    const bool layout_known = p.kv_layout_known || mixed_kv;
     common_json layout = {
         {"cache_layout_version", 2},
         // nlohmann/json treats the uncast ggml/llama enums as boolean-like
@@ -3535,8 +4062,29 @@ std::string common_prompt_cache_layout(llama_context * ctx) {
     layout["type_v"] = static_cast<int32_t>(p.type_v);
     layout["type_k_aux"] = static_cast<int32_t>(p.type_k_aux);
     layout["type_v_aux"] = static_cast<int32_t>(p.type_v_aux);
-    layout["kv_layout_known"] = p.kv_layout_known;
-    if (!p.kv_layout_known) {
+    layout["kv_layout_known"] = layout_known;
+    if (mixed_kv) {
+        const auto & kvarn_params = ctx->get_cparams().kvarn;
+        layout["mixed_kv"] = true;
+        layout["mixed_kvarn_type"] = static_cast<int32_t>(kvarn_params.type);
+        layout["mixed_kvarn_bits_k"] = kvarn_params.key_bits;
+        layout["mixed_kvarn_bits_v"] = kvarn_params.value_bits;
+        layout["mixed_layer_count"] = llama_model_n_layer(llama_get_model(ctx));
+        common_json remote_layers = common_json::array();
+        for (const auto & layer : kvarn->standard_layer_layout()) {
+            remote_layers.push_back({
+                {"layer", layer.layer_id},
+                {"type_k", static_cast<int32_t>(layer.type_k)},
+                {"type_v", static_cast<int32_t>(layer.type_v)},
+                {"rotation_k", layer.rotation_k},
+                {"rotation_v", layer.rotation_v},
+                {"v_transposed", layer.v_transposed},
+                {"device", layer.device},
+            });
+        }
+        layout["mixed_remote_layers"] = std::move(remote_layers);
+    }
+    if (!layout_known) {
         // Unknown memory layouts remain bound to the original context lifetime in legacy mode.
         layout["source_context"] = p.context_instance;
         layout["source_capacity"] = llama_n_ctx_seq(ctx);
