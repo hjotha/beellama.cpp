@@ -463,6 +463,22 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
 
+    // Local-split layers: the scheduler would otherwise extend the Vulkan split to the
+    // gate ops and ship the whole Qcur_full (Q + gate) across the device boundary.
+    // Keep them on the layer device so only Q/K/V go out and the attention result comes back.
+    if (!is_remote && cparams.local_attn_backend && full_attn_idx < cparams.remote_attn_layers) {
+        ggml_backend_dev_t layer_dev = model.dev_layer(il);
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_get_device(backend) == layer_dev) {
+                ggml_backend_sched_set_tensor_backend(sched, gate, backend);
+                ggml_backend_sched_set_tensor_backend(sched, gate_sigmoid, backend);
+                ggml_backend_sched_set_tensor_backend(sched, cur, backend);
+                break;
+            }
+        }
+    }
+
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);
 

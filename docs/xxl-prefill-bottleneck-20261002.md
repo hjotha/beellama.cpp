@@ -345,3 +345,69 @@ Duas descobertas de código/configuração:
 | A | `Environment=TMPDIR=<diretório em disco>` na unit de produção | evita refazer 73k (~18–27 min) em turnos XXL com checkpoint | baixo (escrita em disco do spool) | config + reload/restart |
 | B | Readback via buffer host **cached** (ou cópia GPU para staging pinned) | 0,17 → >2 GiB/s: −~0,27 s por ubatch; −~26% a 8k, −5 a 9% a 73k [H] | baixo | média |
 | C | Fixar `gate_sigmoid`/`attn_gated` na CUDA | elimina `Qcur_full`: −~4,4 ms por camada por ubatch e −60% dos bytes enviados [H] | baixo | baixa |
+
+## 11. Correções aplicadas e validadas — 2026-10-02 15:38–16:03
+
+Artefatos: `/home/hjotha/beellama-mixed-kv-20261001-130910/xxl-fix-20261002/`
+(`runner2.py`–`runner5.py`, `V*`/`Q*` com `server.log`, `result.json`,
+`telemetry.jsonl`; bibliotecas antigas em `baseline-libs/` para A/B na mesma
+janela). Nenhuma janela registrou alerta de kernel (`fence_hit= []`).
+
+Mudanças:
+
+1. `ggml_vk_buffer_read_2d` (`ggml-vulkan.cpp`): em UMA, o `memcpy` direto da
+   mapping só é usado quando a memória é `eHostCached`; senão a leitura passa
+   pelo staging cached (mesma rota de dGPU).
+2. `build_layer_attn` (`src/models/qwen35.cpp`): nas camadas local-split,
+   `gate`, `gate_sigmoid` e `attn_gated` são fixados no dispositivo da camada.
+3. Unit de produção: `TMPDIR=/var/tmp/beellama-spool` (disco).
+4. INI de produção: `spec-draft-n-max-xxl = 0` (como no XXL anterior de
+   102400); XL inalterado.
+
+### Validação [O]
+
+- `test-backend-ops test -b Vulkan0 -o FLASH_ATTN_EXT -p 'hsk=256,hsv=256,.*type_K=q4_0,type_V=q4_0'` e
+  `test-backend-ops test -b Vulkan0 -o CPY`: exit 0, `OK`.
+- Cópias por 8k frio + warm (V1, XXL MTP2, N=10):
+
+| Fluxo | Antigo | Novo |
+|---|---|---|
+| `Qcur_full` CUDA→Vulkan | 4063 MiB, 1769 ms | removido |
+| saída Vulkan→CUDA | `attn_gated` 2032 MiB, 11.565 ms (0,17 GiB/s) | `attn_pregate` 2031 MiB, 1378 ms (1,44 GiB/s) |
+
+- Tempo (V1): frio de 8.192 tokens **36,1 s → 23,4 s (−35%)**; warm +256 com
+  `TMPDIR` em disco 2,9 s → 2,3 s (`adaptive cache common prefix=8192`);
+  decode ~29–30 tok/s nos dois.
+- Isolamento: só o readback novo é **bit-idêntico** ao antigo (KL = 0;
+  TTFT 2k ~7,3 → ~5,0 s). Só a fixação do gate muda a numérica de forma
+  determinística.
+- Qualidade da fixação do gate, 16 prompts de 2.048 tokens, top-20 do
+  primeiro token, referência 100% CUDA KVarN4 (tier S): top-1 igual 16/16 em
+  ambos; KL médio vs referência antigo 3,09e-04, novo 2,57e-04 (mediana
+  2,0e-05 vs 3,2e-05); novo mais próximo em 7/16; KL antigo→novo médio
+  1,03e-04. Equivalente dentro do erro do caminho misto.
+
+### XXL com MTP desligado [O]
+
+```
+mixed KV auto-placement: CUDA owner=CUDA0 CUDA=1562.3/1670.4 MiB reserve=799.6 MiB (RS=149.6, MTP=0.0), Vulkan=720.0/7493.0 MiB reserve=512.0 MiB, host handoff=9.1 MiB chunk=1024 tokens -> Vulkan Qx layers=5, CUDA KVarN layers=11
+```
+
+| XXL 131072, código novo, 32.768 tokens | Camadas Radeon | Frio | Warm +256 | Decode (64 tokens, 32k) |
+|---|---:|---:|---:|---:|
+| MTP2 (V3) | 10 | 218,1 s | 5,99 s | 14,6 tok/s |
+| MTP0 (V2) | 5 | **113,8 s** | 3,76 s | **18,3 tok/s** |
+
+Antes das correções (A2, MTP2): 262,67 s para 32.640 tokens.
+
+### Limite que permanece
+
+O placement é por **capacidade**, não por ocupação: ao entrar no XXL de
+131072, as 5 camadas remotas são usadas desde o token 0. A configuração
+anterior (`ctx-size-xxl = 102400`, `spec-draft-n-max-xxl = 0`, sem
+`remote-attn`) cabia inteira na 4070; para a lentidão começar só acima de
+~102k é preciso placement por ocupação (KV das primeiras ~102k posições na
+CUDA para todas as camadas e só o excedente na Radeon, com merge dos parciais
+da atenção), ainda não implementado. Só há 5 perfis adaptativos
+(`COMMON_CONTEXT_PROFILE_*`), então não dá para inserir um perfil
+102400-só-CUDA sem alterar o XL.
