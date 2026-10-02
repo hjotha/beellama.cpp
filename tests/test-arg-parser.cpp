@@ -922,6 +922,76 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(common_context_profile_for_budget(five_profile, 1201) == COMMON_CONTEXT_PROFILE_XXLONG);
         assert(common_context_profile_for_budget(five_profile, 1400) == COMMON_CONTEXT_PROFILE_XXLONG);
 
+        common_params six_profile = tri_profile;
+        argv = {
+            "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+            "--mtp-max-tokens", "500", "--ctx-size-mtp-short", "300",
+            "--mtp-short-max-tokens", "250", "--spec-draft-n-max-short", "4",
+            "--spec-draft-n-max-long", "0",
+            "--ctx-size-xl", "1200", "--xl-max-tokens", "1200", "--batch-size-xl", "64",
+            "--spec-draft-n-max-xl", "0",
+            "--cache-type-k-xl", "q4_0", "--cache-type-v-xl", "q4_0",
+            "--ctx-size-xxl", "1400", "--xxl-max-tokens", "1400", "--batch-size-xxl", "64",
+            "--spec-draft-n-max-xxl", "0",
+            "--cache-type-k-xxl", "kvarn4", "--cache-type-v-xxl", "kvarn4",
+            "--ctx-size-xxxl", "1600", "--xxxl-max-tokens", "1600", "--batch-size-xxxl", "64",
+            "--spec-draft-n-max-xxxl", "0",
+            "--cache-type-k-xxxl", "kvarn4", "--cache-type-v-xxxl", "kvarn4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), six_profile, LLAMA_EXAMPLE_SERVER));
+        assert(six_profile.ctx_size_xxlong == 1400);
+        assert(six_profile.xxlong_max_tokens == 1400);
+        assert(six_profile.ctx_size_xxxlong == 1600);
+        assert(six_profile.xxxlong_max_tokens == 1600);
+        assert(six_profile.batch_size_xxxlong == 64);
+        assert(six_profile.spec_draft_n_max_xxxlong == 0);
+        assert(six_profile.kvarn_xxxlong.type != LLAMA_KVARN_TYPE_DISABLED);
+        assert(six_profile.cache_kvarn_bits_k_xxxlong == 4);
+        assert(six_profile.cache_kvarn_bits_v_xxxlong == 4);
+        assert(common_context_xxxlong_limit(six_profile) == 1600);
+        assert(common_context_adaptive_error(six_profile).empty());
+        assert(common_context_profile_for_budget(six_profile, 1000) == COMMON_CONTEXT_PROFILE_LONG);
+        assert(common_context_profile_for_budget(six_profile, 1001) == COMMON_CONTEXT_PROFILE_XLONG);
+        assert(common_context_profile_for_budget(six_profile, 1200) == COMMON_CONTEXT_PROFILE_XLONG);
+        assert(common_context_profile_for_budget(six_profile, 1201) == COMMON_CONTEXT_PROFILE_XXLONG);
+        assert(common_context_profile_for_budget(six_profile, 1400) == COMMON_CONTEXT_PROFILE_XXLONG);
+        assert(common_context_profile_for_budget(six_profile, 1401) == COMMON_CONTEXT_PROFILE_XXXLONG);
+        assert(common_context_profile_for_budget(six_profile, 1600) == COMMON_CONTEXT_PROFILE_XXXLONG);
+
+        // With XXXL disabled the five-tier selection is unchanged.
+        assert(six_profile.ctx_size_xxxlong != 0);
+        common_params six_profile_no_xxxl = six_profile;
+        six_profile_no_xxxl.ctx_size_xxxlong = 0;
+        six_profile_no_xxxl.xxxlong_max_tokens = 0;
+        assert(common_context_adaptive_error(six_profile_no_xxxl).empty());
+        assert(common_context_profile_for_budget(six_profile_no_xxxl, 1401) == COMMON_CONTEXT_PROFILE_XXLONG);
+        assert(common_context_profile_for_budget(six_profile_no_xxxl, 1600) == COMMON_CONTEXT_PROFILE_XXLONG);
+
+        // XXXL validation errors.
+        common_params xxxl_invalid = six_profile;
+        xxxl_invalid.ctx_size_xxxlong = 1300;
+        xxxl_invalid.xxxlong_max_tokens = 0;
+        assert(common_context_adaptive_error(xxxl_invalid) ==
+               "--ctx-size-xxxlong must not be smaller than the preceding context size");
+        xxxl_invalid = six_profile;
+        xxxl_invalid.xxxlong_max_tokens = 1300;
+        assert(common_context_adaptive_error(xxxl_invalid) ==
+               "--xxxlong-max-tokens must not be smaller than the preceding context size");
+        xxxl_invalid = six_profile;
+        xxxl_invalid.ctx_size_xxxlong = 0;
+        assert(common_context_adaptive_error(xxxl_invalid) ==
+               "--xxxlong-max-tokens requires --ctx-size-xxxlong");
+        xxxl_invalid = six_profile;
+        xxxl_invalid.ctx_size_xxlong = 0;
+        xxxl_invalid.xxlong_max_tokens = 0;
+        assert(common_context_adaptive_error(xxxl_invalid) ==
+               "--ctx-size-xxxlong requires --ctx-size-xxlong");
+        xxxl_invalid = six_profile;
+        xxxl_invalid.spec_draft_n_max_xxxlong = -1;
+        assert(common_context_adaptive_error(xxxl_invalid) ==
+               "--spec-draft-n-max-xxxlong must be non-negative");
+
         common_params ista_profile;
         argv = {
             "binary_name", "--ctx-size-s", "24576", "--s-max-tokens", "24576",
@@ -1155,6 +1225,35 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         };
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), wide_mtp, LLAMA_EXAMPLE_SERVER));
         assert(wide_mtp.spec_draft_n_max_xxlong == 2);
+
+        common_params xxxl_long_forms = tri_profile;
+        argv = {
+            "binary_name", "--ctx-size", "1000", "--ctx-size-mtp", "600",
+            "--mtp-max-tokens", "500", "--ctx-size-mtp-short", "300",
+            "--mtp-short-max-tokens", "250", "--spec-draft-n-max-short", "4",
+            "--ctx-size-xlong", "1200", "--xlong-max-tokens", "1200",
+            "--ctx-size-xxlong", "1400", "--xxlong-max-tokens", "1400",
+            "--ctx-size-xxxlong", "1600", "--xxxlong-max-tokens", "1600",
+            "--batch-size-xxxlong", "64", "--ubatch-size-xxxlong", "64",
+            "--spec-draft-n-max-xxxlong", "0",
+            "--cache-type-k-xxxlong", "kvarn4", "--cache-type-v-xxxlong", "kvarn4",
+            "--spec-draft-type-k-xxxlong", "kvarn4", "--spec-draft-type-v-xxxlong", "kvarn4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), xxxl_long_forms, LLAMA_EXAMPLE_SERVER));
+        assert(xxxl_long_forms.ctx_size_xxxlong == 1600);
+        assert(xxxl_long_forms.xxxlong_max_tokens == 1600);
+        assert(xxxl_long_forms.batch_size_xxxlong == 64);
+        assert(xxxl_long_forms.ubatch_size_xxxlong == 64);
+        assert(xxxl_long_forms.spec_draft_n_max_xxxlong == 0);
+        assert(xxxl_long_forms.cache_kvarn_bits_k_xxxlong == 4);
+        assert(xxxl_long_forms.cache_kvarn_bits_v_xxxlong == 4);
+        assert(xxxl_long_forms.spec_draft_kvarn_bits_k_xxxlong == 4);
+        assert(xxxl_long_forms.spec_draft_kvarn_bits_v_xxxlong == 4);
+        assert(common_context_xxxlong_limit(xxxl_long_forms) == 1600);
+        assert(common_context_adaptive_error(xxxl_long_forms).empty());
+        assert(common_context_profile_for_budget(xxxl_long_forms, 1401) == COMMON_CONTEXT_PROFILE_XXXLONG);
+        assert(common_context_profile_for_budget(xxxl_long_forms, 1600) == COMMON_CONTEXT_PROFILE_XXXLONG);
     }
 
     {
@@ -1337,6 +1436,12 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
 
         argv = {"binary_name", "--ctx-size-mtp", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--ctx-size-xxxlong", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--xxxlong-max-tokens", "-1"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), parse_adaptive, LLAMA_EXAMPLE_SERVER));
 
         argv = {"binary_name", "--mtp-max-tokens", "-1"};

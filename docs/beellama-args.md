@@ -41,12 +41,12 @@ remain unqualified until backend runtime tests pass. N-gram modes do not own a
 KV context and reject explicit KVarN `--spec-draft-type-k/v` selections during
 argument validation.
 
-Adaptive S/M/L/XL/XXL profiles expose the same batch and cache override shape:
-`--batch-size-{s,m,l,xl,xxl}`, `--ubatch-size-{s,m,l,xl,xxl}`,
-`--cache-type-k/v-{s,m,l,xl,xxl}`, and
-`--spec-draft-type-k/v-{s,m,l,xl,xxl}`. Omitted overrides inherit the shared
+Adaptive S/M/L/XL/XXL/XXXL profiles expose the same batch and cache override shape:
+`--batch-size-{s,m,l,xl,xxl,xxxl}`, `--ubatch-size-{s,m,l,xl,xxl,xxxl}`,
+`--cache-type-k/v-{s,m,l,xl,xxl,xxxl}`, and
+`--spec-draft-type-k/v-{s,m,l,xl,xxl,xxxl}`. Omitted overrides inherit the shared
 target or draft setting. Each tier's draft cache selection is active when its
-corresponding `--spec-draft-n-max-{s,m,l,xl,xxl}` value is positive and inactive
+corresponding `--spec-draft-n-max-{s,m,l,xl,xxl,xxxl}` value is positive and inactive
 when it is zero.
 
 CUDA multi-token KVarN prefill uses transient F16 K/V materialization windows.

@@ -208,10 +208,15 @@ static bool adaptive_test_fault(const char * phase, common_context_profile profi
             value.find("mtp-short") == std::string::npos;
     }
     if (profile == COMMON_CONTEXT_PROFILE_XLONG) {
-        return value.find("xlong") != std::string::npos;
+        return value.find("xlong") != std::string::npos &&
+            value.find("xxlong") == std::string::npos;
     }
     if (profile == COMMON_CONTEXT_PROFILE_XXLONG) {
-        return value.find("xxlong") != std::string::npos;
+        return value.find("xxlong") != std::string::npos &&
+            value.find("xxxlong") == std::string::npos;
+    }
+    if (profile == COMMON_CONTEXT_PROFILE_XXXLONG) {
+        return value.find("xxxlong") != std::string::npos;
     }
     return value.find("long") != std::string::npos;
 }
@@ -2073,7 +2078,7 @@ struct adaptive_slot_snapshot_blob {
     std::vector<adaptive_slot_checkpoint_blob> checkpoints;
 };
 
-// LONG and XLONG are dual-purpose profiles: old snapshots may be target-only,
+// LONG, XLONG, XXLONG and XXXLONG are dual-purpose profiles: old snapshots may be target-only,
 // while a newer profile can carry the resident MTP draft state.  Keep the wire
 // profile IDs stable and infer the snapshot's mode from its payload.
 static bool adaptive_slot_snapshot_carries_mtp(const adaptive_slot_snapshot_blob & snapshot) {
@@ -2082,7 +2087,9 @@ static bool adaptive_slot_snapshot_carries_mtp(const adaptive_slot_snapshot_blob
         return true;
     }
     return (snapshot.profile == COMMON_CONTEXT_PROFILE_LONG ||
-            snapshot.profile == COMMON_CONTEXT_PROFILE_XLONG) &&
+            snapshot.profile == COMMON_CONTEXT_PROFILE_XLONG ||
+            snapshot.profile == COMMON_CONTEXT_PROFILE_XXLONG ||
+            snapshot.profile == COMMON_CONTEXT_PROFILE_XXXLONG) &&
         (!snapshot.data_dft.empty() || !snapshot.data_spec.empty() || snapshot.pos_dft >= 0);
 }
 
@@ -2218,7 +2225,8 @@ static adaptive_slot_snapshot_blob adaptive_slot_decode(const std::vector<uint8_
             snapshot.profile != COMMON_CONTEXT_PROFILE_LONG &&
             snapshot.profile != COMMON_CONTEXT_PROFILE_MTP_SHORT &&
             snapshot.profile != COMMON_CONTEXT_PROFILE_XLONG &&
-            snapshot.profile != COMMON_CONTEXT_PROFILE_XXLONG) {
+            snapshot.profile != COMMON_CONTEXT_PROFILE_XXLONG &&
+            snapshot.profile != COMMON_CONTEXT_PROFILE_XXXLONG) {
         throw std::runtime_error("invalid adaptive slot snapshot profile");
     }
     snapshot.active_ctx = reader.i32();
@@ -3179,9 +3187,18 @@ private:
     int32_t adaptive_cache_kvarn_bits_k_xxlong = 4;
     int32_t adaptive_cache_kvarn_bits_v_xxlong = 4;
 
+    int32_t adaptive_batch_xxxlong   = 0;
+    int32_t adaptive_ubatch_xxxlong  = 0;
+    int32_t adaptive_draft_n_xxxlong = 0;
+    ggml_type adaptive_cache_type_k_xxxlong = GGML_TYPE_Q4_0;
+    ggml_type adaptive_cache_type_v_xxxlong = GGML_TYPE_Q4_0;
+    llama_kvarn_params adaptive_kvarn_xxxlong{};
+    int32_t adaptive_cache_kvarn_bits_k_xxxlong = 4;
+    int32_t adaptive_cache_kvarn_bits_v_xxxlong = 4;
+
     // Per-tier KV cache for the resident MTP draft context. Each tier inherits
     // the global --spec-draft-type-k/-v unless overridden by
-    // --spec-draft-type-k/-v-{s,m,l,xl,xxl}.
+    // --spec-draft-type-k/-v-{s,m,l,xl,xxl,xxxl}.
     struct adaptive_spec_draft_kv {
         ggml_type type_k = GGML_TYPE_F16;
         ggml_type type_v = GGML_TYPE_F16;
@@ -3194,8 +3211,12 @@ private:
     adaptive_spec_draft_kv adaptive_spec_draft_long;
     adaptive_spec_draft_kv adaptive_spec_draft_xlong;
     adaptive_spec_draft_kv adaptive_spec_draft_xxlong;
+    adaptive_spec_draft_kv adaptive_spec_draft_xxxlong;
 
     int32_t adaptive_max_ctx() const {
+        if (params_base.ctx_size_xxxlong > 0) {
+            return params_base.ctx_size_xxxlong;
+        }
         if (params_base.ctx_size_xxlong > 0) {
             return params_base.ctx_size_xxlong;
         }
@@ -3289,6 +3310,7 @@ private:
             case COMMON_CONTEXT_PROFILE_LONG:      return adaptive_draft_n_long;
             case COMMON_CONTEXT_PROFILE_XLONG:     return adaptive_draft_n_xlong;
             case COMMON_CONTEXT_PROFILE_XXLONG:    return adaptive_draft_n_xxlong;
+            case COMMON_CONTEXT_PROFILE_XXXLONG:   return adaptive_draft_n_xxxlong;
             default:                               return 0;
         }
     }
@@ -3297,7 +3319,8 @@ private:
         const int32_t draft_n = adaptive_draft_n_for_profile(profile);
         const int32_t draft_n_max = std::max({
             adaptive_draft_n_short, adaptive_draft_n_medium,
-            adaptive_draft_n_long, adaptive_draft_n_xlong, adaptive_draft_n_xxlong
+            adaptive_draft_n_long, adaptive_draft_n_xlong, adaptive_draft_n_xxlong,
+            adaptive_draft_n_xxxlong
         });
         params_base.speculative.draft.n_max = draft_n;
         params_base.speculative.n_rs_seq_target = draft_n_max > 0 ? uint32_t(draft_n_max) : 0u;
@@ -3349,6 +3372,15 @@ private:
             params_base.kvarn = adaptive_kvarn_xxlong;
             params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_xxlong;
             params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_xxlong;
+        } else if (profile == COMMON_CONTEXT_PROFILE_XXXLONG) {
+            params_base.n_ctx = params_base.ctx_size_xxxlong;
+            params_base.n_batch = adaptive_batch_xxxlong;
+            params_base.n_ubatch = adaptive_ubatch_xxxlong;
+            params_base.cache_type_k = adaptive_cache_type_k_xxxlong;
+            params_base.cache_type_v = adaptive_cache_type_v_xxxlong;
+            params_base.kvarn = adaptive_kvarn_xxxlong;
+            params_base.cache_kvarn_bits_k = adaptive_cache_kvarn_bits_k_xxxlong;
+            params_base.cache_kvarn_bits_v = adaptive_cache_kvarn_bits_v_xxxlong;
         }
         if (params_base.remote_attn_min_ctx_size > 0) {
             const bool enable_remote_attn = common_context_remote_attn_enabled(params_base, params_base.n_ctx);
@@ -3370,6 +3402,7 @@ private:
             case COMMON_CONTEXT_PROFILE_LONG:      draft_kv = &adaptive_spec_draft_long; break;
             case COMMON_CONTEXT_PROFILE_XLONG:     draft_kv = &adaptive_spec_draft_xlong; break;
             case COMMON_CONTEXT_PROFILE_XXLONG:    draft_kv = &adaptive_spec_draft_xxlong; break;
+            case COMMON_CONTEXT_PROFILE_XXXLONG:   draft_kv = &adaptive_spec_draft_xxxlong; break;
             default: break;
         }
         if (draft_kv != nullptr) {
@@ -3392,6 +3425,7 @@ private:
             case COMMON_CONTEXT_PROFILE_LONG:      return "long";
             case COMMON_CONTEXT_PROFILE_XLONG:     return "xlong";
             case COMMON_CONTEXT_PROFILE_XXLONG:    return "xxlong";
+            case COMMON_CONTEXT_PROFILE_XXXLONG:   return "xxxlong";
             default:                               return "unknown";
         }
     }
@@ -3752,6 +3786,7 @@ private:
         result = std::max<uint64_t>(result, params_base.ctx_size_mtp_short);
         result = std::max<uint64_t>(result, params_base.ctx_size_xlong);
         result = std::max<uint64_t>(result, params_base.ctx_size_xxlong);
+        result = std::max<uint64_t>(result, params_base.ctx_size_xxxlong);
         return result > UINT32_MAX ? UINT32_MAX : (uint32_t) result;
     }
 
@@ -4118,7 +4153,7 @@ private:
                 !common_prompt_cache_layout_reusable(file->layout, common_prompt_cache_layout(ctx_tgt))) {
             // The store may hold the branch point in a different convertible
             // representation (q4_0 -> KVarN when crossing into the xxlong
-            // profile); the converter validates the source shape itself.
+            // or xxxlong profile); the converter validates the source shape itself.
             if (auto_convertible_q4_layout(file->layout)) {
                 const std::string converted = convert_route_snapshot(*file, &reference);
                 if (!converted.empty()) {
@@ -4591,6 +4626,28 @@ private:
                 adaptive_kvarn_xxlong.type = llama_kvarn_type_from_name("kvarn_k4v4_g128");
             }
 
+            adaptive_batch_xxxlong   = params.batch_size_xxxlong > 0 ? params.batch_size_xxxlong : params.n_batch;
+            adaptive_ubatch_xxxlong  = params.ubatch_size_xxxlong > 0 ? params.ubatch_size_xxxlong : params.n_ubatch;
+            adaptive_draft_n_xxxlong = params.spec_draft_n_max_xxxlong;
+            adaptive_cache_type_k_xxxlong = params.cache_type_k_xxxlong != GGML_TYPE_COUNT
+                ? params.cache_type_k_xxxlong : params.cache_type_k;
+            adaptive_cache_type_v_xxxlong = params.cache_type_v_xxxlong != GGML_TYPE_COUNT
+                ? params.cache_type_v_xxxlong : params.cache_type_v;
+            adaptive_kvarn_xxxlong   = params.cache_type_k_xxxlong != GGML_TYPE_COUNT
+                ? params.kvarn_xxxlong : params.kvarn;
+            adaptive_cache_kvarn_bits_k_xxxlong = params.cache_type_k_xxxlong != GGML_TYPE_COUNT
+                ? params.cache_kvarn_bits_k_xxxlong : params.cache_kvarn_bits_k;
+            adaptive_cache_kvarn_bits_v_xxxlong = params.cache_type_v_xxxlong != GGML_TYPE_COUNT
+                ? params.cache_kvarn_bits_v_xxxlong : params.cache_kvarn_bits_v;
+
+            if (params.ctx_size_xxxlong > 0 && params.cache_type_k_xxxlong == GGML_TYPE_COUNT) {
+                adaptive_cache_kvarn_bits_k_xxxlong = 4;
+                adaptive_cache_kvarn_bits_v_xxxlong = 4;
+                adaptive_cache_type_k_xxxlong = GGML_TYPE_Q4_0;
+                adaptive_cache_type_v_xxxlong = GGML_TYPE_Q4_0;
+                adaptive_kvarn_xxxlong.type = llama_kvarn_type_from_name("kvarn_k4v4_g128");
+            }
+
             adaptive_spec_draft_short.type_k = params.spec_draft_type_k_short != GGML_TYPE_COUNT
                 ? params.spec_draft_type_k_short : params.speculative.draft.cache_type_k;
             adaptive_spec_draft_short.type_v = params.spec_draft_type_v_short != GGML_TYPE_COUNT
@@ -4630,6 +4687,14 @@ private:
             adaptive_spec_draft_xxlong.bits_k = params.spec_draft_kvarn_bits_k_xxlong;
             adaptive_spec_draft_xxlong.bits_v = params.spec_draft_kvarn_bits_v_xxlong;
             adaptive_spec_draft_xxlong.kvarn = params.spec_draft_kvarn_xxlong;
+
+            adaptive_spec_draft_xxxlong.type_k = params.spec_draft_type_k_xxxlong != GGML_TYPE_COUNT
+                ? params.spec_draft_type_k_xxxlong : params.speculative.draft.cache_type_k;
+            adaptive_spec_draft_xxxlong.type_v = params.spec_draft_type_v_xxxlong != GGML_TYPE_COUNT
+                ? params.spec_draft_type_v_xxxlong : params.speculative.draft.cache_type_v;
+            adaptive_spec_draft_xxxlong.bits_k = params.spec_draft_kvarn_bits_k_xxxlong;
+            adaptive_spec_draft_xxxlong.bits_v = params.spec_draft_kvarn_bits_v_xxxlong;
+            adaptive_spec_draft_xxxlong.kvarn = params.spec_draft_kvarn_xxxlong;
 
             if (params.ctx_size_mtp_short > 0) {
                 apply_profile_params(COMMON_CONTEXT_PROFILE_MTP_SHORT);
@@ -7704,7 +7769,8 @@ if (task.params.cache_prompt) {
                                 ? params_base.ctx_size_mtp_short
                                 : (snapshot.profile == COMMON_CONTEXT_PROFILE_MTP ? params_base.ctx_size_mtp
                                 : (snapshot.profile == COMMON_CONTEXT_PROFILE_XLONG ? params_base.ctx_size_xlong
-                                : (snapshot.profile == COMMON_CONTEXT_PROFILE_XXLONG ? params_base.ctx_size_xxlong : adaptive_long_ctx)));
+                                : (snapshot.profile == COMMON_CONTEXT_PROFILE_XXLONG ? params_base.ctx_size_xxlong
+                                : (snapshot.profile == COMMON_CONTEXT_PROFILE_XXXLONG ? params_base.ctx_size_xxxlong : adaptive_long_ctx))));
                             const int padded_ctx = GGML_PAD(raw_ctx, 256);
                             int expected_ctx = std::min(padded_ctx, llama_model_n_ctx_train(model_tgt));
                             if (params_base.kv_unified_per_slot > 0) {

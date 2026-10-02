@@ -2793,7 +2793,8 @@ void server_models_routes::init_routes() {
                     "LLAMA_ARG_CTX_SIZE_MTP_SHORT",
                     "LLAMA_ARG_CTX_SIZE_MTP",
                     "LLAMA_ARG_CTX_SIZE_XLONG",
-                    "LLAMA_ARG_CTX_SIZE_XXLONG"}) {
+                    "LLAMA_ARG_CTX_SIZE_XXLONG",
+                    "LLAMA_ARG_CTX_SIZE_XXXLONG"}) {
                 std::string ctx_size;
                 if (!m.preset.get_option(option, ctx_size)) {
                     continue;

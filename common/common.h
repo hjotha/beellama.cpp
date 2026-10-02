@@ -603,6 +603,16 @@ struct common_params {
     int32_t cache_kvarn_bits_k_xxlong = 0;
     int32_t cache_kvarn_bits_v_xxlong = 0;
     struct llama_kvarn_params kvarn_xxlong{};
+    int32_t ctx_size_xxxlong      =     0; // adaptive context xxxlong profile, 0 = disabled
+    int32_t xxxlong_max_tokens    =     0; // adaptive context xxxlong threshold, 0 = ctx_size_xxxlong
+    int32_t batch_size_xxxlong    =     0; // logical batch size for xxxlong profile, 0 = inherit global
+    int32_t ubatch_size_xxxlong   =     0; // physical batch size for xxxlong profile, 0 = inherit global
+    int32_t spec_draft_n_max_xxxlong =   0; // draft N for xxxlong profile, 0 = target-only
+    enum ggml_type cache_type_k_xxxlong = GGML_TYPE_COUNT;
+    enum ggml_type cache_type_v_xxxlong = GGML_TYPE_COUNT;
+    int32_t cache_kvarn_bits_k_xxxlong = 0;
+    int32_t cache_kvarn_bits_v_xxxlong = 0;
+    struct llama_kvarn_params kvarn_xxxlong{};
     // Per-tier draft KV cache types for the resident MTP draft context
     // (default: inherit the global --spec-draft-type-k / --spec-draft-type-v).
     enum ggml_type spec_draft_type_k_short = GGML_TYPE_COUNT;
@@ -630,6 +640,11 @@ struct common_params {
     int32_t spec_draft_kvarn_bits_k_xxlong = 0;
     int32_t spec_draft_kvarn_bits_v_xxlong = 0;
     llama_kvarn_params spec_draft_kvarn_xxlong{};
+    enum ggml_type spec_draft_type_k_xxxlong = GGML_TYPE_COUNT;
+    enum ggml_type spec_draft_type_v_xxxlong = GGML_TYPE_COUNT;
+    int32_t spec_draft_kvarn_bits_k_xxxlong = 0;
+    int32_t spec_draft_kvarn_bits_v_xxxlong = 0;
+    llama_kvarn_params spec_draft_kvarn_xxxlong{};
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
@@ -1238,6 +1253,7 @@ enum common_context_profile {
     COMMON_CONTEXT_PROFILE_MTP_SHORT = 2,
     COMMON_CONTEXT_PROFILE_XLONG     = 3,
     COMMON_CONTEXT_PROFILE_XXLONG    = 4,
+    COMMON_CONTEXT_PROFILE_XXXLONG   = 5,
 };
 
 struct common_context_budget {
@@ -1251,6 +1267,7 @@ int64_t common_context_mtp_limit(const common_params & params);
 int64_t common_context_mtp_short_limit(const common_params & params);
 int64_t common_context_xlong_limit(const common_params & params);
 int64_t common_context_xxlong_limit(const common_params & params);
+int64_t common_context_xxxlong_limit(const common_params & params);
 int64_t common_context_output_reserve(
         const common_params & params, int32_t request_n_predict, bool generates_output);
 common_context_budget common_context_budget_for_task(
