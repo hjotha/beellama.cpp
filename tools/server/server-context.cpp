@@ -5662,6 +5662,153 @@ private:
         return false;
     }
 
+    uint32_t adaptive_profile_ctx_size(common_context_profile profile) const {
+        switch (profile) {
+            case COMMON_CONTEXT_PROFILE_MTP_SHORT: return params_base.ctx_size_mtp_short;
+            case COMMON_CONTEXT_PROFILE_MTP:       return params_base.ctx_size_mtp;
+            case COMMON_CONTEXT_PROFILE_LONG:      return adaptive_long_ctx;
+            case COMMON_CONTEXT_PROFILE_XLONG:     return params_base.ctx_size_xlong;
+            case COMMON_CONTEXT_PROFILE_XXLONG:    return params_base.ctx_size_xxlong;
+            case COMMON_CONTEXT_PROFILE_XXXLONG:   return params_base.ctx_size_xxxlong;
+            default:                               return 0;
+        }
+    }
+
+    // True when the profile runs the mixed CUDA KVarN + Vulkan Qx cache
+    // (mirrors the remote-attention gate in apply_profile_params()).
+    bool adaptive_profile_is_mixed(common_context_profile profile) const {
+        const int32_t ctx = (int32_t) adaptive_profile_ctx_size(profile);
+        return params_base.remote_attn_min_ctx_size > 0 && ctx > 0 &&
+            !adaptive_remote_attn_host.empty() &&
+            adaptive_remote_attn_cache_type_k != GGML_TYPE_COUNT &&
+            adaptive_remote_attn_cache_type_v != GGML_TYPE_COUNT &&
+            common_context_remote_attn_enabled(params_base, ctx);
+    }
+
+    static bool adaptive_layout_is_pure_kvarn(const std::string & layout) {
+        try {
+            const common_json parsed = common_json::parse(layout);
+            return parsed.is_object() && !parsed.value("kv_layout_known", true) &&
+                !parsed.value("mixed_kv", false);
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
+
+    // Longest verified prefix of `req` held by a PURE KVarN snapshot in the disk
+    // store (header-only scan, independent of the layout-filtered auto index).
+    size_t adaptive_pure_disk_prefix(const llama_tokens & req) const {
+        size_t best = 0;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            if (!it->is_regular_file(fec) || fec) {
+                continue;
+            }
+            const std::string path = it->path().string();
+            const std::string base = it->path().filename().string();
+            if (path.size() < 4 || path.compare(path.size() - 4, 4, ".bin") != 0 ||
+                    base.find(".tmp") != std::string::npos) {
+                continue;
+            }
+            const auto file = read_unified_snapshot(path, false);
+            if (!file || file->model != adaptive_model_identity->fingerprint() ||
+                    !adaptive_layout_is_pure_kvarn(file->layout)) {
+                continue;
+            }
+            size_t prefix = 0;
+            while (prefix < file->tokens.size() && prefix < req.size() &&
+                    file->tokens[prefix] == req[prefix]) {
+                ++prefix;
+            }
+            // A FULL/recurrent state cannot be partially rewound.
+            if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART && prefix != file->tokens.size()) {
+                continue;
+            }
+            best = std::max(best, prefix);
+        }
+        return best;
+    }
+
+    // Longest prefix of `tokens` already reachable without the disk store: a live slot or
+    // any RAM prompt-cache state.
+    size_t adaptive_resident_prefix(const server_tokens & tokens) const {
+        size_t best = 0;
+        for (const auto & slot : slots) {
+            best = std::max(best, slot.prompt.tokens.get_common_prefix(tokens));
+        }
+        if (prompt_cache) {
+            for (const auto & state : prompt_cache->states) {
+                if (state.model == model_tgt) {
+                    best = std::max(best, state.prompt.tokens.get_common_prefix(tokens));
+                }
+            }
+        }
+        return best;
+    }
+
+    // Restart case for the one-way PURE KVarN -> MIXED handoff. The disk store cannot
+    // convert a pure snapshot into the mixed layout, and the handoff only consumes a RAM
+    // prompt-cache state captured from a live pure context. When the task enters a mixed
+    // profile and only the disk holds a long pure prefix, stage it: switch to the pure
+    // profile that fits the snapshot, restore it from disk, and let the regular profile
+    // switch publish the slot to the RAM cache and run the handoff.
+    // Returns false only if a needed profile transition failed.
+    bool adaptive_stage_pure_disk_prefix(const server_task & task) {
+        constexpr size_t MIN_STAGE_TOKENS = 4096;
+        if (!common_context_is_adaptive(params_base) || !auto_cache_enabled() || !prompt_cache ||
+                !task.params.cache_prompt || !task.need_sampling() || task.is_parent() ||
+                task.tokens.has_media() || !adaptive_model_identity) {
+            return true;
+        }
+        const common_context_profile target = task.context_profile;
+        if (target == active_context_profile || !adaptive_profile_is_mixed(target) ||
+                !adaptive_slots_idle()) {
+            return true;
+        }
+        const llama_tokens req = task.tokens.get_text_tokens();
+        const size_t disk_prefix = adaptive_pure_disk_prefix(req);
+        const size_t resident_prefix = adaptive_resident_prefix(task.tokens);
+        if (disk_prefix < MIN_STAGE_TOKENS || disk_prefix < resident_prefix + MIN_STAGE_TOKENS / 4) {
+            return true;
+        }
+        const common_context_profile stage = common_context_profile_for_budget(
+                params_base, (int64_t) disk_prefix + 1);
+        if (stage == target || adaptive_profile_is_mixed(stage)) {
+            return true;
+        }
+        SRV_INF("adaptive staged restore: %zu-token pure KVarN disk prefix (resident %zu) for mixed profile %s, staging through %s\n",
+                disk_prefix, resident_prefix, adaptive_status_profile_name((int) target).c_str(),
+                adaptive_status_profile_name((int) stage).c_str());
+        if (stage != active_context_profile && !switch_adaptive_context(stage)) {
+            return false;
+        }
+        server_slot * slot = nullptr;
+        for (auto & candidate : slots) {
+            if (!candidate.is_processing()) {
+                slot = &candidate;
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            return true;
+        }
+        if (!slot->prompt.tokens.empty()) {
+            slot->prompt_save(*prompt_cache);
+            prompt_cache->update();
+        }
+        const auto cand = auto_index_lookup(req);
+        if (!cand) {
+            SRV_WRN("%s", "adaptive staged restore: no indexed disk candidate under the staging profile\n");
+            return true;
+        }
+        const int restored = auto_restore_into_slot(*slot, *cand, req, 0);
+        SRV_INF("adaptive staged restore: restored %d tokens into profile %s\n",
+                restored, adaptive_status_profile_name((int) stage).c_str());
+        return true;
+    }
+
     bool switch_adaptive_context(common_context_profile requested) {
         if (!common_context_is_adaptive(params_base)) {
             return true;
@@ -7289,7 +7436,8 @@ if (task.params.cache_prompt) {
                             queue_tasks.defer(std::move(task));
                             break;
                         }
-                        if (!switch_adaptive_context(task.context_profile)) {
+                        if (!adaptive_stage_pure_disk_prefix(task) ||
+                                !switch_adaptive_context(task.context_profile)) {
                             send_error(task, "adaptive context profile transition failed", ERROR_TYPE_SERVER);
                             break;
                         }

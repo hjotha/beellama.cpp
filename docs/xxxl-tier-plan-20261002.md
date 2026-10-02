@@ -160,6 +160,48 @@ Segunda rodada (`slot-save-max-mb = 16384`), sem alertas de kernel:
 | S3 → 96.000+256 | xxlong | `disk`, 96.000 | 8,6 s |
 | S4 restart → 104.000+256 | xxxlong | `disk`, 104.000 | 16,4 s |
 
-Lacuna conhecida: após restart, entrar no XXXL a partir de um snapshot só-XXL em
-disco (sem slot vivo) não converte KVarN → misto e refaz o prompt. Referência
+Lacuna encontrada: após restart, entrar no XXXL a partir de um snapshot só-XXL em
+disco (sem slot vivo) não convertia KVarN → misto e refazia o prompt. Causa: o
+índice de disco só aceita layout igual ou Q4 → KVarN
+(`auto_index_scan_locked`, `auto_convertible_q4_layout`), e o handoff puro → misto
+(`server_mixed_kv_handoff::try_handoff`) só consome estados do cache de prompt em
+RAM capturados de um contexto puro vivo. Corrigida na seção seguinte. Referência
 de custo frio do XXXL (primeira rodada, S4): 104.256 tokens em 1120,1 s.
+
+## Restauração em etapas de snapshot puro em disco para perfil misto (2026-10-02)
+
+`server_context_impl::adaptive_stage_pure_disk_prefix` (`tools/server/server-context.cpp`),
+chamada em `process_single_task` antes da troca de perfil. Quando a tarefa entra num
+perfil misto (remote-attn ativo para aquele contexto), não há prefixo residente
+(slot vivo ou cache de prompt em RAM) e o disco guarda um snapshot KVarN puro que é
+prefixo verificado da requisição (>= 4096 tokens):
+
+1. troca para o perfil puro que comporta o snapshot (`common_context_profile_for_budget`);
+2. restaura o snapshot do disco nesse perfil (`auto_index_lookup` +
+   `auto_restore_into_slot`, que já valida modelo, layout, tokens e checksum);
+3. a troca normal para o perfil misto grava o slot no cache de prompt em RAM e o
+   handoff existente converte KVarN → Q4 nas camadas remotas.
+
+Qualquer falha (sem candidato, restauração recusada, checkpoint ausente) segue o
+caminho antigo: prompt frio no perfil misto.
+
+Validação (27B real, produção parada, instância temporária, `TMPDIR` em disco):
+
+| Escala | Caminho | Resultado |
+|---|---|---|
+| XXL 12288 / XXXL 24576, 5 camadas remotas, 9.984 → 16.000 tokens | frio no XXXL | 37,1 s |
+| idem | handoff com slot vivo | 20,2 s, 9.856 reaproveitados |
+| idem | restart + disco (etapas) | 20,9 s, `mixed_handoff`, 9.984 reaproveitados |
+| XXL 102400 / XXXL 131072, 96.000 → 104.000 tokens | handoff com slot vivo | 176,3 s, 95.872 reaproveitados |
+| idem | restart + disco (etapas) | 183,4 s, `mixed_handoff`, 96.000 reaproveitados |
+| idem (antes da correção) | restart + disco | 1120,1 s, prompt refeito |
+
+Distribuição do primeiro token (top-20): escala pequena, KL frio↔etapas 1,5e-06,
+frio↔vivo 6,5e-06, vivo↔etapas 1,3e-05, top-1 igual nos três; escala real, KL
+vivo↔etapas 6,1e-07, top-1 igual. No caso real, restaurar do disco levou 2,9 s, o
+handoff ~25 s (`convert_ms=18553`) e o restante é prefill de 8.000 tokens no
+XXXL. Sem `restore failed`, `tmpfs`, `ErrorDeviceLost` nem alertas de kernel.
+
+Um primeiro teste em escala real usou `OFFSET=50000` e, por limite do corpus
+(146.328 tokens), ficou em 96.329 tokens dentro do XXL; foi descartado e repetido
+com `OFFSET=30000`.
