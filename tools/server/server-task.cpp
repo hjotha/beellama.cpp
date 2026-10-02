@@ -2317,7 +2317,7 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
             reject("snapshot does not fit destination context");
             continue;
         }
-        if (lcp < 0.25*it->prompt.tokens.size()) { continue; }
+        if (lcp < 0.01*it->prompt.tokens.size()) { continue; }
         // A convertible snapshot can be restored whole if the entire snapshot is a verified prefix,
         // or if the destination KVarN context can cleanly truncate the tail beyond lcp.
         if (convertible_candidate) {
