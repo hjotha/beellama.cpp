@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+#include <cstdarg>
 #include <string>
 #include <vector>
 
@@ -2166,6 +2167,128 @@ struct test_native_attention_options {
     std::vector<double> * attention_times_us = nullptr;
 };
 
+
+// ---------------------------------------------------------------------------
+// Position-split LSE structural reference (plan §4.1, F1b).
+//
+// Computes attention in FP64 over the *dequantized KVarN records that the very
+// graph under test consumed*, reusing the same host reference WHT as the
+// materialized reference path and the same additive mask, GQA mapping and
+// scale. This isolates route/merge error from K/V representation error: the
+// CPU materialized route is measured against the identical reference, so a
+// failure can be attributed to the route instead of the quantization.
+//
+// Layouts match the ggml tensors: O is [head_dim, n_q, n_q_heads, n_stream]
+// and LSE is [n_q_heads, n_q, n_stream], both contiguous.
+// ---------------------------------------------------------------------------
+struct lse_fp64_reference {
+    std::vector<double> o;
+    std::vector<double> lse;
+    std::vector<char>   row_has_keys;   // 0 => fully masked row: O must be 0, LSE -inf
+};
+
+static lse_fp64_reference compute_lse_fp64_reference(
+        const std::vector<float> &          q_host,      // pre-WHT, [head_dim, n_q, n_q_heads, n_stream]
+        const std::vector<ggml_fp16_t> &    k_host,      // [head_dim, n_kv_heads, n_kv, n_stream] rotated
+        const std::vector<ggml_fp16_t> &    v_host,      // [head_dim, n_kv_heads, n_kv, n_stream] rotated
+        const std::vector<ggml_fp16_t> &    mask_host,   // [n_kv, n_q, n_stream], -inf = masked
+        int head_dim, int n_q, int n_q_heads, int n_kv_heads, int n_kv, int n_stream,
+        float scale, bool rotate_q, bool rotate_out) {
+    require(n_q_heads % n_kv_heads == 0, "FP64 reference: GQA ratio must be integral");
+    lse_fp64_reference ref;
+    ref.o.assign(size_t(n_q_heads) * n_q * head_dim, 0.0);
+    ref.lse.assign(size_t(n_q_heads) * n_q, -INFINITY);
+    ref.row_has_keys.assign(size_t(n_q_heads) * n_q, 0);
+
+    std::vector<float> q_row(head_dim);
+    std::vector<double> scores(n_kv);
+    std::vector<double> out_row(head_dim);
+    const int gqa = n_q_heads / n_kv_heads;
+
+    for (int stream = 0; stream < n_stream; ++stream) {
+        for (int qh = 0; qh < n_q_heads; ++qh) {
+            const int kvh = qh / gqa;
+            for (int iq = 0; iq < n_q; ++iq) {
+                const size_t q_off = ((size_t(stream) * n_q_heads + qh) * n_q + iq) * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    q_row[d] = q_host[q_off + d];
+                }
+                if (rotate_q) {
+                    apply_reference_kvarn_wht_head(q_row.data(), head_dim);
+                }
+                double max_score = -INFINITY;
+                int visible = 0;
+                for (int s = 0; s < n_kv; ++s) {
+                    const ggml_fp16_t bias = mask_host[(size_t(stream) * n_q + iq) * n_kv + s];
+                    if (!std::isfinite(ggml_fp16_to_fp32(bias))) {
+                        scores[s] = -INFINITY;
+                        continue;
+                    }
+                    // same contiguous order the k_ref/v_ref tensors use:
+                    // [head_dim, n_kv_heads, n_kv, n_stream]
+                    const size_t k_off = ((size_t(stream) * n_kv + s) * n_kv_heads + kvh) * head_dim;
+                    double acc = 0.0;
+                    for (int d = 0; d < head_dim; ++d) {
+                        acc += double(q_row[d]) * double(ggml_fp16_to_fp32(k_host[k_off + d]));
+                    }
+                    const double score = acc * double(scale) + double(bias);
+                    scores[s] = score;
+                    max_score = std::max(max_score, score);
+                    ++visible;
+                }
+                // O/LSE tensors are declared [head, query] shaped, i.e. row
+                // (query * n_q_heads + head); q_data is filled head-major.
+                const size_t out_base = ((size_t(stream) * n_q + iq) * n_q_heads + qh) * head_dim;
+                const size_t row = (size_t(stream) * n_q + iq) * n_q_heads + qh;
+                if (visible == 0) {
+                    for (int d = 0; d < head_dim; ++d) {
+                        ref.o[out_base + d] = 0.0;
+                    }
+                    ref.lse[row] = -INFINITY;
+                    ref.row_has_keys[row] = 0;
+                    continue;
+                }
+                double denom = 0.0;
+                for (int s = 0; s < n_kv; ++s) {
+                    if (scores[s] == -INFINITY) {
+                        continue;
+                    }
+                    denom += std::exp(scores[s] - max_score);
+                }
+                std::fill(out_row.begin(), out_row.end(), 0.0);
+                for (int s = 0; s < n_kv; ++s) {
+                    if (scores[s] == -INFINITY) {
+                        continue;
+                    }
+                    const double w = std::exp(scores[s] - max_score);
+                    const size_t v_off = ((size_t(stream) * n_kv + s) * n_kv_heads + kvh) * head_dim;
+                    for (int d = 0; d < head_dim; ++d) {
+                        out_row[d] += w * double(ggml_fp16_to_fp32(v_host[v_off + d]));
+                    }
+                }
+                for (int d = 0; d < head_dim; ++d) {
+                    out_row[d] /= denom;
+                }
+                if (rotate_out) {
+                    for (int d = 0; d < head_dim; ++d) {
+                        q_row[d] = float(out_row[d]);
+                    }
+                    apply_reference_kvarn_wht_head(q_row.data(), head_dim);
+                    for (int d = 0; d < head_dim; ++d) {
+                        out_row[d] = q_row[d];
+                    }
+                }
+                for (int d = 0; d < head_dim; ++d) {
+                    ref.o[out_base + d] = out_row[d];
+                }
+                ref.lse[row] = max_score + std::log(denom);
+                ref.row_has_keys[row] = 1;
+            }
+        }
+    }
+    return ref;
+}
+
 static std::vector<float> test_native_flash_attention_output(
         ggml_backend_t backend,
         bool           native_view,
@@ -2194,7 +2317,8 @@ static std::vector<float> test_native_flash_attention_output(
         int            indirect_offset = 0,
         bool           contiguous_current_tail = false,
         const test_native_attention_options & options = {},
-        std::vector<float> * lse_output = nullptr) {
+        std::vector<float> * lse_output = nullptr,
+        lse_fp64_reference * fp64_output = nullptr) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2403,16 +2527,31 @@ static std::vector<float> test_native_flash_attention_output(
         ggml_build_forward_expand(store_graph, stored_v);
     }
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, lse != nullptr ? lse : out);
+    // Position-split LSE: the LSE node consumes the FA tensor, but with
+    // rotate_graph the graph-visible output is the post-FA WHT transform.
+    // Expanding only to `lse` would drop that transform and leave `out`
+    // uncomputed (measured: all-zero O with correct LSE). Expand both.
+    ggml_build_forward_expand(graph, out);
+    if (lse != nullptr) {
+        ggml_build_forward_expand(graph, lse);
+    }
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "native FA: failed to allocate tensors");
 
+    // Fill Q through the tensor's own strides: the two query layouts declare
+    // the head and query axes in opposite order, and a fixed flat index would
+    // silently scramble the production (permuted) layout.
+    const bool q_ne1_is_head = (int) q_in->ne[1] == n_q_heads && (int) q_in->ne[2] == n_q;
+    require(q_ne1_is_head || ((int) q_in->ne[1] == n_q && (int) q_in->ne[2] == n_q_heads),
+            "native FA: unsupported query tensor layout for the test fill");
+    const size_t q_head_stride = (size_t) q_in->nb[q_ne1_is_head ? 1 : 2] / sizeof(float);
+    const size_t q_query_stride = (size_t) q_in->nb[q_ne1_is_head ? 2 : 1] / sizeof(float);
     std::vector<float> q_data((size_t) head_dim * n_q * n_q_heads * n_stream);
     for (int qh = 0; qh < n_q_heads; ++qh) {
         for (int iq = 0; iq < n_q; ++iq) {
             for (int d = 0; d < head_dim; ++d) {
-                q_data[((size_t) qh * n_q + iq) * head_dim + d] =
+                q_data[(size_t) qh * q_head_stride + (size_t) iq * q_query_stride + d] =
                     0.09f * std::sin(float(d) * 0.017f + float(iq) * 0.13f + float(qh) * 0.021f) +
                     0.07f * std::cos(float(d) * 0.031f - float(iq) * 0.05f + float(qh) * 0.033f);
             }
@@ -2687,6 +2826,27 @@ static std::vector<float> test_native_flash_attention_output(
         ggml_backend_tensor_get(body_meta, body_meta_output->data(), 0, ggml_nbytes(body_meta));
     }
     ggml_backend_synchronize(backend);
+
+    if (fp64_output != nullptr) {
+        // Structural reference over the dequantized KVarN records this graph
+        // just consumed (same bytes a materialized route would read), with the
+        // same host reference WHT, mask, GQA mapping and scale.
+        require(float(options.logit_softcap) == 0.0f,
+                "FP64 reference: logit_softcap reference not implemented");
+        require(!production_query_layout,
+                "FP64 reference: production (permuted) query layout not implemented");
+        const std::vector<int64_t> & fp64_idx = read_indices == indices ? idx : read_idx;
+        const std::vector<ggml_fp16_t> k_fp64 = test_kvarn_reference_decode(
+                k_records, stored_k, fp64_idx, n_kv, 0, n_stream, bits_k, false,
+                stage_groups, use_q_rot, swa, slices);
+        const std::vector<ggml_fp16_t> v_fp64 = test_kvarn_reference_decode(
+                v_records, stored_v, fp64_idx, n_kv, 0, n_stream, bits_v, true,
+                stage_groups, use_output_rot, swa, slices);
+        *fp64_output = compute_lse_fp64_reference(
+                q_data, k_fp64, v_fp64, mask_data, head_dim, n_q, n_q_heads,
+                n_kv_heads, n_kv, n_stream, 1.0f / std::sqrt(float(head_dim)),
+                use_q_rot, use_output_rot);
+    }
 
     if (pressure != nullptr) {
         ggml_backend_buffer_free(pressure);
@@ -5962,21 +6122,295 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
     require(route_reset != nullptr && route_get != nullptr,
             "LSE parity: KVarN route telemetry unavailable");
 
-    // Position-split LSE on the native KVarN routes (plan §3.4, F1b).
+    // Position-split LSE structural matrix on the native KVarN routes
+    // (plan §3.4 and §4.1, F1b).
     //
-    // Review 3 found that the CUDA KVarN decode and windowed paths publish a
-    // *wrong O* whenever an LSE attachment is present - rmse 2.3e-1 against the
-    // same route without LSE - while the LSE buffer itself was correct (Q=1:
-    // max|dLSE| = 1.6e-05 vs the CPU reference). Broadening the contract
-    // requires the (max, denom) metadata publish to work when the LSE flag is
-    // set. That path is fail-closed in ggml_cuda_flash_attn_ext_kvarn_supported
-    // (and aborted in the executor) until then, which this harness cannot
-    // observe output-wise; the LSE node/graph contract itself is covered by
-    // tests/test-position-split-lse-{alloc,cu,vk,sched}.
+    // Review 3 reported a wrong O here and the routes were declined
+    // fail-closed; review 4 showed the compared O belonged to a node the
+    // harness graph never computed (it expanded only to the LSE root and
+    // dropped the post-FA transform). Both roots are expanded now.
+    //
+    // Gates, per shape, all against an FP64 reference over the *dequantized
+    // KVarN records the graph consumed*:
+    //   NRMSE(O) <= 1e-3, max_abs(O) <= 1e-2, max_abs(LSE) <= 1e-2,
+    //   identical row classification (fully masked => O == 0 and LSE == -inf
+    //   exactly), no NaN/Inf, no unwritten sentinel, and attachment isolation
+    //   (O with LSE vs O without LSE on the same route).
+    // The CPU materialized route is measured against the same FP64 reference
+    // as a control, so route error is separable from representation error.
+    {
+        struct shape {
+            const char * name;
+            int head_dim, n_q, n_q_heads, n_kv_heads;
+            bool production_layout;
+            bool all_masked;
+            int  exact_tail_tokens;
+        };
+        const shape shapes[] = {
+            { "d64-q1",           64,   1,  6, 1, false, false, 0 },
+            { "d64-q2",           64,   2,  6, 1, false, false, 0 },
+            { "d64-q256",         64, 256, 24, 4, false, false, 0 },
+            { "d128-q1",         128,   1,  6, 1, false, false, 0 },
+            { "d128-q2",         128,   2,  6, 1, false, false, 0 },
+            { "d128-q256",       128, 256, 24, 4, false, false, 0 },
+            { "d256-q1-gqa24",   256,   1, 24, 4, false, false, 0 },
+            { "d256-q2-gqa24",   256,   2, 24, 4, false, false, 0 },
+            { "d256-q2",         256,   2,  6, 1, false, false, 0 },
+            { "d256-q256",       256, 256, 24, 4, false, false, 0 },
+            { "d256-q512",       256, 512, 24, 4, false, false, 0 },
+            { "d256-q4-prod",    256,   4, 24, 4, true,  false, 0 },
+            { "d256-q8-prod",    256,   8, 24, 4, true,  false, 0 },
+            { "d128-q1-allmask", 128,   1,  6, 1, false, true,  0 },
+            { "d128-q256-allmsk",128, 256, 24, 4, false, true,  0 },
+        };
+        const int n_kv = 512;
+        const int stage_groups = 5;
+        std::vector<std::string> failures;
+        int checked = 0;
+        for (const shape & sh : shapes) {
+            test_native_attention_options opts;
+            opts.all_masked = sh.all_masked;
+            const std::string tag = std::string(label) + "/" + sh.name;
+            const auto fail = [&](const char * fmt, ...) {
+                char buf[512];
+                va_list ap;
+                va_start(ap, fmt);
+                vsnprintf(buf, sizeof(buf), fmt, ap);
+                va_end(ap);
+                failures.push_back(tag + ": " + buf);
+                std::fprintf(stderr, "[LSEFAIL] %s: %s\n", tag.c_str(), buf);
+            };
+
+            lse_fp64_reference fp64_gpu, fp64_cpu;
+            std::vector<float> lse_gpu, lse_cpu;
+            test_kvarn_route_stats st_plain = make_test_kvarn_route_stats();
+            test_kvarn_route_stats st_lse = make_test_kvarn_route_stats();
+
+            // Route telemetry is reset immediately before each GPU compute.
+            route_reset();
+            const std::vector<float> o_plain = test_native_flash_attention_output(
+                    gpu, true, true, sh.head_dim, 4, 4, sh.n_q, sh.n_q_heads,
+                    sh.n_kv_heads, n_kv, stage_groups, false, nullptr, false,
+                    sh.exact_tail_tokens, false, GGML_TYPE_F16, 0, false,
+                    sh.production_layout, -1, false, false, false, 0, false,
+                    opts);
+            route_get(&st_plain);
+
+            route_reset();
+            const std::vector<float> o_lse = test_native_flash_attention_output(
+                    gpu, true, true, sh.head_dim, 4, 4, sh.n_q, sh.n_q_heads,
+                    sh.n_kv_heads, n_kv, stage_groups, false, nullptr, false,
+                    sh.exact_tail_tokens, false, GGML_TYPE_F16, 0, false,
+                    sh.production_layout, -1, false, false, false, 0, false,
+                    opts, &lse_gpu, sh.production_layout ? nullptr : &fp64_gpu);
+            route_get(&st_lse);
+
+            // The FP64 reference is defined on the non-permuted query layout
+            // (the harness asserts it). The product, however, feeds a permuted
+            // Q ([D, n_q_heads, n_q]) from llama-graph.cpp, which flips the
+            // contiguous order of the O and LSE rows. That layout contract is
+            // checked directly here: the permuted run must reproduce the
+            // non-permuted run element-wise, and inherits its FP64 gate.
+            if (sh.production_layout) {
+                lse_fp64_reference fp64_np;
+                std::vector<float> lse_np;
+                const std::vector<float> o_np = test_native_flash_attention_output(
+                        gpu, true, true, sh.head_dim, 4, 4, sh.n_q, sh.n_q_heads,
+                        sh.n_kv_heads, n_kv, stage_groups, false, nullptr, false,
+                        sh.exact_tail_tokens, false, GGML_TYPE_F16, 0, false,
+                        false, -1, false, false, false, 0, false, opts,
+                        &lse_np, &fp64_np);
+                if (o_np.size() != o_lse.size()) {
+                    fail("permuted/non-permuted O size mismatch");
+                } else {
+                    double max_diff = 0.0;
+                    for (size_t i = 0; i < o_np.size(); ++i) {
+                        max_diff = std::max(max_diff,
+                                std::fabs(double(o_np[i]) - double(o_lse[i])));
+                    }
+                    if (max_diff != 0.0) {
+                        fail("permuted query layout changed O (max_abs=%.6g): the route "
+                             "indexes rows by the packed (query, head) order instead "
+                             "of the tensor strides", max_diff);
+                    }
+                    if (lse_np.size() != lse_gpu.size()) {
+                        fail("permuted/non-permuted LSE size mismatch");
+                    } else {
+                        double max_lse_diff = 0.0;
+                        for (size_t r = 0; r < lse_np.size(); ++r) {
+                            const double a = lse_np[r];
+                            const double b = lse_gpu[r];
+                            if (std::isinf(a) || std::isinf(b)) {
+                                max_lse_diff = std::max(max_lse_diff,
+                                        std::fabs((std::isinf(a) ? 1.0 : 0.0) -
+                                                  (std::isinf(b) ? 1.0 : 0.0)));
+                                continue;
+                            }
+                            max_lse_diff = std::max(max_lse_diff, std::fabs(a - b));
+                        }
+                        if (max_lse_diff != 0.0) {
+                            fail("permuted query layout changed LSE (max_abs=%.6g): LSE "
+                                 "rows must be indexed [head, query, batch]", max_lse_diff);
+                        }
+                    }
+                }
+            }
+
+            const std::vector<float> o_cpu = test_native_flash_attention_output(
+                    cpu, false, false, sh.head_dim, 4, 4, sh.n_q, sh.n_q_heads,
+                    sh.n_kv_heads, n_kv, stage_groups, false, nullptr, false,
+                    0, false, GGML_TYPE_F16, 0, false, false, -1, false, false,
+                    false, 0, false, opts, &lse_cpu, &fp64_cpu);
+
+            // Dimensions are asserted explicitly: O is head_dim x n_q x
+            // n_q_heads, LSE is n_q x n_q_heads (plan §3.4).
+            const size_t o_size = size_t(sh.head_dim) * sh.n_q * sh.n_q_heads;
+            const size_t lse_size = size_t(sh.n_q) * sh.n_q_heads;
+            if (o_lse.size() != o_size || o_plain.size() != o_size ||
+                    o_cpu.size() != o_size) {
+                fail("O size mismatch: gpu=%zu plain=%zu cpu=%zu expected=%zu",
+                        o_lse.size(), o_plain.size(), o_cpu.size(), o_size);
+                continue;
+            }
+            if (lse_gpu.size() != lse_size) {
+                fail("LSE size mismatch: %zu expected %zu", lse_gpu.size(), lse_size);
+                continue;
+            }
+            if (!sh.production_layout &&
+                    (fp64_gpu.o.size() != o_size || fp64_gpu.lse.size() != lse_size)) {
+                fail("FP64 reference size mismatch: o=%zu lse=%zu",
+                        fp64_gpu.o.size(), fp64_gpu.lse.size());
+                continue;
+            }
+            if (st_lse.route_families == 0) {
+                fail("no KVarN route executed with the LSE attachment (telemetry is zero)");
+            }
+
+            const double k_sentinel = 7777.0;
+            double sum_sq = 0.0, sum_ref_sq = 0.0, sum_plain_sq = 0.0;
+            const bool gate_fp64 = !sh.production_layout;
+            double max_abs_o = 0.0, max_abs_plain = 0.0, max_abs_cpu = 0.0;
+            double max_abs_lse = 0.0;
+            int sentinel_rows = 0, finite_rows = 0, masked_rows = 0;
+            for (size_t i = 0; i < o_size && gate_fp64; ++i) {
+                if (!std::isfinite(o_lse[i])) {
+                    fail("O[%zu] is NaN/Inf with the LSE attached", i);
+                    break;
+                }
+                const double d = double(o_lse[i]) - fp64_gpu.o[i];
+                const double dp = double(o_lse[i]) - double(o_plain[i]);
+                const double dc = double(o_cpu[i]) - fp64_cpu.o[i];
+                sum_sq += d * d;
+                sum_ref_sq += fp64_gpu.o[i] * fp64_gpu.o[i];
+                sum_plain_sq += dp * dp;
+                max_abs_o = std::max(max_abs_o, std::fabs(d));
+                max_abs_plain = std::max(max_abs_plain, std::fabs(dp));
+                max_abs_cpu = std::max(max_abs_cpu, std::fabs(dc));
+            }
+            // LSE loop is separate from the O loop: O has head_dim times more
+            // elements than LSE (review 4, P1 out-of-range reproduction).
+            for (size_t r = 0; r < lse_size && gate_fp64; ++r) {
+                const double got = double(lse_gpu[r]);
+                const double ref = fp64_gpu.lse[r];
+                if (std::fabs(got + k_sentinel) < 1.0) {
+                    ++sentinel_rows;
+                    continue;
+                }
+                if (!fp64_gpu.row_has_keys[r]) {
+                    ++masked_rows;
+                    // A fully masked row is an exact contract, not a tolerance:
+                    // O == 0 and LSE == -inf on both sides.
+                    if (std::isfinite(got)) {
+                        fail("row %zu is fully masked in the reference but the route "
+                             "published a finite LSE (%g)", r, got);
+                    }
+                    continue;
+                }
+                ++finite_rows;
+                if (!std::isfinite(got)) {
+                    fail("row %zu has visible keys but the route published LSE=%g", r, got);
+                    continue;
+                }
+                if (!std::isfinite(ref)) {
+                    fail("row %zu has visible keys but the FP64 reference is not finite", r);
+                    continue;
+                }
+                max_abs_lse = std::max(max_abs_lse, std::fabs(got - ref));
+            }
+            if (gate_fp64 && sentinel_rows > 0) {
+                fail("%d LSE entries still hold the unwritten sentinel", sentinel_rows);
+            }
+            const double rms_ref = std::sqrt(sum_ref_sq / double(o_size));
+            const double nrmse = std::sqrt(sum_sq / double(o_size)) / std::max(rms_ref, 1e-6);
+            const double nrmse_plain = std::sqrt(sum_plain_sq / double(o_size)) / std::max(rms_ref, 1e-6);
+            const double nrmse_cpu = max_abs_cpu; // reported as the control's max abs
+            if (gate_fp64 && nrmse > 1e-3) {
+                fail("NRMSE(O)=%.6g exceeds 1e-3 (max_abs=%.3g, attach_max_abs=%.3g, "
+                        "cpu_control_max_abs=%.3g)", nrmse, max_abs_o, max_abs_plain, nrmse_cpu);
+            }
+            if (gate_fp64 && max_abs_o > 1e-2) {
+                fail("max_abs(O)=%.6g exceeds 1e-2", max_abs_o);
+            }
+            // Attachment isolation is only meaningful when both runs took the
+            // same route: the LSE attachment legitimately selects a different
+            // (still in-gate) route family, e.g. the windowed prefill route
+            // versus the portable native route. Route telemetry decides.
+            const bool same_route =
+                st_plain.decode_vector == st_lse.decode_vector &&
+                st_plain.decode_split  == st_lse.decode_split  &&
+                st_plain.generic_mma   == st_lse.generic_mma   &&
+                st_plain.prompt_prefill== st_lse.prompt_prefill&&
+                st_plain.portable_native == st_lse.portable_native;
+            if (gate_fp64 && same_route && nrmse_plain > 1e-3) {
+                fail("attachment isolation on the same route: "
+                     "NRMSE(O with LSE vs O without)=%.6g exceeds 1e-3", nrmse_plain);
+            }
+            if (gate_fp64 && max_abs_lse > 1e-2) {
+                fail("max_abs(LSE)=%.6g exceeds 1e-2", max_abs_lse);
+            }
+            if (gate_fp64 && finite_rows == 0 && !sh.all_masked) {
+                fail("no row with visible keys: the reference and the route disagree "
+                     "on every row");
+            }
+            ++checked;
+            std::printf("LSE %-18s nrmse=%.3e attach=%.3e maxO=%.3e maxLSE=%.3e "
+                    "rows=%d masked=%d cpu_ctl=%.3e\n"
+                    "    route plain: vec=%llu split=%llu mma=%llu prefill=%llu "
+                    "portable=%llu reduce=%llu families=%u\n"
+                    "    route lse  : vec=%llu split=%llu mma=%llu prefill=%llu "
+                    "portable=%llu reduce=%llu families=%u\n",
+                    sh.name, nrmse, nrmse_plain, max_abs_o, max_abs_lse,
+                    finite_rows, masked_rows, nrmse_cpu,
+                    (unsigned long long) st_plain.decode_vector,
+                    (unsigned long long) st_plain.decode_split,
+                    (unsigned long long) st_plain.generic_mma,
+                    (unsigned long long) st_plain.prompt_prefill,
+                    (unsigned long long) st_plain.portable_native,
+                    (unsigned long long) st_plain.split_reduce,
+                    st_plain.route_families,
+                    (unsigned long long) st_lse.decode_vector,
+                    (unsigned long long) st_lse.decode_split,
+                    (unsigned long long) st_lse.generic_mma,
+                    (unsigned long long) st_lse.prompt_prefill,
+                    (unsigned long long) st_lse.portable_native,
+                    (unsigned long long) st_lse.split_reduce,
+                    st_lse.route_families);
+            std::fflush(stdout);
+        }
+        std::printf("LSE parity %s: %d shapes evaluated, %zu failing\n",
+                label, checked, failures.size());
+        std::fflush(stdout);
+        for (const std::string & f : failures) {
+            std::printf("  FAILED %s\n", f.c_str());
+        }
+        require(failures.empty(),
+                "position-split LSE structural matrix has failing shapes");
+    }
 
     ggml_backend_free(cpu);
     ggml_backend_free(gpu);
 }
+
 
 int main() {
     ggml_backend_load_all();

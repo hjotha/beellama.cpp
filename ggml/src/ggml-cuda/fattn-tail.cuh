@@ -200,7 +200,8 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
         size_t mt_nb1, size_t mt_nb3,
         bool tail_bodyless, bool body_packed,
         size_t body_nb1, size_t body_nb2, size_t body_nb3,
-        size_t dst_nb1, size_t dst_nb2, size_t dst_nb3) {
+        size_t dst_nb1, size_t dst_nb2, size_t dst_nb3,
+        size_t lse_nb0, size_t lse_nb1, size_t lse_nb2) {
     const int iq_packed = blockIdx.x;
     const int ih = blockIdx.y;
     const int ia = blockIdx.z;
@@ -337,8 +338,13 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
                 denom > 0.0f ? (body_value*wb + tail_acc*wt)/denom : 0.0f;
     }
     if (tid == 0 && lse_out != nullptr) {
-        lse_out[(size_t(is)*n_query + iq)*n_head + ih] =
-            denom > 0.0f ? (global_max + logf(denom)) : -INFINITY;
+        // Position-split LSE is declared from the query layout as
+        // ne = {q->ne[1], q->ne[2], q->ne[3]} (plan section 3.4), so its ne[1]
+        // axis is the query and ne[2] the head: index it by strides, exactly
+        // like O, instead of assuming a row order.
+        *reinterpret_cast<float *>(reinterpret_cast<char *>(lse_out) +
+            size_t(ih)*lse_nb0 + size_t(iq)*lse_nb1 + size_t(is)*lse_nb2) =
+                denom > 0.0f ? (global_max + logf(denom)) : -INFINITY;
     }
 }
 
@@ -350,7 +356,8 @@ static __global__ void k_flash_attn_ext_tail_partials_merge(
         bool body_packed,
         size_t body_nb1, size_t body_nb2, size_t body_nb3,
         size_t tail_nb1, size_t tail_nb2, size_t tail_nb3,
-        size_t dst_nb1, size_t dst_nb2, size_t dst_nb3) {
+        size_t dst_nb1, size_t dst_nb2, size_t dst_nb3,
+        size_t lse_nb0, size_t lse_nb1, size_t lse_nb2) {
     const int iq_packed = blockIdx.x;
     const int ih = blockIdx.y;
     const int ia = blockIdx.z;
@@ -394,8 +401,9 @@ static __global__ void k_flash_attn_ext_tail_partials_merge(
         *reinterpret_cast<float *>(drow + size_t(id)*sizeof(float)) = denom > 0.0f ? numerator/denom : 0.0f;
     }
     if (threadIdx.x == 0 && lse_out != nullptr) {
-        lse_out[(size_t(is)*n_query + iq)*n_head + ih] =
-            denom > 0.0f ? (m + logf(denom)) : -INFINITY;
+        *reinterpret_cast<float *>(reinterpret_cast<char *>(lse_out) +
+            size_t(ih)*lse_nb0 + size_t(iq)*lse_nb1 + size_t(is)*lse_nb2) =
+                denom > 0.0f ? (m + logf(denom)) : -INFINITY;
     }
 }
 
@@ -819,6 +827,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         memcpy(&max_bias, dst->op_params + 1*sizeof(float), sizeof(float));
         memcpy(&logit_softcap, dst->op_params + 2*sizeof(float), sizeof(float));
         float * const lse_out = ggml_cuda_fattn_lse_ptr(dst);
+        const ggml_tensor * lse_t = ggml_flash_attn_ext_get_lse_out(dst);
+        const size_t lse_nb0 = lse_t ? lse_t->nb[0] : 0;
+        const size_t lse_nb1 = lse_t ? lse_t->nb[1] : 0;
+        const size_t lse_nb2 = lse_t ? lse_t->nb[2] : 0;
         const dim3 grid(q_max, n_head, n_active);
 #define GGML_CUDA_LAUNCH_INDEXED(TK, TV, MAX_TAIL) \
         k_flash_attn_ext_tail_indexed_small<TK, TV, MAX_TAIL><<<grid, 256, 0, ctx.stream()>>>( \
@@ -834,7 +846,8 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             vt_current ? vt_current->nb[0] : 0, vt_current ? vt_current->nb[1] : 0, vt_current ? vt_current->nb[2] : 0, \
             mt->nb[1], mt->nb[3], \
             tail_bodyless, body_packed, body_pass.nb[1], body_pass.nb[2], body_pass.nb[3], \
-            dst->nb[1], dst->nb[2], dst->nb[3])
+            dst->nb[1], dst->nb[2], dst->nb[3], \
+            lse_out ? lse_nb0 : 0, lse_out ? lse_nb1 : 0, lse_out ? lse_nb2 : 0)
         if (kt->type == GGML_TYPE_F16 && vt->type == GGML_TYPE_F16) {
             GGML_CUDA_LAUNCH_INDEXED(half, half, 256);
         } else if (kt->type == GGML_TYPE_F16 && vt->type == GGML_TYPE_BF16) {
@@ -912,6 +925,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             tail_base_bytes + tail_alloc.actual_size);
     ggml_cuda_flash_attn_ext_dispatch(ctx, &tail_pass);
 
+    const ggml_tensor * lse_t = ggml_flash_attn_ext_get_lse_out(dst);
+    const size_t lse_nb0 = lse_t ? lse_t->nb[0] : 0;
+    const size_t lse_nb1 = lse_t ? lse_t->nb[1] : 0;
+    const size_t lse_nb2 = lse_t ? lse_t->nb[2] : 0;
     const dim3 grid(q_max, n_head, n_active);
     if (tail_bodyless) {
         k_flash_attn_ext_tail_scatter<<<grid, 256, 0, ctx.stream()>>>(
@@ -940,6 +957,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         d_v, n_query, n_head, n_stream, q_max, n_active, body_packed,
         body_pass.nb[1], body_pass.nb[2], body_pass.nb[3],
         tail_pass.nb[1], tail_pass.nb[2], tail_pass.nb[3],
-        dst->nb[1], dst->nb[2], dst->nb[3]);
+        dst->nb[1], dst->nb[2], dst->nb[3],
+        lse_nb0, lse_nb1, lse_nb2);
     CUDA_CHECK(cudaGetLastError());
 }

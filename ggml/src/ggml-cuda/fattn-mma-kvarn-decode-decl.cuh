@@ -33,6 +33,20 @@ struct ggml_cuda_fattn_kvarn_decode_args {
     int64_t nb01;
     int64_t nb02;
     int64_t nb03;
+    // Strides of the FA output (position-split): the combine must honour the
+    // tensor layout, because llama-graph feeds a permuted Q whose O rows are
+    // laid out [head, query] instead of the packed [query, head] order.
+    int64_t nb11;
+    int64_t nb12;
+    int64_t nb13;
+    // Strides of the position-split LSE tensor, which ggml.c derives from the
+    // FA output layout: lse ne = {out->ne[1], out->ne[2], out->ne[3]} =
+    // {n_q_heads, n_q, n_stream}. The head axis is therefore the contiguous
+    // one (nb0), and the tensor must be indexed by strides, never by an
+    // assumed row order.
+    int64_t lse_nb0;
+    int64_t lse_nb1;
+    int64_t lse_nb2;
     int64_t nb30;
     int64_t nb31;
     int64_t nb33;
@@ -54,7 +68,8 @@ struct ggml_cuda_fattn_kvarn_decode_args {
 };
 
 using ggml_cuda_fattn_kvarn_decode_combine_kernel_t = void (*)(
-        const float *, const float2 *, float *, float2 *, float *, int, int, int);
+        const float *, const float2 *, float *, float2 *, float *, int, int, int, int,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 
 template<int D>
 ggml_cuda_fattn_kvarn_decode_combine_kernel_t ggml_cuda_fattn_kvarn_decode_combine_get_kernel();

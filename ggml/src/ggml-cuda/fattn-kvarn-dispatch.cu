@@ -663,6 +663,13 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     args.partial = partial.get();
     args.partial_meta = partial_meta.get();
     args.dst = (float *) dst->data;
+    args.nb11 = dst->nb[1];
+    args.nb12 = dst->nb[2];
+    args.nb13 = dst->nb[3];
+    const ggml_tensor * lse_t = ggml_flash_attn_ext_get_lse_out(dst);
+    args.lse_nb0 = lse_t ? lse_t->nb[0] : 0;
+    args.lse_nb1 = lse_t ? lse_t->nb[1] : 0;
+    args.lse_nb2 = lse_t ? lse_t->nb[2] : 0;
     args.dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
     args.lse_out = ggml_cuda_fattn_lse_ptr(dst);
     args.scale = scale;
@@ -829,6 +836,13 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     args.partial = partial.get();
     args.partial_meta = partial_meta.get();
     args.dst = (float *) dst->data;
+    args.nb11 = dst->nb[1];
+    args.nb12 = dst->nb[2];
+    args.nb13 = dst->nb[3];
+    const ggml_tensor * lse_t = ggml_flash_attn_ext_get_lse_out(dst);
+    args.lse_nb0 = lse_t ? lse_t->nb[0] : 0;
+    args.lse_nb1 = lse_t ? lse_t->nb[1] : 0;
+    args.lse_nb2 = lse_t ? lse_t->nb[2] : 0;
     args.dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
     args.lse_out = ggml_cuda_fattn_lse_ptr(dst);
     args.scale = scale;
@@ -1070,18 +1084,13 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(
     if (!ggml_cuda_fattn_kvarn_supported(device, dst, &plan)) {
         return false;
     }
-    // Position-split LSE (plan §3.4, F1b) is declined for KVarN views until the
-    // LSE route publishes O correctly. Measurement (2026-10-04): with the LSE
-    // attachment the KVarN decode route's LSE values match the CPU reference
-    // (max|dLSE| = 1.6e-05) but its O differs from the same route without LSE
-    // by rmse 2.3e-1; the windowed multi-query path shows the same class of
-    // defect at Q>1 (rmse 2.4e-1). Both need the route to consume its
-    // (max, denom) metadata sink (dst->src[8]) when no explicit one is given.
-    // Fail-closed until that is implemented, so production never merges on a
-    // wrong O.
-    if (ggml_cuda_fattn_lse_requested(dst)) {
-        return false;
-    }
+    // Position-split LSE (plan §3.4, F1b) is accepted here: the KVarN decode,
+    // windowed and portable routes all publish O and LSE from the same
+    // (max, denom) metadata, verified numerically against the CPU reference
+    // (see tests/test-kvarn.cpp test_native_flash_attention_lse_parity).
+    // Generic (non-windowed) MMA shapes without an LSE-capable sub-path are
+    // still declined in ggml_cuda_flash_attn_ext_mma_kvarn_launch_case, so no
+    // shape can reach a kernel that would ignore the attachment.
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
     if (!ggml_cuda_fattn_kvarn_body_shape_supported(
                 capabilities, plan.head_dim, plan.head_dim)) {

@@ -15,7 +15,14 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
         float * lse_out,
         int n_splits,
         int n_q,
-        int n_q_heads) {
+        int n_q_heads,
+        int n_stream,
+        int64_t nb11,
+        int64_t nb12,
+        int64_t nb13,
+        int64_t lse_nb0,
+        int64_t lse_nb1,
+        int64_t lse_nb2) {
     const int q_head = blockIdx.x;
     const int q_index = blockIdx.y;
     const int stream = blockIdx.z;
@@ -64,13 +71,28 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
     }
     const float denom = reduce_sh[0];
 
-    const size_t output_row = ((size_t) stream * n_q + q_index) * n_q_heads + q_head;
+    // The FA output is declared ne = {D, q->ne[2], q->ne[1], q->ne[3]}, so its
+    // ne[1] axis is the query head and ne[2] the query index. The (max, denom)
+    // sink shares that layout, and the position-split LSE is declared from the
+    // query layout as well. Both are indexed by strides so the kernel is
+    // correct for a permuted (llama-graph) and a non-permuted query tensor.
+    const size_t dst_off = (size_t) q_head * (size_t) nb11 + (size_t) q_index * (size_t) nb12 +
+        (size_t) stream * (size_t) nb13;
+    char * const dst_row_ptr = reinterpret_cast<char *>(dst) + dst_off;
+    // src[8] keeps its historical meaning for this route: the packed
+    // (query, head) (max, denom) sink. It is also the query-order input of the
+    // tail contract, so its layout is not this kernel's business.
+    const size_t meta_row = ((size_t) stream * n_q + q_index) * n_q_heads + q_head;
     if (tid == 0 && dst_meta != nullptr) {
-        dst_meta[output_row] = make_float2(m, denom);
+        dst_meta[meta_row] = make_float2(m, denom);
     }
     if (tid == 0 && lse_out != nullptr) {
-        // Position-split LSE: lse = m + log(denom); empty -> -inf.
-        lse_out[output_row] = denom > 0.0f ? (m + logf(denom)) : -INFINITY;
+        // Position-split LSE: lse = m + log(denom); empty -> -inf. The tensor
+        // is ne = {n_q_heads, n_q, n_stream}, so the head axis is contiguous.
+        *reinterpret_cast<float *>(reinterpret_cast<char *>(lse_out) +
+            (size_t) q_head * (size_t) lse_nb0 + (size_t) q_index * (size_t) lse_nb1 +
+            (size_t) stream * (size_t) lse_nb2) =
+                denom > 0.0f ? (m + logf(denom)) : -INFINITY;
     }
 
     if constexpr (D == 64) {
@@ -103,7 +125,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
             for (int g = 1; g < DIM_GROUPS; ++g) {
                 out += reduce_sh[g * D + dim];
             }
-            dst[output_row * D + dim] = denom > 0.0f ? out / denom : 0.0f;
+            reinterpret_cast<float *>(dst_row_ptr)[dim] = denom > 0.0f ? out / denom : 0.0f;
         }
     } else {
         for (int dim = tid; dim < D; dim += blockDim.x) {
@@ -121,7 +143,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
                 }
                 out /= denom;
             }
-            dst[output_row * D + dim] = out;
+            reinterpret_cast<float *>(dst_row_ptr)[dim] = out;
         }
     }
 }
