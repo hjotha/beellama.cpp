@@ -2193,7 +2193,8 @@ static std::vector<float> test_native_flash_attention_output(
         bool           materialized_graph = false,
         int            indirect_offset = 0,
         bool           contiguous_current_tail = false,
-        const test_native_attention_options & options = {}) {
+        const test_native_attention_options & options = {},
+        std::vector<float> * lse_output = nullptr) {
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2302,6 +2303,13 @@ static std::vector<float> test_native_flash_attention_output(
             options.omit_mask ? nullptr : mask, 1.0f / std::sqrt(float(head_dim)),
             options.max_bias, options.logit_softcap);
     ggml_flash_attn_ext_add_sinks(out, sinks);
+    // Position-split LSE (plan §3.4): optional side output. sinks and LSE are
+    // mutually exclusive, so a sink-carrying case cannot request it.
+    ggml_tensor * lse = nullptr;
+    if (lse_output != nullptr) {
+        require(sinks == nullptr, "native FA: sinks and LSE side output are mutually exclusive");
+        lse = ggml_flash_attn_ext_lse_out(ctx, out);
+    }
     if (native_view) {
         out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
             rotate_graph ? (original_value_domain ?
@@ -2395,7 +2403,7 @@ static std::vector<float> test_native_flash_attention_output(
         ggml_build_forward_expand(store_graph, stored_v);
     }
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, out);
+    ggml_build_forward_expand(graph, lse != nullptr ? lse : out);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "native FA: failed to allocate tensors");
@@ -2494,6 +2502,12 @@ static std::vector<float> test_native_flash_attention_output(
     ggml_backend_tensor_set(k_records, k_record_zeros.data(), 0, k_record_zeros.size());
     ggml_backend_tensor_set(v_records, v_record_zeros.data(), 0, v_record_zeros.size());
     ggml_backend_tensor_set(mask, mask_data.data(), 0, ggml_nbytes(mask));
+    if (lse != nullptr) {
+        // sentinel: an LSE-writing route must overwrite every entry, which is
+        // what proves the route actually published LSE (plan §3.4, F1b)
+        std::vector<float> lse_sentinel(ggml_nelements(lse), -7777.0f);
+        ggml_backend_tensor_set(lse, lse_sentinel.data(), 0, ggml_nbytes(lse));
+    }
 
     if (exact_tail_tokens > 0) {
         std::vector<float> k_tail_data(ggml_nelements(k_tail_storage), 0.0f);
@@ -2663,6 +2677,10 @@ static std::vector<float> test_native_flash_attention_output(
 
     std::vector<float> output(ggml_nelements(out));
     ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
+    if (lse_output != nullptr) {
+        lse_output->resize(ggml_nelements(lse));
+        ggml_backend_tensor_get(lse, lse_output->data(), 0, ggml_nbytes(lse));
+    }
     if (body_meta_output != nullptr) {
         require(native_view, "native FA: body metadata reference requires a native CUDA view");
         body_meta_output->resize(ggml_nelements(body_meta));
@@ -3574,6 +3592,7 @@ static void test_native_flash_attention_portable_backend(
 
     std::printf("test-kvarn: %s direct KVarN FlashAttention parity OK\n", backend_label);
 }
+
 
 static void test_native_flash_attention_cpu() {
     ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
@@ -5920,6 +5939,91 @@ static void test_backend_buffer_detach_and_reallocate_views() {
     std::printf("test-kvarn: detached backend buffers reallocate base tensors and views OK\n");
 }
 
+// Position-split LSE numeric proof on the native KVarN CUDA/Vulkan routes
+// (plan §3.4, F1b, second review item 2/5). The support probe only asked
+// supports_op; this runs the kernels and compares numbers, because the windowed
+// single-window fast path used to accept an LSE request for Q >= 512 and return
+// before the finalizers, leaving the LSE buffer untouched.
+static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type device_type, const char * label) {
+    ggml_backend_t gpu = init_test_backend(device_type, false);
+    if (gpu == nullptr) {
+        return;
+    }
+    ggml_backend_t cpu = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    require(cpu != nullptr, "LSE parity: CPU backend unavailable");
+
+    const auto route_fns = get_kvarn_route_stats_fns(gpu);
+    const auto route_reset = route_fns.first;
+    const auto route_get = route_fns.second;
+    const ggml_backend_dev_t gpu_device = ggml_backend_get_device(gpu);
+    const char * dev_name = gpu_device ? ggml_backend_dev_name(gpu_device) : nullptr;
+    const bool vulkan_stats = dev_name != nullptr && std::strncmp(dev_name, "Vulkan", 6) == 0;
+    const uint32_t abi = vulkan_stats ? 1u : 3u;
+    require(route_reset != nullptr && route_get != nullptr,
+            "LSE parity: KVarN route telemetry unavailable");
+
+    // Position-split LSE on the native KVarN decode route (plan §3.4, F1b).
+    //
+    // Proved here, with real numbers: the LSE buffer is pre-filled with a
+    // sentinel and must come back overwritten (only an LSE-writing route can do
+    // that - the windowed single-window shortcut the review found for Q >= 512
+    // returned before the finalizers), every entry must be finite, and the
+    // values must match the CPU backend reference within |dLSE| <= 1e-2.
+    //
+    // Multi-query is not covered: ggml_cuda_flash_attn_ext_kvarn_supported
+    // declines LSE above Q=1 (the windowed multi-chunk path wrote a wrong O,
+    // rmse 2.4e-1 at Q=2, while Q=1 matches at 2.9e-5). That decline is a
+    // scheduling contract, so it is exercised through the scheduler, not by
+    // this direct-compute harness.
+    {
+        const int n_q = 1;
+        std::vector<float> actual_lse;
+        const std::vector<float> actual_o = test_native_flash_attention_output(
+                gpu, true, true, 128, 4, 4, n_q, 2, 2, 512, 3, false,
+                nullptr, false, 0, false, GGML_TYPE_F16, 0, false, false, -1, false, false,
+                false, 0, false, {}, &actual_lse);
+        route_reset();
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats(abi);
+        route_get(&stats);
+        std::printf("test-kvarn: LSE %s n_q=%d supported=%d "
+                    "(routes: generic_mma=%llu prompt_prefill=%llu decode_split=%llu "
+                    "decode_vector=%llu portable=%llu)\n",
+                label, n_q, (int) !actual_lse.empty(),
+                (unsigned long long) stats.generic_mma,
+                (unsigned long long) stats.prompt_prefill,
+                (unsigned long long) stats.decode_split,
+                (unsigned long long) stats.decode_vector,
+                (unsigned long long) stats.portable_native);
+
+        require(!actual_lse.empty(), "LSE: KVarN decode route must export LSE");
+        for (float v : actual_lse) {
+            require(v != -7777.0f, "LSE: route returned without writing the LSE buffer");
+            require(std::isfinite(v), "LSE: device LSE is not finite");
+        }
+        std::vector<float> reference_lse;
+        const std::vector<float> reference_o = test_native_flash_attention_output(
+            cpu, false, false, 128, 4, 4, n_q, 2, 2, 512, 3, false,
+            nullptr, false, 0, false, GGML_TYPE_F16, 0, false, false, -1, false, false,
+            false, 0, false, {}, &reference_lse);
+        require(reference_lse.size() == actual_lse.size(),
+                "LSE: size mismatch between reference and device");
+        float max_lse_error = 0.0f;
+        for (size_t i = 0; i < actual_lse.size(); ++i) {
+            max_lse_error = std::max(max_lse_error, std::fabs(actual_lse[i] - reference_lse[i]));
+        }
+        std::printf("test-kvarn: LSE %s n_q=%d max|dLSE|=%.3e\n", label, n_q, double(max_lse_error));
+        require(max_lse_error <= 1e-2f, "LSE: |dLSE| above the plan gate");
+        // O parity across KVarN routes is covered elsewhere in this file; the
+        // CPU O is not comparable here because it consumes unquantized F16 K/V
+        // while these records are 4-bit in the rotated domain.
+        (void) actual_o;
+        (void) reference_o;
+    }
+
+    ggml_backend_free(cpu);
+    ggml_backend_free(gpu);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -6133,6 +6237,7 @@ int main() {
     test_store_paths_gpu();
     test_native_flash_attention_support_gates();
     test_native_flash_attention_cpu();
+    test_native_flash_attention_lse_parity(GGML_BACKEND_DEVICE_TYPE_GPU, "GPU");
     test_native_flash_attention_gpu();
     test_odd_offset_record_decode_gpu();
     test_d64_materialized_body_exact_tail_gpu();

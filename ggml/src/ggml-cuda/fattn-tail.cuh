@@ -735,9 +735,11 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     for (int i = 5; i < GGML_MAX_SRC; ++i) {
         body_pass.src[i] = nullptr;
     }
-    if (ggml_cuda_fattn_lse_requested(dst)) {
-        body_pass.src[4] = nullptr;
-    }
+    // The sub-pass copies the parent tensor struct, which carries op_params
+    // verbatim: the LSE attachment (flag + back-pointer) must be dropped so the
+    // body pass cannot write the parent's LSE buffer. src[4] is sinks only and
+    // is already null whenever LSE is requested (mutually exclusive).
+    ggml_flash_attn_ext_set_lse_out(&body_pass, nullptr);
     body_pass.src[8] = &body_meta;
     body_pass.view_src = nullptr;
     body_pass.view_offs = 0;
@@ -868,19 +870,26 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     tail_pass.src[3] = &mask_packed;
     // Sinks are part of the body partial for a split source. For a bodyless
     // source the exact pass is the sole softmax and must consume them itself.
-    const bool tail_lse = ggml_cuda_fattn_lse_requested(dst) && dst->src[4] != nullptr;
+    // Position-split LSE (plan §3.4): src[4] is sinks, the LSE destination is
+    // the attachment on the parent node. A bodyless tail is the only softmax for
+    // its keys, so it writes a packed LSE that is scattered into the parent's
+    // LSE tensor afterwards; a body+tail merge combines both partials in
+    // k_flash_attn_ext_tail_partials_merge.
+    ggml_tensor * const lse_out = ggml_flash_attn_ext_get_lse_out(dst);
+    const bool tail_lse = lse_out != nullptr;
     ggml_cuda_pool_alloc<float> tail_lse_packed(pool);
     ggml_tensor lse_packed = {};
     if (tail_lse && tail_bodyless) {
         tail_lse_packed.alloc(size_t(n_head) * q_max * n_active);
-        lse_packed = *dst->src[4];
+        lse_packed = *lse_out;
         lse_packed.data = tail_lse_packed.get();
         ggml_cuda_tail_make_contiguous(lse_packed, n_head, q_max, n_active, 1, sizeof(float));
     }
-    tail_pass.src[4] = (tail_bodyless && !tail_lse) ? dst->src[4] : nullptr;
-    if (tail_lse && tail_bodyless) {
-        tail_pass.src[4] = &lse_packed;
-    }
+    // src[4] stays sinks-only; the sub-pass learns its own LSE destination from
+    // the attachment below.
+    tail_pass.src[4] = tail_bodyless ? dst->src[4] : nullptr;
+    ggml_flash_attn_ext_set_lse_out(&tail_pass,
+        (tail_lse && tail_bodyless) ? &lse_packed : nullptr);
     for (int i = 5; i < GGML_MAX_SRC; ++i) {
         tail_pass.src[i] = nullptr;
     }
@@ -913,13 +922,13 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(cudaGetLastError());
         if (tail_lse) {
             k_flash_attn_ext_tail_scatter<<<grid, 256, 0, ctx.stream()>>>(
-                (const float *) tail_lse_packed.get(), (float *) dst->src[4]->data,
+                (const float *) tail_lse_packed.get(), (float *) lse_out->data,
                 (const int32_t *) qo->data,
                 1, n_query, n_head, n_stream, q_max, n_active,
                 size_t(n_head) * sizeof(float), size_t(n_head) * q_max * sizeof(float),
                 size_t(n_head) * q_max * sizeof(float),
-                sizeof(float), size_t(dst->src[4]->ne[0]) * sizeof(float),
-                size_t(dst->src[4]->ne[0]) * dst->src[4]->ne[1] * sizeof(float));
+                sizeof(float), size_t(lse_out->ne[0]) * sizeof(float),
+                size_t(lse_out->ne[0]) * lse_out->ne[1] * sizeof(float));
             CUDA_CHECK(cudaGetLastError());
         }
         return;

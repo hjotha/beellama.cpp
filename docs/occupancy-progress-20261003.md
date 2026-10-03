@@ -4,7 +4,18 @@ Data: 2026-10-03. Máquina: gokaya (192.168.1.57 / .52). Plano:
 `docs/occupancy-placement-plan-20261002.md` (revisão 2026-10-03 preservada de
 `docs/occupancy-plan-review-20261003`, sha256 `cc5cb1b1...`).
 
-## Baseline de produção (recuperável, antes da 1ª alteração)
+## Baseline de produção — ATENÇÃO: binário original NÃO é recuperável
+> O binário e as bibliotecas originais foram **sobrescritos** pelos builds em
+> `build-optimized`. "Recuperável" aqui significa apenas os *artefatos de
+> observação* (linha de processo, INI, ps), não o executável. Reconstruir um
+> commit conhecido **não** equivale ao binário original `3e104c3fd-dirty`, e o
+> serviço (`llama-server-root`) continua apontando para `build-optimized`:
+> reiniciá-lo agora sobe o **candidato**, não o original. Qualquer retomada
+> deve (a) preservar o incremental atual do candidato, (b) preparar um baseline
+> **conhecido** em diretório separado com hashes/configuração próprios, e (c)
+> declarar esse baseline como novo, nunca como o original.
+
+## Baseline de produção (artefatos de observação, antes da 1ª alteração)
 - Branch base: `main` @ `982eaadaa` (`perf(server): allow prompt cache reuse from 1% common prefix`).
 - Branch tarefa: `feat/occupancy-position-split` baseada no `main`, com a revisão
   do plano carregada como working tree (commitada neste log, não descartada).
@@ -206,14 +217,80 @@ campanha 27B, tudo em porta isolada sem contaminar produção.
   `src/llama-kv-cache-kvarn.cpp` está intocado nesta branch e já não contém a
   string exigida em `main` (`git show main:...| grep -c` = 0).
 
+## Segunda revisão (2026-10-04): itens 0-4 tratados
+- **Item 0 (lifetime/cópias) — corrigido.** `ggml-alloc.c` agora reserva o nó
+  `FLASH_ATTN_EXT_LSE` na posição do produtor (antes de liberar as entradas do
+  FA), tanto em `alloc_graph` quanto em `reserve`;
+  `ggml-backend.cpp:graph_copy_dup_tensor` duplica e religa o tensor LSE no
+  clone; `ggml-rpc.cpp` recusa FA-LSE e o nó LSE em `supports_op` e afirma em
+  `serialize_graph` antes de enviar ponteiro. Regressão nova
+  `tests/test-position-split-lse-alloc.cpp`: **230 checks, 0 falhas** (duas
+  faixas + merge, assert de intervalo LSE vs entrada/saída do produtor,
+  reserve, reset do scheduler, reexecução, com e sem callback de eval, e
+  graph-copy com sentinel). Com a reserva desabilitada o mesmo teste acusa
+  **12 falhas de overlap** (verificado).
+- **Item 1 (gate FP64) — restaurado.** A reprodução estrita acusava O vs FP64
+  de 1.17e-3..4.33e-3. Causa medida: o acumulador `Of` do FA Vulkan é
+  `FLOAT_TYPE` (fp16 no modo default); com `GGML_PREC_F32` os mesmos casos dão
+  3.9e-4..8.5e-4, e a rota LSE é **bit a bit igual** à rota sem LSE. Gates
+  atuais: O vs FP64 com acumulação fp32 (≤1e-3/≤1e-2), split-vs-unsplit no
+  modo de produção (≤1e-3/≤1e-2, exatamente 0 quando ambas usam o reduce),
+  LSE vs FP64 ≤1e-2 com fp32 (o modo default expõe o erro absoluto do score:
+  3e-2..6e-2 em D=256, reportado com teto de sanidade), CPU apenas como
+  cross-check. Vazamento `*(new std::vector<float>())` corrigido.
+- **Item 4 (Vulkan split_k=1) — implementado.** Um pedido de LSE sempre passa
+  pelos partials, mesmo com `split_k == 1`, e o reduce publica O e LSE de um
+  único parcial. Os shaders escrevem partials com `k_num == 1` via novo
+  `LSE_PARTIALS_BIT` no `mask_n_head_log2` empacotado (mesmo padrão do
+  `SINK_ENABLE_BIT`; um campo dedicado não cabia em 128 bytes de push
+  constant), com a condição `k_num > 1 || LSE_PARTIALS_BIT` para não alterar a
+  rota split_k>1 existente. A recusa `KV >= 2*Bc` foi removida.
+  Cobertura: KV 1/3/17 (split_k=1), 128/256/384/512, D=256 com 24:4 e prefill
+  de 256 tokens, F16 e Q4_0, decode/prefill, GQA 1/2/4/6,
+  causal/cheio/fileira vazia → **1105 checks, 0 falhas**. Regressão
+  `test-backend-ops -o FLASH_ATTN_EXT` no Vulkan0: 5392 casos OK, 4/4 backends,
+  exit 0.
+- **Item 2/3 (CUDA) — parcial, com um bug real encontrado.** O atalho
+  single-window `Q >= 512` agora é pulado quando há LSE (ele retornava antes
+  dos finalizadores). Os sub-passos do tail (`body_pass`/`tail_pass`) recebem a
+  limpieza do attachment LSE e o tail-only resolve o destino por
+  `ggml_flash_attn_ext_get_lse_out` (src[4] voltou a ser só sinks).
+  Prova numérica no harness de `tests/test-kvarn.cpp` (novo parâmetro
+  `lse_output`, sentinel antes do compute): rota KVarN **decode** publicando
+  LSE com `max|dLSE| = 1.621e-05` contra a referência CPU.
+  **Bug encontrado e fail-closed**: com `Q > 1` a rota windowed multi-chunk
+  escrevia O errado junto com LSE (rmse 2.4e-1 contra a mesma rota sem LSE em
+  Q=2, enquanto Q=1 bate em 2.9e-5). Até a correção do metadata multi-chunk,
+  `ggml_cuda_flash_attn_ext_kvarn_supported` **recusa** LSE com `Q > 1`.
+- **Item 5 (cobertura) — parcial.** CUDA agora tem prova numérica (não só
+  `supports_op`) via harness do test-kvarn; Vulkan tem a matriz do plano
+  (D=256, GQA 24:4, Q=256). A falha ampla do CUDA em `hsk=320`
+  (`GGML_ASSERT(vec_case != nullptr)`, `fattn.cu:595`) segue intocada e não foi
+  investigada: é anterior à branch e fora das formas obrigatórias.
+- **Item 6 (documentação) — corrigido** no topo (baseline não recuperável) e
+  no F2a (divisão em P, não rejeição).
+
+## Pendências reais após esta rodada
+- CUDA KVarN multi-query com LSE (Q>1): corrigir o metadata multi-chunk da rota
+  windowed e reabilitar; enquanto isso, recusa fail-closed.
+- Vulkan D=256: LSE no modo default tem erro absoluto 3e-2..6e-2 (precisão
+  fp16 herdada do device); o gate obrigatório roda com acumulação fp32.
+- `fattn.cu:595` (hsk=320) e `test-kvarn-mtp-sharing-static` (pré-existente em
+  `main`): fora do escopo desta rodada.
+- F2 (allocator/cache por posição), F3 (grafo/merge), F4 (snapshots), F5
+  (27B), F7 (canário/rollback) continuam não implementados.
+- Produção segue parada; binário original perdido (ver aviso no topo).
+
 ## Desenho F2/F3/F4 (para implementar após o rebuild verde)
-- F2a (ubatch/P, pequeno e seguro): campo `position_split_p` (0=desligado)
-  em `llama_memory_hybrid` (+ setter), checado em `init_batch` APÓS montar
-  `ubatches` e ANTES de `mem_recr->prepare`: para cada ubatch, min/max de
-  `ubatch.pos[i*n_pos]`; se algum cruza P → `FAILED_PREPARE` com motivo
-  explícito, sem mutação (prepare ainda não rodou). A janela recorrente
-  (`1+n_rs_seq` juntos) é subcaso: se ela cruza P, o ubatch cruza P.
-  P chega via cparams (contexto) — origem: perfil adaptativo §3.8.
+- F2a (ubatch/P, **vigente**): o allocator **DIVIDE** os ubatches comuns na
+  fronteira P antes de preparar atenção/recorrência; somente a janela
+  protegida `1+n_rs_seq` (DeltaNet) que cruza P é **rejeitada antes de
+  qualquer mutação** (`FAILED_PREPARE` com motivo explícito, prepare ainda sem
+  rodar). A versão anterior deste documento propunha rejeitar qualquer ubatch
+  que cruzasse P; isso está corrigido aqui e é o comportamento a implementar.
+  Atomicidade a testar: se a segunda preparação (após o split) falhar, nada
+  pode ter sido mutado — inclusive o caminho DeltaNet. P chega via cparams
+  (contexto) — origem: perfil adaptativo §3.8.
 - F2b (cache por posição, núcleo): em `llama_kv_cache_kvarn`, quando P>0,
   cada camada full ganha faixa overflow Q4 em `standard_cache` (cap C-P por
   camada, Vulkan0), tabela lógica única `pos<->cell` no `metadata`,

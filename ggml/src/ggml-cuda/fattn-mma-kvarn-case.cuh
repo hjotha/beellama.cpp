@@ -450,7 +450,12 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             k_desc.get(), v_desc.get(), k_f16.get(), v_f16.get(), 0, chunk_len, plan.n_kv_heads);
 
         const char * mask_data = mask ? (const char *) mask->data : nullptr;
-        if (Q->ne[1] >= 512) {
+        // Position-split LSE (plan §3.4, F1b): the single-window fast path
+        // below runs generic launch_fattn and returns before the LSE
+        // finalizers, so it would accept the op and leave the LSE buffer
+        // untouched. With LSE requested, fall through to the partials+finalize
+        // route below, which publishes O and LSE together.
+        if (Q->ne[1] >= 512 && !ggml_cuda_fattn_lse_requested(dst)) {
             ggml_tensor k_win = *dst->src[1];
             ggml_tensor v_win = *dst->src[2];
 

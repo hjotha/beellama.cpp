@@ -1070,6 +1070,16 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(
     if (!ggml_cuda_fattn_kvarn_supported(device, dst, &plan)) {
         return false;
     }
+    // Position-split LSE (plan §3.4, F1b): the windowed multi-query path
+    // publishes O through its (max, denom) metadata, and with an LSE-only
+    // attachment (no body-meta output) that multi-chunk reduction produces a
+    // wrong O - measured rmse 2.4e-1 against the same route without LSE at
+    // Q=2, while decode (Q=1) matches at 2.9e-5. Decline instead of returning
+    // wrong numbers; the route is re-enabled with the multi-chunk metadata fix.
+    if (ggml_cuda_fattn_lse_requested(dst) && dst->src[0] != nullptr &&
+            dst->src[0]->ne[1] > 1) {
+        return false;
+    }
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
     if (!ggml_cuda_fattn_kvarn_body_shape_supported(
                 capabilities, plan.head_dim, plan.head_dim)) {
