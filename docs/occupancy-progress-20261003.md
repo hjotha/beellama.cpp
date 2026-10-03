@@ -36,7 +36,10 @@ Data: 2026-10-03. Máquina: gokaya (192.168.1.57 / .52). Plano:
 - GPU: RTX 4070 12GiB, driver 610.57.04. Vulkan `vulkaninfo` falha sem DISPLAY
   (`vkCreateDevice ... ERROR_INITIALIZATION_FAILED`) — atenção Radeon via
   backend Vulkan do llama ainda a validar em runtime isolado.
-- Restauração: `systemctl restart llama-server-root` + checagem `:8090/metrics`
+- Restauração: **INVALIDADA** — `systemctl restart llama-server-root` +
+  checagem `:8090/metrics` sobe o candidato de `build-optimized`, não o
+  baseline (que foi sobrescrito). Rollback real exige o baseline conhecido
+  separado preparado cedo nesta campanha.
   e inferência real; binários/configs acima são o estado a restaurar.
 
 ## Mapeamento (subagentes read-only, nada editado por eles)
@@ -269,6 +272,33 @@ campanha 27B, tudo em porta isolada sem contaminar produção.
   investigada: é anterior à branch e fora das formas obrigatórias.
 - **Item 6 (documentação) — corrigido** no topo (baseline não recuperável) e
   no F2a (divisão em P, não rejeição).
+
+## Terceira revisão (2026-10-04): correções e fail-closed
+- P1 do clone: `graph_copy_dup_tensor` publica o clone no mapa **antes** de
+  percorrer arestas que podem retornar a ele. Regressão do teste de clone:
+  232 checks, 0 falhas (eram 2).
+- Vulkan LSE: a rota LSE agora força acumulação fp32 (`!device->fp16 ||
+  prec==F32 || ktype==BF16 || LSE presente`). A matriz real
+  (D=256, nqh=24, nkh=4, nq=256, nkv=512) passou a casar no modo de produção
+  do teste: O nrmse=7.558e-4 (gate 1e-3), LSE max=5.008e-3 (gate 1e-2); o
+  mesmo pedido com `GGML_PREC_F32` explícito casa; `split(f32)` exato 0. O
+  modo default da rota plain continua exposto como piso fp16 her드ado e é
+  reportado, não aceito como"rota LSE de produção".
+- CUDA KVarN LSE: revisado o harness (`route_reset` antes do compute, O da
+  rota LSE contra a rota plain). Descoberta gravíssima: a rota decode KVarN
+  publica O errado com LSE (rmse 2.3e-1 em Q=1 contra a mesma rota sem LSE) e
+  a windowed Q=2 tem o mesmo defeito (rmse 2.4e-1). Mesmo com LSE corretao
+  (Q=1: max|dLSE|=1.621e-05 vs CPU), o merge produziria O errado. Blindagem:
+  `ggml_cuda_flash_attn_ext_kvarn_supported` e o dispatch do executor
+  recusam/abortam qualquer LSE sobre vistas KVarN (fail-closed), com o motivo
+  medido registrado. A reabilitação depende de `dst->src[8]` (metadata) ser
+  sempre publicado também quando um LSE exclusivo é anexado. O tail com LSE
+  permanece recusado fail-closed porque o caminho interno (FA genérico) não
+  exporta LSE; o caminho KVarN-native permanece bloqueado pela mesma
+  blindagem.
+- Testes: clone-edge reparado (232/0), VK real Q256 (485/0), suíte LSE
+  completa 6/6 verde, `test-kvarn` verde. Pendência implementável removida do
+  cronograma atual: não anunciar LSE em KVarN como entregue.
 
 ## Pendências reais após esta rodada
 - CUDA KVarN multi-query com LSE (Q>1): corrigir o metadata multi-chunk da rota

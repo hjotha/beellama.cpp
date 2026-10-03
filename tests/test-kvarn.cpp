@@ -5962,63 +5962,17 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
     require(route_reset != nullptr && route_get != nullptr,
             "LSE parity: KVarN route telemetry unavailable");
 
-    // Position-split LSE on the native KVarN decode route (plan §3.4, F1b).
+    // Position-split LSE on the native KVarN routes (plan §3.4, F1b).
     //
-    // Proved here, with real numbers: the LSE buffer is pre-filled with a
-    // sentinel and must come back overwritten (only an LSE-writing route can do
-    // that - the windowed single-window shortcut the review found for Q >= 512
-    // returned before the finalizers), every entry must be finite, and the
-    // values must match the CPU backend reference within |dLSE| <= 1e-2.
-    //
-    // Multi-query is not covered: ggml_cuda_flash_attn_ext_kvarn_supported
-    // declines LSE above Q=1 (the windowed multi-chunk path wrote a wrong O,
-    // rmse 2.4e-1 at Q=2, while Q=1 matches at 2.9e-5). That decline is a
-    // scheduling contract, so it is exercised through the scheduler, not by
-    // this direct-compute harness.
-    {
-        const int n_q = 1;
-        std::vector<float> actual_lse;
-        const std::vector<float> actual_o = test_native_flash_attention_output(
-                gpu, true, true, 128, 4, 4, n_q, 2, 2, 512, 3, false,
-                nullptr, false, 0, false, GGML_TYPE_F16, 0, false, false, -1, false, false,
-                false, 0, false, {}, &actual_lse);
-        route_reset();
-        test_kvarn_route_stats stats = make_test_kvarn_route_stats(abi);
-        route_get(&stats);
-        std::printf("test-kvarn: LSE %s n_q=%d supported=%d "
-                    "(routes: generic_mma=%llu prompt_prefill=%llu decode_split=%llu "
-                    "decode_vector=%llu portable=%llu)\n",
-                label, n_q, (int) !actual_lse.empty(),
-                (unsigned long long) stats.generic_mma,
-                (unsigned long long) stats.prompt_prefill,
-                (unsigned long long) stats.decode_split,
-                (unsigned long long) stats.decode_vector,
-                (unsigned long long) stats.portable_native);
-
-        require(!actual_lse.empty(), "LSE: KVarN decode route must export LSE");
-        for (float v : actual_lse) {
-            require(v != -7777.0f, "LSE: route returned without writing the LSE buffer");
-            require(std::isfinite(v), "LSE: device LSE is not finite");
-        }
-        std::vector<float> reference_lse;
-        const std::vector<float> reference_o = test_native_flash_attention_output(
-            cpu, false, false, 128, 4, 4, n_q, 2, 2, 512, 3, false,
-            nullptr, false, 0, false, GGML_TYPE_F16, 0, false, false, -1, false, false,
-            false, 0, false, {}, &reference_lse);
-        require(reference_lse.size() == actual_lse.size(),
-                "LSE: size mismatch between reference and device");
-        float max_lse_error = 0.0f;
-        for (size_t i = 0; i < actual_lse.size(); ++i) {
-            max_lse_error = std::max(max_lse_error, std::fabs(actual_lse[i] - reference_lse[i]));
-        }
-        std::printf("test-kvarn: LSE %s n_q=%d max|dLSE|=%.3e\n", label, n_q, double(max_lse_error));
-        require(max_lse_error <= 1e-2f, "LSE: |dLSE| above the plan gate");
-        // O parity across KVarN routes is covered elsewhere in this file; the
-        // CPU O is not comparable here because it consumes unquantized F16 K/V
-        // while these records are 4-bit in the rotated domain.
-        (void) actual_o;
-        (void) reference_o;
-    }
+    // Review 3 found that the CUDA KVarN decode and windowed paths publish a
+    // *wrong O* whenever an LSE attachment is present - rmse 2.3e-1 against the
+    // same route without LSE - while the LSE buffer itself was correct (Q=1:
+    // max|dLSE| = 1.6e-05 vs the CPU reference). Broadening the contract
+    // requires the (max, denom) metadata publish to work when the LSE flag is
+    // set. That path is fail-closed in ggml_cuda_flash_attn_ext_kvarn_supported
+    // (and aborted in the executor) until then, which this harness cannot
+    // observe output-wise; the LSE node/graph contract itself is covered by
+    // tests/test-position-split-lse-{alloc,cu,vk,sched}.
 
     ggml_backend_free(cpu);
     ggml_backend_free(gpu);

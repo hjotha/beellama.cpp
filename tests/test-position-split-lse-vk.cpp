@@ -303,10 +303,10 @@ static float max_abs_diff(const std::vector<float> & a, const std::vector<float>
 //  5. The CPU reference itself must satisfy the same LSE gate.
 static bool run_one(ggml_backend_t vk, ggml_backend_t cpu, const vk_case & c) {
     const host_data h = make_host_data(c, 777);
-    std::vector<float> O_lse, LSE_vk, O_base, O_f32, O_cpu, LSE_cpu;
-    bool sup_lse = false, sup_base = false, sup_f32 = false, sup_cpu = false;
+    std::vector<float> O_lse, LSE_vk, O_base, O_f32, LSE_f32, O_plain_f32, O_cpu, LSE_cpu;
+    bool sup_lse = false, sup_base = false, sup_f32 = false, sup_plain_f32 = false, sup_cpu = false;
 
-    // 1. production precision mode, LSE route
+    // 1. production request: LSE route (forces f32 accumulation in the kernel)
     if (!run_backend(vk, c, h, O_lse, LSE_vk, &sup_lse, true, false)) {
         CHECK(false);
         return true;
@@ -318,19 +318,18 @@ static bool run_one(ggml_backend_t vk, ggml_backend_t cpu, const vk_case & c) {
     }
     CHECK(c.expect_support);
 
-    // 2. production precision mode, plain FA (no LSE side output)
+    // 2. production request: plain FA, default precision (fp16 O accumulator)
     std::vector<float> LSE_unused;
     if (!run_backend(vk, c, h, O_base, LSE_unused, &sup_base, false, false)) {
         CHECK(false);
         return true;
     }
-    CHECK(sup_base); // a plain FA run must not be declined when LSE was accepted
+    CHECK(sup_base);
     if (!sup_base) {
         return true;
     }
 
-    // 3. fp32 accumulation, LSE route: this is the mandatory FP64 gate
-    std::vector<float> LSE_f32;
+    // 3. explicit fp32 accumulate: LSE route
     if (!run_backend(vk, c, h, O_f32, LSE_f32, &sup_f32, true, true)) {
         CHECK(false);
         return true;
@@ -340,12 +339,22 @@ static bool run_one(ggml_backend_t vk, ggml_backend_t cpu, const vk_case & c) {
         return true;
     }
 
-    // 4. CPU reference (different arithmetic: extra cross-check only)
+    // 4. explicit fp32 accumulate: plain route (same math, unsplit)
+    if (!run_backend(vk, c, h, O_plain_f32, LSE_unused, &sup_plain_f32, false, true)) {
+        CHECK(false);
+        return true;
+    }
+    CHECK(sup_plain_f32);
+    if (!sup_plain_f32) {
+        return true;
+    }
+
+    // 5. CPU reference (different arithmetic: extra cross-check only)
     if (!run_backend(cpu, c, h, O_cpu, LSE_cpu, &sup_cpu, true, false)) {
         CHECK(false);
         return true;
     }
-    CHECK(sup_cpu); // the CPU FA always exports LSE (reference path)
+    CHECK(sup_cpu);
     if (!sup_cpu) {
         return true;
     }
@@ -355,64 +364,39 @@ static bool run_one(ggml_backend_t vk, ggml_backend_t cpu, const vk_case & c) {
     reference_fp64(c, h, Oref, LSEref);
 
     for (size_t i = 0; i < O_lse.size(); ++i) {
-        if (!std::isfinite(O_lse[i]) || !std::isfinite(O_f32[i])) {
+        if (!std::isfinite(O_lse[i]) || !std::isfinite(O_f32[i]) || !std::isfinite(O_plain_f32[i])) {
             CHECK(false);
             return true;
         }
     }
 
-    // mandatory gate 1: O vs FP64 with fp32 accumulation
+    // mandatory gate 1: O vs FP64 with fp32 accumulation. Both the explicit
+    // f32acc run and the default-request LSE run must satisfy it, because the
+    // integrated LSE route always uses fp32 accumulation (plan §3.4).
+    const double nrmse_lse_fp64 = nrmse(O_lse, Oref);
     const double nrmse_f32_fp64 = nrmse(O_f32, Oref);
+    const float max_o_lse_fp64 = max_abs_diff(O_lse, Oref);
     const float max_o_f32_fp64 = max_abs_diff(O_f32, Oref);
+    CHECK(nrmse_lse_fp64 <= 1e-3);
+    CHECK(max_o_lse_fp64 <= 1e-2f);
     CHECK(nrmse_f32_fp64 <= 1e-3);
     CHECK(max_o_f32_fp64 <= 1e-2f);
+    // the two runs of the LSE route must agree (same internal precision)
+    CHECK(max_abs_diff(O_lse, O_f32) <= 1e-6f);
 
-    // mandatory gate 2: production mode, LSE route vs plain FA route (plan
-    // split/unsplit tolerance). It is exactly 0 whenever both routes run the
-    // split-K reduce; it is ~1e-4 (fp16 O accumulator rounding) when the plain
-    // route divides in-kernel because its tuned split_k is 1 and the LSE route
-    // goes through a single-partial reduce.
-    const double nrmse_split = nrmse(O_lse, O_base);
-    const float max_o_split = max_abs_diff(O_lse, O_base);
+    // mandatory gate 2: split-vs-unsplit with the same (fp32) precision
+    const double nrmse_split = nrmse(O_f32, O_plain_f32);
+    const float max_o_split = max_abs_diff(O_f32, O_plain_f32);
     CHECK(nrmse_split <= 1e-3);
     CHECK(max_o_split <= 1e-2f);
 
-    // reported only: the fp16 O accumulator floor of the production mode
-    const double nrmse_prod_fp64 = nrmse(O_lse, Oref);
-    const double nrmse_lse_cpu = nrmse(O_lse, O_cpu);
-    const double nrmse_base_cpu = nrmse(O_base, O_cpu);
-    std::printf("  [%s] kv=%s D=%d nq=%d nkv=%d nqh=%d nkh=%d\n"
-        "        vs-fp64: f32acc=%.3e (max %.3e) prod=%.3e | prod split-vs-unsplit: %.3e (max %.3e)\n"
-        "        vs-cpu: lse=%.3e base=%.3e\n",
-        g_current, ggml_type_name(c.kv_type), c.D, c.nq, c.nkv, c.nqh, c.nkh,
-        nrmse_f32_fp64, max_o_f32_fp64, nrmse_prod_fp64, nrmse_split, max_o_split,
-        nrmse_lse_cpu, nrmse_base_cpu);
-    // sanity cap on the inherited fp16-accumulate deviation: a real regression
-    // in the shared FA path would show up here as well
-    CHECK(nrmse_prod_fp64 <= 1e-2);
-    CHECK(nrmse_lse_cpu <= std::max(1e-3, 1.5 * nrmse_base_cpu));
-
-    // mandatory gate 3: LSE vs FP64 with fp32 accumulation. In the default
-    // (fp16 accumulate) mode the scores carry an absolute error of ~|s|*5e-4,
-    // and LSE = m + log(sum exp) exposes it directly - unlike O, where the
-    // softmax normalizes it away. At D=256 that is 3e-2..6e-2 of inherited
-    // device precision, so the mandatory gate uses the f32-accumulate run and
-    // the production number is reported with a sanity cap.
-    float max_l_f32_fp64 = 0;
-    for (size_t i = 0; i < LSE_f32.size(); ++i) {
-        if (std::isinf(LSEref[i]) && LSEref[i] < 0) {
-            CHECK(std::isinf(LSE_f32[i]) && LSE_f32[i] < 0);
-            continue;
-        }
-        CHECK(std::isfinite(LSE_f32[i]));
-        max_l_f32_fp64 = std::max(max_l_f32_fp64, std::fabs(LSE_f32[i] - float(LSEref[i])));
-    }
-    CHECK(max_l_f32_fp64 <= 1e-2f);
-
+    // mandatory gate 3: LSE vs FP64, and this is the point of the fp32 route:
+    // the merge weights are computed from it, so it must be precise even at
+    // D=256 (default fp16 scores would give 3e-2..6e-2 here).
     float max_l_fp64 = 0, max_l_cpu = 0, max_l_cpu_ref_fp64 = 0;
+    float max_l_f32 = 0;
     for (size_t i = 0; i < LSE_vk.size(); ++i) {
         if (std::isinf(LSEref[i]) && LSEref[i] < 0) {
-            // fully masked row: O = 0, LSE = -inf
             CHECK(std::isinf(LSE_vk[i]) && LSE_vk[i] < 0);
             for (int d = 0; d < c.D; ++d) {
                 CHECK(O_lse[i * c.D + d] == 0.0f);
@@ -424,21 +408,34 @@ static bool run_one(ggml_backend_t vk, ggml_backend_t cpu, const vk_case & c) {
             return true;
         }
         max_l_fp64 = std::max(max_l_fp64, std::fabs(LSE_vk[i] - float(LSEref[i])));
+        if (std::isfinite(LSE_f32[i])) {
+            max_l_f32 = std::max(max_l_f32, std::fabs(LSE_f32[i] - float(LSEref[i])));
+        }
         max_l_cpu = std::max(max_l_cpu, std::fabs(LSE_vk[i] - LSE_cpu[i]));
         max_l_cpu_ref_fp64 = std::max(max_l_cpu_ref_fp64,
             std::fabs(LSE_cpu[i] - float(LSEref[i])));
     }
-    std::printf("        lse: vs-fp64 f32acc=%.3e prod=%.3e | vs-cpu=%.3e (cpu vs-fp64=%.3e)\n",
-        max_l_f32_fp64, max_l_fp64, max_l_cpu, max_l_cpu_ref_fp64);
-    // sanity cap on the inherited fp16-score deviation of the production mode
-    CHECK(max_l_fp64 <= 1e-1);
-    // The CPU reference must honour the same gate when both sides evaluate QK
-    // at the same precision (F16 K/V). With Q4_0 K/V the CPU vec_dot quantizes
-    // Q to int8, which puts ~2e-2 on its own LSE; that number is reported, not
-    // gated, because the authoritative LSE gate above is the FP64 comparison.
+    CHECK(max_l_fp64 <= 1e-2f);
+    CHECK(max_l_f32 <= 1e-2f);
+    // the CPU reference's own deviation is gated only where its arithmetic
+    // matches (F16 K/V). For Q4_0 the CPU vec_dot quantizes Q to int8, which
+    // pushes ITS LSE ~4e-2 off FP64; that value is printed, not gated.
     if (c.kv_type == GGML_TYPE_F16) {
         CHECK(max_l_cpu_ref_fp64 <= 1e-2f);
     }
+
+    // reported: the inherited fp16-accumulator floor of the *plain* route, kept
+    // as the measured reason the LSE route forces fp32 accumulation
+    const double nrmse_prod_fp64 = nrmse(O_base, Oref);
+    const double nrmse_lse_cpu = nrmse(O_lse, O_cpu);
+    std::printf("  [%s] kv=%s D=%d nq=%d nkv=%d nqh=%d nkh=%d\n"
+        "        lse-route vs-fp64: nrmse=%.3e max=%.3e | explicit-f32: %.3e %.3e\n"
+        "        split(f32): nrmse=%.3e max=%.3e | prod(default) plain-route nrmse=%.3e\n"
+        "        lse: LSE_vk=%.3e LSE_f32=%.3e | vs-cpu lse-route=%.3e\n",
+        g_current, ggml_type_name(c.kv_type), c.D, c.nq, c.nkv, c.nqh, c.nkh,
+        nrmse_lse_fp64, max_o_lse_fp64, nrmse_f32_fp64, max_o_f32_fp64,
+        nrmse_split, max_o_split, nrmse_prod_fp64,
+        max_l_fp64, max_l_f32, nrmse_lse_cpu);
     return true;
 }
 
@@ -563,13 +560,14 @@ int main() {
         CHECK(run_one(vk, cpu, c));
     }
     {
+        // real plan coverage: D=256, GQA 24:4, Q=256 prefill, KV=512
         vk_case c;
         c.D = 256;
-        c.nqh = 4;
-        c.nkh = 1;
-        c.nq = 64;
-        c.nkv = 128;
-        g_current = "vk_d256_q256_prefill";
+        c.nqh = 24;
+        c.nkh = 4;
+        c.nq = 256;
+        c.nkv = 512;
+        g_current = "vk_d256_gqa24_4_q256";
         CHECK(run_one(vk, cpu, c));
     }
 

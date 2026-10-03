@@ -961,6 +961,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (uses_kvarn) {
+        // runtime twin of the ggml_backend_supports_op gate above
+        const bool lse_rt = ggml_flash_attn_ext_get_lse_out(dst) != nullptr;
+        if (lse_rt) {
+            GGML_ABORT("position-split LSE route for KVarN views is fail-closed until the\n"
+                "             metadata-publish path is fixed (review 3: O was wrong with LSE)");
+        }
         if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
             GGML_ABORT("unsupported KVarN CUDA FlashAttention route");
         }
@@ -977,6 +983,16 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool lse_requested = ggml_flash_attn_ext_get_lse_out(dst) != nullptr;
     const bool tail_bodyless = ggml_get_op_params_i32(
         dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0;
+    // Position-split LSE on KVarN routes (plan §3.4, F1b): measured in review
+    // 3, the KVarN decode and windowed paths publish a correct LSE buffer but
+    // a wrong O (rmse 2.3e-1 in both the Q=1 decode route and the Q=2 windowed
+    // route, against the same route without LSE). Until the (max, denom)
+    // metadata publish is fixed for both, every KVarN LSE request is declined
+    // so no graph can silently take that route. The generic (non-KVarN) LSE
+    // contract remains reserved/declined below.
+    if (uses_kvarn && lse_requested) {
+        return false;
+    }
     const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
         ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(device, dst);
     if (portable_kvarn_tail) {

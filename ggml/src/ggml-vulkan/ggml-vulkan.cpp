@@ -12836,7 +12836,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     uint32_t workgroups_y = (uint32_t)neq2;
     uint32_t workgroups_z = (uint32_t)neq3;
 
-    const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
+    // Position-split LSE routes are validated in fp32-accumulation precision
+    // (plan §3.4): the LSE exposes an *absolute* score error that the default
+    // fp16 O accumulator produces and that softmax normalization hides inside
+    // O, but which changes the merge weights of the two ranges. The LSE route
+    // therefore runs with f32acc regardless of the requested precision, and
+    // the validated numbers apply to that route specifically.
+    const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16 ||
+        ggml_flash_attn_ext_get_lse_out(dst) != nullptr;
 
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     auto is_dense_kv_cache = [](const ggml_tensor * t) {

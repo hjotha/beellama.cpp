@@ -2314,6 +2314,12 @@ static struct ggml_tensor * graph_copy_dup_tensor(struct ggml_hash_set hash_set,
     memcpy(dst->op_params, src->op_params, sizeof(dst->op_params));
     ggml_set_name(dst, src->name);
 
+    // publish the clone before walking any edge that may return to it. The
+    // FA -> LSE back-pointer creates lse_node->src[0] == fa, so copying the
+    // FA attachment recurses into the LSE node, which recurses back into FA:
+    // returning the slot here is what keeps clse->src[0] == cfa.
+    node_copies[id] = dst;
+
     // copy src
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         struct ggml_tensor * s = src->src[i];
