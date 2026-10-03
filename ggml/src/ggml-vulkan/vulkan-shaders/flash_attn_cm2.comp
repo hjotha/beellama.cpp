@@ -432,7 +432,7 @@ void main() {
 
     // If there is split_k, then the split_k resolve shader does the final
     // division by L. Store the intermediate O value and per-row m and L values.
-    if (p.k_num > 1) {
+    if (p.k_num > 1 || (p.mask_n_head_log2 & LSE_PARTIALS_BIT) != 0) {
         coopmat<D_TYPE, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator> O_D = coopmat<D_TYPE, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator>(O);
 
         if (p.gqa_ratio > 1) {

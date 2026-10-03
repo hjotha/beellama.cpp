@@ -654,9 +654,11 @@ void main() {
     }
 
 
-    // If there is split_k, then the split_k resolve shader does the final
+    // If the partials are requested, the split_k resolve shader does the final
     // division by L. Store the intermediate O value and per-row m and L values.
-    if (p.k_num > 1) {
+    // write_partials also covers k_num == 1, where the reduce then publishes O
+    // and LSE from a single partial (position-split LSE, plan §3.4).
+    if (p.k_num > 1 || (p.mask_n_head_log2 & LSE_PARTIALS_BIT) != 0) {
         if (p.gqa_ratio > 1) {
             // note: O and Q have swapped coord 1,2.
             uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
