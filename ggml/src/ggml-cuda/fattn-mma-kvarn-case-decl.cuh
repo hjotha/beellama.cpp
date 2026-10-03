@@ -43,19 +43,6 @@ static inline bool ggml_cuda_fattn_kvarn_window_enabled() {
     return env == nullptr || atoi(env) != 0;
 }
 
-// True when the documented windowed gate applies (Q>1, no sinks, MIXED
-// domain, supported dims). Used by the MMA launch pre-check to decline LSE
-// ops early so the dispatcher reaches the portable route.
-static inline bool ggml_cuda_fattn_kvarn_windowed_lse_applies(const ggml_tensor * dst) {
-    const ggml_tensor * Q = dst->src[0];
-    const int DKQ = (int) Q->ne[0];
-    return ggml_cuda_fattn_kvarn_window_enabled() &&
-        Q->ne[1] > 1 &&
-        ggml_cuda_fattn_sinks_or_null(dst) == nullptr &&
-        ggml_cuda_fattn_kvarn_domain(dst) == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V &&
-        (DKQ == 128 || DKQ == 256 || DKQ == 512);
-}
-
 // Position-split LSE post-pass for single-split kernels that only publish
 // (max, denom) metadata: lse = m + log(denom); empty -> -inf.
 // Row order matches the LSE layout: ((stream * n_q + q) * n_heads + h).
@@ -136,6 +123,19 @@ static inline const char * ggml_cuda_fattn_kvarn_domain_name(const ggml_tensor *
     }
 
     return "unknown";
+}
+
+// True when the documented windowed gate applies (Q>1, no sinks, MIXED
+// domain, supported dims). Used by the MMA launch pre-check to decline LSE
+// ops early so the dispatcher reaches the portable route.
+static inline bool ggml_cuda_fattn_kvarn_windowed_lse_applies(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const int DKQ = (int) Q->ne[0];
+    return ggml_cuda_fattn_kvarn_window_enabled() &&
+        Q->ne[1] > 1 &&
+        ggml_cuda_fattn_sinks_or_null(dst) == nullptr &&
+        ggml_cuda_fattn_kvarn_domain(dst) == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V &&
+        (DKQ == 128 || DKQ == 256 || DKQ == 512);
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2>

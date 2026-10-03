@@ -2,6 +2,7 @@
 
 #include "fattn-common.cuh"
 #include "fattn-kvarn-dispatch.cuh"
+#include "fattn-mma-kvarn-case-decl.cuh"
 #if defined(GGML_CUDA_KVARN)
 #include "kvarn.cuh"
 #endif
@@ -336,7 +337,6 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
                 denom > 0.0f ? (body_value*wb + tail_acc*wt)/denom : 0.0f;
     }
     if (tid == 0 && lse_out != nullptr) {
-        // Position-split LSE of the combined body+tail range.
         lse_out[(size_t(is)*n_query + iq)*n_head + ih] =
             denom > 0.0f ? (global_max + logf(denom)) : -INFINITY;
     }
@@ -394,7 +394,6 @@ static __global__ void k_flash_attn_ext_tail_partials_merge(
         *reinterpret_cast<float *>(drow + size_t(id)*sizeof(float)) = denom > 0.0f ? numerator/denom : 0.0f;
     }
     if (threadIdx.x == 0 && lse_out != nullptr) {
-        // Position-split LSE of the combined body+tail range.
         lse_out[(size_t(is)*n_query + iq)*n_head + ih] =
             denom > 0.0f ? (m + logf(denom)) : -INFINITY;
     }
@@ -736,9 +735,6 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     for (int i = 5; i < GGML_MAX_SRC; ++i) {
         body_pass.src[i] = nullptr;
     }
-    // The body sub-pass must not inherit the top-level LSE tensor: its packed
-    // rows do not match the full LSE layout. The combined LSE is written by
-    // the tail merge kernels below.
     if (ggml_cuda_fattn_lse_requested(dst)) {
         body_pass.src[4] = nullptr;
     }
@@ -872,8 +868,6 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     tail_pass.src[3] = &mask_packed;
     // Sinks are part of the body partial for a split source. For a bodyless
     // source the exact pass is the sole softmax and must consume them itself.
-    // With LSE requested, the full-size LSE tensor does not match the packed
-    // tail pass; a packed staging buffer is used and scattered below.
     const bool tail_lse = ggml_cuda_fattn_lse_requested(dst) && dst->src[4] != nullptr;
     ggml_cuda_pool_alloc<float> tail_lse_packed(pool);
     ggml_tensor lse_packed = {};
@@ -915,10 +909,9 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             (const float *) tail_pass.data, (float *) dst->data, (const int32_t *) qo->data,
             d_v, n_query, n_head, n_stream, q_max, n_active,
             tail_pass.nb[1], tail_pass.nb[2], tail_pass.nb[3],
-            dst->nb[1], dst->nb[2], dst->nb[3>);
+            dst->nb[1], dst->nb[2], dst->nb[3]);
         CUDA_CHECK(cudaGetLastError());
         if (tail_lse) {
-            // Scatter the packed LSE with d=1 through the same mapping.
             k_flash_attn_ext_tail_scatter<<<grid, 256, 0, ctx.stream()>>>(
                 (const float *) tail_lse_packed.get(), (float *) dst->src[4]->data,
                 (const int32_t *) qo->data,
