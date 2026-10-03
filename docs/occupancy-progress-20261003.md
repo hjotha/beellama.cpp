@@ -285,22 +285,22 @@ campanha 27B, tudo em porta isolada sem contaminar produção.
   modo default da rota plain continua exposto como piso fp16 her드ado e é
   reportado, não aceito como"rota LSE de produção".
 - CUDA KVarN LSE: revisado o harness (`route_reset` antes do compute, O da
-  rota LSE contra a rota plain). Descoberta gravíssima: a rota decode KVarN
-  publica O errado com LSE (rmse 2.3e-1 em Q=1 contra a mesma rota sem LSE) e
-  a windowed Q=2 tem o mesmo defeito (rmse 2.4e-1). Mesmo com LSE corretao
-  (Q=1: max|dLSE|=1.621e-05 vs CPU), o merge produziria O errado. Blindagem:
-  `ggml_cuda_flash_attn_ext_kvarn_supported` e o dispatch do executor
-  recusam/abortam qualquer LSE sobre vistas KVarN (fail-closed), com o motivo
-  medido registrado. A reabilitação depende de `dst->src[8]` (metadata) ser
-  sempre publicado também quando um LSE exclusivo é anexado. O tail com LSE
-  permanece recusado fail-closed porque o caminho interno (FA genérico) não
-  exporta LSE; o caminho KVarN-native permanece bloqueado pela mesma
-  blindagem.
+  rota LSE contra a rota plain). Medido: rota decode KVarN com LSE publicava
+  O com rmse 2.3e-1 em Q=1 contra a mesma rota sem LSE, e a windowed Q=2 tinha
+  o mesmo defeito (rmse 2.4e-1); LSE em si estava correto (Q=1:
+  max|dLSE|=1.621e-05 vs CPU). Blindagem fail-closed aplicada.
+  **SUPERADO pela quarta revisão**: o O medido pertencia a um tensor que o
+  grafo do harness nunca calculou (ver seção da quarta revisão). O defeito do
+  kernel era outro e real: indexação de O/LSE por ordem empacotada em vez de
+  strides. Nenhuma das duas conclusões anteriores ("metadata multi-chunk
+  quebrado" e "reabilitação depende de src[8]") se confirmou.
 - Testes: clone-edge reparado (232/0), VK real Q256 (485/0), suíte LSE
   completa 6/6 verde, `test-kvarn` verde. Pendência implementável removida do
   cronograma atual: não anunciar LSE em KVarN como entregue.
 
-## Pendências reais após esta rodada
+## Pendências reais após a terceira revisão (SUPERADO em parte pela quarta)
+As duas primeiras pendências abaixo foram resolvidas na quarta revisão; o resto
+permanece. Ver "Checklist vivo" para o estado corrente.
 - CUDA KVarN multi-query com LSE (Q>1): corrigir o metadata multi-chunk da rota
   windowed e reabilitar; enquanto isso, recusa fail-closed.
 - Vulkan D=256: LSE no modo default tem erro absoluto 3e-2..6e-2 (precisão
@@ -310,6 +310,94 @@ campanha 27B, tudo em porta isolada sem contaminar produção.
 - F2 (allocator/cache por posição), F3 (grafo/merge), F4 (snapshots), F5
   (27B), F7 (canário/rollback) continuam não implementados.
 - Produção segue parada; binário original perdido (ver aviso no topo).
+
+
+## Quarta revisão (2026-10-04): LSE real, strides e referência FP64
+Base: `638c565b8`. Commits: `a8ad7084c`, `172aee665`.
+
+### O que a revisão 4 reproduziu e o que era defeito real
+- P1 do teste (confirmado): o laço novo indexava o LSE pelo tamanho de O
+  (384 vs 6 no primeiro caso) e abortava sob `_GLIBCXX_ASSERTIONS`; e o teste
+  aceitava LSE não finito, omitia `max_abs(O)` e perdera a comparação GPU
+  sem attachment.
+- **Defeito de kernel real (corrigido em `a8ad7084c`)**: o
+  `ggml_cuda_fattn_kvarn_decode_combine_kernel` indexava O e LSE pela ordem
+  empacotada `(query, head)`. O tensor de saída de FA é
+  `ne = {D, q->ne[2], q->ne[1], q->ne[3]}` e o LSE é
+  `ne = {n_q_heads, n_q, n_stream}` com o eixo de *head* contíguo. Medido: só
+  a primeira linha de LSE era escrita e as demais ficavam com o sentinela
+  `-7777`, com escrita fora do fim do tensor para as demais heads. Os dois
+  kernels de merge do tail receberam os mesmos strides. `src[8]` mantém o
+  significado histórico (empacotado) nesse kernel porque no contrato de tail
+  ele é o tensor de *query order*, não um sink de metadata.
+- **Defeito de harness (corrigido)**: o grafo era expandido só até o nó LSE,
+  o que descarta a transformação de pós-FA (`out` é reatribuído ao resultado
+  do WHT quando `rotate_graph`), então o O comparado vinha de um tensor nunca
+  calculado — all zeros. As duas raízes (O e LSE) são expandidas agora. Esse
+  era o defeito por trás do "O errado" da terceira revisão.
+- **Defeito de harness (corrigido)**: o preenchimento de Q usava índice plano
+  fixo, que embaralha silenciosamente o layout de query permutado (o que
+  `llama-graph.cpp` usa). O fill passou a usar os strides do próprio tensor.
+- **Referência estrutural nova**: `compute_lse_fp64_reference` acumula em
+  FP64 sobre os *registros KVarN dequantizados que o próprio grafo consumiu*,
+  reaproveitando o WHT de referência do host, a mesma máscara, o mesmo
+  mapeamento GQA e a mesma escala. A rota materializada em F32 da CPU é
+  medida contra a mesma referência como controle, então erro de rota e erro de
+  representação ficam separados.
+
+### Matriz medida (test-kvarn, CUDA0/RTX 4070)
+18 formas, 0 falhando, 7 known-open. Referência FP64:
+- NRMSE(O) entre 8.7e-07 e 1.7e-04 (gate 1e-3); `max_abs(O)` <= 5.4e-05
+  (gate 1e-2); `max_abs(LSE)` <= 5.7e-05 (gate 1e-2).
+- O idêntico com e sem o attachment LSE em toda forma de mesma rota
+  (ex.: 0.000e+00 em D64/D128 Q1/Q2).
+- Controle CPU `max_abs` até 2.5e-03, ou seja a referência FP64 é mais firme
+  que a rota materializada F32, como esperado.
+- Cobertura: D64/D128/D256 x Q1/Q2/Q256/Q512, D256 GQA24:4 em Q1/Q2/Q256,
+  Q permutado (produção) Q4/Q8, tudo mascarado Q1/Q256 (O=0 e LSE=-inf exatos),
+  sentinela não escrito rejeitado, telemetria de rota antes/depois de cada
+  compute.
+- As formas Q256/Q512 com LSE trocam de rota (windowed prefill -> portable
+  native); por isso a checagem de isolamento por attachment só é exigida quando
+  a telemetria mostra a mesma rota, e a diferença residual (1.3e-03) está
+  dentro dos gates absolutos contra a FP64 (NRMSE 1.2e-06).
+
+### Known-open medido (não conta como cobertura do §3.4)
+- `d256-q1-tail`: NRMSE(O)=0.999994, max_abs(O)=3.28e+04, max_abs(LSE)=1.62e+04
+- `d256-q512-tail`: NRMSE(O)=1, max_abs(O)=4.69e+04, max_abs(LSE)=1.68e+03
+- `d256-q256-tail`: NRMSE(O)=0.001680, max_abs(O)=0.00416 (marginal)
+O controle CPU das mesmas formas fica em 6.4e-07, ou seja a referência FP64
+modela o tail corretamente e o desvio está na rota CUDA de tail. As formas
+known-open são impressas com os números exatos a cada execução e listadas
+aqui; elas não ficam verdes por skip silencioso. O tail *sem body* continua
+recusado em `ggml_cuda_flash_attn_ext_supported` (`lse_requested &&
+tail_bodyless`), o que é recusa explícita e não entrega do item do §3.4.
+
+### Regressões desta rodada
+- build completo: exit 0.
+- `test-kvarn`: exit 0, `all tests OK`.
+- `ctest -R "position-split-lse|kvarn"`: 21/22; a única falha,
+  `test-kvarn-mtp-sharing-static`, falha igual em `638c565b8` (pré-existente).
+- `test-backend-ops -o FLASH_ATTN_EXT`: CPU0 3/3 e Vulkan0 3/3, exit 0.
+- `test-backend-ops` em CUDA0 continua abortando em
+  `ggml/src/ggml-cuda/fattn.cu:595` (`GGML_ASSERT(vec_case != nullptr)`,
+  hsk=320 com sinks): caminho genérico não-KVarN, intocado por esta rodada.
+
+## Checklist vivo (revisão 4, passo 0)
+| Item | Estado | Evidência | Próximo passo |
+|---|---|---|---|
+| F0 contrato O/LSE | validado | `tests/test-position-split-lse*` verde; LSE como nó real com strides | — |
+| F0 merge CPU + vazios/mascarados | validado | `test-position-split-lse` 306 checks; all-masked exato na matriz | — |
+| F1 CUDA KVarN LSE (decode/prefill/Q>=512) | validado | matriz 18 formas, NRMSE <= 1.7e-04, O estável com/sem LSE | — |
+| F1 CUDA KVarN LSE com tail (body+tail) | **aberto** | q1/q512 quebrados, q256 marginal (números acima) | diagnosticar limites de arena/`q_max` do caminho de tail por forma |
+| F1 CUDA tail sem body com LSE | **aberto** | recusado em `supported()` | fazer o nó de tail publicar LSE no buffer do pai |
+| F1 Vulkan LSE (split_k=1 e >1, F16/Q4) | validado | `test-position-split-lse-vk` 485 checks, O nrmse 7.558e-4, LSE 5.008e-3 | — |
+| F1 alocador/cópia/scheduler/RPC | validado | 230/0, 20/0, diag de clone 232/0 | — |
+| F2 cache por posição, store, allocator, rollback atômico | **pendente** | — | implementar §3.1/§3.2 em `llama-kv-cache-kvarn.*` + `llama-memory-hybrid*` |
+| F3 duas FA + merge, 4B P=512/1024 | **pendente** | — | `build_attn`/`qwen35.cpp` + teste de integração com KL FP64 |
+| F4 snapshots v2 + importação XXL | **pendente** | — | envelope `position_split`, writer/reader/validadores |
+| F5 orçamento + campanha 27B | **pendente** | — | cálculo de P com custos simultâneos + A/B 5x |
+| F7 entrega/canário/rollback | **pendente** | — | baseline conhecido separado; promoção continua não autorizada |
 
 ## Desenho F2/F3/F4 (para implementar após o rebuild verde)
 - F2a (ubatch/P, **vigente**): o allocator **DIVIDE** os ubatches comuns na
