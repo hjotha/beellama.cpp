@@ -752,6 +752,13 @@ if (GGML_VULKAN)
     set_property(TEST test-position-split-lse-sched PROPERTY LABELS main)
 endif()
 
+add_executable(test-position-split-ubatch test-position-split-ubatch.cpp)
+target_include_directories(test-position-split-ubatch PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(test-position-split-ubatch PRIVATE cxx_std_17)
+target_link_libraries(test-position-split-ubatch PRIVATE llama)
+add_test(NAME test-position-split-ubatch WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-ubatch>)
+set_property(TEST test-position-split-ubatch PROPERTY LABELS main)
+
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})

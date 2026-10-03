@@ -6,6 +6,7 @@
 #include "llama-ext.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-position-split.h"
 #include "llama-io.h"
 #include "llama-io-file.h"
 #include "llama-kv-cache-kvarn.h"
@@ -437,6 +438,26 @@ llama_context::llama_context(
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+    }
+
+    // Position-split boundary (plan §3.1/§3.8). Until the second attention
+    // range is integrated (F3) the boundary only drives the ubatch division of
+    // §3.2, so it is accepted here but validated strictly: a multiple of 256,
+    // inside the context, and never silently migrated during execution.
+    cparams.kv_position_split_p = 0;
+    {
+        const char * env_p = getenv("LLAMA_KV_POSITION_SPLIT_P");
+        if (env_p != nullptr && env_p[0] != '\0') {
+            const long value = strtol(env_p, nullptr, 10);
+            if (value <= 0 || !llama_position_split::is_valid_p(uint32_t(value), cparams.n_ctx_seq)) {
+                throw std::runtime_error(
+                    "LLAMA_KV_POSITION_SPLIT_P must be a multiple of 256 with 0 < P < n_ctx, got " +
+                    std::string(env_p));
+            }
+            cparams.kv_position_split_p = uint32_t(value);
+            LLAMA_LOG_INFO("%s: position-split KV placement enabled with P=%u (C=%u)\n",
+                           __func__, cparams.kv_position_split_p, cparams.n_ctx_seq);
+        }
     }
 
     cparams.kv_tail_rollback_tokens = std::max(params.kv_tail_rollback_tokens, params.n_rs_seq);

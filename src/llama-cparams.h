@@ -124,6 +124,11 @@ bool kv_unified;
     uint32_t  kv_tail_rollback_tokens = 0;
     ggml_type kv_tail_type   = GGML_TYPE_COUNT;
 
+    // Position-split KV placement (plan §3.1/§3.8): local KVarN range [0,P)
+    // with the overflow range [P,C) handled by the second attention range.
+    // 0 keeps the current per-layer placement. Fixed for the whole context.
+    uint32_t  kv_position_split_p = 0;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 

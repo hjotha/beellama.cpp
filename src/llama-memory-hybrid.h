@@ -16,6 +16,21 @@
 // utilizes instances of llama_memory_recurrent and llama_kv_cache to
 //   support models where each layer may be either attention-based or recurrent
 
+namespace llama_position_split {
+
+// Plan §3.2. Divides every ubatch that crosses P, or fails with an explicit
+// reason *before* any state is mutated. `n_keep` is the protected recurrent
+// window size (1 + n_rs_seq); those trailing tokens must stay in one ubatch.
+// All-or-nothing: on failure `out` is left empty.
+bool divide_ubatches_at_p(
+        const std::vector<llama_ubatch> & in,
+                             uint32_t   p,
+                             uint32_t   n_keep,
+                  std::vector<llama_ubatch> & out,
+                             std::string & error);
+
+} // namespace llama_position_split
+
 class llama_memory_hybrid : public llama_memory_i {
 public:
     llama_memory_hybrid(
@@ -46,7 +61,8 @@ public:
                 ggml_type   tail_type = GGML_TYPE_F16,
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                  uint32_t   tail_rollback_tokens = 0,
-    const layer_device_cb & device_for_layer = nullptr);
+    const layer_device_cb & device_for_layer = nullptr,
+                 uint32_t   position_split_p = 0);
 
     llama_memory_hybrid(
         const llama_model & model,
@@ -134,11 +150,27 @@ public:
     // llama_memory_hybrid specific API
     //
 
+    // Position-split placement (plan §3.1/§3.2). P == 0 keeps the current
+    // behaviour; P > 0 fixes the local KVarN range to [0,P) and reserves the
+    // overflow range [P,C) for the second attention range.
+    uint32_t position_split_boundary() const { return position_split_p; }
+    bool     position_split_enabled() const { return position_split_p > 0; }
+
     llama_kv_cache * get_mem_attn() const;
     // base-interface accessor for the attention memory; valid for every attention
     // cache implementation, including KVarN which does not derive from llama_kv_cache
     llama_memory_i * get_mem_attn_base() const { return mem_attn.get(); }
     llama_memory_recurrent * get_mem_recr() const;
+
+    // Divides every ubatch that crosses the position boundary P so no prepared
+    // ubatch spans two attention ranges, and rejects the preparation - before
+    // any state is mutated - when the protected recurrent window cannot stay
+    // inside a single ubatch (plan §3.2).
+    bool position_split_ubatches(
+            const std::vector<llama_ubatch> & in,
+                                 uint32_t   p,
+                  std::vector<llama_ubatch> & out,
+                             std::string & error) const;
 
 private:
     const llama_hparams & hparams;
@@ -146,6 +178,9 @@ private:
     const std::unique_ptr<llama_memory_i> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 
+    // Fixed for the whole context, chosen by the §3.8 budget; never migrated
+    // implicitly during execution.
+    uint32_t position_split_p = 0;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {

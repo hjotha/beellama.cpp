@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-state-q4.h"
+#include "llama-position-split.h"
 
 //
 // llama_memory_hybrid
@@ -37,7 +38,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                 ggml_type   tail_type,
                  uint32_t   tail_tokens_requested,
                  uint32_t   tail_rollback_tokens,
-    const layer_device_cb & device_for_layer) :
+    const layer_device_cb & device_for_layer,
+                 uint32_t   position_split_p) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -78,7 +80,13 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )),
+    position_split_p(position_split_p) {
+    if (position_split_p > 0 && !llama_position_split::is_valid_p(position_split_p)) {
+        GGML_ABORT("position split boundary P=%u is not a valid multiple of %u below the capacity",
+                   position_split_p, llama_position_split::kAlignTokens);
+    }
+}
 
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
@@ -87,6 +95,177 @@ llama_memory_hybrid::llama_memory_hybrid(
     hparams(model.hparams),
     mem_attn(std::move(mem_attn)),
     mem_recr(std::move(mem_recr)) {
+}
+
+
+//
+// Position-split ubatch handling (plan §3.2).
+//
+// An attention range boundary P must never fall inside a prepared ubatch: the
+// store of the ubatch would have to write two ranges (KVarN local and Q4
+// overflow) with a single store, which the cache does not implement yet. The
+// boundary is therefore enforced *before* any prepare runs:
+//
+//   - a common ubatch that crosses P is divided at P;
+//   - the protected recurrent window (the trailing 1 + n_rs_seq tokens that
+//     keep the rollback snapshots valid) may not be divided, so a window that
+//     crosses P rejects the preparation with an explicit reason, before any
+//     state (KV, slot table or recurrent state) is mutated.
+//
+
+// Copies one half of an ubatch into an owning llama_ubatch. `sel` lists the
+// token indices (in ubatch order) that belong to the new ubatch.
+static llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int32_t> & sel) {
+    GGML_ASSERT(!sel.empty() && sel.size() <= src.n_tokens);
+
+    llama_ubatch out;
+    out.b_equal_seqs = src.b_equal_seqs;
+    out.n_tokens     = uint32_t(sel.size());
+    out.n_pos        = src.n_pos;
+
+    // Every subset of a single-sequence-set ubatch keeps that sequence set, so
+    // n_seq_tokens divides evenly; mixed ubatches are rejected by the caller.
+    out.n_seqs     = src.n_seqs;
+    out.n_seq_tokens = out.n_tokens / out.n_seqs;
+    GGML_ASSERT(out.n_seq_tokens * out.n_seqs == out.n_tokens);
+
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->token.resize(out.n_tokens);
+    data->pos.resize(size_t(out.n_tokens) * src.n_pos);
+    data->n_seq_id.resize(out.n_tokens);
+    data->seq_id.resize(out.n_tokens);
+    data->output.resize(out.n_tokens);
+    for (uint32_t s = 0; s < src.n_seqs_unq; ++s) {
+        data->seq_id_unq.push_back(src.seq_id_unq[s]);
+    }
+    data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
+    out.n_seqs_unq = src.n_seqs_unq;
+
+    for (size_t i = 0; i < sel.size(); ++i) {
+        const int32_t t = sel[i];
+        data->token[i] = src.token[t];
+        for (uint32_t p = 0; p < src.n_pos; ++p) {
+            data->pos[i * src.n_pos + p] = src.pos[size_t(t) * src.n_pos + p];
+        }
+        data->n_seq_id[i] = src.n_seq_id[t];
+        data->output[i]  = src.output[t];
+
+        const int32_t n_ids = src.n_seq_id[t];
+        data->seq_id[i] = data->seq_id_data.data() + data->seq_id_data.size();
+        for (int32_t s = 0; s < n_ids; ++s) {
+            data->seq_id_data.push_back(src.seq_id[t][s]);
+        }
+    }
+    for (uint32_t s = 0; s < src.n_seqs_unq; ++s) {
+        data->seq_idx[data->seq_id_unq[s]] = src.seq_idx[data->seq_id_unq[s]];
+    }
+
+    out.data       = data;
+    out.token      = data->token.data();
+    // llama_ubatch carries no embedding width, so the position split is only
+    // defined for token ubatches. An embedding ubatch that crosses P is
+    // rejected by the caller with an explicit reason instead of being copied
+    // with a guessed row stride.
+    out.embd       = nullptr;
+    out.pos        = data->pos.data();
+    out.n_seq_id   = data->n_seq_id.data();
+    out.seq_id     = data->seq_id.data();
+    out.seq_id_unq = data->seq_id_unq.data();
+    out.seq_idx    = data->seq_idx.data();
+    out.output     = data->output.data();
+
+    return out;
+}
+
+bool llama_position_split::divide_ubatches_at_p(
+        const std::vector<llama_ubatch> & in,
+                             uint32_t   p,
+                             uint32_t   n_keep,
+                  std::vector<llama_ubatch> & out,
+                             std::string & error) {
+    out.clear();
+    error.clear();
+
+    for (const llama_ubatch & ub : in) {
+        // Absolute position range of this ubatch.
+        llama_pos pos_min = ub.pos[0];
+        llama_pos pos_max = ub.pos[0];
+        for (uint32_t i = 1; i < ub.n_tokens; ++i) {
+            pos_min = std::min(pos_min, ub.pos[i]);
+            pos_max = std::max(pos_max, ub.pos[i]);
+        }
+
+        const bool crosses = pos_min < llama_pos(p) && pos_max >= llama_pos(p);
+
+        if (!crosses) {
+            out.push_back(ub);
+            continue;
+        }
+
+        if (ub.embd != nullptr) {
+            error = "embedding ubatch crosses P: the position split is defined for token "
+                    "ubatches only";
+            return false;
+        }
+        if (ub.n_seqs != 1 || ub.n_pos != 1) {
+            error = "ubatch crossing P has " + std::to_string(ub.n_seqs) +
+                    " sequence sets and " + std::to_string(ub.n_pos) +
+                    " position axes: only single-sequence-set token ubatches can be divided";
+            return false;
+        }
+
+        // The protected recurrent window is the trailing 1 + n_rs_seq tokens of
+        // the sequence. It must stay in one ubatch so the rollback snapshots
+        // remain valid, so it can never be divided.
+        if (n_keep > 0 && ub.n_seq_tokens > n_keep) {
+            const uint32_t win_start = ub.n_seq_tokens - n_keep;
+            const llama_pos win_begin = ub.pos[win_start];
+            const llama_pos win_end   = pos_max + 1;
+            const std::string reason = llama_position_split::validate_recurrent_window(
+                    uint32_t(std::max<llama_pos>(win_begin, 0)),
+                    uint32_t(std::max<llama_pos>(win_end, 0)), p);
+            if (!reason.empty()) {
+                error = reason;
+                return false;
+            }
+        } else if (n_keep > 0) {
+            // The whole ubatch is inside the protected window.
+            error = "protected recurrent window (1 + n_rs_seq = " + std::to_string(n_keep) +
+                    ") crosses P";
+            return false;
+        }
+
+        // Divide at P: the trailing part keeps the protected window together.
+        std::vector<int32_t> head;
+        std::vector<int32_t> tail;
+        head.reserve(ub.n_tokens);
+        tail.reserve(ub.n_tokens);
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            if (ub.pos[i] < llama_pos(p)) {
+                head.push_back(int32_t(i));
+            } else {
+                tail.push_back(int32_t(i));
+            }
+        }
+        if (head.empty() || tail.empty()) {
+            error = "position split produced an empty half";
+            return false;
+        }
+        out.push_back(llama_ubatch_subset(ub, head));
+        out.push_back(llama_ubatch_subset(ub, tail));
+    }
+
+    return true;
+}
+
+bool llama_memory_hybrid::position_split_ubatches(
+        const std::vector<llama_ubatch> & in,
+                             uint32_t   p,
+                  std::vector<llama_ubatch> & out,
+                             std::string & error) const {
+    const uint32_t n_keep = mem_recr != nullptr && mem_recr->n_rs_seq > 0
+        ? mem_recr->n_rs_seq + 1 : 0;
+    return llama_position_split::divide_ubatches_at_p(in, p, n_keep, out, error);
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -124,6 +303,19 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         if (balloc.get_n_used() < balloc.get_n_tokens()) {
             // failed to find a suitable split
             break;
+        }
+
+        // Position split (plan §3.2): enforce the boundary P before anything is
+        // prepared, so a rejection cannot leave partial state behind.
+        if (position_split_p > 0) {
+            std::vector<llama_ubatch> split;
+            std::string split_error;
+            if (!position_split_ubatches(ubatches, position_split_p, split, split_error)) {
+                LLAMA_LOG_ERROR("%s: position split rejected before prepare: %s\n",
+                                __func__, split_error.c_str());
+                return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            }
+            ubatches = std::move(split);
         }
 
         // prepare the recurrent batches first

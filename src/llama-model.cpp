@@ -3371,7 +3371,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* tail_type         */ params.kv_tail_type,
                                 /* tail requested    */ params.kv_tail_tokens_requested,
                                 /* rollback reserve  */ params.kv_tail_rollback_tokens,
-                                /* device override   */ attention_device);
+                                /* device override   */ attention_device,
+                                /* position split P  */ cparams.kv_position_split_p);
                         }
                     }
                 } else {
