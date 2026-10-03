@@ -133,3 +133,41 @@ campanha 27B, tudo em porta isolada sem contaminar produção.
 - Produção parada (`systemctl stop llama-server-root`, VRAM 11881→1 MiB);
   `test-kvarn` passou (36s) sem contenção. Baseline recuperável em
   `/tmp/prod-ps-full-20261003.txt` + `/tmp/router-production-baseline.ini`.
+
+## F1 validação CUDA (compilação)
+- Primeira tentativa de rebuild total expôs 3 erros reais (todos corrigidos):
+  `domain()` usado antes de definido em `case-decl.cuh` (reordenado),
+  `window_enabled`/`window_chunk` duplicados entre `case.cuh` e `case-decl`
+  (unificados no decl), falta de `<cstdlib>` e de include do decl no
+  `fattn-tail.cuh`. Um erro fantasma no scatter ("expected an expression"
+  em código pré-existente intacto) era cascata do decl quebrado — bisseção
+  por hunks confirmou que cada hunk do tail compila isoladamente; após os
+  fixes o TU compila com o conteúdo integral.
+- Rebuild total em andamento (`build-optimized`, commit `56c46ce05`).
+
+## Desenho F2/F3/F4 (para implementar após o rebuild verde)
+- F2a (ubatch/P, pequeno e seguro): campo `position_split_p` (0=desligado)
+  em `llama_memory_hybrid` (+ setter), checado em `init_batch` APÓS montar
+  `ubatches` e ANTES de `mem_recr->prepare`: para cada ubatch, min/max de
+  `ubatch.pos[i*n_pos]`; se algum cruza P → `FAILED_PREPARE` com motivo
+  explícito, sem mutação (prepare ainda não rodou). A janela recorrente
+  (`1+n_rs_seq` juntos) é subcaso: se ela cruza P, o ubatch cruza P.
+  P chega via cparams (contexto) — origem: perfil adaptativo §3.8.
+- F2b (cache por posição, núcleo): em `llama_kv_cache_kvarn`, quando P>0,
+  cada camada full ganha faixa overflow Q4 em `standard_cache` (cap C-P por
+  camada, Vulkan0), tabela lógica única `pos<->cell` no `metadata`,
+  `get_k/v_for_attention` por faixa, `cpy_k/v` com índices por faixa,
+  `seq_rm`/rollback atômicos (valida tudo antes de mutar; fora da reserva
+  exata → checkpoint+replay ou rejeição), tail/stage só no local.
+  Tudo atrás de `position_split_enabled()` (P>0); P==0 = comportamento atual.
+- F3 (grafo): em `build_attn`/`build_layer_attn`, se P>0 e `n_kv>P`: FA
+  local (KVarN/CUDA, máscara só-padding) + FA overflow (Q4/Vulkan, máscara
+  com offset P) + cópias Q/O/LSE + merge por composição GGML
+  (`exp/sub/mul/add/div` existentes, primeiro; op dedicada só se medição
+  mandar) + gate/`wo` na CUDA. Se `n_kv<=P`: caminho só-CUDA atual, e o
+  teste prova ausência de nós Vulkan no grafo. Q copiado para Vulkan uma
+  vez por camada (reuso entre... não há reuso entre camadas; 16 cópias Q).
+- F4 (estado v2): envelope `KMS2`/`position_split` + P/C/ocupação +
+  descritores `(layer,range)`; writer/reader/validadores/spool/handoff/
+  índice; leitor velho rejeita v2, novo preserva v1; importação XXL
+  (`n<=P`) em processo novo só com XXL em disco; P diferente→miss.
