@@ -17,11 +17,6 @@ using ggml_cuda_fattn_kernel_attr_ptr_t = fattn_kernel_t;
 // when concurrent long prompts require less transient K/V scratch.
 static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 65536;
 
-static inline bool ggml_cuda_fattn_kvarn_window_enabled() {
-    const char * env = getenv("GGML_KVARN_WINDOW");
-    return env == nullptr || atoi(env) != 0;
-}
-
 static inline int ggml_cuda_fattn_kvarn_window_chunk(const int n_kv) {
     const char * env = getenv("GGML_KVARN_WINDOW_CHUNK");
     if (env == nullptr) {
@@ -774,6 +769,16 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     if (ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case<DKQ, DV, ncols1, ncols2>(
             ctx, dst, plan, nbytes_shared_total_f16, logit_softcap != 0.0f)) {
         return;
+    }
+
+    // Position-split LSE (plan §3.4) is exported by the windowed path above.
+    // The generic MMA launch below publishes no (max, denom) metadata. Abort
+    // loudly (fail-closed) instead of running silently without LSE; the
+    // launch_case pre-check routes LSE ops to portable whenever the
+    // documented windowed gate does not apply, so reaching here means VRAM
+    // pressure declined the windowed chunks (max_chunk < 256).
+    if (ggml_cuda_fattn_lse_requested(dst)) {
+        GGML_ABORT("position-split LSE requested but KVarN windowed path declined (VRAM pressure?)");
     }
 
     ggml_tensor * orig_k = dst->src[1];

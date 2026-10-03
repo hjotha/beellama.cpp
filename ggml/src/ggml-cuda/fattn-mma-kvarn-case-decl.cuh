@@ -2,6 +2,8 @@
 
 #include "fattn-mma-kvarn.cuh"
 
+#include <cstdlib>
+
 void ggml_cuda_fattn_kvarn_init_descs(
         const ggml_cuda_fattn_kvarn_plan & plan,
         ggml_cuda_fattn_kvarn_desc * k_desc,
@@ -24,11 +26,49 @@ static inline bool ggml_cuda_fattn_lse_requested(const ggml_tensor * dst) {
 }
 
 static inline float * ggml_cuda_fattn_lse_ptr(ggml_tensor * dst) {
-    return ggml_cuda_fattn_lse_requested(dst) ? (float *) dst->src[4]->data : nullptr;
+    // Null-safe: internal sub-passes (body/tail) may carry the flag with a
+    // null src[4]; only the top-level op owns the LSE tensor.
+    return (ggml_cuda_fattn_lse_requested(dst) && dst->src[4] != nullptr) ?
+        (float *) dst->src[4]->data : nullptr;
 }
 
 static inline const ggml_tensor * ggml_cuda_fattn_sinks_or_null(const ggml_tensor * dst) {
     return ggml_cuda_fattn_lse_requested(dst) ? nullptr : dst->src[4];
+}
+
+// Windowed KVarN prefill gate (documented contract, plan §3.4 matrix). Only
+// this generic-MMA sub-path exports LSE; the plain MMA launch below does not.
+static inline bool ggml_cuda_fattn_kvarn_window_enabled() {
+    const char * env = getenv("GGML_KVARN_WINDOW");
+    return env == nullptr || atoi(env) != 0;
+}
+
+// True when the documented windowed gate applies (Q>1, no sinks, MIXED
+// domain, supported dims). Used by the MMA launch pre-check to decline LSE
+// ops early so the dispatcher reaches the portable route.
+static inline bool ggml_cuda_fattn_kvarn_windowed_lse_applies(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const int DKQ = (int) Q->ne[0];
+    return ggml_cuda_fattn_kvarn_window_enabled() &&
+        Q->ne[1] > 1 &&
+        ggml_cuda_fattn_sinks_or_null(dst) == nullptr &&
+        ggml_cuda_fattn_kvarn_domain(dst) == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V &&
+        (DKQ == 128 || DKQ == 256 || DKQ == 512);
+}
+
+// Position-split LSE post-pass for single-split kernels that only publish
+// (max, denom) metadata: lse = m + log(denom); empty -> -inf.
+// Row order matches the LSE layout: ((stream * n_q + q) * n_heads + h).
+static __global__ void ggml_cuda_fattn_kvarn_meta_to_lse_kernel(
+        const float2 * meta,
+        float * lse_out,
+        size_t n_rows) {
+    const size_t row = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+    const float2 m = meta[row];
+    lse_out[row] = m.y > 0.0f ? (m.x + logf(m.y)) : -INFINITY;
 }
 
 template <int D>

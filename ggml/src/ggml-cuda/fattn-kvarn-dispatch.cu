@@ -950,6 +950,13 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_launch_case(
     if (!ggml_cuda_fattn_kvarn_mma_case_eligible<DKQ, DV, ncols1, ncols2>(ctx)) {
         return false;
     }
+    if (ggml_cuda_fattn_lse_requested(dst) &&
+            !ggml_cuda_fattn_kvarn_windowed_lse_applies(dst)) {
+        // Position-split LSE is exported only by the windowed sub-path.
+        // Decline early so the dispatcher reaches the portable route
+        // (combine/post-pass LSE) instead of the silent generic MMA launch.
+        return false;
+    }
     ggml_cuda_flash_attn_ext_mma_kvarn_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
     return true;
 }

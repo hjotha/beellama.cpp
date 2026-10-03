@@ -1,0 +1,121 @@
+#version 450
+
+// Position-split LSE export (plan docs/occupancy-placement-plan-20261002.md
+// §3.4, F1a): reduces the split-K (max, denom) partials published by the Q4
+// FlashAttention kernel into per-row LSE, without touching the FA shaders.
+// lse = m_max + log(L) in ln (after scale/mask/bias/softcap); empty or fully
+// masked row -> -inf. Sinks are folded exactly like fa_split_k_reduce.
+// Row order matches the LSE contract (lse[(b*n_q+q)*nh+h]): the grid and the
+// (l/m_offset, lm_stride) addressing are identical to
+// flash_attn_split_k_reduce.comp; only the O loop is replaced by the LSE
+// write. F1b will add in-kernel export for the split_k == 1 path; until then
+// the host forces split_k >= 2 whenever LSE is requested (KV >= 2).
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_s[];};
+layout (binding = 2) writeonly buffer L {float data_lse[];};
+
+layout (push_constant) uniform parameter {
+    uint D;
+    uint ne1;
+    uint ne2;
+    uint ne3;
+    uint k_num;
+    uint sinks;
+} p;
+
+shared float tmpsh[BLOCK_SIZE];
+
+void main() {
+    // Each workgroup handles one LSE row.
+    const uint n = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint i2 = gl_WorkGroupID.z % p.ne2;
+    const uint i3 = gl_WorkGroupID.z / p.ne2;
+
+    uint k_num = p.k_num;
+
+    // Split-K buffer layout (same as fa_split_k_reduce): O partials first
+    // ([D, ne1, k, ne2, ne3]), then the (L, M) rows ([ne1, k, ne2, ne3]).
+    uint l_offset = p.D * p.ne1 * p.ne2 * p.ne3 * k_num + p.ne1 * 2 * (0/*split_k_index*/ + p.k_num * (i2 + p.ne2 * i3)) + n;
+    uint m_offset = p.D * p.ne1 * p.ne2 * p.ne3 * k_num + p.ne1 * 2 * (0/*split_k_index*/ + p.k_num * (i2 + p.ne2 * i3)) + p.ne1 + n;
+    uint lm_stride = p.ne1 * 2;
+
+    // Compute the max m value for the row (identical to fa_split_k_reduce).
+    float m_max = -1.0/0.0;
+    for (uint k = 0; k + tid < k_num; k += BLOCK_SIZE) {
+        float m = data_a[m_offset + (k + tid) * lm_stride];
+        m_max = max(m_max, m);
+    }
+
+    // reduce across the workgroup
+    tmpsh[tid] = m_max;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            m_max = max(m_max, tmpsh[tid + s]);
+            tmpsh[tid] = m_max;
+        }
+        barrier();
+    }
+    m_max = tmpsh[0];
+
+    barrier();
+
+    // Compute L based on m_max (identical to fa_split_k_reduce).
+    float L = 0;
+    for (uint k = 0; k + tid < k_num; k += BLOCK_SIZE) {
+        float l = data_a[l_offset + (k + tid) * lm_stride];
+        float m = data_a[m_offset + (k + tid) * lm_stride];
+        L += exp(m - m_max) * l;
+    }
+
+    // reduce across the workgroup
+    tmpsh[tid] = L;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            L += tmpsh[tid + s];
+            tmpsh[tid] = L;
+        }
+        barrier();
+    }
+    L = tmpsh[0];
+
+    float sink;
+    if (p.sinks != 0) {
+        sink = data_s[n];
+
+        float ms = 1.0f;
+        float vs = 1.0f;
+
+        if (sink > m_max) {
+            ms = exp(m_max - sink);
+        } else {
+            vs = exp(sink - m_max);
+        }
+
+        L = L*ms + vs;
+        // NOTE: fa_split_k_reduce folds the sink into the O weights but keeps
+        // m_max for the denominator; the LSE of the sink-augmented row is
+        // m_max + log(L) with this same L. Sinks are rejected in
+        // position-split mode, so this branch is validation-only.
+        m_max = max(m_max, sink);
+    }
+
+    // LSE: -inf for empty/fully-masked rows (L == 0 or m_max == -inf).
+    float lse = -1.0/0.0;
+    if (L > 0.0 && !(m_max == -1.0/0.0)) {
+        lse = m_max + log(L);
+    }
+
+    if (tid == 0) {
+        data_lse[(i3 * p.ne2 + i2) * p.ne1 + n] = lse;
+    }
+}

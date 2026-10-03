@@ -186,6 +186,7 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
         const char * kt_current, const char * vt_current, const half * mt,
         const int32_t * query_order, const int32_t * run_desc,
         const float * body, const float2 * body_meta, float * dst,
+        float * lse_out,
         int d_k, int d_v, int n_query, int n_head, int n_stream,
         int q_max, int n_active, int n_head_k, int n_head_v, int desc_stride,
         float scale, float max_bias, float logit_softcap,
@@ -334,10 +335,16 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
         *reinterpret_cast<float *>(drow + size_t(d)*sizeof(float)) =
                 denom > 0.0f ? (body_value*wb + tail_acc*wt)/denom : 0.0f;
     }
+    if (tid == 0 && lse_out != nullptr) {
+        // Position-split LSE of the combined body+tail range.
+        lse_out[(size_t(is)*n_query + iq)*n_head + ih] =
+            denom > 0.0f ? (global_max + logf(denom)) : -INFINITY;
+    }
 }
 
 static __global__ void k_flash_attn_ext_tail_partials_merge(
         const float * body, const float * tail, float * dst,
+        float * lse_out,
         const float2 * body_meta, const float2 * tail_meta, const int32_t * query_order,
         int d, int n_query, int n_head, int n_stream, int q_max, int n_active,
         bool body_packed,
@@ -385,6 +392,11 @@ static __global__ void k_flash_attn_ext_tail_partials_merge(
             numerator += *reinterpret_cast<const float *>(trow + size_t(id)*sizeof(float))*wt;
         }
         *reinterpret_cast<float *>(drow + size_t(id)*sizeof(float)) = denom > 0.0f ? numerator/denom : 0.0f;
+    }
+    if (threadIdx.x == 0 && lse_out != nullptr) {
+        // Position-split LSE of the combined body+tail range.
+        lse_out[(size_t(is)*n_query + iq)*n_head + ih] =
+            denom > 0.0f ? (m + logf(denom)) : -INFINITY;
     }
 }
 
@@ -724,6 +736,12 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     for (int i = 5; i < GGML_MAX_SRC; ++i) {
         body_pass.src[i] = nullptr;
     }
+    // The body sub-pass must not inherit the top-level LSE tensor: its packed
+    // rows do not match the full LSE layout. The combined LSE is written by
+    // the tail merge kernels below.
+    if (ggml_cuda_fattn_lse_requested(dst)) {
+        body_pass.src[4] = nullptr;
+    }
     body_pass.src[8] = &body_meta;
     body_pass.view_src = nullptr;
     body_pass.view_offs = 0;
@@ -802,6 +820,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         memcpy(&scale, dst->op_params + 0*sizeof(float), sizeof(float));
         memcpy(&max_bias, dst->op_params + 1*sizeof(float), sizeof(float));
         memcpy(&logit_softcap, dst->op_params + 2*sizeof(float), sizeof(float));
+        float * const lse_out = ggml_cuda_fattn_lse_ptr(dst);
         const dim3 grid(q_max, n_head, n_active);
 #define GGML_CUDA_LAUNCH_INDEXED(TK, TV, MAX_TAIL) \
         k_flash_attn_ext_tail_indexed_small<TK, TV, MAX_TAIL><<<grid, 256, 0, ctx.stream()>>>( \
@@ -809,7 +828,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             kt_current ? (const char *) kt_current->data : nullptr, \
             vt_current ? (const char *) vt_current->data : nullptr, (const half *) mt->data, \
             (const int32_t *) qo->data, (const int32_t *) rd->data, \
-            (const float *) body_pass.data, body_meta_alloc.get(), (float *) dst->data, \
+            (const float *) body_pass.data, body_meta_alloc.get(), (float *) dst->data, lse_out, \
             d_k, d_v, n_query, n_head, n_stream, q_max, n_active, n_head_k, n_head_v, desc_stride, \
             scale, max_bias, logit_softcap, q->nb[1], q->nb[2], q->nb[3], \
             history_slots, kt->nb[0], kt->nb[1], kt->nb[2], vt->nb[0], vt->nb[1], vt->nb[2], \
@@ -853,7 +872,21 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     tail_pass.src[3] = &mask_packed;
     // Sinks are part of the body partial for a split source. For a bodyless
     // source the exact pass is the sole softmax and must consume them itself.
-    tail_pass.src[4] = tail_bodyless ? dst->src[4] : nullptr;
+    // With LSE requested, the full-size LSE tensor does not match the packed
+    // tail pass; a packed staging buffer is used and scattered below.
+    const bool tail_lse = ggml_cuda_fattn_lse_requested(dst) && dst->src[4] != nullptr;
+    ggml_cuda_pool_alloc<float> tail_lse_packed(pool);
+    ggml_tensor lse_packed = {};
+    if (tail_lse && tail_bodyless) {
+        tail_lse_packed.alloc(size_t(n_head) * q_max * n_active);
+        lse_packed = *dst->src[4];
+        lse_packed.data = tail_lse_packed.get();
+        ggml_cuda_tail_make_contiguous(lse_packed, n_head, q_max, n_active, 1, sizeof(float));
+    }
+    tail_pass.src[4] = (tail_bodyless && !tail_lse) ? dst->src[4] : nullptr;
+    if (tail_lse && tail_bodyless) {
+        tail_pass.src[4] = &lse_packed;
+    }
     for (int i = 5; i < GGML_MAX_SRC; ++i) {
         tail_pass.src[i] = nullptr;
     }
@@ -882,12 +915,25 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             (const float *) tail_pass.data, (float *) dst->data, (const int32_t *) qo->data,
             d_v, n_query, n_head, n_stream, q_max, n_active,
             tail_pass.nb[1], tail_pass.nb[2], tail_pass.nb[3],
-            dst->nb[1], dst->nb[2], dst->nb[3]);
+            dst->nb[1], dst->nb[2], dst->nb[3>);
         CUDA_CHECK(cudaGetLastError());
+        if (tail_lse) {
+            // Scatter the packed LSE with d=1 through the same mapping.
+            k_flash_attn_ext_tail_scatter<<<grid, 256, 0, ctx.stream()>>>(
+                (const float *) tail_lse_packed.get(), (float *) dst->src[4]->data,
+                (const int32_t *) qo->data,
+                1, n_query, n_head, n_stream, q_max, n_active,
+                size_t(n_head) * sizeof(float), size_t(n_head) * q_max * sizeof(float),
+                size_t(n_head) * q_max * sizeof(float),
+                sizeof(float), size_t(dst->src[4]->ne[0]) * sizeof(float),
+                size_t(dst->src[4]->ne[0]) * dst->src[4]->ne[1] * sizeof(float));
+            CUDA_CHECK(cudaGetLastError());
+        }
         return;
     }
     k_flash_attn_ext_tail_partials_merge<<<grid, 256, 0, ctx.stream()>>>(
         (const float *) body_pass.data, (const float *) tail_pass.data, (float *) dst->data,
+        ggml_cuda_fattn_lse_ptr(dst),
         body_meta_alloc.get(), tail_meta_alloc.get(), (const int32_t *) qo->data,
         d_v, n_query, n_head, n_stream, q_max, n_active, body_packed,
         body_pass.nb[1], body_pass.nb[2], body_pass.nb[3],

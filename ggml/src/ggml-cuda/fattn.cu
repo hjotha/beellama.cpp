@@ -974,6 +974,9 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
+    const bool lse_requested = ((const int32_t *) dst->op_params)[7] != 0 && dst->src[4] != nullptr;
+    const bool tail_bodyless = ggml_get_op_params_i32(
+        dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0;
     const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
         ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(device, dst);
     if (portable_kvarn_tail) {
@@ -986,11 +989,22 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
                 !ggml_cuda_flash_attn_ext_tail_pass_supported(device, dst)) {
             return false;
         }
+        // Position-split LSE (plan §3.4, F1b): the bodyless tail sub-pass runs
+        // generic packed FA with no LSE path, so decline explicitly
+        // (fail-closed). Indexed and merge tails export combined LSE.
+        if (lse_requested && tail_bodyless) {
+            return false;
+        }
         return true;
     }
 
     if (uses_kvarn) {
         return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
+    }
+    // Position-split LSE (plan §3.4, F1b): generic FA exports no LSE yet.
+    // Decline explicitly (fail-closed) instead of running silently without it.
+    if (lse_requested) {
+        return false;
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

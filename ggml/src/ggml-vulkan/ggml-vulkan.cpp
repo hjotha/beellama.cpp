@@ -1201,6 +1201,7 @@ struct vk_device_struct {
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
+    vk_pipeline pipeline_flash_attn_split_k_lse;
     vk_pipeline pipeline_count_experts;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
@@ -6174,6 +6175,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_lse, "fa_split_k_lse", fa_split_k_lse_len, fa_split_k_lse_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
     if (device->fp16 && device->subgroup_basic && device->subgroup_arithmetic) {
         ggml_vk_create_pipeline(device, device->pipeline_paged_attn_f16_d128, "paged_attn_f16_d128", paged_attn_f16_d128_len, paged_attn_f16_d128_data, "main", 12, sizeof(vk_paged_attn_push_constants), {1, 1, 1}, {}, 1);
         if (device->max_workgroup_size_log2 >= 8) {
@@ -12813,6 +12815,20 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
+    // Position-split LSE (plan §3.4, F1a): src[4] carries the LSE output
+    // instead of sinks (mutually exclusive by attach contract).
+    const ggml_tensor * lse = (dst->op_params[7] != 0 && dst->src[4] != nullptr) ? dst->src[4] : nullptr;
+    if (lse != nullptr) {
+        sinks = nullptr;
+        // Fail-closed: only the generic Q4 path below exports LSE (F1a).
+        // KVarN-native and tail paths with LSE are declined in supported();
+        // abort loudly if one ever reaches the executor directly.
+        if (ggml_backend_vk_kvarn_view_base(k) != nullptr ||
+                ggml_backend_vk_kvarn_view_base(v) != nullptr ||
+                dst->src[5] != nullptr) {
+            GGML_ABORT("position-split LSE requested on Vulkan KVarN/tail path (F1b pending)");
+        }
+    }
     uint32_t gqa_ratio = 1;
     uint32_t qk_ratio = neq2 / nek2;
     uint32_t workgroups_x = (uint32_t)neq1;
@@ -12961,6 +12977,19 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         split_k = CEIL_DIV(KV, split_kv);
     }
 
+    // Position-split LSE (plan §3.4, F1a) is reduced from the split-K (max,
+    // denom) partials, so it needs split_k >= 2 (in-kernel split-1 export is
+    // F1b). Split_kv alignment is a performance tiling with no correctness
+    // effect, so an exact bisection is used when forcing; tuned splits >= 2
+    // are kept as-is. Supported() guarantees KV >= 2 when LSE is requested.
+    if (lse != nullptr) {
+        GGML_ASSERT(KV >= 2);
+        if (split_k < 2) {
+            split_kv = (KV + 1) / 2;
+            split_k = 2;
+        }
+    }
+
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.
     // For matrices, the order is (inner to outer) [HSV, ne1, k, ne2, ne3].
@@ -13105,6 +13134,18 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     {split_k_buf, sinks_buf, dst_buf},
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
         ctx->prealloc_split_k_need_sync = true;
+        if (lse != nullptr) {
+            // Position-split LSE (plan §3.4, F1a): reduce the same (max,
+            // denom) partials to per-row LSE. Row order matches the LSE
+            // contract (lse[(b*n_q+q)*nh+h]); verified by
+            // test-position-split-lse-vk against the CPU reference.
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_lse, 1);
+            vk_subbuffer lse_buf = ggml_vk_tensor_subbuffer(ctx, lse);
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_lse,
+                                        {split_k_buf, sinks_buf, lse_buf},
+                                        pc2, { (uint32_t)ne1, 1, (uint32_t)(ne2 * ne3) });
+            ctx->prealloc_split_k_need_sync = true;
+        }
     } else {
         if (gqa_ratio > 1) {
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
@@ -21165,6 +21206,26 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if ((op->src[10] == nullptr) != (op->src[11] == nullptr)) {
                     return false;
                 }
+                // Position-split LSE (plan §3.4, F1a): src[4] carries the LSE
+                // output (F32, ne = { n_head_q, n_q, n_batch }) instead of
+                // sinks. KVarN-native and tail paths export no LSE yet (F1b);
+                // the generic Q4 path exports via split-K reduce (split>=2).
+                const bool lse_requested = ggml_get_op_params_i32(
+                    op, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT) != 0 && op->src[4] != nullptr;
+                if (lse_requested) {
+                    const ggml_tensor * lse = op->src[4];
+                    if (lse->type != GGML_TYPE_F32 || !ggml_is_contiguous(lse) ||
+                            lse->ne[0] != op->ne[1] || lse->ne[1] != op->ne[2] ||
+                            lse->ne[2] != op->ne[3]) {
+                        return false;
+                    }
+                    if (op->src[5] != nullptr) {
+                        return false; // tail+LSE: F1b
+                    }
+                    if (op->src[1]->ne[1] < 2) {
+                        return false; // need split_k >= 2 for partials
+                    }
+                }
                 vk_kvarn_attn_side k_side = {};
                 vk_kvarn_attn_side v_side = {};
                 const bool uses_kvarn_k = ggml_backend_vk_kvarn_view_base(op->src[1]) != nullptr;
@@ -21172,6 +21233,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const bool kvarn_k = ggml_vk_kvarn_attn_parse_side(op->src[1], k_side);
                 const bool kvarn_v = ggml_vk_kvarn_attn_parse_side(op->src[2], v_side);
                 if (uses_kvarn_k || uses_kvarn_v) {
+                    if (lse_requested) {
+                        return false; // KVarN-native LSE: F1b
+                    }
                     const bool tail_ok = ggml_vk_kvarn_attn_tail_sources_supported(op);
                     const int domain = ggml_get_op_params_i32(
                         op, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN);

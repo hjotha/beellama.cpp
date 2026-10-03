@@ -8783,7 +8783,7 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
 static inline void ggml_fattn_ext_write_lse(
         const ggml_tensor * dst, int64_t n_head_q, int64_t n_q,
         int64_t iq1, int64_t iq2, int64_t iq3, float M, float S) {
-    if (dst->op_params[7] == 0) {
+    if (dst->op_params[7] == 0 || dst->src[4] == nullptr) {
         return;
     }
     const ggml_tensor * lse = dst->src[4];

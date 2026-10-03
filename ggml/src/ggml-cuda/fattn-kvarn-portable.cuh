@@ -834,14 +834,7 @@ static inline bool ggml_cuda_fattn_kvarn_portable_supported(
          body_meta->ne[3] == q->ne[3] && ggml_is_contiguous(body_meta));
     const bool domain_ok = ggml_cuda_fattn_kvarn_rotated_decode_domain(dst) ||
         ggml_cuda_fattn_kvarn_domain(dst) == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
-    // Position-split LSE is exported only by the split combine kernel. The
-    // direct single-split kernels have no LSE path, so reject explicitly
-    // (fail-closed) instead of running silently without LSE.
-    const int portable_splits = q->ne[0] == 64 ?
-        (plan.n_kv + GGML_CUDA_FATTN_KVARN_PORTABLE_SPLIT_TOKENS - 1) /
-            GGML_CUDA_FATTN_KVARN_PORTABLE_SPLIT_TOKENS : 1;
-    const bool lse_ok = !ggml_cuda_fattn_lse_requested(dst) || portable_splits > 1;
-    return lse_ok && domain_ok &&
+    return domain_ok &&
         (q->ne[0] == 64 || q->ne[0] == 128 || q->ne[0] == 256 || q->ne[0] == 512) &&
         q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         q->ne[0] == dst->src[1]->ne[0] && q->ne[0] == dst->src[2]->ne[0] &&
@@ -891,6 +884,16 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
     const size_t partial_meta_elements = n_splits > 1 ? n_rows * n_splits : 1;
     ggml_cuda_pool_alloc<float> partial(pool, partial_elements);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, partial_meta_elements);
+    float * const lse_out = ggml_cuda_fattn_lse_ptr(dst);
+    // Single-split kernels publish (max, denom) to output_meta only. When LSE
+    // is requested but the caller provided no body-meta buffer, stage the
+    // metadata in a transient buffer for the LSE post-pass below.
+    ggml_cuda_pool_alloc<float2> lse_meta_tmp(pool);
+    float2 * single_meta = body_meta ? (float2 *) body_meta->data : nullptr;
+    if (lse_out != nullptr && n_splits == 1 && single_meta == nullptr) {
+        lse_meta_tmp.alloc(n_rows);
+        single_meta = lse_meta_tmp.get();
+    }
     const bool v_original_domain = ggml_cuda_fattn_kvarn_v_original_domain(dst);
     ggml_cuda_fattn_kvarn_init_descs(
         plan, k_desc.get(), v_desc.get(), 0, v_original_domain ? 1 : 0, stream);
@@ -918,8 +921,7 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
                     (const char *) q->data, k_desc.get(), v_desc.get(), \
                     mask ? (const char *) mask->data : nullptr, \
                     sinks ? (const float *) sinks->data : nullptr, \
-                    n_splits > 1 ? partial_meta.get() : \
-                        (body_meta ? (float2 *) body_meta->data : nullptr), \
+                    n_splits > 1 ? partial_meta.get() : single_meta, \
                     n_splits > 1 ? (char *) partial.get() : (char *) dst->data, \
                     scale, max_bias, logit_softcap, \
                     q->nb[1], q->nb[2], q->nb[3], \
@@ -953,8 +955,7 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
             mt ? (const char *) mt->data : nullptr,
             qo ? (const int32_t *) qo->data : nullptr,
             rd ? (const int32_t *) rd->data : nullptr,
-            n_splits > 1 ? partial_meta.get() :
-                (body_meta ? (float2 *) body_meta->data : nullptr),
+            n_splits > 1 ? partial_meta.get() : single_meta,
             n_splits > 1 ? (char *) partial.get() : (char *) dst->data,
             scale, max_bias, logit_softcap,
             q->nb[1], q->nb[2], q->nb[3],
@@ -994,6 +995,16 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
                 ggml_cuda_fattn_lse_ptr(dst),
                 dst->nb[1], dst->nb[2], dst->nb[3],
                 n_splits, (int) q->ne[1], (int) q->ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    if (lse_out != nullptr && n_splits == 1) {
+        // Position-split LSE post-pass over the single-split (max, denom)
+        // metadata (plan §3.4). Row order matches the LSE layout.
+        const int lse_threads = 256;
+        const int lse_blocks = (int) ((n_rows + lse_threads - 1) / lse_threads);
+        ggml_cuda_fattn_kvarn_meta_to_lse_kernel<<<lse_blocks, lse_threads, 0, stream>>>(
+            single_meta, lse_out, n_rows);
         CUDA_CHECK(cudaGetLastError());
     }
 }
