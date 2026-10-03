@@ -2635,6 +2635,13 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_lse_out(
             const struct ggml_tensor * a);
 
+    // Rebind the LSE destination of an FA node. Only for graph cloning, which
+    // copies op_params verbatim and would otherwise leave the clone writing
+    // into the original graph's tensor.
+    GGML_API void ggml_flash_attn_ext_set_lse_out(
+            struct ggml_tensor * a,
+            struct ggml_tensor * lse);
+
     // Attach per-sequence exact-KV arenas to an existing body FlashAttention
     // operation. query_order packs caller queries in sequence-major order and
     // run_desc records { arena, packed start, query count, consecutive run }.

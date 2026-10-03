@@ -5748,6 +5748,15 @@ struct ggml_tensor * ggml_flash_attn_ext_get_lse_out(
     return (struct ggml_tensor *) ptr;
 }
 
+void ggml_flash_attn_ext_set_lse_out(
+        struct ggml_tensor * a,
+        struct ggml_tensor * lse) {
+    GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
+    const uintptr_t ptr = (uintptr_t) lse;
+    memcpy(&a->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR], &ptr, sizeof(ptr));
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT, lse != NULL ? 1 : 0);
+}
+
 void ggml_flash_attn_ext_add_kv_tail(
         struct ggml_tensor * a,
         struct ggml_tensor * k_tail,

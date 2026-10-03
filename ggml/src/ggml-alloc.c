@@ -794,6 +794,34 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         }
     }
 
+    // Position-split FA LSE side outputs (plan §3.4) are written by their
+    // producer but are separate graph nodes. The plain node-by-node order
+    // below would allocate the LSE tensor one node *after* the FA node, i.e.
+    // after the FA inputs it still reads have been returned to the free list,
+    // so the LSE block could land on memory the FA kernel is reading while it
+    // writes the side output. Reserve it at the producer's position instead:
+    // same liveness as any other node output (freed only after its last
+    // consumer), but never overlapping the producer's live inputs.
+    int * lse_node_of = NULL;
+    if (graph->n_nodes > 0) {
+        lse_node_of = (int *) malloc(sizeof(int) * graph->n_nodes);
+        for (int i = 0; i < graph->n_nodes; i++) {
+            lse_node_of[i] = -1;
+        }
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_FLASH_ATTN_EXT_LSE || node->src[0] == NULL) {
+                continue;
+            }
+            for (int p = 0; p < i; p++) {
+                if (graph->nodes[p] == node->src[0]) {
+                    lse_node_of[p] = i;
+                    break;
+                }
+            }
+        }
+    }
+
     // allocate tensors
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
@@ -810,6 +838,13 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
         // allocate node
         ggml_gallocr_allocate_node(galloc, node, buffer_id);
+
+        // reserve the FA LSE side output before this node's inputs are freed
+        if (lse_node_of != NULL && lse_node_of[i] >= 0) {
+            const int li = lse_node_of[i];
+            ggml_gallocr_allocate_node(galloc, graph->nodes[li],
+                get_node_buffer_id(node_buffer_ids, li));
+        }
 
         AT_PRINTF("exec: %s (%s) <= ", ggml_op_desc(node), node->name);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -867,9 +902,10 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
                     }
                 }
             }
-            AT_PRINTF("\n");
+AT_PRINTF("\n");
         }
     }
+    free(lse_node_of);
 }
 
 static bool ggml_gallocr_reserve_n_impl(

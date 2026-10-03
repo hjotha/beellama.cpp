@@ -2323,6 +2323,18 @@ static struct ggml_tensor * graph_copy_dup_tensor(struct ggml_hash_set hash_set,
         dst->src[i] = graph_copy_dup_tensor(hash_set, node_copies, ctx_allocated, ctx_unallocated, s);
     }
 
+    // Position-split FA LSE (plan §3.4): op_params are copied verbatim above,
+    // which would leave the clone with a back-pointer into the *source* graph.
+    // Duplicate the side-output tensor and rebind it; it is a graph node, so
+    // the later node walk finds the existing copy in the hash set.
+    if (src->op == GGML_OP_FLASH_ATTN_EXT) {
+        struct ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(src);
+        if (lse != NULL) {
+            struct ggml_tensor * lse_copy = graph_copy_dup_tensor(hash_set, node_copies, ctx_allocated, ctx_unallocated, lse);
+            ggml_flash_attn_ext_set_lse_out(dst, lse_copy);
+        }
+    }
+
     node_copies[id] = dst;
     return dst;
 }

@@ -986,6 +986,16 @@ static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, const s
 
 static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, const std::shared_ptr<rpc_dispatcher> & dispatcher, size_t * output_size) {
     uint32_t n_nodes = cgraph->n_nodes;
+    // Position-split FA LSE is not transferable (see
+    // ggml_backend_rpc_device_supports_op): refuse here too, so no code path
+    // can serialize a graph whose FA node holds a local LSE back-pointer.
+    for (uint32_t i = 0; i < n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        GGML_ASSERT(node->op != GGML_OP_FLASH_ATTN_EXT_LSE &&
+            "RPC: FLASH_ATTN_EXT_LSE side-output nodes are not supported");
+        GGML_ASSERT(!(node->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_lse_out(node)) &&
+            "RPC: FLASH_ATTN_EXT with an LSE side output is not supported");
+    }
     std::vector<rpc_tensor> tensors;
     std::unordered_set<ggml_tensor*> visited;
     for (uint32_t i = 0; i < n_nodes; i++) {
@@ -2185,7 +2195,17 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // Position-split FA LSE (plan §3.4) is rejected at the RPC boundary: the
+    // FA node carries a back-pointer to its LSE tensor in op_params, and
+    // op_params are serialized byte-wise (and hashed for allocation), so the
+    // remote side could never resolve that pointer. Refuse instead of shipping
+    // a pointer that the peer would dereference as garbage.
+    if (op != NULL) {
+        if (op->op == GGML_OP_FLASH_ATTN_EXT_LSE ||
+            (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_lse_out(op))) {
+            return false;
+        }
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }
