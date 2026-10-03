@@ -707,6 +707,12 @@ target_link_libraries(test-local-split-attn PRIVATE ggml)
 add_test(NAME test-local-split-attn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-local-split-attn>)
 set_property(TEST test-local-split-attn PROPERTY LABELS main)
 
+add_executable(test-position-split-merge test-position-split-merge.cpp)
+target_include_directories(test-position-split-merge PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(test-position-split-merge PRIVATE cxx_std_17)
+add_test(NAME test-position-split-merge WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge>)
+set_property(TEST test-position-split-merge PROPERTY LABELS main)
+
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
