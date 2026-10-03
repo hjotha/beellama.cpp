@@ -744,6 +744,13 @@ if (GGML_VULKAN)
     add_test(NAME test-position-split-lse-vk WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-lse-vk>)
     set_property(TEST test-position-split-lse-vk PROPERTY LABELS main)
 
+    add_executable(test-position-split-merge-graph test-position-split-merge-graph.cpp)
+    target_include_directories(test-position-split-merge-graph PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+    target_compile_features(test-position-split-merge-graph PRIVATE cxx_std_17)
+    target_link_libraries(test-position-split-merge-graph PRIVATE ggml ggml-vulkan)
+    add_test(NAME test-position-split-merge-graph WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge-graph>)
+    set_property(TEST test-position-split-merge-graph PROPERTY LABELS main)
+
     add_executable(test-position-split-lse-sched test-position-split-lse-sched.cpp)
     target_include_directories(test-position-split-lse-sched PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
     target_compile_features(test-position-split-lse-sched PRIVATE cxx_std_17)

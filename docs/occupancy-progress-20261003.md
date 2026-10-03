@@ -383,6 +383,46 @@ tail_bodyless`), o que é recusa explícita e não entrega do item do §3.4.
   `ggml/src/ggml-cuda/fattn.cu:595` (`GGML_ASSERT(vec_case != nullptr)`,
   hsk=320 com sinks): caminho genérico não-KVarN, intocado por esta rodada.
 
+
+## F3 core — duas FA + merge no mesmo grafo (2026-10-04)
+Teste: `tests/test-position-split-merge-graph.cpp`.
+
+O mecanismo do §3.3 foi montado e roda em um grafo único com o scheduler real:
+- faixa local F16 na CPU e faixa overflow Q4 no Vulkan0, cada uma com seu nó
+  `FLASH_ATTN_EXT` e seu `FLASH_ATTN_EXT_LSE`;
+- as cópias entre backends ficam por conta do scheduler (nada de `cpy` manual);
+- o merge usa apenas operações existentes: `clamp` (contrato de faixa vazia,
+  LSE = -1e30 em vez de -inf), `add`/`sub`/`abs`/`scale` para o máximo
+  elemento-a-elemento sem op de max, `exp`, `mul`, `add`, `div` e `log`; o
+  denominador recebe `+eps` para que duas faixas vazias deem 0 exato em vez de
+  NaN;
+- os pesos são vistos como `[1, n_q_heads, n_q]` com os strides do tensor LSE
+  (`nb[1]` para head, `nb[2]` para query), que é o que torna a composição
+  correta para o `ne` declarado de O e de LSE;
+- abaixo de P o grafo tem **um** nó de atenção (verificado contando os nós
+  `FLASH_ATTN_EXT`), sem segundo range e sem aritmética de merge: nada pode rodar
+  no segundo backend (§3.8);
+- a rota CUDA local continua recusando LSE fora do KVarN, então o
+  par exercitado aqui é CPU + Vulkan0; o par CUDA/KVarN + Vulkan/Q4 é coberto
+  separadamente por `test-kvarn` e `test-position-split-lse-vk`.
+
+### Known-open medido (não conta como cobertura do §3.3)
+- O comparativo de O contra a referência FP64 **não** está verde neste formato:
+  `merge Q=1 nrmse=2.092e+00 max_abs=4.575e-01`, `Q=2 nrmse=2.766e+00`,
+  `Q=4 nrmse=2.811e+00`, `below P nrmse=1.044e+00`,
+  `empty overflow nrmse=1.044e+00`, `merged lse max_abs=5.782e-02`.
+- Isolamento feito até aqui: o LSE merged concorda com a referência dentro de
+  ~1e-2, logo pontuação e pesos concordam e o resíduo está no caminho de O; a
+  mesma divergência aparece num probe isolado da FA da CPU contra a mesma
+  referência FP64 com dados aleatórios em D=128/NKV=512 (nrmse 0.94), e a
+  mesma referência bate **exatamente** com a FA em dados estruturados pequenos
+  (D=4, NKV=3, NQH=2, NKH=1), então a divergência não é da composição do
+  merge. `ggml_prec_set_acc(F32)` não muda o resultado dessa FA.
+- Próximo passo de diagnóstico: comparar a FA com uma referência composta por
+  ops do próprio ggml (`mul_mat` + `soft_max` + `mul_mat`) no mesmo formato, para
+  decidir se o erro está na FA da CPU ou na referência do teste, e só então
+  fechar o gate do §4.1 para o merge.
+
 ## Checklist vivo (revisão 4, passo 0)
 | Item | Estado | Evidência | Próximo passo |
 |---|---|---|---|
@@ -394,7 +434,8 @@ tail_bodyless`), o que é recusa explícita e não entrega do item do §3.4.
 | F1 Vulkan LSE (split_k=1 e >1, F16/Q4) | validado | `test-position-split-lse-vk` 485 checks, O nrmse 7.558e-4, LSE 5.008e-3 | — |
 | F1 alocador/cópia/scheduler/RPC | validado | 230/0, 20/0, diag de clone 232/0 | — |
 | F2 cache por posição, store, allocator, rollback atômico | **pendente** | — | implementar §3.1/§3.2 em `llama-kv-cache-kvarn.*` + `llama-memory-hybrid*` |
-| F3 duas FA + merge, 4B P=512/1024 | **pendente** | — | `build_attn`/`qwen35.cpp` + teste de integração com KL FP64 |
+| F3 core duas FA + merge (mecanismo) | **parcial** | `test-position-split-merge-graph`: grafo, scheduler, merge e "um nó abaixo de P" validados; comparação numérica de O known-open (números acima) | isolar FA vs referência FP64, depois integrar `build_attn`/`qwen35.cpp` |
+| F3 integração 4B P=512/1024, KL FP64 | **pendente** | — | `build_attn`/`qwen35.cpp` + teste de integração com KL FP64 |
 | F4 snapshots v2 + importação XXL | **pendente** | — | envelope `position_split`, writer/reader/validadores |
 | F5 orçamento + campanha 27B | **pendente** | — | cálculo de P com custos simultâneos + A/B 5x |
 | F7 entrega/canário/rollback | **pendente** | — | baseline conhecido separado; promoção continua não autorizada |
