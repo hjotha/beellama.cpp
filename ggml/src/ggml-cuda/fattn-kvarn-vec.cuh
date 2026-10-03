@@ -350,7 +350,7 @@ void ggml_cuda_fattn_kvarn_vec_launch(const ggml_cuda_fattn_kvarn_decode_args & 
     combine_kernel
         <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS,
             nbytes_shared_combine, args.stream>>>(
-            args.partial, args.partial_meta, args.dst, args.dst_meta,
+            args.partial, args.partial_meta, args.dst, args.dst_meta, args.lse_out,
             args.n_splits, 1, args.n_q_heads);
     CUDA_CHECK(cudaGetLastError());
 }

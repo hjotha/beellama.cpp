@@ -576,7 +576,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_supported(
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * sinks = ggml_cuda_fattn_sinks_or_null(dst);
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
@@ -664,6 +664,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     args.partial_meta = partial_meta.get();
     args.dst = (float *) dst->data;
     args.dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
+    args.lse_out = ggml_cuda_fattn_lse_ptr(dst);
     args.scale = scale;
     args.logit_softcap = logit_softcap;
     args.nb01 = Q->nb[1];
@@ -719,7 +720,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * sinks = ggml_cuda_fattn_sinks_or_null(dst);
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
@@ -829,6 +830,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     args.partial_meta = partial_meta.get();
     args.dst = (float *) dst->data;
     args.dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
+    args.lse_out = ggml_cuda_fattn_lse_ptr(dst);
     args.scale = scale;
     args.logit_softcap = logit_softcap;
     args.nb01 = Q->nb[1];

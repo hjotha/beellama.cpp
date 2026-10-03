@@ -8774,6 +8774,24 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
         const ggml_compute_params * params,
         ggml_tensor * dst);
 
+// Position-split LSE export (plan docs/occupancy-placement-plan-20261002.md
+// §3.4): lse = log(sum(exp(score))) in ln, after scale/mask/bias/softcap.
+// When GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT != 0, src[4] carries the LSE
+// tensor (F32 contiguous, ne = { n_head_q, n_q, n_batch }) instead of sinks;
+// sinks and LSE output are mutually exclusive (attach API asserts this).
+// Empty range or fully-masked query: O = 0, LSE = -inf.
+static inline void ggml_fattn_ext_write_lse(
+        const ggml_tensor * dst, int64_t n_head_q, int64_t n_q,
+        int64_t iq1, int64_t iq2, int64_t iq3, float M, float S) {
+    if (dst->op_params[7] == 0) {
+        return;
+    }
+    const ggml_tensor * lse = dst->src[4];
+    const float v = S > 0.0f ? (M + logf(S)) : -INFINITY;
+    float * out = (float *) ((char *) lse->data + ((iq3 * n_q + iq1) * n_head_q + iq2) * sizeof(float));
+    *out = v;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8786,7 +8804,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * sinks = dst->op_params[7] != 0 ? NULL : dst->src[4];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9008,6 +9026,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+            ggml_fattn_ext_write_lse(dst, neq2, N, i1, i2, i3, M, S);
         }
     }
 }
@@ -9020,7 +9039,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * sinks = dst->op_params[7] != 0 ? NULL : dst->src[4];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9294,6 +9313,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32 + tq * DV, nb1);
+            ggml_fattn_ext_write_lse(dst, neq2, N, i1, i2, i3, M[tq], S[tq]);
         }
 
         ir += tile_rows;
@@ -9369,6 +9389,7 @@ static void ggml_flash_attn_ext_reduce_partials(
         }
         // iq1=0, iq3=0 for decode
         memcpy((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
+        ggml_fattn_ext_write_lse(dst, n_q_heads, ne1, 0, q_head, 0, M_final, S_final);
     }
 }
 
@@ -9515,7 +9536,7 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
     const ggml_tensor * k  = dst->src[1];
     const ggml_tensor * v  = dst->src[2];
     const ggml_tensor * mb = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * sinks = dst->op_params[7] != 0 ? NULL : dst->src[4];
     const ggml_tensor * kt = dst->src[5];
     const ggml_tensor * vt = dst->src[6];
     const ggml_tensor * mt = dst->src[7];
@@ -9683,6 +9704,7 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
         for (int64_t d = 0; d < dv; ++d) {
             out[d] = acc[d]*inv;
         }
+        ggml_fattn_ext_write_lse(dst, nh, nq, iq, ih, is, max_score, rowsum);
     }
 }
 
@@ -12630,7 +12652,7 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
 
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * mask = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * sinks = dst->op_params[7] != 0 ? NULL : dst->src[4];
     const ggml_tensor * k_tail = dst->src[5];
     const ggml_tensor * v_tail = dst->src[6];
     const ggml_tensor * tail_mask = dst->src[7];
@@ -12839,6 +12861,7 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
         for (int64_t dim = 0; dim < head_dim; ++dim) {
             output[dim] = accumulator[dim] * inv_sum;
         }
+        ggml_fattn_ext_write_lse(dst, n_query_heads, n_query, query, query_head, stream, maximum, sum);
     }
     return true;
 }

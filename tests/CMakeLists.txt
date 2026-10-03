@@ -713,6 +713,13 @@ target_compile_features(test-position-split-merge PRIVATE cxx_std_17)
 add_test(NAME test-position-split-merge WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge>)
 set_property(TEST test-position-split-merge PROPERTY LABELS main)
 
+add_executable(test-position-split-lse test-position-split-lse.cpp)
+target_include_directories(test-position-split-lse PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+target_compile_features(test-position-split-lse PRIVATE cxx_std_17)
+target_link_libraries(test-position-split-lse PRIVATE ggml)
+add_test(NAME test-position-split-lse WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-lse>)
+set_property(TEST test-position-split-lse PROPERTY LABELS main)
+
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})

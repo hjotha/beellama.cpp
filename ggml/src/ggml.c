@@ -5696,10 +5696,36 @@ void ggml_flash_attn_ext_add_sinks(
 
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT) == 0);
     GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+void ggml_flash_attn_ext_add_lse_out(
+        struct ggml_tensor * a,
+        struct ggml_tensor * lse) {
+    GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(lse != NULL);
+    GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(lse->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(lse));
+    // lse->ne = { n_head_q, n_q, n_batch }; a->ne = { D, n_head_q, n_q, n_batch }
+    GGML_ASSERT(lse->ne[0] == a->ne[1]);
+    GGML_ASSERT(lse->ne[1] == a->ne[2]);
+    GGML_ASSERT(lse->ne[2] == a->ne[3]);
+
+    a->src[4] = lse;
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT, 1);
+}
+
+bool ggml_flash_attn_ext_has_lse_out(
+        const struct ggml_tensor * a) {
+    if (a == NULL || a->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+    return ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT) != 0;
 }
 
 void ggml_flash_attn_ext_add_kv_tail(

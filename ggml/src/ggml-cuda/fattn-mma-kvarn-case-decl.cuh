@@ -14,7 +14,22 @@ using ggml_cuda_fattn_kvarn_window_dequant_kernel_t = void (*)(
         const ggml_cuda_fattn_kvarn_desc *, const ggml_cuda_fattn_kvarn_desc *,
         half *, half *, int, int, int);
 using ggml_cuda_fattn_kvarn_window_finalize_kernel_t = void (*)(
-        float *, const float2 *, float2 *, int);
+        float *, const float2 *, float2 *, float *, int);
+
+// Position-split LSE export (plan §3.4). When OP_PARAM_LSE_OUT != 0, src[4]
+// carries the LSE output tensor (F32, ne = { n_head_q, n_q, n_batch }) instead
+// of sinks; sinks and LSE are mutually exclusive (attach API asserts this).
+static inline bool ggml_cuda_fattn_lse_requested(const ggml_tensor * dst) {
+    return ((const int32_t *) dst->op_params)[7] != 0;
+}
+
+static inline float * ggml_cuda_fattn_lse_ptr(ggml_tensor * dst) {
+    return ggml_cuda_fattn_lse_requested(dst) ? (float *) dst->src[4]->data : nullptr;
+}
+
+static inline const ggml_tensor * ggml_cuda_fattn_sinks_or_null(const ggml_tensor * dst) {
+    return ggml_cuda_fattn_lse_requested(dst) ? nullptr : dst->src[4];
+}
 
 template <int D>
 ggml_cuda_fattn_kvarn_window_dequant_kernel_t ggml_cuda_fattn_kvarn_window_dequant_get_kernel();
@@ -22,8 +37,7 @@ ggml_cuda_fattn_kvarn_window_dequant_kernel_t ggml_cuda_fattn_kvarn_window_dequa
 template<int D>
 ggml_cuda_fattn_kvarn_window_finalize_kernel_t ggml_cuda_fattn_kvarn_window_finalize_get_kernel();
 
-static inline enum ggml_flash_attn_ext_kvarn_domain ggml_cuda_fattn_kvarn_domain(const ggml_tensor * dst) {
-    return (enum ggml_flash_attn_ext_kvarn_domain) ggml_get_op_params_i32(
+static inline enum ggml_flash_attn_ext_kvarn_domain ggml_cuda_fattn_kvarn_domain(const ggml_tensor * dst) {    return (enum ggml_flash_attn_ext_kvarn_domain) ggml_get_op_params_i32(
             dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN);
 }
 

@@ -105,3 +105,31 @@ git checkout -b feat/occupancy-position-split main
 Nenhum ganho presumido; números históricos (§2/D) são estimativas do termo
 Radeon, não latência total. Próximo passo: F1 com 4B P pequeno, depois
 campanha 27B, tudo em porta isolada sem contaminar produção.
+
+## F1 — contrato executável + CPU verde (2026-10-03/04, produção parada)
+- Contrato GGML: `GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT=7` + 
+  `ggml_flash_attn_ext_add_lse_out(a, lse)` / `has_lse_out` (`ggml.h`/`ggml.c`).
+  LSE reusa `src[4]` (slot de sinks); sinks e LSE mutuamente exclusivos
+  (attach asserts). Layout: F32 contíguo `ne={n_head_q, n_q, n_batch}`,
+  `lse[(b*n_q+q)*n_head_q+h]`; vazio/mascarado: O=0, LSE=-inf.
+  Backends sem LSE na rota devem falhar o op (fail-closed), não escrever lixo.
+- CPU (`ggml-cpu/ops.cpp`): helper `ggml_fattn_ext_write_lse` + 5 sites
+  (one-chunk, tiled, split-reduce, kvarn-native, tail_ref), com gate de sinks.
+- CUDA (NÃO compilado ainda — validação pendente no rebuild total):
+  helpers em `fattn-mma-kvarn-case-decl.cuh`, LSE em decode-combine
+  (cobre split e vec), windowed single/multi finalize, portable-combine;
+  gates de sinks; rejeição explícita no portable single-split com LSE.
+  Faltam: FA genérica (`fattn.cu`), MMA fallback genérico e `fattn-tail.cuh`.
+- `tests/test-position-split-lse.cpp` (novo, 306 checks, 0 falhas no build
+  CPU-only `/tmp/build-split-cpu`): Q=1 decode + prefill Q=2/32, GQA 4/2,
+  D=64 e D=256, F16 e Q4_0, causal/cheia/fileira-mascarada, merge E2E
+  FA[0,5)+FA[5,12) vs FA cheia. Gates estritos cumpridos SEM afrouxar:
+  NRMSE≤1e-3, |O|≤1e-2, |LSE|≤1e-2, -inf exato, sem NaN/Inf.
+  Achado registrado (não é afrouxamento): a referência usa KV dequantizado +
+  Q efetivo do kernel (CPU Q4_0 usa dot Q8_0 — kernel LSE bate com referência
+  Q8-FP64 nos 5 decimais; o "erro" vs Q pristino é viés de representação
+  pré-existente, que o softmax cancela em O). KVarN-native e body+tail no
+  F3/integração.
+- Produção parada (`systemctl stop llama-server-root`, VRAM 11881→1 MiB);
+  `test-kvarn` passou (36s) sem contenção. Baseline recuperável em
+  `/tmp/prod-ps-full-20261003.txt` + `/tmp/router-production-baseline.ini`.

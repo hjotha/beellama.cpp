@@ -81,6 +81,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_finalize_kernel(
         float * acc_ptr,
         const float2 * acc_meta_ptr,
         float2 * dst_meta_ptr,
+        float * lse_ptr,
         const int n_rows) {
     const int row = blockIdx.x;
     const int d = threadIdx.x;
@@ -93,6 +94,10 @@ static __global__ void ggml_cuda_fattn_kvarn_window_finalize_kernel(
     v = rowsum > 0.0f ? v / rowsum : 0.0f;
     if (d == 0 && dst_meta_ptr != nullptr) {
         dst_meta_ptr[row] = acc_meta_ptr[row];
+    }
+    if (d == 0 && lse_ptr != nullptr) {
+        // Position-split LSE: lse = m + log(denom); empty -> -inf.
+        lse_ptr[row] = rowsum > 0.0f ? (acc_meta_ptr[row].x + logf(rowsum)) : -INFINITY;
     }
 }
 

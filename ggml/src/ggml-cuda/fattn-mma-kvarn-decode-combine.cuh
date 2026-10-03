@@ -12,6 +12,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
         const float2 * partial_meta,
         float * dst,
         float2 * dst_meta,
+        float * lse_out,
         int n_splits,
         int n_q,
         int n_q_heads) {
@@ -66,6 +67,10 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
     const size_t output_row = ((size_t) stream * n_q + q_index) * n_q_heads + q_head;
     if (tid == 0 && dst_meta != nullptr) {
         dst_meta[output_row] = make_float2(m, denom);
+    }
+    if (tid == 0 && lse_out != nullptr) {
+        // Position-split LSE: lse = m + log(denom); empty -> -inf.
+        lse_out[output_row] = denom > 0.0f ? (m + logf(denom)) : -INFINITY;
     }
 
     if constexpr (D == 64) {

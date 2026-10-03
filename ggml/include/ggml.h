@@ -469,6 +469,7 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT      = 7,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {
@@ -2582,6 +2583,30 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Optional LSE (log-sum-exp) output for position-split attention merge
+    // (docs/occupancy-placement-plan-20261002.md §3.4).
+    // When attached, backends export per-query/head LSE alongside O:
+    //   lse = log(sum(exp(score))) in ln, after scale, mask, bias, softcap.
+    //   Same absolute positions/RoPE, GQA and conventions on both ranges.
+    //   Empty range or fully-masked query: O = 0, LSE = -inf.
+    // The LSE tensor reuses src[4] (the sinks slot): sinks and LSE output are
+    // mutually exclusive (position-split mode rejects sinks). The flag
+    // GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT disambiguates.
+    // Layout contract (F32, contiguous):
+    //   dst->ne = { D, n_head_q, n_q, n_batch }.
+    //   lse->ne = { n_head_q, n_q, n_batch } (3D).
+    //   lse[(b * n_q + q) * n_head_q + h] is the LSE for batch b, query q,
+    //   head h. n_batch is 1 in the initial single-sequence mode.
+    // Backends that cannot export LSE on a given route must fail the op
+    // (return false) instead of silently writing garbage; the position-split
+    // graph validates routes upfront and rejects such configs explicitly.
+    GGML_API void ggml_flash_attn_ext_add_lse_out(
+            struct ggml_tensor * a,
+            struct ggml_tensor * lse);
+
+    GGML_API bool ggml_flash_attn_ext_has_lse_out(
+            const struct ggml_tensor * a);
 
     // Attach per-sequence exact-KV arenas to an existing body FlashAttention
     // operation. query_order packs caller queries in sequence-major order and

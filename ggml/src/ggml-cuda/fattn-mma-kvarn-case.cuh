@@ -268,6 +268,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_single_finalize_kernel(
         const float2 * partial_ptr,
         float * dst_ptr,
         float2 * dst_meta_ptr,
+        float * lse_ptr,
         const uint3 ne01,
         const int ne02,
         const int ne12,
@@ -306,6 +307,10 @@ static __global__ void ggml_cuda_fattn_kvarn_window_single_finalize_kernel(
     if (d == 0 && dst_meta_ptr != nullptr) {
         dst_meta_ptr[row_off] = part_meta;
     }
+    if (d == 0 && lse_ptr != nullptr) {
+        // Position-split LSE: lse = m + log(denom); empty -> -inf.
+        lse_ptr[row_off] = part_meta.y > 0.0f ? (part_meta.x + logf(part_meta.y)) : -INFINITY;
+    }
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
@@ -321,8 +326,9 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * mask = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * sinks = ggml_cuda_fattn_sinks_or_null(dst);
     float2 * const dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
+    float * const lse_out = ggml_cuda_fattn_lse_ptr(dst);
     const enum ggml_flash_attn_ext_kvarn_domain domain = ggml_cuda_fattn_kvarn_domain(dst);
     if (!ggml_cuda_fattn_kvarn_window_enabled() ||
             Q->ne[1] <= 1 || sinks != nullptr ||
@@ -521,7 +527,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             mask ? (int64_t) mask->nb[3] : 0);
         ggml_cuda_kernel_launch_params single_finalize_params(merge_grid, merge_block, 0, stream);
         ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_single_finalize_kernel<DV, ncols1, ncols2>, single_finalize_params,
-            partial.get(), (float *) dst->data, dst_meta, ne01, Q->ne[2], plan.n_kv_heads, gqa_ratio, ntiles_dst);
+            partial.get(), (float *) dst->data, dst_meta, lse_out, ne01, Q->ne[2], plan.n_kv_heads, gqa_ratio, ntiles_dst);
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
@@ -569,7 +575,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const dim3 finalize_grid((uint32_t) n_rows, 1, 1);
     ggml_cuda_kernel_launch_params finalize_params(finalize_grid, merge_block, 0, stream);
     ggml_cuda_kernel_launch(finalize_kernel, finalize_params,
-        (float *) dst->data, acc_meta.get(), dst_meta, n_rows);
+        (float *) dst->data, acc_meta.get(), dst_meta, lse_out, n_rows);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

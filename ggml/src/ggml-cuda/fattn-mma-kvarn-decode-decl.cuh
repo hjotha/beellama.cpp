@@ -27,6 +27,7 @@ struct ggml_cuda_fattn_kvarn_decode_args {
     float2 * partial_meta;
     float * dst;
     float2 * dst_meta;
+    float * lse_out; // position-split LSE (F32 per query/head), nullptr when not requested
     float scale;
     float logit_softcap;
     int64_t nb01;
@@ -53,7 +54,7 @@ struct ggml_cuda_fattn_kvarn_decode_args {
 };
 
 using ggml_cuda_fattn_kvarn_decode_combine_kernel_t = void (*)(
-        const float *, const float2 *, float *, float2 *, int, int, int);
+        const float *, const float2 *, float *, float2 *, float *, int, int, int);
 
 template<int D>
 ggml_cuda_fattn_kvarn_decode_combine_kernel_t ggml_cuda_fattn_kvarn_decode_combine_get_kernel();
