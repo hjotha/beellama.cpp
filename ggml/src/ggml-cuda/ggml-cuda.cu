@@ -2511,6 +2511,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_PAGED_ATTN:
             ggml_cuda_op_paged_attn(ctx, dst);
             break;
+        case GGML_OP_FLASH_ATTN_EXT_LSE:
+            // side-output node: the FLASH_ATTN_EXT kernel that produced
+            // src[0] already wrote this buffer; nothing to launch
+            break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
@@ -6346,6 +6350,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 ggml_backend_buft_is_cuda(op->src[3]->buffer->buft);
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_FLASH_ATTN_EXT_LSE:
+            // must stay on the same backend as src[0] (the FA node that wrote
+            // the buffer); the scheduler pins it, so accept unconditionally
+            return op->type == GGML_TYPE_F32 && op->src[0] != nullptr &&
+                op->src[0]->op == GGML_OP_FLASH_ATTN_EXT;
 
         default:
             return false;

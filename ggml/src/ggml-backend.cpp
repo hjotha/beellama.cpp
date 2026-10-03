@@ -1339,6 +1339,24 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    // pass 4b: pin position-split FA LSE side outputs to the FA node's backend
+    // The GGML_OP_FLASH_ATTN_EXT_LSE node performs no compute: the
+    // FLASH_ATTN_EXT kernel that produced src[0] writes the buffer directly.
+    // It must therefore live on the same backend as that FA node, otherwise
+    // the kernel would write a buffer owned by another backend. Runs after all
+    // heuristics so no later pass can move it (plan §3.4, review C).
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->op != GGML_OP_FLASH_ATTN_EXT_LSE || node->src[0] == NULL) {
+            continue;
+        }
+        const int fa_backend_id = tensor_backend_id(node->src[0]);
+        GGML_ASSERT(fa_backend_id != -1);
+        GGML_ASSERT(ggml_backend_supports_op(sched->backends[fa_backend_id], node));
+        SET_CAUSE(node, "4.fa_lse");
+        tensor_backend_id(node) = fa_backend_id;
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;

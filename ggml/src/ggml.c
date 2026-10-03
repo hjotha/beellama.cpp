@@ -1169,9 +1169,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
     "PAGED_ATTN",
     "REMOTE_ATTN",
+    "FLASH_ATTN_EXT_LSE",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1290,9 +1291,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "paged_attn",
     "remote_attn(q, k, v, pos)",
+    "fa_lse(x)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5703,21 +5705,29 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
-void ggml_flash_attn_ext_add_lse_out(
-        struct ggml_tensor * a,
-        struct ggml_tensor * lse) {
+struct ggml_tensor * ggml_flash_attn_ext_lse_out(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a) {
+    GGML_ASSERT(ctx != NULL);
     GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(lse != NULL);
+    // sinks and LSE export are mutually exclusive
     GGML_ASSERT(a->src[4] == NULL);
-    GGML_ASSERT(lse->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(lse));
-    // lse->ne = { n_head_q, n_q, n_batch }; a->ne = { D, n_head_q, n_q, n_batch }
-    GGML_ASSERT(lse->ne[0] == a->ne[1]);
-    GGML_ASSERT(lse->ne[1] == a->ne[2]);
-    GGML_ASSERT(lse->ne[2] == a->ne[3]);
+    // single attachment per FA node
+    GGML_ASSERT(ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT) == 0);
 
-    a->src[4] = lse;
+    // lse->ne = { n_head_q, n_q, n_batch }; a->ne = { D, n_head_q, n_q, n_batch }
+    const int64_t ne[3] = { a->ne[1], a->ne[2], a->ne[3] };
+
+    struct ggml_tensor * lse = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
+    lse->op     = GGML_OP_FLASH_ATTN_EXT_LSE;
+    lse->src[0] = a;
+    ggml_set_name(lse, "fa_lse");
+
+    const uintptr_t ptr = (uintptr_t) lse;
+    memcpy(&a->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR], &ptr, sizeof(ptr));
     ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT, 1);
+
+    return lse;
 }
 
 bool ggml_flash_attn_ext_has_lse_out(
@@ -5726,6 +5736,16 @@ bool ggml_flash_attn_ext_has_lse_out(
         return false;
     }
     return ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT) != 0;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_get_lse_out(
+        const struct ggml_tensor * a) {
+    if (!ggml_flash_attn_ext_has_lse_out(a)) {
+        return NULL;
+    }
+    uintptr_t ptr = 0;
+    memcpy(&ptr, &a->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR], sizeof(ptr));
+    return (struct ggml_tensor *) ptr;
 }
 
 void ggml_flash_attn_ext_add_kv_tail(

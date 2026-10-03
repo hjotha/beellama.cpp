@@ -18,22 +18,22 @@ using ggml_cuda_fattn_kvarn_window_dequant_kernel_t = void (*)(
 using ggml_cuda_fattn_kvarn_window_finalize_kernel_t = void (*)(
         float *, const float2 *, float2 *, float *, int);
 
-// Position-split LSE export (plan §3.4). When OP_PARAM_LSE_OUT != 0, src[4]
-// carries the LSE output tensor (F32, ne = { n_head_q, n_q, n_batch }) instead
-// of sinks; sinks and LSE are mutually exclusive (attach API asserts this).
+// Position-split LSE export (plan §3.4). The LSE output is a real graph node
+// attached with ggml_flash_attn_ext_lse_out(); src[4] stays reserved for sinks.
+// Internal sub-passes (body/tail) are fresh FA nodes without the attachment,
+// so ggml_flash_attn_ext_get_lse_out() returns NULL for them.
 static inline bool ggml_cuda_fattn_lse_requested(const ggml_tensor * dst) {
-    return ((const int32_t *) dst->op_params)[7] != 0;
+    return ggml_flash_attn_ext_get_lse_out(dst) != nullptr;
 }
 
 static inline float * ggml_cuda_fattn_lse_ptr(ggml_tensor * dst) {
-    // Null-safe: internal sub-passes (body/tail) may carry the flag with a
-    // null src[4]; only the top-level op owns the LSE tensor.
-    return (ggml_cuda_fattn_lse_requested(dst) && dst->src[4] != nullptr) ?
-        (float *) dst->src[4]->data : nullptr;
+    ggml_tensor * lse = ggml_cuda_fattn_lse_requested(dst) ?
+        ggml_flash_attn_ext_get_lse_out(dst) : nullptr;
+    return lse ? (float *) lse->data : nullptr;
 }
 
 static inline const ggml_tensor * ggml_cuda_fattn_sinks_or_null(const ggml_tensor * dst) {
-    return ggml_cuda_fattn_lse_requested(dst) ? nullptr : dst->src[4];
+    return dst->src[4];
 }
 
 // Windowed KVarN prefill gate (documented contract, plan §3.4 matrix). Only

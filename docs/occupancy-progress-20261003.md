@@ -74,7 +74,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -I src tests/test-position-split-merge.cpp \
 git checkout -b feat/occupancy-position-split main
 ```
 
-## Fases 1-7 — pendentes (não declaradas concluídas)
+## Fases 2-7 — pendentes (não declaradas concluídas)
 - F1 (LSE nas rotas): expor F32/query/head após chunks+tail no CUDA
   (windowed/decode Q=1/MMA/portable), após `fa_split_k_reduce` (`split_k>1`)
   ou kernel final (`=1`) no Vulkan, estender `ggml_kv_tail_attention_merge*`
@@ -144,6 +144,67 @@ campanha 27B, tudo em porta isolada sem contaminar produção.
   por hunks confirmou que cada hunk do tail compila isoladamente; após os
   fixes o TU compila com o conteúdo integral.
 - Rebuild total em andamento (`build-optimized`, commit `56c46ce05`).
+
+## F1b — revisão externa A/B/C: contrato LSE como nó real (2026-10-04)
+- Revisão C (fatal, aceita): o LSE em `src[4]` **não tem aresta FA→LSE**. O
+  scheduler podia stagear uma cópia de leaf do tensor LSE no backend do FA, o
+  kernel escrevia nessa cópia e um consumidor posterior lia o buffer original.
+- Contrato novo (`GGML_OP_FLASH_ATTN_EXT_LSE`, op 108, inserido no fim do
+  enum para não deslocar valores existentes):
+  - `ggml_flash_attn_ext_lse_out(ctx, fa)` cria um tensor F32
+    `ne={n_head_q,n_q,n_batch}` com `src[0]=fa`: existe no grafo como **nó**,
+    então a aresta FA→LSE dá ordenação, lifetime de buffer para todos os
+    consumidores e cópia cross-backend correta a partir do buffer do FA.
+  - O FA guarda apenas um back-pointer para o LSE em `op_params[8]` (slot
+    `GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR`, via memcpy de `uintptr_t`); o
+    hash de tensor é por identidade de ponteiro, então o grafo não muda de
+    hash; nada é serializado (RPC não suporta FA-LSE).
+  - `src[4]` volta a ser exclusivamente sinks. `ggml_flash_attn_ext_add_lse_out`
+    foi removida (API interna da branch).
+  - Backends: caso no-op de compute + `supports_op` em CPU
+    (`ggml-cpu.c`/`ggml-cpu.cpp`), CUDA (`ggml-cuda.cu`) e Vulkan
+    (`ggml-vulkan.cpp`); kernels resolvem o destino por
+    `ggml_flash_attn_ext_get_lse_out(dst)`.
+  - Scheduler: novo **pass 4b** em `ggml_backend_sched_split_graph` fixa o
+    LSE no backend do nó FA depois de todos os heurísticos (nenhuma passagem
+    posterior move o nó), com assert de suporte.
+  - `GGML_OP_COUNT` 107→108 e `RPC_PROTO_PATCH_VERSION` 2→3
+    (`ggml-rpc.h` static_assert).
+- F1a Vulkan: causa raiz do desvio `+ln2` encontrada e corrigida. Em
+  `flash_attn_base.glsl` o range de blocos KV por split é
+  `start_j = split_k_index*split_kv/Bc`, `end_j = CEIL_DIV(min(KV,(split_k_index+1)*split_kv), Bc)`;
+  com `split_kv` não múltiplo de `Bc` (bisection forçado) dois splits liam o
+  mesmo bloco, duplicando o denominador (+ln2 em LSE e no O). Agora o split
+  forçado arredonda para múltiplo de `Bc`
+  (`split_kv = ROUNDUP(CEIL_DIV(KV,2), Bc)`, `split_k = CEIL_DIV(KV, split_kv)`,
+  assert `split_k>=2 && split_kv%Bc==0`). `supported_op` declara
+  `KV >= 2*Bc` (Bc de `get_fa_tuning_params`) e **recusa fail-closed** abaixo
+  disso — nada de skip.
+- Testes novos/atualizados (todos fail-closed; recusa é check, não skip):
+  - `tests/test-position-split-lse-vk.cpp` (registrado no CMake): 335 checks,
+    0 falhas. Sonda o limiar do device (neste host `kv_min=128`, Bc=64),
+    exige "recusa abaixo, aceita acima"; O da rota LSE é **bit a bit igual**
+    ao da rota FA sem LSE (NRMSE 0.000e+00 em todos os casos), LSE vs FP64
+    ≤ 9.2e-3 (gate do plano 1e-2); cobertura F16 e Q4_0, decode/prefill,
+    GQA 2/4, máscara causal/cheio/fileira vazia.
+  - `tests/test-position-split-lse-sched.cpp` (novo, revisão C): FA em
+    Vulkan, consumidor `sum` pinado em CPU → 20 checks, 0 falhas. Prova nó de
+    grafo real, ordem FA→LSE (callback de eval), co-localização
+    `lse==fa==Vulkan0`, `splits=2`/`copies=1` e que o consumidor CPU lê
+    exatamente os valores escritos pelo kernel (sum_gpu==sum_cpu), que era o
+    hazard do `src[4]`.
+  - `tests/test-position-split-lse-cu.cpp` (novo, registrado): 7 checks,
+    0 falhas. FA genérico CUDA continua **recusando** LSE (fail-closed) e o
+    nó `FLASH_ATTN_EXT_LSE` é suportado/co-localizado no CUDA para as rotas
+    KVarN.
+  - `tests/test-position-split-lse.cpp` (CPU): 306 checks, 0 falhas com o nó.
+- Regressões: `test-backend-ops -o FLASH_ATTN_EXT` em CPU `4/4 backends
+  passed` (exit 0) e em **Vulkan0 5392 casos OK, `4/4 backends passed`**
+  (exit 0) — a rota split-K corrigida não afeta o FA sem LSE.
+- `ctest -R "position-split|kvarn|test-alloc"`: 22/23. A única falha,
+  `test-kvarn-mtp-sharing-static`, é **pré-existente**: o arquivo
+  `src/llama-kv-cache-kvarn.cpp` está intocado nesta branch e já não contém a
+  string exigida em `main` (`git show main:...| grep -c` = 0).
 
 ## Desenho F2/F3/F4 (para implementar após o rebuild verde)
 - F2a (ubatch/P, pequeno e seguro): campo `position_split_p` (0=desligado)

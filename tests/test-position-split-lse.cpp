@@ -214,12 +214,9 @@ static bool run_fa_cpu(const fa_case & c, int kv_len, int kv_offset,
         }
     }
     ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, kt, vt, mask, 1.0f, 0.0f, 0.0f);
-    ggml_tensor * lse = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nqh, nq, 1);
-    ggml_flash_attn_ext_add_lse_out(fa, lse);
+    ggml_tensor * lse = ggml_flash_attn_ext_lse_out(ctx, fa);
 
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, fa);
-    // lse is src[4] of fa: ensure it is computed (same node). Mark it too.
     ggml_build_forward_expand(gf, lse);
     ggml_graph_compute_with_ctx(ctx, gf, 1);
 

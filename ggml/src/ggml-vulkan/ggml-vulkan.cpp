@@ -185,6 +185,7 @@ static constexpr vk::DeviceQueueCreateFlagBits eInternallySynchronizedKHR = vk::
 #endif
 
 #define ROUNDUP_POW2(M, N) (((M) + (N) - 1) & ~((N) - 1))
+#define ROUNDUP(M, N) (((M) + (N) - 1) / (N) * (N))
 #define CEIL_DIV(M, N) (((M) / (N)) + (((M) % (N)) != 0))
 static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
@@ -12815,9 +12816,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
-    // Position-split LSE (plan §3.4, F1a): src[4] carries the LSE output
-    // instead of sinks (mutually exclusive by attach contract).
-    const ggml_tensor * lse = (dst->op_params[7] != 0 && dst->src[4] != nullptr) ? dst->src[4] : nullptr;
+    // Position-split LSE (plan §3.4, F1a): resolved from the FA node's attached
+    // LSE side output (src[4] stays reserved for sinks).
+    const ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(dst);
     if (lse != nullptr) {
         sinks = nullptr;
         // Fail-closed: only the generic Q4 path below exports LSE (F1a).
@@ -12979,15 +12980,23 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // Position-split LSE (plan §3.4, F1a) is reduced from the split-K (max,
     // denom) partials, so it needs split_k >= 2 (in-kernel split-1 export is
-    // F1b). Split_kv alignment is a performance tiling with no correctness
-    // effect, so an exact bisection is used when forcing; tuned splits >= 2
-    // are kept as-is. Supported() guarantees KV >= 2 when LSE is requested.
+    // F1b).
+    // split_kv MUST stay a multiple of Bc: the shader derives its KV block
+    // range as
+    //   start_j = split_k_index * split_kv / Bc
+    //   end_j   = CEIL_DIV(min(KV, (split_k_index + 1) * split_kv), Bc)
+    // (vulkan-shaders/flash_attn_base.glsl), so an unaligned split_kv makes
+    // two splits read the same block. That duplicates the denominator and
+    // biases LSE by +ln(2) (and O by the same factor). The tuned path above
+    // already rounds to `alignment` (= block_cols == Bc); the forced
+    // bisection must do the same. supported() guarantees KV >= 2*Bc here, so
+    // two non-empty splits always remain.
     if (lse != nullptr) {
-        GGML_ASSERT(KV >= 2);
         if (split_k < 2) {
-            split_kv = (KV + 1) / 2;
-            split_k = 2;
+            split_kv = ROUNDUP(CEIL_DIV(KV, 2), Bc);
+            split_k = CEIL_DIV(KV, split_kv);
         }
+        GGML_ASSERT(split_k >= 2 && split_kv % Bc == 0);
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
@@ -13139,6 +13148,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             // denom) partials to per-row LSE. Row order matches the LSE
             // contract (lse[(b*n_q+q)*nh+h]); verified by
             // test-position-split-lse-vk against the CPU reference.
+            GGML_LOG_DEBUG("%s: FA-LSE split_k=%u split_kv=%u ne=(%lld,%lld,%lld) D=%u gqa=%u N=%u KV=%u\n",
+                __func__, split_k, split_kv, (long long) ne1, (long long) ne2, (long long) ne3,
+                HSV, gqa_ratio, N, KV);
             ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_lse, 1);
             vk_subbuffer lse_buf = ggml_vk_tensor_subbuffer(ctx, lse);
             ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_lse,
@@ -18344,6 +18356,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_FLASH_ATTN_EXT_LSE:
+        // side-output node: the FLASH_ATTN_EXT pass already wrote this buffer
+        break;
+
     case GGML_OP_PAGED_ATTN:
         ggml_vk_paged_attn(ctx, compute_ctx, node);
 
@@ -21201,19 +21217,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_FLASH_ATTN_EXT_LSE:
+            // side-output node written by the FLASH_ATTN_EXT pass; the
+            // scheduler pins it to the FA backend, so accept unconditionally
+            return op->type == GGML_TYPE_F32 && op->src[0] != nullptr &&
+                op->src[0]->op == GGML_OP_FLASH_ATTN_EXT;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 if ((op->src[10] == nullptr) != (op->src[11] == nullptr)) {
                     return false;
                 }
-                // Position-split LSE (plan §3.4, F1a): src[4] carries the LSE
-                // output (F32, ne = { n_head_q, n_q, n_batch }) instead of
+                // Position-split LSE (plan §3.4, F1a): the LSE output is a
+                // real graph node attached with
+                // ggml_flash_attn_ext_lse_out(); src[4] stays reserved for
                 // sinks. KVarN-native and tail paths export no LSE yet (F1b);
                 // the generic Q4 path exports via split-K reduce (split>=2).
-                const bool lse_requested = ggml_get_op_params_i32(
-                    op, GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT) != 0 && op->src[4] != nullptr;
+                const ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(op);
+                const bool lse_requested = lse != nullptr;
                 if (lse_requested) {
-                    const ggml_tensor * lse = op->src[4];
                     if (lse->type != GGML_TYPE_F32 || !ggml_is_contiguous(lse) ||
                             lse->ne[0] != op->ne[1] || lse->ne[1] != op->ne[2] ||
                             lse->ne[2] != op->ne[3]) {
@@ -21222,8 +21243,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (op->src[5] != nullptr) {
                         return false; // tail+LSE: F1b
                     }
-                    if (op->src[1]->ne[1] < 2) {
-                        return false; // need split_k >= 2 for partials
+                    // The LSE route reduces split-K partials, and each split
+                    // must own a non-empty, Bc-aligned KV block range (see the
+                    // split_kv alignment note in ggml_vk_flash_attn). Two
+                    // non-empty splits therefore need KV >= 2*Bc; smaller KV
+                    // needs the in-kernel split-1 export (F1b) and is declined
+                    // fail-closed here.
+                    {
+                        const uint32_t hsk = op->src[1]->ne[0];
+                        const uint32_t hsv = op->src[2]->ne[0];
+                        const uint32_t n_rows = op->ne[1];
+                        const uint32_t n_kv = op->src[1]->ne[1];
+                        const vk_fa_tuning_params tp = get_fa_tuning_params(
+                            device, hsk, hsv, n_rows, n_kv, op->src[1]->type, op->src[2]->type, false);
+                        if (n_kv < 2u * tp.block_cols) {
+                            return false;
+                        }
                     }
                 }
                 vk_kvarn_attn_side k_side = {};

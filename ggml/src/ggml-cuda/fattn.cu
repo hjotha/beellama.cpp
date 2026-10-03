@@ -974,7 +974,7 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
-    const bool lse_requested = ((const int32_t *) dst->op_params)[7] != 0 && dst->src[4] != nullptr;
+    const bool lse_requested = ggml_flash_attn_ext_get_lse_out(dst) != nullptr;
     const bool tail_bodyless = ggml_get_op_params_i32(
         dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0;
     const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&

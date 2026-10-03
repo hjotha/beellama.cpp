@@ -544,6 +544,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
                     src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0)
             ) && op->type == GGML_TYPE_F32;
+        case GGML_OP_FLASH_ATTN_EXT_LSE:
+            // side-output node: src[0] is a FLASH_ATTN_EXT output that wrote
+            // this buffer; nothing to compute here
+            return op->type == GGML_TYPE_F32 && src0 != nullptr &&
+                src0->op == GGML_OP_FLASH_ATTN_EXT && op->ne[3] == 1;
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:

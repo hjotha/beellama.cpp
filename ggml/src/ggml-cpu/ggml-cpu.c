@@ -2121,6 +2121,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_paged_attn(params, tensor);
             } break;
+        case GGML_OP_FLASH_ATTN_EXT_LSE:
+            {
+                // No compute: the LSE side output is written by the
+                // FLASH_ATTN_EXT kernel that produced src[0]. This node only
+                // exists to carry the FA -> LSE graph edge and the buffer
+                // lifetime, so the scheduler must co-locate it with the FA
+                // backend (see ggml_backend_sched_split_graph).
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2382,6 +2390,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_KVARN_STORE:
         case GGML_OP_KVARN_VIEW:
         case GGML_OP_REMOTE_ATTN:
+        case GGML_OP_FLASH_ATTN_EXT_LSE:
             {
                 n_tasks = 1;
             } break;

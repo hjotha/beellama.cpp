@@ -8776,17 +8776,17 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
 
 // Position-split LSE export (plan docs/occupancy-placement-plan-20261002.md
 // §3.4): lse = log(sum(exp(score))) in ln, after scale/mask/bias/softcap.
-// When GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT != 0, src[4] carries the LSE
-// tensor (F32 contiguous, ne = { n_head_q, n_q, n_batch }) instead of sinks;
-// sinks and LSE output are mutually exclusive (attach API asserts this).
+// The LSE tensor is attached to the FA node with
+// ggml_flash_attn_ext_lse_out() and resolved here through
+// ggml_flash_attn_ext_get_lse_out(); src[4] stays reserved for sinks.
 // Empty range or fully-masked query: O = 0, LSE = -inf.
 static inline void ggml_fattn_ext_write_lse(
         const ggml_tensor * dst, int64_t n_head_q, int64_t n_q,
         int64_t iq1, int64_t iq2, int64_t iq3, float M, float S) {
-    if (dst->op_params[7] == 0 || dst->src[4] == nullptr) {
+    const ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(dst);
+    if (lse == nullptr) {
         return;
     }
-    const ggml_tensor * lse = dst->src[4];
     const float v = S > 0.0f ? (M + logf(S)) : -INFINITY;
     float * out = (float *) ((char *) lse->data + ((iq3 * n_q + iq1) * n_head_q + iq2) * sizeof(float));
     *out = v;
