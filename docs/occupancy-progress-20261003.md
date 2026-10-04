@@ -445,11 +445,44 @@ O mecanismo do §3.3 foi montado e roda em um grafo único com o scheduler real:
 | F1 Vulkan LSE (split_k=1 e >1, F16/Q4) | validado | `test-position-split-lse-vk` 485 checks, O nrmse 7.558e-4, LSE 5.008e-3 | — |
 | F1 alocador/cópia/scheduler/RPC | validado | 230/0, 20/0, diag de clone 232/0 | — |
 | F2 cache por posição, store, allocator, rollback atômico | **pendente** | — | implementar §3.1/§3.2 em `llama-kv-cache-kvarn.*` + `llama-memory-hybrid*` |
-| F3 core duas FA + merge (mecanismo) | **parcial** | `test-position-split-merge-graph`: grafo, scheduler, merge e "um nó abaixo de P" validados; O numérico known-open, causa isolada na cobertura de chaves da FA da CPU (ver acima) | caracterizar a cobertura de chaves da FA de referência, fechar o gate do §4.1 e integrar `build_attn`/`qwen35.cpp` |
+| F3 core duas FA + merge (mecanismo) | **mecanismo validado** | `9a283459a`: aritmética do merge é **exata** (0.000e+00 em O e LSE, 5 formas) contra as saídas de faixa única do mesmo backend; uma faixa mascarada = faixa local exata; ambas mascaradas = O=0 e LSE=-inf; abaixo de P 1 nó de FA e 0 nós no backend overflow (n_kv 8/128/512); `25075 checks, 0 failures` | integrar `build_attn`/`qwen35.cpp` e fechar o par real CUDA/KVarN + Vulkan/Q4 |
 | F3 integração 4B P=512/1024, KL FP64 | **pendente** | — | `build_attn`/`qwen35.cpp` + teste de integração com KL FP64 |
 | F4 snapshots v2 + importação XXL | **pendente** | — | envelope `position_split`, writer/reader/validadores |
 | F5 orçamento + campanha 27B | **pendente** | — | cálculo de P com custos simultâneos + A/B 5x |
 | F7 entrega/canário/rollback | **pendente** | — | baseline conhecido separado; promoção continua não autorizada |
+
+## Achados do merge (2026-10-04, `9a283459a`)
+- **O erro do merge é zero.** Combinando no host as duas saídas de faixa
+  única do mesmo backend (`base` local + `ovf` overflow, ambos com máscara
+  totalmente visível, que é exatamente o que o grafo alimenta o combine) o
+  resultado reproduz a saída fundida do grafo com `max|ΔO| = 0.000e+00` e
+  `max|ΔLSE| = 0.000e+00` nas 5 formas. O NRMSE do merge contra FP64 é
+  praticamente idêntico ao erro de faixa única do backend
+  (ex.: D256 Q1 `1.127e-3` fundido vs `1.036e-3` faixa única).
+- **Layout da máscara:** `ne = {n_kv, n_q, n_kv_heads}` é o único formato que
+  satisfaz `q->ne[2] % mask->ne[2] == 0` em `ggml.c:5639` (o eixo ne[2] é um
+  eixo de cabeça). Formatos com `ne[2] = n_q` causam assert para `n_q=4,
+  n_qh=6`. Este achado invalida as formas testadas antes com `ne[2] = n_q`.
+- **Fidelidade por backend (gate fica com o dono da rota):** com KV F16 no
+  backend Vulkan a faixa única mede `1.0e-3..1.1e-3` em D=256 Q1/Q256, acima
+  do gate de `1e-3`; o merge não contribui para isso. As rotas do produto têm
+  fidelidade medida abaixo do gate: CUDA KVarN `1.7e-4` (`test-kvarn`) e
+  Vulkan Q4 `7.6e-4` (`test-position-split-lse-vk`). KV Q4_0 como faixa local
+  piora o backend (`1.4e-3..1.6e-3`), por isso a faixa local do protótipo
+  continua F16.
+- **ABERTO — máscara causal por query não é aplicada pela FA:** com máscara
+  causal `s <= t` em `ne = {n_kv, n_q, n_kv_heads}`, a FA deste build devolve
+  `NRMSE 0.49..6.8` contra a referência FP64 (o caso Q=1, em que só a chave 0
+  está visível, erra por fator ~2 em relação a "todas visíveis", compatível
+  com a máscara ser ignorada). A máscara local totalmente visível bate
+  (`8.5e-4`). Isto é um defeito do backend FA, não do merge, e precisa ser
+  resolvido antes de F3 integrar a máscara real do overflow.
+- **Abaixo de P** a estrutura está provada com a faixa local em backend
+  distinto do overflow: 1 nó de FA, 0 nós no backend overflow. O número de
+  fidelidade impresso nesse caso (`4.7e-4`, `1.7e-3`, `3.3e-3` para n_kv
+  8/128/512) é da FA da CPU usada como substituta e cresce com n_kv por
+ accumulate F16; o gate de fidelidade da faixa local do produto é o do
+  `test-kvarn` na rota KVarN/CUDA.
 
 ## Desenho F2/F3/F4 (para implementar após o rebuild verde)
 - F2a (ubatch/P, **vigente**): o allocator **DIVIDE** os ubatches comuns na
