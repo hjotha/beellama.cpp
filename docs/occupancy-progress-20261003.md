@@ -451,6 +451,36 @@ O mecanismo do §3.3 foi montado e roda em um grafo único com o scheduler real:
 | F5 orçamento + campanha 27B | **pendente** | — | cálculo de P com custos simultâneos + A/B 5x |
 | F7 entrega/canário/rollback | **pendente** | — | baseline conhecido separado; promoção continua não autorizada |
 
+## Tail KVarN com LSE: gates duros, ainda reprovando (2026-10-04)
+`tests/test-kvarn` não aceita mais known-open: as três formas de tail são
+gateadas como as demais e a matriz fica **vermelha** (`18 shapes evaluated, 0
+failing, 8 tail-shape violations`).
+- `d256-q1-tail`: `NRMSE(O)=0.999961`, `max_abs(O)=5.3e+03`,
+  `max_abs(LSE)=16199.6`.
+- `d256-q256-tail`: `NRMSE(O)=2.02e-3`, `max_abs(LSE)=1.03e-2`.
+- `d256-q512-tail`: `NRMSE(O)=1.0`, `max_abs(O)=3.12e+04`,
+  `max_abs(LSE)=22565.6`.
+- **Não é defeito de LSE:** `attach_max_abs` entre a rota com LSE e a rota sem
+  LSE é `~3e-8` nas três formas; o controle CPU contra FP64 é `6e-7..1e-3`. As
+  duas rotas GPU estão igualmente erradas, logo o defeito está no caminho do
+  tail em si, não no attachment de LSE.
+- **Leitura de memória não inicializada:** os valores mudam entre execuções
+  idênticas (`max_abs(O)` de `3.17e+04`, `3.28e+04`, `4.69e+04`, `5.3e+03` na
+  mesma forma), assinatura de buffer não preenchido, não de arredondamento.
+- Layouts já conferidos e coerentes: a FA de tile escreve `(max, denom)` em
+  `dst_final_meta` quando `gridDim.y == 1` e em `dst_meta` quando há split, e
+  `flash_attn_combine_results` escreve `(sequence*ne01 + col)*ne02 + head`, que é
+  exatamente o índice lido por
+  `k_flash_attn_ext_tail_indexed_small`/`..._partials_merge`. No teste
+  `rd->ne[0] == 6 + tail_stride`, então `body_packed == false` e o corpo não é
+  reempacotado.
+- Telemetria das três formas: `prefill=1, mma=0, vec=0, split=0, portable=0`,
+  isto é, a passagem de corpo e a de tail caem na rota genérica (`dispatch`),
+  não nas entradas KVarN. `GGML_CUDA_FATTN_KVARN_ENTRY_COMPACT_TAIL` declina.
+- Próximo passo: instrumentar `k_flash_attn_ext_tail_indexed_small` com
+  sentinel em `body_meta`/`tail_meta`/`scores` para localizar qual buffer chega
+  não inicializado nas formas `q1` e `q512` (as duas com `NRMSE ≈ 1`).
+
 ## Achados do merge (2026-10-04, `9a283459a`)
 - **O erro do merge é zero.** Combinando no host as duas saídas de faixa
   única do mesmo backend (`base` local + `ovf` overflow, ambos com máscara

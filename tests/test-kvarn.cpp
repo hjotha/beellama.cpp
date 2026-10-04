@@ -6240,12 +6240,11 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
             int  exact_tail_current_tokens;
             bool exact_tail_bodyless;
             bool fp64_reference;
-            // Known-open shapes are measured and printed on every run with
-            // their exact numbers, but do not fail the suite: they track
-            // defects that predate the position-split work and are listed in
-            // docs/occupancy-progress-20261003.md. They are never counted as
-            // covered by plan section 3.4.
-            bool known_open;
+            // Tail shapes carry the same gates as every other shape. Defects
+            // that predate the position-split work are tracked in
+            // docs/occupancy-progress-20261003.md and still fail the suite;
+            // they are never counted as covered by plan section 3.4.
+            bool tail;
         };
         // fp64_reference = false: the FP64 reference models the main KV range
         // only, so tail shapes are gated against the CPU route driven with the
@@ -6285,9 +6284,9 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
                 va_start(ap, fmt);
                 vsnprintf(buf, sizeof(buf), fmt, ap);
                 va_end(ap);
-                if (sh.known_open) {
+                if (sh.tail) {
                     open_issues.push_back(tag + ": " + buf);
-                    std::fprintf(stderr, "[LSEOPEN] %s: %s\n", tag.c_str(), buf);
+                    std::fprintf(stderr, "[LSEFAIL-TAIL] %s: %s\n", tag.c_str(), buf);
                     return;
                 }
                 failures.push_back(tag + ": " + buf);
@@ -6512,16 +6511,20 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
                     st_lse.route_families);
             std::fflush(stdout);
         }
-        std::printf("LSE parity %s: %d shapes evaluated, %zu failing, %zu known-open\n",
+        std::printf("LSE parity %s: %d shapes evaluated, %zu failing, %zu tail-shape violations\n",
                 label, checked, failures.size(), open_issues.size());
         std::fflush(stdout);
         for (const std::string & f : failures) {
             std::printf("  FAILED %s\n", f.c_str());
         }
+        // Tail-shape violations are tracked separately but still fail the
+        // matrix: a tracked defect is not a passing gate.
         for (const std::string & f : open_issues) {
-            std::printf("  OPEN   %s\n", f.c_str());
+            std::printf("  TAIL   %s\n", f.c_str());
         }
-        require(failures.empty(),
+        // require() aborts, which drops buffered stdout: flush the report first.
+        std::fflush(stdout);
+        require(failures.empty() && open_issues.empty(),
                 "position-split LSE structural matrix has failing shapes");
     }
 
