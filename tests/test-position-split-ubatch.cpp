@@ -48,17 +48,20 @@ static llama_ubatch make_ubatch(uint32_t n_tokens, llama_pos pos0, uint32_t n_ke
     data->n_seq_id.assign(n_tokens, 1);
     data->seq_id.resize(n_tokens);
     data->output.assign(n_tokens, 0);
-    data->seq_id_unq = { 0 };
+    // Non-zero sequence ids: a zeroed or never-written pointer must not be able
+    // to look like a pass (review 5, R1).
+    const llama_seq_id kSeq = 7;
+    data->seq_id_unq = { kSeq };
     data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
-    data->seq_idx[0] = 0;
-    data->seq_id_data = { 0 };
+    data->seq_idx[kSeq] = 0;
+    data->seq_id_data.assign(n_tokens, kSeq);
 
     for (uint32_t i = 0; i < n_tokens; ++i) {
         data->token[i] = llama_token(1000 + i);
         data->pos[i]   = pos0 + llama_pos(i);
         // The trailing n_keep_tail tokens are the protected window.
         data->output[i] = (n_keep_tail > 0 && i + n_keep_tail >= n_tokens) ? 1 : 0;
-        data->seq_id[i] = data->seq_id_data.data();
+        data->seq_id[i] = data->seq_id_data.data() + i;
     }
 
     ub.data       = data;
@@ -142,6 +145,35 @@ int main() {
             for (uint32_t i = 0; i < out[1].n_tokens; ++i) {
                 check(out[1].token[i] == in[0].token[out[0].n_tokens + i], "tail token identity");
             }
+            // R1: the halves own their sequence ids. Real consumers dereference
+            // these pointers (llama-memory-recurrent.cpp), so both halves must
+            // resolve to the expected ids and stay valid after the source
+            // ubatch is released and after the results are moved.
+            const auto check_ids = [&](const llama_ubatch & ub, const std::string & tag) {
+                for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                    check(ub.seq_id[i] != nullptr, tag + ": seq_id pointer is not null");
+                    if (ub.seq_id[i] == nullptr) {
+                        return;
+                    }
+                    check(ub.n_seq_id[i] == 1, tag + ": n_seq_id");
+                    for (int32_t k = 0; k < ub.n_seq_id[i]; ++k) {
+                        check(ub.seq_id[i][k] == 7, tag + ": sequence id value");
+                    }
+                }
+            };
+            check_ids(out[0], "head");
+            check_ids(out[1], "tail");
+            {
+                // Release the source before dereferencing the halves again.
+                std::vector<llama_ubatch> moved;
+                moved.push_back(std::move(out[0]));
+                moved.push_back(std::move(out[1]));
+                in.clear();
+                in.shrink_to_fit();
+                check_ids(moved[0], "head after source release");
+                check_ids(moved[1], "tail after source release");
+                out = std::move(moved);
+            }
         }
     }
 
@@ -220,6 +252,35 @@ int main() {
             check(!any_cross, std::string(occ.name) + ": no output ubatch crosses P");
             check(total_out == occ.total, std::string(occ.name) + ": token count preserved");
         }
+    }
+
+    // 5b) R2: a valid ubatch followed by a rejected one must leave no partial
+    // output, because init_batch treats the helper as all-or-nothing.
+    {
+        std::vector<llama_ubatch> in;
+        in.push_back(make_ubatch(64, 0, NKEEP));      // valid, below P
+        in.push_back(make_ubatch(12, 501, NKEEP));    // rejected: window crosses P
+        std::vector<llama_ubatch> out;
+        std::string err;
+        check(!llama_position_split::divide_ubatches_at_p(in, P, NKEEP, out, err),
+              "R2: batch with a rejected ubatch fails");
+        check(out.empty(), "R2: rejection after a valid prefix leaves no output");
+        check(!err.empty(), "R2: rejection carries a reason");
+    }
+
+    // 5c) R2: a valid prefix followed by a rejection *after* the division point
+    // must also leave no output.
+    {
+        std::vector<llama_ubatch> in;
+        in.push_back(make_ubatch(300, 400, NKEEP));   // divided at P
+        // positions [509,515): the protected window is the trailing 4 tokens
+        // [511,515), which straddles P = 512 and must be rejected.
+        in.push_back(make_ubatch(6, 509, NKEEP));
+        std::vector<llama_ubatch> out;
+        std::string err;
+        check(!llama_position_split::divide_ubatches_at_p(in, P, NKEEP, out, err),
+              "R2c: batch with a rejected ubatch after a divided one fails");
+        check(out.empty(), "R2c: no partial output survives the rejection");
     }
 
     // 6) P == 0 disables the split entirely (current behaviour).

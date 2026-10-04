@@ -141,6 +141,27 @@ static llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vec
     data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
     out.n_seqs_unq = src.n_seqs_unq;
 
+    // The sequence id storage is filled completely *before* any pointer is
+    // published: publishing data() + size() while the vector still grows hands
+    // out a null pointer on the first token and dangling pointers after every
+    // reallocation (review 5, R1). Consumers dereference these pointers in
+    // llama-memory-recurrent.cpp.
+    std::vector<size_t> id_offset(sel.size(), 0);
+    size_t total_ids = 0;
+    for (size_t i = 0; i < sel.size(); ++i) {
+        id_offset[i] = total_ids;
+        total_ids += size_t(src.n_seq_id[sel[i]]);
+    }
+    data->seq_id_data.resize(total_ids);
+    size_t cursor = 0;
+    for (size_t i = 0; i < sel.size(); ++i) {
+        const int32_t t = sel[i];
+        const int32_t n_ids = src.n_seq_id[t];
+        for (int32_t k = 0; k < n_ids; ++k) {
+            data->seq_id_data[cursor + size_t(k)] = src.seq_id[t][k];
+        }
+        cursor += size_t(n_ids);
+    }
     for (size_t i = 0; i < sel.size(); ++i) {
         const int32_t t = sel[i];
         data->token[i] = src.token[t];
@@ -149,12 +170,7 @@ static llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vec
         }
         data->n_seq_id[i] = src.n_seq_id[t];
         data->output[i]  = src.output[t];
-
-        const int32_t n_ids = src.n_seq_id[t];
-        data->seq_id[i] = data->seq_id_data.data() + data->seq_id_data.size();
-        for (int32_t s = 0; s < n_ids; ++s) {
-            data->seq_id_data.push_back(src.seq_id[t][s]);
-        }
+        data->seq_id[i]  = data->seq_id_data.data() + id_offset[i];
     }
     for (uint32_t s = 0; s < src.n_seqs_unq; ++s) {
         data->seq_idx[data->seq_id_unq[s]] = src.seq_idx[data->seq_id_unq[s]];
@@ -186,6 +202,11 @@ bool llama_position_split::divide_ubatches_at_p(
     out.clear();
     error.clear();
 
+    // All-or-nothing (review 5, R2): the caller relies on `out` being empty on
+    // failure, so the result is staged and published only when every ubatch was
+    // accepted.
+    std::vector<llama_ubatch> staged;
+
     for (const llama_ubatch & ub : in) {
         // Absolute position range of this ubatch.
         llama_pos pos_min = ub.pos[0];
@@ -198,7 +219,7 @@ bool llama_position_split::divide_ubatches_at_p(
         const bool crosses = pos_min < llama_pos(p) && pos_max >= llama_pos(p);
 
         if (!crosses) {
-            out.push_back(ub);
+            staged.push_back(ub);
             continue;
         }
 
@@ -251,10 +272,11 @@ bool llama_position_split::divide_ubatches_at_p(
             error = "position split produced an empty half";
             return false;
         }
-        out.push_back(llama_ubatch_subset(ub, head));
-        out.push_back(llama_ubatch_subset(ub, tail));
+        staged.push_back(llama_ubatch_subset(ub, head));
+        staged.push_back(llama_ubatch_subset(ub, tail));
     }
 
+    out = std::move(staged);
     return true;
 }
 
