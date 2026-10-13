@@ -190,10 +190,10 @@ def main() -> None:
         "every release cache must fall back to the same backend/toolchain key in the parent channel",
     )
     require(
-        release.count("if: ${{ success() || cancelled() }}")
+        release.count("if: ${{ success() && !cancelled() }}")
         == save_count,
-        "every rolling-cache save must run for successful and cancelled builds, "
-        "but skip failed builds so a crash cannot evict healthy entries",
+        "every rolling-cache save must run for successful builds, "
+        "and skip cancelled/failed builds",
     )
     require(
         "always() && needs.release-meta.outputs.preview == 'true'" not in release,

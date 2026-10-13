@@ -8,6 +8,7 @@ import os
 import threading
 
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
 import re
 import json
 from json import JSONDecodeError
@@ -151,6 +152,8 @@ class ServerProcess:
         }
         if "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
+        if "TMPDIR" not in os.environ:
+            env["TMPDIR"] = "/var/tmp"
         if self.external_server:
             print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
             return
@@ -158,10 +161,21 @@ class ServerProcess:
             server_path = self.server_path
         elif "LLAMA_SERVER_BIN_PATH" in os.environ:
             server_path = os.environ["LLAMA_SERVER_BIN_PATH"]
-        elif os.name == "nt":
-            server_path = "../../../build/bin/Release/llama-server.exe"
         else:
-            server_path = "../../../build/bin/llama-server"
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            candidates = [
+                os.path.join(repo_root, "build-optimized", "bin", "llama-server"),
+                os.path.join(repo_root, "build", "bin", "llama-server"),
+                os.path.join(repo_root, "build", "bin", "Release", "llama-server.exe") if os.name == "nt" else None,
+                "../../../build/bin/Release/llama-server.exe" if os.name == "nt" else "../../../build/bin/llama-server",
+            ]
+            server_path = None
+            for cand in candidates:
+                if cand and os.path.exists(cand):
+                    server_path = cand
+                    break
+            if server_path is None:
+                server_path = os.path.join(repo_root, "build-optimized", "bin", "llama-server")
         server_args = [
             "--host",
             self.server_host,
@@ -285,13 +299,30 @@ class ServerProcess:
         if self.chat_template:
             server_args.extend(["--chat-template", self.chat_template])
         if self.chat_template_file:
-            server_args.extend(["--chat-template-file", self.chat_template_file])
+            ct_path = self.chat_template_file
+            if not os.path.isabs(ct_path) and not os.path.exists(ct_path):
+                test_dir = os.path.dirname(os.path.abspath(__file__))
+                for cand in [
+                    os.path.normpath(os.path.join(test_dir, ct_path)),
+                    os.path.normpath(os.path.join(test_dir, "unit", ct_path)),
+                    os.path.normpath(os.path.join(repo_root, ct_path.replace("../", ""))),
+                ]:
+                    if os.path.exists(cand):
+                        ct_path = cand
+                        break
+            server_args.extend(["--chat-template-file", ct_path])
         if self.mmproj_url:
             server_args.extend(["--mmproj-url", self.mmproj_url])
         if self.no_mmproj:
             server_args.append("--no-mmproj")
         if self.media_path:
-            server_args.extend(["--media-path", self.media_path])
+            media_path = self.media_path
+            if not os.path.exists(media_path):
+                repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+                cand = os.path.normpath(os.path.join(repo_root, media_path.replace("../", "")))
+                if os.path.exists(cand):
+                    media_path = cand
+            server_args.extend(["--media-path", media_path])
         if self.sleep_idle_seconds is not None:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
@@ -368,11 +399,14 @@ class ServerProcess:
 
         self._output_thread = threading.Thread(target=pump_output, daemon=True)
         self._output_thread.start()
-        if not self._ready_event.wait(timeout_seconds):
+        start_time = time.time()
+        while not self._ready_event.is_set():
             if self._exit_event.is_set():
                 self.process.wait()
                 raise RuntimeError(f"Server process died with return code {self.process.returncode}")
-            raise TimeoutError(f"Server did not start within {timeout_seconds} seconds")
+            if time.time() - start_time >= timeout_seconds:
+                raise TimeoutError(f"Server did not start within {timeout_seconds} seconds")
+            self._ready_event.wait(0.1)
         self.ready = True
 
     def stop(self) -> None:

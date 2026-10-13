@@ -149,18 +149,33 @@ json format_error_response(const std::string & message, const enum error_type ty
 
 bool server_mixed_state_spool_dir(std::string & out) {
     const char * configured = std::getenv("TMPDIR");
-    std::error_code ec;
-    std::filesystem::path dir = (configured && configured[0])
-            ? std::filesystem::absolute(std::filesystem::path(configured))
-            : std::filesystem::temp_directory_path();
-    // Delegate to the shared transaction preflight so the server and the
-    // tested core agree on what "usable disk-backed spool" means.
     std::string err;
-    if (!llama_state_rollback::spool_usable(dir.string(), &err)) {
+    if (configured && configured[0]) {
+        const std::filesystem::path dir = std::filesystem::absolute(std::filesystem::path(configured));
+        if (llama_state_rollback::spool_usable(dir.string(), &err)) {
+            out = dir.string();
+            return true;
+        }
         return false;
     }
-    out = dir.string();
-    return true;
+
+    const std::filesystem::path dir = std::filesystem::temp_directory_path();
+    if (llama_state_rollback::spool_usable(dir.string(), &err)) {
+        out = dir.string();
+        return true;
+    }
+
+#if defined(__linux__)
+    std::error_code ec;
+    if (std::filesystem::is_directory("/var/tmp", ec) && !ec) {
+        if (llama_state_rollback::spool_usable("/var/tmp", &err)) {
+            out = "/var/tmp";
+            return true;
+        }
+    }
+#endif
+
+    return false;
 }
 
 json server_slot_stats::to_json() const {

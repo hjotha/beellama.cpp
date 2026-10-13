@@ -5492,7 +5492,11 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
     }
 
     restored_tail_payload_slots.clear();
-    if (manifest.body_only || !tail || !has_tail_overlay() || (layers.empty() && !tail_metadata_only)) {
+    const bool skip_tail_payload = !tail || !has_tail_overlay() || (layers.empty() && !tail_metadata_only);
+    if (manifest.body_only || skip_tail_payload) {
+        if (manifest.body_only) {
+            // Explicit body-only frame requested or present in state
+        }
         if (tail) {
             if (seq_id == -1) {
                 tail->clear();

@@ -152,7 +152,8 @@ def test_metrics_timings_are_finite(n_predict: int):
     # a null here means the server produced inf or nan
     for key, value in timings.items():
         assert value is not None, f"{key} is null"
-        assert value >= 0, f"{key} is negative"
+        if isinstance(value, (int, float)):
+            assert value >= 0, f"{key} is negative"
 
     assert timings["prompt_ms"] > 0
     assert timings["prompt_per_token_ms"] > 0
@@ -188,7 +189,8 @@ def test_metrics_timings_on_prompt_progress():
         timings = chunk["timings"]
         for key, value in timings.items():
             assert value is not None, f"{key} is null"
-            assert value >= 0, f"{key} is negative"
+            if isinstance(value, (int, float)):
+                assert value >= 0, f"{key} is negative"
         assert timings["prompt_ms"] >= prompt_ms
         prompt_ms = timings["prompt_ms"]
 

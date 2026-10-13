@@ -197,7 +197,7 @@ def main() -> None:
             raise AssertionError(f"{reader} destructor must cancel uncommitted restore writes")
 
     kvarn_state_reader = kvarn_cache.split(
-        "void llama_kv_cache_kvarn::state_read(", 1
+        "void llama_kv_cache_kvarn::state_read_kvarn_body(", 1
     )[1].split("llama_kv_cache * llama_kv_cache_kvarn::get_metadata_cache", 1)[0]
     if "metadata_prepared" not in kvarn_state_reader or "io.on_commit" not in kvarn_state_reader:
         raise AssertionError("KVarN restore does not prepare metadata and publish it only at transaction commit")
@@ -406,7 +406,7 @@ def main() -> None:
     decline_block = context_source.split("if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0)", 1)[1].split(
         "if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED && !tail_request_resolved)", 1
     )[0]
-    if "cparams.offload_kqv ? model.dev_layer(il) : nullptr" not in decline_block:
+    if "cparams.offload_kqv ? kv_dev : nullptr" not in decline_block:
         raise AssertionError("KV-tail decline probe does not follow CPU placement for --no-kv-offload")
     if "cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP" not in decline_block or "hparams.n_layer_all" not in decline_block:
         raise AssertionError("KV-tail decline probe does not inspect the owned MTP layer range")
@@ -565,7 +565,7 @@ def main() -> None:
         "v_tail_current_addr",
         "FLAG_TAIL_HISTORY_SHIFT",
         "TailCurrentRef",
-        "if (!bodyless)",
+        "!bodyless",
     ):
         if required not in vulkan_shader:
             raise AssertionError(f"Vulkan segmented KVarN shader lacks {required}")

@@ -66,9 +66,10 @@ def test_router_chat_completion_stream(model: str, success: bool):
 
 
 def _get_model_ids(is_reload: bool = False, headers: dict | None = None) -> set[str]:
-    res = server.make_request(
-        "GET", "/models" + ("?reload=1" if is_reload else ""), headers=headers
-    )
+    if is_reload:
+        res_reload = server.make_request("POST", "/models/reload", data={}, headers=headers)
+        assert res_reload.status_code == 200
+    res = server.make_request("GET", "/models", headers=headers)
     assert res.status_code == 200
     return {item["id"] for item in res.body.get("data", [])}
 
@@ -427,7 +428,7 @@ def test_router_reload_models():
 
     auth_headers = {"Authorization": f"Bearer {server.api_key}"}
 
-    ids = _get_model_ids()
+    ids = _get_model_ids(headers=auth_headers)
     assert "model-reload-a" in ids
     assert "model-reload-b" in ids
 
@@ -442,7 +443,7 @@ def test_router_reload_models():
         )
 
     try:
-        get_res = server.make_request("GET", "/models?reload=1")
+        get_res = server.make_request("GET", "/models?reload=1", headers=auth_headers)
         assert get_res.status_code == 200
         ids = {item["id"] for item in get_res.body.get("data", [])}
         assert "model-reload-a" in ids, "GET must not mutate the model registry"
@@ -459,7 +460,7 @@ def test_router_reload_models():
         assert reload_res.status_code == 200
         assert reload_res.body.get("success") is True
 
-        ids = _get_model_ids()
+        ids = _get_model_ids(headers=auth_headers)
         assert "model-reload-a" not in ids, "removed model should no longer appear"
         assert "model-reload-b" in ids, "unchanged model should still appear"
         assert "model-reload-c" in ids, "newly added model should appear"

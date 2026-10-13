@@ -6547,7 +6547,6 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-            update_cache = update_cache && task.params.cache_prompt;
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -9729,17 +9728,6 @@ private:
                         }
                         llama_set_snapkv_prefill_end(ctx_tgt, slot.id, snapkv_prefill_end);
                         llama_set_snapkv_prefill_end(ctx_dft, slot.id, snapkv_prefill_end);
-
-                        // this is to signal the client that the request has started processing
-                        if (slot.task->params.stream) {
-                            if (slot.task->params.return_progress) {
-                                // send initial 0% progress update if needed
-                                send_partial_response(slot, {}, true);
-                            } else {
-                                // otherwise, for streaming without progress, signal HTTP to send the headers (i.e. 200 status)
-                                send_partial_response(slot, {}, false, true);
-                            }
-                        }
                     } // end of SLOT_STATE_STARTED
 
                     if (!slot.can_split()) {
