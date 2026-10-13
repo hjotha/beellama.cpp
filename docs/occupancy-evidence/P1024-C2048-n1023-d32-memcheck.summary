@@ -1,0 +1,10 @@
+tool=memcheck
+P=1024 C=2048 n_tokens=1023 decode=32 port=20700
+sanitizer_pid=176569 sanitizer_exit=0 target_pid=176580 forced_cleanup=0
+http=200 tokens_evaluated=1023
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P1024-C2048-n1023-d32-memcheck.log

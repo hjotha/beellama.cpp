@@ -140,6 +140,18 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
  * server_tokens is a helper to manage the input tokens and image for the server.
  * it is made this way to simplify the logic of KV cache management.
  */
+// Resolve a DISK-BACKED mixed-state spool directory and make sure
+// <dir>/beellama-mixed-state exists.
+//
+// The mixed-state reader (src/llama-kv-cache-kvarn.cpp) refuses a tmpfs/ramfs
+// spool - spooling a multi-gigabyte prompt snapshot into RAM would be another
+// anonymous-RAM-sized copy that merely looks like disk IO - and then mkstemp's
+// inside <TMPDIR>/beellama-mixed-state, so the directory must exist too. Every
+// caller that needs a mixed state to be writable (restore, rollback, conversion)
+// must resolve the spool through this helper and fail closed when it returns
+// false. Returns false without touching `out` when no usable directory exists.
+bool server_mixed_state_spool_dir(std::string & out);
+
 struct server_tokens {
     bool has_mtmd = false;
 
@@ -376,6 +388,19 @@ struct server_slot_stats {
     std::string cache_source     = "none";
     std::string cache_reason     = "none";
 
+    // Cache work that happens before or within prompt processing. Slot/RAM
+    // phases are outside prompt_ms; checkpoint restore is also exposed
+    // separately so user-visible wall time can be reconciled.
+    double cache_slot_ms               = 0.0;
+    double cache_ram_save_ms                 = 0.0;
+    double cache_ram_load_ms                 = 0.0;
+    double cache_ram_restore_prepare_ms      = 0.0;
+    double cache_ram_restore_commit_ms       = 0.0;
+    double cache_ram_update_ms               = 0.0;
+    double cache_checkpoint_restore_ms       = 0.0;
+    double cache_checkpoint_prepare_ms       = 0.0;
+    double cache_checkpoint_commit_ms        = 0.0;
+
     // speculative decoding stats
     // note: the per-position breakdown lives in server_slot, it is not needed in a task result
     uint64_t n_draft_tokens      = 0;
@@ -450,6 +475,83 @@ struct server_slot_stats {
     }
 
     // false if the slot never started, i.e. the task result carries no stats
+    // F5 per-token decode timing. TEST-ONLY, env-gated (LLAMA_SERVER_F5_PER_TOKEN_TIMING=1),
+    // bounded and allocation-free after the first reserve: two vector pushes per generated
+    // token and NOTHING else -- no logging, no JSON, no I/O in the decode loop. The whole
+    // payload is serialised once, batched, in the FINAL result.
+    //
+    // Why this exists: client-side SSE arrival gaps are NOT per-token latency. The native
+    // endpoint withholds text while a UTF-8 character is incomplete (server-context.cpp
+    // send_partial_response is only reached when validate_utf8() shows no partial character),
+    // so some generated tokens produce NO stream event while slot.stats.n_gen still advances.
+    // Streaming clients therefore see fewer events than tokens and can never recover true
+    // per-token timing. These samples are taken on the token path, after the context is
+    // synchronized, and are immune to that withholding and to client buffering.
+    static constexpr size_t F5_PER_TOKEN_MAX = 16384;
+
+    bool         f5_per_token_enabled  = false;
+    bool         f5_truncated          = false;
+    bool         f5_spec_seen          = false;   // any token accepted via speculation/MTP
+    int64_t      f5_decode_iterations  = 0;
+    int64_t      f5_tokens_recorded    = 0;
+    int64_t      f5_last_token_us      = 0;
+    double       f5_ttft_ms            = -1.0; // first-token latency, EXCLUDED from token_ms
+    std::vector<double>   f5_token_ms;        // inter-emission latency per generated token
+    std::vector<int32_t> f5_tokens_per_iter; // tokens attributed to each decode iteration
+    int64_t      f5_iter_token_base_         = 0;
+    std::vector<double>   f5_iter_ms;         // per decode iteration (authoritative step time)
+
+    void f5_arm(int64_t t_now_us) {
+        f5_token_ms.clear(); f5_tokens_per_iter.clear(); f5_iter_ms.clear();
+        f5_decode_iterations = 0; f5_tokens_recorded = 0; f5_truncated = false;
+        f5_spec_seen = false; f5_last_token_us = t_now_us; f5_iter_token_base_ = 0;
+        f5_ttft_ms = -1.0;
+        if (!f5_per_token_enabled) { return; }
+        // Reserve the WHOLE bounded capacity up front, so the decode loop can never
+        // reallocate (and never allocate at all) after this point.
+        f5_token_ms.reserve(F5_PER_TOKEN_MAX);
+        f5_iter_ms.reserve(F5_PER_TOKEN_MAX);
+        f5_tokens_per_iter.reserve(F5_PER_TOKEN_MAX);
+    }
+
+    // one generated token; t_now_us must be taken after the ctx is synchronized
+    void f5_record_token(int64_t t_now_us, bool speculative) {
+        if (!f5_per_token_enabled) { f5_last_token_us = t_now_us; return; }
+        const double ms = f5_last_token_us > 0 ? (double) (t_now_us - f5_last_token_us) / 1000.0 : 0.0;
+        f5_last_token_us = t_now_us;
+        if (speculative) { f5_spec_seen = true; }
+        // Exact counter for EVERY generated token, including the first one and
+        // including tokens dropped once the bounded capture is full, so the consumer
+        // can always reconcile samples against tokens_predicted.
+        f5_tokens_recorded++;
+        // The FIRST interval starts at request/reset time, so it spans prompt
+        // processing and is TTFT, not a decode step. It is recorded separately and
+        // deliberately excluded from token_ms (decode p95 input).
+        if (f5_ttft_ms < 0.0) { f5_ttft_ms = ms; return; }
+        if ((int64_t) f5_token_ms.size() < (int64_t) F5_PER_TOKEN_MAX) {
+            f5_token_ms.push_back(ms);
+        } else {
+            f5_truncated = true;
+        }
+    }
+
+    // close one decode iteration (1 token in the canonical non-speculative path)
+    void f5_close_iteration(double iter_ms) {
+        if (!f5_per_token_enabled) { return; }
+        if ((int64_t) f5_iter_ms.size() < (int64_t) F5_PER_TOKEN_MAX) {
+            f5_iter_ms.push_back(iter_ms);
+            f5_tokens_per_iter.push_back((int32_t) (f5_tokens_recorded - f5_iter_token_base_));
+            f5_decode_iterations++;
+        } else {
+            f5_truncated = true;
+        }
+    }
+
+    // Call f5_begin_iteration() at the START of each decode iteration, before any
+    // token is recorded for it; f5_close_iteration() then attributes exactly the tokens
+    // produced by that iteration (1 in the canonical non-speculative path).
+    void f5_begin_iteration() { f5_iter_token_base_ = f5_tokens_recorded; }
+
     bool is_set() const {
         return t_start > 0;
     }

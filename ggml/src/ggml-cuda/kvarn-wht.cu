@@ -210,6 +210,24 @@ static __global__ void kvarn_wht_wave_kernel(
 }
 
 void ggml_cuda_op_kvarn_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (getenv("F4_RP_KDISC") != nullptr) {
+        auto wh = [](const ggml_tensor * t) -> unsigned long long {
+            if (!t || !t->buffer || !t->data) { return 0; }
+            std::vector<uint8_t> b(size_t(ggml_nbytes(t)));
+            ggml_backend_tensor_get(t, b.data(), 0, b.size());
+            unsigned long long h = 1469598103934665603ull;
+            for (size_t i = 0; i < b.size(); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+            return h;
+        };
+        const ggml_tensor * sc = dst->src[0];
+        fprintf(stderr, "KDISC-WHT before src=%s ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu] "
+                "type=%s srchash=%016llx dsthash=%016llx\n",
+                sc ? ggml_type_name(sc->type) : "-",
+                sc ? (long long) sc->ne[0] : -1, sc ? (long long) sc->ne[1] : -1,
+                sc ? (long long) sc->ne[2] : -1,
+                sc ? (size_t) sc->nb[0] : 0, sc ? (size_t) sc->nb[1] : 0, sc ? (size_t) sc->nb[2] : 0,
+                ggml_type_name(dst->type), sc ? wh(sc) : 0ull, wh(dst));
+    }
     const ggml_tensor * src0 = dst->src[0];
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
     GGML_ASSERT(dst->type == src0->type);
@@ -255,6 +273,26 @@ void ggml_cuda_op_kvarn_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         case GGML_TYPE_F16:  GGML_CUDA_KVARN_WHT_TYPE(half); break;
         case GGML_TYPE_BF16: GGML_CUDA_KVARN_WHT_TYPE(nv_bfloat16); break;
         default: GGML_ABORT("unsupported KVarN WHT input type");
+    }
+    if (getenv("F4_RP_KDISC") != nullptr) {
+        cudaStreamSynchronize(stream);
+        auto wh2 = [](const ggml_tensor * tt) -> unsigned long long {
+            if (!tt || !tt->buffer || !tt->data) { return 0; }
+            std::vector<uint8_t> b(size_t(ggml_nbytes(tt)));
+            ggml_backend_tensor_get(tt, b.data(), 0, b.size());
+            unsigned long long h = 1469598103934665603ull;
+            for (size_t ii = 0; ii < b.size(); ++ii) { h ^= b[ii]; h *= 1099511628211ull; }
+            return h;
+        };
+        const ggml_tensor * sc2 = dst->src[0];
+        fprintf(stderr, "KDISC-WHT after  src=%s ne=[%lld,%lld,%lld] srchash=%016llx "
+                "dsthash=%016llx dst_ne=[%lld,%lld,%lld] dst_nb=[%zu,%zu,%zu,%zu]\n",
+                sc2 ? ggml_type_name(sc2->type) : "-",
+                sc2 ? (long long) sc2->ne[0] : -1, sc2 ? (long long) sc2->ne[1] : -1,
+                sc2 ? (long long) sc2->ne[2] : -1, sc2 ? wh2(sc2) : 0ull, wh2(dst),
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+                (size_t) dst->nb[0], (size_t) dst->nb[1], (size_t) dst->nb[2],
+                (size_t) dst->nb[3]);
     }
 #undef GGML_CUDA_KVARN_WHT_TYPE
 #undef GGML_CUDA_KVARN_WHT_LAUNCH

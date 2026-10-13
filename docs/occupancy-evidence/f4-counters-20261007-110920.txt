@@ -1,0 +1,4 @@
+below-P prefix : auto-1ee08d954f58561c-3d5802841d3db425-556.bin sha=3ffe4aa267f9119fac64d4ec
+GPU ready: inactive gpu=0
+launched setup P=1024 slots=/home/hjotha/f4-spool/cnt-20261007T110920Z/setup caps=10,1200
+NO 1200-TOKEN SNAPSHOT (above-P control unavailable)

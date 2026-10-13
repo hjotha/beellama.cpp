@@ -487,10 +487,14 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
             const int rest = target % (SLICES * gqa_head_count);
             const int slice = rest / gqa_head_count;
             const int h = rest % gqa_head_count;
-            const half * q_row = (const half *) q_sh[qt] + h * (2 * Q_STRIDE2) + slice * RECORD_DIM;
+            const float * q_original = qt < q_count && q_head0 + h < n_q_heads ?
+                (const float *) (Q + nb03 * stream + nb02 * (q_head0 + h) + nb01 * (q_base + qt)) : nullptr;
             float zq = 0.0f;
             for (int dim = 0; dim < RECORD_DIM; ++dim) {
-                const float q_val = __half2float(q_row[dim]);
+                // Fold the record axis into the original F32 query, then round
+                // once for MMA. Rounding Q*scale first and q*axis_scale again
+                // adds avoidable error; the zero-point term also needs F32 Q.
+                const float q_val = q_original ? q_original[slice * RECORD_DIM + dim] * scale : 0.0f;
                 zq += KVARN_K_AXIS_ZP(slice, dim) * q_val;
                 const float q_prime = KVARN_K_AXIS_SCALE(slice, dim) * q_val;
                 ((half *) q_sh[qt])[h * (2 * Q_STRIDE2) + slice * RECORD_DIM + dim] =

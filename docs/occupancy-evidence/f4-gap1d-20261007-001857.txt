@@ -1,0 +1,12 @@
+GPU ready: inactive gpu=0
+launched P=256 pid=2947366 health=200 split=[off]
+R1-populate ERROR {'code': 500, 'message': 'model name=qwen-3.8-27b failed to load', 'type': 'server_error'}
+PREREQ FAIL: split not enabled for P=256 after first request
+    [46513] 0.05.391.660 E llama_init_from_model: failed to initialize the context: position-split KV exige todas as 16 camadas full no backend remoto (recebido 1)
+    [46513] 0.05.391.666 E cmn  create_conte: failed to create context with model '/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+    [46513] 0.05.391.679 E cmn  common_init_: failed to create context with model '/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+    [46513] 0.05.391.684 E srv    load_model: failed to create_context with model '/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf'
+    [46513] 0.05.392.458 E srv  llama_server: exiting due to model loading error
+    0.05.896.283 W srv    operator(): got exception: {"error":{"code":500,"message":"model name=qwen-3.8-27b failed to load","type":"server_error"}}
+=== SUMMARY ===
+DONE

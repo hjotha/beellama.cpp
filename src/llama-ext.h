@@ -5,6 +5,8 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+
+#include <string>
 #include "llama-kv-memory-stats.h"
 
 #include <array>
@@ -47,6 +49,78 @@ LLAMA_API bool llama_model_mtp_weights_set_resident(
         llama_model * model, bool resident, llama_mtp_weights_fault fault = llama_mtp_weights_fault::none);
 // Do not read concurrently with residency changes; publish a copy for HTTP status.
 LLAMA_API llama_mtp_weights_info llama_model_mtp_weights_get_info(const llama_model * model);
+
+// Per-layer, per-field diagnostic of the LIVE KVarN state of one sequence.
+// One line per layer: placement (local/remote), live cells, live position range,
+// payload type/bit widths and a hash over that layer's LIVE payload (padding and
+// inactive cells excluded). Returns an empty string when the context memory is
+// not a KVarN cache. This exists because diffing a serialized blob cannot say
+// which layer or field diverged, and a large byte delta alone is not evidence of
+// a defect.
+LLAMA_API std::string llama_kvarn_live_layer_table(struct llama_context * ctx, llama_seq_id seq_id);
+
+// PROOF HELPER for the live-span mapping: rewrite exactly one byte inside the
+// live span of a given tensor row (or inside an INACTIVE row when `live` is
+// false) and report whether that byte was actually written. Used by the test to
+// prove the live hash can detect a one-live-byte mutation and that an inactive
+// byte is outside the live span.
+LLAMA_API bool llama_kvarn_probe_mutation(struct llama_context * ctx, llama_seq_id seq_id,
+        int layer_index, const char * tensor, uint32_t row, bool live);
+
+// INDEPENDENT proof of the live-span mapping. Rewrites ONE byte of ONE
+// (head, group|slot) span selected by the AUTHORITATIVE view layout (nb[1] head
+// stride, nb[2] group/slot stride, group = cell / KVAR_N_GROUP), and reports the
+// span it touched plus the materialized full-logit vector AFTER the rewrite. The
+// verifier therefore does not reuse the hashing formula: it checks that a live
+// mutation changes the materialized output, and that a byte outside the live span
+// does not.
+LLAMA_API bool llama_kvarn_probe_head_span(struct llama_context * ctx, llama_seq_id seq_id,
+        int layer_index, uint32_t head, uint32_t group_or_slot, const char * tensor,
+        bool live, uint8_t * orig_out, uint8_t * new_out, uint32_t * group_used_out);
+// F4: returns the exact leaf bytes/values the attention consumer actually read
+// for (layer, head, position) on its most recent routing, together with the
+// source identity (route/range/name/type/offset). `float` output holds the
+// dequantized values for F16/F32 leaves and the raw bytes (as floats) for
+// quantized/permuted leaves; `info` always states which one it is.
+LLAMA_API bool llama_kvarn_captured_head(struct llama_context * ctx, int layer, bool value,
+        uint32_t head, llama_pos pos, size_t index, float * out, size_t n_out, char * info, size_t info_len);
+LLAMA_API size_t llama_kvarn_capture_routes(struct llama_context * ctx, int layer, bool value, uint32_t head);
+LLAMA_API void llama_kvarn_capture_clear(struct llama_context * ctx);
+
+LLAMA_API bool llama_kvarn_materialized_probe(struct llama_context * ctx, llama_seq_id seq_id,
+        int layer_index, uint32_t head, bool value, llama_pos pos, std::vector<float> * out);
+LLAMA_API bool llama_kvarn_probe_restore_byte(struct llama_context * ctx, llama_seq_id seq_id,
+        int layer_index, uint32_t head, uint32_t group, const char * tensor, uint8_t orig);
+// Remote-overflow probe: mutate one byte of the occupied Q4 companion storage
+// (live, first owned cell with pos >= P) or of an empty cell (inactive).
+LLAMA_API bool llama_kvarn_probe_remote_span(struct llama_context * ctx, llama_seq_id seq_id,
+        int layer_index, uint32_t head, bool value, bool live,
+        uint8_t * orig_out, uint8_t * new_out, uint32_t * row_used_out,
+        llama_pos * pos_used_out);
+LLAMA_API bool llama_kvarn_probe_remote_restore(struct llama_context * ctx, llama_seq_id seq_id,
+        int layer_index, uint32_t head, bool value, uint32_t row, uint8_t orig);
+
+// [TAG_SLOT_SAVE_CHECKPOINTS] Lineage epoch of the mixed KVarN state. Partial snapshots
+// (context checkpoints) replay only into the exact owner epoch they were captured under; a
+// full-state restore advances the epoch, which strands checkpoints persisted next to a state
+// file. The durable companion stores the epoch at save time and the server adopts it after the
+// restore. Returns 0 when the context memory is not a mixed KVarN cache.
+LLAMA_API uint64_t llama_kvarn_state_owner_epoch(struct llama_context * ctx);
+
+// Adopt `epoch` as the current mixed KVarN owner epoch (see above). Returns true when the
+// epoch is now in effect; 0 and UINT64_MAX are refused.
+LLAMA_API bool llama_kvarn_adopt_state_owner_epoch(struct llama_context * ctx, uint64_t epoch);
+
+// [TAG_SLOT_SAVE_CHECKPOINTS] Process-random owner id of the mixed KVarN state. Partial
+// snapshots are owner-bound: the full-state restore recreates the cells but not this id, so
+// a durable checkpoint companion stores it and the server adopts it after the restore
+// (fine-grained cell-reference checks still validate every replay). Returns 0 when the
+// context memory is not a mixed KVarN cache.
+LLAMA_API uint64_t llama_kvarn_state_owner_id(struct llama_context * ctx);
+
+// Adopt `owner_id` as the current mixed KVarN owner id (see above). Returns true when the
+// id is now in effect; 0 is refused.
+LLAMA_API bool llama_kvarn_adopt_state_owner_id(struct llama_context * ctx, uint64_t owner_id);
 
 // Managed MTP target, owner-thread only. Zero means no tracked unmasked NextN decode.
 // State imports, failed/new decodes, encode, output reservation and a NextN mode change invalidate the ID.
@@ -319,3 +393,63 @@ LLAMA_API size_t llama_state_seq_convert_file_rotated(
     llama_context * ctx, const char * src, size_t offset, size_t size, uint64_t checksum,
     const char * dst, llama_token * out, size_t capacity, size_t * count,
     int32_t rotation_k, int32_t rotation_v);
+
+// ---------------------------------------------------------------------------
+// F4 import forensics: section map of a sequence-state blob.
+//
+// Walks the REAL serialized bytes of the mixed frame carried by a sequence
+// snapshot and renders every contiguous region with the schema
+//   {start, end, kind, layer, field, stream, count, stride, checksum}
+// using ABSOLUTE offsets in the sequence blob (the 8-byte sequence header and
+// the 16-byte mixed envelope are included). Returns an empty string when the
+// blob carries no mixed frame, and never invents a layout: a frame the real
+// parser would reject makes this throw-free call report the failure text.
+LLAMA_API std::string llama_mixed_state_section_map(const uint8_t * seq_blob, size_t size);
+
+// Locates `offset` (absolute, sequence-blob coordinates) inside that map and
+// writes the owning region to *out_text. Returns false when the blob has no
+// mixed frame or the offset is not covered by it.
+LLAMA_API bool llama_mixed_state_locate(const uint8_t * seq_blob, size_t size,
+        size_t offset, std::string * out_text);
+
+// Writer-side section map of the most recent state save performed with
+// F4_STATE_SECTIONS in the environment; empty otherwise. Recorded while the
+// bytes are emitted, independent of the reader walk above.
+LLAMA_API std::string llama_mixed_state_write_section_map(void);
+
+// Per-section byte comparison of two sequence-state blobs that share the same
+// mixed-frame schema. For every section pair: kind/layer/stream/size, whether
+// the region is byte-identical, how many bytes differ, and the first differing
+// offset RELATIVE TO THAT SECTION (so a payload divergence is reported inside
+// the payload it belongs to, not as an opaque absolute offset). Sections whose
+// kind/layer/stream/size disagree are reported as STRUCTURE MISMATCH, which is
+// a layout difference between representations and not by itself a defect.
+LLAMA_API std::string llama_mixed_state_section_diff(
+        const uint8_t * a, size_t na, const uint8_t * b, size_t nb);
+
+// Start/end (absolute, sequence-blob coordinates) of whatever the hybrid
+// memory appends AFTER the mixed attention frame - for this model the
+// DeltaNet recurrent state, written by llama_memory_recurrent::state_write.
+// Both a split and a pure sequence put the recurrent region LAST and serialize
+// it with the same writer, so equal-length tails of two blobs are one
+// representation and a byte comparison of them IS normalized. Returns false
+// when the blob carries no mixed frame.
+LLAMA_API bool llama_mixed_state_post_frame(const uint8_t * seq_blob, size_t size,
+        size_t * out_start, size_t * out_end);
+
+// Per-model-layer view of the LIVE DeltaNet recurrent state (r_l / s_l / p_l)
+// read straight from the tensors the model consumes, plus a byte disagreement
+// scan between two contexts at the same freeze point. This is the recurrent
+// counterpart of llama_mixed_state_section_diff: the attention frame has a
+// schema to walk, the recurrent tail does not, so the only honest normalized
+// comparison is between the tensors themselves (same writer, same layout, two
+// contexts). Reports the first differing byte per layer/tensor.
+LLAMA_API std::string llama_recurrent_state_diff(llama_context * ctx_a, llama_context * ctx_b,
+        llama_seq_id seq_id);
+
+// F4 fixture-only: tag the dump stream produced while a given context is
+// evaluating its graph. The test sets a tag immediately BEFORE each prefill so
+// every dumped node carries the configuration that produced it; changing the
+// tag resets the evaluation counter, which is what prevents a sample captured
+// during one prefill from ever being attributed to another.
+LLAMA_API void llama_f4_set_dump_tag(const char * tag);

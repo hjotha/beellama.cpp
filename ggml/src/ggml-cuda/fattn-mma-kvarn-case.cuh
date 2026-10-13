@@ -17,7 +17,13 @@ using ggml_cuda_fattn_kernel_attr_ptr_t = fattn_kernel_t;
 // when concurrent long prompts require less transient K/V scratch.
 static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 65536;
 
-static inline int ggml_cuda_fattn_kvarn_window_chunk(const int n_kv) {
+static inline int ggml_cuda_fattn_kvarn_window_chunk(const ggml_tensor * dst, const int n_kv) {
+    const int context_chunk = ggml_get_op_params_i32(
+            dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK);
+    if (context_chunk > 0) {
+        return std::min(n_kv, context_chunk);
+    }
+
     const char * env = getenv("GGML_KVARN_WINDOW_CHUNK");
     if (env == nullptr) {
         return std::min(n_kv, GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK);
@@ -101,7 +107,14 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
     constexpr bool V_is_K_view = false;
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = true;
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, false, needs_fixup, is_fixup>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, false, needs_fixup, is_fixup,
+            GGML_TYPE_F16, GGML_TYPE_F16,
+#if defined(TURING_MMA_AVAILABLE)
+            DKQ == 256 && DV == 256 && ncols >= 64 && nwarps*16 == ncols
+#else
+            false
+#endif
+        >
         (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
@@ -354,7 +367,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const int ntiles_dst = ntiles_x * ntiles_z_gqa * plan.n_kv_heads * Q->ne[3];
     const int n_rows = (int) ((size_t) Q->ne[1] * Q->ne[2] * Q->ne[3]);
     const size_t partial_fixup_f2 = (size_t) ntiles_dst * (2 * ncols + ncols * (DV / 2));
-    int window_chunk = ggml_cuda_fattn_kvarn_window_chunk(plan.n_kv);
+    int window_chunk = ggml_cuda_fattn_kvarn_window_chunk(dst, plan.n_kv);
 
     // K/V scratch and the partial merge buffer must fit at the same time.
     // Keep graph recovery headroom and a little space for pool descriptors.

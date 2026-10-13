@@ -1,0 +1,182 @@
+{
+  "scope": "Diagnostic controls; acceptance P102400 C131072 and all gates unchanged",
+  "prefix": {
+    "argv": [
+      "/home/hjotha/beellama.cpp/build-optimized/bin/test-position-split-teacher-pair",
+      "-m",
+      "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+      "-c",
+      "105216",
+      "-b",
+      "512",
+      "-ub",
+      "256",
+      "-np",
+      "1",
+      "-ngl",
+      "99",
+      "--device",
+      "CUDA0",
+      "--flash-attn",
+      "on",
+      "-ctk",
+      "q4_0",
+      "-ctv",
+      "q4_0",
+      "--fit",
+      "off",
+      "--no-context-shift",
+      "--spec-type",
+      "none",
+      "--paired-quality-only",
+      "--paired-token-file",
+      "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+      "--paired-output-dir",
+      "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/q4-cuda",
+      "--paired-start",
+      "104968",
+      "--paired-count",
+      "32",
+      "--paired-model-sha256",
+      "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+      "--paired-build-id",
+      "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+      "--paired-pure-cuda-baseline",
+      "--paired-prefix-state-out"
+    ],
+    "env": {
+      "PATH": "/opt/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/bin",
+      "GGML_KVARN_WINDOW_CHUNK": "4096",
+      "GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB": "18",
+      "GGML_NO_BACKTRACE": "1",
+      "TMPDIR": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/spool"
+    },
+    "started": 1791868261.6893988,
+    "diagnostic_only": true,
+    "context_note": "C105216 on every future paired arm after C131072 CUDA allocation failed before prefill. P102400/C131072 acceptance remains unchanged.",
+    "reuse_plan": "Export prefix104967 once, use exact same cache for remote0/5/16 at C105216; preserve original and SHA256 before/after restores.",
+    "estimate_seconds": [
+      180,
+      360
+    ],
+    "exit_code": 0,
+    "ended": 1791868440.6685958
+  },
+  "cache": {
+    "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/q4-cuda/prefix-cache.bin",
+    "bytes": 2094585588,
+    "sha256": "e8c20cfd8a34b5b3206c995156e1b88ed7c0c98b59091ad8be2de7eff728adbf",
+    "configuration": {
+      "config_core": "model_sha256=e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838;n_ctx=105216;n_batch=512;n_ubatch=256;n_seq=1;n_params=27320697856;p=0;kv_k=0;kv_v=0;overflow_k=144;overflow_v=144;cache_type_k=2:q4_0;cache_type_v=2:q4_0;remote_layers=auto",
+      "model": "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+      "cache_type_k_numeric": 2,
+      "cache_type_k_name": "q4_0",
+      "cache_type_v_numeric": 2,
+      "cache_type_v_name": "q4_0",
+      "reference_arm": "gpu_quality_only",
+      "pure_cuda_baseline": true,
+      "quality_only": true,
+      "reference_option_ignored_in_quality_only": "cpu",
+      "layered_baseline": false,
+      "arm_classification": "quality_only_gpu_trajectory",
+      "model_sha256_operator_verified": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+      "build_bundle_sha256_operator_verified": "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+      "compiled_commit": "d9db0b881",
+      "compiled_build": "b12366-d9db0b881-dirty",
+      "n_rs_seq": 0,
+      "teacher_file": {
+        "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+        "bytes": 708895,
+        "xxh64": "a2ea4b52457f1ea3"
+      },
+      "token_format": "json",
+      "starts": [
+        104968
+      ],
+      "count": 32,
+      "checkpoint_method": "none_quality_trajectory",
+      "state_spool_directory": null,
+      "full_prefix_verification": false,
+      "fixed_current_kv": false
+    }
+  },
+  "comparison": {
+    "q4-cuda": {
+      "mean_nll": 0.7601551181062529,
+      "ppl_ratio_vs_q4_cuda": 1.0,
+      "mean_kl_from_q4_cuda": 0.0,
+      "first_position_kl": 0.0,
+      "bit_equal_q4_cuda": true
+    },
+    "restore-q4-cuda": {
+      "mean_nll": 0.7601551181062529,
+      "ppl_ratio_vs_q4_cuda": 1.0,
+      "mean_kl_from_q4_cuda": 0.0,
+      "first_position_kl": 0.0,
+      "bit_equal_q4_cuda": true
+    },
+    "restore-q4-remote-5": {
+      "mean_nll": 0.7693659039253806,
+      "ppl_ratio_vs_q4_cuda": 1.0092533356456077,
+      "mean_kl_from_q4_cuda": 0.00032340528812057354,
+      "first_position_kl": 3.381059325955458e-06,
+      "bit_equal_q4_cuda": false
+    },
+    "restore-q4-remote-full": {
+      "mean_nll": 0.7669797788849142,
+      "ppl_ratio_vs_q4_cuda": 1.006848001844106,
+      "mean_kl_from_q4_cuda": 0.0003492538450969462,
+      "first_position_kl": 2.3638670466990605e-07,
+      "bit_equal_q4_cuda": false
+    },
+    "restore-kvarn4-cuda": {
+      "mean_nll": 0.9302356488658072,
+      "ppl_ratio_vs_q4_cuda": 1.1854003086639204,
+      "mean_kl_from_q4_cuda": 0.13441281590344656,
+      "first_position_kl": 0.002403873131175075,
+      "bit_equal_q4_cuda": false
+    },
+    "p105216-old": {
+      "mean_nll": 0.9302356488658072,
+      "ppl_ratio_vs_q4_cuda": 1.1854003086639204,
+      "mean_kl_from_q4_cuda": 0.13441281590344656,
+      "first_position_kl": 0.002403873131175075,
+      "bit_equal_q4_cuda": false
+    },
+    "kvarn_projection_bit_equal_original": true
+  },
+  "f16_dispatch": {
+    "argv": [
+      "/home/hjotha/beellama.cpp/build-optimized/bin/test-backend-ops",
+      "test",
+      "-b",
+      "Vulkan0",
+      "-o",
+      "FLASH_ATTN_EXT",
+      "--seed",
+      "42",
+      "-j",
+      "1",
+      "--test-file",
+      "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/f16-dispatch-fixture.txt"
+    ],
+    "started": 1791868873.2036672,
+    "diagnostic_only": true,
+    "pid": 1912840,
+    "exit_code": 0,
+    "seconds": 15.56762146949768
+  },
+  "interpretation": [
+    "Shared Q4 prefix105k does not reproduce original candidate/baseline PPL1.0351368303: backend placement ratios remain below1.01 in this diagnostic. This is not acceptance baseline.",
+    "KVarN pure CUDA import reproduces original P105216 captures exactly; representation/prefill trajectory remains implicated, not proved implementation bug.",
+    "F16 attention operator130560KV control passed against CPU; no model prefix repeated. Does not prove sustained F16 model prefill is safe.",
+    "CUDA uniformQ4 C131072 allocation failed before prefill; C105216 diagnostic completed. No production memory-gate claim."
+  ],
+  "pending": [
+    "32-token fixed-current-KV diagnostic from cached P102400",
+    "Original quality failures105k and115k unresolved",
+    "130560 quality reference incomplete",
+    "Warmup plus5 alternating performance pairs includingP+256 pending",
+    "F7 promotion blocked by cumulative gates"
+  ]
+}

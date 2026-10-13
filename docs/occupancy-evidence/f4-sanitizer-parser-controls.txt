@@ -1,0 +1,20 @@
+# run-sanitizer.sh parser negative controls
+generated: 2026-10-04T23:06:00Z
+
+missing  : present=0 count=none invalid=0   -> expect present=0 count=none
+zero     : present=1 count=0 invalid=0      -> expect present=1 count=0
+positive : present=1 count=12 invalid=0  -> expect present=1 count=12
+invalid  : present=1 count=1 invalid=1   -> expect invalid>=1
+
+runner verdict mapping:
+  summary missing            -> RC=5
+  summary present, count!=0 -> RC=4
+  invalid accesses>0         -> RC=4
+  http != 200                -> RC=3
+  tokens_evaluated != n     -> RC=3
+  sanitizer --error-exitcode -> RC=4
+  sanitizer timeout          -> RC=6
+  forced cleanup, no report  -> RC=7
+
+NOTE: a run is green only with sanitizer_exit=0, error_summary_present=1,
+count=0, http=200 and tokens_evaluated==n. Absence of a summary is NOT a pass.

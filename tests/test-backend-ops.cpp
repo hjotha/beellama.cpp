@@ -11368,6 +11368,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // DIAGNOSTIC (F5 packed overflow Q4_0 investigation, temporary): model-shaped
+    // Q4_0 K/V with cache-like views over a larger buffer, non-aligned and aligned
+    // live extents and multiple query-row counts.
+    for (int kv : { 640, 952, 1024, 1152, 1536 }) {
+        for (int nb : { 1, 7, 64, 512 }) {
+            for (bool kvv : { false, true }) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                            128, 128, 8, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                            GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, kvv, false, 0));
+            }
+        }
+    }
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));

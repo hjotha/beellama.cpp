@@ -76,6 +76,65 @@ static llama_ubatch make_ubatch(uint32_t n_tokens, llama_pos pos0, uint32_t n_ke
     return ub;
 }
 
+
+// Component-major position layout exactly as the runtime fills it:
+//   pos[i]                 -> sequence position of token i (component 0)
+//   pos[n_tokens + i]      -> component 1
+//   pos[2*n_tokens + i]    -> component 2  ...  (see llama-kv-cache.cpp:3031-3038)
+// The production KV cache reads `ubatch.pos[i]`; every position-split site that
+// instead indexed `pos[i * n_pos]` mis-classified tokens whenever n_pos > 1.
+static llama_ubatch make_ubatch_npos4(uint32_t n_tokens, llama_pos pos0, uint32_t n_keep_tail) {
+    const uint32_t n_pos = 4;
+    llama_ubatch ub;
+    ub.b_equal_seqs = 1;
+    ub.n_tokens     = n_tokens;
+    ub.n_seq_tokens = n_tokens;
+    ub.n_seqs       = 1;
+    ub.n_seqs_unq   = 1;
+    ub.n_pos        = n_pos;
+
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->token.resize(n_tokens);
+    data->pos.resize(size_t(n_tokens) * n_pos);
+    data->n_seq_id.assign(n_tokens, 1);
+    data->seq_id.resize(n_tokens);
+    data->output.assign(n_tokens, 0);
+    const llama_seq_id kSeq = 7;
+    data->seq_id_unq = { kSeq };
+    data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
+    data->seq_idx[kSeq] = 0;
+    data->seq_id_data.assign(n_tokens, kSeq);
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_pos p = pos0 + llama_pos(i);
+        data->token[i] = llama_token(1000 + i);
+        // component 0 is the temporal/sequence position; the spatial components
+        // differ, exactly as M-RoPE fills them, so an accessor that indexes
+        // `pos[i * n_pos]` reads a spatial value instead of the sequence one.
+        data->pos[i] = p;
+        for (uint32_t c = 1; c < n_pos; ++c) {
+            data->pos[size_t(c) * n_tokens + i] = p + llama_pos(1000 * c);
+        }
+        // pin the layout the KV cache relies on (llama-kv-cache.cpp:3031)
+        if (i == 1) {
+            data->pos[1] = p;   // pos[1] is token 1's sequence position
+        }
+        data->output[i] = (n_keep_tail > 0 && i + n_keep_tail >= n_tokens) ? 1 : 0;
+        data->seq_id[i] = data->seq_id_data.data() + i;
+    }
+
+    ub.data       = data;
+    ub.token      = data->token.data();
+    ub.embd       = nullptr;
+    ub.pos        = data->pos.data();
+    ub.n_seq_id   = data->n_seq_id.data();
+    ub.seq_id     = data->seq_id.data();
+    ub.seq_id_unq = data->seq_id_unq.data();
+    ub.seq_idx    = data->seq_idx.data();
+    ub.output     = data->output.data();
+    return ub;
+}
+
 static void check_ubatch_equal(const llama_ubatch & a, const llama_ubatch & b, const std::string & tag) {
     check(a.n_tokens == b.n_tokens, tag + ": n_tokens");
     check(a.n_seq_tokens == b.n_seq_tokens, tag + ": n_seq_tokens");
@@ -281,6 +340,87 @@ int main() {
         check(!llama_position_split::divide_ubatches_at_p(in, P, NKEEP, out, err),
               "R2c: batch with a rejected ubatch after a divided one fails");
         check(out.empty(), "R2c: no partial output survives the rejection");
+    }
+
+
+    // 5d) F4: component-major positions (n_pos > 1) must split on the SAME
+    // sequence position the KV cache stores (`pos[i]`, llama-kv-cache.cpp:3031).
+    // Reading `pos[i * n_pos]` classifies tokens with the wrong position and
+    // ships overflow tokens into the local band, which the allocator then
+    // cannot satisfy (observed: 216 local tokens vs 214 free local cells).
+    {
+        const uint32_t n = 300;
+        std::vector<llama_ubatch> in;
+        in.push_back(make_ubatch_npos4(n, 400, NKEEP));   // positions [400,700)
+        std::vector<llama_ubatch> out;
+        std::string err;
+        check(llama_position_split::divide_ubatches_at_p(in, P, NKEEP, out, err),
+              "n_pos=4 crossing ubatch is divided: " + err);
+        check(out.size() == 2, "n_pos=4 crossing ubatch yields two ubatches");
+        if (out.size() == 2) {
+            // Every token of the head must be strictly below P by the accessor
+            // the allocator uses (pos[i]), and every tail token at/above P.
+            uint32_t head_bad = 0, tail_bad = 0;
+            for (uint32_t i = 0; i < out[0].n_tokens; ++i) {
+                if (!(out[0].pos[i] >= 400 && out[0].pos[i] < llama_pos(P))) { ++head_bad; }
+            }
+            for (uint32_t i = 0; i < out[1].n_tokens; ++i) {
+                if (!(out[1].pos[i] >= llama_pos(P) && out[1].pos[i] < 700)) { ++tail_bad; }
+            }
+            check(head_bad == 0, "n_pos=4 head holds only [400,P) by pos[i]");
+            check(tail_bad == 0, "n_pos=4 tail holds only [P,700) by pos[i]");
+            check(out[0].n_tokens == P - 400, "n_pos=4 head token count is P-400");
+            check(out[1].n_tokens == 700 - P, "n_pos=4 tail token count is 700-P");
+            // The local band must never receive more tokens than [0,P) can hold:
+            // 400..P is P-400 tokens and they are the only local ones.
+            uint32_t local_tokens = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (in[0].pos[i] < llama_pos(P)) { ++local_tokens; }
+            }
+            check(local_tokens == P - 400, "n_pos=4 local token count matches [400,P)");
+            check(out[0].n_tokens == local_tokens,
+                  "n_pos=4 divided head holds exactly the local tokens");
+        }
+    }
+
+
+    // 5e) F4: tail_extent_queries -- the history-only extent helper. Before the
+    // fix every graph used the WHOLE ubatch's q_max, so an overflow ubatch sized
+    // mask/read-idxs/run_desc with tail_tokens + q_max while deliberately
+    // binding no current segment (fattn-tail.cuh then asserted
+    // mt->ne[0] <= kt->ne[1] + kt_current->ne[1]).
+    {
+        const int64_t q_max = 298;
+        // non-P mode must not change legacy behaviour
+        check(llama_position_split::tail_extent_queries(false, P, nullptr, 0, q_max) == q_max,
+              "tail extent: non-P mode keeps q_max");
+        // empty ubatch / no positions -> keep q_max (nothing to classify)
+        check(llama_position_split::tail_extent_queries(true, P, nullptr, 0, q_max) == q_max,
+              "tail extent: null positions keeps q_max");
+        llama_pos none = 0;
+        check(llama_position_split::tail_extent_queries(true, P, &none, 0, q_max) == q_max,
+              "tail extent: empty ubatch keeps q_max");
+        // P disabled inside P-mode plumbing
+        check(llama_position_split::tail_extent_queries(true, 0, &none, 1, q_max) == q_max,
+              "tail extent: P == 0 keeps q_max");
+        // all-local ubatch -> number of local tokens (current segment IS bound)
+        llama_pos loc[4] = { 0, 1, 2, 3 };
+        check(llama_position_split::tail_extent_queries(true, P, loc, 4, q_max) == 4,
+              "tail extent: local-only ubatch reports its token count");
+        llama_pos loc2[256];
+        for (int i = 0; i < 256; ++i) { loc2[i] = llama_pos(i); }
+        check(llama_position_split::tail_extent_queries(true, P, loc2, 256, q_max) == 256,
+              "tail extent: full local band reports P tokens");
+        // overflow present -> history only (this is the case that asserted)
+        llama_pos ovf[3] = { uint32_t(P), uint32_t(P) + 1, uint32_t(P) + 2 };
+        check(llama_position_split::tail_extent_queries(true, P, ovf, 3, q_max) == 1,
+              "tail extent: overflow ubatch falls back to the persistent tail");
+        llama_pos mixed[2] = { llama_pos(P) - 1, llama_pos(P) };
+        check(llama_position_split::tail_extent_queries(true, P, mixed, 2, q_max) == 1,
+              "tail extent: a single overflow token makes the read history-only");
+        // the pre-fix behaviour (always q_max) must NOT be reported for overflow
+        check(llama_position_split::tail_extent_queries(true, P, ovf, 3, q_max) != q_max,
+              "tail extent: overflow never reuses the whole-ubatch q_max");
     }
 
     // 6) P == 0 disables the split entirely (current behaviour).

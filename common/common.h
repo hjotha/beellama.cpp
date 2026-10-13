@@ -328,8 +328,9 @@ struct common_params_model {
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
-    int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_max    = 3; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min    = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_ubatch = 0; // physical batch size (0 = auto: at least 128)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -364,6 +365,7 @@ struct common_params_speculative_draft {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 2048,
         /*.fail_if_unsupported =*/ true,
     };
 
@@ -822,6 +824,7 @@ struct common_params {
     ggml_type   remote_attn_cache_type_k = GGML_TYPE_COUNT; // opt-in Qx override on local Vulkan layers
     ggml_type   remote_attn_cache_type_v = GGML_TYPE_COUNT;
     int32_t     remote_attn_min_ctx_size = 0; // minimum adaptive profile context size before enabling remote attention
+    uint32_t kv_position_split_p = 0; // fixed local KV position boundary; 0 disables
     size_t      remote_attn_cuda_reserve = 650 * 1024 * 1024; // 650 MiB default safety reserve (covers compute graph & allocator headroom)
     size_t      remote_attn_vulkan_reserve = 512 * 1024 * 1024; // Vulkan FA graph/workspace headroom for Qx placement
 
@@ -841,6 +844,7 @@ struct common_params {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 0,
         /*.fail_if_unsupported =*/ true,
     };
     // path to a K-cache mean-centering bias file (GGUF), or empty to disable.
@@ -1614,6 +1618,21 @@ bool common_prompt_cache_layout_convertible(
         std::string * source_type_k = nullptr,
         std::string * source_type_v = nullptr);
 
+// Layout predicate for the PURE KVarN -> position-split KVarN snapshot path.
+// Accepts only a source that reports an unknown representation without the
+// split block against a destination that does report the split block, with all
+// remaining identity/geometry fields equal. Disjoint from the q4 -> KVarN data
+// conversion above. The P position-split gate is enforced by the state reader.
+bool common_prompt_cache_layout_pure_to_split(
+        const std::string & source_layout,
+        const std::string & target_layout);
+
+// Semantic eligibility only: the native reader validates split framing,
+// empty overflow, occupied positions, types and destination capacity.
+bool common_prompt_cache_layout_split_to_pure(
+        const std::string & source_layout,
+        const std::string & target_layout);
+
 // Cross-context snapshot reuse predicate: exact layout equality, or two
 // layouts that both report an unknown representation and differ only in their
 // context-lifetime or unavailable type metadata. The restore path still
@@ -1630,6 +1649,10 @@ struct common_prompt_checkpoint {
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
+
+    // [TAG_SLOT_SAVE_CHECKPOINTS] mixed-KVarN lineage epoch the payload was
+    // captured under (server-stamped at creation; 0 = unknown).
+    uint64_t owner_epoch = 0;
 
     llama_pos pos_min = -1;
     llama_pos pos_max = -1;

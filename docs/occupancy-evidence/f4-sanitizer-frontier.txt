@@ -1,0 +1,104 @@
+# F4 sanitizer — position-split frontier (corrected runner)
+generated: 2026-10-04T23:13:27Z
+runner: tools/occupancy-f4/run-sanitizer.sh
+tool: /opt/cuda/bin/compute-sanitizer (--error-exitcode 99)
+green requires ALL of: sanitizer_exit=0, ERROR SUMMARY present with count 0,
+http=200, tokens_evaluated==n, invalid_accesses=0, leftover_gpu_mib=0.
+Absence of a summary is NOT a pass (RC=5).
+
+## P1024-C2048-n1023-d32-memcheck
+tool=memcheck
+P=1024 C=2048 n_tokens=1023 decode=32 port=20700
+sanitizer_pid=176569 sanitizer_exit=0 target_pid=176580 forced_cleanup=0
+http=200 tokens_evaluated=1023
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P1024-C2048-n1023-d32-memcheck.log
+
+## P1024-C2048-n1025-d1-memcheck
+tool=memcheck
+P=1024 C=2048 n_tokens=1025 decode=1 port=20700
+sanitizer_pid=172958 sanitizer_exit=0 target_pid=172969 forced_cleanup=0
+http=200 tokens_evaluated=1025
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P1024-C2048-n1025-d1-memcheck.log
+
+## P1024-C2048-n1032-d1-initcheck
+tool=initcheck
+P=1024 C=2048 n_tokens=1032 decode=1 port=20700
+sanitizer_pid=178815 sanitizer_exit=0 target_pid=178825 forced_cleanup=0
+http=200 tokens_evaluated=1032
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P1024-C2048-n1032-d1-initcheck.log
+
+## P1024-C2048-n1032-d1-memcheck
+tool=memcheck
+P=1024 C=2048 n_tokens=1032 decode=1 port=20700
+sanitizer_pid=173828 sanitizer_exit=0 target_pid=173838 forced_cleanup=0
+http=200 tokens_evaluated=1032
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P1024-C2048-n1032-d1-memcheck.log
+
+## P512-C1024-n511-d64-memcheck
+tool=memcheck
+P=512 C=1024 n_tokens=511 decode=64 port=20700
+sanitizer_pid=174692 sanitizer_exit=0 target_pid=174702 forced_cleanup=0
+http=200 tokens_evaluated=511
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P512-C1024-n511-d64-memcheck.log
+
+## P512-C1024-n513-d1-initcheck
+tool=initcheck
+P=512 C=1024 n_tokens=513 decode=1 port=20700
+sanitizer_pid=178030 sanitizer_exit=0 target_pid=178040 forced_cleanup=0
+http=200 tokens_evaluated=513
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P512-C1024-n513-d1-initcheck.log
+
+## P512-C1024-n513-d1-memcheck
+tool=memcheck
+P=512 C=1024 n_tokens=513 decode=1 port=20700
+sanitizer_pid=170869 sanitizer_exit=0 target_pid=170879 forced_cleanup=0
+http=200 tokens_evaluated=513
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P512-C1024-n513-d1-memcheck.log
+
+## P512-C1024-n520-d1-memcheck
+tool=memcheck
+P=512 C=1024 n_tokens=520 decode=1 port=20700
+sanitizer_pid=171475 sanitizer_exit=0 target_pid=171485 forced_cleanup=0
+http=200 tokens_evaluated=520
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P512-C1024-n520-d1-memcheck.log
+

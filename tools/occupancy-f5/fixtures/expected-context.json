@@ -1,0 +1,24 @@
+{
+  "expected": {
+    "batch_size": 512,
+    "branch": "feat/occupancy-position-split",
+    "c": 131072,
+    "commit": "d9db0b88155ec4350942306696378c57ac0485c8",
+    "corpus_path": "fixtures/synthetic-corpus.txt",
+    "corpus_sha256": "732db35d35d2ba5d2e4d6eaadd641a1e813f333f7628473695e4aa4b583a4364",
+    "model_path": "fixtures/synthetic-target-model.gguf",
+    "model_sha256": "6f7d3732bb341e86f4d7998693427beeba35a98df83224526c1c91c1a853258c",
+    "p": 102400,
+    "seed": 42,
+    "ubatch_size": 256
+  },
+  "notes": "Fixture context: synthetic paths and content hashes, never a real campaign. Replace model/corpus hashes with the real campaign values before any measured run.",
+  "protocol": {
+    "alternating": true,
+    "first_arm": "baseline",
+    "measured_runs_per_arm": 5,
+    "min_token_samples": 32,
+    "warmup_runs": 1
+  },
+  "schema_version": "f5-context-v1"
+}

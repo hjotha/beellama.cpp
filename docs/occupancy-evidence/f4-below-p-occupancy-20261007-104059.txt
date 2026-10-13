@@ -1,0 +1,17 @@
+prefix=auto-1ee08d954f58561c-3d5802841d3db425-556.bin sha=3ffe4aa267f9119fac64d4ec4018e33a69ca93609348d8fc05889506b24f03f6
+request: 557 ids (556 restored from disk + fixed token 791) with P=1024 -> 557 < P
+GPU ready: inactive gpu=0
+loaded
+--- effective P / split + copy accounting emitted by the engine at load ---
+--- remote-attn arg resolution (what actually took effect) ---
+0.00.205.353 I srv          load:   --remote-attn
+0.00.205.353 I srv          load:   --remote-attn-cache-type-k
+0.00.205.354 I srv          load:   --remote-attn-cache-type-v
+0.00.205.354 I srv          load:   --remote-attn-layers
+0.00.205.354 I srv          load:   --remote-attn-min-context
+--- /metrics (after-load): live tail/occupancy counters ---
+  response cache_n=556 cache_lcp_n=0 predicted_n=1
+slot auto_restore: id  0 | task 0 | auto-restore: reused 556 tokens from disk (in-memory match was 0), bytes=198387122 restore_ms=390.582 workspace=52428800, file=/home/hjotha/f4-spool/occ-20261007T104059Z/target-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+--- /metrics (after-557-request): live tail/occupancy counters ---
+--- ggml/backend counters present in /metrics ---
+RUN_DIR=/home/hjotha/f4-spool/occ-20261007T104059Z

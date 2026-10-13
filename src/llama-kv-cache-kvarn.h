@@ -1,12 +1,17 @@
 #pragma once
 
+#include "llama-kv-mixed-state.h"
 #include "llama-kv-cache.h"
 #include "llama-kvarn.h"
+#include "llama-position-split.h"
+#include "ggml-cpp.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <tuple>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -53,6 +58,12 @@ bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev, int head_dim);
 bool llama_kvarn_backend_native_attention_uses_original_v(ggml_backend_dev_t dev);
 uint32_t llama_kvarn_backend_native_rotated_max_query_tokens(ggml_backend_dev_t dev);
 bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev);
+
+// Writer-side section map of the most recent mixed-state save, one line per
+// emitted region. Empty unless F4_STATE_SECTIONS was in the environment for
+// that save. Recorded as the bytes are emitted, so it is independent of the
+// reader-side walk (llama_mixed_state_section_map).
+std::string llama_kv_cache_kvarn_state_write_sections_text();
 
 // Additive handoff accessor (one-way pure->mixed prefix reuse). Exposes the
 // authoritative per-layer compressed tensors and geometry for stream 0
@@ -153,6 +164,7 @@ public:
     void graph_compute_start() override;
     void graph_compute_finish(ggml_status compute_status) override;
     void graph_compute_complete(ggml_backend_sched_t sched, ggml_status compute_status) override;
+    void capture_after_compute(ggml_backend_sched_t sched, ggml_status status) override;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -194,10 +206,49 @@ public:
     ggml_tensor * get_v_native(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_k_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
     ggml_tensor * get_v_for_attention(ggml_context * ctx, int32_t il, bool native_attention) const;
+    // F3: recuperação KVarN restrita a uma lista explícita de células
+    // (leitura por faixa). Usa os mesmos caminhos native/materialize da
+    // leitura completa, mas com n_kv e mat idxs do chamador. O chamador
+    // garante que todas as células pertencem à mesma faixa e que o plano de
+    // leitura cobre exatamente essas células.
+    // F4: range_id is EXPLICIT and names the body being READ, which is not
+    // necessarily the body this graph stored. build_attn_position_split always
+    // reads the local body (kRangeLocal) even inside an overflow-only ubatch,
+    // where the current range is 1; deriving the read key from the current range
+    // made the local read depend on which ubatch happened to be executing and
+    // only worked because the overflow store writes no slot. A Q4 view must
+    // never be reachable through this path: the local body is F16 KVarN stage.
+    // F4: marks a split-range tensor for executed-node capture (fixture only,
+    // gated by F4_TRACE_CAPTURE inside). Lets llama-graph.cpp mark the tensors
+    // build_attn_position_split feeds its two FA nodes.
+    void mark_split_tensor(ggml_tensor * t, int32_t il, bool value, uint32_t range_id) const;
+    ggml_tensor * get_k_for_range(
+            ggml_context * ctx, int32_t il, bool native_attention,
+            uint32_t range_id, uint32_t n_range, ggml_tensor * range_mat_idxs) const;
+    ggml_tensor * get_v_for_range(
+            ggml_context * ctx, int32_t il, bool native_attention,
+            uint32_t range_id, uint32_t n_range, ggml_tensor * range_mat_idxs) const;
     bool uses_native_attention(int32_t il) const;
     bool uses_kvarn_layer(int32_t il) const;
     bool uses_standard_layer(int32_t il) const;
     bool has_standard_cache() const;
+    bool has_qualified_dflash_mask() const;
+    ggml_backend_dev_t native_attention_backend(int32_t il) const;
+    bool position_split_enabled() const;
+    // Occupancy plan 3.1: "O tail/stage do KVarN continua so na faixa local;
+    // o overflow Q4 nao tem tail." True when `il` carries the KVarN exact tail
+    // under the current placement; the tail follows the LOCAL owner of the
+    // layer, never the presence of the Q4 companion.
+    bool tail_on_layer(int32_t il) const;
+    // True when a LOCAL tail can be read by the graph being built: no valid
+    // ubatch (graph reserve) or an overflow-only ubatch with NO local history
+    // means there is nothing local to pair with; an overflow ubatch that DOES
+    // have local history is exactly the dual-range builder, which must read
+    // the local tail (plan 3.4) even though its current range is overflow.
+    bool local_tail_available() const;
+    // F3: acesso ao cache proprietário para leitura por faixa (listas de
+    // células, máscaras e índices). O grafo usa somente métodos const.
+    const llama_kv_cache_kvarn * get_kvarn_cache() const { return cache; }
     bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
@@ -211,7 +262,66 @@ public:
     void set_input_kvarn_rot(ggml_tensor * dst) const;
     ggml_tensor * build_input_kvarn_mat_idxs(ggml_context * ctx) const;
     void set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // F4: set_mat_idxs runs once per graph, before any K/V read. The store
+    // slots hold tensors owned by the PREVIOUS graph's ggml_context, and that
+    // context is reused across ubatches. Without clearing here, a slot written
+    // by an earlier ubatch is still readable by the next one: in P-mode an
+    // overflow ubatch left a Q4 view under the local key and the local KVarN
+    // read then consumed Q4_0 bytes as if they were the F16 stage. Clearing
+    // makes every read resolve against this graph's own stores, falling back
+    // to the persistent layer stage.
     void set_mat_idxs(ggml_tensor * idxs) const { mat_idxs = idxs; }
+    // F3: índices de leitura KVarN restritos à faixa local (pos<P), com a
+    // mesma codificação de stage-slot do caminho completo. O chamador obtém a
+    // lista via cache->position_split_live_cells(LOCAL) e dimensiona dst com
+    // o tamanho dela; células vazias nunca entram na lista.
+    // F4: P-mode graphs drive the local range through this setter instead of
+    // set_mat_idxs, so it must reset the store slots too; otherwise the slots
+    // written by a previous ubatch survive into this graph.
+    void set_input_kvarn_mat_idxs_local(
+            ggml_tensor * dst, const std::vector<uint32_t> & local_cells) const {
+        set_input_kvarn_mat_idxs_local_impl(dst, local_cells);
+    }
+
+    // F4: drop the previous ubatch's K/V store slots. Public because the graph
+    // builder calls it at the ubatch boundary even when the range input tensor
+    // has no buffer yet (first graph of a slot), where a stale slot would
+    // otherwise still be visible to the local read.
+    void reset_graph_store_slots() const override {
+        if (getenv("LLAMA_KVARN_SLOT_TRACE") != nullptr) {
+            std::fprintf(stderr, "kv-slot-reset k=%zu v=%zu\n", stored_k.size(), stored_v.size());
+        }
+        stored_k.clear();
+        stored_v.clear();
+    }
+
+    // F4 test seam: exposes the REAL per-graph store slots and the REAL key
+    // builder, so a regression can drive the production identity logic instead of
+    // re-implementing it. Read/write only; the production path never calls these.
+    struct store_slot_probe {
+        // THE production key: (mapped_layer_id << 32) | range_id. Shared with the
+        // store and the readers so a test cannot drift from production identity.
+        static uint64_t range_store_key(uint32_t mapped_layer_id, uint32_t range_id) {
+            return (int64_t(mapped_layer_id) << 32) | int64_t(range_id);
+        }
+        static uint64_t key(uint32_t mapped_layer_id, uint32_t range_id) {
+            return range_store_key(mapped_layer_id, range_id);
+        }
+        static size_t size(const llama_kv_cache_kvarn_context & ctx, bool value) {
+            return value ? ctx.stored_v.size() : ctx.stored_k.size();
+        }
+        static void put(llama_kv_cache_kvarn_context & ctx, uint32_t mapped_layer_id,
+                        uint32_t range_id, ggml_tensor * t, bool value) {
+            (value ? ctx.stored_v : ctx.stored_k)[key(mapped_layer_id, range_id)] = t;
+        }
+        static ggml_tensor * get(const llama_kv_cache_kvarn_context & ctx,
+                                 uint32_t mapped_layer_id, uint32_t range_id, bool value) {
+            const auto & m = value ? ctx.stored_v : ctx.stored_k;
+            const auto it = m.find(key(mapped_layer_id, range_id));
+            return it == m.end() ? nullptr : it->second;
+        }
+    };
+    friend struct store_slot_probe;
 
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const override;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const override;
@@ -259,6 +369,23 @@ public:
 private:
     llama_kv_cache_context * base() const;
     int32_t graph_layer_for(int32_t il) const;
+    // F2b: safe current-ubatch range for position-split routing. Returns true
+    // and sets range when the base has a valid ubatch. Returns false during
+    // graph reserve/sizing (no valid ubatch); the caller must fall back to
+    // legacy layer routing instead of dereferencing an invalid ubatch.
+    bool current_position_split_range(llama_position_split::range_kind & range) const;
+    // F4: range id of the store/read slot for the current graph. Outside P-mode
+    // this is always the local body (0), which is the historical single-range
+    // behaviour; in P-mode an overflow ubatch reads and writes range 1 so the
+    // two physical bodies of one layer never share a slot.
+    uint32_t current_position_split_range_id() const {
+        llama_position_split::range_kind range = llama_position_split::range_kind::LOCAL;
+        return current_position_split_range(range)
+                ? uint32_t(range == llama_position_split::range_kind::OVERFLOW
+                        ? llama_position_split::kRangeOverflow
+                        : llama_position_split::kRangeLocal)
+                : llama_position_split::kRangeLocal;
+    }
     bool uses_shared_live_indices() const;
     const std::vector<int64_t> & compact_read_plan() const;
     std::vector<int64_t> shared_live_indices() const;
@@ -269,8 +396,16 @@ private:
     mutable std::vector<int64_t> compact_read_plan_cache;
     llama_context * update_lctx;
 
-    mutable std::unordered_map<int32_t, ggml_tensor *> stored_k;
-    mutable std::unordered_map<int32_t, ggml_tensor *> stored_v;
+    // F4: the store slot is keyed by (layer_id, range_id), NOT layer_id alone.
+    // In P-mode one full layer owns two physical bodies -- the local KVarN stage
+    // (F16) and the overflow Q4 companion -- so a layer-only key let the Q4
+    // view overwrite the local stage and the local read then consumed Q4_0
+    // bytes as if they were the F16 stage. range_id 0 is the local body.
+    void set_input_kvarn_mat_idxs_local_impl(
+            ggml_tensor * dst, const std::vector<uint32_t> & local_cells) const;
+
+    mutable std::unordered_map<int64_t, ggml_tensor *> stored_k;
+    mutable std::unordered_map<int64_t, ggml_tensor *> stored_v;
     mutable ggml_tensor * mat_idxs = nullptr; // SWA per-cell absolute positions for views/materialization
 };
 
@@ -301,7 +436,8 @@ public:
             ggml_type standard_type_k = GGML_TYPE_COUNT,
             ggml_type standard_type_v = GGML_TYPE_COUNT,
             bool standard_v_trans = false,
-            const layer_device_cb & standard_device_for_layer = nullptr);
+            const layer_device_cb & standard_device_for_layer = nullptr,
+            uint32_t position_split_p = 0);
     ~llama_kv_cache_kvarn() override;
 
     llama_memory_context_ptr init_batch(
@@ -389,6 +525,165 @@ public:
     bool uses_standard_layer(int32_t il) const;
     bool has_kvarn_layers() const { return !layers.empty(); }
     bool has_standard_cache() const { return bool(standard_cache); }
+
+    // Per-LAYER, per-FIELD diagnostic of the LIVE state of one sequence.
+    // One line per layer with named fields: layer id, whether the layer lives on
+    // the remote backend, the live cell count, the live position range, the
+    // payload type/bit widths and a hash over the layer's live payload. Used to
+    // compare a PURE source against a destination immediately after an import,
+    // per layer and per field, instead of diffing an opaque serialized blob.
+    std::string live_layer_table(llama_seq_id seq_id) const;
+
+    // Flip one byte in the addressed span; see llama_kvarn_probe_mutation.
+    bool probe_mutation(llama_seq_id seq_id, int layer_index, const char * tensor,
+            uint32_t row, bool live);
+    bool probe_head_span(llama_seq_id seq_id, int layer_index, uint32_t head,
+            uint32_t group_or_slot, const char * tensor, bool live,
+            uint8_t * orig_out = nullptr, uint8_t * new_out = nullptr,
+            uint32_t * group_used_out = nullptr);
+    bool probe_restore_byte(llama_seq_id seq_id, int layer_index, uint32_t head,
+            uint32_t group, const char * tensor, uint8_t orig);
+    // Remote-overflow probe: flip one byte of the Q4 companion storage for a
+    // model attention layer, at (head, storage row). Live targets the first
+    // owned cell with pos >= P (the occupied overflow range); inactive targets
+    // the first empty cell, which no gather reads. Row addressing reuses the
+    // exact view layout the overflow gather uses (absolute cell rows).
+    // Returns the target position through pos_used_out (-1 when none).
+    bool probe_remote_span(llama_seq_id seq_id, int layer_index, uint32_t head,
+            bool value, bool live, uint8_t * orig_out = nullptr,
+            uint8_t * new_out = nullptr, uint32_t * row_used_out = nullptr,
+            llama_pos * pos_used_out = nullptr);
+    bool probe_remote_restore_byte(llama_seq_id seq_id, int layer_index, uint32_t head,
+            bool value, uint32_t row, uint8_t orig);
+
+    // Consumer-path probe: read the values the attention graph actually consumes
+    // for (layer, head, position) through the KVarN materializer, with no decode.
+    bool materialized_probe(llama_seq_id seq_id, int layer_index, uint32_t head,
+            bool value, llama_pos pos, std::vector<float> & out,
+            std::string * status_out = nullptr, ggml_backend_t backend = nullptr) const;
+    // Backend owned by this cache, used by materialized_probe(). Assigned from
+    // the cache's own transfer backends; never created on demand.
+    ggml_backend_t probe_backend = nullptr;
+
+public:
+    // The leaf tensor materialized_probe() will read, for callers that need to
+    // inspect its buffer type.
+    const ggml_tensor * probe_leaf(int layer_index, bool value) const;
+    // A backend that this cache's context already owns and that supports the
+    // leaf's buffer type, or nullptr. Never initialises a backend.
+    ggml_backend_t resolve_probe_backend(int layer_index, bool value) const;
+
+    // Captured consumer-leaf samples, filled by f4_trace_attention_source()
+    // during the real build_attn routing (F4_TRACE_CAPTURE=1). This is the only
+    // honest way to compare B/C against the tensor the consumer actually read.
+    struct capture_sample {
+        bool        valid   = false;
+        bool        value   = false;
+        int32_t     layer   = -1;
+        uint32_t    head    = 0;
+        llama_pos   pos     = -1;
+        std::string route;
+        std::string range;
+        std::string name;
+        int         type    = -1;
+        uint64_t    offset  = 0;
+        uint64_t    nbytes  = 0;
+        int32_t     shared_il = -1;   // graph/model layer used by build_attn
+        int32_t     mapped    = -1;   // KVarN storage id for that model layer
+        std::string stored_name;       // persistent store behind the read
+        std::string stored_from;       // range slot or materialization source
+        int         stored_type = -1;
+        std::string records_name;      // I8 record leaf for KVarN reads
+        int         records_type = -1;
+        std::string backend;           // device/buft that executed the node
+        std::string src;               // executed input chain for compute nodes
+        uint32_t    mark_seq  = 0;     // scheduler mark for this request
+        size_t      fa_hits   = 0;     // FA nodes executed with this leaf input
+        uint64_t    gen       = 0;     // scheduler compute generation that produced it
+        std::vector<uint8_t>  raw;   // exact bytes read (Q4_0/permuted)
+        std::vector<float>    vec;   // dequantized values (F16/F32 only)
+    };
+    static std::vector<capture_sample> & capture_slot(int32_t layer, bool value, uint32_t head);
+    // Indexes the samples captured for (layer, value, head); `out` receives every
+    // distinct route the consumer used, newest last. Multiple routes coexist in
+    // one decode (split-aware LOCAL and legacy standard_local), so collapsing to
+    // one sample hides which source the graph really consumed.
+    size_t capture_count(int32_t layer, bool value, uint32_t head) const;
+    // Returns the captured sample for (layer, head) after the most recent
+    // consumer read, or false when that consumer route never captured it.
+    bool captured(int32_t layer, bool value, uint32_t head,
+                  llama_pos pos, size_t index, capture_sample & out) const;
+    void clear_captures() const;
+    static void capture_from_leaf(const char * fn, int32_t il, bool value, const char * route,
+                                  llama_position_split::range_kind range, bool have_range,
+                                  uint32_t range_id, ggml_tensor * t, int32_t shared_il,
+                                  int32_t mapped, llama_pos pos);
+    // Scheduler-eval capture for tensors that only exist as executed graph
+    // nodes. `eval_note_candidate` marks the returned K/V tensor with a unique
+    // fixture-only name; `eval_wants_node` matches that mark on the actually
+    // allocated/executed node copy; `eval_capture_node` reads it after the
+    // scheduler synchronizes that node. Never invents data and never creates a
+    // backend. Only active when F4_TRACE_CAPTURE is set.
+    struct eval_mark {
+        uint32_t    seq = 0;
+        int32_t     il = -1;
+        bool        value = false;
+        uint32_t    range_id = 0;
+        std::string route;
+        std::string range;
+        std::string orig_name;
+        int32_t     shared_il = -1;
+        int32_t     mapped = -1;
+        std::string stored_name;
+        std::string stored_from;
+        int         stored_type = -1;
+        const ggml_tensor * stored_ptr = nullptr; // persistent/graph store behind the read
+        uint64_t    stored_nbytes = 0;
+        std::string records_name;
+        int         records_type = -1;
+        int64_t     head_dim = 0;   // marked tensor ne[0]: consumer head width
+        int64_t     n_head = 0;     // marked tensor ne[1]: consumer head count
+        llama_pos   pos = 0;
+    };
+    static bool eval_capture_armed();
+    static uint32_t eval_note_candidate(int32_t il, bool value, uint32_t range_id,
+                                        const char * route, const char * range,
+                                        int32_t shared_il, int32_t mapped,
+                                        llama_pos pos, ggml_tensor * t);
+    static bool eval_wants_node(struct ggml_tensor * t);
+    static bool eval_capture_node(struct ggml_tensor * t);
+    static size_t eval_mark_count();
+    static size_t eval_hit_count();
+
+    struct pending_capture {
+        int32_t il; bool value;
+        llama_position_split::range_kind range; bool have_range;
+        const ggml_tensor * tensor;
+    };
+    static std::vector<pending_capture> pending_;
+    void capture_after_compute(ggml_backend_sched_t sched, ggml_status status);
+
+public:
+    mutable std::map<std::tuple<int32_t, bool, uint32_t>, std::vector<capture_sample>> captures;
+    // F2b: fronteira de posição entre a faixa local KVarN4 [0,P) e a faixa
+    // overflow Q4 [P,C). P == 0 mantém o cache de faixa única legado.
+    bool position_split_enabled() const { return position_split_p_ != 0; }
+    uint32_t position_split_p() const { return position_split_p_; }
+    uint32_t position_split_local_capacity() const { return kv_size_local; }
+    uint32_t position_split_overflow_capacity() const { return kv_size_overflow; }
+    // Tabela lógica única de faixas por camada full (Fase 2b): dois
+    // descritores por camada, [0,P) CUDA/KVarN4 e [P,C) Vulkan0/Q4, sem
+    // lacunas nem sobreposições. Vazio quando o modo está desligado.
+    std::vector<llama_position_split::range_desc> position_split_ranges() const;
+    // Motivo de rejeição do modo por posição, vazio quando válido.
+    const std::string & position_split_error() const { return position_split_error_; }
+    // F3: células vivas por faixa para a sequência 0, ordenadas por posição
+    // absoluta. Usado para montar índices/máscaras de leitura por faixa.
+    // Retorna false sem mutar nada se o modo estiver desligado, a sequência
+    // for inválida ou qualquer célula estiver fora do contrato.
+    bool position_split_live_cells(
+            llama_position_split::range_kind range,
+            std::vector<uint32_t> & cells_out) const;
     // Additive handoff accessor: raw standard-cache storage for remote layers
     // (rawstorage token rows; the attention views are permuted).
     llama_kv_cache * get_standard_cache() const { return standard_cache.get(); }
@@ -398,6 +693,39 @@ public:
     std::vector<llama_kv_cache_kvarn_layer_layout> kvarn_layer_layout() const;
     uint64_t mixed_state_owner_id() const { return state_owner_id; }
     uint64_t mixed_state_owner_epoch() const { return state_owner_epoch; }
+    // [TAG_SLOT_SAVE_CHECKPOINTS] Adopt the lineage epoch carried by a durable checkpoint
+    // companion. Only the server's SLOT_RESTORE flow calls this, after the full state that
+    // produced those partial snapshots was loaded into this cache; every replay still passes
+    // the fine-grained reference/identity validation.
+    bool adopt_state_owner_epoch(uint64_t epoch) {
+        if (epoch == 0 || epoch == UINT64_MAX) {
+            return false;
+        }
+        state_owner_epoch = epoch;
+        return true;
+    }
+    // [TAG_SLOT_SAVE_CHECKPOINTS] Adopt the owner id carried by a durable
+    // checkpoint companion (payloads are owner-bound; the full-state restore
+    // recreates the cells but not the process-random owner id). Only the
+    // server's SLOT_RESTORE flow calls this after loading the state the
+    // checkpoints were captured from; every replay still passes the
+    // fine-grained cell-reference validation.
+    bool adopt_state_owner_id(uint64_t owner_id) {
+        if (owner_id == 0) {
+            return false;
+        }
+        state_owner_id = owner_id;
+        return true;
+    }
+    // F4 v2: stable model/RoPE identity stamped into the position_split envelope
+    // by the caller that built this cache. A snapshot saved under one identity is
+    // refused by a cache with a different one, before any staging happens.
+    void set_mixed_state_identity(uint64_t model_id, uint64_t rope_id) {
+        state_model_id = model_id;
+        state_rope_id  = rope_id;
+    }
+    uint64_t mixed_state_model_id() const { return state_model_id; }
+    uint64_t mixed_state_rope_id() const { return state_rope_id; }
     ggml_tensor * standard_get_k(ggml_context * ctx, int32_t il, uint32_t n_kv,
             const llama_kv_cache::slot_info & sinfo) const;
     ggml_tensor * standard_get_v(ggml_context * ctx, int32_t il, uint32_t n_kv,
@@ -427,6 +755,8 @@ public:
     void set_indexer_mirror(bool value) { indexer_mirror = value; }
     bool uses_compact_read_indices() const { return !indexer_mirror && !swa && n_stream == 1 && n_seq_max > 1; }
     bool uses_native_attention(int32_t il) const;
+    bool has_qualified_dflash_mask() const;
+    ggml_backend_dev_t native_attention_backend(int32_t il) const;
     bool mixed_tail_native_preferred(int32_t il) const;
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
@@ -487,6 +817,7 @@ private:
         uint32_t k_slices;
         uint32_t v_slices;
         bool native_attention;
+        ggml_backend_dev_t native_attention_owner;
         bool mixed_tail_native;
         bool native_original_v;
         uint32_t native_rotated_max_query_tokens;
@@ -529,6 +860,21 @@ private:
             llama_state_seq_flags flags) const;
     void state_read_mixed(llama_io_read_i & io, llama_seq_id seq_id,
             llama_state_seq_flags flags, llama_kv_cache::slot_info_vec_t * sinfos_out,
+            const llama_kv_cache::slot_info_vec_t * sinfos_in, uint32_t magic_pre = 0);
+
+    // F4 §3.6: authorized PURE KVarN frame -> mixed/position-split cache.
+    // `io` must present the original byte stream (use llama_io_read_replay when
+    // the leading word was already read to classify the frame): the pure reader
+    // consumes the metadata block and then the KVRN body marker itself, in the
+    // same order the pure writer produced them.
+    //
+    // Identity, types, domain, positions, exact tail, recurrent state and
+    // integrity are validated by the existing pure reader; gate_prepared then
+    // runs on the prepared metadata cache, still before the live cache is
+    // mutated. Only the local range [0,P) is populated and the overflow range
+    // [P,C) stays empty. Nothing is truncated or requantized.
+    void state_read_pure_to_mixed_import(llama_io_read_i & io, llama_seq_id seq_id,
+            llama_state_seq_flags flags, llama_kv_cache::slot_info_vec_t * sinfos_out,
             const llama_kv_cache::slot_info_vec_t * sinfos_in);
     std::unique_ptr<llama_kv_cache> make_metadata_cache() const;
     bool can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
@@ -548,7 +894,17 @@ private:
     const llama_kvarn_params params;
     const uint32_t n_stream;
     const uint32_t n_seq_max;
+    // Capacidade lógica total C (tabela única de células/posições).
     const uint32_t kv_size;
+    // F2b: capacidades por faixa. Com P == 0 ambas reproduzem kv_size, e o
+    // cache segue de faixa única (comportamento legado). Com P != 0, a faixa
+    // local KVarN4 tem P células e o intervalo lógico de overflow Q4 é C-P.
+    // O companheiro Q4 compartilha a tabela lógica de células do metadados,
+    // portanto usa as mesmas coordenadas absolutas; somente as linhas de
+    // células de overflow recebem stores.
+    const uint32_t kv_size_local;
+    const uint32_t kv_size_overflow;
+    const uint32_t position_split_p_;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
     const uint32_t tail_groups;   // non-SWA scheduler span; SWA fixed local tail
@@ -564,8 +920,12 @@ private:
     const uint32_t exact_tail_tokens_requested;
     const ggml_type exact_tail_type_requested;
     ggml_type exact_tail_type;
-    const uint64_t state_owner_id;
+    uint64_t state_owner_id;
     uint64_t state_owner_epoch = 1;
+    // F4 v2: model/RoPE identity for the position_split envelope. Zero means
+    // "not stamped"; a split cache refuses to save without it.
+    uint64_t state_model_id = 0;
+    uint64_t state_rope_id  = 0;
 
     std::unique_ptr<llama_kv_cache> metadata;
     // Optional ordinary Qx payloads for selected remote layers. This cache
@@ -576,6 +936,7 @@ private:
     std::vector<cache_buffer> ctxs_bufs;
     llama_kv_cache::stream_copy_info pending_stream_copies;
     const bool migration_enabled;
+    std::string position_split_error_;
     ggml_backend_dev_t migration_prefill_dev = nullptr;
     ggml_backend_dev_t migration_remote_dev = nullptr;
     bool migration_remote_active = false;

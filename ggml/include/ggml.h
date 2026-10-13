@@ -473,6 +473,8 @@ extern "C" {
         // pointer-sized slot pair holding the LSE destination tensor
         // (set by ggml_flash_attn_ext_lse_out, read by backends)
         GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR      = 8,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 10,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK = 11,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {
@@ -2632,6 +2634,17 @@ extern "C" {
 
     // LSE destination attached to an FA node (NULL when not requested).
     // Backends call this to resolve the side-effect output buffer.
+    // Reads the three leading float parameters written by ggml_flash_attn_ext()
+    // (bytes 0..11 of op_params). ggml_tensor::op_params is int32_t[N], so an
+    // index selects a 32-bit SLOT (byte 4*N); using "+ N*sizeof(float)" advances
+    // 4x too far and lands on unrelated slots (e.g. LSE_PTR at slot 8 / byte 32).
+    // All readers of these fields must go through this helper.
+    GGML_API void ggml_flash_attn_ext_get_alibi_params(
+            const struct ggml_tensor * a,
+            float                   * scale,
+            float                   * max_bias,
+            float                   * logit_softcap);
+
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_lse_out(
             const struct ggml_tensor * a);
 

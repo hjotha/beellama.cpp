@@ -96,8 +96,17 @@ struct llama_memory_context_i {
     // until the graph finishes. Wrappers must forward both hooks to their
     // participating child contexts.
     virtual void graph_compute_start() {}
+
+    // F4: called at the GRAPH CONSTRUCTION boundary, before any K/V store or
+    // reader of the new graph runs. Caches whose per-graph store slots hold
+    // tensors owned by a reused ggml_context must drop them here. Wrappers with
+    // participating child contexts must forward this to all of them.
+    virtual void reset_graph_store_slots() const {}
     virtual void graph_compute_finish(ggml_status /* status */) {}
     virtual void graph_compute_complete(ggml_backend_sched_t /* sched */, ggml_status /* status */) {}
+    // F4: lets a memory implementation read graph-computed tensors after the
+    // compute, when their data finally exists. Default is a no-op.
+    virtual void capture_after_compute(ggml_backend_sched_t /* sched */, ggml_status /* status */) {}
 
 };
 

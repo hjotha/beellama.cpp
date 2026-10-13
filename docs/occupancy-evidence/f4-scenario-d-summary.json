@@ -1,0 +1,8 @@
+{
+ "scenario": "D",
+ "exit_code": 0,
+ "runs": 13,
+ "complete": 13,
+ "failed": 0,
+ "note": "D8a-D8d index discovery PURE->split added; kvarn/D7-state/full-logits gates still open"
+}

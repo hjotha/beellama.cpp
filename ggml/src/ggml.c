@@ -5748,6 +5748,17 @@ struct ggml_tensor * ggml_flash_attn_ext_get_lse_out(
     return (struct ggml_tensor *) ptr;
 }
 
+void ggml_flash_attn_ext_get_alibi_params(
+        const struct ggml_tensor * a,
+        float                   * scale,
+        float                   * max_bias,
+        float                   * logit_softcap) {
+    GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (scale)         { memcpy(scale,         a->op_params + 0, sizeof(float)); }
+    if (max_bias)      { memcpy(max_bias,      a->op_params + 1, sizeof(float)); }
+    if (logit_softcap) { memcpy(logit_softcap, a->op_params + 2, sizeof(float)); }
+}
+
 void ggml_flash_attn_ext_set_lse_out(
         struct ggml_tensor * a,
         struct ggml_tensor * lse) {
@@ -5779,6 +5790,20 @@ void ggml_flash_attn_ext_add_kv_tail(
     a->src[7] = mask_tail;
     a->src[8] = query_order;
     a->src[9] = run_desc;
+    // F4_TAIL_TRACE: report the operand extents the fast-tail kernel asserts
+    // against (fattn-tail.cuh: mt->ne[0] <= kt->ne[1] + kt_current->ne[1]).
+    if (getenv("F4_TAIL_TRACE")) {
+        fprintf(stderr,
+            "F4TAIL bind k_tail=[%lld,%lld,%lld,%lld] v_tail=[%lld,%lld] "
+            "mask_tail=[%lld,%lld] order=[%lld] run_desc=[%lld,%lld] q=%lld\n",
+            (long long) k_tail->ne[0], (long long) k_tail->ne[1],
+            (long long) k_tail->ne[2], (long long) k_tail->ne[3],
+            (long long) v_tail->ne[0], (long long) v_tail->ne[1],
+            (long long) mask_tail->ne[0], (long long) mask_tail->ne[1],
+            (long long) query_order->ne[0],
+            (long long) run_desc->ne[0], (long long) run_desc->ne[1],
+            (long long) (a->src[1] ? a->src[1]->ne[1] : -1));
+    }
 }
 
 void ggml_flash_attn_ext_set_kv_tail_bodyless(struct ggml_tensor * a) {
@@ -7020,12 +7045,56 @@ struct ggml_tensor * ggml_kvarn_view(
         int                   bits,
         bool                  value,
         int                   stage_groups) {
+    // Opt-in geometry dump: placed BEFORE the contract asserts so a rejected
+    // view reports which tensor and which field is wrong, instead of only the
+    // file:line of whichever assert fired first.
+    if (getenv("GGML_KVARN_VIEW_TRACE") != NULL) {
+        fprintf(stderr,
+            "ggml_kvarn_view: records ne=[%lld,%lld,%lld,%lld] type=%d | "
+            "stage ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%d | "
+            "indices ne0=%lld type=%d | n_kv=%d stream_start=%d n_stream=%d "
+            "bits=%d value=%d stage_groups=%d required_multiple=%d "
+            "stage_valid_record_dim=%d\n",
+            (long long) records->ne[0], (long long) records->ne[1],
+            (long long) records->ne[2], (long long) records->ne[3], (int) records->type,
+            (long long) stage_after_store->ne[0], (long long) stage_after_store->ne[1],
+            (long long) stage_after_store->ne[2], (long long) stage_after_store->ne[3],
+            (size_t) stage_after_store->nb[0], (size_t) stage_after_store->nb[1],
+            (size_t) stage_after_store->nb[2], (size_t) stage_after_store->nb[3],
+            (int) stage_after_store->type,
+            (long long) indices->ne[0], (int) indices->type,
+            n_kv, stream_start, n_stream, bits, (int) value, stage_groups,
+            128 * stage_groups,
+            (int) ggml_kvarn_valid_record_dim(stage_after_store->ne[0]));
+    }
     GGML_ASSERT(records->type == GGML_TYPE_I8);
     GGML_ASSERT(stage_after_store->type == GGML_TYPE_F16);
     GGML_ASSERT(indices->type == GGML_TYPE_I64);
     GGML_ASSERT(stage_groups >= 2);
-    GGML_ASSERT(ggml_kvarn_valid_record_dim(stage_after_store->ne[0]) &&
-            stage_after_store->ne[2] % (128 * stage_groups) == 0);
+    // Report the exact geometry when the stage layout is rejected: the stage
+    // tensor must be a whole number of (128 * stage_groups) record groups, and
+    // a bare assert gives no way to see which tensor violated it.
+    if (!(ggml_kvarn_valid_record_dim(stage_after_store->ne[0]) &&
+            stage_after_store->ne[2] % (128 * stage_groups) == 0)) {
+        fprintf(stderr,
+            "ggml_kvarn_view: stage layout rejected: "
+            "stage ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%d | "
+            "records ne=[%lld,%lld,%lld,%lld] type=%d | "
+            "indices ne0=%lld type=%d | "
+            "n_kv=%d stream_start=%d n_stream=%d bits=%d value=%d stage_groups=%d "
+            "required_multiple=%d\n",
+            (long long) stage_after_store->ne[0], (long long) stage_after_store->ne[1],
+            (long long) stage_after_store->ne[2], (long long) stage_after_store->ne[3],
+            (size_t) stage_after_store->nb[0], (size_t) stage_after_store->nb[1],
+            (size_t) stage_after_store->nb[2], (size_t) stage_after_store->nb[3],
+            (int) stage_after_store->type,
+            (long long) records->ne[0], (long long) records->ne[1],
+            (long long) records->ne[2], (long long) records->ne[3], (int) records->type,
+            (long long) indices->ne[0], (int) indices->type,
+            n_kv, stream_start, n_stream, bits, (int) value, stage_groups,
+            128 * stage_groups);
+        GGML_ABORT("ggml_kvarn_view: stage layout rejected");
+    }
     GGML_ASSERT(stage_after_store->ne[1] == records->ne[1]);
     GGML_ASSERT(n_kv > 0 && ggml_kvarn_valid_bits(bits));
     GGML_ASSERT(records->ne[0] == (int64_t) ggml_kvarn_record_bytes(stage_after_store->ne[0], bits, value));
@@ -8212,6 +8281,15 @@ struct ggml_tensor ** ggml_graph_nodes(struct ggml_cgraph * cgraph) {
 
 int ggml_graph_n_nodes(struct ggml_cgraph * cgraph) {
     return cgraph->n_nodes;
+}
+
+int ggml_graph_n_leafs(struct ggml_cgraph * cgraph) {
+    return cgraph->n_leafs;
+}
+
+struct ggml_tensor * ggml_graph_leaf(struct ggml_cgraph * cgraph, int i) {
+    GGML_ASSERT(i >= 0 && i < cgraph->n_leafs);
+    return cgraph->leafs[i];
 }
 
 void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {

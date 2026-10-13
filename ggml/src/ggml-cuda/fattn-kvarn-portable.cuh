@@ -191,7 +191,12 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
 
     float accumulator[VALUES] = {};
     if (tid == 0) {
-        maximum = -FLT_MAX;
+        // Empty-row contract: a row that never sees an unmasked key (the
+        // all-masked shape) must keep a FINITE running max and a zero denominator,
+        // so the per-key scale below is a plain 1 and the final write is exactly 0.
+        // -FLT_MAX as the sentinel makes old_scale/weight the 0*Inf / Inf products
+        // that surface as NaN in O.
+        maximum = 0.0f;
         denominator = 0.0f;
     }
     __syncthreads();
@@ -298,8 +303,8 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
                 weight_shared = 0.0f;
             } else {
                 const float next_maximum = fmaxf(maximum, score);
-                const float old_scale = maximum == -FLT_MAX ?
-                    0.0f : expf(maximum - next_maximum);
+                const float old_scale = denominator > 0.0f ?
+                    expf(maximum - next_maximum) : 0.0f;
                 const float weight = expf(score - next_maximum);
                 maximum = next_maximum;
                 denominator = denominator * old_scale + weight;
@@ -468,6 +473,14 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             output_meta[row * n_splits + split] = make_float2(maximum, denominator);
         }
         weight_shared = n_splits == 1 && denominator > 0.0f ? 1.0f / denominator : 1.0f;
+        // Empty-row contract: with denominator == 0 the row contributed no key, so
+        // the pair must be the exact neutral value; the masked branch sets
+        // old_scale_shared to 1 while the else branch leaves weight_shared at its
+        // previous value, which is how an all-masked row reached NaN in O.
+        if (denominator <= 0.0f) {
+            old_scale_shared = 1.0f;
+            weight_shared = 0.0f;
+        }
     }
     if constexpr (D == 64) {
         __syncwarp();
@@ -481,7 +494,10 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
 #pragma unroll
         for (int i = 0; i < VALUES; ++i) {
             const int dim = i * THREADS + tid;
-            output[dim] = accumulator[i] * old_scale_shared * weight_shared;
+            // Contract: an all-masked row (denominator == 0) must publish exactly
+            // 0. The guard also keeps a valid row bit-identical.
+            output[dim] = denominator > 0.0f ?
+                accumulator[i] * old_scale_shared * weight_shared : 0.0f;
         }
     } else {
         const size_t row = ((size_t) stream * n_query + query) * n_query_heads + query_head;
@@ -489,7 +505,7 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
 #pragma unroll
         for (int i = 0; i < VALUES; ++i) {
             const int dim = i * THREADS + tid;
-            partial[dim] = accumulator[i] * old_scale_shared;
+            partial[dim] = denominator > 0.0f ? accumulator[i] * old_scale_shared : 0.0f;
         }
     }
 }
@@ -767,7 +783,14 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_combine_kernel(
     extern __shared__ float weights[];
     __shared__ float denominator;
     if (tid == 0) {
-        float m = -FLT_MAX;
+        // Empty-row contract: a row whose every split is empty (all-masked, e.g.
+        // the q256 full-mask case) must publish O exactly 0 and LSE -inf, never NaN.
+        // m must stay a FINITE sentinel in that case: with m = -FLT_MAX the
+        // per-split weight becomes expf(meta.x - m) with both operands equal for an
+        // empty split, and 0 * NaN or a later 0/0 leaks NaN into `value`. Use 0.0f
+        // as the neutral running max and gate the weight on a positive denom, so
+        // empty splits contribute exactly 0 weight and no invalid arithmetic.
+        float m = 0.0f;
         for (int split = 0; split < n_splits; ++split) {
             const float2 meta = partial_meta[row * n_splits + split];
             if (meta.y > 0.0f) {
@@ -876,10 +899,21 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
     const size_t n_desc = (size_t) plan.n_stream * plan.n_kv_heads;
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> k_desc(pool, n_desc);
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> v_desc(pool, n_desc);
-    const int n_splits = D == 64 ?
-        (plan.n_kv + GGML_CUDA_FATTN_KVARN_PORTABLE_SPLIT_TOKENS - 1) /
-            GGML_CUDA_FATTN_KVARN_PORTABLE_SPLIT_TOKENS : 1;
     const size_t n_rows = (size_t) q->ne[1] * q->ne[2] * q->ne[3];
+    const bool split_d256_decode = D == 256 && q->ne[1] == 1 &&
+        !tail_attached && ggml_cuda_fattn_kvarn_v_original_domain(dst);
+    const int desired_splits = (int64_t(plan.n_kv) + GGML_CUDA_FATTN_KVARN_PORTABLE_SPLIT_TOKENS - 1) /
+        GGML_CUDA_FATTN_KVARN_PORTABLE_SPLIT_TOKENS;
+    // Bound additional decode scratch for larger head/stream counts.
+    const size_t decode_split_budget = 16u * 1024u * 1024u;
+    const size_t bytes_per_split = n_rows * (D * sizeof(float) + sizeof(float2));
+    // Combine uses one shared float per split; stay below default shared limits.
+    const size_t decode_shared_split_limit = 32u * 1024u / sizeof(float);
+    const int decode_split_limit = bytes_per_split > 0 ?
+        (int) std::min(decode_shared_split_limit,
+            std::max<size_t>(1, decode_split_budget / bytes_per_split)) : 1;
+    const int n_splits = D == 64 ? desired_splits :
+        (split_d256_decode ? std::min(desired_splits, decode_split_limit) : 1);
     const size_t partial_elements = n_splits > 1 ? n_rows * n_splits * D : 1;
     const size_t partial_meta_elements = n_splits > 1 ? n_rows * n_splits : 1;
     ggml_cuda_pool_alloc<float> partial(pool, partial_elements);

@@ -22,11 +22,13 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 
 // dedup helpers
 
@@ -112,6 +114,62 @@ static ggml_tensor * build_attn_inp_kq_mask(
     ggml_set_name(res, "attn_inp_kq_mask");
 
     return res;
+}
+
+// Physical-map binding for the packed overflow view, factored out because TWO reuse
+// paths must enforce it: llm_graph_input_attn_kv::can_reuse and the hybrid memory
+// inputs' can_reuse (which duplicates a subset of the attention checks and does NOT
+// call it -- that duplication is exactly how a stale view survived 254 decode steps).
+static bool split_packed_map_still_valid(
+        const llama_kv_cache_context * attn_mctx,
+        bool     packed,
+        uint32_t baked_row0,
+        uint32_t baked_rows,
+        const char * where) {
+    if (!packed) {
+        return true;
+    }
+    // The packed overflow view lives in the KVarN attention context. Accept either that
+    // context directly or a hybrid wrapper around it.
+    const llama_kv_cache_context * kv_attn = nullptr;
+    if (const auto * kv = dynamic_cast<const llama_kv_cache_kvarn_context *>(attn_mctx)) {
+        kv_attn = kv;
+    } else if (const auto * hyb = dynamic_cast<const llama_memory_hybrid_context *>(attn_mctx)) {
+        kv_attn = hyb->get_attn_kv_context();
+    }
+    const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(kv_attn);
+    if (!kvarn_ctx || !kvarn_ctx->position_split_enabled()) {
+        return false;
+    }
+    // baked_row0 is deliberately the absolute/global cell ID. This reuse guard
+    // compares metadata cell order, not compact Qx physical rows; only packed
+    // view construction calls payload_row_for_cell().
+    const auto * kvarn_cache = kvarn_ctx->get_kvarn_cache();
+    std::vector<uint32_t> ovf;
+    if (!kvarn_cache ||
+        !kvarn_cache->position_split_live_cells(
+                    llama_position_split::range_kind::OVERFLOW, ovf)) {
+        return false;
+    }
+    // Capacity-stable extent: the live run may grow up to the baked extent while
+    // the graph is reused; the mask is refilled every batch and rows past the live
+    // run stay masked. Only a changed first row or a fragmented run invalidates.
+    const bool same_extent = !ovf.empty() && ovf.front() == baked_row0 &&
+        ovf.size() <= size_t(baked_rows);
+    bool ascending = same_extent;
+    for (size_t i = 1; ascending && i < ovf.size(); ++i) {
+        ascending = ovf[i] == ovf[i-1] + 1;
+    }
+    if (!(same_extent && ascending)) {
+        if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
+            fprintf(stderr,
+                    "[F5OVF] reuse REFUSED (%s): baked row0=%u rows=%u | live row0=%u n=%zu contiguous=%d\n",
+                    where, baked_row0, baked_rows, ovf.empty() ? 0u : ovf.front(),
+                    ovf.size(), int(ascending));
+        }
+        return false;
+    }
+    return true;
 }
 
 static bool can_reuse_kq_mask(
@@ -441,7 +499,31 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_rs::set_history(const llama_memory_recurrent_context * mctx_cur) {
+    // Other recurrent architectures may not consume the DeltaNet history input.
+    // Unused graph inputs have no allocated backend buffer.
+    if (!s_history || !s_history->buffer) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_history->buffer));
+    const int64_t n_seqs = mctx_cur->get_ubatch().n_seqs;
+    const int64_t n_history = s_history->ne[0] / n_seqs;
+    int32_t * data = (int32_t *) s_history->data;
+    for (int64_t age = 0; age < n_history; ++age) {
+        for (int64_t seq = 0; seq < n_seqs; ++seq) {
+            data[age*n_seqs + seq] = mctx_cur->s_history(seq, age);
+        }
+    }
+}
+
+bool llm_graph_input_rs::can_reuse_history(const llm_graph_params & params) const {
+    const int64_t n_history = std::max<int64_t>(0,
+            (int64_t) params.cparams.n_rs_seq + 1 - params.ubatch.n_seq_tokens);
+    return s_history ? s_history->ne[0] == n_history*params.ubatch.n_seqs : n_history == 0;
+}
+
 void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mctx_cur, const llama_ubatch * ubatch) {
+    set_history(mctx_cur); // s_copy consumes the pending rollback index
     const int64_t n_rs = mctx_cur->get_n_rs();
 
     if (s_copy) {
@@ -485,6 +567,7 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
 
     res &= head == mctx_cur->get_head();
     res &= rs_z == mctx_cur->get_rs_z();
+    res &= can_reuse_history(params);
 
     return res;
 }
@@ -631,6 +714,20 @@ static llama_seq_id tail_query_plan_primary_seq(
     return ubatch.seq_id_unq[stream];
 }
 
+
+// P-mode-aware wrapper over the shared helper in llama-position-split.h.
+template <typename Ctx>
+static int64_t tail_extent_queries(const Ctx * mctx, const llama_ubatch & ub, int64_t q_max) {
+    const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+    if (!kvarn || !kvarn->position_split_enabled()) {
+        return q_max;
+    }
+    const auto * cache = kvarn->get_kvarn_cache();
+    const uint32_t p = cache ? cache->position_split_p() : 0;
+    return llama_position_split::tail_extent_queries(kvarn->position_split_enabled(), p,
+            ub.pos, ub.n_tokens, q_max);
+}
+
 static std::pair<int64_t, int64_t> tail_query_plan_shape(const llama_ubatch & ubatch) {
     const bool explicit_tokens = tail_query_plan_has_explicit_tokens(ubatch);
     std::map<llama_seq_id, int64_t> counts;
@@ -774,7 +871,15 @@ llm_graph_input_attn_kv_iswa::llm_graph_input_attn_kv_iswa(
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
-    mctx->set_input_tail_idxs(self_tail_idxs, ubatch);
+    // The tail WRITE index is consumed only by the local tail store. A
+    // position-split overflow ubatch stores Q4 overflow keys and never writes
+    // the local tail, so nothing references this input, the scheduler prunes it
+    // and it arrives here without a buffer -- the same contract already used
+    // for self_kq_mask and self_kvarn_mat_idxs above. An allocated input that
+    // is not host memory still fails inside ggml_backend_buffer_is_host().
+    if (self_tail_idxs && self_tail_idxs->buffer) {
+        mctx->set_input_tail_idxs(self_tail_idxs, ubatch);
+    }
     set_tail_query_plan(self_tail_query_order, self_tail_run_desc, *ubatch);
     if (self_kvarn_mat_idxs && self_kvarn_mat_idxs->buffer) {
         const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
@@ -798,6 +903,164 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
         GGML_ASSERT(kvarn && kvarn->has_standard_cache());
         kvarn->set_standard_input_kq_mask(self_kq_mask_standard, ubatch, cparams.causal_attn);
+    }
+
+    // F3 position-split range inputs. Recompute live cells per batch (history
+    // grows); sizes must match the built tensors (can_reuse rebuilds on
+    // change), otherwise fail closed rather than filling a stale layout.
+    // Masks/idxs are filled via backend copies so tensor placement (host or
+    // device) never matters.
+    if ((self_kq_mask_local && self_kq_mask_local->buffer) ||
+            (self_kq_mask_overflow && self_kq_mask_overflow->buffer) ||
+            (self_kvarn_mat_idxs_local && self_kvarn_mat_idxs_local->buffer) ||
+            (self_overflow_cell_idxs && self_overflow_cell_idxs->buffer) ||
+            (self_ovf_view_rows && self_ovf_view_rows->buffer)) {
+        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+        GGML_ASSERT(kvarn && kvarn->position_split_enabled());
+        const auto * kvarn_cache = kvarn->get_kvarn_cache();
+        GGML_ASSERT(kvarn_cache != nullptr);
+        const auto * standard_cache = kvarn_cache->get_standard_cache();
+        if (!standard_cache) {
+            throw std::runtime_error("position-split overflow indices require the standard Qx cache");
+        }
+        const uint32_t payload_origin = standard_cache->get_payload_row_origin();
+        const uint32_t payload_size = standard_cache->get_payload_size();
+        std::vector<uint32_t> local_cells, overflow_cells;
+        GGML_ASSERT(kvarn_cache->position_split_live_cells(
+                    llama_position_split::range_kind::LOCAL, local_cells));
+        GGML_ASSERT(kvarn_cache->position_split_live_cells(
+                    llama_position_split::range_kind::OVERFLOW, overflow_cells));
+        split_local_cells = std::move(local_cells);
+        split_overflow_cells = std::move(overflow_cells);
+        const auto * metadata = kvarn_cache->get_metadata_cache();
+        GGML_ASSERT(metadata != nullptr);
+        // Range masks: temporal causal rule over absolute positions. P-mode
+        // is single-sequence, non-SWA, non-Alibi (validated at cache
+        // creation); fail closed otherwise. M-RoPE spatial tie-breaks are
+        // unnecessary for text batches with distinct temporal positions.
+        if (hparams.use_alibi) {
+            throw std::runtime_error("position-split range masks do not support Alibi bias");
+        }
+        auto fill_range_mask = [&](ggml_tensor * mask, const std::vector<uint32_t> & cells, const char * what) {
+            GGML_ASSERT(mask && mask->buffer);
+            const int64_t n_cap = mask->ne[0];
+            GGML_ASSERT(int64_t(cells.size()) <= n_cap);
+            const int64_t n_q = mask->ne[1];
+            GGML_ASSERT(int64_t(ubatch->n_tokens) == n_q);
+            GGML_ASSERT(ubatch->n_pos >= 1 && ubatch->pos != nullptr);
+            std::vector<float> host(size_t(n_cap*n_q), -INFINITY);
+            const auto & all_cells = metadata->get_cells(0);
+            for (int64_t qi = 0; qi < n_q; ++qi) {
+                const llama_pos p_q = ubatch->pos[qi];
+                for (size_t ki = 0; ki < cells.size(); ++ki) {
+                    const llama_pos p_k = all_cells.pos_get(cells[ki]);
+                    const bool visible = !cparams.causal_attn || (p_k <= p_q);
+                    host[size_t(qi*n_cap + ki)] = visible ? 0.0f : -INFINITY;
+                }
+                // Beyond live cells: fully masked (empty).
+            }
+            if (mask->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> host16(host.size());
+                for (size_t i = 0; i < host.size(); ++i) {
+                    host16[i] = ggml_fp32_to_fp16(host[i]);
+                }
+                ggml_backend_tensor_set(mask, host16.data(), 0, host16.size()*sizeof(ggml_fp16_t));
+            } else if (mask->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(mask, host.data(), 0, host.size()*sizeof(float));
+            } else {
+                throw std::runtime_error(format(
+                        "position-split %s mask has unsupported type %s",
+                        what, ggml_type_name(mask->type)));
+            }
+            (void) what;
+        };
+        if (self_kq_mask_local && self_kq_mask_local->buffer) {
+            fill_range_mask(self_kq_mask_local, split_local_cells, "local");
+            if (self_kq_mask_tail && self_kq_mask_tail->buffer) {
+                // Dual attention consumes the local range mask, so the general
+                // self_kq_mask can be pruned. Its allocation must not decide
+                // whether the shared exact-tail inputs/descriptor are filled.
+                std::vector<int64_t> local_read_cells(size_t(self_kq_mask_local->ne[0]), -1);
+                for (size_t i = 0; i < split_local_cells.size(); ++i) {
+                    local_read_cells[i] = split_local_cells[i];
+                }
+                metadata->set_input_kq_mask_tail_mapped(
+                        self_kq_mask_local, self_kq_mask_tail,
+                        self_tail_read_idxs, self_tail_body_read_idxs, self_tail_bias_read_idxs,
+                        ubatch, cparams.causal_attn, local_read_cells);
+                metadata->set_input_tail_body_plan(
+                        self_tail_query_order, self_tail_run_desc, self_kq_mask_local,
+                        ubatch, cparams.causal_attn);
+            }
+        }
+        if (self_kq_mask_overflow && self_kq_mask_overflow->buffer) {
+            fill_range_mask(self_kq_mask_overflow, split_overflow_cells, "overflow");
+        }
+        if (self_kvarn_mat_idxs_local && self_kvarn_mat_idxs_local->buffer) {
+            GGML_ASSERT(int64_t(split_local_cells.size()) <= self_kvarn_mat_idxs_local->ne[0]);
+            kvarn->set_input_kvarn_mat_idxs_local(self_kvarn_mat_idxs_local, split_local_cells);
+        }
+        if (self_overflow_cell_idxs && self_overflow_cell_idxs->buffer) {
+            GGML_ASSERT(int64_t(split_overflow_cells.size()) <= self_overflow_cell_idxs->ne[0]);
+            GGML_ASSERT(self_overflow_cell_idxs->type == GGML_TYPE_I32);
+            std::vector<int32_t> host_cells(size_t(self_overflow_cell_idxs->ne[0]), 0);
+            for (size_t i = 0; i < split_overflow_cells.size(); ++i) {
+                const uint32_t global_cell = split_overflow_cells[i];
+                if (global_cell < kvarn_cache->position_split_p() ||
+                        global_cell >= kvarn_cache->get_kv_size()) {
+                    throw std::runtime_error(format(
+                            "position-split overflow cell %u is outside global range [P=%u,C=%u)",
+                            global_cell, kvarn_cache->position_split_p(), kvarn_cache->get_kv_size()));
+                }
+                // The metadata and range mask stay in global cell coordinates. Qx
+                // GET_ROWS consumes the companion's physical payload row instead.
+                // The cache owns this mapping because compact v2 payloads start at P
+                // while legacy standard rows still start at zero.
+                const uint32_t physical_row = standard_cache->payload_row_for_cell(global_cell);
+                if (physical_row >= payload_size || physical_row > uint32_t(INT32_MAX)) {
+                    throw std::runtime_error(format(
+                            "position-split overflow cell %u maps outside Qx payload origin=%u size=%u (row=%u)",
+                            global_cell, payload_origin, payload_size, physical_row));
+                }
+                host_cells[i] = int32_t(physical_row);
+            }
+            if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
+                // Ground truth for the row-mapping question: what row indices does the
+                // gather actually reads (global cell IDs and physical payload rows),
+                // and are both mappings contiguous ascending runs?
+                const size_t n = split_overflow_cells.size();
+                bool global_asc = n > 0;
+                bool physical_asc = n > 0;
+                for (size_t i = 1; i < n; ++i) {
+                    global_asc = global_asc && split_overflow_cells[i] == split_overflow_cells[i-1] + 1;
+                    physical_asc = physical_asc && host_cells[i] == host_cells[i-1] + 1;
+                }
+                const int32_t g0 = n ? int32_t(split_overflow_cells[0]) : -1;
+                const int32_t g1 = n > 1 ? int32_t(split_overflow_cells[1]) : -1;
+                const int32_t g2 = n > 2 ? int32_t(split_overflow_cells[2]) : -1;
+                const int32_t gl = n ? int32_t(split_overflow_cells[n-1]) : -1;
+                const int32_t p0 = n ? host_cells[0] : -1;
+                const int32_t p1 = n > 1 ? host_cells[1] : -1;
+                const int32_t p2 = n > 2 ? host_cells[2] : -1;
+                const int32_t pl = n ? host_cells[n-1] : -1;
+                fprintf(stderr, "[F5IDX] n=%zu payload_origin=%u payload_size=%u global_first=[%d,%d,%d] global_last=%d physical_first=[%d,%d,%d] physical_last=%d global_ascending=%d physical_ascending=%d\n",
+                        n, payload_origin, payload_size, g0, g1, g2, gl, p0, p1, p2, pl,
+                        int(global_asc), int(physical_asc));
+            }
+            ggml_backend_tensor_set(self_overflow_cell_idxs,
+                    host_cells.data(), 0, host_cells.size()*sizeof(int32_t));
+        }
+        if (self_ovf_view_rows && self_ovf_view_rows->buffer) {
+            GGML_ASSERT(self_ovf_view_rows->type == GGML_TYPE_I32);
+            const int64_t n = self_ovf_view_rows->ne[0];
+            std::vector<int32_t> rows;
+            rows.resize(size_t(n));
+            for (int64_t i = 0; i < n; ++i) {
+                rows[size_t(i)] = int32_t(i); // identity over the packed view rows
+            }
+            ggml_backend_tensor_set(self_ovf_view_rows,
+                    rows.data(), 0, rows.size()*sizeof(int32_t));
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -829,7 +1092,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto [q_max, n_active] = tail_query_plan_shape(params.ubatch);
     res &= self_tail_query_order == nullptr ||
             (self_tail_query_order->ne[0] == q_max && self_tail_query_order->ne[1] == n_active);
-    const uint32_t tail_attention_stride = mctx->get_tail_attention_stride(uint32_t(q_max));
+    const uint32_t tail_attention_stride = mctx->get_tail_attention_stride(
+            uint32_t(tail_extent_queries(mctx, params.ubatch, q_max)));
     const int64_t tail_desc_stride = 6 + tail_attention_stride +
             (mctx->can_pack_tail_body(params.ubatch) ? mctx->get_tail_body_execution_stride() : 0);
     res &= self_tail_run_desc == nullptr ||
@@ -852,6 +1116,40 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
     res &= self_kq_mask_standard == nullptr ||
             can_reuse_kq_mask(self_kq_mask_standard, mctx, params.ubatch, params.cparams);
+    // F3: split range inputs are capacity-sized (P and C-P), so history
+    // growth never forces a rebuild. Only the query count must match; refresh
+    // the stored cell lists so set_input fills fresh data.
+    if (self_kq_mask_local || self_kq_mask_overflow ||
+            self_kvarn_mat_idxs_local || self_overflow_cell_idxs) {
+        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+        bool split_ok = kvarn && kvarn->position_split_enabled();
+        std::vector<uint32_t> local_cells, overflow_cells;
+        if (split_ok) {
+            const auto * kvarn_cache = kvarn->get_kvarn_cache();
+            split_ok = kvarn_cache &&
+                kvarn_cache->position_split_live_cells(
+                    llama_position_split::range_kind::LOCAL, local_cells) &&
+                kvarn_cache->position_split_live_cells(
+                    llama_position_split::range_kind::OVERFLOW, overflow_cells);
+        }
+        const int64_t n_q = params.ubatch.n_tokens;
+        split_ok = split_ok &&
+            (self_kq_mask_local == nullptr || self_kq_mask_local->ne[1] == n_q) &&
+            (self_kq_mask_overflow == nullptr || self_kq_mask_overflow->ne[1] == n_q);
+        // The graph may carry a packed Q4 view of the overflow storage, which is only
+        // valid while the live run keeps the same row, extent and order. An append inside
+        // existing padding changes the live extent WITHOUT changing n_kv or the query
+        // count, so the size-only checks above cannot see it.
+        split_ok = split_ok && split_packed_map_still_valid(
+                static_cast<const llama_kv_cache_context *>(
+                    dynamic_cast<const llama_memory_context_i *>(mctx)),
+                split_ovf_packed, split_ovf_row0, split_ovf_n_rows, "attn");
+        if (split_ok) {
+            split_local_cells = std::move(local_cells);
+            split_overflow_cells = std::move(overflow_cells);
+        }
+        res &= split_ok;
+    }
     res &= self_kq_mask_tail == nullptr ||
             (self_kq_mask_tail->ne[0] == tail_attention_stride &&
              self_kq_mask_tail->ne[1] == self_kq_mask->ne[1] &&
@@ -1553,7 +1851,15 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
                 ubatch, cparams.causal_attn);
     }
 
-    mctx->set_input_tail_idxs(self_tail_idxs, ubatch);
+    // The tail WRITE index is consumed only by the local tail store. A
+    // position-split overflow ubatch stores Q4 overflow keys and never writes
+    // the local tail, so nothing references this input, the scheduler prunes it
+    // and it arrives here without a buffer -- the same contract already used
+    // for self_kq_mask and self_kvarn_mat_idxs above. An allocated input that
+    // is not host memory still fails inside ggml_backend_buffer_is_host().
+    if (self_tail_idxs && self_tail_idxs->buffer) {
+        mctx->set_input_tail_idxs(self_tail_idxs, ubatch);
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -1603,7 +1909,8 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     inp_raw->mctx = raw_ctx;
     const auto [tail_q_max, tail_n_active] = tail_query_plan_shape(params.ubatch);
     GGML_UNUSED(tail_n_active);
-    const uint32_t tail_attention_stride = raw_ctx->get_tail_attention_stride(uint32_t(tail_q_max));
+    const uint32_t tail_attention_stride = raw_ctx->get_tail_attention_stride(
+            uint32_t(tail_extent_queries(raw_ctx, params.ubatch, tail_q_max)));
 
     if (inp_raw->self_k_idxs && inp_raw->self_k_idxs->buffer) {
         res &= inp_raw->self_k_idxs->ne[0] == raw_ctx->get_n_write();
@@ -1706,6 +2013,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
       //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
         res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+        // Packed overflow views are baked per graph; this path does not call
+        // inp_attn->can_reuse(), so the binding is enforced here as well, against the
+        // ATTENTION memory context (never the hybrid one).
+        res &= split_packed_map_still_valid(mctx->get_attn(),
+                inp_attn->split_ovf_packed, inp_attn->split_ovf_row0,
+                inp_attn->split_ovf_n_rows, "hybrid");
         res &= inp_attn->self_tail_read_idxs == nullptr ||
                 (inp_attn->self_tail_read_idxs->ne[0] == tail_attention_stride &&
                  inp_attn->self_tail_read_idxs->ne[1] == params.ubatch.n_tokens);
@@ -3353,6 +3666,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     GGML_ASSERT(!k_tail || tail_route != LLAMA_KV_TAIL_ROUTE_NONE);
     GGML_ASSERT(!tail_read_idxs || use_native_tail);
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && (k_tail == nullptr || use_native_tail);
+    if (getenv("F4_TAIL_TRACE")) {
+        fprintf(stderr, "F4MHA il=%d flash=%d kq_b=%p k_tail=%p route=%d idx=%p "
+                "native=%d use_fa=%d mask=%p n_kv=%lld\n",
+                il, (int) cparams.flash_attn, (void *) kq_b, (void *) k_tail,
+                (int) tail_route, (void *) tail_read_idxs, (int) use_native_tail,
+                (int) use_flash_attn, (void *) kq_mask, (long long) n_kv_max);
+    }
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -3371,9 +3691,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        GGML_ASSERT(cparams.kvarn.window_chunk <= uint32_t(INT32_MAX));
+        cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK] =
+                static_cast<int32_t>(cparams.kvarn.window_chunk);
         if (kvarn_domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) {
             cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) kvarn_domain;
         }
+        // Raw FlashAttention output, before any native KV-tail merge rewrites
+        // the node. This is the operator boundary the fixture dump compares.
+        cb(cur, "fa_out", il);
         if (use_native_tail) {
             GGML_ASSERT(tail_query_order && tail_run_desc);
             cur = k_tail_current ?
@@ -3398,6 +3724,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (final_attn_op) {
             *final_attn_op = cur;
+            if (getenv("F4_TAIL_TRACE")) {
+                fprintf(stderr, "F4SET il=%d final=%p cur=%p merged=%d\n",
+                        il, (void *) final_attn_op, (void *) cur, (int) use_native_tail);
+            }
         }
 
         if (v_mla) {
@@ -3529,8 +3859,33 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+static void validate_native_kvarn_noncausal_operation(
+        const llama_kv_cache_context * mctx, int32_t il, ggml_tensor * op) {
+    const auto * cache = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+    auto * dev = cache ? cache->native_attention_backend(il) : nullptr;
+    if (op && op->op == GGML_OP_FLASH_ATTN_EXT) {
+        op->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK] = 1;
+    }
+    if (!dev || !op || op->op != GGML_OP_FLASH_ATTN_EXT ||
+            !ggml_backend_dev_supports_op(dev, op)) {
+        throw std::runtime_error(format(
+                "KVarN non-causal layer %d final native attention operation is unsupported by %s",
+                il, dev ? ggml_backend_dev_name(dev) : "unknown"));
+    }
+}
+
+// `ubatch_writes_local_range` states, from the UBATCH alone (not from what was
+// built), whether the tokens this graph stores belong to the local range. The
+// plan's route.has_current is a per-layer property meaning "a graph that writes
+// the local range carries a current K/V segment"; a position-split OVERFLOW
+// ubatch writes Q4 overflow keys instead, so its local tail is read purely as
+// HISTORY and must carry no current segment. That is made explicit here rather
+// than relaxing the guard: a present or half-present current segment in such a
+// graph still fails, as does any mismatch in body/exact types, has_body or
+// body_execution_rows.
 static void validate_native_tail_operation(
-        const llama_kv_cache_context * mctx, int32_t il, const ggml_tensor * op) {
+        const llama_kv_cache_context * mctx, int32_t il, const ggml_tensor * op,
+        bool ubatch_writes_local_range) {
     const auto * route = mctx->get_tail_layer_route(il);
     if (!route || route->capability.route != LLAMA_KV_TAIL_ROUTE_NATIVE) {
         return;
@@ -3540,8 +3895,9 @@ static void validate_native_tail_operation(
                 "KV tail layer %d advertised native attention but built no final FlashAttention operation", il));
     }
     const bool has_current = op->src[10] != nullptr || op->src[11] != nullptr;
+    const bool expect_current = route->has_current && ubatch_writes_local_range;
     if ((op->src[10] == nullptr) != (op->src[11] == nullptr) ||
-            has_current != route->has_current) {
+            has_current != expect_current) {
         throw std::logic_error(format(
                 "KV tail layer %d current-segment descriptor does not match the final operation", il));
     }
@@ -3550,8 +3906,22 @@ static void validate_native_tail_operation(
             op->src[5]->type != route->exact_type_k || op->src[6]->type != route->exact_type_v ||
             route->has_body != mctx->has_kv_body(il) ||
             route->body_execution_rows != mctx->get_tail_body_execution_rows(il)) {
+        // Report every compared field: the guard must stay fail-closed, and a
+        // message that only says "does not match" leaves the operator to guess
+        // which of the six conditions moved.
         throw std::logic_error(format(
-                "KV tail layer %d execution descriptor does not match final tensor types or extents", il));
+                "KV tail layer %d execution descriptor does not match final tensor types or extents: "
+                "k_src_type=%d route_body_k=%d v_src_type=%d route_body_v=%d "
+                "kt_src_type=%d route_exact_k=%d vt_src_type=%d route_exact_v=%d "
+                "has_body_src=%d route_has_body=%d rows_src=%d route_rows=%d",
+                il,
+                op->src[1] ? (int) op->src[1]->type : -1, (int) route->body_type_k,
+                op->src[2] ? (int) op->src[2]->type : -1, (int) route->body_type_v,
+                op->src[5] ? (int) op->src[5]->type : -1, (int) route->exact_type_k,
+                op->src[6] ? (int) op->src[6]->type : -1, (int) route->exact_type_v,
+                (int) mctx->has_kv_body(il), (int) route->has_body,
+                (int) mctx->get_tail_body_execution_rows(il),
+                (int) route->body_execution_rows));
     }
     auto * dev = route->owner;
     if (!dev || !ggml_backend_dev_supports_op(dev, op)) {
@@ -3659,15 +4029,20 @@ static void build_attn_inp_tail(
              ggml_tensor *& tail_query_order,
              ggml_tensor *& tail_run_desc,
                     bool   pack_sparse_body) {
-    tail_idxs = mctx->build_input_tail_idxs(ctx0, ubatch);
     if (mctx->get_tail_tokens() == 0) {
+        // No exact tail: leave all tail inputs null so set_input skips them.
+        // (Previously tail_idxs was built unconditionally, leaving a
+        // buffer-less tensor that crashed set_input when tails are disabled,
+        // e.g. position-split mode.)
         return;
     }
+    tail_idxs = mctx->build_input_tail_idxs(ctx0, ubatch);
     const auto [q_max, n_active] = tail_query_plan_shape(ubatch);
     GGML_ASSERT(q_max > 0 && n_active > 0);
     const uint32_t arena_stride = mctx->get_tail_arena_stride();
     const uint32_t body_execution_stride = mctx->get_tail_body_execution_stride();
-    const uint32_t attention_stride = mctx->get_tail_attention_stride(uint32_t(q_max));
+    const uint32_t attention_stride = mctx->get_tail_attention_stride(
+            uint32_t(tail_extent_queries(mctx, ubatch, q_max)));
     GGML_ASSERT(attention_stride >= mctx->get_tail_tokens());
     GGML_ASSERT(mctx->has_compact_tail() || arena_stride >= attention_stride);
     tail_read_idxs = ggml_new_tensor_2d(
@@ -3859,6 +4234,51 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             inp->self_kvarn_mat_idxs = kvarn->build_input_kvarn_mat_idxs(ctx0);
             kvarn->set_mat_idxs(inp->self_kvarn_mat_idxs);
         }
+        // F3 position-split range inputs (P-mode only). Sized to the RANGE
+        // CAPACITY (P and C-P), never to live counts: history can grow
+        // between graph build and set_input (pipelined prepare), so exact
+        // sizing races. set_input fills the live prefix and masks the rest
+        // as empty (-inf); FA cost scales with capacity, acceptable for
+        // validation (a future optimization rebuilds on count change).
+        // Both ranges must be non-empty... (see below; empty live lists are
+        // fine, tensors still built at capacity).
+        if (kvarn->position_split_enabled()) {
+            const auto * kvarn_cache = kvarn->get_kvarn_cache();
+            if (kvarn_cache) {
+                const uint32_t p = kvarn_cache->position_split_p();
+                const uint32_t c = kvarn_cache->get_kv_size();
+                const int64_t n_q = ubatch.n_tokens;
+                const int64_t n_stream = 1;
+                inp->self_kq_mask_local = ggml_new_tensor_4d(ctx0,
+                        inp->self_kq_mask->type,
+                        int64_t(p), n_q, 1, n_stream);
+                ggml_set_input(inp->self_kq_mask_local);
+                ggml_set_name(inp->self_kq_mask_local, "attn_inp_kq_mask_local");
+                inp->self_kq_mask_local_cnv = inp->self_kq_mask_local;
+                inp->self_kq_mask_overflow = ggml_new_tensor_4d(ctx0,
+                        inp->self_kq_mask->type,
+                        int64_t(c - p), n_q, 1, n_stream);
+                ggml_set_input(inp->self_kq_mask_overflow);
+                ggml_set_name(inp->self_kq_mask_overflow, "attn_inp_kq_mask_overflow");
+                inp->self_kq_mask_overflow_cnv = inp->self_kq_mask_overflow;
+                inp->self_kvarn_mat_idxs_local = ggml_new_tensor_1d(ctx0,
+                        GGML_TYPE_I64, int64_t(p));
+                ggml_set_input(inp->self_kvarn_mat_idxs_local);
+                ggml_set_name(inp->self_kvarn_mat_idxs_local, "attn_inp_kvarn_mat_idxs_local");
+                inp->self_overflow_cell_idxs = ggml_new_tensor_1d(ctx0,
+                        GGML_TYPE_I32, int64_t(c - p));
+                ggml_set_input(inp->self_overflow_cell_idxs);
+                ggml_set_name(inp->self_overflow_cell_idxs, "attn_inp_overflow_cell_idxs");
+                // Identity-row input for the packed view read (tiny: one i32 per
+                // overflow cell at capacity). The view rows are fed to attention as
+                // F16 through the supported GET_ROWS path; see the builder.
+                inp->self_ovf_view_rows = ggml_new_tensor_1d(ctx0,
+                        GGML_TYPE_I32, int64_t(c - p));
+                ggml_set_input(inp->self_ovf_view_rows);
+                ggml_set_name(inp->self_ovf_view_rows, "attn_inp_ovf_view_rows");
+                // Cell lists refreshed in set_input/can_reuse; leave empty here.
+            }
+        }
     }
 
     return inp;
@@ -3935,6 +4355,31 @@ void llm_graph_context::build_kv_store(
             __func__, il, has_exact_tail ? "yes" : "not-configured");
 }
 
+static bool llm_kvarn_native_attention_for(
+        const llama_kv_cache_kvarn_context * cache, llm_arch arch, bool causal,
+        bool swa, int il, int head_dim) {
+    if (!cache || !cache->uses_native_attention(il)) {
+        return false;
+    }
+    if (causal || arch != LLM_ARCH_DFLASH) {
+        return llama_kvarn_native_attention_allowed(causal, arch);
+    }
+    // Test-only materialized oracle for the same persistent records.
+    const char * force_materialized = getenv("LLAMA_KVARN_TEST_MATERIALIZE_NONCAUSAL");
+    if (force_materialized && atoi(force_materialized) != 0) {
+        return false;
+    }
+    const bool owned_dflash = cache->has_qualified_dflash_mask();
+    return llama_kvarn_native_attention_allowed({
+        owned_dflash ? (swa ? LLAMA_KVARN_MASK_DFLASH_SWA : LLAMA_KVARN_MASK_DFLASH_BLOCK) :
+            LLAMA_KVARN_MASK_UNSUPPORTED,
+        owned_dflash,
+        cache->uses_native_attention(il),
+        llama_kvarn_backend_supports_non_causal_mask(cache->native_attention_backend(il)),
+        head_dim,
+    });
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -3961,9 +4406,8 @@ ggml_tensor * llm_graph_context::build_attn(
     // Backend preferences choose an implementation inside the final operation;
     // they must not veto direct KVarN attention and force full materialization.
     // validate_native_tail_operation() proves the actual attached-tail shape.
-    const bool kvarn_native_attention = use_kvarn &&
-        kvarn_ctx->uses_native_attention(il) &&
-        llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
+    const bool kvarn_native_attention = llm_kvarn_native_attention_for(
+        kvarn_ctx, arch, cparams.causal_attn, false, il, (int) q_cur->ne[0]);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
@@ -4054,8 +4498,11 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * kq_mask = kq_mask_override ? kq_mask_override :
-            (kvarn_ctx && kvarn_ctx->uses_standard_layer(il) ?
+            (kvarn_ctx && kvarn_ctx->uses_standard_layer(il) && !kvarn_ctx->position_split_enabled() ?
                 inp->get_standard_kq_mask() : inp->get_kq_mask());
+    // Shared graph input: name it without a layer suffix so a later layer
+    // renaming the same tensor cannot strand it outside the dump whitelist.
+    cb(kq_mask, "kq_mask", -1);
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kvarn ?
@@ -4064,6 +4511,17 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = use_kvarn ?
         kvarn_ctx->get_v_for_attention(ctx0, il, kvarn_plan.native_attention) :
         mctx_cur->get_v(ctx0, il);
+    // The K/V that FlashAttention actually consumes in this layer, as opposed
+    // to the cache store they were read from. Named ONLY when the fixture
+    // capture is off: capture_from_leaf() renames its candidate to "f4kv_<seq>"
+    // and BOTH eval_wants_node() and the FlashAttention linkage key off that
+    // prefix, so overwriting it here silently emptied the executed-sample
+    // registry (F4SELECT routes=0) and every consumer gate reported
+    // unavailable data while the decode itself still succeeded.
+    if (getenv("F4_TRACE_CAPTURE") == nullptr || getenv("F4_TRACE_CAPTURE")[0] == '\0') {
+        cb(k, "fa_kv_k", il);
+        cb(v, "fa_kv_v", il);
+    }
     ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
             inp->self_kvarn_rot_64, inp->self_kvarn_rot_128,
             inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
@@ -4082,6 +4540,19 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
     llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    // Fixture-only: say exactly which of the four gates that decide whether a
+    // tail is BUILT differs between configurations. The operator census shows
+    // the split graph has zero tail nodes and the pure graph has 48; without
+    // this line there is no way to tell whether the plan, the compact-tail
+    // capability or the tensor retrieval is what turns the tail off.
+    if (getenv("F4_TAIL_TRACE")) {
+        fprintf(stderr, "F4TAIL il=%d compact=%d route=%d k_tail=%d v_tail=%d "
+                "gather=%d tail_read_idxs=%d kv_tail_tokens=%u split_p=%u\n",
+                il, (int) compact_tail, (int) tail_route,
+                k_tail != nullptr, v_tail != nullptr, gather_k_tail,
+                tail_read_idxs != nullptr, cparams.kv_tail_tokens,
+                cparams.kv_position_split_p);
+    }
     // A backend query-width fallback still requires the generic tail oracle.
     // Non-causal DFlash and D64 are different: only record-consuming attention
     // is unqualified. Their materialized F16 body can retain the advertised
@@ -4139,14 +4610,18 @@ ggml_tensor * llm_graph_context::build_attn(
     if (use_kvarn && k_tail) {
         GGML_ASSERT(v_tail && kvarn_rot);
         k_tail = ggml_kvarn_wht_aux(ctx0, k_tail, kvarn_rot->ne[0]);
-        if (use_kvarn_rotated_domain) {
-            v_tail = ggml_kvarn_wht_aux(ctx0, v_tail, kvarn_rot->ne[0]);
-        }
+        // msg57 F5: the KVarN FA un-rotates the V it loads from the records and
+        // the stage, and it applies the SAME transform to the attached tail V.
+        // The stored tail is in the ORIGINAL domain, so the tail V must be
+        // rotated in EVERY domain - not only in the fully rotated one, where it
+        // happened to be rotated before. Measured in
+        // tests/test-position-split-real-pair (domain ROTATED_K_ORIGINAL_V):
+        // rotated tail V -> NRMSE 3.168e-04 / maxO 4.297e-03 (PASS);
+        // unrotated tail V -> NRMSE 2.155e-01 / maxO 1.857e+00 (catastrophic).
+        v_tail = ggml_kvarn_wht_aux(ctx0, v_tail, kvarn_rot->ne[0]);
         if (k_tail_current) {
             k_tail_current = ggml_kvarn_wht_aux(ctx0, k_tail_current, kvarn_rot->ne[0]);
-            if (use_kvarn_rotated_domain) {
-                v_tail_current = ggml_kvarn_wht_aux(ctx0, v_tail_current, kvarn_rot->ne[0]);
-            }
+            v_tail_current = ggml_kvarn_wht_aux(ctx0, v_tail_current, kvarn_rot->ne[0]);
         }
     }
     ggml_tensor * kq_mask_tail = tail_route == LLAMA_KV_TAIL_ROUTE_NONE ? nullptr : inp->get_kq_mask_tail();
@@ -4175,8 +4650,12 @@ k_tail, v_tail, kq_mask_tail, kq_b_tail,
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
     }
+    if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn &&
+            kvarn_plan.native_attention) {
+        validate_native_kvarn_noncausal_operation(mctx_cur, il, final_tail_op);
+    }
     if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
-        validate_native_tail_operation(mctx_cur, il, final_tail_op);
+        validate_native_tail_operation(mctx_cur, il, final_tail_op, true);
     }
     if (compact_tail && k_cur && v_cur) {
         if (ggml_tensor * written = mctx_cur->cpy_k_tail(
@@ -4198,6 +4677,8 @@ k_tail, v_tail, kq_mask_tail, kq_b_tail,
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
 
+    cur = apply_attention_reference_cpu(cur, il);
+
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
@@ -4216,6 +4697,1093 @@ k_tail, v_tail, kq_mask_tail, kq_b_tail,
     }
 
     return cur;
+}
+
+bool llm_graph_context::use_position_split_attention(int il) const {
+    // mctx may be a hybrid context; unwrap to the KVarN attention context.
+    const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+    if (!kvarn_ctx) {
+        if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+            kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(
+                hybrid->get_attn_kv_context());
+        }
+    }
+    if (!kvarn_ctx || !kvarn_ctx->position_split_enabled()) {
+        return false;
+    }
+    if (!kvarn_ctx->uses_kvarn_layer(il)) {
+        return false;
+    }
+    const auto * kvarn_cache = kvarn_ctx->get_kvarn_cache();
+    if (!kvarn_cache) {
+        return false;
+    }
+    const uint32_t p = kvarn_cache->position_split_p();
+    // Every overflow batch uses range-relative inputs, including an empty
+    // local history. Compact Qx rows cannot consume the legacy global mask.
+    // (n_kv_global alone is insufficient: the first overflow token sees
+    // exactly P local tokens, i.e. n_kv == P, not > P.)
+    // Invalid/mixed ubatches (e.g. graph reserve dummies) fall back to legacy.
+    if (ubatch.n_pos < 1 || ubatch.n_tokens == 0 || ubatch.pos == nullptr) {
+        return false;
+    }
+    bool local = false;
+    bool overflow = false;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const auto kind = llama_position_split::range_for_pos(
+                ubatch.pos[i], p, kvarn_cache->get_kv_size()).kind;
+        if (kind == llama_position_split::range_kind::INVALID) {
+            return false;
+        }
+        if (kind == llama_position_split::range_kind::LOCAL) {
+            local = true;
+        } else {
+            overflow = true;
+        }
+    }
+    if (local && overflow) {
+        return false;
+    }
+    if (local) {
+        return false;
+    }
+    // An empty local range has an all-masked FA contribution (O=0, LSE=-inf).
+    // Keep the same split path so overflow masks and physical rows agree.
+    std::vector<uint32_t> local_cells;
+    const bool has_local = kvarn_cache->position_split_live_cells(
+        llama_position_split::range_kind::LOCAL, local_cells) &&
+        !local_cells.empty();
+    LLAMA_LOG_DEBUG("%s: il=%d P=%u n_kv=%u n_tokens=%u has_local=%d n_local=%zu overflow_batch=%d -> %s\n",
+            __func__, il, p, kvarn_ctx->get_n_kv(), ubatch.n_tokens,
+            int(has_local), local_cells.size(), int(overflow),
+            overflow ? "split" : "legacy");
+    return overflow;
+}
+
+
+ggml_tensor * llm_graph_context::apply_attention_reference_cpu(ggml_tensor * output, int il) const {
+    const char * reference_env = std::getenv("LLAMA_OVF_ATTN_REFERENCE_CPU");
+    if (!reference_env || std::strcmp(reference_env, "1") != 0) { return output; }
+    // Long-context comparisons may build an identical GPU prefix first and
+    // start the CPU oracle at a fixed suffix. This isolates attention/merge
+    // error on the same persistent KV representation without requantization.
+    if (const char * minimum = std::getenv("LLAMA_OVF_ATTN_REFERENCE_CPU_MIN_POS")) {
+        const std::string value(minimum);
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+            throw std::invalid_argument("invalid CPU attention reference minimum position");
+        }
+        const uint64_t threshold = std::stoull(value);
+        if (threshold > uint64_t(INT32_MAX)) {
+            throw std::invalid_argument("CPU attention reference minimum position is out of range");
+        }
+        bool active = false;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            active |= ubatch.pos[i] >= int64_t(threshold);
+        }
+        if (!active) { return output; }
+    }
+    ggml_backend_t backend_host = backend_cpu;
+    if (!backend_host) {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            auto * backend = ggml_backend_sched_get_backend(sched, i);
+            auto * device = ggml_backend_get_device(backend);
+            if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) { backend_host = backend; break; }
+        }
+    }
+    if (!backend_host) { throw std::runtime_error("CPU structural attention reference requires a CPU backend"); }
+    std::unordered_map<ggml_tensor *, ggml_tensor *> host_tensors;
+    std::function<ggml_tensor *(ggml_tensor *)> host_copy;
+    host_copy = [&](ggml_tensor * tensor) -> ggml_tensor * {
+        if (!tensor) { return nullptr; }
+        if (auto it = host_tensors.find(tensor); it != host_tensors.end()) { return it->second; }
+        const bool descriptor = tensor->op == GGML_OP_KVARN_VIEW;
+        const bool view = tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE ||
+                tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE;
+        ggml_tensor * result;
+        if (descriptor || view) {
+            result = ggml_dup_tensor(ctx0, tensor);
+            host_tensors.emplace(tensor, result);
+            result->op = tensor->op;
+            std::memcpy(result->op_params, tensor->op_params, sizeof(tensor->op_params));
+            std::memcpy(result->nb, tensor->nb, sizeof(tensor->nb));
+            for (int i = 0; i < GGML_MAX_SRC; ++i) { result->src[i] = host_copy(tensor->src[i]); }
+            if (view) {
+                result->view_src = host_copy(tensor->view_src);
+                result->view_offs = tensor->view_offs;
+            }
+        } else {
+            if (!ggml_is_contiguous(tensor)) {
+                throw std::runtime_error(format("CPU attention reference cannot copy strided owner %s", tensor->name));
+            }
+            result = ggml_cont(ctx0, tensor);
+            host_tensors.emplace(tensor, result);
+        }
+        ggml_format_name(result, "%s_ref_host", tensor->name);
+        ggml_backend_sched_set_tensor_backend(sched, result, backend_host);
+        return result;
+    };
+    ggml_build_forward_expand(gf, output);
+    std::vector<ggml_tensor *> roots;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) { roots.push_back(ggml_graph_node(gf, i)); }
+    std::vector<ggml_tensor *> attention_nodes;
+    std::unordered_set<ggml_tensor *> visited;
+    std::function<void(ggml_tensor *)> discover = [&](ggml_tensor * node) {
+        if (!node || !visited.insert(node).second) { return; }
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) { attention_nodes.push_back(node); return; }
+        for (int i = 0; i < GGML_MAX_SRC; ++i) { discover(node->src[i]); }
+    };
+    discover(output);
+    if (attention_nodes.empty()) {
+        throw std::runtime_error(format("CPU structural attention reference found no FA in layer %d", il));
+    }
+    std::unordered_map<ggml_tensor *, ggml_tensor *> original_domain_outputs;
+    const auto is_kvarn_read = [](const ggml_tensor * tensor) {
+        while (tensor && (tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE ||
+                tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE)) {
+            tensor = tensor->src[0];
+        }
+        return tensor && tensor->op == GGML_OP_KVARN_VIEW;
+    };
+    for (ggml_tensor * attention : attention_nodes) {
+        const int local_domain = attention->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN];
+        for (int i = 0; i < GGML_MAX_SRC; ++i) { attention->src[i] = host_copy(attention->src[i]); }
+        if (is_kvarn_read(attention->src[1])) {
+            attention->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+        } else {
+            // The ordinary CPU Q4 dot kernel quantizes Q to Q8. That is an
+            // additional approximation, not an oracle for the stored Q4 KV.
+            // Decode standard K/V to F32 on the host, leaving Q unchanged and
+            // selecting the F32 output accumulator instead of half V sums.
+            for (int i : {1, 2}) {
+                if (attention->src[i]->type != GGML_TYPE_F32) {
+                    attention->src[i] = ggml_cast(ctx0, attention->src[i], GGML_TYPE_F32);
+                    ggml_backend_sched_set_tensor_backend(sched, attention->src[i], backend_host);
+                }
+            }
+        }
+        if (local_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V) {
+            ggml_tensor * derotated = ggml_kvarn_wht(ctx0, attention, int(attention->ne[0]));
+            ggml_backend_sched_set_tensor_backend(sched, derotated, backend_host);
+            original_domain_outputs.emplace(attention, derotated);
+        }
+        ggml_backend_sched_set_tensor_backend(sched, attention, backend_host);
+        if (!ggml_backend_supports_op(backend_host, attention)) {
+            throw std::runtime_error(format("CPU structural attention reference unsupported in layer %d", il));
+        }
+    }
+    for (ggml_tensor * node : roots) {
+        if (node->op == GGML_OP_FLASH_ATTN_EXT_LSE) {
+            ggml_backend_sched_set_tensor_backend(sched, node, backend_host);
+            continue;
+        }
+        if (original_domain_outputs.count(node)) { continue; }
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (auto replacement = original_domain_outputs.find(node->src[i]); replacement != original_domain_outputs.end()) {
+                node->src[i] = replacement->second;
+            }
+        }
+        if (auto replacement = original_domain_outputs.find(node->view_src); replacement != original_domain_outputs.end()) {
+            node->view_src = replacement->second;
+        }
+    }
+    if (auto replacement = original_domain_outputs.find(output); replacement != original_domain_outputs.end()) {
+        output = replacement->second;
+    }
+    ggml_graph_clear(gf);
+    for (ggml_tensor * root : roots) { ggml_build_forward_expand(gf, root); }
+    ggml_build_forward_expand(gf, output);
+    fprintf(stderr, "%s: layer %d ATTENTION-REFERENCE-CPU %zu FA node(s); native records/exact-tail/overflow staged\n",
+            __func__, il, attention_nodes.size());
+    return output;
+}
+
+// F4 bounded allocation evidence (env-gated; shape/type/op/bytes only, no payloads).
+static void f4_tensor_trace(const char * tag, const char * name, ggml_tensor * t) {
+    if (t == nullptr || std::getenv("F4_ALLOC_TRACE") == nullptr) {
+        return;
+    }
+    char ne[GGML_MAX_DIMS * 14];
+    int off = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        off += snprintf(ne + off, sizeof(ne) - off, "%s%" PRId64, i ? "," : "", t->ne[i]);
+    }
+    LLAMA_LOG_INFO("F4TRACE %s %-20s op=%-14s type=%-8s ne=[%s] bytes=%zu buf=%s\n",
+            tag, name, ggml_op_name(t->op), ggml_type_name(t->type), ne, ggml_nbytes(t),
+            t->buffer ? "allocated" : "unallocated");
+}
+
+ggml_tensor * llm_graph_context::build_attn_position_split(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        float kq_scale,
+        int il) const {
+    // F3 dual-range attention: local CUDA/KVarN FA + overflow Vulkan/Q4 FA +
+    // stable CUDA merge. Requires use_position_split_attention(il); every
+    // deviation fails closed instead of silently falling back.
+    const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(inp->mctx);
+    if (!kvarn_ctx || !kvarn_ctx->position_split_enabled() || !kvarn_ctx->uses_kvarn_layer(il)) {
+        throw std::runtime_error("position-split attention requires an enabled P-mode KVarN layer");
+    }
+    const auto * kvarn_cache = kvarn_ctx->get_kvarn_cache();
+    if (!kvarn_cache || !kvarn_cache->has_standard_cache()) {
+        throw std::runtime_error("position-split attention requires the Q4 overflow companion");
+    }
+    if (!inp->self_kq_mask_local || !inp->self_kq_mask_overflow ||
+            !inp->self_kvarn_mat_idxs_local || !inp->self_overflow_cell_idxs) {
+        throw std::runtime_error("position-split attention requires range-split graph inputs");
+    }
+    const uint32_t n_local = uint32_t(inp->self_kq_mask_local->ne[0]);
+    const uint32_t n_overflow = uint32_t(inp->self_kq_mask_overflow->ne[0]);
+    if (n_local == 0 || n_overflow == 0) {
+        throw std::runtime_error("position-split attention requires non-empty local and overflow histories");
+    }
+    if (int64_t(n_local) != inp->self_kq_mask_local->ne[0] ||
+            int64_t(n_overflow) != inp->self_kq_mask_overflow->ne[0] ||
+            int64_t(n_local) != inp->self_kvarn_mat_idxs_local->ne[0] ||
+            int64_t(n_overflow) != inp->self_overflow_cell_idxs->ne[0]) {
+        throw std::runtime_error("position-split range inputs do not match live histories");
+    }
+
+    // F5 (measured): only OCCUPIED overflow rows may enter the materialized
+    // gather / dual-FA scratch. The graph inputs stay capacity-sized (they are
+    // the reservation and the live cells are filled into their leading rows), but
+    // at n_kv = P + 256 the capacity (C - P) was 135x the occupancy, and the
+    // capacity-sized gather reserved 606.06 MiB on CUDA and failed cudaMalloc
+    // (docs/occupancy-evidence/f5-f5-cross-P96512-L96768b-n96768.log). Slicing a
+    // view keeps the capacity allocation, keeps the fill order and the slicing so
+    // the unused trailing rows are simply never materialized or masked in.
+    const uint32_t p_split = kvarn_cache->position_split_p();
+    const uint32_t c_split = kvarn_cache->get_kv_size();
+    const uint32_t n_kv_live = std::min<uint32_t>(kvarn_ctx->get_n_kv(), c_split);
+    const uint32_t n_ovf_occ = n_kv_live > p_split ? n_kv_live - p_split : 0;
+    if (n_ovf_occ == 0 || n_ovf_occ > n_overflow) {
+        throw std::runtime_error(
+            "position-split overflow occupancy is inconsistent with the live histories");
+    }
+    ggml_tensor * ovf_idxs = inp->self_overflow_cell_idxs;
+    ggml_tensor * mask_overflow = inp->self_kq_mask_overflow_cnv;
+    uint32_t n_ovf_used = n_overflow;
+    // With the packed view enabled the extent policy is decided below to stay
+    // stable across tokens; keep the mask at range capacity here instead of
+    // cropping it to the live occupancy (otherwise the capacity view would be
+    // wider than a cropped mask and the builder would fail closed).
+    static const bool ovf_packed_view_env = [] {
+        const char * v = std::getenv("LLAMA_OVF_PACKED_VIEW");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    if (n_ovf_occ < n_overflow && !ovf_packed_view_env) {
+        ovf_idxs = ggml_view_1d(ctx0, inp->self_overflow_cell_idxs,
+                int64_t(n_ovf_occ), 0);
+        ggml_set_name(ovf_idxs, "attn_overflow_cell_idxs_occ");
+        // ggml_view_4d(ctx, a, ne0..ne3, nb1, nb2, nb3, offset): the strides come
+        // before the offset, and the crop is taken on the tensor the consumer
+        // actually reads (self_kq_mask_overflow_cnv, which carries the required
+        // mask dtype/conversion), with its REAL strides and offset 0.
+        ggml_tensor * mask_src = inp->self_kq_mask_overflow_cnv;
+        if (mask_src->nb[1] == 0) {
+            throw std::runtime_error("position-split overflow mask has a zero row stride");
+        }
+        mask_overflow = ggml_view_4d(ctx0, mask_src,
+                int64_t(n_ovf_occ), mask_src->ne[1], mask_src->ne[2], mask_src->ne[3],
+                mask_src->nb[1], mask_src->nb[2], mask_src->nb[3], 0);
+        if (mask_overflow->type != mask_src->type ||
+                mask_overflow->ne[1] != mask_src->ne[1] ||
+                mask_overflow->ne[2] != mask_src->ne[2] ||
+                mask_overflow->ne[3] != mask_src->ne[3] ||
+                mask_overflow->nb[0] != mask_src->nb[0] ||
+                mask_overflow->nb[1] != mask_src->nb[1] ||
+                int64_t(n_ovf_occ) > int64_t(n_overflow)) {
+            throw std::runtime_error("position-split overflow mask crop changed the mask contract");
+        }
+        // The overflow FA requires a CONTIGUOUS mask, and a crop that inherits the
+        // capacity row stride is never contiguous. Materialize ONLY the occupied
+        // rows into a packed tensor of the occupied extent: capacity-sized input
+        // allocation and fill order are untouched, dtype/conversion are preserved,
+        // and the unused trailing rows never reach the compute scratch. This is
+        // the small supported step; the capacity-sized inputs stay as reserved.
+        mask_overflow = ggml_cont(ctx0, mask_overflow);
+        if (!ggml_is_contiguous(mask_overflow) ||
+                mask_overflow->ne[0] != int64_t(n_ovf_occ) ||
+                mask_overflow->ne[1] != mask_src->ne[1] ||
+                mask_overflow->type != mask_src->type) {
+            throw std::runtime_error(
+                "position-split overflow mask is not contiguous at the occupied extent");
+        }
+        ggml_set_name(mask_overflow, "attn_inp_kq_mask_overflow_occ");
+        n_ovf_used = n_ovf_occ;
+    }
+    if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
+        LLAMA_LOG_INFO("F4TRACE counts il=%d n_kv=%u P=%u C=%u n_local_cap=%u n_ovf_cap=%u n_ovf_occ=%u n_ovf_used=%u\n",
+                il, kvarn_ctx->get_n_kv(), p_split, c_split, n_local, n_overflow, n_ovf_occ, n_ovf_used);
+    }
+
+    // Stores (range-routed by cpy_k/cpy_v).
+    // The local exact tail is decided by tail_on_layer(), which is range-aware:
+    // it is ON for a local-range graph and OFF for this overflow-range builder,
+    // so fa1 here still reads the whole local body and fa2 stays tail-free
+    // (plan 3.1: tail/stage only on the local range, Q4 overflow none). The
+    // former blanket "tails disabled in P-mode" wording described a shortcut
+    // that also removed the tail from the local range, contrary to plan
+    // 3.1/3.4/3.6; see llama-kv-cache-kvarn.cpp tail_on_layer().
+    // Expand Q/K/V together to prevent reordering (same as single-range).
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
+        ggml_tensor * k_written = kvarn_ctx->cpy_k(ctx0, k_cur, k_idxs, il);
+        GGML_ASSERT(k_written != nullptr);
+        ggml_build_forward_expand(gf, k_written);
+        ggml_tensor * v_written = kvarn_ctx->cpy_v(ctx0, v_cur, v_idxs, il);
+        GGML_ASSERT(v_written != nullptr);
+        ggml_build_forward_expand(gf, v_written);
+    }
+
+    // Use the same capability/domain plan as single-range attention for both
+    // decode and prefill. Supported shapes consume native KVarN records;
+    // unsupported shapes use the planner's explicit materialization fallback.
+    // A separate query-count cap would unnecessarily densify the entire local
+    // range and change the graph's memory budget near P.
+    const bool native_attention = kvarn_ctx->uses_native_attention(il) &&
+        llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
+    const auto kvarn_plan = llama_kvarn_plan_attention(
+        native_attention,
+        kvarn_ctx->native_attention_uses_original_v(il),
+        kvarn_ctx->native_rotated_max_query_tokens(il),
+        (uint32_t) q_cur->ne[2],
+        (int) q_cur->ne[0]);
+    const auto kvarn_domain = kvarn_plan.domain;
+    if (std::getenv("F5_ROUTE_TRACE") != nullptr) {
+        fprintf(stderr, "[F5ROUTE] il=%d nq=%lld native=%d nativereq=%d domain=%d nrotmax=%u minctx=%u\n",
+                il, (long long) q_cur->ne[2], int(kvarn_plan.native_attention),
+                int(native_attention), int(kvarn_domain),
+                kvarn_ctx->native_rotated_max_query_tokens(il),
+                kvarn_ctx->get_kvarn_cache()->position_split_p());
+    }
+    const bool use_kvarn_rotated_domain =
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    const bool use_kvarn_mixed_domain =
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    const bool use_kvarn_q_rot = use_kvarn_rotated_domain || use_kvarn_mixed_domain;
+    const bool local_tail_here = kvarn_ctx->tail_on_layer(il);
+    ggml_tensor * kvarn_rot = nullptr;
+    if (use_kvarn_q_rot || local_tail_here) {
+        kvarn_rot = llm_kvarn_rot_for_dim(
+            inp->self_kvarn_rot_64, inp->self_kvarn_rot_128,
+            inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q_cur->ne[0]);
+        GGML_ASSERT(kvarn_rot != nullptr);
+    }
+    ggml_tensor * q_local = q_cur;
+    if (use_kvarn_q_rot) {
+        GGML_ASSERT(q_local->type == GGML_TYPE_F32);
+        q_local = ggml_kvarn_wht_aux(ctx0, q_local, kvarn_rot->ne[0]);
+    }
+
+    // Local K/V via KVarN native range read (same domain as single-range).
+    // EXPLICIT local body: this runs inside overflow-only ubatches too, where
+    // the current range is 1. Naming the read range keeps the local lookup
+    // independent of which ubatch is executing.
+    ggml_tensor * k_local = kvarn_ctx->get_k_for_range(
+        ctx0, il, kvarn_plan.native_attention,
+        llama_position_split::kRangeLocal, n_local, inp->self_kvarn_mat_idxs_local);
+    ggml_tensor * v_local = kvarn_ctx->get_v_for_range(
+        ctx0, il, kvarn_plan.native_attention,
+        llama_position_split::kRangeLocal, n_local, inp->self_kvarn_mat_idxs_local);
+    GGML_ASSERT(k_local != nullptr && v_local != nullptr);
+
+    // Overflow K/V via Q4 gather from the shared companion storage.
+    const auto * standard_cache = kvarn_cache->get_standard_cache();
+    GGML_ASSERT(standard_cache != nullptr);
+    GGML_ASSERT(!standard_cache->v_transposed());
+    ggml_tensor * k_storage = standard_cache->get_k_storage(il);
+    ggml_tensor * v_storage = standard_cache->get_v_storage(il);
+    GGML_ASSERT(k_storage != nullptr && v_storage != nullptr);
+    const int64_t n_embd_k = k_storage->ne[0];
+    const int64_t n_embd_v = v_storage->ne[0];
+    ggml_tensor * k_storage_2d = ggml_reshape_2d(ctx0, k_storage,
+        n_embd_k, k_storage->ne[1]*k_storage->ne[2]);
+    ggml_tensor * v_storage_2d = ggml_reshape_2d(ctx0, v_storage,
+        n_embd_v, v_storage->ne[1]*v_storage->ne[2]);
+    const uint32_t payload_origin = standard_cache->get_payload_row_origin();
+    const uint32_t payload_size = standard_cache->get_payload_size();
+    // Gather the Q4_0 overflow K/V DIRECTLY as F16.
+    //
+    // ggml_get_rows() always materialises an F32 result for a quantized source
+    // (ggml.c: ggml_get_rows -> ggml_get_rows_as(..., GGML_TYPE_F32)), and the
+    // flash-attention path casts that F32 tensor to F16 right afterwards. At the
+    // campaign scale that is a full F32 write plus a full F32 read of the
+    // gathered overflow K and V, per layer, per decoded token -- pure waste,
+    // because the values are immediately rounded to F16 anyway.
+    //
+    // ggml_get_rows_as(..., GGML_TYPE_F16) is the same GGML_OP_GET_ROWS with an
+    // F16 destination: it dequantises once and stores F16. Both backends that
+    // can host the overflow cache already support it:
+    //   ggml-cuda/getrows.cu      case GGML_TYPE_F16 in get_rows_cuda()
+    //   ggml-vulkan: dispatch at ggml_vk_op_get_pipeline() (dst->type == F16 ->
+    //   pipeline_get_rows[src0->type]) with the Q4_0 pipeline created for it.
+    // The downstream `if (k->type == GGML_TYPE_F32) k = ggml_cast(...)` guard
+    // simply stops firing, so no consumer changes type unexpectedly.
+    // A/B toggle for the destination type above, default ON. LLAMA_OVF_GATHER_F16=0
+    // restores the legacy F32 materialisation + F16 cast so both paths can be compared
+    // inside the SAME binary and the SAME config.
+    static const bool ovf_gather_f16 = [] {
+        const char * v = std::getenv("LLAMA_OVF_GATHER_F16");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+
+    // PACKED fast path (structural): when the live overflow cells are ONE contiguous
+    // ascending run, the attention can read a zero-copy VIEW of the Q4_0 storage rows
+    // instead of gathering them. No GET_ROWS, no F32, no F16 scratch: the Vulkan FA
+    // pipeline consumes the packed Q4_0 K/V natively (the FA pipeline state is keyed by
+    // k_type/v_type, ggml-vulkan.cpp get_fa_pipeline_state), which is exactly what the
+    // production per-layer remote path does with its zero-copy quantized views.
+    //
+    // FAIL CLOSED. The view replaces the gather only when ALL of these hold:
+    //   * the live overflow cell list is available and its size equals n_ovf_used;
+    //   * cell ids ascend by exactly 1 (single run -> contiguous rows, block aligned
+    //     because every offset is a whole number of Q4_0 rows);
+    //   * absolute positions ascend strictly along that run, so the per-range mask
+    //     columns (built in set_input from the position-sorted list) keep the same
+    //     order as the view's rows. Any deviation -> indexed gather, never a wrong view.
+    // Fragmented (wrapped ring, eviction) layouts therefore keep the gather, and the
+    // reason is logged instead of being silently converted to another KV format.
+    // DEFAULT OFF -- MEASURED INCORRECT, not merely unproven.
+    // The numeric gate (full-vocab capture, three deterministic prefixes 3000/3072/3200,
+    // packed vs indexed gather, same binary/config) rejected the view:
+    //   n3000 KL 2.09e-02 nat/token, ppl ratio 25.2, dLSE 1.607
+    //   n3072 KL 2.50e-03, ppl ratio 0.671, dLSE 0.793
+    //   n3200 KL 9.27e-02, ppl ratio 28.6, argmax FLIPPED, generated token diverged
+    // Cause VERIFIED by reviewer traces and reproduced in the shader source:
+    // the packed view carried n_view = live rows (e.g. 640) while the contiguous
+    // overflow mask kept the padded n_ovf_used width (e.g. 768). The overflow FA
+    // derives its mask stride from the K/V extent
+    // (vulkan-shaders/flash_attn_base.glsl:213 `m_stride = KV`;
+    //  flash_attn.comp:222 `data_m[(i*Br + r)*m_stride + ...]`), so every query
+    // row after the first read the WRONG mask row. Fixed below by cropping and
+    // materializing a contiguous mask with exactly the K/V extent and passing
+    // that same extent as n_kv_max.
+    // Two rejected hypotheses, kept for the record:
+    //   * rotation_k/rotation_v is a FEATURE-SPACE Hadamard basis on the stored values
+    //     (llama-kv-cache-kvarn.cpp: rotation::hadamard(feature width), applied to the
+    //     cached basis), not a logical-cell -> physical-row offset. Both the gather and
+    //     a raw view read the same stored basis, so it cannot explain the divergence.
+    //   * global cell IDs form one contiguous run; the Qx cache's authoritative
+    //     payload_row_for_cell mapping must also form a contiguous physical run.
+    //     Compact split payloads begin at P, so global cell row0 and physical view
+    //     row0 are intentionally tracked separately below.
+    // The quantized Vulkan FA path (k_type_eff == Q4_0 at neq1 == 1, proactive dequant
+    // disabled for neq1 < 64) is still gated only by the numeric tests that follow,
+    // not by assumption.
+    static const bool ovf_packed_view = [] {
+        const char * v = std::getenv("LLAMA_OVF_PACKED_VIEW");
+        return v != nullptr && std::strcmp(v, "0") != 0;
+    }();
+    const char * ovf_path = "indexed_gather";
+    uint32_t ovf_row0 = 0;
+    bool ovf_use_view = false;
+    // Layout invariants a view depends on, checked instead of assumed:
+    //   * the storage row stride must equal one packed row of its own type
+    //     (ggml_row_size), otherwise rows are not addressable as views;
+    //   * the live run must lie inside the storage extent.
+    const bool k_rows_exact = k_storage->nb[1] == ggml_row_size(k_storage->type, n_embd_k);
+    const bool v_rows_exact = v_storage->nb[1] == ggml_row_size(v_storage->type, n_embd_v);
+    const uint32_t k_rows = uint32_t(k_storage->ne[1] * k_storage->ne[2]);
+    const uint32_t v_rows = uint32_t(v_storage->ne[1] * v_storage->ne[2]);
+    if (k_rows != payload_size || v_rows != payload_size) {
+        throw std::runtime_error(format(
+                "Qx payload row shape mismatch: declared origin=%u size=%u, physical K/V rows=%u/%u",
+                payload_origin, payload_size, k_rows, v_rows));
+    }
+    uint32_t ovf_n_view = 0; // extent the view will actually cover (live rows only)
+    uint32_t ovf_physical_row0 = 0;
+    if (ovf_packed_view) {
+        std::vector<uint32_t> cells;
+        ovf_use_view = kvarn_cache->position_split_live_cells(
+                    llama_position_split::range_kind::OVERFLOW, cells) && !cells.empty();
+        // get_n_kv() can include padding/pending cells, so the LIVE cell count is the
+        // authority for the view extent. Any disagreement with the padded n_ovf_used is
+        // expected and handled by cropping the mask to the same extent below, instead
+        // of leaving mask stride and K/V extent out of sync.
+        if (ovf_use_view && cells.size() != size_t(n_ovf_used)) {
+            ovf_path = "packed_view_live_extent";
+        }
+        for (size_t i = 1; ovf_use_view && i < cells.size(); ++i) {
+            if (cells[i] != cells[i-1] + 1) {
+                ovf_use_view = false;
+                ovf_path = "indexed_gather_fragmented";
+                break;
+            }
+        }
+        if (ovf_use_view) {
+            const auto & meta_cells = kvarn_cache->get_metadata_cache()->get_cells(0);
+            llama_pos prev = meta_cells.pos_get(cells.front());
+            for (size_t i = 1; i < cells.size(); ++i) {
+                const llama_pos cur = meta_cells.pos_get(cells[i]);
+                if (!(cur > prev)) {
+                    ovf_use_view = false;
+                    ovf_path = "indexed_gather_position_order";
+                    break;
+                }
+                prev = cur;
+            }
+        }
+        // `cells` and the masks use global metadata IDs. The Qx companion may
+        // store only its owned payload interval, so a global cell ID is not
+        // necessarily a physical tensor row (compact v2 starts at P). Keep the
+        // absolute row for the graph reuse guard and bake a separate physical
+        // row for storage access.
+        if (ovf_use_view) {
+            const uint32_t global_row0 = cells.front();
+            if (global_row0 < p_split || uint64_t(global_row0) + cells.size() > c_split) {
+                throw std::runtime_error(format(
+                        "packed overflow global cells exceed owned range [P=%u,C=%u)",
+                        p_split, c_split));
+            }
+            ovf_row0 = global_row0; // absolute/global; do not remap this reuse key
+            ovf_physical_row0 = standard_cache->payload_row_for_cell(global_row0);
+            if (ovf_physical_row0 >= payload_size) {
+                throw std::runtime_error(format(
+                        "packed overflow row map is outside Qx payload: global=%u physical=%u origin=%u size=%u",
+                        global_row0, ovf_physical_row0, payload_origin, payload_size));
+            }
+            for (size_t i = 1; i < cells.size(); ++i) {
+                const uint32_t physical = standard_cache->payload_row_for_cell(cells[i]);
+                if (physical != ovf_physical_row0 + i) {
+                    ovf_use_view = false;
+                    ovf_path = "indexed_gather_noncontiguous_payload_rows";
+                    break;
+                }
+            }
+        }
+        if (ovf_use_view && !(k_rows_exact && v_rows_exact)) {
+            ovf_use_view = false;
+            ovf_path = "indexed_gather_row_stride";
+        }
+        if (ovf_use_view && (uint64_t(ovf_physical_row0) + cells.size() > k_rows ||
+                              uint64_t(ovf_physical_row0) + cells.size() > v_rows)) {
+            ovf_use_view = false;
+            ovf_path = "indexed_gather_extent";
+        }
+        if (ovf_use_view) {
+            ovf_n_view = uint32_t(cells.size());
+            ovf_path = "packed_view";
+        }
+    }
+    if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
+        // stderr on purpose: the server log callback filters INFO from the model
+        // process, which silently swallowed an earlier LLAMA_LOG_INFO version of
+        // this line and made the fast path look disengaged.
+        fprintf(stderr, "[F5OVF] il=%d path=%s n_ovf_used=%u n_view=%u row0_global=%u row0_physical=%u payload_origin=%u payload_size=%u ktype=%s krows=%u kstride_ok=%d vstride_ok=%d kne=%lld|%lld|%lld|%lld vne=%lld|%lld|%lld|%lld knb1=%zu vnb1=%zu\n",
+                il, ovf_path, n_ovf_used, ovf_n_view, ovf_row0, ovf_physical_row0, payload_origin, payload_size,
+                ggml_type_name(k_storage->type), k_rows, int(k_rows_exact), int(v_rows_exact),
+                (long long) k_storage->ne[0], (long long) k_storage->ne[1], (long long) k_storage->ne[2], (long long) k_storage->ne[3],
+                (long long) v_storage->ne[0], (long long) v_storage->ne[1], (long long) v_storage->ne[2], (long long) v_storage->ne[3],
+                k_storage->nb[1], v_storage->nb[1]);
+    }
+
+    // Extent used for the overflow K/V and mask. Identical to the gather path
+    // (n_ovf_used, the padded occupancy) on purpose: the isolated op test
+    // tests/test-fa-q4-view.cpp shows that a valid-vs-padded extent difference
+    // alone moves single-query O by ~1.4e-4 because split_k changes, which is the
+    // magnitude class of the model-level packed residual. Rows past the live run
+    // are masked -inf by the range mask, so no inactive row is attended.
+    uint32_t n_ovf_rows = n_ovf_used;
+    if (ovf_use_view) {
+        // Stable-extent policy (measured): using the LIVE extent as the baked size
+        // forces a graph rebuild on every decode token (reuse guard refuses), which
+        // measured 226 ms/token vs 88 ms/token for the capacity-stable gather path
+        // at 36K (docs/occupancy-evidence/profile-prof-q4cont*.log). Bake the live
+        // run rounded up to 256 rows instead, capped at the range capacity: the
+        // extent stays constant between 256-token growth steps, so graphs are
+        // reused; rows past the live run stay masked -inf and are zeroed below.
+        // (Baking the WHOLE range capacity was tried and is both wasteful - ~73 MB
+        // of tail zeroing per layer - and numerically wrong for the raw Q4 FA:
+        // capq4 vs capf16 measured KL 1.89e-3.)
+        uint32_t stable = (ovf_n_view + 255u) & ~255u;
+        if (stable > n_overflow) { stable = n_overflow; }
+        if (stable > 0 && uint64_t(ovf_physical_row0) + stable <= k_rows &&
+                uint64_t(ovf_physical_row0) + stable <= v_rows) {
+            n_ovf_rows = stable;
+            ovf_path = "packed_view_stable256";
+        } else if (uint64_t(ovf_physical_row0) + n_ovf_used > k_rows ||
+                   uint64_t(ovf_physical_row0) + n_ovf_used > v_rows) {
+            ovf_use_view = false;
+            ovf_path = "indexed_gather_extent_padded";
+        }
+    }
+
+    // Non-finite stale bytes in the INACTIVE tail of the storage poison the raw
+    // Q4 FA even though the range mask is -inf for those rows (measured with
+    // FA_Q4_NAN_TAIL in tests/test-fa-q4-view.cpp: O 3.4e38, LSE inf). The gather
+    // reference never sees them: it reads a finite duplicated cell-0 row. Zero the
+    // tail rows [live, padded) before the graph computes; the graph's own K/V store
+    // later writes only the live rows, so the zeros persist for this evaluation.
+    static const bool ovf_zero_tail = [] {
+        const char * v = std::getenv("LLAMA_OVF_ZERO_TAIL");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    if (ovf_use_view && ovf_zero_tail && n_ovf_rows > ovf_n_view &&
+            k_storage->buffer && v_storage->buffer) {
+        const size_t k_row = ggml_row_size(k_storage->type, n_embd_k);
+        const size_t v_row = ggml_row_size(v_storage->type, n_embd_v);
+        const size_t k_off = size_t(ovf_physical_row0 + ovf_n_view) * k_storage->nb[1];
+        const size_t v_off = size_t(ovf_physical_row0 + ovf_n_view) * v_storage->nb[1];
+        std::vector<uint8_t> zk(k_row * (n_ovf_rows - ovf_n_view), 0);
+        std::vector<uint8_t> zv(v_row * (n_ovf_rows - ovf_n_view), 0);
+        ggml_backend_tensor_set(k_storage, zk.data(), k_off, zk.size());
+        ggml_backend_tensor_set(v_storage, zv.data(), v_off, zv.size());
+        if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
+            fprintf(stderr, "[F5OVF] il=%d zeroed inactive tail rows=%u bytes=%zu|%zu\n",
+                    il, n_ovf_rows - ovf_n_view, zk.size(), zv.size());
+        }
+    }
+
+    // Record the physical map that this graph bakes in, so can_reuse() can refuse a
+    // graph whose view would no longer describe the live rows.
+    inp->split_ovf_packed = ovf_use_view;
+    inp->split_ovf_row0   = ovf_row0;
+    inp->split_ovf_n_view = ovf_n_view;
+    inp->split_ovf_n_rows = n_ovf_rows;
+
+    ggml_tensor * k_ovf_gathered = nullptr;
+    ggml_tensor * v_ovf_gathered = nullptr;
+    if (ovf_use_view) {
+        const uint64_t k_off = uint64_t(ovf_physical_row0) * k_storage->nb[1];
+        const uint64_t v_off = uint64_t(ovf_physical_row0) * v_storage->nb[1];
+        k_ovf_gathered = ggml_view_2d(ctx0, k_storage, n_embd_k, int64_t(n_ovf_rows), k_storage->nb[1], k_off);
+        v_ovf_gathered = ggml_view_2d(ctx0, v_storage, n_embd_v, int64_t(n_ovf_rows), v_storage->nb[1], v_off);
+        ggml_set_name(k_ovf_gathered, "attn_k_ovf_packed_view");
+        ggml_set_name(v_ovf_gathered, "attn_v_ovf_packed_view");
+        // The packed view rows are read back as F16 through the SUPPORTED GET_ROWS
+        // path over an in-graph identity index list. Measured: this matches the gather
+        // reference (mean KL 8.7e-4 at 3000/3072/3200/3328/3584, all argmax equal),
+        // while feeding the raw Q4_0 view to the Vulkan FA diverges (mean KL 4.83,
+        // argmax flips) because the quantized FA path and the F16 path do not agree
+        // for this layout; Vulkan has no dequant_transpose pipeline for Q4_0
+        // (ggml-vulkan.cpp:6044 creates it only for Q8_0), so the F16 scratch path
+        // cannot be selected. Keep the raw Q4_0 FA behind an explicit opt-in until
+        // it is fixed and gated; bounded by the live view extent, no whole-cache
+        // expansion and no format change (storage stays Q4_0).
+        // Raw Q4_0 FA selection. LLAMA_OVF_PACKED_Q4_FA=1 enables every layer;
+        // LLAMA_OVF_PACKED_Q4_FA_IL=3,7,11 enables only the listed layers, which is
+        // how the first divergent layer is isolated against the F16 reference.
+        static const bool ovf_q4_fa_all = [] {
+            const char * v = std::getenv("LLAMA_OVF_PACKED_Q4_FA");
+            return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+        }();
+        static const std::string ovf_q4_fa_list = [] {
+            const char * v = std::getenv("LLAMA_OVF_PACKED_Q4_FA_IL");
+            return v != nullptr ? std::string(v) : std::string();
+        }();
+        bool ovf_q4_fa = ovf_q4_fa_all;
+        if (!ovf_q4_fa && !ovf_q4_fa_list.empty()) {
+            size_t a = 0;
+            while (a <= ovf_q4_fa_list.size()) {
+                const size_t b = ovf_q4_fa_list.find(',', a);
+                const std::string tok = ovf_q4_fa_list.substr(
+                        a, b == std::string::npos ? std::string::npos : b - a);
+                if (!tok.empty() && std::atoi(tok.c_str()) == il) { ovf_q4_fa = true; break; }
+                if (b == std::string::npos) { break; }
+                a = b + 1;
+            }
+        }
+        if (!ovf_q4_fa) {
+            if (inp->self_ovf_view_rows == nullptr) {
+                throw std::runtime_error(
+                    "packed overflow view requires its identity row input");
+            }
+            ggml_tensor * rows = ggml_view_1d(ctx0, inp->self_ovf_view_rows,
+                    int64_t(n_ovf_rows), 0);
+            k_ovf_gathered = ggml_get_rows_as(ctx0, k_ovf_gathered, rows, GGML_TYPE_F16);
+            v_ovf_gathered = ggml_get_rows_as(ctx0, v_ovf_gathered, rows, GGML_TYPE_F16);
+            ggml_set_name(k_ovf_gathered, "attn_k_ovf_view_f16");
+            ggml_set_name(v_ovf_gathered, "attn_v_ovf_view_f16");
+            fprintf(stderr, "[F5PROBE] il=%d packed_view_getrows_f16 n=%u (padded extent)\n", il, n_ovf_rows);
+        } else {
+            static const bool cont_kv = [] {
+                const char * v = std::getenv("F5_OVF_CONT_KV");
+                return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+            }();
+            if (cont_kv) {
+                // Candidate fix: materialize the Q4 view with a real copy op. This
+                // (a) creates an explicit store->read dependency edge for the
+                // scheduler/barrier tracking and (b) gives the FA a tensor with its
+                // own buffer. q4->q4 copy is far cheaper than the F16 gather.
+                static const bool k_only_cont = [] {
+                    const char * v = std::getenv("F5_OVF_CONT_K_ONLY");
+                    return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+                }();
+                k_ovf_gathered = ggml_cont(ctx0, k_ovf_gathered);
+                ggml_set_name(k_ovf_gathered, "attn_k_ovf_cont");
+                if (!k_only_cont) {
+                    v_ovf_gathered = ggml_cont(ctx0, v_ovf_gathered);
+                    ggml_set_name(v_ovf_gathered, "attn_v_ovf_cont");
+                }
+            }
+            if (std::getenv("F5_OVF_EXPAND_VIEWS") != nullptr) {
+                // Zero-copy lifetime experiment: make the Q4 views explicit graph
+                // outputs so the scheduler cannot alias their buffer with a writer.
+                ggml_build_forward_expand(gf, k_ovf_gathered);
+                ggml_build_forward_expand(gf, v_ovf_gathered);
+            }
+            if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
+            // DIAGNOSTIC: the SAME view rows read back as F16, expanded into the
+            // graph only so the dump can compare the effective K/V values of the
+            // raw-Q4 leg against the gather reference leg.
+            if (inp->self_ovf_view_rows == nullptr) {
+                throw std::runtime_error("packed overflow view requires its identity row input");
+            }
+            static const bool one_row = [] {
+                const char * v = std::getenv("F5_DBG_ONE_ROW");
+                return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+            }();
+            ggml_tensor * rows = ggml_view_1d(ctx0, inp->self_ovf_view_rows,
+                    one_row ? 1 : int64_t(n_ovf_rows), 0);
+            ggml_tensor * k_dbg = ggml_get_rows_as(ctx0, k_ovf_gathered, rows, GGML_TYPE_F16);
+            ggml_tensor * v_dbg = ggml_get_rows_as(ctx0, v_ovf_gathered, rows, GGML_TYPE_F16);
+            static const bool k_only = [] {
+                const char * v = std::getenv("F5_DBG_K_ONLY");
+                return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+            }();
+            char nm[64];
+            snprintf(nm, sizeof(nm), "f5k16-%d", il); ggml_set_name(k_dbg, nm);
+            snprintf(nm, sizeof(nm), "f5v16-%d", il); ggml_set_name(v_dbg, nm);
+            ggml_build_forward_expand(gf, k_dbg);
+            if (!k_only) {
+                ggml_build_forward_expand(gf, v_dbg);
+            }
+            }
+        }
+    } else {
+        k_ovf_gathered = ovf_gather_f16
+            ? ggml_get_rows_as(ctx0, k_storage_2d, ovf_idxs, GGML_TYPE_F16)
+            : ggml_get_rows(ctx0, k_storage_2d, ovf_idxs);
+        v_ovf_gathered = ovf_gather_f16
+            ? ggml_get_rows_as(ctx0, v_storage_2d, ovf_idxs, GGML_TYPE_F16)
+            : ggml_get_rows(ctx0, v_storage_2d, ovf_idxs);
+    }
+    f4_tensor_trace("gather", "k_ovf_gathered", k_ovf_gathered);
+    f4_tensor_trace("gather", "v_ovf_gathered", v_ovf_gathered);
+    f4_tensor_trace("mask",   "mask_overflow",  mask_overflow);
+    f4_tensor_trace("store",  "k_storage",      k_storage);
+    f4_tensor_trace("store",  "v_storage",      v_storage);
+    const int64_t n_head_kv = hparams.n_head_kv(il);
+    const int64_t head_dim_k = hparams.n_embd_head_k(il);
+    const int64_t head_dim_v = hparams.n_embd_head_v(il);
+    GGML_ASSERT(n_embd_k == head_dim_k * n_head_kv);
+    GGML_ASSERT(n_embd_v == head_dim_v * n_head_kv);
+    // The overflow FA reads the mask with stride = KV (the K/V extent):
+    // vulkan-shaders/flash_attn_base.glsl:213 sets `m_stride = KV`, and
+    // flash_attn.comp:222 indexes `data_m[(i*Br + r)*m_stride + ...]`. A mask
+    // WIDER than the packed K/V therefore makes query rows past the first read
+    // the wrong mask row (live640 with padded768 reproduced exactly this).
+    // Crop AND materialize a CONTIGUOUS mask with exactly the extent the K/V
+    // carries, and use that same extent as n_kv_max below. The capacity-sized
+    // graph input keeps its allocation and fill order; only the compute view
+    // shrinks, so no KV format is converted and no padding row is unmasked.
+    if (mask_overflow->ne[0] != int64_t(n_ovf_rows)) {
+        ggml_tensor * mask_src = mask_overflow;
+        if (mask_src->ne[0] < int64_t(n_ovf_rows)) {
+            throw std::runtime_error(
+                "position-split overflow mask is narrower than the packed K/V extent");
+        }
+        mask_overflow = ggml_view_4d(ctx0, mask_src,
+                int64_t(n_ovf_rows), mask_src->ne[1], mask_src->ne[2], mask_src->ne[3],
+                mask_src->nb[1], mask_src->nb[2], mask_src->nb[3], 0);
+        mask_overflow = ggml_cont(ctx0, mask_overflow);
+        if (!ggml_is_contiguous(mask_overflow) ||
+                mask_overflow->ne[0] != int64_t(n_ovf_rows) ||
+                mask_overflow->type != mask_src->type) {
+            throw std::runtime_error(
+                "position-split overflow mask crop to the packed K/V extent failed");
+        }
+        ggml_set_name(mask_overflow, "attn_inp_kq_mask_overflow_occ");
+    }
+    ggml_tensor * k_overflow = ggml_reshape_4d(ctx0, k_ovf_gathered,
+        head_dim_k, n_head_kv, int64_t(n_ovf_rows), 1);
+    ggml_tensor * v_overflow = ggml_reshape_4d(ctx0, v_ovf_gathered,
+        head_dim_v, n_head_kv, int64_t(n_ovf_rows), 1);
+    // F4: mark the overflow K/V the second FA consumes, so executed-node
+    // capture covers the dual-range path too (fixture-gated, no-op otherwise).
+    kvarn_ctx->mark_split_tensor(k_overflow, il, false, llama_position_split::kRangeOverflow);
+    kvarn_ctx->mark_split_tensor(v_overflow, il, true,  llama_position_split::kRangeOverflow);
+
+    // Masks per range (filled in set_input from live cell lists).
+    ggml_tensor * mask_local = inp->self_kq_mask_local_cnv;
+    GGML_ASSERT(mask_local != nullptr && mask_overflow != nullptr);
+
+    // Local body + exact tail (plan 3.4: the LOCAL LSE must normalize the
+    // COMPLETE local output, body + tail KVarN, before it is merged with the
+    // Q4 overflow). fa2 stays tail-free (plan 3.1). The operands are the very
+    // same inputs the single-range path uses, so the body/tail exactly-once
+    // bookkeeping (tail_read_idxs, kq_mask_tail, query order, run descriptor)
+    // is shared rather than reimplemented for this builder.
+    ggml_tensor * k_tail_local   = nullptr;
+    ggml_tensor * v_tail_local   = nullptr;
+    ggml_tensor * mask_tail_local = nullptr;
+    ggml_tensor * bias_tail_local = nullptr;
+    ggml_tensor * tail_idx_local  = nullptr;
+    ggml_tensor * tail_order_local = nullptr;
+    ggml_tensor * tail_desc_local  = nullptr;
+    llama_kv_tail_route route_local = LLAMA_KV_TAIL_ROUTE_NONE;
+    if (local_tail_here) {
+        route_local = kvarn_ctx->get_tail_route(il);
+        k_tail_local = kvarn_ctx->get_k_tail(ctx0, il);
+        v_tail_local = kvarn_ctx->get_v_tail(ctx0, il);
+        tail_idx_local = inp->get_tail_read_idxs();
+        if (route_local == LLAMA_KV_TAIL_ROUTE_NONE) {
+            k_tail_local = nullptr;
+            v_tail_local = nullptr;
+        }
+        // Fail closed instead of building a half-wired tail: a present tail
+        // without its read indices would silently read the wrong keys.
+        if (k_tail_local != nullptr && (v_tail_local == nullptr || tail_idx_local == nullptr)) {
+            throw std::logic_error(format(
+                    "position-split layer %d: local exact tail present without "
+                    "its V or read-index operand", il));
+        }
+        if (k_tail_local != nullptr) {
+            mask_tail_local = inp->get_kq_mask_tail();
+            bias_tail_local = build_attn_bias_tail(
+                    nullptr, inp->get_tail_bias_read_idxs(), mask_tail_local);
+            tail_order_local = inp->get_tail_query_order();
+            tail_desc_local  = inp->get_tail_run_desc();
+            // Same domain rule as the single-range path: the stored tail is
+            // unrotated, the local body records are rotated.
+            GGML_ASSERT(kvarn_rot != nullptr);
+            // NO current segment here: this builder runs for an OVERFLOW
+            // ubatch, which writes Q4 overflow keys, so the local tail is read
+            // purely as HISTORY (validate_native_tail_operation(..., false)).
+            // Overflow keys must never enter the local tail.
+            k_tail_local = ggml_kvarn_wht_aux(ctx0, k_tail_local, kvarn_rot->ne[0]);
+            // Same rule as the single-range path above: the FA un-rotates the
+            // tail V too, so the stored (original-domain) tail V must be rotated
+            // in every domain. See the measurement cited there.
+            v_tail_local = ggml_kvarn_wht_aux(ctx0, v_tail_local, kvarn_rot->ne[0]);
+            // Same domain rule for the current segment: K is always rotated for
+            // the KVarN Q-rot path, V only in the rotated-domain case.
+        }
+    }
+
+    // Two FlashAttention ops with LSE side outputs. No sinks/bias/softcap in
+    // P-mode (fail closed below; plan 3.4 keeps sinks out of the first mode);
+    // precision F32 like the single-range path.
+    ggml_tensor * fa1 = nullptr;
+    ggml_tensor * fa2 = nullptr;
+    ggml_tensor * final_local_tail_op = nullptr;
+    // Argument order mirrors build_attn() exactly: slot 5 is the MODEL's KQ
+    // bias (must stay null -- a non-null value there silently disables the
+    // FlashAttention branch and leaves final_attn_op unset), and the tail bias
+    // is slot 14. Passing the tail bias one slot early compiled fine and only
+    // failed at the GGML_ASSERT(fa1 != nullptr) below.
+    ggml_tensor * o1 = build_attn_mha(q_local, k_local, v_local,
+        nullptr, mask_local, nullptr, nullptr, int64_t(n_local),
+        kq_scale, il,
+        k_tail_local, v_tail_local, mask_tail_local, bias_tail_local,
+        tail_idx_local, tail_order_local, tail_desc_local,
+        route_local, kvarn_domain,
+        nullptr, nullptr, kvarn_ctx->get_tail_slots(),
+        !kvarn_ctx->has_kv_body(il), &final_local_tail_op);
+if (getenv("F4_TAIL_TRACE")) {
+    fprintf(stderr, "F4SPLIT il=%d local_tail=%d route_local=%d k_tail=%p v_tail=%p "
+            "mask_tail=%p bias_tail=%p idx=%p order=%p desc=%p n_local=%d\n",
+            il, (int) local_tail_here, (int) route_local,
+            (void *) k_tail_local, (void *) v_tail_local, (void *) mask_tail_local,
+            (void *) bias_tail_local, (void *) tail_idx_local,
+            (void *) tail_order_local, (void *) tail_desc_local, (int) n_local);
+}
+// build_attn_mha returns the FINAL (possibly tail-merged) node through
+// final_local_tail_op; fa1 is what the merge below consumes and what the
+// validator must see.
+fa1 = final_local_tail_op;
+GGML_ASSERT(fa1 != nullptr);
+if (route_local == LLAMA_KV_TAIL_ROUTE_NATIVE) {
+    validate_native_tail_operation(inp->mctx, il, final_local_tail_op, false);
+}
+ggml_tensor * lse1 = ggml_flash_attn_ext_lse_out(ctx0, fa1);
+    ggml_tensor * o2 = build_attn_mha(q_cur, k_overflow, v_overflow,
+        nullptr, mask_overflow, nullptr, nullptr, int64_t(n_ovf_rows),
+        kq_scale, il,
+    nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr,
+    static_cast<llama_kv_tail_route>(0),
+    GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO,
+    nullptr, nullptr, 0, false, &fa2);
+GGML_ASSERT(fa2 != nullptr);
+ggml_tensor * lse2 = ggml_flash_attn_ext_lse_out(ctx0, fa2);
+ggml_prec_set_acc(fa1, GGML_PREC_F32);
+ggml_prec_set_acc(fa2, GGML_PREC_F32);
+if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
+    // Unique per-layer names so F4_NODE_DUMP can compare the overflow FA output
+    // and its LSE between the raw-Q4 and the F16 reference legs.
+    char nm[64];
+    snprintf(nm, sizeof(nm), "f5fa2-%d", il);  ggml_set_name(fa2,  nm);
+    snprintf(nm, sizeof(nm), "f5lse2-%d", il); ggml_set_name(lse2, nm);
+    snprintf(nm, sizeof(nm), "f5k-%d", il);    ggml_set_name(k_overflow, nm);
+    snprintf(nm, sizeof(nm), "f5v-%d", il);    ggml_set_name(v_overflow, nm);
+    snprintf(nm, sizeof(nm), "f5mask-%d", il); ggml_set_name(mask_overflow, nm);
+}
+    // F4: the KVarN domain must land on the FINAL FA node, which is not
+    // necessarily the node build_attn_mha created internally (it may be
+    // re-wrapped). The single-range paths already do this after the call
+    // (llm_flash_attn_ext_set_kvarn_domain); the split path did not, so the
+    // local range kept whatever op_params happened to contain. That value is
+    // not a valid domain id, the CUDA KVarN gate then refused the shape, and
+    // ggml_cuda_flash_attn_ext aborted the whole process ("unsupported KVarN
+    // CUDA FlashAttention route"). Set it explicitly on both range nodes.
+    llm_flash_attn_ext_set_kvarn_domain(fa1, kvarn_domain);
+    llm_flash_attn_ext_set_kvarn_domain(fa2, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO);
+
+    // Local O back to the original V domain before merging (same rule as the
+    // single-range path: the KVarN native output is rotated unless the backend
+    // uses the original V domain).
+    if (use_kvarn_rotated_domain) {
+        GGML_ASSERT(o1->type == GGML_TYPE_F32);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        o1 = ggml_kvarn_wht_aux(ctx0, o1, kvarn_rot->ne[0]);
+    }
+
+    // Stable merge on CUDA (validated pattern from test-position-split-merge-graph).
+    // O is [D,H,Q,B] after restoring the 4D layout; LSE is [H,Q,B].
+    const int64_t n_qh = lse1->ne[0];
+    const int64_t n_q = lse1->ne[1];
+    const int64_t n_b = lse1->ne[2];
+    GGML_ASSERT(lse2->ne[0] == n_qh && lse2->ne[1] == n_q && lse2->ne[2] == n_b);
+    const int64_t head_dim = q_cur->ne[0];
+    // build_attn_mha returns O flattened as [(D*H), (Q*B)]; restore 4D.
+    GGML_ASSERT(o1->ne[0] == head_dim*n_qh && o1->ne[1] == n_q*n_b);
+    GGML_ASSERT(o2->ne[0] == head_dim*n_qh && o2->ne[1] == n_q*n_b);
+    ggml_tensor * o1_4d = ggml_reshape_4d(ctx0, o1, head_dim, n_qh, n_q, n_b);
+    ggml_tensor * o2_4d = ggml_reshape_4d(ctx0, o2, head_dim, n_qh, n_q, n_b);
+    ggml_tensor * c1 = ggml_clamp(ctx0, lse1, -1e6f, 1e30f);
+    ggml_tensor * c2 = ggml_clamp(ctx0, lse2, -1e6f, 1e30f);
+    ggml_tensor * mx = ggml_scale(ctx0,
+            ggml_add(ctx0, ggml_add(ctx0, c1, c2), ggml_abs(ctx0, ggml_sub(ctx0, c1, c2))),
+            0.5f);
+    ggml_tensor * e1 = ggml_exp(ctx0, ggml_sub(ctx0, lse1, mx));
+    ggml_tensor * e2 = ggml_exp(ctx0, ggml_sub(ctx0, lse2, mx));
+    ggml_tensor * w1 = ggml_reshape_4d(ctx0, e1, 1, n_qh, n_q, n_b);
+    ggml_tensor * w2 = ggml_reshape_4d(ctx0, e2, 1, n_qh, n_q, n_b);
+    ggml_tensor * num = ggml_add(ctx0, ggml_mul(ctx0, o1_4d, w1), ggml_mul(ctx0, o2_4d, w2));
+    ggml_tensor * den = ggml_add(ctx0, e1, e2);
+    // Both ranges are non-empty here (validated above), so den > 0 always:
+    // plain division is exact with no epsilon, and merged LSE is exact.
+    // Broadcast den as [1,H,Q,B] like the validated merge-graph pattern.
+    ggml_tensor * den_4d = ggml_reshape_4d(ctx0, den, 1, n_qh, n_q, n_b);
+    ggml_tensor * o_merged_4d = ggml_div(ctx0, num, den_4d);
+    ggml_tensor * lse_merged = ggml_add(ctx0, mx, ggml_log(ctx0, den));
+    ggml_tensor * o_merged = ggml_reshape_2d(ctx0, o_merged_4d,
+        o_merged_4d->ne[0]*o_merged_4d->ne[1], o_merged_4d->ne[2]*o_merged_4d->ne[3]);
+    // Materialize to a fresh contiguous buffer (not a view) so the returned
+    // O always owns an allocated output buffer. A reshape view of the div
+    // output was left without a valid buffer by the scheduler in the
+    // multi-backend split graph (isolated: standalone mul read OOB on the
+    // view while sigmoid was clean; materializing eliminates it). Cheap and
+    // permanent.
+    o_merged = ggml_cont_2d(ctx0, o_merged, o_merged->ne[0], o_merged->ne[1]);
+
+    // Explicitly expand every split FA/LSE/merge node in dependency order.
+    // The scheduler must allocate all of them; relying solely on output
+    // dependencies left the merged output unallocated in one configuration
+    // (isolated via no-fusion run: standalone mul read OOB on o_merged
+    // while sigmoid was clean).
+    ggml_build_forward_expand(gf, fa1);
+    ggml_build_forward_expand(gf, lse1);
+    ggml_build_forward_expand(gf, fa2);
+    ggml_build_forward_expand(gf, lse2);
+    ggml_build_forward_expand(gf, o_merged_4d);
+    ggml_build_forward_expand(gf, lse_merged);
+    ggml_build_forward_expand(gf, o_merged);
+
+    // Backend placement: overflow FA/LSE/K/V/mask on Vulkan, everything else
+    // (local FA/LSE, merge, outputs) on CUDA. Q stays on CUDA; the scheduler
+    // copies it to Vulkan for FA2. Fail closed if either backend is missing.
+    // Split input tensors (masks/idxs) stay on host CPU so set_input can fill
+    // them; the scheduler copies to device backends as needed. backend_cpu
+    // may be null, so locate a host backend from the scheduler explicitly.
+    ggml_backend_t backend_host = backend_cpu;
+    if (!backend_host) {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t be = ggml_backend_sched_get_backend(sched, i);
+            ggml_backend_dev_t dev = be ? ggml_backend_get_device(be) : nullptr;
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                backend_host = be;
+                break;
+            }
+        }
+    }
+    if (!backend_host) {
+        throw std::runtime_error("position-split attention requires a host CPU backend for range inputs");
+    }
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_host);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_overflow, backend_host);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_kvarn_mat_idxs_local, backend_host);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_overflow_cell_idxs, backend_host);
+    ggml_backend_t backend_vulkan = cparams.local_attn_backend;
+    if (!backend_vulkan) {
+        throw std::runtime_error("position-split attention requires the Vulkan overflow backend");
+    }
+    ggml_backend_t backend_cuda = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t be = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t dev = be ? ggml_backend_get_device(be) : nullptr;
+        const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                name && std::strncmp(name, "CUDA", 4) == 0) {
+            backend_cuda = be;
+            break;
+        }
+    }
+    if (!backend_cuda) {
+        throw std::runtime_error("position-split attention requires a CUDA backend for local/merge");
+    }
+    ggml_backend_sched_set_tensor_backend(sched, fa2, backend_vulkan);
+    ggml_backend_sched_set_tensor_backend(sched, lse2, backend_vulkan);
+    ggml_backend_sched_set_tensor_backend(sched, k_overflow, backend_vulkan);
+    ggml_backend_sched_set_tensor_backend(sched, v_overflow, backend_vulkan);
+    ggml_backend_sched_set_tensor_backend(sched, mask_overflow, backend_vulkan);
+    ggml_backend_sched_set_tensor_backend(sched, k_ovf_gathered, backend_vulkan);
+    ggml_backend_sched_set_tensor_backend(sched, v_ovf_gathered, backend_vulkan);
+    ggml_backend_sched_set_tensor_backend(sched, fa1, backend_cuda);
+    ggml_backend_sched_set_tensor_backend(sched, lse1, backend_cuda);
+    ggml_backend_sched_set_tensor_backend(sched, o_merged, backend_cuda);
+    ggml_backend_sched_set_tensor_backend(sched, lse_merged, backend_cuda);
+    // Opt-in tail-WHT anchor (expressed default OFF, msg57). Arms by REAL
+    // behavior of LLAMA_OVF_TAIL_LOCAL_CUDA:
+    //   unset -> OFF (legacy placement: fa2's Vulkan preset leaks backward
+    //            (expand-up) into the tail WHT nodes, ~8 MB/token round trip
+    //            of bit-static tails and RADV F16 WHT rounding up to 1 ulp
+    //            away from the CPU golden, wht-parity maxabs 1.953e-03)
+    //   "0"   -> OFF
+    //   "1"   -> ON (k_tail_local/v_tail_local computed on CUDA with fa1;
+    //            wht-parity maxabs 6.104e-05)
+    //   other -> OFF (fail closed, unambiguous)
+    // Promoting ON to the default requires an independent reference gate
+    // (msg57 item 3); until then this stays an A/B arm only.
+    // ONLY the WHT compute outputs are anchored: index/order/desc/mask
+    // bookkeeping stays wherever the current placement puts it (some of it
+    // is CPU-written and asserts host buffers). If CUDA refuses an op
+    // (unsupported shape), set_if_supported falls back safely and staging
+    // persists (measurable, no crash). No-ops when the local tail is absent.
+    // Never touches fa2/overflow placement.
+    static const bool tail_local_cuda_enabled = [] {
+        const char * e = std::getenv("LLAMA_OVF_TAIL_LOCAL_CUDA");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    if (tail_local_cuda_enabled && k_tail_local != nullptr) {
+        ggml_backend_sched_set_tensor_backend(sched, k_tail_local, backend_cuda);
+        if (v_tail_local != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, v_tail_local, backend_cuda);
+        }
+    }
+    o_merged = apply_attention_reference_cpu(o_merged, il);
+    cb(o_merged, "attn_position_split_merged", il);
+    LLAMA_LOG_INFO("%s: layer %d position-split dual FA: local=%u keys (CUDA/KVarN), overflow=%u keys (Vulkan/Q4), merge on CUDA\n",
+            __func__, il, n_local, n_overflow);
+    return o_merged;
 }
 
 static std::unique_ptr<llm_graph_input_attn_kv_paged> build_attn_inp_kv_paged_impl(
@@ -4447,9 +6015,8 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx && kvarn_ctx->uses_kvarn_layer(il);
-    const bool kvarn_native_attention = use_kvarn &&
-        kvarn_ctx->uses_native_attention(il) &&
-        llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
+    const bool kvarn_native_attention = llm_kvarn_native_attention_for(
+        kvarn_ctx, arch, cparams.causal_attn, is_swa, il, (int) q_cur->ne[0]);
     const auto kvarn_plan = use_kvarn ? llama_kvarn_plan_attention(
         kvarn_native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
@@ -4667,8 +6234,12 @@ k_tail, v_tail, kq_mask_tail, kq_b_tail,
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
     }
+    if (use_kvarn && arch == LLM_ARCH_DFLASH && !cparams.causal_attn &&
+            kvarn_plan.native_attention) {
+        validate_native_kvarn_noncausal_operation(mctx_cur, il, final_tail_op);
+    }
     if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
-        validate_native_tail_operation(mctx_cur, il, final_tail_op);
+        validate_native_tail_operation(mctx_cur, il, final_tail_op, true);
     }
     if (compact_tail && k_cur && v_cur) {
         if (ggml_tensor * written = mctx_cur->cpy_k_tail(
@@ -5026,7 +6597,8 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     if (raw_ctx->get_tail_tokens() > 0) {
         const auto [tail_q_max, tail_n_active] = tail_query_plan_shape(ubatch);
         GGML_UNUSED(tail_n_active);
-        const uint32_t attention_stride = raw_ctx->get_tail_attention_stride(uint32_t(tail_q_max));
+        const uint32_t attention_stride = raw_ctx->get_tail_attention_stride(
+                uint32_t(tail_extent_queries(raw_ctx, ubatch, tail_q_max)));
         inp_raw->self_tail_read_idxs = ggml_new_tensor_2d(
                 ctx0, GGML_TYPE_I32, attention_stride, ubatch.n_tokens);
         ggml_set_input(inp_raw->self_tail_read_idxs);
@@ -5102,6 +6674,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
+
+    const int64_t n_history = std::max<int64_t>(0,
+            (int64_t) mctx_cur->get_n_rs_seq() + 1 - ubatch.n_seq_tokens);
+    if (n_history > 0) {
+        inp->s_history = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_history*n_seqs);
+        ggml_set_input(inp->s_history);
+    }
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);

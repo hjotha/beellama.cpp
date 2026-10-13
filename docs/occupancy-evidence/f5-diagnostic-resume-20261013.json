@@ -1,0 +1,252 @@
+{
+  "schema": "occupancy-diagnostic-resume-v1",
+  "time_utc": "2026-10-13T04:48:42.855021+00:00",
+  "branch": "feat/occupancy-position-split",
+  "status": "diagnostics_complete_plan_not_complete",
+  "smoke": {
+    "case": "DOROV3 P=512 n=641 Q8",
+    "checks": 260,
+    "failures": 0,
+    "not_executed": 0,
+    "merged_nrmse": 0.0004665,
+    "max_O": 0.006761,
+    "max_LSE": 0.002446,
+    "evidence": "foreground tool stdout; not independently saved as a log"
+  },
+  "onepoint": {
+    "N": 104999,
+    "input_position": 104998,
+    "prefix_tokens": 104998,
+    "metrics": {
+      "kl_nat": 0.00021053967377375785,
+      "max_abs_logits": 0.13941311836242676,
+      "max_logp_difference": 0.1597868596971317,
+      "reference_nll": 9.252976227648556,
+      "candidate_nll": 9.279169289661972
+    },
+    "prefix_proof": {
+      "equal": true,
+      "bytes_compared": 2074888611,
+      "first_difference": null,
+      "before_xxh64": "6c0edcf5e7f2f6a4",
+      "after_xxh64": "6c0edcf5e7f2f6a4",
+      "method": "exact streaming byte comparison of native full KV/table/recurrent sequence files; no metadata normalization",
+      "verified": true
+    },
+    "post_gpu_restore_proof": {
+      "equal": true,
+      "bytes_compared": 2074975529,
+      "first_difference": null,
+      "before_xxh64": "34936bdc151f2579",
+      "after_xxh64": "34936bdc151f2579",
+      "method": "exact streaming byte comparison of native full KV/table/recurrent sequence files; no metadata normalization"
+    },
+    "current_kv_tensors": 32,
+    "current_kv_all_byte_equal": true,
+    "protocol_eligible": false,
+    "limitation": "One point, fresh prefill ending at104998 differs from historical 32-step path starting104968; CPU oracle retains merge on CUDA."
+  },
+  "cached_control": {
+    "original": {
+      "nll": 9.279169289661983,
+      "max_abs_vs_original": 0.0,
+      "kl_cpu_to_arm": 0.00021053967377739733
+    },
+    "cpu": {
+      "nll": 9.252976227648563,
+      "max_abs_vs_original": 0.13941311836242676,
+      "kl_cpu_to_arm": 0.0
+    },
+    "restore": {
+      "nll": 9.279169289661983,
+      "max_abs_vs_original": 0.0,
+      "kl_cpu_to_arm": 0.00021053967377739733
+    },
+    "cont_k": {
+      "nll": 9.279169289661983,
+      "max_abs_vs_original": 0.0,
+      "kl_cpu_to_arm": 0.00021053967377739733
+    },
+    "quality_candidate": {
+      "nll": 9.26142629268487,
+      "max_abs_vs_original": 2.1060569286346436,
+      "kl_cpu_to_arm": 0.0013217748477085936
+    },
+    "quality_baseline": {
+      "nll": 6.976621949212362,
+      "max_abs_vs_original": 4.211922645568848,
+      "kl_cpu_to_arm": 0.06679521572701727
+    }
+  },
+  "ablation_p105216": {
+    "baseline": {
+      "mean_nll": 0.8540895116374135,
+      "mean_kl_f16": 0.08295461179805633,
+      "ppl_ratio_vs_baseline": 1.0
+    },
+    "candidate": {
+      "mean_nll": 0.8886231328270755,
+      "mean_kl_f16": 0.027099020768655623,
+      "ppl_ratio_vs_baseline": 1.035136830322768
+    },
+    "f16_reference": {
+      "mean_nll": 0.7139507949449498,
+      "mean_kl_f16": 0.0,
+      "ppl_ratio_vs_baseline": 0.8692376492636735
+    },
+    "p105216": {
+      "mean_nll": 0.9302356488658071,
+      "mean_kl_f16": 0.1343469755805656,
+      "ppl_ratio_vs_baseline": 1.0791202622791836
+    }
+  },
+  "cont_k_full_trajectory": {
+    "mean_nll": 0.8886231328270755,
+    "mean_kl_f16": 0.027099020768655623,
+    "max_abs_vs_original": 0.0,
+    "ppl_ratio_vs_baseline": 1.035136830322768
+  },
+  "inferences": [
+    "Missing F5_OVF_CONT_KV did not change any of the 32 historical105k captures when enabled for the complete fresh trajectory.",
+    "Moving P above the full105k trajectory did not solve quality; it worsened PPL ratio to1.0791202622791836.",
+    "Results do not prove a Radeon-only or LSE-merge root cause. No source defect was established.",
+    "Current fixed-P102400 quality gates still fail; do not promote or relax criteria."
+  ],
+  "caches": [
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-onepoint/capture/native-prefix-before.bin",
+      "bytes": 2074888611,
+      "sha256": "80e3928f2f2691fe2eb16c0dc771d77307875e2fb52755671368f5c65ed97bbb",
+      "command": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-onepoint/command.json",
+      "configuration": {
+        "config_core": "model_sha256=e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838;n_ctx=131072;n_batch=512;n_ubatch=256;n_seq=1;n_params=27320697856;p=102400;kv_k=4;kv_v=4;overflow_k=2;overflow_v=2;cache_type_k=2:q4_0;cache_type_v=2:q4_0;remote_layers=full",
+        "model": "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+        "cache_type_k_numeric": 2,
+        "cache_type_k_name": "q4_0",
+        "cache_type_v_numeric": 2,
+        "cache_type_v_name": "q4_0",
+        "reference_arm": "cpu",
+        "pure_cuda_baseline": false,
+        "quality_only": false,
+        "reference_option_ignored_in_quality_only": null,
+        "layered_baseline": false,
+        "arm_classification": "position_split_candidate",
+        "model_sha256_operator_verified": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+        "build_bundle_sha256_operator_verified": "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+        "compiled_commit": "d9db0b881",
+        "compiled_build": "b12366-d9db0b881-dirty",
+        "n_rs_seq": 0,
+        "teacher_file": {
+          "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+          "bytes": 708895,
+          "xxh64": "a2ea4b52457f1ea3"
+        },
+        "token_format": "json",
+        "starts": [
+          104999
+        ],
+        "count": 1,
+        "checkpoint_method": "full",
+        "state_spool_directory": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-onepoint/capture/native-spool",
+        "full_prefix_verification": true,
+        "fixed_current_kv": true
+      },
+      "reusability": "Only after matching model, build, corpus prefix, P/C, KV, recurrent and MTP configuration; never direct restore across P values."
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-p105216/capture/prefix-cache.bin",
+      "bytes": 2073044938,
+      "sha256": "6b402ead9fc371d5706bbc05028839a3fe1ffb8a561046184f75adf943e97ccd",
+      "command": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-p105216/command.json",
+      "configuration": {
+        "config_core": "model_sha256=e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838;n_ctx=131072;n_batch=512;n_ubatch=256;n_seq=1;n_params=27320697856;p=105216;kv_k=4;kv_v=4;overflow_k=2;overflow_v=2;cache_type_k=2:q4_0;cache_type_v=2:q4_0;remote_layers=full",
+        "model": "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+        "cache_type_k_numeric": 2,
+        "cache_type_k_name": "q4_0",
+        "cache_type_v_numeric": 2,
+        "cache_type_v_name": "q4_0",
+        "reference_arm": "gpu_quality_only",
+        "pure_cuda_baseline": false,
+        "quality_only": true,
+        "reference_option_ignored_in_quality_only": "cpu",
+        "layered_baseline": false,
+        "arm_classification": "quality_only_gpu_trajectory",
+        "model_sha256_operator_verified": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+        "build_bundle_sha256_operator_verified": "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+        "compiled_commit": "d9db0b881",
+        "compiled_build": "b12366-d9db0b881-dirty",
+        "n_rs_seq": 0,
+        "teacher_file": {
+          "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+          "bytes": 708895,
+          "xxh64": "a2ea4b52457f1ea3"
+        },
+        "token_format": "json",
+        "starts": [
+          104968
+        ],
+        "count": 32,
+        "checkpoint_method": "none_quality_trajectory",
+        "state_spool_directory": null,
+        "full_prefix_verification": false,
+        "fixed_current_kv": false
+      },
+      "reusability": "Only after matching model, build, corpus prefix, P/C, KV, recurrent and MTP configuration; never direct restore across P values."
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cont-k-full/capture/prefix-cache.bin",
+      "bytes": 2072194153,
+      "sha256": "1d88e046206f10700971c380c8a6610153454ac04adcbbe12a97ebe482437f27",
+      "command": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cont-k-full/command.json",
+      "configuration": {
+        "config_core": "model_sha256=e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838;n_ctx=131072;n_batch=512;n_ubatch=256;n_seq=1;n_params=27320697856;p=102400;kv_k=4;kv_v=4;overflow_k=2;overflow_v=2;cache_type_k=2:q4_0;cache_type_v=2:q4_0;remote_layers=full",
+        "model": "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+        "cache_type_k_numeric": 2,
+        "cache_type_k_name": "q4_0",
+        "cache_type_v_numeric": 2,
+        "cache_type_v_name": "q4_0",
+        "reference_arm": "gpu_quality_only",
+        "pure_cuda_baseline": false,
+        "quality_only": true,
+        "reference_option_ignored_in_quality_only": "cpu",
+        "layered_baseline": false,
+        "arm_classification": "quality_only_gpu_trajectory",
+        "model_sha256_operator_verified": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+        "build_bundle_sha256_operator_verified": "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+        "compiled_commit": "d9db0b881",
+        "compiled_build": "b12366-d9db0b881-dirty",
+        "n_rs_seq": 0,
+        "teacher_file": {
+          "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+          "bytes": 708895,
+          "xxh64": "a2ea4b52457f1ea3"
+        },
+        "token_format": "json",
+        "starts": [
+          104968
+        ],
+        "count": 32,
+        "checkpoint_method": "none_quality_trajectory",
+        "state_spool_directory": null,
+        "full_prefix_verification": false,
+        "fixed_current_kv": false
+      },
+      "reusability": "Only after matching model, build, corpus prefix, P/C, KV, recurrent and MTP configuration; never direct restore across P values."
+    }
+  ],
+  "kernel_new_matches": [],
+  "active_test_or_server_processes": [],
+  "remaining": [
+    "Fixed-P102400 quality at105k/115k;130560 F16 dispatch/device-loss investigation with justified short control",
+    "Full structural calibrated32-position coverage where still missing",
+    "Performance warmup plus5A/B pairs includingP+256=102656",
+    "F7 only after all mandatory gates pass"
+  ],
+  "scope_preserved": [
+    "No production configuration/source edit",
+    "No merge/commit/push/reset/reboot",
+    "No Xbox task changes",
+    "No original cache/offload-manifest changes"
+  ],
+  "evidence_root": "/home/hjotha/f4-spool/f5-campaign/final-20261012"
+}

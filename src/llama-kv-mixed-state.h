@@ -41,6 +41,43 @@
 // whole-file tail_crc, all XXH64 seed 0 (same as src/llama-io-file.h).
 // Corruption detection, not cryptographic authentication.
 //
+// Wire format version 2 (F4 position_split), explicit little-endian:
+//   Same leading layout as v1, then the v1 header grows a position_split block.
+//   v2 is a strict superset of v1 so a v1 reader fails closed on the magic:
+//
+//   [0]   magic           u32   "KMS2" (0x32534D4B)
+//   [4]   version         u32   2
+//   [8]   flags           u32   full | partial | body_only
+//   [12]  owner_epoch     u64
+//   [20]  owner_id        u64
+//   [28]  n_layers        u32   descriptor count (2 per full layer when split)
+//   [32]  n_used          u32   shared occupied cell prefix length
+//   [36]  metadata_version u32
+//   [40]  metadata_bytes  u64
+//   [48]  metadata_checksum u64
+//   [56]  split_p         u32   local boundary P
+//   [60]  split_c         u32   total logical capacity C
+//   [64]  model_id        u64   caller-defined model identity hash
+//   [72]  rope_id         u64   caller-defined RoPE identity hash
+//   [80]  reserved        u32[4] all zero
+//   [96]  header_crc      u64   XXH64(seed 0) over bytes [0, 104) with the
+//                               crc field itself zeroed
+//   [104] metadata blob (metadata_bytes)          once, full/partial only
+//        per descriptor, in order:
+//          layer descriptor (fixed 113 bytes = the 101 v1 bytes followed by
+//            range_id u32, range_start u32, range_end u32)
+//          payload bytes (payload_bytes)          per payload_mode
+//        shared cell summary, one entry per cell of the prefix [0, n_used):
+//          pos i32, x i32, y i32, tok i32, n_seq u16, seq ids i32 * n_seq
+//        tail_crc u64   XXH64(seed 0) over every byte preceding it
+//
+// v2 range contract: descriptor identity is the PAIR (layer_id, range_id).
+// Every full layer carries exactly two descriptors, range_id 0 = local
+// [0,P) and range_id 1 = overflow [P,C), with no gap and no overlap at P.
+// An empty range may omit its payload bytes but MUST keep its descriptor.
+// P/C/model_id/rope_id are matched EXACTLY against the destination before any
+// staging is reachable, so a mismatched restore fails without mutating state.
+//
 // Snapshot flags contract:
 //   full      - metadata blob + cells + descriptors + complete payloads
 //               (every layer payload_mode == mode_full); replayable anywhere.
@@ -137,7 +174,12 @@ enum class rotation : uint8_t {
 enum layout_id : uint16_t {
     layout_kvarn_records_stage_tail = 1, // KVarN: record groups + stage rows + optional exact tail
     layout_standard_qx_rows         = 2, // standard: contiguous Qx rows per stream
+    layout_standard_qx_compact_rows = 3, // split v2 overflow: physical row = global cell - P
 };
+
+// Shared by native compact Qx storage and its codec tests. The logical cell
+// must belong to the owned interval [origin,capacity); never wrap or clamp it.
+uint32_t qx_payload_row_for_cell(uint32_t origin, uint32_t capacity, uint32_t global_cell);
 
 // Per-layer payload mode (part of the wire format). Determines whether and
 // how payload bytes travel with the snapshot:
@@ -204,7 +246,7 @@ enum kvarn_type : uint16_t {
 };
 
 struct layer_desc {
-    uint32_t layer_id = 0; // model layer index; must be unique
+    uint32_t layer_id = 0; // model layer index; must be unique (v1) / paired with range_id (v2)
     cache_kind kind = cache_kind::unknown;
     uint16_t k_type = 0; // standard_qx_type or kvarn_type wire id
     uint16_t v_type = 0;
@@ -233,6 +275,25 @@ struct layer_desc {
     uint64_t payload_rows = 0;  // rows (kvarn stage rows / record groups; qx token rows)
     uint64_t payload_bytes = 0; // exact payload size; 0 = derive from blob size at serialize
     uint64_t payload_checksum = 0; // XXH64(seed 0) over payload bytes (set by codec)
+    // F4 v2 range identity. Wire-serialized ONLY in version 2; the v1 codec
+    // ignores these fields on read and rejects them on write, so a v1 frame can
+    // never carry range identity it cannot validate. Uniqueness is on the PAIR
+    // (layer_id, range_id): one full layer owns range_id 0 = local [0,P) and
+    // range_id 1 = overflow [P,C).
+    uint32_t range_id = 0;  // 0 = local [0,P), 1 = overflow [P,C)
+    uint32_t range_start = 0; // inclusive logical cell index (v2 only)
+    uint32_t range_end = 0;   // exclusive logical cell index (v2 only)
+};
+
+// F4 v2 envelope: position_split identity + occupancy of the two ranges.
+// All fields are REQUIRED in a v2 snapshot (no defaults are inferred) and must
+// match the destination exactly in validate_expected_snapshot(); a mismatch
+// fails BEFORE any staging, so a P/C/model/rope divergence never mutates state.
+struct position_split {
+    uint32_t p = 0;  // local capacity boundary [0,P)
+    uint32_t c = 0;  // total logical capacity [0,C)
+    uint64_t model_id = 0; // caller-defined stable model identity hash
+    uint64_t rope_id = 0;  // caller-defined stable RoPE/positional identity hash
 };
 
 // validated cell summary: lightweight, used for capacity/prefix checks only
@@ -249,6 +310,32 @@ struct layer_blob {
     layer_desc desc;
     const uint8_t * data = nullptr;
     size_t size = 0;
+};
+
+// Serialized snapshot identity. v1 leaves position_split empty and travels in
+// the v1 header. v2 REQUIRES a populated position_split and travels in the v2
+// header, which is a strict superset (the same first 96 bytes plus the
+// position_split block) so v1 readers fail closed on the v2 magic/version.
+// ORIGINAL WRITER identity of a PURE (non-split) frame, serialized in the KMS3
+// header and covered by the header checksum (integrity, not authenticity). It
+// travels WITH the payload, so it is bound to the exact validated bytes and
+// cannot be supplied, forged from the destination, or left stale by a previous
+// load: each parse produces its own value and the frame fails closed without it.
+struct source_identity {
+    uint64_t model_id  = 0; // llama_mixed_state_model_id of the WRITER
+    uint64_t rope_id   = 0; // llama_mixed_state_rope_id of the WRITER
+    uint64_t config_id = 0; // descriptor_config_id of the WRITER's layer set
+};
+
+struct serialize_options {
+    // empty => emit a v1/v3 frame; populated => emit a v2 frame. A v2 frame
+    // with p == 0 or c <= p is rejected before any byte is produced.
+    std::optional<position_split> split;
+    // populated => emit a KMS3 frame carrying the ORIGINAL WRITER identity
+    // (used by pure, non-split snapshots so a split destination can verify the
+    // source separately from itself). Ignored when `split` is set: a split
+    // frame already carries identity in its envelope.
+    std::optional<source_identity> source;
 };
 
 struct parse_options {
@@ -291,12 +378,17 @@ struct expected_layer {
     uint32_t payload_cells;
     uint64_t payload_rows;
     uint64_t payload_bytes;
+    // F4 v2 range identity; both descriptors of one full layer share layer_id
+    // and are told apart by range_id only.
+    uint32_t range_id;
+    uint32_t range_start;
+    uint32_t range_end;
 
     static expected_layer from_desc(const layer_desc & d);
 };
 
 struct expected_snapshot {
-    std::vector<expected_layer> layers; // exact set; duplicate layer ids rejected
+    std::vector<expected_layer> layers; // exact set; duplicates rejected on (layer_id, range_id)
     // destination capacity; REQUIRED (validate fails if unset): n_used <= capacity
     std::optional<uint64_t> capacity_cells;
     // expected metadata schema version of the opaque blob. REQUIRED for
@@ -307,6 +399,11 @@ struct expected_snapshot {
     // snapshot's; for full/body_only they are optional exact checks.
     std::optional<uint64_t> owner_epoch;
     std::optional<uint64_t> owner_id;
+    // F4 v2: REQUIRED when the snapshot carries a position_split envelope (the
+    // caller must know its own P/C/model/rope) and rejected as a mismatch when
+    // it does not. P/C/model/rope identity is compared EXACTLY: a v2 snapshot
+    // can never be replayed into a differently placed cache.
+    std::optional<position_split> split;
 };
 
 // Transactional commit: no publication happens before finish(). stage_*
@@ -321,11 +418,30 @@ struct expected_snapshot {
 // consumes the ticket): stage_layer, finish and abort always; stage_metadata
 // whenever the snapshot carries the metadata blob (full/partial).
 struct commit_handlers {
-    std::function<bool(uint32_t layer_id, const layer_desc &, const uint8_t * payload, size_t size)> stage_layer;
+    // F4 v2: layer_id is no longer unique on its own. Handlers receive the
+    // range_id alongside it so the two descriptors of one full layer stage into
+    // their OWN range buffers and cannot overwrite each other. range_id is 0 for
+    // every v1 frame, which keeps existing v1 handlers correct unchanged.
+    std::function<bool(uint32_t layer_id, uint32_t range_id, const layer_desc &, const uint8_t * payload, size_t size)> stage_layer;
     std::function<bool(uint32_t metadata_version, const uint8_t * metadata, size_t size)> stage_metadata;
     std::function<void()> finish; // swap staged state in; infallible by contract
     std::function<void()> abort;  // roll back anything staged by this handler set
+    // Optional F4 v2 hook invoked BEFORE any layer staging, carrying the
+    // validated position_split identity (p, c, model_id, rope_id) so the caller
+    // can stage DeltaNet/recurrent state and the logical cell table for both
+    // ranges as ONE unit. A false return aborts with nothing published, which is
+    // what makes the KV + table + DeltaNet restore atomic. It is declared LAST so
+    // the historical positional initialization order of the handlers above stays
+    // source compatible; a v2 commit REQUIRES it and fails closed without it.
+    std::function<bool(const position_split &)> stage_split;
 };
+
+
+// Canonical hash over the CONFIG-relevant, range-geometry-independent
+// descriptor fields of a layer set. Written into a KMS3 frame as
+// `config_id` and recomputed on read, so a source config is compared against
+// the destination's separately from model/RoPE.
+uint64_t descriptor_config_id(const std::vector<layer_desc> & layers);
 
 class kv_mixed_error : public std::runtime_error {
 public:
@@ -343,10 +459,60 @@ public:
     uint32_t metadata_version() const { return metadata_version_; }
     const uint8_t * metadata_blob() const { return metadata_.data(); }
     size_t metadata_size() const { return metadata_.size(); }
+    // F4 v2: the position_split envelope of a parsed frame; empty for v1.
+    // v1 frames can never present one, so a caller can branch on this to tell
+    // which layout it is holding.
+    const std::optional<position_split> & split() const { return split_; }
+    bool has_split() const { return split_.has_value(); }
+    // KMS3: ORIGINAL WRITER identity of a pure frame. Absent on legacy v1
+    // frames, which therefore fail closed for a pure->split conversion.
+    const source_identity & frame_source_identity() const { return source_; }
+    bool has_source_identity() const { return source_present_; }
     const std::vector<layer_desc> & layers() const { return layers_; }
     const std::vector<cell_entry> & cells() const { return cells_; }
     const uint8_t * payload(size_t layer_index) const { return payloads_[layer_index].data; }
     size_t payload_size(size_t layer_index) const { return payloads_[layer_index].size; }
+
+    // Plan 3.6 (lines 187-191): authorized import of a PURE KVarN (non-split)
+    // snapshot into a position_split destination. The source carries ONE
+    // descriptor per layer; the split destination owns two (local + overflow).
+    // This adopts the destination envelope and materializes the missing
+    // descriptors as EMPTY ranges -- bytes omitted, description kept -- so the
+    // existing v2 integrity check, staged reader and atomic commit run
+    // UNCHANGED. Model/RoPE/geometry identity is established by the caller's
+    // layout predicate (common_prompt_cache_layout_pure_to_split); this call
+    // only guarantees that no synthesized range carries payload and that the
+    // source is fully covered by the destination descriptor set.
+    //
+    // Contract enforced HERE, before anything is rebound:
+    //  * source identity must be established by the caller's earlier trusted
+    //    check (server-context.cpp: common_prompt_cache_layout_pure_to_split)
+    //    and must equal the destination's model/RoPE identity;
+    //  * every invariant descriptor field (formats, dimensions, strides,
+    //    domain, layout, owner, tail, payload shape) must already agree with
+    //    the authorized conversion; equal payload LENGTH alone is not
+    //    compatibility;
+    //  * payload_bytes must match the mapped payload actually present;
+    //  * only range_start/range_end are rewritten, and payload_checksum of the
+    //    source is preserved verbatim as authenticated payload provenance.
+    void adopt_split_for_import(const position_split & want,
+                                const std::vector<layer_desc> & destination_descs,
+                                const source_identity & source);
+
+    // Explicit inverse import, full snapshots only. Validate the original
+    // authenticated split envelope and BOTH source ranges before projecting
+    // local descriptors into a pure KVarN destination. Occupancy must fit
+    // min(source P, destination capacity); every overflow payload must be
+    // empty. All local representation/tail/stride invariants match exactly.
+    // This does not edit the source bytes or opaque I/O manifest. The native
+    // caller must separately consume and validate the empty overflow trailer
+    // before registering the existing deferred KV/table/recurrent commit.
+    // Failure leaves this snapshot's descriptor/payload ownership unchanged.
+    void project_split_to_pure_for_import(
+            uint32_t destination_capacity,
+            uint64_t destination_model_id,
+            uint64_t destination_rope_id,
+            const std::vector<layer_desc> & destination_descs);
 
     // Serialize a complete, validated snapshot. For full/partial the opaque
     // metadata blob (version + bytes) is mandatory; for body_only it must be
@@ -368,7 +534,8 @@ public:
                           uint64_t owner_epoch,
                           uint64_t owner_id,
                           std::vector<uint8_t> & out,
-                          const parse_options & opts = {});
+                          const parse_options & opts = {},
+                          const serialize_options & ser = {});
 
     // Parse + fully validate a snapshot (owning mode). No callbacks and no
     // state publication happen here; the result is a staged snapshot.
@@ -446,6 +613,10 @@ private:
     };
 
     uint32_t version_ = 1;
+    // F4 v2 envelope; unset means this is a v1 frame.
+    std::optional<position_split> split_;
+    source_identity source_;
+    bool source_present_ = false;
     snapshot_flags flags_ = snapshot_flags::full;
     uint64_t owner_epoch_ = 0;
     uint64_t owner_id_ = 0;

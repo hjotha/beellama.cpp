@@ -1,0 +1,245 @@
+{
+  "gateway_observed": "GT-BE98 192.168.1.1",
+  "target": "gokaya 192.168.1.57",
+  "branch": "feat/occupancy-position-split",
+  "proven_diagnostic_defect": "Imported cache replay used batch31 while original teacher trajectory used31 sequential single-token decodes. Original oracle GPU logits differed maxabs0.38291287422180176.",
+  "fix": "Only imported diagnostic replay now advances one token per decode; default fresh prefill unchanged.",
+  "build": {
+    "argv": [
+      "cmake",
+      "--build",
+      "/home/hjotha/beellama.cpp/build-optimized",
+      "--target",
+      "test-position-split-teacher-pair",
+      "-j",
+      "2"
+    ],
+    "exit_code": 0,
+    "seconds": 8.439013957977295,
+    "source_sha256": "18d8653b7429946750d02de566498f24f9d2a5efb4db9586a80c4c0e9f03b875",
+    "binary_sha256": "7f7d40bf5523aecc58a2842fff19a8e1dc0c765b62f85ba2e1a27ea76e39d712",
+    "diagnostic_only": true
+  },
+  "trajectory_validation": {
+    "bit_equal_original_failed_trajectory": true,
+    "max_abs_logits": 0.0
+  },
+  "metrics": {
+    "kl_nat": 0.0002943190761710849,
+    "max_abs_logits": 0.15897083282470703,
+    "max_logp_difference": 0.16763143464545038,
+    "reference_nll": 9.282983968728185,
+    "candidate_nll": 9.261426292684877
+  },
+  "prefix_proof": {
+    "equal": true,
+    "bytes_compared": 2074888611,
+    "first_difference": null,
+    "before_xxh64": "f634a10ae145fb8c",
+    "after_xxh64": "f634a10ae145fb8c",
+    "method": "exact streaming byte comparison of native full KV/table/recurrent sequence files; no metadata normalization",
+    "verified": true
+  },
+  "post_gpu_restore_proof": {
+    "equal": true,
+    "bytes_compared": 2074975529,
+    "first_difference": null,
+    "before_xxh64": "f4054e3b07977a68",
+    "after_xxh64": "f4054e3b07977a68",
+    "method": "exact streaming byte comparison of native full KV/table/recurrent sequence files; no metadata normalization"
+  },
+  "current_kv_proof": {
+    "complete": true,
+    "required_count": 32,
+    "captured_count": 32,
+    "injected_count": 32,
+    "all_byte_equal": true,
+    "protocol": "GPU current Kcur/Vcur captured after producer and replayed bytewise into CPU teacher step before cache store"
+  },
+  "complete": true,
+  "protocol_acceptance_eligible": false,
+  "prefill_route_parity": {
+    "argv": [
+      "timeout",
+      "45s",
+      "/home/hjotha/beellama.cpp/build-optimized/bin/test-kvarn"
+    ],
+    "env_delta": {
+      "GGML_KVARN_TEST_PREFILL_PARITY_ONLY": "1",
+      "GGML_KVARN_WINDOW_CHUNK": "4096"
+    },
+    "exit_code": 0,
+    "seconds": 1.7119057178497314
+  },
+  "interpretation": "At exact original failed token CPU same-byte attention does not improve NLL. Does not prove intrinsic quantization failure, fix PPL, or qualify imported diagnostic for acceptance.",
+  "preserved": "Previous source/binary, prior oracle, original caches and production libraries retained; no commit/merge/push or production changes.",
+  "portable_same_cache_ablation": {
+    "mean_nll": 0.8843320898727001,
+    "ppl_ratio_vs_original_candidate": 0.995718150416026,
+    "ppl_ratio_vs_original_baseline": 1.0307045301164943,
+    "mean_kl_from_original_candidate": 0.00011337986900383031,
+    "all_logits_bit_equal": false
+  },
+  "portable_execution": {
+    "started": 1791890587.981764,
+    "diagnostic_only": true,
+    "pid": 2339331,
+    "exit_code": 0,
+    "seconds": 146.83682918548584,
+    "cache_preserved": true
+  },
+  "portable_interpretation": "Forced portable kernel improves candidate trajectory PPL by about0.43percent but ratio1.0307045301164943 remains above1.01; diagnostic not acceptance.",
+  "long_operator": {
+    "case": "DOROV3 LONG P=102400 n=105000 Q1",
+    "original_checks": 158,
+    "original_failures": 6,
+    "raw_f32_repaired": {
+      "audit_f16_materializer_maxdiff": 0,
+      "local_nrmse": 0.001580865,
+      "local_max_o": 0.02184496,
+      "local_max_lse": 0.003241342,
+      "merged_nrmse": 0.001573734,
+      "merged_max_o": 0.02164169
+    },
+    "logs": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/raw-f32-long-repaired.log",
+    "original_store_gate_unresolved": true,
+    "production_libraries_unchanged": true,
+    "candidate_source_manifest": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/q1-split-source-manifest.json",
+    "isolated_build_job": "jW6FzVXg8jP-u1fg14EtauJIACY2Wop9"
+  },
+  "isolated_q1_correction": {
+    "source_manifest": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/q1-split-source-manifest.json",
+    "library_sha256": "8df00f5760b811e09a1900d3eb16bb9a98b9ae76771063f090f629e540ddc2e0",
+    "small_checks": 158,
+    "small_failures": 0,
+    "long_checks": 158,
+    "long_failures": 2,
+    "long_remaining_failures": "unchanged CPU/GPU store_abs_k<=1 diagnostic, A/A2",
+    "long_raw_local_nrmse": 3.815748e-07,
+    "long_raw_local_max_o": 5.30353e-06,
+    "long_raw_merged_nrmse": 3.445524e-06,
+    "long_raw_merged_max_o": 2.855348e-05,
+    "original_o_lse_gates_pass": true,
+    "production_updated": false,
+    "quality_gate_pass": false,
+    "log": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/q1-split-long.log",
+    "actual_model_route": "ROTATED decode-split, unaffected by DOROV3 correction",
+    "quality_comparison": {
+      "split": {
+        "mean_nll": 0.8886231328270755,
+        "ppl_vs_original_baseline": 1.035136830322768,
+        "mean_decode_seconds": 0.29809051009375
+      },
+      "portable": {
+        "mean_nll": 0.8843320898727003,
+        "ppl_vs_original_baseline": 1.0307045301164948,
+        "mean_decode_seconds": 4.26663475046875
+      },
+      "original": {
+        "mean_nll": 0.8886231328270755,
+        "ppl_vs_original_baseline": 1.035136830322768,
+        "mean_decode_seconds": 0.32459679081250004
+      }
+    },
+    "fresh_quality_gate_solved": false,
+    "revised_build_sha256": "19ea4dfa3b7bef667224d476ec4e08589a14c0bff6da8d67660153ed6d3c3e83"
+  },
+  "actual_rotated_operator": {
+    "case": "LONGROTATED P102400 n105000 Q1",
+    "local_nrmse": 8.442e-05,
+    "local_max_o": 0.0001556,
+    "local_max_lse": 0.002427,
+    "overflow_nrmse": 0.0002941,
+    "overflow_max_o": 0.00071,
+    "overflow_max_lse": 0.0001648,
+    "merged_nrmse": 8.595e-05,
+    "merged_max_o": 0.0001655,
+    "merged_max_lse": 0.002401,
+    "complete_gate_pass": false,
+    "checks": 158,
+    "failures": 10,
+    "failures_reason": "2 store_abs/step plus8 negative control sensitivity/reference mismatches; positiveO/LSEpass",
+    "store_argmax": {
+      "head": 3,
+      "pos": 19024,
+      "dim": 236,
+      "group": 148,
+      "code_differences": 14,
+      "max_code_delta": 1,
+      "axes_difference": 0,
+      "same_decoder_fp64_wht_delta": -0.0428830161436
+    },
+    "log": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/longrotated-105k.log"
+  },
+  "window8192": {
+    "mean_nll": 0.8738222219270289,
+    "diagnostic_ratio_vs_old_baseline": 1.019928687146324,
+    "note": "Not acceptance: corresponding baseline must use same8192 configuration if promoted for validation.",
+    "cache_sha256": "46f9a5094a0e6608ab278959d473b3adbe2ace7788be51c3bc7afca2c6325aa8",
+    "effective_chunks": [
+      256,
+      512,
+      768,
+      1024,
+      1280,
+      1536,
+      1792,
+      2048,
+      2304,
+      2560,
+      2816,
+      3072,
+      3328,
+      3584,
+      3840,
+      4096,
+      4352,
+      4608,
+      4864,
+      5120,
+      5376,
+      5632,
+      5888,
+      6144,
+      6400,
+      6656,
+      6912,
+      7168,
+      7424,
+      7680
+    ],
+    "receipt": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/window8192-command.json",
+    "seconds": 294.16721200942993
+  },
+  "revised_matrix": {
+    "allmask": {
+      "exit_code": 0,
+      "seconds": 3.855398416519165,
+      "log": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/v2-allmask.log"
+    },
+    "body": {
+      "exit_code": 0,
+      "seconds": 1.0500664710998535,
+      "log": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/v2-body.log"
+    },
+    "tail": {
+      "exit_code": 0,
+      "seconds": 1.3097937107086182,
+      "log": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/v2-tail.log"
+    },
+    "q8": {
+      "exit_code": 0,
+      "seconds": 2.027798891067505,
+      "log": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/v2-q8.log"
+    },
+    "rotated115": {
+      "exit_code": 1,
+      "seconds": 131.0065257549286,
+      "log": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-uniform-long/v2-rotated115.log",
+      "remaining_failures": "two unchangedstoreassertions;positiveO/LSEandduplicate/dropcontrolsPASS",
+      "merged_nrmse": 9.11e-05,
+      "merged_max_o": 0.0001894,
+      "merged_max_lse": 0.002303
+    }
+  }
+}

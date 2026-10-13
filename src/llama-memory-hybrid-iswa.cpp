@@ -163,15 +163,24 @@ void llama_memory_hybrid_iswa::clear(bool data) {
 }
 
 bool llama_memory_hybrid_iswa::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    return mem_recr->can_seq_rm(seq_id, p0, p1) &&
-           mem_attn->can_seq_rm(seq_id, p0, p1);
+    const bool recr_ok = mem_recr->can_seq_rm(seq_id, p0, p1);
+    const bool attn_ok = mem_attn->can_seq_rm(seq_id, p0, p1);
+    if (getenv("LLAMA_SEQRM_DBG") && (!recr_ok || !attn_ok)) {
+        fprintf(stderr, "SEQRMDBG hybrid-iswa can_seq_rm seq=%d p0=%d p1=%d recr=%d attn=%d\n",
+                seq_id, p0, p1, int(recr_ok), int(attn_ok));
+    }
+    return recr_ok && attn_ok;
 }
 
 bool llama_memory_hybrid_iswa::seq_rm_plan(
         llama_seq_id seq_id, llama_pos p0, llama_pos p1,
         llama_pos & planned_p0, llama_pos & planned_p1) const {
-    return llama_memory_seq_rm_plan_all(
+    const bool ok = llama_memory_seq_rm_plan_all(
             seq_id, p0, p1, { mem_attn.get(), mem_recr.get() }, planned_p0, planned_p1);
+    if (getenv("LLAMA_SEQRM_DBG") && !ok) {
+        fprintf(stderr, "SEQRMDBG hybrid-iswa seq_rm_plan fail seq=%d p0=%d p1=%d\n", seq_id, p0, p1);
+    }
+    return ok;
 }
 
 bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

@@ -7,6 +7,10 @@
 
 #include "llama-kv-mixed-state-stream.h"
 
+#define XXH_INLINE_ALL
+#include "../vendor/hash/xxhash/xxhash.h"
+
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -183,7 +187,7 @@ struct blob_producer {
     std::map<uint32_t, size_t> calls; // per-layer read call count
     size_t max_chunk = 0;
 
-    size_t read(uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
+    size_t read(uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
         ++calls[layer_id];
         max_chunk = std::max(max_chunk, count);
         const auto it = data.find(layer_id);
@@ -222,8 +226,8 @@ static bool stream_fixture(const fixture & f, size_t chunk, vector_sink & sink,
     stream_options opts;
     opts.transfer_buffer_bytes = chunk;
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-        return producer.read(layer_id, offset, dst, count);
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+        return producer.read(layer_id, range_id, offset, dst, count);
     };
     stream_write_callbacks writes;
     writes.write_bytes = [&](const uint8_t * bytes, size_t count) {
@@ -284,8 +288,8 @@ static void test_reference_layer_never_read() {
     stream_options opts;
     opts.transfer_buffer_bytes = 64;
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-        return producer.read(layer_id, offset, dst, count);
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+        return producer.read(layer_id, range_id, offset, dst, count);
     };
     stream_write_callbacks writes;
     writes.write_bytes = [&](const uint8_t * bytes, size_t count) { return sink.write(bytes, count); };
@@ -322,7 +326,7 @@ static void test_large_virtual_payload_bounded_scratch() {
     size_t max_read_chunk = 0;
     uint64_t read_calls = 0;
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
         ++read_calls;
         max_read_chunk = std::max(max_read_chunk, count);
         CHECK(count <= (1u << 20));
@@ -350,7 +354,7 @@ static void test_producer_failure() {
     stream_options opts;
     opts.transfer_buffer_bytes = 64;
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t, uint64_t, uint8_t *, size_t count) {
+    reads.read_payload = [&](uint32_t, uint32_t, uint64_t, uint8_t *, size_t count) {
         return count - 1; // short read: producer failure
     };
     stream_write_callbacks writes;
@@ -360,7 +364,7 @@ static void test_producer_failure() {
     CHECK(sink.calls == 0);
 
     // producer throwing propagates
-    reads.read_payload = [&](uint32_t, uint64_t, uint8_t *, size_t) -> size_t {
+    reads.read_payload = [&](uint32_t, uint32_t, uint64_t, uint8_t *, size_t) -> size_t {
         throw std::runtime_error("producer boom");
     };
     bool thrown = false;
@@ -383,7 +387,7 @@ static void test_producer_mutation() {
     stream_options opts;
     opts.transfer_buffer_bytes = f.p0.size(); // one chunk per pass
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
         if (offset + count > sizes[layer_id]) {
             return size_t(0);
         }
@@ -415,8 +419,8 @@ static void test_sink_failure() {
     stream_options opts;
     opts.transfer_buffer_bytes = 64;
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-        return producer.read(layer_id, offset, dst, count);
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+        return producer.read(layer_id, range_id, offset, dst, count);
     };
     stream_write_callbacks writes;
     writes.write_bytes = [](const uint8_t *, size_t) { return false; }; // sink refuses everything
@@ -440,8 +444,8 @@ static void test_overflow_and_validation_before_write() {
     writes.write_bytes = [&](const uint8_t * bytes, size_t count) { return sink.write(bytes, count); };
     auto reads_ok = [&]() {
         stream_read_callbacks r;
-        r.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-            return producer.read(layer_id, offset, dst, count);
+        r.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+            return producer.read(layer_id, range_id, offset, dst, count);
         };
         return r;
     };
@@ -523,8 +527,8 @@ static void test_overflow_accounting() {
     writes.write_bytes = [&](const uint8_t * bytes, size_t count) { return sink.write(bytes, count); };
     auto reads_ok = [&]() {
         stream_read_callbacks r;
-        r.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-            return producer.read(layer_id, offset, dst, count);
+        r.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+            return producer.read(layer_id, range_id, offset, dst, count);
         };
         return r;
     };
@@ -569,7 +573,7 @@ static void test_overflow_accounting() {
         ok_in.layers.push_back(d0);
         stream_read_callbacks reads;
         int read_calls = 0;
-        reads.read_payload = [&](uint32_t, uint64_t, uint8_t *, size_t) {
+        reads.read_payload = [&](uint32_t, uint32_t, uint64_t, uint8_t *, size_t) {
             ++read_calls;
             return size_t(0); // truncate immediately
         };
@@ -612,8 +616,8 @@ static void test_on_fault_exactly_once() {
     writes.write_bytes = [&](const uint8_t * bytes, size_t count) { return sink.write(bytes, count); };
     auto reads_ok = [&]() {
         stream_read_callbacks r;
-        r.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-            return producer.read(layer_id, offset, dst, count);
+        r.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+            return producer.read(layer_id, range_id, offset, dst, count);
         };
         return r;
     };
@@ -654,7 +658,7 @@ static void test_on_fault_exactly_once() {
     // producer throwing: wrapped into kv_mixed_error, on_fault once
     {
         stream_read_callbacks reads;
-        reads.read_payload = [&](uint32_t, uint64_t, uint8_t *, size_t) -> size_t {
+        reads.read_payload = [&](uint32_t, uint32_t, uint64_t, uint8_t *, size_t) -> size_t {
             throw std::runtime_error("producer boom");
         };
         CHECK(run(f.input, reads, writes, {}));
@@ -681,7 +685,7 @@ static void test_body_only_cells_guard() {
     stream_write_callbacks writes;
     writes.write_bytes = [&](const uint8_t * bytes, size_t count) { return sink.write(bytes, count); };
     stream_read_callbacks reads;
-    reads.read_payload = [](uint32_t, uint64_t, uint8_t *, size_t) { return size_t(0); };
+    reads.read_payload = [](uint32_t, uint32_t, uint64_t, uint8_t *, size_t) { return size_t(0); };
 
     // body_only with cells: both APIs must reject; stream must not emit
     // n_used != 0 bytes that the parser would refuse
@@ -712,8 +716,8 @@ static void test_validation_matrix_equivalence() {
     vector_sink sink;
     stream_write_callbacks writes;
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-        return producer.read(layer_id, offset, dst, count);
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+        return producer.read(layer_id, range_id, offset, dst, count);
     };
     std::vector<uint8_t> out;
 
@@ -941,8 +945,8 @@ static void test_stream_parse_view_integration() {
     stream_options opts;
     opts.transfer_buffer_bytes = 128;
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-        return producer.read(layer_id, offset, dst, count);
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+        return producer.read(layer_id, range_id, offset, dst, count);
     };
     stream_write_callbacks writes;
     writes.write_bytes = [&](const uint8_t * bytes, size_t count) {
@@ -956,6 +960,211 @@ static void test_stream_parse_view_integration() {
     CHECK(v.backing() == owner);
     CHECK(std::memcmp(v.payload(0), f.p0.data(), f.p0.size()) == 0);
     CHECK(std::memcmp(v.payload(1), f.p1.data(), f.p1.size()) == 0);
+}
+
+static void test_compact_split_streaming() {
+    const uint32_t p = 512, c = 1024;
+    position_split split;
+    split.p = p; split.c = c; split.model_id = 0x1234567890abcdefull; split.rope_id = 0xfedcba0987654321ull;
+    std::vector<uint8_t> local_bytes(128), overflow_bytes(2*1152), metadata(48);
+    fill_pattern(local_bytes, 101); fill_pattern(overflow_bytes, 102); fill_pattern(metadata, 103);
+    auto local = make_kvarn_layer(7, kv4v4, 4, 4, uint8_t(kvarn_domain::rotated), 0, 0, local_bytes.size());
+    local.range_end = p;
+    auto overflow = make_qx_layer(7, sx_q4_0, sx_q4_0, 0, 0);
+    overflow.owner = owner_target; overflow.v_trans = 0; overflow.head_dim_v = 256;
+    overflow.layout = layout_standard_qx_compact_rows;
+    overflow.k_stride = 576; overflow.v_stride = 576;
+    overflow.range_id = 1; overflow.range_start = p; overflow.range_end = c;
+
+    const auto make_input = [&](bool partial, uint32_t table_size, bool occupied_overflow) {
+        stream_input input;
+        input.split = split; input.metadata_version = 1;
+        input.metadata = metadata.data(); input.metadata_size = metadata.size();
+        input.flags = partial ? snapshot_flags::partial : snapshot_flags::full;
+        input.owner_epoch = partial ? 11 : 0; input.owner_id = partial ? 12 : 0;
+        input.cells.resize(table_size);
+        const uint32_t local_cell = std::min(p, table_size)-1;
+        input.cells[local_cell].pos = int32_t(local_cell); input.cells[local_cell].seq_ids = {0};
+        if (occupied_overflow) {
+            input.cells[p].pos = int32_t(p); input.cells[p].seq_ids = {0};
+            input.cells[table_size-1].pos = int32_t(table_size-1); input.cells[table_size-1].seq_ids = {0};
+        }
+        auto k = local;
+        k.payload_cells = table_size; k.payload_rows = occupied_overflow ? 3 : 1;
+        k.payload_mode = partial ? mode_partial_overlay : mode_full;
+        auto q = overflow;
+        q.payload_cells = occupied_overflow ? 2 : 0; q.payload_rows = q.payload_cells;
+        q.payload_bytes = !partial && occupied_overflow ? overflow_bytes.size() : 0;
+        q.payload_mode = partial ? mode_resident_reference : mode_full;
+        input.layers = {k, q};
+        return input;
+    };
+    const auto vector_encode = [&](const stream_input & input, std::vector<uint8_t> & out) {
+        std::vector<layer_blob> blobs;
+        for (const auto & d : input.layers) {
+            const auto & payload = d.kind == cache_kind::standard_qx ? overflow_bytes : local_bytes;
+            blobs.push_back({d, d.payload_bytes ? payload.data() : nullptr, size_t(d.payload_bytes)});
+        }
+        serialize_options options; options.split = input.split; options.source = input.source;
+        return snapshot::serialize(blobs, input.cells, input.metadata_version,
+                input.metadata, input.metadata_size, input.flags,
+                input.owner_epoch, input.owner_id, out, {}, options);
+    };
+    size_t reads = 0, writes = 0, overflow_reads = 0, max_chunk = 0;
+    const auto stream_encode = [&](const stream_input & input, std::vector<uint8_t> & out,
+                                   const stream_options & options) {
+        stream_read_callbacks producer;
+        producer.read_payload = [&](uint32_t layer, uint32_t range, uint64_t offset, uint8_t * dst, size_t count) {
+            ++reads; max_chunk = std::max(max_chunk, count);
+            if (layer != 7 || range > 1) { return size_t(0); }
+            const auto & payload = range == 1 ? overflow_bytes : local_bytes;
+            if (range == 1) { ++overflow_reads; }
+            if (offset > payload.size() || count > payload.size()-size_t(offset)) { return size_t(0); }
+            std::memcpy(dst, payload.data()+size_t(offset), count);
+            return count;
+        };
+        stream_write_callbacks sink;
+        sink.write_bytes = [&](const uint8_t * bytes, size_t count) {
+            ++writes; out.insert(out.end(), bytes, bytes+count); return true;
+        };
+        return stream_serialize(input, producer, sink, options);
+    };
+    stream_options options; options.transfer_buffer_bytes = 17;
+    for (bool partial : {false, true}) {
+        for (uint32_t table_size : {uint32_t(2), p, p+3, c}) {
+            const bool occupied = table_size > p;
+            const auto input = make_input(partial, table_size, occupied);
+            std::vector<uint8_t> reference, streamed;
+            CHECK(vector_encode(input, reference));
+            reads = writes = overflow_reads = max_chunk = 0;
+            CHECK(stream_encode(input, streamed, options));
+            CHECK(streamed == reference && stream_serialized_size(input, options) == reference.size());
+            CHECK(!stream_describe(streamed.data(), streamed.size()).empty());
+            CHECK(max_chunk <= options.transfer_buffer_bytes);
+            CHECK((overflow_reads == 0) == (partial || !occupied));
+            auto owner = std::make_shared<std::vector<uint8_t>>(streamed);
+            for (bool borrowed : {false, true}) {
+                auto state = borrowed ? snapshot::parse_view(owner->data(), owner->size(), owner)
+                                      : snapshot::parse(streamed.data(), streamed.size());
+                CHECK(state.has_split() && state.layers()[1].layout == layout_standard_qx_compact_rows);
+                CHECK(state.layers()[1].payload_rows == (occupied ? 2u : 0u));
+                CHECK(state.cells().size() == table_size && state.cells().back().pos == int32_t(table_size-1));
+                CHECK(state.payload_size(1) == ((!partial && occupied) ? overflow_bytes.size() : 0));
+                CHECK(std::memcmp(state.payload(0), local_bytes.data(), local_bytes.size()) == 0);
+                if (!partial && occupied) {
+                    CHECK(std::memcmp(state.payload(1), overflow_bytes.data(), overflow_bytes.size()) == 0);
+                }
+                if (partial) {
+                    CHECK_THROWS(state.project_split_to_pure_for_import(p, split.model_id, split.rope_id, {}));
+                } else if (occupied) {
+                    auto target = input.layers[0]; target.range_start = 0; target.range_end = 0;
+                    CHECK_THROWS(state.project_split_to_pure_for_import(c, split.model_id, split.rope_id, {target}));
+                    CHECK(state.has_split() && state.layers().size() == 2);
+                } else {
+                    auto target = input.layers[0]; target.range_start = 0; target.range_end = 0;
+                    state.project_split_to_pure_for_import(p, split.model_id, split.rope_id, {target});
+                    CHECK(!state.has_split() && state.layers().size() == 1 && state.has_source_identity());
+                    CHECK(state.payload_size(0) == local_bytes.size());
+                }
+                CHECK(*owner == reference);
+            }
+        }
+    }
+
+    const auto full = make_input(false, p+3, true);
+    const auto both_refuse_before_callbacks = [&](const stream_input & bad) {
+        reads = writes = overflow_reads = 0;
+        int faults = 0;
+        stream_options opts = options; opts.on_fault = [&](const std::string &) { ++faults; };
+        std::vector<uint8_t> destination{6, 7, 8};
+        CHECK_THROWS(stream_encode(bad, destination, opts));
+        CHECK(destination == std::vector<uint8_t>({6, 7, 8}));
+        CHECK(reads == 0 && writes == 0 && faults == 1);
+        faults = 0;
+        CHECK_THROWS(stream_serialized_size(bad, opts));
+        CHECK(reads == 0 && writes == 0 && faults == 1);
+        CHECK_THROWS(vector_encode(bad, destination));
+        CHECK(destination == std::vector<uint8_t>({6, 7, 8}));
+    };
+    auto bad = full;
+    bad.layers[1].payload_cells = c-p+1; bad.layers[1].payload_rows = c-p+1;
+    both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].payload_rows = 1; both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].payload_cells = 1; bad.layers[1].payload_rows = 1; both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].v_trans = 1; both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].n_stream = 2; both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].owner = 255; both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].tail_type = sx_f16; both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].kvarn_domain = uint8_t(kvarn_domain::rotated); both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].range_start = p-1; both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].range_end = c+1; both_refuse_before_callbacks(bad);
+    bad = full; bad.layers[1].range_id = 0; both_refuse_before_callbacks(bad);
+    bad = full; bad.cells[p].pos = int32_t(p-1); both_refuse_before_callbacks(bad);
+    bad = full; bad.cells[p-1].pos = int32_t(p); both_refuse_before_callbacks(bad);
+    bad = full; bad.cells[p].pos = int32_t(c); both_refuse_before_callbacks(bad);
+    bad = full; bad.cells[p].seq_ids.clear(); both_refuse_before_callbacks(bad);
+    bad = full; bad.cells.resize(c+1); both_refuse_before_callbacks(bad);
+    bad = full; bad.split.reset(); bad.layers.erase(bad.layers.begin());
+    bad.layers[0].range_id = 0; bad.layers[0].range_start = 0; bad.layers[0].range_end = 0;
+    both_refuse_before_callbacks(bad); // compact cannot hide inside v1/v3
+
+    // Build real legacy bytes, then change only their wire layout marker and
+    // repair the whole-file checksum. The real parser must reject their now
+    // compact geometry even though their integrity checks are satisfied.
+    const size_t overflow_desc = 104 + metadata.size() + 113 + local_bytes.size();
+    const auto rehash = [](std::vector<uint8_t> & bytes) {
+        const uint64_t hash = XXH64(bytes.data(), bytes.size()-8, 0);
+        for (int i = 0; i < 8; ++i) { bytes[bytes.size()-8+size_t(i)] = uint8_t(hash >> (8*i)); }
+    };
+    for (int error = 0; error < 4; ++error) {
+        auto legacy = full;
+        legacy.layers[1].layout = layout_standard_qx_rows;
+        if (error == 0) {
+            legacy.layers[1].payload_cells = c-p+1; legacy.layers[1].payload_rows = c-p+1;
+        } else if (error == 1) {
+            legacy.layers[1].payload_cells = 1; legacy.layers[1].payload_rows = 1;
+        } else if (error == 2) {
+            legacy.cells[p].pos = int32_t(p-1);
+        } else {
+            legacy.layers[1].v_trans = 1;
+        }
+        std::vector<uint8_t> malformed;
+        CHECK(stream_encode(legacy, malformed, options));
+        CHECK(snapshot::parse(malformed.data(), malformed.size()).layers()[1].layout == layout_standard_qx_rows);
+        malformed[overflow_desc+22] = uint8_t(layout_standard_qx_compact_rows);
+        malformed[overflow_desc+23] = 0;
+        rehash(malformed);
+        CHECK_THROWS(snapshot::parse(malformed.data(), malformed.size()));
+        auto owner = std::make_shared<std::vector<uint8_t>>(malformed);
+        CHECK_THROWS(snapshot::parse_view(owner->data(), owner->size(), owner));
+        CHECK_THROWS(stream_describe(malformed.data(), malformed.size()));
+    }
+
+    // Both import directions consume the real streamed bytes through the same
+    // vector parser/projectors; neither requires a second wire interpretation.
+    auto pure_input = make_input(false, p, false);
+    pure_input.split.reset(); pure_input.layers.resize(1);
+    pure_input.layers[0].range_end = 0;
+    source_identity identity;
+    identity.model_id = split.model_id; identity.rope_id = split.rope_id;
+    identity.config_id = descriptor_config_id(pure_input.layers); pure_input.source = identity;
+    std::vector<uint8_t> pure_streamed, pure_reference;
+    CHECK(vector_encode(pure_input, pure_reference));
+    CHECK(stream_encode(pure_input, pure_streamed, options));
+    CHECK(pure_streamed == pure_reference);
+    CHECK(!stream_describe(pure_streamed.data(), pure_streamed.size()).empty());
+    auto state = snapshot::parse(pure_streamed.data(), pure_streamed.size());
+    const auto target = make_input(false, p, false);
+    state.adopt_split_for_import(split, target.layers, identity);
+    stream_input imported = target; imported.layers = state.layers(); imported.cells = state.cells();
+    std::vector<uint8_t> imported_streamed, imported_reference;
+    CHECK(stream_encode(imported, imported_streamed, options));
+    CHECK(vector_encode(imported, imported_reference));
+    CHECK(imported_streamed == imported_reference);
+    auto restored = snapshot::parse(imported_streamed.data(), imported_streamed.size());
+    restored.project_split_to_pure_for_import(p, split.model_id, split.rope_id, pure_input.layers);
+    CHECK(!restored.has_split() && restored.payload_size(0) == local_bytes.size());
+    CHECK(pure_streamed == pure_reference);
 }
 
 int main() {
@@ -977,6 +1186,7 @@ int main() {
     test_file_backing();
 #endif
     test_stream_parse_view_integration();
+    test_compact_split_streaming();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

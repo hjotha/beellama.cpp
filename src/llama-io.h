@@ -2,8 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct ggml_tensor;
 
@@ -45,4 +48,65 @@ public:
     virtual size_t n_bytes() = 0;
 
     void read_string(std::string & str);
+};
+
+// F4 §3.6: replays a short prefix that was already consumed from `inner` and
+// then delegates everything else. llama_io_read_i has no peek/seek, so a caller
+// that must classify a frame has to read the leading word first; wrapping the
+// reader here restores the exact original byte stream without teaching any
+// reader about speculative reads.
+//
+// Only read() is served from the prefix, and only until it drains. Every
+// transactional and tensor operation (read_tensor, stage_tensor_set/clear,
+// on_commit, commit, cancel) is forwarded to `inner` untouched, so the restore
+// transaction still belongs to the original reader. n_bytes() already counts the
+// prefix, because it was read from `inner` before this wrapper existed.
+class llama_io_read_replay final : public llama_io_read_i {
+public:
+    llama_io_read_replay(llama_io_read_i & inner, const void * prefix, size_t prefix_size)
+        : m_inner(inner) {
+        const uint8_t * src = static_cast<const uint8_t *>(prefix);
+        m_prefix.assign(src, src + prefix_size);
+    }
+
+    void read(void * dst, size_t size) override {
+        if (m_offset < m_prefix.size()) {
+            const size_t available = m_prefix.size() - m_offset;
+            const size_t take = size < available ? size : available;
+            memcpy(dst, m_prefix.data() + m_offset, take);
+            m_offset += take;
+            dst = static_cast<uint8_t *>(dst) + take;
+            size -= take;
+        }
+        if (size > 0) {
+            m_inner.read(dst, size);
+        }
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        m_inner.read_tensor(tensor, offset, size);
+    }
+    void stage_tensor_set(ggml_tensor * tensor, const void * src, size_t offset, size_t size) override {
+        m_inner.stage_tensor_set(tensor, src, offset, size);
+    }
+    void stage_tensor_clear(ggml_tensor * tensor, size_t offset, size_t size) override {
+        m_inner.stage_tensor_clear(tensor, offset, size);
+    }
+    void on_commit(std::function<void()> callback) override {
+        m_inner.on_commit(std::move(callback));
+    }
+    void commit() override {
+        m_inner.commit();
+    }
+    void cancel() override {
+        m_inner.cancel();
+    }
+    size_t n_bytes() override {
+        return m_inner.n_bytes();
+    }
+
+private:
+    llama_io_read_i & m_inner;
+    std::vector<uint8_t> m_prefix;
+    size_t m_offset = 0;
 };

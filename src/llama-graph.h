@@ -339,6 +339,10 @@ public:
     bool can_reuse_rs(const llama_memory_recurrent_context * mctx_cur, const llm_graph_params & params);
 
     ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_history = nullptr; // I32 [(n_rs_seq + 1 - n_seq_tokens) * n_seqs] for short batches
+
+    void set_history(const llama_memory_recurrent_context * mctx_cur);
+    bool can_reuse_history(const llm_graph_params & params) const;
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
@@ -459,6 +463,41 @@ public:
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_standard = nullptr; // Qx layers: shared cells, no KVarN tail masking
     ggml_tensor * self_kq_mask_standard_cnv = nullptr;
+    // F3 position-split range masks/indices (P-mode only, null otherwise).
+    // Local mask covers live local cells [0,P); overflow mask covers live
+    // overflow cells [P,C). Both are filled per batch from the live cell
+    // lists; the FA for each range consumes its own mask, so the two ranges
+    // never see each other's keys.
+    ggml_tensor * self_kq_mask_local = nullptr;
+    ggml_tensor * self_kq_mask_local_cnv = nullptr;
+    ggml_tensor * self_kq_mask_overflow = nullptr;
+    ggml_tensor * self_kq_mask_overflow_cnv = nullptr;
+    // F3: KVarN native read indices restricted to local cells, same encoding
+    // as self_kvarn_mat_idxs. Sized to the live local count; rebuilt when it
+    // changes.
+    ggml_tensor * self_kvarn_mat_idxs_local = nullptr;
+    // F3: overflow cell list for Q4 gather, I64 [n_overflow_live]. Filled per
+    // batch from position-ordered live overflow cells.
+    ggml_tensor * self_overflow_cell_idxs = nullptr;
+    // DIAGNOSTIC ONLY (LLAMA_OVF_VIEW_PROBE_GETROWS=1): identity row indices over
+    // the packed overflow view, used to read the raw Q4_0 view rows back as F16
+    // through the supported GET_ROWS path instead of the (unsupported) Q4_0->F16
+    // CAST. This separates "raw view rows/basis are wrong" from "quantized Vulkan
+    // FA path differs", with no whole-cache expansion.
+    ggml_tensor * self_ovf_view_rows = nullptr;
+    // F3: live cell lists per range (position order), refreshed on every
+    // set_input/can_reuse from the P-mode cache. Used to fill the split
+    // masks/indices above; sizes drive graph reuse (rebuild on change).
+    std::vector<uint32_t> split_local_cells;
+    std::vector<uint32_t> split_overflow_cells;
+    // Physical identity of the packed overflow view baked into this graph. The size-only
+    // reuse guard above cannot see it: an append inside the existing padding keeps n_kv
+    // and the query count unchanged while the LIVE row run grows, so reusing the graph
+    // would silently read a stale extent. These fields make reuse refuse that case.
+    bool     split_ovf_packed = false;
+    uint32_t split_ovf_row0   = 0;
+    uint32_t split_ovf_n_view = 0;
+    uint32_t split_ovf_n_rows = 0; // baked K/V+mask extent (capacity-stable policy)
     ggml_tensor * self_kq_mask_tail = nullptr; // F32/F16 [tail_tokens, n_batch/n_stream, 1, n_stream]
 
     // note: assumes v_rot^2 == I
@@ -1518,6 +1557,21 @@ ggml_tensor * build_attn_mha_paged(
                   float   kq_scale,
                     int   il,
             ggml_tensor * kq_mask_override = nullptr) const;
+
+    // F3 position-split dual-range attention. True when P-mode is active,
+    // global history exceeds P and current queries are overflow-range.
+    bool use_position_split_attention(int il) const;
+    ggml_tensor * apply_attention_reference_cpu(ggml_tensor * output, int il) const;
+    // F3: local CUDA/KVarN FA + overflow Vulkan/Q4 FA + stable CUDA merge.
+    // Returns merged O in original V domain. Caller applies gate/wo.
+    // Requires use_position_split_attention(il); fail-closed otherwise.
+    ggml_tensor * build_attn_position_split(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            float kq_scale,
+            int il) const;
 
     llm_graph_input_attn_kv_paged * build_attn_inp_kv_paged() const;
 

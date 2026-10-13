@@ -1,0 +1,29 @@
+# F4 range-store identity fix — evidence 2026-10-04T22:25:19Z
+
+## tool
+tools/occupancy-f4/repro-abort.py (GGML_KVARN_VIEW_TRACE, LLAMA_KVARN_RANGE_TRACE, LLAMA_KVARN_STORE_TRACE, LLAMA_KVARN_SLOT_TRACE)
+
+## frontier matrix (assert intacto, stage_groups=3/384 unchanged)
+P1024-C2048-n1023: OK n_predict=1 content='2'
+P1024-C2048-n1024: OK n_predict=1 content='8'
+P1024-C2048-n1025: OK n_predict=1 content='3'
+P1024-C2048-n1032: OK n_predict=1 content='8'
+P1024-C2048-n1152: OK n_predict=1 content='1'
+P512-C1024-n511: OK n_predict=1 content='1'
+P512-C1024-n512: OK n_predict=1 content='5'
+P512-C1024-n513: OK n_predict=1 content='5'
+P512-C1024-n520: OK n_predict=1 content='5'
+P512-C1024-n640: OK n_predict=1 content='8'
+
+## slot resets per run
+
+see /tmp/f4-r2-*
+
+## unit
+position-split-ranges: 423 checks, 0 failures
+PASS: 409 checks, 0 failures
+PASS: 819 checks, 0 failures
+PASS: 20225 checks, 0 failures
+
+## ctest -R position-split (exit 8)
+position-split-merge-graph: 3268759 checks, 2 failures, 8 mandatory shapes

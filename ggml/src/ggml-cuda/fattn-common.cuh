@@ -1339,8 +1339,20 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         max_val = max_val_new;
     }
 
-    // Write back final result:
-    *dst = dst_val / rowsum;
+    // Write back final result.
+    // Empty-row contract, tightened: only an EXACT zero rowsum together with
+    // consistent empty metadata (max_val == -INFINITY) selects the masked value
+    // O = 0 / LSE = -inf. Anything else (positive rowsum, negative or NaN
+    // rowsum, or metadata inconsistent with the sum) is an INVARIANT FAILURE and
+    // must keep its evidence instead of being sanitized: we publish NaN there,
+    // which the value-contract tests reject, so the defect stays visible.
+    // The empty-row signal is the SUM being exactly zero: that is the sum over no
+    // unmasked keys, and its max is an arbitrary sentinel because no score was ever
+    // produced (this row is assembled from fixups, so demanding max == -inf here
+    // would reject legitimate empties and leak NaN through the O contract).
+    // Anything nonzero keeps the original division, so a negative or NaN rowsum
+    // still publishes NaN and stays visible as an invariant failure.
+    *dst = rowsum == 0.0f ? 0.0f : dst_val / rowsum;
     if (tid == 0 && dst_final_meta != nullptr) {
         const int row = (sequence*ne01 + jt*ncols1 + j)*ne02 + zt_Q + c;
         dst_final_meta[row] = make_float2(max_val, rowsum);
@@ -1456,8 +1468,20 @@ static __global__ void flash_attn_stream_k_fixup_general(
         kbc_stop = kbc;
     }
 
-    // Write back final result:
-    *dst = dst_val / rowsum;
+    // Write back final result.
+    // Empty-row contract, tightened: only an EXACT zero rowsum together with
+    // consistent empty metadata (max_val == -INFINITY) selects the masked value
+    // O = 0 / LSE = -inf. Anything else (positive rowsum, negative or NaN
+    // rowsum, or metadata inconsistent with the sum) is an INVARIANT FAILURE and
+    // must keep its evidence instead of being sanitized: we publish NaN there,
+    // which the value-contract tests reject, so the defect stays visible.
+    // The empty-row signal is the SUM being exactly zero: that is the sum over no
+    // unmasked keys, and its max is an arbitrary sentinel because no score was ever
+    // produced (this row is assembled from fixups, so demanding max == -inf here
+    // would reject legitimate empties and leak NaN through the O contract).
+    // Anything nonzero keeps the original division, so a negative or NaN rowsum
+    // still publishes NaN and stays visible as an invariant failure.
+    *dst = rowsum == 0.0f ? 0.0f : dst_val / rowsum;
     if (tid == 0 && dst_final_meta != nullptr) {
         const int row = (sequence*ne01 + jt*ncols1 + j)*ne02 + zt_Q + c;
         dst_final_meta[row] = make_float2(max_val, rowsum);

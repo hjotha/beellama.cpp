@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,8 +43,18 @@ def main() -> None:
     assert "get_materialization_source(shared_il" in kvarn, (
         "shared MTP attention must read the target's persistent KVarN records"
     )
-    assert "shared_graph_layers.empty() && cache->uses_native_attention" in kvarn, (
-        "shared MTP reads must use the materialization path until segmented tail sharing is available"
+    native_admission = re.search(
+        r"bool llama_kv_cache_kvarn_context::uses_native_attention\(int32_t il\) const\s*\{([^}]*)\}",
+        kvarn,
+        re.S,
+    )
+    assert native_admission, "missing KVarN context native-attention admission function"
+    assert re.search(
+        r"shared_graph_layers\.empty\(\)\s*&&\s*cache->uses_kvarn_layer\(graph_layer_for\(il\)\)\s*&&\s*cache->uses_native_attention\(graph_layer_for\(il\)\)",
+        native_admission.group(1),
+    ), (
+        "native MTP attention admission must require no shared layers, a supported "
+        "KVarN layer, and backend native-attention support"
     )
     assert "metadata.swap(*prepared_owner)" not in kvarn, (
         "KVarN restore must preserve metadata object identity for shared MTP views"

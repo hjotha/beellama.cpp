@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "../../src/llama-state-rollback.h"
 #include "src/llama-ext.h"
 #define XXH_STATIC_LINKING_ONLY
 #include "hash/xxhash/xxhash.h"
@@ -16,6 +17,11 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+
+#if defined(__linux__)
+#    include <sys/vfs.h>
+#    include <sys/statfs.h>
+#endif
 #include <sstream>
 #include <unordered_set>
 
@@ -394,6 +400,24 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
             {"token", loop_guard_event.token},
             {"token_piece", loop_guard_event.token_piece},
             {"reason", loop_guard_event.reason},
+        };
+    }
+    // F5 per-token decode timing: emitted ONCE, here, batched. The decode loop only pushed
+    // numbers into bounded vectors, so no serialization cost was paid per token.
+    if (stats.f5_per_token_enabled) {
+        res["f5_per_token"] = json {
+            {"ttft_ms",            stats.f5_ttft_ms},
+            {"clock",              "ggml_time_us (monotonic)"},
+            {"definition",         "inter-emission latency on the token path, after ctx sync,"
+                                   " before SSE: server-side decode step, transport excluded"},
+            {"tokens_recorded",    stats.f5_tokens_recorded},
+            {"decode_iterations",  stats.f5_decode_iterations},
+            {"speculative_seen",   stats.f5_spec_seen},
+            {"truncated",          stats.f5_truncated},
+            {"capacity",           (int64_t) server_slot_stats::F5_PER_TOKEN_MAX},
+            {"token_ms",           stats.f5_token_ms},
+            {"iteration_ms",       stats.f5_iter_ms},
+            {"tokens_per_iteration", stats.f5_tokens_per_iter},
         };
     }
     if (!stream && !probs_output.empty()) {
@@ -1888,7 +1912,8 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view target,
         server_prompt_state_view draft,
         server_prompt_state_view speculative,
-        const server_prompt_restore_transaction_io & io) {
+        const server_prompt_restore_transaction_io & io,
+        server_prompt_restore_timings * timings) {
     if (!io.prepare || !io.commit) {
         return { false, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_INVALID_IO };
     }
@@ -1900,10 +1925,18 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
     }
 
     const auto prepare = [&](bool enabled, server_prompt_state_kind kind, server_prompt_state_view state) {
-        if (enabled && !io.prepare(kind, state)) {
-            return server_prompt_restore_result {
-                false, true, kind, SERVER_PROMPT_RESTORE_PREPARE_REJECTED
-            };
+        if (enabled) {
+            const auto t_start = std::chrono::steady_clock::now();
+            const bool prepared = io.prepare(kind, state);
+            if (timings) {
+                timings->prepare_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t_start).count();
+            }
+            if (!prepared) {
+                return server_prompt_restore_result {
+                    false, true, kind, SERVER_PROMPT_RESTORE_PREPARE_REJECTED
+                };
+            }
         }
         return server_prompt_restore_result {
             true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE
@@ -1923,15 +1956,20 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
 
     // Speculative apply is prepared and no-fail. Memory commits likewise only
     // publish already-validated backend writes and metadata.
-    if (io.restore_speculative) {
-        io.commit(SERVER_PROMPT_STATE_SPECULATIVE);
-    }
-    if (io.restore_target) {
-        io.commit(SERVER_PROMPT_STATE_MAIN);
-    }
-    if (io.restore_draft) {
-        io.commit(SERVER_PROMPT_STATE_DRAFT);
-    }
+    const auto commit = [&](bool enabled, server_prompt_state_kind kind) {
+        if (!enabled) {
+            return;
+        }
+        const auto t_start = std::chrono::steady_clock::now();
+        io.commit(kind);
+        if (timings) {
+            timings->commit_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_start).count();
+        }
+    };
+    commit(io.restore_speculative, SERVER_PROMPT_STATE_SPECULATIVE);
+    commit(io.restore_target, SERVER_PROMPT_STATE_MAIN);
+    commit(io.restore_draft, SERVER_PROMPT_STATE_DRAFT);
     return { true, false, SERVER_PROMPT_STATE_MAIN, SERVER_PROMPT_RESTORE_NONE };
 }
 
@@ -1954,7 +1992,8 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         server_prompt_state_view speculative_state,
         bool restore_target,
         bool restore_draft,
-        bool restore_speculative) {
+        bool restore_speculative,
+        server_prompt_restore_timings * timings) {
     using memory_plan_ptr = std::unique_ptr<
             llama_state_seq_restore_plan,
             decltype(&llama_state_seq_restore_plan_free)>;
@@ -1997,7 +2036,7 @@ server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
         },
     };
     return server_prompt_restore_transaction_diagnostic(
-            target_state, draft_state, speculative_state, io);
+            target_state, draft_state, speculative_state, io, timings);
 }
 
 bool server_prompt_cache::reserve_transient(size_t bytes) {
@@ -2136,7 +2175,22 @@ server_prompt_cache_result server_prompt_cache::restore(server_prompt & prompt, 
 
 server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & prompt, const server_prompt_cache_state & state,
         llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot,
-        bool copy_prompt, bool allow_bootstrap) {
+        bool copy_prompt, bool allow_bootstrap, server_prompt_restore_timings * timings) {
+    struct restore_timer {
+        server_prompt_restore_timings * timings;
+        int64_t started = ggml_time_us();
+        bool committing = false;
+        void begin_commit() {
+            if (timings) { timings->prepare_us += ggml_time_us() - started; }
+            started = ggml_time_us();
+            committing = true;
+        }
+        ~restore_timer() {
+            if (timings) {
+                (committing ? timings->commit_us : timings->prepare_us) += ggml_time_us() - started;
+            }
+        }
+    } timer { timings };
     const auto info = llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt));
     restore_invalid = false;
     auto miss = [&](const char * reason, bool invalid = false) {
@@ -2148,17 +2202,26 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
         return miss("snapshot model differs");
     }
     const std::string target_layout = common_prompt_cache_layout(ctx_tgt);
+    // Native KVarN layout imports preserve the local representation. The
+    // transactional reader validates identity, positions and payloads in both
+    // directions, including empty overflow and n <= min(P,C) for split->pure.
+    // Keep these separate from converted_mode, which requantizes q4 rows.
+    const bool native_kvarn_import_mode =
+        !common_prompt_cache_layout_reusable(state.layout_tgt, target_layout) &&
+        (common_prompt_cache_layout_pure_to_split(state.layout_tgt, target_layout) ||
+         common_prompt_cache_layout_split_to_pure(state.layout_tgt, target_layout));
     const bool converted_mode =
         !common_prompt_cache_layout_reusable(state.layout_tgt, target_layout) &&
         common_prompt_cache_layout_convertible(state.layout_tgt, target_layout);
-    if ((!common_prompt_cache_layout_reusable(state.layout_tgt, target_layout) && !converted_mode) ||
-            (!converted_mode && ctx_dft && state.has_draft() &&
+    if ((!common_prompt_cache_layout_reusable(state.layout_tgt, target_layout) && !converted_mode && !native_kvarn_import_mode) ||
+            (!converted_mode && !native_kvarn_import_mode && ctx_dft && state.has_draft() &&
              !common_prompt_cache_layout_reusable(state.layout_dft, common_prompt_cache_layout(ctx_dft)))) {
         return miss("snapshot model or attention layout differs");
     }
     if (state.pos_tgt < 0 || state.prompt.tokens.empty() || state.pos_tgt >= (llama_pos) llama_n_ctx_seq(ctx_tgt) ||
             state.prompt.tokens.size() > llama_n_ctx_seq(ctx_tgt) ||
-            (!converted_mode && ctx_dft && state.has_draft() && state.pos_dft >= (llama_pos) llama_n_ctx_seq(ctx_dft))) {
+            (!converted_mode && !native_kvarn_import_mode && ctx_dft && state.has_draft() &&
+             state.pos_dft >= (llama_pos) llama_n_ctx_seq(ctx_dft))) {
         return miss("snapshot does not fit destination context");
     }
     if (state.pos_dft < -1 || state.prompt.tokens.pos_next() != state.pos_tgt + 1 ||
@@ -2179,7 +2242,7 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
     } catch (const std::bad_alloc &) { return miss("snapshot integrity allocation failed"); }
       catch (const std::exception & e) { return miss(e.what(), true); }
     const bool bootstrap_only = info.managed && ctx_dft &&
-        (converted_mode || !state.has_draft() || state.data.spec.empty());
+        (converted_mode || native_kvarn_import_mode || !state.has_draft() || state.data.spec.empty());
     if (bootstrap_only && !allow_bootstrap) {
         last_reason = "target-only snapshot requires MTP bootstrap";
         return server_prompt_cache_result::needs_bootstrap;
@@ -2197,11 +2260,247 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
                 return miss("restore prompt copy exceeds RAM cache budget");
             }
             candidate = state.prompt.clone();
-            if (converted_mode) {
+            if (converted_mode || native_kvarn_import_mode) {
+                // Prompt checkpoints are bound to the source context instance;
+                // native layout imports and data conversions must discard them.
                 candidate.checkpoints.clear();
             }
         }
     } catch (const std::bad_alloc &) { return miss("restore allocation failed"); }
+
+    // The restore writes into an emptied sequence, so the DESTINATION's resident
+    // state is captured first and put back verbatim if the restore is refused.
+    // Without this, a rejected restore would silently destroy a previously
+    // populated target (KV, positions and recurrent/DeltaNet state) plus its
+    // draft/MTP carry. If the resident state cannot be serialized, fail closed
+    // BEFORE any mutation instead of destroying what cannot be restored.
+    // The restore writes into an emptied sequence, so the DESTINATION's resident
+    // state is captured first and put back verbatim if the restore is refused.
+    //
+    // The capture uses the NATIVE SEQUENCE FILE route (save_file /
+    // load_file_streaming) rather than get_data_ext/set_data_ext on purpose:
+    // llama_state_seq_set_data_ext cannot rebuild a position-split destination
+    // at all (verified: capture -> seq_rm -> set_data_ext returns 0 and loses
+    // every position, for both FLAGS_NONE and FLAGS_SELF_CONTAINED), while the
+    // streaming file route is the one the disk-restore path uses successfully.
+    // A data-path rollback would silently report "destination LOST".
+    //
+    // Nothing is captured when the destination has no resident state, so the
+    // common empty-destination path costs nothing.
+    // Disk-backed mixed-state spool, shared with the disk restore path. The
+    // reader refuses tmpfs and needs <TMPDIR>/beellama-mixed-state to exist, so
+    // a failed resolution means "no restorable representation": the guard then
+    // refuses BEFORE mutating instead of claiming a rollback.
+    std::string rollback_spool;
+    if (!server_mixed_state_spool_dir(rollback_spool)) {
+        rollback_spool.clear();
+    }
+
+    // The restore writes into an emptied sequence, so the DESTINATION's full
+    // resident transaction - target KV, draft KV, common_speculative carry,
+    // tokens and checkpoints - is captured first and put back verbatim if the
+    // restore is refused. prompt_cache_clear() destroys ALL of those, so a
+    // guard that only saved the target would silently lose the draft and the
+    // MTP carry on every refusal.
+    //
+    // The capture uses the NATIVE SEQUENCE FILE route (save_file +
+    // load_file_streaming). llama_state_seq_set_data_ext cannot rebuild a
+    // position-split destination at all (measured: capture -> seq_rm ->
+    // set_data_ext returns 0 and loses every position, for both FLAGS_NONE and
+    // FLAGS_SELF_CONTAINED), so a data-path rollback is unusable for split.
+    //
+    // Empty is decided by POSITIONS AND TOKENS, not by get_size()==0 alone: a
+    // size of zero with resident tokens/positions is still resident state.
+    struct destination_guard {
+        llama_context * tgt;
+        llama_context * dft;
+        common_speculative * spec;
+        llama_seq_id seq;
+        std::string spool;                 // disk-backed dir; empty = none usable
+        std::vector<llama_token> tgt_tokens, dft_tokens;
+        std::vector<uint8_t> tgt_blob, dft_blob;
+        std::vector<uint8_t> carry;
+        llama_pos carry_pos = -1;
+        bool tgt_had_state = false, dft_had_state = false;
+        bool captured = false;
+        bool carry_captured = false;
+        bool carry_present = false;
+
+        // Resident iff the context reports a position range, not merely bytes.
+        static bool resident(llama_context * c, llama_seq_id q, llama_tokens & toks) {
+            if (!c) {
+                return false;
+            }
+            llama_pos pmax = -1;
+            if (!llama_state_rollback::resident_positions(c, q, &pmax)) {
+                return false;
+            }
+            toks.assign((size_t) pmax + 1, 0);
+            return true;
+        }
+
+        // Capture via the DATA frame the mixed-state reader actually processes.
+        // llama_state_seq_save_file is NOT usable here: state_seq_can_save is
+        // false for a split destination and it returns 0 silently. The data path
+        // round-trips correctly PROVIDED the mixed-state spool is disk-backed and
+        // <TMPDIR>/beellama-mixed-state exists.
+        static bool capture_one(llama_context * c, llama_seq_id q, const llama_tokens & toks,
+                                std::vector<uint8_t> & blob_out) {
+            // shared core with server-context: same residency/capture rules
+            llama_pos pmax = -1;
+            bool had_resident = false;
+            std::string err;
+            if (!llama_state_rollback::capture_resident(c, q, blob_out, &pmax,
+                                                         &had_resident, &err)) {
+                blob_out.clear();
+                return false;
+            }
+            return had_resident && !blob_out.empty();
+        }
+
+        destination_guard(llama_context * t, llama_context * d, common_speculative * sp, llama_seq_id q,
+                          const llama_tokens & resident_tgt, const llama_tokens & resident_dft,
+                          std::string spool_dir)
+            : tgt(t), dft(d), spec(sp), seq(q), spool(std::move(spool_dir)) {
+            (void) spool;
+            // Residency is decided by POSITIONS. An empty caller token list while
+            // positions are resident is INCONSISTENT metadata and must fail closed,
+            // never read as "nothing resident".
+            tgt_had_state = resident(tgt, seq, tgt_tokens);
+            dft_had_state = dft && resident(dft, seq, dft_tokens);
+            if (tgt_had_state && resident_tgt.size() < tgt_tokens.size()) {
+                return; // inconsistent metadata: caller cannot describe what is resident
+            }
+            if (dft_had_state && resident_dft.size() < dft_tokens.size()) {
+                return;
+            }
+            // The carry lives outside the KV caches: prompt_cache_clear() resets
+            // it, so it must be captured (and be allowed to block mutation) even
+            // when both KV sequences are empty.
+            if (spec) {
+                carry_captured = common_speculative_get_state(spec, seq, carry);
+                carry_present = carry_captured && !carry.empty();
+                if (spec && !carry_captured) {
+                    return; // cannot describe the resident carry -> fail closed
+                }
+            }
+            if (!tgt_had_state && !dft_had_state && !carry_present) {
+                return; // nothing resident at all
+            }
+            if (spool.empty()) {
+                SRV_WRN("%s\n", "rollback guard: no disk-backed mixed-state spool "
+                                 "directory (TMPDIR is tmpfs or missing "
+                                 "<TMPDIR>/beellama-mixed-state); refusing before mutation");
+                return; // no disk-backed representation available -> fail closed
+            }
+            // The capture token array must be the real resident list.
+            if (tgt_had_state) {
+                const size_t want = tgt_tokens.size();
+                if (resident_tgt.size() < want) {
+                    return;
+                }
+                tgt_tokens.assign(resident_tgt.begin(), resident_tgt.begin() + want);
+            }
+            if (dft_had_state) {
+                const size_t want = dft_tokens.size();
+                if (resident_dft.size() < want) {
+                    return;
+                }
+                dft_tokens.assign(resident_dft.begin(), resident_dft.begin() + want);
+            }
+            bool ok = true;
+            if (tgt_had_state) {
+                ok = capture_one(tgt, seq, tgt_tokens, tgt_blob);
+                if (!ok) {
+                    // state_seq_can_save is false for a split destination, or the
+                    // spool write failed; either way there is no representation
+                    // and may_mutate() keeps the destination untouched.
+                    SRV_WRN("%s\n", "rollback guard: destination state could not be "
+                                     "serialized; a refused restore would be refused "
+                                     "before mutation");
+                }
+            }
+            if (ok && dft_had_state) {
+                ok = capture_one(dft, seq, dft_tokens, dft_blob);
+            }
+            if (ok && spec && carry_present) {
+                carry_pos = llama_memory_seq_pos_max(llama_get_memory(tgt), seq);
+            }
+            if (!ok) {
+                cleanup();
+                return;
+            }
+            captured = (tgt_had_state && !tgt_blob.empty()) ||
+                       (dft_had_state && !dft_blob.empty()) || carry_present;
+        }
+
+        void cleanup() {
+            // No capture files are written (the data path is in-memory), so there
+            // are no orphans to remove; the buffers are released here.
+            tgt_blob.clear();
+            tgt_blob.shrink_to_fit();
+            dft_blob.clear();
+            dft_blob.shrink_to_fit();
+            captured = false;
+        }
+
+        ~destination_guard() { cleanup(); }
+
+        // Safe to clear+load only when there was nothing resident, or the full
+        // resident transaction was captured and can be streamed back.
+        bool may_mutate() const {
+            if (!tgt_had_state && !dft_had_state && !carry_present) {
+                return true; // nothing to lose
+            }
+            // A carry that exists but was not captured blocks mutation.
+            if (carry_present && !carry_captured) {
+                return false;
+            }
+            return captured;
+        }
+
+        enum class rollback_result { not_attempted, restored, lost };
+
+        rollback_result rollback() {
+            // Always clear first: a refused restore may have left PARTIAL state
+            // even when the destination started empty.
+            prompt_cache_clear(tgt, dft, spec, seq);
+            if (!captured) {
+                return (tgt_had_state || dft_had_state || carry_present)
+                        ? rollback_result::lost : rollback_result::not_attempted;
+            }
+            bool ok = true;
+            // Shared core (same bytes + watermark verification the test runs).
+            // The speculative carry transaction below stays server-owned.
+            if (tgt_had_state && !tgt_blob.empty()) {
+                ok = ok && llama_state_rollback::rollback_resident(
+                               tgt, seq, tgt_blob, (llama_pos) tgt_tokens.size() - 1) ==
+                           llama_state_rollback::rollback_result::restored;
+            }
+            if (ok && dft_had_state && !dft_blob.empty()) {
+                ok = ok && llama_state_rollback::rollback_resident(
+                               dft, seq, dft_blob, (llama_pos) dft_tokens.size() - 1) ==
+                           llama_state_rollback::rollback_result::restored;
+            }
+            if (ok && spec && carry_captured) {
+                ok = common_speculative_set_state(spec, seq, carry, carry_pos);
+            }
+            return ok ? rollback_result::restored : rollback_result::lost;
+        }
+    } guard(ctx_tgt, ctx_dft, spec, id_slot,
+            prompt.tokens.get_text_tokens(),
+            // The draft follows the target token-for-token in this server, so the
+            // same list is the correct description of its resident sequence. The
+            // rollback still validates the restored token count and position and
+            // reports `lost` rather than claiming success if that is wrong.
+            prompt.tokens.get_text_tokens(),
+            rollback_spool);
+
+    if (!guard.may_mutate()) {
+        return miss("destination state could not be captured for rollback; refusing before mutation");
+    }
+
+    timer.begin_commit();
     prompt_cache_clear(ctx_tgt, ctx_dft, spec, id_slot);
     bool target_ok = false;
     if (converted_mode) {
@@ -2262,15 +2561,25 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
     // KVarN draft layout, so it is dropped and bootstrap re-syncs it for MTP
     // destinations (bootstrap_only above).
     const bool draft_ok = target_ok && (bootstrap_only || !ctx_dft || !state.has_draft() ||
-        (!converted_mode && llama_state_seq_set_data_ext(ctx_dft, state.data.drft.data(), state.data.drft.size(), id_slot,
+        (!converted_mode && !native_kvarn_import_mode && llama_state_seq_set_data_ext(ctx_dft, state.data.drft.data(), state.data.drft.size(), id_slot,
             LLAMA_STATE_SEQ_FLAGS_NONE) == state.data.drft.size() &&
          llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id_slot) == state.pos_dft));
     const bool carry_ok = draft_ok && (bootstrap_only || !ctx_dft || state.data.spec.empty() ||
-        (!converted_mode && common_speculative_set_state(spec, id_slot, state.data.spec, state.pos_tgt)));
+        (!converted_mode && !native_kvarn_import_mode && common_speculative_set_state(spec, id_slot, state.data.spec, state.pos_tgt)));
     if (!target_ok || !draft_ok || !carry_ok) {
-        prompt_cache_clear(ctx_tgt, ctx_dft, spec, id_slot);
-        prompt.clear();
-        return miss(!target_ok ? "target restore failed" : !draft_ok ? "draft restore failed" : "MTP carry restore failed", true);
+        const char * why = !target_ok ? "target restore failed" : !draft_ok ? "draft restore failed" : "MTP carry restore failed";
+        // Put the destination back before reporting, and never claim it survived
+        // when the rollback itself failed.
+        switch (guard.rollback()) {
+            case destination_guard::rollback_result::restored:
+                return miss(why, true);
+            case destination_guard::rollback_result::not_attempted:
+                return miss(why, true);
+            case destination_guard::rollback_result::lost:
+                return miss("restore failed AND the resident destination state was LOST; "
+                            "the destination is NOT intact", true);
+        }
+        return miss(why, true);
     }
     if (copy_prompt) { prompt = std::move(candidate); }
     last_reason = bootstrap_only ? "target-only snapshot restored; MTP bootstrap required" : "snapshot restored";
@@ -2278,9 +2587,13 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
 }
 
 server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new,
-        llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot) {
+        llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot,
+        const server_prompt_cache_state * excluded, server_prompt_restore_timings * timings) {
     last_reason = "no better matching snapshot";
-    if (tokens_new.empty()) { return server_prompt_cache_result::unchanged; }
+    if (tokens_new.empty() || std::none_of(states.begin(), states.end(),
+            [&](const auto & state) { return &state != excluded; })) {
+        return server_prompt_cache_result::unchanged;
+    }
     const auto info = llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt));
     auto best = states.end();
     int best_lcp = prompt.tokens.get_common_prefix(tokens_new);
@@ -2291,6 +2604,7 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
     int rejected_lcp = -1;
     std::string rejected_reason;
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (&*it == excluded) { continue; }
         const int lcp = it->prompt.tokens.get_common_prefix(tokens_new);
         if (!lcp) { continue; }
         auto reject = [&](const char * reason) {
@@ -2365,9 +2679,9 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
         if (rejected_lcp > best_lcp) { last_reason = rejected_reason; }
         return server_prompt_cache_result::unchanged;
     }
-    auto result = restore_impl(prompt, *best, ctx_tgt, ctx_dft, spec, id_slot, info.managed, false);
+    auto result = restore_impl(prompt, *best, ctx_tgt, ctx_dft, spec, id_slot, info.managed, false, timings);
     if (result == server_prompt_cache_result::needs_bootstrap) {
-        result = restore_impl(prompt, *best, ctx_tgt, ctx_dft, spec, id_slot, info.managed, true);
+        result = restore_impl(prompt, *best, ctx_tgt, ctx_dft, spec, id_slot, info.managed, true, timings);
     }
     if (result == server_prompt_cache_result::miss && restore_invalid) { best->quarantined = true; }
     if (result == server_prompt_cache_result::hit || result == server_prompt_cache_result::needs_bootstrap) {

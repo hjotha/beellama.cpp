@@ -1,0 +1,916 @@
+F4 §3.6 — Estado, snapshots, prompt cache e transições
+=====================================================
+branch : feat/occupancy-position-split
+HEAD   : d9db0b881
+data   : 2026-10-05
+
+## O que foi verificado como REAL (nao mock)
+
+1) tests/test-mixed-kv-transition-harness.py = UNIT MOCK, NAO INTEGRACAO.
+   O proprio cabecalho diz "Exercises the acceptance runner against a fake HTTP
+   endpoint" e o arquivo monta ThreadingHTTPServer + canned responses
+   (tests/test-mixed-kv-transition-harness.py:4,24-26,41-46). Nao exercita
+   snapshot em disco, P/C, importacao XXL nem tokens reutilizados. NAO conta
+   como evidencia de §3.6.
+
+2) tests/test-kv-mixed-handoff.cpp = motor REAL em nivel de tensor.
+   Constroi fontes KVarN de verdade via ggml_kvarn_store (linhas 101-166),
+   inclui set_prefix/convert_to_sink com materializador de leitura, e cobre
+   select_prefix, plan_build, copy local, convert remoto, scatter/accounting,
+   wiring errado, prefixo longo selado, state machine com zero writes, captura/
+   orcamento e overflow de bytes.
+   COMANDO : cmake --build build-optimized -j10 --target test-kv-mixed-handoff
+   RESULTADO: "test-kv-mixed-handoff: one-way PURE->MIXED handoff engine (CPU)"
+              "== summary: ALL PASS"   EXIT=0
+   sha256 bin  : 503cc6bed1fad7d1e7136908
+   sha256 fonte: a97fa4a01ca631e991aea93c
+   LIMITE: e CPU e in-process. NAO tem P, NAO tem disco, NAO tem processo novo,
+   e portanto nao cobre a matriz §3.6.
+
+3) Envelope v2 com identidade por faixa JA EXISTE e valida P/C.
+   src/llama-kv-mixed-state.cpp:261 validate_range_v2 (range_id local/overflow,
+   0<range<...), :289 validate_split_envelope com "invalid position_split
+   bounds (require 0 < P < C)", :244 exige envelope position_split v2.
+   As suites v2 ja verdes: mixed-state 409/0, state-stream 819/0, mixed-io 20225/0.
+
+## LACUNA ENCONTRADA, com evidencia (nao e palpite)
+
+O caminho REAL de selecao/importacao em disco e
+tools/server/server-mixed-kv-handoff.cpp. O predicate de elegibilidade em
+:395-448 valida identidade (model, model_instance, integrity, quarantine),
+geometria contra o source CAPTURADO (:412-414 source_layout == layout_tgt),
+LCP com os tokens novos (:419-424), e exige checkpoint host-only dentro do LCP
+(:431-442). Rejeita com "no compatible host checkpoint within the LCP".
+
+ grep -rnE "POSITION_SPLIT_P|position_split|split_p" tools/server/server-mixed-kv-handoff.cpp
+ -> ZERO ocorrencias.
+
+Consequencia direta, item a item do §3.6:
+  * n_saved <= P deve provar hit/importacao com local preenchido e overflow
+    vazio: NAO HA GATE de P na selecao. O destino herda o proprio cparams
+    (:233 out.mem_params.kvarn = out.cparams.kvarn), mas a DECISAO de aceitar
+    o snapshot nao consulta P.
+  * n_saved > P deve REJEITAR importacao direta com destino intacto e fallback
+    explicito: NAO IMPLEMENTADO. Nada no predicate compara n_saved com P, e
+    nao ha ramo de rejeicao por esse motivo.
+  * split -> so-CUDA: importar a faixa local so quando n <= min(P, capacidade):
+    NAO IMPLEMENTADO.
+  * ocupacao maior que a capacidade destino rejeitada: nao ha verificacao de
+    capacidade no predicate (so geometria do source vs layout do destino).
+  * P diferente => cache miss: so e verdade por consequencia indireta de
+    source_layout != layout_tgt (:412). Nao existe checagem nominal de P, o
+    que deixa o motivo de rejeicao opaco em vez de explicito.
+
+Isto e exatamente o que o plano pede para provar em processo novo, e o teste
+integracao correspondente NAO EXISTE. O motor unit nao o substitui.
+
+## Por que a lacuna nao foi fechada neste turno
+
+Fechar a selecao exige: (a) editar o predicate de elegibilidade do caminho de
+disco, que NAO e kernel e portanto seria permitido, e (b) validar em processo
+novo com so o snapshot XXL no disco, medindo tokens reutilizados e ausencia de
+prefill do prefixo importado. (b) exige o harness de integracao real, que hoje
+nao existe (o .py e mock). Fazer (a) sem (b) seria exatamente a mudanca em
+kernel/predicado nao validada que o plano proibe. O contexto do turno acabou
+antes de poder construirt o harness de integracao, entao a lacuna fica
+registrada e aberta, nao fechada por suposicao.
+
+## Proximo passo concreto e delimitado
+
+1) Escrever tools/occupancy-f4/f4-disk-xxl.sh (harness REAL, nao mock):
+   construir snapshot PURE KVarN com o proprio llama-server no processo A,
+  iller o processo A, deixar SOMENTE o snapshot no disco, e no processo B com
+   LLAMA_KV_POSITION_SPLIT_P=P medir: hit/miss, n_saved, P/C, tokens
+   efetivamente reutilizados e a prova de que o prefixo importado nao foi
+   reprocessado (comparar estado recorrente e proximos logits, nao so texto).
+2) Matriz minima a fechar com saida real:
+   n_saved<=P hit/import ; n_saved>P rejeita com destino intacto ; P diferente
+   => miss ; ocupacao>capacidade rejeitada ; snapshot invalido sem mutacao ;
+   split->CUDA com n<=min(P,capacidade) ; mesmo P/C abaixo e acima de P.
+3) Só entao editar o predicate de :395-448 para tornar a recusa por P explicita,
+   com o teste de integracao como gate.
+
+## Estado de producao
+Producao mantida conforme autorizacao vigente. Host bounds ASan/valgrind do
+harness real-pair segue PENDENTE (sem build sanitizer) -- nao declarado verde.
+
+## CORRECAO AO PRÓPRIO RELATORIO: qual harness é o de integracao
+
+Existe DOIS arquivos com nome quase igual, e eu tinha apontado o errado:
+
+  tests/test-mixed-kv-transition-harness.py  -> UNIT MOCK. Sobe um
+    ThreadingHTTPServer com respostas enlatadas (:4, :24-26, :41-46) para
+    exercitar o runner. NAO toca GPU, disco, snapshot nem P.
+
+  tools/test-mixed-kv-transition.py -> INTEGRACAO REAL (1562 linhas). Sobe
+    apenas o seu proprio llama-server, em process group isolado, porta
+    isolada e --slot-save-path proprio (class ServerInstance ~:669, start em
+    :715, wait_ready :355, stop_server :401). Cenarios A/B/C.
+    O cenario A (:761) JA PROVA, com processo novo:
+      - salva base, apaga e restaura, continuacao;
+      - "A fresh same-profile server instance then restores the same snapshot
+        file and continues, proving cross-context state usability" (:11-18);
+      - RAM prompt cache DESLIGADO (--cache-ram 0) e --ctx-checkpoints 1
+        explicito (:775), ou seja o restore vem do DISCO;
+      - exige igualdade de token/byte E de texto, e declara determinismo como
+        obrigatorio, nunca pulado (:11-12).
+    O mock em tests/ exercita a LOGICA do runner; o de tools/ faz o trabalho.
+
+## O que falta de verdade para §3.6
+O cenario A cobre restauracao em processo novo a partir do disco, mas SEM a
+dimensao P: --scenarios aceita {A,B,C} (:194, :1444) e nenhum cenario liga
+LLAMA_KV_POSITION_SPLIT_P. A dimensao P e so por env var
+(src/llama-context.cpp:450, exige multiplo de 256 e 0 < P < n_ctx).
+
+Proximo entregavel, agora com o alvo certo: um cenario D neste runner real
+(NAO no mock), que
+  1) produza o snapshot PURE KVarN no processo A;
+  2) finalize o processo A e deixe SOMENTE o snapshot no disco;
+  3) no processo B, com LLAMA_KV_POSITION_SPLIT_P=P:
+       n_saved <= P  -> hit/importacao, local preenchido, overflow vazio,
+                        prefixo importado NAO reprocessado;
+       n_saved >  P  -> rejeita importacao direta, destino intacto, fallback
+                        explicito, sem truncar nem promover snapshot invalido;
+       P diferente  -> cache miss;
+       ocupacao > capacidade destino -> rejeitada;
+       snapshot invalido -> sem mutacao;
+       split -> so-CUDA com n <= min(P, capacidade), sem overflow ocupado;
+  4) compare estado recorrente e PROXIMOS LOGITS nas transicoes, nao so texto.
+
+Nao executei o cenario A nesta sessao (exige GPU livre, modelo e tempo de
+execucao) -- portanto NAO ha numero novo dele aqui. O que acima e leitura de
+codigo com file:line, mais os unicos dois numeros que rodei de fato:
+  test-kv-mixed-handoff: ALL PASS, EXIT=0
+  test-position-split-real-pair: 296 checks / 0 failures / 0 not-executed,
+  ctest Passed, compute-sanitizer memcheck SAN_EXIT=0 ERROR SUMMARY: 0 errors.
+
+## CORRECAO 2 — trace ate os validadores: a validacao de P EXISTE (eu errei)
+
+O aviso do plano era correto: ausencia do nome P num arquivo nao prova
+ausencia de validacao transitiva. Rastreando ate os validadores:
+
+  server-mixed-kv-handoff.cpp:645  import_sequence_prefix(seq, selected, ...)
+  -> llama-kv-cache.cpp:6247  if (n_tokens > get_size()) throw
+      [CAPACIDADE: validada; rejeita ocupacao > capacidade do destino]
+  -> llama-kv-cache.cpp:6267  find_slot(ubatch, false)
+  -> llama-kv-cache.cpp:2500  if (allocation_position_split_p != 0 && n_stream != 1) return {}
+  -> llama-kv-cache.cpp:2516  position_split_ubatch_cell_window(...)
+  -> llama-kv-cache.cpp:2393-2400
+         range_for_pos(...) por token; kind INVALID -> false
+         if (local == overflow) return false;     <-- REJEITA ubatch que CRESCE P
+         local  -> range_end = P        (so a faixa [0,P))
+         ovf    -> range_begin = P      (so a faixa [P,C))
+
+Conclusao: o gate de P e de CAPACIDADE existe e e transitivo.
+  n_saved > P  -> import_sequence_prefix lanca -> try_handoff_impl
+                  -> fail("candidate metadata import failed: ...") (:645-651)
+                  -> cguard descarta o candidato PRIVADO -> destino intacto
+                  -> caller cai no caminho frio (cache miss / reprocessamento)
+  n_saved <= P -> range_begin=0, range_end=P -> importa na faixa local
+
+O que REALMENTE falta e o MOTIVO EXPLICITO e a prova por processo novo, nao a
+validacao. §3.6 exige "n_saved>P rejeicao direta sem mutacao e fallback
+explicito": o comportamento existe (rejeita, destino intacto, frio), mas a
+motacao chega como excecao generica de import, nao como rejeicao nomeada por P,
+e nunca foi observada num processo novo so com o snapshot em disco.
+
+## CORRECAO 3 — bloqueio estrutural do "processo novo" (achado maior)
+
+Rastreando a origem de in.source, o handoff NAO pode rodar em processo novo:
+
+  server-mixed-kv-handoff.h:43-59  struct source_capture { bool valid=false; ... }
+  server-context.cpp:3301-3303
+      mixed_handoff_source_ = capture_source(ctx_tgt);   // do contexto VIVO
+  server-context.cpp:6173  hi.source = &mixed_handoff_source_;
+  server-mixed-kv-handoff.cpp:378  if (... || !in.source->valid)
+                                        return fail("invalid handoff input");
+
+O PAYLOAD vem do disco (Phase 1 FULL restore de in.state->data.main, :530-543),
+porem o DESCRITOR (bits KVarN, n_ctx_seq, exact_tail_tokens, kvarn_layers,
+source_layout) vem do capture ao vivo. Em um processo novo NAO existe contexto
+PURE KVarN vivo -> mixed_handoff_source_ fica value-init com valid=false ->
+"invalid handoff input". Alem disso a origem exige uma TRANSICAO ADAPTATIVA
+no mesmo processo (tier MTP/local -> tier LONG/remoto), que e o cenario B; o
+handoff dispara em server-context.cpp:6130+ quando o load do prompt cache falha.
+
+Isto e a razao real pela qual §3.6 "processo novo, somente snapshot XXL no disco"
+nao fecha hoje: o motor sabe ler o corpo do disco, mas nao sabe derivar o
+geometria/descritor do proprio envelope do snapshot. Fechar isso exige derivar
+source_capture do header/envelope v2 do snapshot (com validacao de identidade
+modelo/instance/integridade) em vez de exigir o contexto puro vivo. Mudanca de
+arquitetura de decisao, nao um gate de uma linha.
+
+## Situacao apos este trace (honesta)
+- Correcoes do meu relatorio anterior: (a) a validacao de P e de capacidade
+  EXISTEM e sao transitivas; (b) o bloqueio de "processo novo" e estrutural e
+  esta em server-context.cpp:3301 + server-mixed-kv-handoff.cpp:378.
+- Nenhum codigo foi editado neste turno. Nenhum numero novo de integracao foi
+  produzido: nao ha, ainda, cenario D no runner real.
+
+## CORRECAO 4 — trace do validador de envelope v2 (o que §3.6 mais pede)
+
+src/llama-kv-cache-kvarn.cpp:4486-4513, dentro do reader de estado:
+  :4490  if (parsed.has_split() != position_split_enabled()) throw
+         "mixed state snapshot has no position_split envelope but this cache
+          is split"  /  "...carries a position_split envelope but this cache is not split"
+  :4496-4501  want = { P = position_split_p(), C = metadata->get_size(),
+                       model_id = state_model_id, rope_id = state_rope_id }
+  :4503-4512  if (got.p != want.p || got.c != want.c ||
+                  got.model_id != want.model_id || got.rope_id != want.rope_id) throw
+         "mixed state position_split mismatch: snapshot P=%u C=%llu ... cache P=%u C=%llu ..."
+  :4517  manifest entries que nomeiam layer/range que o cache nao possui -> throw
+  :4525  desc.payload_bytes != manifest_bytes -> throw
+
+Isto cobre, com rejeicao ANTES de qualquer staging/mutacao:
+  * P diferente          -> mismatch nomeado (P e C separados)
+  * C/capacidade diferente -> mismatch nomeado
+  * snapshot NAO-split em cache split (e o inverso) -> rejeitado
+  * ocupacao/manifesto incoerente com o cache -> rejeitado
+Ou seja: "P diferente => versao inicial rejeita e faz cache miss", "capacidade
+insuficiente rejeitada" e "snapshot invalido sem mutacao" JA tem validador de
+envelope. A COMPARACAO ja e P,C,model_id,rope_id -- estritamente mais forte que
+"mesmo P/C e layout".
+
+O que ainda nao existe e a prova observada em processo novo so com o snapshot
+XXL no disco (cenario D), e a rejeicao por P com MOTIVO EXPLICITO no caminho do
+handoff (hoje chega como excecao generica de import em
+server-mixed-kv-handoff.cpp:645-651).
+
+=============================================================================
+RESULTADO REAL — CENARIO D EXECUTADO (runner REAL, nao o mock)
+=============================================================================
+branch feat/occupancy-position-split   HEAD d9db0b881
+harness tools/test-mixed-kv-transition.py  sha256 d0b0fae03161fe3731a79107
+                                       (O MOCK tests/test-mixed-kv-transition-
+                                       harness.py NAO foi usado nem conta)
+binario build-optimized/bin/llama-server sha256 3220fcd46c8364ca063adea3
+modelo  Qwen3.5-4B-MTP-Q4_K_M.gguf      sha256 3874209241c9a397e2f62cd3
+saida  /home/hjotha/f4-D-run/ (results.jsonl, cases.jsonl, server-*.log)
+copias docs/occupancy-evidence/f4-scenario-d-results.jsonl
+       docs/occupancy-evidence/f4-scenario-d-run.log
+
+COMANDO
+python3 tools/test-mixed-kv-transition.py --scenarios D \
+  --remote-kv-types q4_0 --remote-attn-layers 8 --split-full-layers 8 \
+  --split-p-local 256 --split-p-high 512 \
+  --split-ctx-local 1024 --split-ctx-high 2048 --split-tokens-local 192 \
+  --ctx-size 2048 --prompt-tokens 1024 --prompt-long 700 --prompt-short 300 \
+  --local-ctx 512 --high-ctx 1024 --gate-ctx 513 \
+  --disk-tmpdir /home/hjotha/f4-disk-tmp --port 18192 \
+  --output-dir /home/hjotha/f4-D-run --telemetry-device none
+EXIT=0   "1 scenarios, 0 failed, 0 pending_evidence"
+
+CONFIG REAL OBSERVADA (logs do servidor)
+  KVarN position-split: P=512 C=2048 local=512 overflow=1536 camadas full=8
+  enabling structured KVarN cache type kvarn_k4v4_g128 for target layers [0, 32)
+  RAM prompt cache DESLIGADO: --cache-ram 0 (em todas as pernas)
+  spool em disco: TMPDIR=/home/hjotha/f4-D-run/spool-<case> (ext4, NUNCA tmpfs)
+
+PERNAS EXECUTADAS (estado real)
+  D1 n_saved<=P, MESMO P, PROCESSO NOVO, SO O SNAPSHOT EM DISCO -> COMPLETE
+     P=512, prefill 192 tokens, n_saved=128 (<=P), n_written=63611679
+     restore em processo novo: n_restored=128, n_read=63611679
+     reuse: cache_n=128 == n_saved ; prompt_n=96 == 64 (nao selado) + 32 (sufixo)
+     -> NENHUM token do snapshot foi reprocessado. A precondicao do §3.6
+        (n_saved <= P) e o "hit sem prefill do prefixo importado" ficam
+        PROVADOS em processo novo, so com o snapshot em disco.
+     Nota real: n_saved=128 < prefill 192 porque o frame em disco guarda grupos
+     SELADOS; os 64 tokens ainda em stage nao entram no snapshot. Por isso o
+     gate correto e cache_n == n_saved, e nao cache_n == len(prefix).
+
+  D2 P DIFERENTE (P=256 vs snapshot P=512) -> COMPLETE
+     restore HTTP 400, cache_n=0, prompt_n=224 (tudo reprocessado = cache miss)
+     motivo real no log: "mixed state position_split mismatch:
+       snapshot P=512 C=2048 model=15308290160351574727 rope=9047987368603649408"
+     -> versao inicial rejeita e faz cache miss, como §3.6 exige.
+
+  D3 MESMO P/C, ocupacao ACIMA de P -> COMPLETE
+     P=512, restore OK n_restored=128, cache_n=128, prompt_n=96
+     -> restore exato do snapshot split.
+
+  D4 SNAPSHOT SPLIT EM CACHE NAO-SPLIT -> COMPLETE
+     P omitido (ver abaixo), restore HTTP 400, cache_n=0, prompt_n=224
+     motivo real: "legacy KV state lacks compact-tail representation metadata"
+     -> rejeitado por incompatibilidade de framing, com destino intacto.
+
+  D5 CAPACIDADE INSUFICIENTE (ctx=1024 < C=2048) -> COMPLETE
+     restore HTTP 400, cache_n=0, motivo: mesmo "position_split mismatch" nomeado
+     (P=512 C=2048 do snapshot vs cache com C=1024)
+     -> ocupacao maior que a capacidade destino e rejeitada.
+
+  D6 SNAPSHOT INVALIDO -> INCONCLUSIVO (nao verde, nao "defeito")
+     byte invertido em 31805839 de 63611679; restore do frame corrompido foi
+     ACEITO (corrupted_restore_accepted=true); o snapshot BOM nao foi mutado.
+     Atribuicao necessaria: o envelope v2 CHECA payload por XXH64 e LANCA
+     (llama-kv-mixed-state.cpp:885 com fault() -> throw em :84-85). Logo o byte
+     invertido nao caiu num payload com checksum, OU esse restore manual nao
+     valida o checksum do envelope. Nao se afirma defeito nem aprovacao.
+
+ACESSO AO DISCO CONFIRMADO NAS PERNAS DE REJEICAO
+  D2/D3/D4/D5: snapshot_preserved=true (sha256 antes == depois do restore).
+  O arquivo original nunca e mutado; cada perna recebe uma COPIA em
+  slot-save-<leg>/ e o original so e lido.
+
+ACHADOS DE CONFIG (reais,Todos com mensagem do servidor)
+  * LLAMA_KV_POSITION_SPLIT_P=0 NAO desativa o split: o servidor sai com
+    "LLAMA_KV_POSITION_SPLIT_P must be a multiple of 256 with 0 < P < n_ctx,
+    got 0". A variavel tem de ser OMITIDA, nao valer 0.
+  * O split exige TODAS as camadas full no backend remoto: com
+    --remote-attn-layers 1 o servidor sai com "position-split KV exige todas as
+    8 camadas full no backend remoto (recebido 1)". As pernas split usam
+    --remote-attn-layers = --split-full-layers = 8.
+  * O spool exige TMPDIR em disco real: com /tmp (tmpfs) o restore falha com
+    "mixed state spool directory is tmpfs/ramfs; set TMPDIR to a disk-backed
+    directory". O harness REJEITA tmpfs/ramfs em --disk-tmpdir antes de rodar.
+
+O QUE §3.6 AINDA NAO ESTA COBERTO (nao declarado verde)
+  * handoff PURE KVarN -> MIXED (importacao XXL com conversao autorizada,
+    cenario B) em PROCESSO NOVO: bloqueado estruturalmente, ver CORRECAO 3
+    (server-context.cpp:3301 + server-mixed-kv-handoff.cpp:378 exigem um
+    contexto PURE KVarN VIVO). As pernas D provam o caminho de RESTORE em
+    processo novo, que e o que existe hoje.
+  * rejeicao por P com MOTIVO EXPLICITO no caminho do handoff: hoje o P chega
+    como excecao generica de import (server-mixed-kv-handoff.cpp:645-651).
+  * comparacao de ESTADO RECURRENTE e PROXIMOS LOGITS entre as pernas: o runner
+    grava tokens, texto, timings e completion_probabilities, mas ainda NAO
+    compara o estado recorrente/DeltaNet entre legs. Requirement do §3.6
+    ("comparar estado recorrente e proximos logits, nao so texto") segue
+    PENDENTE.
+  * split -> so-CUDA (n <= min(P, capacidade)) nao e expressivel hoje: o
+    servidor RECUSA a combinacao (achado acima), o que e coerente com
+    "versao inicial rejeita", mas precisa ser registrado como tal.
+
+=============================================================================
+REVISAO DO CENARIO D — FALSOS POSITIVOS CORRIGIDOS
+=============================================================================
+branch feat/occupancy-position-split  HEAD d9db0b881
+harness tools/test-mixed-kv-transition.py
+  (mock tests/test-mixed-kv-transition-harness.py usado SO como suite unit)
+binario sha256 3220fcd46c8364ca063adea3   modelo sha256 3874209241c9a397e2f62cd3
+saida /home/hjotha/f4-D-run/
+copias docs/occupancy-evidence/f4-scenario-d-results.jsonl
+       docs/occupancy-evidence/f4-scenario-d-summary.json
+       docs/occupancy-evidence/f4-scenario-d-run.log
+
+COMANDO (mesmo de antes)
+python3 tools/test-mixed-kv-transition.py --scenarios D --remote-kv-types q4_0 \
+  --remote-attn-layers 8 --split-full-layers 8 --split-p-local 256 \
+  --split-p-high 512 --split-ctx-local 1024 --split-ctx-high 2048 \
+  --split-tokens-local 192 --ctx-size 2048 --prompt-tokens 1024 \
+  --prompt-long 700 --prompt-short 300 --local-ctx 512 --high-ctx 1024 \
+  --gate-ctx 513 --disk-tmpdir /home/hjotha/f4-disk-tmp --port 18192 \
+  --output-dir /home/hjotha/f4-D-run --telemetry-device none
+
+RESULTADO REAL
+  EXIT=1   "9 runs: 7 complete, 2 failed, 0 inconclusive, 0 not_executed
+            -> INCOMPLETE (exit 1)"
+  legs nao aceitaveis: D0a-pure-xxl-below-p-p512(failed),
+                        D0b-pure-xxl-above-p-p512(failed)
+  suite unit: 92 testes, OK
+
+(1) AGREGADOR — falso positivo corrigido
+  Antes: main() contava so failed/pending_evidence, entao inconclusive e
+  not_executed escapavam com EXIT=0. Agora aggregate_run_states() aceita
+  SOMENTE state == "complete"; failed, pending_evidence, inconclusive,
+  not_executed, state AUSENTE e state DESCONHECIDO todos -> incomplete -> exit 1.
+  Cobertura unit (11 testes): todos-complete, failed, pending_evidence,
+  inconclusive, not_executed (4 pernas), misto, state ausente, state
+  desconhecido, lista vazia, rotulo perna.
+  summary.json agora traz total_runs/complete/failed/pending/inconclusive/
+  not_executed/unacceptable_runs/unacceptable_legs/incomplete/exit_code.
+
+(2) D3 e D5 — fixtures honestas (n_ctx NAO e ocupacao)
+  D3 agora tem snapshot PROPRIO com prefill 1280 e ocupacao persistida
+  n_saved=640 > P=512 (antes reutilizava o n_saved=128 do D1, que nunca
+  provava "acima de P"). Restore OK: n_restored=640, cache_n=640,
+  prompt_n=160, overflow_occupied_tokens=128. A precondicao
+  (n_saved > P) e ASSERTADA antes do restore; se nao hold, a perna e failed.
+  D5 idem, com fixture no ctx de ORIGEM 2048 e DESTINO ctx=1024:
+  n_saved=1152 > dest_ctx=1024. Restore HTTP 400 (rejeitado, como §3.6 exige).
+  O erro anterior "fixture prefill nao cabe" era porque o fixture era
+  construido no ctx de DESTINO; agora e no de origem.
+
+(3) ROTULO HONESTO + CAMINHO PURE XXL REAL
+  D1 foi relabelado kind="split_to_split_below_p": e split->split abaixo de P,
+  em processo novo, so com o snapshot em disco. NAO e o XXL puro->split do
+  §3.6 e nao pode ser relatado como tal.
+  D0a/D0b implementam o caminho PURE XXL de verdade: processo FONTE com
+  KVarN puro, sem split e SEM --remote-attn (logo kv_layout_known=false,
+  common.cpp:4093-4094,4117), gravando snapshot so em disco; processo
+  DESTINO NOVO com split P=512 e NENHUM contexto PURE vivo.
+    D0a n_saved=128 <= P=512 -> FAILED (restauro HTTP 400, cache_n=0,
+         prompt_n=224): o §3.6 exige importacao explicita com local
+         preenchido; ela NAO existe.
+    D0b n_saved=640 >  P=512 -> FAILED. A recusa ocorre, mas pelo motivo
+         GENERICO "incompatible mixed KV state envelope", o MESMO do D0a.
+         Por isso a perna exige p_attributable e falha: acima/abaixo de P e
+         indistinguivel, logo a fronteira P nao esta provada. (Este era um
+         falso positivo meu anterior: D0b "passava" so porque eu esperava
+         recusa.)
+  RAIZ EXATA da recusa (localizada, nao e bloqueio externo):
+    src/llama-kv-cache-kvarn.cpp:4415-4421 le o primeiro u32 do frame e exige
+    MIXED_KV_STATE_ENVELOPE_MAGIC = 0x4D4B5351 ("QSKM") versao 1
+    (:61-62); senao throw "incompatible mixed KV state envelope".
+    O snapshot PURE gravado e um container state-seq cujo primeiro u32 e
+    LLAMA_STATE_SEQ_MAGIC = LLAMA_FILE_MAGIC_GGSQ = 0x67677371
+    (include/llama.h:43,48), versao 3. Verificado nos bytes do arquivo:
+    magic u32=0x67677371 v=3.
+    => O container state-seq PURE nao e reconhecido pelo leitor misto. E
+       exatamente o que o plano antecipa: "a selecao no indice de disco deve
+       reconhecer a conversao autorizada: os predicados atuais de layout nao
+       dao compatibilidade direta automaticamente".
+  TAREFA (nao bloqueio): fazer a selecao do indice de disco reconhecer a
+  conversao PURE->split autorizada e executar a importacao em etapas com os
+  prepare/commit existentes, preenchendo local e deixando overflow vazio.
+  Nenhum kernel foi alterado; nenhum predicate foi mudado.
+
+(4) D6 — corrupcao comprovada + estado destino comparado
+  Antes: flip cego em len//2 (caiu fora de qualquer regiao verificada, o frame
+  foi aceito -> "inconclusive", nao provava nada) e byte_before gravado DEPOIS
+  do XOR. Agora locate_checksummed_payload_byte() so devolve um byte
+  comprovadamente dentro de (a) payload coberto pelo XXH64 do envelope
+  (llama-kv-mixed-state.cpp:885, fault() -> throw em :84-85) ou (b) cabecalho
+  reconhecido; com framing desconhecido devolve None e a perna fica
+  not_executed. Para o frame real (state-seq) o alvo e o byte 2 do magic
+  reconhecido.
+  Resultado real: region=state_seq_header_magic offset=2 before=103 after=152
+  -> restore do frame corrompido REJEITADO; snapshot bom preservado;
+  estado destino comparado ANTES e DEPOIS: tokens identicos E
+  completion_probabilities (proximos logits) identicos ->
+  destination_tokens_unchanged=true, destination_next_logits_unchanged=true.
+  Hash de arquivo preservado NAO e usado como prova de destino intacto.
+
+(5) UNPACK — bug corrigido e com teste
+  O ramo "source snapshot unavailable" desempacotava 5 de 6 campos
+  (ValueError/UnboundLocalError em vez de not_executed). A tabela negative_legs
+  tem 7 campos; os tres sites de unpack foram normalizados e ha teste que
+  varre TODOS os unpack sites e compara com a aridade da tabela, alem do teste
+  do ramo not_executed.
+
+(6) ESTADO RECURRENTE / PROXIMOS LOGITS
+  D7 cria a referencia controlada: em processo novo e slot vazio, o mesmo
+  prompt+seed duas vezes (com erase entre) reproduz tokens E
+  completion_probabilities identicos -> logits_reproducible=true. Se isso
+  falha a perna falha, de modo que uma igualdade posterior de logits nunca
+  pode ser coincidencia de texto. compare_completion_probabilities()
+  compara id + logprob + top_logprobs com tolerancia 1e-9 e trata vazio/
+  None como NAO igual. Nenhuma perna aprova por texto/timings sozinho.
+
+PRODUCAO
+  Restaurada: llama-server-root.service active, porta 8090, health HTTP 200,
+  GPU 11671 MiB. Um build -j10 (nada recompilou: o cenario D e so Python).
+  Sem commit/push/merge/deploy/promocao; sem segredos; sem mudanca de
+  permissao; F5/F7 nao tocados. Par numerico 296/0/0 nao foi tocado nem
+  enfraquecido.
+
+=============================================================================
+CORRECAO 5 — TRACE DA DISCRIMINACAO (o offset realmente lido)
+=============================================================================
+O relato anterior estava IMPRECISO e esta corrigido. Nao se comparam
+framings/offsets diferentes:
+
+  src/llama-kv-cache-kvarn.cpp:4694-4702  state_read_sinfo()
+      if (standard_cache) { state_read_mixed(...); return; }   // destino MISTED
+      state_read_kvarn_body(...);                             // destino PURE
+
+A discriminacao NAO e "GGSQ no offset 0 versus QSKM no offset 0". O
+despacho e pela CLASSE DO CACHE DESTINO (standard_cache), e as DUAS leituras
+ocorrem no MESMO offset: a posicao logo apos o cabecalho GGSQ do container
+state-seq, que o leitor externo ja consumiu. state_read_mixed recebe
+llama_io_read_i JA POSICIONADO (assinatura em
+src/llama-kv-cache-kvarn.h:666), portanto o QSKM e lido como ENVELOPE INTERNO
+no offset corrente, nao como o primeiro byte do arquivo.
+
+O que realmente ocorre no D0a:
+  * destino = split/mixed  -> standard_cache=true -> roda state_read_mixed
+  * esse leitor le, no offset corrente, envelope_magic QSKM 0x4D4B5351 v1
+    (:4415-4421, constantes em :61-62)
+  * a FONTE PURE escreveu, nesse mesmo offset, o framing de KVarN BODY
+    (o log do servidor mostra: "state_read_kvarn_body: KVarN state restore:
+    kind=full-remap version=16 stage_rows=128 ...")
+  * magic divergente -> throw "incompatible mixed KV state envelope"
+
+Logo: nao ha incompatibilidade de offset/ container. O que falta e a
+CONVERSAO AUTORIZADA PURE->split que o plano exige ("a selecao no indice de
+disco deve reconhecer a conversao autorizada: os predicados atuais de layout
+nao dao compatibilidade direta automaticamente"): o leitor misto aceita, sob
+validacao completa, um frame de body KVarN PURE como origem de importacao,
+quando n_saved <= P, preenchendo so a faixa local [0,P) e deixando overflow
+vazio, com prepare/stage/commit existentes.
+
+=============================================================================
+ACHADO DE IMPLEMENTACAO — a interface nao permite peek
+=============================================================================
+src/llama-io.h:27-43  class llama_io_read_i expoe SOMENTE:
+    read(void*, size_t)          // sequencial
+    read_tensor(...)
+    stage_tensor_set/clear, on_commit, commit, cancel, n_bytes
+NAO existe peek, seek, tell nem reposicionamento.
+
+Consequencia direta para a importacao PURE->split: o dispatch nao pode "espihar"
+o magic e devolver o cursor. Como AMBOS os leitores leem o magic como os
+primeiros 4 bytes do offset corrente
+  state_read_kvarn_body  src/llama-kv-cache-kvarn.cpp:4750  (KVRN 0x4e52564b)
+  state_read_mixed       src/llama-kv-cache-kvarn.cpp:4416  (QSKM 0x4D4B5351)
+a discriminacao tem de ser feita lendo o magic UMA vez no dispatcher
+(state_read_sinfo, :4694-4702) e repassando-o aos leitores, ou os dois leitores
+ganham um parametro "magic ja consumido". Sem isso nao ha como distinguir um
+frame PURE de um frame mixed no mesmo offset sem consumir bytes que o leitor
+precisa.
+
+Este e o projeto minimo para o item (3) do plano, com os pontos de edicao reais:
+ 1. state_read_sinfo passa a ler o magic uma vez erotear por (standard_cache,
+    magic): QSKM+mixed, KVRN+PURE, KVRN+mixed = CONVERSAO AUTORIZADA (o item
+    novo), QSKM+PURE = erro explicito.
+ 2. A conversao autorizada so pode prosseguir apos validar, NESTA ordem e sem
+    mutar antes: modelo/instance, tipos KVarN, dominio, P do frame vs P do
+    cache, ocupacao vs capacidade, posicoes, tail exato, estado recorrente,
+    integridade. Rejeicao por n_saved > P tem deOccurred ANTES de qualquer
+    stage/commit e com motivo nomeado por P.
+ 3. O preenchimento usa os mesmos stage_tensor_set/commit ja existentes
+    (llama-io.h:38-42), preenchendo apenas a faixa local [0,P) e deixando a
+    overflow VAZIA; nunca truncar nem requantizar.
+
+Nenhum kernel alterado. Nenhum predicate alterado. Build e testes C++ nao foram
+tocados neste trecho: o unico codigo modificado ate agora e o runner de
+aceitacao em Python (cenario D), com 92 testes unitarios verdes.
+
+=============================================================================
+INCREMENTO 2 — IMPORT PURE->MIXED: CODIGO ESCRITO, D0 SEGUINDE FALHANDO
+=============================================================================
+Implementado em src/llama-kv-cache-kvarn.{h,cpp} (sem tocar kernel):
+
+1) DISPATCH SEM PEEK (o problema real da interface)
+   src/llama-io.h:27-43 nao tem peek/seek. Como os dois leitores leem o magic
+   como os primeiros 4 bytes do offset corrente, state_read_sinfo
+   (:4697-4724) agora le o magic UMA VEZ e o repassa:
+     state_read_mixed(..., uint32_t magic_pre = 0)              (h:667)
+     state_read_kvarn_body(..., validate_prepared, magic_pre = 0)(h:659)
+   magic_pre == 0 significa "nao pre-consumido" (0 nao e magic valido), entao
+   TODOS os caminhos legados seguem lendo o magic eles mesmos. Nenhuma
+   mudanca de comportamento nos caminhos existentes.
+
+2) NOVA COSTA DE CONVERSAO AUTORIZADA
+   state_read_pure_to_mixed_import() exige P != 0 e P < C, e chama
+   state_read_kvarn_body com gate_prepared. O gate roda no cache de metadata
+   preparado, ANTES de qualquer mutacao do cache vivo, e valida:
+     - remapeamento de celula dentro da tabela de destino
+     - posicao de toda celula ocupada: pos < P  (senão recusa)
+     - ocupacao <= capacidade C
+     - ocupacao <= P
+   A recusa e lancada como kv_mixed_error com motivo que nomeia P e diz
+   explicitamente que nao trunca nem requantifica. O overflow [P,C) nunca e
+   referenciado e fica vazio.
+
+Build unico -j10 OK (target llama-server).
+
+3) RESULTADO REAL — REGRESSAO, exit 1 honesto
+   EXIT=1  9 runs: 7 complete, 2 failed -> INCOMPLETE
+   legs: D0a-pure-xxl-below-p-p512(failed),
+         D0b-pure-xxl-above-p-p512(failed)
+   D1-D7 e todas as negativas continuam complete (regressao nao quebrou).
+   Suite unit: 92 testes OK.
+
+   D0a: http_status=400, cache_n=0, prompt_n=224
+     cache-hit require cache_n>0, got 0
+     imported prefix foi re-prefillado (prompt_n=224 != 96)
+   D0b: recusa NAO e atribuivel a P, porque o gate nunca foi alcancado:
+     "unrecognized mixed KV state frame kind 0x4c54564b: expected QSKM
+      envelope or KVRN pure body"
+
+4) ACHADO NOVO E DECISIVO — o marker do frame PURE e KVTL, nao KVRN
+   0x4c54564b = "KVTL" = LLAMA_KV_TAIL_STATE_MAGIC
+   (src/llama-kv-cache.cpp:4421). E o marker do container state-v2 de
+   manifesto, gravado em src/llama-kv-cache.cpp:5532 junto de version,
+   state_flags, tail tokens/tipo, storage kind, rollback tokens, group_id,
+   manifest_size, body_payload_size e tail_payload_size (:5524-5545).
+   KVAR_N_STATE_MAGIC = 0x4e52564b ("KVRN", :496, gravado em :3962/:6090)
+   e um framing de body DIFERENTE, usado pelo leitor state_read_kvarn_body
+   (:4750).
+
+   Logo o snapshot PURE que D0 grava NAO e um "KVRN body": e um frame
+   state-v2 (KVTL) com manifesto + body + tail. O dispatch correto, portanto,
+   NAO esta em state_read_sinfo: o cabecalho KVTL + manifesto e consumido
+   ACIMA de state_read_sinfo, em llama_kv_cache::state_read_impl
+   (src/llama-kv-cache.cpp:5666-5682), que le o marker e, se for KVTL, entra
+   no ramo state-v2 (:5676+), e senao cai em state_read_body com o marker
+   repassado como n_stream_cur (:5682, assinatura llama-kv-cache.h:655).
+
+   CORRECAO NECESSARIA no proximo incremento:
+   - o ponto de integracao do gate P tem de subir para o ramo KVTL de
+     state_read_impl (ou para um wrapper equivalente), porque e la que o
+     manifesto e o tail sao lidos;
+   - o dispatch em state_read_sinfo deve aceitar KVTL como third caso e
+     tratar o payload de body/tail que vier a seguir conforme o ramo state-v2,
+     nao como body KVRN cru;
+   - ler o marker uma vez e repassar (como ja foi feito) continua correto e
+     deve ser preservado.
+
+   Nenhum kernel alterado. Nenhum predicate de validacao relaxado. O leitor v2
+   nao foi relaxado: nenhum caminho passa a aceitar frame sem validar.
+
+=============================================================================
+INCREMENTO 3 — F4 §3.6 GATE VERDE: 9 runs, 9 complete, EXIT=0
+=============================================================================
+branch feat/occupancy-position-split  HEAD d9db0b881
+arquivos meus deste incremento:
+  src/llama-io.h                       (llama_io_read_replay)
+  src/llama-kv-cache-kvarn.h/.cpp      (dispatch + state_read_pure_to_mixed_import)
+  tools/test-mixed-kv-transition.py    (extrator de motivo de recusa)
+build unico -j10. Nenhum kernel tocado.
+
+1) O ERRO DE FRAMING EXATO (corrigido)
+   A leitura especulativa em state_read_sinfo NAO era o magic KVRN. O writer
+   puro grava o bloco de metadata PRIMEIRO:
+     state_write_kvarn_body:3939  metadata->state_write(io, seq_id, flags)  [KVTL]
+     state_write_kvarn_body:3962  io.write(&KVAR_N_STATE_MAGIC, ...)        [KVRN]
+   e o leitor puro espelha exatamente essa ordem:
+     state_read_kvarn_body:4849   metadata_prepared->state_read_sinfo(...) [KVTL]
+     state_read_kvarn_body:4860+  io.read(&magic, ...)                     [KVRN]
+   Logo o magic pre-consumido pertence ao metadata KVTL, e o envelope QSKM e o
+   body KVRN ficam em offsets DIFERENTES. Reaproveitar magic_pre de metadata no
+   KVRN posterior era o bug.
+
+   CORRECAO APLICADA:
+   - magic_pre ficou SO em state_read_mixed (o envelope QSKM e de fato o primeiro
+     que o leitor misto le). Nao ha mais magic_pre em state_read_kvarn_body.
+   - novo class llama_io_read_replay em src/llama-io.h:64. Serve o prefixo de 4
+     bytes ja lido APENAS no read(), ate drenar, e delega TODAS as demais
+     operacoes (read_tensor, stage_tensor_set, stage_tensor_clear, on_commit,
+     commit, cancel, n_bytes) ao IO original. A transacao de restore continua
+     pertencendo ao leitor original; nenhum parser/validador existente foi
+     reescrito ou reordenado.
+   - state_read_sinfo le a palavra inicial UMA vez: se for QSKM entrega a
+     state_read_mixed(magic_pre=); senao embrulha em llama_io_read_replay e passa
+     o fluxo ORIGINAL reconstruido para state_read_pure_to_mixed_import, que
+     chama o leitor puro existente, que consome KVTL e KVRN na ordem correta.
+   - manifest/body/tail NAO foram reimplementados nem movidos para o parser
+     global.
+
+2) GATE P (executado imediatamente apos a metadata preparada, antes de mutar)
+   gate_prepared e o validate_prepared do leitor puro: roda no cache de metadata
+   restauravel, antes de qualquer mudanca no cache vivo.
+   - usa as celulas PREPARADAS em coordenadas de destino DIRETO, sem remap
+     duplo (o remap ja foi aplicado pelo leitor).
+   - rejeita se cell >= P ou pos >= P, com motivo que nomeia P e diz que o
+     overflow [P,C) seria necessario e que a recusa NAO trunca nem requantiza.
+   - rejeita ocupacao > C.
+   - aceita apenas com toda celula em [0,P): o overflow nunca e referenciado e
+     fica vazio.
+
+3) RESULTADO REAL (mesmo comando de antes, porta 18200)
+   EXIT=0
+   Finished: 1 scenarios, 9 runs: 9 complete, 0 failed, 0 pending_evidence,
+             0 inconclusive, 0 not_executed -> complete (exit 0)
+   D1-D7 e todas as negativas seguem complete: sem regressao.
+   Suite unit do harness: 92 testes OK.
+
+   D0a-pure-xxl-below-p-p512 -> complete
+     n_saved=128 <= P=512
+     cache_n=128 (= n_saved), n_restored=128, prompt_n=96
+     no_prefill_of_imported_prefix=True (224-128=96)
+     => importacao explicita, local preenchido, prefixo importado NAO
+        re-prefillado.
+
+   D0b-pure-xxl-above-p-p512 -> complete
+     n_saved=640 > P=512
+     cache_n=0, destination_intact=True, p_attributable=True
+     motivo real: "pure KVarN state needs cell 512 at position 512, at or
+     beyond position-split P=512 (occupancy 513 cells); the overflow range [P,C)
+     would be required and this restore refuses to truncate or requantize to fit"
+
+4) CORRECAO SEPARADA NO HARNESS (nao relateda ao codigo C++)
+   O extrator de motivo pegava a linha de debug benigna
+   use_position_split_attention(... P=512 ... -> split), porque o filtro era
+   `"position_split" in line` e usava next() (primeira casa). Isso fazia D0b
+   parecer "nao atribuivel a P" mesmo com a recusa correta.
+   Novo refusal_reason_from_log(): parseia a severidade do logger (timestamp
+   + "D"/"I"/"E"), descarta D e I, aceita so superficie real de erro, e PREFERE
+   a linha que nomeia a fronteira position-split. Sem isso a perna seria
+   reprovada por um falso negativo do harness. Verificado com teste direto:
+   debug/info sao ignorados e a linha com P ganha da generica.
+
+5) REGRESSAO
+   test-kv-mixed-handoff / test-kv-mixed-state / test-kv-mixed-state-stream /
+   test-kv-mixed-io: 4/4 Passed.
+   test-position-split-real-pair: Passed, "296 checks, 0 failures,
+   0 not-executed" (par numerico preservado).
+
+   test-kvarn, test-kvarn-d64-parallel-static e test-kvarn-mtp-sharing-static
+   FALHAM, mas sao PRE-EXISTENTES e nao relacionados: sao falhas numericas de
+   atencao em kernel (NaN em O, NRMSE > 1e-3, "1572864 value-contract failures",
+   "position-split LSE structural matrix has failing shapes") em codigo de
+   kernel ja modificado no branch antes deste incremento.
+   PROVA: revertei src/llama-io.h, src/llama-kv-cache-kvarn.h e
+   src/llama-kv-cache-kvarn.cpp para HEAD, rebuildi e test-kvarn falhou com os
+   MESMOS numeros (1572864 value-contract failures e as mesmas shapes). Depois
+   restaurei meus arquivos e rebuildi. Nenhum kernel foi alterado por mim.
+
+6) PRODUCAO
+   llama-server-root.service active, porta 8090, health HTTP 200.
+   Observacao operacional: o stop dessa unit deu timeout de SIGTERM e caiu em
+   "failed" (KILL); foi preciso reset-failed antes de novo start. Isso e
+   pre-existente ao comportamento da unit, nao efeito deste incremento.
+   Sem commit/push/merge/deploy; sem segredos; sem mudanca de permissao;
+   F5/F7 intocados; modelo somente leitura.
+
+AINDA ABERTO (proximos incrementos, naobloqueiam o gate D):
+   - discovery no indice de disco: hoje D0 aciona o restore por endpoint;
+     falta o indice descobrir sozinho o snapshot XXL em disco.
+   - D7 ainda e so reprodutibilidade de tokens/completion_probabilities: nao
+     compara o estado recorrente da transicao nem full logits. Falta referencia
+     de execucao e instrumentacao verificavel de estado DeltaNet e proximos
+     logits; top-k nao e vetor completo para KL.
+   - split->CUDA sem overflow ocupado, regressoes integradas em
+     tests/test-position-split-ranges.cpp, sanitizer host, KL full-logit.
+
+=============================================================================
+INCREMENTO 4 — DISCOVERY: DIAGNOSTICO FECHADO, IMPLEMENTACAO NAO FEITA
+=============================================================================
+ESTADO: F4 §3.6 NAO esta verde. D0a/D0b (import manual via endpoint
+/slots/:id?action=restore) passam, mas o gate da secao exige discovery no indice
+com processo novo e SOMENTE o snapshot em disco. Isso NAO esta implementado.
+test-kvarn e os 2 estaticos continuam falhando, logo o gate geral segue fechado.
+
+1) POR QUE O INDICE HOJE REJEITA O SNAPSHOT PURE (verificado no codigo)
+   tools/server/server-context.cpp:3812-3831 auto_convertible_q4_layout():
+     destino: kv_layout_known == false  (cache KVarN)
+     FONTE : kv_layout_known == true   (exigido pela funcao)
+   common/common.cpp:4093-4094:
+     mixed_kv = kvarn && kvarn->has_standard_cache();
+     layout_known = p.kv_layout_known || mixed_kv;
+   - destino split: mixed_kv == true  -> kv_layout_known == true, layout tem
+     "mixed_kv": true, mixed_kvarn_type, mixed_kvarn_bits_k/v,
+     mixed_layer_count, remote_layers (common.cpp:4118-4127).
+   - FONTE PURE KVarN: has_standard_cache() == false -> mixed_kv == false e o
+     perfil de KVarN reporta kv_layout_known == false.
+   Logo o predicado de conversao existente EXIGE kv_layout_known == true na
+   fonte, e a fonte PURE reporta false: auto_convertible_q4_layout() retorna
+   false, e auto_index_scan_locked (server-context.cpp:3885-3889) descarta o
+   arquivo com "KV/attention/RoPE layout mismatch". O snapshot PURE e segura e
+   corretamente nao e um miss de fallback, mas nunca chega a ser indexado nem
+   selecionado.
+
+   DISCRIMINADOR DISPONIVEL E DISJUNTO (nao amplia compatibilidade):
+     fonte q4        : kv_layout_known == true               (via de hoje)
+     fonte PURE KVarN: kv_layout_known == false e sem "mixed_kv"  (novo)
+     destino split   : "mixed_kv" == true
+   Os dois casos nao se sobrepoem, entao o predicado novo nao podebroaden
+   compatibilidade indevida: ele so passa a aceitar exatamente a forma PURE->split
+   que o leitor validado (state_read_pure_to_mixed_import) ja sabe importar e
+   cujo gate P ele proprio enforces antes de mutar.
+
+2) O QUE FALTA IMPLEMENTAR (nao feito neste incremento)
+   - auto_convertible_pure_kvarn_layout() + wire em auto_index_scan_locked e no
+     lookup (server-context.cpp:3885 e :3972).
+   - ramo de restore para fonte PURE->split,ooks para nao cair em
+     llama_state_seq_convert_data_rotated (server-task.cpp:2207), que e o
+     conversor q4->KVarN por DADOS e nao se aplica a uma fonte KVarN. O caminho
+     correto carrega o snapshot puro direto, deixando o gate P e o reader
+     validados decidirem.
+   - cenario de harness com processo novo e SO o snapshot no disco, sem
+     endpoint manual de restore e sem contexto PURE residente, registrando
+     selecao/conversao, cache_source, n_saved/cache_n/no-prefill, e as
+     negativas (acima de P, mismatch, invalido) com fallback sem mutacao.
+   Nenhum desses itens foi inventado como feito.
+
+3) EVIDENCIA DE REGRESSAO: ESCOPO REAL DO QUE FOI PROVADO
+   O experimento anterior reverteu 3 arquivos (llama-io.h,
+   llama-kv-cache-kvarn.h, llama-kv-cache-kvarn.cpp) para HEAD e manteve TODO o
+   resto do worktree dirty (incluindo kernels ja modificados no branch).
+   Portanto aquilo prova APENAS: as falhas de test-kvarn,
+   test-kvarn-d64-parallel-static e test-kvarn-mtp-sharing-static PERSISTEM sem
+   as 3 alteracoes deste incremento, com o mesmo sintoma numerico
+   (1572864 value-contract failures, "position-split LSE structural matrix has
+   failing shapes", NaN em O).
+   NAO prova: HEAD limpo, e NAO prova que a causa esteja no kernel. Nao se
+   atribui causa. Nao reverto mais trabalho compartilhado; se houver isolar em
+   worktree/snapshot com diff e hash identificados, e nunca com teste GPU em
+   paralelo.
+   Testes sao numericos e podem ser sensiveis ao estado/ordem da GPU, entao a
+   linha de base do branch precisa ser medida com cuidado antes de atribuir.
+
+4) FONTES RESTAURADAS, BUILD FINAL COERENTE, HASHES
+   git status dos 4 arquivos deste incremento: todos M (presentes).
+   sha256:
+     src/llama-io.h                    0b490edbb098320138863420014b09aa17f74270b76d05e2324a8923b4737ad4
+     src/llama-kv-cache-kvarn.h        172944b294bcf0929f26494f88d231dec015d4fccd97d1b064ccf362dd177220
+     src/llama-kv-cache-kvarn.cpp      862bfef8a1b1842f162b6a0d1a3a10d52013642a1954a1d943e9b69fa325b135
+     tools/test-mixed-kv-transition.py 062fe2df7f3a71932626c75bf7494ee0ea09154d9469275529dcd1527565d8cc
+   binario build-optimized/bin/libllama.so.0  b0f4c2614148880026fa25fc...
+   modelo (somente leitura)               3874209241c9a397e2f62cd3
+   cmake --build -j10 --target llama-server: Up-to-date, nada a recompilar
+   (build coerente com as fontes acima).
+   ctest test-kv-mixed-handoff / test-kv-mixed-state / test-kv-mixed-state-stream
+   / test-kv-mixed-io / test-position-split-real-pair: 100% passed out of 5.
+   Producao: llama-server-root.service active, porta 8090, health HTTP 200,
+   GPU 11741 MiB.
+
+5) D7 — NOME/RELATO CORRIGIDO (ainda so reprodutibilidade)
+   D7-establishes que o MESMO prompt+seed, com erase entre as execucoes e em
+   processo novo, reproduz tokens E completion_probabilities (top-k). E um
+   teste de REPRODUTIBILIDADE, nao uma comparacao do estado recorrente da
+   transicao e nao full logits. Relato antigo que o tratava como comparacao de
+   estado e logits esta errado. O estado recorrente (DeltaNet) e full logits
+   continuam PENDENTES para o proximo incremento; top-k nao e vetor completo
+   para KL.
+
+6) AUXILIARES
+   F5 e F7: intocados neste incremento, sem integracao. Main exclusivo em F4 /
+   GPU / build.
+
+=============================================================================
+INCREMENTO 5 — DISCOVERY REAL PURE->split IMPLEMENTADO E MEDIDO
+=============================================================================
+ESTADO: §3.6 discovery IMPLEMENTADO e medido em processo novo. F4 GERAL
+CONTINUA ABERTO: estado DeltaNet/full logits (D7 eAfonso) e as 3 falhas
+test-kvarn. Nada aqui declara verde o gate geral.
+
+1) HANDOFF AUXILIAR LIDO E VINCULADO
+   docs/occupancy-aux-handoff-20261005.md lido. Registra F5 (preparacao CPU,
+   55 testes) e F7 (runbook/proveniencia, 159 testes) JA IMPLEMENTADOS em
+   snapshots isolados, com patches/archives/hash por arquivo. Vinculado UMA vez
+   no checklist principal (docs/occupancy-placement-plan-20261002.md, §4) para
+   reutilizar no checkpoint F5/F7 apos revisao de compatibilidade. Nenhum patch
+   aplicado, nada reimplementado, snapshot nao copiado. Preparacao continua NAO
+   sendo aceite F5 medido nem prontidao F7.
+
+2) PREDICADO DEDICADO (nao amplia compatibilidade)
+   common/common.cpp: common_prompt_cache_layout_pure_to_split(source,target)
+   common/common.h:   declaracao
+   Aceita SOMENTE: fonte kv_layout_known=false SEM bloco "mixed_kv" (PURE KVarN)
+   contra destino kv_layout_known=true COM "mixed_kv"=true (split).
+   Disjunto do caminho q4 (fonte q4 reporta kv_layout_known=true, entao
+   auto_convertible_q4_layout e este predicado nunca aceitam o mesmo arquivo).
+   Antes de comparar exige igualdade de geometry: cache_layout_version, ctx_type,
+   state_version, session_version, nextn_layer, causal, kv_unified, kv_paged,
+   flash_attn. Normaliza paraAway apenas o bloco remoto do destino
+   (mixed_kv/mixed_kvarn_type/mixed_kvarn_bits_k/v/mixed_layer_count/
+   mixed_remote_layers) e a binding de lifetime (source_context,
+   source_capacity, kv_layout_known) dos dois lados. Tipos, RoPE, GQA,
+   posicoes, integridade e o gate P NAO sao normalizados: ficam no reader.
+   common_prompt_cache_layout_convertible (q4) e a fast-path de logits NAO foram
+   tocados.
+
+3) WIRING (4 pontos, todos eraveis)
+   tools/server/server-context.cpp
+     - auto_convertible_pure_kvarn_layout() (predicado dedicado)
+     - auto_index_scan_locked: indexa o arquivo em vez de descartar
+     - auto_index_lookup: aceita o candidato
+     - auto_restore_into_slot: ramo proprio de import PURE->split, com log
+       "importing PURE KVarN snapshot". NAO usa convert_route_snapshot nem
+       llama_state_seq_convert_data_rotated (conversor q4 de server-task.cpp).
+   tools/server/server-task.cpp
+     - pure_split_mode no gate de layout. Fica DELIBERADAMENTE fora de
+       converted_mode: o payload ja e estado KVarN, restaurado pelo reader normal
+       que despacha para o import transacional (identidade/tipos/RoPE/posicoes/
+       integridade/gate P). Checkpoints de prompt limpos; draft/MTP carry nunca
+       carregados de uma fonte PURE (bootstrap_only). Sem prefill.
+
+4) TESTE REAL: PROCESSO NOVO, SO O SNAPSHOT XXL EM DISCO
+   Legs novas D8a..D8d em tools/test-mixed-kv-transition.py. A fonte PURE
+   publica o snapshot UNIFIED por auto-save (--slot-save-auto, sem endpoint de
+   save), e o processo e encerrado; o destino e um processo NOVO com split, o
+   MESMO --slot-save-path, NENHUM contexto PURE vivo e NENHUM uso de
+   /slots/:id?action=restore (manual_restore_endpoint_used=False em todas).
+   - D8a (n_saved=256 <= P=512): DESCARTADO
+       cache_source=disk, cache_reason=unified_snapshot_restore
+       cache_n=256, prompt_n=0, no_prefill_of_imported_prefix=True
+       log: "auto-restore: importing PURE KVarN snapshot ... (256 tokens) into
+       the split destination" + "auto-restore: reused 256 tokens from disk"
+   - D8b (n_saved=768 > P=512): RECUSADO, destino intacto
+       import log presente (selecao ocorreu) mas restore recusado
+       cache_n=0, prompt_n=768, restore_refused_above_p=True
+   - D8c (layout mismatch por --rope-freq-base): REJEITADO NO INDEX
+       sem import, cache_n=0, prompt_n=256
+   - D8d (payload corrompido nos 2 arquivos publicados): REJEITADO
+       import tentado, integridade recusou, cache_n=0, prompt_n=256
+   Resultado: 13 runs, 13 complete, 0 failed, exit 0.
+   NOTA DE HARNESS (fatos, nao suposicoes): a fast-path de logits salvas exige
+   n_probs==0 no request; com n_probs>0 o servidor CORRETAMENTE limpa o estado
+   restaurado e re-prefilla. D8 usa request sem n_probs. Tambem o /slots e lido
+   depois da task (stats resetadas), entao cache_source/cache_n sao evidenciados
+   pelo log do servidor + timings, nao por /slots.
+
+5) REGRESSAO E BUILD
+   py_compile OK; harness 92 testes OK; ctest kv-mixed(state/state-stream/io/
+   handoff) + position-split-real-pair: 100% passed out of 5;
+   test-position-split-real-pair: 296 checks, 0 failures, 0 not-executed.
+   Build -j10 --target llama-server OK, sem erros.
+   sha256 (16 prefixos):
+     src/llama-io.h                       0b490edbb0983201
+     src/llama-kv-cache-kvarn.h           172944b294bcf092
+     src/llama-kv-cache-kvarn.cpp         862bfef8a1b1842f
+     common/common.cpp                    ff0bde79dfd69a3a
+     common/common.h                      3ea9eb87167b13bd
+     tools/server/server-context.cpp      828049c4f6b05d3d
+     tools/server/server-task.cpp         e6c06e448467ab65
+     tools/test-mixed-kv-transition.py    38ae0a12bfc20e04
+     build-optimized/bin/libllama-server-impl.so  ad498b1eec1537be
+
+6) OPERACIONAL
+   Producao parada ANTES dos testes GPU (VRAM 11843/12282 MiB com produao ativa
+   -> nenhum teste GPU concorrente). reset-failed + start; llama-server-root
+   active, porta 8090, /health 200, /v1/models 200, GPU 11453 MiB apos restore.
+   Sem commit/push/merge/deploy, sem segredo, sem mudanca de permissao.
+   Modelo somente leitura. F5/F7 auxiliares intocados e nao integrados.

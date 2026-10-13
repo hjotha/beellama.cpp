@@ -111,16 +111,18 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 
 - `docs/beellama-features.md` - fork feature and compatibility matrix.
 - `docs/beellama-args.md` - Bee arguments, aliases, and removals.
-- `docs/quickstart-qwen36-dflash.md` - Qwen3.6 DFlash guide.
-- `docs/quickstart-gemma-4-31b-dflash.md` - Gemma 4 DFlash guide.
 - `docs/preset.md` - INI preset format.
 
 ### Invariants
 
-- KVarN is supported for target caches and draft-owned MTP caches on Qwen3.5,
-  Qwen3.6, and Qwen3.8/Qwen4Exp. Shared Gemma 4 MTP continues to use the target
-  cache representation. Other draft and auxiliary contexts use normal cache
-  types.
+- KVarN is supported for target caches and owned draft caches used by
+  draft-simple, EAGLE3, audited Qwen MTP, DFlash1/DFlash2, and non-MLA DSpark.
+  DSV4/MLA DSpark remains unsupported because its latent cache is not dense K/V. Shared
+  Gemma 4 MTP continues to use the target cache representation; n-gram modes
+  have no draft model cache.
+- CUDA DFlash1/DFlash2 non-causal KVarN attention uses direct records only for
+  qualified owned dense-K/V layers and supported shapes. Unsupported shapes,
+  DSpark, and unqualified backends retain materialized attention.
 - CUDA, CPU, Vulkan, and HIP/ROCm consume KVarN records directly in native
   attention paths. Vulkan native attention requires shader Int64 and
   buffer-device-address support. Materialization is an explicit fallback, not

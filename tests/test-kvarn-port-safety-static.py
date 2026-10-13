@@ -9,6 +9,8 @@ DECODE_VEC = (ROOT / "ggml/src/ggml-cuda/fattn-kvarn-vec.cuh").read_text(encodin
 DECODE_COMBINE = (ROOT / "ggml/src/ggml-cuda/fattn-mma-kvarn-decode-combine.cuh").read_text(encoding="utf-8")
 WINDOW_CASE = (ROOT / "ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh").read_text(encoding="utf-8")
 WINDOW_COMMON = (ROOT / "ggml/src/ggml-cuda/fattn-mma-kvarn-window-common.cuh").read_text(encoding="utf-8")
+GGML_HEADER = (ROOT / "ggml/include/ggml.h").read_text(encoding="utf-8")
+LLAMA_GRAPH = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
 GENERATOR = (ROOT / "ggml/src/ggml-cuda/template-instances/generate_cu_files.py").read_text(encoding="utf-8")
 DECODE_COMBINE_INSTANCE = (ROOT / "ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-decode-combine-instance.cu").read_text(encoding="utf-8")
 WINDOW_COMMON_INSTANCE = (ROOT / "ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-window-common-instance.cu").read_text(encoding="utf-8")
@@ -113,6 +115,18 @@ assert "__shared__ float denom_sh[Q_TILE][MAX_GQA + GGML_CUDA_FATTN_KVARN_DECODE
     "decode dedup no longer preserves the verified baseline shared-memory footprint"
 assert "static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 65536;" in WINDOW_CASE, \
     "default KVarN window must retain a single 64K materialization chunk"
+assert "GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 10" in GGML_HEADER, \
+    "KVarN context window lacks a dedicated FlashAttention operation parameter"
+window_chunk = function_body(
+    WINDOW_CASE,
+    "static inline int ggml_cuda_fattn_kvarn_window_chunk(const ggml_tensor * dst, const int n_kv)",
+)
+assert "GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK" in window_chunk and \
+       window_chunk.index("GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK") < window_chunk.index("getenv"), \
+    "CUDA KVarN window selection must prefer the per-context value before the environment fallback"
+assert "cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK]" in LLAMA_GRAPH and \
+       "static_cast<int32_t>(cparams.kvarn.window_chunk)" in LLAMA_GRAPH, \
+    "llama graph construction does not propagate the context KVarN window into FlashAttention"
 for duplicate in (
     "GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK",
     "ggml_cuda_fattn_kvarn_window_enabled",
@@ -189,5 +203,31 @@ assert expected_version == state_version, \
     f"KVarN state test expects v{expected_version}, production writes v{state_version}"
 assert unsupported_version == state_version + 1, \
     "KVarN state test must reject the version immediately after the current format"
+
+# Persistent local-range reads do not necessarily have a KVARN_STORE parent.
+# Publish head geometry from the owning layer before folding physical slices.
+view_body = function_body(CACHE, "ggml_tensor * llama_kv_cache_kvarn::view(")
+assert re.search(r"result->op_params\[5\]\s*=\s*int32_t\(slices\)", view_body), \
+    "persistent NONE-stage KVarN descriptor lost authoritative head slices"
+assert view_body.index("result->op_params[5]") < view_body.index("if (slices > 1)"), \
+    "head slices must be attached to the descriptor before its reshape"
+
+# The dual-range graph prunes the ordinary mask. Exact-tail fill and run
+# descriptor publication must be driven by the live local mask instead.
+set_inputs = function_body(LLAMA_GRAPH, "void llm_graph_input_attn_kv::set_input(")
+local_fill = function_body(set_inputs, "if (self_kq_mask_local && self_kq_mask_local->buffer)")
+assert "metadata->set_input_kq_mask_tail_mapped(" in local_fill, \
+    "dual-range local exact mask is still gated by the pruned ordinary mask"
+assert "metadata->set_input_tail_body_plan(" in local_fill, \
+    "dual-range local tail descriptor is not published from the live local mask"
+assert "self_kq_mask_local, self_kq_mask_tail" in local_fill and "local_read_cells" in local_fill, \
+    "dual-range tail planner is not bound to the local physical-to-read mapping"
+
+STANDARD_CACHE = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+tail_plan = function_body(STANDARD_CACHE, "void llama_kv_cache::set_input_tail_body_plan(")
+assert "llama_position_split::tail_extent_queries(" in tail_plan, \
+    "tail descriptor extent uses actual overflow query count instead of the P-aware graph extent"
+assert "persistent_tail_only" in tail_plan, \
+    "overflow-only multi-query planner lacks persistent-tail candidate restriction"
 
 print("KVarN port safety source invariants: OK")

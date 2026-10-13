@@ -18,9 +18,11 @@ This repository combines [Anbeeld's BeeLlama](https://github.com/Anbeeld/beellam
 
 ## Fork Features
 
-- **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`.
+- **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`. Supports 64-, 128-, 256-, and 512-dimensional K/V heads.
 - **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
+- **KVarN for speculative decoding**: compress supported owned MTP, DFlash, EAGLE3, and non-MLA DSpark caches independently of the target with `--spec-draft-type-k` and `--spec-draft-type-v`.
+- **Independent draft micro-batch sizing**: MTP, DFlash, and other drafters get their own batch size setting, `-ubd`, which defaults to 128. This saves gigabytes of memory (especially with DFlash) with little to no performance loss.
 - **Adaptive draft-max for DFlash**: adjusts the active DFlash draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection and realtime control**: detect repeated hidden reasoning, stop or close it, and let opted-in clients end reasoning through a live control request.
 - **INI model presets and KLD tooling**: configure reusable model profiles and compare logits, perplexity and cache quality at the actual serving batch/ubatch.
@@ -454,9 +456,11 @@ llama-server -m target.gguf --spec-type draft-dflash \
   --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1
 ```
 
-Standard draft cache types remain a portable starting point. The qualified CUDA
-DFlash-family route also accepts draft KVarN, with materialized attention; see
-[Bee cache and generation controls](#bee-cache-and-generation-controls).
+DFlash1, DFlash2, and non-MLA DSpark can use an owned draft KVarN cache with
+`--spec-draft-type-k/v kvarnN`. On capable CUDA devices, supported DFlash1/DFlash2
+non-causal block attention consumes compressed KVarN records directly; unsupported
+shapes and backends materialize the body. Multi-stream SWA draft caches retain
+the materialized route; non-MLA DSpark stays materialized.
 
 ### KVarN Target Cache
 

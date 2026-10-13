@@ -1,0 +1,9 @@
+server P=256 pid=2927586 health=200
+R1-populate ERROR {'code': 500, 'message': 'model name=qwen-3.8-27b failed to load', 'type': 'server_error'}
+R2-hit ERROR {'code': 500, 'message': 'model name=qwen-3.8-27b failed to load', 'type': 'server_error'}
+server P=256 pid=2927962 health=200
+R3-newproc-hit ERROR {'code': 500, 'message': 'model name=qwen-3.8-27b failed to load', 'type': 'server_error'}
+server P=512 pid=2928174 health=200
+R4-diffP ERROR {'code': 500, 'message': 'model name=qwen-3.8-27b failed to load', 'type': 'server_error'}
+server nosplit pid=2928385 health=200
+R5-nosplit ok prompt=1372 completion=16 cache_n=0 lcp=0 planned=0 reprocessed=1372

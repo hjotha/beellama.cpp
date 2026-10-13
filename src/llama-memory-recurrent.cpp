@@ -182,7 +182,12 @@ bool llama_memory_recurrent::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama
     const auto & cell = cells[tail_id];
     if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
         const llama_pos rollback = cell.pos - (p0 - 1);
-        return rollback >= 1 && rollback <= llama_pos(n_rs_seq);
+        const bool ok = rs_idx[seq_id] == 0 && rollback >= 1 && rollback <= llama_pos(n_rs_seq);
+        if (getenv("LLAMA_SEQRM_DBG") && !ok) {
+            fprintf(stderr, "SEQRMDBG recr can_seq_rm rollback-bounded seq=%d p0=%d p1=%d tail_pos=%d rollback=%d n_rs_seq=%u\n",
+                    seq_id, p0, p1, cell.pos, int(rollback), n_rs_seq);
+        }
+        return ok;
     }
     return true;
 }
@@ -929,6 +934,14 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     io.write(&cell_count, sizeof(cell_count));
 
+    if (const char * e = getenv("F4_STATE_SECTIONS"); e != nullptr && *e != '\0') {
+        fprintf(stderr, "[recr] state_write seq=%d cell_count=%u size=%u n_rs_seq=%u "
+                "ranges=%zu ranges_data=%zu data_bytes=%llu\n",
+                (int) seq_id, cell_count, size, n_rs_seq,
+                cell_ranges.size(), cell_ranges_data.size(),
+                (unsigned long long) state_data_bytes(cell_count));
+    }
+
     state_write_meta(io, cell_ranges, seq_id);
     state_write_data(io, cell_ranges_data);
 }
@@ -994,7 +1007,17 @@ if (!res) {
 
     try {
         res = res && state_read_data(io, cell_count, restore_head);
+    } catch (const std::exception & e) {
+        // Do not swallow the cause: the generic "failed to restore kv cache"
+        // below hides WHICH reader/extent diverged on the pure->split route.
+        LLAMA_LOG_ERROR("%s: recurrent state_read_data failed for cell_count=%u "
+                        "at stream offset=%zu: %s\n",
+                        __func__, cell_count, io.n_bytes(), e.what());
+        res = false;
     } catch (...) {
+        LLAMA_LOG_ERROR("%s: recurrent state_read_data failed for cell_count=%u "
+                        "at stream offset=%zu: unknown exception\n",
+                        __func__, cell_count, io.n_bytes());
         res = false;
     }
 
@@ -1444,6 +1467,10 @@ uint32_t llama_memory_recurrent_context::get_n_rs() const {
     return is_full ? mem->size : mem->n;
 }
 
+uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
+    return mem->n_rs_seq;
+}
+
 uint32_t llama_memory_recurrent_context::get_head() const {
     return is_full ? 0 : mem->head;
 }
@@ -1466,6 +1493,22 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+int32_t llama_memory_recurrent_context::s_history(int i, uint32_t age) const {
+    const uint32_t cell_idx = i + mem->head;
+    const auto & cell = mem->cells[cell_idx];
+    uint32_t idx = 0;
+    if (!cell.seq_id.empty()) {
+        const llama_seq_id seq = *cell.seq_id.begin();
+        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+            idx = mem->rs_idx[seq];
+        }
+    }
+    // Older snapshots beyond the physical reserve are not used for rollback.
+    // Keep the read in bounds while the newest snapshots refill after replay.
+    idx = std::min(mem->n_rs_seq, idx + age);
+    return (int32_t)(idx * mem->size) + cell.src0;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

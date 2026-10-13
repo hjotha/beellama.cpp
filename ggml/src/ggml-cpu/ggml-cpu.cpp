@@ -506,8 +506,20 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             if (kvarn_k || kvarn_v) {
                 const int domain = ggml_get_op_params_i32(
                     op, GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN);
+                // Test-only (env-gated, default OFF): the KVarN CPU FA below is
+                // domain-agnostic (it decodes the records exactly as stored and
+                // the graph owns the Q/V rotations and any O un-rotation), so
+                // ROTATED_K_ORIGINAL_V is computable too. Production placement
+                // never selects the CPU for these nodes; the gate only opens
+                // for the msg57 structural-reference arm.
+                static const bool allow_mixed_domain = [] {
+                    const char * e = getenv("GGML_CPU_KVARN_ALLOW_MIXED_DOMAIN");
+                    return e != nullptr && e[0] == '1' && e[1] == '\0';
+                }();
                 const bool rotated = domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED ||
-                    (domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO && src0->ne[1] == 1);
+                    (domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO && src0->ne[1] == 1) ||
+                    (allow_mixed_domain &&
+                     domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V);
                 const bool tail_ok = op->src[5] == nullptr ||
                     (op->src[6] != nullptr && op->src[7] != nullptr &&
                      op->src[8] != nullptr && op->src[9] != nullptr &&

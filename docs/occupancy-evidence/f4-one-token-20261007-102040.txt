@@ -1,0 +1,18 @@
+RUN=/home/hjotha/f4-spool/cmpq4-20261007T102040Z
+RUN_ID=one-token-20261007T101915Z
+BUILD_ID=9f2fafe49ef88549-7f6b98a24ea48342
+fixed checkpoint: prefix=556 + fixed_token=791 -> 557 tokens, output_pos=556
+GPU ready: inactive gpu=0
+reused frozen prefix: auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+reused producer capture: /home/hjotha/f4-spool/cmpq4-20261007T102040Z/cap.producer.n557.json /home/hjotha/f4-spool/cmpq4-20261007T102040Z/cap.producer.n557.logits /home/hjotha/f4-spool/cmpq4-20261007T102040Z/cap.producer.n557.tokens 
+launched target P=1024 slots=/home/hjotha/f4-spool/cmpq4-20261007T102040Z/target-slots pid=3906946
+  B-target prompt_n=None cache_n=556 lcp=0 predicted=1 evaluated_suffix=?
+{"prompt_n": null, "cache_n": 556, "cache_lcp_n": 0, "predicted_n": 1}
+[49479] 0.05.115.745 I srv    load_model: auto disk prompt cache enabled: indexed 2 prefix boundaries from /home/hjotha/f4-spool/cmpq4-20261007T102040Z/target-slots/ (block=256)
+[49479] 0.05.144.402 I slot auto_restore: id  0 | task 0 | auto-restore: importing PURE KVarN snapshot /home/hjotha/f4-spool/cmpq4-20261007T102040Z/target-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin (556 tokens) into the split destination
+[49479] 0.05.505.122 I slot auto_restore: id  0 | task 0 | auto-restore: reused 556 tokens from disk (in-memory match was 0), bytes=198387119 restore_ms=361.391 workspace=52428800, file=/home/hjotha/f4-spool/cmpq4-20261007T102040Z/target-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+[F4CAP target] captured phase=target tokens=557 input_pos=556 output_pos=556 vocab=248320 pos_max=556 seq_hash=d972974f112ecb97 layout_hash=58a99e8d3506cae8 cache=disk/committed
+  gates   : NRMSE(O)=8.046505e-02 max|O|=1.056292e+00 |dLSE|=3.560000e-02 argmax 279/279
+VERDICT: FAIL
+comparator_rc=1
+RUN_DIR=/home/hjotha/f4-spool/cmpq4-20261007T102040Z

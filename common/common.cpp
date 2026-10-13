@@ -2862,6 +2862,10 @@ common_memory_seq_rm_result common_memory_seq_rm_suffix(
         const common_memory_seq_rm_io & io,
         const std::function<llama_pos(llama_pos)> & normalize_p0,
         llama_pos & planned_p0) {
+    if (getenv("LLAMA_SEQRM_DBG")) {
+        LLAMA_LOG_WARN("SEQRMDBG suffix-enter seq=%d req_p0=%d has_draft=%d\n",
+                       seq_id, requested_p0, int(io.has_draft));
+    }
     const auto clear_complete_sequences = [&]() {
         const bool clear_target = io.remove(COMMON_MEMORY_CONTEXT_TARGET, seq_id, -1, -1);
         const bool clear_draft = !io.has_draft ||
@@ -2881,6 +2885,12 @@ common_memory_seq_rm_result common_memory_seq_rm_suffix(
     const bool draft_planned = !io.has_draft || io.plan(
             COMMON_MEMORY_CONTEXT_DRAFT, seq_id, requested_p0, -1, draft_p0, draft_p1);
     if (!target_planned || !draft_planned || target_p1 >= 0 || (io.has_draft && draft_p1 >= 0)) {
+        if (getenv("LLAMA_SEQRM_DBG")) {
+            LLAMA_LOG_WARN("SEQRMDBG plan-fail seq=%d req_p0=%d target_planned=%d target_p0=%d target_p1=%d "
+                           "has_draft=%d draft_planned=%d draft_p0=%d draft_p1=%d\n",
+                           seq_id, requested_p0, int(target_planned), target_p0, target_p1,
+                           int(io.has_draft), int(draft_planned), draft_p0, draft_p1);
+        }
         clear_complete_sequences();
         return COMMON_MEMORY_SEQ_RM_FULL_REPROCESS;
     }
@@ -2892,6 +2902,12 @@ common_memory_seq_rm_result common_memory_seq_rm_suffix(
     const bool draft_accepts = !io.has_draft || io.can_remove(
             COMMON_MEMORY_CONTEXT_DRAFT, seq_id, planned_p0, -1);
     if (!target_accepts || !draft_accepts) {
+        if (getenv("LLAMA_SEQRM_DBG")) {
+            LLAMA_LOG_WARN("SEQRMDBG can-fail seq=%d req_p0=%d planned_p0=%d target_accepts=%d "
+                           "has_draft=%d draft_accepts=%d\n",
+                           seq_id, requested_p0, planned_p0, int(target_accepts),
+                           int(io.has_draft), int(draft_accepts));
+        }
         clear_complete_sequences();
         return COMMON_MEMORY_SEQ_RM_FULL_REPROCESS;
     }
@@ -3507,6 +3523,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // Remote KV+attention accelerator (Xbox RKVA). params.remote_attn_host is
     // kept alive by the caller through llama_init_from_model(), where the
     // backend connects during context construction.
+    cparams.kv_position_split_p = params.kv_position_split_p;
+    if (common_context_is_adaptive(params) &&
+            (!common_remote_attn_is_local_vulkan(params.remote_attn_host) ||
+             (params.remote_attn_min_ctx_size > 0 && params.n_ctx < params.remote_attn_min_ctx_size))) {
+        cparams.kv_position_split_p = 0;
+    }
     cparams.remote_attn_host         = params.remote_attn_host.empty() ? nullptr : params.remote_attn_host.c_str();
     cparams.remote_attn_port         = params.remote_attn_port;
     cparams.remote_attn_prefill      = (params.remote_attn_prefill == "migrate") ? 1 : 0;
@@ -4162,6 +4184,76 @@ void common_prompt_cache_layout_drop_lifetime(common_json & layout) {
     }
 }
 } // namespace
+
+bool common_prompt_cache_layout_pure_to_split(
+        const std::string & source_layout,
+        const std::string & target_layout) {
+    // PURE KVarN -> position-split KVarN.  The source is a pure KVarN memory
+    // (kv_layout_known=false, no "mixed_kv" block) and the destination is a
+    // split KVarN memory (kv_layout_known=true, "mixed_kv"=true).  These two
+    // shapes are disjoint from the q4 -> KVarN data conversion handled by
+    // common_prompt_cache_layout_convertible(): a q4 source reports
+    // kv_layout_known=true, so this predicate never accepts it.  Identity, cache
+    // types, RoPE, GQA, ctx and layer geometry still have to match exactly; only
+    // the "is the remote split present" block and the source lifetime binding
+    // are normalized away.  The P position-split gate itself is enforced later
+    // by the state reader, not here.
+    try {
+        common_json source = common_json::parse(source_layout);
+        common_json target = common_json::parse(target_layout);
+        if (!source.is_object() || !target.is_object()) {
+            return false;
+        }
+        if (!target.contains("mixed_kv") || !target.at("mixed_kv").is_boolean() ||
+                !target.at("mixed_kv").get<bool>() || !common_prompt_cache_layout_known(target)) {
+            return false; // destination must be the split (mixed) KVarN layout
+        }
+        if (!target.contains("mixed_layer_count") || !target.at("mixed_layer_count").is_number_integer() ||
+                source.contains("mixed_kv")) {
+            return false;
+        }
+        if (common_prompt_cache_layout_known(source)) {
+            return false; // a known source is a q4/metadata cache, not PURE KVarN
+        }
+        common_prompt_cache_layout_drop_types(source);
+        common_prompt_cache_layout_drop_types(target);
+        // Both sides must describe the same model geometry before the
+        // remote-layer block is removed, so a mismatched model cannot pass.
+        if (source.at("cache_layout_version") != target.at("cache_layout_version") ||
+                source.at("ctx_type") != target.at("ctx_type") ||
+                source.at("state_version") != target.at("state_version") ||
+                source.at("session_version") != target.at("session_version") ||
+                source.at("nextn_layer") != target.at("nextn_layer") ||
+                source.at("causal") != target.at("causal") ||
+                source.at("kv_unified") != target.at("kv_unified") ||
+                source.at("kv_paged") != target.at("kv_paged") ||
+                source.at("flash_attn") != target.at("flash_attn")) {
+            return false;
+        }
+        for (const char * key : { "mixed_kv", "mixed_kvarn_type", "mixed_kvarn_bits_k",
+                                  "mixed_kvarn_bits_v", "mixed_layer_count", "mixed_remote_layers" }) {
+            target.erase(key);
+        }
+        // Both sides are normalized for the lifetime binding: the source is
+        // unknown-representation (and therefore carries source_context /
+        // source_capacity), while the destination is known. The representation
+        // itself is what the checks above already pinned down.
+        common_prompt_cache_layout_drop_lifetime(source);
+        common_prompt_cache_layout_drop_lifetime(target);
+        return source == target;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+bool common_prompt_cache_layout_split_to_pure(
+        const std::string & source_layout,
+        const std::string & target_layout) {
+    // Reversing the semantic check requires a mixed KVarN source and a pure
+    // KVarN destination. This does not authorize discarding the overflow:
+    // the native transactional reader must prove it empty and n <= min(P,C).
+    return common_prompt_cache_layout_pure_to_split(target_layout, source_layout);
+}
 
 bool common_prompt_cache_layout_convertible(
         const std::string & source_layout,

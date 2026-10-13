@@ -2,6 +2,7 @@
 #include "llama-memory-recurrent.h"
 #include "llama-ext.h"
 #include "ggml-remote-attn.h"
+#include "llama-kv-cache-kvarn.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -343,6 +344,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
+    // Positions are a shared graph input (il = -1 in cb): naming them once
+    // keeps a stable, layer-independent identity for the fixture dump.
+    cb(inp_pos, "inp_pos", -1);
+
     // Qwen3Next uses a single Q projection that outputs query + gate
     auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
             n_embd_head * 2, n_head,
@@ -352,6 +357,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+    // The RoPE below reassigns Kcur/Vcur and re-names those outputs "Kcur"/
+    // "Vcur" too, leaving two distinct tensors with one name. Rename the
+    // projection outputs while they are still in hand so the fixture dump can
+    // tell pre-norm projection from post-RoPE without guessing.
+    cb(Kcur, "Kproj", il);
+    cb(Vcur, "Vproj", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
@@ -426,16 +437,31 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         cb(cur, "attn_remote", il);
     } else {
-        const bool local_split = cparams.local_attn_backend && full_attn_idx < cparams.remote_attn_layers;
+        // F3 position-split: dual-range attention (local CUDA/KVarN +
+        // overflow Vulkan/Q4 + CUDA merge) owns backend placement internally.
+        // Skip the local_split Vulkan pinning below, which would move the
+        // CUDA merge/gate off-device. Gate/wo stay on CUDA after the merge.
+        // Note: in P-mode the KVarN local store is always on CUDA (device
+        // separation in create_memory), so local_split must stay off even
+        // for below-P batches; otherwise Vulkan would run CUDA-resident FA.
+        // use_position_split_attention() decides per batch (dual only for
+        // overflow batches with local history).
+        const bool p_mode = cparams.kv_position_split_p != 0;
+        const bool use_position_split = p_mode && use_position_split_attention(il);
+        const bool local_split = !p_mode && cparams.local_attn_backend && full_attn_idx < cparams.remote_attn_layers;
         if (local_split) {
             ggml_build_forward_expand(gf, Qcur);
             ggml_build_forward_expand(gf, Kcur);
             ggml_build_forward_expand(gf, Vcur);
         }
         const int first_attn_node = ggml_graph_n_nodes(gf);
-        cur = build_attn(inp,
-                    nullptr, nullptr, nullptr,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        if (use_position_split) {
+            cur = build_attn_position_split(inp, Qcur, Kcur, Vcur, kq_scale, il);
+        } else {
+            cur = build_attn(inp,
+                        nullptr, nullptr, nullptr,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        }
         if (local_split) {
             ggml_build_forward_expand(gf, cur);
             auto * dev = ggml_backend_get_device(cparams.local_attn_backend);

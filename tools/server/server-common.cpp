@@ -8,6 +8,16 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "../../src/llama-state-rollback.h"
+
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+
+#if defined(__linux__)
+#    include <sys/vfs.h>
+#    include <sys/statfs.h>
+#endif
 #include "hash/xxhash/xxhash.h"
 
 #include <random>
@@ -137,6 +147,22 @@ json format_error_response(const std::string & message, const enum error_type ty
 // server_slot_stats
 //
 
+bool server_mixed_state_spool_dir(std::string & out) {
+    const char * configured = std::getenv("TMPDIR");
+    std::error_code ec;
+    std::filesystem::path dir = (configured && configured[0])
+            ? std::filesystem::absolute(std::filesystem::path(configured))
+            : std::filesystem::temp_directory_path();
+    // Delegate to the shared transaction preflight so the server and the
+    // tested core agree on what "usable disk-backed spool" means.
+    std::string err;
+    if (!llama_state_rollback::spool_usable(dir.string(), &err)) {
+        return false;
+    }
+    out = dir.string();
+    return true;
+}
+
 json server_slot_stats::to_json() const {
     json base = {
         {"cache_n",                n_prompt_cached},
@@ -145,6 +171,15 @@ json server_slot_stats::to_json() const {
         {"cache_reprocessed_n",    cache_reprocessed_n},
         {"cache_source",           cache_source},
         {"cache_reason",           cache_reason},
+        {"cache_slot_ms",          cache_slot_ms},
+        {"cache_ram_save_ms",      cache_ram_save_ms},
+        {"cache_ram_load_ms",      cache_ram_load_ms},
+        {"cache_ram_restore_prepare_ms", cache_ram_restore_prepare_ms},
+        {"cache_ram_restore_commit_ms",  cache_ram_restore_commit_ms},
+        {"cache_ram_update_ms",    cache_ram_update_ms},
+        {"cache_checkpoint_restore_ms", cache_checkpoint_restore_ms},
+        {"cache_checkpoint_prepare_ms", cache_checkpoint_prepare_ms},
+        {"cache_checkpoint_commit_ms",  cache_checkpoint_commit_ms},
 
         {"prompt_n",               n_prompt_processed},
         {"prompt_ms",              t_prompt_ms()},

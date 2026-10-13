@@ -20,6 +20,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-paged.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-position-split.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -47,6 +48,44 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// F4 v2: stable identities stamped into the position_split snapshot envelope.
+// These are FNV-1a over the fields that decide how KV positions are laid out and
+// interpreted. They are NOT cryptographic: they exist so a snapshot written by
+// a differently shaped model (or with a different RoPE configuration) fails
+// closed at restore instead of being replayed into an incompatible placement.
+static uint64_t llama_mixed_state_hash_mix(uint64_t h, uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        h ^= uint8_t((v >> (8 * i)) & 0xFF);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static uint64_t llama_mixed_state_hash_init() {
+    return 1469598103934665603ull; // FNV-1a 64 offset basis
+}
+
+static uint64_t llama_mixed_state_model_id(llm_arch arch, const llama_hparams & hparams) {
+    uint64_t h = llama_mixed_state_hash_init();
+    h = llama_mixed_state_hash_mix(h, uint64_t(arch));
+    h = llama_mixed_state_hash_mix(h, uint64_t(hparams.n_layer()));
+    h = llama_mixed_state_hash_mix(h, hparams.n_embd_head_k(0));
+    h = llama_mixed_state_hash_mix(h, hparams.n_embd_head_v(0));
+    h = llama_mixed_state_hash_mix(h, hparams.n_head_kv(0));
+    return h;
+}
+
+static uint64_t llama_mixed_state_rope_id(const llama_hparams & hparams) {
+    uint64_t h = llama_mixed_state_hash_init();
+    h = llama_mixed_state_hash_mix(h, uint64_t(llama_rope_type(hparams.rope_type)));
+    // freq_base is a float; hash its bit pattern so it is exact
+    uint32_t bits = 0;
+    std::memcpy(&bits, &hparams.rope_freq_base_train, sizeof(bits));
+    h = llama_mixed_state_hash_mix(h, uint64_t(bits));
+    h = llama_mixed_state_hash_mix(h, uint64_t(hparams.n_ctx_orig_yarn));
+    return h;
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -2810,6 +2849,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     llama_memory_i * res;
     llama_memory_i::layer_device_cb attention_device;
     llama_memory_i::layer_device_cb migration_device;
+    // F2b: o modo por posição é fail-closed fora das precondições do plano
+    // (Fase 2b: P fixo, múltiplo de 256, uma sequência, sem SWA, sem
+    // context shift, sem MTP e com as duas faixas em toda camada full).
+    // Recusar aqui evita um P aceito por um caminho de memória que não
+    // alocaria a faixa overflow em absoluto.
+    if (cparams.kv_position_split_p != 0) {
+        if (hparams.n_swa > 0 && hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+            throw std::invalid_argument("position-split KV não suporta memória SWA/iSWA");
+        }
+        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            throw std::invalid_argument("position-split KV não suporta contexto MTP");
+        }
+        if (cparams.n_seq_max != 1) {
+            throw std::invalid_argument("position-split KV exige uma única sequência");
+        }
+        if (!llama_position_split::is_valid_p(cparams.kv_position_split_p, cparams.n_ctx_seq)) {
+            throw std::invalid_argument(format(
+                    "position-split KV: P=%u inválido para C=%u (múltiplo de 256, 0 < P < C)",
+                    cparams.kv_position_split_p, cparams.n_ctx_seq));
+        }
+    }
     if (cparams.local_attn_backend) {
         const auto dev = ggml_backend_get_device(cparams.local_attn_backend);
         const int n_remote = cparams.remote_attn_layers;
@@ -3274,12 +3334,76 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.local_attn_backend != nullptr &&
                                     cparams.remote_attn_layers > 0 &&
                                     params.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+                            // F3: placement físico por faixa. O KVarN local vive
+                            // na CUDA (camada do modelo); o Q4 de overflow vive
+                            // na Vulkan (backend de atenção local). Por padrão
+                            // ambos usariam attention_device; no modo P o KVarN
+                            // precisa do dispositivo da camada, não do remoto.
+                            llama_memory_i::layer_device_cb position_split_local_device;
+                            if (cparams.kv_position_split_p != 0) {
+                                if (!mixed_remote_selected) {
+                                    throw std::invalid_argument(
+                                            "position-split KV exige cache remoto Q4 (tipos K/V + backend local)");
+                                }
+                                if (params.remote_attn_cache_type_k != GGML_TYPE_Q4_0 ||
+                                        params.remote_attn_cache_type_v != GGML_TYPE_Q4_0) {
+                                    throw std::invalid_argument(
+                                            "position-split KV exige Q4_0 nas duas faixas remotas (plano §3.1)");
+                                }
+                                // O backend de overflow é validado pelos buffers
+                                // reais no ctor do cache (todas as camadas Q4
+                                // devem estar na Vulkan); aqui só garantimos a
+                                // intenção de rotear todas as full layers.
+                                int n_full_attn = 0;
+                                for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                                    if (hparams.has_kv(il) && !hparams.is_recr(il)) {
+                                        ++n_full_attn;
+                                    }
+                                }
+                                if (cparams.remote_attn_layers != n_full_attn) {
+                                    throw std::invalid_argument(format(
+                                            "position-split KV exige todas as %d camadas full no backend "
+                                            "remoto (recebido %d)", n_full_attn,
+                                            cparams.remote_attn_layers));
+                                }
+                                for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                                    if (!hparams.has_kv(il) || hparams.is_recr(il)) {
+                                        continue;
+                                    }
+                                    auto * layer_dev = dev_layer(int32_t(il));
+                                    const char * layer_name = layer_dev ?
+                                        ggml_backend_dev_name(layer_dev) : nullptr;
+                                    if (!layer_dev ||
+                                            ggml_backend_dev_type(layer_dev) !=
+                                            GGML_BACKEND_DEVICE_TYPE_GPU ||
+                                            !layer_name ||
+                                            std::strncmp(layer_name, "CUDA", 4) != 0) {
+                                        throw std::invalid_argument(format(
+                                                "position-split KV exige camada full %u na CUDA "
+                                                "para o KVarN local (está em %s)",
+                                                il, layer_name ? layer_name : "dispositivo desconhecido"));
+                                    }
+                                }
+                                position_split_local_device = [this](int32_t il) {
+                                    return dev_layer(il);
+                                };
+                            }
                             if (mixed_remote_selected) {
                                 const int n_remote = cparams.remote_attn_layers;
-                                filter_remote_standard = [this, n_remote](int32_t il) {
+                                const bool position_split = cparams.kv_position_split_p != 0;
+                                filter_remote_standard = [this, n_remote, position_split](int32_t il) {
                                     if (il < 0 || uint32_t(il) >= hparams.n_layer() ||
                                             !hparams.has_kv(uint32_t(il)) || hparams.is_recr(uint32_t(il))) {
                                         return false;
+                                    }
+                                    // F2b/F3: com position-split, TODAS as camadas full
+                                    // precisam das duas faixas (local KVarN4 + overflow Q4).
+                                    // O filtro remoto deixa de ser um prefixo e passa a
+                                    // cobrir todas as camadas full; o filtro KVarN também
+                                    // as inclui (a validação no ctor do cache exige os
+                                    // mesmos conjuntos nas duas faixas).
+                                    if (position_split) {
+                                        return true;
                                     }
                                     int full_idx = 0;
                                     for (int32_t layer = 0; layer < il; ++layer) {
@@ -3290,7 +3414,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     return full_idx < n_remote;
                                 };
                                 const auto local_filter = filter_attn;
-                                filter_kvarn = [local_filter, filter_remote_standard](int32_t il) {
+                                filter_kvarn = [local_filter, filter_remote_standard, position_split](int32_t il) {
+                                    if (position_split) {
+                                        return !local_filter || local_filter(il);
+                                    }
                                     return (!local_filter || local_filter(il)) && !filter_remote_standard(il);
                                 };
                             }
@@ -3315,11 +3442,24 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter_kvarn, nullptr, params.kv_tail_tokens,
                                         kvarn_tail_type, params.kv_tail_tokens_requested,
-                                        params.kv_tail_rollback_tokens, attention_device, migration_device,
+                                        params.kv_tail_rollback_tokens,
+                                        cparams.kv_position_split_p != 0 && position_split_local_device ?
+                                            position_split_local_device : attention_device,
+                                        migration_device,
                                         filter_remote_standard,
                                         mixed_remote_selected ? params.remote_attn_cache_type_k : GGML_TYPE_COUNT,
                                         mixed_remote_selected ? params.remote_attn_cache_type_v : GGML_TYPE_COUNT,
-                                        !cparams.flash_attn, attention_device);
+                                        !cparams.flash_attn, attention_device,
+                                        cparams.kv_position_split_p);
+                                // F4 v2: stamp the model/RoPE identity that the
+                                // position_split snapshot envelope must match on
+                                // restore. Derived from the loaded model geometry
+                                // and RoPE configuration, so a snapshot written by
+                                // a differently shaped or positioned model is
+                                // refused instead of being replayed.
+                                kvarn_attn->set_mixed_state_identity(
+                                        llama_mixed_state_model_id(arch, hparams),
+                                        llama_mixed_state_rope_id(hparams));
                                 // QSA's index cache mirrors the attention cells cell for cell,
                                 // which the compact read plan's reordered rows cannot represent.
                                 if (needs_mem_idx && filter_idx) {
@@ -3344,7 +3484,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         cparams.n_seq_max, cparams.n_ubatch,
                                         cparams.offload_kqv, cparams.kv_unified, std::move(filter_idx));
                             } else {
-                                res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
+                                res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr),
+                                        cparams.kv_position_split_p);
                             }
                         } else {
                             res = new llama_memory_hybrid(

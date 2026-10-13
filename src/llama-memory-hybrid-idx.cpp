@@ -696,6 +696,10 @@ bool llama_memory_hybrid_idx_context::apply() {
     return res;
 }
 
+void llama_memory_hybrid_idx_context::reset_graph_store_slots() const {
+    ctx_attn->reset_graph_store_slots();
+}
+
 void llama_memory_hybrid_idx_context::graph_compute_start() {
     llama_memory_hybrid_context::graph_compute_start();
     if (ctx_idx) {

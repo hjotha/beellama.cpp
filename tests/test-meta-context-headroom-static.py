@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import re
 from pathlib import Path
+import re
 
 src = (Path(__file__).resolve().parents[1] / "ggml/src/ggml-backend-meta.cpp").read_text(encoding="utf-8")
 match = re.search(r"constexpr size_t compute_headroom = (\d+);", src)

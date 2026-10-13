@@ -1,0 +1,354 @@
+{
+  "schema": "occupancy-factor-isolation-v1",
+  "observed_utc": "2026-10-13T05:05:17.153939+00:00",
+  "branch": "feat/occupancy-position-split",
+  "status": "Diagnósticos suportados concluídos; plano completo ainda bloqueado pelo gate de qualidade.",
+  "cached_105k": {
+    "raw_q4": {
+      "mean_nll": 0.8886231328270755,
+      "mean_kl_f16": 0.027099020768655623,
+      "max_abs_vs_original": 0.0,
+      "ppl_ratio_vs_baseline": 1.035136830322768
+    },
+    "dequant_f16": {
+      "mean_nll": 0.8886231328270755,
+      "mean_kl_f16": 0.027099020768655623,
+      "max_abs_vs_original": 0.0,
+      "ppl_ratio_vs_baseline": 1.035136830322768
+    },
+    "original": {
+      "mean_nll": 0.8886231328270755,
+      "mean_kl_f16": 0.027099020768655623,
+      "max_abs_vs_original": 0.0,
+      "ppl_ratio_vs_baseline": 1.035136830322768
+    },
+    "baseline": {
+      "mean_nll": 0.8540895116374135,
+      "mean_kl_f16": 0.08295461179805633,
+      "max_abs_vs_original": 11.692075729370117,
+      "ppl_ratio_vs_baseline": 1.0
+    },
+    "f16_reference": {
+      "mean_nll": 0.7139507949449498,
+      "mean_kl_f16": 0.0,
+      "max_abs_vs_original": 13.140355825424194,
+      "ppl_ratio_vs_baseline": 0.8692376492636735
+    }
+  },
+  "short_independent_prefills": {
+    "q4-cuda": {
+      "mean_nll": 1.017802524599576,
+      "mean_kl_from_q4_cuda": 0.0,
+      "max_abs_vs_q4_cuda": 0.0,
+      "ppl_ratio_vs_q4_cuda": 1.0
+    },
+    "q4-remote-5-v2": {
+      "mean_nll": 1.028421885673425,
+      "mean_kl_from_q4_cuda": 0.002088965536996475,
+      "max_abs_vs_q4_cuda": 1.341203510761261,
+      "ppl_ratio_vs_q4_cuda": 1.0106759466120303
+    },
+    "q4-remote-full": {
+      "mean_nll": 1.0393524026673993,
+      "mean_kl_from_q4_cuda": 0.0031499385716074273,
+      "max_abs_vs_q4_cuda": 1.8200788497924805,
+      "ppl_ratio_vs_q4_cuda": 1.0217837536657612
+    },
+    "kvarn4-cuda": {
+      "mean_nll": 1.2441274507514772,
+      "mean_kl_from_q4_cuda": 0.3162572233848244,
+      "max_abs_vs_q4_cuda": 8.708640098571777,
+      "ppl_ratio_vs_q4_cuda": 1.2539830509767722
+    }
+  },
+  "short_shared_prefix": {
+    "q4-cuda": {
+      "mean_nll": 1.017802524599576,
+      "mean_kl_from_q4_cuda": 0.0,
+      "max_abs_vs_q4_cuda": 0.0,
+      "ppl_ratio_vs_q4_cuda": 1.0
+    },
+    "q4-remote-5-v2": {
+      "mean_nll": 1.015739259120882,
+      "mean_kl_from_q4_cuda": 0.00033534285831574744,
+      "max_abs_vs_q4_cuda": 1.5478405952453613,
+      "ppl_ratio_vs_q4_cuda": 0.9979388615903695
+    },
+    "q4-remote-full": {
+      "mean_nll": 1.0176806968566408,
+      "mean_kl_from_q4_cuda": 0.0004921474287789708,
+      "max_abs_vs_q4_cuda": 1.1783599853515625,
+      "ppl_ratio_vs_q4_cuda": 0.9998781796777628
+    }
+  },
+  "findings": [
+    "Em 105k, Q4 nativo e F16 dequantizado da mesma representação Q4 produziram logits idênticos em 32 posições. O snapshot de 104967 tokens foi reutilizado, sem replay.",
+    "No controle de 4k, Q4 foi mantido fixo para variar placement entre CUDA, cinco camadas Radeon e todas as camadas Radeon. A troca de formato foi medida separadamente, mantendo CUDA.",
+    "Com prefixos independentes, os ratios contra Q4 CUDA foram 1.0106759466120303 e 1.0217837536657612. Com o mesmo prefixo Q4/GDN, caíram para 0.9979388615903695 e 0.9998781796777628. Isso sustenta efeito acumulado do prefill, mas não distingue sozinho store de atenção.",
+    "A comparação de formato em CUDA teve ratio 1.2539830509767722. É diagnóstico de 4k, não resultado transferível a 105k ou alteração da baseline."
+  ],
+  "limits": [
+    "Os braços após o primeiro token seguem trajetórias próprias; estes pares não são o protocolo fixed-current-KV de aceitação.",
+    "A execução F16 dequantizada mantém a perda de informação já existente nos bytes Q4. Não é uma referência de KV F16 original.",
+    "Não foi demonstrado defeito de implementação, nem causa única da falha longa."
+  ],
+  "specific_blocker": {
+    "needed": "Para isolar essas variáveis em 105k sem mudar a baseline de aceitação, é necessário um prefixo nativo de 104967 tokens com representação uniforme, identidade completa e estado GDN correspondente.",
+    "available": "Há snapshots split P102400 e P105216, mais os novos snapshots curtos. A baseline longa guardou logits e tokens, mas nenhum estado nativo.",
+    "why_not_restore": "O leitor rejeita split em contexto P=0 e P/C incompatíveis. Não há conversor autorizado para fabricar a referência de cinco ou 16 camadas a partir desses snapshots.",
+    "constraint": "A instrução atual proíbe repetir prefill longo. É necessária autorização para construir uma vez o prefixo longo de controle, ou fornecer um snapshot compatível.",
+    "service_cache_inventory": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/baseline-cache-inventory.json",
+    "service_cache_limit": "Os 32 nomes indicam no máximo 6852 tokens; conteúdo sem permissão de leitura no usuário atual. Nenhuma elevação de privilégio foi usada."
+  },
+  "preparation": {
+    "F5_harness": "55 testes CPU aprovados pelo auxiliar.",
+    "F7_suites": "Suites de inventário e regressão aprovadas; regressão registrou 66 testes.",
+    "AB": "Sintaxe do wrapper e hashes dos cinco requests aprovados. Protocolo mantém 10 warmups e 50 medições alternadas, incluindo P + 256 = 102656. Nenhuma medição A/B foi executada.",
+    "F7_observations": [
+      "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/f7-current-elf-observation.json",
+      "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/f7-rollback-elf-observation.json",
+      "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/f7-current-config-hashes.json"
+    ],
+    "F7_limits": "ELF DT_NEEDED e hashes são preparação; não provam dependências carregadas dinamicamente, startup, rollback real ou canário. O inventário histórico não foi sobrescrito.",
+    "pending": "Binding final de A/B, qualidade longa, referência F16 130560, performance real, rollback operacional e canário após gates aprovados."
+  },
+  "artifacts": [
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/baseline-cache-inventory.json",
+      "sha256": "addff6da086a77abd7e2796607ed3a74e1765d7970256b5c66a25608e773f9c7"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/comparison.json",
+      "sha256": "8dc90126c28d9aef3b3df752e2d79fd105594de246c08177be96e06bc2ac9b4d"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/dequant-f16-command.json",
+      "sha256": "f108d1f1e16268e33974894b2343e7e9012462cc211803f2fbddde96fd918770"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/f7-current-config-hashes.json",
+      "sha256": "3186a5e13a999142f5bfdf64cb0b252f0389beb7270e58161c7eec42abd3da42"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/f7-current-elf-observation.json",
+      "sha256": "dfc08d696f4525f0b1813d31c116745c9d002b9bd5ad5fa7b35547e13fc8f5da"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/f7-rollback-elf-observation.json",
+      "sha256": "17e276d7e7e8d7f964056c1b5550b32c9cfd74b75d4c5b753222341249be8640"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/preflight.json",
+      "sha256": "1255a825d541af1eb745730cc94dbd41accd1bb6aeafc3c4aa5e3f11bea7f69b"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-cached-q4-vs-f16/raw-q4-command.json",
+      "sha256": "b587c0e0f789579e35ccfcfa9c37739822e40871b0196b045a0b5bbc178a897b"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/comparison.json",
+      "sha256": "860fa9d0a8eca4802bc189037a7fbd92e33a81b1eca867c21ca8fa5e1670283f"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/kvarn4-cuda-command.json",
+      "sha256": "b6fad2e402ac2b12f1b2d39e8b16981f4211ea2e2ef07cb959ed8a3d5013ec8e"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/q4-cuda-command.json",
+      "sha256": "cdf7f05da460e4b720f168349f1653a48132541ced5e6f50c8ae860645471003"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/q4-remote-5-command.json",
+      "sha256": "818e08054eeb4881ce1ff982f934779049fe0f1e52384c5a42876e1072db7808"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/q4-remote-5-v2-command.json",
+      "sha256": "3687ed2735b10c2e7b92fe85fdb76b8c55663f4d186cfb3b116c7ad0251ae0e4"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/q4-remote-full-command.json",
+      "sha256": "61520d5790811457acf17f483ea187ac2281b34e6b2498c3efe533595b0718d6"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-shared-prefix/comparison.json",
+      "sha256": "92781530060289fdb49ccccf8aeef2bbf0f4d6df4d189a8c160ba7ece9fd73af"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-shared-prefix/preflight.json",
+      "sha256": "3db847a1708303304132763c9d8e8763faa08793e09275b1465b9b10725f784e"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-shared-prefix/q4-cuda-command.json",
+      "sha256": "58d66b01d9bc429f64e5daccb5abf5495f8ee5c49a2789052fcbed6903ec338b"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-shared-prefix/q4-remote-5-v2-command.json",
+      "sha256": "d43cf9daedf732459677e6f3801b82f502f39b46295755538f214470ea6da4c3"
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-shared-prefix/q4-remote-full-command.json",
+      "sha256": "72ef0614829de5c7c98c716209e5511815acd3be0fd32bed294667766e552e73"
+    }
+  ],
+  "new_short_caches": [
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/q4-cuda/prefix-cache.bin",
+      "bytes": 230125588,
+      "sha256": "742b9b3ce279369797512803c3bd032f23a775b8679dfa7e9a4b3c14ab871ce7",
+      "configuration": {
+        "config_core": "model_sha256=e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838;n_ctx=4096;n_batch=512;n_ubatch=256;n_seq=1;n_params=27320697856;p=0;kv_k=0;kv_v=0;overflow_k=144;overflow_v=144;cache_type_k=2:q4_0;cache_type_v=2:q4_0;remote_layers=auto",
+        "model": "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+        "cache_type_k_numeric": 2,
+        "cache_type_k_name": "q4_0",
+        "cache_type_v_numeric": 2,
+        "cache_type_v_name": "q4_0",
+        "reference_arm": "gpu_quality_only",
+        "pure_cuda_baseline": true,
+        "quality_only": true,
+        "reference_option_ignored_in_quality_only": "cpu",
+        "layered_baseline": false,
+        "arm_classification": "quality_only_gpu_trajectory",
+        "model_sha256_operator_verified": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+        "build_bundle_sha256_operator_verified": "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+        "compiled_commit": "d9db0b881",
+        "compiled_build": "b12366-d9db0b881-dirty",
+        "n_rs_seq": 0,
+        "teacher_file": {
+          "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+          "bytes": 708895,
+          "xxh64": "a2ea4b52457f1ea3"
+        },
+        "token_format": "json",
+        "starts": [
+          3968
+        ],
+        "count": 32,
+        "checkpoint_method": "none_quality_trajectory",
+        "state_spool_directory": null,
+        "full_prefix_verification": false,
+        "fixed_current_kv": false
+      },
+      "prefix_tokens": 3967
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/q4-remote-5-v2/prefix-cache.bin",
+      "bytes": 230125588,
+      "sha256": "5108a9dd33dab14e9ab034662303811822a109c4c8061322685d072156b930e4",
+      "configuration": {
+        "config_core": "model_sha256=e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838;n_ctx=4096;n_batch=512;n_ubatch=256;n_seq=1;n_params=27320697856;p=0;kv_k=0;kv_v=0;overflow_k=144;overflow_v=144;cache_type_k=2:q4_0;cache_type_v=2:q4_0;remote_layers=5",
+        "model": "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+        "cache_type_k_numeric": 2,
+        "cache_type_k_name": "q4_0",
+        "cache_type_v_numeric": 2,
+        "cache_type_v_name": "q4_0",
+        "reference_arm": "gpu_quality_only",
+        "pure_cuda_baseline": false,
+        "quality_only": true,
+        "reference_option_ignored_in_quality_only": "cpu",
+        "layered_baseline": true,
+        "arm_classification": "quality_only_gpu_trajectory",
+        "model_sha256_operator_verified": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+        "build_bundle_sha256_operator_verified": "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+        "compiled_commit": "d9db0b881",
+        "compiled_build": "b12366-d9db0b881-dirty",
+        "n_rs_seq": 0,
+        "teacher_file": {
+          "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+          "bytes": 708895,
+          "xxh64": "a2ea4b52457f1ea3"
+        },
+        "token_format": "json",
+        "starts": [
+          3968
+        ],
+        "count": 32,
+        "checkpoint_method": "none_quality_trajectory",
+        "state_spool_directory": null,
+        "full_prefix_verification": false,
+        "fixed_current_kv": false
+      },
+      "prefix_tokens": 3967
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/q4-remote-full/prefix-cache.bin",
+      "bytes": 230125588,
+      "sha256": "625bbf775d592e4f938eef5ca4cd681b26c180944727c0d87468e96ec223763c",
+      "configuration": {
+        "config_core": "model_sha256=e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838;n_ctx=4096;n_batch=512;n_ubatch=256;n_seq=1;n_params=27320697856;p=0;kv_k=0;kv_v=0;overflow_k=144;overflow_v=144;cache_type_k=2:q4_0;cache_type_v=2:q4_0;remote_layers=full",
+        "model": "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+        "cache_type_k_numeric": 2,
+        "cache_type_k_name": "q4_0",
+        "cache_type_v_numeric": 2,
+        "cache_type_v_name": "q4_0",
+        "reference_arm": "gpu_quality_only",
+        "pure_cuda_baseline": false,
+        "quality_only": true,
+        "reference_option_ignored_in_quality_only": "cpu",
+        "layered_baseline": true,
+        "arm_classification": "quality_only_gpu_trajectory",
+        "model_sha256_operator_verified": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+        "build_bundle_sha256_operator_verified": "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+        "compiled_commit": "d9db0b881",
+        "compiled_build": "b12366-d9db0b881-dirty",
+        "n_rs_seq": 0,
+        "teacher_file": {
+          "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+          "bytes": 708895,
+          "xxh64": "a2ea4b52457f1ea3"
+        },
+        "token_format": "json",
+        "starts": [
+          3968
+        ],
+        "count": 32,
+        "checkpoint_method": "none_quality_trajectory",
+        "state_spool_directory": null,
+        "full_prefix_verification": false,
+        "fixed_current_kv": false
+      },
+      "prefix_tokens": 3967
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/diagnosis-20261013-short-placement/kvarn4-cuda/prefix-cache.bin",
+      "bytes": 262921389,
+      "sha256": "8c0466324f9ebd32a706f5d3f64e3a228bfc8e88117fe66607a964ee60f1fca2",
+      "configuration": {
+        "config_core": "model_sha256=e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838;n_ctx=4096;n_batch=512;n_ubatch=256;n_seq=1;n_params=27320697856;p=0;kv_k=4;kv_v=4;overflow_k=144;overflow_v=144;cache_type_k=2:q4_0;cache_type_v=2:q4_0;remote_layers=auto",
+        "model": "/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+        "cache_type_k_numeric": 2,
+        "cache_type_k_name": "q4_0",
+        "cache_type_v_numeric": 2,
+        "cache_type_v_name": "q4_0",
+        "reference_arm": "gpu_quality_only",
+        "pure_cuda_baseline": true,
+        "quality_only": true,
+        "reference_option_ignored_in_quality_only": "cpu",
+        "layered_baseline": false,
+        "arm_classification": "quality_only_gpu_trajectory",
+        "model_sha256_operator_verified": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+        "build_bundle_sha256_operator_verified": "d3857ab2f6351ebba3181d6e5f9164552694a61b1940537c01fd679919ff00d0",
+        "compiled_commit": "d9db0b881",
+        "compiled_build": "b12366-d9db0b881-dirty",
+        "n_rs_seq": 0,
+        "teacher_file": {
+          "path": "/home/hjotha/f4-spool/f5-campaign/final-20261012/capacity-input-130561.json",
+          "bytes": 708895,
+          "xxh64": "a2ea4b52457f1ea3"
+        },
+        "token_format": "json",
+        "starts": [
+          3968
+        ],
+        "count": 32,
+        "checkpoint_method": "none_quality_trajectory",
+        "state_spool_directory": null,
+        "full_prefix_verification": false,
+        "fixed_current_kv": false
+      },
+      "prefix_tokens": 3967
+    }
+  ],
+  "active_test_processes": [],
+  "new_kernel_error_matches": [],
+  "source_changes": "Somente novo relatório de evidência nesta branch. Nenhuma alteração de implementação, produção, gates, baseline ou tarefa Xbox."
+}

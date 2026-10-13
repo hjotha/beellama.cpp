@@ -1,4 +1,6 @@
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-kvarn-materializer.h"
+#include "llama-kv-qx-convert.h"
 
 #include "ggml-backend.h"
 #include "llama-context.h"
@@ -66,6 +68,13 @@ constexpr uint64_t MIXED_KV_STATE_MAX_FRAME_BYTES = 4ull << 40;
 // add up to 37 MiB (2^20 events x 37 bytes), plus layer/header bookkeeping.
 constexpr uint64_t MIXED_KV_STATE_MAX_MANIFEST_BYTES = 102ull << 20;
 constexpr uint64_t MIXED_KV_STATE_FRAME_MARGIN_BYTES = 128ull << 20;
+
+// F4 import forensics: section map of the most recent mixed-state save, filled
+// only when F4_STATE_SECTIONS is present in the environment. The reader-side
+// walk (stream_describe) is independent; agreeing maps prove the write order
+// matches the schema the reader recovers from the bytes.
+std::vector<llama_kv_mixed::stream_section> g_state_write_sections;
+const bool g_capture_state_sections = getenv("F4_STATE_SECTIONS") != nullptr;
 
 std::string create_conversion_temp_path(const std::string & destination);
 
@@ -162,16 +171,81 @@ uint64_t next_mixed_state_owner_id() {
     }
 }
 
+// F2b: cada ubatch dividido em P contém exatamente uma faixa. Classificar o
+// ubatch corrente pelas posições absolutas (primeira posição por token para
+// M-RoPE); um ubatch misto indica que a divisão antes do prepare foi burlada
+// e deve falhar em vez de gravar na faixa errada.
+static llama_position_split::range_kind position_split_current_ubatch_range(
+        const llama_ubatch & ubatch, uint32_t p, uint32_t c) {
+    if (ubatch.n_pos < 1 || ubatch.n_tokens == 0 || ubatch.pos == nullptr) {
+        throw std::runtime_error("position-split KV precisa de um ubatch com posições absolutas");
+    }
+    bool local = false;
+    bool overflow = false;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const auto range = llama_position_split::range_for_pos(
+                ubatch.pos[i], p, c);
+        if (range.kind == llama_position_split::range_kind::INVALID) {
+            throw std::runtime_error("position-split KV encontrou posição fora de [0,C)");
+        }
+        if (range.kind == llama_position_split::range_kind::LOCAL) {
+            local = true;
+        } else {
+            overflow = true;
+        }
+    }
+    if (local == overflow) {
+        throw std::runtime_error("position-split KV encontrou ubatch cruzando P; a divisão antes do prepare falhou");
+    }
+    return local ? llama_position_split::range_kind::LOCAL :
+        llama_position_split::range_kind::OVERFLOW;
+}
+
+// F2b: uma leitura/gravação local só é completa se nenhum histórico de
+// overflow sobreviveu sem rollback. Sem isso, o anel KVarN local retornaria
+// apenas o prefixo abaixo de P.
+static void require_position_split_local_history(
+        const llama_kv_cache_kvarn * cache,
+        const char * operation) {
+    if (cache->get_metadata_cache()->seq_pos_max(0) >= llama_pos(cache->position_split_p())) {
+        throw std::runtime_error(
+                std::string(operation) +
+                ": histórico de overflow sem rollback antes de acesso local");
+    }
+}
+
+static uint32_t split_overflow_payload_rows(
+        const std::vector<llama_kv_mixed::cell_entry> & cells, uint32_t p) {
+    uint32_t rows = 0;
+    if (p != 0) {
+        for (size_t i = p; i < cells.size(); ++i) {
+            if (cells[i].pos >= 0) { ++rows; }
+        }
+    }
+    return rows;
+}
+
 std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
         const llama_kv_cache_kvarn & cache,
-        const std::unordered_map<uint32_t, uint64_t> & payload_sizes,
+        const std::unordered_map<uint64_t, uint64_t> & payload_sizes,
         bool partial,
         uint32_t payload_cells,
-        uint64_t payload_rows) {
+        uint64_t payload_rows,
+        uint32_t compact_overflow_rows) {
     using namespace llama_kv_mixed;
     std::vector<layer_desc> result;
-    const auto payload_size = [&](uint32_t layer_id) {
-        const auto it = payload_sizes.find(layer_id);
+    // F4 v2: payload sizes are keyed by the packed (layer_id, range_id) pair.
+    // In P-mode every full layer owns BOTH bodies -- local KVarN [0,P) and Qx
+    // overflow [P,C) -- so the two descriptors must be told apart by range_id and
+    // the frame must be v2. Outside P-mode the KVarN and Qx layer sets are
+    // DISJOINT (a layer is either remote or local, never both), so a single
+    // range 0 suffices and the frame stays v1-compatible.
+    const uint32_t local_range = llama_position_split::kRangeLocal;
+    const uint32_t overflow_range = cache.position_split_enabled()
+            ? llama_position_split::kRangeOverflow
+            : llama_position_split::kRangeLocal;
+    const auto payload_size = [&](uint32_t layer_id, uint32_t range_id) {
+        const auto it = payload_sizes.find(mixed_range_key(layer_id, range_id));
         return it == payload_sizes.end() ? uint64_t(0) : it->second;
     };
 
@@ -204,7 +278,12 @@ std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
         desc.payload_mode = partial ? mode_partial_overlay : mode_full;
         desc.payload_cells = payload_cells;
         desc.payload_rows = payload_rows;
-        desc.payload_bytes = payload_size(layer.layer_id);
+        desc.range_id = local_range;
+        if (cache.position_split_enabled()) {
+            desc.range_start = 0;
+            desc.range_end = cache.position_split_p();
+        }
+        desc.payload_bytes = payload_size(layer.layer_id, local_range);
         if (partial && desc.payload_bytes == 0) {
             desc.payload_mode = mode_resident_reference;
         }
@@ -221,7 +300,9 @@ std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
         desc.v_rot = layer.rotation_v == 0 ? uint8_t(rotation::none) : uint8_t(rotation::hadamard);
         desc.k_rot_width = layer.rotation_k;
         desc.v_rot_width = layer.rotation_v;
-        desc.layout = layout_standard_qx_rows;
+        const bool compact_payload = cache.position_split_enabled() &&
+            cache.get_standard_cache()->get_payload_row_origin() != 0;
+        desc.layout = compact_payload ? layout_standard_qx_compact_rows : layout_standard_qx_rows;
         desc.owner = owner_target;
         desc.v_trans = layer.v_transposed ? 1 : 0;
         desc.token_group = uint32_t(std::max<int64_t>(1, ggml_blck_size(layer.type_k)));
@@ -232,22 +313,34 @@ std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
         desc.k_stride = layer.row_stride_k;
         desc.v_stride = layer.row_stride_v;
         desc.payload_mode = partial ? mode_resident_reference : mode_full;
-        desc.payload_cells = payload_cells;
-        desc.payload_rows = payload_rows;
-        desc.payload_bytes = partial ? 0 : payload_size(layer.layer_id);
-        if (partial && payload_size(layer.layer_id) != 0) {
+        desc.payload_cells = compact_payload ? compact_overflow_rows : payload_cells;
+        desc.payload_rows = compact_payload ? compact_overflow_rows : payload_rows;
+        desc.range_id = overflow_range;
+        if (cache.position_split_enabled()) {
+            desc.range_start = cache.position_split_p();
+            desc.range_end = uint32_t(cache.get_metadata_cache()->get_size());
+        }
+        desc.payload_bytes = partial ? 0 : payload_size(layer.layer_id, overflow_range);
+        if (partial && payload_size(layer.layer_id, overflow_range) != 0) {
             throw kv_mixed_error(format(
                     "mixed partial Qx layer %u unexpectedly has serialized payload bytes", layer.layer_id));
         }
         result.push_back(desc);
     }
 
+    // F4 v2: descriptors are ordered by the PAIR (layer_id, range_id), and
+    // uniqueness is on the pair too. Ordering by layer_id alone is what made v1
+    // reject two ranges of one layer with "duplicate layer ownership".
     std::sort(result.begin(), result.end(), [](const layer_desc & a, const layer_desc & b) {
-        return a.layer_id < b.layer_id;
+        if (a.layer_id != b.layer_id) {
+            return a.layer_id < b.layer_id;
+        }
+        return a.range_id < b.range_id;
     });
     for (size_t i = 1; i < result.size(); ++i) {
-        if (result[i - 1].layer_id == result[i].layer_id) {
-            throw kv_mixed_error("mixed state has duplicate layer ownership");
+        if (result[i - 1].layer_id == result[i].layer_id &&
+                result[i - 1].range_id == result[i].range_id) {
+            throw kv_mixed_error("mixed state has duplicate layer/range ownership");
         }
     }
     return result;
@@ -446,6 +539,21 @@ constexpr uint32_t KVAR_N_STATE_RECORDS_SELECTIVE = 2;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL_REMAP_STAGE = 3;
 
 } // namespace
+
+bool llama_kv_cache_kvarn_context::current_position_split_range(
+        llama_position_split::range_kind & range) const {
+    range = llama_position_split::range_kind::INVALID;
+    if (!cache->position_split_enabled()) {
+        return false;
+    }
+    const llama_kv_cache_context * base_ptr = base();
+    if (base_ptr == nullptr || !base_ptr->has_valid_current_ubatch()) {
+        return false;
+    }
+    range = position_split_current_ubatch_range(
+            base_ptr->get_ubatch(), cache->position_split_p(), cache->get_kv_size());
+    return range != llama_position_split::range_kind::INVALID;
+}
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
     if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -1011,6 +1119,10 @@ void llama_kv_cache_kvarn_context::graph_compute_finish(ggml_status compute_stat
     base()->graph_compute_finish(compute_status);
 }
 
+void llama_kv_cache_kvarn_context::capture_after_compute(ggml_backend_sched_t sched, ggml_status status) {
+    if (cache) { cache->capture_after_compute(sched, status); }
+}
+
 void llama_kv_cache_kvarn_context::graph_compute_complete(
         ggml_backend_sched_t sched, ggml_status compute_status) {
     if (compute_status == GGML_STATUS_SUCCESS && !shared_graph_layers.empty()) {
@@ -1141,19 +1253,520 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k(ggml_context * ctx, int32_t il
     return get_k_for_attention(ctx, il, uses_native_attention(il));
 }
 
+// F4: identidade real da fonte lida pelo consumidor de atencao. `consumer_ok`
+// sozinho nao prova que a fonte correta foi escolhida; metadata global de
+// celulas nao prova que cada record remoto esta vivo. Habilitado por
+// F4_TRACE_SOURCE=1. Somente leitura/observacao.
+
+// F4: capture the exact leaf the attention consumer receives, per (layer, head),
+// at the position it was actually read. `consumer_ok` does not prove the right
+// source was chosen; this does. Enabled with F4_TRACE_CAPTURE=1 and the layer
+// list in F4_CAPTURE_LAYERS (comma separated, "all" for every layer).
+static std::map<std::tuple<int32_t, bool, uint32_t>, std::vector<llama_kv_cache_kvarn::capture_sample>> g_f4_caps;
+
+static bool f4_capture_layer_enabled(int32_t il) {
+    static const int mode = [] {
+        const char * e = getenv("F4_TRACE_CAPTURE");
+        return e && *e ? 1 : 0;
+    }();
+    if (!mode) { return false; }
+    static const std::string list = [] {
+        const char * e = getenv("F4_CAPTURE_LAYERS");
+        return e && *e ? std::string(e) : std::string();
+    }();
+    if (list.empty() || list == "all") { return true; }
+    const std::string want = std::to_string(il);
+    size_t a = 0;
+    while (a <= list.size()) {
+        const size_t b = list.find(',', a);
+        const std::string tok = list.substr(a, b == std::string::npos ? std::string::npos : b - a);
+        if (tok == want) { return true; }
+        if (b == std::string::npos) { break; }
+        a = b + 1;
+    }
+    return false;
+}
+
+static std::unordered_map<uint32_t, llama_kv_cache_kvarn::eval_mark> g_f4_eval_marks;
+static std::unordered_map<uint32_t, size_t> g_f4_eval_fa_hits;
+static uint32_t g_f4_eval_seq = 0;
+// Scheduler compute generation: incremented once per finished scheduler
+// compute (see capture_after_compute). Every executed sample is stamped with
+// the generation running when it was captured. clear_captures records the
+// generation, and captured() rejects anything older: a prefill sample can
+// never satisfy a post-decode select, even across graph reuse.
+static uint64_t g_f4_gen = 0;
+static uint64_t g_f4_clear_gen = 0;
+
+bool llama_kv_cache_kvarn::eval_capture_armed() {
+    const char * e = getenv("F4_TRACE_CAPTURE");
+    return e && *e;
+}
+
+static bool f4_parse_mark_seq(const char * name, uint32_t & seq) {
+    if (!name || std::strncmp(name, "f4kv_", 5) != 0) { return false; }
+    unsigned v = 0;
+    if (std::sscanf(name + 5, "%u", &v) != 1 || v == 0) { return false; }
+    seq = (uint32_t) v;
+    return true;
+}
+
+uint32_t llama_kv_cache_kvarn::eval_note_candidate(int32_t il, bool value, uint32_t range_id,
+        const char * route, const char * range, int32_t shared_il, int32_t mapped,
+        llama_pos pos, ggml_tensor * t) {
+    if (!eval_capture_armed() || !f4_capture_layer_enabled(il) || !t || !route || !range) { return 0; }
+    if (t->ne[1] <= 0) { return 0; }
+    eval_mark m;
+    m.seq = ++g_f4_eval_seq;
+    if (m.seq == 0) { m.seq = ++g_f4_eval_seq; }
+    m.il = il;
+    m.value = value;
+    m.range_id = range_id;
+    m.route = route;
+    m.range = range;
+    m.orig_name = ggml_get_name(t);
+    m.shared_il = shared_il;
+    m.mapped = mapped;
+    m.pos = pos;
+    const ggml_tensor * vbase = nullptr;
+    if (t->op == GGML_OP_RESHAPE && t->src[0] && t->src[0]->op == GGML_OP_KVARN_VIEW) {
+        vbase = t->src[0];
+    } else if (t->op == GGML_OP_KVARN_VIEW) {
+        vbase = t;
+    }
+    if (vbase) {
+        if (vbase->src[0]) {
+            m.records_name = ggml_get_name(vbase->src[0]);
+            m.records_type = (int) vbase->src[0]->type;
+        }
+        if (vbase->src[1]) {
+            m.stored_name = ggml_get_name(vbase->src[1]);
+            m.stored_type = (int) vbase->src[1]->type;
+            m.stored_ptr  = vbase->src[1];
+            m.stored_nbytes = vbase->src[1] ? ggml_nbytes(vbase->src[1]) : 0;
+        }
+        m.stored_from = "kvarn_view_src";
+    } else {
+        const ggml_tensor * s = t;
+        while (s && !s->buffer && s->view_src) { s = s->view_src; }
+        if (s) {
+            m.stored_name = ggml_get_name(s);
+            m.stored_type = (int) s->type;
+            m.stored_ptr  = s;
+            m.stored_nbytes = ggml_nbytes(s);
+        }
+        m.stored_from = t->view_src ? "view_src" : "self";
+    }
+    m.head_dim = t->ne[0];
+    m.n_head   = t->ne[1];
+    g_f4_eval_marks[m.seq] = m;
+    ggml_format_name(t, "f4kv_%u", m.seq);
+    return m.seq;
+}
+
+bool llama_kv_cache_kvarn::eval_wants_node(struct ggml_tensor * t) {
+    if (!eval_capture_armed() || !t) { return false; }
+    uint32_t seq = 0;
+    if (f4_parse_mark_seq(t->name, seq)) {
+        return g_f4_eval_marks.find(seq) != g_f4_eval_marks.end();
+    }
+    if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const auto * s = t->src[i];
+            if (s && f4_parse_mark_seq(s->name, seq) &&
+                    g_f4_eval_marks.find(seq) != g_f4_eval_marks.end()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool llama_kv_cache_kvarn::eval_capture_node(struct ggml_tensor * t) {
+    if (!eval_capture_armed() || !t) { return false; }
+    uint32_t seq = 0;
+    if (f4_parse_mark_seq(t->name, seq)) {
+        const auto mit = g_f4_eval_marks.find(seq);
+        if (mit == g_f4_eval_marks.end()) { return false; }
+        // Pure permutes/transposes of a marked tensor carry the mark name but
+        // swap the head/slot axes: slicing them by (head, slot) would
+        // misattribute heads. The RESHAPE/VIEW node underneath holds the same
+        // data with canonical strides, so only it is sampled. FA linkage is
+        // still proven by F4FA hits on the permuted names.
+        if (t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) { return true; }
+        const eval_mark & m = mit->second;
+        // The marked K/V tensor is usually a view-like node (RESHAPE/PERMUTE)
+        // whose data only exists inside its store. Read the full per-head dump
+        // from the persistent/graph store recorded at mark time, AFTER this
+        // node executed: same head strides the probe uses, every slot. The
+        // node's own execution (this callback firing) plus the FA hit below is
+        // what ties the dump to the executed consumer. Stable-slot assumption:
+        // the graph's own stores write only the current ubatch positions, so a
+        // history slot read here is what attention read; any violation shows up
+        // as a non-localized diff and fails the gate.
+        const ggml_tensor * st = m.stored_ptr;
+        if (!st || !st->buffer || !st->data) {
+            fprintf(stderr, "F4EVAL seq=%u il=%d kv=%s nostore op=%d\n",
+                    seq, (int) m.il, m.value ? "V" : "K", (int) t->op);
+            return true;
+        }
+        // Slice the store per (head, slot) with the CONSUMER's head width
+        // (marked ne[0]) over the STORE's own slot geometry (ne[2] slots,
+        // nb[2] slot stride). The marked view may declare more slots than the
+        // store holds (padded n_kv); the store bounds are authoritative and
+        // identical across same-shape graphs, so dumps stay comparable.
+        if (m.head_dim <= 0 || st->ne[2] <= 0 || st->nb[2] <= 0) {
+            fprintf(stderr, "F4EVAL seq=%u il=%d kv=%s badstrides\n",
+                    seq, (int) m.il, m.value ? "V" : "K");
+            return true;
+        }
+        const size_t total = ggml_nbytes(st);
+        char be[128] = "?";
+        {
+            auto * bt = ggml_backend_buffer_get_type(st->buffer);
+            auto * dev = bt ? ggml_backend_buft_get_device(bt) : nullptr;
+            std::snprintf(be, sizeof(be), "%s", dev ? ggml_backend_dev_name(dev) : (bt ? ggml_backend_buft_name(bt) : "?"));
+        }
+        const uint32_t n_head = (uint32_t) std::min<int64_t>(m.n_head, 2);
+        const int64_t n_slot = st->ne[2];
+        const size_t row = ggml_row_size(st->type, m.head_dim);
+        const size_t slot_stride = (size_t) st->nb[2];
+        const size_t base_off = 0;
+        for (uint32_t h = 0; h < n_head; ++h) {
+            capture_sample cs;
+            cs.valid  = true;
+            cs.value  = m.value;
+            cs.layer  = m.il;
+            cs.head   = h;
+            cs.pos    = m.pos;
+            cs.route  = m.route;
+            cs.range  = m.range;
+            cs.name   = m.orig_name;
+            cs.type   = (int) st->type;
+            cs.offset = (size_t) h * row;
+            cs.nbytes = row * (size_t) n_slot;
+            cs.shared_il = m.shared_il;
+            cs.mapped    = m.mapped;
+            cs.stored_name  = m.stored_name;
+            cs.stored_from  = m.stored_from;
+            cs.stored_type  = m.stored_type;
+            cs.records_name = m.records_name;
+            cs.records_type = m.records_type;
+            cs.backend = be;
+            cs.mark_seq = seq;
+            cs.gen = g_f4_gen;
+            cs.src = m.stored_from;
+            cs.raw.assign(cs.nbytes, 0);
+            for (int64_t s = 0; s < n_slot; ++s) {
+                const size_t off = base_off + (size_t) h * row + (size_t) s * slot_stride;
+                if (row == 0 || off + row > total) {
+                    fprintf(stderr, "F4EVAL seq=%u il=%d kv=%s head=%u slot=%lld outofrange off=%zu\n",
+                            seq, (int) m.il, m.value ? "V" : "K", h, (long long) s, off);
+                    cs.valid = false;
+                    break;
+                }
+                ggml_backend_tensor_get(st, cs.raw.data() + (size_t) s * row, off, row);
+            }
+            if (!cs.valid) { continue; }
+            if (st->type == GGML_TYPE_F16) {
+                const size_t n = cs.nbytes / sizeof(ggml_fp16_t);
+                cs.vec.resize(n);
+                // F16 rows may be strided per slot; dequantize row by row.
+                for (int64_t s = 0; s < n_slot; ++s) {
+                    const size_t rn = row / sizeof(ggml_fp16_t);
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) (cs.raw.data() + (size_t) s * row),
+                            cs.vec.data() + (size_t) s * rn, (int) rn);
+                }
+            } else if (st->type == GGML_TYPE_F32 && (row % sizeof(float)) == 0) {
+                cs.vec.resize(cs.nbytes / sizeof(float));
+                std::memcpy(cs.vec.data(), cs.raw.data(), cs.vec.size() * sizeof(float));
+            }
+            auto & slot = g_f4_caps[std::make_tuple(m.il, m.value, h)];
+            bool replaced = false;
+            for (auto & prev : slot) {
+                if (prev.route == cs.route && prev.range == cs.range && prev.name == cs.name &&
+                    prev.type == cs.type && prev.nbytes == cs.nbytes &&
+                    prev.shared_il == cs.shared_il && prev.mapped == cs.mapped) {
+                    prev = cs;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) { slot.push_back(std::move(cs)); }
+            const auto hit = g_f4_eval_fa_hits.find(seq);
+            static std::set<std::pair<uint32_t, uint32_t>> g_f4_eval_printed;
+            if (g_f4_eval_printed.insert({seq, h}).second) {
+                fprintf(stderr, "F4EVAL seq=%u il=%d kv=%s head=%u route=%s range=%s shared=%d mapped=%d stype=%d nbytes=%zu backend=%s fa=%zu store=[%s] gen=%llu\n",
+                        seq, (int) m.il, m.value ? "V" : "K", h, m.route.c_str(), m.range.c_str(),
+                        (int) m.shared_il, (int) m.mapped, (int) st->type, cs.nbytes, be,
+                        hit == g_f4_eval_fa_hits.end() ? 0 : hit->second, m.stored_name.c_str(),
+                        (unsigned long long) cs.gen);
+            }
+        }
+        return true;
+    }
+    if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+        bool hit = false;
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const auto * s = t->src[i];
+            if (s && f4_parse_mark_seq(s->name, seq) &&
+                    g_f4_eval_marks.find(seq) != g_f4_eval_marks.end()) {
+                g_f4_eval_fa_hits[seq]++;
+                hit = true;
+                const auto & m = g_f4_eval_marks[seq];
+                fprintf(stderr, "F4FA seq=%u il=%d kv=%s src=%d fa_op=%d total_hits=%zu\n",
+                        seq, (int) m.il, m.value ? "V" : "K", i, (int) t->op,
+                        g_f4_eval_fa_hits[seq]);
+            }
+        }
+        return hit;
+    }
+    return false;
+}
+
+size_t llama_kv_cache_kvarn::eval_mark_count() {
+    return g_f4_eval_marks.size();
+}
+
+size_t llama_kv_cache_kvarn::eval_hit_count() {
+    size_t n = 0;
+    for (const auto & e : g_f4_eval_fa_hits) { n += e.second; }
+    return n;
+}
+
+void llama_kv_cache_kvarn::capture_from_leaf(const char * fn, int32_t il, bool value,
+        const char * route, llama_position_split::range_kind range, bool have_range,
+        uint32_t range_id, ggml_tensor * t, int32_t shared_il, int32_t mapped, llama_pos pos) {
+    if (!f4_capture_layer_enabled(il) || !t) { return; }
+    // Cells are ne[2]; heads are ne[1]; head_dim is ne[0].
+    if (t->ne[1] <= 0) { return; }
+    const char * range_name =
+        have_range ? (range == llama_position_split::range_kind::LOCAL ? "LOCAL" : "ABOVE") : "none";
+    const uint32_t seq = eval_note_candidate(il, value, range_id, route, range_name,
+            shared_il, mapped, pos, t);
+    // Build-time identity/source evidence only. Equality samples come solely
+    // from the scheduler eval callback on executed nodes, never from reading
+    // an uncomputed graph tensor here.
+    const ggml_tensor * bt_src = t;
+    while (bt_src && !bt_src->buffer && bt_src->view_src) { bt_src = bt_src->view_src; }
+    char btname[192] = "?";
+    if (bt_src && bt_src->buffer) {
+        std::snprintf(btname, sizeof(btname), "%s",
+                ggml_backend_buft_name(ggml_backend_buffer_get_type(bt_src->buffer)));
+    }
+    fprintf(stderr, "F4CAP %s il=%d kv=%s route=%s range=%s shared=%d mapped=%d name=%s type=%d seq=%u buft=%s ne=[%lld,%lld,%lld,%lld]\n",
+            fn, (int) il, value ? "V" : "K", route, range_name,
+            (int) shared_il, (int) mapped, ggml_get_name(t), (int) t->type, seq, btname,
+            (long long) t->ne[0], (long long) t->ne[1],
+            (long long) t->ne[2], (long long) t->ne[3]);
+}
+
+std::vector<llama_kv_cache_kvarn::pending_capture> llama_kv_cache_kvarn::pending_;
+
+void llama_kv_cache_kvarn::capture_after_compute(ggml_backend_sched_t sched, ggml_status status) {
+    ++g_f4_gen;
+    if (pending_.empty()) { return; }
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "F4CAP post-compute status=%d pending=%zu\n", (int) status, pending_.size());
+    }
+    for (auto it = pending_.begin(); it != pending_.end(); ) {
+        const ggml_tensor * t = it->tensor;
+        ggml_backend_t be = nullptr;
+        if (!be && sched) {
+            const int nb = ggml_backend_sched_get_n_backends(sched);
+            for (int i = 0; i < nb; ++i) {
+                ggml_backend_t cand = ggml_backend_sched_get_backend(sched, i);
+                if (!cand) { continue; }
+                if (t->buffer && ggml_backend_supports_buft(cand, ggml_backend_buffer_get_type(t->buffer))) { be = cand; break; }
+            }
+        }
+        if (!be || !t->buffer) { ++it; continue; }  // keep pending; never invent data
+        const uint32_t n_head = std::min<uint32_t>((uint32_t) t->ne[1], 2u);
+        for (uint32_t h = 0; h < n_head; ++h) {
+            capture_sample cs;
+            cs.valid  = true;
+            cs.value  = it->value;
+            cs.layer  = it->il;
+            cs.head   = h;
+            cs.pos    = 0;
+            cs.route  = "kvarn_native";
+            cs.range  = it->have_range ? (it->range == llama_position_split::range_kind::LOCAL ? "LOCAL" : "ABOVE") : "none";
+            cs.name   = ggml_get_name(t);
+            cs.type   = (int) t->type;
+            cs.offset = (uint64_t) h * t->nb[1];
+            cs.nbytes = t->nb[1] > 0 ? (uint64_t) t->nb[1] : 0;
+            if (cs.nbytes == 0) { continue; }
+            cs.raw.assign((size_t) cs.nbytes, 0);
+            ggml_backend_tensor_get(t, cs.raw.data(), cs.offset, cs.nbytes);
+            if (t->type == GGML_TYPE_F16) {
+                cs.vec.resize((size_t) t->ne[0]);
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) cs.raw.data(), cs.vec.data(), (int) t->ne[0]);
+            }
+            auto & slot = g_f4_caps[std::make_tuple(it->il, it->value, h)];
+            bool replaced = false;
+            for (auto & prev : slot) {
+                if (prev.route == cs.route && prev.range == cs.range && prev.type == cs.type &&
+                    prev.nbytes == cs.nbytes) { prev = cs; replaced = true; break; }
+            }
+            if (!replaced) { slot.push_back(std::move(cs)); }
+            fprintf(stderr, "F4CAP post il=%d kv=%s head=%u route=kvarn_native range=%s type=%d nbytes=%llu\n",
+                    (int) it->il, it->value ? "V" : "K", h, cs.range.c_str(), cs.type,
+                    (unsigned long long) cs.nbytes);
+        }
+        it = pending_.erase(it);
+    }
+}
+
+std::vector<llama_kv_cache_kvarn::capture_sample> & llama_kv_cache_kvarn::capture_slot(
+        int32_t layer, bool value, uint32_t head) {
+    return g_f4_caps[std::make_tuple(layer, value, head)];
+}
+
+size_t llama_kv_cache_kvarn::capture_count(int32_t layer, bool value, uint32_t head) const {
+    const auto it = g_f4_caps.find(std::make_tuple(layer, value, head));
+    return it == g_f4_caps.end() ? 0 : it->second.size();
+}
+
+void llama_kv_cache_kvarn::clear_captures() const {
+    g_f4_caps.clear();
+    pending_.clear();
+    g_f4_clear_gen = g_f4_gen;
+}
+
+bool llama_kv_cache_kvarn::captured(int32_t layer, bool value, uint32_t head,
+        llama_pos pos, size_t index, capture_sample & out) const {
+    const auto it = g_f4_caps.find(std::make_tuple(layer, value, head));
+    if (it == g_f4_caps.end() || index >= it->second.size()) { return false; }
+    out = it->second[index];
+    if (!out.valid) { return false; }
+    if (out.gen < g_f4_clear_gen) { return false; } // stale: predates the last clear
+    if (pos >= 0 && out.pos != pos) { return false; }
+    const auto hit = g_f4_eval_fa_hits.find(out.mark_seq);
+    out.fa_hits = hit == g_f4_eval_fa_hits.end() ? 0 : hit->second;
+    return true;
+}
+
+static void f4_trace_attention_source(const char * fn, int32_t il, bool value,
+        const char * route, llama_position_split::range_kind range, bool have_range,
+        const ggml_tensor * t) {
+    static const bool on = getenv("F4_TRACE_SOURCE") != nullptr;
+    if (!on) { return; }
+    if (!t) {
+        fprintf(stderr, "F4SRC %s il=%d kv=%s route=%s range=%s TENSOR=null\n",
+                fn, (int) il, value ? "V" : "K", route,
+                have_range ? (range == llama_position_split::range_kind::LOCAL ? "LOCAL" : "ABOVE") : "none");
+        return;
+    }
+    // A permuted view has no buffer of its own: report the buft of the view
+    // source, otherwise the "type/layout" evidence is missing.
+    const ggml_tensor * bt_src = t;
+    while (bt_src && !bt_src->buffer && bt_src->view_src) { bt_src = bt_src->view_src; }
+    char btname[192] = "?";
+    if (bt_src && bt_src->buffer) {
+        snprintf(btname, sizeof(btname), "%s", ggml_backend_buft_name(ggml_backend_buffer_get_type(bt_src->buffer)));
+    }
+    char nes[128];
+    snprintf(nes, sizeof(nes), "[%lld,%lld,%lld,%lld]",
+            (long long) t->ne[0], (long long) t->ne[1],
+            (long long) t->ne[2], (long long) t->ne[3]);
+    // Raw-byte occupancy of the ACTUAL leaf the consumer reads. These are byte
+    // statistics, NOT dequantized values: they prove the region was written,
+    // and they are never used to conclude anything about semantic content.
+    double bmin = 0.0, bmax = 0.0, bnorm = 0.0;
+    int64_t bcount = 0;
+    if (bt_src && bt_src->buffer && ggml_nbytes(t) > 0) {
+        std::vector<uint8_t> hb(ggml_nbytes(t));
+        ggml_backend_tensor_get(bt_src, hb.data(), t->view_offs, ggml_nbytes(t));
+        {
+            bmin = bmax = hb[0];
+            for (size_t i = 0; i < hb.size(); ++i) {
+                bmin = hb[i] < bmin ? hb[i] : bmax;
+                bmax = hb[i] > bmax ? hb[i] : bmax;
+                bnorm += (double) hb[i] * (double) hb[i];
+            }
+            bcount = (int64_t) hb.size();
+        }
+    }
+    fprintf(stderr, "F4SRC %s il=%d kv=%s route=%s range=%s name=%s type=%d buft=%s off=%zu ne=%s nb1=%zu nb0=%zu nelem=%lld min=%.6g max=%.6g norm=%.6g\n",
+            fn, (int) il, value ? "V" : "K", route,
+            have_range ? (range == llama_position_split::range_kind::LOCAL ? "LOCAL" : "ABOVE") : "none",
+            ggml_get_name(t), (int) t->type, btname,
+            (size_t) t->view_offs, nes,
+            (size_t) t->nb[1], (size_t) t->nb[0], (long long) ggml_nelements(t), 0.0, 0.0, 0.0);
+    if (bcount) {
+        fprintf(stderr, "F4BYTES %s il=%d kv=%s name=%s nbytes=%lld raw_min=%.0f raw_max=%.0f raw_norm=%.0f\n",
+                fn, (int) il, value ? "V" : "K", ggml_get_name(t), (long long) bcount, bmin, bmax, bnorm);
+    }
+}
+
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_attention(
         ggml_context * ctx, int32_t il, bool native_attention) const {
-    if (uses_standard_layer(il)) {
-        return cache->standard_get_k(ctx, il, get_n_kv(), current_sinfo());
+    bool use_standard_route = uses_standard_layer(il) && !cache->position_split_enabled();
+    llama_position_split::range_kind range = llama_position_split::range_kind::LOCAL;
+    const bool have_range = current_position_split_range(range);
+    if (cache->position_split_enabled()) {
+        // F2b/F3: leitura por faixa. Abaixo de P (ubatch local), usa o anel
+        // KVarN local. Acima de P (ubatch overflow), a leitura única só vale
+        // se não houver histórico local (todo o histórico é overflow); com
+        // histórico local, a atenção exige as duas faixas e o merge (F3).
+        // Sem ubatch válido (reserva de grafo), usa a rota legada por camada.
+        if (have_range) {
+            if (range == llama_position_split::range_kind::LOCAL) {
+                require_position_split_local_history(cache, "position-split KV read");
+                use_standard_route = false;
+            } else {
+                std::vector<uint32_t> local_cells;
+                const bool has_local = cache->position_split_live_cells(
+                    llama_position_split::range_kind::LOCAL, local_cells) &&
+                    !local_cells.empty();
+                if (has_local) {
+                    throw std::runtime_error("position-split KV: leitura acima de P exige as duas faixas e o merge (F3)");
+                }
+                use_standard_route = true;
+            }
+        } else {
+            // No usable ubatch (graph reserve / sizing): the documented
+            // fallback is legacy per-layer routing. tail_on_layer() is gated on
+            // the same absence of a valid ubatch, so this path carries no tail
+            // and no native-tail validator runs against it.
+            use_standard_route = uses_standard_layer(il);
+        }
+    }
+    if (use_standard_route) {
+        const int32_t shared_il = graph_layer_for(il);
+        const int32_t mapped = cache->uses_kvarn_layer(shared_il) ? cache->mapped_layer_id(shared_il) : -1;
+        const auto * standard = cache->get_standard_cache();
+        if (have_range && standard->get_payload_row_origin() != 0) {
+            throw std::runtime_error("compact overflow attention requires mapped range inputs, not a global single-range mask");
+        }
+        // init_full() has logical n_kv=C and no current ubatch. Its sizing
+        // graph must reserve a physical C-P view; it is never executed.
+        const uint32_t n_read = !have_range && standard->get_payload_row_origin() != 0
+                ? standard->get_payload_size() : get_n_kv();
+        ggml_tensor * sk = cache->standard_get_k(ctx, il, n_read, current_sinfo());
+        f4_trace_attention_source("get_k", il, false, "standard_local", range, have_range, sk);
+        const uint32_t range_id = have_range ? current_position_split_range_id() : UINT32_MAX;
+        llama_kv_cache_kvarn::capture_from_leaf("get_k", il, false, "standard_local", range, have_range,
+                range_id, sk, shared_il, mapped, /*pos=*/0);
+        return sk;
     }
     const int32_t shared_il = graph_layer_for(il);
-    const auto it = stored_k.find(cache->mapped_layer_id(shared_il));
+    const auto it = stored_k.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+            current_position_split_range_id()));
     ggml_tensor * stored = it != stored_k.end() ? it->second :
             cache->get_materialization_source(shared_il, false);
     GGML_ASSERT(stored != nullptr);
-    return native_attention ? get_k_native(ctx, il) :
+    const int32_t mapped = cache->uses_kvarn_layer(shared_il) ? cache->mapped_layer_id(shared_il) : -1;
+    ggml_tensor * kr = native_attention ? get_k_native(ctx, il) :
         cache->materialize(ctx, stored, shared_il, get_n_kv(), current_sinfo(), false,
                 mat_idxs, uses_compact_read_indices());
+    f4_trace_attention_source("get_k", il, false,
+            native_attention ? "kvarn_native" : "kvarn_materialized", range, have_range, kr);
+    const uint32_t range_id = have_range ? current_position_split_range_id() : UINT32_MAX;
+    llama_kv_cache_kvarn::capture_from_leaf("get_k", il, false,
+            native_attention ? "kvarn_native" : "kvarn_materialized", range, have_range,
+            range_id, kr, shared_il, mapped, /*pos=*/0);
+    return kr;
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il) const {
@@ -1162,21 +1775,118 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
         ggml_context * ctx, int32_t il, bool native_attention) const {
-    if (uses_standard_layer(il)) {
-        return cache->standard_get_v(ctx, il, get_n_kv(), current_sinfo());
+    bool use_standard_route = uses_standard_layer(il) && !cache->position_split_enabled();
+    llama_position_split::range_kind range = llama_position_split::range_kind::LOCAL;
+    const bool have_range = current_position_split_range(range);
+    if (cache->position_split_enabled()) {
+        // F2b/F3: leitura por faixa (ver get_k_for_attention).
+        if (have_range) {
+            if (range == llama_position_split::range_kind::LOCAL) {
+                require_position_split_local_history(cache, "position-split KV read");
+                use_standard_route = false;
+            } else {
+                std::vector<uint32_t> local_cells;
+                const bool has_local = cache->position_split_live_cells(
+                    llama_position_split::range_kind::LOCAL, local_cells) &&
+                    !local_cells.empty();
+                if (has_local) {
+                    throw std::runtime_error("position-split KV: leitura acima de P exige as duas faixas e o merge (F3)");
+                }
+                use_standard_route = true;
+            }
+        } else {
+            // No usable ubatch (graph reserve / sizing): the documented
+            // fallback is legacy per-layer routing. tail_on_layer() is gated on
+            // the same absence of a valid ubatch, so this path carries no tail
+            // and no native-tail validator runs against it.
+            use_standard_route = uses_standard_layer(il);
+        }
+    }
+    if (use_standard_route) {
+        const int32_t shared_il = graph_layer_for(il);
+        const int32_t mapped = cache->uses_kvarn_layer(shared_il) ? cache->mapped_layer_id(shared_il) : -1;
+        const auto * standard = cache->get_standard_cache();
+        if (have_range && standard->get_payload_row_origin() != 0) {
+            throw std::runtime_error("compact overflow attention requires mapped range inputs, not a global single-range mask");
+        }
+        const uint32_t n_read = !have_range && standard->get_payload_row_origin() != 0
+                ? standard->get_payload_size() : get_n_kv();
+        ggml_tensor * sv = cache->standard_get_v(ctx, il, n_read, current_sinfo());
+        f4_trace_attention_source("get_v", il, true, "standard_local", range, have_range, sv);
+        const uint32_t range_id = have_range ? current_position_split_range_id() : UINT32_MAX;
+        llama_kv_cache_kvarn::capture_from_leaf("get_v", il, true, "standard_local", range, have_range,
+                range_id, sv, shared_il, mapped, /*pos=*/0);
+        return sv;
     }
     const int32_t shared_il = graph_layer_for(il);
-    const auto it = stored_v.find(cache->mapped_layer_id(shared_il));
+    const auto it = stored_v.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+            current_position_split_range_id()));
     ggml_tensor * stored = it != stored_v.end() ? it->second :
             cache->get_materialization_source(shared_il, true);
     GGML_ASSERT(stored != nullptr);
-    return native_attention ? get_v_native(ctx, il) :
+    const int32_t mapped = cache->uses_kvarn_layer(shared_il) ? cache->mapped_layer_id(shared_il) : -1;
+    ggml_tensor * vr = native_attention ? get_v_native(ctx, il) :
         cache->materialize(ctx, stored, shared_il, get_n_kv(), current_sinfo(), true,
                 mat_idxs, uses_compact_read_indices());
+    f4_trace_attention_source("get_v", il, true,
+            native_attention ? "kvarn_native" : "kvarn_materialized", range, have_range, vr);
+    const uint32_t range_id = have_range ? current_position_split_range_id() : UINT32_MAX;
+    llama_kv_cache_kvarn::capture_from_leaf("get_v", il, true,
+            native_attention ? "kvarn_native" : "kvarn_materialized", range, have_range,
+            range_id, vr, shared_il, mapped, /*pos=*/0);
+    return vr;
+}
+
+// Which range owns the exact tail for `il`?
+//
+// Occupancy plan 3.1 keeps the KVarN tail/stage on the LOCAL range and leaves
+// the Q4 overflow without a tail. Under position-split both the KVarN cache and
+// the Q4 companion own the same layer id, one per range, so testing for the
+// companion (`uses_standard_layer`) silently suppressed the LOCAL tail too --
+// the opposite of the approved behaviour -- and `get_tail_tokens()` returned 0
+// outright whenever P-mode was on. Both shortcuts are replaced by this single
+// predicate so the tail, the compact indices, the store and the body-execution
+// rows can never disagree about which layer has one.
+bool llama_kv_cache_kvarn_context::local_tail_available() const {
+    if (!cache->position_split_enabled()) {
+        return true;
+    }
+    llama_position_split::range_kind range = llama_position_split::range_kind::INVALID;
+    if (!current_position_split_range(range)) {
+        // Graph reserve/sizing: no valid ubatch, documented legacy fallback.
+        return false;
+    }
+    if (range == llama_position_split::range_kind::LOCAL) {
+        return true;
+    }
+    // Overflow range. The local tail is only readable when there IS a local
+    // history: that is precisely the dual-range builder (plan 3.3/3.4), where
+    // fa1 must produce a body+tail local O/LSE. An overflow-only ubatch has no
+    // local keys at all, so it stays tail-free (plan 3.1).
+    std::vector<uint32_t> local_cells;
+    return cache->position_split_live_cells(llama_position_split::range_kind::LOCAL,
+            local_cells) && !local_cells.empty();
+}
+
+bool llama_kv_cache_kvarn_context::tail_on_layer(int32_t il) const {
+    if (!cache->position_split_enabled()) {
+        return !uses_standard_layer(il);
+    }
+    if (!shared_graph_layers.empty()) {
+        return false;
+    }
+    if (!cache->uses_kvarn_layer(graph_layer_for(il))) {
+        return false;
+    }
+    // Occupancy plan 3.1: the tail lives on the LOCAL range and the Q4 overflow
+    // has none, so it follows the local owner of the layer plus availability of
+    // a local history -- never the presence of the Q4 companion, and never a
+    // blanket P-mode kill switch.
+    return local_tail_available();
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_tail(ggml_context * ctx, int32_t il) const {
-    if (uses_standard_layer(il)) {
+    if (!tail_on_layer(il)) {
         GGML_UNUSED(ctx);
         return nullptr;
     }
@@ -1184,7 +1894,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k_tail(ggml_context * ctx, int32
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_tail(ggml_context * ctx, int32_t il) const {
-    if (uses_standard_layer(il)) {
+    if (!tail_on_layer(il)) {
         GGML_UNUSED(ctx);
         return nullptr;
     }
@@ -1200,10 +1910,22 @@ ggml_type llama_kv_cache_kvarn_context::get_tail_type() const {
 }
 
 uint32_t llama_kv_cache_kvarn_context::get_tail_tokens() const {
+    // Occupancy plan 3.1/3.6 require the local exact tail to survive P-mode
+    // (the PURE import at n<=P must validate and preserve it), so the former
+    // "return 0 in P-mode" shortcut is gone. It is now gated on the same range
+    // test as tail_on_layer() so the tail graph inputs built from this value
+    // can never disagree with the route: no valid ubatch (graph reserve) or an
+    // overflow-only ubatch means no tail inputs, exactly as before.
+    if (cache->position_split_enabled() && !local_tail_available()) {
+        return 0;
+    }
     return base()->get_tail_tokens();
 }
 
 uint32_t llama_kv_cache_kvarn_context::get_tail_tokens(int32_t il) const {
+    if (!tail_on_layer(il)) {
+        return 0;
+    }
     return cache->uses_kvarn_layer(graph_layer_for(il)) ? base()->get_tail_tokens() : 0;
 }
 
@@ -1220,7 +1942,7 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_body_execution_stride() const {
 }
 
 uint32_t llama_kv_cache_kvarn_context::get_tail_body_execution_rows(int32_t il) const {
-    if (cache->uses_standard_layer(graph_layer_for(il))) return 0;
+    if (!tail_on_layer(il)) return 0;
     return shared_graph_layers.empty() ?
             cache->get_metadata_cache()->get_tail_body_execution_rows(il) : 0;
 }
@@ -1230,7 +1952,7 @@ bool llama_kv_cache_kvarn_context::has_compact_tail() const {
 }
 
 bool llama_kv_cache_kvarn_context::has_compact_tail(int32_t il) const {
-    if (uses_standard_layer(il)) return false;
+    if (!tail_on_layer(il)) return false;
     return shared_graph_layers.empty() && base()->has_compact_tail();
 }
 
@@ -1255,13 +1977,17 @@ bool llama_kv_cache_kvarn_context::has_standard_cache() const {
     return shared_graph_layers.empty() && cache->has_standard_cache();
 }
 
+bool llama_kv_cache_kvarn_context::position_split_enabled() const {
+    return cache->position_split_enabled();
+}
+
 bool llama_kv_cache_kvarn_context::has_tail_current(int32_t il) const {
-    if (uses_standard_layer(il)) return false;
+    if (!tail_on_layer(il)) return false;
     return shared_graph_layers.empty() && cache->get_metadata_cache()->has_tail_current(il);
 }
 
 ggml_backend_dev_t llama_kv_cache_kvarn_context::get_tail_backend(int32_t il) const {
-    if (uses_standard_layer(il)) return nullptr;
+    if (!tail_on_layer(il)) return nullptr;
     return shared_graph_layers.empty() ? cache->get_metadata_cache()->get_tail_backend(il) : nullptr;
 }
 
@@ -1274,17 +2000,17 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_rollback_tokens() const {
 }
 
 llama_kv_tail_route llama_kv_cache_kvarn_context::get_tail_route(int32_t il) const {
-    if (uses_standard_layer(il)) return LLAMA_KV_TAIL_ROUTE_NONE;
+    if (!tail_on_layer(il)) return LLAMA_KV_TAIL_ROUTE_NONE;
     return shared_graph_layers.empty() ? cache->get_tail_route(il) : LLAMA_KV_TAIL_ROUTE_NONE;
 }
 
 const llama_kv_tail_layer_route * llama_kv_cache_kvarn_context::get_tail_layer_route(int32_t il) const {
-    if (uses_standard_layer(il)) return nullptr;
+    if (!tail_on_layer(il)) return nullptr;
     return shared_graph_layers.empty() ? cache->get_metadata_cache()->get_tail_layer_route(il) : nullptr;
 }
 
 bool llama_kv_cache_kvarn_context::get_tail_explicit_bias(int32_t il) const {
-    if (uses_standard_layer(il)) return false;
+    if (!tail_on_layer(il)) return false;
     return shared_graph_layers.empty() && cache->get_tail_explicit_bias(il);
 }
 
@@ -1297,7 +2023,8 @@ bool llama_kv_cache_kvarn_context::can_pack_tail_body(const llama_ubatch & ubatc
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_native(ggml_context * ctx, int32_t il) const {
     const int32_t shared_il = graph_layer_for(il);
-    const auto it = stored_k.find(cache->mapped_layer_id(shared_il));
+    const auto it = stored_k.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+            current_position_split_range_id()));
     ggml_tensor * stored = it != stored_k.end() ? it->second :
             cache->get_materialization_source(shared_il, false);
     GGML_ASSERT(stored != nullptr);
@@ -1306,11 +2033,108 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k_native(ggml_context * ctx, int
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_native(ggml_context * ctx, int32_t il) const {
     const int32_t shared_il = graph_layer_for(il);
-    const auto it = stored_v.find(cache->mapped_layer_id(shared_il));
+    const auto it = stored_v.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+            current_position_split_range_id()));
     ggml_tensor * stored = it != stored_v.end() ? it->second :
             cache->get_materialization_source(shared_il, true);
     GGML_ASSERT(stored != nullptr);
     return cache->view(ctx, stored, shared_il, get_n_kv(), current_sinfo(), true, mat_idxs);
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_range(
+        ggml_context * ctx, int32_t il, bool native_attention,
+        uint32_t range_id, uint32_t n_range, ggml_tensor * range_mat_idxs) const {
+    const int32_t shared_il = graph_layer_for(il);
+    const auto it = stored_k.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+            range_id));
+    ggml_tensor * stored = it != stored_k.end() ? it->second :
+            cache->get_materialization_source(shared_il, false);
+    GGML_ASSERT(stored != nullptr);
+    // F3: mesma decisão native/materialize da leitura completa, mas sobre a
+    // lista explícita da faixa. O chamador dimensionou range_mat_idxs com as
+    // células da faixa em ordem de posição.
+    GGML_ASSERT(range_mat_idxs != nullptr);
+    // Opt-in identity trace: shows WHICH tensor reaches ggml_kvarn_view as the
+    // stage, whether it came from this graph's store or from the layer's
+    // persistent stage, and what the mapped layer actually is. A wrong tensor
+    // type here is invisible in the shapes alone.
+    if (getenv("LLAMA_KVARN_RANGE_TRACE") != nullptr) {
+        const bool uses_kv  = cache->uses_kvarn_layer(shared_il);
+        const bool uses_std = cache->uses_standard_layer(shared_il);
+        std::fprintf(stderr,
+            "kv-range-trace k il=%d shared_il=%d mapped=%u read_range=%u cur_range=%u from=%s "
+            "stored=%p type=%d ne=[%lld,%lld,%lld] name=%s | "
+            "layer.k_stage=%p type=%d ne=[%lld,%lld,%lld] name=%s | "
+            "layer.k_records=%p type=%d uses_kvarn_layer=%d uses_standard_layer=%d "
+            "n_range=%u mat_idxs=%p ne0=%lld\n",
+            il, shared_il, cache->mapped_layer_id(shared_il),
+            range_id, current_position_split_range_id(),
+            it != stored_k.end() ? "stored_k" : "materialization_source",
+            (const void *) stored, stored ? (int) stored->type : -1,
+            stored ? (long long) stored->ne[0] : -1LL,
+            stored ? (long long) stored->ne[1] : -1LL,
+            stored ? (long long) stored->ne[2] : -1LL,
+            stored && stored->name[0] ? stored->name : "<none>",
+            (const void *) cache->get_materialization_source(shared_il, false),
+            (int) (cache->get_materialization_source(shared_il, false)
+                        ? cache->get_materialization_source(shared_il, false)->type : -1),
+            cache->get_materialization_source(shared_il, false)
+                ? (long long) cache->get_materialization_source(shared_il, false)->ne[0] : -1LL,
+            cache->get_materialization_source(shared_il, false)
+                ? (long long) cache->get_materialization_source(shared_il, false)->ne[1] : -1LL,
+            cache->get_materialization_source(shared_il, false)
+                ? (long long) cache->get_materialization_source(shared_il, false)->ne[2] : -1LL,
+            (cache->get_materialization_source(shared_il, false)
+                && cache->get_materialization_source(shared_il, false)->name[0])
+                ? cache->get_materialization_source(shared_il, false)->name : "<none>",
+            (const void *) cache->get_materialization_source(shared_il, false),
+            uses_kv, uses_std,
+            n_range, (const void *) range_mat_idxs,
+            range_mat_idxs ? (long long) range_mat_idxs->ne[0] : -1LL);
+    }
+    ggml_tensor * out = nullptr;
+    if (native_attention) {
+        out = cache->view(ctx, stored, shared_il, n_range, current_sinfo(),
+                false, range_mat_idxs);
+    } else {
+        out = cache->materialize(ctx, stored, shared_il, n_range, current_sinfo(),
+                false, range_mat_idxs, uses_compact_read_indices());
+    }
+    mark_split_tensor(out, il, false, range_id);
+    return out;
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_range(
+        ggml_context * ctx, int32_t il, bool native_attention,
+        uint32_t range_id, uint32_t n_range, ggml_tensor * range_mat_idxs) const {
+    const int32_t shared_il = graph_layer_for(il);
+    const auto it = stored_v.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+            range_id));
+    ggml_tensor * stored = it != stored_v.end() ? it->second :
+            cache->get_materialization_source(shared_il, true);
+    GGML_ASSERT(stored != nullptr);
+    GGML_ASSERT(range_mat_idxs != nullptr);
+    ggml_tensor * out = nullptr;
+    if (native_attention) {
+        out = cache->view(ctx, stored, shared_il, n_range, current_sinfo(),
+                true, range_mat_idxs);
+    } else {
+        out = cache->materialize(ctx, stored, shared_il, n_range, current_sinfo(),
+                true, range_mat_idxs, uses_compact_read_indices());
+    }
+    mark_split_tensor(out, il, true, range_id);
+    return out;
+}
+
+void llama_kv_cache_kvarn_context::mark_split_tensor(ggml_tensor * t, int32_t il,
+        bool value, uint32_t range_id) const {
+    if (!llama_kv_cache_kvarn::eval_capture_armed() || !t) { return; }
+    const int32_t shared_il = graph_layer_for(il);
+    const int32_t mapped = cache->uses_kvarn_layer(shared_il) ? cache->mapped_layer_id(shared_il) : -1;
+    const bool local = range_id == llama_position_split::kRangeLocal;
+    llama_kv_cache_kvarn::eval_note_candidate(il, value, range_id,
+            local ? "split_local" : "split_overflow", local ? "LOCAL" : "ABOVE",
+            shared_il, mapped, /*pos=*/0, t);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx, int n_rot) const {
@@ -1330,11 +2154,60 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
         return nullptr;
     }
     const int32_t shared_il = graph_layer_for(il);
+    if (cache->position_split_enabled()) {
+        // F2b: stores funcionais por faixa. O hybrid divide o ubatch em P
+        // antes do prepare, então este grafo contém exatamente uma faixa. A
+        // faixa local usa os registros KVarN; a faixa de overflow usa o
+        // companheiro Q4 nas mesmas células lógicas compartilhadas. Sem
+        // ubatch válido (reserva de grafo), usa a rota legada por camada.
+        llama_position_split::range_kind range;
+        if (current_position_split_range(range)) {
+            if (range == llama_position_split::range_kind::OVERFLOW) {
+                if (!cache->uses_standard_layer(shared_il)) {
+                    throw std::runtime_error("position-split KV sem faixa Q4 para a camada de overflow");
+                }
+                return cache->standard_cpy_k(ctx, k_cur, k_idxs, shared_il, current_sinfo());
+            }
+            if (!cache->uses_kvarn_layer(shared_il)) {
+                throw std::runtime_error("position-split KV sem faixa KVarN para a camada local");
+            }
+            require_position_split_local_history(cache, "position-split KV store");
+            auto * position_result = cache->store(ctx, k_cur, k_idxs, shared_il, current_sinfo(), false);
+            if (getenv("LLAMA_KVARN_STORE_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                    "kv-store-trace k il=%d mapped=%u WRITE range=%u tensor=%p type=%d "
+                    "ne=[%lld,%lld,%lld] name=%s\n",
+                    shared_il, cache->mapped_layer_id(shared_il),
+                    llama_position_split::kRangeLocal, (const void *) position_result,
+                    position_result ? (int) position_result->type : -1,
+                    position_result ? (long long) position_result->ne[0] : -1LL,
+                    position_result ? (long long) position_result->ne[1] : -1LL,
+                    position_result ? (long long) position_result->ne[2] : -1LL,
+                    position_result && position_result->name[0] ? position_result->name : "<none>");
+            }
+            stored_k[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+                    llama_position_split::kRangeLocal)] = position_result;
+            return position_result;
+        }
+    }
     if (cache->uses_standard_layer(shared_il)) {
         return cache->standard_cpy_k(ctx, k_cur, k_idxs, shared_il, current_sinfo());
     }
     auto * result = cache->store(ctx, k_cur, k_idxs, shared_il, current_sinfo(), false);
-    stored_k[cache->mapped_layer_id(shared_il)] = result;
+    if (getenv("LLAMA_KVARN_STORE_TRACE") != nullptr) {
+        std::fprintf(stderr,
+            "kv-store-trace k il=%d mapped=%u WRITE range=%u tensor=%p type=%d "
+            "ne=[%lld,%lld,%lld] name=%s (single-range site)\n",
+            shared_il, cache->mapped_layer_id(shared_il),
+            current_position_split_range_id(), (const void *) result,
+            result ? (int) result->type : -1,
+            result ? (long long) result->ne[0] : -1LL,
+            result ? (long long) result->ne[1] : -1LL,
+            result ? (long long) result->ne[2] : -1LL,
+            result && result->name[0] ? result->name : "<none>");
+    }
+    stored_k[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+            current_position_split_range_id())] = result;
     return result;
 }
 
@@ -1347,11 +2220,31 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
         return nullptr;
     }
     const int32_t shared_il = graph_layer_for(il);
+    if (cache->position_split_enabled()) {
+        llama_position_split::range_kind range;
+        if (current_position_split_range(range)) {
+            if (range == llama_position_split::range_kind::OVERFLOW) {
+                if (!cache->uses_standard_layer(shared_il)) {
+                    throw std::runtime_error("position-split KV sem faixa Q4 para a camada de overflow");
+                }
+                return cache->standard_cpy_v(ctx, v_cur, v_idxs, shared_il, current_sinfo());
+            }
+            if (!cache->uses_kvarn_layer(shared_il)) {
+                throw std::runtime_error("position-split KV sem faixa KVarN para a camada local");
+            }
+            require_position_split_local_history(cache, "position-split KV store");
+            auto * position_result = cache->store(ctx, v_cur, v_idxs, shared_il, current_sinfo(), true);
+            stored_v[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+                    llama_position_split::kRangeLocal)] = position_result;
+            return position_result;
+        }
+    }
     if (cache->uses_standard_layer(shared_il)) {
         return cache->standard_cpy_v(ctx, v_cur, v_idxs, shared_il, current_sinfo());
     }
     auto * result = cache->store(ctx, v_cur, v_idxs, shared_il, current_sinfo(), true);
-    stored_v[cache->mapped_layer_id(shared_il)] = result;
+    stored_v[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+            current_position_split_range_id())] = result;
     return result;
 }
 
@@ -1368,7 +2261,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_with_tail(
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_tail(
         ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
         int32_t il, ggml_tensor * dependency) const {
-    if (uses_standard_layer(il)) return nullptr;
+    if (!tail_on_layer(il)) return nullptr;
     if (!shared_graph_layers.empty() || !k_cur || !tail_idxs) {
         return nullptr;
     }
@@ -1378,7 +2271,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_tail(
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_tail(
         ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
         int32_t il, ggml_tensor * dependency) const {
-    if (uses_standard_layer(il)) return nullptr;
+    if (!tail_on_layer(il)) return nullptr;
     if (!shared_graph_layers.empty() || !v_cur || !tail_idxs) {
         return nullptr;
     }
@@ -1504,7 +2397,47 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst, c
     }
 }
 
+void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs_local_impl(
+        ggml_tensor * dst, const std::vector<uint32_t> & local_cells) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I64);
+    GGML_ASSERT(local_cells.size() <= size_t(dst->ne[0]));
+    // Encode to a host temp (live prefix + -1 padding for unused capacity),
+    // then copy via the backend so tensor placement never matters.
+    std::vector<int64_t> host(size_t(dst->ne[0]), -1);
+    const auto * metadata = cache->get_metadata_cache();
+    const auto & sinfo = current_sinfo();
+    for (size_t read = 0; read < local_cells.size(); ++read) {
+        const uint32_t cell = local_cells[read];
+        int32_t stage_slot = -1;
+        if (metadata->allocation_cell_uses_stage(cell)) {
+            if (!sinfo.empty() && !sinfo.stage_slots.empty()) {
+                for (uint32_t stream = 0; stream < sinfo.n_stream() && stage_slot < 0; ++stream) {
+                    for (size_t i = 0; i < sinfo.idxs[stream].size(); ++i) {
+                        if (sinfo.idxs[stream][i] == cell) {
+                            stage_slot = int32_t(sinfo.stage_slots[stream][i]);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (stage_slot < 0) {
+                stage_slot = metadata->allocation_cell_stage_slot(cell);
+            }
+            GGML_ASSERT(stage_slot >= 0);
+        }
+        host[read] = stage_slot >= 0 ?
+                llama_kvarn_encode_stage_cell(cell, uint32_t(stage_slot)) : int64_t(cell);
+    }
+    ggml_backend_tensor_set(dst, host.data(), 0, host.size()*sizeof(int64_t));
+}
+
 void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (cache->position_split_enabled() && ubatch->pos &&
+            position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
+                llama_position_split::range_kind::OVERFLOW) {
+        cache->get_standard_cache()->set_input_k_idxs(dst, ubatch, current_sinfo());
+        return;
+    }
     if (cache->is_swa()) {
         GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
         int64_t * data = (int64_t *) dst->data;
@@ -1533,6 +2466,12 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const lla
 }
 
 void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (cache->position_split_enabled() && ubatch->pos &&
+            position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
+                llama_position_split::range_kind::OVERFLOW) {
+        cache->get_standard_cache()->set_input_v_idxs(dst, ubatch, current_sinfo());
+        return;
+    }
     if (cache->is_swa()) {
         set_input_k_idxs(dst, ubatch);
         return;
@@ -1561,6 +2500,12 @@ void llama_kv_cache_kvarn_context::set_input_tail_body_idxs(ggml_tensor * dst) c
 }
 
 void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (cache->position_split_enabled() && ubatch->pos &&
+            position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
+                llama_position_split::range_kind::OVERFLOW) {
+        cache->get_standard_cache()->set_input_k_idxs_backend(dst, ubatch, current_sinfo());
+        return;
+    }
     if (cache->is_swa()) {
         const auto & sinfo = current_sinfo();
         GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
@@ -1589,6 +2534,12 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, c
 }
 
 void llama_kv_cache_kvarn_context::set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (cache->position_split_enabled() && ubatch->pos &&
+            position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
+                llama_position_split::range_kind::OVERFLOW) {
+        cache->get_standard_cache()->set_input_v_idxs_backend(dst, ubatch, current_sinfo());
+        return;
+    }
     if (cache->is_swa()) {
         const auto & sinfo = current_sinfo();
         GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
@@ -1745,6 +2696,13 @@ struct llama_kv_cache_kvarn::migration_queue {
 
     migration_queue(const migration_queue &) = delete;
     migration_queue & operator=(const migration_queue &) = delete;
+
+    // The backends this cache actually owns and uses for record transfers. The
+    // consumer path must use these, not a freshly initialised backend: creating
+    // and destroying an extra backend instance corrupts context teardown.
+    ggml_backend_t record_backend(bool cuda) const {
+        return cuda ? cuda_backend.get() : vulkan_backend.get();
+    }
 
     ~migration_queue() {
         if (!drain()) {
@@ -1922,13 +2880,20 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         ggml_type standard_type_k,
         ggml_type standard_type_v,
         bool standard_v_trans,
-        const layer_device_cb & standard_device_for_layer) :
+        const layer_device_cb & standard_device_for_layer,
+        uint32_t position_split_p) :
     model(model),
     hparams(hparams),
     params(params),
     n_stream(unified ? 1u : n_seq_max),
     n_seq_max(n_seq_max),
     kv_size(kv_size),
+    // F2b: P é fixo por contexto. A tabela lógica de células continua com C
+    // posições (é ela que resolve seq_rm/rollback por posição absoluta), mas
+    // o anel KVarN local cobre só [0,P) e a faixa overflow Q4 cobre [P,C).
+    kv_size_local(position_split_p != 0 ? position_split_p : kv_size),
+    kv_size_overflow(position_split_p != 0 ? kv_size - position_split_p : kv_size),
+    position_split_p_(position_split_p),
     // Dynamic staging: size the lossless F16 ring from position semantics.
     // Non-SWA keeps a permanent sink slot plus the scheduler-span tail. SWA has
     // no sink, so every stage slot is part of the local tail.
@@ -1941,7 +2906,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     // size, and a batched prefill needs the union of every row's sliding window.
     // The record ring stores only tiles older than the F16 tail; loaders account
     // for the tail offset when deciding whether a ring slot is live.
-    n_groups_per_stream(kvarn_record_groups_per_stream(kv_size, n_ubatch, n_swa, swa, tail_groups)),
+    n_groups_per_stream(kvarn_record_groups_per_stream(kv_size_local, n_ubatch, n_swa, swa, tail_groups)),
     exact_tail_tokens(tail_tokens),
     metadata_n_pad(n_pad),
     metadata_n_swa(n_swa),
@@ -1982,6 +2947,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups &&
         "KVarN tail depth must fit within the F16 stage");
     exact_tail_type = metadata->get_tail_type();
+    if (position_split_p != 0) {
+        // F2b: a mesma tabela lógica de células aloca ubatches locais em
+        // [0,P) e ubatches de overflow em [P,C). O companheiro Q4 compartilha
+        // essa tabela, então usa as mesmas coordenadas absolutas.
+        metadata->set_position_split_p(position_split_p);
+    }
     if (!swa) {
         metadata->set_allocation_group_size(KVAR_N_GROUP, n_stream == 1 ? tail_groups : 1u);
     }
@@ -1995,29 +2966,43 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
         standard_cache = std::make_unique<llama_kv_cache>(
                 model, hparams, standard_type_k, standard_type_v, standard_v_trans,
-                offload, unified, kv_size, n_seq_max, n_pad, n_swa, swa_type,
+                offload, unified, kv_size_overflow, n_seq_max, n_pad, n_swa, swa_type,
                 metadata.get(), standard_layer_filter, nullptr, nullptr, "remote_",
                 n_ubatch, 0, exact_tail_type_requested, 0, false, 0, 0, false,
-                standard_device_for_layer, false, true);
-        for (const uint32_t il : standard_cache->get_layer_ids()) {
-            const ggml_tensor * key = standard_cache->get_k_storage(int32_t(il));
-            const ggml_tensor * value = standard_cache->get_v_storage(int32_t(il));
-            if (!key || !value || !key->buffer || !value->buffer) {
-                throw std::runtime_error(format("mixed standard KV layer %u has no allocated K/V payload", il));
+                standard_device_for_layer, false, true, position_split_p);
+    if (standard_cache) {
+            for (const uint32_t il : standard_cache->get_layer_ids()) {
+                const ggml_tensor * key = standard_cache->get_k_storage(int32_t(il));
+                const ggml_tensor * value = standard_cache->get_v_storage(int32_t(il));
+                if (!key || !value || !key->buffer || !value->buffer) {
+                    throw std::runtime_error(format("mixed standard KV layer %u has no allocated K/V payload", il));
+                }
+                const auto key_buft = ggml_backend_buffer_get_type(key->buffer);
+                const auto value_buft = ggml_backend_buffer_get_type(value->buffer);
+                const auto key_dev = key_buft ? ggml_backend_buft_get_device(key_buft) : nullptr;
+                const auto value_dev = value_buft ? ggml_backend_buft_get_device(value_buft) : nullptr;
+                if (key_dev != value_dev) {
+                    throw std::runtime_error(format("mixed standard KV layer %u places K/V on different devices", il));
+                }
+                // F3: no modo P, a faixa Q4 de overflow deve estar fisicamente na
+                // Vulkan. Valida o buffer real, não a intenção de configuração.
+                // (O tipo do dispositivo Vulkan varia por backend; o nome é o
+                // identificador estável.)
+                if (position_split_p_ != 0) {
+                    const char * dev_name = key_dev ? ggml_backend_dev_name(key_dev) : nullptr;
+                    if (!dev_name || std::strncmp(dev_name, "Vulkan", 6) != 0) {
+                        throw std::runtime_error(format(
+                                "position-split KV exige a faixa Q4 da camada %u na Vulkan (está em %s)",
+                                il, dev_name ? dev_name : "dispositivo desconhecido"));
+                    }
+                }
+                const bool rotated = standard_cache->uses_attn_rot_k() || standard_cache->uses_attn_rot_v();
+                LLAMA_LOG_INFO("mixed KV layer=%u device=%s type_k=%s type_v=%s domain=%s\n",
+                        il, key_dev ? ggml_backend_dev_name(key_dev) : "CPU",
+                        ggml_type_name(key->type), ggml_type_name(value->type),
+                        rotated ? "standard-hadamard" : "standard-original");
             }
-            const auto key_buft = ggml_backend_buffer_get_type(key->buffer);
-            const auto value_buft = ggml_backend_buffer_get_type(value->buffer);
-            const auto key_dev = key_buft ? ggml_backend_buft_get_device(key_buft) : nullptr;
-            const auto value_dev = value_buft ? ggml_backend_buft_get_device(value_buft) : nullptr;
-            if (key_dev != value_dev) {
-                throw std::runtime_error(format("mixed standard KV layer %u places K/V on different devices", il));
-            }
-            const bool rotated = standard_cache->uses_attn_rot_k() || standard_cache->uses_attn_rot_v();
-            LLAMA_LOG_INFO("mixed KV layer=%u device=%s type_k=%s type_v=%s domain=%s\n",
-                    il, key_dev ? ggml_backend_dev_name(key_dev) : "CPU",
-                    ggml_type_name(key->type), ggml_type_name(value->type),
-                    rotated ? "standard-hadamard" : "standard-original");
-        }
+    }
         if (standard_cache->get_layer_ids().empty()) {
             throw std::runtime_error("mixed KV override selected no remote standard-cache layers");
         }
@@ -2200,6 +3185,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             (uint32_t) k_slices,
             (uint32_t) v_slices,
             native_attention,
+            dev,
             mixed_tail_native,
             native_original_v,
             native_rotated_max_query_tokens,
@@ -2319,6 +3305,56 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
 
             map_layer_ids[il] = src->second;
         }
+    }
+
+    // F2b: modo por posição. P é fixo por contexto, múltiplo de 256, uma
+    // sequência e sem SWA; cada camada full precisa das DUAS faixas (local
+    // KVarN4 [0,P) e overflow Q4 [P,C)). Qualquer precondição ausente é
+    // fail-closed com motivo explícito — nunca um layout meio-split nem um
+    // cache que resolve a faixa errada.
+    if (position_split_p != 0) {
+        const auto kvarn_layers = [&]() {
+            std::vector<uint32_t> ids;
+            ids.reserve(map_layer_ids.size());
+            for (const auto & [il, idx] : map_layer_ids) {
+                (void) idx;
+                ids.push_back(uint32_t(il));
+            }
+            std::sort(ids.begin(), ids.end());
+            return ids;
+        }();
+        std::vector<uint32_t> standard_layers;
+        if (standard_cache) {
+            standard_layers = standard_cache->get_layer_ids();
+            std::sort(standard_layers.begin(), standard_layers.end());
+        }
+        std::vector<uint32_t> full_layers;
+        full_layers.reserve(kvarn_layers.size() + standard_layers.size());
+        std::set_union(kvarn_layers.begin(), kvarn_layers.end(),
+                       standard_layers.begin(), standard_layers.end(),
+                       std::back_inserter(full_layers));
+        position_split_error_ = llama_position_split::validate_ranges(
+                position_split_ranges(), position_split_p, kv_size, full_layers);
+        if (position_split_error_.empty() && swa) {
+            position_split_error_ = "position-split exige cache não-SWA";
+        }
+        if (position_split_error_.empty() && (n_seq_max != 1 || n_stream != 1)) {
+            position_split_error_ = "position-split exige uma única sequência";
+        }
+        if (position_split_error_.empty() && !standard_cache) {
+            position_split_error_ = "position-split exige a faixa overflow Q4 por camada full";
+        }
+        if (position_split_error_.empty() && standard_layers != kvarn_layers) {
+            position_split_error_ =
+                "position-split exige as mesmas camadas full nas faixas local e overflow";
+        }
+        if (!position_split_error_.empty()) {
+            throw std::invalid_argument(format(
+                    "position-split KV inválido: %s", position_split_error_.c_str()));
+        }
+        LLAMA_LOG_INFO(
+                "KVarN position-split: P=%u C=%u local=%u overflow=%u camadas full=%zu\n",
+                position_split_p, kv_size, kv_size_local, kv_size_overflow, full_layers.size());
     }
 
     size_t total_bytes = 0;
@@ -2584,6 +3620,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         migration_prefill_dev = prefill_dev;
         migration_remote_dev = mirror_dev;
         migration_copies = std::make_unique<migration_queue>(prefill_dev, mirror_dev);
+        // The consumer (materialized_probe) runs on the backend that OWNS the
+        // records, so it uses the cache's own transfer backend. No backend is
+        // created on demand anywhere.
+        probe_backend = migration_copies->record_backend(/*cuda=*/true);
         migration_mirror_stale = false;
         LLAMA_LOG_INFO("KVarN prefill migration enabled: CUDA owner with Vulkan mirror; "
                 "ownership changes only at explicit request boundaries\n");
@@ -3018,6 +4058,71 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
         return p0 <= 0 && p1 < 0;
     }
 
+    // F2b: remoção funcional por faixa. O cache Q4 companheiro compartilha a
+    // tabela lógica de células do metadados, então a mutação acontece uma vez
+    // no metadados; aqui só validamos todas as faixas tocadas antes disso.
+    // Convenção llama.cpp: p0<0 com p1<0 é limpeza completa; normaliza p0
+    // para 0 na classificação (o metadados continua recebendo os sentinelas
+    // originais, que ele já entende).
+    if (position_split_enabled()) {
+        if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max) {
+            return false;
+        }
+        // Limpeza completa: remove tudo, então a exatidão KVarN por faixa é
+        // irrelevante; basta o metadados permitir (ele sempre permite
+        // full clear). Registros físicos órfãos serão sobrescritos no reuso.
+        if (p0 <= 0 && p1 < 0) {
+            return metadata->can_seq_rm(seq_id, p0, p1);
+        }
+        const llama_pos norm_p0 = (p0 < 0 && p1 < 0) ? 0 : p0;
+        const llama_pos effective_end = p1 < 0 ? llama_pos(kv_size) : p1;
+        const auto shape = llama_position_split::classify_removal(
+                norm_p0, effective_end, position_split_p_, kv_size);
+        if (shape == llama_position_split::rm_span_kind::INVALID) {
+            if (getenv("LLAMA_SEQRM_DBG")) {
+                fprintf(stderr, "SEQRMDBG kvarn-ps can_remove INVALID seq=%d p0=%d p1=%d norm_p0=%d end=%d split_p=%u kv=%d\n",
+                        seq_id, p0, p1, int(norm_p0), int(effective_end),
+                        position_split_p_, int(kv_size));
+            }
+            return false;
+        }
+        if (!metadata->can_seq_rm(seq_id, p0, p1)) {
+            if (getenv("LLAMA_SEQRM_DBG")) {
+                fprintf(stderr, "SEQRMDBG kvarn-ps can_remove metadata-refused seq=%d p0=%d p1=%d shape=%d\n",
+                        seq_id, p0, p1, int(shape));
+            }
+            return false;
+        }
+        if (shape != llama_position_split::rm_span_kind::OVERFLOW_ONLY) {
+            const llama_pos local_end = shape == llama_position_split::rm_span_kind::CROSSING
+                ? llama_pos(position_split_p_) : effective_end;
+            const llama_pos pos_max = metadata->seq_pos_max(seq_id);
+            if (llama_kvarn_can_remove_range(pos_max, norm_p0, local_end, KVAR_N_GROUP)) {
+                return true;
+            }
+            if (norm_p0 <= 0 || p1 >= 0) {
+                if (getenv("LLAMA_SEQRM_DBG")) {
+                    fprintf(stderr, "SEQRMDBG kvarn-ps can_remove range-refused seq=%d p0=%d p1=%d pos_max=%d local_end=%d\n",
+                            seq_id, p0, p1, int(pos_max), int(local_end));
+                }
+                return false;
+            }
+            llama_pos planned_p0 = -1;
+            llama_pos planned_p1 = -1;
+            const bool planned = llama_kvarn_plan_remove_range(
+                    pos_max, norm_p0, local_end, KVAR_N_GROUP,
+                    stream_is_exclusive_for(seq_id), planned_p0, planned_p1);
+            const bool ok = planned && planned_p0 == norm_p0 && planned_p1 == local_end;
+            if (getenv("LLAMA_SEQRM_DBG") && !ok) {
+                fprintf(stderr, "SEQRMDBG kvarn-ps can_remove plan-mismatch seq=%d p0=%d p1=%d pos_max=%d local_end=%d planned=%d pp0=%d pp1=%d\n",
+                        seq_id, p0, p1, int(pos_max), int(local_end), int(planned),
+                        int(planned_p0), int(planned_p1));
+            }
+            return ok;
+        }
+        return true;
+    }
+
     // seq_rm() delegates the mutation to the metadata cache, which owns the
     // compact precision tail and its much tighter suffix-rollback reserve. The
     // capability query has to honour that too: callers treat can_seq_rm() as a
@@ -3058,6 +4163,14 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
         planned_p1 = p1;
         return true;
     }
+    if (position_split_enabled()) {
+        if (!can_seq_rm(seq_id, p0, p1)) {
+            return false;
+        }
+        planned_p0 = p0;
+        planned_p1 = p1;
+        return true;
+    }
     if (uint32_t(seq_id) >= n_seq_max) {
         return false;
     }
@@ -3081,6 +4194,26 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
 }
 
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (position_split_enabled()) {
+        // F2b: remoção funcional por faixa. Toda a validação acontece antes
+        // da drenagem/mutação; o companheiro Q4 compartilha a tabela de
+        // células do metadados, portanto a mutação lógica única abaixo deixa
+        // as duas faixas consistentes.
+        if (!can_seq_rm(seq_id, p0, p1)) {
+            LLAMA_LOG_WARN("%s: position-split KV recusou seq_rm fora da reserva exata "
+                           "(seq_id = %d, p0 = %d, p1 = %d); cache intacto\n",
+                           __func__, seq_id, p0, p1);
+            return false;
+        }
+        drain_prefill_migration();
+        apply_pending_stream_copies(nullptr);
+        const bool metadata_removed = metadata->seq_rm(seq_id, p0, p1);
+        const bool companion_removed = standard_cache ?
+            standard_cache->seq_rm(seq_id, p0, p1) : true;
+        const bool removed = metadata_removed && companion_removed;
+        if (removed && migration_enabled) migration_mirror_stale = true;
+        return removed;
+    }
     drain_prefill_migration();
     apply_pending_stream_copies(nullptr);
     if (!can_seq_rm(seq_id, p0, p1)) {
@@ -3104,6 +4237,39 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    if (position_split_enabled()) {
+        // F2b: remoção funcional por célula. Resolve a posição absoluta da
+        // célula antes de drenar/mutar; a tabela é compartilhada com o
+        // companheiro Q4, então a mutação lógica única basta.
+        if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max) {
+            return false;
+        }
+        const auto & cells = metadata->get_cells(seq_id);
+        if (cell_idx >= cells.size() || cells.is_empty(cell_idx)) {
+            return false;
+        }
+        const llama_pos cell_pos = cells.pos_get(cell_idx);
+        const auto cell_range = llama_position_split::range_for_pos(
+                cell_pos, position_split_p_, kv_size);
+        if (cell_range.kind == llama_position_split::range_kind::INVALID) {
+            return false;
+        }
+        if (cell_range.kind == llama_position_split::range_kind::LOCAL) {
+            const llama_pos pos_max = metadata->seq_pos_max(seq_id);
+            if (pos_max >= 0) {
+                const llama_pos earliest_exact = std::max<llama_pos>(
+                        0, pos_max / KVAR_N_GROUP - 1) * KVAR_N_GROUP;
+                if (cell_pos < earliest_exact) {
+                    return false;
+                }
+            }
+        }
+        drain_prefill_migration();
+        apply_pending_stream_copies(nullptr);
+        const bool removed = metadata->seq_rm_cell(seq_id, cell_idx);
+        if (removed && migration_enabled) migration_mirror_stale = true;
+        return removed;
+    }
     drain_prefill_migration();
     apply_pending_stream_copies(nullptr);
     if (swa) {
@@ -3207,7 +4373,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
 }
 
 bool llama_kv_cache_kvarn::requires_state_for_partial_restore() const {
-    return true;
+    // SWA rings overwrite historical records, so a partial checkpoint must own
+    // the live window. Dense KVarN keeps every surviving prefix group in the
+    // record body; suffixes inside the current and previous group can be
+    // trimmed in place, the same way a body-backed exact tail can.
+    return swa;
 }
 
 bool llama_kv_cache_kvarn::stream_is_exclusive_for(llama_seq_id seq_id) const {
@@ -3408,6 +4578,15 @@ uint64_t llama_kv_cache_kvarn::get_kv_tail_planner_timing_ns() const {
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (standard_cache) {
+        state_write_mixed(io, seq_id, flags);
+        return;
+    }
+    // PURE (no-remote) source, explicit plan-3.6 contract: keep the pure cache
+    // PURE -- no remote ownership, no fabricated standard_cache -- but write it
+    // through the mixed writer so the frame carries the envelope and the
+    // ORIGINAL WRITER identity (KMS3). Legacy pure frames stay readable because
+    // the reader dispatches on the leading word (KVTL/KVRN vs QSKM).
+    if (state_model_id != 0 && state_rope_id != 0) {
         state_write_mixed(io, seq_id, flags);
         return;
     }
@@ -3683,8 +4862,14 @@ void llama_kv_cache_kvarn::state_write_kvarn_body(
 
 void llama_kv_cache_kvarn::state_write_mixed(
         llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if (!standard_cache || migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
-        throw std::runtime_error("mixed state currently requires static non-SWA one-stream KV ownership");
+    // A split destination MUST own the Q4 overflow companion; a PURE source or
+    // a PURE destination has no standard_cache by definition and must never be
+    // forced to invent remote ownership (plan 3.6: pure stays no-remote).
+    if ((standard_cache == nullptr && position_split_enabled()) ||
+            migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
+        throw std::runtime_error(
+                "mixed state requires static non-SWA one-stream KV ownership"
+                " (and an overflow companion in split mode)");
     }
     constexpr uint32_t supported_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
             LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
@@ -3704,57 +4889,88 @@ void llama_kv_cache_kvarn::state_write_mixed(
         throw std::runtime_error("mixed KV state cannot be saved while a stream copy is pending");
     }
 
-    std::unordered_map<const ggml_tensor *, uint32_t> tensor_layers;
-    const auto add_tensor = [&](const ggml_tensor * tensor, uint32_t layer_id) {
+    std::unordered_map<const ggml_tensor *, std::pair<uint32_t, uint32_t>> tensor_ranges;
+    // F4 v2: a tensor is identified by the PAIR (layer_id, range_id). In P-mode
+    // the local KVarN tensors are range 0 and the overflow Qx tensors range 1,
+    // so one layer legitimately owns tensors under two different range ids.
+    const auto add_tensor = [&](const ggml_tensor * tensor, uint32_t layer_id, uint32_t range_id) {
         while (tensor && tensor->view_src) {
             tensor = tensor->view_src;
         }
         if (!tensor) {
             return;
         }
-        const auto [it, inserted] = tensor_layers.emplace(tensor, layer_id);
-        if (!inserted && it->second != layer_id) {
-            throw std::runtime_error("mixed state tensor is shared across different layer IDs");
+        const auto [it, inserted] = tensor_ranges.emplace(
+                tensor, std::make_pair(layer_id, range_id));
+        if (!inserted && (it->second.first != layer_id || it->second.second != range_id)) {
+            throw std::runtime_error("mixed state tensor is shared across different layer/range ownership");
         }
     };
     for (const auto & layer : layers) {
         for (ggml_tensor * tensor : { layer.k_records, layer.v_records,
                 layer.k_stage, layer.v_stage, layer.k_tail, layer.v_tail }) {
-            add_tensor(tensor, layer.il);
+            add_tensor(tensor, layer.il, llama_position_split::kRangeLocal);
         }
-        for (ggml_tensor * tensor : layer.k_records_stream) add_tensor(tensor, layer.il);
-        for (ggml_tensor * tensor : layer.v_records_stream) add_tensor(tensor, layer.il);
-        for (ggml_tensor * tensor : layer.k_stage_stream) add_tensor(tensor, layer.il);
-        for (ggml_tensor * tensor : layer.v_stage_stream) add_tensor(tensor, layer.il);
+        for (ggml_tensor * tensor : layer.k_records_stream) add_tensor(tensor, layer.il, llama_position_split::kRangeLocal);
+        for (ggml_tensor * tensor : layer.v_records_stream) add_tensor(tensor, layer.il, llama_position_split::kRangeLocal);
+        for (ggml_tensor * tensor : layer.k_stage_stream) add_tensor(tensor, layer.il, llama_position_split::kRangeLocal);
+        for (ggml_tensor * tensor : layer.v_stage_stream) add_tensor(tensor, layer.il, llama_position_split::kRangeLocal);
     }
-    for (const uint32_t il : standard_cache->get_layer_ids()) {
-        add_tensor(standard_cache->get_k_storage(int32_t(il)), il);
-        add_tensor(standard_cache->get_v_storage(int32_t(il)), il);
+    if (standard_cache) {
+        for (const uint32_t il : standard_cache->get_layer_ids()) {
+            // MUST mirror mixed_state_layer_descs: in P-mode the Qx body is range 1
+            // (the layer also owns a local KVarN body); outside P-mode the layer sets
+            // are disjoint and the Qx body is range 0, keeping the frame v1.
+            const uint32_t range = position_split_enabled()
+                    ? llama_position_split::kRangeOverflow
+                    : llama_position_split::kRangeLocal;
+            add_tensor(standard_cache->get_k_storage(int32_t(il)), il, range);
+            add_tensor(standard_cache->get_v_storage(int32_t(il)), il, range);
+        }
     }
 
-    llama_kv_mixed::split_writer split([&](const ggml_tensor * tensor) -> uint32_t {
+    llama_kv_mixed::split_writer split([&](const ggml_tensor * tensor) -> uint64_t {
         while (tensor && tensor->view_src) {
             tensor = tensor->view_src;
         }
-        const auto it = tensor_layers.find(tensor);
-        if (it == tensor_layers.end()) {
+        const auto it = tensor_ranges.find(tensor);
+        if (it == tensor_ranges.end()) {
             throw llama_kv_mixed::kv_mixed_error(
                     "mixed state writer received a tensor without a layer descriptor");
         }
-        return it->second;
+        return llama_kv_mixed::mixed_range_key(it->second.first, it->second.second);
     });
     state_write_kvarn_body(split, seq_id, flags);
-    standard_cache->state_write_shared_payload(split, seq_id, partial);
+    if (standard_cache) {
+        std::vector<uint32_t> overflow_cells;
+        bool empty_split_overflow = false;
+        if (position_split_enabled() && !partial) {
+            if (!position_split_live_cells(llama_position_split::range_kind::OVERFLOW, overflow_cells)) {
+                throw llama_kv_mixed::kv_mixed_error("split state writer cannot validate overflow occupancy");
+            }
+            empty_split_overflow = overflow_cells.empty();
+        }
+        if (empty_split_overflow) {
+            // The companion shares the logical table, whose LOCAL cells are
+            // occupied even though overflow is empty. Do not serialize unused
+            // Qx rows for them. Keep an explicit, validated native trailer.
+            const uint32_t empty_overflow[] = {1u, 1u, 0u}; // full, one stream, zero overflow cells
+            split.write(empty_overflow, sizeof(empty_overflow));
+        } else {
+            standard_cache->state_write_shared_payload(split, seq_id, partial);
+        }
+    }
 
     uint32_t payload_rows = 0;
     auto cells = mixed_state_cells(metadata.get(), seq_id, payload_rows);
     const uint32_t payload_cells = uint32_t(cells.size());
-    std::unordered_map<uint32_t, uint64_t> payload_sizes;
+    // F4 v2: the manifest now keys payload sizes by the packed range key
+    std::unordered_map<uint64_t, uint64_t> payload_sizes;
     for (const auto & entry : split.manifest().layer_payload_sizes) {
         payload_sizes.emplace(entry.first, entry.second);
     }
     auto layer_descs = mixed_state_layer_descs(*this, payload_sizes, partial,
-            payload_cells, payload_rows);
+            payload_cells, payload_rows, split_overflow_payload_rows(cells, position_split_p()));
 
     std::string manifest_error;
     const auto manifest = llama_kv_mixed::mixed_manifest_serialize(
@@ -3773,6 +4989,34 @@ void llama_kv_cache_kvarn::state_write_mixed(
     input.flags = partial ? llama_kv_mixed::snapshot_flags::partial : llama_kv_mixed::snapshot_flags::full;
     input.owner_epoch = partial ? state_owner_epoch : 0;
     input.owner_id = partial ? state_owner_id : 0;
+    // F4 v2: only a split cache emits the envelope, and it refuses to save
+    // without a stamped model/RoPE identity so a restore can never guess.
+    if (position_split_enabled()) {
+        if (state_model_id == 0 || state_rope_id == 0) {
+            throw std::runtime_error(
+                    "mixed KV state cannot save in split mode without a stamped model/RoPE identity");
+        }
+        llama_kv_mixed::position_split split;
+        split.p = position_split_p();
+        split.c = uint32_t(metadata->get_size());
+        split.model_id = state_model_id;
+        split.rope_id  = state_rope_id;
+        if (!llama_position_split::is_valid_p(split.p, split.c)) {
+            throw std::runtime_error(format(
+                    "mixed KV state split P=%u C=%u is not a valid position_split placement",
+                    split.p, split.c));
+        }
+        input.split = split;
+    } else if (state_model_id != 0 && state_rope_id != 0) {
+        // PURE (non-split) frame: stamp the ORIGINAL WRITER identity so a split
+        // destination can verify the source separately from itself. Config id is
+        // the hash of this frame's own descriptors, covered by the header crc.
+        llama_kv_mixed::source_identity src;
+        src.model_id  = state_model_id;
+        src.rope_id   = state_rope_id;
+        src.config_id = llama_kv_mixed::descriptor_config_id(input.layers);
+        input.source = src;
+    }
 
     const uint64_t frame_size = llama_kv_mixed::stream_serialized_size(input);
     if (frame_size > MIXED_KV_STATE_MAX_FRAME_BYTES || frame_size > size_t(-1)) {
@@ -3789,26 +5033,52 @@ void llama_kv_cache_kvarn::state_write_mixed(
     }
 
     llama_kv_mixed::stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-        return split.read_payload(layer_id, offset, dst, count);
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+        return split.read_payload(layer_id, range_id, offset, dst, count);
     };
     llama_kv_mixed::stream_write_callbacks writes;
     writes.write_bytes = [&](const uint8_t * bytes, size_t count) {
         io.write(bytes, count);
         return true;
     };
-    if (!llama_kv_mixed::stream_serialize(input, reads, writes)) {
+    // F4 import forensics: record the section map as the bytes are emitted.
+    llama_kv_mixed::stream_options opts;
+    if (g_capture_state_sections) {
+        g_state_write_sections.clear();
+        opts.on_section = [](const llama_kv_mixed::stream_section & s) {
+            g_state_write_sections.push_back(s);
+        };
+    }
+    if (!llama_kv_mixed::stream_serialize(input, reads, writes, opts)) {
         throw llama_kv_mixed::kv_mixed_error("failed to serialize mixed KV state");
     }
+}
+
+std::string llama_kv_cache_kvarn_state_write_sections_text() {
+    if (!g_capture_state_sections) {
+        return {};
+    }
+    std::string out;
+    for (const auto & s : g_state_write_sections) {
+        out += llama_kv_mixed::stream_section_text(s);
+        out += '\n';
+    }
+    return out;
 }
 
 void llama_kv_cache_kvarn::state_read_mixed(
         llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
         llama_kv_cache::slot_info_vec_t * sinfos_out,
-        const llama_kv_cache::slot_info_vec_t * sinfos_in) {
+        const llama_kv_cache::slot_info_vec_t * sinfos_in, uint32_t magic_pre) {
     using namespace llama_kv_mixed;
-    if (!standard_cache || migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
-        throw std::runtime_error("mixed state currently requires static non-SWA one-stream KV ownership");
+    // A split destination MUST own the Q4 overflow companion; a PURE source or
+    // a PURE destination has no standard_cache by definition and must never be
+    // forced to invent remote ownership (plan 3.6: pure stays no-remote).
+    if ((standard_cache == nullptr && position_split_enabled()) ||
+            migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
+        throw std::runtime_error(
+                "mixed state requires static non-SWA one-stream KV ownership"
+                " (and an overflow companion in split mode)");
     }
     constexpr uint32_t supported_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
             LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
@@ -3859,9 +5129,11 @@ void llama_kv_cache_kvarn::state_read_mixed(
         for (const ggml_tensor * tensor : layer.k_stage_stream) add_tensor_capacity(tensor);
         for (const ggml_tensor * tensor : layer.v_stage_stream) add_tensor_capacity(tensor);
     }
-    for (const uint32_t il : standard_cache->get_layer_ids()) {
-        add_tensor_capacity(standard_cache->get_k_storage(int32_t(il)));
-        add_tensor_capacity(standard_cache->get_v_storage(int32_t(il)));
+    if (standard_cache) {
+        for (const uint32_t il : standard_cache->get_layer_ids()) {
+            add_tensor_capacity(standard_cache->get_k_storage(int32_t(il)));
+            add_tensor_capacity(standard_cache->get_v_storage(int32_t(il)));
+        }
     }
     const uint64_t cell_margin = uint64_t(metadata->get_size()) * 32u;
     const uint64_t fixed_margin = MIXED_KV_STATE_FRAME_MARGIN_BYTES + cell_margin;
@@ -3869,10 +5141,12 @@ void llama_kv_cache_kvarn::state_read_mixed(
             ? MIXED_KV_STATE_MAX_FRAME_BYTES
             : kv_payload_capacity + fixed_margin;
 
-    uint32_t envelope_magic = 0;
+    uint32_t envelope_magic = magic_pre;
     uint32_t envelope_version = 0;
     uint64_t frame_bytes = 0;
-    io.read(&envelope_magic, sizeof(envelope_magic));
+    if (magic_pre == 0) {
+        io.read(&envelope_magic, sizeof(envelope_magic));
+    }
     io.read(&envelope_version, sizeof(envelope_version));
     io.read(&frame_bytes, sizeof(frame_bytes));
     if (envelope_magic != MIXED_KV_STATE_ENVELOPE_MAGIC ||
@@ -3917,7 +5191,52 @@ void llama_kv_cache_kvarn::state_read_mixed(
         throw kv_mixed_error(manifest_error.empty() ? "invalid mixed state I/O manifest" : manifest_error);
     }
 
-    std::unordered_map<uint32_t, uint64_t> payload_sizes;
+    const bool original_split_frame = parsed.has_split();
+    const bool split_to_pure_import = original_split_frame && !position_split_enabled() && !standard_cache;
+    std::unordered_set<uint64_t> source_empty_overflow_keys;
+    // Preserve and validate the ORIGINAL two-range framing before projection.
+    // A zero occupied extent is not permission to ignore an unchecked payload
+    // or virtual tensor event belonging to the discarded overflow range.
+    if (split_to_pure_import) {
+        uint64_t extent = 0;
+        for (const auto & cell : parsed.cells()) {
+            if (cell.pos >= 0) { extent = std::max(extent, uint64_t(cell.pos)+1u); }
+        }
+        const uint32_t source_p = parsed.split()->p;
+        const uint32_t destination_capacity = metadata->get_size();
+        if (extent > std::min<uint64_t>(source_p, destination_capacity)) {
+            // Attribute occupied-overflow refusal to its actual logical
+            // extent before inspecting the naturally nonempty Qx payload.
+            // Below-P candidates still face every original manifest guard.
+            throw kv_mixed_error(format(
+                    "split-to-pure import refused: snapshot extent %llu exceeds min(P=%u, capacity=%u)",
+                    (unsigned long long) extent, source_p, destination_capacity));
+        }
+        std::unordered_map<uint64_t, const layer_desc *> original_descs;
+        for (const auto & desc : parsed.layers()) {
+            original_descs.emplace(mixed_range_key(desc.layer_id, desc.range_id), &desc);
+            if (desc.range_id == llama_position_split::kRangeOverflow) {
+                source_empty_overflow_keys.insert(mixed_range_key(desc.layer_id, desc.range_id));
+            }
+        }
+        for (const auto & entry : manifest.layer_payload_sizes) {
+            const auto it = original_descs.find(entry.first);
+            if (it == original_descs.end() || entry.second != it->second->payload_bytes) {
+                throw kv_mixed_error("split-to-pure import: source manifest names unknown or inconsistent range payload");
+            }
+            if (source_empty_overflow_keys.count(entry.first) && entry.second != 0) {
+                throw kv_mixed_error("split-to-pure import: overflow payload is not empty");
+            }
+        }
+        for (const auto & event : manifest.events) {
+            if (event.kind == 1 && event.range_id == llama_position_split::kRangeOverflow) {
+                throw kv_mixed_error("split-to-pure import: overflow tensor event cannot be discarded");
+            }
+        }
+    }
+
+    // F4 v2: payload sizes are keyed by the packed (layer_id, range_id) pair
+    std::unordered_map<uint64_t, uint64_t> payload_sizes;
     payload_sizes.reserve(manifest.layer_payload_sizes.size());
     for (const auto & entry : manifest.layer_payload_sizes) {
         payload_sizes.emplace(entry.first, entry.second);
@@ -3932,22 +5251,101 @@ void llama_kv_cache_kvarn::state_read_mixed(
         throw kv_mixed_error("mixed state cell count is inconsistent");
     }
     auto expected_descs = mixed_state_layer_descs(
-            *this, payload_sizes, partial, uint32_t(parsed.cells().size()), payload_rows);
-    std::unordered_set<uint32_t> expected_layer_ids;
-    expected_layer_ids.reserve(expected_descs.size());
+            *this, payload_sizes, partial, uint32_t(parsed.cells().size()), payload_rows,
+            split_overflow_payload_rows(parsed.cells(), position_split_p()));
+    if (split_to_pure_import) {
+        parsed.project_split_to_pure_for_import(metadata->get_size(), state_model_id, state_rope_id, expected_descs);
+        // These entries were independently checked against the original
+        // descriptor set and have no events/payload. The virtual metadata
+        // stream (including its empty-overflow trailer) remains unchanged.
+        manifest.layer_payload_sizes.erase(std::remove_if(manifest.layer_payload_sizes.begin(),
+                manifest.layer_payload_sizes.end(), [&](const auto & entry) {
+                    return source_empty_overflow_keys.count(entry.first) != 0;
+                }), manifest.layer_payload_sizes.end());
+        LLAMA_LOG_INFO("%s: importing split local range into pure KVarN; overflow unoccupied and payload empty\n", __func__);
+    }
+    std::unordered_set<uint64_t> expected_range_keys;
+    expected_range_keys.reserve(expected_descs.size());
     expected_snapshot expected;
     expected.layers.reserve(expected_descs.size());
     for (const layer_desc & desc : expected_descs) {
-        expected_layer_ids.insert(desc.layer_id);
+        expected_range_keys.insert(llama_kv_mixed::mixed_range_key(desc.layer_id, desc.range_id));
         expected.layers.push_back(expected_layer::from_desc(desc));
     }
+    // F4 v2: the frame's position_split must match this cache's own placement
+    // exactly. A snapshot saved with a different P/C (or a different model/RoPE
+    // identity) fails here, BEFORE any staging, so no partial restore happens.
+    // Plan 3.6 (lines 187-191): an AUTHORIZED import of a PURE XXL KVarN
+    // snapshot (no envelope) into this position_split destination. It is only
+    // legal while the snapshot extent fits min(P, capacity); model/RoPE/geometry
+    // identity was already established by the caller's layout predicate
+    // (common_prompt_cache_layout_pure_to_split), and types/domain/positions/
+    // tail/cells are validated against this destination by
+    // validate_expected_snapshot. Everything below -- staged reader, v2
+    // descriptor integrity and the atomic KV+table+DeltaNet commit -- runs
+    // unchanged, and this throws BEFORE any staging.
+    if (position_split_enabled() && !parsed.has_split()) {
+        llama_pos max_pos = -1;
+        for (const cell_entry & cell : parsed.cells()) {
+            if (cell.pos >= 0 && cell.pos > max_pos) {
+                max_pos = cell.pos;
+            }
+        }
+        const uint64_t cap = (uint64_t) metadata->get_size();
+        const uint64_t limit = std::min<uint64_t>((uint64_t) position_split_p(), cap);
+        const uint64_t extent = max_pos < 0 ? 0 : (uint64_t) max_pos + 1;
+        if (extent > limit) {
+            throw kv_mixed_error(format(
+                    "pure KVarN import refused: snapshot extent %llu exceeds "
+                    "min(P=%u, capacity=%llu)",
+                    (unsigned long long) extent, position_split_p(),
+                    (unsigned long long) limit));
+        }
+        position_split want;
+        want.p        = position_split_p();
+        want.c        = metadata->get_size();
+        want.model_id = state_model_id;
+        want.rope_id  = state_rope_id;
+        // Source identity comes from the frame itself (KMS3, header-crc
+        // protected and bound to these exact payload bytes). A legacy v1 frame
+        // has none and fails closed inside the adapter. Nothing destination-
+        // derived is ever substituted for source provenance.
+        parsed.adopt_split_for_import(want, expected_descs, parsed.frame_source_identity());
+    }
+    if (parsed.has_split() != position_split_enabled()) {
+        throw kv_mixed_error(this->position_split_enabled()
+                ? "mixed state snapshot has no position_split envelope but this cache is split"
+                : "mixed state snapshot carries a position_split envelope but this cache is not split");
+    }
+    if (parsed.has_split()) {
+        position_split want;
+        want.p        = position_split_p();
+        want.c        = metadata->get_size();
+        want.model_id = state_model_id;
+        want.rope_id  = state_rope_id;
+        const auto & got = *parsed.split();
+        if (got.p != want.p || got.c != want.c ||
+                got.model_id != want.model_id || got.rope_id != want.rope_id) {
+            throw kv_mixed_error(format(
+                    "mixed state position_split mismatch: snapshot P=%u C=%llu model=%llu rope=%llu, "
+                    "cache P=%u C=%llu model=%llu rope=%llu",
+                    got.p, (unsigned long long) got.c,
+                    (unsigned long long) got.model_id, (unsigned long long) got.rope_id,
+                    want.p, (unsigned long long) want.c,
+                    (unsigned long long) want.model_id, (unsigned long long) want.rope_id));
+        }
+        expected.split = want;
+    }
     for (const auto & entry : manifest.layer_payload_sizes) {
-        if (expected_layer_ids.count(entry.first) == 0) {
-            throw kv_mixed_error("mixed state I/O manifest names a layer not owned by this cache");
+        if (expected_range_keys.count(entry.first) == 0) {
+            throw kv_mixed_error(format(
+                    "mixed state I/O manifest names layer %u range %u, which this cache does not own",
+                    llama_kv_mixed::mixed_key_layer(entry.first),
+                    llama_kv_mixed::mixed_key_range(entry.first)));
         }
     }
     for (const layer_desc & desc : parsed.layers()) {
-        const auto it = payload_sizes.find(desc.layer_id);
+        const auto it = payload_sizes.find(llama_kv_mixed::mixed_range_key(desc.layer_id, desc.range_id));
         const uint64_t manifest_bytes = it == payload_sizes.end() ? 0 : it->second;
         if (desc.payload_bytes != manifest_bytes) {
             throw kv_mixed_error("mixed state descriptor and I/O manifest payload sizes differ");
@@ -3996,11 +5394,16 @@ void llama_kv_cache_kvarn::state_read_mixed(
     std::vector<split_reader::payload_span> spans;
     spans.reserve(manifest.layer_payload_sizes.size());
     for (const auto & entry : manifest.layer_payload_sizes) {
-        const uint32_t layer_id = entry.first;
+        const uint32_t layer_id = llama_kv_mixed::mixed_key_layer(entry.first);
+        const uint32_t range_id = llama_kv_mixed::mixed_key_range(entry.first);
+        // F4 v2: match the descriptor on the PAIR, not on layer_id alone, or
+        // both ranges of one layer would resolve to the same descriptor.
         const auto desc_it = std::find_if(parsed.layers().begin(), parsed.layers().end(),
-                [layer_id](const layer_desc & desc) { return desc.layer_id == layer_id; });
+                [&](const layer_desc & desc) {
+                    return desc.layer_id == layer_id && desc.range_id == range_id;
+                });
         if (desc_it == parsed.layers().end()) {
-            throw kv_mixed_error("mixed state payload has no layer descriptor");
+            throw kv_mixed_error("mixed state payload has no matching layer/range descriptor");
         }
         const size_t layer_index = size_t(desc_it - parsed.layers().begin());
         const size_t size = parsed.payload_size(layer_index);
@@ -4012,7 +5415,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
             if (data == nullptr) {
                 throw kv_mixed_error("mixed state payload has no mapped backing data");
             }
-            spans.push_back({ layer_id, data, size, parsed.backing() });
+            spans.push_back({ layer_id, range_id, data, size, parsed.backing() });
         }
     }
 
@@ -4079,7 +5482,44 @@ void llama_kv_cache_kvarn::state_read_mixed(
     if (restored_rows != payload_rows) {
         throw kv_mixed_error("mixed snapshot cell summary does not match the restored KVarN rows");
     }
-    standard_cache->state_read_shared_payload(reader, seq_id, partial, restored_sinfos);
+    // PURE -> split translation: the pure producer has no standard/overflow
+    // companion, so it never wrote the shared-payload header. The manifest's
+    // own byte accounting says so (measured: cursor == declared_total = 18705471
+    // and the consumer then asks for 4 more bytes = the `kind` u32 at the top
+    // of state_read_shared_payload). Read it only when bytes are actually
+    // declared; otherwise leave the companion overflow EMPTY (plan 3.6:
+    // "preencher local e deixar overflow vazio"). No padding, no relaxed bound:
+    // a source that DOES declare trailing bytes still goes through the reader.
+    bool empty_split_overflow = split_to_pure_import;
+    if (!partial && position_split_enabled() && original_split_frame) {
+        empty_split_overflow = true;
+        for (const auto & cell : parsed.cells()) {
+            if (cell.pos >= llama_pos(position_split_p())) { empty_split_overflow = false; }
+        }
+        for (const auto & desc : parsed.layers()) {
+            if (desc.range_id == llama_position_split::kRangeOverflow && desc.payload_bytes != 0) {
+                empty_split_overflow = false;
+            }
+        }
+    }
+    if (!partial && empty_split_overflow) {
+        // This must be the canonical explicit empty companion written above.
+        // Reject truncated/extra metadata and validate all three fields BEFORE
+        // reader.defer_to(io) publishes any staged KV/table/recurrent writes.
+        if (reader.remaining() != 3*sizeof(uint32_t)) {
+            throw kv_mixed_error("empty split overflow has a missing or noncanonical native trailer");
+        }
+        uint32_t trailer[3];
+        reader.read(trailer, sizeof(trailer));
+        if (trailer[0] != 1 || trailer[1] != 1 || trailer[2] != 0) {
+            throw kv_mixed_error("empty split overflow trailer contains occupied rows or incompatible stream/kind");
+        }
+    } else if (standard_cache && reader.remaining() > 0) {
+        standard_cache->state_read_shared_payload(reader, seq_id, partial, restored_sinfos);
+    } else {
+        LLAMA_LOG_INFO("%s: pure source declares no shared/overflow payload; "
+                       "leaving the companion overflow empty\n", __func__);
+    }
     if (reader.remaining() != 0) {
         throw kv_mixed_error("mixed state I/O manifest contains trailing legacy bytes");
     }
@@ -4097,6 +5537,14 @@ void llama_kv_cache_kvarn::state_read_mixed(
 bool llama_kv_cache_kvarn_context::uses_native_attention(int32_t il) const {
     return shared_graph_layers.empty() && cache->uses_kvarn_layer(graph_layer_for(il)) &&
             cache->uses_native_attention(graph_layer_for(il));
+}
+
+bool llama_kv_cache_kvarn_context::has_qualified_dflash_mask() const {
+    return shared_graph_layers.empty() && cache->has_qualified_dflash_mask();
+}
+
+ggml_backend_dev_t llama_kv_cache_kvarn_context::native_attention_backend(int32_t il) const {
+    return shared_graph_layers.empty() ? cache->native_attention_backend(graph_layer_for(il)) : nullptr;
 }
 
 bool llama_kv_cache_kvarn_context::mixed_tail_native_preferred(int32_t il) const {
@@ -4120,10 +5568,950 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         llama_kv_cache::slot_info_vec_t * sinfos_out,
         const llama_kv_cache::slot_info_vec_t * sinfos_in) {
     if (standard_cache) {
-        state_read_mixed(io, seq_id, flags, sinfos_out, sinfos_in);
+        // F4 §3.6. llama_io_read_i is sequential and offers no peek/seek, so the
+        // leading word is read once here to classify the frame.
+        //
+        // That leading word is NOT the KVRN body marker: the pure writer emits
+        // the metadata block FIRST (state_write_kvarn_body: metadata->state_write
+        // at :3939) and only then KVAR_N_STATE_MAGIC (:3962), and the pure
+        // reader mirrors it (metadata_prepared->state_read_sinfo at :4849, then
+        // the KVRN magic). So for a pure frame this word is the metadata marker
+        // (KVTL, llama-kv-cache.cpp:4421), not KVRN.
+        //
+        // Therefore the two cases are handled differently:
+        //  - QSKM mixed envelope: the pre-read word IS the envelope magic the
+        //    mixed reader expects first, so it is handed over as magic_pre.
+        //  - anything else: treat it as a pure KVarN frame, replay the 4 bytes
+        //    so the pure reader sees the exact original stream and consumes
+        //    metadata then KVRN in the correct order.
+        uint32_t leading = 0;
+        io.read(&leading, sizeof(leading));
+        if (leading == MIXED_KV_STATE_ENVELOPE_MAGIC) {
+            state_read_mixed(io, seq_id, flags, sinfos_out, sinfos_in, leading);
+            return;
+        }
+        llama_io_read_replay replay(io, &leading, sizeof(leading));
+        state_read_pure_to_mixed_import(replay, seq_id, flags, sinfos_out, sinfos_in);
         return;
     }
-    state_read_kvarn_body(io, seq_id, flags, sinfos_out, sinfos_in);
+    // PURE destination: dispatch on the leading word (narrow, intended).
+    // A QSKM frame (pure source written through the mixed writer) is handled by
+    // the mixed reader; anything else (KVTL/KVRN legacy body) is replayed so the
+    // legacy parser sees the exact original stream and order.
+    {
+        uint32_t leading = 0;
+        io.read(&leading, sizeof(leading));
+        if (leading == MIXED_KV_STATE_ENVELOPE_MAGIC) {
+            state_read_mixed(io, seq_id, flags, sinfos_out, sinfos_in, leading);
+            return;
+        }
+        llama_io_read_replay replay(io, &leading, sizeof(leading));
+        state_read_kvarn_body(replay, seq_id, flags, sinfos_out, sinfos_in);
+        return;
+    }
+}
+// F4 §3.6: authorized PURE KVarN frame -> mixed (position-split) cache.
+//
+// `io` presents the original byte stream (state_read_sinfo replays the leading
+// word it consumed to classify the frame). The existing pure reader does all
+// parsing and validation: model/instance identity, KVarN types, the domain,
+// positions, the exact-tail payload, the recurrent state and the frame
+// integrity. It materializes into this cache only through its own
+// prepare/commit, so nothing is committed before the frame has validated.
+//
+// gate_prepared is invoked by that reader on the restore-only metadata cache,
+// immediately after the metadata block is prepared and BEFORE the live cache is
+// mutated, so a rejection here leaves the destination intact.
+//
+// Acceptance requires every restored cell to land inside the local range [0,P).
+// The overflow range [P,C) is then never referenced and stays empty. Nothing is
+// ever truncated or requantized to satisfy the gate.
+
+// Per-layer, per-field table of the LIVE state of one sequence.
+//
+// Two hashes are reported and they are NOT interchangeable:
+//   full_tensor_hash : diagnostic only. Covers the whole tensor span, so it
+//                      includes padding and inactive cells and can never be used
+//                      as a live-state gate.
+//   live_payload_hash: the gate candidate. Only the rows holding a LIVE cell of
+//                      this sequence are read, addressed by the per-row stride
+//                      from ggml_row_size(t, 0) (which honours nb[] and therefore
+//                      block sizes for quantized types). Read through
+//                      ggml_backend_tensor_get after synchronizing the producing
+//                      context, so remote (non-host) payloads are covered too.
+// `skipped` counts live rows that a tensor could not address; a live layer with
+// skipped>0 or bytes==0 is reported UNSUPPORTED, never as an equality.
+// Per-layer live span table for the local/standard cache that executes
+// alongside KVarN. Same contract as the KVarN table: live_payload_hash covers
+// only rows owned by the sequence; full_tensor_hash is diagnostic only.
+std::string llama_kv_cache::live_layer_table(llama_seq_id seq_id) const {
+    // Authoritative mapping, reused from state_write_data(): the per-cell stride
+    // is ggml_row_size(tensor->type, hparams.n_embd_k_gqa(il)) -- NOT
+    // tensor->ne[0] -- and the tensor is the per-STREAM view
+    // (layer.k_stream[stream]). Using ne[0] addresses the wrong span whenever the
+    // tensor is multi-dimensional, and previously segfaulted here.
+    std::string out;
+    char line[512];
+    const auto & scells = get_cells(seq_id);
+    std::vector<uint32_t> rows;
+    llama_pos pmin = -1, pmax = -1;
+    for (uint32_t cell = get_payload_row_origin(); cell < scells.size(); ++cell) {
+        if (scells.is_empty(cell)) { continue; }
+        if (!scells.seq_get_all(cell).test(seq_id)) { continue; }
+        rows.push_back(cell);
+        const llama_pos pos = scells.pos_get(cell);
+        if (pmin < 0 || pos < pmin) { pmin = pos; }
+        if (pos > pmax) { pmax = pos; }
+    }
+    snprintf(line, sizeof(line),
+             "standard_cache n_layers=%zu n_stream=%u n_ctx=%u payload_origin=%u physical_rows=%u\n",
+             layers.size(), (unsigned) n_stream, (unsigned) get_size(),
+             get_payload_row_origin(), get_payload_size());
+    out += line;
+    for (size_t li = 0; li < layers.size(); ++li) {
+        const auto & sl = layers[li];
+        const uint32_t il = sl.il;
+        uint64_t live_hash = 1469598103934665603ull;
+        size_t live_bytes = 0, skipped = 0, unaddressable = 0;
+        auto mix = [&](ggml_tensor * t, uint64_t row_size) {
+            if (!t || row_size == 0) { ++unaddressable; return; }
+            const size_t nrows = ggml_nrows(t);
+            std::vector<uint8_t> b((size_t) row_size);
+            for (uint32_t r : rows) {
+                const uint32_t physical_row = payload_row_for_cell(r);
+                if (uint64_t(physical_row) >= uint64_t(nrows)) { ++skipped; continue; }
+                ggml_backend_tensor_get(t, b.data(), size_t(physical_row) * size_t(row_size), size_t(row_size));
+                for (size_t i = 0; i < b.size(); ++i) { live_hash ^= b[i]; live_hash *= 1099511628211ull; }
+                live_bytes += b.size();
+            }
+        };
+        for (uint32_t st = 0; st < n_stream; ++st) {
+            if (st < sl.k_stream.size() && sl.k_stream[st]) {
+                mix(sl.k_stream[st], ggml_row_size(sl.k_stream[st]->type,
+                        (int) hparams.n_embd_k_gqa(il)));
+            } else { ++unaddressable; }
+            if (st < sl.v_stream.size() && sl.v_stream[st]) {
+                mix(sl.v_stream[st], ggml_row_size(sl.v_stream[st]->type,
+                        (int) hparams.n_embd_v_gqa(il)));
+            } else { ++unaddressable; }
+        }
+        const char * cov = (live_bytes == 0 || skipped > 0 || unaddressable > 0)
+                ? "UNSUPPORTED" : "covered";
+        snprintf(line, sizeof(line),
+                 "layer=%u placement=local cache=standard live_rows=%zu pos_min=%d "
+                 "pos_max=%d live_bytes=%zu skipped=%zu unaddressable=%zu coverage=%s "
+                 "live_payload_hash=%016llx\n",
+                 il, rows.size(), (int) pmin, (int) pmax, live_bytes, skipped,
+                 unaddressable, cov, (unsigned long long) live_hash);
+        out += line;
+    }
+    return out;
+}
+
+bool llama_kv_cache::probe_mutation(llama_seq_id seq_id, int layer_index, const char * tensor,
+        uint32_t row, bool live) {
+    if (layer_index < 0 || (size_t) layer_index >= layers.size() || !tensor) {
+        return false;
+    }
+    const auto & l = layers[layer_index];
+    ggml_tensor * t = nullptr;
+    const std::string want(tensor);
+    if (want == "k") { t = l.k; } else if (want == "v") { t = l.v; }
+    if (!t) { return false; }
+    const size_t nrows = ggml_nrows(t);
+    const size_t rowb  = ggml_row_size(t->type, (int) t->ne[0]);
+    if (nrows == 0 || rowb == 0) { return false; }
+    uint32_t target = row;
+    if (live) {
+        const auto & scells = get_cells(seq_id);
+        for (uint32_t cell = 0; cell < scells.size(); ++cell) {
+            if (scells.is_empty(cell) || !scells.seq_get_all(cell).test(seq_id)) { continue; }
+            target = cell;
+            break;
+        }
+    } else {
+        uint32_t live_row = UINT32_MAX;
+        const auto & scells = get_cells(seq_id);
+        for (uint32_t cell = 0; cell < scells.size(); ++cell) {
+            if (!scells.is_empty(cell) && scells.seq_get_all(cell).test(seq_id)) { live_row = cell; break; }
+        }
+        for (uint32_t r = 0; r < nrows; ++r) {
+            if (r != live_row) { target = r; break; }
+        }
+        if (target >= nrows || target == live_row) { return false; }
+    }
+    if (target >= nrows) { return false; }
+    uint8_t byte = 0;
+    ggml_backend_tensor_get(t, &byte, target * rowb, 1);
+    const uint8_t want_byte = (uint8_t) (byte ^ 0xff);
+    ggml_backend_tensor_set(t, &want_byte, target * rowb, 1);
+    uint8_t after = 0;
+    ggml_backend_tensor_get(t, &after, target * rowb, 1);
+    return after == want_byte;
+}
+
+std::string llama_kv_cache_kvarn::live_layer_table(llama_seq_id seq_id) const {
+    std::string out;
+    char line[640];
+    const std::string layout = standard_cache ? "kvarn+standard" : "kvarn_only";
+    snprintf(line, sizeof(line),
+             "cache layers=%zu type=%d key_bits=%d value_bits=%d stage_groups=%u "
+             "tail_groups=%u placement=%s token_group=%u split_p=%u seq=%d\n",
+             layers.size(), (int) params.type, params.key_bits, params.value_bits,
+             (unsigned) stage_groups, (unsigned) tail_groups, layout.c_str(),
+             (unsigned) KVAR_N_GROUP, (unsigned) position_split_p_, (int) seq_id);
+    out += line;
+    const auto remote = standard_layer_layout();
+    // Live rows of this sequence, from the metadata cells.
+    std::vector<uint32_t> live_rows;
+    llama_pos pmin = -1, pmax = -1;
+    if (metadata) {
+        const auto & cells = metadata->get_cells(0);
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) { continue; }
+            if (!cells.seq_get_all(cell).test(seq_id)) { continue; }
+            live_rows.push_back(cell);
+            const llama_pos pos = cells.pos_get(cell);
+            if (pmin < 0 || pos < pmin) { pmin = pos; }
+            if (pos > pmax) { pmax = pos; }
+        }
+    }
+    for (size_t li = 0; li < layers.size(); ++li) {
+        const auto & l = layers[li];
+        bool is_remote = false;
+        for (const auto & r : remote) {
+            if (r.layer_id == l.il) { is_remote = true; break; }
+        }
+        uint64_t live_hash = 1469598103934665603ull;
+        uint64_t full_hash = 1469598103934665603ull;
+        size_t live_bytes = 0, skipped = 0, unaddressable = 0;
+        size_t diag_bytes = 0;
+        auto mix_full = [&](ggml_tensor * t) {
+            if (!t || !t->buffer || ggml_n_dims(t) < 1) { return; }
+            const size_t nb = ggml_nbytes(t);
+            if (!nb) { return; }
+            std::vector<uint8_t> b(nb);
+            ggml_backend_tensor_get(t, b.data(), 0, nb);
+            for (size_t i = 0; i < nb; ++i) { full_hash ^= b[i]; full_hash *= 1099511628211ull; }
+            diag_bytes += nb;
+        };
+        // AUTHORITATIVE span mapping, reused from the reader/writer views at
+        // :2520-2535: the tensors are viewed as
+        //   view_3d(k_record_dim, n_head_k_sliced, n_groups_per_stream)  records
+        //   view_3d(k_record_dim, n_head_k_sliced, KVAR_N_GROUP*stage_groups) stage
+        // with nb[1] as the HEAD stride and nb[2] as the GROUP/SLOT stride, and a
+        // stream base of s * <axis2> * nb[2]. A live cell therefore maps to
+        // group = cell / KVAR_N_GROUP, NOT to row `cell` of a ne[0] row. Hashing
+        // `cell * ggml_row_size(type, ne[0])` would address the wrong head and the
+        // wrong group, which a self-consistent mutation probe cannot detect.
+        // EXACT unit size: the view is
+        //   view_3d(k_record_size, n_head_k_sliced, n_groups_per_stream,
+        //            k_records->nb[1], k_records->nb[2], ...)
+        // so element (d, head, group) lives at d*nb[0] + head*nb[1] + group*nb[2]
+        // and ONE (head, group) unit is k_record_size*nb[0] bytes, i.e. the head
+        // stride nb[1]. Reading nb[2] bytes instead would spill into the other
+        // heads of the same group, which is what the previous version did.
+        // Head counts must be derived exactly as at allocation:
+        //   n_head_k_sliced = n_head_kv * k_slices, n_head_v_sliced = n_head_kv * v_slices
+        // (using k_slices alone, or n_head_kv alone, addresses the wrong count).
+        const uint32_t axis2_unused = 0;
+        auto mix_live_3d = [&](ggml_tensor * t, uint32_t, uint32_t,
+                               const std::vector<uint32_t> & groups, size_t & skipped_local) {
+            if (!t || !t->buffer || t->ne[0] <= 0 || t->ne[2] <= 0) {
+                ++unaddressable;
+                return;
+            }
+            // REAL shape (src/llama-kv-kvarn-materializer.h:109-111):
+            //   records: I8 leaf [record_bytes, phys_heads, groups_per_stream]
+            //   stage  : F16 leaf [record_dim, phys_heads, 128*stage_groups]
+            // so ONE (head, group) unit is ne[0]*nb[0] bytes -- record_bytes --
+            // NOT nb[1], which is the stride BETWEEN heads. The head and group
+            // counts are the tensor's own ne[1]/ne[2]; k_slices/n_head_kv are
+            // descriptor values that need not match phys_heads.
+            const size_t unit    = size_t(t->ne[0]) * t->nb[0];
+            const size_t hstride = t->nb[1];
+            const size_t gstride = t->nb[2];
+            const size_t total   = ggml_nbytes(t);
+            const uint32_t real_heads  = (uint32_t) t->ne[1];
+            const uint32_t real_groups = (uint32_t) t->ne[2];
+            if (unit == 0 || gstride == 0 || real_heads == 0) { ++unaddressable; return; }
+            std::vector<uint8_t> b(unit);
+            for (uint32_t g : groups) {
+                if (g >= real_groups) { ++skipped_local; continue; }
+                for (uint32_t h = 0; h < real_heads; ++h) {
+                    const size_t off = size_t(h) * hstride + size_t(g) * gstride;
+                    if (off + unit > total) { ++skipped_local; continue; }
+                    ggml_backend_tensor_get(t, b.data(), off, unit);
+                    for (size_t i = 0; i < b.size(); ++i) {
+                        live_hash ^= b[i];
+                        live_hash *= 1099511628211ull;
+                    }
+                    live_bytes += b.size();
+                }
+            }
+        };
+        // The REAL set of groups this sequence occupies: dedup cell -> group, no
+        // range walk (a range walk would include holes and repeat a group once per
+        // cell).
+        std::vector<uint32_t> live_slots;
+        for (uint32_t c : live_rows) {
+            if (std::find(live_slots.begin(), live_slots.end(), c) == live_slots.end()) {
+                live_slots.push_back(c);
+            }
+        }
+        std::vector<uint32_t> live_groups;
+        for (uint32_t c : live_rows) {
+            const uint32_t g = c / KVAR_N_GROUP;
+            if (std::find(live_groups.begin(), live_groups.end(), g) == live_groups.end()) {
+                live_groups.push_back(g);
+            }
+        }
+        if (!live_groups.empty()) {
+            (void) axis2_unused;
+            mix_live_3d(l.k_records, 0, 0, live_groups, skipped);
+            mix_live_3d(l.v_records, 0, 0, live_groups, skipped);
+        }
+        // Stage and tail are slot-addressed (axis2 = slots), not cell-addressed.
+        // Stage is slot-addressed; only slots this sequence actually occupies are
+        // live, so the metadata's cells are mapped to their stage slots instead of
+        // walking the whole stage_groups*KVAR_N_GROUP space.
+        auto mix_slots = [&](ggml_tensor * t, uint32_t n_heads, size_t & skipped_local) {
+            if (!t || !t->buffer || t->ne[0] <= 0 || t->ne[2] <= 0) {
+                ++unaddressable;
+                return;
+            }
+            const size_t unit = size_t(t->ne[0]) * t->nb[0];
+            const size_t head_stride = t->nb[1];
+            const size_t slot_stride = t->nb[2];
+            const size_t total       = ggml_nbytes(t);
+            const uint32_t real_heads = (uint32_t) t->ne[1];
+            const uint32_t real_slots = (uint32_t) t->ne[2];
+            if (unit == 0 || slot_stride == 0 || real_heads == 0) { ++unaddressable; return; }
+            std::vector<uint8_t> b(unit);
+            (void) n_heads;
+            for (uint32_t sl : live_slots) {
+                if (sl >= real_slots) { ++skipped_local; continue; }
+                for (uint32_t h = 0; h < real_heads; ++h) {
+                    const size_t off = size_t(h) * head_stride + size_t(sl) * slot_stride;
+                    if (off + unit > total) { ++skipped_local; continue; }
+                    ggml_backend_tensor_get(t, b.data(), off, unit);
+                    for (size_t i = 0; i < b.size(); ++i) {
+                        live_hash ^= b[i];
+                        live_hash *= 1099511628211ull;
+                    }
+                    live_bytes += b.size();
+                }
+            }
+        };
+        mix_slots(l.k_stage, l.n_head_kv * l.k_slices, skipped);
+        mix_slots(l.v_stage, l.n_head_kv * l.v_slices, skipped);
+        // Tail uses ne[0] as its row (see the stream-copy path at :3819).
+        auto mix_tail = [&](ggml_tensor * t) {
+            if (!t || !t->buffer || t->ne[0] <= 0 || t->ne[1] <= 0) { ++unaddressable; return; }
+            const size_t row = size_t(t->ne[0]) * t->nb[0];
+            const size_t nrows = ggml_nrows(t);
+            if (row == 0 || nrows == 0) { ++unaddressable; return; }
+            std::vector<uint8_t> b(row);
+            for (uint32_t r : live_rows) {
+                if (r >= nrows) { ++skipped; continue; }
+                ggml_backend_tensor_get(t, b.data(), size_t(r) * row, row);
+                for (size_t i = 0; i < b.size(); ++i) { live_hash ^= b[i]; live_hash *= 1099511628211ull; }
+                live_bytes += b.size();
+            }
+        };
+        mix_tail(l.k_tail);
+        mix_tail(l.v_tail);
+        mix_full(l.k_records);  mix_full(l.v_records);
+        mix_full(l.k_stage);     mix_full(l.v_stage);
+        mix_full(l.k_tail);      mix_full(l.v_tail);
+
+        const char * coverage = (live_bytes == 0 || skipped > 0) ? "UNSUPPORTED" : "covered";
+        snprintf(line, sizeof(line),
+                 "layer=%u placement=%s native_attn=%d tail_native=%d n_head_kv=%u "
+                 "head_dim_k=%u head_dim_v=%u live_rows=%u pos_min=%d pos_max=%d "
+                 "live_bytes=%zu skipped=%zu full_tensor_bytes=%zu coverage=%s "
+                 "live_payload_hash=%016llx full_tensor_hash=%016llx\n",
+                 l.il, is_remote ? "remote" : "local", (int) l.native_attention,
+                 (int) l.mixed_tail_native, l.n_head_kv, l.head_dim_k, l.head_dim_v,
+                 (unsigned) live_rows.size(), (int) pmin, (int) pmax, live_bytes, skipped,
+                 diag_bytes, coverage,
+                 (unsigned long long) live_hash, (unsigned long long) full_hash);
+        out += line;
+    }
+    // The LOCAL cache that actually executes alongside KVarN must be visible
+    // too: a table of only the remote-placed layers cannot prove anything about
+    // the executed path, and in this configuration the KVarN cache holds only the
+    // remote layers while the majority execute locally here.
+    if (standard_cache) {
+        out += standard_cache->live_layer_table(seq_id);
+    }
+    return out;
+}
+
+
+// Proof helper: address ONE byte of ONE tensor row, either inside the live span
+// of the sequence or inside an inactive row, and flip it. Returns true only if
+// the byte was actually addressed and written, so the test can assert that a
+// live mutation is observable and an inactive one is not part of the live hash.
+bool llama_kv_cache_kvarn::probe_mutation(llama_seq_id seq_id, int layer_index,
+        const char * tensor, uint32_t row, bool live) {
+    // `layer_index` is a MODEL layer, resolved exactly like probe_head_span(),
+    // probe_leaf() and materialized_probe() do. Indexing `layers[]` positionally
+    // here meant "layer 0" reached model layer 3 through this API while the
+    // head-span probe refused it, so the fixture was proving one layer and
+    // mutating another.
+    if (layer_index < 0 || map_layer_ids.find(layer_index) == map_layer_ids.end() || !tensor) {
+        return false;
+    }
+    const auto & l = layer_for(layer_index);
+    ggml_tensor * t = nullptr;
+    const std::string want(tensor);
+    if      (want == "k_records") { t = l.k_records; }
+    else if (want == "v_records") { t = l.v_records; }
+    else if (want == "k_stage")    { t = l.k_stage; }
+    else if (want == "v_stage")    { t = l.v_stage; }
+    else if (want == "k_tail")     { t = l.k_tail; }
+    else if (want == "v_tail")     { t = l.v_tail; }
+    if (!t || !t->buffer) { return false; }
+
+    // Address the tensor with the SAME (head, group) layout that
+    // live_payload_hash() uses: element (d, head, group) lives at
+    // d*nb[0] + head*nb[1] + group*nb[2] and one unit is ne[0]*nb[0] bytes.
+    // The previous version addressed a LINEAR row (target * row_size), which
+    // runs past the end of one group into the NEXT head's live unit -- an
+    // "inactive" write therefore landed inside a hashed (head, group) unit and
+    // moved the live hash, which is a leak of the mapping, not of the hash.
+    const size_t unit    = size_t(t->ne[0]) * t->nb[0];
+    const size_t hstride = size_t(t->nb[1]);
+    const size_t gstride = size_t(t->nb[2]);
+    const uint32_t real_heads  = (uint32_t) t->ne[1];
+    const uint32_t real_groups = (uint32_t) t->ne[2];
+    if (unit == 0 || hstride == 0 || gstride == 0 || real_heads == 0 || real_groups == 0) {
+        return false;
+    }
+    const uint32_t head = row < real_heads ? row : 0;
+
+    std::vector<uint32_t> live_groups;
+    uint32_t first_live_cell = UINT32_MAX;
+    if (metadata) {
+        const auto & cells = metadata->get_cells(0);
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell) || !cells.seq_get_all(cell).test(seq_id)) { continue; }
+            if (first_live_cell == UINT32_MAX) { first_live_cell = cell; }
+            const uint32_t g = cell / KVAR_N_GROUP;
+            if (std::find(live_groups.begin(), live_groups.end(), g) == live_groups.end()) {
+                live_groups.push_back(g);
+            }
+        }
+    }
+
+    uint32_t group = UINT32_MAX;
+    if (live) {
+        // The authoritative live unit: the group of the first live cell.
+        if (first_live_cell == UINT32_MAX) { return false; }
+        group = first_live_cell / KVAR_N_GROUP;
+    } else {
+        // The first group this sequence does NOT occupy. If every group is
+        // live there is nothing outside the live span to prove, and saying so
+        // beats writing somewhere that looks inactive.
+        for (uint32_t g = 0; g < real_groups; ++g) {
+            if (std::find(live_groups.begin(), live_groups.end(), g) == live_groups.end()) {
+                group = g;
+                break;
+            }
+        }
+        if (group == UINT32_MAX) { return false; }
+    }
+    if (group >= real_groups) { return false; }
+    const size_t off = size_t(head) * hstride + size_t(group) * gstride;
+    if (off + unit > ggml_nbytes(t)) { return false; }
+
+    uint8_t byte = 0;
+    ggml_backend_tensor_get(t, &byte, off, 1);
+    const uint8_t want_byte = (uint8_t) (byte ^ 0xff);
+    ggml_backend_tensor_set(t, &want_byte, off, 1);
+    uint8_t after = 0;
+    ggml_backend_tensor_get(t, &after, off, 1);
+    return after == want_byte;
+}
+
+
+// Independent proof of the live-span mapping: address ONE (head, group|slot)
+// span using the authoritative view layout and flip ONE byte inside it.
+//
+// The ORIGINAL byte is returned so the caller can restore it exactly. That
+// matters: llama_memory_clear() does NOT rewrite bytes it never visited, so a
+// probe that leaves its mutation behind contaminates every later probe and makes
+// an "inactive" read look like it changed the output.
+//
+// The returned span is described by field/head/group so the verifier can compare
+// the materialized K/V it reads back, not just the final logits.
+bool llama_kv_cache_kvarn::probe_head_span(llama_seq_id seq_id, int layer_index,
+        uint32_t head, uint32_t group_or_slot, const char * tensor, bool live,
+        uint8_t * orig_out, uint8_t * new_out, uint32_t * group_used_out) {
+    if (orig_out) { *orig_out = 0; }
+    if (new_out)  { *new_out = 0; }
+    if (group_used_out) { *group_used_out = 0; }
+    // `layer_index` is a MODEL layer; resolve mapped KVarN storage explicitly.
+    if (layer_index < 0 || map_layer_ids.find(layer_index) == map_layer_ids.end() || !tensor) {
+        return false;
+    }
+    const auto & l = layer_for(layer_index);
+    ggml_tensor * t = nullptr;
+    bool slot_addressed = false;
+    bool v_field = false;
+    const std::string want(tensor);
+    if      (want == "k_records") { t = l.k_records; }
+    else if (want == "v_records") { t = l.v_records; v_field = true; }
+    else if (want == "k_stage")    { t = l.k_stage; slot_addressed = true; }
+    else if (want == "v_stage")    { t = l.v_stage; slot_addressed = true; v_field = true; }
+    if (!t || !t->buffer || t->ne[0] <= 0 || t->ne[2] <= 0) { return false; }
+    // REAL shape: unit = ne[0]*nb[0] (record_bytes for the I8 records leaf),
+    // heads = ne[1], groups/slots = ne[2]. k_slices/n_head_kv are descriptor
+    // values and must not be used to size the address space.
+    const size_t unit    = size_t(t->ne[0]) * t->nb[0];
+    const size_t hstride = t->nb[1];
+    const size_t gstride = t->nb[2];
+    const size_t total   = ggml_nbytes(t);
+    const uint32_t n_heads = (uint32_t) t->ne[1];
+    // The test addresses LOGICAL heads, but KVarN storage packs head SLICES:
+    // logical head h owns physical slices [h*slices, h*slices+slices). Mutate
+    // the first slice so the change lands inside logical head h (and only it).
+    const uint32_t slices = slot_addressed ? (v_field ? l.v_slices : l.k_slices) : 1u;
+    if (slices == 0) { return false; }
+    // F4_TEST_HEAD_STRIDE=slices (default: logical head -> its first slice)
+    //                             one (record_head == logical head).
+    // Measured, not assumed: which row the FA actually consumes for logical
+    // head 1 decides whether the probe row is the consumed row.
+    const uint64_t phys_head = (getenv("F4_TEST_HEAD_STRIDE") &&
+                                std::string(getenv("F4_TEST_HEAD_STRIDE")) == "one")
+                                   ? (uint64_t) head
+                                   : (uint64_t) head * slices;
+    if (unit == 0 || gstride == 0 || n_heads == 0 || phys_head >= n_heads) { return false; }
+    const uint32_t axis2 = (uint32_t) t->ne[2];
+
+    // Enumerate the REAL cells this sequence owns (not a front..back range).
+    std::vector<uint32_t> own;
+    if (metadata) {
+        const auto & cells = metadata->get_cells(0);
+        for (uint32_t c = 0; c < cells.size(); ++c) {
+            if (cells.is_empty(c)) { continue; }
+            if (!cells.seq_get_all(c).test(seq_id)) { continue; }
+            own.push_back(c);
+        }
+    }
+    if (own.empty()) { return false; }
+    uint32_t target = 0;
+    if (live) {
+        if (slot_addressed) {
+            // Stage: group 0's slot is always read (eager from_stage), so the
+            // first owned cell is a valid live target.
+            target = own.front();
+        } else {
+            // Records: record group 0 is the stage's permanent sink and is NEVER
+            // consumed (eager store writes a record only for
+            // pos == KVAR_N_GROUP-1 && group > 0, and materialize reads
+            // from_record only for 1 <= group < live_group). Picking
+            // own.front()/KVAR_N_GROUP always selected group 0, so a "live"
+            // record mutation could never reach FA. Select the highest owned
+            // cell whose group is strictly below live_group; if no sealed record
+            // exists yet there is nothing live to mutate and we say so.
+            const uint32_t lg = own.back() / KVAR_N_GROUP;
+            uint32_t best = 0;
+            bool found = false;
+            for (uint32_t c : own) {
+                const uint32_t g = c / KVAR_N_GROUP;
+                if (g >= 1u && g < lg) { best = c; found = true; }
+            }
+            if (!found) {
+                if (group_used_out) { *group_used_out = UINT32_MAX; }
+                return false;
+            }
+            target = best / KVAR_N_GROUP;
+        }
+    } else {
+        // A slot/group this sequence does NOT occupy: first index the sequence
+        // does not own, inside the same axis.
+        bool found = false;
+        for (uint32_t g = 0; g < axis2; ++g) {
+            bool occupied = false;
+            for (uint32_t c : own) {
+                const uint32_t k = slot_addressed ? c : (c / KVAR_N_GROUP);
+                if (k == g) { occupied = true; break; }
+            }
+            if (!occupied) { target = g; found = true; break; }
+        }
+        if (!found) { return false; }
+    }
+    if (target >= axis2) { return false; }
+    const size_t off = size_t(phys_head) * hstride + size_t(target) * gstride;
+    if (off + unit > total) { return false; }
+    if (getenv("F4_TEST_MAP")) {
+        // Mutation byte interval -> logical coordinates and the strides used.
+        printf("KDISC-MUT tensor=%-9s head=%u phys_head=%llu slices=%u axis2=%u "
+               "cell=%u target=%u %s slot_or_grp=%u dim=0 bytes=[%zu,%zu) unit=%zu "
+               "nb=[%zu,%zu,%zu] ne=[%lld,%lld,%lld]\n",
+               tensor, head, (unsigned long long) phys_head, slices, axis2,
+               own.front(), target,
+               slot_addressed ? "stage_cell" : "record_group",
+               slot_addressed ? (unsigned) (target % 128u) : (unsigned) target,
+               off, off + unit, unit,
+               (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2],
+               (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2]);
+    }
+    uint8_t byte = 0;
+    ggml_backend_tensor_get(t, &byte, off, 1);
+    const uint8_t flipped = (uint8_t) (byte ^ 0xff);
+    // BEFORE capture of the operand row the FA consumes (stage row when
+    // from_stage, record row when from_record): a logit change may only be
+    // expected once THIS row actually changes.
+    std::vector<uint8_t> row_before(unit, 0), row_after(unit, 0);
+    if (getenv("F4_TEST_MAP")) { ggml_backend_tensor_get(t, row_before.data(), off, unit); }
+    ggml_backend_tensor_set(t, &flipped, off, 1);
+    uint8_t after = 0;
+    ggml_backend_tensor_get(t, &after, off, 1);
+    if (getenv("F4_TEST_MAP")) {
+        ggml_backend_tensor_get(t, row_after.data(), off, unit);
+        auto f16b = [](const uint8_t * b) -> float {
+            uint16_t h = 0; std::memcpy(&h, b, 2); return ggml_fp16_to_fp32((ggml_fp16_t) h);
+        };
+        size_t nd = 0;
+        for (size_t i = 0; i < unit; ++i) { if (row_before[i] != row_after[i]) { ++nd; } }
+        printf("KDISC-ROW tensor=%-9s head=%u bytes=[%zu,%zu) changed=%zu/%zu "
+               "before=[%.7g,%.7g] after=[%.7g,%.7g]\n",
+               tensor, head, off, off + unit, nd, unit,
+               f16b(row_before.data()), f16b(row_before.data() + 2),
+               f16b(row_after.data()), f16b(row_after.data() + 2));
+    }
+    if (orig_out) { *orig_out = byte; }
+    if (new_out)  { *new_out = after; }
+    if (group_used_out) { *group_used_out = target; }
+    return after == flipped;
+}
+
+// Restore a byte previously flipped by probe_head_span.
+static size_t unit_of(const ggml_tensor * t) { return size_t(t->ne[0]) * t->nb[0]; }
+
+bool llama_kv_cache_kvarn::probe_remote_span(llama_seq_id seq_id, int layer_index, uint32_t head,
+        bool value, bool live, uint8_t * orig_out, uint8_t * new_out,
+        uint32_t * row_used_out, llama_pos * pos_used_out) {
+    if (orig_out) { *orig_out = 0; }
+    if (new_out)  { *new_out = 0; }
+    if (row_used_out) { *row_used_out = 0; }
+    if (pos_used_out) { *pos_used_out = -1; }
+    // Model layer -> mapped KVarN storage AND companion standard layer. Both
+    // must exist: the overflow range only exists for attention layers with a
+    // Q4 companion.
+    if (layer_index < 0 || map_layer_ids.find(layer_index) == map_layer_ids.end()) { return false; }
+    if (!position_split_enabled() || !standard_cache) { return false; }
+    if (!uses_standard_layer(layer_index)) { return false; }
+    const auto & l = layer_for(layer_index);
+    ggml_tensor * t = value ? standard_cache->get_v_storage(layer_index)
+                            : standard_cache->get_k_storage(layer_index);
+    if (!t || !t->buffer) { return false; }
+    const uint32_t head_dim = value ? l.head_dim_v : l.head_dim_k;
+    const uint32_t n_head   = l.n_head_kv;
+    if (head_dim == 0 || n_head == 0 || head >= n_head) { return false; }
+    // Metadata IDs stay global; physical Qx rows start at the payload origin.
+    const size_t row_h = ggml_row_size(t->type, (int64_t) head_dim);
+    const size_t row_p = ggml_row_size(t->type, (int64_t) head_dim * n_head);
+    const size_t total = ggml_nbytes(t);
+    if (row_h == 0 || row_p == 0) { return false; }
+    if (!metadata) { return false; }
+    const uint32_t stream = metadata->get_stream_for_seq(seq_id);
+    const auto & cells = metadata->get_cells(stream);
+    const uint32_t p = position_split_p();
+    uint32_t target = UINT32_MAX;
+    llama_pos target_pos = -1;
+    if (live) {
+        // First owned cell at or above P: genuinely occupied overflow.
+        for (uint32_t c = standard_cache->get_payload_row_origin(); c < cells.size(); ++c) {
+            if (cells.is_empty(c) || !cells.seq_get_all(c).test(seq_id)) { continue; }
+            if (cells.pos_get(c) < (llama_pos) p) { continue; }
+            target = c;
+            target_pos = cells.pos_get(c);
+            break;
+        }
+    } else {
+        // First empty owned payload cell: read by no gather. LOCAL metadata
+        // holes have no physical storage in a compact Qx companion.
+        for (uint32_t c = standard_cache->get_payload_row_origin(); c < cells.size(); ++c) {
+            if (cells.is_empty(c)) { target = c; break; }
+        }
+    }
+    if (target == UINT32_MAX) { return false; }
+    const uint32_t physical_row = standard_cache->payload_row_for_cell(target);
+    const size_t off = size_t(head) * row_h + size_t(physical_row) * row_p;
+    if (off + 1 > total) { return false; }
+    uint8_t byte = 0;
+    ggml_backend_tensor_get(t, &byte, off, 1);
+    const uint8_t flipped = (uint8_t) (byte ^ 0xff);
+    ggml_backend_tensor_set(t, &flipped, off, 1);
+    uint8_t after = 0;
+    ggml_backend_tensor_get(t, &after, off, 1);
+    if (orig_out) { *orig_out = byte; }
+    if (new_out)  { *new_out = after; }
+    if (row_used_out) { *row_used_out = target; }
+    if (pos_used_out) { *pos_used_out = target_pos; }
+    return after == flipped;
+}
+
+bool llama_kv_cache_kvarn::probe_remote_restore_byte(llama_seq_id, int layer_index, uint32_t head,
+        bool value, uint32_t row, uint8_t orig) {
+    if (layer_index < 0 || map_layer_ids.find(layer_index) == map_layer_ids.end()) { return false; }
+    if (!standard_cache || !uses_standard_layer(layer_index)) { return false; }
+    const auto & l = layer_for(layer_index);
+    ggml_tensor * t = value ? standard_cache->get_v_storage(layer_index)
+                            : standard_cache->get_k_storage(layer_index);
+    if (!t || !t->buffer) { return false; }
+    const uint32_t head_dim = value ? l.head_dim_v : l.head_dim_k;
+    const uint32_t n_head   = l.n_head_kv;
+    if (head_dim == 0 || n_head == 0 || head >= n_head) { return false; }
+    const size_t row_h = ggml_row_size(t->type, (int64_t) head_dim);
+    const size_t row_p = ggml_row_size(t->type, (int64_t) head_dim * n_head);
+    if (row < standard_cache->get_payload_row_origin() || row >= standard_cache->get_size()) { return false; }
+    const uint32_t physical_row = standard_cache->payload_row_for_cell(row);
+    const size_t off = size_t(head) * row_h + size_t(physical_row) * row_p;
+    if (row_h == 0 || row_p == 0 || off + 1 > ggml_nbytes(t)) { return false; }
+    ggml_backend_tensor_set(t, &orig, off, 1);
+    uint8_t back = 0;
+    ggml_backend_tensor_get(t, &back, off, 1);
+    return back == orig;
+}
+
+bool llama_kv_cache_kvarn::probe_restore_byte(llama_seq_id, int layer_index, uint32_t head,
+        uint32_t group, const char * tensor, uint8_t orig) {
+    if (layer_index < 0 || map_layer_ids.find(layer_index) == map_layer_ids.end() || !tensor) {
+        return false;
+    }
+    const auto & l = layer_for(layer_index);
+    ggml_tensor * t = nullptr;
+    bool v_field = false;
+    bool slot_addressed = false;
+    const std::string want(tensor);
+    if      (want == "k_records") { t = l.k_records; }
+    else if (want == "v_records") { t = l.v_records; v_field = true; }
+    else if (want == "k_stage")    { t = l.k_stage; slot_addressed = true; }
+    else if (want == "v_stage")    { t = l.v_stage; slot_addressed = true; v_field = true; }
+    if (!t || !t->buffer) { return false; }
+    const uint32_t slices = slot_addressed ? (v_field ? l.v_slices : l.k_slices) : 1u;
+    if (slices == 0) { return false; }
+    const uint64_t phys_head = (uint64_t) head * slices;
+    const uint32_t n_heads = (uint32_t) t->ne[1];
+    if (phys_head >= n_heads || unit_of(t) == 0) { return false; }
+    const size_t off = size_t(phys_head) * t->nb[1] + size_t(group) * t->nb[2];
+    ggml_backend_tensor_set(t, &orig, off, 1);
+    uint8_t back = 0;
+    ggml_backend_tensor_get(t, &back, off, 1);
+    return back == orig;
+}
+
+
+// CONSUMER-PATH probe: read back the values the attention graph actually
+// consumes, through llama_kv_qx::materializer, BEFORE any decode. This is the
+// only way to tell "the span is wrong" from "the byte is semantically inert":
+// the consumer table shows the value of the exact (layer, head, position) field.
+//
+// Returns false when the consumer path cannot be built for this layer, so the
+// caller must report UNSUPPORTED instead of claiming coverage.
+ggml_backend_t llama_kv_cache_kvarn::resolve_probe_backend(int layer_index, bool value) const {
+    const ggml_tensor * leaf = probe_leaf(layer_index, value);
+    if (!leaf || !leaf->buffer) { return nullptr; }
+    const ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(leaf->buffer);
+    // The cache's own transfer backend owns the records in the split placement.
+    if (probe_backend && ggml_backend_supports_buft(probe_backend, bt)) {
+        return probe_backend;
+    }
+    return nullptr;
+}
+
+const ggml_tensor * llama_kv_cache_kvarn::probe_leaf(int layer_index, bool value) const {
+    if (layer_index < 0 || map_layer_ids.find(layer_index) == map_layer_ids.end()) { return nullptr; }
+    const auto & l = layer_for(layer_index);
+    return value ? l.v_records : l.k_records;
+}
+
+bool llama_kv_cache_kvarn::materialized_probe(llama_seq_id seq_id, int layer_index,
+        uint32_t head, bool value, llama_pos pos, std::vector<float> & out,
+        std::string * status_out, ggml_backend_t backend) const {
+    out.clear();
+    auto fail = [&](const char * why) {
+        if (status_out) { *status_out = why; }
+        return false;
+    };
+    if (layer_index < 0 || map_layer_ids.find(layer_index) == map_layer_ids.end()) {
+        return fail("unmapped_layer");
+    }
+    const auto & l = layer_for(layer_index);
+    ggml_tensor * records = value ? l.v_records : l.k_records;
+    ggml_tensor * stage   = value ? l.v_stage   : l.k_stage;
+    if (!records || !stage || !records->buffer || !stage->buffer) {
+        return fail("missing_leaf_tensor");
+    }
+    if (ggml_n_dims(records) < 3 || records->ne[1] == 0) {
+        return fail("records_not_3d");
+    }
+    // The sequence's own STREAM, not a hardcoded stream 0.
+    if (!metadata) {
+        return fail("no_metadata");
+    }
+    const uint32_t stream = metadata->get_stream_for_seq(seq_id);
+    if (stream >= n_stream) {
+        return fail("bad_stream");
+    }
+    const auto & cells = metadata->get_cells(stream);
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t c = 0; c < cells.size(); ++c) {
+        if (cells.is_empty(c) || !cells.seq_get_all(c).test(seq_id)) { continue; }
+        if (cells.pos_get(c) == pos) { slot = c; break; }
+    }
+    if (slot == UINT32_MAX) {
+        return fail("pos_not_mapped");
+    }
+    const uint32_t phys_heads = (uint32_t) records->ne[1];
+    if (head >= phys_heads) {
+        return fail("head_out_of_range");
+    }
+    // LOGICAL heads: validate_source computes phys_heads = n_heads * head_slices,
+    // so n_heads must be the LOGICAL count. Derive both from the real tensor so
+    // the geometry is not guessed.
+    const uint32_t logical_heads = l.n_head_kv ? l.n_head_kv : phys_heads;
+    if (logical_heads == 0 || phys_heads % logical_heads != 0) {
+        return fail("head_geometry_mismatch");
+    }
+    const uint32_t slices = phys_heads / logical_heads;
+    const uint32_t head_dim  = value ? l.head_dim_v : l.head_dim_k;
+    llama_kvarn_geometry geometry = {};
+    if (head_dim == 0 || !llama_kvarn_geometry_for((int) head_dim, geometry)) {
+        return fail("unsupported_head_geometry");
+    }
+    const uint32_t record_dim = geometry.record_dim;
+    if (geometry.head_dim != head_dim || geometry.head_slices != slices ||
+            head_dim % record_dim != 0 || head_dim / record_dim != slices) {
+        return fail("record_geometry_mismatch");
+    }
+    llama_kv_qx::materializer_config cfg;
+    cfg.head_dim     = head_dim;
+    cfg.n_heads      = logical_heads;
+    cfg.value        = value;
+    cfg.record_dim   = record_dim;
+    cfg.head_slices  = slices;
+    cfg.bits         = (int) (value ? params.value_bits : params.key_bits);
+    cfg.stage_groups = (int) stage_groups;
+    cfg.max_window   = 1;
+    llama_kv_qx::materializer_source src;
+    src.records = records;
+    src.stage   = stage;
+    // The OWNING backend of the leaves, obtained from the leaf buffer's device.
+    // validate_source requires ggml_backend_supports_buft(backend,
+    // ggml_backend_buffer_get_type(t->buffer)) for BOTH leaves, so a CPU backend
+    // over device pointers would be rejected -- and must not be relaxed.
+    ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(records->buffer);
+    ggml_backend_dev_t dev = bt ? ggml_backend_buft_get_device(bt) : nullptr;
+    if (!dev) {
+        return fail("no_buffer_device");
+    }
+    // Use a backend the CACHE already owns. Never initialise one here: an extra
+    // backend instance outliving or racing context teardown crashes
+    // ggml_backend_buffer_free() inside ~llama_context().
+    src.backend = backend ? backend : probe_backend;
+    if (!src.backend) {
+        return fail("no_cache_owned_backend");
+    }
+    if (!ggml_backend_supports_buft(src.backend, bt)) {
+        return fail("backend_lacks_buft");
+    }
+    if (records->buffer != stage->buffer) {
+        // Distinct leaf buffers are fine as long as the backend supports both.
+        if (!ggml_backend_supports_buft(src.backend, ggml_backend_buffer_get_type(stage->buffer))) {
+            return fail("backend_lacks_stage_buft");
+        }
+    }
+    llama_kv_qx::materializer mat(cfg, src);
+    if (!mat.valid()) {
+        if (status_out) {
+            *status_out = std::string("materializer_invalid:") + mat.last_status_name();
+        }
+        return false;
+    }
+    // Index map uses the STREAM-RELATIVE slot the writer used.
+    std::vector<int64_t> idx(1, (int64_t) slot);
+    if (mat.set_prefix(idx.data(), 1) != llama_kv_qx::mat_status::ok) {
+        if (status_out) { *status_out = "set_prefix_failed"; }
+        return false;
+    }
+    const size_t n_out = size_t(cfg.head_dim) * cfg.n_heads;
+    std::vector<float> buf(n_out, 0.0f);
+    llama_kv_qx::block_request req;
+    req.t0 = 0;
+    req.n_tokens = 1;
+    req.head_dim = cfg.head_dim;
+    req.n_heads  = cfg.n_heads;
+    req.value    = cfg.value;
+    req.out_f32  = buf.data(); // always a correctly sized buffer
+    if (!llama_kv_qx::materializer_read_block(&mat, req)) {
+        if (status_out) {
+            *status_out = std::string("read_block_failed:") + mat.last_status_name();
+        }
+        return false;
+    }
+    const size_t base = size_t(head) * cfg.head_dim;
+    out.assign(buf.begin() + base, buf.begin() + base + cfg.head_dim);
+    if (status_out) { *status_out = "ok"; }
+    return true;
+}
+
+void llama_kv_cache_kvarn::state_read_pure_to_mixed_import(
+        llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+        llama_kv_cache::slot_info_vec_t * sinfos_out,
+        const llama_kv_cache::slot_info_vec_t * sinfos_in) {
+    if (position_split_p_ == 0) {
+        throw std::runtime_error(
+                "pure KVarN state restore into a mixed cache requires a position-split boundary P; "
+                "this cache has none (LLAMA_KV_POSITION_SPLIT_P unset)");
+    }
+    const uint32_t p = position_split_p_;
+    const uint32_t capacity = metadata ? metadata->get_size() : 0u;
+    if (p >= capacity) {
+        throw std::runtime_error(format(
+                "position-split P=%u is not below the mixed cache capacity C=%u",
+                p, capacity));
+    }
+
+    // Runs on the restore-only metadata cache, immediately after the metadata
+    // block is prepared and BEFORE the live cache is mutated.
+    const auto gate_prepared = [&](const llama_kv_cache & prepared,
+            const std::unordered_map<uint32_t, uint32_t> &) {
+        // `prepared` holds destination coordinates already, so they are read
+        // directly: remapping again would double-remap and misjudge P.
+        const auto & cells = prepared.get_cells(0);
+        uint32_t occupied = 0;
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const llama_pos pos = cells.pos_get(cell);
+            ++occupied;
+            // The P gate. A cell at or beyond P would require the overflow
+            // range: refuse with a reason attributable to P, and never drop,
+            // truncate or requantize the frame to force it through.
+            if (cell >= p || pos >= llama_pos(p)) {
+                throw llama_kv_mixed::kv_mixed_error(format(
+                        "pure KVarN state needs cell %u at position %d, at or beyond "
+                        "position-split P=%u (occupancy %u cells); the overflow range "
+                        "[P,C) would be required and this restore refuses to "
+                        "truncate or requantize to fit",
+                        cell, (int) pos, p, occupied));
+            }
+        }
+        if (occupied > capacity) {
+            throw llama_kv_mixed::kv_mixed_error(format(
+                    "pure KVarN state occupancy %u exceeds the mixed cache capacity C=%u",
+                    occupied, capacity));
+        }
+    };
+
+    state_read_kvarn_body(io, seq_id, flags, sinfos_out, sinfos_in, gate_prepared);
 }
 
 void llama_kv_cache_kvarn::state_read_kvarn_body(
@@ -4166,7 +6554,7 @@ void llama_kv_cache_kvarn::state_read_kvarn_body(
     std::vector<std::vector<int32_t>> exact_destinations = metadata_prepared->take_restored_tail_payload_slots();
     const bool on_device = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0;
 
-    uint32_t magic;
+    uint32_t magic = 0;
     uint32_t version;
     int32_t type;
     uint32_t n_layers;
@@ -4583,6 +6971,65 @@ bool llama_kv_cache_kvarn::uses_kvarn_layer(int32_t il) const {
     return map_layer_ids.find(il) != map_layer_ids.end();
 }
 
+// F2b: tabela lógica única de faixas por camada full. Cada camada full
+// contribui exatamente dois descritores, [0,P) CUDA/KVarN4 e [P,C) Vulkan0/Q4,
+// sem lacunas nem sobreposições; validate_ranges() no construtor rejeita
+// qualquer tabela fora desse contrato.
+std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_split_ranges() const {
+    std::vector<llama_position_split::range_desc> out;
+    if (position_split_p_ == 0) {
+        return out;
+    }
+    out.reserve(map_layer_ids.size() * 2);
+    for (const auto & [il, idx] : map_layer_ids) {
+        (void) idx;
+        const uint32_t layer = uint32_t(il);
+        out.push_back({layer, llama_position_split::kRangeLocal, 0, position_split_p_, 0, 0});
+        out.push_back({layer, llama_position_split::kRangeOverflow, position_split_p_, kv_size, 1, 1});
+    }
+    return out;
+}
+
+bool llama_kv_cache_kvarn::position_split_live_cells(
+        llama_position_split::range_kind range,
+        std::vector<uint32_t> & cells_out) const {
+    cells_out.clear();
+    if (!position_split_enabled()) {
+        return false;
+    }
+    if (range != llama_position_split::range_kind::LOCAL &&
+            range != llama_position_split::range_kind::OVERFLOW) {
+        return false;
+    }
+    if (n_seq_max != 1) {
+        return false;
+    }
+    const auto & cells = metadata->get_cells(0);
+    std::vector<std::pair<llama_pos, uint32_t>> ordered;
+    ordered.reserve(cells.size());
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell) || !cells.seq_has(cell, 0)) {
+            continue;
+        }
+        const llama_pos pos = cells.pos_get(cell);
+        const auto kind = llama_position_split::range_for_pos(pos, position_split_p_, kv_size).kind;
+        if (kind == llama_position_split::range_kind::INVALID) {
+            return false;
+        }
+        if (kind == range) {
+            ordered.emplace_back(pos, cell);
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const auto & a, const auto & b) {
+        return a.first < b.first;
+    });
+    cells_out.reserve(ordered.size());
+    for (const auto & entry : ordered) {
+        cells_out.push_back(entry.second);
+    }
+    return true;
+}
+
 bool llama_kv_cache_kvarn::uses_standard_layer(int32_t il) const {
     return standard_cache && standard_cache->has_layer(il);
 }
@@ -4771,6 +7218,15 @@ bool llama_kv_cache_kvarn::uses_native_attention(int32_t il) const {
     return layer_for(il).native_attention;
 }
 
+bool llama_kv_cache_kvarn::has_qualified_dflash_mask() const {
+    return model.arch == LLM_ARCH_DFLASH && model.dspark_markov_w1 == nullptr &&
+        hparams.dsv4_hc_mult == 0;
+}
+
+ggml_backend_dev_t llama_kv_cache_kvarn::native_attention_backend(int32_t il) const {
+    return layer_for(il).native_attention_owner;
+}
+
 bool llama_kv_cache_kvarn::mixed_tail_native_preferred(int32_t il) const {
     return layer_for(il).mixed_tail_native;
 }
@@ -4893,6 +7349,11 @@ ggml_tensor * llama_kv_cache_kvarn::view(
     result->op_params[9] = 1;
     result->op_params[10] = !swa && mat_idxs ? 1 : 0;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
+    // Reads of a completed local range may use the persistent stage directly,
+    // whose NONE tensor carries no store op_params. Publish logical head
+    // geometry explicitly rather than inheriting the factory's one-slice
+    // default. CPU/Vulkan descriptor readers require this after the boundary.
+    result->op_params[5] = int32_t(slices);
     if (slices > 1) {
         result = ggml_reshape_4d(
                 ctx,

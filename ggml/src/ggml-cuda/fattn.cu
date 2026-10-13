@@ -865,6 +865,7 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
 }
 
 #include "fattn-tail.cuh"
+static int g_kdisc_seen = 0;
 
 static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * qo = dst->src[8];
@@ -941,6 +942,10 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
     return true;
 }
 
+// Number of valid KDISC tail-merge records read in this process (-1 = missing),
+// so the fixture can fail the diagnostic as INCOMPLETE instead of passing.
+extern "C" int ggml_cuda_kdisc_rec_count(void) { return g_kdisc_seen; }
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
@@ -956,13 +961,170 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
     if (has_exact_tail) {
+        // KDISC: record the ACTUAL route selected for a node carrying src[5..9],
+        // the descriptor geometry it will consume, and the key counts. This is
+        // the dispatch that has to be explained, not the fixture's merge_two.
+        if (getenv("F4_RP_KDISC") != nullptr) {
+            const ggml_tensor * kt = dst->src[5];
+            const ggml_tensor * vt = dst->src[6];
+            const ggml_tensor * mt = dst->src[7];
+            const ggml_tensor * qo = dst->src[8];
+            const ggml_tensor * rd = dst->src[9];
+            const ggml_tensor * kb = dst->src[1];
+            fprintf(stderr,
+                "KDISC-ROUTE uses_kvarn=%d portable_kvarn_tail=%d lse=%d bodyless=%d "
+                "q=[%lld,%lld,%lld] k=[%lld,%lld,%lld,%lld] kt=[%lld,%lld,%lld,%lld] "
+                "mask_t=[%lld,%lld] qo=[%lld,%lld] rd=[%lld,%lld] "
+                "body_keys=%lld tail_keys=%lld route=ggml_cuda_flash_attn_ext_tail\n",
+                (int) uses_kvarn, (int) portable_kvarn_tail,
+                (int) (ggml_flash_attn_ext_get_lse_out(dst) != nullptr),
+                ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0,
+                (long long) dst->src[0]->ne[0], (long long) dst->src[0]->ne[1], (long long) dst->src[0]->ne[2],
+                (long long) kb->ne[0], (long long) kb->ne[1], (long long) kb->ne[2], (long long) kb->ne[3],
+                (long long) kt->ne[0], (long long) kt->ne[1], (long long) kt->ne[2], (long long) kt->ne[3],
+                (long long) mt->ne[0], (long long) mt->ne[1],
+                (long long) qo->ne[0], (long long) qo->ne[1],
+                (long long) rd->ne[0], (long long) rd->ne[1],
+                (long long) (kb ? kb->ne[1] : 0),
+                (long long) (kt ? kt->ne[1] : 0));
+        }
         ggml_cuda_flash_attn_ext_tail(ctx, dst);
+        if (getenv("F4_RP_KDISC") != nullptr) {
+            cudaStreamSynchronize(ctx.stream());
+            ggml_kdisc_rec recs[8];
+            int n = -1;
+            cudaError_t e1 = cudaMemcpyFromSymbol(recs, g_kdisc_rec, sizeof(recs), 0, cudaMemcpyDeviceToHost);
+            cudaError_t e2 = cudaMemcpyFromSymbol(&n, g_kdisc_n, sizeof(int), 0, cudaMemcpyDeviceToHost);
+            g_kdisc_seen = (e1 == cudaSuccess && e2 == cudaSuccess) ? n : -1;
+            int on = -1; cudaMemcpyFromSymbol(&on, g_kdisc_on, sizeof(int), 0, cudaMemcpyDeviceToHost);
+            fprintf(stderr, "KDISC-REC n=%d read_ok=%d,%d dev_flag=%d\n", n,
+                    (int)(e1==cudaSuccess), (int)(e2==cudaSuccess), on);
+            for (int i = 0; i < n && i < 8; ++i) {
+                const ggml_kdisc_rec & r = recs[i];
+                fprintf(stderr,
+                    "KDISC-REC[%d] marker=%08x iq_p=%d ih=%d ia=%d iq=%d is=%d iqg=%d "
+                    "bvalid=%d tvalid=%d | body(max=%.9g norm=%.9g o0=%.9g) "
+                    "tail(max=%.9g norm=%.9g o0=%.9g) | m=%.9g wb=%.9g wt=%.9g denom=%.9g "
+                    "| out_o0=%.9g out_lse=%.9g\n",
+                    i, r.marker, r.iq_packed, r.ih, r.ia, r.iq, r.is, r.iq_global,
+                    r.body_valid, r.tail_valid,
+                    r.body_max, r.body_norm, r.body_o0,
+                    r.tail_max, r.tail_norm, r.tail_o0,
+                    r.m, r.wb, r.wt, r.denom, r.out_o0, r.out_lse);
+            }
+            {
+                ggml_kdisc_pre pres[4]; int np = -1;
+                cudaError_t e3 = cudaMemcpyFromSymbol(pres, g_kdisc_pre, sizeof(pres), 0, cudaMemcpyDeviceToHost);
+                cudaError_t e4 = cudaMemcpyFromSymbol(&np, g_kdisc_np, sizeof(int), 0, cudaMemcpyDeviceToHost);
+                fprintf(stderr, "KDISC-PRE-SCORES n=%d read=%d,%d\n", np,
+                        (int)(e3==cudaSuccess), (int)(e4==cudaSuccess));
+                for (int i = 0; i < np && i < 4; ++i) {
+                    const ggml_kdisc_pre & r = pres[i];
+                    fprintf(stderr,
+                        "KDISC-PRE[%d] marker=%08x n_tail=%d slot0=%d row0=%d "
+                        "q=[%.9g,%.9g,%.9g,%.9g] k0=%.9g tail_max_raw=%.9g\n",
+                        i, r.marker, r.n_tail, r.slot0, r.row0,
+                        r.q[0], r.q[1], r.q[2], r.q[3], r.k0, r.tail_max_raw);
+                    // ---- scalar reference from the ACTUAL device bytes ----
+                    const ggml_tensor * KT = dst->src[5];   // rotated tail K, F16
+                    const ggml_tensor * Q  = dst->src[0];   // Q, F32
+                    if (KT && Q && KT->buffer && KT->data && Q->buffer && Q->data) {
+                        const size_t kt_bytes = (size_t) ggml_nbytes(KT);
+                        const size_t kt_logical = (size_t) (KT->ne[0]*KT->ne[1]*KT->ne[2]*KT->ne[3])
+                                                  * ggml_type_size(KT->type);
+                        // Q->data is a CUDA device pointer: copy BOTH operands to
+                        // the host first and index only the host copies.
+                        const size_t q_bytes = (size_t) ggml_nbytes(Q);
+                        std::vector<uint8_t> kb(kt_bytes), qb(q_bytes);
+                        ggml_backend_tensor_get(KT, kb.data(), 0, kt_bytes);
+                        ggml_backend_tensor_get(Q,  qb.data(), 0, q_bytes);
+                        const int D = (int) KT->ne[0];
+                        const int row = r.row0, hk = r.ih_k;
+                        double ref_dot = 0.0;
+                        int oob = 0;
+                        for (int d = 0; d < D && d < r.d_k; ++d) {
+                            const size_t ko = size_t(d)*KT->nb[0] + size_t(row)*KT->nb[1] +
+                                              size_t(hk)*KT->nb[2];
+                            if (ko + sizeof(ggml_fp16_t) > kb.size()) { ++oob; continue; }
+                            const float kv = ggml_fp16_to_fp32(
+                                *(const ggml_fp16_t *) (kb.data() + ko));
+                            // Q row for iq=0, ih=0, is=0 (strides from the tensor)
+                            const size_t qo = size_t(0)*Q->nb[1] + size_t(0)*Q->nb[2] +
+                                              size_t(0)*Q->nb[3] + size_t(d)*Q->nb[0];
+                            if (qo + sizeof(float) > qb.size()) { ++oob; continue; }
+                            const float qv = *(const float *) (qb.data() + qo);
+                            ref_dot += double(qv)*double(kv);
+                        }
+                        const double ref_score = ref_dot*double(r.scale) + double(r.mask0);
+                        float sc_scale = 0.f, sc_maxbias = 0.f, sc_softcap = 0.f;
+                        ggml_flash_attn_ext_get_alibi_params(dst, &sc_scale, &sc_maxbias, &sc_softcap);
+                        const double sc_applied = (sc_softcap != 0.0f)
+                            ? double(sc_softcap)*std::tanh(double(r.dot0)*double(r.scale)/double(sc_softcap))
+                            : double(r.dot0)*double(r.scale);
+                        fprintf(stderr, "KDISC-SOFTCAP scale=%.9g max_bias=%.9g "
+                                "logit_softcap=%.9g (bits=%08x) applied_score=%.9g "
+                                "rec_scale=%.9g\n",
+                                sc_scale, sc_maxbias, sc_softcap,
+                                (unsigned) (uint32_t) *(const int32_t *) (dst->op_params + 2),
+                                sc_applied, r.scale);
+                        fprintf(stderr,
+                            "KDISC-DOT[%d] D=%d row=%d hk=%d scale=%.9g | kernel dot0=%.9g "
+                            "mask0=%.9g score0=%.9g | scalar dot=%.9g score=%.9g | "
+                            "d_dot=%.3e d_score=%.3e oob=%d | kt_bytes=%zu logical=%zu padded=%d "
+                            "kt_ne=[%lld,%lld,%lld,%lld] kt_nb=[%zu,%zu,%zu,%zu] q_ne=[%lld,%lld,%lld] "
+                            "q_nb=[%zu,%zu,%zu,%zu]\n",
+                            i, D, row, hk, r.scale, r.dot0, r.mask0, r.score0,
+                            ref_dot, ref_score,
+                            std::fabs(double(r.dot0) - ref_dot),
+                            std::fabs(double(r.score0) - ref_score), oob,
+                            kt_bytes, kt_logical, (int)(kt_bytes != kt_logical),
+                            (long long) KT->ne[0], (long long) KT->ne[1],
+                            (long long) KT->ne[2], (long long) KT->ne[3],
+                            (size_t) KT->nb[0], (size_t) KT->nb[1],
+                            (size_t) KT->nb[2], (size_t) KT->nb[3],
+                            (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2],
+                            (size_t) Q->nb[0], (size_t) Q->nb[1], (size_t) Q->nb[2],
+                            (size_t) Q->nb[3]);
+                    }
+                    fprintf(stderr, "KDISC-SCORES[%d] ", i);
+                    for (int j = 0; j < r.n_tail && j < 32; ++j) {
+                        fprintf(stderr, "%.9g%s", r.scores[j],
+                                (j + 1 < r.n_tail && j + 1 < 32) ? "," : "");
+                    }
+                    fprintf(stderr, "\n");
+                }
+                int zp = 0; cudaMemcpyToSymbol(g_kdisc_np, &zp, sizeof(int));
+            }
+            if (n <= 0 || recs[0].marker != 0xAA55AA51) {
+                fprintf(stderr, "KDISC-REC-MISSING expected=1 got=%d marker=%08x -> "
+                        "diagnostic INCOMPLETE\n", n, n > 0 ? recs[0].marker : 0);
+                g_kdisc_seen = -1;
+            }
+            int zero = 0;
+            cudaMemcpyToSymbol(g_kdisc_n, &zero, sizeof(int));
+        }
         return;
     }
 
     if (uses_kvarn) {
         // runtime twin of the ggml_backend_supports_op gate above
         if (!ggml_cuda_flash_attn_ext_kvarn(ctx, dst)) {
+            // Report the exact reason: the graph-time gate and this runtime gate
+            // must agree, and a silent GGML_ABORT gives no way to tell which
+            // shape/domain combination was refused.
+            const ggml_tensor * q = dst->src[0];
+            const ggml_tensor * k = dst->src[1];
+            const ggml_tensor * v = dst->src[2];
+            std::fprintf(stderr,
+                "unsupported KVarN CUDA FlashAttention route: "
+                "q=[%lld,%lld,%lld,%lld] k=[%lld,%lld,%lld,%lld] v=[%lld,%lld,%lld,%lld] "
+                "qtype=%d ktype=%d vtype=%d kvarn_domain=%d exact_tail=%d\n",
+                (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
+                (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3],
+                (int) q->type, (int) k->type, (int) v->type,
+                dst->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN],
+                (int) has_exact_tail);
             GGML_ABORT("unsupported KVarN CUDA FlashAttention route");
         }
         return;

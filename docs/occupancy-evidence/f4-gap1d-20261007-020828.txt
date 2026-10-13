@@ -1,0 +1,13 @@
+GPU ready: inactive gpu=0
+launched P=256 pid=3104368 health=200 split=[off]
+R1-populate ok prompt=1372 completion=16 cache_n=0 lcp=0 reprocessed=1372
+split active: [F4TAIL(bind)] for P=256
+R2-hit-same-server ok prompt=1372 completion=16 cache_n=0 lcp=1372 reprocessed=1372
+launched P=256 pid=3104891 health=200 split=[off]
+R3-new-process-hit ok prompt=1372 completion=16 cache_n=0 lcp=0 reprocessed=1372
+split active: [F4TAIL(bind)] for P=256
+launched P=512 pid=3105229 health=200 split=[off]
+R4-diff-P ok prompt=1372 completion=16 cache_n=0 lcp=0 reprocessed=1372
+split active: [F4TAIL(bind)] for P=512
+=== SUMMARY ===
+DONE

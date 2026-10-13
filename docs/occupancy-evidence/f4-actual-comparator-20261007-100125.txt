@@ -1,0 +1,19 @@
+RUN=/home/hjotha/f4-spool/cmp-20261007T100125Z
+RUN_ID=cmp-20261007T100125Z
+BUILD_ID=d9746b4fd486dac5-7f6b98a24ea48342
+GPU ready: inactive gpu=0
+launched producer P=off preset=test-pure-preset.ini pid=3878290 log=f4-actual-producer-100126.log
+A-produce prompt_n=556 cache_n=0 lcp=0 predicted=1 content=''
+[F4CAP producer] captured phase=producer tokens=556 input_pos=555 output_pos=555 vocab=248320 seq_hash=10e6fcc8012c85bf layout_hash=9c494171cb7b6417 cache=none/no_common_prefix
+producer stopped; disk prefix snapshots:
+  total 193744
+  -rw------- 1 hjotha hjotha 198387119 Oct  7 12:01 auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+immutable_prefix=auto-1ee08d954f58561c-3d5802841d3db425-556.bin sha=95f65311fdf661da86de71ab57ba3d780acc91d06317051c3a732e8a7d8c1cf1
+launched target P=1024 preset=test-split-preset.ini pid=3878631 log=f4-actual-target-100137.log
+B-import prompt_n=556 cache_n=556 lcp=0 predicted=1 content=''
+[53557] 0.06.174.292 I srv    load_model: auto disk prompt cache enabled: indexed 2 prefix boundaries from /home/hjotha/f4-spool/cmp-20261007T100125Z/slots/ (block=256)
+[53557] 0.06.219.904 I slot auto_restore: id  0 | task 0 | auto-restore: importing PURE KVarN snapshot /home/hjotha/f4-spool/cmp-20261007T100125Z/slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin (556 tokens) into the split destination
+[53557] 0.06.544.894 I slot auto_restore: id  0 | task 0 | auto-restore: reused 556 tokens from disk (in-memory match was 0), bytes=198387119 restore_ms=325.627 workspace=52428800, file=/home/hjotha/f4-spool/cmp-20261007T100125Z/slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+SHA_AFTER_PREFIX=95f65311fdf661da86de71ab57ba3d780acc91d06317051c3a732e8a7d8c1cf1 (must equal SHA_BEFORE)
+comparator_rc=2
+RUN_DIR=/home/hjotha/f4-spool/cmp-20261007T100125Z

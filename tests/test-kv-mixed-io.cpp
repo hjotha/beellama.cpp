@@ -181,7 +181,7 @@ public:
 
 static void test_split_writer_records_without_reads() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     const char a[] = "A";
     const char bc[] = "BC";
     const char d[] = "D";
@@ -207,13 +207,13 @@ static void test_split_writer_records_without_reads() {
     CHECK(m.events[4].kind == 0 && m.events[4].size == 1 && m.events[4].stream_offset == 2371);
     CHECK(m.metadata.size() == 4 && std::memcmp(m.metadata.data(), "ABCD", 4) == 0);
     CHECK(m.layer_payload_sizes.size() == 2);
-    CHECK(m.layer_payload_sizes[0].first == 0 && m.layer_payload_sizes[0].second == 320);
-    CHECK(m.layer_payload_sizes[1].first == 1 && m.layer_payload_sizes[1].second == 2048);
+    CHECK(m.layer_payload_sizes[0].first == mixed_range_key(0, 0) && m.layer_payload_sizes[0].second == 320);
+    CHECK(m.layer_payload_sizes[1].first == mixed_range_key(1, 0) && m.layer_payload_sizes[1].second == 2048);
     CHECK(m.total_stream_bytes == 2372);
     CHECK(m.validate().empty());
 
     // adjacent ordinary writes combine into one metadata run
-    split_writer w2([](const ggml_tensor *) { return 0u; });
+    split_writer w2([](const ggml_tensor *) { return mixed_range_key(0, 0); });
     w2.write("XY", 2);
     w2.write("Z", 1);
     CHECK(w2.manifest().events.size() == 1);
@@ -223,7 +223,7 @@ static void test_split_writer_records_without_reads() {
 
 static void test_split_writer_bounds() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor *) { return 0u; });
+    split_writer w([](const ggml_tensor *) { return mixed_range_key(0, 0); });
     const uint8_t b[4] = { 1, 2, 3, 4 };
     CHECK_THROWS(w.write_tensor(nullptr, 0, 1));
     CHECK_THROWS(w.write_tensor(ts.t0, 3200, 1)); // beyond nbytes
@@ -232,20 +232,20 @@ static void test_split_writer_bounds() {
 
     split_writer_limits lim;
     lim.max_metadata_bytes = 4;
-    split_writer wm([](const ggml_tensor *) { return 0u; }, lim);
+    split_writer wm([](const ggml_tensor *) { return mixed_range_key(0, 0); }, lim);
     wm.write(b, 4);
     CHECK_THROWS(wm.write(b, 1)); // metadata budget
 
     split_writer_limits le;
     le.max_events = 2;
-    split_writer we([](const ggml_tensor *) { return 0u; }, le);
+    split_writer we([](const ggml_tensor *) { return mixed_range_key(0, 0); }, le);
     we.write(b, 1);
     we.write_tensor(ts.t0, 0, 16);
     CHECK_THROWS(we.write(b, 1)); // event budget
 
     split_writer_limits lp;
     lp.max_payload_bytes = 100;
-    split_writer wp([](const ggml_tensor *) { return 0u; }, lp);
+    split_writer wp([](const ggml_tensor *) { return mixed_range_key(0, 0); }, lp);
     wp.write_tensor(ts.t0, 0, 100);
     CHECK_THROWS(wp.write_tensor(ts.t0, 0, 1));    // per-layer cap
     CHECK_THROWS(wp.write_tensor(ts.t0, 101, 1));  // layer total overflow check
@@ -254,7 +254,7 @@ static void test_split_writer_bounds() {
 
 static void test_manifest_wire_roundtrip() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write("A", 1);
     w.write_tensor(ts.t0, 64, 320);
     w.write("BC", 2);
@@ -278,7 +278,7 @@ static void test_manifest_wire_roundtrip() {
 
     // strict parse failures
     std::vector<uint8_t> bad = wire;
-    bad[4] = 2; // version
+    bad[4] = 7; // unknown version (2 is now valid)
     CHECK(!mixed_manifest_parse(bad.data(), bad.size(), parsed, &err));
     bad = wire;
     bad[0] ^= 0xFF; // magic
@@ -292,7 +292,7 @@ static void test_manifest_wire_roundtrip() {
 
 static void test_read_payload_slices() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write("TAG", 3);
     w.write_tensor(ts.t0, 64, 320);   // layer 0 event 1
     w.write_tensor(ts.t1, 0, 2048);   // layer 1
@@ -308,26 +308,26 @@ static void test_read_payload_slices() {
     };
     for (const auto & sl : slices) {
         std::vector<uint8_t> dst(sl.second);
-        const size_t got = w.read_payload(0, sl.first, dst.data(), sl.second);
+        const size_t got = w.read_payload(0, 0, sl.first, dst.data(), sl.second);
         CHECK(got == sl.second);
         CHECK(std::memcmp(dst.data(), ref0.data() + sl.first, sl.second) == 0);
     }
     // out-of-range: short/zero returns
     std::vector<uint8_t> dst(16);
-    CHECK(w.read_payload(0, 448, dst.data(), 16) == 0);
-    CHECK(w.read_payload(0, 1000, dst.data(), 16) == 0);
-    CHECK(w.read_payload(9, 0, dst.data(), 16) == 0);
-    CHECK(w.read_payload(1, 2040, dst.data(), 16) == 8); // clipped at layer end
+    CHECK(w.read_payload(0, 0, 448, dst.data(), 16) == 0);
+    CHECK(w.read_payload(0, 0, 1000, dst.data(), 16) == 0);
+    CHECK(w.read_payload(9, 0, 0, dst.data(), 16) == 0);
+    CHECK(w.read_payload(1, 0, 2040, dst.data(), 16) == 8); // clipped at layer end
     CHECK(std::memcmp(dst.data(), ref1.data() + 2040, 8) == 0);
     // cross-event read
     std::vector<uint8_t> xdst(50);
-    CHECK(w.read_payload(0, 300, xdst.data(), 50) == 50);
+    CHECK(w.read_payload(0, 0, 300, xdst.data(), 50) == 50);
     CHECK(std::memcmp(xdst.data(), ref0.data() + 300, 50) == 0);
 }
 
 static void test_split_reader_reverse_and_outer_commit() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write("A", 1);
     w.write_tensor(ts.t0, 64, 320);
     w.write("BC", 2);
@@ -341,8 +341,8 @@ static void test_split_reader_reverse_and_outer_commit() {
     auto owner1 = std::make_shared<std::vector<uint8_t>>(ref1);
     std::weak_ptr<const void> weak0 = owner0;
     std::weak_ptr<const void> weak1 = owner1;
-    split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 },
-                                   { 1, owner1->data(), owner1->size(), owner1 } });
+    split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 },
+                                   { 1, 0, owner1->data(), owner1->size(), owner1 } });
     CHECK(r.remaining() == 2372);
 
     dests dd = make_dests(ts, { ts.t0, ts.t1 });
@@ -389,7 +389,7 @@ static void test_split_reader_reverse_and_outer_commit() {
 
 static void test_read_across_events_and_tensor_splits() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor *) { return 0u; });
+    split_writer w([](const ggml_tensor *) { return mixed_range_key(0, 0); });
     w.write("XY", 2);
     w.write_tensor(ts.t0, 0, 100);
     w.write("Z", 1);
@@ -399,7 +399,7 @@ static void test_read_across_events_and_tensor_splits() {
 
     auto owner = std::make_shared<std::vector<uint8_t>>(ref);
     std::weak_ptr<const void> weak = owner;
-    split_reader r(w.manifest(), { { 0, owner->data(), owner->size(), owner } });
+    split_reader r(w.manifest(), { { 0, 0, owner->data(), owner->size(), owner } });
 
     // read() spanning metadata -> tensor event
     uint8_t buf[4];
@@ -469,7 +469,7 @@ static void test_fixup_caps_and_big_borrowed() {
     lds.buf = ggml_backend_alloc_ctx_tensors(lds.ctx, lds.be);
     g_wrap_set = 0;
 
-    split_reader r(m, { { 0, owner->data(), owner->size(), owner } }, lim);
+    split_reader r(m, { { 0, 0, owner->data(), owner->size(), owner } }, lim);
     r.read_tensor(lds.d0, 0, size_t(big)); // borrowed: no staging needed
     CHECK(r.remaining() == 0);
     std::vector<uint8_t> fix(64);
@@ -478,7 +478,7 @@ static void test_fixup_caps_and_big_borrowed() {
     // cap failure is TERMINAL: checked on a separate reader instance, and the
     // failed reader must not be reused (no partial retry accepted)
     {
-        split_reader r2(m, { { 0, owner->data(), owner->size(), owner } }, lim);
+        split_reader r2(m, { { 0, 0, owner->data(), owner->size(), owner } }, lim);
         r2.stage_tensor_set(lds.d0, fix.data(), 0, 64);
         CHECK_THROWS(r2.stage_tensor_set(lds.d0, fix.data(), 64, (1u << 20) - 32)); // TOTAL 1 MiB + 64 B
         CHECK_THROWS(r2.read_tensor(lds.d0, 0, 1)); // terminal: no retry
@@ -494,15 +494,15 @@ static void test_fixup_caps_and_big_borrowed() {
 
 static void test_defer_ordering_and_qx_append() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 0, 3200);
     w.write_tensor(ts.t1, 0, 2048);
     const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
     const std::vector<uint8_t> ref1 = ref_payload(w.manifest(), ts, 1);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
     auto owner1 = std::make_shared<std::vector<uint8_t>>(ref1);
-    split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 },
-                                   { 1, owner1->data(), owner1->size(), owner1 } });
+    split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 },
+                                   { 1, 0, owner1->data(), owner1->size(), owner1 } });
 
     dests dd = make_dests(ts, { ts.t0, ts.t1, ts.t1 });
     ggml_tensor * d0 = dd.t[0];
@@ -542,12 +542,12 @@ static void test_defer_ordering_and_qx_append() {
 
 static void test_outer_cancel_releases_everything() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 0, 3200);
     const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
     std::weak_ptr<const void> weak = owner0;
-    split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+    split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
 
     dests dd = make_dests(ts, { ts.t0 });
     r.read_tensor(dd.t[0], 0, 3200);
@@ -600,7 +600,7 @@ static void test_borrowed_mutation_detected() {
     lds.buf = ggml_backend_alloc_ctx_tensors(lds.ctx, lds.be);
     g_wrap_set = 0;
 
-    split_reader r(m, { { 0, owner->data(), owner->size(), owner } }, lim);
+    split_reader r(m, { { 0, 0, owner->data(), owner->size(), owner } }, lim);
     r.read_tensor(lds.d0, 0, size_t(size));
     CHECK(r.remaining() == 0);
     owner->data()[12345] ^= 0xFF; // mutate the backing after queue
@@ -619,19 +619,19 @@ static void test_borrowed_mutation_detected() {
 
 static void test_commit_defer_contract() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 0, 3200);
     const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
 
     // direct commit rejected
     {
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
         CHECK_THROWS(r.commit());
     }
     // repeated defer rejected
     {
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
         dests dd = make_dests(ts, { ts.t0 });
         r.read_tensor(dd.t[0], 0, 3200);
         CHECK(r.remaining() == 0);
@@ -644,7 +644,7 @@ static void test_commit_defer_contract() {
     }
     // defer with unconsumed stream rejected
     {
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
         mock_outer outer;
         CHECK_THROWS(r.defer_to(outer));
     }
@@ -653,7 +653,7 @@ static void test_commit_defer_contract() {
         std::weak_ptr<const void> weak = owner0;
         dests dd = make_dests(ts, { ts.t0 });
         {
-            split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+            split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
             r.read_tensor(dd.t[0], 0, 3200);
             CHECK(r.remaining() == 0);
             CHECK(!weak.expired());
@@ -666,40 +666,40 @@ static void test_commit_defer_contract() {
 
 static void test_reader_ctor_validation() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 0, 3200);
     w.write_tensor(ts.t1, 0, 2048);
     const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
 
     // missing span for a declared layer
-    CHECK_THROWS(split_reader(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } }));
+    CHECK_THROWS(split_reader(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } }));
     // duplicate span for the same layer
-    CHECK_THROWS(split_reader(w.manifest(), { { 0, owner0->data(), 3200, owner0 },
-                                              { 0, owner0->data(), 3200, owner0 },
-                                              { 1, owner0->data(), 2048, owner0 } }));
+    CHECK_THROWS(split_reader(w.manifest(), { { 0, 0, owner0->data(), 3200, owner0 },
+                                              { 0, 0, owner0->data(), 3200, owner0 },
+                                              { 1, 0, owner0->data(), 2048, owner0 } }));
     // span size mismatch
-    CHECK_THROWS(split_reader(w.manifest(), { { 0, owner0->data(), 3199, owner0 },
-                                              { 1, owner0->data(), 2048, owner0 } }));
+    CHECK_THROWS(split_reader(w.manifest(), { { 0, 0, owner0->data(), 3199, owner0 },
+                                              { 1, 0, owner0->data(), 2048, owner0 } }));
     // span for an undeclared layer
-    CHECK_THROWS(split_reader(w.manifest(), { { 9, owner0->data(), 3200, owner0 },
-                                              { 1, owner0->data(), 2048, owner0 } }));
+    CHECK_THROWS(split_reader(w.manifest(), { { 9, 0, owner0->data(), 3200, owner0 },
+                                              { 1, 0, owner0->data(), 2048, owner0 } }));
     // null data with nonzero size
-    CHECK_THROWS(split_reader(w.manifest(), { { 0, nullptr, 3200, owner0 },
-                                              { 1, owner0->data(), 2048, owner0 } }));
+    CHECK_THROWS(split_reader(w.manifest(), { { 0, 0, nullptr, 3200, owner0 },
+                                              { 1, 0, owner0->data(), 2048, owner0 } }));
     // span count cap
     {
         split_reader_limits lim;
         lim.max_payload_spans = 1;
-        CHECK_THROWS(split_reader(w.manifest(), { { 0, owner0->data(), 3200, owner0 },
-                                                  { 1, owner0->data(), 2048, owner0 } }, lim));
+        CHECK_THROWS(split_reader(w.manifest(), { { 0, 0, owner0->data(), 3200, owner0 },
+                                                  { 1, 0, owner0->data(), 2048, owner0 } }, lim));
     }
     // per-span byte cap
     {
         split_reader_limits lim;
         lim.max_payload_bytes = 3000;
-        CHECK_THROWS(split_reader(w.manifest(), { { 0, owner0->data(), 3200, owner0 },
-                                                  { 1, owner0->data(), 2048, owner0 } }, lim));
+        CHECK_THROWS(split_reader(w.manifest(), { { 0, 0, owner0->data(), 3200, owner0 },
+                                                  { 1, 0, owner0->data(), 2048, owner0 } }, lim));
     }
     // malformed manifests (structural validation)
     {
@@ -722,18 +722,18 @@ static void test_reader_ctor_validation() {
         m.events[0].kind = 9;
         CHECK(!m.validate().empty());
         m = w.manifest();
-        m.version = 2;
+        m.version = 7; // unknown version is rejected (1 and 2 are valid)
         CHECK(!m.validate().empty());
     }
 }
 
 static void test_callback_failure_during_outer_commit() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 0, 3200);
     const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
-    split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+    split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
     dests dd = make_dests(ts, { ts.t0 });
     r.read_tensor(dd.t[0], 0, 3200);
     r.on_commit([]() -> void { throw std::runtime_error("publication callback failed"); });
@@ -793,7 +793,7 @@ static void test_stream_serialized_size() {
         fill_pattern(p0, 52);
         fill_pattern(p1, 53);
         stream_read_callbacks reads;
-        reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
+        reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
             const std::vector<uint8_t> & p = layer_id == 1 ? p0 : p1;
             if (offset + count > p.size()) {
                 return size_t(0);
@@ -858,7 +858,7 @@ static void test_stream_serialized_size() {
 
 static void test_split_writer_sizing_no_gpu_read() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 64, 320);
     w.write_tensor(ts.t0, 384, 128);
     w.write_tensor(ts.t1, 0, 2048);
@@ -870,7 +870,8 @@ static void test_split_writer_sizing_no_gpu_read() {
 
     stream_input in;
     for (const auto & lp : m.layer_payload_sizes) {
-        in.layers.push_back(make_qx_desc(lp.first, lp.second));
+        // the manifest keys by the packed (layer_id, range_id) pair
+        in.layers.push_back(make_qx_desc(mixed_key_layer(lp.first), lp.second));
     }
     in.metadata_version = 1;
     in.metadata = wire.data();
@@ -883,8 +884,8 @@ static void test_split_writer_sizing_no_gpu_read() {
 
     // and the real streamed size matches, with read_payload served by the writer
     stream_read_callbacks reads;
-    reads.read_payload = [&](uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) {
-        return w.read_payload(layer_id, offset, dst, count);
+    reads.read_payload = [&](uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) {
+        return w.read_payload(layer_id, range_id, offset, dst, count);
     };
     uint64_t written = 0;
     std::vector<uint8_t> streamed;
@@ -926,7 +927,7 @@ static void test_large_metadata_offsets() {
     // CRITICAL regression: ordinary metadata larger than 255 bytes BEFORE a
     // tensor event plus trailing metadata; meta_offsets must be u64
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     std::vector<uint8_t> head(1024);
     fill_pattern(head, 61);
     std::vector<uint8_t> tail_meta(300);
@@ -946,8 +947,8 @@ static void test_large_metadata_offsets() {
     const std::vector<uint8_t> ref0 = ref_payload(m, ts, 0);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
     auto owner1 = std::make_shared<std::vector<uint8_t>>(ref1_payload(m, ts, 1));
-    split_reader r(m, { { 0, owner0->data(), owner0->size(), owner0 },
-                        { 1, owner1->data(), owner1->size(), owner1 } });
+    split_reader r(m, { { 0, 0, owner0->data(), owner0->size(), owner0 },
+                        { 1, 0, owner1->data(), owner1->size(), owner1 } });
 
     // read() must serve the head metadata correctly across the >255 boundary
     std::vector<uint8_t> got_head(1024);
@@ -972,7 +973,7 @@ static void test_large_metadata_offsets() {
 static void test_manifest_malformed() {
     constexpr uint64_t MAX_T = uint64_t(1) << 42; // 4 TiB sanity bound (module-internal)
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write("META", 4); // metadata event so the length-mismatch checks apply
     w.write_tensor(ts.t0, 0, 3200);
     const std::vector<uint8_t> wire = mixed_manifest_serialize(w.manifest());
@@ -1050,14 +1051,14 @@ static void test_manifest_malformed() {
 
 static void test_reader_terminal_state() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 0, 3200);
     const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
 
     // cancel is terminal: every later operation is rejected; repeated cancel ok
     {
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
         dests dd = make_dests(ts, { ts.t0 });
         r.read_tensor(dd.t[0], 0, 3200);
         r.cancel();
@@ -1074,7 +1075,7 @@ static void test_reader_terminal_state() {
     }
     // defer is terminal too
     {
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
         dests dd = make_dests(ts, { ts.t0 });
         r.read_tensor(dd.t[0], 0, 3200);
         mock_outer outer;
@@ -1086,14 +1087,14 @@ static void test_reader_terminal_state() {
     }
     // empty on_commit callback rejected
     {
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
         CHECK_THROWS(r.on_commit({}));
     }
     // guard failure leaves the reader terminal (no partial retry)
     {
         split_reader_limits lim;
         lim.max_fixup_staging = 64;
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } }, lim);
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } }, lim);
         dests dd = make_dests(ts, { ts.t0 });
         std::vector<uint8_t> fix(64);
         r.stage_tensor_set(dd.t[0], fix.data(), 0, 64);
@@ -1105,7 +1106,7 @@ static void test_reader_terminal_state() {
     {
         split_reader_limits lim;
         lim.max_operations = 3;
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } }, lim);
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } }, lim);
         dests dd = make_dests(ts, { ts.t0 });
         r.read_tensor(dd.t[0], 0, 3200); // 1 op (single event)
         r.stage_tensor_clear(dd.t[0], 0, 8); // 2 ops
@@ -1117,7 +1118,7 @@ static void test_reader_terminal_state() {
     {
         split_reader_limits lim;
         lim.max_callbacks = 1;
-        split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } }, lim);
+        split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } }, lim);
         r.on_commit([]() {});
         CHECK_THROWS(r.on_commit([]() {}));
     }
@@ -1127,10 +1128,10 @@ static void test_writer_seal_and_limits() {
     tensors ts = make_tensors();
     // seal: read_payload then write/write_tensor are rejected
     {
-        split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+        split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
         w.write_tensor(ts.t0, 0, 64);
         uint8_t dst[16];
-        CHECK(w.read_payload(0, 0, dst, 16) == 16);
+        CHECK(w.read_payload(0, 0, 0, dst, 16) == 16);
         CHECK_THROWS(w.write_tensor(ts.t0, 64, 64));   // after producer read
         CHECK_THROWS(w.write("X", 1));                 // after producer read
         const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
@@ -1138,17 +1139,17 @@ static void test_writer_seal_and_limits() {
     }
     // read_payload null dst / overflow guards
     {
-        split_writer w([](const ggml_tensor *) { return 0u; });
+        split_writer w([](const ggml_tensor *) { return mixed_range_key(0, 0); });
         w.write_tensor(ts.t0, 0, 3200);
-        CHECK_THROWS(w.read_payload(0, 0, nullptr, 16));
+        CHECK_THROWS(w.read_payload(0, 0, 0, nullptr, 16));
         std::vector<uint8_t> dst(16);
-        CHECK(w.read_payload(0, (uint64_t(1) << 42), dst.data(), 16) == 0); // overflow-safe
+        CHECK(w.read_payload(0, 0, (uint64_t(1) << 42), dst.data(), 16) == 0); // overflow-safe
     }
     // max_virtual_stream_bytes enforced in write and write_tensor
     {
         split_writer_limits lim;
         lim.max_virtual_stream_bytes = 100;
-        split_writer w([](const ggml_tensor *) { return 0u; }, lim);
+        split_writer w([](const ggml_tensor *) { return mixed_range_key(0, 0); }, lim);
         w.write_tensor(ts.t0, 0, 100);
         CHECK_THROWS(w.write_tensor(ts.t0, 0, 1));
         CHECK_THROWS(w.write("X", 1));
@@ -1157,7 +1158,7 @@ static void test_writer_seal_and_limits() {
     {
         split_writer_limits lim;
         lim.max_virtual_stream_bytes = 100;
-        split_writer w([](const ggml_tensor *) { return 0u; }, lim);
+        split_writer w([](const ggml_tensor *) { return mixed_range_key(0, 0); }, lim);
         w.write_tensor(ts.t0, 0, 100);
         CHECK_THROWS(w.write_tensor(ts.t0, 0, 1));
         CHECK_THROWS(w.write("X", 1)); // terminal
@@ -1169,7 +1170,7 @@ static void test_many_events_sequential() {
     // correct; no quadratic event-0 rescans
     const uint32_t n = 10001;
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor *) { return 0u; });
+    split_writer w([](const ggml_tensor *) { return mixed_range_key(0, 0); });
     std::vector<uint8_t> meta(n);
     for (uint32_t i = 0; i < n; ++i) {
         meta[i] = uint8_t(i);
@@ -1185,7 +1186,7 @@ static void test_many_events_sequential() {
 
     const std::vector<uint8_t> ref0 = ref_payload(m, ts, 0);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
-    split_reader r(m, { { 0, owner0->data(), owner0->size(), owner0 } });
+    split_reader r(m, { { 0, 0, owner0->data(), owner0->size(), owner0 } });
     // destination tensor of n bytes (10001 F32 elements -> 40004 B)
     ggml_init_params params{};
     params.mem_size = 1u << 20;
@@ -1226,11 +1227,11 @@ static void test_many_events_sequential() {
 
 static void test_duplicate_outer_callback_invocation() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 0, 64);
     const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
     auto owner0 = std::make_shared<std::vector<uint8_t>>(ref0);
-    split_reader r(w.manifest(), { { 0, owner0->data(), owner0->size(), owner0 } });
+    split_reader r(w.manifest(), { { 0, 0, owner0->data(), owner0->size(), owner0 } });
     dests dd = make_dests(ts, { ts.t0 });
     g_wrap_set = 0;
     r.read_tensor(dd.t[0], 0, 64);
@@ -1241,11 +1242,11 @@ static void test_duplicate_outer_callback_invocation() {
     // a buggy outer invoking the callback twice must be detected
     {
         // fresh transaction
-        split_writer w2([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+        split_writer w2([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
         w2.write_tensor(ts.t0, 0, 64);
         const std::vector<uint8_t> r2 = ref_payload(w2.manifest(), ts, 0);
         auto o2 = std::make_shared<std::vector<uint8_t>>(r2);
-        split_reader r3(w2.manifest(), { { 0, o2->data(), o2->size(), o2 } });
+        split_reader r3(w2.manifest(), { { 0, 0, o2->data(), o2->size(), o2 } });
         dests dd2 = make_dests(ts, { ts.t0 });
         r3.read_tensor(dd2.t[0], 0, 64);
         mock_outer bad;
@@ -1267,15 +1268,15 @@ static void test_duplicate_outer_callback_invocation() {
 
 static void test_owner_required() {
     tensors ts = make_tensors();
-    split_writer w([](const ggml_tensor * t) { return t->ne[1] == 8 ? 0u : 1u; });
+    split_writer w([](const ggml_tensor * t) { return mixed_range_key(t->ne[1] == 8 ? 0 : 1, 0); });
     w.write_tensor(ts.t0, 0, 3200);
     const std::vector<uint8_t> ref0 = ref_payload(w.manifest(), ts, 0);
 
     // nonzero span without an owner is rejected (zero-copy lifetime claims)
-    CHECK_THROWS(split_reader(w.manifest(), { { 0, ref0.data(), ref0.size(), nullptr } }));
+    CHECK_THROWS(split_reader(w.manifest(), { { 0, 0, ref0.data(), ref0.size(), nullptr } }));
     // queue_borrowed without an owner is rejected
     {
-        split_reader r(w.manifest(), { { 0, ref0.data(), ref0.size(), std::make_shared<std::vector<uint8_t>>(ref0) } });
+        split_reader r(w.manifest(), { { 0, 0, ref0.data(), ref0.size(), std::make_shared<std::vector<uint8_t>>(ref0) } });
         dests dd = make_dests(ts, { ts.t0 });
         CHECK_THROWS(r.queue_borrowed(dd.t[0], 0, ref0.data(), 8, nullptr));
     }

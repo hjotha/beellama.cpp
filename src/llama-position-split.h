@@ -27,6 +27,11 @@
 
 namespace llama_position_split {
 
+// llama_pos is int32_t in the public API (include/llama.h). The alias is local
+// to this backend-free contract header so it compiles standalone; an identical
+// typedef in a wider scope is legal when both are visible.
+using llama_pos = int32_t;
+
 inline constexpr uint32_t kCapacityC        = 131072;
 inline constexpr uint32_t kTargetP          = 102400;
 inline constexpr uint32_t kAlignTokens       = 256;
@@ -142,6 +147,81 @@ inline bool ubatch_crosses_p(uint32_t pos_start, uint32_t n_tokens, uint32_t p) 
     return pos_start < p && end > p;
 }
 
+// Atribuição de faixa por posição (Fase 2b): cada posição absoluta pertence
+// a exatamente uma faixa. Local [0,P) vive na CUDA (KVarN4); overflow [P,C)
+// na Vulkan0 (Q4). `index_in_range` é o índice dentro da faixa (pos no local,
+// pos-P no overflow), pronto para indexar células da faixa. Posições fora de
+// [0,C), ou qualquer P inválido (incluindo P == 0, modo desligado), resultam
+// em INVALID: fail-closed, nunca adivinhar faixa.
+enum class range_kind : uint8_t {
+    LOCAL    = 0,
+    OVERFLOW = 1,
+    INVALID  = 2,
+};
+
+struct range_pos {
+    range_kind kind = range_kind::INVALID;
+    uint32_t index_in_range = 0;
+};
+
+inline range_pos range_for_pos(int64_t pos, uint32_t p, uint32_t c = kCapacityC) {
+    range_pos out;
+    if (!is_valid_p(p, c) || pos < 0 || uint64_t(pos) >= c) {
+        return out;
+    }
+    if (uint64_t(pos) < p) {
+        out.kind = range_kind::LOCAL;
+        out.index_in_range = uint32_t(pos);
+    } else {
+        out.kind = range_kind::OVERFLOW;
+        out.index_in_range = uint32_t(uint64_t(pos) - p);
+    }
+    return out;
+}
+
+// Divide um intervalo contíguo [pos_start, pos_start + n_tokens) nas contagens
+// por faixa, para occupancy/seq_rm/rollback (§4.1: P-129, P-128, P-1, P, P+1,
+// P+128). Falha fechada (false + motivo) em intervalo vazio, início negativo
+// ou qualquer token além de C. Um intervalo que não cruza P deixa a outra
+// contagem em zero; isso não é erro.
+inline bool split_span_at_p(int64_t pos_start, uint64_t n_tokens, uint32_t p, uint32_t c,
+                            uint32_t & local_count, uint32_t & overflow_count,
+                            std::string & error) {
+    local_count = 0;
+    overflow_count = 0;
+    error.clear();
+    if (!is_valid_p(p, c)) {
+        error = "P inválido (exige múltiplo de 256, 0 < P < C)";
+        return false;
+    }
+    if (n_tokens == 0) {
+        error = "intervalo vazio não tem faixa";
+        return false;
+    }
+    if (pos_start < 0) {
+        error = "posição inicial negativa";
+        return false;
+    }
+    const uint64_t end = uint64_t(pos_start) + n_tokens;
+    if (end > c) {
+        error = "intervalo excede a capacidade C";
+        return false;
+    }
+    const uint64_t local_end = end < p ? end : p;
+    if (local_end > uint64_t(pos_start)) {
+        local_count = uint32_t(local_end - uint64_t(pos_start));
+    }
+    const uint64_t ovf_start = uint64_t(pos_start) > p ? uint64_t(pos_start) : p;
+    if (end > ovf_start) {
+        overflow_count = uint32_t(end - ovf_start);
+    }
+    if (uint64_t(local_count) + uint64_t(overflow_count) != n_tokens) {
+        error = "partição interna inconsistente";
+        return false;
+    }
+    return true;
+}
+
 // Validação da janela protegida recorrente (1 + n_rs_seq deve ficar junta).
 // Se a janela [win_start, win_end) atravessa P, a versão inicial rejeita o
 // prepare antes de qualquer mutação (retorna motivo; não divide a janela).
@@ -153,6 +233,39 @@ inline std::string validate_recurrent_window(uint32_t win_start, uint32_t win_en
         return "janela recorrente atravessa P: rejeitar prepare sem mutação";
     }
     return "";
+}
+
+// Classificação de remoção/rollback por faixa (§§3.1-3.2, Fase 2b).
+// Uma remoção [p0,p1) toca no máximo as duas faixas; o chamador (cache)
+// decide representabilidade KVarN/checkpoint a partir daqui, mas a
+// classificação em si é total e fail-closed: intervalo vazio, invertido ou
+// além de C nunca produz um plano parcial.
+enum class rm_span_kind : uint8_t {
+    LOCAL_ONLY    = 0, // [p0,p1) ⊆ [0,P)
+    OVERFLOW_ONLY = 1, // [p0,p1) ⊆ [P,C)
+    CROSSING      = 2, // p0 < P <= p1: overflow inteiro + sufixo local
+    INVALID       = 3,
+};
+
+// A remoção do llama.cpp usa p1 negativo como "até o fim do contexto".
+// Normalizar esse sentinela para C antes da classificação/planejamento; p1
+// negativo nunca significa uma posição negativa real aqui.
+inline int64_t normalize_removal_end(int64_t p1, uint32_t c) {
+    return p1 < 0 ? int64_t(c) : p1;
+}
+
+inline rm_span_kind classify_removal(int64_t p0, int64_t p1, uint32_t p, uint32_t c = kCapacityC) {
+    const int64_t end = normalize_removal_end(p1, c);
+    if (!is_valid_p(p, c) || end <= p0 || p0 < 0 || uint64_t(end) > c) {
+        return rm_span_kind::INVALID;
+    }
+    if (uint64_t(end) <= p) {
+        return rm_span_kind::LOCAL_ONLY;
+    }
+    if (uint64_t(p0) >= p) {
+        return rm_span_kind::OVERFLOW_ONLY;
+    }
+    return rm_span_kind::CROSSING;
 }
 
 // Conversão (m,l) -> LSE: lse = m + log(l), com l = denom (>= 0).
@@ -262,6 +375,125 @@ inline uint32_t choose_p(uint64_t cuda_free_bytes, uint64_t local_bytes_per_laye
         p -= kAlignTokens;
     }
     return 0; // nenhum P suportado: rejeitar configuração
+}
+
+// ---------------------------------------------------------------------------
+// Remoção/rollback transacional (Fase 2b, §§3.1-3.2 e 4.1)
+// ---------------------------------------------------------------------------
+
+// Uma remoção [p0,p1) é convertida em passos por faixa antes de qualquer
+// mutação: o chamador valida o plano inteiro e só então aplica. Nada é
+// escrito durante o planejamento, e um plano inválido não deixa estado
+// parcial para o chamarista desfazer.
+enum class removal_disposition : uint8_t {
+    APPLY            = 0, // representável in-place nas faixas envolvidas
+    NEEDS_CHECKPOINT = 1, // fora da reserva exata: exige checkpoint/replay
+    REJECT           = 2, // intervalo ou P inválido
+};
+
+// Passo de remoção dentro de uma faixa: `start_index`/`n_tokens` são índices
+// intra-faixa (posição - P no overflow), nunca absolutos.
+struct range_removal_step {
+    uint32_t range_id     = kRangeLocal;
+    uint32_t start_index  = 0;
+    uint32_t n_tokens     = 0;
+    // true quando o passo remove um sufixo da faixa (exige truncamento
+    // monotônico do anel); false quando remove do meio (replay).
+    bool suffix = false;
+};
+
+struct removal_plan {
+    std::vector<range_removal_step> steps;
+    rm_span_kind shape = rm_span_kind::INVALID;
+};
+
+// Planeja a remoção [p0,p1) nas faixas de um contexto (C) com fronteira P.
+// p1 negativo significa C, como na API de seq_rm do llama.cpp.
+// `exact_reserve` é o sufixo representável in-place por faixa (tail/stage
+// exatos); fora dele o plano exige checkpoint/replay. Retorna APPLY,
+// NEEDS_CHECKPOINT ou REJECT e, em caso de sucesso, o plano completo.
+inline removal_disposition plan_removal(
+        int64_t p0, int64_t p1, uint32_t p, uint32_t c,
+        uint32_t exact_reserve, uint32_t & exact_reserve_clamped,
+        removal_plan & out) {
+    out.steps.clear();
+    out.shape = rm_span_kind::INVALID;
+    if (!is_valid_p(p, c)) {
+        return removal_disposition::REJECT;
+    }
+    exact_reserve_clamped = exact_reserve > c ? c : exact_reserve;
+    const rm_span_kind shape = classify_removal(p0, p1, p, c);
+    if (shape == rm_span_kind::INVALID) {
+        return removal_disposition::REJECT;
+    }
+    out.shape = shape;
+
+    // Divisão canônica do intervalo nas duas faixas.
+    const uint64_t end = uint64_t(normalize_removal_end(p1, c));
+    const uint64_t local_end = end < p ? end : p;
+    const uint64_t ovf_start = uint64_t(p0) > p ? uint64_t(p0) : p;
+    bool needs_checkpoint = false;
+
+    if (local_end > uint64_t(p0)) {
+        range_removal_step step;
+        step.range_id    = kRangeLocal;
+        step.start_index = uint32_t(p0);
+        step.n_tokens    = uint32_t(local_end - uint64_t(p0));
+        step.suffix      = local_end == p; // termina em P => sufixo da faixa local
+        out.steps.push_back(step);
+    }
+    if (end > ovf_start) {
+        range_removal_step step;
+        step.range_id    = kRangeOverflow;
+        step.start_index = uint32_t(ovf_start - p);
+        step.n_tokens    = uint32_t(end - ovf_start);
+        step.suffix      = end == c; // termina em C => sufixo da faixa overflow
+        out.steps.push_back(step);
+    }
+
+    // Representabilidade: um passo é in-place apenas se cabe inteiro na
+    // reserva exata da sua faixa; senão depende de checkpoint/replay.
+    for (const auto & step : out.steps) {
+        const uint32_t reserve = exact_reserve_clamped;
+        const uint32_t need = step.suffix ? step.n_tokens : step.start_index + step.n_tokens;
+        if (need > reserve) {
+            needs_checkpoint = true;
+        }
+    }
+    return needs_checkpoint ? removal_disposition::NEEDS_CHECKPOINT
+                            : removal_disposition::APPLY;
+}
+
+
+// Tail extent for a graph (plan 3.1/3.4). The local tail carries the
+// in-flight rows ONLY when this graph's ubatch writes the local range; a
+// position-split OVERFLOW ubatch stores Q4 overflow keys, so its local tail is
+// read purely as history and must not be sized with its query count (that would
+// promise q_max current rows the graph deliberately does not bind and trip
+// fattn-tail.cuh's mt->ne[0] <= kt->ne[1] + kt_current->ne[1]).
+//
+// Returns the query count to feed llama_kv_cache::get_tail_attention_stride():
+//   - P-mode off            -> q_max (unchanged legacy behaviour)
+//   - empty ubatch          -> q_max (nothing to classify)
+//   - any token >= P        -> 1 (configured persistent-tail extent only)
+//   - all tokens < P        -> number of local tokens
+inline int64_t tail_extent_queries(
+        bool        position_split_enabled,
+        uint32_t    p,
+        const llama_pos * pos,
+        uint32_t    n_tokens,
+        int64_t     q_max) {
+    if (!position_split_enabled || p == 0 || pos == nullptr || n_tokens == 0) {
+        return q_max;
+    }
+    int64_t local = 0;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (pos[i] >= llama_pos(p)) {
+            return 1;
+        }
+        ++local;
+    }
+    return local;
 }
 
 } // namespace llama_position_split

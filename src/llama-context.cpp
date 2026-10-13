@@ -10,10 +10,12 @@
 #include "llama-io.h"
 #include "llama-io-file.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-memory-hybrid.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-mixed-mtp-budget.h"
 #include "llama-kv-mixed-placement.h"
+#include "llama-kv-mixed-state-stream.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
 #include "ggml-remote-attn.h"
@@ -440,25 +442,18 @@ llama_context::llama_context(
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
-    // Position-split boundary (plan §3.1/§3.8). Until the second attention
-    // range is integrated (F3) the boundary only drives the ubatch division of
-    // §3.2, so it is accepted here but validated strictly: a multiple of 256,
-    // inside the context, and never silently migrated during execution.
+    // Position-split boundary (plan §3.1/§3.8). Abaixo de P, a fronteira já
+    // orienta divisão do ubatch, alocação por faixa, stores locais e
+    // remoção/rollback; a leitura única acima de P continua pendente da
+    // segunda faixa e do merge (F3). O valor é validado estritamente: múltiplo
+    // de 256, dentro do contexto, e nunca migrado silenciosamente.
     cparams.kv_position_split_p = 0;
-    {
-        const char * env_p = getenv("LLAMA_KV_POSITION_SPLIT_P");
-        if (env_p != nullptr && env_p[0] != '\0') {
-            const long value = strtol(env_p, nullptr, 10);
-            if (value <= 0 || !llama_position_split::is_valid_p(uint32_t(value), cparams.n_ctx_seq)) {
-                throw std::runtime_error(
-                    "LLAMA_KV_POSITION_SPLIT_P must be a multiple of 256 with 0 < P < n_ctx, got " +
-                    std::string(env_p));
-            }
-            cparams.kv_position_split_p = uint32_t(value);
-            LLAMA_LOG_INFO("%s: position-split KV placement enabled with P=%u (C=%u)\n",
-                           __func__, cparams.kv_position_split_p, cparams.n_ctx_seq);
-        }
-    }
+    // The strict P validation (plan 3.1/3.8) is NOT done here: at this point
+    // cparams.n_ctx_seq has not been computed yet, and reading it returned an
+    // indeterminate value -- the old log printed C=21979 and C=22091, neither a
+    // multiple of 256, and a valid P=512 was rejected with "0 < P < n_ctx" on
+    // some runs and accepted on others. It runs further down, right after
+    // n_ctx_seq is derived and padded.
 
     cparams.kv_tail_rollback_tokens = std::max(params.kv_tail_rollback_tokens, params.n_rs_seq);
     cparams.n_rs_seq = params.n_rs_seq;
@@ -505,6 +500,9 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (params.kvarn.window_chunk > uint32_t(std::numeric_limits<int32_t>::max())) {
+        throw std::invalid_argument("KVarN window chunk exceeds the supported range");
+    }
     cparams.kvarn             = params.kvarn;
     cparams.remote_attn_enabled = (params.remote_attn_host != nullptr && params.remote_attn_host[0] != '\0');
     cparams.remote_attn_prefill = params.remote_attn_prefill;
@@ -763,7 +761,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (cparams.dflash_selector_only || model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr && !cparams.dflash_split) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -906,6 +904,13 @@ llama_context::llama_context(
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
+        const char * attention_reference = getenv("LLAMA_OVF_ATTN_REFERENCE_CPU");
+        if (attention_reference && std::strcmp(attention_reference, "1") == 0 &&
+                getenv("LLAMA_OVF_ATTN_REFERENCE_CPU_MIN_POS")) {
+            // The reference suffix changes graph placement as positions cross
+            // the threshold, even when all tensor dimensions stay unchanged.
+            graph_reuse_disable = true;
+        }
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
@@ -928,6 +933,46 @@ llama_context::llama_context(
         if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
             LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+        }
+    }
+
+    // Position-split boundary (plan 3.1/3.8): multiple of 256, 0 < P < effective
+    // n_ctx_seq, never migrated silently. Running it against the EFFECTIVE value
+    // makes the verdict deterministic and keeps the two failure classes apart:
+    // this throw is an invalid SETTING, while an out-of-memory or backend
+    // failure is reported separately by the caller.
+    {
+        uint64_t value = params.kv_position_split_p;
+        std::string requested = std::to_string(value);
+        const char * env_p = getenv("LLAMA_KV_POSITION_SPLIT_P");
+        if (value == 0 && env_p && env_p[0] != '\0') {
+            char * end = nullptr;
+            errno = 0;
+            value = strtoull(env_p, &end, 10);
+            requested = env_p;
+            if (errno == ERANGE || !end || *end != '\0' || env_p[0] == '-') {
+                throw std::invalid_argument("invalid LLAMA_KV_POSITION_SPLIT_P: " + requested);
+            }
+            if (value == 0) { throw std::invalid_argument("LLAMA_KV_POSITION_SPLIT_P must be positive"); }
+        }
+        if (value != 0) {
+            if (params.mtp_reserve_enabled) {
+                throw std::invalid_argument("position-split KV requires MTP disabled in the active profile");
+            }
+            if (value > UINT32_MAX || !llama_position_split::is_valid_p(uint32_t(value), cparams.n_ctx_seq)) {
+                throw std::runtime_error(
+                    "KV position-split P must be a multiple of 256 with 0 < P < n_ctx: "
+                    "requested_P=" + requested +
+                    " requested_n_ctx=" + std::to_string(params.n_ctx) +
+                    " n_seq_max=" + std::to_string(cparams.n_seq_max) +
+                    " effective_n_ctx_seq=" + std::to_string(cparams.n_ctx_seq) +
+                    " [invalid setting, not an allocation failure]");
+            }
+            cparams.kv_position_split_p = uint32_t(value);
+            LLAMA_LOG_INFO("%s: position-split KV placement enabled with P=%u "
+                           "(requested n_ctx=%u effective n_ctx_seq=%u n_seq_max=%u)\n",
+                           __func__, cparams.kv_position_split_p, params.n_ctx,
+                           cparams.n_ctx_seq, cparams.n_seq_max);
         }
     }
 
@@ -3020,6 +3065,499 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// F4 fixture-only scheduler hook. When F4_TRACE_CAPTURE is set, KVarN marks the
+// exact K/V tensors returned to build_attn and this callback reads the scheduler
+// copies that actually execute, after that node is synchronized. It chains any
+// pre-existing cparams callback. Without the env var the scheduler path is
+// byte-for-byte the old one.
+static ggml_backend_sched_eval_callback g_f4_prev_eval_cb = nullptr;
+static void * g_f4_prev_eval_user = nullptr;
+
+// ---------------------------------------------------------------------------
+// F4 node dump (fixture-only, READ-ONLY, no graph perturbation).
+//
+// The dump walks the finished graph AFTER a successful compute and copies the
+// whitelisted tensors out of their real scheduler buffers. It never asks the
+// scheduler to split or materialize a node, so enabling it cannot change which
+// ops are fused, which backend computes what, or the numerical result; that is
+// checked separately (dump on vs dump off must produce the same NRMSE).
+//
+// Arming: F4_NODE_DUMP=<path>. Dumping additionally requires a non-empty tag
+// set through llama_f4_set_dump_tag() immediately before the prefill under
+// test; an empty tag means "not under test" and nothing is written. Changing
+// the tag resets the evaluation counter, so a sample produced during one
+// prefill can never be read as a sample from another.
+// ---------------------------------------------------------------------------
+
+static std::string g_f4_dump_tag;
+static uint32_t    g_f4_dump_eval = 0;
+
+static bool f4_dump_armed() {
+    static const bool on = [] {
+        const char * e = getenv("F4_NODE_DUMP");
+        return e && *e;
+    }();
+    return on;
+}
+
+static const char * f4_dump_path() {
+    static const char * p = [] {
+        const char * e = getenv("F4_NODE_DUMP");
+        return e && *e ? e : nullptr;
+    }();
+    return p;
+}
+
+static const std::set<std::string> & f4_dump_roles() {
+    static const std::set<std::string> s = [] {
+        std::set<std::string> r;
+        const char * e = getenv("F4_NODE_DUMP_ROLES");
+        std::string spec = (e && *e)
+            ? std::string(e)
+            : std::string("l_out,attn_norm,Qcur_full,Kproj,Vproj,Qcur_reshaped,"
+                          "Qcur_normed,Kcur_normed,gate_reshaped,Qcur,Kcur,Vcur,"
+                          "kq_mask,kq_mask_local,kq_mask_overflow,inp_pos,"
+                          "fa_kv_k,fa_kv_v,fa_out,attn_pregate,attn_remote,"
+                          "gate_sigmoid,attn_gated,attn_output,attn_residual,"
+                          "attn_post_norm,ffn_out,post_ffn");
+        size_t a = 0;
+        while (a <= spec.size()) {
+            const size_t b = spec.find(',', a);
+            const std::string tok = spec.substr(a, b == std::string::npos ? spec.size() : b - a);
+            if (!tok.empty()) { r.insert(tok); }
+            if (b == std::string::npos) { break; }
+            a = b + 1;
+        }
+        return r;
+    }();
+    return s;
+}
+
+static const std::set<int> & f4_dump_layers() {
+    static const std::set<int> s = [] {
+        std::set<int> r;
+        const char * e = getenv("F4_NODE_DUMP_LAYERS");
+        std::string spec = (e && *e) ? std::string(e) : std::string("2,3");
+        size_t a = 0;
+        while (a <= spec.size()) {
+            const size_t b = spec.find(',', a);
+            const std::string tok = spec.substr(a, b == std::string::npos ? spec.size() : b - a);
+            if (!tok.empty()) {
+                try { r.insert(std::stoi(tok)); } catch (...) {}
+            }
+            if (b == std::string::npos) { break; }
+            a = b + 1;
+        }
+        return r;
+    }();
+    return s;
+}
+
+// Names are "<role>-<il>" (see llama_context::graph_get_cb), or bare "<role>"
+// for tensors named with il == -1 such as shared graph inputs.
+static bool f4_dump_match(const ggml_tensor * t) {
+    if (!f4_dump_armed() || g_f4_dump_tag.empty() || !t || !t->name[0]) { return false; }
+    std::string n = t->name;
+    // The scheduler names a cross-backend operand "<backend>#<name>#<index>".
+    // The middle segment is the tensor the graph actually built, so strip the
+    // scheduler decoration or the real operand would fall outside the whitelist
+    // and only its undecorated twin (which the scheduler may not even fill)
+    // would be compared.
+    const size_t h1 = n.find('#');
+    if (h1 != std::string::npos) {
+        const size_t h2 = n.find('#', h1 + 1);
+        if (h2 != std::string::npos) { n = n.substr(h1 + 1, h2 - h1 - 1); }
+    }
+    const size_t dash = n.rfind('-');
+    if (dash == std::string::npos) {
+        return f4_dump_roles().count(n) > 0;
+    }
+    if (!f4_dump_roles().count(n.substr(0, dash))) { return false; }
+    try {
+        return f4_dump_layers().count(std::stoi(n.substr(dash + 1))) > 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Optional verbatim value dump for a small whitelist of (usually tiny) tensors
+// so a hash mismatch can be attributed to specific entries instead of just "the
+// bytes differ". Limited by F4_NODE_DUMP_FULL_EVALS to keep the file small.
+static const std::set<std::string> & f4_dump_full_names() {
+    static const std::set<std::string> s = [] {
+        std::set<std::string> r;
+        const char * e = getenv("F4_NODE_DUMP_FULL");
+        if (!e || !*e) { return r; }
+        size_t a = 0;
+        const std::string spec(e);
+        while (a <= spec.size()) {
+            const size_t b = spec.find(',', a);
+            const std::string tok = spec.substr(a, b == std::string::npos ? spec.size() : b - a);
+            if (!tok.empty()) { r.insert(tok); }
+            if (b == std::string::npos) { break; }
+            a = b + 1;
+        }
+        return r;
+    }();
+    return s;
+}
+
+static int f4_dump_full_evals() {
+    static const int v = [] {
+        const char * e = getenv("F4_NODE_DUMP_FULL_EVALS");
+        return (e && *e) ? std::atoi(e) : -1;
+    }();
+    return v;
+}
+
+static bool f4_dump_full_wanted(const ggml_tensor * t) {
+    if (f4_dump_full_names().empty()) { return false; }
+    const int lim = f4_dump_full_evals();
+    if (lim >= 0 && (int) g_f4_dump_eval > lim) { return false; }
+    const std::string n = t->name;
+    const size_t dash = n.rfind('-');
+    const std::string role = dash == std::string::npos ? n : n.substr(0, dash);
+    return f4_dump_full_names().count(role) > 0 || f4_dump_full_names().count(n) > 0;
+}
+
+static uint64_t f4_fnv1a(const void * data, size_t n, uint64_t h = 14695981039346656037ULL) {
+    const auto * p = (const uint8_t *) data;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+// Views share their producer's storage: RESHAPE/PERMUTE/TRANSPOSE/VIEW and the
+// KVarN leaf views carry no buffer of their own. Resolve to a tensor that does,
+// and carry the view's byte offset so the copy covers the bytes the consumer
+// actually reads, not the whole backing store. Only view-like ops are stepped
+// through: resolving through a real op would hash its INPUT and silently
+// mislabel a mismatch as an upstream one.
+struct f4_dump_src { const ggml_tensor * t = nullptr; const char * from = "self"; size_t off = 0; };
+
+static f4_dump_src f4_dump_resolve(const ggml_tensor * t) {
+    f4_dump_src r;
+    const ggml_tensor * s = t;
+    for (int hop = 0; hop < 8 && s; ++hop) {
+        if (s->buffer) {
+            if (s != t && t->data && s->data && t->data >= s->data) {
+                r.off = (size_t) ((const char *) t->data - (const char *) s->data);
+                r.from = "view_into_src";
+            }
+            r.t = s;
+            return r;
+        }
+        if (s->view_src && s->view_src != s && s->view_src->buffer) {
+            if (t->data && s->view_src->data && t->data >= s->view_src->data) {
+                r.off = (size_t) ((const char *) t->data - (const char *) s->view_src->data);
+            } else {
+                r.off = (size_t) s->view_offs;
+            }
+            r.t = s->view_src;
+            r.from = "view_src";
+            return r;
+        }
+        const bool view_like = s->op == GGML_OP_RESHAPE || s->op == GGML_OP_PERMUTE ||
+                               s->op == GGML_OP_TRANSPOSE || s->op == GGML_OP_VIEW ||
+                               s->op == GGML_OP_KVARN_VIEW;
+        if (view_like && s->src[0] && s->src[0] != s) {
+            s = s->src[0]; r.from = "viewlike_src0"; continue;
+        }
+        break;
+    }
+    return r;
+}
+
+// Hash `len` bytes at `off` inside a resolved source, in 4 MiB chunks. Returns
+// 0 only if nothing was read; `status` explains anything else.
+static uint64_t f4_hash_span(const ggml_tensor * src, size_t off, size_t len,
+                             const char ** status, size_t * hashed) {
+    uint64_t hash = 14695981039346656037ULL;
+    *hashed = 0;
+    if (len == 0) { *status = "empty"; return hash; }
+    constexpr size_t CHUNK = 1u << 22;
+    std::vector<uint8_t> buf(std::min(CHUNK, len));
+    for (size_t o = 0; o < len; o += CHUNK) {
+        const size_t n = std::min(CHUNK, len - o);
+        try {
+            ggml_backend_tensor_get(src, buf.data(), off + o, n);
+        } catch (...) {
+            *status = "readfailed";
+            return hash;
+        }
+        hash = f4_fnv1a(buf.data(), n, hash);
+        *hashed += n;
+    }
+    return hash;
+}
+
+static void f4_dump_tensor(const ggml_tensor * t) {
+    const char * path = f4_dump_path();
+    if (!path) { return; }
+    const f4_dump_src rs = f4_dump_resolve(t);
+    const ggml_tensor * src = rs.t;
+    // The FNV offset basis on the first call: seeding with 0 would make an
+    // all-zero tensor hash to 0 and be indistinguishable from "not hashed".
+    uint64_t hash = 14695981039346656037ULL;
+    const char * status = "ok";
+    char backend[128] = "-";
+    size_t hashed = 0;
+    if (!src) {
+        status = "nobuffer";
+    } else {
+        auto * bt = ggml_backend_buffer_get_type(src->buffer);
+        auto * dev = bt ? ggml_backend_buft_get_device(bt) : nullptr;
+        std::snprintf(backend, sizeof(backend), "%s", dev ? ggml_backend_dev_name(dev)
+                        : (bt ? ggml_backend_buft_name(bt) : "?"));
+        const size_t src_total = ggml_nbytes(src);
+        if (rs.off > src_total) {
+            status = "viewbeyondstore";
+        } else {
+            // Copy the view's own span, clamped to what the backing store holds:
+            // a KVarN view may declare the padded n_kv width while the store
+            // only holds the cells written so far.
+            const size_t want = ggml_nbytes(t);
+            const size_t len0 = std::min(want, src_total - rs.off);
+            if (len0 == 0) {
+                status = "empty";
+            } else {
+                constexpr size_t CHUNK = 1u << 22;
+                std::vector<uint8_t> buf(std::min(CHUNK, len0));
+                for (size_t off = 0; off < len0; off += CHUNK) {
+                    const size_t len = std::min(CHUNK, len0 - off);
+                    try {
+                        ggml_backend_tensor_get(src, buf.data(), rs.off + off, len);
+                    } catch (...) {
+                        status = "readfailed";
+                        break;
+                    }
+                    hash = f4_fnv1a(buf.data(), len, hash);
+                    hashed += len;
+                }
+                if (len0 < want) { status = "clamped"; }
+            }
+        }
+    }
+    char fa[80] = "-";
+    // For FlashAttention also record its operands: a fixture name is a label,
+    // not an edge, so without the source names there is no way to tell whether
+    // the tensor a fixture calls "kq_mask" is the mask this node reads.
+    char fasrc[640] = "-";
+    if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+        // [0]=scale bits [1]=alibi [2]=softcap [3]=precision [4]=kvarn domain
+        // (ggml_flash_attn_ext_set_n_kv_max also writes index 4, so this is
+        // whatever was written last).
+        std::snprintf(fa, sizeof(fa), "%d,%d,%d,%d,%d", t->op_params[0], t->op_params[1],
+                      t->op_params[2], t->op_params[3], t->op_params[4]);
+        const char * nm[4] = { "-", "-", "-", "-" };
+        for (int i = 0; i < 4 && i < GGML_MAX_SRC; ++i) {
+            if (t->src[i]) { nm[i] = t->src[i]->name[0] ? t->src[i]->name : "(unnamed)"; }
+        }
+        std::snprintf(fasrc, sizeof(fasrc), "%s|%s|%s|%s", nm[0], nm[1], nm[2], nm[3]);
+    }
+    FILE * f = std::fopen(path, "a");
+    if (!f) { return; }
+    std::fprintf(f,
+        "NODE tag=%s eval=%u name=%s op=%s dtype=%s ne=%lld|%lld|%lld|%lld "
+        "nb=%zu,%zu,%zu,%zu bytes=%zu flags=%u src=%s srcname=%s srcdtype=%s srcbytes=%zu "
+        "srcoff=%zu hashed=%zu backend=%s hash=%016llx status=%s fa=%s fasrc=%s\n",
+        g_f4_dump_tag.c_str(), g_f4_dump_eval, t->name, ggml_op_name(t->op),
+        ggml_type_name(t->type),
+        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+        t->nb[0], t->nb[1], t->nb[2], t->nb[3], ggml_nbytes(t), t->flags,
+        rs.from, src ? src->name : "-", src ? ggml_type_name(src->type) : "-",
+        src ? ggml_nbytes(src) : 0, rs.off, hashed,
+        backend, (unsigned long long) hash, status, fa, fasrc);
+    // FlashAttention's operands are live RIGHT NOW (this fires immediately
+    // after the node computed), so they can be read here even when the graph
+    // itself is not in front of us -- which is the only way to reach the
+    // scheduler's cross-backend operand copies. This is the comparison that
+    // says whether the mask and the K/V actually consumed differ.
+    if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+        static const bool want_src = [] {
+            const char * e = getenv("F4_NODE_DUMP_FA_SRC");
+            return e && *e && std::atoi(e) != 0;
+        }();
+        if (want_src) {
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                ggml_tensor * opnd = t->src[i];
+                if (!opnd) { continue; }
+                const f4_dump_src rs2 = f4_dump_resolve(opnd);
+                const char * st2 = "ok";
+                size_t h2 = 0;
+                uint64_t hv = 0;
+                if (!rs2.t) {
+                    st2 = "nobuffer";
+                } else {
+                    const size_t stot = ggml_nbytes(rs2.t);
+                    if (rs2.off > stot) { st2 = "viewbeyondstore"; }
+                    else { hv = f4_hash_span(rs2.t, rs2.off, std::min(ggml_nbytes(opnd), stot - rs2.off), &st2, &h2); }
+                }
+                std::fprintf(f, "FASRC tag=%s eval=%u idx=%d name=%s op=%s dtype=%s "
+                                "ne=%lld|%lld|%lld|%lld bytes=%zu src=%s srcbytes=%zu hashed=%zu "
+                                "hash=%016llx status=%s\n",
+                             g_f4_dump_tag.c_str(), g_f4_dump_eval, i,
+                             opnd->name, ggml_op_name(opnd->op), ggml_type_name(opnd->type),
+                             (long long) opnd->ne[0], (long long) opnd->ne[1],
+                             (long long) opnd->ne[2], (long long) opnd->ne[3],
+                             ggml_nbytes(opnd), rs2.from,
+                             rs2.t ? ggml_nbytes(rs2.t) : 0, h2,
+                             (unsigned long long) hv, st2);
+            }
+        }
+    }
+    if (f4_dump_full_wanted(t) && src) {
+        const size_t nbyte = std::min(ggml_nbytes(t), (ggml_nbytes(src) > rs.off ? ggml_nbytes(src) - rs.off : size_t(0)));
+        if (nbyte > 0 && t->type == GGML_TYPE_F16 && (nbyte % 2) == 0) {
+            std::vector<uint8_t> raw(nbyte);
+            ggml_backend_tensor_get(src, raw.data(), rs.off, nbyte);
+            std::fprintf(f, "DATA tag=%s eval=%u name=%s kind=f16 n=%zu v=",
+                         g_f4_dump_tag.c_str(), g_f4_dump_eval, t->name, nbyte / 2);
+            const size_t n = nbyte / 2;
+            std::vector<float> tmp(n);
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), tmp.data(), (int) n);
+            for (size_t i = 0; i < n; ++i) {
+                std::fprintf(f, i ? ",%.9g" : "%.9g", (double) tmp[i]);
+            }
+            std::fprintf(f, "\n");
+        } else if (nbyte > 0 && t->type == GGML_TYPE_F32 && (nbyte % 4) == 0) {
+            std::vector<uint8_t> raw(nbyte);
+            ggml_backend_tensor_get(src, raw.data(), rs.off, nbyte);
+            std::fprintf(f, "DATA tag=%s eval=%u name=%s kind=f32 n=%zu v=",
+                         g_f4_dump_tag.c_str(), g_f4_dump_eval, t->name, nbyte / 4);
+            const size_t n = nbyte / 4;
+            for (size_t i = 0; i < n; ++i) {
+                float val; std::memcpy(&val, raw.data() + i * 4, 4);
+                std::fprintf(f, i ? ",%.9g" : "%.9g", (double) val);
+            }
+            std::fprintf(f, "\n");
+        } else if (nbyte > 0 && t->type == GGML_TYPE_I32 && (nbyte % 4) == 0) {
+            std::vector<uint8_t> raw(nbyte);
+            ggml_backend_tensor_get(src, raw.data(), rs.off, nbyte);
+            std::fprintf(f, "DATA tag=%s eval=%u name=%s kind=i32 n=%zu v=",
+                         g_f4_dump_tag.c_str(), g_f4_dump_eval, t->name, nbyte / 4);
+            const size_t n = nbyte / 4;
+            for (size_t i = 0; i < n; ++i) {
+                int32_t val; std::memcpy(&val, raw.data() + i * 4, 4);
+                std::fprintf(f, i ? ",%d" : "%d", (int) val);
+            }
+            std::fprintf(f, "\n");
+        }
+    }
+    std::fclose(f);
+}
+
+void llama_f4_set_dump_tag(const char * tag) {
+    const std::string next = tag ? tag : "";
+    if (next == g_f4_dump_tag) { return; }
+    g_f4_dump_tag = next;
+    g_f4_dump_eval = 0;
+    if (f4_dump_armed()) {
+        fprintf(stderr, "F4DUMP tag=%s eval_counter_reset\n",
+                g_f4_dump_tag.empty() ? "(off)" : g_f4_dump_tag.c_str());
+    }
+}
+
+// Called once per finished graph, after compute has synchronized. Only INPUT
+// tensors are read here: their memory is written by set_inputs and read by the
+// graph, never overwritten by a later node, so a post-compute copy is exact.
+// Intermediate results are NOT read here -- the scheduler legitimately reuses a
+// buffer region as soon as its producer's live range ends, so a post-compute
+// copy of an intermediate node would return whatever the last writer left in
+// that region. Those go through the eval callback below, which fires while the
+// node's own value is still the live occupant.
+// Declared here instead of in ggml.h on purpose: adding them to the public
+// header would invalidate every translation unit in the tree, including the
+// CUDA template instances, which costs a multi-hour rebuild for two accessors.
+// The definitions live in ggml/src/ggml.c and keep the same C linkage.
+extern "C" {
+int                  ggml_graph_n_leafs(struct ggml_cgraph * cgraph);
+struct ggml_tensor * ggml_graph_leaf(struct ggml_cgraph * cgraph, int i);
+}
+
+// Advances the per-tag evaluation index once per ubatch, BEFORE that ubatch
+// computes, so input copies taken after the graph and intermediate copies taken
+// during it are stamped with the same index and cannot be crossed.
+static void f4_dump_next_eval() {
+    if (!f4_dump_armed()) { return; }
+    if (g_f4_dump_tag.empty()) {
+        // Server-side auto-tag: the dump otherwise only fires when a test calls
+        // llama_f4_set_dump_tag() right before the prefill under test.
+        const char * t = getenv("F4_NODE_DUMP_AUTOTAG");
+        if (t && *t) { g_f4_dump_tag = t; }
+    }
+    ++g_f4_dump_eval;
+}
+
+// Optional operator census: writes one line per graph node (op, shape) for the
+// first F4_NODE_DUMP_OPMAP evaluations. Names are auto-generated and therefore
+// not comparable across configurations, but the MULTISET of operators is, and
+// it is what says whether an operator exists on one side only -- which is the
+// only way to locate an operand set that a named-node dump cannot see.
+static void f4_dump_opmap(ggml_cgraph * gf) {
+    static const int lim = [] {
+        const char * e = getenv("F4_NODE_DUMP_OPMAP");
+        return (e && *e) ? std::atoi(e) : -1;
+    }();
+    if (lim < 0 || (int) g_f4_dump_eval > lim) { return; }
+    FILE * f = std::fopen(f4_dump_path(), "a");
+    if (!f) { return; }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        std::fprintf(f, "OP tag=%s eval=%u i=%d op=%s ne=%lld|%lld|%lld|%lld name=%s\n",
+                     g_f4_dump_tag.c_str(), g_f4_dump_eval, i, ggml_op_name(t->op),
+                     (long long) t->ne[0], (long long) t->ne[1],
+                     (long long) t->ne[2], (long long) t->ne[3], t->name);
+    }
+    std::fclose(f);
+}
+
+static void f4_dump_graph(ggml_cgraph * gf) {
+    if (!f4_dump_armed() || g_f4_dump_tag.empty() || !gf) { return; }
+    f4_dump_opmap(gf);
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        const bool is_input = (t->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+        if (is_input && f4_dump_match(t)) { f4_dump_tensor(t); }
+    }
+    // Graph INPUTS (masks, positions, indices) are LEAVES, not nodes: ggml puts
+    // every op==NONE tensor in cgraph->leafs. Walking nodes only would silently
+    // skip exactly the mask and position tensors this bisect has to compare.
+    for (int i = 0; i < ggml_graph_n_leafs(gf); ++i) {
+        ggml_tensor * t = ggml_graph_leaf(gf, i);
+        if (f4_dump_match(t)) { f4_dump_tensor(t); }
+    }
+}
+
+// Intermediate results: asked for so the scheduler evaluates them as their own
+// step (their value is then live and uniquely owned when the callback fires),
+// captured immediately after that step completes.
+static bool f4_dump_wants(const ggml_tensor * t) {
+    if (!t || t->op == GGML_OP_NONE) { return false; }
+    return f4_dump_match(t);
+}
+
+static bool f4_dump_capture(const ggml_tensor * t) {
+    if (!f4_dump_wants(t)) { return false; }
+    f4_dump_tensor(t);
+    return true;
+}
+
+static bool f4_sched_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(user_data);
+    if (ask) {
+        if (f4_dump_wants(t)) { return true; }
+        if (llama_kv_cache_kvarn::eval_wants_node(t)) { return true; }
+        if (g_f4_prev_eval_cb) { return g_f4_prev_eval_cb(t, ask, g_f4_prev_eval_user); }
+        return false;
+    }
+    const bool dumped = f4_dump_capture(t);
+    GGML_UNUSED(dumped);
+    const bool captured = llama_kv_cache_kvarn::eval_capture_node(t);
+    GGML_UNUSED(captured);
+    if (g_f4_prev_eval_cb) { return g_f4_prev_eval_cb(t, ask, g_f4_prev_eval_user); }
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     llama_memory_context_finish_guard memory_finish_guard(mctx);
     if (mctx && !mctx->apply()) {
@@ -3050,8 +3588,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         res->reset();
 
+        // F4: drop the K/V store slots at the GRAPH CONSTRUCTION boundary, before
+        // any store or reader of this graph runs. The slots hold tensors owned by
+        // the ggml_context of the previous graph, and that context is reused
+        // across ubatches (and re-created on rebuild/reserve), so a slot written
+        // by a dead graph can still be reachable here. Clearing later, in
+        // set_inputs, was too late: build_graph above already reads K/V, and the
+        // first graph of a slot has no input buffer yet. Doing it here is safe for
+        // this graph because nothing of THIS graph is stored yet; dependencies
+        // inside the graph are built after this point and are unaffected.
+        if (mctx) {
+            mctx->reset_graph_store_slots();
+        }
+
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        const char * f4_eval_env = getenv("F4_TRACE_CAPTURE");
+        const char * f4_dump_env = getenv("F4_NODE_DUMP");
+        if ((f4_eval_env && *f4_eval_env) || (f4_dump_env && *f4_dump_env)) {
+            g_f4_prev_eval_cb = cparams.cb_eval;
+            g_f4_prev_eval_user = cparams.cb_eval_user_data;
+            ggml_backend_sched_set_eval_callback(sched.get(), f4_sched_eval_cb, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -3087,9 +3646,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (mctx) {
         mctx->graph_compute_start();
     }
+    f4_dump_next_eval();
+    static const bool f5_stage_timing = [] {
+        const char * v = getenv("LLAMA_F5_STAGE_TIMING");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    const int64_t f5_t_mid = f5_stage_timing ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (f5_stage_timing) {
+        fprintf(stderr, "[F5STAGE] n_tokens=%u graph_compute_host_ms=%.3f\n",
+                ubatch.n_tokens, (ggml_time_us() - f5_t_mid)/1000.0);
+    }
     memory_finish_guard.finish(status);
     if (mctx) {
+        mctx->capture_after_compute(sched.get(), status);
         mctx->graph_compute_complete(sched.get(), status);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -3097,6 +3667,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+
+    // F4: snapshot the whitelisted tensors of THIS finished graph. Read-only,
+    // after synchronization, never touches the scheduler's split decisions.
+    f4_dump_graph(res->get_gf());
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -4295,6 +4869,13 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
+    // F4: same boundary rule as process_ubatch. The reserve graph is built with a
+    // memory context too, so the K/V store slots must be dropped before it reads
+    // them; otherwise a stale slot from a previous ubatch is reachable here too.
+    if (mctx) {
+        mctx->reset_graph_store_slots();
+    }
+
     auto * gf = model.build_graph(gparams);
 
     // verify transform coverage on the pristine graph: after scheduling,
@@ -4794,7 +5375,12 @@ private:
         const size_t position = file->tell();
         const size_t end = file->size();
         if (position > end || size > end - position) {
-            throw std::runtime_error("truncated sequence state file");
+            throw std::runtime_error(
+                    "truncated sequence state file [class=file_remaining_check"
+                    " position=" + std::to_string(position) +
+                    " end=" + std::to_string(end) +
+                    " requested=" + std::to_string(size) +
+                    " available=" + std::to_string(end > position ? end - position : 0) + "]");
         }
     }
 
@@ -5852,7 +6438,16 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         io.read(tokens_out, size_t(header[2])*sizeof(llama_token));
         state_seq_read_data(io, seq_id, 0);
         if (io.n_bytes() != state_size || io.checksum() != checksum) {
-            throw std::runtime_error("sequence state file integrity check failed");
+            // Which half failed matters: logical extent vs content digest.
+            throw std::runtime_error(
+                    std::string("sequence state file integrity check failed [")
+                    + (io.n_bytes() != state_size
+                        ? "extent read=" + std::to_string(io.n_bytes()) +
+                          " expected=" + std::to_string(state_size)
+                        : std::string("digest read=")) + (io.n_bytes() != state_size
+                        ? "" : std::to_string(io.checksum())) +
+                    (io.n_bytes() != state_size
+                        ? "" : " expected=" + std::to_string(checksum)) + "]");
         }
         io.commit();
         if (memory->seq_pos_max(seq_id) >= int64_t(cparams.n_ctx_seq)) {
@@ -5911,6 +6506,11 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         LLAMA_LOG_DEBUG("%s: - reading memory module\n", __func__);
 
         memory->state_read(io);
+
+        // A full restore can move cache placement backwards without changing
+        // tensor shapes. Rebuild its cached views and construction-time tail
+        // initialization on the next decode, only after the restore commits.
+        io.on_commit([this]() { gf_res_prev->reset(); });
     }
 
     return io.n_bytes();
@@ -5928,6 +6528,13 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     nextn_decode_id = 0;
     if (memory) {
         memory->state_read(io, seq_id, flags);
+
+        if (!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            // Register after memory's callbacks so failed/prepared restores do
+            // not invalidate the live graph. Partial speculative checkpoints
+            // retain their existing graph-reuse behavior.
+            io.on_commit([this]() { gf_res_prev->reset(); });
+        }
     }
 
     return io.n_bytes();
@@ -6128,6 +6735,13 @@ void llama_context::opt_epoch_iter(
 
             res->reset();
 
+            // F4: model-sizing also builds a graph with a memory context; apply
+            // the same store-slot boundary so a sizing pass cannot observe a
+            // slot left behind by a real ubatch.
+            if (mctx) {
+                mctx->reset_graph_store_slots();
+            }
+
             auto * gf = model.build_graph(gparams);
 
             struct ggml_context * ctx_compute_opt;
@@ -6297,6 +6911,7 @@ llama_context_params llama_context_default_params() {
         /*.mtp_reserve_type_k          =*/ GGML_TYPE_F16,
         /*.mtp_reserve_type_v          =*/ GGML_TYPE_F16,
         /*.mtp_reserve_rollback_tokens =*/ 0,
+        /*.kv_position_split_p       =*/ 0,
     };
 
     return result;
@@ -7177,6 +7792,519 @@ size_t llama_state_seq_convert_data_to_mem(llama_context * ctx, const uint8_t * 
     if (!ctx || !src) { return 0; }
     return ctx->state_seq_convert_data_to_mem(src, size, src_checksum, ram_tokens, ram_n_tokens,
             out, tokens_out, capacity, count_out);
+}
+
+std::string llama_kvarn_live_layer_table(llama_context * ctx, llama_seq_id seq_id) {
+    if (!ctx) { return {}; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        mem = hybrid->get_mem_attn_base();
+    }
+    if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) {
+        return kvarn->live_layer_table(seq_id);
+    }
+    if (auto * sc = dynamic_cast<llama_kv_cache *>(mem)) {
+        return sc->live_layer_table(seq_id);
+    }
+    return {};
+}
+
+namespace {
+
+// A sequence blob is [4B io magic][4B seq_id] and, for a mixed/split cache, a
+// 16-byte envelope [4B "QSKM"][4B version][8B frame_size] before the KMS
+// frame. Locate the frame by ITS OWN magic instead of trusting a remembered
+// envelope, so a layout change can never silently shift every reported offset.
+bool mixed_frame_offset(const uint8_t * blob, size_t size, size_t * out) {
+    if (blob == nullptr || size < 4) {
+        return false;
+    }
+    const auto rd32 = [&](size_t o) -> uint32_t {
+        return uint32_t(blob[o]) | (uint32_t(blob[o + 1]) << 8) |
+               (uint32_t(blob[o + 2]) << 16) | (uint32_t(blob[o + 3]) << 24);
+    };
+    constexpr uint32_t KMS1 = 0x31534D4Bu;
+    constexpr uint32_t KMS2 = 0x32534D4Bu;
+    for (size_t cand : { size_t(24), size_t(8), size_t(0) }) {
+        if (cand + 4 > size) {
+            continue;
+        }
+        const uint32_t m = rd32(cand);
+        if (m == KMS1 || m == KMS2) {
+            *out = cand;
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+std::string llama_mixed_state_section_map(const uint8_t * seq_blob, size_t size) {
+    size_t off = 0;
+    if (!mixed_frame_offset(seq_blob, size, &off)) {
+        return {};
+    }
+    try {
+        const auto secs = llama_kv_mixed::stream_describe(seq_blob + off, size - off);
+        std::string out = "frame_offset=" + std::to_string(off) +
+                          " sections=" + std::to_string(secs.size()) + "\n";
+        for (auto s : secs) {
+            s.start += off;
+            s.end   += off;
+            out += "  " + llama_kv_mixed::stream_section_text(s) + "\n";
+        }
+        return out;
+    } catch (const std::exception & e) {
+        return std::string("describe failed: ") + e.what() + "\n";
+    }
+}
+
+bool llama_mixed_state_locate(const uint8_t * seq_blob, size_t size, size_t offset,
+                              std::string * out_text) {
+    size_t off = 0;
+    if (!mixed_frame_offset(seq_blob, size, &off) || offset < off) {
+        return false;
+    }
+    try {
+        const auto secs = llama_kv_mixed::stream_describe(seq_blob + off, size - off);
+        for (auto s : secs) {
+            if (offset >= off + s.start && offset < off + s.end) {
+                if (out_text) {
+                    s.start += off;
+                    s.end   += off;
+                    *out_text = llama_kv_mixed::stream_section_text(s);
+                }
+                return true;
+            }
+        }
+    } catch (const std::exception &) {
+        return false;
+    }
+    return false;
+}
+
+bool llama_mixed_state_post_frame(const uint8_t * seq_blob, size_t size,
+        size_t * out_start, size_t * out_end) {
+    size_t off = 0;
+    if (!mixed_frame_offset(seq_blob, size, &off)) {
+        return false;
+    }
+    try {
+        const auto secs = llama_kv_mixed::stream_describe(seq_blob + off, size - off);
+        // stream_describe already reports whatever follows the frame as a
+        // "trailing" section, so the frame end is the end of the last section
+        // that is NOT trailing. Requiring the frame to end strictly before the
+        // blob end would make this function fail on every blob that has one.
+        size_t frame_end = 0;
+        bool have_frame = false;
+        for (auto s : secs) {
+            if (strcmp(s.kind, "trailing") == 0) {
+                continue;
+            }
+            frame_end = std::max<size_t>(frame_end, off + s.end);
+            have_frame = true;
+        }
+        if (!have_frame || frame_end >= size) {
+            return false;
+        }
+        if (out_start) { *out_start = frame_end; }
+        if (out_end)   { *out_end   = size; }
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+std::string llama_recurrent_state_diff(llama_context * ctx_a, llama_context * ctx_b,
+        llama_seq_id seq_id) {
+    auto get = [](llama_context * c) -> llama_memory_recurrent * {
+        if (!c) {
+            return nullptr;
+        }
+        auto * hyb = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(c));
+        return hyb ? hyb->get_mem_recr() : nullptr;
+    };
+    llama_memory_recurrent * ra = get(ctx_a);
+    llama_memory_recurrent * rb = get(ctx_b);
+    if (!ra || !rb) {
+        return "recurrent-diff: one side has no hybrid/DeltaNet memory\n";
+    }
+    std::string out = "recurrent-diff: seq=" + std::to_string(seq_id) +
+                      " cells_a=" + std::to_string(ra->size) +
+                      " cells_b=" + std::to_string(rb->size) +
+                      " n_rs_seq_a=" + std::to_string(ra->n_rs_seq) +
+                      " n_rs_seq_b=" + std::to_string(rb->n_rs_seq) +
+                      " layer_slots_a=" + std::to_string(ra->r_l.size()) +
+                      " layer_slots_b=" + std::to_string(rb->r_l.size()) + "\n";
+    const size_t n_layer = std::min(ra->r_l.size(), rb->r_l.size());
+    size_t compared = 0, diverging = 0;
+    double worst_abs = 0.0;
+    int worst_layer = -1;
+    const char * worst_name = "-";
+    std::vector<uint8_t> ba, bb;
+    for (size_t il = 0; il < n_layer; ++il) {
+        const std::pair<const char *, ggml_tensor *> t_a[] = {
+            { "r", ra->r_l[il] }, { "s", ra->s_l[il] },
+            { "p", il < ra->p_l.size() ? ra->p_l[il] : nullptr },
+        };
+        const std::pair<const char *, ggml_tensor *> t_b[] = {
+            { "r", rb->r_l[il] }, { "s", rb->s_l[il] },
+            { "p", il < rb->p_l.size() ? rb->p_l[il] : nullptr },
+        };
+        if (ra->r_l[il] == nullptr && rb->r_l[il] == nullptr) {
+            continue;
+        }
+        for (int k = 0; k < 3; ++k) {
+            const char * name = t_a[k].first;
+            ggml_tensor * ta = t_a[k].second;
+            ggml_tensor * tb = t_b[k].second;
+            ++compared;
+            if ((ta == nullptr) != (tb == nullptr)) {
+                out += "  layer=" + std::to_string(il) + " " + name +
+                       ": PRESENCE MISMATCH a=" + (ta ? "yes" : "no") +
+                       " b=" + (tb ? "yes" : "no") + "\n";
+                ++diverging;
+                continue;
+            }
+            if (ta == nullptr) {
+                continue;
+            }
+            const size_t na = ggml_nbytes(ta);
+            const size_t nb = ggml_nbytes(tb);
+            if (na != nb) {
+                out += "  layer=" + std::to_string(il) + " " + name +
+                       ": SIZE MISMATCH a=" + std::to_string(na) +
+                       " b=" + std::to_string(nb) + "\n";
+                ++diverging;
+                continue;
+            }
+            if (na == 0) {
+                continue;
+            }
+            constexpr size_t CHUNK = 1u << 20;
+            ba.resize(std::min(CHUNK, na));
+            bb.resize(std::min(CHUNK, nb));
+            size_t nd = 0;
+            size_t first = SIZE_MAX;
+            double max_abs = 0.0;
+            for (size_t off = 0; off < na; off += CHUNK) {
+                const size_t len = std::min(CHUNK, na - off);
+                ggml_backend_tensor_get(ta, ba.data(), off, len);
+                ggml_backend_tensor_get(tb, bb.data(), off, len);
+                for (size_t i = 0; i < len; ++i) {
+                    if (ba[i] != bb[i]) {
+                        if (first == SIZE_MAX) { first = off + i; }
+                        ++nd;
+                    }
+                }
+                if (ta->type == GGML_TYPE_F32) {
+                    const float * fa = reinterpret_cast<const float *>(ba.data());
+                    const float * fb = reinterpret_cast<const float *>(bb.data());
+                    const size_t nf = len / sizeof(float);
+                    for (size_t i = 0; i < nf; ++i) {
+                        max_abs = std::max(max_abs, std::fabs((double) fa[i] - (double) fb[i]));
+                    }
+                }
+            }
+            if (nd == 0) {
+                continue;
+            }
+            ++diverging;
+            if (max_abs > worst_abs) {
+                worst_abs   = max_abs;
+                worst_layer = (int) il;
+                worst_name  = name;
+            }
+            out += "  layer=" + std::to_string(il) + " " + name +
+                   " bytes=" + std::to_string(na) +
+                   " ndiff=" + std::to_string(nd) +
+                   " first=" + std::to_string(first) +
+                   " max_abs=" + std::to_string(max_abs) +
+                   " shape=" + std::to_string(ta->ne[0]) + "x" + std::to_string(ta->ne[1]) +
+                   "x" + std::to_string(ta->ne[2]) +
+                   " type=" + std::string(ggml_type_name(ta->type)) + "\n";
+        }
+    }
+    out += "recurrent-diff: compared_tensors=" + std::to_string(compared) +
+           " diverging=" + std::to_string(diverging) +
+           " worst=layer" + std::to_string(worst_layer) + "." + worst_name +
+           " max_abs=" + std::to_string(worst_abs) + "\n";
+    return out;
+}
+std::string llama_mixed_state_write_section_map(void) {
+    return llama_kv_cache_kvarn_state_write_sections_text();
+}
+
+std::string llama_mixed_state_section_diff(
+        const uint8_t * a, size_t na, const uint8_t * b, size_t nb) {
+    size_t oa = 0;
+    size_t ob = 0;
+    if (!mixed_frame_offset(a, na, &oa) || !mixed_frame_offset(b, nb, &ob)) {
+        return "section-diff: one of the blobs carries no mixed frame\n";
+    }
+    std::vector<llama_kv_mixed::stream_section> sa;
+    std::vector<llama_kv_mixed::stream_section> sb;
+    try {
+        sa = llama_kv_mixed::stream_describe(a + oa, na - oa);
+        sb = llama_kv_mixed::stream_describe(b + ob, nb - ob);
+    } catch (const std::exception & e) {
+        return std::string("section-diff: describe failed: ") + e.what() + "\n";
+    }
+    std::string out = "section-diff: a_sections=" + std::to_string(sa.size()) +
+                      " b_sections=" + std::to_string(sb.size()) +
+                      " frame_a=" + std::to_string(oa) + " frame_b=" + std::to_string(ob) + "\n";
+    const size_t n = std::min(sa.size(), sb.size());
+    size_t diverging_sections = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const auto & x = sa[i];
+        const auto & y = sb[i];
+        const bool same_shape =
+                strcmp(x.kind, y.kind) == 0 && strcmp(x.field, y.field) == 0 &&
+                x.layer_id == y.layer_id && x.range_id == y.range_id &&
+                (x.end - x.start) == (y.end - y.start);
+        const size_t len = size_t(std::min<uint64_t>(x.end - x.start, y.end - y.start));
+        size_t first_local = len;
+        size_t ndiff = 0;
+        for (size_t k = 0; k < len; ++k) {
+            if (a[oa + x.start + k] != b[ob + y.start + k]) {
+                if (first_local == len) { first_local = k; }
+                ++ndiff;
+            }
+        }
+        const bool equal = same_shape && ndiff == 0 &&
+                           (x.end - x.start) == (y.end - y.start);
+        if (equal) {
+            continue;
+        }
+        ++diverging_sections;
+        std::string line = "  sec#" + std::to_string(i) + " [" + std::to_string(x.start) +
+                "," + std::to_string(x.end) + ") " + x.kind + "/" + x.field;
+        if (x.layer_id != UINT32_MAX) {
+            line += " layer=" + std::to_string(x.layer_id);
+        }
+        if (x.range_id != UINT32_MAX) {
+            line += " stream=" + std::to_string(x.range_id);
+        }
+        line += " bytes=" + std::to_string(x.end - x.start) + "/" + std::to_string(y.end - y.start);
+        if (!same_shape) {
+            line += " STRUCTURE MISMATCH";
+        }
+        line += " ndiff=" + std::to_string(ndiff);
+        if (first_local != len) {
+            line += " first_local=" + std::to_string(first_local);
+            line += " abs=" + std::to_string(oa + x.start + first_local);
+        }
+        if (x.checksum != 0 || y.checksum != 0) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), " checksum=%016llx/%016llx",
+                     (unsigned long long) x.checksum, (unsigned long long) y.checksum);
+            line += buf;
+        }
+        if (x.k_stride != 0 || x.v_stride != 0) {
+            line += " stride=" + std::to_string(x.k_stride) + "/" + std::to_string(x.v_stride);
+        }
+        out += line + "\n";
+    }
+    out += "section-diff: diverging_sections=" + std::to_string(diverging_sections) +
+           " of " + std::to_string(n) + "\n";
+    if (sa.size() != sb.size()) {
+        out += "section-diff: SECTION COUNT MISMATCH\n";
+    }
+    return out;
+}
+
+bool llama_kvarn_probe_mutation(llama_context * ctx, llama_seq_id seq_id, int layer_index,
+        const char * tensor, uint32_t row, bool live) {
+    if (!ctx) { return false; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        mem = hybrid->get_mem_attn_base();
+    }
+    if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) {
+        return kvarn->probe_mutation(seq_id, layer_index, tensor, row, live);
+    }
+    if (auto * sc = dynamic_cast<llama_kv_cache *>(mem)) {
+        return sc->probe_mutation(seq_id, layer_index, tensor, row, live);
+    }
+    return false;
+}
+
+// [TAG_SLOT_SAVE_CHECKPOINTS] Durable-checkpoint lineage epoch access for the server save/
+// restore flow. Mirrors the navigation used by the KVarN probe helpers above.
+static llama_kv_cache_kvarn * llama_kvarn_mixed_cache(llama_context * ctx) {
+    if (!ctx) { return nullptr; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        mem = hybrid->get_mem_attn_base();
+    }
+    return dynamic_cast<llama_kv_cache_kvarn *>(mem);
+}
+
+uint64_t llama_kvarn_state_owner_epoch(llama_context * ctx) {
+    auto * kvarn = llama_kvarn_mixed_cache(ctx);
+    return kvarn ? kvarn->mixed_state_owner_epoch() : 0;
+}
+
+bool llama_kvarn_adopt_state_owner_epoch(llama_context * ctx, uint64_t epoch) {
+    auto * kvarn = llama_kvarn_mixed_cache(ctx);
+    return kvarn ? kvarn->adopt_state_owner_epoch(epoch) : false;
+}
+
+uint64_t llama_kvarn_state_owner_id(llama_context * ctx) {
+    auto * kvarn = llama_kvarn_mixed_cache(ctx);
+    return kvarn ? kvarn->mixed_state_owner_id() : 0;
+}
+
+bool llama_kvarn_adopt_state_owner_id(llama_context * ctx, uint64_t owner_id) {
+    auto * kvarn = llama_kvarn_mixed_cache(ctx);
+    return kvarn ? kvarn->adopt_state_owner_id(owner_id) : false;
+}
+
+bool llama_kvarn_probe_head_span(llama_context * ctx, llama_seq_id seq_id, int layer_index,
+        uint32_t head, uint32_t group_or_slot, const char * tensor, bool live,
+        uint8_t * orig_out, uint8_t * new_out, uint32_t * group_used_out) {
+    if (!ctx) { return false; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        mem = hybrid->get_mem_attn_base();
+    }
+    if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) {
+        return kvarn->probe_head_span(seq_id, layer_index, head, group_or_slot, tensor, live, orig_out, new_out, group_used_out);
+    }
+    if (auto * sc = dynamic_cast<llama_kv_cache *>(mem)) {
+        return sc->probe_mutation(seq_id, layer_index, tensor, 0, live);
+    }
+    return false;
+}
+
+void llama_kvarn_capture_clear(llama_context * ctx) {
+    if (!ctx) { return; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) { mem = hybrid->get_mem_attn_base(); }
+    if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) { kvarn->clear_captures(); }
+}
+
+size_t llama_kvarn_capture_routes(llama_context * ctx, int layer, bool value, uint32_t head) {
+    if (!ctx) { return 0; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) { mem = hybrid->get_mem_attn_base(); }
+    auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem);
+    return kvarn ? kvarn->capture_count(layer, value, head) : 0;
+}
+
+bool llama_kvarn_captured_head(llama_context * ctx, int layer, bool value,
+        uint32_t head, llama_pos pos, size_t index, float * out, size_t n_out, char * info, size_t info_len) {
+    if (!ctx || !out || n_out == 0) { return false; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) { mem = hybrid->get_mem_attn_base(); }
+    auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem);
+    if (!kvarn) { return false; }
+    llama_kv_cache_kvarn::capture_sample cs;
+    if (!kvarn->captured(layer, value, head, pos, index, cs)) {
+        if (info && info_len) {
+            snprintf(info, info_len, "absent layer=%d kv=%s head=%u index=%zu of %zu",
+                    layer, value ? "V" : "K", head, index, kvarn->capture_count(layer, value, head));
+        }
+        return false;
+    }
+    if (info && info_len) {
+        snprintf(info, info_len,
+                "layer=%d kv=%s head=%u pos=%lld route=%s range=%s name=%s type=%d offset=%llu nbytes=%llu elem=%zu shared=%d mapped=%d stored=%s:%s/%d records=%s/%d backend=%s fa=%zu seq=%u gen=%llu",
+                cs.layer, value ? "V" : "K", cs.head, (long long) cs.pos, cs.route.c_str(),
+                cs.range.c_str(), cs.name.c_str(), cs.type,
+                (unsigned long long) cs.offset, (unsigned long long) cs.nbytes, cs.vec.size(),
+                cs.shared_il, cs.mapped,
+                cs.stored_name.c_str(), cs.stored_from.c_str(), cs.stored_type,
+                cs.records_name.c_str(), cs.records_type,
+                cs.backend.c_str(), cs.fa_hits, cs.mark_seq, (unsigned long long) cs.gen);
+    }
+    if (!cs.vec.empty()) {
+        const size_t n = std::min(n_out, cs.vec.size());
+        for (size_t i = 0; i < n; ++i) { out[i] = cs.vec[i]; }
+        if (n < n_out) { for (size_t i = n; i < n_out; ++i) { out[i] = NAN; } }
+        return true;
+    }
+    if (!cs.raw.empty()) {
+        const size_t n = std::min(n_out, cs.raw.size());
+        for (size_t i = 0; i < n; ++i) { out[i] = (float) cs.raw[i]; }
+        if (n < n_out) { for (size_t i = n; i < n_out; ++i) { out[i] = NAN; } }
+        return true;
+    }
+    return false;
+}
+
+ggml_backend_t llama_context::backend_supporting_buft(ggml_backend_buffer_type_t bt) const {
+    if (!bt) { return nullptr; }
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (ggml_backend_supports_buft(backend_ptrs[i], bt)) {
+            return backend_ptrs[i];
+        }
+    }
+    return nullptr;
+}
+
+bool llama_kvarn_materialized_probe(llama_context * ctx, llama_seq_id seq_id, int layer_index,
+        uint32_t head, bool value, llama_pos pos, std::vector<float> * out) {
+    if (!ctx || !out) { return false; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        mem = hybrid->get_mem_attn_base();
+    }
+    auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem);
+    if (!kvarn) { return false; }
+    // The consumer must run on a backend this context ALREADY owns, chosen by
+    // asking which of the context's backends supports the leaf's buffer type.
+    // Never initialise a backend here: an extra instance corrupts teardown.
+    const ggml_tensor * leaf = kvarn->probe_leaf(layer_index, value);
+    ggml_backend_t be = nullptr;
+    if (leaf && leaf->buffer) {
+        be = ctx->backend_supporting_buft(ggml_backend_buffer_get_type(leaf->buffer));
+    }
+    std::string st;
+    const bool ok = kvarn->materialized_probe(seq_id, layer_index, head, value, pos, *out, &st, be);
+    if (!ok) {
+        LLAMA_LOG_WARN("%s: materialized_probe unavailable: status=%s\n", __func__, st.c_str());
+    }
+    return ok;
+}
+
+bool llama_kvarn_probe_remote_span(llama_context * ctx, llama_seq_id seq_id, int layer_index,
+        uint32_t head, bool value, bool live,
+        uint8_t * orig_out, uint8_t * new_out, uint32_t * row_used_out,
+        llama_pos * pos_used_out) {
+    if (!ctx) { return false; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) { mem = hybrid->get_mem_attn_base(); }
+    if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) {
+        return kvarn->probe_remote_span(seq_id, layer_index, head, value, live,
+                orig_out, new_out, row_used_out, pos_used_out);
+    }
+    return false;
+}
+
+bool llama_kvarn_probe_remote_restore(llama_context * ctx, llama_seq_id seq_id, int layer_index,
+        uint32_t head, bool value, uint32_t row, uint8_t orig) {
+    if (!ctx) { return false; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) { mem = hybrid->get_mem_attn_base(); }
+    if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) {
+        return kvarn->probe_remote_restore_byte(seq_id, layer_index, head, value, row, orig);
+    }
+    return false;
+}
+
+bool llama_kvarn_probe_restore_byte(llama_context * ctx, llama_seq_id seq_id, int layer_index,
+        uint32_t head, uint32_t group, const char * tensor, uint8_t orig) {
+    if (!ctx) { return false; }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        mem = hybrid->get_mem_attn_base();
+    }
+    if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) {
+        return kvarn->probe_restore_byte(seq_id, layer_index, head, group, tensor, orig);
+    }
+    return false;
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

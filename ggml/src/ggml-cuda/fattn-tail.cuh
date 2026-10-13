@@ -7,6 +7,43 @@
 #include "kvarn.cuh"
 #endif
 
+// ---------------------------------------------------------------------------
+// KDISC diagnostic records (behind F4_RP_KDISC only; production never sets the
+// flag, so g_kdisc_on stays 0 and no record is written).
+// The merge kernel writes one record per (iq_packed, ih, ia) for head0/query0
+// with a marker; the host copies them out after a stream synchronize.
+// ---------------------------------------------------------------------------
+struct ggml_kdisc_rec {
+    int      marker;        // 0xAA55AA51 when actually written
+    int      iq_packed, ih, ia, iq, is, iq_global;
+    int      body_valid, tail_valid;
+    float    body_max, body_norm;   // body partial meta
+    float    tail_max, tail_norm;   // tail partial meta
+    float    m, wb, wt, denom;      // values the merge actually used
+    float    body_o0, tail_o0;      // first lane of each partial row
+    float    out_o0, out_lse;       // what the merge produced
+};
+
+struct ggml_kdisc_pre {
+    int    marker;                 // 0x51A1CE01 when written
+    int    n_tail;
+    int    slot0, row0;            // resolved ring slot/row for token 0
+    float  q[4];                   // qrow[0..3]
+    float  k0;                     // K value consumed for token 0, lane 0
+    float  scores[32];             // scores BEFORE expf conversion
+    float  tail_max_raw;           // reduction result before weight conversion
+    float  dot0, mask0, score0;    // token0: pre-scale dot, mask, final score
+    int    ih_k, d_k;              // head mapping + reduction length
+    float  scale;
+};
+
+__device__ int                g_kdisc_on = 0;
+__device__ int                g_kdisc_n  = 0;
+__device__ ggml_kdisc_rec     g_kdisc_rec[8];
+__device__ int                g_kdisc_np = 0;
+__device__ float              g_kdisc_dot0 = 0.0f, g_kdisc_mask0 = 0.0f, g_kdisc_score0 = 0.0f;
+__device__ ggml_kdisc_pre     g_kdisc_pre[4];
+
 template<typename T>
 static __global__ void k_flash_attn_ext_tail_pack_arenas(
         const char * src, const char * current, T * dst, const int32_t * run_desc,
@@ -164,6 +201,7 @@ static __global__ void k_flash_attn_ext_tail_pack_q_mask(
     }
 }
 
+
 template<typename T>
 static __device__ __forceinline__ float tail_value_to_float(T value);
 
@@ -240,6 +278,13 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
             (ih < int(nh_log2) ? powf(m0, ih + 1) : powf(m1, 2*(ih - int(nh_log2)) + 1)) : 1.0f;
 
     for (int token = warp; token < n_tail; token += 8) {
+        const float mask = __half2float(*reinterpret_cast<const half *>(
+                reinterpret_cast<const char *>(mt) + size_t(token)*sizeof(half) +
+                size_t(iq)*mt_nb1 + size_t(is)*mt_nb3));
+        if (mask == -INFINITY) {
+            if (lane == 0) { scores[token] = -INFINITY; }
+            continue;
+        }
         const int slot = desc[6 + token];
         const bool from_current = kt_current && slot >= history_slots;
         const int row = from_current ? slot - history_slots : slot;
@@ -255,17 +300,46 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
         }
         dot = warp_reduce_sum(dot);
         if (lane == 0) {
-            const float mask = __half2float(*reinterpret_cast<const half *>(
-                    reinterpret_cast<const char *>(mt) + size_t(token)*sizeof(half) +
-                    size_t(iq)*mt_nb1 + size_t(is)*mt_nb3));
             float score = dot*scale;
             if (logit_softcap != 0.0f) {
                 score = logit_softcap*tanhf(score/logit_softcap);
             }
             scores[token] = score + slope*mask;
+            // Must be guarded for the SAME block the record is taken from:
+            // grid.y = n_head, so without ih==0 the six head blocks race on
+            // these device globals and the record would mix heads.
+            if (g_kdisc_on && token == 0 && iq_packed == 0 && ih == 0 && ia == 0) {
+                g_kdisc_dot0 = dot; g_kdisc_mask0 = mask; g_kdisc_score0 = scores[0];
+            }
         }
     }
     __syncthreads();
+
+    // KDISC: snapshot scores BEFORE they are overwritten by expf weights, plus
+    // the exact q/K values and the resolved slot/row the kernel consumed.
+    if (g_kdisc_on && tid == 0 && iq_packed == 0 && ih == 0 && ia == 0 &&
+            n_tail > 0 && isfinite(scores[0])) {
+        const int slot0 = desc[6 + 0];
+        const bool cur0 = kt_current && slot0 >= history_slots;
+        const int  row0 = cur0 ? slot0 - history_slots : slot0;
+        const char * src0 = cur0 ? kt_current : kt;
+        const TK kv0 = *reinterpret_cast<const TK *>(
+                src0 + size_t(row0)*(cur0 ? kt_nb1 : kt_nb1) + size_t(ih_k)*(cur0 ? kt_nb2 : kt_nb2));
+        const int ps = atomicAdd(&g_kdisc_np, 1);
+        if (ps >= 0 && ps < 4) {
+            ggml_kdisc_pre r;
+            r.marker = 0x51A1CE01;
+            r.n_tail = n_tail;
+            r.slot0 = slot0; r.row0 = row0;
+            r.q[0] = qrow[0]; r.q[1] = qrow[1]; r.q[2] = qrow[2]; r.q[3] = qrow[3];
+            r.k0 = tail_value_to_float(kv0);
+            for (int i = 0; i < 32; ++i) { r.scores[i] = (i < n_tail) ? scores[i] : 0.0f; }
+            r.tail_max_raw = reduction[0];
+            r.dot0 = g_kdisc_dot0; r.mask0 = g_kdisc_mask0; r.score0 = g_kdisc_score0;
+            r.ih_k = ih_k; r.d_k = d_k; r.scale = scale;
+            g_kdisc_pre[ps] = r;
+        }
+    }
 
     float local_max = -INFINITY;
     for (int token = tid; token < n_tail; token += blockDim.x) {
@@ -322,6 +396,8 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
     for (int d = tid; d < d_v; d += blockDim.x) {
         float tail_acc = 0.0f;
         for (int token = 0; token < n_tail; ++token) {
+            const float weight = scores[token];
+            if (weight == 0.0f) { continue; }
             const int slot = desc[6 + token];
             const bool from_current = vt_current && slot >= history_slots;
             const int row = from_current ? slot - history_slots : slot;
@@ -331,7 +407,7 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
                     size_t(d)*(from_current ? vtc_nb0 : vt_nb0) +
                     size_t(row)*(from_current ? vtc_nb1 : vt_nb1) +
                     size_t(ih_v)*(from_current ? vtc_nb2 : vt_nb2));
-            tail_acc += tail_value_to_float(vval)*scores[token];
+            tail_acc += tail_value_to_float(vval)*weight;
         }
         const float body_value = bv ? *reinterpret_cast<const float *>(brow + size_t(d)*sizeof(float)) : 0.0f;
         *reinterpret_cast<float *>(drow + size_t(d)*sizeof(float)) =
@@ -345,6 +421,35 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
         *reinterpret_cast<float *>(reinterpret_cast<char *>(lse_out) +
             size_t(ih)*lse_nb0 + size_t(iq)*lse_nb1 + size_t(is)*lse_nb2) =
                 denom > 0.0f ? (global_max + logf(denom)) : -INFINITY;
+    }
+    // KDISC (F4_RP_KDISC only): this is the ACTIVE body+tail combination for
+    // small indexed tails -- one launch consumes the body partial and produces
+    // the merged O/LSE. Record head0/query0 so the first wrong value can be
+    // attributed to body partial, tail partial, normalization or the combine.
+    if (tid == 0 && g_kdisc_on && iq_packed == 0 && ih == 0 && ia == 0) {
+        const int slot = atomicAdd(&g_kdisc_n, 1);
+        if (slot >= 0 && slot < 8) {
+            ggml_kdisc_rec r;
+            r.marker     = 0xAA55AA51;
+            r.iq_packed  = iq_packed; r.ih = ih; r.ia = ia;
+            r.iq         = iq;        r.is = is; r.iq_global = iq_global;
+            r.body_valid = bv ? 1 : 0;
+            r.tail_valid = tv ? 1 : 0;
+            r.body_max   = bm.x;
+            r.body_norm  = bm.y;
+            r.tail_max   = tail_max_shared;
+            r.tail_norm  = tail_sum_shared;
+            r.m          = global_max;
+            r.wb         = wb;
+            r.wt         = wt;
+            r.denom      = denom;
+            r.body_o0    = (bv && brow) ? *reinterpret_cast<const float *>(brow)
+                                        : 0.0f;
+            r.tail_o0    = 0.0f;   // tail accumulates in registers, not a row
+            r.out_o0     = *reinterpret_cast<const float *>(drow);
+            r.out_lse    = denom > 0.0f ? (global_max + logf(denom)) : -INFINITY;
+            g_kdisc_rec[slot] = r;
+        }
     }
 }
 
@@ -400,10 +505,32 @@ static __global__ void k_flash_attn_ext_tail_partials_merge(
         }
         *reinterpret_cast<float *>(drow + size_t(id)*sizeof(float)) = denom > 0.0f ? numerator/denom : 0.0f;
     }
-    if (threadIdx.x == 0 && lse_out != nullptr) {
-        *reinterpret_cast<float *>(reinterpret_cast<char *>(lse_out) +
-            size_t(ih)*lse_nb0 + size_t(iq)*lse_nb1 + size_t(is)*lse_nb2) =
-                denom > 0.0f ? (m + logf(denom)) : -INFINITY;
+    if (threadIdx.x == 0) {
+        if (lse_out != nullptr) {
+            *reinterpret_cast<float *>(reinterpret_cast<char *>(lse_out) +
+                size_t(ih)*lse_nb0 + size_t(iq)*lse_nb1 + size_t(is)*lse_nb2) =
+                    denom > 0.0f ? (m + logf(denom)) : -INFINITY;
+        }
+        if (g_kdisc_on && iq_packed == 0 && ih == 0 && ia == 0) {
+            const int slot = atomicAdd(&g_kdisc_n, 1);
+            if (slot >= 0 && slot < 8) {
+                ggml_kdisc_rec r;
+                r.marker     = 0xAA55AA51;
+                r.iq_packed  = iq_packed; r.ih = ih; r.ia = ia;
+                r.iq         = iq;        r.is = is; r.iq_global = iq_global;
+                r.body_valid = bv ? 1 : 0; r.tail_valid = tv ? 1 : 0;
+                r.body_max   = bm.x;      r.body_norm = bm.y;
+                r.tail_max   = tm.x;      r.tail_norm = tm.y;
+                r.m = m; r.wb = wb; r.wt = wt; r.denom = denom;
+                r.body_o0    = bv ? *reinterpret_cast<const float *>(brow) : 0.0f;
+                r.tail_o0    = tv ? *reinterpret_cast<const float *>(trow) : 0.0f;
+                r.out_o0     = denom > 0.0f ? (bv ? (*reinterpret_cast<const float *>(brow))*wb : 0.0f)
+                                                        + (tv ? (*reinterpret_cast<const float *>(trow))*wt : 0.0f)
+                                          : 0.0f;
+                r.out_lse    = denom > 0.0f ? (m + logf(denom)) : -INFINITY;
+                g_kdisc_rec[slot] = r;
+            }
+        }
     }
 }
 
@@ -503,6 +630,57 @@ static ggml_tensor ggml_cuda_tail_materialize_kvarn_view(
 #endif
 
 static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // KDISC helpers, function scope so both the entry and pre-dispatch probes
+    // can see them (they live in separate gated blocks).
+    auto kdisc_hash = [](const ggml_tensor * t) -> unsigned long long {
+        if (!t || !t->buffer || !t->data) { return 0; }
+        std::vector<uint8_t> b(size_t(ggml_nbytes(t)));
+        ggml_backend_tensor_get(t, b.data(), 0, b.size());
+        unsigned long long h = 1469598103934665603ull;
+        for (size_t i = 0; i < b.size(); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+        return h;
+    };
+    unsigned long long q_h0 = 0, kt_h0 = 0;
+    // KDISC: record the real launch geometry of the exact-tail route, including
+    // the partials->merge reduction, so "split/reduction count" is measured and
+    // not inferred from graph shape.
+    if (getenv("F4_RP_KDISC") != nullptr) {
+        int one = 1, zero = 0;
+        cudaError_t e_on = cudaMemcpyToSymbol(g_kdisc_on, &one, sizeof(int));
+        cudaError_t e_z  = cudaMemcpyToSymbol(g_kdisc_n, &zero, sizeof(int));
+        int back = -1;
+        cudaError_t e_rd = cudaMemcpyFromSymbol(&back, g_kdisc_on, sizeof(int), 0, cudaMemcpyDeviceToHost);
+        fprintf(stderr, "KDISC-FLAG set_on=%d set_n=%d read_back=%d read_err=%d\n",
+                (int) e_on, (int) e_z, back, (int) e_rd);
+        // Does the internal body_pass scratch / compute touch the live Q or the
+        // rotated tail-K that indexed_small will read? (entry hash below,
+        // compared with the pre-dispatch hash further down)
+        q_h0 = kdisc_hash(dst->src[0]);
+        kt_h0 = kdisc_hash(dst->src[5]);
+        fprintf(stderr, "KDISC-IO entry q=%p+%zu qhash=%016llx kt=%p+%zu kthash=%016llx\n",
+                dst->src[0]->data, (size_t) ggml_nbytes(dst->src[0]), q_h0,
+                dst->src[5]->data, (size_t) ggml_nbytes(dst->src[5]), kt_h0);
+        const ggml_tensor * qo = dst->src[8];
+        const ggml_tensor * rd = dst->src[9];
+        const ggml_tensor * kt = dst->src[5];
+        const ggml_tensor * mt = dst->src[7];
+        const int64_t n_head = dst->ne[1];
+        const int64_t q_max = qo ? qo->ne[0] : -1;
+        const int64_t n_active = qo ? qo->ne[1] : -1;
+        const int64_t tail_stride = mt ? mt->ne[0] : -1;
+        int32_t n_tail = -1;
+        if (rd && rd->buffer && rd->ne[0] >= 5) {
+            std::vector<int32_t> tmp(size_t(rd->ne[0]) * size_t(rd->ne[1]));
+            ggml_backend_tensor_get(rd, tmp.data(), 0, ggml_nbytes(rd));
+            n_tail = tmp[4];
+        }
+        fprintf(stderr,
+            "KDISC-TAIL-LAUNCH fn=ggml_cuda_flash_attn_ext_tail grid=(q_max=%lld,n_head=%lld,"
+            "n_active=%lld) block=256 kt_rows=%lld tail_stride=%lld n_tail_words=%d "
+            "partial_merge=k_flash_attn_ext_tail_partials_merge\n",
+            (long long) q_max, (long long) n_head, (long long) n_active,
+            (long long) (kt ? kt->ne[1] : -1), (long long) tail_stride, n_tail);
+    }
     const ggml_tensor * q  = dst->src[0];
     const ggml_tensor * kb = dst->src[1];
     const ggml_tensor * vb = dst->src[2];
@@ -744,10 +922,57 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         body_pass.src[i] = nullptr;
     }
     // The sub-pass copies the parent tensor struct, which carries op_params
-    // verbatim: the LSE attachment (flag + back-pointer) must be dropped so the
-    // body pass cannot write the parent's LSE buffer. src[4] is sinks only and
-    // is already null whenever LSE is requested (mutually exclusive).
-    ggml_flash_attn_ext_set_lse_out(&body_pass, nullptr);
+    // verbatim: the parent's LSE attachment must not be inherited, or the body
+    // pass would write the parent's LSE buffer. The body gets a transient,
+    // discarded LSE of its own instead of none (review 6, R5).
+    //
+    // Why this is not just a dispatch trick: the tail merge consumes the
+    // body's (max, denom) metadata from src[8] AND its O output, so the body
+    // must take an exact meta-publishing route. Without an LSE request the
+    // dispatcher serves prompt-generic-mma (see the LSE-requested early
+    // decline in ggml_cuda_flash_attn_ext_mma_kvarn_launch_case), whose O is
+    // ~1e-3 off on some data (the non-tail d256-q256 shape shows the same
+    // 1.25e-3 as attach divergence), and the merge would inherit it. With LSE
+    // requested the same predicates reject generic-mma and serve
+    // portable-native (exact), or decode-split where eligible (q1, unaffected
+    // by the flag in route selection). Both plain and LSE parent runs attach
+    // it, so attachment isolation compares identical routes.
+    //
+    // R5 evidence: support/execute agreement is proven per run by route
+    // telemetry (same_route + printed route family); the best-kernel support
+    // probe (ggml_cuda_get_best_fattn_kernel) reads only src[0..3]/ne/nb/type,
+    // so it is unaffected by src[8]/LSE by inspection. Lifetime matches every
+    // other tail transient (stream-ordered pool, scoped to this function).
+    // Windowed original-V prompt bodies already publish precise metadata.
+    // D256/Q1 original-V bodies need the precise route too: long-context
+    // coverage disproved the former assumption that every small-Q MMA body
+    // meets the O gate. Sinks keep their existing generic route contract.
+    ggml_cuda_pool_alloc<float> body_lse_alloc(pool);
+    ggml_tensor body_lse = *qo;
+    const bool parent_body_sinks = body_pass.src[4] != nullptr;
+    const auto body_domain = ggml_cuda_fattn_kvarn_domain(&body_pass);
+    const bool body_windowed_applies =
+        body_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V &&
+        n_query > 1 && !parent_body_sinks;
+    // Long D256/Q1 original-V bodies exceed the O error gate on generic MMA.
+    // Request precise body metadata/output; portable split-K bounds decode cost.
+    const bool body_precise_d256_decode =
+        body_pass.src[0]->ne[0] == 256 && body_pass.src[0]->ne[1] == 1 &&
+        body_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    if (!tail_bodyless && !parent_body_sinks && !body_windowed_applies &&
+            (n_query > 16 || body_precise_d256_decode)) {
+        body_lse_alloc.alloc(n_body_rows);
+        body_lse.data = body_lse_alloc.get();
+        ggml_cuda_tail_make_contiguous(body_lse,
+                n_head, body_packed ? q_max : n_query, body_packed ? n_active : n_stream, 1,
+                sizeof(float));
+        ggml_flash_attn_ext_set_lse_out(&body_pass, &body_lse);
+    } else {
+        ggml_flash_attn_ext_set_lse_out(&body_pass, nullptr);
+    }
+    // Reset: when the parent carries sinks the body must stay on the real
+    // generic KVarN route (coverage), so no transient LSE attaches at all.
+    (void) parent_body_sinks;
     body_pass.src[8] = &body_meta;
     body_pass.view_src = nullptr;
     body_pass.view_offs = 0;
@@ -823,15 +1048,41 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
         float scale = 1.0f;
         float max_bias = 0.0f;
         float logit_softcap = 0.0f;
-        memcpy(&scale, dst->op_params + 0*sizeof(float), sizeof(float));
-        memcpy(&max_bias, dst->op_params + 1*sizeof(float), sizeof(float));
-        memcpy(&logit_softcap, dst->op_params + 2*sizeof(float), sizeof(float));
+        // op_params is int32_t[GGML_MAX_OP_PARAMS/4]: index N is byte 4*N, NOT
+        // byte N*sizeof(float). The old "+ N*sizeof(float)" advanced 4x too far:
+        //   max_bias      read byte 16 (= KVARN_DOMAIN, i32[4])
+        //   logit_softcap read byte 32 (= LSE_PTR, i32[8], a HOST POINTER)
+        // so any FA node with an attached LSE (ggml_flash_attn_ext_lse_out) fed a
+        // pointer-derived softcap into score = softcap*tanh(score/softcap),
+        // corrupting the tail scores run-to-run. Writer side is
+        // memcpy(op_params, {scale,max_bias,logit_softcap}, 12) -> bytes 0,4,8.
+        ggml_flash_attn_ext_get_alibi_params(dst, &scale, &max_bias, &logit_softcap);
         float * const lse_out = ggml_cuda_fattn_lse_ptr(dst);
         const ggml_tensor * lse_t = ggml_flash_attn_ext_get_lse_out(dst);
         const size_t lse_nb0 = lse_t ? lse_t->nb[0] : 0;
         const size_t lse_nb1 = lse_t ? lse_t->nb[1] : 0;
         const size_t lse_nb2 = lse_t ? lse_t->nb[2] : 0;
         const dim3 grid(q_max, n_head, n_active);
+    // KDISC: AFTER the body scratch allocation and the body pass, immediately
+    // before indexed_small consumes Q and the rotated tail K.
+    if (getenv("F4_RP_KDISC") != nullptr) {
+        const unsigned long long q_h1 = kdisc_hash(dst->src[0]);
+        const unsigned long long kt_h1 = kdisc_hash(dst->src[5]);
+        const char * bp = (const char *) body_pass.data;
+        const char * qp = (const char *) dst->src[0]->data;
+        const char * kp = (const char *) dst->src[5]->data;
+        const size_t qs = (size_t) ggml_nbytes(dst->src[0]);
+        const size_t ks = (size_t) ggml_nbytes(dst->src[5]);
+        const size_t bs = (size_t) body_alloc.actual_size;
+        fprintf(stderr, "KDISC-IO post-body qhash=%016llx kthash=%016llx %s | "
+                "body_pass=%p+%zu q=%p+%zu kt=%p+%zu overlap[bodyQ=%d bodyK=%d]\n",
+                q_h1, kt_h1,
+                (q_h0 == q_h1 && kt_h0 == kt_h1) ? "UNCHANGED" : "*** MODIFIED BY BODY WORK ***",
+                (void *) bp, bs, (void *) qp, qs, (void *) kp, ks,
+                (int) (bp && qp && bp < qp + qs && qp < bp + bs),
+                (int) (bp && kp && bp < kp + ks && kp < bp + bs));
+    }
+
 #define GGML_CUDA_LAUNCH_INDEXED(TK, TV, MAX_TAIL) \
         k_flash_attn_ext_tail_indexed_small<TK, TV, MAX_TAIL><<<grid, 256, 0, ctx.stream()>>>( \
             (const float *) q->data, (const char *) kt->data, (const char *) vt->data, \
@@ -930,6 +1181,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const size_t lse_nb1 = lse_t ? lse_t->nb[1] : 0;
     const size_t lse_nb2 = lse_t ? lse_t->nb[2] : 0;
     const dim3 grid(q_max, n_head, n_active);
+    if (getenv("F4_RP_KDISC") != nullptr) {
+        fprintf(stderr, "KDISC-TAIL-PATH tail_bodyless=%d -> %s\n", (int) tail_bodyless,
+                tail_bodyless ? "scatter (merge SKIPPED)" : "partials_merge");
+    }
     if (tail_bodyless) {
         k_flash_attn_ext_tail_scatter<<<grid, 256, 0, ctx.stream()>>>(
             (const float *) tail_pass.data, (float *) dst->data, (const int32_t *) qo->data,
@@ -949,6 +1204,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             CUDA_CHECK(cudaGetLastError());
         }
         return;
+    }
+    if (getenv("F4_RP_KDISC") != nullptr) {
+        fprintf(stderr, "KDISC-TAIL-PATH launching partials_merge grid=(%d,%d,%d)\n",
+                (int) grid.x, (int) grid.y, (int) grid.z);
     }
     k_flash_attn_ext_tail_partials_merge<<<grid, 256, 0, ctx.stream()>>>(
         (const float *) body_pass.data, (const float *) tail_pass.data, (float *) dst->data,

@@ -69,11 +69,28 @@ as the intended workload. Keep both `-b` and `-ub` identical between baseline
 and candidate runs. Record the model file, command, prompt or corpus, sampling
 settings, GPU, and commit with every result.
 
+CUDA KVarN prefill uses direct records for supported shapes and transient F16
+K/V windows for unsupported shapes. The
+target-context default keeps one window through 65,536 active tokens to avoid an
+additional partial-softmax merge. `--kvarn-window-chunk` and
+`--spec-draft-kvarn-window-chunk` select positive token counts for the target
+and owned draft contexts independently. The draft context defaults to `2048`,
+which keeps its transient F16 workspace bounded for shallow speculative models;
+the target context falls back to `GGML_KVARN_WINDOW_CHUNK`. The value does not
+change the context size, retained cache, KVarN bit width, or precision-tail
+length. Smaller windows remain mathematically online-softmax equivalent but
+change floating-point reduction order, so KLD comparisons must record both
+context settings.
+
 The CUDA specialized split, SWA-vector, and tiled descriptor-native MMA routes
 publish the same optional FP32 `(maximum, denominator)` metadata as upstream
-FlashAttention. Single-token generation uses split/vector decode, while short
-multi-token verification uses tiled MMA to reuse decoded K/V tiles across query
-rows. Q9-Q16 batches with GQA above four use a fused 128-column tile when the
+FlashAttention. For 64-dimensional heads, query widths 1 through 16 are eligible
+for split decode when the device and concrete geometry support it. Geometry
+selection keeps the single-query KV partition so autoregressive generation and
+speculative verification use the same online-softmax partitioning; if no valid
+geometry exists, dispatch retains the portable or materialized fallback. Other
+head dimensions keep their existing split limit of eight rows and generic-MMA
+policy. Q9-Q16 batches with GQA above four use a fused 128-column tile when the
 concrete kernel fits the device's opt-in shared-memory budget and has nonzero
 measured occupancy; all other devices and shapes retain the regular tile
 matrix. An attached precision tail therefore does not force KVarN away from its
@@ -132,10 +149,20 @@ reservation and zero cumulative per-context growth.
 
 ### Backend support and limitations
 
-KVarN supports target contexts and draft-owned MTP caches for Qwen3.5/Qwen3.6
-dense and MoE models and standalone Qwen3.8/Qwen4Exp MTP sidecars. Shared Gemma
-4 MTP reads the target cache representation and does not allocate an independent
-draft record store. Other draft and auxiliary modes remain on standard caches.
+KVarN supports target contexts and owned draft caches for draft-simple, EAGLE3,
+Qwen3.5/Qwen3.6 dense and MoE MTP, standalone Qwen3.8/Qwen4Exp MTP sidecars,
+DFlash1/DFlash2, and non-MLA DSpark. DSV4/MLA DSpark fails closed because its
+latent cache is incompatible with KVarN's dense K/V records. DFlash-family modes
+use one K/V pair for both full-attention and SWA sub-caches. On capable CUDA
+backends, owned DFlash1/DFlash2 D128/D256/D512 non-causal block attention can
+consume records directly for supported query/domain/tail shapes. Unqualified
+shapes and other backends retain materialized attention; persistent K/V remains
+compressed on either route. Multi-stream SWA (`--parallel 2` or higher without
+unified draft storage) stays materialized because record-native multi-slot
+parity is not qualified. Non-MLA DSpark remains materialized. Shared
+Gemma 4 MTP reads the target cache representation and does not allocate an
+independent draft record store. N-gram modes have no draft model cache and
+reject explicit draft KVarN selections during argument validation.
 CUDA selects specialized descriptor-native FlashAttention on Turing and newer
 GPUs, then falls back to a portable
 direct-record route when those matrix instructions are unavailable or the
@@ -573,6 +600,7 @@ baseline before pinning a smaller depth.
 - [`--spec-type draft-dflash`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-draft-model`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-draft-n-max`](beellama-args.md#dflash-and-adaptive-draft-depth)
+- [`--spec-draft-ubatch-size`, `-ubd`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-dm-controller`](beellama-args.md#dflash-and-adaptive-draft-depth)
 - [`--spec-dm-profit-baseline-interval`](beellama-args.md#dflash-and-adaptive-draft-depth)
 
@@ -581,7 +609,10 @@ baseline before pinning a smaller depth.
 Compare adaptive and fixed-depth runs with the same prompt, target and draft
 files, cache types, sampling settings, and GPU. Report generated and accepted
 draft tokens as well as wall-clock throughput; output bytes are not a stable
-cross-build oracle for speculative decoding.
+cross-build oracle for speculative decoding. Draft contexts inherit target `-b`,
+while physical `-ubd` sets draft work per batch without changing target `-ub`.
+Smaller draft ubatches can reduce draft graph and workspace memory at the cost
+of prompt catch-up throughput.
 
 ### Known limitations
 

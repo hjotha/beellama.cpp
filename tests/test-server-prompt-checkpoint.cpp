@@ -31,6 +31,12 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(server_prompt_checkpoint_boundary(795,   4, 128) == 768);
     assert(server_prompt_checkpoint_boundary(3,     4, 128) == 0);
 
+    assert(server_prompt_checkpoint_interval(131072, 32,    0, 128) == 4096);
+    assert(server_prompt_checkpoint_interval(131072, 32, 8192, 128) == 8192);
+    assert(server_prompt_checkpoint_interval(120000, 32,    0, 128) == 3840);
+    assert(server_prompt_checkpoint_interval(0,      32, 8192, 128) == 0);
+    assert(server_prompt_checkpoint_interval(131072,  0, 8192, 128) == 0);
+
     assert(!server_draft_context_owns_state(false, false));
     assert( server_draft_context_owns_state(true,  false));
     assert(!server_draft_context_owns_state(true,  true));
@@ -226,6 +232,23 @@ static void slot_save_prefers_only_the_last_aligned_checkpoint() {
     assert(!server_prompt_save_aligned_checkpoint(too_new, 6734, 128));
 }
 
+static void prompt_cache_does_not_restore_just_admitted_live_state() {
+    server_prompt_cache cache(1, 0);
+    server_prompt current = make_prompt({1, 2, 3, 4});
+    server_prompt_data data;
+    data.main = {0x2a};
+    cache.states.emplace_back();
+    cache.states.back().prompt = current.clone();
+    cache.states.back().data = std::move(data);
+    const auto * admitted = &cache.states.back();
+
+    server_tokens requested(llama_tokens {1, 2, 9}, false);
+    assert(cache.load(current, requested, nullptr, nullptr, nullptr, 0, admitted) ==
+            server_prompt_cache_result::unchanged);
+    assert(cache.restore_attempts == 0);
+    assert(current.tokens.size() == 4);
+}
+
 static void checkpoint_failed_target_save_cannot_reuse_stale_bytes() {
     common_prompt_checkpoint checkpoint;
     checkpoint.data_tgt.resize(32, 0x5a);
@@ -403,6 +426,30 @@ static void server_planned_removal_preserves_atomic_media_chunks() {
     assert(removed_p0 == media_end);
 }
 
+static void cache_phase_timings_are_public() {
+    server_slot_stats stats;
+    stats.cache_slot_ms = 12.5;
+    stats.cache_ram_save_ms = 3.0;
+    stats.cache_ram_load_ms = 7.0;
+    stats.cache_ram_restore_prepare_ms = 5.0;
+    stats.cache_ram_restore_commit_ms = 2.0;
+    stats.cache_ram_update_ms = 0.5;
+    stats.cache_checkpoint_restore_ms = 2.0;
+    stats.cache_checkpoint_prepare_ms = 1.5;
+    stats.cache_checkpoint_commit_ms = 0.5;
+
+    const auto value = stats.to_json();
+    assert(value.at("cache_slot_ms") == 12.5);
+    assert(value.at("cache_ram_save_ms") == 3.0);
+    assert(value.at("cache_ram_load_ms") == 7.0);
+    assert(value.at("cache_ram_restore_prepare_ms") == 5.0);
+    assert(value.at("cache_ram_restore_commit_ms") == 2.0);
+    assert(value.at("cache_ram_update_ms") == 0.5);
+    assert(value.at("cache_checkpoint_restore_ms") == 2.0);
+    assert(value.at("cache_checkpoint_prepare_ms") == 1.5);
+    assert(value.at("cache_checkpoint_commit_ms") == 0.5);
+}
+
 static void prompt_cache_accounting_shares_checkpoint_bytes() {
     server_prompt source = make_prompt({7, 8, 9});
     source.checkpoints.push_back(make_checkpoint(3, 3, 200*KIB));
@@ -471,6 +518,7 @@ static void prompt_cache_make_room_fails_when_single_state_exceeds_budget() {
 
 int main() {
     prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp();
+    prompt_cache_does_not_restore_just_admitted_live_state();
     prompt_cache_self_contained_wins_over_native();
     prompt_cache_checkpoint_must_respect_alignment_and_position();
     restore_transaction_validation_failures_are_atomic();
@@ -483,6 +531,7 @@ int main() {
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();
     server_planned_removal_preserves_atomic_media_chunks();
+    cache_phase_timings_are_public();
     prompt_cache_accounting_shares_checkpoint_bytes();
     prompt_cache_make_room_evicts_until_budget_fits();
     prompt_cache_make_room_keeps_kept_state();

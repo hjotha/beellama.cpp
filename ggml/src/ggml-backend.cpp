@@ -10,8 +10,33 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-f4-counters.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+
+#if defined(LLAMA_F4_TEST_COUNTERS)
+#include <cstring>
+// Prints the counter window and starts a new one. Called by the server's
+// TEST-ONLY capture hook, so the window covers exactly the work since the
+// previous capture (model-load init excluded).
+GGML_BACKEND_API void ggml_f4_counters_dump_and_reset(const char * tag) {
+    auto & c = ggml_f4_counters();
+    fprintf(stderr,
+            "F4COUNT tag=%s copies=%llu copy_bytes=%llu copies_in_vk=%llu copies_out_vk=%llu "
+            "vk_copy_bytes=%llu vk_graphs=%llu vk_nodes=%llu\n",
+            tag ? tag : "-",
+            (unsigned long long) c.copies_total.load(),
+            (unsigned long long) c.copies_bytes.load(),
+            (unsigned long long) c.copies_in_vulkan.load(),
+            (unsigned long long) c.copies_out_vulkan.load(),
+            (unsigned long long) c.copies_vulkan_bytes.load(),
+            (unsigned long long) c.vk_graphs.load(),
+            (unsigned long long) c.vk_nodes.load());
+    c.copies_total = 0; c.copies_bytes = 0;
+    c.copies_in_vulkan = 0; c.copies_out_vulkan = 0; c.copies_vulkan_bytes = 0;
+    c.vk_graphs = 0; c.vk_nodes = 0;
+}
+#endif
 
 #include <assert.h>
 #include <limits.h>
@@ -797,6 +822,17 @@ static bool ggml_backend_sched_allows_bufferless_kvarn_src(
 
 #ifndef GGML_SCHED_MAX_COPIES
 #define GGML_SCHED_MAX_COPIES 4
+#endif
+
+
+#if defined(LLAMA_F4_TEST_COUNTERS)
+static inline bool ggml_f4_dev_is_vulkan(ggml_backend_t b) {
+    if (b == nullptr) {
+        return false;
+    }
+    const char * n = ggml_backend_dev_name(ggml_backend_get_device(b));
+    return n != nullptr && strncmp(n, "Vulkan", 6) == 0;
+}
 #endif
 
 struct ggml_backend_sched_split {
@@ -1770,9 +1806,57 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Local reversible diagnostic (env-gated at call site, default off):
+// FNV-1a content hash of staged cross-backend bytes, full + 8 chunks
+// (dirty ranges). Reads back device bytes synchronously: perturbs timing,
+// never used for acceptance numbers; content comparison only.
+static uint64_t f5_fnv1a(const uint8_t * p, size_t n, uint64_t h) {
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t) p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void f5_hash_staged_print(int64_t gid, ggml_backend_t exec_backend, struct ggml_tensor * staged) {
+    const size_t n = ggml_nbytes(staged);
+    struct ggml_tensor * root = staged;
+    while (root->view_src != nullptr) {
+        root = root->view_src;
+    }
+    if (n == 0 || n > (1u << 20)) {
+        fprintf(stderr, "[HASHSTAGED] gid=%lld backend=%s input=%s bytes=%zu offs=%zu root=%p SKIP\n",
+                (long long) gid, ggml_backend_name(exec_backend),
+                staged->name ? staged->name : "-", n,
+                (size_t) staged->view_offs, (void *) root);
+        return;
+    }
+    static uint8_t * buf = nullptr;
+    if (buf == nullptr) {
+        buf = (uint8_t *) malloc(1u << 20);
+        if (buf == nullptr) {
+            return;
+        }
+    }
+    ggml_backend_tensor_get(staged, buf, 0, n);
+    uint64_t full = f5_fnv1a(buf, n, 1469598103934665603ULL);
+    char chunks[8 * 17];
+    char * w = chunks;
+    for (int c = 0; c < 8; c++) {
+        size_t off = (n * (size_t) c) / 8;
+        size_t end = (n * (size_t) (c + 1)) / 8;
+        uint64_t h = f5_fnv1a(buf + off, end - off, 1469598103934665603ULL);
+        w += snprintf(w, 17, "%016llx", (unsigned long long) h);
+    }
+    fprintf(stderr, "[HASHSTAGED] gid=%lld backend=%s input=%s bytes=%zu offs=%zu root=%p view=%d full=%016llx chunks=%s\n",
+            (long long) gid, ggml_backend_name(exec_backend),
+            staged->name ? staged->name : "-", n,
+            (size_t) staged->view_offs, (void *) root, staged->view_src != nullptr ? 1 : 0,
+            (unsigned long long) full, chunks);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
-    GGML_ASSERT(sched);
-    struct ggml_backend_sched_split * splits = sched->splits;
+    GGML_ASSERT(sched);    struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1780,10 +1864,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // Local reversible diagnostic (env-gated, default off): monotonic graph
+    // id + per-split host markers for exact timeline reconstruction.
+    // Zero overhead when GGML_SCHED_SPLIT_SPAN is unset.
+    static int64_t f5_span_gid = 0;
+    const int64_t f5_gid = ++f5_span_gid;
+    static const bool f5_span = [] {
+        const char * v = std::getenv("GGML_SCHED_SPLIT_SPAN");
+        return v != nullptr && *v != '\0';
+    }();
+    static const bool f5_hash = [] {
+        const char * v = std::getenv("GGML_SCHED_HASH_STAGED");
+        return v != nullptr && *v != '\0';
+    }();
+    static const bool f5_nodedump = [] {
+        const char * v = std::getenv("GGML_SCHED_NODE_DUMP");
+        return v != nullptr && *v != '\0';
+    }();
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t f5_t_iter = f5_span ? ggml_time_us() : 0;
+        int64_t f5_wait_us = 0;
+        int64_t f5_memcpy_us = 0;
+        int f5_ncopies = 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1794,21 +1900,55 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
+        const int64_t f5_t_postsync = f5_span ? ggml_time_us() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+            // F4 bounded scheduler evidence (env-gated): which backend owns each
+            // split input, and which backend executes the split. A Vulkan-owned
+            // Q4 source feeding a CUDA split is exactly the case that forces a
+            // full-capacity copy into the CUDA scratch.
+            if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
+                struct ggml_tensor * in = split->inputs[input_id];
+                // Tensor IDENTITY (pointer + view-root) so aliases and repeated
+                // split mentions can be deduplicated: a repeated NAME is not
+                // proof of distinct allocations.
+                struct ggml_tensor * root = in;
+                while (root->view_src != nullptr) {
+                    root = root->view_src;
+                }
+                fprintf(stderr, "F4SCHED split=%d exec_backend=%s input=%-22s op=%-11s type=%-6s ne0=%lld bytes=%zu owner_backend=%-6s ptr=%p root=%p view=%d offs=%zu src0=%s\n",
+                        split_id, ggml_backend_name(split_backend),
+                        in->name ? in->name : "-", ggml_op_name(in->op),
+                        ggml_type_name(in->type), (long long) in->ne[0], ggml_nbytes(in),
+                        input_backend ? ggml_backend_name(input_backend) : "none",
+                        (void *) in, (void *) root, in->view_src != nullptr ? 1 : 0,
+                        in->view_offs,
+                        in->src[0] ? (in->src[0]->name ? in->src[0]->name : "(unnamed)") : "-");
+            }
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                const int64_t f5_h0 = f5_hash ? ggml_time_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                const int64_t f5_h1 = f5_hash ? ggml_time_us() : 0;
+                ggml_f4_count_copy(ggml_nbytes(input), ggml_f4_dev_is_vulkan(input_backend),
+                                   ggml_f4_dev_is_vulkan(split_backend));
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (f5_hash) {
+                    const int64_t f5_h2 = ggml_time_us();
+                    f5_wait_us += f5_h1 - f5_h0;
+                    f5_memcpy_us += f5_h2 - f5_h1;
+                    f5_ncopies++;
+                    f5_hash_staged_print(f5_gid, split_backend, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1915,6 +2055,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             const char * value = std::getenv("GGML_BACKEND_COPY_PROFILE");
                             return value != nullptr && std::strcmp(value, "1") == 0;
                         }();
+                        const int64_t f5_fb0 = f5_hash ? ggml_time_us() : 0;
                         const int64_t src_sync_start = profile_backend_copies ? ggml_time_us() : 0;
                         ggml_backend_synchronize(input_backend);
                         const int64_t src_sync_us = profile_backend_copies ? ggml_time_us() - src_sync_start : 0;
@@ -1926,7 +2067,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         const int64_t dst_sync_us = profile_backend_copies ? ggml_time_us() - dst_sync_start : 0;
                         const int64_t copy_start = profile_backend_copies ? ggml_time_us() : 0;
+                        ggml_f4_count_copy(ggml_nbytes(input), ggml_f4_dev_is_vulkan(input_backend),
+                                           ggml_f4_dev_is_vulkan(split_backend));
+                        const int64_t f5_fb1 = f5_hash ? ggml_time_us() : 0;
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (f5_hash) {
+                            const int64_t f5_fb2 = ggml_time_us();
+                            f5_wait_us += f5_fb1 - f5_fb0;
+                            f5_memcpy_us += f5_fb2 - f5_fb1;
+                            f5_ncopies++;
+                            f5_hash_staged_print(f5_gid, split_backend, input_cpy);
+                        }
                         if (profile_backend_copies) {
                             GGML_LOG_INFO("backend copy profile: %s -> %s tensor=%s bytes=%zu src_sync=%.3f ms dst_sync=%.3f ms copy=%.3f ms\n",
                                     ggml_backend_dev_name(ggml_backend_get_device(input_backend)),
@@ -1939,9 +2090,59 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+        const int64_t f5_t_postcopy = f5_span ? ggml_time_us() : 0;
 
+        // Local reversible diagnostic (env-gated): for splits with a large
+        // cross-backend input, list the split's nodes so the consumer of a
+        // staged tensor can be identified exactly (placement fix design).
+        if (f5_nodedump) {
+            bool big_cross = false;
+            for (int input_id = 0; input_id < split->n_inputs && !big_cross; input_id++) {
+                struct ggml_tensor * in = split->inputs[input_id];
+                ggml_backend_t ob = ggml_backend_sched_get_tensor_backend(sched, in);
+                if (ob != nullptr && ob != split_backend && ggml_nbytes(in) > 65536) {
+                    big_cross = true;
+                }
+            }
+            if (big_cross) {
+                fprintf(stderr, "[NODEDUMP] gid=%lld split_backend=%s nodes=%d\n",
+                        (long long) f5_gid, ggml_backend_name(split_backend), split->graph.n_nodes);
+                for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+                    struct ggml_tensor * nd = split->graph.nodes[ni];
+                    fprintf(stderr, "[NODEDUMP] gid=%lld op=%s name=%s ne=[%lld,%lld,%lld,%lld]\n",
+                            (long long) f5_gid, ggml_op_name(nd->op), nd->name ? nd->name : "-",
+                            (long long) nd->ne[0], (long long) nd->ne[1],
+                            (long long) nd->ne[2], (long long) nd->ne[3]);
+                }
+            }
+        }
+
+        // Diagnostic, env-gated: per-split wall time per backend. The extra
+        // synchronize only runs when enabled, and only once per split (not per
+        // layer), so it cannot silently inflate the final acceptance numbers.
+        static const bool sched_split_timing = [] {
+            const char * v = getenv("GGML_SCHED_SPLIT_TIMING");
+            return v != nullptr && *v != '\0';
+        }();
         if (!sched->callback_eval) {
+            const int64_t st_t0 = sched_split_timing ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sched_split_timing) {
+                ggml_backend_synchronize(split_backend);
+                fprintf(stderr, "[SPLIT] backend=%s nodes=%d wall_ms=%.3f\n",
+                        ggml_backend_name(split_backend), split->graph.n_nodes,
+                        (ggml_time_us() - st_t0) / 1000.0);
+            }
+            if (f5_span) {
+                fprintf(stderr, "[SPLITSPAN] gid=%lld backend=%s nodes=%d t_iter_us=%lld t_postsync_us=%lld t_postcopy_us=%lld\n",
+                        (long long) f5_gid, ggml_backend_name(split_backend), split->graph.n_nodes,
+                        (long long) f5_t_iter, (long long) f5_t_postsync, (long long) f5_t_postcopy);
+            }
+            if (f5_hash) {
+                fprintf(stderr, "[SPLITWAIT] gid=%lld backend=%s wait_us=%lld memcpy_us=%lld ncopies=%d\n",
+                        (long long) f5_gid, ggml_backend_name(split_backend),
+                        (long long) f5_wait_us, (long long) f5_memcpy_us, f5_ncopies);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }

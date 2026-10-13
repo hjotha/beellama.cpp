@@ -51,15 +51,33 @@ namespace llama_kv_mixed {
 
 constexpr uint32_t MIXED_IO_MANIFEST_MAGIC = 0x4D534D4B; // "KMSM"
 constexpr uint32_t MIXED_IO_MANIFEST_VERSION = 1;
-constexpr uint32_t MIXED_IO_WIRE_EVENT_SIZE = 37; // kind1+layer4+payload_off8+size8+stream_off8+tensor_off8
-constexpr uint32_t MIXED_IO_WIRE_LAYER_SIZE = 12; // layer_id4+total8
+// F4 v2: the manifest grows a range_id on both the event and the payload-size
+// entry, so identity is the (layer_id, range_id) pair. v1 manifests are still
+// accepted and parse with range_id 0 on every entry, which is exactly the v1
+// layout's meaning.
+constexpr uint32_t MIXED_IO_MANIFEST_VERSION_V2 = 2;
+constexpr uint32_t MIXED_IO_WIRE_EVENT_SIZE = 37; // v1: kind1+layer4+payload_off8+size8+stream_off8+tensor_off8
+constexpr uint32_t MIXED_IO_WIRE_EVENT_SIZE_V2 = 41; // + range_id4
+constexpr uint32_t MIXED_IO_WIRE_LAYER_SIZE = 12; // v1: layer_id4+total8
+constexpr uint32_t MIXED_IO_WIRE_LAYER_SIZE_V2 = 16; // + range_id4
 constexpr uint64_t MIXED_IO_MANIFEST_MAX_METADATA = 64ull << 20; // parse/serialize cap
+
+// F4 v2: descriptor identity is the PAIR (layer_id, range_id). Packs the pair
+// into one comparable key so every sorted container (payload sizes, payload
+// index, span index) keeps a single total order without changing its shape.
+// v1 frames only ever use range_id 0, which reproduces the old ordering.
+inline uint64_t mixed_range_key(uint32_t layer_id, uint32_t range_id) {
+    return (uint64_t(layer_id) << 32) | uint64_t(range_id);
+}
+inline uint32_t mixed_key_layer(uint64_t key) { return uint32_t(key >> 32); }
+inline uint32_t mixed_key_range(uint64_t key) { return uint32_t(key & 0xFFFFFFFFu); }
 
 // ordered event in the virtual legacy stream (wire-stable)
 struct mixed_manifest_event {
     uint8_t kind = 0;            // 0 = metadata run, 1 = tensor payload
     uint32_t layer_id = 0;       // tensor events only
-    uint64_t payload_offset = 0; // layer-local byte offset of this event's bytes
+    uint32_t range_id = 0;       // F4 v2: 0 = local [0,P), 1 = overflow [P,C)
+    uint64_t payload_offset = 0; // range-local byte offset of this event's bytes
     uint64_t size = 0;
     uint64_t stream_offset = 0;  // absolute offset in the virtual legacy stream
     uint64_t tensor_offset = 0;  // tensor events only: byte offset in the source tensor
@@ -68,10 +86,12 @@ struct mixed_manifest_event {
 // versioned manifest: ordinary metadata + ordered events (no process
 // pointers) + per-layer payload sizes
 struct mixed_manifest {
-    uint32_t version = MIXED_IO_MANIFEST_VERSION;
+    uint32_t version = MIXED_IO_MANIFEST_VERSION_V2;
     std::vector<uint8_t> metadata;                    // concatenated write() bytes
     std::vector<mixed_manifest_event> events;         // ordered by stream_offset
-    std::vector<std::pair<uint32_t, uint64_t>> layer_payload_sizes; // sorted by layer_id
+    // F4 v2: keyed by the packed (layer_id, range_id) pair, sorted ascending, so
+    // two ranges of one layer are distinct entries instead of colliding.
+    std::vector<std::pair<uint64_t, uint64_t>> layer_payload_sizes; // key -> total bytes
     uint64_t total_stream_bytes = 0;
 
     // structural validation shared by writer finalize and reader ctor;
@@ -98,8 +118,10 @@ struct split_writer_limits {
 // No tensor bytes are read during recording (only ggml_nbytes for bounds).
 class split_writer final : public ::llama_io_write_i {
 public:
-    // maps a source tensor to its logical codec layer id
-    using layer_fn = std::function<uint32_t(const ::ggml_tensor *)>;
+    // F4 v2: maps a source tensor to its logical codec RANGE (layer + range),
+    // not just a layer. range_id 0 is the local KVarN range and 1 the overflow
+    // Qx range; returning range_id > 1 is rejected.
+    using layer_fn = std::function<uint64_t(const ::ggml_tensor *)>;
 
     explicit split_writer(layer_fn layer_of, split_writer_limits limits = {});
     ~split_writer() override = default;
@@ -121,7 +143,7 @@ public:
     // the captured ggml tensor ranges via ggml_backend_tensor_get in bounded
     // chunks (no full copy). Returns bytes served (== count on success; short
     // when the range is out of bounds).
-    size_t read_payload(uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) const;
+    size_t read_payload(uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) const;
 
 private:
     struct tensor_range {
@@ -134,8 +156,10 @@ private:
     mixed_manifest manifest_;
     std::vector<tensor_range> event_tensors_; // parallel to manifest_.events (kind==1)
     uint64_t stream_size_ = 0;
-    std::vector<uint64_t> layer_bytes_;       // layer_id -> total bytes
-    mutable std::unordered_map<uint32_t, std::vector<const mixed_manifest_event *>> payload_index_; // lazy per-layer events
+    // F4 v2: indexed by packed range key offset. Sized to max_layers * 2 so
+    // both ranges of every layer get their own running byte count.
+    std::unordered_map<uint64_t, uint64_t> layer_bytes_; // packed key -> total bytes
+    mutable std::unordered_map<uint64_t, std::vector<const mixed_manifest_event *>> payload_index_; // lazy per range
     mutable bool sealed_ = false; // first read_payload seals the writer: later writes rejected
                           // (payload_index_ holds pointers into events)
 
@@ -158,11 +182,12 @@ struct split_reader_limits {
 // defer_to() registers the single outer publication callback.
 class split_reader final : public ::llama_io_read_i {
 public:
-    // borrowed immutable payload span for one layer. owner MUST be non-null
+    // borrowed immutable payload span for one RANGE. owner MUST be non-null
     // for any span with size > 0: the zero-copy lifetime claims depend on the
     // retained owner keeping the backing alive until the outer io releases it
     struct payload_span {
         uint32_t layer_id = 0;
+        uint32_t range_id = 0; // F4 v2: paired with layer_id
         const uint8_t * data = nullptr;
         uint64_t size = 0;
         std::shared_ptr<const void> owner;
@@ -224,7 +249,7 @@ private:
     mixed_manifest manifest_;
     std::vector<uint64_t> meta_offsets_; // per-event metadata byte offset (kind==0)
     std::vector<payload_span> spans_;
-    std::vector<size_t> span_by_layer_; // layer_id -> span index (invalid == SIZE_MAX)
+    std::vector<size_t> span_by_range_; // packed range key -> span index (invalid == SIZE_MAX)
     split_reader_limits limits_;
     uint64_t cursor_ = 0;
     size_t event_idx_ = 0;              // monotonic event cursor (consume is sequential)

@@ -12634,6 +12634,27 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
     const bool has_k = kvarn_cpu_attn_parse_side(dst->src[1], k);
     const bool has_v = kvarn_cpu_attn_parse_side(dst->src[2], v);
     if (!has_k && !has_v) {
+        if (kvarn_cpu_attn_view_base(dst->src[1]) || kvarn_cpu_attn_view_base(dst->src[2])) {
+            for (int side = 1; side <= 2; ++side) {
+                const auto * tensor = dst->src[side];
+                for (int depth = 0; tensor && depth < 5; ++depth) {
+                    fprintf(stderr, "CPU KVarN invalid descriptor side=%d depth=%d op=%s type=%s ne=%lld,%lld,%lld,%lld data=%p params=",
+                            side, depth, ggml_op_name(tensor->op), ggml_type_name(tensor->type),
+                            (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3], tensor->data);
+                    for (int i = 0; i < 12; ++i) { fprintf(stderr, "%d,", ggml_get_op_params_i32(tensor, i)); }
+                    fprintf(stderr, "\n");
+                    if (tensor->op == GGML_OP_KVARN_VIEW) {
+                        for (int i = 0; i < 3; ++i) {
+                            const auto * src = tensor->src[i];
+                            if (src) { fprintf(stderr, "  src%d type=%s ne=%lld,%lld,%lld data=%p\n", i, ggml_type_name(src->type), (long long)src->ne[0], (long long)src->ne[1], (long long)src->ne[2], src->data); }
+                        }
+                        break;
+                    }
+                    tensor = tensor->src[0];
+                }
+            }
+            GGML_ABORT("invalid CPU KVarN attention descriptor; refusing generic F16 interpretation");
+        }
         return false;
     }
 
@@ -12808,6 +12829,12 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
 
         if (k_tail != nullptr) {
             const int64_t n_tail = desc[4];
+            if (params->ith == 0 && !(n_tail >= 0 && n_tail <= tail_mask->ne[0])) {
+                fprintf(stderr, "CPU KVarN tail contract: n_tail=%lld mask=%lld,%lld,%lld,%lld desc_shape=%lld,%lld fields=%d,%d,%d,%d,%d,%d order_shape=%lld,%lld\n",
+                        (long long)n_tail, (long long)tail_mask->ne[0], (long long)tail_mask->ne[1], (long long)tail_mask->ne[2], (long long)tail_mask->ne[3],
+                        (long long)run_desc->ne[0], (long long)run_desc->ne[1], desc[0],desc[1],desc[2],desc[3],desc[4],desc[5],
+                        (long long)query_order->ne[0], (long long)query_order->ne[1]);
+            }
             GGML_ASSERT(n_tail >= 0 && n_tail <= tail_mask->ne[0]);
             const auto load_tail = [](const ggml_tensor * tensor, const char * ptr) {
                 return tensor->type == GGML_TYPE_F16 ?
@@ -12815,6 +12842,14 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
                     ggml_bf16_to_fp32(*(const ggml_bf16_t *) ptr);
             };
             for (int64_t token = 0; token < n_tail; ++token) {
+                const float mask_value = slope * ggml_fp16_to_fp32(
+                    *(const ggml_fp16_t *) ((const char *) tail_mask->data +
+                        token * tail_mask->nb[0] + query * tail_mask->nb[1] +
+                        stream * tail_mask->nb[3]));
+                // A range mask can exclude a current/overflow candidate whose
+                // arena is deliberately not bound to this local attention.
+                // Fully masked rows must not require or dereference that arena.
+                if (mask_value == -INFINITY) { continue; }
                 const int64_t slot = desc[6 + token];
                 const bool from_current = k_tail_current != nullptr && slot >= k_tail->ne[1];
                 const ggml_tensor * tail_k_source = from_current ? k_tail_current : k_tail;
@@ -12822,10 +12857,6 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
                 const int64_t source_row = from_current ? slot - k_tail->ne[1] : slot;
                 GGML_ASSERT(source_row >= 0 && source_row < tail_k_source->ne[1] &&
                         source_row < tail_v_source->ne[1]);
-                const float mask_value = slope * ggml_fp16_to_fp32(
-                    *(const ggml_fp16_t *) ((const char *) tail_mask->data +
-                        token * tail_mask->nb[0] + query * tail_mask->nb[1] +
-                        stream * tail_mask->nb[3]));
                 consume(mask_value,
                     [&](int64_t dim) {
                         const char * ptr = (const char *) tail_k_source->data +

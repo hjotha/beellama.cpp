@@ -1,0 +1,17 @@
+launched producer P=off pid=3189475
+A-produce prompt=556 cache_n=0 lcp=0 planned=0 reprocessed=556
+producer exited; snapshots on disk:
+total 386868
+-rw------- 1 hjotha hjotha 197579721 Oct  7 03:09 auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+-rw------- 1 hjotha hjotha 198567323 Oct  7 03:09 auto-1ee08d954f58561c-62e5f8fd1f9ceb61-571.bin
+atomic publication: 2 finalized .bin file(s), 0 in-flight .tmp (excluded from the index by the .tmp predicate)
+  auto-1ee08d954f58561c-3d5802841d3db425-556.bin sha=75509889e74257a1 size=197579721
+  auto-1ee08d954f58561c-62e5f8fd1f9ceb61-571.bin sha=7219f3e42c26e812 size=198567323
+launched consumer P=1024 pid=3189901
+B-import prompt=556 cache_n=556 lcp=0 planned=0 reprocessed=0
+[59303] 0.05.003.072 I slot auto_restore: id  0 | task 0 | auto-restore: importing PURE KVarN snapshot /home/hjotha/f4-spool/gap3-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin (556 tokens) into the split destination
+[59303] 0.05.003.423 I slot do_slot_rest: id  0 | task 0 | auto-restore: authorized state conversion (model=7f88559fa5250ae7 rope=7d90e892cdd78580, pure_to_split=1 reusable=0)
+[59303] 0.05.453.688 I slot auto_restore: id  0 | task 0 | auto-restore: reused 556 tokens from disk (in-memory match was 0), bytes=197579721 restore_ms=451.188 workspace=52428800, file=/home/hjotha/f4-spool/gap3-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+[59303] 0.05.003.072 I slot auto_restore: id  0 | task 0 | auto-restore: importing PURE KVarN snapshot /home/hjotha/f4-spool/gap3-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin (556 tokens) into the split destination
+=== SUMMARY ===
+DONE

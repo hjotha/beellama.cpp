@@ -110,6 +110,24 @@ static void test_attention_domain_policy() {
     require(llama_kvarn_native_attention_allowed(false, LLM_ARCH_QWEN35),
             "the DFlash qualification gate must not alter other architecture routes");
 
+    const llama_kvarn_native_attention_request qualified = {
+        LLAMA_KVARN_MASK_DFLASH_BLOCK, true, true, true, 128,
+    };
+    require(llama_kvarn_native_attention_allowed(qualified),
+            "owned CUDA DFlash block must admit qualified native attention");
+    for (const auto & unqualified : {
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_DFLASH_BLOCK, false, true, true, 128 },
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_DFLASH_BLOCK, true, false, true, 128 },
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_DFLASH_BLOCK, true, true, false, 128 },
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_UNSUPPORTED, true, true, true, 128 },
+            llama_kvarn_native_attention_request{ LLAMA_KVARN_MASK_DFLASH_BLOCK, true, true, true, 64 },
+    }) {
+        require(!llama_kvarn_native_attention_allowed(unqualified),
+                "unqualified non-causal KVarN route must remain materialized");
+    }
+    require(llama_kvarn_native_attention_allowed({ LLAMA_KVARN_MASK_DFLASH_SWA, true, true, true, 256 }),
+            "owned CUDA DFlash SWA must admit qualified native attention");
+
     const auto portable_decode = llama_kvarn_plan_attention(true, false, 16, 1);
     require(portable_decode.native_attention,
             "portable single-token decode must use native KVarN attention");
@@ -746,6 +764,7 @@ static void test_runtime_validation() {
         }
 
         const auto params = llama_kvarn_params_for_type(type);
+        require(params.window_chunk == 0, "KVarN preset overrides the environment/default window");
         require(llama_kvarn_validate_runtime(params, supported) == nullptr, "valid runtime rejected");
     }
 
@@ -2372,7 +2391,11 @@ static std::vector<float> test_native_flash_attention_output(
         bool           contiguous_current_tail = false,
         const test_native_attention_options & options = {},
         std::vector<float> * lse_output = nullptr,
-        lse_fp64_reference * fp64_output = nullptr) {
+        lse_fp64_reference * fp64_output = nullptr,
+        int            window_chunk = 0,
+        bool           non_causal_holes = false,
+        int            visible_from = 0) {
+
     ggml_init_params params = {
         /*.mem_size   =*/ 32 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -2462,7 +2485,7 @@ static std::vector<float> test_native_flash_attention_output(
         v = ggml_kvarn_materialize(ctx, v_records, stored_v, read_indices,
                 n_kv, 0, n_stream, bits_v, true, stage_groups);
         k->op_params[4] = rotate_graph ? 1 : 0;
-        v->op_params[4] = rotate_graph ? 1 : 0;
+        v->op_params[4] = use_output_rot ? 1 : 0;
         k->op_params[5] = slices;
         v->op_params[5] = slices;
         k->op_params[6] = swa ? 1 : 0;
@@ -2488,6 +2511,7 @@ static std::vector<float> test_native_flash_attention_output(
         require(sinks == nullptr, "native FA: sinks and LSE side output are mutually exclusive");
         lse = ggml_flash_attn_ext_lse_out(ctx, out);
     }
+    out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK] = window_chunk;
     if (native_view) {
         out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] =
             rotate_graph ? (original_value_domain ?
@@ -2568,6 +2592,9 @@ static std::vector<float> test_native_flash_attention_output(
             require(ggml_backend_supports_op(backend, out),
                     "native compact segmented KVarN tail was rejected by its backend");
         }
+    }
+    if (native_view && non_causal_mask) {
+        out->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK] = 1;
     }
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     if (use_output_rot) {
@@ -2664,7 +2691,8 @@ static std::vector<float> test_native_flash_attention_output(
         for (int ikv = 0; ikv < n_kv; ++ikv) {
             // DFlash non-causal blocks can see every live row in their stream;
             // retain a short masked suffix to represent empty/padded cache cells.
-            const bool dflash_visible = ikv + 4 < n_kv;
+            const bool dflash_visible = ikv >= visible_from && ikv + 4 < n_kv &&
+                (!non_causal_holes || ikv % 11 != 3 || iq % 2 == 0);
             const bool visible = non_causal_mask
                 ? dflash_visible
                 : ikv <= iq + n_kv - n_q;
@@ -2913,14 +2941,31 @@ static std::vector<float> test_native_flash_attention_output(
                     "FP64 reference: exact-tail current arena not implemented");
             require(!exact_tail_bodyless,
                     "FP64 reference: tail-without-body is not modelled yet");
+            // Tokens [0, history) live in the history arena, tokens
+            // [history, exact_tail_tokens) in the current arena. Reading every
+            // token from k_tail_data over-reads the history heap buffer for the
+            // current-arena tokens.
+            const int history_tail_tokens =
+                    exact_tail_tokens - exact_tail_current_tokens;
             k_tail_ref.resize((size_t) exact_tail_tokens * n_kv_heads * head_dim);
             v_tail_ref.resize((size_t) exact_tail_tokens * n_kv_heads * head_dim);
             for (int t = 0; t < exact_tail_tokens; ++t) {
+                const bool from_current = t >= history_tail_tokens;
+                const int source_t = from_current ? t - history_tail_tokens : t;
+                const std::vector<float> & k_src =
+                        from_current ? k_tail_current_data : k_tail_data;
+                const std::vector<float> & v_src =
+                        from_current ? v_tail_current_data : v_tail_data;
                 for (int h = 0; h < n_kv_heads; ++h) {
                     for (int d = 0; d < head_dim; ++d) {
                         const size_t off = ((size_t) t * n_kv_heads + h) * head_dim + d;
-                        k_tail_ref[off] = ggml_fp32_to_fp16(k_tail_data[off]);
-                        v_tail_ref[off] = ggml_fp32_to_fp16(v_tail_data[off]);
+                        const size_t src_off =
+                                ((size_t) source_t * n_kv_heads + h) * head_dim + d;
+                        // Float values here: the consumer uses them directly
+                        // as doubles. Storing fp16 bit patterns (as an earlier
+                        // revision did) inflates every tail score by ~1e4.
+                        k_tail_ref[off] = k_src[src_off];
+                        v_tail_ref[off] = v_src[src_off];
                     }
                 }
             }
@@ -3857,7 +3902,10 @@ static void test_dflash_non_causal_attention_parity() {
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
 
     const auto check = [&](ggml_backend_t backend, int head_dim, int bits_k, int bits_v,
-                           int n_q, int n_kv, bool exact_tail) {
+                           int n_q, int n_kv, bool exact_tail, bool swa = false,
+                           int current = 0, bool original_v = false, bool holes = false,
+                           ggml_type exact_type = GGML_TYPE_F16, bool eager = true,
+                           int visible_from = 0) {
         if (std::getenv("GGML_KVARN_TEST_TRACE_NATIVE") != nullptr) {
             std::fprintf(stderr, "DFlash non-causal trace: %s D%d K%dV%d nq=%d nkv=%d tail=%d\n",
                     backend == cpu_backend ? "CPU" : "GPU",
@@ -3868,14 +3916,38 @@ static void test_dflash_non_causal_attention_parity() {
         // materialization or attention-route error.
         const std::vector<float> expected = test_native_flash_attention_output(
                 backend, false, true, head_dim, bits_k, bits_v, n_q,
-                4, 1, n_kv, 3, false, nullptr, false, exact_tail ? 128 : 0,
-                false, GGML_TYPE_F16, 0, false, true, -1, true, true);
+                4, 1, n_kv, 3, swa, nullptr, false, exact_tail ? 128 : 0,
+                original_v, exact_type, current, false, true, -1, eager, true,
+                false, 0, false, {}, nullptr, nullptr, 0, holes, visible_from);
         const std::vector<float> actual = test_native_flash_attention_output(
                 backend, false, true, head_dim, bits_k, bits_v, n_q,
-                4, 1, n_kv, 3, false, nullptr, false, exact_tail ? 128 : 0,
-                false, GGML_TYPE_F16, 0, false, true, -1, true, true, true);
+                4, 1, n_kv, 3, swa, nullptr, false, exact_tail ? 128 : 0,
+                original_v, exact_type, current, false, true, -1, eager, true,
+                true, 0, false, {}, nullptr, nullptr, 0, holes, visible_from);
         require_close_f32_rmse(actual, expected, 1e-3f,
                 "DFlash non-causal materialized KVarN fallback differs from reference");
+        if (backend != gpu_backend) {
+            return;
+        }
+        const auto [reset_routes, get_routes] = get_kvarn_route_stats_fns(backend);
+        require(reset_routes && get_routes, "DFlash CUDA native route telemetry is unavailable");
+        reset_routes();
+        const std::vector<float> direct = test_native_flash_attention_output(
+                backend, true, true, head_dim, bits_k, bits_v, n_q,
+                4, 1, n_kv, 3, swa, nullptr, false, exact_tail ? 128 : 0,
+                original_v, exact_type, current, false, true, -1, eager, true,
+                false, 0, false, {}, nullptr, nullptr, 0, holes, visible_from);
+        test_kvarn_route_stats routes = make_test_kvarn_route_stats();
+        get_routes(&routes);
+        require(routes.direct_entry + routes.compact_tail_entry > 0 &&
+                routes.materialize_fallback == 0,
+                "DFlash non-causal record-native attention did not execute");
+        if (swa && head_dim > 128) {
+            require(routes.portable_native > 0,
+                    "non-causal multi-slice SWA did not select the qualified portable route");
+        }
+        require_close_f32_rmse(direct, actual, 1e-3f,
+                "DFlash non-causal direct-record attention differs from materialized oracle");
     };
 
     for (ggml_backend_t backend : { cpu_backend, gpu_backend }) {
@@ -3889,6 +3961,28 @@ static void test_dflash_non_causal_attention_parity() {
         }
         for (int n_kv : { 127, 128, 129, 255, 256, 257 }) {
             check(backend, 256, 4, 2, std::min(16, n_kv), n_kv, false);
+        }
+        check(backend, 512, 8, 8, 9, 1024, false);
+        check(backend, 128, 4, 4, 4, 257, true, false, 4, false, true);
+        check(backend, 128, 4, 2, 4, 257, true, false, 0, false, false, GGML_TYPE_BF16);
+        check(backend, 256, 4, 2, 9, 1024, true, false, 0, false, false, GGML_TYPE_BF16);
+        check(backend, 256, 4, 2, 9, 257, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 384, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 512, false, false, 0, false, false, GGML_TYPE_F16);
+        check(backend, 128, 4, 2, 9, 512, false, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 512, false, true, 0, false, false, GGML_TYPE_F16, false, 256);
+        check(backend, 256, 4, 2, 9, 512, false, true, 0, false, false, GGML_TYPE_F16, false);
+        check(backend, 256, 4, 2, 9, 512, false, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 512, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 768, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 1024, true, true, 0, false, false, GGML_TYPE_F16);
+        check(backend, 256, 4, 2, 9, 1024, true, true, 0, false, false, GGML_TYPE_BF16);
+        check(backend, 256, 4, 2, 9, 1024, true, true, 1, false, false, GGML_TYPE_BF16);
+        check(backend, 256, 4, 2, 9, 1024, true, true, 1, false, true, GGML_TYPE_BF16);
+        check(backend, 512, 4, 2, 9, 512, true, true, 1, false, true, GGML_TYPE_BF16);
+        check(backend, 128, 4, 2, 8, 257, true, true, 0, false, true);
+        if (backend == gpu_backend) {
+            check(backend, 128, 4, 2, 64, 1024, true, false, 0, true, true);
         }
     }
 
@@ -3940,6 +4034,60 @@ static void test_odd_offset_record_decode_gpu() {
                 "odd-offset record-backed indirect decode differs from materialized reference");
         require(stats.decode_split > 0 && stats.materialize_fallback == 0,
                 "odd-offset indirect regression did not exercise direct split decode");
+    }
+
+    ggml_backend_free(gpu_backend);
+}
+
+static void test_d64_multi_query_split_parity_gpu() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr ||
+            !backend_supports_kvarn_flash_attention_shape(gpu_backend, 64)) {
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
+        }
+        return;
+    }
+
+    const auto route_stats_fns = get_kvarn_route_stats_fns(gpu_backend);
+    require(route_stats_fns.first != nullptr && route_stats_fns.second != nullptr,
+            "D64 multi-query split parity requires CUDA route telemetry");
+
+    for (const auto bits : { std::pair<int, int>{4, 4}, {8, 8} }) {
+        for (int n_q : {1, 2, 7, 8, 9, 10, 15, 16}) {
+            for (int n_kv : {127, 128, 129, 255, 256, 257, 4096, 16640, 32768}) {
+                const std::vector<float> expected = test_native_flash_attention_output(
+                        gpu_backend, false, true, 64, bits.first, bits.second, n_q,
+                        32, 8, n_kv, 5, false, nullptr, false, 0, false,
+                        GGML_TYPE_F16, 0, false, true, -1, true);
+                route_stats_fns.first();
+                const std::vector<float> actual = test_native_flash_attention_output(
+                        gpu_backend, true, true, 64, bits.first, bits.second, n_q,
+                        32, 8, n_kv, 5, false, nullptr, false, 0, false,
+                        GGML_TYPE_F16, 0, false, true, -1, true);
+                test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+                route_stats_fns.second(&stats);
+
+                require_close_f32_rmse(actual, expected, 1e-2f,
+                        "D64 multi-query split decode differs from materialized reference");
+                std::printf("kvarn-d64-mq: k%d/v%d nq=%d nkv=%d split=%llu portable=%llu candidates=%llu compact=%llu direct=%llu\n",
+                        bits.first, bits.second, n_q, n_kv,
+                        (unsigned long long) stats.decode_split,
+                        (unsigned long long) stats.portable_native,
+                        (unsigned long long) stats.geometry_candidates,
+                        (unsigned long long) stats.compact_tail_entry,
+                        (unsigned long long) stats.direct_entry);
+                std::fflush(stdout);
+                require(stats.generic_mma == 0 && stats.materialize_fallback == 0 &&
+                            stats.decode_split + stats.portable_native > 0,
+                        "D64 multi-query verification did not use a direct-record route");
+                if (n_kv >= 4096) {
+                    require(stats.decode_split > 0 && stats.split_reduce > 0 &&
+                                stats.portable_native == 0 && stats.generic_shape_rejected == 0,
+                            "long-context D64 multi-query verification did not stay on split decode");
+                }
+            }
+        }
     }
 
     ggml_backend_free(gpu_backend);
@@ -4098,6 +4246,15 @@ static void test_native_flash_attention_gpu() {
                     capabilities.portable_integrated_tail_bf16 &&
                     capabilities.minimum_dynamic_shared_bytes > 0,
                     "native KVarN backend capability record omitted its portable body-plus-tail contract");
+            const bool is_cuda = std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0;
+            const bool non_causal = (capabilities.route_families &
+                GGML_BACKEND_KVARN_ROUTE_NON_CAUSAL_MASK) != 0;
+            require(non_causal == (is_cuda && capabilities.original_v_domain &&
+                        capabilities.portable_direct_body &&
+                        capabilities.portable_integrated_tail_f16),
+                    "KVarN non-causal capability was advertised without a qualified CUDA route");
+            require(llama_kvarn_backend_supports_non_causal_mask(dev) == non_causal,
+                    "non-causal backend admission disagrees with the advertised capability");
             hip_safe_first = capabilities.specialized_generic_mma &&
                 !capabilities.original_v_domain;
             hip_physical_wave_size = capabilities.physical_warp_size;
@@ -4678,6 +4835,19 @@ static void test_native_flash_attention_prefill_route_parity() {
         // reduction order slightly while preserving the online-softmax result.
         require_close_f32_rmse(generic, chunked, 3e-4f,
                 "chunked KVarN prefill merge disagrees with generic attention");
+
+        std::vector<float> context_chunked;
+        {
+            const std::string global_chunk = std::to_string(n_kv);
+            scoped_test_env force_global_chunk("GGML_KVARN_WINDOW_CHUNK", global_chunk.c_str());
+            context_chunked = test_native_flash_attention_output(
+                    gpu_backend, true, true, 256, bits, bits, 512, 6, 1,
+                    n_kv, 3, false, nullptr, false, tail_candidates, true,
+                    GGML_TYPE_F16, 0, false, false, -1, false, false, false, 0,
+                    false, {}, nullptr, nullptr, std::max(128, n_kv/2));
+        }
+        require_close_f32_rmse(chunked, context_chunked, 1e-7f,
+                "per-context KVarN window does not override the global environment fallback");
     };
 
     require_route_parity(4, 512, 128,
@@ -6191,12 +6361,206 @@ static void test_backend_buffer_detach_and_reallocate_views() {
     std::printf("test-kvarn: detached backend buffers reallocate base tensors and views OK\n");
 }
 
+// The numeric gate below is shared by the GPU shapes and by host-only
+// negative controls. A corrupted buffer must return a failure here; the
+// controls prove that NaN, +Inf and the unwritten LSE sentinel cannot pass
+// as a fully masked row or as finite output.
+struct lse_parity_value_verdict {
+    std::vector<std::string> failures;
+    size_t total_failures = 0;
+    int finite_rows = 0;
+    int masked_rows = 0;
+};
+
+static lse_parity_value_verdict check_lse_parity_value_contracts(
+        const char * shape_name,
+        int head_dim,
+        bool all_masked,
+        bool plain_matches_gate_layout,
+        const std::vector<float> & o_gate,
+        const std::vector<float> & o_plain,
+        const std::vector<float> & o_cpu,
+        const std::vector<float> & lse_gate,
+        const lse_fp64_reference & fp64_gate) {
+    lse_parity_value_verdict out;
+    // Keep the first failure detail for reproduction and count the rest. A
+    // fully masked large shape can otherwise produce millions of identical
+    // log lines without adding evidence.
+    constexpr size_t k_max_detailed_failures = 32;
+    const auto fail = [&](const std::string & detail) {
+        ++out.total_failures;
+        if (out.failures.size() < k_max_detailed_failures) {
+            out.failures.push_back(std::string(shape_name) + ": " + detail);
+        }
+    };
+    if (head_dim <= 0) {
+        fail("invalid head dimension for the O/LSE gate");
+        return out;
+    }
+    if (o_gate.size() != fp64_gate.o.size() || o_plain.size() != fp64_gate.o.size() ||
+            o_cpu.size() != fp64_gate.o.size() || lse_gate.size() != fp64_gate.lse.size() ||
+            fp64_gate.row_has_keys.size() != fp64_gate.lse.size()) {
+        fail("reference/output size mismatch before the value contracts");
+        return out;
+    }
+
+    for (size_t i = 0; i < o_gate.size(); ++i) {
+        const size_t row = i / size_t(head_dim);
+        if (row >= fp64_gate.row_has_keys.size()) {
+            fail("O index is outside the reference row table");
+            return out;
+        }
+        const bool masked = fp64_gate.row_has_keys[row] == 0;
+        if (!std::isfinite(o_gate[i])) {
+            fail("gated O[" + std::to_string(i) + "] is " + std::to_string(o_gate[i]));
+        }
+        if (!std::isfinite(o_plain[i])) {
+            fail("plain O[" + std::to_string(i) + "] is " + std::to_string(o_plain[i]));
+        }
+        if (!std::isfinite(o_cpu[i])) {
+            fail("CPU O[" + std::to_string(i) + "] is " + std::to_string(o_cpu[i]));
+        }
+        if (masked) {
+            if (o_gate[i] != 0.0f) {
+                fail("masked O[" + std::to_string(i) + "] is " +
+                        std::to_string(o_gate[i]) + " instead of exact 0");
+            } else {
+                if (!plain_matches_gate_layout) {
+                    fail("masked production-layout plain O requires an explicit row mapping");
+                } else if (o_plain[i] != 0.0f) {
+                    fail("masked plain O[" + std::to_string(i) + "] is " +
+                            std::to_string(o_plain[i]) + " instead of exact 0");
+                }
+            }
+            if (o_cpu[i] != 0.0f) {
+                fail("masked CPU O[" + std::to_string(i) + "] is " +
+                        std::to_string(o_cpu[i]) + " instead of exact 0");
+            }
+            if (fp64_gate.o[i] != 0.0) {
+                fail("FP64 reference for masked O[" + std::to_string(i) + "] is not exact 0");
+            }
+        } else if (!std::isfinite(fp64_gate.o[i])) {
+            fail("FP64 reference for visible O[" + std::to_string(i) + "] is not finite");
+        }
+    }
+
+    constexpr float k_unwritten_lse = -7777.0f;
+    for (size_t r = 0; r < lse_gate.size(); ++r) {
+        const float got = lse_gate[r];
+        if (std::fabs(got - k_unwritten_lse) < 1.0f) {
+            fail("LSE row " + std::to_string(r) + " still holds the unwritten sentinel");
+            continue;
+        }
+        if (fp64_gate.row_has_keys[r] == 0) {
+            ++out.masked_rows;
+            if (!(got == -INFINITY)) {
+                fail("masked LSE row " + std::to_string(r) + " is " +
+                        std::to_string(got) + " instead of exact -inf");
+            }
+            if (!(fp64_gate.lse[r] == -INFINITY)) {
+                fail("FP64 reference for masked LSE row " + std::to_string(r) +
+                        " is not exact -inf");
+            }
+            continue;
+        }
+        ++out.finite_rows;
+        if (!std::isfinite(got)) {
+            fail("visible LSE row " + std::to_string(r) + " is " +
+                    std::to_string(got));
+        }
+        if (!std::isfinite(fp64_gate.lse[r])) {
+            fail("FP64 reference for visible LSE row " + std::to_string(r) +
+                    " is not finite");
+        }
+    }
+    if (all_masked) {
+        for (size_t r = 0; r < fp64_gate.row_has_keys.size(); ++r) {
+            if (fp64_gate.row_has_keys[r] != 0) {
+                fail("all-masked shape has visible keys in reference row " +
+                        std::to_string(r));
+            }
+        }
+    }
+    return out;
+}
+
+static void test_lse_parity_value_contracts_reject_corruption() {
+    const int head_dim = 2;
+    const std::vector<float> o_valid = {0.125f, -0.25f, 0.0f, 0.0f};
+    const std::vector<float> lse_valid = {0.5f, -INFINITY};
+    lse_fp64_reference fp64_valid;
+    fp64_valid.o = {0.125, -0.25, 0.0, 0.0};
+    fp64_valid.lse = {0.5, -INFINITY};
+    fp64_valid.row_has_keys = {1, 0};
+
+    const auto valid = check_lse_parity_value_contracts(
+            "negative-control", head_dim, false, true,
+            o_valid, o_valid, o_valid, lse_valid, fp64_valid);
+    require(valid.failures.empty() && valid.finite_rows == 1 && valid.masked_rows == 1,
+            "LSE parity negative-control baseline must pass the value gate");
+    const auto expect_rejection = [&](
+            const char * case_name,
+            const std::vector<float> & bad_o_gate,
+            const std::vector<float> & bad_o_plain,
+            const std::vector<float> & bad_o_cpu,
+            const std::vector<float> & bad_lse,
+            const lse_fp64_reference & bad_fp64) {
+        const auto verdict = check_lse_parity_value_contracts(
+                case_name, head_dim, false, true,
+                bad_o_gate, bad_o_plain, bad_o_cpu, bad_lse, bad_fp64);
+        if (!verdict.failures.empty()) {
+            return;
+        }
+        std::fprintf(stderr, "test-kvarn: negative control accepted: %s\n", case_name);
+        require(false, "LSE parity verifier accepted a corrupted buffer");
+    };
+
+    const float nan = std::nanf("");
+    const float inf = INFINITY;
+    auto bad = o_valid;
+    bad[0] = nan;
+    expect_rejection("gated O NaN", bad, o_valid, o_valid, lse_valid, fp64_valid);
+    bad = o_valid;
+    bad[1] = inf;
+    expect_rejection("gated O +Inf", bad, o_valid, o_valid, lse_valid, fp64_valid);
+    bad = o_valid;
+    bad[0] = nan;
+    expect_rejection("plain O NaN", o_valid, bad, o_valid, lse_valid, fp64_valid);
+    bad = o_valid;
+    bad[1] = -inf;
+    expect_rejection("CPU O -Inf", o_valid, o_valid, bad, lse_valid, fp64_valid);
+    bad = o_valid;
+    bad[2] = 0.03125f;
+    expect_rejection("masked O nonzero", bad, o_valid, o_valid, lse_valid, fp64_valid);
+    bad = o_valid;
+    bad[3] = -0.0625f;
+    expect_rejection("masked plain O nonzero", o_valid, bad, o_valid, lse_valid, fp64_valid);
+    auto bad_lse = lse_valid;
+    bad_lse[1] = nan;
+    expect_rejection("masked LSE NaN", o_valid, o_valid, o_valid, bad_lse, fp64_valid);
+    bad_lse = lse_valid;
+    bad_lse[1] = inf;
+    expect_rejection("masked LSE +Inf", o_valid, o_valid, o_valid, bad_lse, fp64_valid);
+    bad_lse = lse_valid;
+    bad_lse[0] = inf;
+    expect_rejection("visible LSE +Inf", o_valid, o_valid, o_valid, bad_lse, fp64_valid);
+    bad_lse = lse_valid;
+    bad_lse[0] = -7777.0f;
+    expect_rejection("unwritten LSE sentinel", o_valid, o_valid, o_valid, bad_lse, fp64_valid);
+    auto bad_fp64 = fp64_valid;
+    bad_fp64.lse[0] = nan;
+    expect_rejection("non-finite FP64 LSE", o_valid, o_valid, o_valid, lse_valid, bad_fp64);
+}
+
 // Position-split LSE numeric proof on the native KVarN CUDA/Vulkan routes
 // (plan §3.4, F1b, second review item 2/5). The support probe only asked
 // supports_op; this runs the kernels and compares numbers, because the windowed
 // single-window fast path used to accept an LSE request for Q >= 512 and return
 // before the finalizers, leaving the LSE buffer untouched.
 static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type device_type, const char * label) {
+    // Prove the verifier rejects corrupted buffers before it trusts real
+    // kernel output. This host-only check cannot be relaxed to get green.
+    test_lse_parity_value_contracts_reject_corruption();
     ggml_backend_t gpu = init_test_backend(device_type, false);
     if (gpu == nullptr) {
         return;
@@ -6246,8 +6610,11 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
             // they are never counted as covered by plan section 3.4.
             bool tail;
         };
-        // fp64_reference = false: the FP64 reference models the main KV range
-        // only, so tail shapes are gated against the CPU route driven with the
+        // fp64_reference = true for every structural shape. Production layouts
+        // cannot request the FP64 reference from the permuted graph (the
+        // reference is only defined for the non-permuted query order), so
+        // their gate uses the mathematically equivalent non-permuted run
+        // below. Tail shapes are gated against the CPU route driven with the
         // same dequantized records and the same tail inputs.
         const shape shapes[] = {
             { "d64-q1",           64,   1,  6, 1, false, false, 0, 0, false, true , false },
@@ -6261,8 +6628,8 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
             { "d256-q2",         256,   2,  6, 1, false, false, 0, 0, false, true , false },
             { "d256-q256",       256, 256, 24, 4, false, false, 0, 0, false, true , false },
             { "d256-q512",       256, 512, 24, 4, false, false, 0, 0, false, true , false },
-            { "d256-q4-prod",    256,   4, 24, 4, true,  false, 0, 0, false, false , false },
-            { "d256-q8-prod",    256,   8, 24, 4, true,  false, 0, 0, false, false , false },
+            { "d256-q4-prod",    256,   4, 24, 4, true,  false, 0, 0, false, true , false },
+            { "d256-q8-prod",    256,   8, 24, 4, true,  false, 0, 0, false, true , false },
             { "d128-q1-allmask", 128,   1,  6, 1, false, true,  0, 0, false, true , false },
             { "d128-q256-allmsk",128, 256, 24, 4, false, true,  0, 0, false, true , false },
             { "d256-q1-tail",    256,   1, 24, 4, false, false, 128, 4, false, true , true },
@@ -6293,8 +6660,8 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
                 std::fprintf(stderr, "[LSEFAIL] %s: %s\n", tag.c_str(), buf);
             };
 
-            lse_fp64_reference fp64_gpu, fp64_cpu;
-            std::vector<float> lse_gpu, lse_cpu;
+            lse_fp64_reference fp64_gpu, fp64_cpu, fp64_np;
+            std::vector<float> lse_gpu, lse_cpu, lse_np, o_np;
             test_kvarn_route_stats st_plain = make_test_kvarn_route_stats();
             test_kvarn_route_stats st_lse = make_test_kvarn_route_stats();
 
@@ -6316,7 +6683,7 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
                     sh.exact_tail_tokens, false, GGML_TYPE_F16,
                     sh.exact_tail_current_tokens, sh.exact_tail_bodyless,
                     sh.production_layout, -1, false, false, false, 0, false,
-                    opts, &lse_gpu, sh.fp64_reference ? &fp64_gpu : nullptr);
+                    opts, &lse_gpu, (!sh.production_layout && sh.fp64_reference) ? &fp64_gpu : nullptr);
             route_get(&st_lse);
 
             // The FP64 reference is defined on the non-permuted query layout
@@ -6326,14 +6693,16 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
             // checked directly here: the permuted run must reproduce the
             // non-permuted run element-wise, and inherits its FP64 gate.
             if (sh.production_layout) {
-                lse_fp64_reference fp64_np;
-                std::vector<float> lse_np;
-                const std::vector<float> o_np = test_native_flash_attention_output(
+                const std::vector<float> o_np_run = test_native_flash_attention_output(
                         gpu, true, true, sh.head_dim, 4, 4, sh.n_q, sh.n_q_heads,
                         sh.n_kv_heads, n_kv, stage_groups, false, nullptr, false,
                         sh.exact_tail_tokens, false, GGML_TYPE_F16, 0, false,
                         false, -1, false, false, false, 0, false, opts,
                         &lse_np, &fp64_np);
+                o_np = o_np_run;
+                // The production output inherits the non-permuted FP64 gate
+                // only because the layout contract above is exact.
+                fp64_gpu = fp64_np;
                 if (o_np.size() != o_lse.size()) {
                     fail("permuted/non-permuted O size mismatch");
                 } else {
@@ -6350,21 +6719,19 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
                     if (lse_np.size() != lse_gpu.size()) {
                         fail("permuted/non-permuted LSE size mismatch");
                     } else {
-                        double max_lse_diff = 0.0;
+                        bool lse_layout_matches = true;
                         for (size_t r = 0; r < lse_np.size(); ++r) {
                             const double a = lse_np[r];
                             const double b = lse_gpu[r];
-                            if (std::isinf(a) || std::isinf(b)) {
-                                max_lse_diff = std::max(max_lse_diff,
-                                        std::fabs((std::isinf(a) ? 1.0 : 0.0) -
-                                                  (std::isinf(b) ? 1.0 : 0.0)));
-                                continue;
+                            if (!(a == b)) {
+                                lse_layout_matches = false;
+                                break;
                             }
-                            max_lse_diff = std::max(max_lse_diff, std::fabs(a - b));
                         }
-                        if (max_lse_diff != 0.0) {
-                            fail("permuted query layout changed LSE (max_abs=%.6g): LSE "
-                                 "rows must be indexed [head, query, batch]", max_lse_diff);
+                        if (!lse_layout_matches) {
+                            fail("permuted query layout changed LSE: LSE "
+                                 "rows must be indexed [head, query, batch] and match exactly, "
+                                 "including -inf (NaN and +Inf are not equivalent)");
                         }
                     }
                 }
@@ -6390,8 +6757,13 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
                 fail("LSE size mismatch: %zu expected %zu", lse_gpu.size(), lse_size);
                 continue;
             }
-            if (!sh.production_layout &&
-                    (fp64_gpu.o.size() != o_size || fp64_gpu.lse.size() != lse_size)) {
+            if (sh.production_layout &&
+                    (o_np.size() != o_size || lse_np.size() != lse_size)) {
+                fail("non-permuted production-equivalent size mismatch: o=%zu lse=%zu expected=%zu/%zu",
+                        o_np.size(), lse_np.size(), o_size, lse_size);
+                continue;
+            }
+            if (fp64_gpu.o.size() != o_size || fp64_gpu.lse.size() != lse_size) {
                 fail("FP64 reference size mismatch: o=%zu lse=%zu",
                         fp64_gpu.o.size(), fp64_gpu.lse.size());
                 continue;
@@ -6400,69 +6772,66 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
                 fail("no KVarN route executed with the LSE attachment (telemetry is zero)");
             }
 
-            const double k_sentinel = 7777.0;
+            // Production shapes are numerically gated through the equivalent
+            // non-permuted outputs; the plain production run only checks the
+            // production tensor order by exact comparison.
+            const std::vector<float> & o_gate = sh.production_layout ? o_np : o_lse;
+            const std::vector<float> & lse_gate = sh.production_layout ? lse_np : lse_gpu;
+            const lse_fp64_reference & fp64_gate = sh.production_layout ? fp64_np : fp64_gpu;
+            const bool plain_matches_gate_layout = !sh.production_layout;
+            int finite_rows = 0, masked_rows = 0;
+            const lse_parity_value_verdict value_verdict = check_lse_parity_value_contracts(
+                    sh.name, sh.head_dim, sh.all_masked, plain_matches_gate_layout,
+                    o_gate, o_plain, o_cpu, lse_gate, fp64_gate);
+            for (const std::string & issue : value_verdict.failures) {
+                fail("%s", issue.c_str());
+            }
+            if (value_verdict.total_failures > value_verdict.failures.size()) {
+                fail("%zu value-contract failures (%zu details retained above)",
+                        value_verdict.total_failures, value_verdict.failures.size());
+            }
+            finite_rows = value_verdict.finite_rows;
+            masked_rows = value_verdict.masked_rows;
+
             double sum_sq = 0.0, sum_ref_sq = 0.0, sum_plain_sq = 0.0;
             const bool gate_fp64 = sh.fp64_reference;
             double max_abs_o = 0.0, max_abs_plain = 0.0, max_abs_cpu = 0.0;
             double max_abs_lse = 0.0;
-            int sentinel_rows = 0, finite_rows = 0, masked_rows = 0;
             for (size_t i = 0; i < o_size && gate_fp64; ++i) {
-                if (!std::isfinite(o_lse[i])) {
+                if (!std::isfinite(o_gate[i])) {
                     fail("O[%zu] is NaN/Inf with the LSE attached", i);
                     break;
                 }
-                const double d = double(o_lse[i]) - fp64_gpu.o[i];
+                const double d = double(o_gate[i]) - fp64_gate.o[i];
                 const double dp = double(o_lse[i]) - double(o_plain[i]);
                 const double dc = double(o_cpu[i]) - fp64_cpu.o[i];
                 sum_sq += d * d;
-                sum_ref_sq += fp64_gpu.o[i] * fp64_gpu.o[i];
+                sum_ref_sq += fp64_gate.o[i] * fp64_gate.o[i];
                 sum_plain_sq += dp * dp;
                 max_abs_o = std::max(max_abs_o, std::fabs(d));
                 max_abs_plain = std::max(max_abs_plain, std::fabs(dp));
                 max_abs_cpu = std::max(max_abs_cpu, std::fabs(dc));
             }
-            // LSE loop is separate from the O loop: O has head_dim times more
-            // elements than LSE (review 4, P1 out-of-range reproduction).
+            // The shared value gate above classifies masked/visible rows,
+            // rejects NaN/+Inf/sentinel values and counts rows. This loop only
+            // measures the finite visible-row LSE error already proven finite.
             for (size_t r = 0; r < lse_size && gate_fp64; ++r) {
-                const double got = double(lse_gpu[r]);
-                const double ref = fp64_gpu.lse[r];
-                if (std::fabs(got + k_sentinel) < 1.0) {
-                    ++sentinel_rows;
+                if (fp64_gate.row_has_keys[r] == 0) {
                     continue;
                 }
-                if (!fp64_gpu.row_has_keys[r]) {
-                    ++masked_rows;
-                    // A fully masked row is an exact contract, not a tolerance:
-                    // O == 0 and LSE == -inf on both sides.
-                    if (std::isfinite(got)) {
-                        fail("row %zu is fully masked in the reference but the route "
-                             "published a finite LSE (%g)", r, got);
-                    }
-                    continue;
-                }
-                ++finite_rows;
-                if (!std::isfinite(got)) {
-                    fail("row %zu has visible keys but the route published LSE=%g", r, got);
-                    continue;
-                }
-                if (!std::isfinite(ref)) {
-                    fail("row %zu has visible keys but the FP64 reference is not finite", r);
-                    continue;
-                }
+                const double got = double(lse_gate[r]);
+                const double ref = fp64_gate.lse[r];
                 max_abs_lse = std::max(max_abs_lse, std::fabs(got - ref));
-            }
-            if (gate_fp64 && sentinel_rows > 0) {
-                fail("%d LSE entries still hold the unwritten sentinel", sentinel_rows);
             }
             const double rms_ref = std::sqrt(sum_ref_sq / double(o_size));
             const double nrmse = std::sqrt(sum_sq / double(o_size)) / std::max(rms_ref, 1e-6);
             const double nrmse_plain = std::sqrt(sum_plain_sq / double(o_size)) / std::max(rms_ref, 1e-6);
             const double nrmse_cpu = max_abs_cpu; // reported as the control's max abs
-            if (gate_fp64 && nrmse > 1e-3) {
+            if (gate_fp64 && !(nrmse <= 1e-3)) {
                 fail("NRMSE(O)=%.6g exceeds 1e-3 (max_abs=%.3g, attach_max_abs=%.3g, "
                         "cpu_control_max_abs=%.3g)", nrmse, max_abs_o, max_abs_plain, nrmse_cpu);
             }
-            if (gate_fp64 && max_abs_o > 1e-2) {
+            if (gate_fp64 && !(max_abs_o <= 1e-2)) {
                 fail("max_abs(O)=%.6g exceeds 1e-2", max_abs_o);
             }
             // Attachment isolation is only meaningful when both runs took the
@@ -6475,11 +6844,11 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
                 st_plain.generic_mma   == st_lse.generic_mma   &&
                 st_plain.prompt_prefill== st_lse.prompt_prefill&&
                 st_plain.portable_native == st_lse.portable_native;
-            if (gate_fp64 && same_route && nrmse_plain > 1e-3) {
+            if (gate_fp64 && same_route && !(nrmse_plain <= 1e-3)) {
                 fail("attachment isolation on the same route: "
                      "NRMSE(O with LSE vs O without)=%.6g exceeds 1e-3", nrmse_plain);
             }
-            if (gate_fp64 && max_abs_lse > 1e-2) {
+            if (gate_fp64 && !(max_abs_lse <= 1e-2)) {
                 fail("max_abs(LSE)=%.6g exceeds 1e-2", max_abs_lse);
             }
             if (gate_fp64 && finite_rows == 0 && !sh.all_masked) {
@@ -6625,6 +6994,12 @@ int main() {
         return 0;
     }
 
+    if (std::getenv("GGML_KVARN_TEST_D64_MULTI_QUERY_ONLY") != nullptr) {
+        test_d64_multi_query_split_parity_gpu();
+        std::printf("test-kvarn: D64 multi-query split parity OK\n");
+        return 0;
+    }
+
     kvarn_suffix_rollback_capability_contract();
     kvarn_composite_exclusivity_forwards();
     kvarn_composite_removal_plan_forwards();
@@ -6749,6 +7124,7 @@ int main() {
     test_native_flash_attention_lse_parity(GGML_BACKEND_DEVICE_TYPE_GPU, "GPU");
     test_native_flash_attention_gpu();
     test_odd_offset_record_decode_gpu();
+    test_d64_multi_query_split_parity_gpu();
     test_d64_materialized_body_exact_tail_gpu();
     test_native_flash_attention_prefill_route_parity();
     test_dflash_non_causal_attention_parity();

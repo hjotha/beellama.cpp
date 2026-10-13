@@ -1,0 +1,9 @@
+GPU ready: inactive gpu=0
+launched P=256 pid=3098784 health=200 split=[off]
+R1-populate ERROR {'code': 500, 'message': 'decode() failed: KV tail layer 3 current-segment descriptor does not match the final operation', 'type': 'server_error'}
+PREREQ FAIL: split not enabled for P=256 after first request
+    [48049] 0.05.485.637 W NVIDIA GPU memory clock lock: nvmlDeviceSetMemoryLockedClocks failed: Insufficient Permissions (requires elevated privilege), skipping dynamic memory lock
+    [48049] 0.05.842.634 E srv  update_slots: decode() failed: KV tail layer 3 current-segment descriptor does not match the final operation
+    [48049] 0.05.842.643 E srv    send_error: task id = 0, error: decode() failed: KV tail layer 3 current-segment descriptor does not match the final operation
+=== SUMMARY ===
+DONE

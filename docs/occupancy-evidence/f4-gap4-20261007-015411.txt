@@ -1,0 +1,30 @@
+launched server pid=3248464
+P1-populate prompt=556 cache_n=0 reprocessed=556
+fingerprint BEFORE = 6c35d2c18dcb1b5209ac5c2b58db1e1a72923b925ffd79a25d4fafd6a57efe61  file=auto-1ee08d954f58561c-e8b24134cbffd159-563.bin
+wrong_model prompt=556 cache_n=512 reprocessed=44
+  [wrong_model] loader: 
+  [wrong_model] MISSING expected refusal: source model identity does not match the destination
+  [wrong_model] FINGERPRINT CHANGED 6c35d2c18dcb1b5209ac5c2b58db1e1a72923b925ffd79a25d4fafd6a57efe61 -> 0489a53ed08bac122c3c6064ff7605ff357c408d6e22c31467d142e6fed3a9a9
+wrong_model_crc prompt=556 cache_n=512 reprocessed=44
+  [wrong_model_crc] loader: 
+  [wrong_model_crc] MISSING expected refusal: source identity checksum mismatch
+  [wrong_model_crc] FINGERPRINT CHANGED 6c35d2c18dcb1b5209ac5c2b58db1e1a72923b925ffd79a25d4fafd6a57efe61 -> b82292aa1c7fb0220d9bfc45773437a14f42d31e000d0a5320284ed6dc982e02
+wrong_rope prompt=556 cache_n=512 reprocessed=44
+  [wrong_rope] loader: 
+  [wrong_rope] MISSING expected refusal: source RoPE identity does not match the destination
+  [wrong_rope] FINGERPRINT CHANGED 6c35d2c18dcb1b5209ac5c2b58db1e1a72923b925ffd79a25d4fafd6a57efe61 -> 9646d2098293da58386a0c78e897a6d93ab33dbf2acb7f568caefd3ca8955c83
+unknown_ver prompt=556 cache_n=512 reprocessed=44
+  [unknown_ver] loader: 
+  [unknown_ver] MISSING expected refusal: unsupported snapshot version
+  [unknown_ver] FINGERPRINT CHANGED 6c35d2c18dcb1b5209ac5c2b58db1e1a72923b925ffd79a25d4fafd6a57efe61 -> 4ca9f5687e00220f2e937710a23543678ab6a2c8e351510bfdcc51ef86c1a91e
+corrupt_header prompt=556 cache_n=512 reprocessed=44
+  [corrupt_header] loader: 
+  [corrupt_header] MISSING expected refusal: header checksum mismatch
+  [corrupt_header] FINGERPRINT CHANGED 6c35d2c18dcb1b5209ac5c2b58db1e1a72923b925ffd79a25d4fafd6a57efe61 -> 6fda94a8b9c688f3db9c538c5bb2427420c26d9cbaa4e50da76925cb347d2787
+truncated prompt=556 cache_n=512 reprocessed=44
+  [truncated] loader: 
+  [truncated] FINGERPRINT CHANGED 6c35d2c18dcb1b5209ac5c2b58db1e1a72923b925ffd79a25d4fafd6a57efe61 -> 9b43e9129c0a375e9ac82e425a8c16e5a92bdc174d4715563419e215ea802ef7
+P3-reprocess prompt=556 cache_n=512 reprocessed=44
+FINAL fingerprint CHANGED 6c35d2c18dcb1b5209ac5c2b58db1e1a72923b925ffd79a25d4fafd6a57efe61 -> fecda1ae433646dcfcf147e034c038fce1d5420ec07519229889cef97ff513bb
+=== SUMMARY ===
+DONE

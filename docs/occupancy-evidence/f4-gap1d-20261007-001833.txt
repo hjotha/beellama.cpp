@@ -1,0 +1,5 @@
+GPU ready: inactive gpu=0
+launched P=256 pid=2946657 health=200 split=[off]
+PREREQ FAIL: split not enabled for P=256
+=== SUMMARY ===
+DONE

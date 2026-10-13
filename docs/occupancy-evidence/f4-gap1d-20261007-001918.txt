@@ -1,0 +1,11 @@
+GPU ready: inactive gpu=0
+launched P=256 pid=2948096 health=200 split=[off]
+R1-populate ERROR {'code': 500, 'message': 'model name=qwen-3.8-27b failed to load', 'type': 'server_error'}
+PREREQ FAIL: split not enabled for P=256 after first request
+    [45817] 0.05.589.609 E llama_init_from_model: failed to initialize the context: position-split KV não suporta contexto MTP
+    [45817] 0.05.589.612 E common_speculative_init_result: failed to create MTP context
+    [45817] 0.05.589.618 E srv    load_model: failed to create MTP context
+    [45817] 0.05.590.767 E srv  llama_server: exiting due to model loading error
+    0.06.102.913 W srv    operator(): got exception: {"error":{"code":500,"message":"model name=qwen-3.8-27b failed to load","type":"server_error"}}
+=== SUMMARY ===
+DONE

@@ -5,6 +5,7 @@
 #include "llama-context.h"
 #include "llama-state-q4.h"
 #include "llama-position-split.h"
+#include "llama-kv-cache-kvarn.h"
 
 //
 // llama_memory_hybrid
@@ -91,10 +92,41 @@ llama_memory_hybrid::llama_memory_hybrid(
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
         std::unique_ptr<llama_memory_i> mem_attn,
-        std::unique_ptr<llama_memory_recurrent> mem_recr) :
+        std::unique_ptr<llama_memory_recurrent> mem_recr,
+        uint32_t position_split_p) :
     hparams(model.hparams),
     mem_attn(std::move(mem_attn)),
-    mem_recr(std::move(mem_recr)) {
+    mem_recr(std::move(mem_recr)),
+    position_split_p(position_split_p) {
+    // F2b: a fronteira é fixada junto com o cache por posição, para que a
+    // divisão do ubatch em P e a recusa fail-closed sejam as mesmas duas
+    // camadas que alocam as faixas. Nota: o parâmetro mem_attn foi movido
+    // para o membro na lista de inicialização; usar this->mem_attn aqui.
+    if (position_split_p != 0) {
+        const uint32_t c = this->mem_attn ? this->mem_attn->get_kv_size() : 0;
+        if (!llama_position_split::is_valid_p(position_split_p, c)) {
+            throw std::invalid_argument(format(
+                    "llama_memory_hybrid: P=%u inválido para C=%u (múltiplo de 256, 0 < P < C)",
+                    position_split_p, c));
+        }
+    }
+    // The boundary must be fixed together with the cache on BOTH sides. The
+    // previous check only ran when this hybrid's own P was non-zero, so a
+    // hybrid built without P in front of a P-enabled KVarN cache was accepted
+    // silently and the ubatch division at P was skipped: crossing ubatches then
+    // reached find_slot and the local band filled past its usable capacity.
+    // Fail closed symmetrically instead of allowing that state.
+    if (this->mem_attn) {
+        if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(this->mem_attn.get())) {
+            const uint32_t cache_p = kvarn->position_split_p();
+            if (cache_p != position_split_p) {
+                throw std::invalid_argument(format(
+                        "llama_memory_hybrid: P=%u diverge do cache por posição P=%u "
+                        "[split boundary must be fixed together with the cache]",
+                        position_split_p, cache_p));
+            }
+        }
+    }
 }
 
 
@@ -162,12 +194,16 @@ static llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vec
         }
         cursor += size_t(n_ids);
     }
+    for (uint32_t p = 0; p < src.n_pos; ++p) {
+        const size_t dst_base = size_t(p) * sel.size();
+        const size_t src_base = size_t(p) * src.n_tokens;
+        for (size_t i = 0; i < sel.size(); ++i) {
+            data->pos[dst_base + i] = src.pos[src_base + size_t(sel[i])];
+        }
+    }
     for (size_t i = 0; i < sel.size(); ++i) {
         const int32_t t = sel[i];
         data->token[i] = src.token[t];
-        for (uint32_t p = 0; p < src.n_pos; ++p) {
-            data->pos[i * src.n_pos + p] = src.pos[size_t(t) * src.n_pos + p];
-        }
         data->n_seq_id[i] = src.n_seq_id[t];
         data->output[i]  = src.output[t];
         data->seq_id[i]  = data->seq_id_data.data() + id_offset[i];
@@ -208,12 +244,18 @@ bool llama_position_split::divide_ubatches_at_p(
     std::vector<llama_ubatch> staged;
 
     for (const llama_ubatch & ub : in) {
-        // Absolute position range of this ubatch.
+        // Absolute position range of this ubatch, using the first (temporal)
+        // position per token so M-RoPE spatial components never define a range.
+        if (ub.n_pos < 1 || ub.pos == nullptr) {
+            error = "ubatch without positions cannot be range-checked at P";
+            return false;
+        }
         llama_pos pos_min = ub.pos[0];
         llama_pos pos_max = ub.pos[0];
         for (uint32_t i = 1; i < ub.n_tokens; ++i) {
-            pos_min = std::min(pos_min, ub.pos[i]);
-            pos_max = std::max(pos_max, ub.pos[i]);
+            const llama_pos pos = ub.pos[i];
+            pos_min = std::min(pos_min, pos);
+            pos_max = std::max(pos_max, pos);
         }
 
         const bool crosses = pos_min < llama_pos(p) && pos_max >= llama_pos(p);
@@ -228,10 +270,9 @@ bool llama_position_split::divide_ubatches_at_p(
                     "ubatches only";
             return false;
         }
-        if (ub.n_seqs != 1 || ub.n_pos != 1) {
+        if (ub.n_seqs != 1) {
             error = "ubatch crossing P has " + std::to_string(ub.n_seqs) +
-                    " sequence sets and " + std::to_string(ub.n_pos) +
-                    " position axes: only single-sequence-set token ubatches can be divided";
+                    " sequence sets: only single-sequence-set token ubatches can be divided";
             return false;
         }
 
@@ -400,15 +441,24 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    return mem_recr->can_seq_rm(seq_id, p0, p1) &&
-           mem_attn->can_seq_rm(seq_id, p0, p1);
+    const bool recr_ok = mem_recr->can_seq_rm(seq_id, p0, p1);
+    const bool attn_ok = mem_attn->can_seq_rm(seq_id, p0, p1);
+    if (getenv("LLAMA_SEQRM_DBG") && (!recr_ok || !attn_ok)) {
+        fprintf(stderr, "SEQRMDBG hybrid can_seq_rm seq=%d p0=%d p1=%d recr=%d attn=%d\n",
+                seq_id, p0, p1, int(recr_ok), int(attn_ok));
+    }
+    return recr_ok && attn_ok;
 }
 
 bool llama_memory_hybrid::seq_rm_plan(
         llama_seq_id seq_id, llama_pos p0, llama_pos p1,
         llama_pos & planned_p0, llama_pos & planned_p1) const {
-    return llama_memory_seq_rm_plan_all(
+    const bool ok = llama_memory_seq_rm_plan_all(
             seq_id, p0, p1, { mem_attn.get(), mem_recr.get() }, planned_p0, planned_p1);
+    if (getenv("LLAMA_SEQRM_DBG") && !ok) {
+        fprintf(stderr, "SEQRMDBG hybrid seq_rm_plan fail seq=%d p0=%d p1=%d\n", seq_id, p0, p1);
+    }
+    return ok;
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -659,6 +709,10 @@ bool llama_memory_hybrid_context::apply() {
     return res;
 }
 
+void llama_memory_hybrid_context::reset_graph_store_slots() const {
+    ctx_attn->reset_graph_store_slots();
+}
+
 void llama_memory_hybrid_context::graph_compute_start() {
     ctx_attn->graph_compute_start();
     ctx_recr->graph_compute_start();
@@ -673,6 +727,12 @@ void llama_memory_hybrid_context::graph_compute_complete(
         ggml_backend_sched_t sched, ggml_status compute_status) {
     ctx_attn->graph_compute_complete(sched, compute_status);
     ctx_recr->graph_compute_complete(sched, compute_status);
+}
+
+void llama_memory_hybrid_context::capture_after_compute(
+        ggml_backend_sched_t sched, ggml_status compute_status) {
+    ctx_attn->capture_after_compute(sched, compute_status);
+    ctx_recr->capture_after_compute(sched, compute_status);
 }
 
 llama_memory_status llama_memory_hybrid_context::get_status() const {

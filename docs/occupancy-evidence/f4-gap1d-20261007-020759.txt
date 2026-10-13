@@ -1,0 +1,8 @@
+GPU ready: inactive gpu=0
+launched P=256 pid=3103482 health=200 split=[off]
+R1-populate ok prompt=1372 completion=16 cache_n=0 lcp=0 reprocessed=1372
+PREREQ FAIL: split not enabled for P=256 after first request
+    [43579] 0.05.019.953 W NVIDIA GPU memory clock lock: nvmlDeviceSetMemoryLockedClocks failed: Insufficient Permissions (requires elevated privilege), skipping dynamic memory lock
+    [43579] 0.09.723.048 W NVIDIA GPU power limit: nvmlDeviceSetPowerManagementLimit failed: Insufficient Permissions (requires elevated privilege), skipping dynamic power limit
+=== SUMMARY ===
+DONE

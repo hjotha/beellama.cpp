@@ -10,6 +10,15 @@ endif()
 
 # server-context containing the core server logic, used by llama-server and CLI
 
+# F4 TEST-ONLY full-logit capture hook (f4-test-logit-capture.*). OFF by default
+# and enabled ONLY for the build-f4 test tree, so it is never compiled into
+# build-optimized / production binaries. It adds no configuration surface.
+option(LLAMA_F4_TEST_LOGIT_CAPTURE "F4 test-only full-logit capture hook (never in production builds)" OFF)
+set(F4_TEST_LOGIT_CAPTURE_SOURCES)
+if (LLAMA_F4_TEST_LOGIT_CAPTURE)
+    list(APPEND F4_TEST_LOGIT_CAPTURE_SOURCES f4-test-logit-capture.cpp f4-test-logit-capture.h)
+endif()
+
 set(TARGET server-context)
 
 add_library(${TARGET} STATIC
@@ -41,6 +50,7 @@ server-loop-guard.cpp
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    ${F4_TEST_LOGIT_CAPTURE_SOURCES}
 )
 
 if (BUILD_SHARED_LIBS)
@@ -48,6 +58,16 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
+
+if (LLAMA_F4_TEST_LOGIT_CAPTURE)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_F4_TEST_LOGIT_CAPTURE=1)
+endif()
+
+# F4 TEST-ONLY backend copy/dispatch counters (ggml-f4-counters.h). OFF by
+# default; enabled only in build-f4, so nothing is added to build-optimized.
+if (LLAMA_F4_TEST_COUNTERS)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_F4_TEST_COUNTERS=1)
+endif()
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd vendor::hash ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 

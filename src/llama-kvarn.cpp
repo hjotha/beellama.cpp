@@ -1,5 +1,7 @@
 #include "llama-kvarn.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -61,11 +63,47 @@ static constexpr std::array<llama_kvarn_type_desc, LLAMA_KVARN_TYPE_COUNT> KVAR_
     LLAMA_KVARN_DESC(8, 8),
 }};
 
+bool llama_kvarn_backend_supports_non_causal_mask(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!llama_kvarn_backend_supports_non_causal_mask(
+                        ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    using capabilities_fn_t = bool (*)(ggml_backend_dev_t, ggml_backend_kvarn_capabilities *);
+    auto * fn = reg ? reinterpret_cast<capabilities_fn_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_capabilities")) : nullptr;
+    if (!fn) {
+        return false;
+    }
+    ggml_backend_kvarn_capabilities capabilities = {};
+    capabilities.struct_size = sizeof(capabilities);
+    capabilities.abi_version = GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION;
+    return fn(dev, &capabilities) && capabilities.struct_size == sizeof(capabilities) &&
+        capabilities.abi_version == GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION &&
+        (capabilities.route_families & GGML_BACKEND_KVARN_ROUTE_NON_CAUSAL_MASK) != 0;
+}
+
 bool llama_kvarn_native_attention_allowed(bool causal_attn, llm_arch arch) {
-    // DFlash non-causal block masks are qualified through the materialized
-    // oracle. Keep native record-consuming attention for causal DFlash and
-    // all existing architectures.
+    // The pre-existing causal and other-architecture policy is independent of
+    // the separately qualified non-causal DFlash route.
     return causal_attn || arch != LLM_ARCH_DFLASH;
+}
+
+bool llama_kvarn_native_attention_allowed(const llama_kvarn_native_attention_request & request) {
+    return (request.mask == LLAMA_KVARN_MASK_DFLASH_BLOCK ||
+            request.mask == LLAMA_KVARN_MASK_DFLASH_SWA) &&
+        request.owned_dense_kv && request.native_body_and_tail &&
+        request.backend_non_causal_mask &&
+        (request.head_dim == 128 || request.head_dim == 256 || request.head_dim == 512);
 }
 
 llama_kvarn_attention_plan llama_kvarn_plan_attention(
@@ -103,8 +141,31 @@ llama_kvarn_attention_plan llama_kvarn_plan_attention(
         return { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
     }
     if (native_original_v) {
-        return { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V };
+        // msg57 F5: the ROTATED_K_ORIGINAL_V route is the only production route
+        // never validated against the FP64 oracle, and it is measurably wrong:
+        //   * the exact tail: the graph feeds the STORED (original) tail V, but
+        //     the kernel applies the same inverse WHT it applies to the body V,
+        //     so the tail contribution is double-transformed
+        //     (test-position-split-real-pair: NRMSE 2.155e-01, maxO 1.857e+00);
+        //   * prefill: the mma original-domain V loader rounds the un-rotated V
+        //     to F16 before accumulating (maxO 1.03e-02 > the 1e-2 gate), while
+        //     the same geometry in the fully rotated domain passes at
+        //     NRMSE 3.977e-05 / maxO 1.363e-04 through portable-native.
+        // LLAMA_KVARN_PREFILL_ROTATED_DOMAIN=1 keeps the native route but in the
+        // fully rotated domain, so the graph un-rotates O and rotates the tail V
+        // (both already implemented) instead of relying on the kernel's
+        // original-domain V path. Default OFF preserves the historical layout
+        // for A/B; the F5 campaign measures this switch.
+        static const bool prefill_rotated_domain = [] {
+            const char * e = getenv("LLAMA_KVARN_PREFILL_ROTATED_DOMAIN");
+            return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+        }();
+        return prefill_rotated_domain
+            ? llama_kvarn_attention_plan { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED }
+            : llama_kvarn_attention_plan { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V };
     }
+    // unchanged: without the original-V capability the large-query route stays
+    // on the materialized fallback.
     return { false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
 }
 
@@ -159,6 +220,7 @@ llama_kvarn_params llama_kvarn_default_params() {
         /*.group               =*/ 128,
         /*.sinkhorn_iters      =*/ 16,
         /*.sink_tokens         =*/ 128,
+        /*.window_chunk        =*/ 0,
         /*.fail_if_unsupported =*/ true,
     };
 }

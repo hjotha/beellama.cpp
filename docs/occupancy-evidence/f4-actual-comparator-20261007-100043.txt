@@ -1,0 +1,10 @@
+RUN=/home/hjotha/f4-spool/cmp-20261007T100043Z
+RUN_ID=cmp-20261007T100043Z
+BUILD_ID=d9746b4fd486dac5-7f6b98a24ea48342
+GPU ready: inactive gpu=0
+launched producer P=off preset=test-pure-preset.ini pid=3877078 log=f4-actual-producer-100044.log
+A-produce prompt_n=556 cache_n=0 lcp=0 predicted=1 content=''
+producer stopped; disk prefix snapshots:
+  total 193740
+  -rw------- 1 hjotha hjotha 198387119 Oct  7 12:00 auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+NO 514-TOKEN PREFIX SNAPSHOT ON DISK

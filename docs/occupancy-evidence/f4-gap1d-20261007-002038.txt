@@ -1,0 +1,7 @@
+GPU ready: inactive gpu=0
+launched P=256 pid=2950515 health=200 split=[off]
+R1-populate ERROR {'code': 500, 'message': 'model name=qwen-3.8-27b failed to load', 'type': 'server_error'}
+PREREQ FAIL: split not enabled for P=256 after first request
+    0.03.375.572 W srv    operator(): got exception: {"error":{"code":500,"message":"model name=qwen-3.8-27b failed to load","type":"server_error"}}
+=== SUMMARY ===
+DONE

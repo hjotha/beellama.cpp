@@ -89,7 +89,7 @@ struct wire_reader {
 
 std::string mixed_manifest::validate(uint32_t max_layers, uint64_t max_metadata,
                                      uint32_t max_events) const {
-    if (version != MIXED_IO_MANIFEST_VERSION) {
+    if (version != MIXED_IO_MANIFEST_VERSION && version != MIXED_IO_MANIFEST_VERSION_V2) {
         return "unsupported mixed-io manifest version";
     }
     if (metadata.size() > max_metadata) {
@@ -138,53 +138,59 @@ std::string mixed_manifest::validate(uint32_t max_layers, uint64_t max_metadata,
         return "mixed-io manifest total_stream_bytes is nonzero without events";
     }
     if (layer_payload_sizes.size() > max_layers) {
-        return "mixed-io manifest layer count exceeds the limit";
+        return "mixed-io manifest range count exceeds the limit";
     }
-    uint32_t prev_layer = 0;
+    uint64_t prev_key = 0;
     bool first = true;
     for (const auto & lp : layer_payload_sizes) {
-        if (!first && lp.first <= prev_layer) {
-            return "mixed-io manifest layer ids are not strictly ordered";
+        // strictly ordered by the packed (layer_id, range_id) key, so two ranges
+        // of one layer are distinct entries instead of colliding
+        if (!first && lp.first <= prev_key) {
+            return "mixed-io manifest range keys are not strictly ordered";
         }
         first = false;
-        prev_layer = lp.first;
+        prev_key = lp.first;
         if (lp.second > MIXED_IO_MAX_TOTAL) {
-            return "mixed-io manifest layer payload size overflows the sanity bound";
+            return "mixed-io manifest range payload size overflows the sanity bound";
         }
     }
-    // every tensor event must reference a declared layer; layer-local
-    // payload offsets must be monotonic and within the layer total
-    std::unordered_map<uint32_t, uint64_t> layer_used;
-    std::unordered_map<uint32_t, uint64_t> layer_prev_off;
+    // every tensor event must reference a declared range; range-local
+    // payload offsets must be monotonic and within the range total
+    std::unordered_map<uint64_t, uint64_t> range_used;
+    std::unordered_map<uint64_t, uint64_t> range_prev_off;
     for (const mixed_manifest_event & e : events) {
         if (e.kind != 1) {
             continue;
         }
+        if (e.range_id > 1) {
+            return "mixed-io manifest tensor event has an unknown range_id";
+        }
+        const uint64_t key = mixed_range_key(e.layer_id, e.range_id);
         const auto it = std::find_if(layer_payload_sizes.begin(), layer_payload_sizes.end(),
-                                     [&](const std::pair<uint32_t, uint64_t> & lp) {
-                                         return lp.first == e.layer_id;
+                                     [&](const std::pair<uint64_t, uint64_t> & lp) {
+                                         return lp.first == key;
                                      });
         if (it == layer_payload_sizes.end()) {
-            return "mixed-io manifest tensor event references an undeclared layer";
+            return "mixed-io manifest tensor event references an undeclared range";
         }
-        const uint64_t prev = layer_prev_off.count(e.layer_id) ? layer_prev_off[e.layer_id] : 0;
+        const uint64_t prev = range_prev_off.count(key) ? range_prev_off[key] : 0;
         if (e.payload_offset != prev) {
             return "mixed-io manifest tensor event payload offsets are not contiguous";
         }
         // pre-bounded additions
         if (e.size > MIXED_IO_MAX_TOTAL - prev) {
-            return "mixed-io manifest layer payload offsets overflow the sanity bound";
+            return "mixed-io manifest range payload offsets overflow the sanity bound";
         }
-        layer_prev_off[e.layer_id] = prev + e.size;
-        const uint64_t used = layer_used[e.layer_id];
+        range_prev_off[key] = prev + e.size;
+        const uint64_t used = range_used[key];
         if (e.size > it->second - used) {
-            return "mixed-io manifest tensor event exceeds its layer payload size";
+            return "mixed-io manifest tensor event exceeds its range payload size";
         }
-        layer_used[e.layer_id] = used + e.size;
+        range_used[key] = used + e.size;
     }
     for (const auto & lp : layer_payload_sizes) {
-        if (layer_used[lp.first] != lp.second) {
-            return "mixed-io manifest layer payload size does not match its events";
+        if (range_used[lp.first] != lp.second) {
+            return "mixed-io manifest range payload size does not match its events";
         }
     }
     return "";
@@ -201,22 +207,25 @@ std::vector<uint8_t> mixed_manifest_serialize(const mixed_manifest & m, std::str
     const uint64_t n_metadata = m.metadata.size();
     const uint64_t n_events = m.events.size();
     const uint64_t n_layers = m.layer_payload_sizes.size();
+    const bool v2 = m.version >= MIXED_IO_MANIFEST_VERSION_V2;
+    const uint32_t event_bytes = v2 ? MIXED_IO_WIRE_EVENT_SIZE_V2 : MIXED_IO_WIRE_EVENT_SIZE;
+    const uint32_t layer_bytes_wire = v2 ? MIXED_IO_WIRE_LAYER_SIZE_V2 : MIXED_IO_WIRE_LAYER_SIZE;
     // overflow-checked wire body size
     uint64_t body = 16 + n_metadata + 8;
-    if (n_events > (MIXED_IO_MAX_TOTAL - body) / MIXED_IO_WIRE_EVENT_SIZE) {
+    if (n_events > (MIXED_IO_MAX_TOTAL - body) / event_bytes) {
         if (error) {
             *error = "mixed-io manifest event table size overflows";
         }
         return {};
     }
-    body += n_events * MIXED_IO_WIRE_EVENT_SIZE + 8;
-    if (n_layers > (MIXED_IO_MAX_TOTAL - body) / MIXED_IO_WIRE_LAYER_SIZE) {
+    body += n_events * event_bytes + 8;
+    if (n_layers > (MIXED_IO_MAX_TOTAL - body) / layer_bytes_wire) {
         if (error) {
             *error = "mixed-io manifest layer table size overflows";
         }
         return {};
     }
-    body += n_layers * MIXED_IO_WIRE_LAYER_SIZE + 8;
+    body += n_layers * layer_bytes_wire + 8;
     if (body > std::numeric_limits<size_t>::max()) {
         if (error) {
             *error = "mixed-io manifest exceeds the host size_t range";
@@ -233,6 +242,9 @@ std::vector<uint8_t> mixed_manifest_serialize(const mixed_manifest & m, std::str
     for (const mixed_manifest_event & e : m.events) {
         out.push_back(e.kind);
         put_u32(out, e.layer_id);
+        if (v2) {
+            put_u32(out, e.range_id);
+        }
         put_u64(out, e.payload_offset);
         put_u64(out, e.size);
         put_u64(out, e.stream_offset);
@@ -240,7 +252,10 @@ std::vector<uint8_t> mixed_manifest_serialize(const mixed_manifest & m, std::str
     }
     put_u64(out, n_layers);
     for (const auto & lp : m.layer_payload_sizes) {
-        put_u32(out, lp.first);
+        put_u32(out, mixed_key_layer(lp.first));
+        if (v2) {
+            put_u32(out, mixed_key_range(lp.first));
+        }
         put_u64(out, lp.second);
     }
     put_u64(out, m.total_stream_bytes);
@@ -264,12 +279,17 @@ bool mixed_manifest_parse(const uint8_t * data, size_t size, mixed_manifest & ou
         }
         return false;
     }
-    if (!r.u32(out.version) || out.version != MIXED_IO_MANIFEST_VERSION) {
+    if (!r.u32(out.version) ||
+            (out.version != MIXED_IO_MANIFEST_VERSION &&
+             out.version != MIXED_IO_MANIFEST_VERSION_V2)) {
         if (error) {
             *error = "unsupported mixed-io manifest version";
         }
         return false;
     }
+    const bool v2 = out.version >= MIXED_IO_MANIFEST_VERSION_V2;
+    const uint32_t event_bytes = v2 ? MIXED_IO_WIRE_EVENT_SIZE_V2 : MIXED_IO_WIRE_EVENT_SIZE;
+    const uint32_t layer_bytes_wire = v2 ? MIXED_IO_WIRE_LAYER_SIZE_V2 : MIXED_IO_WIRE_LAYER_SIZE;
     uint64_t n_metadata = 0;
     // cap BEFORE copying; SIZE_MAX guard before the size_t cast
     if (!r.u64(n_metadata) || n_metadata > MIXED_IO_MANIFEST_MAX_METADATA ||
@@ -291,8 +311,8 @@ bool mixed_manifest_parse(const uint8_t * data, size_t size, mixed_manifest & ou
         return false;
     }
     // check the remaining wire bytes cover the event table BEFORE reserve
-    if (n_events > (MIXED_IO_MAX_TOTAL - r.pos) / MIXED_IO_WIRE_EVENT_SIZE ||
-            n_events * MIXED_IO_WIRE_EVENT_SIZE > r.size - r.pos) {
+    if (n_events > (MIXED_IO_MAX_TOTAL - r.pos) / event_bytes ||
+            n_events * event_bytes > r.size - r.pos) {
         if (error) {
             *error = "truncated mixed-io manifest event table";
         }
@@ -301,8 +321,21 @@ bool mixed_manifest_parse(const uint8_t * data, size_t size, mixed_manifest & ou
     out.events.reserve(size_t(n_events));
     for (uint64_t i = 0; i < n_events; ++i) {
         mixed_manifest_event e;
-        if (!r.u8(e.kind) || !r.u32(e.layer_id) || !r.u64(e.payload_offset) ||
-                !r.u64(e.size) || !r.u64(e.stream_offset) || !r.u64(e.tensor_offset)) {
+        if (!r.u8(e.kind) || !r.u32(e.layer_id)) {
+            if (error) {
+                *error = "truncated mixed-io manifest event";
+            }
+            return false;
+        }
+        // v1 has no range field on the wire: every entry is range 0
+        if (v2 && !r.u32(e.range_id)) {
+            if (error) {
+                *error = "truncated mixed-io manifest event range id";
+            }
+            return false;
+        }
+        if (!r.u64(e.payload_offset) || !r.u64(e.size) || !r.u64(e.stream_offset) ||
+                !r.u64(e.tensor_offset)) {
             if (error) {
                 *error = "truncated mixed-io manifest event";
             }
@@ -317,7 +350,7 @@ bool mixed_manifest_parse(const uint8_t * data, size_t size, mixed_manifest & ou
         }
         return false;
     }
-    if (n_layers * MIXED_IO_WIRE_LAYER_SIZE > r.size - r.pos) {
+    if (n_layers * layer_bytes_wire > r.size - r.pos) {
         if (error) {
             *error = "truncated mixed-io manifest layer table";
         }
@@ -326,14 +359,27 @@ bool mixed_manifest_parse(const uint8_t * data, size_t size, mixed_manifest & ou
     out.layer_payload_sizes.reserve(size_t(n_layers));
     for (uint64_t i = 0; i < n_layers; ++i) {
         uint32_t layer_id = 0;
+        uint32_t range_id = 0;
         uint64_t total = 0;
-        if (!r.u32(layer_id) || !r.u64(total)) {
+        if (!r.u32(layer_id)) {
             if (error) {
                 *error = "truncated mixed-io manifest layer entry";
             }
             return false;
         }
-        out.layer_payload_sizes.emplace_back(layer_id, total);
+        if (v2 && !r.u32(range_id)) {
+            if (error) {
+                *error = "truncated mixed-io manifest layer range id";
+            }
+            return false;
+        }
+        if (!r.u64(total)) {
+            if (error) {
+                *error = "truncated mixed-io manifest layer entry";
+            }
+            return false;
+        }
+        out.layer_payload_sizes.emplace_back(mixed_range_key(layer_id, range_id), total);
     }
     if (!r.u64(out.total_stream_bytes)) {
         if (error) {
@@ -378,7 +424,6 @@ split_writer::split_writer(layer_fn layer_of, split_writer_limits limits)
     if (limits_.max_layers == 0 || limits_.max_events == 0) {
         io_fail("split_writer: invalid limits");
     }
-    layer_bytes_.assign(limits_.max_layers, 0);
 }
 
 void split_writer::write(const void * src, size_t size) {
@@ -442,10 +487,18 @@ void split_writer::write_tensor(ggml_tensor * tensor, size_t offset, size_t size
     if (offset > nbytes || size > nbytes - offset) {
         fail("split_writer: tensor range exceeds the tensor size");
     }
-    const uint32_t layer_id = layer_of_(tensor);
+    // F4 v2: the callback returns the packed (layer_id, range_id) key so both
+    // ranges of one full layer land in their own payload bucket.
+    const uint64_t range_key = layer_of_(tensor);
+    const uint32_t layer_id = mixed_key_layer(range_key);
+    const uint32_t range_id = mixed_key_range(range_key);
     if (layer_id >= limits_.max_layers) {
         fail("split_writer: layer id exceeds the layer limit");
     }
+    if (range_id > 1) {
+        fail("split_writer: range id must be 0 (local) or 1 (overflow)");
+    }
+    const uint64_t & bytes = layer_bytes_[range_key];
     if (limits_.max_virtual_stream_bytes != 0 &&
             size > limits_.max_virtual_stream_bytes - stream_size_) {
         fail_terminal("split_writer: virtual stream cap exceeded");
@@ -453,9 +506,8 @@ void split_writer::write_tensor(ggml_tensor * tensor, size_t offset, size_t size
     if (size > MIXED_IO_MAX_TOTAL - stream_size_) {
         fail_terminal("split_writer: virtual stream size overflows the sanity bound");
     }
-    if (limits_.max_payload_bytes != 0 &&
-            size > limits_.max_payload_bytes - layer_bytes_[layer_id]) {
-        fail_terminal("split_writer: layer payload exceeds the per-layer cap");
+    if (limits_.max_payload_bytes != 0 && size > limits_.max_payload_bytes - bytes) {
+        fail_terminal("split_writer: range payload exceeds the per-range cap");
     }
     if (manifest_.events.size() >= limits_.max_events) {
         fail_terminal("split_writer: event budget exceeded");
@@ -464,24 +516,25 @@ void split_writer::write_tensor(ggml_tensor * tensor, size_t offset, size_t size
     mixed_manifest_event e;
     e.kind = 1;
     e.layer_id = layer_id;
-    e.payload_offset = layer_bytes_[layer_id];
+    e.range_id = range_id;
+    e.payload_offset = bytes;
     e.size = size;
     e.stream_offset = stream_size_;
     e.tensor_offset = offset;
     manifest_.events.push_back(e);
     event_tensors_.push_back({ tensor, offset });
 
-    layer_bytes_[layer_id] += size;
+    layer_bytes_[range_key] += size;
     stream_size_ += size;
     manifest_.total_stream_bytes = stream_size_;
 
     auto it = std::lower_bound(manifest_.layer_payload_sizes.begin(),
                                manifest_.layer_payload_sizes.end(),
-                               std::make_pair(layer_id, uint64_t(0)));
-    if (it != manifest_.layer_payload_sizes.end() && it->first == layer_id) {
+                               std::make_pair(range_key, uint64_t(0)));
+    if (it != manifest_.layer_payload_sizes.end() && it->first == range_key) {
         it->second += size;
     } else {
-        manifest_.layer_payload_sizes.insert(it, std::make_pair(layer_id, uint64_t(size)));
+        manifest_.layer_payload_sizes.insert(it, std::make_pair(range_key, uint64_t(size)));
     }
 }
 
@@ -496,7 +549,7 @@ uint64_t split_writer::virtual_stream_bytes() const {
     return stream_size_;
 }
 
-size_t split_writer::read_payload(uint32_t layer_id, uint64_t offset, uint8_t * dst, size_t count) const {
+size_t split_writer::read_payload(uint32_t layer_id, uint32_t range_id, uint64_t offset, uint8_t * dst, size_t count) const {
     if (count == 0) {
         return 0;
     }
@@ -509,10 +562,16 @@ size_t split_writer::read_payload(uint32_t layer_id, uint64_t offset, uint8_t * 
     // first producer read seals the writer: payload_index_ holds pointers
     // into events, which later writes would reallocate
     sealed_ = true;
-    auto & evs = payload_index_[layer_id];
+    if (range_id > 1) {
+        io_fail("split_writer: unknown range id for read_payload");
+    }
+    const uint64_t range_key = mixed_range_key(layer_id, range_id);
+    auto & evs = payload_index_[range_key];
     if (evs.empty()) {
         for (size_t i = 0; i < manifest_.events.size(); ++i) {
-            if (manifest_.events[i].kind == 1 && manifest_.events[i].layer_id == layer_id) {
+            if (manifest_.events[i].kind == 1 &&
+                    manifest_.events[i].layer_id == layer_id &&
+                    manifest_.events[i].range_id == range_id) {
                 evs.push_back(&manifest_.events[i]);
             }
         }
@@ -584,8 +643,8 @@ split_reader::split_reader(mixed_manifest manifest, std::vector<payload_span> sp
             meta_off += manifest_.events[i].size;
         }
     }
-    // spans: unique layer ids, exact size match with the manifest layer table
-    span_by_layer_.assign(manifest_.layer_payload_sizes.size(), SIZE_MAX);
+    // spans: unique (layer, range) keys, exact size match with the manifest table
+    span_by_range_.assign(manifest_.layer_payload_sizes.size(), SIZE_MAX);
     for (size_t s = 0; s < spans_.size(); ++s) {
         const payload_span & sp = spans_[s];
         if (sp.data == nullptr && sp.size > 0) {
@@ -601,25 +660,29 @@ split_reader::split_reader(mixed_manifest manifest, std::vector<payload_span> sp
         if (limits_.max_payload_bytes != 0 && sp.size > limits_.max_payload_bytes) {
             io_fail("split_reader: span exceeds the per-span cap");
         }
+        if (sp.range_id > 1) {
+            io_fail("split_reader: span has an unknown range id");
+        }
+        const uint64_t key = mixed_range_key(sp.layer_id, sp.range_id);
         auto it = std::lower_bound(manifest_.layer_payload_sizes.begin(),
                                    manifest_.layer_payload_sizes.end(),
-                                   std::make_pair(sp.layer_id, uint64_t(0)));
-        if (it == manifest_.layer_payload_sizes.end() || it->first != sp.layer_id) {
-            io_fail("split_reader: span references an undeclared layer");
+                                   std::make_pair(key, uint64_t(0)));
+        if (it == manifest_.layer_payload_sizes.end() || it->first != key) {
+            io_fail("split_reader: span references an undeclared range");
         }
         if (it->second != sp.size) {
-            io_fail("split_reader: span size does not match the manifest layer payload size");
+            io_fail("split_reader: span size does not match the manifest range payload size");
         }
         const size_t idx = size_t(it - manifest_.layer_payload_sizes.begin());
-        if (span_by_layer_[idx] != SIZE_MAX) {
-            io_fail("split_reader: duplicate payload span for a layer");
+        if (span_by_range_[idx] != SIZE_MAX) {
+            io_fail("split_reader: duplicate payload span for a range");
         }
-        span_by_layer_[idx] = s;
+        span_by_range_[idx] = s;
     }
-    // every declared layer must have a span
+    // every declared range must have a span
     for (size_t i = 0; i < manifest_.layer_payload_sizes.size(); ++i) {
-        if (span_by_layer_[i] == SIZE_MAX) {
-            io_fail("split_reader: missing payload span for a declared layer");
+        if (span_by_range_[i] == SIZE_MAX) {
+            io_fail("split_reader: missing payload span for a declared range");
         }
     }
 }
@@ -650,7 +713,26 @@ void split_reader::consume(void * dst, size_t size, bool as_tensor_op,
                              // invariant: events[idx] contains cursor_ (or idx == size)
     while (need > 0) {
         if (idx >= manifest_.events.size()) {
-            fail_terminal("split_reader: virtual stream truncated");
+            // Expected vs actual, plus the first divergent event, so the
+            // mapping/extent defect can be pinned without guessing.
+            const mixed_manifest_event * last =
+                    manifest_.events.empty() ? nullptr : &manifest_.events.back();
+            std::string detail =
+                " [cursor=" + std::to_string(cursor_) +
+                " needed=" + std::to_string(need) +
+                " declared_total=" + std::to_string(manifest_.total_stream_bytes) +
+                " events=" + std::to_string(manifest_.events.size()) +
+                " event_idx=" + std::to_string(idx);
+            if (last) {
+                detail += " last_event{off=" + std::to_string(last->stream_offset) +
+                          " size=" + std::to_string(last->size) +
+                          " end=" + std::to_string(last->stream_offset + last->size) +
+                          " layer=" + std::to_string(last->layer_id) +
+                          " range=" + std::to_string(last->range_id) +
+                          " kind=" + std::to_string(last->kind) + "}";
+            }
+            detail += " as_tensor=" + std::string(as_tensor_op ? "1" : "0") + "]";
+            fail_terminal("split_reader: virtual stream truncated" + detail);
         }
         const mixed_manifest_event & e = manifest_.events[idx];
         const uint64_t local = cursor_ - e.stream_offset;
@@ -678,11 +760,17 @@ void split_reader::consume(void * dst, size_t size, bool as_tensor_op,
                 std::memcpy(out + part_dst_off, src, size_t(take));
             }
         } else {
-            // tensor event: the span must cover the layer-local range
+            // tensor event: the span must cover the range-local byte range
             const auto it = std::lower_bound(manifest_.layer_payload_sizes.begin(),
                                              manifest_.layer_payload_sizes.end(),
-                                             std::make_pair(e.layer_id, uint64_t(0)));
-            const size_t span_idx = span_by_layer_[size_t(it - manifest_.layer_payload_sizes.begin())];
+                                             std::make_pair(mixed_range_key(e.layer_id, e.range_id), uint64_t(0)));
+            if (it == manifest_.layer_payload_sizes.end() || it->first != mixed_range_key(e.layer_id, e.range_id)) {
+                fail_terminal("split_reader: tensor event references an undeclared range");
+            }
+            const size_t span_idx = span_by_range_[size_t(it - manifest_.layer_payload_sizes.begin())];
+            if (span_idx == SIZE_MAX) {
+                fail_terminal("split_reader: tensor event has no payload span");
+            }
             const payload_span & sp = spans_[span_idx];
             const uint64_t local_payload = e.payload_offset + local;
             if (local_payload + take > sp.size) {

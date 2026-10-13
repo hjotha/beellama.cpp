@@ -1,0 +1,7 @@
+control-pristine       exit=0   rejected=no   loaded=yes  replayed=yes  must load, exit 0
+magic                  exit=1   rejected=yes  loaded=no   replayed=no   bad magic
+version                exit=1   rejected=yes  loaded=no   replayed=no   bad version
+tokencount             exit=1   rejected=yes  loaded=no   replayed=no   bad token count
+mid-payload            exit=0   rejected=no   loaded=yes  replayed=yes  byte in state payload
+tail-last-byte         exit=0   rejected=no   loaded=yes  replayed=yes  last byte of file
+trailing-garbage       exit=1   rejected=yes  loaded=no   replayed=no   extra bytes after payload

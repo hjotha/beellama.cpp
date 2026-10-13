@@ -93,6 +93,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-f4-counters.h"
 #include "fattn-kvarn-route-policy.h"
 
 #include "ggml-vulkan-shaders.hpp"
@@ -3135,6 +3136,29 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
 
     // Spin (w/pause) waiting for the graph to finish executing.
     vk::Result result;
+    // Opt-in blocking wait (diagnostic/candidate): the default spin keeps the
+    // calling thread ~94% busy for the whole decode step, which contends with the
+    // UMA iGPU and roughly doubles the overflow FA time (measured 1.86 ms idle ->
+    // 3.97 ms under CPU load, matching the 3.8 ms in-model per-layer cost). With
+    // this enabled the thread blocks in the driver instead of spinning.
+    static const bool fence_blocking = [] {
+        const char * v = std::getenv("GGML_VK_FENCE_BLOCKING");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    if (fence_blocking) {
+        for (;;) {
+            result = ctx->device->device.waitForFences({ ctx->fence }, true, 100000000ull /*100 ms*/);
+            if (result == vk::Result::eSuccess) {
+                break;
+            }
+            if (result != vk::Result::eTimeout) {
+                GGML_LOG_ERROR("ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
+                throw vk::SystemError(vk::make_error_code(result), "ggml_vulkan: waitForFences");
+            }
+        }
+        ctx->device->device.resetFences({ ctx->fence });
+        return;
+    }
     for (;;) {
         try {
             result = ctx->device->device.getFenceStatus(ctx->fence);
@@ -12971,12 +12995,25 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // Try to use split_k when KV is large enough to be worth the overhead.
     if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        // Integer division with NO lower bound here: a workgroup count larger
+        // than shader_core_count*2 makes split_k == 0. split_k==0 then
+        //   - dispatches dispatch_x = split_k * workgroups_x == 0 workgroups, so
+        //     the FA kernel never runs and O stays zeroed, and
+        //   - sizes the split-K temporaries as (... * split_k) == 0, so the
+        //     reduce never publishes LSE (which is why LSE came back -inf).
+        // The LSE path always takes the partial/reduce route below
+        // (use_split_k_buffers = split_k > 1 || lse != nullptr), so 0 is not a
+        // valid "no split" value -- floor it at 1, i.e. the documented
+        // single-partial reduce. The gqa_ratio <= 1 branch cannot reach 0
+        // because its own guard already ensures the quotient is >= 1.
+        split_k = std::max(1u, split_k);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
             split_k = shader_core_count * 2 / total_wgs_no_split;
         }
     }
+    GGML_ASSERT(split_k >= 1);
 
     if (split_k > 1) {
         // Try to evenly split KV into split_k chunks, but it needs to be a multiple
@@ -19909,6 +19946,7 @@ static int32_t find_first_set(uint32_t x) {
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+    ggml_f4_count_vk_graph(cgraph->n_nodes);
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     ctx->device->diag_cgraph = nullptr;

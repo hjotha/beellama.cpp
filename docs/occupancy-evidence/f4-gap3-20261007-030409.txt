@@ -1,0 +1,14 @@
+launched producer P=off pid=3180388
+A-produce prompt=556 cache_n=0 lcp=0 planned=0 reprocessed=556
+producer exited; snapshots on disk:
+total 328752
+-rw------- 1 hjotha hjotha 168180922 Oct  7 03:04 auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+-rw------- 1 hjotha hjotha 168458454 Oct  7 03:04 auto-1ee08d954f58561c-62e5f8fd1f9ceb61-571.bin
+atomic publication: 2 finalized .bin file(s), 0 in-flight .tmp (excluded from the index by the .tmp predicate)
+  auto-1ee08d954f58561c-3d5802841d3db425-556.bin sha=3082511dbb373bd0 size=168180922
+  auto-1ee08d954f58561c-62e5f8fd1f9ceb61-571.bin sha=6c38905ecffaccc1 size=168458454
+launched consumer P=1024 pid=3180838
+B-import prompt=556 cache_n=0 lcp=0 planned=0 reprocessed=556
+[40993] 0.05.740.836 W slot auto_restore: id  0 | task 0 | auto-restore: candidate /home/hjotha/f4-spool/gap3-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin failed native streaming validation; destination was EMPTY beforehand, nothing to restore
+=== SUMMARY ===
+DONE

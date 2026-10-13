@@ -1,0 +1,31 @@
+RUN=/home/hjotha/f4-spool/cmpm-20261007T102824Z
+RUN_ID=matched-20261007T102824Z
+BUILD_ID=9f2fafe49ef88549-7f6b98a24ea48342
+anchor_prefix_ids=1de29c04afad0de1e60c578eea412e20c77203b2d48de7a5b05e09ae45ae3967 n=556 fixed_token=791 checkpoint=557 output_pos=556
+anchor_prefix_bin=auto-1ee08d954f58561c-3d5802841d3db425-556.bin sha=95f65311fdf661da86de71ab57ba3d780acc91d06317051c3a732e8a7d8c1cf1
+GPU ready: inactive gpu=0
+launched producer P=off slots=/home/hjotha/f4-spool/cmpm-20261007T102824Z/a-baseline-slots captures=556,557 pid=3916994
+  A-req1 {"cache_n": 0, "cache_lcp_n": 0, "predicted_n": 1}
+prefix state BEFORE the append: bin=auto-1ee08d954f58561c-3d5802841d3db425-556.bin sha=3ffe4aa267f9119fac64d4ec4018e33a69ca93609348d8fc05889506b24f03f6
+prefix capture BEFORE the append: pos_max=555 state_bytes=197390727 tokens_n=556 seq=10e6fcc8012c85bf
+  A-req2 {"cache_n": 556, "cache_lcp_n": 556, "predicted_n": 1}
+[F4CAP A] captured phase=producer tokens=556 input_pos=555 output_pos=555 vocab=248320 pos_max=555 seq_hash=10e6fcc8012c85bf layout_hash=9c494171cb7b6417 cache=none/no_common_prefix
+[F4CAP A] captured phase=producer tokens=557 input_pos=556 output_pos=556 vocab=248320 pos_max=556 seq_hash=d972974f112ecb97 layout_hash=9c494171cb7b6417 cache=live/committed
+--- occupancy evidence (A) ---
+  F4MHA lines=160  F4TAIL lines=320  layers_with_active_tail=160
+  max n_kv seen=n_kv=0  split_p values=split_p=0,  n_local values=
+target candidate dir holds ONLY: auto-1ee08d954f58561c-3d5802841d3db425-556.bin  (files=1)
+launched target P=1024 slots=/home/hjotha/f4-spool/cmpm-20261007T102824Z/target-slots captures=557 pid=3917412
+  B-req {"cache_n": 556, "cache_lcp_n": 0, "predicted_n": 1}
+[58137] 0.05.705.577 I srv    load_model: auto disk prompt cache enabled: indexed 2 prefix boundaries from /home/hjotha/f4-spool/cmpm-20261007T102824Z/target-slots/ (block=256)
+[58137] 0.05.749.513 I slot auto_restore: id  0 | task 0 | auto-restore: importing PURE KVarN snapshot /home/hjotha/f4-spool/cmpm-20261007T102824Z/target-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin (556 tokens) into the split destination
+[58137] 0.06.149.220 I slot auto_restore: id  0 | task 0 | auto-restore: reused 556 tokens from disk (in-memory match was 0), bytes=198387122 restore_ms=400.095 workspace=52428800, file=/home/hjotha/f4-spool/cmpm-20261007T102824Z/target-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+[F4CAP B] captured phase=target tokens=557 input_pos=556 output_pos=556 vocab=248320 pos_max=556 seq_hash=d972974f112ecb97 layout_hash=58a99e8d3506cae8 cache=disk/committed
+--- occupancy evidence (B) ---
+  F4MHA lines=128  F4TAIL lines=160  layers_with_active_tail=32
+  max n_kv seen=n_kv=0  split_p values=split_p=1024,  n_local values=
+target_prefix_sha_after=3ffe4aa267f9119fac64d4ec4018e33a69ca93609348d8fc05889506b24f03f6 (must equal 3ffe4aa267f9119fac64d4ec4018e33a69ca93609348d8fc05889506b24f03f6)
+  gates   : NRMSE(O)=0.000000e+00 max|O|=0.000000e+00 |dLSE|=0.000000e+00 argmax 279/279
+VERDICT: PASS
+A_vs_B_rc=0
+RUN_DIR=/home/hjotha/f4-spool/cmpm-20261007T102824Z

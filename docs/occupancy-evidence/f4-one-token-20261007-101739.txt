@@ -1,0 +1,29 @@
+RUN=/home/hjotha/f4-spool/cmp-20261007T101739Z
+RUN_ID=one-token-20261007T101739Z
+BUILD_ID=16bb70b5eca74db4-7f6b98a24ea48342
+fixed checkpoint: prefix=556 + fixed_token=791 -> 557 tokens, output_pos=556
+GPU ready: inactive gpu=0
+launched prefix P=off slots=/home/hjotha/f4-spool/cmp-20261007T101739Z/frozen-slots pid=3901569
+  P-freeze prompt_n=556 cache_n=0 lcp=0 predicted=1
+captured prefix ids: n=556 sha=1de29c04afad0de1
+frozen_prefix=auto-1ee08d954f58561c-3d5802841d3db425-556.bin bytes=198387119 sha=95f65311fdf661da86de71ab57ba3d780acc91d06317051c3a732e8a7d8c1cf1
+  request built: 557 token ids, last (the fixed next token) = 791
+target candidate dir: auto-1ee08d954f58561c-3d5802841d3db425-556.bin (files=1, prefix_only=yes)
+target_prefix_sha=95f65311fdf661da86de71ab57ba3d780acc91d06317051c3a732e8a7d8c1cf1
+launched producer P=off slots=/home/hjotha/f4-spool/cmp-20261007T101739Z/baseline-slots pid=3901988
+  A-baseline prompt_n=None cache_n=0 lcp=0 predicted=1 evaluated_suffix=?
+{"prompt_n": null, "cache_n": 0, "cache_lcp_n": 0, "predicted_n": 1}
+[F4CAP producer] captured phase=producer tokens=557 input_pos=556 output_pos=556 vocab=248320 pos_max=556 seq_hash=d972974f112ecb97 layout_hash=9c494171cb7b6417 cache=none/no_common_prefix
+[53065] 0.05.054.120 I srv    load_model: auto disk prompt cache enabled: indexed 0 prefix boundaries from /home/hjotha/f4-spool/cmp-20261007T101739Z/baseline-slots/ (block=256)
+launched target P=1024 slots=/home/hjotha/f4-spool/cmp-20261007T101739Z/target-slots pid=3902308
+  B-target prompt_n=None cache_n=556 lcp=0 predicted=1 evaluated_suffix=?
+{"prompt_n": null, "cache_n": 556, "cache_lcp_n": 0, "predicted_n": 1}
+[49233] 0.05.119.519 I srv    load_model: auto disk prompt cache enabled: indexed 2 prefix boundaries from /home/hjotha/f4-spool/cmp-20261007T101739Z/target-slots/ (block=256)
+[49233] 0.05.149.288 I slot auto_restore: id  0 | task 0 | auto-restore: importing PURE KVarN snapshot /home/hjotha/f4-spool/cmp-20261007T101739Z/target-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin (556 tokens) into the split destination
+[49233] 0.05.505.608 I slot auto_restore: id  0 | task 0 | auto-restore: reused 556 tokens from disk (in-memory match was 0), bytes=198387119 restore_ms=356.603 workspace=52428800, file=/home/hjotha/f4-spool/cmp-20261007T101739Z/target-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+[F4CAP target] captured phase=target tokens=557 input_pos=556 output_pos=556 vocab=248320 pos_max=556 seq_hash=d972974f112ecb97 layout_hash=58a99e8d3506cae8 cache=disk/committed
+target_prefix_sha_after=95f65311fdf661da86de71ab57ba3d780acc91d06317051c3a732e8a7d8c1cf1 (must equal 95f65311fdf661da86de71ab57ba3d780acc91d06317051c3a732e8a7d8c1cf1)
+baseline_slot_dir_contents=1 file(s)
+REFUSED: config_hash differs: producer='ab41bc9df9de70ea' target='d84d9a5020fad976'
+comparator_rc=2
+RUN_DIR=/home/hjotha/f4-spool/cmp-20261007T101739Z

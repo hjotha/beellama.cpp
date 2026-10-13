@@ -157,6 +157,7 @@ public:
     bool next()  override;
     bool apply() override;
     void graph_compute_start() override;
+    void reset_graph_store_slots() const override;
     void graph_compute_finish(ggml_status status) override;
 
     //

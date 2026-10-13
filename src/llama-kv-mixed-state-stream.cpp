@@ -5,9 +5,11 @@
 #include "../vendor/hash/xxhash/xxhash.h"
 
 #include "llama-kv-mixed-state-stream.h"
+#include "llama-position-split.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <unordered_set>
@@ -32,6 +34,15 @@ constexpr uint32_t KMS_DESC_BYTES   = 101;
 constexpr uint32_t KMS_MAX_LAYERS   = 4096;
 constexpr uint32_t KMS_MAX_SEQ      = 256; // LLAMA_MAX_SEQ
 constexpr uint32_t KMS_MAX_CELLS    = 268435456u; // 1 << 28
+constexpr uint32_t KMS2_MAGIC        = 0x32534D4B; // "KMS2"
+constexpr uint32_t KMS2_HEADER_BYTES = 104;
+constexpr uint32_t KMS2_CRC_OFFSET   = 96;
+constexpr uint32_t KMS2_DESC_BYTES   = KMS_DESC_BYTES + 12; // + range_id/start/end
+// KMS3: v1 prefix (96) + source model/rope/config (24) + identity crc (8) = 128
+constexpr uint32_t KMS3_MAGIC         = 0x33534D4B; // "KMS3"
+constexpr uint32_t KMS3_HEADER_BYTES  = 128;
+constexpr uint32_t KMS3_IDENTITY_OFF  = KMS_HEADER_BYTES;
+constexpr uint32_t KMS3_IDENTITY_CRC  = KMS_HEADER_BYTES + 24;
 constexpr uint64_t KMS_MAX_TOTAL    = uint64_t(1) << 42; // 4 TiB sanity bound
 constexpr size_t   KMS_MAX_TRANSFER = 8u << 20; // 8 MiB
 
@@ -146,7 +157,7 @@ void validate_desc(layer_desc & d, bool serializing) {
             if (!is_standard_type(d.k_type) || !is_standard_type(d.v_type)) {
                 fail(where + ": unknown standard qx type id");
             }
-            if (d.layout != layout_standard_qx_rows) {
+            if (d.layout != layout_standard_qx_rows && d.layout != layout_standard_qx_compact_rows) {
                 fail(where + ": unknown standard layout id");
             }
             if (d.tail_type != 0) {
@@ -154,6 +165,9 @@ void validate_desc(layer_desc & d, bool serializing) {
             }
             if (d.v_trans > 1) {
                 fail(where + ": invalid v_trans flag");
+            }
+            if (d.layout == layout_standard_qx_compact_rows && d.v_trans != 0) {
+                fail(where + ": compact standard payload cannot transpose V");
             }
             if (d.kvarn_domain != 0) {
                 fail(where + ": standard caches cannot carry a kvarn domain");
@@ -262,6 +276,17 @@ stream_prepared stream_prepare(const stream_input & input, const stream_options 
     check_flags(input.flags, input.owner_epoch, true);
     const bool partial   = (uint32_t(input.flags & snapshot_flags::partial)) != 0;
     const bool body_only = (uint32_t(input.flags & snapshot_flags::body_only)) != 0;
+    // F4 v2: the same envelope rules the owning codec applies, so the two
+    // encoders cannot disagree about what a valid v2 frame is.
+    const bool v2 = input.split.has_value();
+    if (v2) {
+        if (input.split->p == 0 || input.split->c == 0 || input.split->p >= input.split->c) {
+            fail("stream: invalid position_split bounds (require 0 < P < C)");
+        }
+        if (input.split->p % llama_position_split::kAlignTokens != 0) {
+            fail("stream: position_split P must be a multiple of the alignment");
+        }
+    }
 
     if (opts.transfer_buffer_bytes == 0 || opts.transfer_buffer_bytes > KMS_MAX_TRANSFER) {
         fail("stream: transfer buffer must be within 1..8 MiB");
@@ -290,18 +315,55 @@ stream_prepared stream_prepare(const stream_input & input, const stream_options 
     // checked cumulative accounting, u64 widened before any arithmetic so
     // 32-bit size_t cannot wrap; invariant: total <= KMS_MAX_TOTAL
     uint64_t total_bytes = 0;
-    add_budget(total_bytes, KMS_HEADER_BYTES, "header");
+        const bool v3 = !v2 && input.source.has_value();
+        add_budget(total_bytes, v2 ? KMS2_HEADER_BYTES
+                : (v3 ? KMS3_HEADER_BYTES : KMS_HEADER_BYTES), "header");
     add_budget(total_bytes, uint64_t(input.metadata_size), "metadata blob");
     add_budget(total_bytes, 8, "tail checksum");
 
     stream_prepared out;
     out.descs.reserve(input.layers.size());
-    std::unordered_set<uint32_t> seen;
+    std::unordered_set<uint64_t> seen;
     for (const layer_desc & raw : input.layers) {
         layer_desc d = raw;
         validate_desc(d, true);
-        if (!seen.insert(d.layer_id).second) {
-            fail("stream: duplicate layer id");
+        if (v2) {
+            // F4 v2: identity is the (layer_id, range_id) pair and each range
+            // must be exactly [0,P) local (kvarn) or [P,C) overflow (standard).
+            if (d.range_id > llama_position_split::kRangeOverflow) {
+                fail("stream: unknown range_id");
+            }
+            if (d.range_end <= d.range_start || d.range_end > input.split->c) {
+                fail("stream: invalid range bounds for the split capacity");
+            }
+            if (d.range_id == llama_position_split::kRangeLocal) {
+                if (d.range_start != 0 || d.range_end != input.split->p ||
+                        d.kind != cache_kind::kvarn) {
+                    fail("stream: local range must be [0,P) and a kvarn cache");
+                }
+            } else if (d.range_start != input.split->p || d.range_end != input.split->c ||
+                    d.kind != cache_kind::standard_qx) {
+                fail("stream: overflow range must be [P,C) and a standard qx cache");
+            }
+            if (d.layout == layout_standard_qx_compact_rows &&
+                    (d.payload_cells != d.payload_rows ||
+                     d.payload_rows > uint64_t(input.split->c - input.split->p))) {
+                fail("stream: compact Qx payload rows exceed C-P or disagree with cell count");
+            }
+            const uint64_t key = (uint64_t(d.layer_id) << 32) | d.range_id;
+            if (!seen.insert(key).second) {
+                fail("stream: duplicate (layer_id, range_id) descriptor pair");
+            }
+        } else {
+            if (d.layout == layout_standard_qx_compact_rows) {
+                fail("stream: compact Qx rows require the v2 position_split envelope");
+            }
+            if (d.range_id != 0 || d.range_start != 0 || d.range_end != 0) {
+                fail("stream: range identity requires the v2 position_split envelope");
+            }
+            if (!seen.insert(d.layer_id).second) {
+                fail("stream: duplicate layer id");
+            }
         }
         if (partial) {
             if (d.payload_mode == mode_partial_overlay) {
@@ -327,9 +389,34 @@ stream_prepared stream_prepare(const stream_input & input, const stream_options 
         // descriptor room must be reserved BEFORE the payload, so a
         // payload that exactly fills the bound without its descriptor
         // fails instead of pushing total past the bound
-        add_budget(total_bytes, KMS_DESC_BYTES, "layer descriptor");
+        add_budget(total_bytes, v2 ? KMS2_DESC_BYTES : KMS_DESC_BYTES, "layer descriptor");
         add_budget(total_bytes, d.payload_bytes, "payload");
         out.descs.push_back(d);
+    }
+    if (v2) {
+        // every layer that owns a local range must also own the matching
+        // overflow range, and the two must tile [0,C) with no gap or overlap
+        for (const layer_desc & d : out.descs) {
+            if (d.range_id != llama_position_split::kRangeLocal) {
+                continue;
+            }
+            const layer_desc * ovf = nullptr;
+            for (const layer_desc & other : out.descs) {
+                if (other.layer_id == d.layer_id &&
+                        other.range_id == llama_position_split::kRangeOverflow) {
+                    ovf = &other;
+                    break;
+                }
+            }
+            if (ovf == nullptr) {
+                fail("stream: layer " + std::to_string(d.layer_id) +
+                        " has a local range but no matching overflow range");
+            }
+            if (d.range_end != ovf->range_start || ovf->range_end != input.split->c) {
+                fail("stream: layer " + std::to_string(d.layer_id) +
+                        " ranges do not tile [0,C) without gap or overlap");
+            }
+        }
     }
     // cells: validate sequence counts and account (incl. per-cell seq ids)
     // before summation
@@ -342,6 +429,34 @@ stream_prepared stream_prepare(const stream_input & input, const stream_options 
             fail("stream: empty cell carries sequence ids");
         }
         cells_bytes += 18 + uint64_t(c.seq_ids.size()) * 4;
+    }
+    if (v2) {
+        // Mirror the vector codec's compact-cell validation. The cell summary
+        // retains global IDs; only occupied [P,C) cells count as Qx rows.
+        for (const auto & d : out.descs) {
+            if (d.layout != layout_standard_qx_compact_rows) { continue; }
+            const auto & split = *input.split;
+            if (input.cells.size() > split.c) {
+                fail("stream: compact Qx cell table exceeds C");
+            }
+            uint32_t rows = 0;
+            for (size_t i = 0; i < input.cells.size(); ++i) {
+                const auto & cell = input.cells[i];
+                if (cell.pos >= 0) {
+                    if ((i < split.p) != (uint64_t(cell.pos) < split.p) ||
+                            uint64_t(cell.pos) >= split.c || cell.seq_ids.empty()) {
+                        fail("stream: compact Qx cell has invalid range, position or ownership");
+                    }
+                    if (i >= split.p) {
+                        (void) qx_payload_row_for_cell(split.p, split.c, uint32_t(i));
+                        ++rows;
+                    }
+                }
+            }
+            if (d.payload_rows != rows) {
+                fail("stream: compact Qx row count differs from occupied overflow cells");
+            }
+        }
     }
     add_budget(total_bytes, cells_bytes, "cell metadata");
     if (opts.max_total_bytes != 0 && total_bytes > opts.max_total_bytes) {
@@ -395,7 +510,7 @@ bool stream_serialize(const stream_input & input,
             uint64_t offset = 0;
             while (remaining > 0) {
                 const size_t chunk = size_t(std::min<uint64_t>(remaining, transfer));
-                const size_t got = reads.read_payload(d.layer_id, offset, buf.data(), chunk);
+                const size_t got = reads.read_payload(d.layer_id, d.range_id, offset, buf.data(), chunk);
                 if (got != chunk) {
                     fail("stream: producer truncated payload (layer " + std::to_string(d.layer_id) + ")");
                 }
@@ -406,11 +521,15 @@ bool stream_serialize(const stream_input & input,
             pass1_checksums[i] = XXH64_digest(&h);
         }
 
-        // --- header with placeholder crc (exactly KMS_HEADER_BYTES) ---
+        // --- header with placeholder crc ---
         std::vector<uint8_t> header;
-        header.reserve(KMS_HEADER_BYTES);
-        put_u32(header, KMS_MAGIC);
-        put_u32(header, 1); // version
+        const bool v2 = input.split.has_value();
+        const bool v3 = !v2 && input.source.has_value();
+        const uint32_t header_bytes = v2 ? KMS2_HEADER_BYTES
+                : (v3 ? KMS3_HEADER_BYTES : KMS_HEADER_BYTES);
+        header.reserve(header_bytes);
+        put_u32(header, v2 ? KMS2_MAGIC : (v3 ? KMS3_MAGIC : KMS_MAGIC));
+        put_u32(header, v2 ? 2 : (v3 ? 3 : 1)); // version
         put_u32(header, uint32_t(input.flags));
         put_u64(header, input.owner_epoch);
         put_u64(header, input.owner_id);
@@ -419,15 +538,39 @@ bool stream_serialize(const stream_input & input,
         put_u32(header, input.metadata_version);
         put_u64(header, body_only ? 0 : input.metadata_size);
         put_u64(header, body_only || input.metadata_size == 0 ? 0 : XXH64(input.metadata, input.metadata_size, 0));
-        for (int i = 0; i < 8; ++i) {
-            put_u32(header, 0); // reserved[8]
+        if (v2) {
+            put_u32(header, input.split->p);
+            put_u32(header, input.split->c);
+            put_u64(header, input.split->model_id);
+            put_u64(header, input.split->rope_id);
+            for (int i = 0; i < 4; ++i) {
+                put_u32(header, 0); // reserved[4]
+            }
+        } else {
+            for (int i = 0; i < 8; ++i) {
+                put_u32(header, 0); // reserved[8]
+            }
         }
         for (int i = 0; i < 8; ++i) {
             header.push_back(0); // header_crc placeholder
         }
         const uint64_t header_crc = XXH64(header.data(), header.size(), 0);
+        const size_t crc_off = v2 ? KMS2_CRC_OFFSET : 88;
         for (int i = 0; i < 8; ++i) {
-            header[88 + i] = uint8_t((header_crc >> (8 * i)) & 0xFF);
+            header[crc_off + i] = uint8_t((header_crc >> (8 * i)) & 0xFF);
+        }
+        if (v3) {
+            if (input.source->model_id == 0 || input.source->rope_id == 0 ||
+                    input.source->config_id == 0) {
+                fail("stream: KMS3 source identity is incomplete");
+            }
+            const size_t identity_off = header.size();
+            put_u64(header, input.source->model_id);
+            put_u64(header, input.source->rope_id);
+            put_u64(header, input.source->config_id);
+            const uint64_t identity_crc = XXH64(header.data() + identity_off,
+                    KMS3_IDENTITY_CRC - KMS3_IDENTITY_OFF, 0);
+            put_u64(header, identity_crc);
         }
 
         // --- pass 2: write pass ---
@@ -446,31 +589,63 @@ bool stream_serialize(const stream_input & input,
             return true;
         };
 
+        // writer-side section map (diagnostic): one entry per emitted region,
+        // absolute frame offsets, same schema as stream_describe().
+        auto note = [&](const char * kind, const char * field, uint32_t layer_id,
+                        uint32_t range_id, uint64_t count, uint64_t k_stride,
+                        uint64_t v_stride, uint64_t checksum,
+                        uint64_t start, uint64_t end) {
+            if (!opts.on_section) {
+                return;
+            }
+            stream_section s;
+            s.start = start; s.end = end;
+            s.kind = kind; s.field = field;
+            s.layer_id = layer_id; s.range_id = range_id;
+            s.count = count; s.k_stride = k_stride; s.v_stride = v_stride;
+            s.checksum = checksum;
+            opts.on_section(s);
+        };
+
         emit(header.data(), header.size());
+        note("header", "header", UINT32_MAX, UINT32_MAX, 0, 0, 0, 0, 0, written);
         if (!body_only && input.metadata_size > 0) {
+            const uint64_t at = written;
             emit(input.metadata, input.metadata_size);
+            note("metadata", "manifest", UINT32_MAX, UINT32_MAX, 0, 0, 0,
+                 XXH64(input.metadata, input.metadata_size, 0), at, written);
         }
         std::vector<uint64_t> pass2_checksums(descs.size(), 0);
         for (size_t i = 0; i < descs.size(); ++i) {
             const layer_desc & d = descs[i];
             std::vector<uint8_t> desc_bytes;
-            desc_bytes.reserve(KMS_DESC_BYTES);
+            desc_bytes.reserve(v2 ? KMS2_DESC_BYTES : KMS_DESC_BYTES);
             layer_desc dw = d;
             dw.payload_checksum = pass1_checksums[i];
             write_desc(desc_bytes, dw);
+            if (v2) {
+                // F4 v2: the range identity follows the v1 descriptor bytes
+                put_u32(desc_bytes, dw.range_id);
+                put_u32(desc_bytes, dw.range_start);
+                put_u32(desc_bytes, dw.range_end);
+            }
+            const uint64_t desc_at = written;
             emit(desc_bytes.data(), desc_bytes.size());
+            note("descriptor", "descriptor", d.layer_id, d.range_id, d.payload_cells,
+                 d.k_stride, d.v_stride, pass1_checksums[i], desc_at, written);
 
             const bool carries = d.payload_mode == mode_full || d.payload_mode == mode_partial_overlay;
             if (!carries || d.payload_bytes == 0) {
                 continue;
             }
+            const uint64_t payload_at = written;
             XXH64_state_t h;
             XXH64_reset(&h, 0);
             uint64_t remaining = d.payload_bytes;
             uint64_t offset = 0;
             while (remaining > 0) {
                 const size_t chunk = size_t(std::min<uint64_t>(remaining, transfer));
-                const size_t got = reads.read_payload(d.layer_id, offset, buf.data(), chunk);
+                const size_t got = reads.read_payload(d.layer_id, d.range_id, offset, buf.data(), chunk);
                 if (got != chunk) {
                     fail("stream: producer truncated payload on write pass (layer " +
                          std::to_string(d.layer_id) + ")");
@@ -480,9 +655,12 @@ bool stream_serialize(const stream_input & input,
                 offset += chunk;
                 remaining -= chunk;
             }
+            note("payload", "payload_kv", d.layer_id, d.range_id, d.payload_cells,
+                 d.k_stride, d.v_stride, pass1_checksums[i], payload_at, written);
             pass2_checksums[i] = XXH64_digest(&h);
         }
         if (!body_only) {
+            const uint64_t cells_at = written;
             for (const cell_entry & c : input.cells) {
                 std::vector<uint8_t> cell_bytes;
                 cell_bytes.reserve(18 + size_t(c.seq_ids.size()) * 4);
@@ -496,6 +674,8 @@ bool stream_serialize(const stream_input & input,
                 }
                 emit(cell_bytes.data(), cell_bytes.size());
             }
+            note("cells", "cell_entry", UINT32_MAX, UINT32_MAX, input.cells.size(),
+                 0, 0, 0, cells_at, written);
         }
 
         // producer mutation detection: pass 2 checksums must equal pass 1
@@ -511,7 +691,9 @@ bool stream_serialize(const stream_input & input,
         for (int i = 0; i < 8; ++i) {
             tail[i] = uint8_t((tail_crc >> (8 * i)) & 0xFF);
         }
+        const uint64_t tail_at = written;
         emit(tail.data(), tail.size());
+        note("tail", "tail_crc", UINT32_MAX, UINT32_MAX, 0, 0, 0, tail_crc, tail_at, written);
         return true;
     } catch (const kv_mixed_error & e) {
         // single outer boundary: on_fault exactly once, error preserved
@@ -557,6 +739,191 @@ uint64_t stream_serialized_size(const stream_input & input, const stream_options
         }
         throw kv_mixed_error(msg);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reader-side section map: walk the REAL frame bytes.
+
+namespace {
+
+struct byte_view {
+    const uint8_t * p = nullptr;
+    size_t n = 0;
+
+    void need(size_t off, size_t len, const char * what) const {
+        if (p == nullptr || off > n || len > n - off) {
+            throw kv_mixed_error(std::string("describe: truncated ") + what);
+        }
+    }
+    uint16_t u16(size_t off) const {
+        need(off, 2, "u16");
+        return uint16_t(uint16_t(p[off]) | (uint16_t(p[off + 1]) << 8));
+    }
+    uint32_t u32(size_t off) const {
+        need(off, 4, "u32");
+        return uint32_t(p[off]) | (uint32_t(p[off + 1]) << 8) |
+               (uint32_t(p[off + 2]) << 16) | (uint32_t(p[off + 3]) << 24);
+    }
+    uint64_t u64(size_t off) const {
+        return uint64_t(u32(off)) | (uint64_t(u32(off + 4)) << 32);
+    }
+};
+
+// descriptor wire field offsets (mirror of write_desc / write_desc_v2)
+constexpr size_t DESC_LAYER_ID   = 0;
+constexpr size_t DESC_K_STRIDE   = 56;
+constexpr size_t DESC_V_STRIDE   = 64;
+constexpr size_t DESC_MODE       = 72;
+constexpr size_t DESC_PAYLOAD_CELLS = 73;
+constexpr size_t DESC_PAYLOAD_ROWS  = 77;
+constexpr size_t DESC_PAYLOAD_BYTES = 85;
+constexpr size_t DESC_PAYLOAD_CKSUM = 93;
+constexpr size_t DESC_RANGE_ID   = 101; // v2 only
+
+} // namespace
+
+std::vector<stream_section> stream_describe(const uint8_t * data, size_t size) {
+    std::vector<stream_section> out;
+    const byte_view r{data, size};
+    if (data == nullptr || size < 8) {
+        throw kv_mixed_error("describe: frame smaller than the magic");
+    }
+    const uint32_t magic = r.u32(0);
+    const bool v2 = magic == KMS2_MAGIC;
+    const bool v3 = magic == KMS3_MAGIC;
+    if (!v2 && !v3 && magic != KMS_MAGIC) {
+        throw kv_mixed_error("describe: unknown frame magic");
+    }
+    const uint32_t header_bytes = v2 ? KMS2_HEADER_BYTES
+            : (v3 ? KMS3_HEADER_BYTES : KMS_HEADER_BYTES);
+    const uint32_t desc_bytes   = v2 ? KMS2_DESC_BYTES   : KMS_DESC_BYTES;
+    r.need(0, header_bytes, "header");
+    const uint32_t version = r.u32(4);
+    if (version != (v2 ? 2u : (v3 ? 3u : 1u))) {
+        throw kv_mixed_error("describe: version/magic mismatch");
+    }
+    if (v2 || v3) {
+        // This walk must respect compact geometry and pure-source identity
+        // exactly as the real reader does. Borrow synchronously: no payload
+        // copy or escaping view; the caller keeps the input alive throughout.
+        std::shared_ptr<const void> backing(data, [](const void *) {});
+        (void) snapshot::parse_view(data, size, std::move(backing));
+    }
+    // KMS3 retains the 96-byte prefix CRC and a separate identity-block CRC.
+    // The borrowed parser above checked that identity; do not hash 128 bytes
+    // against its prefix CRC here.
+    const size_t crc_off = v2 ? KMS2_CRC_OFFSET : 88;
+    const uint32_t crc_span = v2 ? KMS2_HEADER_BYTES : KMS_HEADER_BYTES;
+    std::vector<uint8_t> hdr(data, data + crc_span);
+    std::memset(hdr.data() + crc_off, 0, 8);
+    if (XXH64(hdr.data(), crc_span, 0) != r.u64(crc_off)) {
+        throw kv_mixed_error("describe: header checksum mismatch");
+    }
+
+    const uint32_t flags     = r.u32(8);
+    const uint32_t n_layers  = r.u32(28);
+    const uint32_t n_used    = r.u32(32);
+    const uint64_t meta_size = r.u64(40);
+    const bool body_only = (flags & uint32_t(snapshot_flags::body_only)) != 0;
+    if (n_layers > KMS_MAX_LAYERS) {
+        throw kv_mixed_error("describe: layer count exceeds the bound");
+    }
+
+    auto push = [&](uint64_t start, uint64_t end, const char * kind, const char * field) {
+        stream_section s;
+        s.start = start; s.end = end; s.kind = kind; s.field = field;
+        out.push_back(s);
+        return &out.back();
+    };
+
+    uint64_t cur = 0;
+    push(0, header_bytes, "header", "header");
+    cur = header_bytes;
+    if (!body_only && meta_size > 0) {
+        r.need(cur, meta_size, "metadata");
+        auto * s = push(cur, cur + meta_size, "metadata", "manifest");
+        s->checksum = r.u64(48);
+        cur += meta_size;
+    }
+    for (uint32_t i = 0; i < n_layers; ++i) {
+        r.need(cur, desc_bytes, "layer descriptor");
+        auto * d = push(cur, cur + desc_bytes, "descriptor", "descriptor");
+        d->layer_id  = r.u32(cur + DESC_LAYER_ID);
+        d->range_id  = v2 ? r.u32(cur + DESC_RANGE_ID) : 0;
+        d->k_stride  = r.u64(cur + DESC_K_STRIDE);
+        d->v_stride  = r.u64(cur + DESC_V_STRIDE);
+        d->count     = r.u32(cur + DESC_PAYLOAD_CELLS);
+        d->checksum  = r.u64(cur + DESC_PAYLOAD_CKSUM);
+        const uint8_t mode = data[cur + DESC_MODE];
+        const uint64_t payload_bytes = r.u64(cur + DESC_PAYLOAD_BYTES);
+        cur += desc_bytes;
+        const bool carries = mode == mode_full || mode == mode_partial_overlay;
+        if (carries && payload_bytes > 0) {
+            r.need(cur, payload_bytes, "payload");
+            auto * p = push(cur, cur + payload_bytes, "payload", "payload_kv");
+            p->layer_id  = d->layer_id;
+            p->range_id  = d->range_id;
+            p->count     = d->count;
+            p->k_stride  = d->k_stride;
+            p->v_stride  = d->v_stride;
+            p->checksum  = d->checksum;
+            cur += payload_bytes;
+        }
+    }
+    if (!body_only && n_used > 0) {
+        const uint64_t cells_start = cur;
+        for (uint32_t i = 0; i < n_used; ++i) {
+            r.need(cur, 18, "cell entry");
+            const uint16_t nseq = r.u16(cur + 16);
+            cur += 18;
+            r.need(cur, uint64_t(nseq) * 4, "cell seq ids");
+            cur += uint64_t(nseq) * 4;
+        }
+        auto * c = push(cells_start, cur, "cells", "cell_entry");
+        c->count = n_used;
+    }
+    if (cur + 8 > size) {
+        throw kv_mixed_error("describe: truncated tail checksum");
+    }
+    push(cur, cur + 8, "tail", "tail_crc");
+    cur += 8;
+    if (cur > size) {
+        throw kv_mixed_error("describe: frame claims " + std::to_string(cur) +
+                             " bytes but only " + std::to_string(size) + " are present");
+    }
+    if (cur < size) {
+        // The sequence blob is [mixed attention frame][whatever the hybrid
+        // memory appends afterwards] - for this model the DeltaNet recurrent
+        // state. Report it as its own region instead of pretending the frame
+        // owns those bytes: an unattributed tail is exactly how a layer table
+        // that only lists attention rows ends up being read as "the 32 layers".
+        auto * t = push(cur, size, "trailing", "post_frame_state");
+        t->count = size - cur;
+    }
+    return out;
+}
+
+std::string stream_section_text(const stream_section & s) {
+    std::string t = "[" + std::to_string(s.start) + "," + std::to_string(s.end) + ") " +
+                    s.kind + "/" + s.field;
+    if (s.layer_id != UINT32_MAX) {
+        t += " layer=" + std::to_string(s.layer_id);
+    }
+    if (s.range_id != UINT32_MAX) {
+        t += " stream=" + std::to_string(s.range_id);
+    }
+    if (s.count != 0) {
+        t += " count=" + std::to_string(s.count);
+    }
+    if (s.k_stride != 0 || s.v_stride != 0) {
+        t += " stride=" + std::to_string(s.k_stride) + "/" + std::to_string(s.v_stride);
+    }
+    if (s.checksum != 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) s.checksum);
+        t += std::string(" checksum=0x") + buf;
+    }
+    return t;
 }
 
 #if defined(__linux__)

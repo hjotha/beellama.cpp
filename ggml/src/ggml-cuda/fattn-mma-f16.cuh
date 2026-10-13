@@ -1227,7 +1227,7 @@ template<int DV, int ncols> struct mma_tile_sizes {
 #endif // defined(TURING_MMA_AVAILABLE)
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup,
-    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
+    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, bool fp32_window_accum = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -1414,47 +1414,89 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr);
     }
 
+    // KVarN windows retain tensor-core tile products but accumulate their
+    // online-softmax contributions in FP32. Repeated half accumulation and
+    // half rescaling otherwise compound across the whole context window.
+    constexpr int window_acc_count = cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J);
+    float2 window_sum[fp32_window_accum ? window_acc_count : 1][fp32_window_accum ? T_C_VKQ::ne : 1] = {};
+    float window_previous_max[cols_per_thread];
+    auto window_begin = [&]() {
+        if constexpr (fp32_window_accum) {
+            static_assert(np == 1 && cols_per_warp == 16 && is_fixup && !needs_fixup,
+                          "FP32 KVarN window accumulation requires one warp per query tile");
+            for (int col = 0; col < cols_per_thread; ++col) { window_previous_max[col] = KQ_max[col]; }
+            for (int i = 0; i < window_acc_count; ++i) {
+                for (int l = 0; l < T_C_VKQ::ne; ++l) { VKQ_C[i].x[l] = make_half2(0.0f, 0.0f); }
+            }
+        }
+    };
+    auto window_end = [&]() {
+        if constexpr (fp32_window_accum) {
+            float rescale[cols_per_thread];
+            for (int col = 0; col < cols_per_thread; ++col) {
+                const float delta = window_previous_max[col] - KQ_max[col];
+                rescale[col] = delta >= SOFTMAX_FTZ_THRESHOLD ? expf(delta) : 0.0f;
+            }
+            for (int i = 0; i < window_acc_count; ++i) {
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    const float2 partial = __half22float2(VKQ_C[i].x[l]);
+                    const float factor = rescale[l % cols_per_thread];
+                    window_sum[i][l].x = window_sum[i][l].x * factor + partial.x;
+                    window_sum[i][l].y = window_sum[i][l].y * factor + partial.y;
+                }
+            }
+        }
+    };
+
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
     if constexpr (ncols2 == 1 || use_sparse) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
+            window_begin();
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, kvarn_smem, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+        window_end();
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
+        window_begin();
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, kvarn_smem, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+        window_end();
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
+            window_begin();
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, kvarn_smem, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+        window_end();
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
+        window_begin();
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, kvarn_smem, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+        window_end();
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
@@ -1489,6 +1531,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 KQ_rowsum[col] += __shfl_xor_sync(0xFFFFFFFFULL, KQ_rowsum[col], offset, warp_size);
             }
         }
+    }
+
+    if constexpr (fp32_window_accum) {
+        // The window reducer owns the final normalization and LSE. Publish
+        // unnormalized FP32 partials directly, without a final half round-trip.
+        const int j0 = threadIdx.y * cols_per_warp;
+        if (threadIdx.x % 4 < cols_per_thread) {
+            const int col = threadIdx.x % cols_per_thread;
+            const int jc = j0 + T_C_VKQ::get_i(threadIdx.x % 4);
+            dstk_fixup[(gridDim.x + blockIdx.x)*ncols + jc] = make_float2(KQ_max[col], KQ_rowsum[col]);
+        }
+        float2 * values = dstk_fixup + gridDim.x*(2*ncols) + blockIdx.x*(ncols*(DV/2));
+        for (int i = 0; i < window_acc_count; ++i) {
+            for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                const int jc = j0 + T_C_VKQ::get_i(l);
+                const int j = jc / ncols2, c = jc % ncols2;
+                if (jt*ncols1 + j < int(ne01.z) && zt_gqa*ncols2 + c < gqa_ratio) {
+                    const int dim = i*T_C_VKQ::J + T_C_VKQ::get_j(l);
+                    values[jc*(DV/2) + dim] = window_sum[i][l];
+                }
+            }
+        }
+        return;
     }
 
     // If attention sinks are used, potentially re-scale if KQ_max is small.
@@ -1711,7 +1776,19 @@ for (int imeta = 0; imeta < nmeta; ++imeta) {
 
 #pragma unroll
             for (int imeta = 0; imeta < nmeta; ++imeta) {
-                KQ_cms[imeta] = expf(meta[imeta].x - KQ_cmn);
+                // Empty-row contract: a split with rowsum 0 contributes nothing.
+                // Gating on rowsum keeps this from evaluating (-inf) - (-inf) when
+                // the whole row is masked, which is how an empty warp produced NaN
+                // and then 0*NaN poisoned a mixed nonempty merge. A nonempty split
+                // takes the identical expression as before.
+                // Only a split with a strictly positive rowsum contributes. An
+                // exact-zero split is a legitimately empty partial and must not
+                // poison a mixed nonempty merge through 0*NaN; a NEGATIVE or NaN
+                // rowsum is an invariant failure and is deliberately left to
+                // evaluate (and therefore to surface) instead of being hidden.
+                KQ_cms[imeta] = meta[imeta].y >= 0.0f ?
+                    (meta[imeta].y > 0.0f ? expf(meta[imeta].x - KQ_cmn) : 0.0f) :
+                    expf(meta[imeta].x - KQ_cmn);
             }
 
             KQ_crs = KQ_cms[0]*meta[0].y; // KQ combine rowsum, scaled sum of all parallel warps.
@@ -1874,8 +1951,17 @@ for (int imeta = 0; imeta < nmeta; ++imeta) {
 
                         if (!needs_fixup && !is_fixup) {
                             const float KQ_rowsum_j = meta_j[1];
-                            dstk_val.x /= KQ_rowsum_j;
-                            dstk_val.y /= KQ_rowsum_j;
+                            // Exact-zero rowsum == no unmasked key in this split,
+                            // so the masked value is exactly 0. Any other rowsum
+                            // (including negative or NaN) takes the original
+                            // division and therefore stays visible as a failure.
+                            if (KQ_rowsum_j == 0.0f) {
+                                dstk_val.x = 0.0f;
+                                dstk_val.y = 0.0f;
+                            } else {
+                                dstk_val.x /= KQ_rowsum_j;
+                                dstk_val.y /= KQ_rowsum_j;
+                            }
                         }
 
                         if (is_fixup) {

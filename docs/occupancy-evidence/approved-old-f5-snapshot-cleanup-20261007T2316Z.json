@@ -1,0 +1,93 @@
+{
+  "approval": "Telegram551 replied to550; exact four old F5 directories; completed auto-*.bin only",
+  "before_available_bytes": 53101830144,
+  "files": [
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-n96000-003/slots/auto-1ee08d954f58561c-557207a7feebb825-96031.bin",
+      "bytes": 3684612760,
+      "mtime_ns": 1791374645227138159,
+      "inode": 26099656
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-n96000-003/slots/auto-1ee08d954f58561c-4366416c01397adc-96000.bin",
+      "bytes": 3688382813,
+      "mtime_ns": 1791374638813032603,
+      "inode": 26099655
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r1/P97792/slots/auto-1ee08d954f58561c-557207a7feebb825-96031.bin",
+      "bytes": 3684612760,
+      "mtime_ns": 1791378687890495679,
+      "inode": 26099734
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r1/P97792/slots/auto-1ee08d954f58561c-4366416c01397adc-96000.bin",
+      "bytes": 3688382812,
+      "mtime_ns": 1791378680745985359,
+      "inode": 26099733
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r1/P96768/slots/auto-1ee08d954f58561c-9b5c9a9597138f79-96031.bin",
+      "bytes": 3684612759,
+      "mtime_ns": 1791378514685428026,
+      "inode": 26099725
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r1/P96768/slots/auto-1ee08d954f58561c-4366416c01397adc-96000.bin",
+      "bytes": 3688382813,
+      "mtime_ns": 1791378507770950396,
+      "inode": 26099723
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r1/P98560/slots/auto-1ee08d954f58561c-9b5c9a9597138f79-96031.bin",
+      "bytes": 3684612759,
+      "mtime_ns": 1791378863235821705,
+      "inode": 26099743
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r1/P98560/slots/auto-1ee08d954f58561c-4366416c01397adc-96000.bin",
+      "bytes": 3688382814,
+      "mtime_ns": 1791378851289483056,
+      "inode": 26099742
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r2/P97536/slots/auto-1ee08d954f58561c-9b5c9a9597138f79-96031.bin",
+      "bytes": 3684612758,
+      "mtime_ns": 1791379325824768273,
+      "inode": 26099768
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r2/P97536/slots/auto-1ee08d954f58561c-4366416c01397adc-96000.bin",
+      "bytes": 3688382813,
+      "mtime_ns": 1791379315220003369,
+      "inode": 26099767
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r2/P97024/slots/auto-1ee08d954f58561c-4366416c01397adc-96000.bin",
+      "bytes": 3688382814,
+      "mtime_ns": 1791379139694700401,
+      "inode": 26099753
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r3/P96768/slots/auto-1ee08d954f58561c-9b5c9a9597138f79-96031.bin",
+      "bytes": 3684612759,
+      "mtime_ns": 1791379697164520223,
+      "inode": 26099779
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r3/P96768/slots/auto-1ee08d954f58561c-4366416c01397adc-96000.bin",
+      "bytes": 3688382813,
+      "mtime_ns": 1791379688624639105,
+      "inode": 26099778
+    },
+    {
+      "path": "/home/hjotha/f4-spool/f5-campaign/f5-sweep-r3/P97024/slots/auto-1ee08d954f58561c-4366416c01397adc-96000.bin",
+      "bytes": 3688382814,
+      "mtime_ns": 1791379862312621392,
+      "inode": 26099788
+    }
+  ],
+  "total_bytes": 51614739061,
+  "after_available_bytes": 104716660736,
+  "deleted_count": 14
+}

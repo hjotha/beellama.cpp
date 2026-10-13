@@ -1,0 +1,17 @@
+below-P prefix : auto-1ee08d954f58561c-3d5802841d3db425-556.bin sha=3ffe4aa267f9119fac64d4ec
+GPU ready: inactive gpu=0
+launched setup P=1024 slots=/home/hjotha/f4-spool/cnt-20261007T111043Z/setup caps=10,1200
+  setup-warm cache_n=0 lcp=0 predicted=1
+  setup-long cache_n=10 lcp=10 predicted=1
+[F4CAP setup] captured phase=setup tokens=10 input_pos=9 output_pos=9 vocab=248320 pos_max=9 seq_hash=6f7f89d8249f31ad layout_hash=58a99e8d3506cae8 cache=none/no_common_prefix
+[F4CAP setup] captured phase=setup tokens=1200 input_pos=1199 output_pos=1199 vocab=248320 pos_max=1199 seq_hash=0a3afcf2993338b0 layout_hash=58a99e8d3506cae8 cache=live/committed
+above-P prefix: auto-1ee08d954f58561c-8592ae58a162eab0-1200.bin sha=5819e39bb69ec1575259e963
+launched below P=1024 slots=/home/hjotha/f4-spool/cnt-20261007T111043Z/below-slots caps=10,557
+  below-warm cache_n=0 lcp=0 predicted=1
+  below-main cache_n=556 lcp=0 predicted=1
+auto_restore: id  0 | task 2 | auto-restore: reused 556 tokens from disk (in-memory match was 10), bytes=198387122 restore_ms=544.251 workspace=52428800, file=/home/hjotha/f4-spool/cnt-20261007T111043Z/below-slots/auto-1ee08d954f58561c-3d5802841d3db425-556.bin
+launched above P=1024 slots=/home/hjotha/f4-spool/cnt-20261007T111043Z/above-slots caps=10,1201
+  above-warm cache_n=0 lcp=0 predicted=1
+  above-main cache_n=1200 lcp=0 predicted=1
+auto_restore: id  0 | task 2 | auto-restore: reused 1200 tokens from disk (in-memory match was 10), bytes=227707767 restore_ms=533.268 workspace=52428800, file=/home/hjotha/f4-spool/cnt-20261007T111043Z/above-slots/auto-1ee08d954f58561c-8592ae58a162eab0-1200.bin
+RUN_DIR=/home/hjotha/f4-spool/cnt-20261007T111043Z

@@ -1,0 +1,5597 @@
+{
+  "bindings": {
+    "capacity_sha256": "ad330477b9b8253fe837977b178d2f01fdb740883bf1d5dcf7f58b1c6ec1d59b",
+    "context_sha256": "e3ebb5cd70a435396983387a9ee45946944eeecf851c0c53399b8403e505356b",
+    "cycles_sha256": "380bdac90231c846537e55c3246bf278b058c0ae0da0a6f46d0f0568b34c9cbe",
+    "provenance_sha256": "fe1311d3b1bde9844bc75f5a35864984424bfd6da608f77ef49d121d75995fa9",
+    "quality_sha256": "b12e65f8e8d01b72eeb4c861d49b015e7f1a297c752afa6995f717b33dae83da",
+    "restore_sha256": "5aa61fdacb709d65960167346a4ae022b13c8eb78f76895bb312da235ae5d351",
+    "runs_sha256": "e2ac77c74441e00e427e847e650a965f76acb6b35a919602bb072018a416dfd3"
+  },
+  "capacity": {
+    "gen_count": 512,
+    "gen_end_tokens": 131072,
+    "gen_ok": true,
+    "gen_start_tokens": 130560,
+    "occupied_positions": 131072,
+    "over_capacity_rejected": true,
+    "over_capacity_state_intact": true,
+    "over_capacity_tokens": 131073,
+    "run_ids": [
+      "above_p_130560-m038",
+      "above_p_130560-m040",
+      "above_p_130560-m042",
+      "above_p_130560-m044",
+      "above_p_130560-m046"
+    ]
+  },
+  "cases": [
+    {
+      "baseline_arm": "xxl",
+      "case_id": "below_p_96000",
+      "kind": "below_p",
+      "length_tokens": 96000
+    },
+    {
+      "baseline_arm": "xxxl",
+      "case_id": "above_p_105000",
+      "kind": "above_p",
+      "length_tokens": 105000
+    },
+    {
+      "baseline_arm": "xxxl",
+      "case_id": "above_p_115000",
+      "kind": "above_p",
+      "length_tokens": 115000
+    },
+    {
+      "baseline_arm": "xxxl",
+      "case_id": "above_p_130560",
+      "kind": "above_p",
+      "length_tokens": 130560
+    }
+  ],
+  "cycles": [
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 1,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12884901888,
+        "vulkan": 3221225472
+      },
+      "run_ids": [
+        "below_p_96000-m002"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 2,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12889096192,
+        "vulkan": 3223322624
+      },
+      "run_ids": [
+        "below_p_96000-m004"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 3,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12893290496,
+        "vulkan": 3225419776
+      },
+      "run_ids": [
+        "below_p_96000-m006"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 4,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12897484800,
+        "vulkan": 3227516928
+      },
+      "run_ids": [
+        "below_p_96000-m008"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 5,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12901679104,
+        "vulkan": 3229614080
+      },
+      "run_ids": [
+        "below_p_96000-m010"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 6,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12905873408,
+        "vulkan": 3231711232
+      },
+      "run_ids": [
+        "below_p_96000-m003"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 7,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12910067712,
+        "vulkan": 3233808384
+      },
+      "run_ids": [
+        "below_p_96000-m005"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 8,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12914262016,
+        "vulkan": 3235905536
+      },
+      "run_ids": [
+        "below_p_96000-m007"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 9,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12918456320,
+        "vulkan": 3238002688
+      },
+      "run_ids": [
+        "below_p_96000-m009"
+      ]
+    },
+    {
+      "corruption_count": 0,
+      "divergent_suffix_ok": true,
+      "driver_error_count": 0,
+      "generation_ok": true,
+      "index": 10,
+      "oom_count": 0,
+      "restore_ok": true,
+      "retained_bytes": {
+        "cuda": 12922650624,
+        "vulkan": 3240099840
+      },
+      "run_ids": [
+        "below_p_96000-m011"
+      ]
+    }
+  ],
+  "evidence_kind": "synthetic_fixture",
+  "notes": [
+    "Synthetic fixture: every number here is invented for parser/validator coverage. It is not a measurement and must never be quoted as an F5 result. evidence_origin stays 'synthetic_fixture' so relabelling evidence_kind to 'measured' cannot make it acceptable."
+  ],
+  "protocol": {
+    "alternating": true,
+    "first_arm": "baseline",
+    "measured_runs_per_arm": 5,
+    "min_token_samples": 32,
+    "warmup_runs": 1
+  },
+  "provenance": {
+    "batch_size": 512,
+    "binary_path": "build/bin/llama-server",
+    "binary_sha256": "078f8ec1aa7d1b843e810d67aa04fad95f37bbf50e2a3a0627506363e149410c",
+    "branch": "feat/occupancy-position-split",
+    "build": "SYNTHETIC-FIXTURE-BUILD",
+    "c": 131072,
+    "cache_state": "cold",
+    "cache_types": {
+      "local": "kvarn4",
+      "overflow": "q4_0"
+    },
+    "clocks": {
+      "mem_mhz": 0,
+      "sm_mhz": 0
+    },
+    "collected_at_utc": "2026-10-05T00:00:00+00:00",
+    "collector": "make_fixtures.py (synthetic, never a measurement)",
+    "command": "build/bin/llama-server -m fixtures/synthetic-target-model.gguf -c 131072 -b 512 -ub 256 -fa on --spec-type none --spec-draft-n-max 0",
+    "commit": "d9db0b88155ec4350942306696378c57ac0485c8",
+    "concurrency": "none",
+    "corpus_path": "fixtures/synthetic-corpus.txt",
+    "corpus_sha256": "732db35d35d2ba5d2e4d6eaadd641a1e813f333f7628473695e4aa4b583a4364",
+    "dirty": true,
+    "driver": "SYNTHETIC-FIXTURE-DRIVER",
+    "evidence_origin": "synthetic_fixture",
+    "governor": "auto",
+    "hardware": {
+      "gpu": "SYNTHETIC-FIXTURE-GPU",
+      "vram_total_bytes": 17179869184
+    },
+    "model_path": "fixtures/synthetic-target-model.gguf",
+    "model_sha256": "6f7d3732bb341e86f4d7998693427beeba35a98df83224526c1c91c1a853258c",
+    "p": 102400,
+    "prompt_sha256": "ee20ece6e2cbc6567d6047ba148aafa8cfd0422da1d287329af220ac5a761ecb",
+    "sampling": {
+      "greedy": true,
+      "temperature": 0.0,
+      "top_k": 1,
+      "top_p": 1.0
+    },
+    "seed": 42,
+    "ubatch_size": 256
+  },
+  "quality": [
+    {
+      "arm": "xxl",
+      "case_id": "below_p_96000",
+      "kl_mean_nat_per_token": 0.002,
+      "perplexity": 9.0,
+      "reference": "f16",
+      "run_ids": [
+        "below_p_96000-m002",
+        "below_p_96000-m004",
+        "below_p_96000-m006",
+        "below_p_96000-m008",
+        "below_p_96000-m010"
+      ]
+    },
+    {
+      "arm": "split",
+      "case_id": "below_p_96000",
+      "kl_mean_nat_per_token": 0.0024,
+      "perplexity": 9.045,
+      "reference": "f16",
+      "run_ids": [
+        "below_p_96000-m003",
+        "below_p_96000-m005",
+        "below_p_96000-m007",
+        "below_p_96000-m009",
+        "below_p_96000-m011"
+      ]
+    },
+    {
+      "arm": "xxxl",
+      "case_id": "above_p_105000",
+      "kl_mean_nat_per_token": 0.002,
+      "perplexity": 9.5,
+      "reference": "f16",
+      "run_ids": [
+        "above_p_105000-m014",
+        "above_p_105000-m016",
+        "above_p_105000-m018",
+        "above_p_105000-m020",
+        "above_p_105000-m022"
+      ]
+    },
+    {
+      "arm": "split",
+      "case_id": "above_p_105000",
+      "kl_mean_nat_per_token": 0.0024,
+      "perplexity": 9.5475,
+      "reference": "f16",
+      "run_ids": [
+        "above_p_105000-m015",
+        "above_p_105000-m017",
+        "above_p_105000-m019",
+        "above_p_105000-m021",
+        "above_p_105000-m023"
+      ]
+    },
+    {
+      "arm": "xxxl",
+      "case_id": "above_p_115000",
+      "kl_mean_nat_per_token": 0.002,
+      "perplexity": 10.0,
+      "reference": "f16",
+      "run_ids": [
+        "above_p_115000-m026",
+        "above_p_115000-m028",
+        "above_p_115000-m030",
+        "above_p_115000-m032",
+        "above_p_115000-m034"
+      ]
+    },
+    {
+      "arm": "split",
+      "case_id": "above_p_115000",
+      "kl_mean_nat_per_token": 0.0024,
+      "perplexity": 10.05,
+      "reference": "f16",
+      "run_ids": [
+        "above_p_115000-m027",
+        "above_p_115000-m029",
+        "above_p_115000-m031",
+        "above_p_115000-m033",
+        "above_p_115000-m035"
+      ]
+    },
+    {
+      "arm": "xxxl",
+      "case_id": "above_p_130560",
+      "kl_mean_nat_per_token": 0.002,
+      "perplexity": 10.5,
+      "reference": "f16",
+      "run_ids": [
+        "above_p_130560-m038",
+        "above_p_130560-m040",
+        "above_p_130560-m042",
+        "above_p_130560-m044",
+        "above_p_130560-m046"
+      ]
+    },
+    {
+      "arm": "split",
+      "case_id": "above_p_130560",
+      "kl_mean_nat_per_token": 0.0024,
+      "perplexity": 10.5525,
+      "reference": "f16",
+      "run_ids": [
+        "above_p_130560-m039",
+        "above_p_130560-m041",
+        "above_p_130560-m043",
+        "above_p_130560-m045",
+        "above_p_130560-m047"
+      ]
+    }
+  ],
+  "restore": [
+    {
+      "length_tokens": 96000,
+      "next_logits_max_abs_diff": 0.0,
+      "ok": true,
+      "prefix_reprefill_tokens": 0,
+      "run_ids": [
+        "below_p_96000-m002",
+        "below_p_96000-m004",
+        "below_p_96000-m006",
+        "below_p_96000-m008",
+        "below_p_96000-m010"
+      ],
+      "scenario": "exact_import",
+      "tokens_reused": 96000
+    },
+    {
+      "length_tokens": 105000,
+      "next_logits_max_abs_diff": 0.0,
+      "ok": true,
+      "prefix_reprefill_tokens": 0,
+      "run_ids": [
+        "above_p_105000-m014",
+        "above_p_105000-m016",
+        "above_p_105000-m018",
+        "above_p_105000-m020",
+        "above_p_105000-m022"
+      ],
+      "scenario": "exact_import",
+      "tokens_reused": 105000
+    },
+    {
+      "length_tokens": 115000,
+      "next_logits_max_abs_diff": 0.0,
+      "ok": true,
+      "prefix_reprefill_tokens": 0,
+      "run_ids": [
+        "above_p_115000-m026",
+        "above_p_115000-m028",
+        "above_p_115000-m030",
+        "above_p_115000-m032",
+        "above_p_115000-m034"
+      ],
+      "scenario": "exact_import",
+      "tokens_reused": 115000
+    },
+    {
+      "length_tokens": 130560,
+      "next_logits_max_abs_diff": 0.0,
+      "ok": true,
+      "prefix_reprefill_tokens": 0,
+      "run_ids": [
+        "above_p_130560-m038",
+        "above_p_130560-m040",
+        "above_p_130560-m042",
+        "above_p_130560-m044",
+        "above_p_130560-m046"
+      ],
+      "scenario": "exact_import",
+      "tokens_reused": 130560
+    },
+    {
+      "length_tokens": 131072,
+      "next_logits_max_abs_diff": 0.0,
+      "ok": true,
+      "prefix_reprefill_tokens": 0,
+      "run_ids": [
+        "above_p_130560-m038",
+        "above_p_130560-m040",
+        "above_p_130560-m042",
+        "above_p_130560-m044",
+        "above_p_130560-m046"
+      ],
+      "scenario": "exact_import",
+      "tokens_reused": 131072
+    }
+  ],
+  "runs": [
+    {
+      "arm": "xxl",
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30000.0,
+      "run_id": "below_p_96000-warm-xxl",
+      "sequence_index": 0,
+      "token_latencies_ms": [
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4
+      ],
+      "ttft_ms": 30200.0,
+      "warmup": true
+    },
+    {
+      "arm": "split",
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30500.0,
+      "run_id": "below_p_96000-warm-split",
+      "sequence_index": 1,
+      "token_latencies_ms": [
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9
+      ],
+      "ttft_ms": 30700.0,
+      "warmup": true
+    },
+    {
+      "arm": "xxl",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m002.log",
+          "sha256": "d2c98fca2cd47dcf4cfef6804e5e85188c902b1b3f3f36d1361ec9d7364345a4"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30000.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m002",
+      "sequence_index": 2,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4
+      ],
+      "ttft_ms": 30200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m003.log",
+          "sha256": "af1eccc57515e48fd7cbfeee2b3cafc7fbac15a7e5d08ad43840199e49ab5689"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30500.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m003",
+      "sequence_index": 3,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9
+      ],
+      "ttft_ms": 30700.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxl",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m004.log",
+          "sha256": "2e2cf5a1f54a2c56e9655da6af820e2216c061423aea6e0733ad5c97700ce387"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30000.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m004",
+      "sequence_index": 4,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4
+      ],
+      "ttft_ms": 30200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m005.log",
+          "sha256": "1c46d55baf94f661f5c130a7d61a7217bd6e757361c67605938beb6850cb39c7"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30500.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m005",
+      "sequence_index": 5,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9
+      ],
+      "ttft_ms": 30700.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxl",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m006.log",
+          "sha256": "1ea254e8b263abf6b021082509f367113fec913a837e5dd2b56a37d3cbc93f1a"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30000.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m006",
+      "sequence_index": 6,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4
+      ],
+      "ttft_ms": 30200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m007.log",
+          "sha256": "1e8840baccf2697a33e58c1f03f539c7e89cf7a94f8fe252cafd2c19ca730dee"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30500.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m007",
+      "sequence_index": 7,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9
+      ],
+      "ttft_ms": 30700.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxl",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m008.log",
+          "sha256": "47332ddea7a0262833854536d51ff3a49cd46f2438db59838cf26e1aaaf673a8"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30000.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m008",
+      "sequence_index": 8,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4
+      ],
+      "ttft_ms": 30200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m009.log",
+          "sha256": "76db9e6e0d15e11c3367af1bb7a2b6108ef778bd70f9f7e2357c945a0dd33a71"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30500.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m009",
+      "sequence_index": 9,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9
+      ],
+      "ttft_ms": 30700.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxl",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m010.log",
+          "sha256": "7acbafc6c8a53650fb4cf679fe2c060a67a11d1c6965b544b8d07b9fb78eb85f"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30000.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m010",
+      "sequence_index": 10,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4,
+        42.4,
+        41.6,
+        40.8,
+        40.0,
+        42.0,
+        41.2,
+        40.4
+      ],
+      "ttft_ms": 30200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/below_p_96000-m011.log",
+          "sha256": "d09788f1855530cf5f105b673a3c3c93b8540962f0c8526aea2c34cf909cd7fc"
+        }
+      ],
+      "case_id": "below_p_96000",
+      "oom_count": 0,
+      "prefill_ms": 30500.0,
+      "routes": {
+        "vulkan_attention_executed": false
+      },
+      "run_id": "below_p_96000-m011",
+      "sequence_index": 11,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9,
+        42.9,
+        42.1,
+        41.3,
+        40.5,
+        42.5,
+        41.7,
+        40.9
+      ],
+      "ttft_ms": 30700.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 40000.0,
+      "run_id": "above_p_105000-warm-xxxl",
+      "sequence_index": 0,
+      "token_latencies_ms": [
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4
+      ],
+      "ttft_ms": 40200.0,
+      "warmup": true
+    },
+    {
+      "arm": "split",
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 34000.0,
+      "run_id": "above_p_105000-warm-split",
+      "sequence_index": 1,
+      "token_latencies_ms": [
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4
+      ],
+      "ttft_ms": 34200.0,
+      "warmup": true
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m014.log",
+          "sha256": "cca6554dcc4c3732759104bae210d1b744ff5648ca4ef7433a0224e5573e10c1"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 40000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m014",
+      "sequence_index": 2,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4
+      ],
+      "ttft_ms": 40200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m015.log",
+          "sha256": "8172fbb61156316e2461941c80634475a23c0a3624a37f711d2e2ae842cd7edf"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 34000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m015",
+      "sequence_index": 3,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4
+      ],
+      "ttft_ms": 34200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m016.log",
+          "sha256": "5494bbbf9c3e37b8ad095924e0a74041bb885bcfc45a1a00d4b0c7b5f76d02ff"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 40000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m016",
+      "sequence_index": 4,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4
+      ],
+      "ttft_ms": 40200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m017.log",
+          "sha256": "8e429daece90892172ee5692698769e8577014dfd81cd7f2968f4ce1ab370b01"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 34000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m017",
+      "sequence_index": 5,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4
+      ],
+      "ttft_ms": 34200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m018.log",
+          "sha256": "44d579bd081e88d8ab846f7bbb387b9064cc267eddd2d322d618971fad1b3de2"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 40000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m018",
+      "sequence_index": 6,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4
+      ],
+      "ttft_ms": 40200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m019.log",
+          "sha256": "b2850cfdee9b52b916132a97a398f4f326ce98e543171030bd13c3c287b456f1"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 34000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m019",
+      "sequence_index": 7,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4
+      ],
+      "ttft_ms": 34200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m020.log",
+          "sha256": "fbee51734e432413f33a0691d79589f69dcdcb2a74554295ab8fcece6a27be91"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 40000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m020",
+      "sequence_index": 8,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4
+      ],
+      "ttft_ms": 40200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m021.log",
+          "sha256": "cb6c73414f6ed1a7be2973c703bd64a9faa29767bdf88d70a514dfb92fca38ee"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 34000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m021",
+      "sequence_index": 9,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4
+      ],
+      "ttft_ms": 34200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m022.log",
+          "sha256": "7f34cbe69933c4912e02191d5c4d00a1362f7cc3001d8e367f8b7351358f6b3f"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 40000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m022",
+      "sequence_index": 10,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4,
+        47.4,
+        46.6,
+        45.8,
+        45.0,
+        47.0,
+        46.2,
+        45.4
+      ],
+      "ttft_ms": 40200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_105000-m023.log",
+          "sha256": "fdaa28888694de17a942d03133e9c9eabb3064526483af8c6df37142e16cb403"
+        }
+      ],
+      "case_id": "above_p_105000",
+      "oom_count": 0,
+      "prefill_ms": 34000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_105000-m023",
+      "sequence_index": 11,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4,
+        48.4,
+        47.6,
+        46.8,
+        46.0,
+        48.0,
+        47.2,
+        46.4
+      ],
+      "ttft_ms": 34200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 45000.0,
+      "run_id": "above_p_115000-warm-xxxl",
+      "sequence_index": 0,
+      "token_latencies_ms": [
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4
+      ],
+      "ttft_ms": 45200.0,
+      "warmup": true
+    },
+    {
+      "arm": "split",
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 38000.0,
+      "run_id": "above_p_115000-warm-split",
+      "sequence_index": 1,
+      "token_latencies_ms": [
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4
+      ],
+      "ttft_ms": 38200.0,
+      "warmup": true
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m026.log",
+          "sha256": "da5e1b2d1db94650d6011332d8c5fecac218e403d1fa2aff2fa80af0de45515b"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 45000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m026",
+      "sequence_index": 2,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4
+      ],
+      "ttft_ms": 45200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m027.log",
+          "sha256": "cc2105a179639f64dbc1177bea584815ef40bc2d0447ad7f59ce89d516a11d90"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 38000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m027",
+      "sequence_index": 3,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4
+      ],
+      "ttft_ms": 38200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m028.log",
+          "sha256": "2ee536f5f5e3dbc2e32c1f1adf29e451e8d7cbfd9ed97b4b0b4b6c79bb3e3371"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 45000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m028",
+      "sequence_index": 4,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4
+      ],
+      "ttft_ms": 45200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m029.log",
+          "sha256": "0eb66b6fb75eaf3aa1b52a5e35fb528fd06d8ba0d1fe891d62dd6a9817d7d0b7"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 38000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m029",
+      "sequence_index": 5,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4
+      ],
+      "ttft_ms": 38200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m030.log",
+          "sha256": "2c25768ade75cc0a43e9b55a29c46514bcbef7409f081adcaef5b9c16e21060b"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 45000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m030",
+      "sequence_index": 6,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4
+      ],
+      "ttft_ms": 45200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m031.log",
+          "sha256": "8c7eb179a7fcf36c37594c9ed78a6b033d6087c1d4405d4d3931d5d75c646c3a"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 38000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m031",
+      "sequence_index": 7,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4
+      ],
+      "ttft_ms": 38200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m032.log",
+          "sha256": "1a226452512a3dffc62ee183675ba497310e081981269bca56c793e5c98f0e5b"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 45000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m032",
+      "sequence_index": 8,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4
+      ],
+      "ttft_ms": 45200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m033.log",
+          "sha256": "b8e8602279e748b61d24079d795e8c08e7e4103f4d641ef3d564120f734a3830"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 38000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m033",
+      "sequence_index": 9,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4
+      ],
+      "ttft_ms": 38200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m034.log",
+          "sha256": "b86453bcd49a4dc2161a4817d1b2be7c6f9618fef7792f2535648d7e91648dfd"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 45000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m034",
+      "sequence_index": 10,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4,
+        50.4,
+        49.6,
+        48.8,
+        48.0,
+        50.0,
+        49.2,
+        48.4
+      ],
+      "ttft_ms": 45200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_115000-m035.log",
+          "sha256": "4eb8ec0af728a9ca56b78bda86b7b59d950a13a89cfdfe72045296fad9abbae7"
+        }
+      ],
+      "case_id": "above_p_115000",
+      "oom_count": 0,
+      "prefill_ms": 38000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_115000-m035",
+      "sequence_index": 11,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4,
+        51.4,
+        50.6,
+        49.8,
+        49.0,
+        51.0,
+        50.2,
+        49.4
+      ],
+      "ttft_ms": 38200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 52000.0,
+      "run_id": "above_p_130560-warm-xxxl",
+      "sequence_index": 0,
+      "token_latencies_ms": [
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4
+      ],
+      "ttft_ms": 52200.0,
+      "warmup": true
+    },
+    {
+      "arm": "split",
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 43000.0,
+      "run_id": "above_p_130560-warm-split",
+      "sequence_index": 1,
+      "token_latencies_ms": [
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4
+      ],
+      "ttft_ms": 43200.0,
+      "warmup": true
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m038.log",
+          "sha256": "6e1cbdb39556123188faca50182d57b4d7e63816e3f5c4d89211d78d2b8054f1"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 52000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m038",
+      "sequence_index": 2,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4
+      ],
+      "ttft_ms": 52200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m039.log",
+          "sha256": "cfcb9cb0b986cff035b5e0abf4c3e18dc4df338b22e6303af517488b7bbfa9d0"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 43000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m039",
+      "sequence_index": 3,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4
+      ],
+      "ttft_ms": 43200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m040.log",
+          "sha256": "ad46fc1dc4756d4f8691829378e3758d187e04c21550bcb2d2ca034fa23db4d6"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 52000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m040",
+      "sequence_index": 4,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4
+      ],
+      "ttft_ms": 52200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m041.log",
+          "sha256": "a49775eba23e7646892d709d4311258ff7052b4a76079b1d3e2006d66b53c4dc"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 43000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m041",
+      "sequence_index": 5,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4
+      ],
+      "ttft_ms": 43200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m042.log",
+          "sha256": "07cf08b5f8716deb42384e96a10e10d56cd3d0014b7799cbe8141df8c45c39aa"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 52000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m042",
+      "sequence_index": 6,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4
+      ],
+      "ttft_ms": 52200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m043.log",
+          "sha256": "9424f622ad6cb8f15a65a4f3f564b77ec2599230ed880008440d0f28502cee6d"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 43000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m043",
+      "sequence_index": 7,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4
+      ],
+      "ttft_ms": 43200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m044.log",
+          "sha256": "72c9e2f7d6cc6f65900939e3eaf886f31b4711b141b26785610f8a50df36b9ea"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 52000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m044",
+      "sequence_index": 8,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4
+      ],
+      "ttft_ms": 52200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m045.log",
+          "sha256": "e15bd02b617eb8c3b3afe6b86252e6d82d84d70930dcc63af29e9074681f967e"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 43000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m045",
+      "sequence_index": 9,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4
+      ],
+      "ttft_ms": 43200.0,
+      "warmup": false
+    },
+    {
+      "arm": "xxxl",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m046.log",
+          "sha256": "4bdb9b60a258d407210b5a85833fd95d30980f6012f6097910e463b9ae6f1ed5"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 52000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m046",
+      "sequence_index": 10,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4,
+        54.4,
+        53.6,
+        52.8,
+        52.0,
+        54.0,
+        53.2,
+        52.4
+      ],
+      "ttft_ms": 52200.0,
+      "warmup": false
+    },
+    {
+      "arm": "split",
+      "artifacts": [
+        {
+          "path": "raw/above_p_130560-m047.log",
+          "sha256": "9106907f6062809029600ff85c37e4fab0759d6fb813031adaa40211a63e41a2"
+        }
+      ],
+      "case_id": "above_p_130560",
+      "oom_count": 0,
+      "prefill_ms": 43000.0,
+      "routes": {
+        "vulkan_attention_executed": true
+      },
+      "run_id": "above_p_130560-m047",
+      "sequence_index": 11,
+      "telemetry": {
+        "cuda": {
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 15032385536
+            },
+            "decode": {
+              "peak_bytes": 13958643712
+            },
+            "load": {
+              "peak_bytes": 10737418240
+            },
+            "prefill": {
+              "peak_bytes": 15032385536
+            },
+            "restore": {
+              "peak_bytes": 12884901888
+            }
+          }
+        },
+        "host": {
+          "mem_available_min_bytes": 8589934592,
+          "stages": {
+            "boundary_cross": {
+              "peak_bytes": 8589934592
+            },
+            "decode": {
+              "peak_bytes": 8589934592
+            },
+            "load": {
+              "peak_bytes": 6442450944
+            },
+            "prefill": {
+              "peak_bytes": 8589934592
+            },
+            "restore": {
+              "peak_bytes": 7516192768
+            }
+          },
+          "swap_in_bytes": 0,
+          "swap_out_bytes": 0
+        },
+        "vulkan": {
+          "gtt_available_min_bytes": 2147483648,
+          "gtt_peak_bytes": 637534208,
+          "stages": {
+            "boundary_cross": {
+              "attention_copy_bytes": 4194304,
+              "peak_bytes": 637534208
+            },
+            "decode": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "load": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 100663296
+            },
+            "prefill": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 536870912
+            },
+            "restore": {
+              "attention_copy_bytes": 0,
+              "peak_bytes": 268435456
+            }
+          }
+        }
+      },
+      "token_latencies_ms": [
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4,
+        55.4,
+        54.6,
+        53.8,
+        53.0,
+        55.0,
+        54.2,
+        53.4
+      ],
+      "ttft_ms": 43200.0,
+      "warmup": false
+    }
+  ],
+  "schema_version": "f5-evidence-v2"
+}

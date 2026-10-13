@@ -1,0 +1,11 @@
+GPU ready: inactive gpu=0
+launched P=256 pid=3082549 health=200 split=[off]
+R1-populate BAD-JSON
+PREREQ FAIL: split not enabled for P=256 after first request
+    [40411] 0.05.519.545 W NVIDIA GPU memory clock lock: nvmlDeviceSetMemoryLockedClocks failed: Insufficient Permissions (requires elevated privilege), skipping dynamic memory lock
+    [40411] ../../../../ggml/src/ggml-cuda/fattn-tail.cuh:713: GGML_ASSERT(mt->ne[0] > 0 && kt->ne[1] + (kt_current ? kt_current->ne[1] : 0) >= mt->ne[0]) failed
+    0.11.929.597 E srv    operator(): http client error: Failed to read connection
+    0.11.929.619 E srv    operator(): http client error: Failed to read connection
+    0.11.929.637 E srv    operator(): http client error: Failed to read connection
+=== SUMMARY ===
+DONE

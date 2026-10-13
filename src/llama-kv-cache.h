@@ -135,7 +135,8 @@ public:
                      bool   disable_attn_rot = false,
     const layer_device_cb & device_for_layer = nullptr,
                      bool   inherit_attn_rotations = true,
-                     bool   own_payload_with_shared_cells = false);
+                     bool   own_payload_with_shared_cells = false,
+                 uint32_t   payload_row_origin = 0);
 
     ~llama_kv_cache() = default;
 
@@ -216,6 +217,12 @@ bool requires_state_for_partial_restore() const override;
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
     uint32_t get_stream_for_seq(llama_seq_id seq_id) const;
+
+    // Logical metadata still covers [0,C). A compact owning companion stores
+    // only [origin,C), with physical row = global cell - origin.
+    uint32_t get_payload_row_origin() const;
+    uint32_t get_payload_size() const;
+    uint32_t payload_row_for_cell(uint32_t global_cell) const;
 
     // return all cell indices for seq_id at the given position
     std::vector<uint32_t> cells_at(llama_seq_id seq_id, llama_pos p) const;
@@ -314,6 +321,15 @@ bool requires_state_for_partial_restore() const override;
     void clone_logical_state_from(const llama_kv_cache & source);
     void swap_logical_state_from(llama_kv_cache & source);
     void set_allocation_group_size(uint32_t group_size, uint32_t stage_groups = 1);
+    // F2b: partição lógica do espaço de células por posição absoluta. Com P
+    // diferente de zero, ubatches locais usam células [0,P) e ubatches de
+    // overflow usam células [P,C); P == 0 preserva o alocador legado.
+    void set_position_split_p(uint32_t position_split_p) {
+        allocation_position_split_p = position_split_p;
+    }
+    uint32_t get_position_split_p() const {
+        return allocation_position_split_p;
+    }
     bool allocation_cell_uses_stage(uint32_t cell) const;
     int32_t allocation_cell_stage_slot(uint32_t cell) const;
     const std::vector<int32_t> & get_allocation_stage_slots() const;
@@ -437,6 +453,13 @@ bool requires_state_for_partial_restore() const override;
     }
     int32_t rotation_v() const { return attn_rot_v ? 64 : 0; }
 
+    // Diagnostic: per-layer live span hash for a sequence. See
+    // llama_kvarn_live_layer_table; a full-tensor hash cannot exclude inactive
+    // cells, so only rows owned by the sequence are read.
+    std::string live_layer_table(llama_seq_id seq_id) const;
+    bool probe_mutation(llama_seq_id seq_id, int layer_index, const char * tensor,
+            uint32_t row, bool live);
+
 private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
@@ -517,6 +540,7 @@ private:
     std::vector<std::vector<int32_t>> restored_tail_payload_slots;
     uint32_t allocation_group_size = 1;
     uint32_t allocation_stage_groups = 1;
+    uint32_t allocation_position_split_p = 0;
     // Structured unified caches reserve whole record groups for one exact
     // sequence-id set. Completed records remain freely shareable capacity;
     // only incomplete groups contend for the small cyclic F16 stage. Keep an
@@ -560,6 +584,8 @@ private:
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
     const bool own_payload_with_shared_cells;
+    const uint32_t payload_row_origin;
+    uint32_t payload_size = 0;
 
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 
@@ -697,6 +723,11 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    // F2b: safe validity probe for the current ubatch. get_ubatch() has only
+    // a debug assert; in Release an empty/out-of-range context is UB. Callers
+    // that classify the current ubatch (e.g. position-split range routing)
+    // must check this first and fall back instead of dereferencing garbage.
+    bool has_valid_current_ubatch() const;
 
     //
     // llama_kv_cache_context specific API

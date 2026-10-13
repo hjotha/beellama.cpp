@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 // Payload staging is independent of tensor/file size. Metadata prepared by the
@@ -23,7 +24,18 @@ public:
     }
 
     void read(void * dst, size_t count) override {
-        if (count > size - consumed) { throw std::runtime_error("truncated sequence state file"); }
+        if (count > size - consumed) {
+            // Bounded failure context: logical cursor vs physical file cursor.
+            // A large offset alone does not prove the reader limit is wrong --
+            // the REQUESTED count or the logical cursor may be the defect.
+            throw std::runtime_error(
+                "truncated sequence state file [class=llama_io_read_file_stream"
+                " total=" + std::to_string(size) +
+                " consumed=" + std::to_string(consumed) +
+                " requested=" + std::to_string(count) +
+                " available=" + std::to_string(size - consumed) +
+                " physical_tell=" + std::to_string((size_t) file.tell()) + "]");
+        }
         file.read_raw(dst, count);
         XXH64_update(&hash, dst, count);
         consumed += count;

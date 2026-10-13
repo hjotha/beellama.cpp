@@ -412,6 +412,8 @@ include(GNUInstallDirs)
 # build the library
 #
 
+option(LLAMA_F4_TEST_COUNTERS "F4 test-only backend copy/dispatch counters (never in production builds)" OFF)
+
 add_subdirectory(src)
 
 #

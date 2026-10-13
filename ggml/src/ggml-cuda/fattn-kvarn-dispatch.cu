@@ -491,6 +491,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         k_original_domain,
         v_original_domain);
     CUDA_CHECK(cudaGetLastError());
+
 }
 
 static inline bool ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(int k_bits, int v_bits) {
@@ -777,6 +778,15 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     GGML_CUDA_FATTN_KVARN_FAST_DECODE_DISPATCH_K(GGML_CUDA_FATTN_KVARN_SELECT);
 #undef GGML_CUDA_FATTN_KVARN_SELECT
 
+    if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
+        fprintf(stderr,
+            "CUDA_FA_ROUTE_GEOMETRY kernel=KVARN_DECODE_SPLIT D=%d bits=[%d,%d] "
+            "nq=%d nkv=%d gqa=%d available=%d candidates=%d split_tokens=%d nwarps=%d q_tile=%d\n",
+            D, plan.k.bits, plan.v.bits, n_q, plan.n_kv, gqa_ratio,
+            int(geometry.use_split), geometry.candidate_count, geometry.split_tokens,
+            geometry.nwarps, geometry.q_tile);
+        fflush(stderr);
+    }
     if (!geometry.use_split) {
         return false;
     }
@@ -1067,6 +1077,14 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn(
 
 
 
+static bool ggml_cuda_fattn_kvarn_noncausal_swa_needs_portable(
+        const ggml_tensor * dst, const ggml_cuda_fattn_kvarn_plan & plan) {
+    // Specialized SWA is unqualified for multi-slice non-causal records after
+    // a stage-ring wrap. The portable route consumes the same compressed records.
+    return dst->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK] != 0 &&
+        plan.head_dim > 128 && plan.k.swa && plan.v.swa;
+}
+
 bool ggml_cuda_flash_attn_ext_kvarn_uses_views(
         const ggml_tensor * dst) {
     return ggml_cuda_fattn_kvarn_uses_views(dst);
@@ -1095,6 +1113,9 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(
     if (!ggml_cuda_fattn_kvarn_body_shape_supported(
                 capabilities, plan.head_dim, plan.head_dim)) {
         return false;
+    }
+    if (ggml_cuda_fattn_kvarn_noncausal_swa_needs_portable(dst, plan)) {
+        return capabilities.portable_native && ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
     }
 #if defined(GGML_USE_HIP)
     // HIP graphs stay in the rotated domain. The portable operation predicate
@@ -1133,9 +1154,12 @@ bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(
         const ggml_tensor * dst) {
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
+    ggml_cuda_fattn_kvarn_plan plan;
     const bool portable_route =
         !capabilities.specialized_routes ||
-        (force_portable != nullptr && atoi(force_portable) != 0);
+        (force_portable != nullptr && atoi(force_portable) != 0) ||
+        (dst && ggml_cuda_fattn_kvarn_supported(device, dst, &plan) &&
+         ggml_cuda_fattn_kvarn_noncausal_swa_needs_portable(dst, plan));
     return dst != nullptr && dst->src[10] == nullptr &&
         dst->src[0]->ne[0] != 64 &&
         capabilities.portable_native && portable_route &&
@@ -1234,12 +1258,14 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     }
 
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
+    const bool required_portable = ggml_cuda_fattn_kvarn_noncausal_swa_needs_portable(dst, plan);
     if (capabilities.portable_native &&
-            force_portable != nullptr && atoi(force_portable) != 0 &&
+            (required_portable || (force_portable != nullptr && atoi(force_portable) != 0)) &&
             ggml_cuda_fattn_kvarn_portable_supported(plan, dst)) {
         g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
         ggml_cuda_fattn_kvarn_debug_route(
-            ctx.device, plan, dst, entry_path, "portable-native", "forced");
+            ctx.device, plan, dst, entry_path, "portable-native",
+            required_portable ? "noncausal-swa" : "forced");
         return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
     }
 
@@ -1270,7 +1296,6 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         int(Q->ne[0]), int(Q->ne[1]), gqa, plan.k.bits, plan.v.bits,
         plan.k.swa && plan.v.swa, dst->src[8] != nullptr,
         vector_eligible, split_eligible, prompt_prefill,
-        ggml_cuda_fattn_kvarn_split_max_q(plan, Q),
     });
 
     if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {

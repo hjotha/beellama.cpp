@@ -1,0 +1,10 @@
+tool=memcheck
+P=512 C=1024 n_tokens=520 decode=1 port=20700
+sanitizer_pid=171475 sanitizer_exit=0 target_pid=171485 forced_cleanup=0
+http=200 tokens_evaluated=520
+sanitizer_summary========== ERROR SUMMARY: 0 errors
+error_count=0 error_summary_present=1
+invalid_accesses=0 cuda_errors=0 initcheck_findings=0 leaked=0
+leftover_gpu_mib=0
+verdict=0 reason=green
+log=docs/occupancy-evidence/P512-C1024-n520-d1-memcheck.log

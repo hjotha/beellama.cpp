@@ -351,6 +351,17 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+# Explicit real-model capacity/restore campaign; never run by default CTest.
+llama_build(test-position-split-capacity.cpp)
+target_include_directories(test-position-split-capacity PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(test-position-split-capacity PRIVATE cxx_std_17)
+
+# Per-token native checkpoint pairing against the CPU structural oracle.
+# Explicit model campaign only; never part of default CTest.
+llama_build(test-position-split-teacher-pair.cpp)
+target_include_directories(test-position-split-teacher-pair PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(test-position-split-teacher-pair PRIVATE cxx_std_17)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-kv-tail-input.cpp)
@@ -480,6 +491,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-lfm2
+        LABEL main
+        ARGS -m "${MODEL_DIR}/lfm2-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-lfm2 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
@@ -690,6 +711,14 @@ endif()
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-std-kv-tail-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Regression for the FLASH_ATTN_EXT op_params reader (int32 slot vs byte index).
+add_executable(test-flash-attn-ext-params test-flash-attn-ext-params.cpp)
+target_include_directories(test-flash-attn-ext-params PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+target_compile_features(test-flash-attn-ext-params PRIVATE cxx_std_17)
+target_link_libraries(test-flash-attn-ext-params PRIVATE ggml)
+add_test(NAME test-flash-attn-ext-params WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-flash-attn-ext-params>)
+set_property(TEST test-flash-attn-ext-params PROPERTY LABELS main)
+
 add_executable(test-kvarn test-kvarn.cpp ../src/llama-kvarn.cpp)
 target_include_directories(test-kvarn PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(test-kvarn PRIVATE cxx_std_17)
@@ -747,9 +776,16 @@ if (GGML_VULKAN)
     add_executable(test-position-split-merge-graph test-position-split-merge-graph.cpp)
     target_include_directories(test-position-split-merge-graph PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
     target_compile_features(test-position-split-merge-graph PRIVATE cxx_std_17)
-    target_link_libraries(test-position-split-merge-graph PRIVATE ggml ggml-vulkan)
+    target_link_libraries(test-position-split-merge-graph PRIVATE llama ggml ggml-vulkan)
     add_test(NAME test-position-split-merge-graph WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge-graph>)
     set_property(TEST test-position-split-merge-graph PROPERTY LABELS main)
+
+    add_executable(test-position-split-real-pair test-position-split-real-pair.cpp)
+    target_include_directories(test-position-split-real-pair PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+    target_compile_features(test-position-split-real-pair PRIVATE cxx_std_17)
+    target_link_libraries(test-position-split-real-pair PRIVATE llama ggml ggml-vulkan)
+    add_test(NAME test-position-split-real-pair WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-real-pair>)
+    set_property(TEST test-position-split-real-pair PROPERTY LABELS main)
 
     add_executable(test-position-split-lse-sched test-position-split-lse-sched.cpp)
     target_include_directories(test-position-split-lse-sched PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
@@ -757,6 +793,15 @@ if (GGML_VULKAN)
     target_link_libraries(test-position-split-lse-sched PRIVATE ggml ggml-vulkan)
     add_test(NAME test-position-split-lse-sched WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-lse-sched>)
     set_property(TEST test-position-split-lse-sched PROPERTY LABELS main)
+
+    # F5 packed-overflow diagnostic: Q4_0 vs F16 FLASH_ATTN_EXT on Vulkan,
+    # equal and padded live extents, O and LSE. Skips cleanly without Vulkan0.
+    add_executable(test-fa-q4-view test-fa-q4-view.cpp)
+    target_include_directories(test-fa-q4-view PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+    target_compile_features(test-fa-q4-view PRIVATE cxx_std_17)
+    target_link_libraries(test-fa-q4-view PRIVATE ggml ggml-vulkan)
+    add_test(NAME test-fa-q4-view WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-fa-q4-view>)
+    set_property(TEST test-fa-q4-view PROPERTY LABELS main)
 endif()
 
 add_executable(test-position-split-ubatch test-position-split-ubatch.cpp)
@@ -765,6 +810,12 @@ target_compile_features(test-position-split-ubatch PRIVATE cxx_std_17)
 target_link_libraries(test-position-split-ubatch PRIVATE llama)
 add_test(NAME test-position-split-ubatch WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-ubatch>)
 set_property(TEST test-position-split-ubatch PROPERTY LABELS main)
+
+add_executable(test-position-split-ranges test-position-split-ranges.cpp)
+target_include_directories(test-position-split-ranges PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(test-position-split-ranges PRIVATE cxx_std_17)
+add_test(NAME test-position-split-ranges WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-ranges>)
+set_property(TEST test-position-split-ranges PROPERTY LABELS main)
 
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
@@ -779,6 +830,10 @@ llama_build_and_test(test-cpu-fattn-support.cpp)
 # the build option instead; the target is resolved when the full project is
 # generated.
 if (LLAMA_BUILD_SERVER)
+    llama_build_and_test(test-f5-per-token-timing.cpp)
+    target_include_directories(test-f5-per-token-timing PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-f5-per-token-timing PRIVATE server-context)
+
     llama_build_and_test(test-server-loop-guard.cpp)
     target_include_directories(test-server-loop-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-loop-guard PRIVATE server-context)
@@ -921,3 +976,12 @@ target_include_directories(test-kv-mixed-handoff PRIVATE ${PROJECT_SOURCE_DIR} $
 
 llama_build_and_test(test-fit-mixed-kv.cpp)
 target_include_directories(test-fit-mixed-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+# Destination-intactness for a REFUSED restore, through the real server restore
+# path (server_prompt_cache::restore) and the real transactional PURE->split
+# import. Links server-context so the code under test is the production code.
+llama_build_and_test(test-kv-mixed-destination-intact.cpp)
+target_link_libraries(test-kv-mixed-destination-intact PRIVATE server-context)
+target_include_directories(test-kv-mixed-destination-intact PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-prompt-cache-native-layout.cpp)

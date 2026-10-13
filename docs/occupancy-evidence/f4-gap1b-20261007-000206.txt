@@ -1,0 +1,10 @@
+A-split-create             exit=1   split=[off] load=none                   match=[] replayed=0
+    err: 0.05.340.049 E cmn  common_init_: failed to create context with model '/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf' 0.05.340.058 E llama_completion: error: unable to create context 
+B-split-hit-sameP          exit=1   split=[off] load=none                   match=[] replayed=0
+    err: 0.04.761.687 E cmn  common_init_: failed to create context with model '/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf' 0.04.761.699 E llama_completion: error: unable to create context 
+C-split-hit-ext            exit=1   split=[off] load=none                   match=[] replayed=0
+    err: 0.04.783.557 E cmn  common_init_: failed to create context with model '/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf' 0.04.783.561 E llama_completion: error: unable to create context 
+D-split-diffP512           exit=1   split=[off] load=none                   match=[] replayed=0
+    err: 0.04.772.893 E cmn  common_init_: failed to create context with model '/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf' 0.04.772.897 E llama_completion: error: unable to create context 
+E-split-snap-XXLdest       exit=0   split=[off] load=miss/new               match=[] replayed=0
+    err: 0.04.894.798 I system_info: n_threads = 8 (n_threads_batch = 8) / 16 | CUDA : ARCHS = 890 | NO_VMM = 1 | USE_GRAPHS = 1 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_

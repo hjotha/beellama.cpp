@@ -1,0 +1,270 @@
+F4 real-pair O/LSE oracle — STATUS: BUILDS AND EXECUTES, GATES NOT YET TRUSTWORTHY
+generated: 2026-10-04T23:35:40TC
+
+## what now exists
+tests/test-position-split-real-pair.cpp — registered in tests/CMakeLists.txt (target
+test-position-split-real-pair, links llama ggml ggml-vulkan, LABELS main).
+
+## real devices (resolved by name, not assumed)
+  device[0] CUDA0   = NVIDIA GeForce RTX 4070
+  device[1] Vulkan0 = AMD Ryzen Z1 Extreme (RADV PHOENIX)  <- chosen as overflow
+  device[2] Vulkan1 = NVIDIA GeForce RTX 4070
+  chosen: local=CUDA0 overflow=Vulkan0
+
+## what the test actually exercises
+  local    : NATIVE KVarN — ggml_kvarn_store + ggml_kvarn_view + permute +
+             KVARN_DOMAIN_ROTATED, FA on CUDA (mirrors test-kvarn.cpp:3440-3476)
+  overflow : Q4_0 via OFFICIAL ggml_quantize_chunk, FA-LSE on Vulkan
+             (log line proves the route ran: ggml_vk_flash_attn: FA-LSE
+              split_k=1 split_kv=64 ne=(6,1,1) D=128 gqa=3 N=3 KV=32)
+  merge    : CUDA, mirroring src/llama-graph.cpp:4623-4639 (ggml has no binary
+             max; mx = 0.5*(c1+c2+|c1-c2|) with clamp [-1e6,1e30])
+  oracle   : FP64 over the SAME rows each codec produced (KVarN materialize on
+             CPU, Q4_0 official CPU dequant), same masks, same scale
+
+## harness bugs found and fixed while getting it to run
+  1. GGML_STATUS_SUCCESS==0, so 'if (!compute())' treated success as failure
+  2. one ggml_context cannot be allocated twice (cuda then vk) -> two contexts
+  3. q_t was missing the head dim; Q4_0 overflow was flat 2D instead of 3D
+  4. ggml_reshape_4d on a FA output asserts (non-contiguous) -> broadcast mul
+  5. bare graph intermediates have no readable buffer -> explicit ggml_cpy
+  6. oracle masks are [q][kv] but tensors are [kv][q] -> transposed
+  7. Q4_0 dequantized rows are [token][head]; oracle wants [head][token]
+
+## current measurements (NOT gate evidence yet)
+  local(CUDA/KVarN) NRMSE=1.68e+00 maxO=2.29e+00
+  ovf(Vulkan/Q4)    NRMSE=5.67e+05 maxO=9.97e-01
+  merged            NRMSE=2.32e+00 maxO=1.43e+00 maxLSE=5.27e-01
+
+These are dominated by remaining harness misalignment (which key/head/row each
+side reads), not yet by kernel fidelity. With n_q=1 the causal mask I generate
+leaves a single unmasked key, so any key/head offset shows up as O(1) error.
+The existing vk/vk prototype already measured per-range fidelity at 1.0e-3..1.4e-3,
+so a 1.68 discrepancy is far too large to be a kernel defect.
+
+## next step
+Align the harness against the production key/head mapping (use the exact
+get_k_for_range/get_v_for_range + kq_mask layout from src/llama-graph.cpp and
+llama-kv-cache-kvarn), then re-measure and locate the FIRST differing element
+before touching any kernel. No kernel edit has been made.
+
+## revisao 23:47 — bug (1) CONFIRMADO e CORRIGIDO, com evidencia
+q4_oracle_rows NAO desquantizava: ggml_backend_tensor_get copia ggml_nbytes()
+= 18 bytes por 32 valores (4.5 B/valor) para um vector<float> de D*nrows
+floats -> escrita fora dos limites. Overflow mediava NRMSE=5.669e+05
+(maxO=9.97e-01): numero invalido, nao fidelidade.
+
+Corrigido com grafo CPU real (ggml_cast Q4_0 -> F32, computado) + comparação
+byte-a-byte dos bytes que vão ao tensor Vulkan vs os usados na referencia
+(K2/V2 bytes differ from reference -> falha). Roundtrip do backend tambem
+verificado.
+
+Efeito medido, mesma build, producao parada:
+  overflow(Vulkan/Q4) NRMSE  5.669e+05 -> 1.072e+00
+  (local CUDA/KVarN)  NRMSE  1.684e+00 -> 1.412e+00
+
+## DECLARADO: ERRO DE HARNESS — gates NAO sao evidencia
+Ainda NRMSE ~1.0-1.4 O(1) em ambas as faixas. O prototipo vk/vk ja media
+1.0e-3..1.4e-3, logo isto e desalinhamento do harness, nao defeito de kernel.
+Nenhum kernel foi editado.
+
+Correcoes ainda PENDENTES (revisao 23:47):
+ (2) local: 'current' do store exige ne[0]=head_dim e ne[1]=n_head_kv
+     (llama-kv-cache-kvarn.cpp:5475-5479) e, se slices>1, reshape para
+     [KVAR_N_GROUP=128, n_head_kv*slices, n_kv]. Meu harness usa
+     [record_dim, slices, kv1] -> falta n_head_kv; o oraculo indexava
+     kh ate n_kvh-1 (leitura fora de limites).
+ (3) layout real de O e {D,H,Q} => ((t*n_qh+h)*D+d); LSE e h+t*n_qh.
+     oracle/merge_ref/masked_rows usam h*n_q+t.
+ (4) mask e {n_kv,n_q} com p+t*n_kv (nao p*n_q+t); causal ABSOLUTA:
+     local = tudo anterior/visivel salvo padding; overflow p<=t+n_ovf-n_q.
+ (5) max do softmax sobre score escalado acc*scale.
+ (6) KVARN_DOMAIN_ROTATED: o harness so marca op_param; a referencia usa
+     linhas de-materializadas (dominio original) enquanto o FA nativo consome
+     records rotacionados. Precisa espelhar WHT/inversa V e ler os records/stage
+     realmente produzidos pelo CUDA.
+ (7) maxdiff deve exigir sizes iguais e tratar NaN/inf; single-range-after-merge
+     deve comparar ho/hl (merged) com a faixa valida; ambas vazias -> O=0 e
+     LSE=-inf.
+
+## revisao 23:47 — seis reparos aplicados no harness
+Corrigidos e verificados por build/execucao:
+
+(1) q4_oracle_rows: grafo CPU real (ggml_cast Q4_0->F32 computado) + comparacao
+    byte-a-byte dos bytes enviados ao tensor Vulkan vs os da referencia.
+    CORRECAO FACTUAL do relato anterior: 18 bytes / 32 valores = 0,5625 B/valor,
+    logo o raw Q4 copiado para vector<float> SUBPREENCHE (ggml_nbytes < D*nrows*4),
+    nao causa overflow por si. O OOB de KV heads e defeito SEPARADO. Ambos
+    foram corrigidos, e a caracterizacao errada esta revogada.
+(2) KVarN 'current' agora e [KVAR_N_GROUP=128, n_kvh*head_slices, n_kv], com
+    grupo == stage->ne[1] == records->ne[1]; asserts de geometria rodam ANTES de
+    qualquer upload/acesso. O oraculo le head/token com head_slices explicito
+    (to_head_rows), eliminando a indexacao kh ate n_kvh-1 sobre um ne[1]=slices.
+(3) O medido e [D, n_qh, n_q] => ((t*n_qh + h)*D + d); LSE e [n_qh, n_q] =>
+    h + t*n_qh. oracle/merge_ref/masked_rows/first_diff corrigidos juntos, com
+    n_q>1 nos casos Q2 e prefill. Verificado em ggml.c:5637 e 5722.
+(4) mask [n_kv, n_q] com p + n_kv*t, sem transpose. Causal ABSOLUTA:
+    local   -> p <= n_local - n_q + t (nunca expoe padding)
+    overflow-> p <= n_ovf - n_q + t  (equivale a p <= t + n_ovf - n_q)
+    A condicao antiga n_ovf-p <= n_q-t liberava sufixo e foi removida.
+(5) max do softmax sobre o score JA escalado (acc*scale); mascarados ficam
+    -inf com peso 0 e sao pulados no segundo passe.
+(6) CAUSA RAIZ ENCONTRADA e nao e mais uma suposicao: a rota nativa CUDA KVarN
+    e recusada em ggml-cuda/fattn-kvarn-dispatch.cu:731, que exige
+    ggml_cuda_fattn_kvarn_rotated_decode_domain(dst) == true, isto e SOMENTE
+    KVARN_DOMAIN_ROTATED. test-kvarn.cpp:116-191 assegura esse invariante em
+    todos os caminhos de producao: os records do corpo persistente sao SEMPRE
+    rotacionados. A matriz de rotacao chega ao store pelo CONTEXTO DO BACKEND
+    (llama_kv_cache_kvarn_context::set_input_kvarn_rot), nao pelo grafo -- um
+    grafo sintetico nao tem como rotacionar. Marcar ROTATED sem rotacionar
+    transformaria V por uma rotacao inexistente, que e exatamente o NRMSE ~1.4
+    medido antes.
+    Consequencia: a faixa local nao pode ser medida pela rota NATIVA neste
+    harness sintetico. Medida pela rota F16 materializada, com as linhas
+    cross-checked contra os records/stage lidos do device CUDA.
+(7) verify_o/verify_lse compartilhados exigem sizes iguais e finitude;
+    inf-inf conta como match so com o mesmo sinal; single-range-after-merge
+    compara ho/hl MERGED contra a faixa valida (antes so comparava only_o com
+    ref); ambas-vazias aplica so o contrato por faixa (O=0, LSE=-inf) porque a
+    formula de merge da producao (clamp + 0/0) viola a precondicao com as duas
+    faixas vazias. Controles negativos passam pelo MESMO verificador: NaN em O,
+    NaN em LSE, NaN em head-query diferente, perturbacao, tamanho errado e
+    LSE finito onde a referencia e -inf.
+
+## estado da execucao
+  real-pair O/LSE: 161 checks, 7 failures, 7 not-executed   (exit 1)
+  devices: CUDA0 = RTX 4070; overflow = Vulkan0 = AMD Ryzen Z1 (RADV PHOENIX)
+
+  local  = NOT-EXECUTED. Nao e falha de kernel: a rota nativa exige ROTATED +
+           matriz de rotacao do contexto do backend (item 6), e a rota F16
+           materializada e recusada por ggml_backend_supports_op(CUDA, FA)
+           neste harness. Gate da faixa local CONTINUA FECHADO.
+  overflow= suportado (ovf=1), mas o par so e medido junto com a faixa local,
+           entao as portas de O/LSE/merge nao puderam ser avaliadas ainda.
+
+Nenhum kernel foi editado. Branch/diffs/modelo preservados.
+
+## revisao 57 — D128 Q1 local REALMENTE EXECUTADO em CUDA0
+  real-pair O/LSE: 254 checks, 13 failures, 0 not-executed   (exit 1)
+
+### recusa F16 isolada (nao e defeito de kernel)
+ggml_backend_supports_op(CUDA, FA) = 0 para a rota materializada porque
+ggml-cuda/fattn.cu:1032-1035 nega LSE em FA GENERICO, fail-closed:
+"generic FA exports no LSE yet". Nao e tipo, stride, geometria nem backend --
+e a ausencia da rota de exportacao de LSE. Logo so a rota KVarN (views em
+src[1]/src[2]) tem LSE. Confirmado.
+
+### contrato de rotacao CORRIGIDO (hipotese anterior estava errada)
+O store NAO depende de matriz externa: ggml-cuda/kvarn.cu:832-875
+(kvarn_convert_rotate_kernel) aplica o butterfly Walsh-Hadamard internamente
+(source_rotation), e por isso o corpo persistente e SEMPRE rotacionado
+(test-kvarn.cpp:116-191). O que faltava era Q. Receita de producao aplicada
+agora, espelhando src/llama-graph.cpp:4223-4226:
+  q1r = ggml_kvarn_wht(q_t, D)
+  fa1 = FA(q1r, view_k, view_v, mask1); domain = ROTATED
+  lse1 = lse_out(fa1)          # aceito porque uses_kvarn
+O materializador recebe op_params[4]=1 (emit rotated) para K e =0 para V,
+exatamente como llama_kv_cache_kvarn::materialize faz. O Q do oraculo e rotacionado
+pelo MESMO op ggml_kvarn_wht rodado em CPU -- sem reimplementar o WHT.
+
+### resultado: overflow Q4_0/Vulkan VERDE, local KVarN ISOLADO em V
+  ovf(Vulkan/Q4) D128 Q1      NRMSE=2.502e-04 maxO=6.280e-04 maxLSE=1.290e-04  PASSA
+  ovf(Vulkan/Q4) D128 Q2      NRMSE=2.959e-04 maxO=7.072e-04 maxLSE=1.897e-04  PASSA
+  ovf(Vulkan/Q4) D128 prefill NRMSE=5.181e-04 maxO=2.242e-03 maxLSE=0.0        PASSA
+  ovf(Vulkan/Q4) D256 Q1      NRMSE=8.641e-04 maxO=2.091e-03 maxLSE=1.694e-04  PASSA
+  (gates: NRMSE 1e-3, maxO 1e-2, maxLSE 1e-2)
+  => itens (1)(3)(4)(5)(7) validados na faixa overflow.
+
+  local(CUDA/KVarN) D128 Q1   NRMSE=1.318e+00 maxO=6.813e+00 maxLSE=6.524e-07
+  local(CUDA/KVarN) D256 Q1   NRMSE=1.358e+00 maxO=1.087e+01 maxLSE=2.995e-03
+
+DIAGNOSTICO PRECISO: LASE local bate a ~6.5e-07 => escores, K rotacionado, Q via
+WHT, mascara, escala e softmax estao CORRETOS. Logo o defeito esta isolado no
+dominio/escala de V. first diff d=0 h=0 t=0: got=7.618196 ref=0.804976.
+Como os valores de V do teste ficam em [0.1,0.9], got=7.62 esta FORA do casco
+convexo de qualquer combinacao convexa das linhas de V => o backend nao esta
+lendo V da mesma representacao que a referencia.
+
+cross-check CPU store vs device records/stage: maxdiffK=0.000e+00
+maxdiffV=0.000e+00 -- a store de CPU e a do device sao identicas, entao a
+divergencia NAO esta no store.
+
+Hipoteses a testar em seguida (nenhuma validada ainda): value_bits distinta de
+key_bits em producao (o harness usa o mesmo `bits` para K e V); o grupo/recorte
+de rotacao de V (v_slices, prism.hadamard.gdn_v_grouped) diferindo de K; e a
+escala por head que o V KVarN carrega. NENHUM KERNEL FOI EDITADO.
+
+### casos de contrato que passam
+both-empty: O=0 e LSE=-inf exatos nas duas faixas (0 not-executed).
+single-range-after-merge: merged-vs-range agora comparado em ho/hl.
+
+### follow-up: por que V e nao K
+- value_bits distinto de key_bits foi verificado e NAO e a causa: o harness usa
+  bits=4 para K e V, que e o tipo legitimo kv4v4 = {4,4} em
+  src/llama-kv-mixed-state.cpp:44-51. O par (key_bits, value_bits) soberano
+  do par persistent-rotated NAO esta no record layout.
+- Queda mais provavel que resta: sinkhorn_iters. O harness fixa 16
+  (ggml_kvarn_store(..., 16, ...)), enquanto producao usa
+  params.sinkhorn_iters do preset. Sinkhorn altera a escala por head que o
+  record de V carrega -- exatamente um fator por head, compativel com LSE exato
+  e O errado por escala. PROXIMO PASSO CONCRETO: obter sinkhorn_iters do preset
+  real e reexecutar, em vez de assumir 16.
+- Nenhuma alteracao de kernel feita ou justificada por este harness.
+
+## revisao 57 (cont) — PAR REAL VERDE
+  real-pair O/LSE: 296 checks, 0 failures, 0 not-executed   (exit 0)
+  ctest: test-position-split-real-pair .... Passed 0.58 sec
+
+Tres defeitos do harness, todos confirmados no codigo e corrigidos:
+
+(1) O local em dominio ROTATED nao era restaurado. Producao
+    src/llama-graph.cpp:4604-4609 aplica ggml_kvarn_wht_aux em o1 ANTES do merge.
+    O harness usava fa1 cru no merge e na copia, dai O fora do casco convexo
+    (got=7.62 para valores em [0.1,0.9]). Hadamard normalizada e propria inversa,
+    entao o mesmo op restaura. AGORA: o1 = ggml_kvarn_wht(fa1, D), e o1 entra no
+    merge E na copia/porta da faixa local. LSE continua ligado ao FA original.
+    Diagnostico porpalitado (sinkhorn_iters) NAO foi perseguido.
+
+(2) verify_lse retornava true no primeiro par de infinitos coincidentes e
+    ignorava o resto. Corrigido: visita todas as posicoes, rejeita mismatch de
+    infinito, continua o loop quando iguais, rejeita NaN dos dois lados, mantem
+    md valido. Controles reforcados: vetor de LSE com shape proprio (antes o
+    teste de NaN em LSE usava um vetor de O, rejeitado so por tamanho), NaN na
+    referencia, e -inf correto no primeiro elemento seguido de NaN / finito /
+    sinal errado em outro head.
+
+(3) Banner e comentario NOT-EXECUTED obsoletos removidos. NOT-EXECUTED agora e
+    impresso apenas quando ggml_backend_supports_op e 0 de fato.
+
+### medicoes (gates NRMSE 1e-3, maxO 1e-2, maxLSE 1e-2)
+devices: CUDA0 = NVIDIA GeForce RTX 4070; overflow = Vulkan0 = AMD Ryzen Z1
+         Extreme (RADV PHOENIX)
+
+caso                          local CUDA/KVarN                     overflow Vulkan/Q4
+D128 Q1 both     NRMSE=3.783e-05 maxO=6.477e-05 maxLSE=6.524e-07 | 2.502e-04 6.280e-04 1.290e-04
+D128 Q2 both     NRMSE=3.758e-05 maxO=6.496e-05 maxLSE=5.226e-07 | 2.959e-04 7.072e-04 1.897e-04
+D128 Q1 local    NRMSE=3.783e-05 maxO=6.477e-05 maxLSE=6.524e-07 | 0 (faixa vazia)
+D128 Q1 ovf      (faixa vazia)                                | 2.502e-04 6.280e-04 1.290e-04
+D128 Q1 prefill  NRMSE=3.581e-05 maxO=1.438e-04 maxLSE=9.739e-07 | 5.181e-04 2.242e-03 2.184e-04
+D256 Q1 both     NRMSE=5.246e-05 maxO=1.409e-04 maxLSE=2.995e-03 | 8.641e-04 2.091e-03 1.694e-04
+
+merged O/LSE:
+D128 Q1 both    NRMSE=6.726e-05 maxO=1.505e-04 maxLSE=3.005e-05  first_bad=768/768 (=nenhum)
+D128 Q2 both    NRMSE=7.518e-05 maxO=1.705e-04 maxLSE=3.348e-05  first_bad=1536/1536 (=nenhum)
+D128 Q1 prefill NRMSE=1.278e-04 maxO=7.707e-04 maxLSE=7.194e-05  first_bad=73728/73728 (=nenhum)
+D256 Q1 both    NRMSE=2.040e-04 maxO=5.468e-04 maxLSE=2.480e-03  first_bad=6144/6144 (=nenhum)
+
+contratos por faixa:
+  both-empty: O=0 e LSE=-inf exatos nas duas faixas (precondicao de merge
+  violada com as duas vazias, entao so o contrato por faixa se aplica)
+  single-range-after-merge: merged-vs-range == rawrange nos dois sentidos
+    (local only 3.783e-05 == 3.783e-05; overflow only 2.502e-04 == 2.502e-04)
+  cross-check store CPU vs device records/stage: maxdiffK=0.000e+00 maxdiffV=0.000e-00
+
+### compute-sanitizer memcheck no harness
+  SAN_EXIT=0, "========= ERROR SUMMARY: 0 errors", teste permanece
+  296 checks / 0 failures / 0 not-executed sob o sanitizer.
+  Nenhum OOB de device no store/view/FA KVarN com a geometria sintetica.
+  Log: docs/occupancy-evidence/f4-real-pair-sanitizer.log
+  host bounds via ASan/valgrind: NAO executado (sem build sanitizer do harness;
+  o binario linka CUDA e valgrind seria inviavel) -- pendente, nao verde.

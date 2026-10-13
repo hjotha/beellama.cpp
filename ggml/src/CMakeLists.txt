@@ -223,6 +223,11 @@ if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
 
+# F4 TEST-ONLY backend copy/dispatch counters. OFF by default (build-f4 only).
+if (LLAMA_F4_TEST_COUNTERS)
+    target_compile_definitions(ggml-base PUBLIC LLAMA_F4_TEST_COUNTERS=1)
+endif()
+
 if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()

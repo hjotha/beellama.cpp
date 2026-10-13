@@ -1,4 +1,5 @@
 #include "ggml-alloc.h"
+#include <stdint.h>
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -1018,6 +1019,92 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            // F4 failing-reservation map (env-gated, bounded). Emitted immediately
+            // BEFORE the allocation attempt, so it describes the graph whose
+            // reservation is oversized.
+            //   * backend attribution comes from the node's OWN destination
+            //     allocation descriptor (node_allocs[k].dst), never src[0];
+            //   * allocation size is dst.size_max (the backend allocation size),
+            //     never ggml_nbytes() of whichever view appears first;
+            //   * invalid / pre-allocated / external allocations (buffer_id < 0)
+            //     are excluded;
+            //   * uniqueness is per (buffer_id, view-root) and reported per buffer;
+            //   * the top list is the largest allocations INSIDE this buffer.
+            // Sizes are per-allocation, NOT a simultaneous-live total.
+            // No payloads.
+            if (getenv("F4_ALLOC_TRACE") != NULL) {
+                const size_t cur_size2 = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                fprintf(stderr, "F4RESERVE buf=%d buft=%s planned=%zu current=%zu n_nodes=%d n_leafs=%d\n",
+                        i, ggml_backend_buft_name(galloc->bufts[i]), new_size, cur_size2,
+                        graph->n_nodes, graph->n_leafs);
+                const int cap = 8192;
+                const struct ggml_tensor * roots[cap];
+                struct ggml_tensor * rten[cap];
+                size_t rbytes[cap];
+                int rchunk[cap];
+                size_t roff[cap];
+                int rcount = 0;
+                size_t sum_alloc = 0;
+                int rskipped = 0;
+                for (int k = 0; k < graph->n_nodes; k++) {
+                    const struct tensor_alloc * d = &galloc->node_allocs[k].dst;
+                    if (d->buffer_id < 0 || d->size_max == 0) {
+                        rskipped++;
+                        continue;
+                    }
+                    if (d->buffer_id != i) {
+                        continue;
+                    }
+                    struct ggml_tensor * root = graph->nodes[k];
+                    while (root != NULL && root->view_src != NULL) {
+                        root = root->view_src;
+                    }
+                    int dup = 0;
+                    for (int s = 0; s < rcount; s++) {
+                        if (roots[s] == root) { dup = 1; break; }
+                    }
+                    if (dup) {
+                        continue;
+                    }
+                    if (rcount >= cap) {
+                        break;
+                    }
+                    roots[rcount] = root;
+                    rten[rcount]   = graph->nodes[k];
+                    rbytes[rcount] = d->size_max;
+                    rchunk[rcount] = d->addr.chunk;
+                    roff[rcount]   = d->addr.offset;
+                    rcount++;
+                    sum_alloc += d->size_max;
+                }
+                fprintf(stderr, "F4RESERVE_SUM buf=%d unique_dst=%d skipped_invalid=%d "
+                        "sum_dst_size_max=%zu (%.2f MiB) [per-allocation sum, not live total]\n",
+                        i, rcount, rskipped, sum_alloc, sum_alloc / 1048576.0);
+                for (int a = 0; a < rcount; a++) {
+                    for (int b = a + 1; b < rcount; b++) {
+                        if (rbytes[b] > rbytes[a]) {
+                            const struct ggml_tensor * tr = roots[a];
+                            struct ggml_tensor * tt = rten[a];
+                            const size_t tb = rbytes[a]; const int tc = rchunk[a]; const size_t to = roff[a];
+                            roots[a] = roots[b]; rten[a] = rten[b]; rbytes[a] = rbytes[b];
+                            rchunk[a] = rchunk[b]; roff[a] = roff[b];
+                            roots[b] = tr; rten[b] = tt; rbytes[b] = tb; rchunk[b] = tc; roff[b] = to;
+                        }
+                    }
+                    if (a >= 25) {
+                        break;
+                    }
+                    fprintf(stderr, "F4RESERVE_TOP buf=%d alloc=%zu (%.2f MiB) chunk=%d off=%zu "
+                            "op=%s type=%s ne=[%lld,%lld,%lld] root=0x%lx\n",
+                            i, rbytes[a], rbytes[a] / 1048576.0, rchunk[a], roff[a],
+                            ggml_op_name(rten[a] != NULL ? rten[a]->op : GGML_OP_NONE),
+                            rten[a] != NULL ? ggml_type_name(rten[a]->type) : "?",
+                            rten[a] != NULL ? (long long) rten[a]->ne[0] : -1,
+                            rten[a] != NULL ? (long long) rten[a]->ne[1] : -1,
+                            rten[a] != NULL ? (long long) rten[a]->ne[2] : -1,
+                            (unsigned long) (intptr_t) roots[a]);
+                }
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;

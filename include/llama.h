@@ -229,9 +229,10 @@ extern "C" {
         int32_t swa_key_bits;
         int32_t swa_value_bits;
         int32_t group;
-        int32_t sinkhorn_iters;
-        int32_t sink_tokens;
-        bool    fail_if_unsupported;
+        int32_t  sinkhorn_iters;
+        int32_t  sink_tokens;
+        uint32_t window_chunk; // CUDA prefill materialization window; 0 = environment/default
+        bool     fail_if_unsupported;
     };
 
     LLAMA_API const char *              llama_kvarn_type_name       (enum llama_kvarn_type type);
@@ -617,6 +618,10 @@ extern "C" {
         enum ggml_type mtp_reserve_type_k;   // standard K type when kvarn disabled
         enum ggml_type mtp_reserve_type_v;   // standard V type when kvarn disabled
         uint32_t mtp_reserve_rollback_tokens; // resolved draft KV tail rollback depth (max(n_rs_seq, kv_tail_rollback_tokens), KVarN minimum 1)
+
+        // Fixed CUDA KVarN / Vulkan Q4 position boundary; 0 leaves placement unchanged.
+        // Appended so existing context-parameter member offsets remain stable.
+        uint32_t kv_position_split_p;
     };
 
     struct llama_model_tensor_override {

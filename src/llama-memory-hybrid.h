@@ -67,7 +67,8 @@ public:
     llama_memory_hybrid(
         const llama_model & model,
         std::unique_ptr<llama_memory_i> mem_attn,
-        std::unique_ptr<llama_memory_recurrent> mem_recr);
+        std::unique_ptr<llama_memory_recurrent> mem_recr,
+        uint32_t position_split_p = 0);
 
     ~llama_memory_hybrid() = default;
 
@@ -183,7 +184,10 @@ private:
     uint32_t position_split_p = 0;
 };
 
+class llama_memory_hybrid_idx_context;
+
 class llama_memory_hybrid_context : public llama_memory_context_i {
+    friend class llama_memory_hybrid_idx_context;
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
@@ -210,8 +214,12 @@ public:
     bool next()  override;
     bool apply() override;
     void graph_compute_start() override;
+    // F4: forward the store-slot reset to the attention child context, which owns
+    // the per-graph K/V slots. The recurrent child has none.
+    void reset_graph_store_slots() const override;
     void graph_compute_finish(ggml_status status) override;
     void graph_compute_complete(ggml_backend_sched_t sched, ggml_status status) override;
+    void capture_after_compute(ggml_backend_sched_t sched, ggml_status status) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

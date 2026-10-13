@@ -3,6 +3,13 @@
 Data: 2026-10-02. Contexto: `docs/xxl-prefill-bottleneck-20261002.md` e
 `docs/xxxl-tier-plan-20261002.md`.
 Revisão: 2026-10-03, contra o código `982eaadaa`.
+Revisão: 2026-10-10 (msg 956, 06:59:54 UTC) — **requisito de memória
+alterado**: o único critério de memória passa a ser a ausência de OOM; o piso
+`max(512 MiB, 5% da VRAM total)` (614 MiB) e a exigência anterior de
+`MemAvailable >= 2 GiB` deixam de ser gates obrigatórios. Medições históricas
+de pico, folga, RAM e swap permanecem registradas como observações, sem
+reescrita de resultados. Qualidade/KL, estado/logits/tokens, estabilidade,
+A/B equivalente e todos os demais escopos/gates permanecem intactos.
 
 Status: proposta de implementação. As metas de aceite abaixo são requisitos
 iniciais, não resultados medidos. Os números históricos do diagnóstico devem
@@ -220,12 +227,16 @@ cópia/staging, scratch/allocator e eventual coexistência durante restore.
 Não usar apenas a memória depois da inicialização como evidência de pico.
 
 - Escolher o maior P múltiplo de 256 até 102400 que respeite todos os limites.
-  Margem CUDA mínima: `max(512 MiB, 5% da VRAM total)` livre no pico observado.
-  Registrar limite calculado, pico medido e folga, sem dupla contagem de buffers
-  reutilizados. Se nenhum P suportado couber, rejeitar a configuração.
+  Gate de memória desde 2026-10-10 (msg 956): ausência de OOM. O piso
+  `max(512 MiB, 5% da VRAM total)` (614 MiB) deixou de ser critério
+  obrigatório; registrar limite histórico, pico medido e folga apenas como
+  observação, sem dupla contagem de buffers reutilizados. Se nenhum P
+  suportado couber sem OOM, rejeitar a configuração.
 - Calcular KV overflow, scratch Vulkan, buffers host e spool separadamente.
-  Exigir pelo menos 2 GiB de `MemAvailable`, sem OOM nem atividade de swap
-  durante a carga; registrar também GTT/heap Vulkan disponível e seu pico.
+  Gate de memória: ausência de OOM durante a carga (msg 956). Registrar
+  `MemAvailable`, atividade de swap, GTT/heap Vulkan e picos como observações
+  (a exigência anterior de `MemAvailable >= 2 GiB` sem swap deixou de ser
+  gate; medições históricas não são reescritas).
 - Fixar P por contexto e registrá-lo em logs/snapshot. Mudança de disponibilidade
   não autoriza migração implícita: novo contexto recalcula P e aplica §3.6.
 - Incluir alocação/reserva e execução reais de prefill, decode, restore e passagem
@@ -248,6 +259,13 @@ falha bloqueia promoção, sem afrouxar tolerância depois de observar resultado
 | 6 (opcional) | Sobreposição CUDA/Vulkan | Só após fases 0–5 verdes; benefício ponta a ponta e ausência de regressão comprovados pelo §4.1 |
 | 7 | Promoção | Gates sequenciais verdes, janela de manutenção, canário e rollback para XXL/XXXL documentado |
 
+Preparação auxiliar existente para F5 e F7 (CPU, sem GPU e sem serviço):
+`docs/occupancy-aux-handoff-20261005.md`. Reutilizar essas ferramentas/runbooks
+no checkpoint F5/F7 após revisão de compatibilidade com a árvore final e
+revalidação de hashes, em vez de reimplementar. Preparação concluída **não** é
+aceite F5 medido nem prontidão F7; ambos continuam abertos e exigem evidência
+própria.
+
 ### 4.1 Protocolo e limites objetivos
 
 **Reprodutibilidade.** Registrar commit, modelos e hashes, comando/configuração,
@@ -263,9 +281,20 @@ erro causado pela troca KVarN/Q4.
 Definir `NRMSE = RMS(O - ref) / max(RMS(ref), 1e-6)`. Exigir NRMSE <= 1e-3, erro absoluto máximo de O <= 1e-2 e erro absoluto
 de LSE finito <= 1e-2. Linhas vazias exigem O=0/LSE=-infinito exatos; nenhuma
 saída válida pode conter NaN/Inf. Logits split versus referência com o mesmo
-KV por faixa: KL média <= 1e-4 nat/token e p99 <= 1e-3 em logits teacher-forced,
-com KL calculada em FP64. Referência só-CUDA com formato diferente não substitui
-essa referência estrutural.
+KV por faixa, incluindo K/V do token atual: KL calculada em FP64 em pelo menos
+32 posições teacher-forced consecutivas. Por decisão do usuário em 2026-10-12,
+aceitar KL média do candidato <= KL média da baseline + 1e-4 nat/token e
+p99 do candidato <= p99 da baseline + 1e-3. Medir a baseline contra sua própria
+referência CPU no mesmo corpus, posições, modelo, build e parâmetros comuns:
+XXL só-CUDA abaixo de P e XXXL por camada acima de P. Registrar os valores
+absolutos e adicionais por comprimento; não reutilizar uma constante de outro
+comprimento. Os limites de O/LSE e de qualidade contra F16 permanecem iguais.
+Cada par CPU/GPU usa exatamente a mesma representação de KV por faixa; a
+baseline com formato diferente não substitui a referência CPU do candidato.
+Na referência de memória fixa, capturar K/V atuais da execução GPU e reutilizar
+os mesmos bytes antes de qualquer store/calibração na execução CPU. Verificar
+o prefixo histórico e a restauração da trajetória GPU; igualdade apenas do
+prefixo N-1 não prova igualdade dos K/V atuais das camadas posteriores.
 
 Cobrir Q=1 e prefill Q=2/256, GQA 24/4, D=256, F16 e Q4, body/tail, rota rápida
 ou fallback, máscaras causal/total, uma/ambas faixas vazias. No teste matemático,
@@ -292,7 +321,10 @@ valor fixo de aprovação; provar ausência de execução Vulkan de atenção ab
 de P. Sobreposição só entra se reduzir a mediana ponta a ponta pelo menos 5%
 contra sequencial em dois comprimentos acima de P, sem piorar demais gates.
 
-**Memória e estabilidade.** Cumprir §3.8 durante cada cenário. Testar 131072
+**Memória e estabilidade.** Cumprir §3.8 durante cada cenário; desde
+2026-10-10 (msg 956) o gate de memória é exclusivamente a ausência de OOM
+(folga de 614 MiB, `MemAvailable` e swap vêm registrados como observação).
+Testar 131072
 posições ocupadas, rejeição limpa ao exceder C e geração 130560 + 512 até C.
 Executar 10 ciclos consecutivos de restore, sufixo divergente e geração junto
 ao limite, sem OOM, erro de driver ou corrupção; memória retida após o ciclo

@@ -277,6 +277,11 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    // Selects, among the backends this context already owns, one that supports
+    // `bt`. Used by the F4 materialized-consumer probe so it never has to
+    // initialise a backend of its own.
+    ggml_backend_t backend_supporting_buft(ggml_backend_buffer_type_t bt) const;
+
 private:
     //
     // output
