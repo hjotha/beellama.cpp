@@ -2092,6 +2092,8 @@ struct adaptive_slot_snapshot_blob {
     std::vector<uint8_t> data_dft;
     std::vector<uint8_t> data_spec;
     std::vector<adaptive_slot_checkpoint_blob> checkpoints;
+    std::vector<float> logits;
+    int32_t logits_n_tokens = -1;
 };
 
 // LONG, XLONG, XXLONG and XXXLONG are dual-purpose profiles: old snapshots may be target-only,
@@ -2752,6 +2754,10 @@ static adaptive_slot_snapshot_blob adaptive_slot_capture(
             ensure_budget(0);
         }
     }
+    if (!slot.logits_last.empty() && slot.logits_last_n_tokens == (int32_t) evaluated) {
+        snapshot.logits = slot.logits_last;
+        snapshot.logits_n_tokens = slot.logits_last_n_tokens;
+    }
     return snapshot;
 }
 
@@ -3036,6 +3042,13 @@ static bool adaptive_slot_restore(
     const bool mtp_managed =
         llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt)).managed;
     slot.bootstrap_pending = destination_mtp && !complete_mtp && mtp_managed;
+    slot.just_restored = true;
+    slot.restored_logits.clear();
+    if (!snapshot.logits.empty() && snapshot.logits_n_tokens == (int32_t) slot.prompt.tokens.size()) {
+        slot.restored_logits = snapshot.logits;
+        slot.logits_last = snapshot.logits;
+        slot.logits_last_n_tokens = snapshot.logits_n_tokens;
+    }
     SLT_TRC(slot, "adaptive slot restore published tokens=%zu checkpoints=%zu complete_mtp=%d bootstrap=%d\n",
             slot.prompt.tokens.size(), slot.prompt.checkpoints.size(), complete_mtp, slot.bootstrap_pending);
     if (slot.bootstrap_pending) {
@@ -8129,6 +8142,10 @@ private:
                                 params_base.mtp_max_tokens, adaptive_long_ctx, max_file_bytes);
                             const auto encoded = adaptive_slot_encode(snapshot, max_file_bytes);
                             const size_t nwrite = adaptive_slot_write_file(filepath, encoded);
+                            if (nwrite > 0 && !slot->logits_last.empty() && slot->logits_last_n_tokens == (int32_t) snapshot.n_tokens) {
+                                const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                                slot_logits_write(filepath, slot->logits_last, nv, (uint32_t) snapshot.n_tokens);
+                            }
                             bool oversized = false;
                             slot_save_enforce_limits(slot_store, params_base.slot_save_max_count,
                                     params_base.slot_save_max_bytes, filepath, oversized);
@@ -8417,7 +8434,7 @@ private:
                                 previous_snapshot = adaptive_slot_capture(
                                     *slot, ctx_tgt, ctx_dft, spec.get(), *adaptive_model_identity,
                                     old_profile, params_base.ctx_size_mtp, params_base.mtp_max_tokens,
-                                    adaptive_long_ctx, max_file_bytes, false);
+                                    adaptive_long_ctx, max_file_bytes, true);
                             }
 
                             if (snapshot.profile != (uint32_t) active_context_profile) {
@@ -8436,6 +8453,14 @@ private:
                             std::string restore_error;
                             if (!adaptive_slot_restore(snapshot, *slot, ctx_tgt, ctx_dft, spec.get(), restore_error)) {
                                 throw std::runtime_error(restore_error);
+                            }
+
+                            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                            if (slot_logits_read(filepath, nv, (uint32_t) slot->prompt.tokens.size(), slot->restored_logits)) {
+                                SLT_INF(*slot, "loaded adaptive logits sidecar (%d vocab, %zu tokens) - regenerate fast-path armed\n",
+                                        nv, slot->prompt.tokens.size());
+                                slot->logits_last = slot->restored_logits;
+                                slot->logits_last_n_tokens = (int32_t) slot->prompt.tokens.size();
                             }
 
                             const int64_t t_end = ggml_time_us();
@@ -9423,10 +9448,9 @@ private:
                                 n_past == slot.task->n_tokens() &&
                                 n_past == (int) slot.prompt.n_tokens()) {
 
-                                slot.just_restored = false; // one-shot consume (this path owns it)
-
                                 if (!slot.restored_logits.empty() && !slot.can_speculate() &&
                                         (slot.task->params.sampling.n_probs == 0 || slot.task->params.post_sampling_probs)) {
+                                    slot.just_restored = false; // one-shot consume (this path owns it)
                                     // --- fast path: emit first token from saved logits, no decode ---
                                     slot.stats.n_prompt_cached     = n_past; // entire prompt "reused"
                                     slot.stats.n_prompt_processed  = 0;      // prompt_n = 0 => observable reuse signal
@@ -9522,15 +9546,21 @@ private:
                                     return;
                                 }
 
-                                // --- safe fallback: no valid sidecar -> clear restored seq, then reprefill ---
-                                // FULL models support full-sequence removal; clearing first guarantees the
-                                // subsequent reprefill writes into an EMPTY sequence instead of re-decoding
-                                // into the already-occupied restored state (which is the crash being fixed).
-                                SLT_WRN(slot, "%s", "restore-continue: saved logits unavailable or incompatible; clearing restored state and re-prefilling\n");
-                                slot.prompt_clear();
-                                n_past   = 0;
-                                pos_next = 0; // mirror the do_reset path; keep the stale full-length value from leaking into the checkpoint-erase loop below
-                                // fall through to the normal guard below with an empty sequence (safe)
+                                if (common_context_seq_rm_max_rollback(slot.ctx_tgt) == 0 &&
+                                    slot.prompt.checkpoints.empty()) {
+                                    // --- safe fallback: no valid sidecar and cannot rollback 1 token -> clear restored seq, then reprefill ---
+                                    // FULL models without suffix rollback support full-sequence removal only; clearing first guarantees the
+                                    // subsequent reprefill writes into an EMPTY sequence instead of re-decoding
+                                    // into the already-occupied restored state (which is the crash being fixed).
+                                    slot.just_restored = false;
+                                    SLT_WRN(slot, "%s", "restore-continue: saved logits unavailable or incompatible and context cannot rollback; clearing restored state and re-prefilling\n");
+                                    slot.prompt_clear();
+                                    n_past   = 0;
+                                    pos_next = 0; // mirror the do_reset path; keep the stale full-length value from leaking into the checkpoint-erase loop below
+                                    // fall through to the normal guard below with an empty sequence (safe)
+                                }
+                                // Otherwise (context supports suffix rollback >= 1 or has checkpoints), fall through to normal
+                                // prompt reuse where n_past-- decodes the last token, leaving slot.just_restored intact for downstream checkpoint search.
                             }
                             // ===== end restore-continue =================================================
 
@@ -9728,6 +9758,7 @@ private:
                         }
                         llama_set_snapkv_prefill_end(ctx_tgt, slot.id, snapkv_prefill_end);
                         llama_set_snapkv_prefill_end(ctx_dft, slot.id, snapkv_prefill_end);
+                        slot.just_restored = false;
                     } // end of SLOT_STATE_STARTED
 
                     if (!slot.can_split()) {
