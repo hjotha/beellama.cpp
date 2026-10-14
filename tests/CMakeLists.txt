@@ -983,5 +983,6 @@ target_include_directories(test-fit-mixed-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-kv-mixed-destination-intact.cpp)
 target_link_libraries(test-kv-mixed-destination-intact PRIVATE server-context)
 target_include_directories(test-kv-mixed-destination-intact PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
+set_tests_properties(test-kv-mixed-destination-intact PROPERTIES ENVIRONMENT "F4_TEST_GPU=1")
 
 llama_build_and_test(test-prompt-cache-native-layout.cpp)
