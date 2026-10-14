@@ -664,7 +664,7 @@ class ModelBase:
                 if bias_types:
                     self._fusable_qkv_bias_layers.add(bid)
 
-   def hadamard_folded_names(self) -> set[str]:
+    def hadamard_folded_names(self) -> set[str]:
         """Source-tensor names folded under a Hadamard manifest, or empty."""
         cached = getattr(self, "_hadamard_folded_names", None)
         if cached is not None:
