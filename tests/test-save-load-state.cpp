@@ -9,7 +9,13 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <clocale>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -1631,6 +1637,24 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
     struct common_params params = base_params;
     params.model.path = model_path;
 
+    static std::atomic<uint64_t> s_file_seq{0};
+    const auto pid =
+#ifdef _WIN32
+        _getpid();
+#else
+        getpid();
+#endif
+    params.out_file = "dump_state_" + std::to_string(pid) + "_" + std::to_string(s_file_seq.fetch_add(1)) + ".bin";
+
+    struct file_cleaner {
+        std::string path;
+        ~file_cleaner() {
+            if (!path.empty()) {
+                std::remove(path.c_str());
+            }
+        }
+    } cleaner{params.out_file};
+
     auto llama_init = common_init_from_params(params, true);
     auto * model = llama_init->model();
 
@@ -2647,7 +2671,13 @@ int main(int argc, char ** argv) {
     common_params params;
     params.prompt = "";
     params.n_batch = 100;
-    params.out_file = "dump_state.bin";
+    params.out_file = "dump_state_" + std::to_string(
+#ifdef _WIN32
+        _getpid()
+#else
+        getpid()
+#endif
+    ) + ".bin";
     params.sampling.seed = 1234;
 
     common_init();

@@ -2490,6 +2490,8 @@ static std::vector<float> test_native_flash_attention_output(
         v->op_params[5] = slices;
         k->op_params[6] = swa ? 1 : 0;
         v->op_params[6] = swa ? 1 : 0;
+        k->op_params[9] = eager_records ? 1 : 0;
+        v->op_params[9] = eager_records ? 1 : 0;
     }
     if ((native_view || materialized_graph) && slices > 1) {
         k = ggml_reshape_4d(ctx, k, head_dim, n_kv_heads, n_kv, n_stream);
