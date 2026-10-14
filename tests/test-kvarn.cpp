@@ -3274,8 +3274,8 @@ static void require_close_f32_rmse(
     double max_diff = 0.0;
     for (size_t i = 0; i < actual.size(); ++i) {
         if (!std::isfinite(actual[i]) || !std::isfinite(expected[i])) {
-            std::fprintf(stderr, "f32 parity non-finite at %zu: actual=%g expected=%g\n",
-                    i, double(actual[i]), double(expected[i]));
+            std::fprintf(stderr, "f32 parity non-finite at %zu: actual=%g expected=%g (context: %s)\n",
+                    i, double(actual[i]), double(expected[i]), message ? message : "none");
             require(false, "f32 parity output contained non-finite value");
         }
         const double diff = double(actual[i]) - double(expected[i]);
@@ -3909,9 +3909,9 @@ static void test_dflash_non_causal_attention_parity() {
                            ggml_type exact_type = GGML_TYPE_F16, bool eager = true,
                            int visible_from = 0) {
         if (std::getenv("GGML_KVARN_TEST_TRACE_NATIVE") != nullptr) {
-            std::fprintf(stderr, "DFlash non-causal trace: %s D%d K%dV%d nq=%d nkv=%d tail=%d\n",
+            std::fprintf(stderr, "DFlash non-causal trace: %s D%d K%dV%d nq=%d nkv=%d tail=%d swa=%d cur=%d origv=%d holes=%d type=%d\n",
                     backend == cpu_backend ? "CPU" : "GPU",
-                    head_dim, bits_k, bits_v, n_q, n_kv, int(exact_tail));
+                    head_dim, bits_k, bits_v, n_q, n_kv, int(exact_tail), int(swa), current, int(original_v), int(holes), int(exact_type));
         }
         // Decode this backend's records with the independent host oracle.
         // CPU/CUDA sealers can quantize differently; that is not a
