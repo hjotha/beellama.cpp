@@ -12086,8 +12086,10 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
 
     const uint32_t slope = Br * acctype;
+    const uint32_t masksh = Bc * (Br / 4) * f16vec4;
+    const uint32_t key_active_sz = Bc * 4;
 
-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope;
+    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + masksh + key_active_sz;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
