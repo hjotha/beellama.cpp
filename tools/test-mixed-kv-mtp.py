@@ -582,7 +582,10 @@ def scenario_m2(args: argparse.Namespace, output_dir: Path, run_meta: dict[str, 
     qx = args.remote_kv_types[0]
     case_id = "M2-adaptive-mtp"
     m2_args = argparse.Namespace(**{**vars(args), "ctx_size": args.high_ctx})
-    instance = r.ServerInstance(m2_args, output_dir, case_id, m2_extra_args(args, qx))
+    spool = output_dir / f"spool-{case_id}"
+    spool.mkdir(parents=True, exist_ok=True)
+    instance = r.ServerInstance(m2_args, output_dir, case_id, m2_extra_args(args, qx),
+                                env_extra={"TMPDIR": str(spool)})
     case_record: dict[str, Any] = {
         "case_id": case_id, "scenario": "M2", "state": "starting",
         "remote_kv_type": qx, "local_ctx": args.local_ctx, "high_ctx": args.high_ctx,

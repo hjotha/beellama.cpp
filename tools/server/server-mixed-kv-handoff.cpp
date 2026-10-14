@@ -550,8 +550,25 @@ result try_handoff_impl(const input & in, result & out,
         if (!skip_ram_header(partial_io, checkpoint->data_tgt.size(), header_error)) {
             return fail(("partial checkpoint parse: " + header_error).c_str());
         }
-        source_kvarn->state_read_sinfo(partial_io, in.seq_id,
-                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &sinfos, nullptr);
+        if (source_kvarn->requires_state_for_partial_restore()) {
+            source_kvarn->state_read_sinfo(partial_io, in.seq_id,
+                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &sinfos, nullptr);
+        } else {
+            // Dense KVarN does not serialize attention KV in partial checkpoints (requires_state_for_partial_restore is false).
+            // Populate sinfos from the metadata cache restored in Phase 1.
+            sinfos.resize(1);
+            sinfos[0].idxs.resize(1);
+            sinfos[0].idxs[0].assign(selected, UINT32_MAX);
+            const auto & cells = source_kvarn->get_metadata_cache()->get_cells(in.seq_id);
+            for (uint32_t c = 0; c < cells.size(); ++c) {
+                if (!cells.is_empty(c) && cells.seq_has(c, in.seq_id)) {
+                    const llama_pos p = cells.pos_get(c);
+                    if (p >= 0 && (uint32_t) p < selected) {
+                        sinfos[0].idxs[0][p] = c;
+                    }
+                }
+            }
+        }
         source_hybrid->get_mem_recr()->state_read(partial_io, in.seq_id,
                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // Complete frame consumption must be verified BEFORE commit.
@@ -592,9 +609,12 @@ result try_handoff_impl(const input & in, result & out,
         return fail("trimmed source positions (KV/RS) do not match the selected prefix");
     }
 
-    // Tail slot -> token mapping (AFTER the canonical trim): must be COMPLETE
-    // for the expected tail window; a missing entry is a hard failure (never
-    // requantize the body).
+    // Tail slot -> token mapping (AFTER the canonical trim): check surviving
+    // exact-tail entries for the transferred prefix. When the source snapshot
+    // was captured after subsequent generation, the sliding tail overlay may have
+    // evicted older rows from the full exact window, but surviving entries remain
+    // valid and contiguous up to the selected boundary. Older prefix tokens are
+    // preserved in the KVarN record body.
     const uint32_t effective_tail_begin = selected > in.source->exact_tail_tokens
             ? selected - in.source->exact_tail_tokens : 0;
     std::unordered_map<uint32_t, int32_t> tail_slot_of_token;
@@ -610,10 +630,14 @@ result try_handoff_impl(const input & in, result & out,
     } catch (const std::exception & error) {
         return fail(("tail snapshot lookup failed: " + std::string(error.what())).c_str());
     }
-    if (in.source->exact_tail_tokens > 0) {
-        const uint32_t tail_begin = selected > in.source->exact_tail_tokens
-                ? selected - in.source->exact_tail_tokens : 0;
-        for (uint32_t pos = tail_begin; pos < selected; ++pos) {
+    uint32_t candidate_tail_begin = selected;
+    if (in.source->exact_tail_tokens > 0 && !tail_slot_of_token.empty()) {
+        uint32_t min_tail_pos = selected;
+        for (const auto & entry : tail_slot_of_token) {
+            min_tail_pos = std::min(min_tail_pos, entry.first);
+        }
+        candidate_tail_begin = min_tail_pos;
+        for (uint32_t pos = candidate_tail_begin; pos < selected; ++pos) {
             if (tail_slot_of_token.find(pos) == tail_slot_of_token.end()) {
                 return fail("expected exact-tail rows are missing from the source snapshot");
             }
@@ -636,10 +660,8 @@ result try_handoff_impl(const input & in, result & out,
             }
         }
         kvarn->get_metadata_cache()->import_sequence_prefix(in.seq_id, selected, exts);
-        if (in.source->exact_tail_tokens > 0) {
-            const uint32_t tail_begin = selected > in.source->exact_tail_tokens
-                    ? selected - in.source->exact_tail_tokens : 0;
-            kvarn->get_metadata_cache()->import_sequence_tail(in.seq_id, tail_begin, selected);
+        if (in.source->exact_tail_tokens > 0 && candidate_tail_begin < selected) {
+            kvarn->get_metadata_cache()->import_sequence_tail(in.seq_id, candidate_tail_begin, selected);
         }
     } catch (const std::exception & error) {
         return fail(("candidate metadata import failed: " + std::string(error.what())).c_str());

@@ -103,7 +103,7 @@ std::shared_ptr<mixed_state_frame_backing> spool_mixed_state_frame(
 #else
     const char * configured_dir = std::getenv("TMPDIR");
 #endif
-    const auto temp_dir = configured_dir && configured_dir[0]
+    auto temp_dir = configured_dir && configured_dir[0]
             ? std::filesystem::absolute(std::filesystem::path(configured_dir))
             : std::filesystem::temp_directory_path();
     std::error_code fs_error;
@@ -120,7 +120,18 @@ std::shared_ptr<mixed_state_frame_backing> spool_mixed_state_frame(
     constexpr long TMPFS_MAGIC_VALUE = 0x01021994;
     constexpr long RAMFS_MAGIC_VALUE = 0x858458f6;
     if (long(fs_info.f_type) == TMPFS_MAGIC_VALUE || long(fs_info.f_type) == RAMFS_MAGIC_VALUE) {
-        throw std::runtime_error("mixed state spool directory is tmpfs/ramfs; set TMPDIR to a disk-backed directory");
+        if (!configured_dir || !configured_dir[0]) {
+            const std::filesystem::path fallback_dir = "/var/tmp";
+            if (std::filesystem::is_directory(fallback_dir, fs_error) && !fs_error &&
+                ::statfs(fallback_dir.c_str(), &fs_info) == 0 &&
+                long(fs_info.f_type) != TMPFS_MAGIC_VALUE && long(fs_info.f_type) != RAMFS_MAGIC_VALUE) {
+                temp_dir = fallback_dir;
+            } else {
+                throw std::runtime_error("mixed state spool directory is tmpfs/ramfs; set TMPDIR to a disk-backed directory");
+            }
+        } else {
+            throw std::runtime_error("mixed state spool directory is tmpfs/ramfs; set TMPDIR to a disk-backed directory");
+        }
     }
 #endif
     const std::string destination = (temp_dir / "beellama-mixed-state").string();
