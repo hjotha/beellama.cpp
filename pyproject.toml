@@ -65,3 +65,9 @@ explicit = true
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "gguf-py/tests"]
+python_files = ["test-*.py", "test_*.py", "*_test.py"]
+addopts = "--ignore=tests/test-tokenizer-0.py --ignore=tests/test-tokenizer-random.py"
+
