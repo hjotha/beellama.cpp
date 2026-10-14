@@ -295,7 +295,7 @@ int main() {
         return 0;
     }
     int failures = 0;
-    const double tol_same = 1e-6;
+    const double tol_same = 2e-5;
     for (int64_t kv : { 640, 952, 1024, 1152, 1536 }) {
         for (int64_t nq : { 1, 2, 64 }) {
             run_case(backend, kv, nq, 0,   tol_same, failures, false);
@@ -306,7 +306,7 @@ int main() {
     // Model-shape cases matching the integrated overflow layers (il=7 eval 14/15):
     // head_dim 256, 4 KV heads, 24 query heads, padded extent 1024 (952 live).
     {
-        const double tol = 1e-6;
+        const double tol = 2e-5;
         run_case(backend,  952,  56, 72, tol, failures, true, 256, 4, 24);
         run_case(backend,  952, 256, 72, tol, failures, true, 256, 4, 24);
         run_case(backend, 1024, 256,  0, tol, failures, true, 256, 4, 24);

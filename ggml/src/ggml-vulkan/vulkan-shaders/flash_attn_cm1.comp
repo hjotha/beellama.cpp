@@ -286,7 +286,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always need to dequant into kvsh; for f16/bf16 we can load
             // directly from global memory when alignment / bounds allow it.
-            const bool stage_k = USE_DECODE_K || KV_bounds_check || d * 16 + 16 > HSK;
+            const bool stage_k = USE_DECODE_K || KV_bounds_check || MASK_ENABLE || d * 16 + 16 > HSK;
             if (stage_k) {
                 barrier();
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * MatBr / 4; idx += gl_WorkGroupSize.x) {
@@ -368,10 +368,11 @@ void main() {
 
             float rowmaxf = NEG_FLT_MAX_OVER_2;
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-                if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                const uint col = c * cols_per_iter + col_tid;
+                if (!key_active[col] || (KV_bounds_check && j * Bc + col >= KV)) {
                     continue;
                 }
-                rowmaxf = max(rowmaxf, float(sfsh[r_vec + (c * cols_per_iter + col_tid) * sfshstride][r_comp]));
+                rowmaxf = max(rowmaxf, float(sfsh[r_vec + col * sfshstride][r_comp]));
             }
             rowmaxf += FATTN_KQ_MAX_OFFSET;
             float Moldf = Mf[r];
