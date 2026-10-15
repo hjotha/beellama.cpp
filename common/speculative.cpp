@@ -6750,10 +6750,21 @@ common_speculative_state_restore_plan * common_speculative_prepare_state(
                         return nullptr;
                     }
                     plan->impl = impl.get();
-                    return plan.release();
+                    break;
                 }
             }
-            return nullptr;
+            if (plan->impl == nullptr) {
+                return nullptr;
+            }
+            const std::vector<uint8_t> empty;
+            for (auto & impl : spec->impls) {
+                if (impl.get() != plan->impl) {
+                    if (!impl->validate_state(seq_id, empty)) {
+                        return nullptr;
+                    }
+                }
+            }
+            return plan.release();
         }
         if (data == nullptr) {
             return nullptr;
@@ -6764,9 +6775,21 @@ common_speculative_state_restore_plan * common_speculative_prepare_state(
         for (auto & impl : spec->impls) {
             if (impl->validate_state(seq_id, plan->payload)) {
                 plan->impl = impl.get();
-                return plan.release();
+                break;
             }
         }
+        if (plan->impl == nullptr) {
+            return nullptr;
+        }
+        const std::vector<uint8_t> empty;
+        for (auto & impl : spec->impls) {
+            if (impl.get() != plan->impl) {
+                if (!impl->validate_state(seq_id, empty)) {
+                    return nullptr;
+                }
+            }
+        }
+        return plan.release();
     } catch (const std::bad_alloc &) {
         return nullptr;
     }
@@ -6787,7 +6810,14 @@ void common_speculative_state_restore_plan_commit(common_speculative_state_resto
         return;
     }
     GGML_ASSERT(plan->impl != nullptr);
-    GGML_ASSERT(plan->impl->set_state(plan->seq_id, plan->payload));
+    const std::vector<uint8_t> empty;
+    for (auto & impl : plan->spec->impls) {
+        if (impl.get() == plan->impl) {
+            GGML_ASSERT(impl->set_state(plan->seq_id, plan->payload));
+        } else {
+            GGML_ASSERT(impl->set_state(plan->seq_id, empty));
+        }
+    }
 }
 
 void common_speculative_state_restore_plan_free(common_speculative_state_restore_plan * plan) {
