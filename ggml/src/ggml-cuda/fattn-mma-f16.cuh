@@ -437,7 +437,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         // 6: max  1*16= 16 bytes,   8 half
         ggml_cuda_unroll<6>{}(load);
     } else {
-        const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
         auto load = [&] __device__ (const int n) {
             const int stride_k = 32 >> n;
             const int k0_start = stride_k == 32 ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
@@ -463,14 +462,30 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                     const half2 * src;
                     if constexpr (use_sparse) {
                         const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
-                        src = index >= 0 ? KV + int64_t(index)*stride_KV + k*h2_per_chunk : zero;
+                        src = index >= 0 ? KV + int64_t(index)*stride_KV + k*h2_per_chunk : nullptr;
                     } else {
-                        src = !oob_check || i < i_sup ? KV + int64_t(k_VKQ_0 + i)*stride_KV + k*h2_per_chunk : zero;
+                        src = !oob_check || i < i_sup ? KV + int64_t(k_VKQ_0 + i)*stride_KV + k*h2_per_chunk : nullptr;
                     }
                     if constexpr (swz) {
-                        ggml_cuda_memcpy_1<16>((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(i, k*h2_per_chunk), src);
+                        half2 * const dst = (half2 *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(i, k*h2_per_chunk));
+                        if (src != nullptr) {
+                            ggml_cuda_memcpy_1<16>(dst, src);
+                        } else {
+                            dst[0] = make_half2(0.0f, 0.0f);
+                            dst[1] = make_half2(0.0f, 0.0f);
+                            dst[2] = make_half2(0.0f, 0.0f);
+                            dst[3] = make_half2(0.0f, 0.0f);
+                        }
                     } else {
-                        ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*4, src);
+                        half2 * const dst = tile_KV + i*stride_tile + k*4;
+                        if (src != nullptr) {
+                            ggml_cuda_memcpy_1<16>(dst, src);
+                        } else {
+                            dst[0] = make_half2(0.0f, 0.0f);
+                            dst[1] = make_half2(0.0f, 0.0f);
+                            dst[2] = make_half2(0.0f, 0.0f);
+                            dst[3] = make_half2(0.0f, 0.0f);
+                        }
                     }
                 }
             }
@@ -532,7 +547,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
                     const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
                     tile_mask[j_sram*(nbatch_fa + 8) + i] = index >= 0 ? mask_h[int64_t(j_vram)*stride_mask + index] : half(-INFINITY);
                 } else {
-                    tile_mask[j_sram*(nbatch_fa + 8) + i] = i < i_sup ? mask_h[int64_t(j_vram)*stride_mask + k_VKQ_0 + i] : half(-INFINITY);
+                    tile_mask[j_sram*(nbatch_fa + 8) + i] = i < i_sup ?
+                        (mask_h ? mask_h[int64_t(j_vram)*stride_mask + k_VKQ_0 + i] : half(0.0f)) : half(-INFINITY);
                 }
             }
         }
@@ -809,8 +825,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // Turing + Volta:
                     const int KQ_idx = l % 2;
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-                    KQ_C[k0/(np*T_C_KQ::I)].x[l] = expf(KQ_C[k0/(np*T_C_KQ::I)].x[l] - KQ_max_new[KQ_idx]);
-                    KQ_rowsum_add[KQ_idx] += KQ_C[k0/(np*T_C_KQ::I)].x[l];
+                    const float diff = KQ_C[k0/(np*T_C_KQ::I)].x[l] - KQ_max_new[KQ_idx];
+                    const float val = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
+                    KQ_C[k0/(np*T_C_KQ::I)].x[l] = val;
+                    KQ_rowsum_add[KQ_idx] += val;
                 } else {
                     KQ_C[k0/(np*T_C_KQ::I)].x[l] = 0.0f;
                 }
@@ -902,8 +920,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // Turing + Volta:
                     const int KQ_idx = (l/2) % 2;
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[KQ_idx]);
-                    KQ_rowsum_add[KQ_idx] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
+                    const float diff = KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[KQ_idx];
+                    const float val = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
+                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = val;
+                    KQ_rowsum_add[KQ_idx] += val;
                 } else {
                     KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
                 }
@@ -1449,7 +1469,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     };
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    if constexpr (ncols2 == 1 || use_sparse) {
+    if constexpr (ncols2 == 1 || use_sparse || is_kvarn_kv) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
@@ -1579,7 +1599,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
             *((uint32_t *) &KQ_max_scale[col]) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
 
-            const float KQ_max_add = expf(sink - KQ_max_new);
+            const float KQ_sink_diff = sink - KQ_max_new;
+            const float KQ_max_add = KQ_sink_diff >= SOFTMAX_FTZ_THRESHOLD ? expf(KQ_sink_diff) : 0.0f;
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_max_add;
         }
 

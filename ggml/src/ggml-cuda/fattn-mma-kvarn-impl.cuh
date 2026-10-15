@@ -279,7 +279,6 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
 
             if constexpr (stride_tile % h2_per_chunk == 0) {
                 if (chunk_aligned) {
-                    const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
                     const int chunks_per_row = dim2_count_local / h2_per_chunk;
                     for (int idx = tid; idx < nbatch_fa * chunks_per_row; idx += nthreads) {
                         const int row = idx / chunks_per_row;
@@ -289,9 +288,15 @@ static __device__ __forceinline__ void flash_attn_ext_kvarn_load_tile(
                         const int stage_pos = tile.stage_pos_begin + row;
                         const int64_t base = ((int64_t) stage_pos * desc.n_record_heads + record_head) *
                             GGML_CUDA_FATTN_KVARN_DIM;
-                        const half2 * src = row < valid_count ?
-                            (const half2 *) (desc.stage + base + 2 * src_h2) : zero;
-                        ggml_cuda_memcpy_1<16>(tile_KV + row * stride_tile + dst_h2, src);
+                        half2 * const dst = tile_KV + row * stride_tile + dst_h2;
+                        if (row < valid_count) {
+                            ggml_cuda_memcpy_1<16>(dst, (const half2 *) (desc.stage + base + 2 * src_h2));
+                        } else {
+                            dst[0] = make_half2(0.0f, 0.0f);
+                            dst[1] = make_half2(0.0f, 0.0f);
+                            dst[2] = make_half2(0.0f, 0.0f);
+                            dst[3] = make_half2(0.0f, 0.0f);
+                        }
                     }
 
                     const int copied_h2 = chunks_per_row * h2_per_chunk;

@@ -1539,13 +1539,14 @@ static __global__ void flash_attn_combine_results(
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
     for (int l = 0; l < parallel_blocks; ++l) {
-        const float KQ_max_scale = expf(meta[l].x - kqmax);
+        const float diff = meta[l].x - kqmax;
+        const float KQ_max_scale = (meta[l].y > 0.0f && diff >= SOFTMAX_FTZ_THRESHOLD) ? expf(diff) : 0.0f;
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    dst[tid] = VKQ_denominator == 0.0f ? 0.0f : VKQ_numerator / VKQ_denominator;
     if (tid == 0 && dst_meta != nullptr) {
         dst_meta[j_dst_unrolled] = make_float2(kqmax, VKQ_denominator);
     }
