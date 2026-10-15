@@ -407,6 +407,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE( 64, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(128, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(256, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE(512, type_K_case, type_V_case)
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -705,10 +706,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
-    // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+    // Asymmetric head sizes (e.g. 192->128, 320->256, 576->512) have no vec instance (DKQ != DV); force them onto MMA.
     const bool can_use_vector_kernel =
         ggml_cuda_fattn_pair_compiled(K->type, V->type) &&
-        Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 &&
+        Q->ne[0] == V->ne[0] &&
+        Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     const bool force_vector_kernel =
@@ -849,7 +851,7 @@ if (ggml_cuda_flash_attn_ext_kvarn_uses_views(dst)) {
 }
 
 static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    switch (ggml_cuda_get_best_fattn_kernel(ctx.device, dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -937,6 +939,15 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
         body.src[2] = &vb;
         body.src[3] = &mb;
         body.src[4] = dst->src[4];
+        return ggml_cuda_get_best_fattn_kernel(device, &body) != BEST_FATTN_KERNEL_NONE;
+    }
+    const bool tail_bodyless = ggml_get_op_params_i32(
+        dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0;
+    if (!tail_bodyless) {
+        ggml_tensor body = *dst;
+        for (int i = 5; i < GGML_MAX_SRC; ++i) {
+            body.src[i] = nullptr;
+        }
         return ggml_cuda_get_best_fattn_kernel(device, &body) != BEST_FATTN_KERNEL_NONE;
     }
     return true;
