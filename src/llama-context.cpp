@@ -1244,7 +1244,7 @@ std::vector<ggml_backend_t> layer_backends;
             }
             uint64_t mixed_host_ram_cap_bytes = 0;
             if (remote_type_k && n_full_attn > 0 &&
-                    params.remote_attn_n_layers == -1) {
+                    params.remote_attn_n_layers == -1 && cparams.kv_position_split_p == 0) {
 #if defined(__linux__)
                 std::ifstream meminfo("/proc/meminfo");
                 if (!meminfo) {
@@ -1287,7 +1287,12 @@ std::vector<ggml_backend_t> layer_backends;
 #endif
             }
             int n_remote = n_full_attn;
-            if (params.remote_attn_n_layers == -1 && remote_type_k) {
+            // Position-split KV (P != 0) keeps BOTH bands on every full-attention
+            // layer (local KVarN [0,P) + remote Q4 [P,C)), so the per-layer budget
+            // count of the auto policy does not apply: auto resolves exactly like
+            // "full" (n_remote stays n_full_attn) and the F3 cache contract still
+            // validates explicit counts unchanged.
+            if (params.remote_attn_n_layers == -1 && remote_type_k && cparams.kv_position_split_p == 0) {
                 ggml_backend_dev_t cuda_dev = nullptr;
                 uint32_t cuda_owner_layer = UINT32_MAX;
                 for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
@@ -1477,7 +1482,7 @@ std::vector<ggml_backend_t> layer_backends;
                         placement.ram_temp_bytes / 1024.0 / 1024.0,
                         (unsigned long long) placement.effective_chunk_tokens,
                         n_remote, n_full_attn - n_remote);
-            } else if (params.remote_attn_n_layers == -1) {
+            } else if (params.remote_attn_n_layers == -1 && cparams.kv_position_split_p == 0) {
                 size_t cuda_free = 0, cuda_total = 0;
                 ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_name("CUDA0");
                 if (!cuda_dev) cuda_dev = ggml_backend_dev_by_name("CUDA");
@@ -1607,6 +1612,12 @@ std::vector<ggml_backend_t> layer_backends;
                                n_local_fit, n_remote, params.remote_attn_host);
             } else if (params.remote_attn_n_layers > 0 && params.remote_attn_n_layers <= n_full_attn) {
                 n_remote = params.remote_attn_n_layers;
+            }
+            if (cparams.kv_position_split_p != 0 && params.remote_attn_n_layers == -1) {
+                LLAMA_LOG_INFO("%s: position-split KV forces all %d full-attention layers onto the remote "
+                               "backend (auto resolves like \"full\")\n",
+                        __func__, n_full_attn);
+                n_remote = n_full_attn;
             }
             cparams.remote_attn_layers = n_remote;
             if (remote_type_k) {

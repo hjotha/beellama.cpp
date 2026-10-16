@@ -4920,7 +4920,7 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
         float kq_scale,
         int il) const {
     // F3 dual-range attention: local CUDA/KVarN FA + overflow Vulkan/Q4 FA +
-    // stable CUDA merge. Requires use_position_split_attention(il); every
+    // stable merge with CUDA outputs. Requires use_position_split_attention(il); every
     // deviation fails closed instead of silently falling back.
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(inp->mctx);
     if (!kvarn_ctx || !kvarn_ctx->position_split_enabled() || !kvarn_ctx->uses_kvarn_layer(il)) {
@@ -5019,28 +5019,42 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
                 il, kvarn_ctx->get_n_kv(), p_split, c_split, n_local, n_overflow, n_ovf_occ, n_ovf_used);
     }
 
-    // Stores (range-routed by cpy_k/cpy_v).
-    // The local exact tail is decided by tail_on_layer(), which is range-aware:
-    // it is ON for a local-range graph and OFF for this overflow-range builder,
-    // so fa1 here still reads the whole local body and fa2 stays tail-free
-    // (plan 3.1: tail/stage only on the local range, Q4 overflow none). The
-    // former blanket "tails disabled in P-mode" wording described a shortcut
-    // that also removed the tail from the local range, contrary to plan
-    // 3.1/3.4/3.6; see llama-kv-cache-kvarn.cpp tail_on_layer().
-    // Expand Q/K/V together to prevent reordering (same as single-range).
+    static const bool tail_local_cuda_enabled = [] {
+        const char * e = std::getenv("LLAMA_OVF_TAIL_LOCAL_CUDA");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    // Grouped single-query decode: construct the range stores now for cache
+    // bookkeeping but defer their expansion until after fa1/LSE1, so the
+    // store + gather + fa2 land in ONE Vulkan cluster instead of reopening CUDA
+    // between them. This stays behind LLAMA_OVF_TAIL_LOCAL_CUDA (which also
+    // anchors the tail WHT below): prefill and the unanchored F16-tail arm
+    // keep the legacy node order because deferring the stores there removes
+    // the early Vulkan-assigned store node that the scheduler's forward expand
+    // pass used to anchor the unanchored (Vulkan-leaked) tail WHT nodes; the
+    // arm would silently flip those WHT bits, and the wht-parity measurement
+    // (docs/occupancy-progress-20261003.md) only covers the anchored arm. Q's
+    // F32 WHT stays on Vulkan: moving it to CUDA changes bits at head width
+    // 256, so it must remain a separate pre-local split.
+    const bool group_overflow_decode = q_cur->ne[2] == 1 &&
+            (!kvarn_ctx->tail_on_layer(il) || tail_local_cuda_enabled);
     ggml_build_forward_expand(gf, q_cur);
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
-    {
-        const auto & k_idxs = inp->get_k_idxs();
-        const auto & v_idxs = inp->get_v_idxs();
-        ggml_tensor * k_written = kvarn_ctx->cpy_k(ctx0, k_cur, k_idxs, il);
-        GGML_ASSERT(k_written != nullptr);
+    ggml_tensor * k_written = kvarn_ctx->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il);
+    ggml_tensor * v_written = kvarn_ctx->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il);
+    GGML_ASSERT(k_written != nullptr && v_written != nullptr);
+    if (!group_overflow_decode) {
         ggml_build_forward_expand(gf, k_written);
-        ggml_tensor * v_written = kvarn_ctx->cpy_v(ctx0, v_cur, v_idxs, il);
-        GGML_ASSERT(v_written != nullptr);
         ggml_build_forward_expand(gf, v_written);
     }
+    std::vector<ggml_tensor *> overflow_probes;
+    const auto expand_overflow_probe = [&](ggml_tensor * node) {
+        if (group_overflow_decode) {
+            overflow_probes.push_back(node);
+        } else {
+            ggml_build_forward_expand(gf, node);
+        }
+    };
 
     // Use the same capability/domain plan as single-range attention for both
     // decode and prefill. Supported shapes consume native KVarN records;
@@ -5426,8 +5440,8 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
             if (std::getenv("F5_OVF_EXPAND_VIEWS") != nullptr) {
                 // Zero-copy lifetime experiment: make the Q4 views explicit graph
                 // outputs so the scheduler cannot alias their buffer with a writer.
-                ggml_build_forward_expand(gf, k_ovf_gathered);
-                ggml_build_forward_expand(gf, v_ovf_gathered);
+                expand_overflow_probe(k_ovf_gathered);
+                expand_overflow_probe(v_ovf_gathered);
             }
             if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
             // DIAGNOSTIC: the SAME view rows read back as F16, expanded into the
@@ -5451,9 +5465,9 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
             char nm[64];
             snprintf(nm, sizeof(nm), "f5k16-%d", il); ggml_set_name(k_dbg, nm);
             snprintf(nm, sizeof(nm), "f5v16-%d", il); ggml_set_name(v_dbg, nm);
-            ggml_build_forward_expand(gf, k_dbg);
+            expand_overflow_probe(k_dbg);
             if (!k_only) {
-                ggml_build_forward_expand(gf, v_dbg);
+                expand_overflow_probe(v_dbg);
             }
             }
         }
@@ -5604,6 +5618,17 @@ if (route_local == LLAMA_KV_TAIL_ROUTE_NATIVE) {
     validate_native_tail_operation(inp->mctx, il, final_local_tail_op, false);
 }
 ggml_tensor * lse1 = ggml_flash_attn_ext_lse_out(ctx0, fa1);
+    if (group_overflow_decode) {
+        // build_attn_mha already expanded fa1. Put its side output here, before
+        // build_attn_mha expands fa2, rather than reopening CUDA after fa2.
+        ggml_build_forward_expand(gf, lse1);
+        ggml_build_forward_expand(gf, k_written);
+        ggml_build_forward_expand(gf, v_written);
+        for (ggml_tensor * probe : overflow_probes) {
+            ggml_build_forward_expand(gf, probe);
+        }
+    }
+
     ggml_tensor * o2 = build_attn_mha(q_cur, k_overflow, v_overflow,
         nullptr, mask_overflow, nullptr, nullptr, int64_t(n_ovf_rows),
         kq_scale, il,
@@ -5646,7 +5671,7 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
         o1 = ggml_kvarn_wht_aux(ctx0, o1, kvarn_rot->ne[0]);
     }
 
-    // Stable merge on CUDA (validated pattern from test-position-split-merge-graph).
+    // Stable merge (validated pattern from test-position-split-merge-graph).
     // O is [D,H,Q,B] after restoring the 4D layout; LSE is [H,Q,B].
     const int64_t n_qh = lse1->ne[0];
     const int64_t n_q = lse1->ne[1];
@@ -5694,13 +5719,17 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     ggml_build_forward_expand(gf, lse1);
     ggml_build_forward_expand(gf, fa2);
     ggml_build_forward_expand(gf, lse2);
+    const int merge_begin = ggml_graph_n_nodes(gf);
     ggml_build_forward_expand(gf, o_merged_4d);
     ggml_build_forward_expand(gf, lse_merged);
     ggml_build_forward_expand(gf, o_merged);
 
-    // Backend placement: overflow FA/LSE/K/V/mask on Vulkan, everything else
-    // (local FA/LSE, merge, outputs) on CUDA. Q stays on CUDA; the scheduler
-    // copies it to Vulkan for FA2. Fail closed if either backend is missing.
+    // Backend placement: overflow FA/LSE/K/V/mask and merge intermediates on
+    // Vulkan; local FA/LSE and final outputs on CUDA. This is still TWO Vulkan
+    // steps per rotated-query layer: the Q WHT runs first as its own pre-local
+    // split (see the q_local pin below when the decode is grouped), then this
+    // overflow cluster. Q itself stays on CUDA; the scheduler copies it to
+    // Vulkan for FA2. Fail closed if either backend is missing.
     // Split input tensors (masks/idxs) stay on host CPU so set_input can fill
     // them; the scheduler copies to device backends as needed. backend_cpu
     // may be null, so locate a host backend from the scheduler explicitly.
@@ -5747,32 +5776,61 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     ggml_backend_sched_set_tensor_backend(sched, mask_overflow, backend_vulkan);
     ggml_backend_sched_set_tensor_backend(sched, k_ovf_gathered, backend_vulkan);
     ggml_backend_sched_set_tensor_backend(sched, v_ovf_gathered, backend_vulkan);
+    if (group_overflow_decode) {
+        // These intermediates already followed lse2 onto Vulkan in the legacy
+        // graph. Make that placement explicit: CUDA expf/logf and Vulkan
+        // exp/log are not bit-identical merely because both tensors are F32.
+        // This includes the original-domain O WHT; the final output CONT stays
+        // CUDA-pinned below with exactly the same arithmetic, and the unread
+        // merged LSE follows the scheduler.
+        for (int i = merge_begin; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node != o_merged && node != lse_merged && !node->view_src &&
+                    ggml_backend_supports_op(backend_vulkan, node)) {
+                ggml_backend_sched_set_tensor_backend(sched, node, backend_vulkan);
+            }
+        }
+        // Preserve the legacy Q-rotation backend even though the overflow
+        // stores no longer precede it. F32 alone does not guarantee identical
+        // WHT rounding across CUDA/Vulkan. Unsupported Vulkan widths (64)
+        // retain the scheduler's existing supported-backend fallback.
+        if (use_kvarn_q_rot && ggml_backend_supports_op(backend_vulkan, q_local)) {
+            ggml_backend_sched_set_tensor_backend(sched, q_local, backend_vulkan);
+            if (q_local->src[0]->op == GGML_OP_CONT) {
+                ggml_backend_sched_set_tensor_backend(sched, q_local->src[0], backend_vulkan);
+            }
+        }
+    }
     ggml_backend_sched_set_tensor_backend(sched, fa1, backend_cuda);
     ggml_backend_sched_set_tensor_backend(sched, lse1, backend_cuda);
     ggml_backend_sched_set_tensor_backend(sched, o_merged, backend_cuda);
-    ggml_backend_sched_set_tensor_backend(sched, lse_merged, backend_cuda);
-    // Opt-in tail-WHT anchor (expressed default OFF, msg57). Arms by REAL
-    // behavior of LLAMA_OVF_TAIL_LOCAL_CUDA:
+    // lse_merged has no readers: the builder returns o_merged only and the
+    // merged LSE is expanded solely as a diagnostic side output, so it is left
+    // to the scheduler's placement instead of being CUDA-pinned.
+    // Opt-in tail-WHT anchor + grouped decode, armed by the REAL value of
+    // LLAMA_OVF_TAIL_LOCAL_CUDA:
     //   unset -> OFF (legacy placement: fa2's Vulkan preset leaks backward
     //            (expand-up) into the tail WHT nodes, ~8 MB/token round trip
     //            of bit-static tails and RADV F16 WHT rounding up to 1 ulp
     //            away from the CPU golden, wht-parity maxabs 1.953e-03)
     //   "0"   -> OFF
     //   "1"   -> ON (k_tail_local/v_tail_local computed on CUDA with fa1;
-    //            wht-parity maxabs 6.104e-05)
+    //            wht-parity maxabs 6.104e-05) AND the grouped single-query
+    //            decode (group_overflow_decode above), which defers the
+    //            overflow stores into the Vulkan fa2 cluster
     //   other -> OFF (fail closed, unambiguous)
     // Promoting ON to the default requires an independent reference gate
-    // (msg57 item 3); until then this stays an A/B arm only.
-    // ONLY the WHT compute outputs are anchored: index/order/desc/mask
+    // (msg57 item 3); until then this stays an A/B arm only. The env gates
+    // the grouped decode in the same arm for the same reason: without the
+    // pinned tail, deferring the stores would move the scheduler's anchor for
+    // the unanchored tail WHT nodes (see group_overflow_decode).
+    // ONLY the WHT compute outputs are anchored here: index/order/desc/mask
     // bookkeeping stays wherever the current placement puts it (some of it
     // is CPU-written and asserts host buffers). If CUDA refuses an op
     // (unsupported shape), set_if_supported falls back safely and staging
     // persists (measurable, no crash). No-ops when the local tail is absent.
-    // Never touches fa2/overflow placement.
-    static const bool tail_local_cuda_enabled = [] {
-        const char * e = std::getenv("LLAMA_OVF_TAIL_LOCAL_CUDA");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
-    }();
+    // Other than the grouped decode, the env does not touch fa2/overflow
+    // placement.
     if (tail_local_cuda_enabled && k_tail_local != nullptr) {
         ggml_backend_sched_set_tensor_backend(sched, k_tail_local, backend_cuda);
         if (v_tail_local != nullptr) {
@@ -5781,7 +5839,7 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     }
     o_merged = apply_attention_reference_cpu(o_merged, il);
     cb(o_merged, "attn_position_split_merged", il);
-    LLAMA_LOG_INFO("%s: layer %d position-split dual FA: local=%u keys (CUDA/KVarN), overflow=%u keys (Vulkan/Q4), merge on CUDA\n",
+    LLAMA_LOG_INFO("%s: layer %d position-split dual FA: local=%u keys (CUDA/KVarN), overflow=%u keys (Vulkan/Q4), merge outputs on CUDA\n",
             __func__, il, n_local, n_overflow);
     return o_merged;
 }
