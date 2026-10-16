@@ -4912,6 +4912,75 @@ static void f4_tensor_trace(const char * tag, const char * name, ggml_tensor * t
             t->buffer ? "allocated" : "unallocated");
 }
 
+// F3 overflow-mask crop+C memo. The overflow range mask is ONE graph input
+// per ubatch (llama-graph.cpp build_attn_inp_kv: self_kq_mask_overflow, filled
+// once in set_input) consumed by every KVarN layer, and the crop extent is a
+// function of the cache-wide occupancy (n_ovf_occ) or the packed-view stable
+// extent (n_ovf_rows), both layer-independent. Without the memo every layer
+// re-creates the view+C and re-stages the same bytes host->device; with it,
+// the first layer builds the cropped contiguous mask and the rest reuse the
+// SAME tensor. Content is bit-identical (ggml_cont is a plain copy, consumers
+// are read-only), and the memo lives in llm_graph_context, which is
+// constructed per build_graph, so no entry can outlive its ggml_context.
+ggml_tensor * llm_graph_context::build_ovf_mask_crop(
+        ggml_tensor * mask_src,
+        int64_t n_cols) const {
+    GGML_ASSERT(mask_src != nullptr);
+    GGML_ASSERT(n_cols > 0 && n_cols <= mask_src->ne[0]);
+    const auto key = std::make_tuple(mask_src, n_cols,
+            mask_src->ne[1], mask_src->ne[2], mask_src->ne[3], mask_src->type);
+    const auto it = ovf_mask_crop_memo.find(key);
+    if (it != ovf_mask_crop_memo.end()) {
+        if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
+            // stderr on purpose: the server log callback filters INFO from the
+            // model process (see the F5OVF trace). Proof of reuse: one
+            // "create" per graph, "reuse" for every following layer.
+            fprintf(stderr, "[F4TRACE] ovf_mask_crop_memo reuse src=%p n_cols=%" PRId64 " ne1=%" PRId64 " -> %p\n",
+                    (const void *) mask_src, n_cols, mask_src->ne[1], (void *) it->second);
+        }
+        return it->second;
+    }
+    // ggml_view_4d(ctx, a, ne0..ne3, nb1, nb2, nb3, offset): the strides come
+    // before the offset, and the crop is taken on the tensor the consumer
+    // actually reads (self_kq_mask_overflow_cnv, which carries the required
+    // mask dtype/conversion), with its REAL strides and offset 0.
+    if (mask_src->nb[1] == 0) {
+        throw std::runtime_error("position-split overflow mask has a zero row stride");
+    }
+    ggml_tensor * mask_view = ggml_view_4d(ctx0, mask_src,
+            n_cols, mask_src->ne[1], mask_src->ne[2], mask_src->ne[3],
+            mask_src->nb[1], mask_src->nb[2], mask_src->nb[3], 0);
+    if (mask_view->type != mask_src->type ||
+            mask_view->ne[1] != mask_src->ne[1] ||
+            mask_view->ne[2] != mask_src->ne[2] ||
+            mask_view->ne[3] != mask_src->ne[3] ||
+            mask_view->nb[0] != mask_src->nb[0] ||
+            mask_view->nb[1] != mask_src->nb[1] ||
+            n_cols > mask_src->ne[0]) {
+        throw std::runtime_error("position-split overflow mask crop changed the mask contract");
+    }
+    // The overflow FA requires a CONTIGUOUS mask, and a crop that inherits the
+    // capacity row stride is never contiguous. Materialize ONLY the cropped
+    // extent: capacity-sized input allocation and fill order are untouched,
+    // dtype/conversion are preserved, and the unused trailing rows never reach
+    // the compute scratch.
+    ggml_tensor * mask_cont = ggml_cont(ctx0, mask_view);
+    if (!ggml_is_contiguous(mask_cont) ||
+            mask_cont->ne[0] != n_cols ||
+            mask_cont->ne[1] != mask_src->ne[1] ||
+            mask_cont->type != mask_src->type) {
+        throw std::runtime_error(
+            "position-split overflow mask is not contiguous at the occupied extent");
+    }
+    ggml_set_name(mask_cont, "attn_inp_kq_mask_overflow_occ");
+    ovf_mask_crop_memo.emplace(key, mask_cont);
+    if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
+        fprintf(stderr, "[F4TRACE] ovf_mask_crop_memo create src=%p n_cols=%" PRId64 " ne1=%" PRId64 " -> %p\n",
+                (const void *) mask_src, n_cols, mask_src->ne[1], (void *) mask_cont);
+    }
+    return mask_cont;
+}
+
 ggml_tensor * llm_graph_context::build_attn_position_split(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * q_cur,
@@ -4977,41 +5046,17 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
         ovf_idxs = ggml_view_1d(ctx0, inp->self_overflow_cell_idxs,
                 int64_t(n_ovf_occ), 0);
         ggml_set_name(ovf_idxs, "attn_overflow_cell_idxs_occ");
-        // ggml_view_4d(ctx, a, ne0..ne3, nb1, nb2, nb3, offset): the strides come
-        // before the offset, and the crop is taken on the tensor the consumer
-        // actually reads (self_kq_mask_overflow_cnv, which carries the required
-        // mask dtype/conversion), with its REAL strides and offset 0.
-        ggml_tensor * mask_src = inp->self_kq_mask_overflow_cnv;
-        if (mask_src->nb[1] == 0) {
-            throw std::runtime_error("position-split overflow mask has a zero row stride");
-        }
-        mask_overflow = ggml_view_4d(ctx0, mask_src,
-                int64_t(n_ovf_occ), mask_src->ne[1], mask_src->ne[2], mask_src->ne[3],
-                mask_src->nb[1], mask_src->nb[2], mask_src->nb[3], 0);
-        if (mask_overflow->type != mask_src->type ||
-                mask_overflow->ne[1] != mask_src->ne[1] ||
-                mask_overflow->ne[2] != mask_src->ne[2] ||
-                mask_overflow->ne[3] != mask_src->ne[3] ||
-                mask_overflow->nb[0] != mask_src->nb[0] ||
-                mask_overflow->nb[1] != mask_src->nb[1] ||
-                int64_t(n_ovf_occ) > int64_t(n_overflow)) {
-            throw std::runtime_error("position-split overflow mask crop changed the mask contract");
-        }
-        // The overflow FA requires a CONTIGUOUS mask, and a crop that inherits the
-        // capacity row stride is never contiguous. Materialize ONLY the occupied
-        // rows into a packed tensor of the occupied extent: capacity-sized input
-        // allocation and fill order are untouched, dtype/conversion are preserved,
-        // and the unused trailing rows never reach the compute scratch. This is
-        // the small supported step; the capacity-sized inputs stay as reserved.
-        mask_overflow = ggml_cont(ctx0, mask_overflow);
-        if (!ggml_is_contiguous(mask_overflow) ||
-                mask_overflow->ne[0] != int64_t(n_ovf_occ) ||
-                mask_overflow->ne[1] != mask_src->ne[1] ||
-                mask_overflow->type != mask_src->type) {
-            throw std::runtime_error(
-                "position-split overflow mask is not contiguous at the occupied extent");
-        }
-        ggml_set_name(mask_overflow, "attn_inp_kq_mask_overflow_occ");
+        // Materialize ONLY the occupied rows into a packed tensor of the
+        // occupied extent: capacity-sized input allocation and fill order are
+        // untouched, dtype/conversion are preserved, and the unused trailing
+        // rows never reach the compute scratch. This is the small supported
+        // step; the capacity-sized inputs stay as reserved. The crop+CONT is
+        // memoized per graph build (build_ovf_mask_crop): every layer crops the
+        // same host-filled source to the same occupancy extent, so the
+        // host->device staging of the identical mask happens once per graph
+        // instead of once per layer.
+        mask_overflow = build_ovf_mask_crop(inp->self_kq_mask_overflow_cnv,
+                int64_t(n_ovf_occ));
         n_ovf_used = n_ovf_occ;
     }
     if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
@@ -5515,17 +5560,10 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
             throw std::runtime_error(
                 "position-split overflow mask is narrower than the packed K/V extent");
         }
-        mask_overflow = ggml_view_4d(ctx0, mask_src,
-                int64_t(n_ovf_rows), mask_src->ne[1], mask_src->ne[2], mask_src->ne[3],
-                mask_src->nb[1], mask_src->nb[2], mask_src->nb[3], 0);
-        mask_overflow = ggml_cont(ctx0, mask_overflow);
-        if (!ggml_is_contiguous(mask_overflow) ||
-                mask_overflow->ne[0] != int64_t(n_ovf_rows) ||
-                mask_overflow->type != mask_src->type) {
-            throw std::runtime_error(
-                "position-split overflow mask crop to the packed K/V extent failed");
-        }
-        ggml_set_name(mask_overflow, "attn_inp_kq_mask_overflow_occ");
+        // Same memoized crop+CONT as the occupied-extent path above: the
+        // stable packed-view extent is layer-independent too, so one
+        // materialized mask serves every layer of the graph.
+        mask_overflow = build_ovf_mask_crop(mask_src, int64_t(n_ovf_rows));
     }
     ggml_tensor * k_overflow = ggml_reshape_4d(ctx0, k_ovf_gathered,
         head_dim_k, n_head_kv, int64_t(n_ovf_rows), 1);

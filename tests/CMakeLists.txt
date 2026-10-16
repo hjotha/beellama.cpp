@@ -817,6 +817,13 @@ target_compile_features(test-position-split-ranges PRIVATE cxx_std_17)
 add_test(NAME test-position-split-ranges WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-ranges>)
 set_property(TEST test-position-split-ranges PROPERTY LABELS main)
 
+add_executable(test-position-split-mask-memo test-position-split-mask-memo.cpp)
+target_include_directories(test-position-split-mask-memo PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(test-position-split-mask-memo PRIVATE cxx_std_17)
+target_link_libraries(test-position-split-mask-memo PRIVATE llama)
+add_test(NAME test-position-split-mask-memo WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-mask-memo>)
+set_property(TEST test-position-split-mask-memo PROPERTY LABELS main)
+
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
