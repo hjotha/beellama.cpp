@@ -65,6 +65,16 @@ static void set_env_llama_ovf_qwht_cuda(const char * value) {
 #endif
 }
 
+// Mirrors the scheduler's own split-skip predicate
+// (ggml_backend_sched_split_graph / ggml_is_view_op in ggml-backend.cpp):
+// only true view OPS are excluded from split accounting. SET_ROWS stores
+// alias their storage via view_src but execute as real overflow nodes, so
+// skipping every view_src tensor would undercount the executable splits.
+static bool test_is_view_op(enum ggml_op op) {
+    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE ||
+           op == GGML_OP_TRANSPOSE || op == GGML_OP_KVARN_VIEW;
+}
+
 static const double kGateNrmseO       = 1e-3;   // plan 4.1: enforced cumulatively
                                                   // on the merged result (R4); the
                                                   // base/ovf reports attribute
@@ -417,6 +427,7 @@ struct merge_result {
     bool fa2_on_requested = false;
     bool qwht_in_cont = false;        // the Q WHT input is a materialized CONT
     bool qwht_cont_on_local = false;  // that CONT ran on the requested local backend
+    bool qwht_on_local = false;       // the Q WHT node itself landed on the local backend
 };
 
 struct eval_counters {
@@ -1064,7 +1075,12 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         ggml_backend_sched_set_tensor_backend(sched, lse2, overflow);
     }
     ggml_backend_sched_set_tensor_backend(sched, o, local);
-    ggml_backend_sched_set_tensor_backend(sched, lse_merged, local);
+    if (schedule_mode != 3 && schedule_mode != 5) {
+        // Modes 3 and 5 mirror the production prefill/unanchored arms, which
+        // leave the reader-less merged LSE to the scheduler; the forced arms
+        // keep the pin for their bitwise A/B isolation.
+        ggml_backend_sched_set_tensor_backend(sched, lse_merged, local);
+    }
 
     if (schedule_mode) {
         // Model inputs are recomputed/uploaded and KV storage is externally
@@ -1147,10 +1163,16 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         res.qwht_cont_on_local =
                 ggml_backend_sched_get_tensor_backend(sched, q_rot->src[0]) == local;
     }
+    res.qwht_on_local = ggml_backend_sched_get_tensor_backend(sched, q_rot) == local;
+    // Count the runs of overflow-placed executable nodes, mirroring the
+    // scheduler's own split pass (ggml_backend_sched_split_graph): view ops are
+    // skipped via test_is_view_op, but the SET_ROWS overflow stores carry a
+    // view_src over their storage and DO execute as overflow nodes, so they
+    // form a real Vulkan cluster and must be counted.
     ggml_backend_t previous = nullptr;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
-        if (node->view_src) { continue; }
+        if (test_is_view_op(node->op)) { continue; }
         ggml_backend_t current = ggml_backend_sched_get_tensor_backend(sched, node);
         if (current != previous && current == overflow) { ++res.overflow_splits; }
         previous = current;
@@ -1528,10 +1550,13 @@ int main() {
                     CHECK(cuda_q_nrmse <= 1e-3);
                     CHECK(cuda_o_nrmse <= 1e-3);
                     CHECK(cuda_lse_nrmse <= 1e-2);
-                    // One fewer Vulkan cluster per layer: the Q WHT no longer
-                    // runs as its own pre-local split.
+                    // One fewer Vulkan cluster per layer (SET_ROWS stores
+                    // counted, as in ggml_backend_sched_split_graph): the Q
+                    // WHT no longer runs as its own pre-local split. The
+                    // direct placement proof is the qwht_on_local check.
                     CHECK(cuda_arm.overflow_splits == after.overflow_splits - 1);
                     CHECK(cuda_arm.splits == after.splits - 2);
+                    CHECK(cuda_arm.qwht_on_local && !after.qwht_on_local);
                     cuda_fresh_bits =
                         same_bits(pass_bits(cuda_arm.o, false), pass_bits(cuda_fresh.o, true)) &&
                         same_bits(pass_bits(cuda_arm.o, true), pass_bits(cuda_fresh.o, false)) &&
@@ -1542,10 +1567,11 @@ int main() {
                     CHECK(cuda_fresh_bits);
                 }
                 std::printf("  cuda-qwht D%d layout%d: splits %d vs %d, Vulkan clusters %d vs %d, "
-                        "nrmse Q=%.3e O=%.3e LSE=%.3e, fresh-negQ=%d\n",
+                        "nrmse Q=%.3e O=%.3e LSE=%.3e, fresh-negQ=%d, qwht-local=%d/%d\n",
                         D, layout, after.splits, cuda_arm.splits,
                         after.overflow_splits, cuda_arm.overflow_splits,
-                        cuda_q_nrmse, cuda_o_nrmse, cuda_lse_nrmse, int(cuda_fresh_bits));
+                        cuda_q_nrmse, cuda_o_nrmse, cuda_lse_nrmse, int(cuda_fresh_bits),
+                        int(after.qwht_on_local), int(cuda_arm.qwht_on_local));
 
                 // Mode-4 visibility control and permuted-Q variants. Same-arm
                 // comparisons stay bitwise (identical logical Q bits into the
@@ -1656,6 +1682,7 @@ int main() {
                         }
                     }
                 }
+                CHECK(pre_store_changed);
                 const merge_result ctl5 = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
                         sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1,
                         pre_cuda.k2_final, pre_cuda.v2_final, 5, layout, 0);
@@ -1676,17 +1703,22 @@ int main() {
                     CHECK(pre_q_nrmse <= 1e-3);
                     CHECK(pre_o_nrmse <= 1e-3);
                     CHECK(pre_lse_nrmse <= 1e-2);
-                    // One fewer Vulkan cluster per layer: the Q WHT runs in
-                    // the local CUDA cluster instead of its own pre-local
-                    // Vulkan split on the prefill path too. In the prefill
-                    // expansion order the total split count is unchanged (the
-                    // removed Vulkan segment is replaced by the CUDA segment
-                    // that carries the WHT), unlike the grouped decode where
-                    // removing the interior Vulkan split merges two CUDA
-                    // segments (-2). Measured stable at 7 vs 7 for all three
-                    // non-decode shapes and layouts.
-                    CHECK(pre_cuda.overflow_splits == pre.overflow_splits - 1);
+                    // Corrected Vulkan-cluster count, with the SET_ROWS
+                    // overflow stores included exactly as the scheduler
+                    // counts them: on the prefill expansion order the Q WHT
+                    // relocation does NOT remove a Vulkan cluster -- the
+                    // early overflow stores keep that segment alive (3 vs 3,
+                    // stable for all three non-decode shapes and layouts),
+                    // unlike the grouped decode where removing the interior
+                    // Vulkan split drops one cluster (3 -> 2) and merges two
+                    // CUDA segments (-2 total splits). The total split count
+                    // is unchanged here because the segment that carried the
+                    // WHT is replaced by the CUDA segment around it (7 vs
+                    // 7). The direct placement proof is the qwht_on_local
+                    // check below.
+                    CHECK(pre_cuda.overflow_splits == pre.overflow_splits);
                     CHECK(pre_cuda.splits == pre.splits);
+                    CHECK(pre_cuda.qwht_on_local && !pre.qwht_on_local);
                 }
                 if (!pre_cuda.declined && !pre_fresh.declined) {
                     pre_fresh_bits =
@@ -1713,11 +1745,12 @@ int main() {
                     CHECK(ctl5_bits);
                 }
                 std::printf("  cuda-qwht prefill D%d Q%d layout%d: splits %d vs %d, Vulkan clusters %d vs %d, "
-                        "nrmse Q=%.3e O=%.3e LSE=%.3e, fresh-negQ=%d, store-to-fa2=%d, perm=%d\n",
+                        "nrmse Q=%.3e O=%.3e LSE=%.3e, fresh-negQ=%d, store-to-fa2=%d, perm=%d, qwht-local=%d/%d\n",
                         D, n_q, layout, pre.splits, pre_cuda.splits,
                         pre.overflow_splits, pre_cuda.overflow_splits,
                         pre_q_nrmse, pre_o_nrmse, pre_lse_nrmse,
-                        int(pre_fresh_bits), int(pre_store_changed && ctl5_bits), int(pre_perm_bits));
+                        int(pre_fresh_bits), int(pre_store_changed && ctl5_bits), int(pre_perm_bits),
+                        int(pre.qwht_on_local), int(pre_cuda.qwht_on_local));
             }
         }
         const merge_result m = run_merge(vk, vk, D, n_q, n_qh, n_kvh,
