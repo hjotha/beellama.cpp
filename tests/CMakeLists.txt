@@ -824,6 +824,14 @@ target_link_libraries(test-position-split-mask-memo PRIVATE llama)
 add_test(NAME test-position-split-mask-memo WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-mask-memo>)
 set_property(TEST test-position-split-mask-memo PROPERTY LABELS main)
 
+# Phase-1 scaffold of the fused position-split span op (CPU-only, no GPU).
+add_executable(test-kvarn-split-fused-scaffold test-kvarn-split-fused-scaffold.cpp)
+target_include_directories(test-kvarn-split-fused-scaffold PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+target_compile_features(test-kvarn-split-fused-scaffold PRIVATE cxx_std_17)
+target_link_libraries(test-kvarn-split-fused-scaffold PRIVATE ggml)
+add_test(NAME test-kvarn-split-fused-scaffold WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn-split-fused-scaffold>)
+set_property(TEST test-kvarn-split-fused-scaffold PROPERTY LABELS main)
+
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})

@@ -2152,6 +2152,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// Host-side dispatcher for GGML_OP_KVARN_SPLIT_FUSED (fused position-split
+// span, "peça (c)"). Phase-1 scaffold: the CUDA kernel lands in phase 2 and
+// supports_op refuses the op unless LLAMA_OVF_FUSED_SPAN=1 + shape contract,
+// so this is only reachable if that guarantee is bypassed (e.g. a hand-made
+// graph). Fail loudly - never silently skip the span.
+static void ggml_cuda_op_kvarn_split_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_ABORT("kvarn split fused: not implemented in phase 1");
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -2514,6 +2525,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT_LSE:
             // side-output node: the FLASH_ATTN_EXT kernel that produced
             // src[0] already wrote this buffer; nothing to launch
+            break;
+        case GGML_OP_KVARN_SPLIT_FUSED:
+            // Phase-1 scaffold: unreachable behind the supports_op gate;
+            // aborts if it is ever dispatched (see the helper).
+            ggml_cuda_op_kvarn_split_fused(ctx, dst);
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
@@ -5807,6 +5823,67 @@ static bool ggml_backend_cuda_memory_checkpoint(
     return true;
 }
 
+// Phase-1 gate for GGML_OP_KVARN_SPLIT_FUSED (fused position-split span).
+// Fail-closed by design: CUDA advertises the op ONLY when
+//   (a) LLAMA_OVF_FUSED_SPAN is exactly "1" (default OFF: the builder's
+//       legacy FA1/FA2/LSE-merge path is untouched and byte-identical), AND
+//   (b) the shape contract of ggml_kvarn_split_fused() holds.
+// The env is read per call (not cached) so the gate cannot go stale across a
+// process's lifetime. Phase 2 refines this with the dtype/route contract of
+// the local KVarN records and the Q4/F16 overflow view once the kernel lands.
+static bool ggml_cuda_kvarn_split_fused_supported(const ggml_tensor * op) {
+    const char * env = getenv("LLAMA_OVF_FUSED_SPAN");
+    if (env == nullptr || strcmp(env, "1") != 0) {
+        return false;
+    }
+
+    const ggml_tensor * q      = op->src[0];
+    const ggml_tensor * k_ovf  = op->src[5];
+    const ggml_tensor * v_ovf  = op->src[6];
+    const ggml_tensor * mask   = op->src[7];
+    const ggml_tensor * k_tail = op->src[8];
+    const ggml_tensor * v_tail = op->src[9];
+    if (op->type != GGML_TYPE_F32 || q == nullptr || k_ovf == nullptr ||
+            v_ovf == nullptr || mask == nullptr) {
+        return false;
+    }
+    if (q->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F32 ||
+            ggml_n_dims(q) != 4 || ggml_n_dims(mask) != 4) {
+        return false;
+    }
+
+    // Output mirrors the o_merged shape [D_v*H_q, Q*B] (D_k == D_v).
+    if (op->ne[0] != q->ne[0]*q->ne[1] || op->ne[1] != q->ne[2]*q->ne[3]) {
+        return false;
+    }
+
+    // Overflow K/V views and crop mask must describe one extent.
+    const int n_ovf_rows = ggml_get_op_params_i32(op, GGML_KVARN_SPLIT_FUSED_PARAM_N_OVF_ROWS);
+    if (k_ovf->ne[0] != v_ovf->ne[0] || k_ovf->ne[1] != v_ovf->ne[1] ||
+            n_ovf_rows <= 0 || k_ovf->ne[1] != n_ovf_rows) {
+        return false;
+    }
+    if (mask->ne[0] != n_ovf_rows || mask->ne[1] != q->ne[2] || mask->ne[3] != q->ne[3]) {
+        return false;
+    }
+
+    // Split geometry: 0 < P < n_kv_live <= P + n_ovf_rows.
+    const int p_split   = ggml_get_op_params_i32(op, GGML_KVARN_SPLIT_FUSED_PARAM_P);
+    const int n_kv_live = ggml_get_op_params_i32(op, GGML_KVARN_SPLIT_FUSED_PARAM_N_KV_LIVE);
+    if (p_split <= 0 || n_kv_live <= p_split || n_kv_live > p_split + n_ovf_rows) {
+        return false;
+    }
+
+    // Exact tail travels together or not at all.
+    if ((k_tail == nullptr) != (v_tail == nullptr)) {
+        return false;
+    }
+
+    // Phase 2: validate src[1..4] (k/v_cur, local KVarN range reads) dtypes and
+    // layouts, the raw-Q4_0 vs F16 overflow view choice, and the tail route.
+    return true;
+}
+
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -6362,6 +6439,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // the buffer); the scheduler pins it, so accept unconditionally
             return op->type == GGML_TYPE_F32 && op->src[0] != nullptr &&
                 op->src[0]->op == GGML_OP_FLASH_ATTN_EXT;
+        case GGML_OP_KVARN_SPLIT_FUSED:
+            // Phase-1 scaffold: true ONLY with LLAMA_OVF_FUSED_SPAN=1 and a
+            // valid shape contract; false otherwise so the scheduler falls
+            // back to the legacy position-split chain (fail closed).
+            return ggml_cuda_kvarn_split_fused_supported(op);
 
         default:
             return false;

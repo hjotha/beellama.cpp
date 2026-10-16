@@ -1170,9 +1170,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAGED_ATTN",
     "REMOTE_ATTN",
     "FLASH_ATTN_EXT_LSE",
+    "KVARN_SPLIT_FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1292,9 +1293,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "paged_attn",
     "remote_attn(q, k, v, pos)",
     "fa_lse(x)",
+    "kvarn_split_fused(q, k, v, k_local, v_local, k_ovf, v_ovf, mask, k_tail, v_tail)",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7217,6 +7219,93 @@ struct ggml_tensor * ggml_remote_attn(
     ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_HEAD_KV, (int) n_head_kv);
     ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_EMBD_HEAD, (int) n_embd_head);
     ggml_set_op_params_f32(result, GGML_REMOTE_ATTN_PARAM_KQ_SCALE, kq_scale);
+    return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+// ggml_kvarn_split_fused
+//
+// Phase-1 scaffold ("peça (c)"): the node carries the full operand set the
+// fused position-split span will need in phase 2, but nothing executes it yet.
+//   * The builder (src/llama-graph.cpp) does not emit the op; the split path
+//     stays byte-identical to the current FA1/FA2/LSE-merge chain.
+//   * CUDA only ADVERTISES the op under LLAMA_OVF_FUSED_SPAN=1 plus the shape
+//     contract (ggml_backend_cuda_device_supports_op, fail-closed otherwise).
+//   * If the op is ever executed, every backend aborts loudly (no silent
+//     no-op): ggml-cpu.c and the CUDA dispatcher both route to an explicit
+//     "not implemented in phase 1" abort.
+//
+// Contract kept intentionally narrow so phase 2 can extend it:
+//   * src[3]/src[4] (local KVarN range reads) are only checked to be present;
+//     their record vs materialized dtype/layout is validated when the kernel
+//     lands.
+//   * src[5]/src[6] are 2D overflow views [D*H_kv, n_ovf_rows] over the Q4_0
+//     companion storage; the raw-Q4 vs F16-view acceptance mirrors the
+//     builder's LLAMA_OVF_PACKED_Q4_FA choice and is deferred.
+//   * The output mirrors the o_merged shape produced by the current merge in
+//     build_attn_inp_kv_overflow(): 2D [D*H_q, Q*B] F32.
+struct ggml_tensor * ggml_kvarn_split_fused(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_cur,
+        struct ggml_tensor  * k_cur,
+        struct ggml_tensor  * v_cur,
+        struct ggml_tensor  * k_local,
+        struct ggml_tensor  * v_local,
+        struct ggml_tensor  * k_ovf,
+        struct ggml_tensor  * v_ovf,
+        struct ggml_tensor  * mask_overflow,
+        struct ggml_tensor  * k_tail,
+        struct ggml_tensor  * v_tail,
+        int                   p_split,
+        int                   n_kv_live,
+        int                   bits_k,
+        int                   bits_v,
+        int                   n_ovf_rows) {
+    GGML_ASSERT(ctx != NULL);
+    GGML_ASSERT(q_cur && k_cur && v_cur && k_local && v_local && k_ovf && v_ovf && mask_overflow);
+    // The exact tail is materialized together or not at all.
+    GGML_ASSERT((k_tail == NULL) == (v_tail == NULL));
+
+    GGML_ASSERT(q_cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_cur->ne[0] > 0 && q_cur->ne[1] > 0 && q_cur->ne[2] > 0 && q_cur->ne[3] > 0);
+
+    // Split geometry (see ggml_kvarn_split_fused_op_param in ggml.h).
+    GGML_ASSERT(p_split > 0);
+    GGML_ASSERT(n_kv_live > p_split && n_kv_live <= p_split + n_ovf_rows);
+    GGML_ASSERT(ggml_kvarn_valid_bits(bits_k) && ggml_kvarn_valid_bits(bits_v));
+    GGML_ASSERT(n_ovf_rows > 0);
+
+    // Overflow views: 2D rows over the companion storage, same extent for K/V.
+    GGML_ASSERT(k_ovf->ne[0] == v_ovf->ne[0] && k_ovf->ne[1] == v_ovf->ne[1]);
+    GGML_ASSERT(k_ovf->ne[1] == n_ovf_rows);
+
+    // Overflow mask: F32, contiguous crop over exactly the view extent, one
+    // row per query and batch of q_cur.
+    GGML_ASSERT(mask_overflow->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask_overflow->ne[0] == n_ovf_rows);
+    GGML_ASSERT(mask_overflow->ne[1] == q_cur->ne[2]);
+    GGML_ASSERT(mask_overflow->ne[3] == q_cur->ne[3]);
+
+    // Same shape as the current o_merged: [D*H_q, Q*B].
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]*q_cur->ne[3]);
+    result->op = GGML_OP_KVARN_SPLIT_FUSED;
+    result->src[0] = q_cur;
+    result->src[1] = k_cur;
+    result->src[2] = v_cur;
+    result->src[3] = k_local;
+    result->src[4] = v_local;
+    result->src[5] = k_ovf;
+    result->src[6] = v_ovf;
+    result->src[7] = mask_overflow;
+    result->src[8] = k_tail;
+    result->src[9] = v_tail;
+    ggml_set_op_params_i32(result, GGML_KVARN_SPLIT_FUSED_PARAM_P,          p_split);
+    ggml_set_op_params_i32(result, GGML_KVARN_SPLIT_FUSED_PARAM_N_KV_LIVE,  n_kv_live);
+    ggml_set_op_params_i32(result, GGML_KVARN_SPLIT_FUSED_PARAM_BITS_K,     bits_k);
+    ggml_set_op_params_i32(result, GGML_KVARN_SPLIT_FUSED_PARAM_BITS_V,     bits_v);
+    ggml_set_op_params_i32(result, GGML_KVARN_SPLIT_FUSED_PARAM_N_OVF_ROWS, n_ovf_rows);
     return result;
 }
 

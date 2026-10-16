@@ -663,6 +663,21 @@ extern "C" {
         // existing op enum values are not shifted.
         GGML_OP_FLASH_ATTN_EXT_LSE,
 
+        // Fused position-split attention + merge for the KVarN overflow span
+        // ("peça (c)" of docs/occupancy-placement-plan-20261002.md and the
+        // follow-up occupancy-aux handoff): ONE op replacing the local KVarN
+        // FA + overflow Q4 FA + LSE merge chain built by
+        // build_attn_inp_kv_overflow() (src/llama-graph.cpp).
+        //
+        // Phase 1 = scaffold only: the builder does NOT emit this op yet
+        // (wiring is phase 2). The CUDA backend advertises it exclusively when
+        // LLAMA_OVF_FUSED_SPAN == "1" AND the shape contract holds
+        // (ggml_backend_cuda_device_supports_op); every other backend and the
+        // default-off environment keep failing closed on the legacy path.
+        // CPU/other backends that would receive it abort loudly (no silent
+        // no-op). Kept last so existing op enum values are not shifted.
+        GGML_OP_KVARN_SPLIT_FUSED,
+
         GGML_OP_COUNT,
     };
 
@@ -2923,6 +2938,77 @@ extern "C" {
             int                   layer_id,
             float                 kq_scale,
             int                   domain);
+
+    // Op params of GGML_OP_KVARN_SPLIT_FUSED. All slots are int32 (op_params
+    // slots; see ggml_set_op_params_i32). Phase 1 defines only the minimum the
+    // scaffold creator writes and the CUDA gate reads; f32/route params
+    // (kq_scale, tail route/domain, query order/run descriptor, WHT domain
+    // flags) are deliberately NOT allocated yet - phase 2 adds them together
+    // with the builder wiring and the kernel so op_params stay self-describing.
+    enum ggml_kvarn_split_fused_op_param {
+        // Overflow split position P: the position axis is split into the local
+        // range [0, P) (KVarN records) and the overflow range [P, C) (Q4_0
+        // companion storage). The overflow K/V view (src[5], src[6]) covers
+        // only rows of the overflow range.
+        GGML_KVARN_SPLIT_FUSED_PARAM_P          = 0,
+        // Live KV length (tokens) for this ubatch: P + live overflow rows.
+        // Bounded by P + n_ovf_rows (rows past the live run are mask -inf).
+        GGML_KVARN_SPLIT_FUSED_PARAM_N_KV_LIVE  = 1,
+        // KVarN record bit width of the local K cache (2/3/4/5/6/8).
+        GGML_KVARN_SPLIT_FUSED_PARAM_BITS_K     = 2,
+        // KVarN record bit width of the local V cache (2/3/4/5/6/8).
+        GGML_KVARN_SPLIT_FUSED_PARAM_BITS_V     = 3,
+        // Row extent of the overflow K/V view (src[5]/src[6] dim 1): the
+        // stable extent baked by the builder (live run rounded up), which may
+        // exceed the live overflow rows; inactive rows are masked -inf.
+        GGML_KVARN_SPLIT_FUSED_PARAM_N_OVF_ROWS = 4,
+    };
+
+    // Fused position-split attention + merge ("peça (c)"): computes the same
+    // o_merged the split builder produces today via
+    //   local FA1 (KVarN range) + overflow FA2 (Q4 companion view) + LSE merge
+    // and returns it in the exact o_merged shape (see src/llama-graph.cpp
+    // build_attn_mha()/merge: 2D [D_v*H_q, Q*B] F32).
+    //
+    // Phase 1 scaffold: creating the node is pure metadata (shape/params);
+    // nothing executes it. The builder does not emit it and no backend
+    // computes it yet - CUDA only ADVERTISES it when LLAMA_OVF_FUSED_SPAN=1
+    // and the shape contract holds, otherwise supports_op is false (fail
+    // closed to the legacy path).
+    //
+    // Sources (NULL allowed only for k_tail/v_tail, and only together):
+    //   src[0] q_cur         [D_k, H_q,  Q, B]     F32, pre-rotation query
+    //   src[1] k_cur         [D_k, H_kv, Q, B]     current-token K rows (store)
+    //   src[2] v_cur         [D_v, H_kv, Q, B]     current-token V rows (store)
+    //   src[3] k_local       local KVarN range read (native or materialized)
+    //   src[4] v_local       local KVarN range read (native or materialized)
+    //   src[5] k_ovf         2D overflow view [D_k*H_kv, n_ovf_rows] of Q4_0 storage
+    //   src[6] v_ovf         2D overflow view [D_v*H_kv, n_ovf_rows] of Q4_0 storage
+    //   src[7] mask_overflow [n_ovf_rows, Q, 1, B] F32 contiguous range mask
+    //   src[8] k_tail        optional exact-tail K (NULL without tail)
+    //   src[9] v_tail        optional exact-tail V (NULL without tail)
+    //
+    // Phase 2 refinements (deferred on purpose, keep phase 1 minimal): local
+    // K/V dtype+layout validation (KVarN records vs materialized F16), raw
+    // Q4_0 vs F16 overflow view acceptance, tail route/query-order/run
+    // descriptor params, WHT/rotation domain, sinks/bias/softcap rejection.
+    GGML_API struct ggml_tensor * ggml_kvarn_split_fused(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_cur,
+            struct ggml_tensor  * k_cur,
+            struct ggml_tensor  * v_cur,
+            struct ggml_tensor  * k_local,
+            struct ggml_tensor  * v_local,
+            struct ggml_tensor  * k_ovf,
+            struct ggml_tensor  * v_ovf,
+            struct ggml_tensor  * mask_overflow,
+            struct ggml_tensor  * k_tail,
+            struct ggml_tensor  * v_tail,
+            int                   p_split,
+            int                   n_kv_live,
+            int                   bits_k,
+            int                   bits_v,
+            int                   n_ovf_rows);
 
     // rows-indexed state read: instead of a gathered [S_v, S_v, H_v, n_seqs]
     // scratch, the op reads each sequence's live state directly from `states`
