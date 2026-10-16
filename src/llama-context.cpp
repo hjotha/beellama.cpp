@@ -1900,22 +1900,37 @@ std::vector<ggml_backend_t> layer_backends;
                 if (!ggml_backend_remote_attn_connect(backend_remote)) {
                     ggml_backend_free(backend_remote);
                     backend_remote = nullptr;
-                    throw std::runtime_error(format(
-                        "%s: failed to connect/handshake with remote-attn server %s:%u",
-                        __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+                    LLAMA_LOG_WARN("%s: remote-attn server %s:%u unreachable, falling back to local vulkan:0\n",
+                        __func__, params.remote_attn_host, (unsigned) params.remote_attn_port);
+                    backend_remote = ggml_backend_local_split_init("vulkan:0");
+                    if (backend_remote) {
+                        ggml_backend_local_split_set_geometry(backend_remote, &geo);
+                        if (ggml_backend_local_split_setup(backend_remote)) {
+                            remote_attn_session = 0;
+                            if (ggml_backend_local_split_create_session(backend_remote, remote_attn_session, 0, (uint32_t) cparams.n_ctx)) {
+                                ggml_backend_local_split_set_active_session(backend_remote, remote_attn_session);
+                                LLAMA_LOG_INFO("%s: fallback local-split attention enabled on vulkan:0\n", __func__);
+                            }
+                        }
+                    }
+                    if (!backend_remote) {
+                        throw std::runtime_error(format(
+                            "%s: failed to connect to %s:%u and fallback to vulkan:0 also failed",
+                            __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
+                    }
+                } else {
+                    remote_attn_session = 0;
+                    if (!ggml_backend_remote_attn_create_session(
+                            backend_remote, remote_attn_session, /*seq_id=*/0, (uint32_t) cparams.n_ctx)) {
+                        ggml_backend_free(backend_remote);
+                        backend_remote = nullptr;
+                        throw std::runtime_error(format("%s: remote-attn CREATE_SESSION failed", __func__));
+                    }
+                    ggml_backend_remote_attn_set_active_session(backend_remote, remote_attn_session);
+                    LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
+                            __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
                 }
-                remote_attn_session = 0;
-                if (!ggml_backend_remote_attn_create_session(
-                        backend_remote, remote_attn_session, /*seq_id=*/0, (uint32_t) cparams.n_ctx)) {
-                    ggml_backend_free(backend_remote);
-                    backend_remote = nullptr;
-                    throw std::runtime_error(format("%s: remote-attn CREATE_SESSION failed", __func__));
-                }
-                ggml_backend_remote_attn_set_active_session(backend_remote, remote_attn_session);
-                LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
-                        __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
             }
-
             // PATH B: the remote op is computed on the CPU backend (pinned in
             // qwen35), so the scheduler uses its proven CUDA<->CPU copies and we
             // do NOT register backend_remote with the scheduler (a minimal custom

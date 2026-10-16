@@ -3112,15 +3112,8 @@ std::string common_context_adaptive_error(const common_params & params, int32_t 
     if (params.remote_attn_min_ctx_size > 0 && params.remote_attn_host.empty()) {
         return "--remote-attn-min-context requires --remote-attn";
     }
-    if (params.remote_attn_min_ctx_size > 0 && !common_remote_attn_is_local_vulkan(params.remote_attn_host)) {
-        return "--remote-attn-min-context requires a local Vulkan --remote-attn backend";
-    }
     if (params.remote_attn_min_ctx_size > 0 && !common_context_is_adaptive(params)) {
         return "--remote-attn-min-context requires adaptive context";
-    }
-    if (common_context_is_adaptive(params) && !params.remote_attn_host.empty() &&
-            !common_remote_attn_is_local_vulkan(params.remote_attn_host)) {
-        return "adaptive context does not support external --remote-attn HOST:PORT sessions";
     }
     if (params.ctx_size_mtp < 0) {
         return "--ctx-size-mtp must be non-negative";
@@ -3461,7 +3454,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         throw std::invalid_argument("--remote-attn-cache-type-k and -v must be supplied together");
     }
     if (remote_cache_k && (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
-            !common_remote_attn_is_local_vulkan(params.remote_attn_host) ||
+            params.remote_attn_host.empty() ||
             params.remote_attn_prefill != "remote" || params.n_parallel != 1 ||
             params.kv_tail_tokens != "0" || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
             params.no_kv_offload)) {
@@ -3550,7 +3543,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // backend connects during context construction.
     cparams.kv_position_split_p = params.kv_position_split_p;
     if (common_context_is_adaptive(params) &&
-            (!common_remote_attn_is_local_vulkan(params.remote_attn_host) ||
+            (params.remote_attn_host.empty() ||
              (params.remote_attn_min_ctx_size > 0 && params.n_ctx < params.remote_attn_min_ctx_size))) {
         cparams.kv_position_split_p = 0;
     }
