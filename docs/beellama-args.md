@@ -17,6 +17,16 @@ Use a single sequence, full attention, no context shift, no MTP, and native
 `--remote-attn vulkan:DEV --remote-attn-layers full` with the supported Q4
 overflow cache types. Unsupported configurations fail during initialization.
 
+`LLAMA_OVF_QWHT_CUDA=1` opts the grouped single-query decode into pinning the
+overflow path's F32 Q Walsh-Hadamard transform (and its contiguous-view input)
+on the local CUDA backend instead of the Vulkan overflow backend, removing one
+pre-local Vulkan cluster per full-attention layer. Only the exact value `1`
+enables it; unset, `0`, or any other value keeps the legacy Vulkan placement
+byte for byte. At head width 256 the CUDA transform is not bit-identical to the
+Vulkan one, so the opt-in arm is validated by tolerance (nrmse, in
+`test-position-split-merge-graph`), never by bitwise equality, and it is not a
+default.
+
 Adaptive profiles below `--remote-attn-min-context` clear this option with
 their remote route; draft contexts also clear it. A snapshot with another P
 does not authorize an implicit repartition. This option remains under the

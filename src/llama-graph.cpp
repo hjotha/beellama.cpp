@@ -5025,11 +5025,12 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
     }();
     // Opt-in relocation of the grouped decode's Q WHT from the Vulkan
     // overflow path to the local CUDA backend (see the q_local pin below).
-    // Default OFF: absent or "0" keeps the legacy Vulkan placement byte for
-    // byte; any other value opts in to the CUDA arm.
+    // Default OFF: absent, "0", or any other value keeps the legacy Vulkan
+    // placement byte for byte; only the exact string "1" opts in to the CUDA
+    // arm, matching LLAMA_OVF_TAIL_LOCAL_CUDA.
     static const bool ovf_qwht_cuda = [] {
         const char * e = std::getenv("LLAMA_OVF_QWHT_CUDA");
-        return e != nullptr && std::strcmp(e, "0") != 0;
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
     }();
     // Grouped single-query decode: construct the range stores now for cache
     // bookkeeping but defer their expansion until after fa1/LSE1, so the
@@ -5042,7 +5043,9 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
     // arm would silently flip those WHT bits, and the wht-parity measurement
     // (docs/occupancy-progress-20261003.md) only covers the anchored arm. Q's
     // F32 WHT stays on Vulkan: moving it to CUDA changes bits at head width
-    // 256, so it must remain a separate pre-local split.
+    // 256, so it must remain a separate pre-local split unless
+    // LLAMA_OVF_QWHT_CUDA=1, which moves the WHT (and its CONT neighbor) onto
+    // the local CUDA backend and removes that pre-local split.
     const bool group_overflow_decode = q_cur->ne[2] == 1 &&
             (!kvarn_ctx->tail_on_layer(il) || tail_local_cuda_enabled);
     ggml_build_forward_expand(gf, q_cur);
@@ -5807,7 +5810,7 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
         //     backend even though the overflow stores no longer precede it.
         //     Unsupported Vulkan widths (64) retain the scheduler's existing
         //     supported-backend fallback.
-        //   LLAMA_OVF_QWHT_CUDA=other (opt-in): pin the Q WHT to the local
+        //   LLAMA_OVF_QWHT_CUDA=1 (opt-in): pin the Q WHT to the local
         //     CUDA backend (the backend fa1/o_merged use), removing the
         //     pre-local Vulkan split so the whole local FA1/LSE1 path runs in
         //     one CUDA cluster. At head width 256 the CUDA WHT bits differ
@@ -5816,14 +5819,13 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
         //     tests/test-position-split-merge-graph and must not silently
         //     become the default. The WHT's CONT input moves with it (the
         //     minimal neighbor needed to keep the transform in one cluster);
-        //     unsupported CUDA WHT shapes retain the scheduler's existing
-        //     supported-backend fallback.
-        if (use_kvarn_q_rot && ovf_qwht_cuda) {
-            if (ggml_backend_supports_op(backend_cuda, q_local)) {
-                ggml_backend_sched_set_tensor_backend(sched, q_local, backend_cuda);
-                if (q_local->src[0]->op == GGML_OP_CONT) {
-                    ggml_backend_sched_set_tensor_backend(sched, q_local->src[0], backend_cuda);
-                }
+        //     when CUDA cannot run the shape, the pin falls back to the
+        //     legacy Vulkan placement below instead of leaving the WHT to an
+        //     unpinned scheduler choice.
+        if (use_kvarn_q_rot && ovf_qwht_cuda && ggml_backend_supports_op(backend_cuda, q_local)) {
+            ggml_backend_sched_set_tensor_backend(sched, q_local, backend_cuda);
+            if (q_local->src[0]->op == GGML_OP_CONT) {
+                ggml_backend_sched_set_tensor_backend(sched, q_local->src[0], backend_cuda);
             }
         } else if (use_kvarn_q_rot && ggml_backend_supports_op(backend_vulkan, q_local)) {
             ggml_backend_sched_set_tensor_backend(sched, q_local, backend_vulkan);

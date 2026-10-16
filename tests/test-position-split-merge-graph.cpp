@@ -415,6 +415,8 @@ struct merge_result {
     int  nodes_on_overflow = 0;
     bool fa1_on_requested = false;
     bool fa2_on_requested = false;
+    bool qwht_in_cont = false;        // the Q WHT input is a materialized CONT
+    bool qwht_cont_on_local = false;  // that CONT ran on the requested local backend
 };
 
 struct eval_counters {
@@ -754,7 +756,13 @@ static merge_result run_merge(ggml_backend_t local, ggml_backend_t overflow,
 //   3 = legacy order with NO manual placements (scheduler's own placement)
 //   4 = mode 2 with the Q WHT pinned to the local CUDA backend, mirroring
 //       LLAMA_OVF_QWHT_CUDA=1; requires the env (set by the caller) and is
-//       gated by tolerance, never bitwise
+//       gated by tolerance, never bitwise.
+// q_layout:
+//   0 = Q is the contiguous leaf
+//   1 = Q is a non-contiguous permuted view over a backing tensor, so the WHT
+//       input is the CONT neighbor ggml_kvarn_wht_aux inserts in production;
+//       mode 4 must pin that CONT with the WHT. Same logical values, so all
+//       same-arm results stay bit-identical to q_layout 0.
 static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflow,
         int D, int n_q, int n_qh, int n_kvh,
         int n_kv1, int n_kv2,
@@ -762,7 +770,8 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         const std::vector<float> & q,
         const std::vector<float> & k1, const std::vector<float> & v1,
         const std::vector<uint8_t> & k2_bytes, const std::vector<uint8_t> & v2_bytes,
-        int schedule_mode = 0, int overflow_layout = 0, int store_mode = 0) {
+        int schedule_mode = 0, int overflow_layout = 0, int store_mode = 0,
+        int q_layout = 0) {
     merge_result res;
     if (n_kv1 <= 0) {
         res.declined = true;
@@ -796,8 +805,19 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         return res;
     }
 
-    ggml_tensor * q_t   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, n_qh, 1);
-    ggml_tensor * q_rot = ggml_kvarn_wht(ctx, q_t, D);
+    // q_layout 1: the leaf is the {D, n_qh, n_q} backing and the permuted view
+    // is the non-contiguous Q (same logical {D, n_q, n_qh} values as q_t in the
+    // contiguous variant); the aux-style CONT into the WHT is the neighbor the
+    // production pin must move with the transform. fa2 consumes the CONT too:
+    // identical bits without exercising strided FA inputs, which are not part
+    // of this pin.
+    ggml_tensor * q_t   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+            D, q_layout ? n_qh : n_q, q_layout ? n_q : n_qh, 1);
+    ggml_tensor * q_wht_in = q_t;
+    if (q_layout) {
+        q_wht_in = ggml_cont(ctx, ggml_permute(ctx, q_t, 0, 2, 1, 3));
+    }
+    ggml_tensor * q_rot = ggml_kvarn_wht(ctx, q_wht_in, D);
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv1);
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, record_dim, record_heads, n_kv1 * n_stream);
     ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, record_dim, record_heads, n_kv1 * n_stream);
@@ -916,7 +936,7 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
                 }
             }
         }
-        fa2 = ggml_flash_attn_ext(ctx, q_t, k2_read, v2_read, m2_read,
+        fa2 = ggml_flash_attn_ext(ctx, q_wht_in, k2_read, v2_read, m2_read,
                 1.0f / std::sqrt(float(D)), 0.0f, 0.0f);
         ggml_prec_set_acc(fa2, GGML_PREC_F32);
         lse2 = ggml_flash_attn_ext_lse_out(ctx, fa2);
@@ -967,16 +987,17 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     ggml_backend_sched_set_tensor_backend(sched, q_t, local);
     if (schedule_mode == 4) {
         // LLAMA_OVF_QWHT_CUDA=1 arm: mirror llama-graph.cpp's opt-in pin and
-        // move the Q WHT to the local (CUDA) backend. Fail closed if the env
-        // is not enabled or CUDA cannot run the transform; this variant exists
+        // move the Q WHT (and its CONT neighbor, when Q arrives as a view)
+        // onto the local (CUDA) backend. Fail closed if the env is not
+        // exactly "1" or CUDA cannot run the transform; this variant exists
         // to exercise that exact production configuration.
         const char * env = std::getenv("LLAMA_OVF_QWHT_CUDA");
-        if (env == nullptr || std::strcmp(env, "0") == 0) {
+        if (env == nullptr || std::strcmp(env, "1") != 0) {
             ggml_backend_sched_free(sched);
             ggml_backend_free(cpu);
             ggml_free(ctx);
             res.declined = true;
-            res.reason = "schedule_mode 4 requires LLAMA_OVF_QWHT_CUDA (non-\"0\")";
+            res.reason = "schedule_mode 4 requires LLAMA_OVF_QWHT_CUDA=1";
             return res;
         }
         if (!ggml_backend_supports_op(local, q_rot)) {
@@ -988,6 +1009,9 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
             return res;
         }
         ggml_backend_sched_set_tensor_backend(sched, q_rot, local);
+        if (q_rot->src[0]->op == GGML_OP_CONT) {
+            ggml_backend_sched_set_tensor_backend(sched, q_rot->src[0], local);
+        }
     } else if (schedule_mode != 3) {
         // Mode 3 leaves the Q WHT to the scheduler on purpose (legacy order
         // reproduces the pre-consolidation placement naturally).
@@ -1107,6 +1131,11 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     }
 
     res.splits = ggml_backend_sched_get_n_splits(sched);
+    res.qwht_in_cont = q_rot->src[0]->op == GGML_OP_CONT;
+    if (res.qwht_in_cont) {
+        res.qwht_cont_on_local =
+                ggml_backend_sched_get_tensor_backend(sched, q_rot->src[0]) == local;
+    }
     ggml_backend_t previous = nullptr;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
@@ -1147,7 +1176,26 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     if (eps != nullptr) {
         ggml_backend_tensor_set(eps, &eps_value, 0, sizeof(float));
     }
-    ggml_backend_tensor_set(q_t, q.data(), 0, ggml_nbytes(q_t));
+    // q_layout 1 uploads the same logical Q in the backing's {D, n_qh, n_q}
+    // physical order, so the permuted view + CONT reproduce q bit for bit.
+    const auto q_to_leaf = [&](const std::vector<float> & src) {
+        if (!q_layout) {
+            return src;
+        }
+        std::vector<float> dst(src.size());
+        for (int h = 0; h < n_qh; ++h) {
+            for (int t = 0; t < n_q; ++t) {
+                for (int d = 0; d < D; ++d) {
+                    dst[(size_t(t) * n_qh + h) * D + d] = src[(size_t(h) * n_q + t) * D + d];
+                }
+            }
+        }
+        return dst;
+    };
+    {
+        const std::vector<float> q_leaf_data = q_to_leaf(q);
+        ggml_backend_tensor_set(q_t, q_leaf_data.data(), 0, ggml_nbytes(q_t));
+    }
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
     ggml_backend_tensor_set(current_k, ck.data(), 0, ggml_nbytes(current_k));
     ggml_backend_tensor_set(current_v, cv.data(), 0, ggml_nbytes(current_v));
@@ -1219,7 +1267,8 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         if (pass) {
             std::vector<float> next_q = q;
             for (float & x : next_q) { x = -x; }
-            ggml_backend_tensor_set(q_t, next_q.data(), 0, ggml_nbytes(q_t));
+            const std::vector<float> next_leaf = q_to_leaf(next_q);
+            ggml_backend_tensor_set(q_t, next_leaf.data(), 0, ggml_nbytes(q_t));
         }
         if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
             res.declined = true;
@@ -1426,6 +1475,32 @@ int main() {
                 for (float & x : q_neg4) { x = -x; }
                 const merge_result cuda_fresh = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
                         sh.n_kv1, sh.n_kv2, true, 1, q_neg4, k1, v1, k2b, v2b, 4, layout, 1);
+                // Mode-4 mirror of the mode-2 visibility control: re-run the
+                // same arm with the mode-4 run's post-run storage bytes
+                // pre-filled and NO store. Identical bits prove the mode-4
+                // fa2 consumed the row its own store wrote.
+                bool cuda_store_changed = false;
+                CHECK(cuda_arm.k2_final.size() == k2b.size() &&
+                      cuda_arm.v2_final.size() == v2b.size());
+                if (cuda_arm.k2_final.size() == k2b.size()) {
+                    const size_t row = ggml_row_size(GGML_TYPE_Q4_0, D);
+                    const size_t plane = row * size_t(sh.n_kv2);
+                    for (int kh = 0; kh < n_kvh && !cuda_store_changed; ++kh) {
+                        const size_t off = size_t(sh.n_kv2 - 1) * row + size_t(kh) * plane;
+                        if (std::memcmp(cuda_arm.k2_final.data() + off, k2b.data() + off, row) != 0) {
+                            cuda_store_changed = true;
+                        }
+                    }
+                }
+                CHECK(cuda_store_changed);
+                const merge_result ctl4 = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1,
+                        cuda_arm.k2_final, cuda_arm.v2_final, 4, layout, 0);
+                // Non-contiguous Q variant of the mode-4 arm: the permuted
+                // view with the aux-style CONT into the WHT exercises the
+                // CONT neighbor the production pin must move with it.
+                const merge_result cuda_perm = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 4, layout, 1, 1);
                 set_env_llama_ovf_qwht_cuda(nullptr);
                 CHECK(!cuda_arm.declined);
                 CHECK(!cuda_fresh.declined);
@@ -1460,6 +1535,42 @@ int main() {
                         D, layout, after.splits, cuda_arm.splits,
                         after.overflow_splits, cuda_arm.overflow_splits,
                         cuda_q_nrmse, cuda_o_nrmse, cuda_lse_nrmse, int(cuda_fresh_bits));
+
+                // Mode-4 visibility control and permuted-Q variants. Same-arm
+                // comparisons stay bitwise (identical logical Q bits into the
+                // same CUDA WHT); the mode-4 tolerance gates (Q/O nrmse <=
+                // 1e-3, LSE <= 1e-2) still apply against the default arm.
+                CHECK(!ctl4.declined);
+                CHECK(!cuda_perm.declined);
+                double perm_q_nrmse = INFINITY;
+                double perm_o_nrmse = INFINITY;
+                double perm_lse_nrmse = INFINITY;
+                bool ctl4_bits = false;
+                bool perm_bits = false;
+                if (!ctl4.declined && !cuda_arm.declined) {
+                    ctl4_bits = same_bits(ctl4.o, cuda_arm.o) && same_bits(ctl4.lse, cuda_arm.lse);
+                    CHECK(ctl4_bits);
+                }
+                if (!cuda_perm.declined && !cuda_arm.declined) {
+                    CHECK(cuda_perm.qwht_in_cont);
+                    CHECK(cuda_perm.qwht_cont_on_local);
+                    perm_bits = same_bits(cuda_perm.q_rot, cuda_arm.q_rot) &&
+                                same_bits(cuda_perm.o, cuda_arm.o) &&
+                                same_bits(cuda_perm.lse, cuda_arm.lse);
+                    CHECK(perm_bits);
+                    perm_q_nrmse = nrmse_ff(cuda_perm.q_rot, after.q_rot);
+                    perm_o_nrmse = nrmse_ff(cuda_perm.o, after.o);
+                    perm_lse_nrmse = nrmse_ff(cuda_perm.lse, after.lse);
+                    CHECK(perm_q_nrmse <= 1e-3);
+                    CHECK(perm_o_nrmse <= 1e-3);
+                    CHECK(perm_lse_nrmse <= 1e-2);
+                }
+                std::printf("  cuda-qwht ctl/perm D%d layout%d: store-to-fa2=%d, qwht-cont=%d/%d, "
+                        "same-arm bits=%d/%d, nrmse Q=%.3e O=%.3e LSE=%.3e\n",
+                        D, layout, int(cuda_store_changed && !ctl4.declined),
+                        int(cuda_perm.qwht_in_cont), int(cuda_perm.qwht_cont_on_local),
+                        int(ctl4_bits), int(perm_bits),
+                        perm_q_nrmse, perm_o_nrmse, perm_lse_nrmse);
 
                 // The reused graph's pass 2 (Q negated in place) must match a
                 // FRESH graph allocated with the negated Q up front, per arm.
