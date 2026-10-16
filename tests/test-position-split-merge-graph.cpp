@@ -755,8 +755,14 @@ static merge_result run_merge(ggml_backend_t local, ggml_backend_t overflow,
 //       pre-consolidation graph
 //   3 = legacy order with NO manual placements (scheduler's own placement)
 //   4 = mode 2 with the Q WHT pinned to the local CUDA backend, mirroring
-//       LLAMA_OVF_QWHT_CUDA=1; requires the env (set by the caller) and is
-//       gated by tolerance, never bitwise.
+//       LLAMA_OVF_QWHT_CUDA=1 in the grouped decode; requires the env (set by
+//       the caller) and is gated by tolerance, never bitwise.
+//   5 = mode 3 (legacy order, natural placement) with the same Q WHT pin,
+//       mirroring LLAMA_OVF_QWHT_CUDA=1 on the PREFILL (non-grouped) path:
+//       stores stay in the legacy early order, the merge steps and the local
+//       O WHT keep the scheduler's placement, and only the Q WHT (and its
+//       CONT neighbor) moves to the local backend. Requires the env too;
+//       tolerance-gated, never bitwise.
 // q_layout:
 //   0 = Q is the contiguous leaf
 //   1 = Q is a non-contiguous permuted view over a backing tensor, so the WHT
@@ -985,19 +991,20 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     ggml_backend_t backends[3] = { overflow, local, cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 3, 8192, false, true);
     ggml_backend_sched_set_tensor_backend(sched, q_t, local);
-    if (schedule_mode == 4) {
-        // LLAMA_OVF_QWHT_CUDA=1 arm: mirror llama-graph.cpp's opt-in pin and
+    if (schedule_mode == 4 || schedule_mode == 5) {
+        // LLAMA_OVF_QWHT_CUDA=1 arms: mirror llama-graph.cpp's opt-in pin and
         // move the Q WHT (and its CONT neighbor, when Q arrives as a view)
-        // onto the local (CUDA) backend. Fail closed if the env is not
-        // exactly "1" or CUDA cannot run the transform; this variant exists
-        // to exercise that exact production configuration.
+        // onto the local (CUDA) backend. Mode 4 is the grouped-decode arm,
+        // mode 5 the prefill arm; both fail closed if the env is not exactly
+        // "1" or CUDA cannot run the transform; these variants exist to
+        // exercise those exact production configurations.
         const char * env = std::getenv("LLAMA_OVF_QWHT_CUDA");
         if (env == nullptr || std::strcmp(env, "1") != 0) {
             ggml_backend_sched_free(sched);
             ggml_backend_free(cpu);
             ggml_free(ctx);
             res.declined = true;
-            res.reason = "schedule_mode 4 requires LLAMA_OVF_QWHT_CUDA=1";
+            res.reason = "schedule_mode 4/5 requires LLAMA_OVF_QWHT_CUDA=1";
             return res;
         }
         if (!ggml_backend_supports_op(local, q_rot)) {
@@ -1012,9 +1019,10 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         if (q_rot->src[0]->op == GGML_OP_CONT) {
             ggml_backend_sched_set_tensor_backend(sched, q_rot->src[0], local);
         }
-    } else if (schedule_mode != 3) {
-        // Mode 3 leaves the Q WHT to the scheduler on purpose (legacy order
-        // reproduces the pre-consolidation placement naturally).
+    } else if (schedule_mode != 3 && schedule_mode != 5) {
+        // Modes 3 and 5 leave the Q WHT to the scheduler on purpose (the
+        // legacy order reproduces the pre-consolidation placement naturally);
+        // mode 5 pins it to local in the branch above instead.
         ggml_backend_sched_set_tensor_backend(sched, q_rot, schedule_mode ? overflow : local);
     }
     ggml_backend_sched_set_tensor_backend(sched, indices, local);
@@ -1031,8 +1039,8 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     ggml_backend_sched_set_tensor_backend(sched, m1_t, local);
     ggml_backend_sched_set_tensor_backend(sched, fa1, local);
     ggml_backend_sched_set_tensor_backend(sched, lse1, local);
-    if (schedule_mode != 3) {
-        // Mode 3 leaves the local O WHT to the scheduler on purpose.
+    if (schedule_mode != 3 && schedule_mode != 5) {
+        // Modes 3 and 5 leave the local O WHT to the scheduler on purpose.
         ggml_backend_sched_set_tensor_backend(sched, o1, schedule_mode ? overflow : local);
     }
     if (with_overflow) {
@@ -1081,10 +1089,12 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         // stays on Vulkan in the forced arms: at D=256 its F32 results differ
         // from CUDA, so that pre-local split is unavoidable. Mode 4 is the
         // mode-2 schedule with the Q WHT forced onto the local CUDA backend
-        // (LLAMA_OVF_QWHT_CUDA=1), which drops that pre-local split.
+        // (LLAMA_OVF_QWHT_CUDA=1), which drops that pre-local split. Mode 5 is
+        // the mode-3 (legacy prefill) schedule with only that same pin, the
+        // production prefill shape.
         ggml_build_forward_expand(gf, stored_k);
         ggml_build_forward_expand(gf, stored_v);
-        if (schedule_mode == 1 || schedule_mode == 3) {
+        if (schedule_mode == 1 || schedule_mode == 3 || schedule_mode == 5) {
             if (store_k) {
                 ggml_build_forward_expand(gf, store_k);
                 ggml_build_forward_expand(gf, store_v);
@@ -1106,10 +1116,11 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         ggml_build_forward_expand(gf, merged_div);
         ggml_build_forward_expand(gf, lse_merged);
         ggml_build_forward_expand(gf, o);
-        if (schedule_mode != 3) {
+        if (schedule_mode != 3 && schedule_mode != 5) {
             // The production graph's unpinned intermediates followed lse2 onto
             // Vulkan already. Pin both forced arms identically to isolate
-            // ordering; mode 3 lets the scheduler reproduce that placement.
+            // ordering; modes 3 and 5 let the scheduler reproduce that
+            // placement (production prefill does the same).
             for (int i = merge_begin; i < ggml_graph_n_nodes(gf); ++i) {
                 ggml_tensor * node = ggml_graph_node(gf, i);
                 if (node != o && node != lse_merged && !node->view_src) {
@@ -1391,16 +1402,16 @@ int main() {
         // (NRMSE <= 1.7e-4). This prototype therefore proves the merge
         // composition, the scheduler copies and the empty-range contract on
         // the backend pair it can drive.
+        const auto same_bits = [](const std::vector<float> & a, const std::vector<float> & b) {
+            return !a.empty() && a.size() == b.size() &&
+                    std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        };
+        const auto pass_bits = [](const std::vector<float> & v, bool second) {
+            const size_t h = v.size() / 2;
+            return std::vector<float>(v.begin() + (second ? h : 0),
+                    v.begin() + (second ? 2 * h : h));
+        };
         if (n_q == 1) {
-            const auto same_bits = [](const std::vector<float> & a, const std::vector<float> & b) {
-                return !a.empty() && a.size() == b.size() &&
-                        std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
-            };
-            const auto pass_bits = [](const std::vector<float> & v, bool second) {
-                const size_t h = v.size() / 2;
-                return std::vector<float>(v.begin() + (second ? h : 0),
-                        v.begin() + (second ? 2 * h : h));
-            };
             for (int layout = 0; layout < 5; ++layout) {
                 // Mode 1: legacy expansion order + the consolidated arm's forced
                 // (pinned) placement. Mode 2: consolidated order + forced
@@ -1602,6 +1613,111 @@ int main() {
                         int(same_bits(plain.q_rot, after.q_rot)), int(same_bits(plain.o, after.o)),
                         int(same_bits(plain.lse, after.lse)),
                         int(store_changed && !ctl.declined), int(fresh_ok));
+            }
+        }
+
+        // LLAMA_OVF_QWHT_CUDA=1 prefill arm (mode 5): the production prefill
+        // runs the non-grouped path (ne[2] != 1), keeps the legacy expansion
+        // order (stores early, no deferred overflow store) and leaves the
+        // local O WHT and the merge steps to the scheduler. Mode 3 is that
+        // untouched reference arm; mode 5 adds ONLY the Q WHT (and its CONT
+        // neighbor) pin to the local CUDA backend, exactly like the
+        // production prefill change, so the A/B isolates the relocation. At
+        // D=256 the CUDA WHT bits differ from Vulkan, so the comparison is
+        // TOLERANCE-based (nrmse Q/O <= 1e-3, LSE <= 1e-2), never bitwise;
+        // the permuted-Q variant exercises the CONT neighbor under the same
+        // pin and the fresh-negQ parity checks the arm's own reused graph.
+        if (n_q > 1) {
+            for (int layout = 0; layout < 5; ++layout) {
+                const merge_result pre = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 3, layout, 1);
+                set_env_llama_ovf_qwht_cuda("1");
+                const merge_result pre_cuda = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 5, layout, 1);
+                const merge_result pre_perm = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 5, layout, 1, 1);
+                std::vector<float> q_neg5 = q;
+                for (float & x : q_neg5) { x = -x; }
+                const merge_result pre_fresh = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q_neg5, k1, v1, k2b, v2b, 5, layout, 1);
+                // Mode-4-style visibility control: re-run the arm with its own
+                // post-run storage bytes and NO store. Identical bits prove
+                // the prefill arm's fa2 consumed the row its store wrote.
+                bool pre_store_changed = false;
+                CHECK(pre_cuda.k2_final.size() == k2b.size() &&
+                      pre_cuda.v2_final.size() == v2b.size());
+                if (pre_cuda.k2_final.size() == k2b.size()) {
+                    const size_t row = ggml_row_size(GGML_TYPE_Q4_0, D);
+                    const size_t plane = row * size_t(sh.n_kv2);
+                    for (int kh = 0; kh < n_kvh && !pre_store_changed; ++kh) {
+                        const size_t off = size_t(sh.n_kv2 - 1) * row + size_t(kh) * plane;
+                        if (std::memcmp(pre_cuda.k2_final.data() + off, k2b.data() + off, row) != 0) {
+                            pre_store_changed = true;
+                        }
+                    }
+                }
+                const merge_result ctl5 = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1,
+                        pre_cuda.k2_final, pre_cuda.v2_final, 5, layout, 0);
+                set_env_llama_ovf_qwht_cuda(nullptr);
+                CHECK(!pre.declined);
+                CHECK(!pre_cuda.declined);
+                CHECK(!pre_perm.declined);
+                CHECK(!pre_fresh.declined);
+                CHECK(!ctl5.declined);
+                double pre_q_nrmse = INFINITY;
+                double pre_o_nrmse = INFINITY;
+                double pre_lse_nrmse = INFINITY;
+                bool pre_fresh_bits = false;
+                if (!pre.declined && !pre_cuda.declined) {
+                    pre_q_nrmse = nrmse_ff(pre_cuda.q_rot, pre.q_rot);
+                    pre_o_nrmse = nrmse_ff(pre_cuda.o, pre.o);
+                    pre_lse_nrmse = nrmse_ff(pre_cuda.lse, pre.lse);
+                    CHECK(pre_q_nrmse <= 1e-3);
+                    CHECK(pre_o_nrmse <= 1e-3);
+                    CHECK(pre_lse_nrmse <= 1e-2);
+                    // One fewer Vulkan cluster per layer: the Q WHT runs in
+                    // the local CUDA cluster instead of its own pre-local
+                    // Vulkan split on the prefill path too. In the prefill
+                    // expansion order the total split count is unchanged (the
+                    // removed Vulkan segment is replaced by the CUDA segment
+                    // that carries the WHT), unlike the grouped decode where
+                    // removing the interior Vulkan split merges two CUDA
+                    // segments (-2). Measured stable at 7 vs 7 for all three
+                    // non-decode shapes and layouts.
+                    CHECK(pre_cuda.overflow_splits == pre.overflow_splits - 1);
+                    CHECK(pre_cuda.splits == pre.splits);
+                }
+                if (!pre_cuda.declined && !pre_fresh.declined) {
+                    pre_fresh_bits =
+                        same_bits(pass_bits(pre_cuda.o, false), pass_bits(pre_fresh.o, true)) &&
+                        same_bits(pass_bits(pre_cuda.o, true), pass_bits(pre_fresh.o, false)) &&
+                        same_bits(pass_bits(pre_cuda.lse, false), pass_bits(pre_fresh.lse, true)) &&
+                        same_bits(pass_bits(pre_cuda.lse, true), pass_bits(pre_fresh.lse, false)) &&
+                        same_bits(pass_bits(pre_cuda.q_rot, false), pass_bits(pre_fresh.q_rot, true)) &&
+                        same_bits(pass_bits(pre_cuda.q_rot, true), pass_bits(pre_fresh.q_rot, false));
+                    CHECK(pre_fresh_bits);
+                }
+                bool pre_perm_bits = false;
+                if (!pre_perm.declined && !pre_cuda.declined) {
+                    CHECK(pre_perm.qwht_in_cont);
+                    CHECK(pre_perm.qwht_cont_on_local);
+                    pre_perm_bits = same_bits(pre_perm.q_rot, pre_cuda.q_rot) &&
+                                    same_bits(pre_perm.o, pre_cuda.o) &&
+                                    same_bits(pre_perm.lse, pre_cuda.lse);
+                    CHECK(pre_perm_bits);
+                }
+                bool ctl5_bits = false;
+                if (!ctl5.declined && !pre_cuda.declined) {
+                    ctl5_bits = same_bits(ctl5.o, pre_cuda.o) && same_bits(ctl5.lse, pre_cuda.lse);
+                    CHECK(ctl5_bits);
+                }
+                std::printf("  cuda-qwht prefill D%d Q%d layout%d: splits %d vs %d, Vulkan clusters %d vs %d, "
+                        "nrmse Q=%.3e O=%.3e LSE=%.3e, fresh-negQ=%d, store-to-fa2=%d, perm=%d\n",
+                        D, n_q, layout, pre.splits, pre_cuda.splits,
+                        pre.overflow_splits, pre_cuda.overflow_splits,
+                        pre_q_nrmse, pre_o_nrmse, pre_lse_nrmse,
+                        int(pre_fresh_bits), int(pre_store_changed && ctl5_bits), int(pre_perm_bits));
             }
         }
         const merge_result m = run_merge(vk, vk, D, n_q, n_qh, n_kvh,
