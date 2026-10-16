@@ -1902,7 +1902,7 @@ std::vector<ggml_backend_t> layer_backends;
                     backend_remote = nullptr;
                     LLAMA_LOG_WARN("%s: remote-attn server %s:%u unreachable, falling back to local vulkan:0\n",
                         __func__, params.remote_attn_host, (unsigned) params.remote_attn_port);
-                    backend_remote = ggml_backend_local_split_init("vulkan:0");
+                    backend_remote = ggml_backend_local_split_init(0, 3);
                     if (backend_remote) {
                         ggml_backend_local_split_set_geometry(backend_remote, &geo);
                         if (ggml_backend_local_split_setup(backend_remote)) {
