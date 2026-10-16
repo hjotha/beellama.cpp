@@ -5023,6 +5023,14 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
         const char * e = std::getenv("LLAMA_OVF_TAIL_LOCAL_CUDA");
         return e != nullptr && e[0] == '1' && e[1] == '\0';
     }();
+    // Opt-in relocation of the grouped decode's Q WHT from the Vulkan
+    // overflow path to the local CUDA backend (see the q_local pin below).
+    // Default OFF: absent or "0" keeps the legacy Vulkan placement byte for
+    // byte; any other value opts in to the CUDA arm.
+    static const bool ovf_qwht_cuda = [] {
+        const char * e = std::getenv("LLAMA_OVF_QWHT_CUDA");
+        return e != nullptr && std::strcmp(e, "0") != 0;
+    }();
     // Grouped single-query decode: construct the range stores now for cache
     // bookkeeping but defer their expansion until after fa1/LSE1, so the
     // store + gather + fa2 land in ONE Vulkan cluster instead of reopening CUDA
@@ -5728,7 +5736,9 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     // Vulkan; local FA/LSE and final outputs on CUDA. This is still TWO Vulkan
     // steps per rotated-query layer: the Q WHT runs first as its own pre-local
     // split (see the q_local pin below when the decode is grouped), then this
-    // overflow cluster. Q itself stays on CUDA; the scheduler copies it to
+    // overflow cluster. With LLAMA_OVF_QWHT_CUDA=1 the Q WHT joins the local
+    // CUDA cluster and only this overflow cluster remains (see the pin below).
+    // Q itself stays on CUDA; the scheduler copies it to
     // Vulkan for FA2. Fail closed if either backend is missing.
     // Split input tensors (masks/idxs) stay on host CPU so set_input can fill
     // them; the scheduler copies to device backends as needed. backend_cpu
@@ -5790,11 +5800,32 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
                 ggml_backend_sched_set_tensor_backend(sched, node, backend_vulkan);
             }
         }
-        // Preserve the legacy Q-rotation backend even though the overflow
-        // stores no longer precede it. F32 alone does not guarantee identical
-        // WHT rounding across CUDA/Vulkan. Unsupported Vulkan widths (64)
-        // retain the scheduler's existing supported-backend fallback.
-        if (use_kvarn_q_rot && ggml_backend_supports_op(backend_vulkan, q_local)) {
+        // Q-rotation backend pin. The pre-consolidation graph ran this F32 WHT
+        // on Vulkan as its own pre-local split, and F32 alone does not
+        // guarantee identical WHT rounding across CUDA/Vulkan.
+        //   LLAMA_OVF_QWHT_CUDA absent/"0" (default): preserve that legacy
+        //     backend even though the overflow stores no longer precede it.
+        //     Unsupported Vulkan widths (64) retain the scheduler's existing
+        //     supported-backend fallback.
+        //   LLAMA_OVF_QWHT_CUDA=other (opt-in): pin the Q WHT to the local
+        //     CUDA backend (the backend fa1/o_merged use), removing the
+        //     pre-local Vulkan split so the whole local FA1/LSE1 path runs in
+        //     one CUDA cluster. At head width 256 the CUDA WHT bits differ
+        //     from the Vulkan ones, so this arm is NOT bit-identical to the
+        //     default: it is validated by tolerance (nrmse) in
+        //     tests/test-position-split-merge-graph and must not silently
+        //     become the default. The WHT's CONT input moves with it (the
+        //     minimal neighbor needed to keep the transform in one cluster);
+        //     unsupported CUDA WHT shapes retain the scheduler's existing
+        //     supported-backend fallback.
+        if (use_kvarn_q_rot && ovf_qwht_cuda) {
+            if (ggml_backend_supports_op(backend_cuda, q_local)) {
+                ggml_backend_sched_set_tensor_backend(sched, q_local, backend_cuda);
+                if (q_local->src[0]->op == GGML_OP_CONT) {
+                    ggml_backend_sched_set_tensor_backend(sched, q_local->src[0], backend_cuda);
+                }
+            }
+        } else if (use_kvarn_q_rot && ggml_backend_supports_op(backend_vulkan, q_local)) {
             ggml_backend_sched_set_tensor_backend(sched, q_local, backend_vulkan);
             if (q_local->src[0]->op == GGML_OP_CONT) {
                 ggml_backend_sched_set_tensor_backend(sched, q_local->src[0], backend_vulkan);

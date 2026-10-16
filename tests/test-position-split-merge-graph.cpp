@@ -51,6 +51,20 @@ static std::string g_case;
     } \
 } while (0)
 
+// The product reads LLAMA_OVF_QWHT_CUDA at graph-build time; the test sets it
+// per variant so the binary is hermetic to the caller's environment.
+static void set_env_llama_ovf_qwht_cuda(const char * value) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_OVF_QWHT_CUDA", value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        setenv("LLAMA_OVF_QWHT_CUDA", value, 1);
+    } else {
+        unsetenv("LLAMA_OVF_QWHT_CUDA");
+    }
+#endif
+}
+
 static const double kGateNrmseO       = 1e-3;   // plan 4.1: enforced cumulatively
                                                   // on the merged result (R4); the
                                                   // base/ovf reports attribute
@@ -730,6 +744,17 @@ static merge_result run_merge(ggml_backend_t local, ggml_backend_t overflow,
 // decoded through a CPU `ggml_kvarn_materialize` side-path in the ORIGINAL
 // domain, so the same kGateNrmseO applies to the composition the product runs.
 // Requires CUDA (local) + Vulkan (overflow) + CPU (materialize side-path).
+//
+// schedule_mode:
+//   0 = single expansion (no order/placement forcing)
+//   1 = legacy expansion order + consolidated (forced) placement
+//   2 = consolidated order + forced placement (the production decode); the Q
+//       WHT stays on the Vulkan overflow backend, bit-identical to the
+//       pre-consolidation graph
+//   3 = legacy order with NO manual placements (scheduler's own placement)
+//   4 = mode 2 with the Q WHT pinned to the local CUDA backend, mirroring
+//       LLAMA_OVF_QWHT_CUDA=1; requires the env (set by the caller) and is
+//       gated by tolerance, never bitwise
 static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflow,
         int D, int n_q, int n_qh, int n_kvh,
         int n_kv1, int n_kv2,
@@ -940,7 +965,30 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     ggml_backend_t backends[3] = { overflow, local, cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 3, 8192, false, true);
     ggml_backend_sched_set_tensor_backend(sched, q_t, local);
-    if (schedule_mode != 3) {
+    if (schedule_mode == 4) {
+        // LLAMA_OVF_QWHT_CUDA=1 arm: mirror llama-graph.cpp's opt-in pin and
+        // move the Q WHT to the local (CUDA) backend. Fail closed if the env
+        // is not enabled or CUDA cannot run the transform; this variant exists
+        // to exercise that exact production configuration.
+        const char * env = std::getenv("LLAMA_OVF_QWHT_CUDA");
+        if (env == nullptr || std::strcmp(env, "0") == 0) {
+            ggml_backend_sched_free(sched);
+            ggml_backend_free(cpu);
+            ggml_free(ctx);
+            res.declined = true;
+            res.reason = "schedule_mode 4 requires LLAMA_OVF_QWHT_CUDA (non-\"0\")";
+            return res;
+        }
+        if (!ggml_backend_supports_op(local, q_rot)) {
+            ggml_backend_sched_free(sched);
+            ggml_backend_free(cpu);
+            ggml_free(ctx);
+            res.declined = true;
+            res.reason = "CUDA WHT not supported for this shape (LLAMA_OVF_QWHT_CUDA=1)";
+            return res;
+        }
+        ggml_backend_sched_set_tensor_backend(sched, q_rot, local);
+    } else if (schedule_mode != 3) {
         // Mode 3 leaves the Q WHT to the scheduler on purpose (legacy order
         // reproduces the pre-consolidation placement naturally).
         ggml_backend_sched_set_tensor_backend(sched, q_rot, schedule_mode ? overflow : local);
@@ -1007,7 +1055,9 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         // bit-equality with mode 2 proves the consolidated schedule changed no
         // bit under the scheduler's natural (legacy) placement too. Q WHT
         // stays on Vulkan in the forced arms: at D=256 its F32 results differ
-        // from CUDA, so that pre-local split is unavoidable.
+        // from CUDA, so that pre-local split is unavoidable. Mode 4 is the
+        // mode-2 schedule with the Q WHT forced onto the local CUDA backend
+        // (LLAMA_OVF_QWHT_CUDA=1), which drops that pre-local split.
         ggml_build_forward_expand(gf, stored_k);
         ggml_build_forward_expand(gf, stored_v);
         if (schedule_mode == 1 || schedule_mode == 3) {
@@ -1018,7 +1068,7 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
             ggml_build_forward_expand(gf, q_rot);
         }
         ggml_build_forward_expand(gf, fa1);
-        if (schedule_mode == 2) {
+        if (schedule_mode == 2 || schedule_mode == 4) {
             ggml_build_forward_expand(gf, lse1);
             if (store_k) {
                 ggml_build_forward_expand(gf, store_k);
@@ -1359,6 +1409,57 @@ int main() {
                     CHECK(same_bits(ctl.o, after.o));
                     CHECK(same_bits(ctl.lse, after.lse));
                 }
+
+                // LLAMA_OVF_QWHT_CUDA=1 arm (mode 4): the same consolidated
+                // schedule with the Q WHT on the local CUDA backend instead of
+                // Vulkan. The test sets the env itself, so the binary behaves
+                // identically regardless of the caller's environment. The Q
+                // WHT bits then differ from the Vulkan arm (at D=256), so the
+                // comparison against the default arm and its oracle-adjacent
+                // gates is TOLERANCE-based (nrmse), never bitwise; the reused
+                // graph's second pass stays bitwise against a fresh graph of
+                // the same arm.
+                set_env_llama_ovf_qwht_cuda("1");
+                const merge_result cuda_arm = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 4, layout, 1);
+                std::vector<float> q_neg4 = q;
+                for (float & x : q_neg4) { x = -x; }
+                const merge_result cuda_fresh = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q_neg4, k1, v1, k2b, v2b, 4, layout, 1);
+                set_env_llama_ovf_qwht_cuda(nullptr);
+                CHECK(!cuda_arm.declined);
+                CHECK(!cuda_fresh.declined);
+                double cuda_q_nrmse = INFINITY;
+                double cuda_o_nrmse = INFINITY;
+                double cuda_lse_nrmse = INFINITY;
+                bool cuda_fresh_bits = false;
+                if (!cuda_arm.declined && !cuda_fresh.declined) {
+                    // Plan gates: nrmse Q/O <= 1e-3 and LSE <= 1e-2 against
+                    // the default (Vulkan-WHT) arm, not bitwise.
+                    cuda_q_nrmse = nrmse_ff(cuda_arm.q_rot, after.q_rot);
+                    cuda_o_nrmse = nrmse_ff(cuda_arm.o, after.o);
+                    cuda_lse_nrmse = nrmse_ff(cuda_arm.lse, after.lse);
+                    CHECK(cuda_q_nrmse <= 1e-3);
+                    CHECK(cuda_o_nrmse <= 1e-3);
+                    CHECK(cuda_lse_nrmse <= 1e-2);
+                    // One fewer Vulkan cluster per layer: the Q WHT no longer
+                    // runs as its own pre-local split.
+                    CHECK(cuda_arm.overflow_splits == after.overflow_splits - 1);
+                    CHECK(cuda_arm.splits == after.splits - 2);
+                    cuda_fresh_bits =
+                        same_bits(pass_bits(cuda_arm.o, false), pass_bits(cuda_fresh.o, true)) &&
+                        same_bits(pass_bits(cuda_arm.o, true), pass_bits(cuda_fresh.o, false)) &&
+                        same_bits(pass_bits(cuda_arm.lse, false), pass_bits(cuda_fresh.lse, true)) &&
+                        same_bits(pass_bits(cuda_arm.lse, true), pass_bits(cuda_fresh.lse, false)) &&
+                        same_bits(pass_bits(cuda_arm.q_rot, false), pass_bits(cuda_fresh.q_rot, true)) &&
+                        same_bits(pass_bits(cuda_arm.q_rot, true), pass_bits(cuda_fresh.q_rot, false));
+                    CHECK(cuda_fresh_bits);
+                }
+                std::printf("  cuda-qwht D%d layout%d: splits %d vs %d, Vulkan clusters %d vs %d, "
+                        "nrmse Q=%.3e O=%.3e LSE=%.3e, fresh-negQ=%d\n",
+                        D, layout, after.splits, cuda_arm.splits,
+                        after.overflow_splits, cuda_arm.overflow_splits,
+                        cuda_q_nrmse, cuda_o_nrmse, cuda_lse_nrmse, int(cuda_fresh_bits));
 
                 // The reused graph's pass 2 (Q negated in place) must match a
                 // FRESH graph allocated with the negated Q up front, per arm.
