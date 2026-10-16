@@ -4922,6 +4922,14 @@ static void f4_tensor_trace(const char * tag, const char * name, ggml_tensor * t
 // SAME tensor. Content is bit-identical (ggml_cont is a plain copy, consumers
 // are read-only), and the memo lives in llm_graph_context, which is
 // constructed per build_graph, so no entry can outlive its ggml_context.
+// Memory note (review): the ONE cropped buffer is pinned from the first
+// consumer to the LAST layer's FA of the graph (its node stays live for the
+// whole build), whereas the replaced per-layer copies could each be recycled
+// right after their own FA. Net peak: +1 cropped-mask buffer per graph
+// (n_cols * ne[1..3] * type_size bytes, usually a few KiB), NOT one per layer;
+// the CPU unit test (tests/test-position-split-mask-memo.cpp) asserts exactly
+// one crop CONT node per graph, and F4_ALLOC_TRACE logs one create + N-1
+// reuses per graph.
 ggml_tensor * llm_graph_context::build_ovf_mask_crop(
         ggml_tensor * mask_src,
         int64_t n_cols) const {
@@ -5692,13 +5700,20 @@ ggml_prec_set_acc(fa1, GGML_PREC_F32);
 ggml_prec_set_acc(fa2, GGML_PREC_F32);
 if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     // Unique per-layer names so F4_NODE_DUMP can compare the overflow FA output
-    // and its LSE between the raw-Q4 and the F16 reference legs.
+    // and its LSE between the raw-Q4 and the F16 reference legs. Only the
+    // per-layer tensors are renamed: mask_overflow is the GRAPH-SHARED mask
+    // (the memoized crop named attn_inp_kq_mask_overflow_occ by
+    // build_ovf_mask_crop, or the attn_inp_kq_mask_overflow graph input when no
+    // crop was needed), consumed by every layer. A per-layer rename would keep
+    // only the last layer's f5mask-<il> on the shared node and clobber the
+    // stable memo name, so its STABLE NAME is the capture selector: list
+    // attn_inp_kq_mask_overflow_occ / attn_inp_kq_mask_overflow in
+    // F4_NODE_DUMP_ROLES to capture the mask (identical for all layers).
     char nm[64];
     snprintf(nm, sizeof(nm), "f5fa2-%d", il);  ggml_set_name(fa2,  nm);
     snprintf(nm, sizeof(nm), "f5lse2-%d", il); ggml_set_name(lse2, nm);
     snprintf(nm, sizeof(nm), "f5k-%d", il);    ggml_set_name(k_overflow, nm);
     snprintf(nm, sizeof(nm), "f5v-%d", il);    ggml_set_name(v_overflow, nm);
-    snprintf(nm, sizeof(nm), "f5mask-%d", il); ggml_set_name(mask_overflow, nm);
 }
     // F4: the KVarN domain must land on the FINAL FA node, which is not
     // necessarily the node build_attn_mha created internally (it may be
