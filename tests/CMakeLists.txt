@@ -773,19 +773,34 @@ if (GGML_VULKAN)
     add_test(NAME test-position-split-lse-vk WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-lse-vk>)
     set_property(TEST test-position-split-lse-vk PROPERTY LABELS main)
 
-    add_executable(test-position-split-merge-graph test-position-split-merge-graph.cpp)
-    target_include_directories(test-position-split-merge-graph PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
-    target_compile_features(test-position-split-merge-graph PRIVATE cxx_std_17)
-    target_link_libraries(test-position-split-merge-graph PRIVATE llama ggml ggml-vulkan)
-    add_test(NAME test-position-split-merge-graph WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge-graph>)
-    set_property(TEST test-position-split-merge-graph PROPERTY LABELS main)
+    # The merge-graph, fused-span and real-pair checks require BOTH the
+    # Vulkan overflow backend and the CUDA local/merge backend at runtime;
+    # they are gated on both so a Vulkan-only build does not register them.
+    if (GGML_CUDA)
+        add_executable(test-position-split-merge-graph test-position-split-merge-graph.cpp)
+        target_include_directories(test-position-split-merge-graph PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+        target_compile_features(test-position-split-merge-graph PRIVATE cxx_std_17)
+        target_link_libraries(test-position-split-merge-graph PRIVATE llama ggml ggml-vulkan)
+        add_test(NAME test-position-split-merge-graph WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge-graph>)
+        set_property(TEST test-position-split-merge-graph PROPERTY LABELS main)
 
-    add_executable(test-position-split-real-pair test-position-split-real-pair.cpp)
-    target_include_directories(test-position-split-real-pair PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
-    target_compile_features(test-position-split-real-pair PRIVATE cxx_std_17)
-    target_link_libraries(test-position-split-real-pair PRIVATE llama ggml ggml-vulkan)
-    add_test(NAME test-position-split-real-pair WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-real-pair>)
-    set_property(TEST test-position-split-real-pair PROPERTY LABELS main)
+        # Phase-2 fused span ("peça (c)"): the GGML_OP_KVARN_SPLIT_FUSED
+        # executor (llama_kvarn_split_fused_exec_register) must reproduce the
+        # legacy two-range chain for D128/D256 decode within the phase-2 gates.
+        add_executable(test-kvarn-split-fused test-kvarn-split-fused.cpp)
+        target_include_directories(test-kvarn-split-fused PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+        target_compile_features(test-kvarn-split-fused PRIVATE cxx_std_17)
+        target_link_libraries(test-kvarn-split-fused PRIVATE llama ggml ggml-vulkan)
+        add_test(NAME test-kvarn-split-fused WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn-split-fused>)
+        set_property(TEST test-kvarn-split-fused PROPERTY LABELS main)
+
+        add_executable(test-position-split-real-pair test-position-split-real-pair.cpp)
+        target_include_directories(test-position-split-real-pair PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+        target_compile_features(test-position-split-real-pair PRIVATE cxx_std_17)
+        target_link_libraries(test-position-split-real-pair PRIVATE llama ggml ggml-vulkan)
+        add_test(NAME test-position-split-real-pair WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-real-pair>)
+        set_property(TEST test-position-split-real-pair PROPERTY LABELS main)
+    endif()
 
     add_executable(test-position-split-lse-sched test-position-split-lse-sched.cpp)
     target_include_directories(test-position-split-lse-sched PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)

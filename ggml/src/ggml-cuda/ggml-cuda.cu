@@ -2152,15 +2152,55 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
-// Host-side dispatcher for GGML_OP_KVARN_SPLIT_FUSED (fused position-split
-// span, "peça (c)"). Phase-1 scaffold: the CUDA kernel lands in phase 2 and
-// supports_op refuses the op unless LLAMA_OVF_FUSED_SPAN=1 + shape contract,
-// so this is only reachable if that guarantee is bypassed (e.g. a hand-made
-// graph). Fail loudly - never silently skip the span.
+// Executor hook for GGML_OP_KVARN_SPLIT_FUSED (fused position-split span,
+// "peça (c)"). The op has no CUDA kernel of its own: its executor lives on the
+// llama side (src/llama-kvarn-split-fused.cpp) because it needs the Vulkan
+// backend, the companion Q4 storage views and the LSE merge sub-graph. The
+// llama context registers it through
+// "ggml_backend_cuda_set_kvarn_split_fused_exec". Fail closed on every path:
+// no registered executor, a failed executor, or any host/Vulkan error inside
+// it aborts instead of leaving a stale span output.
+typedef bool (*ggml_backend_cuda_kvarn_split_fused_exec_t)(void * user_data, struct ggml_tensor * dst);
+
+// The (fn, user_data) pair must be observed atomically: publication and the
+// dispatch-side grab share this mutex, so a dispatcher can never see a new
+// function with a stale user pointer (or the reverse) while the llama side
+// re-registers or clears the slot. The mutex is NOT held across the callback
+// itself: the user pointer is an immortal llama-side dispatcher, so a grabbed
+// pair stays valid even if the slot is cleared while the callback runs.
+static std::mutex g_kvarn_split_fused_exec_mutex;
+static ggml_backend_cuda_kvarn_split_fused_exec_t g_kvarn_split_fused_exec      = nullptr;
+static void *                                     g_kvarn_split_fused_exec_user = nullptr;
+
+static void ggml_backend_cuda_set_kvarn_split_fused_exec(
+        ggml_backend_cuda_kvarn_split_fused_exec_t fn, void * user_data) {
+    std::lock_guard<std::mutex> lock(g_kvarn_split_fused_exec_mutex);
+    // Publish user_data before fn: a concurrent dispatch grabbing between the
+    // two stores would still see the old pair consistently (it holds the lock).
+    g_kvarn_split_fused_exec_user = user_data;
+    g_kvarn_split_fused_exec      = fn;
+}
+
+// Host-side dispatcher for GGML_OP_KVARN_SPLIT_FUSED. The executor stages host
+// buffers and submits a Vulkan graph, so it performs host synchronizations:
+// the split containing this op must never be captured as a CUDA graph (see
+// ggml_cuda_graph_check_compability) and the backend stream is drained here so
+// the executor's device reads observe every earlier node of the same split.
 static void ggml_cuda_op_kvarn_split_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_ABORT("kvarn split fused: not implemented in phase 1");
+    ggml_backend_cuda_kvarn_split_fused_exec_t fn;
+    void * user;
+    {
+        std::lock_guard<std::mutex> lock(g_kvarn_split_fused_exec_mutex);
+        fn   = g_kvarn_split_fused_exec;
+        user = g_kvarn_split_fused_exec_user;
+    }
+    if (fn == nullptr) {
+        GGML_ABORT("kvarn split fused: no executor registered on the CUDA backend");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    if (!fn(user, dst)) {
+        GGML_ABORT("kvarn split fused: executor failed");
+    }
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -2527,8 +2567,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             // src[0] already wrote this buffer; nothing to launch
             break;
         case GGML_OP_KVARN_SPLIT_FUSED:
-            // Phase-1 scaffold: unreachable behind the supports_op gate;
-            // aborts if it is ever dispatched (see the helper).
+            // Reachable only behind the supports_op gate (LLAMA_OVF_FUSED_SPAN
+            // + shape contract); the llama-registered executor runs the span
+            // (Vulkan overflow FA/LSE + CUDA merge) synchronously.
             ggml_cuda_op_kvarn_split_fused(ctx, dst);
             break;
         case GGML_OP_LIGHTNING_INDEXER:
@@ -2731,6 +2772,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        // The fused position-split span runs a host-driven executor (pinned
+        // staging copies + a Vulkan graph submission), so it synchronizes the
+        // stream from inside the op; a captured graph would deadlock/error.
+        if (node->op == GGML_OP_KVARN_SPLIT_FUSED) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs for the fused split span\n", __func__);
+#endif
         }
 
         if (!use_cuda_graph) {
@@ -5823,47 +5874,79 @@ static bool ggml_backend_cuda_memory_checkpoint(
     return true;
 }
 
-// Phase-1 gate for GGML_OP_KVARN_SPLIT_FUSED (fused position-split span).
+// Phase-2 gate for GGML_OP_KVARN_SPLIT_FUSED (fused position-split span).
 // Fail-closed by design: CUDA advertises the op ONLY when
 //   (a) LLAMA_OVF_FUSED_SPAN is exactly "1" (default OFF: the builder's
 //       legacy FA1/FA2/LSE-merge path is untouched and byte-identical), AND
-//   (b) the shape contract of ggml_kvarn_split_fused() holds.
+//   (b) the phase-2 shape/dtype contract of ggml_kvarn_split_fused() holds.
 // The env is read per call (not cached) so the gate cannot go stale across a
-// process's lifetime. Phase 2 refines this with the dtype/route contract of
-// the local KVarN records and the Q4/F16 overflow view once the kernel lands.
+// process's lifetime. The executor itself re-validates every operand it reads.
 static bool ggml_cuda_kvarn_split_fused_supported(const ggml_tensor * op) {
     const char * env = getenv("LLAMA_OVF_FUSED_SPAN");
     if (env == nullptr || strcmp(env, "1") != 0) {
         return false;
     }
 
-    const ggml_tensor * q      = op->src[0];
-    const ggml_tensor * k_ovf  = op->src[5];
-    const ggml_tensor * v_ovf  = op->src[6];
-    const ggml_tensor * mask   = op->src[7];
-    const ggml_tensor * k_tail = op->src[8];
-    const ggml_tensor * v_tail = op->src[9];
-    if (op->type != GGML_TYPE_F32 || q == nullptr || k_ovf == nullptr ||
-            v_ovf == nullptr || mask == nullptr) {
+    const ggml_tensor * q       = op->src[0];
+    const ggml_tensor * k_cur   = op->src[1];
+    const ggml_tensor * v_cur   = op->src[2];
+    const ggml_tensor * o_local = op->src[3];
+    const ggml_tensor * lse     = op->src[4];
+    const ggml_tensor * k_ovf   = op->src[5];
+    const ggml_tensor * v_ovf   = op->src[6];
+    const ggml_tensor * mask    = op->src[7];
+    const ggml_tensor * k_idxs  = op->src[8];
+    const ggml_tensor * v_idxs  = op->src[9];
+    if (op->type != GGML_TYPE_F32 || q == nullptr || k_cur == nullptr || v_cur == nullptr ||
+            o_local == nullptr || lse == nullptr || k_ovf == nullptr || v_ovf == nullptr ||
+            mask == nullptr || k_idxs == nullptr || v_idxs == nullptr) {
         return false;
     }
-    if (q->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F32 ||
-            ggml_n_dims(q) != 4 || ggml_n_dims(mask) != 4) {
+    if (q->type != GGML_TYPE_F32 || k_cur->type != GGML_TYPE_F32 || v_cur->type != GGML_TYPE_F32 ||
+            o_local->type != GGML_TYPE_F32 || lse->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // Phase 2 is decode-only: one single query row per batch stream.
+    if (q->ne[2] != 1 || q->ne[0] <= 0 || q->ne[1] <= 0 || q->ne[3] <= 0) {
+        return false;
+    }
+    const int64_t n_tokens = q->ne[2]*q->ne[3];
+
+    // Current rows must mirror the query geometry.
+    if (k_cur->ne[0] != q->ne[0] || v_cur->ne[0] != q->ne[0] ||
+            k_cur->ne[1] <= 0 || v_cur->ne[1] <= 0 ||
+            k_cur->ne[2] != q->ne[2] || k_cur->ne[3] != q->ne[3] ||
+            v_cur->ne[2] != q->ne[2] || v_cur->ne[3] != q->ne[3]) {
         return false;
     }
 
     // Output mirrors the o_merged shape [D_v*H_q, Q*B] (D_k == D_v).
-    if (op->ne[0] != q->ne[0]*q->ne[1] || op->ne[1] != q->ne[2]*q->ne[3]) {
+    if (op->ne[0] != q->ne[0]*q->ne[1] || op->ne[1] != n_tokens) {
+        return false;
+    }
+    if (o_local->ne[0] != q->ne[0]*q->ne[1] || o_local->ne[1] != n_tokens ||
+            lse->ne[0] != q->ne[1] || lse->ne[1] != q->ne[2] || lse->ne[2] != q->ne[3]) {
         return false;
     }
 
     // Overflow K/V views and crop mask must describe one extent.
     const int n_ovf_rows = ggml_get_op_params_i32(op, GGML_KVARN_SPLIT_FUSED_PARAM_N_OVF_ROWS);
-    if (k_ovf->ne[0] != v_ovf->ne[0] || k_ovf->ne[1] != v_ovf->ne[1] ||
-            n_ovf_rows <= 0 || k_ovf->ne[1] != n_ovf_rows) {
+    if (k_ovf->type != GGML_TYPE_Q4_0 || v_ovf->type != GGML_TYPE_Q4_0) {
         return false;
     }
-    if (mask->ne[0] != n_ovf_rows || mask->ne[1] != q->ne[2] || mask->ne[3] != q->ne[3]) {
+    if (k_ovf->ne[0] != q->ne[0]*k_cur->ne[1] || v_ovf->ne[0] != q->ne[0]*v_cur->ne[1] ||
+            k_ovf->ne[1] != v_ovf->ne[1] || n_ovf_rows <= 0 || k_ovf->ne[1] != n_ovf_rows) {
+        return false;
+    }
+    if (mask->type != GGML_TYPE_F16 || mask->ne[0] != n_ovf_rows ||
+            mask->ne[1] != q->ne[2] || mask->ne[2] != 1 || mask->ne[3] != q->ne[3]) {
+        return false;
+    }
+
+    // Store index lists: one payload row per token.
+    if ((k_idxs->type != GGML_TYPE_I64 && k_idxs->type != GGML_TYPE_I32) ||
+            k_idxs->type != v_idxs->type ||
+            k_idxs->ne[0] != n_tokens || v_idxs->ne[0] != n_tokens) {
         return false;
     }
 
@@ -5874,13 +5957,18 @@ static bool ggml_cuda_kvarn_split_fused_supported(const ggml_tensor * op) {
         return false;
     }
 
-    // Exact tail travels together or not at all.
-    if ((k_tail == nullptr) != (v_tail == nullptr)) {
+    const float kq_scale = ggml_get_op_params_f32(op, GGML_KVARN_SPLIT_FUSED_PARAM_KQ_SCALE);
+    if (!(kq_scale > 0.0f)) {
         return false;
     }
 
-    // Phase 2: validate src[1..4] (k/v_cur, local KVarN range reads) dtypes and
-    // layouts, the raw-Q4_0 vs F16 overflow view choice, and the tail route.
+    // The executor bundle id must be present: it routes the op to the
+    // registering context's sub-graphs (fail closed on a missing bundle).
+    const int bundle_id = ggml_get_op_params_i32(op, GGML_KVARN_SPLIT_FUSED_PARAM_BUNDLE_ID);
+    if (bundle_id <= 0) {
+        return false;
+    }
+
     return true;
 }
 
@@ -6672,6 +6760,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
         return (void *)ggml_backend_cuda_kvarn_capabilities;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_kvarn_split_fused_exec") == 0) {
+        // Registers the llama-side executor for GGML_OP_KVARN_SPLIT_FUSED
+        // (fused position-split span). The executor owns the Vulkan backend,
+        // so it cannot live in the CUDA library itself.
+        return (void *)ggml_backend_cuda_set_kvarn_split_fused_exec;
     }
     if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
         return (void *)ggml_backend_cuda_kvarn_native_ops;

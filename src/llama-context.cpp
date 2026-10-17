@@ -18,6 +18,7 @@
 #include "llama-kv-mixed-state-stream.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
+#include "llama-kvarn-split-fused.h"
 #include "ggml-remote-attn.h"
 #include "ggml-local-split.h"
 
@@ -1878,6 +1879,19 @@ std::vector<ggml_backend_t> layer_backends;
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    // Fused position-split span: release THIS context's executor bundle (its
+    // per-layer Vulkan/CUDA sub-graphs reference this context's backends and
+    // caches) while the backends are still alive. The bundle is owned by the
+    // KVarN cache; other contexts' bundles are untouched.
+    if (cparams.kv_position_split_p != 0) {
+        llama_memory_i * mem = get_memory();
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            mem = hybrid->get_mem_attn_base();
+        }
+        if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) {
+            kvarn->release_fused_span_bundle();
+        }
+    }
     // KVarN's transfer worker can hold CUDA producer events and live tensor
     // pointers. Drain it before scheduler/model backends begin destruction.
     if (memory && !memory->drain_prefill_migration()) {

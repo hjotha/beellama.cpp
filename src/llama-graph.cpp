@@ -14,6 +14,7 @@
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kvarn-split-fused.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-paged.h"
@@ -5394,6 +5395,77 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
         }
     }
 
+    // Raw Q4_0 FA selection. LLAMA_OVF_PACKED_Q4_FA=1 enables every layer;
+    // LLAMA_OVF_PACKED_Q4_FA_IL=3,7,11 enables only the listed layers, which is
+    // how the first divergent layer is isolated against the F16 reference.
+    // Hoisted above the fused-span gate below: the fused executor always reads
+    // the packed window through the F16 gather, so a raw-Q4 layer keeps the
+    // legacy chain.
+    static const bool ovf_q4_fa_all = [] {
+        const char * v = std::getenv("LLAMA_OVF_PACKED_Q4_FA");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    static const std::string ovf_q4_fa_list = [] {
+        const char * v = std::getenv("LLAMA_OVF_PACKED_Q4_FA_IL");
+        return v != nullptr ? std::string(v) : std::string();
+    }();
+    bool ovf_q4_fa = ovf_q4_fa_all;
+    if (!ovf_q4_fa && !ovf_q4_fa_list.empty()) {
+        size_t a = 0;
+        while (a <= ovf_q4_fa_list.size()) {
+            const size_t b = ovf_q4_fa_list.find(',', a);
+            const std::string tok = ovf_q4_fa_list.substr(
+                    a, b == std::string::npos ? std::string::npos : b - a);
+            if (!tok.empty() && std::atoi(tok.c_str()) == il) { ovf_q4_fa = true; break; }
+            if (b == std::string::npos) { break; }
+            a = b + 1;
+        }
+    }
+
+    // Fused span eligibility ("peça (c)" phase 2, LLAMA_OVF_FUSED_SPAN=1,
+    // default OFF -> the legacy chain below stays byte-identical). When
+    // eligible, ONE GGML_OP_KVARN_SPLIT_FUSED node replaces the overflow half
+    // of this chain: the Q4 store (SET_ROWS), the F16 gather, FA2 + LSE2 (all
+    // on Vulkan through the executor's persistent sub-graph) and the LSE merge
+    // (on CUDA). The local half above (Q WHT, KVarN FA1 + tail, LSE1, O WHT)
+    // stays as ordinary nodes and feeds the merge through the op sources.
+    // Eligibility is deliberately narrow; every deviation keeps the legacy
+    // chain:
+    //   * grouped single-query decode (same arm the consolidated order covers;
+    //     prefill and the unanchored F16-tail arm keep their node order),
+    //   * an OVERFLOW ubatch: the executor performs the store into the Q4
+    //     companion, which is only the store of an overflow ubatch (a local
+    //     ubatch writes the local KVarN records and keeps the legacy chain),
+    //   * packed overflow row view (a contiguous raw Q4_0 window the executor
+    //     can alias without a gather node), with the companion V not
+    //     transposed,
+    //   * F16 gather readback, no raw-Q4 FA opt-in for this layer,
+    //   * contiguous single-query q/k/v rows (the executor stages them as flat
+    //     contiguous buffers and its FA has no strided-input contract),
+    //   * no alibi bias and no logit softcap (the executor's overflow FA is
+    //     built with max_bias/softcap hardcoded to zero, exactly like the
+    //     split chain's FA2 for the default hparams),
+    //   * no K mean-centering bias on the companion layer (the executor mirrors
+    //     cpy_k, which would subtract it),
+    //   * no CPU attention-reference oracle (it discovers FA nodes below the
+    //     returned output and would find none behind the fused node).
+    const bool fused_span_eligible = [] {
+        const char * e = std::getenv("LLAMA_OVF_FUSED_SPAN");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }() && group_overflow_decode && kvarn_ctx->current_range_is_overflow() &&
+        ovf_use_view && ovf_gather_f16 && !ovf_q4_fa &&
+        q_cur->ne[2] == 1 && q_cur->ne[3] == 1 &&
+        k_cur->ne[2] == 1 && k_cur->ne[3] == 1 &&
+        v_cur->ne[2] == 1 && v_cur->ne[3] == 1 &&
+        ggml_is_contiguous(q_cur) && ggml_is_contiguous(k_cur) && ggml_is_contiguous(v_cur) &&
+        !standard_cache->v_transposed() &&
+        hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+        !standard_cache->layer_k_bias_present(int32_t(il)) &&
+        [] {
+            const char * e = std::getenv("LLAMA_OVF_ATTN_REFERENCE_CPU");
+            return e == nullptr || e[0] != '1' || e[1] != '\0';
+        }();
+
     // Non-finite stale bytes in the INACTIVE tail of the storage poison the raw
     // Q4 FA even though the range mask is -inf for those rows (measured with
     // FA_Q4_NAN_TAIL in tests/test-fa-q4-view.cpp: O 3.4e38, LSE inf). The gather
@@ -5429,6 +5501,11 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
 
     ggml_tensor * k_ovf_gathered = nullptr;
     ggml_tensor * v_ovf_gathered = nullptr;
+    // Raw packed row views, kept separately for the fused-span gate below: the
+    // executor consumes them directly (aliased into its Vulkan sub-graph)
+    // instead of the gathered readback.
+    ggml_tensor * k_ovf_raw = nullptr;
+    ggml_tensor * v_ovf_raw = nullptr;
     if (ovf_use_view) {
         const uint64_t k_off = uint64_t(ovf_physical_row0) * k_storage->nb[1];
         const uint64_t v_off = uint64_t(ovf_physical_row0) * v_storage->nb[1];
@@ -5436,6 +5513,8 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
         v_ovf_gathered = ggml_view_2d(ctx0, v_storage, n_embd_v, int64_t(n_ovf_rows), v_storage->nb[1], v_off);
         ggml_set_name(k_ovf_gathered, "attn_k_ovf_packed_view");
         ggml_set_name(v_ovf_gathered, "attn_v_ovf_packed_view");
+        k_ovf_raw = k_ovf_gathered;
+        v_ovf_raw = v_ovf_gathered;
         // The packed view rows are read back as F16 through the SUPPORTED GET_ROWS
         // path over an in-graph identity index list. Measured: this matches the gather
         // reference (mean KL 8.7e-4 at 3000/3072/3200/3328/3584, all argmax equal),
@@ -5446,29 +5525,7 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
         // cannot be selected. Keep the raw Q4_0 FA behind an explicit opt-in until
         // it is fixed and gated; bounded by the live view extent, no whole-cache
         // expansion and no format change (storage stays Q4_0).
-        // Raw Q4_0 FA selection. LLAMA_OVF_PACKED_Q4_FA=1 enables every layer;
-        // LLAMA_OVF_PACKED_Q4_FA_IL=3,7,11 enables only the listed layers, which is
-        // how the first divergent layer is isolated against the F16 reference.
-        static const bool ovf_q4_fa_all = [] {
-            const char * v = std::getenv("LLAMA_OVF_PACKED_Q4_FA");
-            return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
-        }();
-        static const std::string ovf_q4_fa_list = [] {
-            const char * v = std::getenv("LLAMA_OVF_PACKED_Q4_FA_IL");
-            return v != nullptr ? std::string(v) : std::string();
-        }();
-        bool ovf_q4_fa = ovf_q4_fa_all;
-        if (!ovf_q4_fa && !ovf_q4_fa_list.empty()) {
-            size_t a = 0;
-            while (a <= ovf_q4_fa_list.size()) {
-                const size_t b = ovf_q4_fa_list.find(',', a);
-                const std::string tok = ovf_q4_fa_list.substr(
-                        a, b == std::string::npos ? std::string::npos : b - a);
-                if (!tok.empty() && std::atoi(tok.c_str()) == il) { ovf_q4_fa = true; break; }
-                if (b == std::string::npos) { break; }
-                a = b + 1;
-            }
-        }
+        // Raw Q4_0 FA selection (hoisted above the fused-span gate).
         if (!ovf_q4_fa) {
             if (inp->self_ovf_view_rows == nullptr) {
                 throw std::runtime_error(
@@ -5676,15 +5733,161 @@ if (route_local == LLAMA_KV_TAIL_ROUTE_NATIVE) {
     validate_native_tail_operation(inp->mctx, il, final_local_tail_op, false);
 }
 ggml_tensor * lse1 = ggml_flash_attn_ext_lse_out(ctx0, fa1);
+
+    // Local O back to the original V domain before merging (same rule as the
+    // single-range path: the KVarN native output is rotated unless the backend
+    // uses the original V domain).
+    if (use_kvarn_rotated_domain) {
+        GGML_ASSERT(o1->type == GGML_TYPE_F32);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        o1 = ggml_kvarn_wht_aux(ctx0, o1, kvarn_rot->ne[0]);
+    }
+
+    // Split input tensors (masks/idxs) stay on host CPU so set_input can fill
+    // them; the scheduler copies to device backends as needed. backend_cpu
+    // may be null, so locate a host backend from the scheduler explicitly.
+    // Resolved before the fused decision: both arms need the same placement.
+    ggml_backend_t backend_host = backend_cpu;
+    if (!backend_host) {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t be = ggml_backend_sched_get_backend(sched, i);
+            ggml_backend_dev_t dev = be ? ggml_backend_get_device(be) : nullptr;
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                backend_host = be;
+                break;
+            }
+        }
+    }
+    if (!backend_host) {
+        throw std::runtime_error("position-split attention requires a host CPU backend for range inputs");
+    }
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_host);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_overflow, backend_host);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_kvarn_mat_idxs_local, backend_host);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_overflow_cell_idxs, backend_host);
+    ggml_backend_t backend_vulkan = cparams.local_attn_backend;
+    if (!backend_vulkan) {
+        throw std::runtime_error("position-split attention requires the Vulkan overflow backend");
+    }
+    ggml_backend_t backend_cuda = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t be = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t dev = be ? ggml_backend_get_device(be) : nullptr;
+        const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                name && std::strncmp(name, "CUDA", 4) == 0) {
+            backend_cuda = be;
+            break;
+        }
+    }
+    if (!backend_cuda) {
+        throw std::runtime_error("position-split attention requires a CUDA backend for local/merge");
+    }
+
+    // Fused-span acceptance MUST be decided before the deferred legacy store
+    // expansion below: the fused executor performs the companion store itself,
+    // so when the span is suppressed its store must not be dropped. Building
+    // the node is pure metadata; the backend answers through supports_op (and
+    // a test-only force-refuse hook can emulate a refusal).
+    static const bool fused_span_force_refuse = [] {
+        const char * e = std::getenv("LLAMA_OVF_FUSED_SPAN_FORCE_REFUSE");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    ggml_tensor * fused = nullptr;
+    if (fused_span_eligible) {
+        // Fused-span acceptance MUST be decided before the deferred legacy
+        // store expansion below (see the comment above). The executor bundle
+        // is per context; acquire it lazily (id baked into the op params).
+        const uint32_t bundle_id = kvarn_cache->acquire_fused_span_bundle(backend_cuda, backend_vulkan);
+        if (bundle_id == 0) {
+            LLAMA_LOG_WARN("%s: layer %d fused split span has no executor bundle; using the legacy chain\n",
+                    __func__, il);
+        } else {
+            // ONE node replacing the overflow half of the chain: store + gather
+            // + FA2 + LSE2 (Vulkan, executor sub-graph) and the LSE merge
+            // (CUDA), returning the same o_merged the legacy chain produces.
+            // The local results (o1 after the domain WHT, lse1) and the raw
+            // packed views travel as op sources.
+            ggml_tensor * candidate = ggml_kvarn_split_fused(ctx0, q_cur, k_cur, v_cur,
+                    o1, lse1, k_ovf_raw, v_ovf_raw, mask_overflow,
+                    inp->get_k_idxs(), inp->get_v_idxs(),
+                    int(p_split), int(n_kv_live),
+                    kvarn_cache->params_key_bits(), kvarn_cache->params_value_bits(),
+                    int(n_ovf_rows), kq_scale, il, int(bundle_id));
+            if (!fused_span_force_refuse && ggml_backend_supports_op(backend_cuda, candidate)) {
+                fused = candidate;
+            } else {
+                LLAMA_LOG_WARN("%s: layer %d fused split span refused%s; using the legacy chain\n",
+                        __func__, il, fused_span_force_refuse ? " by LLAMA_OVF_FUSED_SPAN_FORCE_REFUSE" : " by the CUDA backend");
+            }
+        }
+    }
+
     if (group_overflow_decode) {
         // build_attn_mha already expanded fa1. Put its side output here, before
         // build_attn_mha expands fa2, rather than reopening CUDA after fa2.
         ggml_build_forward_expand(gf, lse1);
-        ggml_build_forward_expand(gf, k_written);
-        ggml_build_forward_expand(gf, v_written);
-        for (ggml_tensor * probe : overflow_probes) {
-            ggml_build_forward_expand(gf, probe);
+        if (fused == nullptr) {
+            // Legacy (and refused-fused) arm: the deferred overflow store and
+            // the diagnostic probes must be expanded here, or the current
+            // token would never reach the Q4 companion.
+            ggml_build_forward_expand(gf, k_written);
+            ggml_build_forward_expand(gf, v_written);
+            for (ggml_tensor * probe : overflow_probes) {
+                ggml_build_forward_expand(gf, probe);
+            }
         }
+    }
+
+    if (fused != nullptr) {
+        // Register the host-side executor (once per CUDA/Vulkan pair); it
+        // owns the Vulkan overflow sub-graph and the CUDA merge sub-graph.
+        if (!llama_kvarn_split_fused_exec_register(backend_cuda, backend_vulkan)) {
+            throw std::runtime_error("position-split fused span: executor registration failed");
+        }
+        // Placement: the local chain keeps its legacy CUDA pins (the
+        // executor reads o1/lse1 there and writes the merged output), the
+        // raw overflow views stay on Vulkan (the scheduler copy for this
+        // op's src[5..9] is suppressed), host range inputs stay on host.
+        ggml_backend_sched_set_tensor_backend(sched, fused, backend_cuda);
+        ggml_backend_sched_set_tensor_backend(sched, fa1, backend_cuda);
+        ggml_backend_sched_set_tensor_backend(sched, lse1, backend_cuda);
+        ggml_backend_sched_set_tensor_backend(sched, o1, backend_cuda);
+        // Cropped mask: pin the CONT to CUDA so it stays inside the single
+        // local cluster (the executor reads it back from there). When no
+        // crop was needed the mask IS the host graph input, which must
+        // stay host (set_input writes it there) and is read directly.
+        if (mask_overflow != inp->self_kq_mask_overflow_cnv) {
+            ggml_backend_sched_set_tensor_backend(sched, mask_overflow, backend_cuda);
+        }
+        // Same Q-WHT pin as the legacy arm below (see the long comment
+        // there): CUDA when opted in and supported, else Vulkan.
+        if (use_kvarn_q_rot && ovf_qwht_cuda && ggml_backend_supports_op(backend_cuda, q_local)) {
+            ggml_backend_sched_set_tensor_backend(sched, q_local, backend_cuda);
+            if (q_local->src[0]->op == GGML_OP_CONT) {
+                ggml_backend_sched_set_tensor_backend(sched, q_local->src[0], backend_cuda);
+            }
+        } else if (use_kvarn_q_rot && (group_overflow_decode || ovf_qwht_cuda) &&
+                ggml_backend_supports_op(backend_vulkan, q_local)) {
+            ggml_backend_sched_set_tensor_backend(sched, q_local, backend_vulkan);
+            if (q_local->src[0]->op == GGML_OP_CONT) {
+                ggml_backend_sched_set_tensor_backend(sched, q_local->src[0], backend_vulkan);
+            }
+        }
+        if (tail_local_cuda_enabled && k_tail_local != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, k_tail_local, backend_cuda);
+            if (v_tail_local != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched, v_tail_local, backend_cuda);
+            }
+        }
+        // The final local FA node must carry the KVarN domain or the CUDA
+        // KVarN gate refuses the shape (see the legacy comment below).
+        llm_flash_attn_ext_set_kvarn_domain(fa1, kvarn_domain);
+        ggml_build_forward_expand(gf, fused);
+        LLAMA_LOG_INFO("%s: layer %d position-split fused span: local=%u keys (CUDA/KVarN), overflow=%u keys (Vulkan/Q4) + merge in one op\n",
+                __func__, il, n_local, n_ovf_rows);
+        cb(fused, "attn_position_split_fused", il);
+        return fused;
     }
 
     ggml_tensor * o2 = build_attn_mha(q_cur, k_overflow, v_overflow,
@@ -5726,15 +5929,6 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     // CUDA FlashAttention route"). Set it explicitly on both range nodes.
     llm_flash_attn_ext_set_kvarn_domain(fa1, kvarn_domain);
     llm_flash_attn_ext_set_kvarn_domain(fa2, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO);
-
-    // Local O back to the original V domain before merging (same rule as the
-    // single-range path: the KVarN native output is rotated unless the backend
-    // uses the original V domain).
-    if (use_kvarn_rotated_domain) {
-        GGML_ASSERT(o1->type == GGML_TYPE_F32);
-        GGML_ASSERT(kvarn_rot != nullptr);
-        o1 = ggml_kvarn_wht_aux(ctx0, o1, kvarn_rot->ne[0]);
-    }
 
     // Stable merge (validated pattern from test-position-split-merge-graph).
     // O is [D,H,Q,B] after restoring the 4D layout; LSE is [H,Q,B].
@@ -5789,54 +5983,16 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     ggml_build_forward_expand(gf, lse_merged);
     ggml_build_forward_expand(gf, o_merged);
 
-    // Backend placement: overflow FA/LSE/K/V/mask and merge intermediates on
-    // Vulkan; local FA/LSE and final outputs on CUDA. This is still TWO Vulkan
-    // steps per rotated-query layer: the Q WHT runs first as its own pre-local
-    // split (pinned on Vulkan in the grouped decode; naturally placed onto
-    // Vulkan, its legacy backend, in prefill), then this overflow cluster.
-    // With LLAMA_OVF_QWHT_CUDA=1 the Q WHT joins the local CUDA cluster in
-    // both arms and only this overflow cluster remains (see the pin below).
-    // Q itself stays on CUDA; the scheduler copies it to
-    // Vulkan for FA2. Fail closed if either backend is missing.
-    // Split input tensors (masks/idxs) stay on host CPU so set_input can fill
-    // them; the scheduler copies to device backends as needed. backend_cpu
-    // may be null, so locate a host backend from the scheduler explicitly.
-    ggml_backend_t backend_host = backend_cpu;
-    if (!backend_host) {
-        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
-            ggml_backend_t be = ggml_backend_sched_get_backend(sched, i);
-            ggml_backend_dev_t dev = be ? ggml_backend_get_device(be) : nullptr;
-            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                backend_host = be;
-                break;
-            }
-        }
-    }
-    if (!backend_host) {
-        throw std::runtime_error("position-split attention requires a host CPU backend for range inputs");
-    }
-    ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_host);
-    ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_overflow, backend_host);
-    ggml_backend_sched_set_tensor_backend(sched, inp->self_kvarn_mat_idxs_local, backend_host);
-    ggml_backend_sched_set_tensor_backend(sched, inp->self_overflow_cell_idxs, backend_host);
-    ggml_backend_t backend_vulkan = cparams.local_attn_backend;
-    if (!backend_vulkan) {
-        throw std::runtime_error("position-split attention requires the Vulkan overflow backend");
-    }
-    ggml_backend_t backend_cuda = nullptr;
-    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
-        ggml_backend_t be = ggml_backend_sched_get_backend(sched, i);
-        ggml_backend_dev_t dev = be ? ggml_backend_get_device(be) : nullptr;
-        const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-                name && std::strncmp(name, "CUDA", 4) == 0) {
-            backend_cuda = be;
-            break;
-        }
-    }
-    if (!backend_cuda) {
-        throw std::runtime_error("position-split attention requires a CUDA backend for local/merge");
-    }
+    // Backend placement (host inputs, backend_host/vulkan/cuda resolution and
+    // the Q-WHT pin moved above, before the fused-span branch): overflow
+    // FA/LSE/K/V/mask and merge intermediates on Vulkan; local FA/LSE and
+    // final outputs on CUDA. This is still TWO Vulkan steps per rotated-query
+    // layer: the Q WHT runs first as its own pre-local split (pinned on Vulkan
+    // in the grouped decode; naturally placed onto Vulkan, its legacy backend,
+    // in prefill), then this overflow cluster. With LLAMA_OVF_QWHT_CUDA=1 the
+    // Q WHT joins the local CUDA cluster in both arms and only this overflow
+    // cluster remains (see the pin above). Q itself stays on CUDA; the
+    // scheduler copies it to Vulkan for FA2.
     ggml_backend_sched_set_tensor_backend(sched, fa2, backend_vulkan);
     ggml_backend_sched_set_tensor_backend(sched, lse2, backend_vulkan);
     ggml_backend_sched_set_tensor_backend(sched, k_overflow, backend_vulkan);

@@ -239,6 +239,11 @@ bool requires_state_for_partial_restore() const override;
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
     bool has_layer(int32_t il) const { return map_layer_ids.find(il) != map_layer_ids.end(); }
+    // Whether this layer's K writes carry the optional per-(head,channel)
+    // mean-centering bias (load_kv_mean_center). The fused position-split
+    // executor mirrors cpy_k without that step, so the builder keeps the
+    // legacy chain whenever a bias is present.
+    bool layer_k_bias_present(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
