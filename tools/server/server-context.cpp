@@ -17,6 +17,7 @@
 #endif
 #include "server-mixed-kv-handoff.h"
 #include "src/llama-kv-mixed-handoff.h"
+#include "src/llama-position-split.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -182,6 +183,31 @@ static common_speculative_output_limits server_output_limits(const common_params
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
+}
+
+// Effective position-split boundary of the context `params` resolves to. The
+// CLIs own P (preset/argument), but llama-context.cpp also accepts
+// LLAMA_KV_POSITION_SPLIT_P when no value was requested, and the adaptive
+// setup zeroes P for tiers below remote-attn-min-context; mirror both so the
+// server-side MTP fallback uses the same boundary as the context that is
+// actually bound. Same derivation as the F4 capture path.
+static uint32_t server_effective_position_split_p(const common_params & params) {
+    uint32_t p = common_context_params_to_llama(params).kv_position_split_p;
+    if (p == 0) {
+        const char * env_p = getenv("LLAMA_KV_POSITION_SPLIT_P");
+        if (env_p && env_p[0] != '\0') {
+            p = uint32_t(strtoul(env_p, nullptr, 10));
+        }
+    }
+    return p;
+}
+
+// LLAMA_MTP_POSITION_SPLIT=1 (exact string) opts into the phase-1 MTP over
+// position-split KV support: the verify batch must never cross P, and the
+// crossing step decodes non-speculatively. Absent/any other value keeps the
+// historical behavior untouched.
+static bool server_mtp_position_split_enabled() {
+    return llama_position_split::mtp_position_split_env_enabled(getenv("LLAMA_MTP_POSITION_SPLIT"));
 }
 
 // Test-only fault injection; unset in production. Values: long, mtp,
@@ -1310,6 +1336,12 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // Effective position-split boundary P of the bound target context (0 =
+    // split disabled). Captured at bind time because the adaptive profile can
+    // switch between split and non-split tiers; used by the phase-1 MTP
+    // fallback to never draft across P (LLAMA_MTP_POSITION_SPLIT=1).
+    uint32_t position_split_p = 0;
+
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
     int32_t n_prompt_tokens_lcp       = 0;
@@ -1632,6 +1664,33 @@ prompt_reset_after_memory_clear();
 
         if (uses_adaptive_dflash() && adaptive_dm.dm_adaptive && adaptive_dm.adaptive_n_max >= 0) {
             n_draft_max = std::min(n_draft_max, adaptive_dm.adaptive_n_max);
+        }
+
+        // LLAMA_MTP_POSITION_SPLIT=1 phase-1 fallback: the speculative verify
+        // batch is the anchor plus the draft tokens, and with n_draft <=
+        // n_rs_seq it is the protected recurrent window that the position
+        // split rejects when it crosses P. Never generate a draft whose verify
+        // would cross P: this step becomes a plain non-speculative decode of
+        // the anchor, and drafting resumes once the anchor itself is at/above
+        // P. The env is MTP-specific and the context refuses MTP+P without it,
+        // so the gate is env + P + an active draft; deterministic and
+        // fail-closed; P == 0 (or env off) is unchanged.
+        if (n_draft_max > 0 && position_split_p > 0 && server_mtp_position_split_enabled()) {
+            const int64_t limit = llama_position_split::spec_draft_limit_at_p(prompt.tokens.pos_next(), position_split_p);
+            if (limit < n_draft_max) {
+                const int clamped = int(std::min<int64_t>(n_draft_max, std::max<int64_t>(limit, 0)));
+                if (clamped == 0) {
+                    // The crossing step: no draft is generated, the anchor
+                    // decodes alone (non-speculative). Once per P crossing, so
+                    // an INFO line is the deterministic E2E evidence.
+                    SLT_INF(*this, "MTP position-split fallback: anchor pos=%d at P=%u would cross the split; decoding this step non-speculatively (draft %d -> 0)\n",
+                            prompt.tokens.pos_next(), position_split_p, n_draft_max);
+                } else {
+                    SLT_DBG(*this, "MTP position-split fallback: anchor pos=%d at P=%u limits draft %d -> %d\n",
+                            prompt.tokens.pos_next(), position_split_p, n_draft_max, clamped);
+                }
+                n_draft_max = clamped;
+            }
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -5490,6 +5549,11 @@ private:
             return false;
         }
 
+        const uint32_t initial_position_split_p = server_effective_position_split_p(params_base);
+        if (server_mtp_position_split_enabled() && initial_position_split_p > 0) {
+            SRV_INF("MTP position-split: target profile ctx=%d has P=%u; drafts never cross the boundary (non-speculative crossing step)\n",
+                    n_ctx_slot_value, initial_position_split_p);
+        }
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -5500,6 +5564,7 @@ private:
             slot.mem.init(ctx_tgt, slot.draft_owns_state ? ctx_dft : nullptr);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot_value;
+            slot.position_split_p = initial_position_split_p;
             slot.clear_context_on_release = elastic_paged_context;
 
             slot.mctx                   = mctx;
@@ -5898,6 +5963,7 @@ private:
             slot.mem.init(nullptr, nullptr);
             slot.spec = nullptr;
             slot.n_ctx = 0;
+            slot.position_split_p = 0;
             slot.bootstrap_pending = false;
         }
     }
@@ -5928,6 +5994,11 @@ private:
             auto_index_scan();
         }
         const int slot_ctx = active_n_ctx_slot();
+        const uint32_t slot_position_split_p = server_effective_position_split_p(params_base);
+        if (server_mtp_position_split_enabled() && slot_position_split_p > 0) {
+            SRV_INF("MTP position-split: target profile ctx=%d has P=%u; drafts never cross the boundary (non-speculative crossing step)\n",
+                    slot_ctx, slot_position_split_p);
+        }
         for (auto & slot : slots) {
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
@@ -5935,6 +6006,7 @@ private:
             slot.mem.init(ctx_tgt, slot.draft_owns_state ? ctx_dft : nullptr);
             slot.spec = spec.get();
             slot.n_ctx = slot_ctx;
+            slot.position_split_p = slot_position_split_p;
             slot.bootstrap_pending = false;
             slot.clear_context_on_release = elastic_paged_context;
         }

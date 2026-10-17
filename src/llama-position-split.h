@@ -150,6 +150,49 @@ inline bool ubatch_crosses_p(uint32_t pos_start, uint32_t n_tokens, uint32_t p) 
     return pos_start < p && end > p;
 }
 
+// ---------------------------------------------------------------------------
+// MTP especulativo sobre o split por posição (peça (d), fase 1)
+// ---------------------------------------------------------------------------
+//
+// O ubatch de verify é o token âncora mais até `n_draft` tokens de draft. Com
+// n_draft <= n_rs_seq esse ubatch é exatamente a janela protegida (1 +
+// n_rs_seq), que divide_ubatches_at_p rejeita quando atravessa P. O fallback
+// determinístico da fase 1 é nunca gerar draft cujo verify atravesse P: o
+// passo que cruzaria decodifica só a âncora (não-especulativo) e o draft
+// volta quando a própria âncora já está em [P, C). Só a string exata "1"
+// habilita; ausente/qualquer outro valor mantém o guard fail-closed.
+inline bool mtp_position_split_env_enabled(const char * value) {
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+// The LLAMA_KV_POSITION_SPLIT_P env fallback applies only to the plain target
+// context. The MTP draft context (and auxiliary/draft contexts that carry
+// ctx_other) has its P deliberately zeroed by
+// common_base_params_to_speculative; resurrecting it from the env there makes
+// llama_model::create_memory reject the context
+// ("position-split KV não suporta contexto MTP", src/llama-model.cpp:2861).
+inline bool position_split_env_p_fallback_applies(bool is_auxiliary_context) {
+    return !is_auxiliary_context;
+}
+
+// Limite de draft para a âncora em `anchor_pos` com fronteira P: o verify
+// [anchor_pos, anchor_pos + n_draft] não pode cruzar P, logo
+// n_draft <= P - anchor_pos - 1 quando a âncora está abaixo de P. Âncora
+// negativa (não deveria ocorrer) falha fechada em 0; âncora >= P não é
+// limitada. P == 0 desliga o limite (modo atual).
+inline int64_t spec_draft_limit_at_p(int64_t anchor_pos, uint32_t p) {
+    if (p == 0) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (anchor_pos < 0) {
+        return 0;
+    }
+    if (uint64_t(anchor_pos) >= p) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    return int64_t(p) - anchor_pos - 1;
+}
+
 // Atribuição de faixa por posição (Fase 2b): cada posição absoluta pertence
 // a exatamente uma faixa. Local [0,P) vive na CUDA (KVarN4); overflow [P,C)
 // na Vulkan0 (Q4). `index_in_range` é o índice dentro da faixa (pos no local,

@@ -826,6 +826,17 @@ target_link_libraries(test-position-split-ubatch PRIVATE llama)
 add_test(NAME test-position-split-ubatch WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-ubatch>)
 set_property(TEST test-position-split-ubatch PROPERTY LABELS main)
 
+# LLAMA_MTP_POSITION_SPLIT=1 phase-1 fallback: the MTP verify batch must never
+# cross P; the crossing step decodes the anchor alone. Drives the prepare with
+# anchors in [P-n_max, P-1] and asserts the unfixed batch is hard-rejected
+# while the fallback batch is accepted unchanged.
+add_executable(test-position-split-mtp-fallback test-position-split-mtp-fallback.cpp)
+target_include_directories(test-position-split-mtp-fallback PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(test-position-split-mtp-fallback PRIVATE cxx_std_17)
+target_link_libraries(test-position-split-mtp-fallback PRIVATE llama)
+add_test(NAME test-position-split-mtp-fallback WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-mtp-fallback>)
+set_property(TEST test-position-split-mtp-fallback PROPERTY LABELS main)
+
 add_executable(test-position-split-ranges test-position-split-ranges.cpp)
 target_include_directories(test-position-split-ranges PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(test-position-split-ranges PRIVATE cxx_std_17)
