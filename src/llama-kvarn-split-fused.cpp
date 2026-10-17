@@ -254,7 +254,6 @@ struct exec_dispatcher {
     std::mutex mutex;
     uint32_t next_id = 1;
     std::unordered_map<uint32_t, std::shared_ptr<exec_state>> bundles;
-    kvarn_split_fused_set_fn set_fn = nullptr; // resolved CUDA-side slot setter
 };
 
 exec_dispatcher g_dispatcher;
@@ -790,11 +789,11 @@ uint32_t llama_kvarn_split_fused_exec_register(ggml_backend_t cuda, ggml_backend
     bundle->cuda = cuda;
     bundle->vulkan = vulkan;
     g_dispatcher.bundles.emplace(id, std::move(bundle));
-    g_dispatcher.set_fn = set_fn;
 
     // The slot always points at the immortal dispatcher; installing it again
-    // is harmless (idempotent pair). Done under the dispatcher lock so a
-    // concurrent removal cannot clear a slot we just installed.
+    // is harmless (idempotent pair). It is installed under the dispatcher lock
+    // and never cleared, so registration cannot race a removal into dropping
+    // a freshly installed callback.
     set_fn(exec_entry, &g_dispatcher);
     return id;
 }
@@ -803,18 +802,15 @@ void llama_kvarn_split_fused_exec_unregister(uint32_t id) {
     if (id == 0) {
         return;
     }
-    bool empty = false;
-    {
-        std::lock_guard<std::mutex> lock(g_dispatcher.mutex);
-        g_dispatcher.bundles.erase(id);
-        empty = g_dispatcher.bundles.empty();
-    }
-    // Clearing the slot is done OUTSIDE the dispatcher lock to keep a single
-    // lock order (registration takes dispatcher -> CUDA-slot; a dispatch grabs
-    // the CUDA slot and then, inside the callback, the dispatcher).
-    if (empty && g_dispatcher.set_fn) {
-        g_dispatcher.set_fn(nullptr, nullptr);
-    }
+    // Release ONLY this bundle. The CUDA callback slot is deliberately never
+    // cleared: the registered (exec_entry, g_dispatcher) pair is immortal and
+    // valid for the process lifetime, so draining the registry can never race
+    // a concurrent registration into installing a callback that a third thread
+    // immediately clears (the old "observe empty, unlock, clear" window). With
+    // no bundles the dispatcher fails closed per op ("no executor bundle"),
+    // which is the same guarantee the cleared slot provided.
+    std::lock_guard<std::mutex> lock(g_dispatcher.mutex);
+    g_dispatcher.bundles.erase(id);
 }
 
 bool llama_kvarn_split_fused_exec_ready(uint32_t id) {

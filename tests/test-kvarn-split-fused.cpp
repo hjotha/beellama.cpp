@@ -646,7 +646,7 @@ int main() {
 #else
     setenv("LLAMA_OVF_FUSED_SPAN_DUMP", dump_path(), 1);
 #endif
-    const uint32_t bundle_id = llama_kvarn_split_fused_exec_register(cuda, vk);
+    uint32_t bundle_id = llama_kvarn_split_fused_exec_register(cuda, vk);
     if (bundle_id == 0) {
         std::printf("  FAIL: executor registration failed\n");
         return 1;
@@ -654,8 +654,10 @@ int main() {
     CHECK(llama_kvarn_split_fused_exec_ready(bundle_id));
 
     // Per-context bundle isolation: a second bundle can be registered and
-    // released without affecting the first one (and only the last release
-    // clears the CUDA callback slot).
+    // released without affecting the first one. The CUDA callback slot is
+    // never cleared (immortal dispatcher), so draining the ENTIRE registry and
+    // registering again must keep a fully functional executor; the executions
+    // below use the freshly registered id.
     {
         const uint32_t idA = llama_kvarn_split_fused_exec_register(cuda, vk);
         const uint32_t idB = llama_kvarn_split_fused_exec_register(cuda, vk);
@@ -668,6 +670,13 @@ int main() {
         llama_kvarn_split_fused_exec_unregister(idB);
         CHECK(!llama_kvarn_split_fused_exec_ready(idB));
         CHECK(llama_kvarn_split_fused_exec_ready(bundle_id));
+
+        llama_kvarn_split_fused_exec_unregister(bundle_id);
+        CHECK(!llama_kvarn_split_fused_exec_ready(bundle_id));
+        const uint32_t idRe = llama_kvarn_split_fused_exec_register(cuda, vk);
+        CHECK(idRe != 0 && idRe != idA && idRe != idB);
+        CHECK(llama_kvarn_split_fused_exec_ready(idRe));
+        bundle_id = idRe;
     }
 
     struct shape { int D, Hq, Hkv; };

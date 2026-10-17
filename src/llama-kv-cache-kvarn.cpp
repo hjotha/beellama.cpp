@@ -1,6 +1,7 @@
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-kvarn-materializer.h"
 #include "llama-kv-qx-convert.h"
+#include "llama-kvarn-split-fused.h"
 
 #include "ggml-backend.h"
 #include "llama-context.h"
@@ -2865,6 +2866,40 @@ private:
 };
 
 llama_kv_cache_kvarn::~llama_kv_cache_kvarn() = default;
+
+// Fused position-split span ("peça (c)"): lazily register ONE executor bundle
+// for this cache instance (one context) and bake its id into every fused op.
+// A backend-pair change releases the old bundle BEFORE registering the new one
+// (see llama-kv-cache-kvarn.h). Registering is idempotent for the same pair;
+// the graph build of one context is single-threaded.
+uint32_t llama_kv_cache_kvarn::acquire_fused_span_bundle(ggml_backend_t cuda, ggml_backend_t vulkan) const {
+    if (fused_span_bundle_id != 0 &&
+            fused_span_bundle_cuda == cuda && fused_span_bundle_vulkan == vulkan) {
+        return fused_span_bundle_id;
+    }
+    if (fused_span_bundle_id != 0) {
+        llama_kvarn_split_fused_exec_unregister(fused_span_bundle_id);
+        fused_span_bundle_id = 0;
+        fused_span_bundle_cuda = nullptr;
+        fused_span_bundle_vulkan = nullptr;
+    }
+    const uint32_t id = llama_kvarn_split_fused_exec_register(cuda, vulkan);
+    if (id != 0) {
+        fused_span_bundle_id = id;
+        fused_span_bundle_cuda = cuda;
+        fused_span_bundle_vulkan = vulkan;
+    }
+    return id;
+}
+
+void llama_kv_cache_kvarn::release_fused_span_bundle() {
+    if (fused_span_bundle_id != 0) {
+        llama_kvarn_split_fused_exec_unregister(fused_span_bundle_id);
+        fused_span_bundle_id = 0;
+        fused_span_bundle_cuda = nullptr;
+        fused_span_bundle_vulkan = nullptr;
+    }
+}
 
 llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const llama_model & model,

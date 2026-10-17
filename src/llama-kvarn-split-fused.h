@@ -34,8 +34,10 @@ uint32_t llama_kvarn_split_fused_exec_register(ggml_backend_t cuda, ggml_backend
 
 // Releases ONLY the bundle `id` (its per-layer sub-graphs and buffers). Other
 // contexts' bundles are untouched; an in-flight callback keeps its bundle
-// alive through a shared reference. When the last bundle goes away the CUDA
-// callback slot is cleared.
+// alive through a shared reference. The CUDA callback slot itself is never
+// cleared (the registered pair is an immortal process-lifetime dispatcher), so
+// unregister cannot race a concurrent registration; with no bundles left the
+// dispatcher fails closed per op.
 void llama_kvarn_split_fused_exec_unregister(uint32_t id);
 
 // Whether bundle `id` is currently registered and executable.
