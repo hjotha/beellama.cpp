@@ -120,3 +120,22 @@ test-server 8095, `LLAMA_MTP_POSITION_SPLIT=1`, n_max=2, repeat run 207.8 tk/s p
   cross-device scheduling or the draft: a CUDA-side Q4 band would remove the round-trip at
   the cost of kvarn4 coverage (budget arithmetic: ~17.2 KiB/token kvarn4 vs ~9 KiB/token
   Q4_0 puts the fully-local frontier near P1 ~ 65k for C=131072).
+
+# Why the split exists: fully-local 131072 is impossible on this box
+
+Measured 2026-10-17 (same 27B, presets without split/remote, 120k prompt, b/ub sweep):
+
+| config | failure |
+|---|---|
+| q4_0 full-C K/V | KV loads (2304 MiB) but the standard FA compute workspace needs 616/564/538 MiB at ub 256/128/64; only ~250-290 MiB free -> `failed to allocate compute pp buffers` |
+| q8_0 full-C K/V | 4352 MiB (34 KiB/token) -> `failed to allocate buffer for kv cache` |
+
+- kvarn4 full-C (2264 MiB KV, no split) does load (compute 62.6 MiB at ub=128; ub=256 does not
+  load) with 1.4-7.4 MiB free, prefills at 75.7 tk/s and then dies in the historical re-reserve
+  class (`launch_mul_mat_q`, `docs/mtp-router-split-plan.md` "What caused the failure").
+- The KVarN path keeps the compute budget small; the standard q4_0/q8_0 attention workspace
+  scales with context and alone exceeds the free VRAM at 131k. Position split (P=96256 local
+  kvarn4 + 34816 tokens Q4_0 on the Radeon) exists precisely to avoid both walls; the decode
+  reference at 120k is 4.66 t/s.
+- No quality/rotation warning was emitted for any quantized cache (the Hadamard rotation stays
+  active for quantized caches).
