@@ -86,3 +86,37 @@ Measured 2026-10-17 on the 27B (kvarn4 P=96256 + Q4 overflow, 120k ctx, test-ser
   MTP/speculative path over the split (piece d), not from cross-device scheduling tricks.
 - The phase-3 executor code was left uncommitted and reverted; phase 2 (`cd91cea7f`) stays as an
   env-gated, default-off scaffold with its reviewed correctness gates.
+
+# MTP-over-split sweep (phase 2): MTP stays OFF at 100-128k
+
+Measured 2026-10-17 on the 27B (kvarn4 local + Q4_0 overflow on the Radeon, 120k prompt,
+test-server 8095, `LLAMA_MTP_POSITION_SPLIT=1`, n_max=2, repeat run 207.8 tk/s prefill).
+
+| config | gate (needed 398 MiB) | result |
+|---|---|---|
+| P=96256 (production) OFF | — | decode **4.66 / 4.59 t/s**, prefill 207.8 tk/s |
+| P=96256..81920 ON (ub=256/128) | 59.4..305.4 free -> FIT-FAIL | fail-closed at init |
+| P=76288 ON | passes (~402 free) | **crash in prefill**: CUDA OOM (cudaMalloc 86 MiB ub=256 / 28 MiB ub=64) |
+| P=74496 ON ub=64 | passes (~432 free) | completes: prefill 46.0 tk/s, decode **3.04 t/s**, acceptance 0.958 (636/664), mean len 2.85 |
+| P=74496 OFF ub=64 | — | prefill 73.5 tk/s, decode **2.55 t/s** |
+
+- MTP wins on the same layout (+19% at P=74496) but reducing P to fit MTP costs ~44%
+  versus the production P=96256 OFF: the overflow scan on the Radeon dominates the
+  100-128k decode, so the draft cannot pay for the local-band shrink.
+- Acceptance on this repeated prompt was 0.958; the owner's field value for this model is
+  ~0.70, which shrinks the amortization further. Even the observed +15% at P=4096 (phase 1,
+  acceptance 0.77) does not survive the P reduction cost at 120k.
+- b/ub does not unlock the budget in the current code: `llama_kvarn_non_swa_tail_groups`
+  (src/llama-kv-cache-kvarn.h:126-149) returns 2 (eager records) regardless of b/ub, so the
+  1.5 MiB/layer stage is constant and the gate free is ub-independent; ub only shrinks the
+  runtime compute spike (86 -> 28 MiB). The historical b/ub lever in
+  docs/mtp-router-split-plan.md:232/:250/:255-268 (MTP on/64 = 60.9k limit vs off/64 =
+  105.5k; b/ub 512 costs ~9k ctx / ~114 MiB) predates this stage implementation; the
+  current tiers still encode it (router-production.ini:91-98, XL as the only 128/128 tier).
+- Production consequence: keep `spec-draft-n-max-xxxl = 0`; MTP stays off in the split tier.
+  The fit gate now uses a 352 MiB overhead (256 + the measured 86 MiB prefill re-reserve)
+  so the P~76k class fails closed at init instead of dying mid-prefill.
+- Next TPS lever in 100-128k is the overflow scan itself (the Radeon Q4 band), not the
+  cross-device scheduling or the draft: a CUDA-side Q4 band would remove the round-trip at
+  the cost of kvarn4 coverage (budget arithmetic: ~17.2 KiB/token kvarn4 vs ~9 KiB/token
+  Q4_0 puts the fully-local frontier near P1 ~ 65k for C=131072).
