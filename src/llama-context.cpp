@@ -18,6 +18,7 @@
 #include "llama-kv-mixed-state-stream.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
+#include "llama-kvarn-split-fused.h"
 #include "ggml-remote-attn.h"
 #include "ggml-local-split.h"
 
@@ -417,6 +418,52 @@ static bool selected_attention_layer(
         if (hparams.has_kv(l) && !hparams.is_recr(l)) ++index;
     }
     return index < count;
+}
+
+// Planned draft-MTP KV reservation (llama_context_params::mtp_reserve_*): size
+// the independent draft cache with the DRAFT representation, the resolved
+// target capacity and the MTP tail policy (init forces tail 0 / F16; KVarN
+// keeps its intrinsic 128-token tail). Shared by the mixed auto-placement
+// planner (P == 0) and the LLAMA_MTP_POSITION_SPLIT=1 fit check (P != 0).
+static uint64_t estimate_mtp_reserve_bytes(
+        const llama_model & model, const llama_context_params & params, const llama_cparams & cparams) {
+    llama_kv_mixed_mtp_input mtp_input = {};
+    mtp_input.n_ctx = cparams.n_ctx_seq;
+    mtp_input.n_seq_max = cparams.n_seq_max;
+    mtp_input.kv_unified = cparams.kv_unified;
+    mtp_input.n_batch = cparams.n_batch;
+    mtp_input.n_ubatch = cparams.n_ubatch;
+    mtp_input.kvarn = params.mtp_reserve_kvarn;
+    mtp_input.kvarn_bits = params.mtp_reserve_kvarn_bits;
+    mtp_input.type_k = params.mtp_reserve_type_k;
+    mtp_input.type_v = params.mtp_reserve_type_v;
+    mtp_input.tail_tokens = 0; // MTP init forces tail 0 / F16
+    mtp_input.tail_type = GGML_TYPE_F16;
+    mtp_input.tail_rollback_tokens = params.mtp_reserve_rollback_tokens;
+    const uint32_t mtp_layer_begin = model.hparams.n_layer();
+    const uint32_t mtp_layer_end = model.hparams.n_layer_all;
+    for (uint32_t il = mtp_layer_begin; il < mtp_layer_end; ++il) {
+        if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
+            continue;
+        }
+        llama_kv_mixed_mtp_layer layer = {};
+        layer.layer = il;
+        layer.head_dim_k = model.hparams.n_embd_head_k(il);
+        layer.head_dim_v = model.hparams.n_embd_head_v(il);
+        layer.n_head_kv = model.hparams.n_head_kv(il);
+        layer.n_embd_k_gqa = model.hparams.n_embd_k_gqa(il);
+        layer.n_embd_v_gqa = model.hparams.n_embd_v_gqa(il);
+        mtp_input.layers.push_back(layer);
+    }
+    llama_kv_mixed_mtp_budget mtp_budget = {};
+    const auto mtp_status = llama_kv_mixed_mtp_budget_estimate(mtp_input, mtp_budget);
+    if (mtp_status != LLAMA_KV_MIXED_OK) {
+        throw std::runtime_error(format(
+                "mixed KV auto-placement cannot reserve the planned draft-MTP cache: %s",
+                mtp_budget.error[0] ? mtp_budget.error :
+                        llama_kv_mixed_status_name(mtp_status)));
+    }
+    return mtp_budget.total_bytes;
 }
 
 llama_context::llama_context(
@@ -945,7 +992,12 @@ llama_context::llama_context(
         uint64_t value = params.kv_position_split_p;
         std::string requested = std::to_string(value);
         const char * env_p = getenv("LLAMA_KV_POSITION_SPLIT_P");
-        if (value == 0 && env_p && env_p[0] != '\0') {
+        // Never resurrect P from the env for an MTP draft (or any auxiliary)
+        // context: common_base_params_to_speculative zeroes it on purpose, and
+        // an MTP context with P != 0 is rejected in create_memory.
+        const bool env_p_fallback = llama_position_split::position_split_env_p_fallback_applies(
+                params.ctx_type == LLAMA_CONTEXT_TYPE_MTP || params.ctx_other != nullptr);
+        if (value == 0 && env_p_fallback && env_p && env_p[0] != '\0') {
             char * end = nullptr;
             errno = 0;
             value = strtoull(env_p, &end, 10);
@@ -956,8 +1008,33 @@ llama_context::llama_context(
             if (value == 0) { throw std::invalid_argument("LLAMA_KV_POSITION_SPLIT_P must be positive"); }
         }
         if (value != 0) {
-            if (params.mtp_reserve_enabled) {
+            // LLAMA_MTP_POSITION_SPLIT=1 (exact string) opts into running the
+            // MTP draft over a position-split target. Absent/any other value
+            // keeps the fail-closed guard byte for byte.
+            const bool mtp_position_split = llama_position_split::mtp_position_split_env_enabled(
+                    getenv("LLAMA_MTP_POSITION_SPLIT"));
+            if (params.mtp_reserve_enabled && !mtp_position_split) {
                 throw std::invalid_argument("position-split KV requires MTP disabled in the active profile");
+            }
+            if (params.mtp_reserve_enabled) {
+                // Same split contracts as the non-MTP path, restated against
+                // this context because the split and the MTP reservation now
+                // share the target: one sequence, non-unified cache, no SWA.
+                if (cparams.n_seq_max != 1) {
+                    throw std::invalid_argument(
+                            "LLAMA_MTP_POSITION_SPLIT=1 requires a single sequence (n_seq_max=1)");
+                }
+                if (cparams.kv_unified) {
+                    throw std::invalid_argument(
+                            "LLAMA_MTP_POSITION_SPLIT=1 requires a non-unified KV cache");
+                }
+                if (hparams.n_swa > 0 && hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    throw std::invalid_argument(
+                            "LLAMA_MTP_POSITION_SPLIT=1 does not support SWA/iSWA memory");
+                }
+                LLAMA_LOG_WARN("%s: LLAMA_MTP_POSITION_SPLIT=1: MTP draft enabled over position-split KV "
+                               "(P=%llu); the step that would cross P decodes non-speculatively\n",
+                               __func__, (unsigned long long) value);
             }
             if (value > UINT32_MAX || !llama_position_split::is_valid_p(uint32_t(value), cparams.n_ctx_seq)) {
                 throw std::runtime_error(
@@ -1244,7 +1321,7 @@ std::vector<ggml_backend_t> layer_backends;
             }
             uint64_t mixed_host_ram_cap_bytes = 0;
             if (remote_type_k && n_full_attn > 0 &&
-                    params.remote_attn_n_layers == -1) {
+                    params.remote_attn_n_layers == -1 && cparams.kv_position_split_p == 0) {
 #if defined(__linux__)
                 std::ifstream meminfo("/proc/meminfo");
                 if (!meminfo) {
@@ -1287,7 +1364,12 @@ std::vector<ggml_backend_t> layer_backends;
 #endif
             }
             int n_remote = n_full_attn;
-            if (params.remote_attn_n_layers == -1 && remote_type_k) {
+            // Position-split KV (P != 0) keeps BOTH bands on every full-attention
+            // layer (local KVarN [0,P) + remote Q4 [P,C)), so the per-layer budget
+            // count of the auto policy does not apply: auto resolves exactly like
+            // "full" (n_remote stays n_full_attn) and the F3 cache contract still
+            // validates explicit counts unchanged.
+            if (params.remote_attn_n_layers == -1 && remote_type_k && cparams.kv_position_split_p == 0) {
                 ggml_backend_dev_t cuda_dev = nullptr;
                 uint32_t cuda_owner_layer = UINT32_MAX;
                 for (uint32_t il = attention_layer_begin; il < attention_layer_end; ++il) {
@@ -1402,43 +1484,7 @@ std::vector<ggml_backend_t> layer_backends;
                 // target-format KVarN (which could push an extra layer onto
                 // the Radeon at 204800).
                 if (params.mtp_reserve_enabled) {
-                    llama_kv_mixed_mtp_input mtp_input = {};
-                    mtp_input.n_ctx = cparams.n_ctx_seq;
-                    mtp_input.n_seq_max = cparams.n_seq_max;
-                    mtp_input.kv_unified = cparams.kv_unified;
-                    mtp_input.n_batch = cparams.n_batch;
-                    mtp_input.n_ubatch = cparams.n_ubatch;
-                    mtp_input.kvarn = params.mtp_reserve_kvarn;
-                    mtp_input.kvarn_bits = params.mtp_reserve_kvarn_bits;
-                    mtp_input.type_k = params.mtp_reserve_type_k;
-                    mtp_input.type_v = params.mtp_reserve_type_v;
-                    mtp_input.tail_tokens = 0; // MTP init forces tail 0 / F16
-                    mtp_input.tail_type = GGML_TYPE_F16;
-                    mtp_input.tail_rollback_tokens = params.mtp_reserve_rollback_tokens;
-                    const uint32_t mtp_layer_begin = model.hparams.n_layer();
-                    const uint32_t mtp_layer_end = model.hparams.n_layer_all;
-                    for (uint32_t il = mtp_layer_begin; il < mtp_layer_end; ++il) {
-                        if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
-                            continue;
-                        }
-                        llama_kv_mixed_mtp_layer layer = {};
-                        layer.layer = il;
-                        layer.head_dim_k = model.hparams.n_embd_head_k(il);
-                        layer.head_dim_v = model.hparams.n_embd_head_v(il);
-                        layer.n_head_kv = model.hparams.n_head_kv(il);
-                        layer.n_embd_k_gqa = model.hparams.n_embd_k_gqa(il);
-                        layer.n_embd_v_gqa = model.hparams.n_embd_v_gqa(il);
-                        mtp_input.layers.push_back(layer);
-                    }
-                    llama_kv_mixed_mtp_budget mtp_budget = {};
-                    const auto mtp_status = llama_kv_mixed_mtp_budget_estimate(mtp_input, mtp_budget);
-                    if (mtp_status != LLAMA_KV_MIXED_OK) {
-                        throw std::runtime_error(format(
-                                "mixed KV auto-placement cannot reserve the planned draft-MTP cache: %s",
-                                mtp_budget.error[0] ? mtp_budget.error :
-                                        llama_kv_mixed_status_name(mtp_status)));
-                    }
-                    mtp_reserve = mtp_budget.total_bytes;
+                    mtp_reserve = estimate_mtp_reserve_bytes(model, params, cparams);
                 }
                 budget.cuda_reserve_bytes = params.remote_attn_cuda_reserve;
                 if (recurrent_reserve > UINT64_MAX - budget.cuda_reserve_bytes ||
@@ -1477,7 +1523,7 @@ std::vector<ggml_backend_t> layer_backends;
                         placement.ram_temp_bytes / 1024.0 / 1024.0,
                         (unsigned long long) placement.effective_chunk_tokens,
                         n_remote, n_full_attn - n_remote);
-            } else if (params.remote_attn_n_layers == -1) {
+            } else if (params.remote_attn_n_layers == -1 && cparams.kv_position_split_p == 0) {
                 size_t cuda_free = 0, cuda_total = 0;
                 ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_name("CUDA0");
                 if (!cuda_dev) cuda_dev = ggml_backend_dev_by_name("CUDA");
@@ -1608,6 +1654,12 @@ std::vector<ggml_backend_t> layer_backends;
             } else if (params.remote_attn_n_layers > 0 && params.remote_attn_n_layers <= n_full_attn) {
                 n_remote = params.remote_attn_n_layers;
             }
+            if (cparams.kv_position_split_p != 0 && params.remote_attn_n_layers == -1) {
+                LLAMA_LOG_INFO("%s: position-split KV forces all %d full-attention layers onto the remote "
+                               "backend (auto resolves like \"full\")\n",
+                        __func__, n_full_attn);
+                n_remote = n_full_attn;
+            }
             cparams.remote_attn_layers = n_remote;
             if (remote_type_k) {
                 int full_idx = 0;
@@ -1652,6 +1704,87 @@ std::vector<ggml_backend_t> layer_backends;
             }
         } else if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) {
             throw std::runtime_error("KV tail cache requested for a model without cache memory");
+        }
+
+        // LLAMA_MTP_POSITION_SPLIT=1 fit gate: the mixed auto-placement planner
+        // that normally prices the draft-MTP reservation is bypassed when P != 0
+        // (the split keeps both bands on every full layer), so the independent
+        // draft context would otherwise discover any shortfall as a raw CUDA
+        // OOM in graph_reserve below (observed: target pp buffers). Fail closed
+        // here, with real numbers, BEFORE the compute buffers: the measured
+        // free CUDA memory must still hold the draft KV reservation plus the
+        // remaining target pp compute buffers and the draft context's
+        // graph/output overhead. The draft context borrows the target model's
+        // weights, so only its cache and compute buffers are new. This runs
+        // after the target KV/RS allocation, so those costs are already out.
+        if (llama_position_split::mtp_position_split_env_enabled(getenv("LLAMA_MTP_POSITION_SPLIT")) &&
+                cparams.kv_position_split_p != 0 && params.mtp_reserve_enabled) {
+            ggml_backend_dev_t cuda_dev = nullptr;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
+                    continue;
+                }
+                auto * dev = model.dev_layer(int32_t(il));
+                const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+                if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                        !name || std::strncmp(name, "CUDA", 4) != 0) {
+                    throw std::runtime_error(format(
+                            "LLAMA_MTP_POSITION_SPLIT=1: full-attention layer %u is not on CUDA (%s); "
+                            "the independent draft-MTP cache cannot be budgeted",
+                            il, name ? name : "unknown device"));
+                }
+                cuda_dev = dev;
+                break;
+            }
+            if (cuda_dev == nullptr) {
+                throw std::runtime_error(
+                        "LLAMA_MTP_POSITION_SPLIT=1: no CUDA full-attention layer found for the draft-MTP cache");
+            }
+            // The draft KV cache is allocated on the MTP layers' model devices,
+            // not on the target full-attention device. This gate only budgets
+            // the single-CUDA-owner case: require every MTP KV layer to sit on
+            // exactly the budget device and fail closed otherwise (a
+            // cross-device draft is not validated here).
+            for (uint32_t il = model.hparams.n_layer(); il < model.hparams.n_layer_all; ++il) {
+                if (!model.hparams.has_kv(il) || model.hparams.is_recr(il)) {
+                    continue;
+                }
+                auto * dev = model.dev_layer(int32_t(il));
+                const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+                if (dev != cuda_dev) {
+                    throw std::runtime_error(format(
+                            "LLAMA_MTP_POSITION_SPLIT=1: MTP KV layer %u is on %s, but the draft-MTP budget "
+                            "was computed for the target CUDA device %s; cross-device draft placement is "
+                            "not validated [fail-closed]",
+                            il, name ? name : "unknown device", ggml_backend_dev_name(cuda_dev)));
+                }
+            }
+            const uint64_t mtp_reserve = estimate_mtp_reserve_bytes(model, params, cparams);
+            size_t cuda_free = 0, cuda_total = 0;
+            ggml_backend_dev_memory(cuda_dev, &cuda_free, &cuda_total);
+            // Overhead beyond the draft KV: the target's remaining pp compute
+            // buffers (61 MiB reserved, 126 MiB measured at 256-token ubatches
+            // on the 27B/4070) plus the one-layer MTP draft compute graph and
+            // output staging. The 2026-10-17 sweep showed configurations that
+            // passed a 256 MiB overhead and then died on a runtime compute
+            // re-reserve (86 MiB at ub=256, 28 MiB at ub=64) before prefill
+            // completed, so account for the measured peak growth (256 + 86)
+            // with a small margin instead of accepting ~0 MiB of headroom.
+            constexpr uint64_t kMtpSplitOverheadBytes = 352ull << 20;
+            const uint64_t needed = mtp_reserve + kMtpSplitOverheadBytes;
+            LLAMA_LOG_INFO("%s: LLAMA_MTP_POSITION_SPLIT=1 fit check: draft-MTP reserve=%.1f MiB, "
+                           "overhead=%.1f MiB, CUDA free=%.1f MiB\n",
+                           __func__, mtp_reserve/1048576.0, kMtpSplitOverheadBytes/1048576.0,
+                           double(cuda_free)/1048576.0);
+            if (uint64_t(cuda_free) < needed) {
+                throw std::runtime_error(format(
+                        "LLAMA_MTP_POSITION_SPLIT=1: the draft-MTP cache does not fit CUDA at P=%u "
+                        "(C=%u): draft reserve %.1f MiB + overhead %.1f MiB = %.1f MiB needed, "
+                        "only %.1f MiB free after the position-split target placement [fail-closed]",
+                        cparams.kv_position_split_p, cparams.n_ctx_seq,
+                        mtp_reserve/1048576.0, kMtpSplitOverheadBytes/1048576.0, needed/1048576.0,
+                        double(cuda_free)/1048576.0));
+            }
         }
 
     }
@@ -1867,6 +2000,19 @@ std::vector<ggml_backend_t> layer_backends;
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    // Fused position-split span: release THIS context's executor bundle (its
+    // per-layer Vulkan/CUDA sub-graphs reference this context's backends and
+    // caches) while the backends are still alive. The bundle is owned by the
+    // KVarN cache; other contexts' bundles are untouched.
+    if (cparams.kv_position_split_p != 0) {
+        llama_memory_i * mem = get_memory();
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            mem = hybrid->get_mem_attn_base();
+        }
+        if (auto * kvarn = dynamic_cast<llama_kv_cache_kvarn *>(mem)) {
+            kvarn->release_fused_span_bundle();
+        }
+    }
     // KVarN's transfer worker can hold CUDA producer events and live tensor
     // pointers. Drain it before scheduler/model backends begin destruction.
     if (memory && !memory->drain_prefill_migration()) {

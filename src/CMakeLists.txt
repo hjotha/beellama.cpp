@@ -23,6 +23,7 @@ set(LLAMA_CORE_SOURCES
     llama-io.cpp
     llama-kv-cache.cpp
     llama-kvarn.cpp
+    llama-kvarn-split-fused.cpp
     llama-kv-cache-kvarn.cpp
     llama-kv-qx-convert.cpp
     llama-kv-kvarn-materializer.cpp

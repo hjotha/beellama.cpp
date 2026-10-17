@@ -254,6 +254,10 @@ public:
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
     bool uses_compact_read_indices() const;
     bool uses_materialization_indices() const;
+    // Whether the graph currently being built routes an OVERFLOW ubatch: the
+    // only range whose store targets the Q4 companion and whose chain the fused
+    // split span may replace. False during graph reserve (no valid ubatch).
+    bool current_range_is_overflow() const { return current_position_split_range_id() == llama_position_split::kRangeOverflow; }
 
     // SWA sliding-window ring: per-cell absolute positions for KVarN reads.
     // Built as a graph input sized [n_kv]; set on the host from cells.pos_get(cell).
@@ -761,6 +765,14 @@ public:
     bool native_attention_uses_original_v(int32_t il) const;
     uint32_t native_rotated_max_query_tokens(int32_t il) const;
 
+    // Fused position-split span ("peça (c)"): one executor bundle per context
+    // (this cache instance). The graph builder acquires it lazily and bakes the
+    // returned id into every fused op; ~llama_context releases it before the
+    // backends go away. A pair change re-registers (the old bundle is released
+    // first). Thread-safety: the graph build of one context is single-threaded.
+    uint32_t acquire_fused_span_bundle(ggml_backend_t cuda, ggml_backend_t vulkan) const;
+    void release_fused_span_bundle();
+
     // Reference-faithful staging keeps one incomplete 128-token group lossless.
     // Completed records are committed eagerly, so physical ubatch size does not
     // change the logical exact suffix.
@@ -931,6 +943,11 @@ private:
     // Optional ordinary Qx payloads for selected remote layers. This cache
     // shares only metadata/cells with `metadata`; its K/V buffers remain owned.
     std::unique_ptr<llama_kv_cache> standard_cache;
+
+    // Fused-span executor bundle identity (see acquire_fused_span_bundle()).
+    mutable uint32_t fused_span_bundle_id = 0;
+    mutable ggml_backend_t fused_span_bundle_cuda = nullptr;
+    mutable ggml_backend_t fused_span_bundle_vulkan = nullptr;
     std::vector<layer> layers;
     std::unordered_map<int32_t, int32_t> map_layer_ids;
     std::vector<cache_buffer> ctxs_bufs;

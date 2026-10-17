@@ -1487,6 +1487,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     continue;
                 }
 
+                // GGML_OP_KVARN_SPLIT_FUSED is executed by a host-side
+                // executor that reaches every operand through its OWN buffer
+                // backend (Vulkan Q4 companion views, host mask/indices), so
+                // the scheduler must not materialize cross-backend copies:
+                // src[5]/src[6] stay the raw Vulkan row views, src[7] the
+                // (host/crop) F16 mask and src[8]/src[9] the host index lists.
+                if (node->op == GGML_OP_KVARN_SPLIT_FUSED && j >= 5 && j <= 9) {
+                    continue;
+                }
+
                 const auto move_src_to_split = [&](struct ggml_tensor ** src_ptr) {
                     struct ggml_tensor * dep_src = *src_ptr;
                     if (dep_src == NULL) {

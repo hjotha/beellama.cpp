@@ -773,19 +773,34 @@ if (GGML_VULKAN)
     add_test(NAME test-position-split-lse-vk WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-lse-vk>)
     set_property(TEST test-position-split-lse-vk PROPERTY LABELS main)
 
-    add_executable(test-position-split-merge-graph test-position-split-merge-graph.cpp)
-    target_include_directories(test-position-split-merge-graph PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
-    target_compile_features(test-position-split-merge-graph PRIVATE cxx_std_17)
-    target_link_libraries(test-position-split-merge-graph PRIVATE llama ggml ggml-vulkan)
-    add_test(NAME test-position-split-merge-graph WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge-graph>)
-    set_property(TEST test-position-split-merge-graph PROPERTY LABELS main)
+    # The merge-graph, fused-span and real-pair checks require BOTH the
+    # Vulkan overflow backend and the CUDA local/merge backend at runtime;
+    # they are gated on both so a Vulkan-only build does not register them.
+    if (GGML_CUDA)
+        add_executable(test-position-split-merge-graph test-position-split-merge-graph.cpp)
+        target_include_directories(test-position-split-merge-graph PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+        target_compile_features(test-position-split-merge-graph PRIVATE cxx_std_17)
+        target_link_libraries(test-position-split-merge-graph PRIVATE llama ggml ggml-vulkan)
+        add_test(NAME test-position-split-merge-graph WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge-graph>)
+        set_property(TEST test-position-split-merge-graph PROPERTY LABELS main)
 
-    add_executable(test-position-split-real-pair test-position-split-real-pair.cpp)
-    target_include_directories(test-position-split-real-pair PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
-    target_compile_features(test-position-split-real-pair PRIVATE cxx_std_17)
-    target_link_libraries(test-position-split-real-pair PRIVATE llama ggml ggml-vulkan)
-    add_test(NAME test-position-split-real-pair WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-real-pair>)
-    set_property(TEST test-position-split-real-pair PROPERTY LABELS main)
+        # Phase-2 fused span ("peça (c)"): the GGML_OP_KVARN_SPLIT_FUSED
+        # executor (llama_kvarn_split_fused_exec_register) must reproduce the
+        # legacy two-range chain for D128/D256 decode within the phase-2 gates.
+        add_executable(test-kvarn-split-fused test-kvarn-split-fused.cpp)
+        target_include_directories(test-kvarn-split-fused PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+        target_compile_features(test-kvarn-split-fused PRIVATE cxx_std_17)
+        target_link_libraries(test-kvarn-split-fused PRIVATE llama ggml ggml-vulkan)
+        add_test(NAME test-kvarn-split-fused WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn-split-fused>)
+        set_property(TEST test-kvarn-split-fused PROPERTY LABELS main)
+
+        add_executable(test-position-split-real-pair test-position-split-real-pair.cpp)
+        target_include_directories(test-position-split-real-pair PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+        target_compile_features(test-position-split-real-pair PRIVATE cxx_std_17)
+        target_link_libraries(test-position-split-real-pair PRIVATE llama ggml ggml-vulkan)
+        add_test(NAME test-position-split-real-pair WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-real-pair>)
+        set_property(TEST test-position-split-real-pair PROPERTY LABELS main)
+    endif()
 
     add_executable(test-position-split-lse-sched test-position-split-lse-sched.cpp)
     target_include_directories(test-position-split-lse-sched PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
@@ -811,11 +826,37 @@ target_link_libraries(test-position-split-ubatch PRIVATE llama)
 add_test(NAME test-position-split-ubatch WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-ubatch>)
 set_property(TEST test-position-split-ubatch PROPERTY LABELS main)
 
+# LLAMA_MTP_POSITION_SPLIT=1 phase-1 fallback: the MTP verify batch must never
+# cross P; the crossing step decodes the anchor alone. Drives the prepare with
+# anchors in [P-n_max, P-1] and asserts the unfixed batch is hard-rejected
+# while the fallback batch is accepted unchanged.
+add_executable(test-position-split-mtp-fallback test-position-split-mtp-fallback.cpp)
+target_include_directories(test-position-split-mtp-fallback PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(test-position-split-mtp-fallback PRIVATE cxx_std_17)
+target_link_libraries(test-position-split-mtp-fallback PRIVATE llama)
+add_test(NAME test-position-split-mtp-fallback WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-mtp-fallback>)
+set_property(TEST test-position-split-mtp-fallback PROPERTY LABELS main)
+
 add_executable(test-position-split-ranges test-position-split-ranges.cpp)
 target_include_directories(test-position-split-ranges PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(test-position-split-ranges PRIVATE cxx_std_17)
 add_test(NAME test-position-split-ranges WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-ranges>)
 set_property(TEST test-position-split-ranges PROPERTY LABELS main)
+
+add_executable(test-position-split-mask-memo test-position-split-mask-memo.cpp)
+target_include_directories(test-position-split-mask-memo PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(test-position-split-mask-memo PRIVATE cxx_std_17)
+target_link_libraries(test-position-split-mask-memo PRIVATE llama)
+add_test(NAME test-position-split-mask-memo WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-mask-memo>)
+set_property(TEST test-position-split-mask-memo PROPERTY LABELS main)
+
+# Phase-1 scaffold of the fused position-split span op (CPU-only, no GPU).
+add_executable(test-kvarn-split-fused-scaffold test-kvarn-split-fused-scaffold.cpp)
+target_include_directories(test-kvarn-split-fused-scaffold PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+target_compile_features(test-kvarn-split-fused-scaffold PRIVATE cxx_std_17)
+target_link_libraries(test-kvarn-split-fused-scaffold PRIVATE ggml)
+add_test(NAME test-kvarn-split-fused-scaffold WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn-split-fused-scaffold>)
+set_property(TEST test-kvarn-split-fused-scaffold PROPERTY LABELS main)
 
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})

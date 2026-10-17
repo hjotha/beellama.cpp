@@ -663,6 +663,21 @@ extern "C" {
         // existing op enum values are not shifted.
         GGML_OP_FLASH_ATTN_EXT_LSE,
 
+        // Fused position-split attention + merge for the KVarN overflow span
+        // ("peça (c)" of docs/occupancy-placement-plan-20261002.md and the
+        // follow-up occupancy-aux handoff): ONE op replacing the local KVarN
+        // FA + overflow Q4 FA + LSE merge chain built by
+        // build_attn_inp_kv_overflow() (src/llama-graph.cpp).
+        //
+        // Phase 1 = scaffold only: the builder does NOT emit this op yet
+        // (wiring is phase 2). The CUDA backend advertises it exclusively when
+        // LLAMA_OVF_FUSED_SPAN == "1" AND the shape contract holds
+        // (ggml_backend_cuda_device_supports_op); every other backend and the
+        // default-off environment keep failing closed on the legacy path.
+        // CPU/other backends that would receive it abort loudly (no silent
+        // no-op). Kept last so existing op enum values are not shifted.
+        GGML_OP_KVARN_SPLIT_FUSED,
+
         GGML_OP_COUNT,
     };
 
@@ -2923,6 +2938,89 @@ extern "C" {
             int                   layer_id,
             float                 kq_scale,
             int                   domain);
+
+    // Op params of GGML_OP_KVARN_SPLIT_FUSED. Slots 0..4 are int32, slot 5 is
+    // the f32 KQ scale (ggml_set_op_params_f32), slots 6+ are int32 again.
+    enum ggml_kvarn_split_fused_op_param {
+        // Overflow split position P: the position axis is split into the local
+        // range [0, P) (KVarN records) and the overflow range [P, C) (Q4_0
+        // companion storage). The overflow K/V view (src[5], src[6]) covers
+        // only rows of the overflow range.
+        GGML_KVARN_SPLIT_FUSED_PARAM_P          = 0,
+        // Live KV length (tokens) for this ubatch: P + live overflow rows.
+        // Bounded by P + n_ovf_rows (rows past the live run are mask -inf).
+        GGML_KVARN_SPLIT_FUSED_PARAM_N_KV_LIVE  = 1,
+        // KVarN record bit width of the local K cache (2/3/4/5/6/8).
+        GGML_KVARN_SPLIT_FUSED_PARAM_BITS_K     = 2,
+        // KVarN record bit width of the local V cache (2/3/4/5/6/8).
+        GGML_KVARN_SPLIT_FUSED_PARAM_BITS_V     = 3,
+        // Row extent of the overflow K/V view (src[5]/src[6] dim 1): the
+        // stable extent baked by the builder (live run rounded up), which may
+        // exceed the live overflow rows; inactive rows are masked -inf.
+        GGML_KVARN_SPLIT_FUSED_PARAM_N_OVF_ROWS = 4,
+        // KQ scale of the overflow FlashAttention (f32 in slot 5).
+        GGML_KVARN_SPLIT_FUSED_PARAM_KQ_SCALE   = 5,
+        // Layer id that built the node. The llama-side executor keys its
+        // per-layer persistent Vulkan/CUDA sub-graphs by it.
+        GGML_KVARN_SPLIT_FUSED_PARAM_LAYER      = 6,
+        // Executor bundle id: the llama context/cache registers one executor
+        // bundle per context and bakes its id here, so the dispatcher routes
+        // the op to the right context's sub-graphs. 0 is invalid (the CUDA
+        // supports_op gate refuses it).
+        GGML_KVARN_SPLIT_FUSED_PARAM_BUNDLE_ID  = 7,
+    };
+
+    // Fused position-split attention + merge ("peça (c)"): phase-2 executable
+    // form. ONE node replaces the overflow half of the split decode chain
+    // built by build_attn_position_split() in src/llama-graph.cpp:
+    //   overflow Q4 store (SET_ROWS) + F16 gather + FA2 + LSE2 on Vulkan,
+    //   then the LSE merge (same formula as the legacy merge, on CUDA),
+    // returning the exact o_merged the legacy chain produces
+    // (2D [D_v*H_q, Q*B] F32).
+    //
+    // The LOCAL half of the chain (Q WHT, local KVarN FA1 + exact tail,
+    // LSE1, O WHT) stays as ordinary outer-graph nodes; src[3]/src[4] carry
+    // their results. Phase-2 scope is decode-only (Q == 1) and requires the
+    // packed overflow row view (LLAMA_OVF_PACKED_VIEW), the F16 gather
+    // (LLAMA_OVF_GATHER_F16 != 0) and no raw-Q4 FA opt-in for the layer; the
+    // builder falls back to the legacy chain on every other combination.
+    //
+    // Sources (all non-NULL; phase-2 slot contract):
+    //   src[0] q_cur         [D_k, H_q,  Q, B]      F32, pre-rotation query
+    //   src[1] k_cur         [D_k, H_kv, Q, B]      F32, current-token K (stored)
+    //   src[2] v_cur         [D_v, H_kv, Q, B]      F32, current-token V (stored)
+    //   src[3] o_local       [D_v*H_q, Q*B]         F32, legacy local FA (+ tail)
+    //   src[4] lse_local     [H_q, Q, B]            F32, legacy local LSE
+    //   src[5] k_ovf         [D_k*H_kv, n_ovf_rows] Q4_0 row view of the companion
+    //   src[6] v_ovf         [D_v*H_kv, n_ovf_rows] Q4_0 row view of the companion
+    //   src[7] mask_overflow [n_ovf_rows, Q, 1, B]  F16 contiguous range mask
+    //   src[8] k_idxs        [Q*B]                  I64/I32 payload rows (store)
+    //   src[9] v_idxs        [Q*B]                  I64/I32 payload rows (store)
+    //
+    // Deferred beyond phase 2: moving the local FA1/tail/stores into the op
+    // (src[1]/src[2] are already reserved for the store half), tail route /
+    // query order / run descriptor op params, WHT domain flags, sinks / bias /
+    // softcap rejection.
+    GGML_API struct ggml_tensor * ggml_kvarn_split_fused(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_cur,
+            struct ggml_tensor  * k_cur,
+            struct ggml_tensor  * v_cur,
+            struct ggml_tensor  * o_local,
+            struct ggml_tensor  * lse_local,
+            struct ggml_tensor  * k_ovf,
+            struct ggml_tensor  * v_ovf,
+            struct ggml_tensor  * mask_overflow,
+            struct ggml_tensor  * k_idxs,
+            struct ggml_tensor  * v_idxs,
+            int                   p_split,
+            int                   n_kv_live,
+            int                   bits_k,
+            int                   bits_v,
+            int                   n_ovf_rows,
+            float                 kq_scale,
+            int                   il,
+            int                   bundle_id);
 
     // rows-indexed state read: instead of a gathered [S_v, S_v, H_v, n_seqs]
     // scratch, the op reads each sequence's live state directly from `states`

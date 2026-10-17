@@ -51,6 +51,30 @@ static std::string g_case;
     } \
 } while (0)
 
+// The product reads LLAMA_OVF_QWHT_CUDA at graph-build time; the test sets it
+// per variant so the binary is hermetic to the caller's environment.
+static void set_env_llama_ovf_qwht_cuda(const char * value) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_OVF_QWHT_CUDA", value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        setenv("LLAMA_OVF_QWHT_CUDA", value, 1);
+    } else {
+        unsetenv("LLAMA_OVF_QWHT_CUDA");
+    }
+#endif
+}
+
+// Mirrors the scheduler's own split-skip predicate
+// (ggml_backend_sched_split_graph / ggml_is_view_op in ggml-backend.cpp):
+// only true view OPS are excluded from split accounting. SET_ROWS stores
+// alias their storage via view_src but execute as real overflow nodes, so
+// skipping every view_src tensor would undercount the executable splits.
+static bool test_is_view_op(enum ggml_op op) {
+    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE ||
+           op == GGML_OP_TRANSPOSE || op == GGML_OP_KVARN_VIEW;
+}
+
 static const double kGateNrmseO       = 1e-3;   // plan 4.1: enforced cumulatively
                                                   // on the merged result (R4); the
                                                   // base/ovf reports attribute
@@ -391,11 +415,19 @@ struct merge_result {
     std::string reason;
     std::vector<float> o;
     std::vector<float> lse;
+    int  splits = 0;
+    int  overflow_splits = 0;
+    std::vector<float> q_rot;
+    std::vector<uint8_t> k2_final;
+    std::vector<uint8_t> v2_final;
     int  attn_nodes = 0;
     int  attn_nodes_on_overflow = 0;
     int  nodes_on_overflow = 0;
     bool fa1_on_requested = false;
     bool fa2_on_requested = false;
+    bool qwht_in_cont = false;        // the Q WHT input is a materialized CONT
+    bool qwht_cont_on_local = false;  // that CONT ran on the requested local backend
+    bool qwht_on_local = false;       // the Q WHT node itself landed on the local backend
 };
 
 struct eval_counters {
@@ -725,13 +757,38 @@ static merge_result run_merge(ggml_backend_t local, ggml_backend_t overflow,
 // decoded through a CPU `ggml_kvarn_materialize` side-path in the ORIGINAL
 // domain, so the same kGateNrmseO applies to the composition the product runs.
 // Requires CUDA (local) + Vulkan (overflow) + CPU (materialize side-path).
+//
+// schedule_mode:
+//   0 = single expansion (no order/placement forcing)
+//   1 = legacy expansion order + consolidated (forced) placement
+//   2 = consolidated order + forced placement (the production decode); the Q
+//       WHT stays on the Vulkan overflow backend, bit-identical to the
+//       pre-consolidation graph
+//   3 = legacy order with NO manual placements (scheduler's own placement)
+//   4 = mode 2 with the Q WHT pinned to the local CUDA backend, mirroring
+//       LLAMA_OVF_QWHT_CUDA=1 in the grouped decode; requires the env (set by
+//       the caller) and is gated by tolerance, never bitwise.
+//   5 = mode 3 (legacy order, natural placement) with the same Q WHT pin,
+//       mirroring LLAMA_OVF_QWHT_CUDA=1 on the PREFILL (non-grouped) path:
+//       stores stay in the legacy early order, the merge steps and the local
+//       O WHT keep the scheduler's placement, and only the Q WHT (and its
+//       CONT neighbor) moves to the local backend. Requires the env too;
+//       tolerance-gated, never bitwise.
+// q_layout:
+//   0 = Q is the contiguous leaf
+//   1 = Q is a non-contiguous permuted view over a backing tensor, so the WHT
+//       input is the CONT neighbor ggml_kvarn_wht_aux inserts in production;
+//       mode 4 must pin that CONT with the WHT. Same logical values, so all
+//       same-arm results stay bit-identical to q_layout 0.
 static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflow,
         int D, int n_q, int n_qh, int n_kvh,
         int n_kv1, int n_kv2,
         bool mask1_visible, int mask2_mode,
         const std::vector<float> & q,
         const std::vector<float> & k1, const std::vector<float> & v1,
-        const std::vector<uint8_t> & k2_bytes, const std::vector<uint8_t> & v2_bytes) {
+        const std::vector<uint8_t> & k2_bytes, const std::vector<uint8_t> & v2_bytes,
+        int schedule_mode = 0, int overflow_layout = 0, int store_mode = 0,
+        int q_layout = 0) {
     merge_result res;
     if (n_kv1 <= 0) {
         res.declined = true;
@@ -765,8 +822,19 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         return res;
     }
 
-    ggml_tensor * q_t   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, n_qh, 1);
-    ggml_tensor * q_rot = ggml_kvarn_wht(ctx, q_t, D);
+    // q_layout 1: the leaf is the {D, n_qh, n_q} backing and the permuted view
+    // is the non-contiguous Q (same logical {D, n_q, n_qh} values as q_t in the
+    // contiguous variant); the aux-style CONT into the WHT is the neighbor the
+    // production pin must move with the transform. fa2 consumes the CONT too:
+    // identical bits without exercising strided FA inputs, which are not part
+    // of this pin.
+    ggml_tensor * q_t   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+            D, q_layout ? n_qh : n_q, q_layout ? n_q : n_qh, 1);
+    ggml_tensor * q_wht_in = q_t;
+    if (q_layout) {
+        q_wht_in = ggml_cont(ctx, ggml_permute(ctx, q_t, 0, 2, 1, 3));
+    }
+    ggml_tensor * q_rot = ggml_kvarn_wht(ctx, q_wht_in, D);
     ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv1);
     ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, record_dim, record_heads, n_kv1 * n_stream);
     ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, record_dim, record_heads, n_kv1 * n_stream);
@@ -804,9 +872,18 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     // the original V domain before merging with the (original-domain) overflow O.
     ggml_tensor * o1 = ggml_kvarn_wht(ctx, fa1, D);
 
+    if (schedule_mode) { ggml_set_output(q_rot); }
+
     ggml_tensor * k2_t = nullptr;
     ggml_tensor * v2_t = nullptr;
     ggml_tensor * m2_t = nullptr;
+    ggml_tensor * overflow_rows = nullptr;
+    std::vector<ggml_tensor *> overflow_prep;
+    ggml_tensor * store_k = nullptr;
+    ggml_tensor * store_v = nullptr;
+    ggml_tensor * cur_store_k = nullptr;
+    ggml_tensor * cur_store_v = nullptr;
+    ggml_tensor * store_idxs = nullptr;
     ggml_tensor * fa2 = nullptr;
     ggml_tensor * lse2 = nullptr;
     ggml_tensor * o = o1;
@@ -824,14 +901,59 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     } else {
         k2_t = ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_0, D, n_kv2, n_kvh, 1);
         v2_t = ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_0, D, n_kv2, n_kvh, 1);
-        m2_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv2, n_q, n_kvh, 1);
+        m2_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv2 + (schedule_mode ? 64 : 0), n_q, n_kvh, 1);
         if (k2_bytes.size() != ggml_nbytes(k2_t) || v2_bytes.size() != ggml_nbytes(v2_t)) {
             ggml_free(ctx);
             res.declined = true;
             res.reason = "host upload byte size does not match overflow range tensors";
             return res;
         }
-        fa2 = ggml_flash_attn_ext(ctx, q_t, k2_t, v2_t, m2_t,
+        if (store_mode) {
+            // The current token written into the overflow storage by an
+            // in-graph store (SET_ROWS into k2_t/v2_t, exactly like the
+            // product's Q4 cache write); fa2's read path still consumes the
+            // storage tensor itself, so the store is ordered only by the
+            // scheduler/split barriers -- the property under test.
+            cur_store_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 1, n_kvh, 1);
+            cur_store_v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 1, n_kvh, 1);
+            store_idxs = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 1, 1);
+            store_k = ggml_set_rows(ctx, k2_t, cur_store_k, store_idxs);
+            store_v = ggml_set_rows(ctx, v2_t, cur_store_v, store_idxs);
+            ggml_set_name(store_k, "attn_ovf_store_k");
+            ggml_set_name(store_v, "attn_ovf_store_v");
+        }
+        ggml_tensor * k2_read = k2_t;
+        ggml_tensor * v2_read = v2_t;
+        ggml_tensor * m2_read = m2_t;
+        if (schedule_mode) {
+            // Capacity-sized host mask, cropped/packed on Vulkan, just like
+            // the occupied and stable-256 product paths.
+            m2_read = ggml_cont(ctx, ggml_view_4d(ctx, m2_t, n_kv2, n_q, n_kvh, 1,
+                    m2_t->nb[1], m2_t->nb[2], m2_t->nb[3], 0));
+            overflow_prep.push_back(m2_read);
+            if (overflow_layout == 1 || overflow_layout == 2) {
+                k2_read = ggml_cont(ctx, k2_t);
+                overflow_prep.push_back(k2_read);
+                if (overflow_layout == 2) {
+                    v2_read = ggml_cont(ctx, v2_t);
+                    overflow_prep.push_back(v2_read);
+                }
+            } else if (overflow_layout >= 3) {
+                overflow_rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv2, n_kvh);
+                const ggml_type type = overflow_layout == 3 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+                k2_read = ggml_get_rows_as(ctx, k2_t, overflow_rows, type);
+                v2_read = ggml_get_rows_as(ctx, v2_t, overflow_rows, type);
+                overflow_prep.push_back(k2_read);
+                overflow_prep.push_back(v2_read);
+                if (type == GGML_TYPE_F32) {
+                    k2_read = ggml_cast(ctx, k2_read, GGML_TYPE_F16);
+                    v2_read = ggml_cast(ctx, v2_read, GGML_TYPE_F16);
+                    overflow_prep.push_back(k2_read);
+                    overflow_prep.push_back(v2_read);
+                }
+            }
+        }
+        fa2 = ggml_flash_attn_ext(ctx, q_wht_in, k2_read, v2_read, m2_read,
                 1.0f / std::sqrt(float(D)), 0.0f, 0.0f);
         ggml_prec_set_acc(fa2, GGML_PREC_F32);
         lse2 = ggml_flash_attn_ext_lse_out(ctx, fa2);
@@ -865,6 +987,11 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         lse_merged = ggml_add(ctx, mx, ggml_log(ctx, den));
     }
 
+    // Reproduce the product's output ownership, including the CUDA LSE add.
+    ggml_tensor * merged_div = o;
+    if (schedule_mode) {
+        o = ggml_cont(ctx, o);
+    }
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (cpu == nullptr) {
         ggml_free(ctx);
@@ -875,7 +1002,40 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     ggml_backend_t backends[3] = { overflow, local, cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 3, 8192, false, true);
     ggml_backend_sched_set_tensor_backend(sched, q_t, local);
-    ggml_backend_sched_set_tensor_backend(sched, q_rot, local);
+    if (schedule_mode == 4 || schedule_mode == 5) {
+        // LLAMA_OVF_QWHT_CUDA=1 arms: mirror llama-graph.cpp's opt-in pin and
+        // move the Q WHT (and its CONT neighbor, when Q arrives as a view)
+        // onto the local (CUDA) backend. Mode 4 is the grouped-decode arm,
+        // mode 5 the prefill arm; both fail closed if the env is not exactly
+        // "1" or CUDA cannot run the transform; these variants exist to
+        // exercise those exact production configurations.
+        const char * env = std::getenv("LLAMA_OVF_QWHT_CUDA");
+        if (env == nullptr || std::strcmp(env, "1") != 0) {
+            ggml_backend_sched_free(sched);
+            ggml_backend_free(cpu);
+            ggml_free(ctx);
+            res.declined = true;
+            res.reason = "schedule_mode 4/5 requires LLAMA_OVF_QWHT_CUDA=1";
+            return res;
+        }
+        if (!ggml_backend_supports_op(local, q_rot)) {
+            ggml_backend_sched_free(sched);
+            ggml_backend_free(cpu);
+            ggml_free(ctx);
+            res.declined = true;
+            res.reason = "CUDA WHT not supported for this shape (LLAMA_OVF_QWHT_CUDA=1)";
+            return res;
+        }
+        ggml_backend_sched_set_tensor_backend(sched, q_rot, local);
+        if (q_rot->src[0]->op == GGML_OP_CONT) {
+            ggml_backend_sched_set_tensor_backend(sched, q_rot->src[0], local);
+        }
+    } else if (schedule_mode != 3 && schedule_mode != 5) {
+        // Modes 3 and 5 leave the Q WHT to the scheduler on purpose (the
+        // legacy order reproduces the pre-consolidation placement naturally);
+        // mode 5 pins it to local in the branch above instead.
+        ggml_backend_sched_set_tensor_backend(sched, q_rot, schedule_mode ? overflow : local);
+    }
     ggml_backend_sched_set_tensor_backend(sched, indices, local);
     ggml_backend_sched_set_tensor_backend(sched, current_k, local);
     ggml_backend_sched_set_tensor_backend(sched, current_v, local);
@@ -890,20 +1050,104 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     ggml_backend_sched_set_tensor_backend(sched, m1_t, local);
     ggml_backend_sched_set_tensor_backend(sched, fa1, local);
     ggml_backend_sched_set_tensor_backend(sched, lse1, local);
-    ggml_backend_sched_set_tensor_backend(sched, o1, local);
+    if (schedule_mode != 3 && schedule_mode != 5) {
+        // Modes 3 and 5 leave the local O WHT to the scheduler on purpose.
+        ggml_backend_sched_set_tensor_backend(sched, o1, schedule_mode ? overflow : local);
+    }
     if (with_overflow) {
         ggml_backend_sched_set_tensor_backend(sched, k2_t, overflow);
         ggml_backend_sched_set_tensor_backend(sched, v2_t, overflow);
-        ggml_backend_sched_set_tensor_backend(sched, m2_t, overflow);
+        ggml_backend_sched_set_tensor_backend(sched, m2_t, schedule_mode ? cpu : overflow);
+        if (overflow_rows) { ggml_backend_sched_set_tensor_backend(sched, overflow_rows, cpu); }
+        for (ggml_tensor * node : overflow_prep) {
+            ggml_backend_sched_set_tensor_backend(sched, node, overflow);
+        }
+        if (store_k) {
+            // The store writes the overflow storage, so it belongs to the same
+            // backend as k2_t/v2_t by contract, not by scheduling choice.
+            ggml_backend_sched_set_tensor_backend(sched, store_k, overflow);
+            ggml_backend_sched_set_tensor_backend(sched, store_v, overflow);
+            ggml_backend_sched_set_tensor_backend(sched, cur_store_k, overflow);
+            ggml_backend_sched_set_tensor_backend(sched, cur_store_v, overflow);
+            ggml_backend_sched_set_tensor_backend(sched, store_idxs, overflow);
+        }
         ggml_backend_sched_set_tensor_backend(sched, fa2, overflow);
         ggml_backend_sched_set_tensor_backend(sched, lse2, overflow);
     }
     ggml_backend_sched_set_tensor_backend(sched, o, local);
-    ggml_backend_sched_set_tensor_backend(sched, lse_merged, local);
+    if (schedule_mode != 3 && schedule_mode != 5) {
+        // Modes 3 and 5 mirror the production prefill/unanchored arms, which
+        // leave the reader-less merged LSE to the scheduler; the forced arms
+        // keep the pin for their bitwise A/B isolation.
+        ggml_backend_sched_set_tensor_backend(sched, lse_merged, local);
+    }
 
+    if (schedule_mode) {
+        // Model inputs are recomputed/uploaded and KV storage is externally
+        // allocated in production. Keep these fixture leaves alive across both
+        // evaluations instead of letting the graph allocator recycle them.
+        for (ggml_tensor * leaf : { q_t, indices, current_k, current_v, k_stage, v_stage,
+                k_records, v_records, m1_t, k2_t, v2_t, m2_t, overflow_rows, eps,
+                cur_store_k, cur_store_v, store_idxs }) {
+            if (leaf) { ggml_set_output(leaf); }
+        }
+    }
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, o);
-    ggml_build_forward_expand(gf, lse_merged);
+    if (schedule_mode) {
+        // Modes 1 and 3 reproduce the pre-consolidation (legacy) expansion
+        // order: the overflow stores run first, then fa1, fa2, lse1, lse2.
+        // Mode 2 follows the consolidated order: fa1/lse1 finish first, then
+        // the moved overflow stores join fa2. Modes 1/2 force the consolidated
+        // arm's placement of the Q WHT, the local O WHT and the merge steps;
+        // mode 3 keeps the legacy order WITHOUT those manual placements, so
+        // bit-equality with mode 2 proves the consolidated schedule changed no
+        // bit under the scheduler's natural (legacy) placement too. Q WHT
+        // stays on Vulkan in the forced arms: at D=256 its F32 results differ
+        // from CUDA, so that pre-local split is unavoidable. Mode 4 is the
+        // mode-2 schedule with the Q WHT forced onto the local CUDA backend
+        // (LLAMA_OVF_QWHT_CUDA=1), which drops that pre-local split. Mode 5 is
+        // the mode-3 (legacy prefill) schedule with only that same pin, the
+        // production prefill shape.
+        ggml_build_forward_expand(gf, stored_k);
+        ggml_build_forward_expand(gf, stored_v);
+        if (schedule_mode == 1 || schedule_mode == 3 || schedule_mode == 5) {
+            if (store_k) {
+                ggml_build_forward_expand(gf, store_k);
+                ggml_build_forward_expand(gf, store_v);
+            }
+            ggml_build_forward_expand(gf, q_rot);
+        }
+        ggml_build_forward_expand(gf, fa1);
+        if (schedule_mode == 2 || schedule_mode == 4) {
+            ggml_build_forward_expand(gf, lse1);
+            if (store_k) {
+                ggml_build_forward_expand(gf, store_k);
+                ggml_build_forward_expand(gf, store_v);
+            }
+        }
+        ggml_build_forward_expand(gf, fa2);
+        ggml_build_forward_expand(gf, lse1);
+        ggml_build_forward_expand(gf, lse2);
+        const int merge_begin = ggml_graph_n_nodes(gf);
+        ggml_build_forward_expand(gf, merged_div);
+        ggml_build_forward_expand(gf, lse_merged);
+        ggml_build_forward_expand(gf, o);
+        if (schedule_mode != 3 && schedule_mode != 5) {
+            // The production graph's unpinned intermediates followed lse2 onto
+            // Vulkan already. Pin both forced arms identically to isolate
+            // ordering; modes 3 and 5 let the scheduler reproduce that
+            // placement (production prefill does the same).
+            for (int i = merge_begin; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node != o && node != lse_merged && !node->view_src) {
+                    ggml_backend_sched_set_tensor_backend(sched, node, overflow);
+                }
+            }
+        }
+    } else {
+        ggml_build_forward_expand(gf, o);
+        ggml_build_forward_expand(gf, lse_merged);
+    }
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         ggml_backend_sched_free(sched);
         ggml_backend_free(cpu);
@@ -911,6 +1155,27 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         res.declined = true;
         res.reason = "sched_alloc_graph failed";
         return res;
+    }
+
+    res.splits = ggml_backend_sched_get_n_splits(sched);
+    res.qwht_in_cont = q_rot->src[0]->op == GGML_OP_CONT;
+    if (res.qwht_in_cont) {
+        res.qwht_cont_on_local =
+                ggml_backend_sched_get_tensor_backend(sched, q_rot->src[0]) == local;
+    }
+    res.qwht_on_local = ggml_backend_sched_get_tensor_backend(sched, q_rot) == local;
+    // Count the runs of overflow-placed executable nodes, mirroring the
+    // scheduler's own split pass (ggml_backend_sched_split_graph): view ops are
+    // skipped via test_is_view_op, but the SET_ROWS overflow stores carry a
+    // view_src over their storage and DO execute as overflow nodes, so they
+    // form a real Vulkan cluster and must be counted.
+    ggml_backend_t previous = nullptr;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (test_is_view_op(node->op)) { continue; }
+        ggml_backend_t current = ggml_backend_sched_get_tensor_backend(sched, node);
+        if (current != previous && current == overflow) { ++res.overflow_splits; }
+        previous = current;
     }
 
     eval_counters counters;
@@ -944,7 +1209,26 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     if (eps != nullptr) {
         ggml_backend_tensor_set(eps, &eps_value, 0, sizeof(float));
     }
-    ggml_backend_tensor_set(q_t, q.data(), 0, ggml_nbytes(q_t));
+    // q_layout 1 uploads the same logical Q in the backing's {D, n_qh, n_q}
+    // physical order, so the permuted view + CONT reproduce q bit for bit.
+    const auto q_to_leaf = [&](const std::vector<float> & src) {
+        if (!q_layout) {
+            return src;
+        }
+        std::vector<float> dst(src.size());
+        for (int h = 0; h < n_qh; ++h) {
+            for (int t = 0; t < n_q; ++t) {
+                for (int d = 0; d < D; ++d) {
+                    dst[(size_t(t) * n_qh + h) * D + d] = src[(size_t(h) * n_q + t) * D + d];
+                }
+            }
+        }
+        return dst;
+    };
+    {
+        const std::vector<float> q_leaf_data = q_to_leaf(q);
+        ggml_backend_tensor_set(q_t, q_leaf_data.data(), 0, ggml_nbytes(q_t));
+    }
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
     ggml_backend_tensor_set(current_k, ck.data(), 0, ggml_nbytes(current_k));
     ggml_backend_tensor_set(current_v, cv.data(), 0, ggml_nbytes(current_v));
@@ -960,14 +1244,14 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         ggml_backend_tensor_set(m1_t, m1_data.data(), 0, ggml_nbytes(m1_t));
     }
     if (with_overflow) {
-        std::vector<ggml_fp16_t> m2_data(size_t(n_kv2) * n_kvh * n_q, ggml_fp32_to_fp16(-INFINITY));
+        std::vector<ggml_fp16_t> m2_data(size_t(m2_t->ne[0]) * n_kvh * n_q, ggml_fp32_to_fp16(-INFINITY));
         for (int t = 0; t < n_q; ++t) {
             for (int kh = 0; kh < n_kvh; ++kh) {
                 for (int s = 0; s < n_kv2; ++s) {
                     const bool vis = mask2_mode == 0 ? true
                                     : mask2_mode == 2 ? false
                                     : s <= t + n_kv2 - n_q;
-                    const size_t off = (size_t(kh) * n_q + t) * n_kv2 + s;
+                    const size_t off = (size_t(kh) * n_q + t) * m2_t->ne[0] + s;
                     m2_data[off] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
                 }
             }
@@ -975,6 +1259,25 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
         ggml_backend_tensor_set(m2_t, m2_data.data(), 0, ggml_nbytes(m2_t));
         ggml_backend_tensor_set(k2_t, k2_bytes.data(), 0, ggml_nbytes(k2_t));
         ggml_backend_tensor_set(v2_t, v2_bytes.data(), 0, ggml_nbytes(v2_t));
+    }
+    if (store_k) {
+        // Deterministic current-token values, distinct from any storage row.
+        std::vector<float> store_row_k(size_t(D) * size_t(n_kvh));
+        std::vector<float> store_row_v(size_t(D) * size_t(n_kvh));
+        for (size_t i = 0; i < store_row_k.size(); ++i) {
+            store_row_k[i] = 0.5f * float(int(i % 97)) - 20.0f;
+            store_row_v[i] = 0.25f * float(int(i % 61)) - 8.0f;
+        }
+        const int64_t store_row_idx = n_kv2 - 1;
+        ggml_backend_tensor_set(cur_store_k, store_row_k.data(), 0, ggml_nbytes(cur_store_k));
+        ggml_backend_tensor_set(cur_store_v, store_row_v.data(), 0, ggml_nbytes(cur_store_v));
+        ggml_backend_tensor_set(store_idxs, &store_row_idx, 0, ggml_nbytes(store_idxs));
+    }
+
+    if (overflow_rows) {
+        std::vector<int32_t> rows(size_t(n_kv2) * n_kvh);
+        for (size_t i = 0; i < rows.size(); ++i) { rows[i] = i % n_kv2; }
+        ggml_backend_tensor_set(overflow_rows, rows.data(), 0, ggml_nbytes(overflow_rows));
     }
 
     int attn = 0;
@@ -991,14 +1294,41 @@ static merge_result run_merge_kvarn(ggml_backend_t local, ggml_backend_t overflo
     }
     res.attn_nodes = attn;
 
-    if (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS) {
-        res.o.assign(ggml_nelements(o), 0.0f);
-        res.lse.assign(ggml_nelements(lse_merged), 0.0f);
-        ggml_backend_tensor_get(o, res.o.data(), 0, ggml_nbytes(o));
-        ggml_backend_tensor_get(lse_merged, res.lse.data(), 0, ggml_nbytes(lse_merged));
+    // Reuse the allocated graph with changed Q to catch stale cross-backend
+    // copies and lifetime mistakes, not just a successful first allocation.
+    for (int pass = 0; pass < (schedule_mode ? 2 : 1); ++pass) {
+        if (pass) {
+            std::vector<float> next_q = q;
+            for (float & x : next_q) { x = -x; }
+            const std::vector<float> next_leaf = q_to_leaf(next_q);
+            ggml_backend_tensor_set(q_t, next_leaf.data(), 0, ggml_nbytes(q_t));
+        }
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+            res.declined = true;
+            res.reason = "sched_graph_compute failed";
+            break;
+        }
+        if (schedule_mode) {
+            const size_t offset = res.q_rot.size();
+            res.q_rot.resize(offset + ggml_nelements(q_rot));
+            ggml_backend_tensor_get(q_rot, res.q_rot.data() + offset, 0, ggml_nbytes(q_rot));
+        }
+        const size_t o_offset = res.o.size();
+        const size_t l_offset = res.lse.size();
+        res.o.resize(o_offset + ggml_nelements(o));
+        res.lse.resize(l_offset + ggml_nelements(lse_merged));
+        ggml_backend_tensor_get(o, res.o.data() + o_offset, 0, ggml_nbytes(o));
+        ggml_backend_tensor_get(lse_merged, res.lse.data() + l_offset, 0, ggml_nbytes(lse_merged));
         res.attn_nodes_on_overflow = counters.attn_on_overflow;
         res.nodes_on_overflow = counters.on_overflow;
-
+    }
+    if (store_k && !res.declined) {
+        // Post-run storage bytes: the caller re-runs the same graph with these
+        // bytes pre-filled and no store to prove fa2 consumed the stored row.
+        res.k2_final.resize(ggml_nbytes(k2_t));
+        res.v2_final.resize(ggml_nbytes(v2_t));
+        ggml_backend_tensor_get(k2_t, res.k2_final.data(), 0, res.k2_final.size());
+        ggml_backend_tensor_get(v2_t, res.v2_final.data(), 0, res.v2_final.size());
     }
     ggml_backend_sched_free(sched);
     ggml_backend_free(cpu);
@@ -1094,6 +1424,335 @@ int main() {
         // (NRMSE <= 1.7e-4). This prototype therefore proves the merge
         // composition, the scheduler copies and the empty-range contract on
         // the backend pair it can drive.
+        const auto same_bits = [](const std::vector<float> & a, const std::vector<float> & b) {
+            return !a.empty() && a.size() == b.size() &&
+                    std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        };
+        const auto pass_bits = [](const std::vector<float> & v, bool second) {
+            const size_t h = v.size() / 2;
+            return std::vector<float>(v.begin() + (second ? h : 0),
+                    v.begin() + (second ? 2 * h : h));
+        };
+        if (n_q == 1) {
+            for (int layout = 0; layout < 5; ++layout) {
+                // Mode 1: legacy expansion order + the consolidated arm's forced
+                // (pinned) placement. Mode 2: consolidated order + forced
+                // placement (the production decode). Mode 3: legacy order with
+                // NO manual placement of the Q WHT, the local O WHT nor the
+                // merge steps, so the scheduler reproduces the legacy
+                // placement by itself. All three carry the in-graph overflow
+                // store of the current token.
+                const merge_result before = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 1, layout, 1);
+                const merge_result after = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 2, layout, 1);
+                const merge_result plain = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 3, layout, 1);
+                CHECK(!before.declined && !after.declined && !plain.declined);
+                if (before.declined || after.declined || plain.declined) {
+                    continue;
+                }
+                CHECK(same_bits(before.q_rot, after.q_rot));
+                CHECK(same_bits(before.o, after.o));
+                CHECK(same_bits(before.lse, after.lse));
+                // The legacy order under the scheduler's own placement must be
+                // bit-identical to the consolidated arm as well.
+                CHECK(same_bits(plain.q_rot, after.q_rot));
+                CHECK(same_bits(plain.o, after.o));
+                CHECK(same_bits(plain.lse, after.lse));
+                CHECK(before.overflow_splits == 3);
+                CHECK(after.overflow_splits == 2);
+                CHECK(after.splits == before.splits - 2);
+
+                // The in-graph overflow store must be visible to fa2's read
+                // path. First prove it executed (the stored token row changed
+                // in the post-run storage bytes), then re-run the same graph
+                // with those bytes pre-filled and NO store: identical O/LSE
+                // proves the first run's fa2 consumed the stored row.
+                bool store_changed = false;
+                CHECK(after.k2_final.size() == k2b.size() &&
+                      after.v2_final.size() == v2b.size());
+                if (after.k2_final.size() == k2b.size()) {
+                    const size_t row = ggml_row_size(GGML_TYPE_Q4_0, D);
+                    const size_t plane = row * size_t(sh.n_kv2);
+                    for (int kh = 0; kh < n_kvh && !store_changed; ++kh) {
+                        const size_t off = size_t(sh.n_kv2 - 1) * row + size_t(kh) * plane;
+                        if (std::memcmp(after.k2_final.data() + off, k2b.data() + off, row) != 0) {
+                            store_changed = true;
+                        }
+                    }
+                }
+                CHECK(store_changed);
+                const merge_result ctl = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1,
+                        after.k2_final, after.v2_final, 2, layout, 0);
+                CHECK(!ctl.declined);
+                if (!ctl.declined) {
+                    CHECK(same_bits(ctl.o, after.o));
+                    CHECK(same_bits(ctl.lse, after.lse));
+                }
+
+                // LLAMA_OVF_QWHT_CUDA=1 arm (mode 4): the same consolidated
+                // schedule with the Q WHT on the local CUDA backend instead of
+                // Vulkan. The test sets the env itself, so the binary behaves
+                // identically regardless of the caller's environment. The Q
+                // WHT bits then differ from the Vulkan arm (at D=256), so the
+                // comparison against the default arm and its oracle-adjacent
+                // gates is TOLERANCE-based (nrmse), never bitwise; the reused
+                // graph's second pass stays bitwise against a fresh graph of
+                // the same arm.
+                set_env_llama_ovf_qwht_cuda("1");
+                const merge_result cuda_arm = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 4, layout, 1);
+                std::vector<float> q_neg4 = q;
+                for (float & x : q_neg4) { x = -x; }
+                const merge_result cuda_fresh = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q_neg4, k1, v1, k2b, v2b, 4, layout, 1);
+                // Mode-4 mirror of the mode-2 visibility control: re-run the
+                // same arm with the mode-4 run's post-run storage bytes
+                // pre-filled and NO store. Identical bits prove the mode-4
+                // fa2 consumed the row its own store wrote.
+                bool cuda_store_changed = false;
+                CHECK(cuda_arm.k2_final.size() == k2b.size() &&
+                      cuda_arm.v2_final.size() == v2b.size());
+                if (cuda_arm.k2_final.size() == k2b.size()) {
+                    const size_t row = ggml_row_size(GGML_TYPE_Q4_0, D);
+                    const size_t plane = row * size_t(sh.n_kv2);
+                    for (int kh = 0; kh < n_kvh && !cuda_store_changed; ++kh) {
+                        const size_t off = size_t(sh.n_kv2 - 1) * row + size_t(kh) * plane;
+                        if (std::memcmp(cuda_arm.k2_final.data() + off, k2b.data() + off, row) != 0) {
+                            cuda_store_changed = true;
+                        }
+                    }
+                }
+                CHECK(cuda_store_changed);
+                const merge_result ctl4 = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1,
+                        cuda_arm.k2_final, cuda_arm.v2_final, 4, layout, 0);
+                // Non-contiguous Q variant of the mode-4 arm: the permuted
+                // view with the aux-style CONT into the WHT exercises the
+                // CONT neighbor the production pin must move with it.
+                const merge_result cuda_perm = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 4, layout, 1, 1);
+                set_env_llama_ovf_qwht_cuda(nullptr);
+                CHECK(!cuda_arm.declined);
+                CHECK(!cuda_fresh.declined);
+                double cuda_q_nrmse = INFINITY;
+                double cuda_o_nrmse = INFINITY;
+                double cuda_lse_nrmse = INFINITY;
+                bool cuda_fresh_bits = false;
+                if (!cuda_arm.declined && !cuda_fresh.declined) {
+                    // Plan gates: nrmse Q/O <= 1e-3 and LSE <= 1e-2 against
+                    // the default (Vulkan-WHT) arm, not bitwise.
+                    cuda_q_nrmse = nrmse_ff(cuda_arm.q_rot, after.q_rot);
+                    cuda_o_nrmse = nrmse_ff(cuda_arm.o, after.o);
+                    cuda_lse_nrmse = nrmse_ff(cuda_arm.lse, after.lse);
+                    CHECK(cuda_q_nrmse <= 1e-3);
+                    CHECK(cuda_o_nrmse <= 1e-3);
+                    CHECK(cuda_lse_nrmse <= 1e-2);
+                    // One fewer Vulkan cluster per layer (SET_ROWS stores
+                    // counted, as in ggml_backend_sched_split_graph): the Q
+                    // WHT no longer runs as its own pre-local split. The
+                    // direct placement proof is the qwht_on_local check.
+                    CHECK(cuda_arm.overflow_splits == after.overflow_splits - 1);
+                    CHECK(cuda_arm.splits == after.splits - 2);
+                    CHECK(cuda_arm.qwht_on_local && !after.qwht_on_local);
+                    cuda_fresh_bits =
+                        same_bits(pass_bits(cuda_arm.o, false), pass_bits(cuda_fresh.o, true)) &&
+                        same_bits(pass_bits(cuda_arm.o, true), pass_bits(cuda_fresh.o, false)) &&
+                        same_bits(pass_bits(cuda_arm.lse, false), pass_bits(cuda_fresh.lse, true)) &&
+                        same_bits(pass_bits(cuda_arm.lse, true), pass_bits(cuda_fresh.lse, false)) &&
+                        same_bits(pass_bits(cuda_arm.q_rot, false), pass_bits(cuda_fresh.q_rot, true)) &&
+                        same_bits(pass_bits(cuda_arm.q_rot, true), pass_bits(cuda_fresh.q_rot, false));
+                    CHECK(cuda_fresh_bits);
+                }
+                std::printf("  cuda-qwht D%d layout%d: splits %d vs %d, Vulkan clusters %d vs %d, "
+                        "nrmse Q=%.3e O=%.3e LSE=%.3e, fresh-negQ=%d, qwht-local=%d/%d\n",
+                        D, layout, after.splits, cuda_arm.splits,
+                        after.overflow_splits, cuda_arm.overflow_splits,
+                        cuda_q_nrmse, cuda_o_nrmse, cuda_lse_nrmse, int(cuda_fresh_bits),
+                        int(after.qwht_on_local), int(cuda_arm.qwht_on_local));
+
+                // Mode-4 visibility control and permuted-Q variants. Same-arm
+                // comparisons stay bitwise (identical logical Q bits into the
+                // same CUDA WHT); the mode-4 tolerance gates (Q/O nrmse <=
+                // 1e-3, LSE <= 1e-2) still apply against the default arm.
+                CHECK(!ctl4.declined);
+                CHECK(!cuda_perm.declined);
+                double perm_q_nrmse = INFINITY;
+                double perm_o_nrmse = INFINITY;
+                double perm_lse_nrmse = INFINITY;
+                bool ctl4_bits = false;
+                bool perm_bits = false;
+                if (!ctl4.declined && !cuda_arm.declined) {
+                    ctl4_bits = same_bits(ctl4.o, cuda_arm.o) && same_bits(ctl4.lse, cuda_arm.lse);
+                    CHECK(ctl4_bits);
+                }
+                if (!cuda_perm.declined && !cuda_arm.declined) {
+                    CHECK(cuda_perm.qwht_in_cont);
+                    CHECK(cuda_perm.qwht_cont_on_local);
+                    perm_bits = same_bits(cuda_perm.q_rot, cuda_arm.q_rot) &&
+                                same_bits(cuda_perm.o, cuda_arm.o) &&
+                                same_bits(cuda_perm.lse, cuda_arm.lse);
+                    CHECK(perm_bits);
+                    perm_q_nrmse = nrmse_ff(cuda_perm.q_rot, after.q_rot);
+                    perm_o_nrmse = nrmse_ff(cuda_perm.o, after.o);
+                    perm_lse_nrmse = nrmse_ff(cuda_perm.lse, after.lse);
+                    CHECK(perm_q_nrmse <= 1e-3);
+                    CHECK(perm_o_nrmse <= 1e-3);
+                    CHECK(perm_lse_nrmse <= 1e-2);
+                }
+                std::printf("  cuda-qwht ctl/perm D%d layout%d: store-to-fa2=%d, qwht-cont=%d/%d, "
+                        "same-arm bits=%d/%d, nrmse Q=%.3e O=%.3e LSE=%.3e\n",
+                        D, layout, int(cuda_store_changed && !ctl4.declined),
+                        int(cuda_perm.qwht_in_cont), int(cuda_perm.qwht_cont_on_local),
+                        int(ctl4_bits), int(perm_bits),
+                        perm_q_nrmse, perm_o_nrmse, perm_lse_nrmse);
+
+                // The reused graph's pass 2 (Q negated in place) must match a
+                // FRESH graph allocated with the negated Q up front, per arm.
+                std::vector<float> q_neg = q;
+                for (float & x : q_neg) { x = -x; }
+                bool fresh_ok = true;
+                for (int mode = 1; mode <= 3; ++mode) {
+                    const merge_result & base_ref = mode == 1 ? before : (mode == 2 ? after : plain);
+                    const merge_result fresh = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                            sh.n_kv1, sh.n_kv2, true, 1, q_neg, k1, v1, k2b, v2b, mode, layout, 1);
+                    CHECK(!fresh.declined);
+                    if (fresh.declined) {
+                        fresh_ok = false;
+                        continue;
+                    }
+                    CHECK(same_bits(pass_bits(base_ref.o, false), pass_bits(fresh.o, true)));
+                    CHECK(same_bits(pass_bits(base_ref.o, true), pass_bits(fresh.o, false)));
+                    CHECK(same_bits(pass_bits(base_ref.lse, false), pass_bits(fresh.lse, true)));
+                    CHECK(same_bits(pass_bits(base_ref.lse, true), pass_bits(fresh.lse, false)));
+                    CHECK(same_bits(pass_bits(base_ref.q_rot, false), pass_bits(fresh.q_rot, true)));
+                    CHECK(same_bits(pass_bits(base_ref.q_rot, true), pass_bits(fresh.q_rot, false)));
+                }
+                std::printf("  decode scheduling D%d layout%d: splits %d -> %d, Vulkan clusters %d -> %d, "
+                        "bitwise Q/O/LSE=%d/%d/%d, legacy-order-no-pin Q/O/LSE=%d/%d/%d, "
+                        "store-to-fa2=%d, fresh-negQ=%d\n", D, layout, before.splits, after.splits,
+                        before.overflow_splits, after.overflow_splits,
+                        int(same_bits(before.q_rot, after.q_rot)), int(same_bits(before.o, after.o)),
+                        int(same_bits(before.lse, after.lse)),
+                        int(same_bits(plain.q_rot, after.q_rot)), int(same_bits(plain.o, after.o)),
+                        int(same_bits(plain.lse, after.lse)),
+                        int(store_changed && !ctl.declined), int(fresh_ok));
+            }
+        }
+
+        // LLAMA_OVF_QWHT_CUDA=1 prefill arm (mode 5): the production prefill
+        // runs the non-grouped path (ne[2] != 1), keeps the legacy expansion
+        // order (stores early, no deferred overflow store) and leaves the
+        // local O WHT and the merge steps to the scheduler. Mode 3 is that
+        // untouched reference arm; mode 5 adds ONLY the Q WHT (and its CONT
+        // neighbor) pin to the local CUDA backend, exactly like the
+        // production prefill change, so the A/B isolates the relocation. At
+        // D=256 the CUDA WHT bits differ from Vulkan, so the comparison is
+        // TOLERANCE-based (nrmse Q/O <= 1e-3, LSE <= 1e-2), never bitwise;
+        // the permuted-Q variant exercises the CONT neighbor under the same
+        // pin and the fresh-negQ parity checks the arm's own reused graph.
+        if (n_q > 1) {
+            for (int layout = 0; layout < 5; ++layout) {
+                const merge_result pre = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 3, layout, 1);
+                set_env_llama_ovf_qwht_cuda("1");
+                const merge_result pre_cuda = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 5, layout, 1);
+                const merge_result pre_perm = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1, k2b, v2b, 5, layout, 1, 1);
+                std::vector<float> q_neg5 = q;
+                for (float & x : q_neg5) { x = -x; }
+                const merge_result pre_fresh = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q_neg5, k1, v1, k2b, v2b, 5, layout, 1);
+                // Mode-4-style visibility control: re-run the arm with its own
+                // post-run storage bytes and NO store. Identical bits prove
+                // the prefill arm's fa2 consumed the row its store wrote.
+                bool pre_store_changed = false;
+                CHECK(pre_cuda.k2_final.size() == k2b.size() &&
+                      pre_cuda.v2_final.size() == v2b.size());
+                if (pre_cuda.k2_final.size() == k2b.size()) {
+                    const size_t row = ggml_row_size(GGML_TYPE_Q4_0, D);
+                    const size_t plane = row * size_t(sh.n_kv2);
+                    for (int kh = 0; kh < n_kvh && !pre_store_changed; ++kh) {
+                        const size_t off = size_t(sh.n_kv2 - 1) * row + size_t(kh) * plane;
+                        if (std::memcmp(pre_cuda.k2_final.data() + off, k2b.data() + off, row) != 0) {
+                            pre_store_changed = true;
+                        }
+                    }
+                }
+                CHECK(pre_store_changed);
+                const merge_result ctl5 = run_merge_kvarn(cuda, vk, D, n_q, n_qh, n_kvh,
+                        sh.n_kv1, sh.n_kv2, true, 1, q, k1, v1,
+                        pre_cuda.k2_final, pre_cuda.v2_final, 5, layout, 0);
+                set_env_llama_ovf_qwht_cuda(nullptr);
+                CHECK(!pre.declined);
+                CHECK(!pre_cuda.declined);
+                CHECK(!pre_perm.declined);
+                CHECK(!pre_fresh.declined);
+                CHECK(!ctl5.declined);
+                double pre_q_nrmse = INFINITY;
+                double pre_o_nrmse = INFINITY;
+                double pre_lse_nrmse = INFINITY;
+                bool pre_fresh_bits = false;
+                if (!pre.declined && !pre_cuda.declined) {
+                    pre_q_nrmse = nrmse_ff(pre_cuda.q_rot, pre.q_rot);
+                    pre_o_nrmse = nrmse_ff(pre_cuda.o, pre.o);
+                    pre_lse_nrmse = nrmse_ff(pre_cuda.lse, pre.lse);
+                    CHECK(pre_q_nrmse <= 1e-3);
+                    CHECK(pre_o_nrmse <= 1e-3);
+                    CHECK(pre_lse_nrmse <= 1e-2);
+                    // Corrected Vulkan-cluster count, with the SET_ROWS
+                    // overflow stores included exactly as the scheduler
+                    // counts them: on the prefill expansion order the Q WHT
+                    // relocation does NOT remove a Vulkan cluster -- the
+                    // early overflow stores keep that segment alive (3 vs 3,
+                    // stable for all three non-decode shapes and layouts),
+                    // unlike the grouped decode where removing the interior
+                    // Vulkan split drops one cluster (3 -> 2) and merges two
+                    // CUDA segments (-2 total splits). The total split count
+                    // is unchanged here because the segment that carried the
+                    // WHT is replaced by the CUDA segment around it (7 vs
+                    // 7). The direct placement proof is the qwht_on_local
+                    // check below.
+                    CHECK(pre_cuda.overflow_splits == pre.overflow_splits);
+                    CHECK(pre_cuda.splits == pre.splits);
+                    CHECK(pre_cuda.qwht_on_local && !pre.qwht_on_local);
+                }
+                if (!pre_cuda.declined && !pre_fresh.declined) {
+                    pre_fresh_bits =
+                        same_bits(pass_bits(pre_cuda.o, false), pass_bits(pre_fresh.o, true)) &&
+                        same_bits(pass_bits(pre_cuda.o, true), pass_bits(pre_fresh.o, false)) &&
+                        same_bits(pass_bits(pre_cuda.lse, false), pass_bits(pre_fresh.lse, true)) &&
+                        same_bits(pass_bits(pre_cuda.lse, true), pass_bits(pre_fresh.lse, false)) &&
+                        same_bits(pass_bits(pre_cuda.q_rot, false), pass_bits(pre_fresh.q_rot, true)) &&
+                        same_bits(pass_bits(pre_cuda.q_rot, true), pass_bits(pre_fresh.q_rot, false));
+                    CHECK(pre_fresh_bits);
+                }
+                bool pre_perm_bits = false;
+                if (!pre_perm.declined && !pre_cuda.declined) {
+                    CHECK(pre_perm.qwht_in_cont);
+                    CHECK(pre_perm.qwht_cont_on_local);
+                    pre_perm_bits = same_bits(pre_perm.q_rot, pre_cuda.q_rot) &&
+                                    same_bits(pre_perm.o, pre_cuda.o) &&
+                                    same_bits(pre_perm.lse, pre_cuda.lse);
+                    CHECK(pre_perm_bits);
+                }
+                bool ctl5_bits = false;
+                if (!ctl5.declined && !pre_cuda.declined) {
+                    ctl5_bits = same_bits(ctl5.o, pre_cuda.o) && same_bits(ctl5.lse, pre_cuda.lse);
+                    CHECK(ctl5_bits);
+                }
+                std::printf("  cuda-qwht prefill D%d Q%d layout%d: splits %d vs %d, Vulkan clusters %d vs %d, "
+                        "nrmse Q=%.3e O=%.3e LSE=%.3e, fresh-negQ=%d, store-to-fa2=%d, perm=%d, qwht-local=%d/%d\n",
+                        D, n_q, layout, pre.splits, pre_cuda.splits,
+                        pre.overflow_splits, pre_cuda.overflow_splits,
+                        pre_q_nrmse, pre_o_nrmse, pre_lse_nrmse,
+                        int(pre_fresh_bits), int(pre_store_changed && ctl5_bits), int(pre_perm_bits),
+                        int(pre.qwht_on_local), int(pre_cuda.qwht_on_local));
+            }
+        }
         const merge_result m = run_merge(vk, vk, D, n_q, n_qh, n_kvh,
                 sh.n_kv1, sh.n_kv2, GGML_TYPE_Q4_0, true, 1,
                 q, k1, v1, k2, v2, k1b, v1b, k2b, v2b);

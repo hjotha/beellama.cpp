@@ -20,11 +20,13 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <exception>
@@ -1986,6 +1988,29 @@ static bool common_fit_mixed_kv_context(common_params & params, llama_model * mo
         remote_policy = 0;
     } else {
         remote_policy = std::atoi(params.remote_attn_layers.c_str());
+    }
+    // Position-split KV keeps both bands on every full-attention layer, so the
+    // auto policy cannot carry a per-layer budget count there: it resolves
+    // exactly like "full"/"all". Mirrors the runtime resolver in
+    // llama-context.cpp (position-split forces all full layers remote). The
+    // runtime also honors LLAMA_KV_POSITION_SPLIT_P when the flag is unset
+    // (llama-context.cpp:947) and the server parses it the same way
+    // (server-context.cpp:4678), so resolve it here too: an invalid value
+    // falls through to P == 0 and the context constructor reports it.
+    bool position_split = resolved.kv_position_split_p != 0;
+    if (!position_split) {
+        const char * env_p = std::getenv("LLAMA_KV_POSITION_SPLIT_P");
+        if (env_p != nullptr && env_p[0] != '\0' && env_p[0] != '-') {
+            char * end = nullptr;
+            errno = 0;
+            const unsigned long long value = std::strtoull(env_p, &end, 10);
+            if (errno == 0 && end != nullptr && *end == '\0' && value > 0) {
+                position_split = true;
+            }
+        }
+    }
+    if (remote_policy < 0 && position_split) {
+        remote_policy = 0;
     }
 
     const uint32_t n_seq = std::max<uint32_t>(1, params.n_parallel);

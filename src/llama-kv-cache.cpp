@@ -3257,6 +3257,15 @@ ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
     return layers[ikv].v;
 }
 
+bool llama_kv_cache::layer_k_bias_present(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+    const int32_t ikv = it->second;
+    return !k_bar.empty() && ikv >= 0 && size_t(ikv) < k_bar.size() && k_bar[ikv] != nullptr;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 

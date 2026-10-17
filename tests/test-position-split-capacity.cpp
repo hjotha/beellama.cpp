@@ -1,5 +1,5 @@
 // Explicit real-model campaign runner. Built, but never registered with CTest:
-// a 131072-token prefill must only run when an operator requests it.
+// a kCapacityC-token prefill must only run when an operator requests it.
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
@@ -1017,8 +1017,9 @@ struct runner {
         require(init && init->model() && init->context(), "model/context initialization failed (inspect logs for OOM)");
         ctx = init->context(); c = int(llama_n_ctx(ctx)); p = int(params.kv_position_split_p); prefix = c-opt.generate;
         require(c == params.n_ctx, "effective C differs from requested C");
-        if (opt.mode == "empty-local") { require(p > 0 && p%256 == 0 && p <= 102400 && p+5 <= c, "empty-local requires aligned P>0 and room for five overflow tokens"); }
-        else { require(!p || (p%256 == 0 && p <= 102400 && p+128 <= prefix), "P must be 256-aligned <=102400 and leave room for boundary probes"); }
+        const uint32_t p_target = llama_position_split::kTargetP;
+        if (opt.mode == "empty-local") { require(p > 0 && p%256 == 0 && p <= int(p_target) && p+5 <= c, "empty-local requires aligned P>0 up to the target and room for five overflow tokens"); }
+        else { require(!p || (p%256 == 0 && p <= int(p_target) && p+128 <= prefix), "P must be 256-aligned up to the target and leave room for boundary probes"); }
         vocab = llama_vocab_n_tokens(llama_model_get_vocab(init->model()));
         if (opt.mode == "empty-local") { require(input.size() > size_t(p+1), "empty-local requires P+2 input tokens"); }
         else { require(input.size() > size_t(prefix), "token file needs at least C-generation+1 tokens (one continuation for divergence)"); }
@@ -1062,7 +1063,10 @@ struct runner {
         report["all_requested_checks_passed"] = all_requested_checks_executed &&
             report["mandatory_executed_checks_pass"].get<bool>();
         report["allocation_outcome"] = "initialization and all requested decodes/restores returned successfully; external logs still required for driver diagnostics";
-        report["production_dimensions"] = c == 131072 && p != 0 && opt.generate == 512 && opt.cycles >= 10;
+        // Legacy C=131072 keeps reporting production dimensions; the C=204800
+        // ceiling (kCapacityC) is the new target instance.
+        const bool production_c = c == 131072 || c == int(llama_position_split::kCapacityC);
+        report["production_dimensions"] = production_c && p != 0 && opt.generate == 512 && opt.cycles >= 10;
         report["production_gate_complete"] = false;
         report["remaining_evidence"] = {"external backend allocator retained-memory evidence", "model SHA256 and hardware/driver/concurrency provenance", "pure-CUDA import and split-to-CUDA conversion matrix are separate campaigns"};
         finish_retention_manifest();
@@ -1074,7 +1078,7 @@ struct runner {
 
 int main(int argc, char ** argv) {
     runner run;
-    run.params.n_ctx = 131072;
+    run.params.n_ctx = llama_position_split::kCapacityC;
     run.params.n_parallel = 1;
     run.params.n_batch = 512;
     run.params.n_ubatch = 256;

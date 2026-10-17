@@ -1793,6 +1793,25 @@ static void ggml_compute_forward_mul_mat_id(
 // Remote KV+attention execution (ggml-remote-attn, ggml-base). C linkage.
 extern bool ggml_remote_attn_exec(struct ggml_tensor * node);
 
+// GGML_OP_KVARN_SPLIT_FUSED (fused position-split span, "peça (c)").
+// Phase 1 = scaffold: the creator ggml_kvarn_split_fused() (ggml.c) performs
+// the real shape/param contract at node creation time (pure metadata; the CPU
+// path never consults supports_op for this op). This forward exists only to
+// keep the dispatch switch total and to fail loudly (never a silent no-op) if
+// the op is ever executed before phase 2 implements the kernel. The asserts
+// mirror the creator contract so a hand-crafted node cannot silently reach an
+// unimplemented path with a different shape.
+static void ggml_compute_forward_kvarn_split_fused(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    GGML_UNUSED(params);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->src[0] != NULL && dst->src[7] != NULL);
+    GGML_ASSERT(dst->ne[0] == dst->src[0]->ne[0]*dst->src[0]->ne[1]);
+    GGML_ASSERT(dst->ne[1] == dst->src[0]->ne[2]*dst->src[0]->ne[3]);
+    GGML_ABORT("kvarn split fused: not implemented in phase 1");
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2199,6 +2218,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     GGML_ABORT("%s: GGML_OP_REMOTE_ATTN remote execution failed\n", __func__);
                 }
             } break;
+        case GGML_OP_KVARN_SPLIT_FUSED:
+            {
+                // Phase-1 scaffold: asserts the creator contract, then aborts
+                // (fail closed; see ggml_compute_forward_kvarn_split_fused).
+                ggml_compute_forward_kvarn_split_fused(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2391,7 +2416,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_KVARN_VIEW:
         case GGML_OP_REMOTE_ATTN:
         case GGML_OP_FLASH_ATTN_EXT_LSE:
+        case GGML_OP_KVARN_SPLIT_FUSED:
             {
+                // KVARN_SPLIT_FUSED is a phase-1 scaffold: single task so the
+                // dispatch reaches the explicit scaffold abort instead of the
+                // generic "op not implemented" path.
                 n_tasks = 1;
             } break;
         case GGML_OP_REPEAT:

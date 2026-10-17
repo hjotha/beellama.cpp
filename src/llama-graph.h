@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <tuple>
 #include <unordered_map>
 
 struct ggml_cgraph;
@@ -1314,6 +1315,15 @@ struct llm_graph_context {
     // both must match. Valid for one graph build only.
     mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
 
+    // F3 position-split overflow mask crop + CONT, keyed by (source tensor,
+    // crop extent, source ne[1..3], source type). Every KVarN layer in one
+    // graph consumes the SAME host-filled overflow mask input with the same
+    // occupancy extent, so the first layer builds the cropped contiguous mask
+    // and the remaining layers reuse it instead of re-staging identical bytes
+    // per layer. Consumers are read-only, so the mask content is unchanged.
+    // Valid for one graph build only, exactly like hadamard_memo.
+    mutable std::map<std::tuple<const ggml_tensor *, int64_t, int64_t, int64_t, int64_t, ggml_type>, ggml_tensor *> ovf_mask_crop_memo;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1572,6 +1582,16 @@ ggml_tensor * build_attn_mha_paged(
             ggml_tensor * v_cur,
             float kq_scale,
             int il) const;
+
+    // F3: crop the position-split overflow mask to n_cols (mask must be wider)
+    // and materialize it contiguous. Memoized per graph build on (mask_src,
+    // n_cols, mask_src->ne[1..3], mask_src->type): every layer shares the same
+    // host-filled source and the same extent, so the crop/CONT is built once
+    // and reused. The returned tensor is read-only for all consumers; fail
+    // closed on any shape/stride deviation.
+    ggml_tensor * build_ovf_mask_crop(
+            ggml_tensor * mask_src,
+            int64_t n_cols) const;
 
     llm_graph_input_attn_kv_paged * build_attn_inp_kv_paged() const;
 
