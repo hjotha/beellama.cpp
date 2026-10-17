@@ -1763,10 +1763,14 @@ std::vector<ggml_backend_t> layer_backends;
             size_t cuda_free = 0, cuda_total = 0;
             ggml_backend_dev_memory(cuda_dev, &cuda_free, &cuda_total);
             // Overhead beyond the draft KV: the target's remaining pp compute
-            // buffers (61 MiB measured at 256-token ubatches on the 27B/4070)
-            // plus the one-layer MTP draft compute graph and output staging.
-            // 256 MiB keeps a margin without pretending to be an exact fit.
-            constexpr uint64_t kMtpSplitOverheadBytes = 256ull << 20;
+            // buffers (61 MiB reserved, 126 MiB measured at 256-token ubatches
+            // on the 27B/4070) plus the one-layer MTP draft compute graph and
+            // output staging. The 2026-10-17 sweep showed configurations that
+            // passed a 256 MiB overhead and then died on a runtime compute
+            // re-reserve (86 MiB at ub=256, 28 MiB at ub=64) before prefill
+            // completed, so account for the measured peak growth (256 + 86)
+            // with a small margin instead of accepting ~0 MiB of headroom.
+            constexpr uint64_t kMtpSplitOverheadBytes = 352ull << 20;
             const uint64_t needed = mtp_reserve + kMtpSplitOverheadBytes;
             LLAMA_LOG_INFO("%s: LLAMA_MTP_POSITION_SPLIT=1 fit check: draft-MTP reserve=%.1f MiB, "
                            "overhead=%.1f MiB, CUDA free=%.1f MiB\n",
