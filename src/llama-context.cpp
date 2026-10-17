@@ -483,6 +483,13 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
     auto * local_attn_dev = local_attention_device(params.remote_attn_host);
+    if (!local_attn_dev && params.kv_position_split_p != 0) {
+        try {
+            local_attn_dev = local_attention_device("vulkan:0");
+        } catch (...) {
+            // Vulkan unavailable; position-split will validate during setup
+        }
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -1822,7 +1829,11 @@ std::vector<ggml_backend_t> layer_backends;
         // Remote KV+attention accelerator (Xbox RKVA). Created after the local
         // backends so it joins backend_ptrs/backend_buft for the scheduler, but
         // it only ever claims GGML_OP_REMOTE_ATTN (which we also pin explicitly).
-        if (cparams.remote_attn_enabled && !cparams.local_attn_backend) {
+        const bool is_local_vulkan = (params.remote_attn_host != nullptr &&
+            (std::strncmp(params.remote_attn_host, "vulkan", 6) == 0 ||
+             std::strcmp(params.remote_attn_host, "local") == 0));
+
+        if (cparams.remote_attn_enabled && (!cparams.local_attn_backend || !is_local_vulkan)) {
             if (model.arch != LLM_ARCH_QWEN35) {
                 throw std::runtime_error(format(
                     "%s: --remote-attn currently supports only the qwen35 arch (this model arch id: %d)",

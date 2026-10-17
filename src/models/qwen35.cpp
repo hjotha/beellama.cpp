@@ -414,7 +414,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         }
     }
 
-    const bool is_remote = (cparams.remote_attn_enabled && !cparams.local_attn_backend && backend_remote != nullptr &&
+    const bool p_mode = cparams.kv_position_split_p != 0;
+    const bool use_position_split = p_mode && use_position_split_attention(il);
+    const bool is_remote = (cparams.remote_attn_enabled && backend_remote != nullptr &&
+                            !use_position_split &&
                             full_attn_idx < cparams.remote_attn_layers);
 
     if (is_remote) {
@@ -446,9 +449,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         // for below-P batches; otherwise Vulkan would run CUDA-resident FA.
         // use_position_split_attention() decides per batch (dual only for
         // overflow batches with local history).
-        const bool p_mode = cparams.kv_position_split_p != 0;
-        const bool use_position_split = p_mode && use_position_split_attention(il);
-        const bool local_split = !p_mode && cparams.local_attn_backend && full_attn_idx < cparams.remote_attn_layers;
+        const bool local_split = !p_mode && !is_remote && cparams.local_attn_backend && full_attn_idx < cparams.remote_attn_layers;
         if (local_split) {
             ggml_build_forward_expand(gf, Qcur);
             ggml_build_forward_expand(gf, Kcur);
