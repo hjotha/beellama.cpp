@@ -3804,6 +3804,11 @@ static bool f4_sched_eval_cb(struct ggml_tensor * t, bool ask, void * user_data)
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool profile_prep = [] {
+        const char * value = std::getenv("LLAMA_GRAPH_PREP_PROFILE");
+        return value && std::strcmp(value, "0") != 0;
+    }();
+    const int64_t prep_start = profile_prep ? ggml_time_us() : 0;
     llama_memory_context_finish_guard memory_finish_guard(mctx);
     if (mctx && memory && backend_remote && cparams.remote_attn_position_split &&
             memory->invalidate_prefix_on_write(ubatch)) {
@@ -3815,6 +3820,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         memory_finish_guard.finish(ret);
         return nullptr;
     }
+    const int64_t prep_applied = profile_prep ? ggml_time_us() : 0;
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -3823,7 +3829,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool reused = !graph_reuse_disable && res->can_reuse(gparams);
+    const int64_t prep_checked = profile_prep ? ggml_time_us() : 0;
+    int64_t prep_reset = prep_checked, prep_built = prep_checked, prep_allocated = prep_checked;
+    if (reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -3860,10 +3869,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         }
+        prep_reset = profile_prep ? ggml_time_us() : 0;
 
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        prep_built = profile_prep ? ggml_time_us() : 0;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -3873,13 +3884,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             memory_finish_guard.finish(ret);
             return nullptr;
         }
-
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             memory_finish_guard.finish(ret);
             return nullptr;
         }
+        prep_allocated = profile_prep ? ggml_time_us() : 0;
     }
 
     // set the input data for the input tensors
@@ -3890,6 +3901,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+    if (profile_prep) {
+        fprintf(stderr, "[GRAPHPREP] start_us=%lld nq=%u reused=%d apply_ms=%.3f check_ms=%.3f reset_ms=%.3f build_ms=%.3f alloc_ms=%.3f inputs_ms=%.3f\n",
+                (long long) prep_start, ubatch.n_tokens, int(reused),
+                (prep_applied - prep_start)/1000.0, (prep_checked - prep_applied)/1000.0,
+                (prep_reset - prep_checked)/1000.0, (prep_built - prep_reset)/1000.0,
+                (prep_allocated - prep_built)/1000.0, (ggml_time_us() - prep_allocated)/1000.0);
     }
 
     if (mctx) {

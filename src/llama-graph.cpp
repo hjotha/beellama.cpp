@@ -2013,7 +2013,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res &= inp_attn->self_tail_query_order == nullptr ||
                 (inp_attn->self_tail_query_order->ne[0] == tail_q_max &&
                  inp_attn->self_tail_query_order->ne[1] == tail_n_active);
-        const uint32_t tail_attention_stride = mctx->get_attn()->get_tail_attention_stride(uint32_t(tail_q_max));
+        const uint32_t tail_attention_stride = mctx->get_attn()->get_tail_attention_stride(
+                uint32_t(tail_extent_queries(mctx->get_attn(), params.ubatch, tail_q_max)));
         const int64_t tail_desc_stride = 6 + tail_attention_stride +
                 (mctx->get_attn()->can_pack_tail_body(params.ubatch) ?
                         mctx->get_attn()->get_tail_body_execution_stride() : 0);
@@ -4759,15 +4760,12 @@ bool llm_graph_context::use_position_split_attention(int il) const {
     if (local) {
         return false;
     }
-    // An empty local range has an all-masked FA contribution (O=0, LSE=-inf).
-    // Keep the same split path so overflow masks and physical rows agree.
-    std::vector<uint32_t> local_cells;
-    const bool has_local = kvarn_cache->position_split_live_cells(
-        llama_position_split::range_kind::LOCAL, local_cells) &&
-        !local_cells.empty();
-    LLAMA_LOG_DEBUG("%s: il=%d P=%u n_kv=%u n_tokens=%u has_local=%d n_local=%zu overflow_batch=%d -> %s\n",
+    // Empty and occupied local histories use the same split route. Do not
+    // scan/sort the full history here merely to populate a debug message:
+    // this predicate is called for every full-attention layer on graph build.
+    LLAMA_LOG_DEBUG("%s: il=%d P=%u n_kv=%u n_tokens=%u overflow_batch=%d -> %s\n",
             __func__, il, p, kvarn_ctx->get_n_kv(), ubatch.n_tokens,
-            int(has_local), local_cells.size(), int(overflow),
+            int(overflow),
             overflow ? "split" : "legacy");
     return overflow;
 }

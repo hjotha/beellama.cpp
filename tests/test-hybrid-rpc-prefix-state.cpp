@@ -93,8 +93,75 @@ static llama_ubatch batch(llama_pos pos, uint32_t count) {
     return ub;
 }
 
+// Exercise the real builder and hybrid reuse wrapper, rather than duplicating
+// their stride policy. An overflow batch reads the local tail as history only;
+// a below-P batch also appends its two current rows to that tail.
+static void test_hybrid_tail_graph_reuse() {
+    for (bool overflow : {false, true}) {
+        tiny_model model;
+        auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
+        auto attention = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
+                llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
+                512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,
+                [](int32_t il) { return il == 0; }, nullptr, 128, GGML_TYPE_F16, 128, 1,
+                nullptr, nullptr, [](int32_t il) { return il == 0; }, GGML_TYPE_Q4_0,
+                GGML_TYPE_Q4_0, false, cpu, 256, true);
+        auto * attn = attention.get();
+        auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+                false, 1, 1, 1, [](int32_t il) { return il == 1; });
+        llama_memory_hybrid hybrid(model, std::move(attention), std::move(recurrent), 256);
+        if (overflow) {
+            auto prefix = attn->init_kv_batch({batch(0, 256)});
+            assert(prefix && prefix->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && prefix->apply());
+            prefix->graph_compute_finish(GGML_STATUS_SUCCESS);
+        }
+        auto ub = batch(overflow ? 256 : 0, 2);
+        llama_memory_hybrid_context memory(&hybrid, attn->init_kv_batch({ub}), {ub});
+        assert(memory.get_status() == LLAMA_MEMORY_STATUS_SUCCESS && memory.apply());
+        llm_graph_result result(4096);
+        llm_graph_params params{};
+        params.arch = model.arch;
+        params.hparams = model.hparams;
+        params.cparams.n_ctx = 512;
+        params.cparams.n_seq_max = 1;
+        params.cparams.n_rs_seq = 1;
+        params.cparams.causal_attn = true;
+        params.cparams.flash_attn = true;
+        params.cparams.kv_position_split_p = 256;
+        params.cparams.remote_attn_position_split = true;
+        params.ubatch = ub;
+        params.n_outputs = 2;
+        params.mctx = &memory;
+        params.res = &result;
+        llm_graph_context graph(params);
+        auto * input = graph.build_inp_mem_hybrid();
+        assert(input && input->inp_attn && input->inp_rs);
+        auto * tail = input->inp_attn->self_tail_read_idxs;
+        assert(tail && tail->ne[1] == 2);
+        const auto * context = memory.get_attn_kv_context();
+        assert(tail->ne[0] == context->get_tail_attention_stride(overflow ? 1 : 2));
+        assert(context->get_tail_attention_stride(1) != context->get_tail_attention_stride(2));
+        assert(input->can_reuse(params));
+        assert(input->can_reuse(params)); // repeated equal-shape target pass
+
+        // A real malformed tail extent must still invalidate reuse.
+        const int64_t saved_extent = tail->ne[0];
+        ++tail->ne[0];
+        assert(!input->can_reuse(params));
+        tail->ne[0] = saved_extent;
+        assert(input->can_reuse(params));
+
+        auto changed = params;
+        changed.ubatch = batch(overflow ? 256 : 0, 1);
+        assert(!input->can_reuse(changed));
+        assert(input->can_reuse(params));
+        memory.graph_compute_finish(GGML_STATUS_SUCCESS);
+    }
+}
+
 int main() {
     ggml_backend_load_all();
+    test_hybrid_tail_graph_reuse();
     tiny_model model;
     auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
     auto attention = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
