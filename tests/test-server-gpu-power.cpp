@@ -199,6 +199,116 @@ struct fake_ryzenadj {
 };
 fake_ryzenadj * fake_ryzenadj::current = nullptr;
 
+static void test_amd_clock_context_gate() {
+    // Only thresholded local Vulkan placement gates AMD clocks. Zero means no gate.
+    assert(server_gpu_power_allow_amd_clocks(true, 0, 0));
+    assert(!server_gpu_power_allow_amd_clocks(true, 131072, 0));
+    assert(!server_gpu_power_allow_amd_clocks(true, 131072, 131071));
+    assert(server_gpu_power_allow_amd_clocks(true, 131072, 131072));
+    assert(server_gpu_power_allow_amd_clocks(true, 131072, 131073));
+    assert(server_gpu_power_allow_amd_clocks(false, 131072, 4096)); // TCP or no remote attention
+
+    // Eligibility can change without changing phase; only clocks are masked.
+    for (auto phase : {server_gpu_power_phase::prefill, server_gpu_power_phase::decode}) {
+        fake_amdgpu_sysfs sys;
+        fake_ryzenadj ryzen;
+        auto api = ryzen.api();
+        server_gpu_power governor(sys.backend(&api));
+        server_gpu_power_config config;
+        config.backend = server_gpu_power_backend_type::amdgpu;
+        config.apu_tdp_w = 10;
+        config.fabric_state = 2;
+        config.amd_sclk_decode = config.amd_sclk_prefill = 1800;
+        assert(governor.init(config));
+
+        governor.update(phase, false);
+        assert(sys.writes.empty());
+        assert((ryzen.writes == std::vector<std::pair<int, uint32_t>>{{0, 10000}, {1, 10000}, {2, 10000}}));
+        governor.update(phase, true);
+        assert(sys.writes == std::vector<std::string>({
+            "power_dpm_force_performance_level:manual\n", "pp_dpm_fclk:2\n",
+            "pp_od_clk_voltage:s 0 1800\n", "pp_od_clk_voltage:s 1 1800\n", "pp_od_clk_voltage:c\n"}));
+        const auto applied = sys.writes.size();
+        governor.update(phase, true);
+        assert(sys.writes.size() == applied);
+        governor.update(phase, false);
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+        assert(ryzen.writes.size() == 3); // clock eligibility must not restore the active TDP cap
+        assert(governor.transition_count() == 1); // eligibility is separate from phase
+        const auto restored = sys.writes.size();
+        governor.update(phase, false);
+        assert(sys.writes.size() == restored);
+
+        governor.update(phase, true);
+        governor.on_sleeping(true);
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+        ryzen.assert_original();
+        governor.on_sleeping(false);
+        const auto before_wake = sys.writes.size();
+        governor.update(phase, false);
+        assert(sys.writes.size() == before_wake);
+        assert(ryzen.limits[0] == 10 && ryzen.limits[1] == 10 && ryzen.limits[2] == 10);
+        governor.update(phase, true);
+        governor.shutdown();
+        assert(sys.writes.back() == "power_dpm_force_performance_level:auto\n");
+        ryzen.assert_original();
+    }
+
+    // The injected fake exposes both backends: masking AMD does not mask NVIDIA
+    // power/memory control, or APU TDP, during phase and eligibility transitions.
+    struct fake_dual_backend : fake_gpu_power_backend {
+        int fabric_sets = 0;
+        int fabric_resets = 0;
+        int tdp_sets = 0;
+        int tdp_resets = 0;
+        bool init(int32_t device, server_gpu_power_device_info & info, std::string & error) override {
+            const bool ok = fake_gpu_power_backend::init(device, info, error);
+            info.fabric_state_supported = true;
+            return ok;
+        }
+        bool init_apu_tdp(std::string &) override { return true; }
+        bool set_apu_tdp(uint32_t mw, std::string &) override {
+            assert(mw == 10000);
+            ++tdp_sets;
+            return true;
+        }
+        bool reset_apu_tdp(std::string &) override { ++tdp_resets; return true; }
+        bool set_fabric_state(int32_t state, std::string &) override {
+            assert(state == 2);
+            ++fabric_sets;
+            return true;
+        }
+        bool reset_fabric_state(std::string &) override { ++fabric_resets; return true; }
+    };
+    auto backend = std::make_unique<fake_dual_backend>();
+    auto * ptr = backend.get();
+    server_gpu_power governor(std::move(backend));
+    server_gpu_power_config config;
+    config.backend = server_gpu_power_backend_type::dual;
+    config.prefill_w = 200;
+    config.decode_w = 165;
+    config.mem_clock_decode = config.mem_clock_prefill = 10501;
+    config.apu_tdp_w = 10;
+    config.fabric_state = 2;
+    config.amd_sclk_decode = config.amd_sclk_prefill = 1800;
+    assert(governor.init(config));
+    governor.update(server_gpu_power_phase::prefill, false);
+    governor.update(server_gpu_power_phase::decode, false);
+    assert(ptr->applied_limits == std::vector<uint32_t>({200000, 165000}));
+    assert(ptr->applied_mem_clocks == std::vector<uint32_t>({10501}));
+    assert(ptr->tdp_sets == 1 && ptr->tdp_resets == 0);
+    assert(ptr->fabric_sets == 0);
+    governor.update(server_gpu_power_phase::decode, true);
+    assert(ptr->applied_mem_clocks == std::vector<uint32_t>({10501, 1800}));
+    assert(ptr->fabric_sets == 1);
+    governor.update(server_gpu_power_phase::decode, false);
+    assert(ptr->fabric_resets == 1 && ptr->reset_mem_calls == 1);
+    assert(ptr->set_calls == 2 && ptr->tdp_sets == 1 && ptr->tdp_resets == 0);
+    governor.shutdown();
+    assert(ptr->applied_limits.back() == 160000);
+    assert(ptr->tdp_resets == 1 && ptr->reset_mem_calls == 2);
+}
+
 static void test_apu_tdp() {
     const auto amd = server_gpu_power_backend_type::amdgpu;
     // Real AMD backend and governor, fake RyzenAdj: no writes until inference.
@@ -457,6 +567,7 @@ static void test_amdgpu() {
 int main() {
     test_amdgpu();
     test_apu_tdp();
+    test_amd_clock_context_gate();
     assert(arbitrate({}) == server_gpu_power_phase::idle);
     assert(arbitrate({ server_gpu_power_slot_state::idle }) == server_gpu_power_phase::idle);
     assert(arbitrate({ server_gpu_power_slot_state::wait_other }) == server_gpu_power_phase::idle);

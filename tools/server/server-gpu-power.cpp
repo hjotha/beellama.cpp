@@ -61,6 +61,10 @@ static bool server_gpu_power_w_to_mw(int32_t power_w, uint32_t & power_mw) {
     return true;
 }
 
+bool server_gpu_power_allow_amd_clocks(bool local_vulkan_remote_attn, int32_t min_ctx, uint32_t active_ctx) {
+    return !local_vulkan_remote_attn || min_ctx <= 0 || active_ctx >= static_cast<uint32_t>(min_ctx);
+}
+
 void server_gpu_power_phase_arbitrator::reset() {
     phase_ = server_gpu_power_phase::idle;
 }
@@ -1268,6 +1272,7 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
     mem_clock_locked_            = false;
     mem_offset_applied_          = false;
     amd_sclk_locked_             = false;
+    allow_amd_clocks_            = true;
     power_limit_changed_         = false;
     enabled_                     = true;
 
@@ -1303,17 +1308,25 @@ bool server_gpu_power::init(const server_gpu_power_config & config) {
     return true;
 }
 
-void server_gpu_power::update(server_gpu_power_phase phase) {
-    if (!enabled_ || !backend_initialized_ || phase == phase_) {
+void server_gpu_power::update(server_gpu_power_phase phase, bool allow_amd_clocks) {
+    if (!enabled_ || !backend_initialized_ || (phase == phase_ && allow_amd_clocks == allow_amd_clocks_)) {
         return;
     }
 
     const server_gpu_power_phase previous = phase_;
+    const bool amd_clock_policy_changed = allow_amd_clocks != allow_amd_clocks_;
+    if (phase != phase_) {
+        transition_count_++;
+    }
     phase_                                = phase;
-    transition_count_++;
+    allow_amd_clocks_                      = allow_amd_clocks;
 
     server_gpu_power_backend * nv = injected_backend_ ? injected_backend_.get() : nvml_backend_.get();
     server_gpu_power_backend * amd = injected_backend_ ? injected_backend_.get() : amdgpu_backend_.get();
+
+    if (amd && amd_clock_policy_changed && (config_.amd_sclk_enabled() || config_.fabric_state >= 0)) {
+        LOG_INF("AMD clock policy: %s for the active context\n", allow_amd_clocks ? "enabled" : "disabled");
+    }
 
     // 1. AMD APU TDP
     if (amd && config_.apu_tdp_w != -1) {
@@ -1448,7 +1461,7 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
 
     // 4. AMD Fabric State
     if (amd && config_.fabric_state >= 0) {
-        const bool active = phase != server_gpu_power_phase::idle;
+        const bool active = allow_amd_clocks && phase != server_gpu_power_phase::idle;
         std::string error;
         if (active && !fabric_state_applied_) {
             if (!amd->set_fabric_state(config_.fabric_state, error)) {
@@ -1468,9 +1481,9 @@ void server_gpu_power::update(server_gpu_power_phase phase) {
     // 5. AMD Graphics (SCLK) Clocks
     if (amd && (decode_amd_sclk_mhz_ > 0 || prefill_amd_sclk_mhz_ > 0)) {
         uint32_t target_sclk = 0;
-        if (phase == server_gpu_power_phase::decode) {
+        if (allow_amd_clocks && phase == server_gpu_power_phase::decode) {
             target_sclk = decode_amd_sclk_mhz_;
-        } else if (phase == server_gpu_power_phase::prefill) {
+        } else if (allow_amd_clocks && phase == server_gpu_power_phase::prefill) {
             target_sclk = prefill_amd_sclk_mhz_;
         }
 
@@ -1510,6 +1523,7 @@ void server_gpu_power::on_sleeping(bool sleeping) {
     }
 
     phase_ = server_gpu_power_phase::idle;
+    allow_amd_clocks_ = true;
     if (!power_limit_changed_) {
         last_applied_power_limit_mw_ = device_info_.original_power_limit_mw;
     }
@@ -1549,6 +1563,7 @@ void server_gpu_power::shutdown() {
     mem_clock_locked_            = false;
     mem_offset_applied_          = false;
     amd_sclk_locked_             = false;
+    allow_amd_clocks_            = true;
     last_applied_power_limit_mw_ = 0;
     last_applied_mem_clock_mhz_  = 0;
     last_applied_mem_offset_mhz_ = 0;

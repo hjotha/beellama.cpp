@@ -34,6 +34,16 @@ does not authorize an implicit repartition. This option remains under the
 acceptance protocol in [the occupancy plan](occupancy-placement-plan-20261002.md);
 its availability alone does not mean production qualification has passed.
 
+With thresholded local Vulkan remote attention, the server applies
+`--amd-sclk-prefill`, `--amd-sclk-decode`, and `--gpu-fabric-state` only when
+the active profile's configured capacity reaches `--remote-attn-min-context`.
+Profiles below the threshold retain the original AMD clock policy. This gate
+does not suspend `--apu-tdp` or NVIDIA power and memory-clock controls. Without
+a local Vulkan threshold, the AMD clock options keep their ordinary phase-based
+behavior. The APU TDP controller restores its initial limits on idle, so the
+host's initial sustained, fast, and slow limits must already satisfy the desired
+power ceiling.
+
 KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and
 `kvarn8`. K and V may use different bit widths. Logical 64-dimensional K/V heads are
 supported on the qualified CPU and CUDA routes with rectangular 64 x 128 K and

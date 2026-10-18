@@ -8789,7 +8789,15 @@ private:
         for (const auto & slot : slots) {
             arbitrator.observe(server_gpu_power_slot_state_from_slot_state(slot.state));
         }
-        gpu_power.update(arbitrator.phase());
+        // Avoid forcing AMD clocks while thresholded local Vulkan attention is
+        // inactive. Match the configured capacity used by the placement gate.
+        // The saved host survives apply_profile_params() clearing the live host.
+        const auto & remote_attn_host = adaptive_remote_attn_host.empty()
+            ? params_base.remote_attn_host : adaptive_remote_attn_host;
+        const bool allow_amd_clocks = server_gpu_power_allow_amd_clocks(
+            common_remote_attn_is_local_vulkan(remote_attn_host),
+            params_base.remote_attn_min_ctx_size, ctx_tgt ? params_base.n_ctx : 0);
+        gpu_power.update(arbitrator.phase(), allow_amd_clocks);
     }
 
     void update_slots() {

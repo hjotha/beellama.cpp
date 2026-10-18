@@ -39,6 +39,9 @@ enum class server_gpu_power_backend_type {
     dual,
 };
 
+// AMD clock overrides follow the local Vulkan placement gate, not prompt length.
+bool server_gpu_power_allow_amd_clocks(bool local_vulkan_remote_attn, int32_t min_ctx, uint32_t active_ctx);
+
 struct server_gpu_power_config {
     int32_t prefill_w         = -1;
     int32_t decode_w          = -1;
@@ -131,7 +134,7 @@ class server_gpu_power {
     ~server_gpu_power();
 
     bool init(const server_gpu_power_config & config);
-    void update(server_gpu_power_phase phase);
+    void update(server_gpu_power_phase phase, bool allow_amd_clocks = true);
     void on_sleeping(bool sleeping);
     void shutdown();
 
@@ -173,6 +176,7 @@ class server_gpu_power {
     bool     fabric_state_applied_        = false;
     bool     apu_tdp_applied_             = false;
     uint32_t apu_tdp_mw_                  = 0;
+    bool     allow_amd_clocks_            = true;
 
     bool     power_limit_supported_      = true;
     bool     mem_clock_supported_        = true;
