@@ -321,6 +321,15 @@ int main() {
             descs.push_back({lid, kRangeOverflow, P, C, 1, 1});
         }
         CHECK(validate_ranges(descs, P, C, full_layers).empty());
+        {
+            auto q8 = descs;
+            for (auto & desc : q8) {
+                if (desc.range_id == kRangeOverflow) desc.format = 2;
+            }
+            CHECK(validate_ranges(q8, P, C, full_layers).empty());
+            q8[1].format = 3;
+            CHECK(!validate_ranges(q8, P, C, full_layers).empty());
+        }
         // Missing overflow range.
         {
             std::vector<range_desc> bad = descs;

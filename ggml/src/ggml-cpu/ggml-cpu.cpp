@@ -5,6 +5,9 @@
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#include "ops.h"
+#include "ggml-cpu-impl.h"
+#include "ggml-kvarn-cpu-store.h"
 
 #include <cctype>
 #include <string>
@@ -740,6 +743,20 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_cpu_kvarn_store_direct_v1") == 0) {
+        return (void *) +[](ggml_tensor * store) {
+            if (!store || store->op != GGML_OP_KVARN_STORE ||
+                    !store->src[0] || !store->src[1] || !store->src[2] || !store->src[3] ||
+                    !store->src[0]->data || !store->src[1]->data ||
+                    !store->src[2]->data || !store->src[3]->data) return false;
+            // This store has no worker barriers or scratch allocation. Keeping
+            // its implementation here makes CPU and RPC-produced records use
+            // exactly the same transform, balancing and rounding operations.
+            const ggml_compute_params params {0, 1, 0, nullptr, nullptr, true};
+            ggml_compute_forward_kvarn_store(&params, store);
+            return true;
+        };
+    }
     if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
         return (void *) +[](ggml_backend_dev_t, ggml_backend_kvarn_capabilities * result) {
             if (result == nullptr || result->struct_size < sizeof(*result) ||

@@ -3812,7 +3812,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN"));
     add_opt(common_arg(
         {"--kv-position-split-p"}, "P",
-        "fixed local CUDA KVarN boundary in tokens; overflow uses Vulkan Q4 (positive multiple of 256; disabled by default)",
+        "fixed local CUDA KVarN boundary in tokens; quantized overflow uses Vulkan or RKVA TCP (positive multiple of 256; disabled by default)",
         [](common_params & params, int value) {
             if (value <= 0 || value % 256 != 0) {
                 throw std::invalid_argument("--kv-position-split-p requires a positive multiple of 256");
@@ -3852,7 +3852,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--remote-attn-cache-type-k"}, "TYPE",
         "optional standard K cache type for locally remote-attended layers (q4_0, q5_0, q6_0, q8_0); "
-        "requires native Vulkan --remote-attn and a global KVarN cache; unset preserves the global cache format",
+        "requires Vulkan or TCP position-split --remote-attn and a global KVarN cache; unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
             params.remote_attn_cache_type_k = parse_remote_attn_standard_cache_type(value);
         }

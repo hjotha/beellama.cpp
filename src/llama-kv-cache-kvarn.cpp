@@ -2927,7 +2927,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         ggml_type standard_type_v,
         bool standard_v_trans,
         const layer_device_cb & standard_device_for_layer,
-        uint32_t position_split_p) :
+        uint32_t position_split_p,
+        bool rpc_position_split) :
     model(model),
     hparams(hparams),
     params(params),
@@ -2940,6 +2941,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     kv_size_local(position_split_p != 0 ? position_split_p : kv_size),
     kv_size_overflow(position_split_p != 0 ? kv_size - position_split_p : kv_size),
     position_split_p_(position_split_p),
+    native_kvarn_rpc_experimental_(rpc_position_split &&
+        std::getenv("GGML_RKVA_RANGE_STORAGE") &&
+        std::strcmp(std::getenv("GGML_RKVA_RANGE_STORAGE"), "kvarn4") == 0 &&
+        std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL") &&
+        std::strcmp(std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL"), "1") == 0),
     // Dynamic staging: size the lossless F16 ring from position semantics.
     // Non-SWA keeps a permanent sink slot plus the scheduler-span tail. SWA has
     // no sink, so every stage slot is part of the local tail.
@@ -3035,8 +3041,15 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 // (O tipo do dispositivo Vulkan varia por backend; o nome é o
                 // identificador estável.)
                 if (position_split_p_ != 0) {
+                    if (key->type != value->type ||
+                            (key->type != GGML_TYPE_Q4_0 && key->type != GGML_TYPE_Q8_0)) {
+                        throw std::invalid_argument("position-split overflow requires matching Q4_0 or Q8_0 K/V");
+                    }
                     const char * dev_name = key_dev ? ggml_backend_dev_name(key_dev) : nullptr;
-                    if (!dev_name || std::strncmp(dev_name, "Vulkan", 6) != 0) {
+                    const bool host_mirror = rpc_position_split &&
+                            ggml_backend_buffer_is_host(key->buffer) &&
+                            ggml_backend_buffer_is_host(value->buffer);
+                    if (!host_mirror && (!dev_name || std::strncmp(dev_name, "Vulkan", 6) != 0)) {
                         throw std::runtime_error(format(
                                 "position-split KV exige a faixa Q4 da camada %u na Vulkan (está em %s)",
                                 il, dev_name ? dev_name : "dispositivo desconhecido"));
@@ -4142,7 +4155,11 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
         if (shape != llama_position_split::rm_span_kind::OVERFLOW_ONLY) {
             const llama_pos local_end = shape == llama_position_split::rm_span_kind::CROSSING
                 ? llama_pos(position_split_p_) : effective_end;
-            const llama_pos pos_max = metadata->seq_pos_max(seq_id);
+            // The metadata also includes the standard-cache overflow. Its
+            // positions must not extend the KVarN suffix-rollback window:
+            // local records stop at P even while overflow tokens are live.
+            const llama_pos pos_max = std::min(
+                    metadata->seq_pos_max(seq_id), llama_pos(position_split_p_) - 1);
             if (llama_kvarn_can_remove_range(pos_max, norm_p0, local_end, KVAR_N_GROUP)) {
                 return true;
             }
@@ -4419,11 +4436,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
 }
 
 bool llama_kv_cache_kvarn::requires_state_for_partial_restore() const {
-    // SWA rings overwrite historical records, so a partial checkpoint must own
-    // the live window. Dense KVarN keeps every surviving prefix group in the
-    // record body; suffixes inside the current and previous group can be
-    // trimmed in place, the same way a body-backed exact tail can.
-    return swa;
+    // Dense records survive a rewind, but their exact F16 overlay does not:
+    // appending can evict the checkpoint's tail even inside a legal trim.
+    // Preserve that window through the existing stage-only partial format.
+    // Mixed caches retain their separate checkpoint policy; pure caches are
+    // also the source of the one-way mixed/positional handoff.
+    return swa || (!standard_cache && exact_tail_tokens > 0);
 }
 
 bool llama_kv_cache_kvarn::stream_is_exclusive_for(llama_seq_id seq_id) const {
@@ -4908,6 +4926,14 @@ void llama_kv_cache_kvarn::state_write_kvarn_body(
 
 void llama_kv_cache_kvarn::state_write_mixed(
         llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (native_kvarn_rpc_experimental_ && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+        const auto & cells = metadata->get_cells(uint32_t(0));
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.pos_get(i) >= int64_t(position_split_p_)) {
+                throw std::runtime_error("native KVarN4 overflow has no FULL snapshot codec; refusing standard-cache bookkeeping save");
+            }
+        }
+    }
     // A split destination MUST own the Q4 overflow companion; a PURE source or
     // a PURE destination has no standard_cache by definition and must never be
     // forced to invent remote ownership (plan 3.6: pure stays no-remote).
@@ -5238,6 +5264,16 @@ void llama_kv_cache_kvarn::state_read_mixed(
     }
 
     const bool original_split_frame = parsed.has_split();
+    if (native_kvarn_rpc_experimental_) {
+        // Validate logical extent before preparing/applying any tensor writes.
+        // Only an unoccupied overflow can bootstrap the native append owner;
+        // native records cannot be recovered from an older Q4/Q8 snapshot.
+        for (const auto & cell : parsed.cells()) {
+            if (cell.pos >= int64_t(position_split_p_)) {
+                throw kv_mixed_error("native KVarN4 cannot restore a standard-cache overflow snapshot; restore a pure local prefix");
+            }
+        }
+    }
     const bool split_to_pure_import = original_split_frame && !position_split_enabled() && !standard_cache;
     std::unordered_set<uint64_t> source_empty_overflow_keys;
     // Preserve and validate the ORIGINAL two-range framing before projection.
@@ -7031,7 +7067,10 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
         (void) idx;
         const uint32_t layer = uint32_t(il);
         out.push_back({layer, llama_position_split::kRangeLocal, 0, position_split_p_, 0, 0});
-        out.push_back({layer, llama_position_split::kRangeOverflow, position_split_p_, kv_size, 1, 1});
+        const auto * key = standard_cache ? standard_cache->get_k_storage(il) : nullptr;
+        const uint8_t format = key && key->type == GGML_TYPE_Q4_0 ? 1 :
+                key && key->type == GGML_TYPE_Q8_0 ? 2 : 255;
+        out.push_back({layer, llama_position_split::kRangeOverflow, position_split_p_, kv_size, 1, format});
     }
     return out;
 }

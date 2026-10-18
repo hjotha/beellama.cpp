@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
+#include "ggml-remote-attn.h"
 #include "ggml.h"
 
 // FIXME: required here for quantization functions
@@ -7219,6 +7220,45 @@ struct ggml_tensor * ggml_remote_attn(
     ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_HEAD_KV, (int) n_head_kv);
     ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_EMBD_HEAD, (int) n_embd_head);
     ggml_set_op_params_f32(result, GGML_REMOTE_ATTN_PARAM_KQ_SCALE, kq_scale);
+    return result;
+}
+
+struct ggml_tensor * ggml_remote_attn_range(
+        struct ggml_context * ctx, struct ggml_tensor * q,
+        struct ggml_tensor * k_written, struct ggml_tensor * v_written,
+        struct ggml_tensor * overflow_cells, struct ggml_tensor * query_pos,
+        int layer_id, uint32_t origin, uint32_t n_live, float kq_scale) {
+    GGML_ASSERT(q && k_written && v_written && overflow_cells && query_pos);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q) && q->ne[3] == 1);
+    GGML_ASSERT((k_written->type == GGML_TYPE_Q4_0 || k_written->type == GGML_TYPE_Q8_0) &&
+            v_written->type == k_written->type);
+    GGML_ASSERT(ggml_are_same_shape(k_written, v_written));
+    GGML_ASSERT(k_written->ne[2] == 1 && k_written->ne[3] == 1);
+    GGML_ASSERT(q->ne[0] > 0 && k_written->ne[0] % q->ne[0] == 0);
+    const int64_t n_head_kv = k_written->ne[0] / q->ne[0];
+    GGML_ASSERT(n_head_kv > 0 && q->ne[1] % n_head_kv == 0);
+    GGML_ASSERT(overflow_cells->type == GGML_TYPE_I32 && query_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(overflow_cells) && ggml_is_contiguous(query_pos));
+    GGML_ASSERT(ggml_nelements(overflow_cells) >= n_live && query_pos->ne[0] >= q->ne[2]);
+    GGML_ASSERT(origin <= INT32_MAX && n_live <= INT32_MAX && layer_id >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            q->ne[0] * q->ne[1] + q->ne[1], q->ne[2]);
+    result->op = GGML_OP_REMOTE_ATTN;
+    result->src[0] = q;
+    result->src[1] = k_written;
+    result->src[2] = v_written;
+    result->src[3] = overflow_cells;
+    result->src[4] = query_pos;
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_LAYER_ID, layer_id);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_DOMAIN, 0);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_HEAD, (int) q->ne[1]);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_HEAD_KV, (int) n_head_kv);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_EMBD_HEAD, (int) q->ne[0]);
+    ggml_set_op_params_f32(result, GGML_REMOTE_ATTN_PARAM_KQ_SCALE, kq_scale);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_RANGE, 1);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_ORIGIN, (int) origin);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_LIVE, (int) n_live);
     return result;
 }
 

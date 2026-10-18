@@ -223,6 +223,8 @@ source_capture capture_source(llama_context * ctx) {
     out.memory_bytes = allocation_bytes(memory);
     out.recurrent_bytes = allocation_bytes(hybrid->get_mem_recr());
     out.valid = true;
+    out.source_owner_id = kvarn->mixed_state_owner_id();
+    out.source_owner_epoch = kvarn->mixed_state_owner_epoch();
     out.cparams = ctx->get_cparams();
     // Deterministic memory params: mem_other is nullptr and swa_full false
     // (the handoff source is single-stream non-SWA; swa_full would reserve a
@@ -446,6 +448,20 @@ result try_handoff_impl(const input & in, result & out,
         return out;
     }
 
+    // A positional split owns BOTH ranges in every full-attention layer.
+    // A pure checkpoint can be reused without conversion only while its
+    // selected, evaluated prefix lies entirely in the local range [0,P).
+    // Do not trim a checkpoint past P or convert prefix rows into overflow.
+    const uint32_t split_p = kvarn->position_split_p();
+    if (split_p != 0) {
+        if (selected > split_p) {
+            return fail("positional handoff prefix exceeds the local boundary P");
+        }
+        if (llama_memory_seq_pos_max(llama_get_memory(in.ctx_tgt), in.seq_id) >= 0) {
+            return fail("positional handoff requires an empty candidate");
+        }
+    }
+
     // The source snapshot and candidate GPU buffers are already resident.
     // Reserve RAM for the CPU source allocation, RS serialization, parser
     // fixups and conversion workspaces before allocating a second cache.
@@ -551,11 +567,21 @@ result try_handoff_impl(const input & in, result & out,
             return fail(("partial checkpoint parse: " + header_error).c_str());
         }
         if (source_kvarn->requires_state_for_partial_restore()) {
+            // FULL restore recreated this private CPU cache from the validated
+            // original snapshot. As with durable checkpoint restore, reconnect
+            // its lineage before replaying an owner-bound partial. Keep all
+            // per-cell/reference checks in the authoritative reader enabled.
+            if (in.source->source_owner_id == 0 || checkpoint->owner_epoch == 0 ||
+                    checkpoint->owner_epoch != in.source->source_owner_epoch ||
+                    !source_kvarn->adopt_state_owner_id(in.source->source_owner_id) ||
+                    !source_kvarn->adopt_state_owner_epoch(checkpoint->owner_epoch)) {
+                return fail("partial checkpoint does not match the captured source lineage");
+            }
             source_kvarn->state_read_sinfo(partial_io, in.seq_id,
                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &sinfos, nullptr);
         } else {
-            // Dense KVarN does not serialize attention KV in partial checkpoints (requires_state_for_partial_restore is false).
-            // Populate sinfos from the metadata cache restored in Phase 1.
+            // A dense source without a volatile exact overlay can omit
+            // attention state. Populate its sinfos from the full restore.
             sinfos.resize(1);
             sinfos[0].idxs.resize(1);
             sinfos[0].idxs[0].assign(selected, UINT32_MAX);
@@ -630,6 +656,17 @@ result try_handoff_impl(const input & in, result & out,
     } catch (const std::exception & error) {
         return fail(("tail snapshot lookup failed: " + std::string(error.what())).c_str());
     }
+    // Positional handoff must preserve the same local prefix representation.
+    // An older RS-only checkpoint can leave an evicted/empty exact overlay
+    // after the full snapshot is trimmed; publishing it would silently replace
+    // those F16 rows with compressed records. Reject before candidate mutation.
+    if (split_p != 0 && in.source->exact_tail_tokens > 0) {
+        for (uint32_t pos = effective_tail_begin; pos < selected; ++pos) {
+            if (tail_slot_of_token.find(pos) == tail_slot_of_token.end()) {
+                return fail("positional handoff checkpoint is missing exact-tail rows");
+            }
+        }
+    }
     uint32_t candidate_tail_begin = selected;
     if (in.source->exact_tail_tokens > 0 && !tail_slot_of_token.empty()) {
         uint32_t min_tail_pos = selected;
@@ -667,9 +704,16 @@ result try_handoff_impl(const input & in, result & out,
         return fail(("candidate metadata import failed: " + std::string(error.what())).c_str());
     }
 
-    // Remote layers from the candidate's authoritative standard layout.
+    // Whole-layer placement converts the selected prefix into each remote
+    // standard layer. Positional placement instead keeps this entire prefix
+    // in compressed local KVarN, so its companion must stay logically empty.
+    // Leaving remote_layers empty also makes the plan copy ALL source layers
+    // below, including those that own a standard overflow companion.
     std::vector<handoff_remote_layer> remote_layers;
     for (const auto & layer : kvarn->standard_layer_layout()) {
+        if (split_p != 0) {
+            continue;
+        }
         handoff_remote_layer remote;
         remote.il = layer.layer_id;
         remote.qx_type_k = (int32_t) layer.type_k;
@@ -1010,6 +1054,10 @@ result try_handoff_impl(const input & in, result & out,
     out.marker = handoff_marker(selected, uint32_t(plan.remote_layers.size()),
             txn.source_bytes(), txn.scratch_bytes(), txn.convert_ms());
     out.marker += " rs_bytes=" + std::to_string(rs_bytes_);
+    if (split_p != 0) {
+        out.marker += " placement=position_split split_p=" + std::to_string(split_p) +
+                " overflow_tokens=0";
+    }
     out.prefix_tokens = in.state->prompt.tokens.get_tokens();
     if (out.prefix_tokens.size() > selected) {
         out.prefix_tokens.resize(selected);

@@ -1,4 +1,6 @@
 #include "server-route-state.h"
+#include "llama-remote-snapshot.h"
+#include "rkva-snapshot-digest.h"
 
 #include "json.h"
 #define XXH_STATIC_LINKING_ONLY
@@ -182,6 +184,8 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     temporary_file temporary(path);
     const size_t written = llama_state_seq_save_file(ctx, temporary.path.c_str(), seq, tokens.data(), tokens.size());
     if (!written) { throw std::runtime_error("router native state save failed"); }
+    const bool remote_disk = llama_remote_disk_snapshot_enabled(ctx);
+    rkva_snapshot::Sha256 remote_hash;
     XXH64_state_t hash;
     XXH64_reset(&hash, 0);
     {
@@ -191,6 +195,7 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
             const size_t count = std::min(left, buffer.size());
             read_exact(input, buffer.data(), count);
             XXH64_update(&hash, buffer.data(), count);
+            if (remote_disk) remote_hash.update(buffer.data(), count);
             left -= count;
         }
     }
@@ -313,6 +318,12 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
             rollback();
         }
         throw;
+    }
+    if (remote_disk) {
+        const auto key = remote_hash.finish();
+        // Host publication/retention is authoritative. Xbox save is optional;
+        // failure leaves the validated GAMES file and upload fallback usable.
+        (void) llama_state_seq_remote_disk_snapshot_save(ctx, seq, key.data(), tokens.size());
     }
     return total;
 }

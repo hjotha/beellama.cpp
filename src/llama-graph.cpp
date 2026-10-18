@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "ggml-remote-attn.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1004,7 +1005,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         if (self_overflow_cell_idxs && self_overflow_cell_idxs->buffer) {
             GGML_ASSERT(int64_t(split_overflow_cells.size()) <= self_overflow_cell_idxs->ne[0]);
             GGML_ASSERT(self_overflow_cell_idxs->type == GGML_TYPE_I32);
-            std::vector<int32_t> host_cells(size_t(self_overflow_cell_idxs->ne[0]), 0);
+            std::vector<int32_t> host_cells(size_t(self_overflow_cell_idxs->ne[0]),
+                    cparams.remote_attn_position_split ? -1 : 0);
             for (size_t i = 0; i < split_overflow_cells.size(); ++i) {
                 const uint32_t global_cell = split_overflow_cells[i];
                 if (global_cell < kvarn_cache->position_split_p() ||
@@ -1023,7 +1025,16 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
                             "position-split overflow cell %u maps outside Qx payload origin=%u size=%u (row=%u)",
                             global_cell, payload_origin, payload_size, physical_row));
                 }
-                host_cells[i] = int32_t(physical_row);
+                if (cparams.remote_attn_position_split) {
+                    const auto expected = kvarn_cache->position_split_p() + uint32_t(i);
+                    if (global_cell != expected || physical_row != i ||
+                            metadata->get_cells(0).pos_get(global_cell) != llama_pos(expected)) {
+                        throw std::runtime_error("RKVA range requires a contiguous, unshifted single-sequence overflow");
+                    }
+                    host_cells[i] = int32_t(global_cell);
+                } else {
+                    host_cells[i] = int32_t(physical_row);
+                }
             }
             if (std::getenv("F4_ALLOC_TRACE") != nullptr) {
                 // Ground truth for the row-mapping question: what row indices does the
@@ -4990,13 +5001,270 @@ ggml_tensor * llm_graph_context::build_ovf_mask_crop(
     return mask_cont;
 }
 
+ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
+        llm_graph_input_attn_kv * inp, ggml_tensor * q_cur, ggml_tensor * k_cur,
+        ggml_tensor * v_cur, float kq_scale, int il, ggml_tensor * positions) const {
+    const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(inp->mctx);
+    if (!kvarn_ctx || !kvarn_ctx->position_split_enabled() || !positions ||
+            !backend_remote || !backend_cpu || !cparams.causal_attn ||
+            hparams.use_alibi || hparams.f_max_alibi_bias != 0.0f || hparams.attn_soft_cap ||
+            !inp->self_kq_mask_local_cnv || !inp->self_overflow_cell_idxs) {
+        throw std::runtime_error("RKVA positional attention requires causal single-sequence KVarN range inputs");
+    }
+    const auto * cache = kvarn_ctx->get_kvarn_cache();
+    const auto * standard = cache->get_standard_cache();
+    if (!standard || standard->get_payload_row_origin() != cache->position_split_p()) {
+        throw std::runtime_error("RKVA range requires a compact quantized checkpoint mirror beginning at P");
+    }
+    ggml_backend_t backend_cuda = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        auto * backend = ggml_backend_sched_get_backend(sched, i);
+        const auto * name = ggml_backend_dev_name(ggml_backend_get_device(backend));
+        if (name && std::strncmp(name, "CUDA", 4) == 0) { backend_cuda = backend; break; }
+    }
+    if (!backend_cuda) throw std::runtime_error("RKVA position split requires local CUDA attention");
+    const uint32_t n_local = uint32_t(inp->self_kq_mask_local->ne[0]);
+    auto * mask_local = inp->self_kq_mask_local_cnv;
+    // Preserve the Q4_0/Q8_0 checkpoint representation; upload only appended rows.
+    auto * k_written = kvarn_ctx->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il);
+    auto * v_written = kvarn_ctx->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il);
+    if (!k_written || !v_written) throw std::runtime_error("missing RKVA companion stores");
+    ggml_backend_sched_set_tensor_backend(sched, k_written, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, v_written, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_overflow_cell_idxs, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_kvarn_mat_idxs_local, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_cpu);
+    ggml_build_forward_expand(gf, k_written);
+    ggml_build_forward_expand(gf, v_written);
+    const bool native_attention = kvarn_ctx->uses_native_attention(il) &&
+        llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
+    const auto kvarn_plan = llama_kvarn_plan_attention(
+        native_attention,
+        kvarn_ctx->native_attention_uses_original_v(il),
+        kvarn_ctx->native_rotated_max_query_tokens(il),
+        (uint32_t) q_cur->ne[2],
+        (int) q_cur->ne[0]);
+    const auto kvarn_domain = kvarn_plan.domain;
+    const bool use_kvarn_rotated_domain =
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
+    const bool use_kvarn_mixed_domain =
+        kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+    const bool use_kvarn_q_rot = use_kvarn_rotated_domain || use_kvarn_mixed_domain;
+    const bool local_tail_here = kvarn_ctx->tail_on_layer(il);
+    ggml_tensor * kvarn_rot = nullptr;
+    if (use_kvarn_q_rot || local_tail_here) {
+        kvarn_rot = llm_kvarn_rot_for_dim(
+            inp->self_kvarn_rot_64, inp->self_kvarn_rot_128,
+            inp->self_kvarn_rot_256, inp->self_kvarn_rot_512, q_cur->ne[0]);
+        GGML_ASSERT(kvarn_rot != nullptr);
+    }
+    ggml_tensor * q_local = q_cur;
+    if (use_kvarn_q_rot) {
+        GGML_ASSERT(q_local->type == GGML_TYPE_F32);
+        q_local = ggml_kvarn_wht_aux(ctx0, q_local, kvarn_rot->ne[0]);
+    }
+
+    // Local K/V via KVarN native range read (same domain as single-range).
+    // EXPLICIT local body: this runs inside overflow-only ubatches too, where
+    // the current range is 1. Naming the read range keeps the local lookup
+    // independent of which ubatch is executing.
+    ggml_tensor * k_local = kvarn_ctx->get_k_for_range(
+        ctx0, il, kvarn_plan.native_attention,
+        llama_position_split::kRangeLocal, n_local, inp->self_kvarn_mat_idxs_local);
+    ggml_tensor * v_local = kvarn_ctx->get_v_for_range(
+        ctx0, il, kvarn_plan.native_attention,
+        llama_position_split::kRangeLocal, n_local, inp->self_kvarn_mat_idxs_local);
+    GGML_ASSERT(k_local != nullptr && v_local != nullptr);
+
+    ggml_tensor * k_tail_local   = nullptr;
+    ggml_tensor * v_tail_local   = nullptr;
+    ggml_tensor * mask_tail_local = nullptr;
+    ggml_tensor * bias_tail_local = nullptr;
+    ggml_tensor * tail_idx_local  = nullptr;
+    ggml_tensor * tail_order_local = nullptr;
+    ggml_tensor * tail_desc_local  = nullptr;
+    llama_kv_tail_route route_local = LLAMA_KV_TAIL_ROUTE_NONE;
+    if (local_tail_here) {
+        route_local = kvarn_ctx->get_tail_route(il);
+        k_tail_local = kvarn_ctx->get_k_tail(ctx0, il);
+        v_tail_local = kvarn_ctx->get_v_tail(ctx0, il);
+        tail_idx_local = inp->get_tail_read_idxs();
+        if (route_local == LLAMA_KV_TAIL_ROUTE_NONE) {
+            k_tail_local = nullptr;
+            v_tail_local = nullptr;
+        }
+        // Fail closed instead of building a half-wired tail: a present tail
+        // without its read indices would silently read the wrong keys.
+        if (k_tail_local != nullptr && (v_tail_local == nullptr || tail_idx_local == nullptr)) {
+            throw std::logic_error(format(
+                    "position-split layer %d: local exact tail present without "
+                    "its V or read-index operand", il));
+        }
+        if (k_tail_local != nullptr) {
+            mask_tail_local = inp->get_kq_mask_tail();
+            bias_tail_local = build_attn_bias_tail(
+                    nullptr, inp->get_tail_bias_read_idxs(), mask_tail_local);
+            tail_order_local = inp->get_tail_query_order();
+            tail_desc_local  = inp->get_tail_run_desc();
+            // Same domain rule as the single-range path: the stored tail is
+            // unrotated, the local body records are rotated.
+            GGML_ASSERT(kvarn_rot != nullptr);
+            // NO current segment here: this builder runs for an OVERFLOW
+            // ubatch, which writes Q4 overflow keys, so the local tail is read
+            // purely as HISTORY (validate_native_tail_operation(..., false)).
+            // Overflow keys must never enter the local tail.
+            k_tail_local = ggml_kvarn_wht_aux(ctx0, k_tail_local, kvarn_rot->ne[0]);
+            // Same rule as the single-range path above: the FA un-rotates the
+            // tail V too, so the stored (original-domain) tail V must be rotated
+            // in every domain. See the measurement cited there.
+            v_tail_local = ggml_kvarn_wht_aux(ctx0, v_tail_local, kvarn_rot->ne[0]);
+            // Same domain rule for the current segment: K is always rotated for
+            // the KVarN Q-rot path, V only in the rotated-domain case.
+        }
+    }
+
+    // Two FlashAttention ops with LSE side outputs. No sinks/bias/softcap in
+    // P-mode (fail closed below; plan 3.4 keeps sinks out of the first mode);
+    // precision F32 like the single-range path.
+    ggml_tensor * fa1 = nullptr;
+    ggml_tensor * final_local_tail_op = nullptr;
+    // Argument order mirrors build_attn() exactly: slot 5 is the MODEL's KQ
+    // bias (must stay null -- a non-null value there silently disables the
+    // FlashAttention branch and leaves final_attn_op unset), and the tail bias
+    // is slot 14. Passing the tail bias one slot early compiled fine and only
+    // failed at the GGML_ASSERT(fa1 != nullptr) below.
+    ggml_tensor * o1 = build_attn_mha(q_local, k_local, v_local,
+        nullptr, mask_local, nullptr, nullptr, int64_t(n_local),
+        kq_scale, il,
+        k_tail_local, v_tail_local, mask_tail_local, bias_tail_local,
+        tail_idx_local, tail_order_local, tail_desc_local,
+        route_local, kvarn_domain,
+        nullptr, nullptr, kvarn_ctx->get_tail_slots(),
+        !kvarn_ctx->has_kv_body(il), &final_local_tail_op);
+    // build_attn_mha returns the final (possibly tail-merged) node through
+    // final_local_tail_op; both the merge and tail validator consume it.
+    fa1 = final_local_tail_op;
+    GGML_ASSERT(fa1 != nullptr);
+    if (route_local == LLAMA_KV_TAIL_ROUTE_NATIVE) {
+        validate_native_tail_operation(inp->mctx, il, final_local_tail_op, false);
+    }
+    ggml_tensor * lse1 = ggml_flash_attn_ext_lse_out(ctx0, fa1);
+
+    // Local O back to the original V domain before merging (same rule as the
+    // single-range path: the KVarN native output is rotated unless the backend
+    // uses the original V domain).
+    if (use_kvarn_rotated_domain) {
+        GGML_ASSERT(o1->type == GGML_TYPE_F32);
+        GGML_ASSERT(kvarn_rot != nullptr);
+        o1 = ggml_kvarn_wht_aux(ctx0, o1, kvarn_rot->ne[0]);
+    }
+
+
+    llm_flash_attn_ext_set_kvarn_domain(fa1, kvarn_domain);
+    ggml_prec_set_acc(fa1, GGML_PREC_F32);
+    int remote_layer = 0;
+    for (int l = 0; l < il; ++l) {
+        if (hparams.has_kv(l) && !hparams.is_recr(l)) ++remote_layer;
+    }
+    auto * range = ggml_remote_attn_range(ctx0, q_cur, k_written, v_written,
+            inp->self_overflow_cell_idxs, positions, remote_layer,
+            cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
+    if (ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
+        // Preserve original projected values as independent graph operands.
+        // The Q4/Q8 companion above remains metadata/bookkeeping only for this
+        // experimental native owner; none of its quantized bytes are decoded.
+        auto * native_k = ggml_cont(ctx0, k_cur);
+        auto * native_v = ggml_cont(ctx0, v_cur);
+        ggml_remote_attn_range_set_native_sources(range, native_k, native_v);
+    }
+    ggml_backend_sched_set_tensor_backend(sched, range, backend_cpu);
+    const int64_t width = q_cur->ne[0]*q_cur->ne[1];
+    auto * o2 = ggml_cont(ctx0, ggml_view_2d(ctx0, range, width, q_cur->ne[2], range->nb[1], 0));
+    auto * lse2 = ggml_cont(ctx0, ggml_view_2d(ctx0, range, q_cur->ne[1], q_cur->ne[2],
+            range->nb[1], size_t(width)*sizeof(float)));
+    ggml_backend_sched_set_tensor_backend(sched, o2, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, lse2, backend_cpu);
+    if (std::getenv("F4_NODE_DUMP") != nullptr) {
+        cb(q_cur, "diag_query", il);
+        cb(fa1, "diag_local_fa", il);
+        cb(o1, "diag_local_out", il);
+        cb(lse1, "diag_local_lse", il);
+        cb(range, "diag_rpc_range", il);
+        cb(o2, "diag_remote_out", il);
+        cb(lse2, "diag_remote_lse", il);
+    }
+    ggml_build_forward_expand(gf, o1);
+    ggml_build_forward_expand(gf, lse1);
+    ggml_build_forward_expand(gf, o2);
+    ggml_build_forward_expand(gf, lse2);
+    const int merge_begin = ggml_graph_n_nodes(gf);
+    // Stable merge (validated pattern from test-position-split-merge-graph).
+    // O is [D,H,Q,B] after restoring the 4D layout; LSE is [H,Q,B].
+    const int64_t n_qh = lse1->ne[0];
+    const int64_t n_q = lse1->ne[1];
+    const int64_t n_b = lse1->ne[2];
+    GGML_ASSERT(lse2->ne[0] == n_qh && lse2->ne[1] == n_q && lse2->ne[2] == n_b);
+    const int64_t head_dim = q_cur->ne[0];
+    // build_attn_mha returns O flattened as [(D*H), (Q*B)]; restore 4D.
+    GGML_ASSERT(o1->ne[0] == head_dim*n_qh && o1->ne[1] == n_q*n_b);
+    GGML_ASSERT(o2->ne[0] == head_dim*n_qh && o2->ne[1] == n_q*n_b);
+    ggml_tensor * o1_4d = ggml_reshape_4d(ctx0, o1, head_dim, n_qh, n_q, n_b);
+    ggml_tensor * o2_4d = ggml_reshape_4d(ctx0, o2, head_dim, n_qh, n_q, n_b);
+    ggml_tensor * c1 = ggml_clamp(ctx0, lse1, -1e6f, 1e30f);
+    ggml_tensor * c2 = ggml_clamp(ctx0, lse2, -1e6f, 1e30f);
+    ggml_tensor * mx = ggml_scale(ctx0,
+            ggml_add(ctx0, ggml_add(ctx0, c1, c2), ggml_abs(ctx0, ggml_sub(ctx0, c1, c2))),
+            0.5f);
+    ggml_tensor * e1 = ggml_exp(ctx0, ggml_sub(ctx0, lse1, mx));
+    ggml_tensor * e2 = ggml_exp(ctx0, ggml_sub(ctx0, lse2, mx));
+    ggml_tensor * w1 = ggml_reshape_4d(ctx0, e1, 1, n_qh, n_q, n_b);
+    ggml_tensor * w2 = ggml_reshape_4d(ctx0, e2, 1, n_qh, n_q, n_b);
+    ggml_tensor * num = ggml_add(ctx0, ggml_mul(ctx0, o1_4d, w1), ggml_mul(ctx0, o2_4d, w2));
+    ggml_tensor * den = ggml_add(ctx0, e1, e2);
+    // Both ranges are non-empty here (validated above), so den > 0 always:
+    // plain division is exact with no epsilon, and merged LSE is exact.
+    // Broadcast den as [1,H,Q,B] like the validated merge-graph pattern.
+    ggml_tensor * den_4d = ggml_reshape_4d(ctx0, den, 1, n_qh, n_q, n_b);
+    ggml_tensor * o_merged_4d = ggml_div(ctx0, num, den_4d);
+    ggml_tensor * o_merged = ggml_reshape_2d(ctx0, o_merged_4d,
+        o_merged_4d->ne[0]*o_merged_4d->ne[1], o_merged_4d->ne[2]*o_merged_4d->ne[3]);
+    // Materialize to a fresh contiguous buffer (not a view) so the returned
+    // O always owns an allocated output buffer. A reshape view of the div
+    // output was left without a valid buffer by the scheduler in the
+    // multi-backend split graph (isolated: standalone mul read OOB on the
+    // view while sigmoid was clean; materializing eliminates it). Cheap and
+    // permanent.
+    o_merged = ggml_cont_2d(ctx0, o_merged, o_merged->ne[0], o_merged->ne[1]);
+
+
+    ggml_build_forward_expand(gf, o_merged);
+    for (int i = merge_begin; i < ggml_graph_n_nodes(gf); ++i) {
+        auto * node = ggml_graph_node(gf, i);
+        if (!node->view_src && node->op != GGML_OP_NONE) {
+            ggml_backend_sched_set_tensor_backend(sched, node, backend_cuda);
+        }
+    }
+    ggml_backend_sched_set_tensor_backend(sched, fa1, backend_cuda);
+    ggml_backend_sched_set_tensor_backend(sched, lse1, backend_cuda);
+    if (q_local != q_cur) ggml_backend_sched_set_tensor_backend(sched, q_local, backend_cuda);
+    if (k_tail_local) ggml_backend_sched_set_tensor_backend(sched, k_tail_local, backend_cuda);
+    if (v_tail_local) ggml_backend_sched_set_tensor_backend(sched, v_tail_local, backend_cuda);
+    ggml_backend_sched_set_tensor_backend(sched, o_merged, backend_cuda);
+    cb(o_merged, "attn_position_split_rpc", il);
+    return o_merged;
+}
+
 ggml_tensor * llm_graph_context::build_attn_position_split(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
         float kq_scale,
-        int il) const {
+        int il,
+        ggml_tensor * positions) const {
+    if (cparams.remote_attn_position_split) {
+        return build_attn_position_split_rpc(inp, q_cur, k_cur, v_cur, kq_scale, il, positions);
+    }
     // F3 dual-range attention: local CUDA/KVarN FA + overflow Vulkan/Q4 FA +
     // stable merge with CUDA outputs. Requires use_position_split_attention(il); every
     // deviation fails closed instead of silently falling back.
@@ -5454,6 +5722,7 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
         return e != nullptr && e[0] == '1' && e[1] == '\0';
     }() && group_overflow_decode && kvarn_ctx->current_range_is_overflow() &&
         ovf_use_view && ovf_gather_f16 && !ovf_q4_fa &&
+        k_storage->type == GGML_TYPE_Q4_0 && v_storage->type == GGML_TYPE_Q4_0 &&
         q_cur->ne[2] == 1 && q_cur->ne[3] == 1 &&
         k_cur->ne[2] == 1 && k_cur->ne[3] == 1 &&
         v_cur->ne[2] == 1 && v_cur->ne[3] == 1 &&
@@ -5890,6 +6159,12 @@ ggml_tensor * lse1 = ggml_flash_attn_ext_lse_out(ctx0, fa1);
         return fused;
     }
 
+    if (std::getenv("F4_NODE_DUMP") != nullptr) {
+        cb(q_cur, "diag_query", il);
+        cb(fa1, "diag_local_fa", il);
+        cb(o1, "diag_local_out", il);
+        cb(lse1, "diag_local_lse", il);
+    }
     ggml_tensor * o2 = build_attn_mha(q_cur, k_overflow, v_overflow,
         nullptr, mask_overflow, nullptr, nullptr, int64_t(n_ovf_rows),
         kq_scale, il,
@@ -5900,6 +6175,10 @@ ggml_tensor * lse1 = ggml_flash_attn_ext_lse_out(ctx0, fa1);
     nullptr, nullptr, 0, false, &fa2);
 GGML_ASSERT(fa2 != nullptr);
 ggml_tensor * lse2 = ggml_flash_attn_ext_lse_out(ctx0, fa2);
+if (std::getenv("F4_NODE_DUMP") != nullptr) {
+    cb(o2, "diag_remote_out", il);
+    cb(lse2, "diag_remote_lse", il);
+}
 ggml_prec_set_acc(fa1, GGML_PREC_F32);
 ggml_prec_set_acc(fa2, GGML_PREC_F32);
 if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {

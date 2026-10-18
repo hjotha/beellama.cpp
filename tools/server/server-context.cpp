@@ -23,6 +23,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-remote-snapshot.h"
 #include "src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
@@ -4764,6 +4765,10 @@ private:
     // format. Invariant 1: first statement is the gate; invariant 5: only called on slot
     // release/reassign, never during generation.
     void auto_save_slot_if_useful(server_slot & slot, const char * reason = "discard") {
+        if (llama_remote_native_kvarn_transient_active(ctx_tgt)) {
+            SLT_DBG(slot, "%s", "auto-save skipped: experimental native KVarN overflow has no snapshot codec\n");
+            return;
+        }
         if (!auto_cache_enabled()) {
             return; // off by default
         }

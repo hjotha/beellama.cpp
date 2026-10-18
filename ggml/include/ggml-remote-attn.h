@@ -17,6 +17,26 @@
 extern "C" {
 #endif
 
+// Extension slots of GGML_OP_REMOTE_ATTN; the legacy slots remain in ggml.h.
+enum ggml_remote_attn_range_op_param {
+    GGML_REMOTE_ATTN_PARAM_RANGE  = 6,
+    GGML_REMOTE_ATTN_PARAM_ORIGIN = 7,
+    GGML_REMOTE_ATTN_PARAM_N_LIVE = 8,
+};
+
+// Query-only v2 overflow attention. Sources 1/2 are the companion SET_ROWS
+// results (Q4_0 or Q8_0 [D*HKV, capacity]); source3 contains global P+i IDs,
+// with optional trailing -1 padding. Output rows pack OUT[D*H] then LSE[H]
+// for each query. The op uploads only the changed/invalidated KV suffix.
+GGML_API struct ggml_tensor * ggml_remote_attn_range(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q,
+        struct ggml_tensor * k_written,
+        struct ggml_tensor * v_written,
+        struct ggml_tensor * overflow_cells,
+        struct ggml_tensor * query_pos,
+        int layer_id, uint32_t origin, uint32_t n_live, float kq_scale);
+
 // KVarN attention domain negotiated in HELLO. Values mirror rkva_domain and
 // GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_*; AUTO lets the server reproduce the host
 // KVarN rotated-domain plan for the configured cache type.
@@ -62,6 +82,11 @@ GGML_API bool ggml_backend_remote_attn_connected(ggml_backend_t backend);
 // except for routing; seq_id is informational (llama sequence).
 GGML_API bool ggml_backend_remote_attn_create_session(
         ggml_backend_t backend, uint32_t session_id, uint32_t seq_id, uint32_t capacity);
+// Range-specific creation: native-quant servers defer KV allocation until
+// CONFIG selects its storage. Old v2 F16 servers use their existing creation.
+GGML_API bool ggml_backend_remote_attn_create_range_session(
+        ggml_backend_t backend, uint32_t session_id, uint32_t seq_id, uint32_t capacity);
+
 GGML_API bool ggml_backend_remote_attn_destroy_session(
         ggml_backend_t backend, uint32_t session_id);
 GGML_API bool ggml_backend_remote_attn_reset(
@@ -69,6 +94,33 @@ GGML_API bool ggml_backend_remote_attn_reset(
 // Remove every stored position >= pos0 (trim and speculative rewind).
 GGML_API bool ggml_backend_remote_attn_trim(
         ggml_backend_t backend, uint32_t session_id, int32_t pos0);
+
+// v2 compact overflow cache. Requires active session and the three RANGE ops.
+// Matching Q4_0/Q8_0 storage is selected when advertised, otherwise the same
+// quantized source expands to F16. An explicit native format must match source.
+// Config resets its range histories; invalidation forces full per-layer resync
+// from the authoritative host companion on the next range attention call.
+GGML_API bool ggml_backend_remote_attn_configure_range(
+        ggml_backend_t backend, uint32_t origin, uint32_t capacity, enum ggml_type cache_type);
+GGML_API void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend);
+
+// Explicit experimental native producer (GGML_RKVA_RANGE_STORAGE=kvarn4 and
+// GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL=1). Append-only original projected F32
+// sources; existing quantized overflow snapshots cannot initialize it.
+GGML_API bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_has_state(ggml_backend_t backend);
+GGML_API void ggml_remote_attn_range_set_native_sources(
+        struct ggml_tensor * node, struct ggml_tensor * keys, struct ggml_tensor * values);
+
+// Optional disk checkpoint accelerator. Opt in with GGML_RKVA_DISK_SNAPSHOTS=1;
+// unsupported servers return false without sending any checkpoint request.
+// Key is SHA256 of the fully verified authoritative HOST native file. The host
+// CPU companion must always be restored first; a disk hit only avoids its LAN
+// reupload. Missing/corrupt snapshots retain the normal full-upload fallback.
+GGML_API bool ggml_backend_remote_attn_disk_snapshot_enabled(ggml_backend_t backend);
+GGML_API bool ggml_backend_remote_attn_disk_snapshot(
+        ggml_backend_t backend, const uint8_t host_state_sha256[32],
+        uint32_t live_rows, bool restore);
 
 // Selects the session used by subsequent graph_compute calls (the graph nodes
 // carry only the layer id).

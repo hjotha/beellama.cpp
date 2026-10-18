@@ -34,6 +34,16 @@ does not authorize an implicit repartition. This option remains under the
 acceptance protocol in [the occupancy plan](occupancy-placement-plan-20261002.md);
 its availability alone does not mean production qualification has passed.
 
+With `--kv-position-split-p P` and a TCP `--remote-attn HOST:PORT`, the RKVA
+range protocol keeps positions `[0,P)` on CUDA and computes only `[P,C)` on
+the remote server. It requires an RKVA v2 range server, matching Q4_0 or Q8_0 remote
+cache types, and one causal Qwen35 sequence. No attention or KV upload RPC
+runs below P; initialization may negotiate a connection for an active split
+profile. `--remote-attn-min-context` still gates the configured adaptive
+profile capacity, rather than individual positions. See
+[Xbox positional overflow](xbox-position-overflow.md) for storage and state
+semantics.
+
 With thresholded local Vulkan remote attention, the server applies
 `--amd-sclk-prefill`, `--amd-sclk-decode`, and `--gpu-fabric-state` only when
 the active profile's configured capacity reaches `--remote-attn-min-context`.

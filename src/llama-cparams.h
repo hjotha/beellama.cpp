@@ -106,6 +106,8 @@ bool kv_unified;
     bool        local_attn_migration = false;
     bool        local_attn_migration_fallback = false;
     bool        remote_attn_enabled = false;
+    // TCP owns only [P,C); the host Q4 companion is a checkpoint/upload mirror.
+    bool        remote_attn_position_split = false;
     int         remote_attn_layers  = 0;   // count of full-attention layers offloaded (0 = none)
     int         remote_attn_prefill = 0;   // 0 = static remote attention, 1 = prefill migration
     bool        remote_attn_stats   = false;

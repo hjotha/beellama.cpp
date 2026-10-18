@@ -5,6 +5,10 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid.h"
+#include "../src/llama-memory-recurrent.h"
+#include "../src/llama-io.h"
+#include "ggml-backend.h"
 #include "../src/llama-model.h"
 #include "../src/llama-ext.h"
 
@@ -550,10 +554,15 @@ static bool test_kvarn_full_window_native_exact(
 }
 
 static bool test_kvarn_partial_checkpoint_history(
-        llama_model * model, const common_params & params, const llama_tokens & tokens) {
+        llama_model * model, const common_params & params, const llama_tokens & tokens,
+        bool single_stream_only = false) {
     if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED || params.kv_tail_tokens.empty() ||
             !std::all_of(params.kv_tail_tokens.begin(), params.kv_tail_tokens.end(), ::isdigit) ||
             std::stoul(params.kv_tail_tokens) == 0) {
+        if (single_stream_only) {
+            LOG_ERR("%s: targeted HYBRID partial checkpoint test requires KVarN and a nonzero numeric exact tail\n", __func__);
+            return false;
+        }
         return true;
     }
 
@@ -565,6 +574,14 @@ static bool test_kvarn_partial_checkpoint_history(
     if (!context) {
         LOG_ERR("%s: failed to create KVarN checkpoint context\n", __func__);
         return false;
+    }
+    if (single_stream_only) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(context.get()));
+        if (!hybrid || !hybrid->requires_state_for_partial_restore() ||
+                !hybrid->get_mem_attn_base()->requires_state_for_partial_restore()) {
+            LOG_ERR("%s: targeted HYBRID partial checkpoint test requires hybrid memory with stateful attention-tail restoration\n", __func__);
+            return false;
+        }
     }
 
     llama_tokens prefix;
@@ -587,7 +604,9 @@ static bool test_kvarn_partial_checkpoint_history(
         n_past += count;
     }
 
-    {
+    if (single_stream_only) {
+        LOG_INF("%s: targeted single-stream HYBRID mode skips the unrelated two-sequence on-device checkpoint subcase\n", __func__);
+    } else {
         auto device_params = context_params;
         device_params.n_seq_max = 2;
         device_params.n_ctx = std::max(device_params.n_ctx, 2*(prefix_tokens + 16));
@@ -711,6 +730,12 @@ static bool test_kvarn_partial_checkpoint_history(
     const llama_token probe_b = tokens.size() < 2 ? llama_token(3) : tokens[1];
     const llama_token extension = tokens.size() < 3 ? llama_token(4) : tokens[2];
 
+    const uint64_t checkpoint_owner_id = llama_kvarn_state_owner_id(context.get());
+    const uint64_t checkpoint_owner_epoch = llama_kvarn_state_owner_epoch(context.get());
+    if (checkpoint_owner_id == 0 || checkpoint_owner_epoch == 0 || checkpoint_owner_epoch == UINT64_MAX) {
+        LOG_ERR("%s: checkpoint fixture has no valid KVarN owner lineage\n", __func__);
+        return false;
+    }
     std::vector<uint8_t> checkpoint_a;
     if (!save_partial(checkpoint_a)) {
         LOG_ERR("%s: failed to save checkpoint A\n", __func__);
@@ -775,12 +800,31 @@ static bool test_kvarn_partial_checkpoint_history(
         return false;
     }
 
+    if (llama_kvarn_state_owner_id(context.get()) != checkpoint_owner_id ||
+            llama_kvarn_state_owner_epoch(context.get()) != checkpoint_owner_epoch) {
+        LOG_ERR("%s: live anchor no longer belongs to the saved checkpoint fixture\n", __func__);
+        return false;
+    }
     std::vector<uint8_t> live_self(llama_state_seq_get_size_ext(context.get(), 0, self_flags));
     if (live_self.empty() || llama_state_seq_get_data_ext(
                 context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
         LOG_ERR("%s: failed to save self-contained restore anchor\n", __func__);
         return false;
     }
+    const auto restore_live_anchor = [&]() {
+        if (llama_state_seq_set_data_ext(
+                    context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+            return false;
+        }
+        // This exact FULL anchor and checkpoints A/B were captured from the
+        // same fixture lineage. FULL advances the live epoch; reconnect only
+        // their saved owner/epoch, as SLOT_RESTORE does for a validated durable
+        // companion. Partial replay still validates every cell reference.
+        return llama_kvarn_adopt_state_owner_id(context.get(), checkpoint_owner_id) &&
+               llama_kvarn_adopt_state_owner_epoch(context.get(), checkpoint_owner_epoch) &&
+               llama_kvarn_state_owner_id(context.get()) == checkpoint_owner_id &&
+               llama_kvarn_state_owner_epoch(context.get()) == checkpoint_owner_epoch;
+    };
     std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> prepared(
             llama_state_seq_prepare_data_ext(
                     context.get(), checkpoint_b.data(), checkpoint_b.size(), 0, partial_flags),
@@ -791,8 +835,7 @@ static bool test_kvarn_partial_checkpoint_history(
     }
     if (llama_state_seq_restore_plan_commit(prepared.get()) != checkpoint_b.size() ||
             llama_memory_seq_pos_max(llama_get_memory(context.get()), 0) != checkpoint_b_past - 1 ||
-            llama_state_seq_set_data_ext(
-                    context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+            !restore_live_anchor()) {
         LOG_ERR("%s: prepared restore commit or anchor recovery failed\n", __func__);
         return false;
     }
@@ -841,6 +884,41 @@ static bool test_kvarn_partial_checkpoint_history(
             !logits_match(live_oracle, live_after_reject)) {
         LOG_ERR("%s: rejected KVarN frame changed live tensor state\n", __func__);
         return false;
+    }
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(context.get()))) {
+        // Older dense hybrid checkpoints contained only the recurrent frame.
+        // Produce that real legacy layout with the authoritative RS writer;
+        // an exact-tail context must reject it without changing live state.
+        struct legacy_writer final : llama_io_write_i {
+            std::vector<uint8_t> bytes;
+            void write(const void * data, size_t size) override {
+                const auto * begin = static_cast<const uint8_t *>(data);
+                bytes.insert(bytes.end(), begin, begin + size);
+            }
+            void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+                const size_t begin = bytes.size();
+                bytes.resize(begin + size);
+                ggml_backend_tensor_get(tensor, bytes.data() + begin, offset, size);
+            }
+            size_t n_bytes() override { return bytes.size(); }
+        } legacy;
+        legacy.write(checkpoint_a.data(), sizeof(uint32_t) + sizeof(llama_seq_id));
+        hybrid->get_mem_recr()->state_write(legacy, 0, partial_flags);
+        std::vector<uint8_t> before_legacy, after_legacy;
+        if (!save_partial(before_legacy)) {
+            return false;
+        }
+        std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> legacy_plan(
+                llama_state_seq_prepare_data_ext(
+                        context.get(), legacy.bytes.data(), legacy.bytes.size(), 0, partial_flags),
+                llama_state_seq_restore_plan_free);
+        if (legacy_plan || llama_state_seq_set_data_ext(
+                    context.get(), legacy.bytes.data(), legacy.bytes.size(), 0, partial_flags) != 0 ||
+                !save_partial(after_legacy) || before_legacy != after_legacy) {
+            LOG_ERR("%s: legacy RS-only checkpoint accepted or changed the live exact-tail state\n", __func__);
+            return false;
+        }
     }
 
     if (const char * path = std::getenv("KVARN_TEST_SELF_STATE")) {
@@ -909,8 +987,7 @@ static bool test_kvarn_partial_checkpoint_history(
     // Partial state references the still-live ordinary-cache body. Restore the
     // self-contained anchor before testing another historical checkpoint;
     // checkpoint A legitimately removed B's later reference cells.
-    if (llama_state_seq_set_data_ext(
-                context.get(), live_self.data(), live_self.size(), 0, self_flags) != live_self.size()) {
+    if (!restore_live_anchor()) {
         LOG_ERR("%s: failed to reestablish live anchor before checkpoint B\n", __func__);
         return false;
     }
@@ -1693,6 +1770,14 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
     }
 
     LOG_INF("%s: the input prompt is %d tokens\n", __func__, (int)tokens.size());
+
+    if (std::getenv("KVARN_TEST_HYBRID_PARTIAL_ONLY")) {
+        if (!test_kvarn_partial_checkpoint_history(model, params, tokens, true)) {
+            return false;
+        }
+        LOG("\nPASS: targeted HYBRID single-stream partial checkpoint validation completed.\n");
+        return true;
+    }
 
     // Test 1: baseline (saves state to disk)
     auto result_baseline = test_baseline(model, params, tokens);

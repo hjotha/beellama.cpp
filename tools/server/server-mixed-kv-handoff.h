@@ -42,6 +42,8 @@ struct source_capture {
     bool has_cell_ext = false;
     std::string source_layout;              // common_prompt_cache_layout of the source ctx
     uint64_t source_model_instance = 0;     // llama_model_mtp_weights_get_info
+    uint64_t source_owner_id = 0;           // original cache lineage, never inferred from a payload
+    uint64_t source_owner_epoch = 0;
     std::vector<llama_kv_cache_kvarn_layer_layout> kvarn_layers;
 };
 

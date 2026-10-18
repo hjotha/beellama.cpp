@@ -20,6 +20,8 @@
 #include "llama-kvarn.h"
 #include "llama-kvarn-split-fused.h"
 #include "ggml-remote-attn.h"
+#include "rkva-snapshot-digest.h"
+#include "llama-remote-snapshot.h"
 #include "ggml-local-split.h"
 
 #include "llama-memory.h"
@@ -483,6 +485,18 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
     auto * local_attn_dev = local_attention_device(params.remote_attn_host);
+    const char * requested_split_env = getenv("LLAMA_KV_POSITION_SPLIT_P");
+    const bool split_requested = params.kv_position_split_p != 0 ||
+            (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP && params.ctx_other == nullptr &&
+             requested_split_env && requested_split_env[0] && std::strcmp(requested_split_env, "0") != 0);
+    const bool tcp_position_split = split_requested &&
+            params.remote_attn_host && params.remote_attn_host[0] && !local_attn_dev;
+    if (tcp_position_split) {
+        local_attn_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!local_attn_dev) {
+            throw std::runtime_error("TCP position-split requires a CPU checkpoint mirror backend");
+        }
+    }
     if (!local_attn_dev && params.kv_position_split_p != 0) {
         try {
             local_attn_dev = local_attention_device("vulkan:0");
@@ -559,6 +573,7 @@ llama_context::llama_context(
     }
     cparams.kvarn             = params.kvarn;
     cparams.remote_attn_enabled = (params.remote_attn_host != nullptr && params.remote_attn_host[0] != '\0');
+    cparams.remote_attn_position_split = tcp_position_split;
     cparams.remote_attn_prefill = params.remote_attn_prefill;
     cparams.remote_attn_stats   = (params.remote_attn_stats != 0);
     cparams.remote_attn_cache_type_k = params.remote_attn_cache_type_k;
@@ -581,7 +596,7 @@ llama_context::llama_context(
                 cparams.remote_attn_prefill != 0 || !is_qx(cparams.remote_attn_cache_type_k) ||
                 !is_qx(cparams.remote_attn_cache_type_v)) {
             throw std::invalid_argument(
-                    "per-layer remote KV formats require Qwen35 target context, native Vulkan, "
+                    "per-layer remote KV formats require Qwen35 target context, native Vulkan or TCP position-split, "
                     "KVarN local cache, Q4/Q5/Q6/Q8 remote K/V, Flash Attention, KV offload, "
                     "one non-unified slot, and static prefill");
         }
@@ -1143,7 +1158,7 @@ llama_context::llama_context(
             }
         }
 
-        if (local_attn_dev) {
+        if (local_attn_dev && !tcp_position_split) {
             if (model.arch != LLM_ARCH_QWEN35 || cparams.kv_paged || !cparams.offload_kqv ||
                     cparams.remote_attn_prefill < 0 || cparams.remote_attn_prefill > 1) {
                 throw std::runtime_error(
@@ -1232,6 +1247,9 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+        if (tcp_position_split) {
+            cparams.local_attn_backend = backend_cpu;
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
@@ -1866,6 +1884,18 @@ std::vector<ggml_backend_t> layer_backends;
             geo.swa            = 0;
             geo.kq_scale       = model.hparams.f_attention_scale == 0.0f ?
                                  1.0f / sqrtf((float) geo.head_dim) : model.hparams.f_attention_scale;
+            if (tcp_position_split) {
+                const char * storage = std::getenv("GGML_RKVA_RANGE_STORAGE");
+                if (storage && std::strcmp(storage, "kvarn4") == 0 &&
+                        (cparams.kv_tail_tokens > 128 || cparams.kv_tail_type != GGML_TYPE_F16)) {
+                    throw std::runtime_error("experimental native Xbox KVarN4 requires an F16 precision tail of at most 128 tokens");
+                }
+                geo.max_ctx = cparams.n_ctx_seq - cparams.kv_position_split_p;
+                // The CPU companion encodes Q4_0 or Q8_0 once. The Xbox uses
+                // matching packed records or their F16 expansion, without WHT.
+                geo.cache_bits_k = geo.cache_bits_v = 0;
+                geo.tail_tokens = geo.tail_groups = 0;
+            }
 
             const bool is_local_vulkan = (params.remote_attn_host != nullptr &&
                 (std::strncmp(params.remote_attn_host, "vulkan", 6) == 0 ||
@@ -1911,6 +1941,9 @@ std::vector<ggml_backend_t> layer_backends;
                 if (!ggml_backend_remote_attn_connect(backend_remote)) {
                     ggml_backend_free(backend_remote);
                     backend_remote = nullptr;
+                    if (tcp_position_split) {
+                        throw std::runtime_error("TCP position-split requires a reachable RKVA range server; refusing Vulkan fallback");
+                    }
                     LLAMA_LOG_WARN("%s: remote-attn server %s:%u unreachable, falling back to local vulkan:0\n",
                         __func__, params.remote_attn_host, (unsigned) params.remote_attn_port);
                     backend_remote = ggml_backend_local_split_init(0, 3);
@@ -1931,15 +1964,32 @@ std::vector<ggml_backend_t> layer_backends;
                     }
                 } else {
                     remote_attn_session = 0;
-                    if (!ggml_backend_remote_attn_create_session(
-                            backend_remote, remote_attn_session, /*seq_id=*/0, (uint32_t) cparams.n_ctx)) {
+                    const bool created = tcp_position_split ?
+                            ggml_backend_remote_attn_create_range_session(
+                                backend_remote, remote_attn_session, 0, geo.max_ctx) :
+                            ggml_backend_remote_attn_create_session(
+                                backend_remote, remote_attn_session, 0, geo.max_ctx);
+                    if (!created) {
                         ggml_backend_free(backend_remote);
                         backend_remote = nullptr;
                         throw std::runtime_error(format("%s: remote-attn CREATE_SESSION failed", __func__));
                     }
                     ggml_backend_remote_attn_set_active_session(backend_remote, remote_attn_session);
-                    LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
-                            __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
+                    if (tcp_position_split && !ggml_backend_remote_attn_configure_range(
+                            backend_remote, cparams.kv_position_split_p, geo.max_ctx,
+                            cparams.remote_attn_cache_type_k)) {
+                        ggml_backend_free(backend_remote);
+                        backend_remote = nullptr;
+                        throw std::runtime_error("RKVA server does not support positional OUT/LSE ranges");
+                    }
+                    if (tcp_position_split) {
+                        LLAMA_LOG_INFO("%s: RKVA position split: CUDA [0,%u), Xbox [%u,%u), %d layers; no ATTN RPC below P\n",
+                                __func__, cparams.kv_position_split_p, cparams.kv_position_split_p,
+                                cparams.n_ctx_seq, n_remote);
+                    } else {
+                        LLAMA_LOG_INFO("%s: remote attention enabled — %d full-attn layers offloaded to %s:%u\n",
+                                __func__, n_remote, params.remote_attn_host, (unsigned) params.remote_attn_port);
+                    }
                 }
             }
             // PATH B: the remote op is computed on the CPU backend (pinned in
@@ -6558,6 +6608,42 @@ size_t llama_context::state_seq_convert_data_to_mem(
     }
 }
 
+bool llama_context::remote_disk_snapshot_enabled() const {
+    return cparams.remote_attn_position_split && cparams.n_seq_max == 1 && backend_remote &&
+           ggml_backend_remote_attn_disk_snapshot_enabled(backend_remote);
+}
+
+bool llama_context::remote_native_kvarn_transient_active() const {
+    return backend_remote && ggml_backend_remote_attn_native_kvarn_has_state(backend_remote);
+}
+
+bool llama_context::remote_disk_snapshot(llama_seq_id seq_id, const uint8_t key[32],
+                                         size_t evaluated_tokens, bool restore) {
+    if (!remote_disk_snapshot_enabled() || seq_id != 0 || !memory || !key ||
+            evaluated_tokens <= cparams.kv_position_split_p ||
+            evaluated_tokens > cparams.n_ctx_seq ||
+            memory->seq_pos_min(seq_id) != 0 ||
+            memory->seq_pos_max(seq_id) != int64_t(evaluated_tokens) - 1) {
+        return false;
+    }
+    synchronize();
+    return ggml_backend_remote_attn_disk_snapshot(backend_remote, key,
+            uint32_t(evaluated_tokens - cparams.kv_position_split_p), restore);
+}
+
+bool llama_remote_disk_snapshot_enabled(const llama_context * ctx) {
+    return ctx && ctx->remote_disk_snapshot_enabled();
+}
+
+bool llama_remote_native_kvarn_transient_active(const llama_context * ctx) {
+    return ctx && ctx->remote_native_kvarn_transient_active();
+}
+
+bool llama_state_seq_remote_disk_snapshot_save(
+        llama_context * ctx, llama_seq_id seq_id, const uint8_t key[32], size_t evaluated_tokens) {
+    return ctx && ctx->remote_disk_snapshot(seq_id, key, evaluated_tokens, false);
+}
+
 size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const char * filepath,
         llama_token * tokens_out, size_t capacity, size_t * count_out, size_t state_size, uint64_t checksum) {
     if (!count_out) { return 0; }
@@ -6579,6 +6665,8 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         }
     }
     try {
+        const bool remote_disk = remote_disk_snapshot_enabled();
+        rkva_snapshot::Sha256 remote_hash;
         llama_file file(filepath, "rb");
         if (state_size > file.size() || state_size < 3*sizeof(uint32_t)) {
             throw std::runtime_error("invalid sequence state file size");
@@ -6593,6 +6681,7 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
                 const size_t count = std::min(left, buffer.size());
                 file.read_raw(buffer.data(), count);
                 XXH64_update(&hash, buffer.data(), count);
+                if (remote_disk) remote_hash.update(buffer.data(), count);
                 left -= count;
             }
             if (XXH64_digest(&hash) != checksum) {
@@ -6625,6 +6714,12 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         if (memory->seq_pos_max(seq_id) >= int64_t(cparams.n_ctx_seq)) {
             throw std::runtime_error("sequence state position exceeds context");
         }
+        if (remote_disk) {
+            const auto key = remote_hash.finish();
+            // CPU/CUDA/native parsing committed and invalidated the RPC epoch
+            // before this optimization. A miss retains full-upload fallback.
+            (void) remote_disk_snapshot(seq_id, key.data(), header[2], true);
+        }
         *count_out = header[2];
         return state_size;
     } catch (const std::exception & error) {
@@ -6637,6 +6732,9 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io, llama_state_seq_flags flags) {
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && remote_native_kvarn_transient_active()) {
+        throw std::runtime_error("native KVarN4 overflow FULL snapshots are not implemented; refusing Q4 bookkeeping state");
+    }
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
     // write model info
@@ -6657,6 +6755,9 @@ size_t llama_context::state_write_data(llama_io_write_i & io, llama_state_seq_fl
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    if (remote_native_kvarn_transient_active()) {
+        throw std::runtime_error("native KVarN4 overflow restore/rewind is unsupported; use a fresh context and pure local prefix");
+    }
     nextn_decode_id = 0;
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
@@ -6682,13 +6783,21 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         // A full restore can move cache placement backwards without changing
         // tensor shapes. Rebuild its cached views and construction-time tail
         // initialization on the next decode, only after the restore commits.
-        io.on_commit([this]() { gf_res_prev->reset(); });
+        io.on_commit([this]() {
+            gf_res_prev->reset();
+            if (cparams.remote_attn_position_split && backend_remote) {
+                ggml_backend_remote_attn_invalidate_range(backend_remote);
+            }
+        });
     }
 
     return io.n_bytes();
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && remote_native_kvarn_transient_active()) {
+        throw std::runtime_error("native KVarN4 overflow FULL snapshots are not implemented; refusing Q4 bookkeeping state");
+    }
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -6697,6 +6806,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (remote_native_kvarn_transient_active()) {
+        throw std::runtime_error("native KVarN4 overflow restore/rewind is unsupported; use a fresh context and pure local prefix");
+    }
     nextn_decode_id = 0;
     if (memory) {
         memory->state_read(io, seq_id, flags);
@@ -6705,7 +6817,12 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
             // Register after memory's callbacks so failed/prepared restores do
             // not invalidate the live graph. Partial speculative checkpoints
             // retain their existing graph-reuse behavior.
-            io.on_commit([this]() { gf_res_prev->reset(); });
+            io.on_commit([this]() {
+                gf_res_prev->reset();
+                if (cparams.remote_attn_position_split && backend_remote) {
+                    ggml_backend_remote_attn_invalidate_range(backend_remote);
+                }
+            });
         }
     }
 

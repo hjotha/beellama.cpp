@@ -3343,12 +3343,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             if (cparams.kv_position_split_p != 0) {
                                 if (!mixed_remote_selected) {
                                     throw std::invalid_argument(
-                                            "position-split KV exige cache remoto Q4 (tipos K/V + backend local)");
+                                            "position-split KV exige cache remoto Q4_0 ou Q8_0 (tipos K/V + backend)");
                                 }
-                                if (params.remote_attn_cache_type_k != GGML_TYPE_Q4_0 ||
-                                        params.remote_attn_cache_type_v != GGML_TYPE_Q4_0) {
+                                if ((params.remote_attn_cache_type_k != GGML_TYPE_Q4_0 &&
+                                     params.remote_attn_cache_type_k != GGML_TYPE_Q8_0) ||
+                                        params.remote_attn_cache_type_v != params.remote_attn_cache_type_k) {
                                     throw std::invalid_argument(
-                                            "position-split KV exige Q4_0 nas duas faixas remotas (plano §3.1)");
+                                            "position-split KV exige K/V remotos do mesmo tipo: Q4_0 ou Q8_0");
                                 }
                                 // O backend de overflow é validado pelos buffers
                                 // reais no ctor do cache (todas as camadas Q4
@@ -3450,7 +3451,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         mixed_remote_selected ? params.remote_attn_cache_type_k : GGML_TYPE_COUNT,
                                         mixed_remote_selected ? params.remote_attn_cache_type_v : GGML_TYPE_COUNT,
                                         !cparams.flash_attn, attention_device,
-                                        cparams.kv_position_split_p);
+                                        cparams.kv_position_split_p,
+                                        cparams.remote_attn_position_split);
                                 // F4 v2: stamp the model/RoPE identity that the
                                 // position_split snapshot envelope must match on
                                 // restore. Derived from the loaded model geometry

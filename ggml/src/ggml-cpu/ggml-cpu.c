@@ -2214,6 +2214,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 // Remote KV+attention: the RPC runs here (CPU backend, pinned
                 // like offload_kqv). Sources are host tensors; output is written
                 // back to this node's host buffer for the scheduler to copy.
+                if (params->ith != 0) {
+                    break;
+                }
                 if (!ggml_remote_attn_exec(tensor)) {
                     GGML_ABORT("%s: GGML_OP_REMOTE_ATTN remote execution failed\n", __func__);
                 }

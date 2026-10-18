@@ -241,6 +241,11 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
+    bool remote_disk_snapshot_enabled() const;
+    bool remote_native_kvarn_transient_active() const;
+    bool remote_disk_snapshot(llama_seq_id seq_id, const uint8_t key[32],
+                              size_t evaluated_tokens, bool restore);
+
     //
     // perf
     //

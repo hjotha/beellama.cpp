@@ -15,10 +15,15 @@
 #include "ggml-impl.h"
 #include "ggml.h"
 #include "remote-attn-protocol.h"
+#include "rkva-kvarn-producer.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -130,6 +135,13 @@ struct rkva_stats {
     uint64_t rpc_us_max  = 0;
     uint64_t xbox_compute_us_sum = 0;
     uint64_t xbox_prepare_us_sum = 0;
+    uint64_t range_upload_calls = 0;
+    uint64_t range_upload_rows = 0;
+    uint64_t range_upload_bytes = 0;
+    uint64_t range_attn_calls = 0;
+    uint64_t range_fused_calls = 0;
+    int64_t range_query_min = -1;
+    int64_t range_query_max = -1;
     std::vector<uint64_t> rpc_us;  // for p50/p95
 };
 
@@ -152,6 +164,24 @@ struct ggml_backend_remote_attn_context {
     rkva_hello_ack ack {};
 
     uint32_t    active_session = RKVA_SESSION_NONE;
+    bool        range_configured = false;
+    ggml_type   range_source_type = GGML_TYPE_COUNT;
+    rkva_wire   range_wire = RKVA_WIRE_F16;
+    uint32_t    range_origin = 0;
+    uint32_t    range_capacity = 0;
+    uint64_t    range_epoch = 1;
+    bool        range_fused = false;
+    bool        range_profile = false;
+    bool        range_profile_controlled = false;
+    uint32_t    range_kernel_mode = 0;
+    struct range_layer {
+        uint64_t epoch = 0;
+        uint32_t rows = 0;
+    };
+    std::vector<range_layer> range_layers;
+    bool range_native_kvarn = false;
+    ggml_backend_cpu_kvarn_store_direct_v1_t native_store = nullptr;
+    std::vector<std::unique_ptr<rkva_kvarn_producer>> native_layers;
 
     // reusable pinned-ish staging (grow-only; never freed per token)
     std::vector<uint8_t> payload_tx;
@@ -169,13 +199,8 @@ struct ggml_backend_remote_attn_context {
 };
 
 static uint64_t now_us() {
-#ifndef _WIN32
-    timeval tv {};
-    gettimeofday(&tv, nullptr);
-    return (uint64_t) tv.tv_sec * 1000000ull + (uint64_t) tv.tv_usec;
-#else
-    return 0;
-#endif
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 // low-level request/response over the persistent socket
@@ -183,8 +208,20 @@ static bool rkva_transact(
         ggml_backend_remote_attn_context * ctx,
         rkva_op op, uint32_t session_id, uint32_t layer_id, uint32_t n_tokens,
         const void * payload, uint32_t payload_bytes,
-        std::vector<uint8_t> & out, uint32_t expected_bytes) {
+        std::vector<uint8_t> & out, uint32_t expected_bytes, int32_t * server_status = nullptr) {
 
+    // A partial frame cannot be retried on the same ordered byte stream. Valid
+    // server errors with an empty body remain recoverable (snapshot fallback).
+    const auto stream_failure = [&]() {
+        ctx->failed = true;
+        ctx->connected = false;
+        ctx->sock.close();
+        out.clear();
+        return false;
+    };
+    if (ctx->failed || !ctx->sock.open()) {
+        return stream_failure();
+    }
     const rkva_request req {
         RKVA_MAGIC, RKVA_VERSION, (uint16_t) op, ++ctx->cycle_id,
         session_id, layer_id, n_tokens, payload_bytes
@@ -198,31 +235,35 @@ static bool rkva_transact(
     }
 #endif
     if (!ctx->sock.write_all(&req, sizeof(req), header_flags)) {
-        return false;
+        return stream_failure();
     }
     if (payload_bytes && !ctx->sock.write_all(payload, payload_bytes)) {
-        return false;
+        return stream_failure();
     }
 
     rkva_response rsp {};
     if (!ctx->sock.read_all(&rsp, sizeof(rsp))) {
-        return false;
+        return stream_failure();
     }
     if (rsp.magic != RKVA_MAGIC || rsp.version != RKVA_VERSION ||
         rsp.op != (uint16_t) op || rsp.cycle_id != req.cycle_id) {
-        return false;
+        return stream_failure();
     }
+    if (server_status) *server_status = rsp.status;
     if (rsp.status != RKVA_OK) {
+        // Optional cache failures carry no payload. Refuse an invalid envelope
+        // instead of desynchronizing the stream before fallback uploads.
+        if (rsp.payload_bytes) { return stream_failure(); }
         GGML_LOG_ERROR("%s: server error status=%d op=%d layer=%u\n",
                        GGML_REMOTE_ATTN_NAME, rsp.status, (int) op, layer_id);
         return false;
     }
-    if (expected_bytes && rsp.payload_bytes != expected_bytes) {
-        return false;
+    if (rsp.payload_bytes > 256u * 1024u * 1024u || (expected_bytes && rsp.payload_bytes != expected_bytes)) {
+        return stream_failure();
     }
     out.resize(rsp.payload_bytes);
     if (rsp.payload_bytes && !ctx->sock.read_all(out.data(), rsp.payload_bytes)) {
-        return false;
+        return stream_failure();
     }
     const uint64_t t1 = now_us();
 
@@ -244,10 +285,255 @@ static bool rkva_transact(
 // REMOTE_ATTN execution
 // ---------------------------------------------------------------------------
 
+static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_tensor * node,
+                                  uint32_t layer, uint32_t live, size_t nq, size_t out_width) {
+    const auto * keys = node->src[5];
+    const auto * values = node->src[6];
+    const size_t width = size_t(ctx->geo.n_head_kv) * 256;
+    if (!keys || !values || keys->type != GGML_TYPE_F32 || values->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(keys) || !ggml_is_contiguous(values) ||
+            !ggml_are_same_shape(keys, values) || keys->ne[0] != 256 ||
+            keys->ne[1] != ctx->geo.n_head_kv || keys->ne[2] != int64_t(nq) ||
+            keys->ne[3] != 1 || nq > 256 || !ctx->native_store) return false;
+    auto & cached = ctx->range_layers[layer];
+    auto & owner = ctx->native_layers[layer];
+    if ((owner && cached.epoch != ctx->range_epoch) ||
+            live != (owner ? owner->rows() : 0u) + nq) {
+        GGML_LOG_ERROR("%s: native KVarN4 requires fresh append-only overflow; quantized snapshot bootstrap/rewind is unsupported\n",
+                       GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    try {
+        if (!owner) {
+            owner.reset(new rkva_kvarn_producer(ctx->range_origin, ctx->range_capacity,
+                ctx->geo.n_head_kv, ctx->geo.sinkhorn_iters, ctx->native_store));
+        }
+        std::vector<float> original_k(nq * width), original_v(nq * width);
+        ggml_backend_tensor_get(keys, original_k.data(), 0, original_k.size() * sizeof(float));
+        ggml_backend_tensor_get(values, original_v.data(), 0, original_v.size() * sizeof(float));
+        if (!owner->append(original_k.data(), original_v.data(), ctx->pos_scratch.data(),
+                            uint32_t(nq), cached.rows == 0, ctx->payload_tx)) return false;
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: native KVarN4 producer failed: %s\n", GGML_REMOTE_ATTN_NAME, error.what());
+        return false;
+    }
+    std::vector<uint8_t> reply;
+    if (ctx->payload_tx.size() > (256u << 20) ||
+            !rkva_transact(ctx, RKVA_KVARN_RANGE_UPLOAD, ctx->active_session, layer, 0,
+                ctx->payload_tx.data(), uint32_t(ctx->payload_tx.size()), reply, 0) || !reply.empty()) return false;
+    ++ctx->stats.range_upload_calls;
+    ctx->stats.range_upload_rows += nq;
+    ctx->stats.range_upload_bytes += ctx->payload_tx.size() - sizeof(rkva_kvarn_range_upload);
+    cached.epoch = ctx->range_epoch;
+    cached.rows = live;
+    const rkva_range_attn request {RKVA_WIRE_F32, 0, {0, 0}};
+    const size_t query_bytes = nq * (sizeof(int32_t) + out_width * sizeof(float));
+    const size_t output_bytes = nq * (out_width + ctx->geo.n_head) * sizeof(float);
+    ctx->payload_tx.resize(sizeof(request) + query_bytes);
+    std::memcpy(ctx->payload_tx.data(), &request, sizeof(request));
+    std::memcpy(ctx->payload_tx.data() + sizeof(request), ctx->pos_scratch.data(), nq * sizeof(int32_t));
+    ggml_backend_tensor_get(node->src[0], ctx->payload_tx.data() + sizeof(request) + nq * sizeof(int32_t),
+                            0, nq * out_width * sizeof(float));
+    if (!rkva_transact(ctx, RKVA_RANGE_ATTN, ctx->active_session, layer, uint32_t(nq),
+            ctx->payload_tx.data(), uint32_t(ctx->payload_tx.size()), reply, uint32_t(output_bytes))) return false;
+    for (size_t offset = 0; offset < reply.size(); offset += sizeof(float)) {
+        float value;
+        std::memcpy(&value, reply.data() + offset, sizeof(value));
+        if (!std::isfinite(value)) return false;
+    }
+    ++ctx->stats.range_attn_calls;
+    if (ctx->stats.range_query_min < 0) ctx->stats.range_query_min = ctx->pos_scratch.front();
+    ctx->stats.range_query_max = std::max<int64_t>(ctx->stats.range_query_max, ctx->pos_scratch.back());
+    auto * dst = static_cast<uint8_t *>(node->data);
+    for (size_t query = 0; query < nq; ++query) {
+        std::memcpy(dst, reply.data() + query * out_width * sizeof(float), out_width * sizeof(float));
+        dst += out_width * sizeof(float);
+        std::memcpy(dst, reply.data() + (nq * out_width + query * ctx->geo.n_head) * sizeof(float),
+                    ctx->geo.n_head * sizeof(float));
+        dst += ctx->geo.n_head * sizeof(float);
+    }
+    return true;
+}
+
+static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor * node) {
+    const auto * q = node->src[0];
+    const auto * k = node->src[1];
+    const auto * v = node->src[2];
+    const auto * cells = node->src[3];
+    const auto * pos = node->src[4];
+    const int layer = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_LAYER_ID);
+    const int n_live = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_N_LIVE);
+    const int origin = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ORIGIN);
+    const size_t nq = q ? (size_t) q->ne[2] : 0;
+    const size_t width = (size_t) ctx->geo.n_head_kv * ctx->geo.head_dim;
+    const size_t out_width = (size_t) ctx->geo.n_head * ctx->geo.head_dim;
+    if (!ctx->range_configured || ctx->active_session == RKVA_SESSION_NONE ||
+            layer < 0 || (size_t) layer >= ctx->range_layers.size() ||
+            origin < 0 || (uint32_t) origin != ctx->range_origin || n_live <= 0 ||
+            (uint32_t) n_live > ctx->range_capacity || !q || !k || !v || !cells || !pos ||
+            q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || q->ne[3] != 1 || nq == 0 ||
+            q->ne[0] != ctx->geo.head_dim || q->ne[1] != ctx->geo.n_head ||
+            k->type != ctx->range_source_type || v->type != ctx->range_source_type ||
+            !ggml_are_same_shape(k, v) || k->ne[0] != (int64_t) width ||
+            k->ne[2] != 1 || k->ne[3] != 1 ||
+            cells->type != GGML_TYPE_I32 || pos->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(cells) || !ggml_is_contiguous(pos) ||
+            ggml_nelements(cells) < n_live || ggml_nelements(pos) < (int64_t) nq ||
+            node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) ||
+            node->ne[0] != (int64_t) (out_width + ctx->geo.n_head) || node->ne[1] != (int64_t) nq ||
+            ggml_get_op_params_f32(node, GGML_REMOTE_ATTN_PARAM_KQ_SCALE) != ctx->geo.kq_scale) {
+        return false;
+    }
+    std::vector<int32_t> ids((size_t) n_live);
+    ggml_backend_tensor_get(cells, ids.data(), 0, ids.size() * sizeof(int32_t));
+    uint32_t count = 0;
+    bool padding = false;
+    for (const auto id : ids) {
+        if (id == -1) {
+            padding = true;
+        } else {
+            if (padding || id < 0 || (uint32_t) id != ctx->range_origin + count) {
+                return false; // holes/reordering are not append-only range histories
+            }
+            ++count;
+        }
+    }
+    if (count == 0 || count > (uint64_t) k->ne[1] || count > (uint64_t) v->ne[1]) {
+        return false;
+    }
+    ctx->pos_scratch.resize(nq);
+    ggml_backend_tensor_get(pos, ctx->pos_scratch.data(), 0, nq * sizeof(int32_t));
+    for (size_t i = 0; i < nq; ++i) {
+        const int64_t p = ctx->pos_scratch[i];
+        if (p < ctx->range_origin || p >= (int64_t) ctx->range_origin + count ||
+                (i && p != (int64_t) ctx->pos_scratch[i-1] + 1)) {
+            return false;
+        }
+    }
+    if ((uint32_t) ctx->pos_scratch.back() + 1 != ctx->range_origin + count) {
+        return false;
+    }
+    if (ctx->range_native_kvarn) {
+        return rkva_run_native_range(ctx, node, uint32_t(layer), count, nq, out_width);
+    }
+    auto & cached = ctx->range_layers[(size_t) layer];
+    uint32_t start = cached.epoch == ctx->range_epoch ? cached.rows : 0;
+    if (start > count || (uint32_t) ctx->pos_scratch.front() < ctx->range_origin + start) {
+        start = 0; // rewind or rewritten rows: replace this layer, never reuse stale KV
+    }
+    const size_t row_bytes = ggml_row_size(ctx->range_source_type, width);
+    if (k->nb[1] < row_bytes || v->nb[1] < row_bytes || width > (16u << 20) / 4) {
+        return false;
+    }
+    const bool native_quant = ctx->range_wire != RKVA_WIRE_F16;
+    std::vector<uint8_t> packed(native_quant ? 0 : row_bytes);
+    std::vector<float> decoded(native_quant ? 0 : width);
+    const auto to_float = ggml_get_type_traits(ctx->range_source_type)->to_float;
+    const size_t upload_row_bytes = native_quant ? row_bytes * 2 : width * 4;
+    const uint32_t chunk_rows = std::max<uint32_t>(1, (16u << 20) / (uint32_t) upload_row_bytes);
+    const uint64_t output_bytes = nq * (out_width + ctx->geo.n_head) * sizeof(float);
+    const uint64_t query_bytes = nq * (sizeof(int32_t) + out_width * sizeof(float));
+    if (output_bytes > (256u << 20) || query_bytes + sizeof(rkva_range_attn) > (256u << 20)) {
+        return false;
+    }
+    std::vector<uint8_t> reply;
+    bool attended = false;
+    while (start < count) {
+        const uint32_t rows = std::min(chunk_rows, count - start);
+        rkva_range_upload upload { start, rows, ctx->range_wire, 0 };
+        const bool combine = ctx->range_fused && start + rows == count &&
+                sizeof(rkva_range_upload_attn) + (uint64_t) rows * upload_row_bytes + query_bytes <= (256u << 20);
+        const size_t prefix = combine ? sizeof(rkva_range_upload_attn) : sizeof(upload);
+        ctx->payload_tx.resize(prefix + (size_t) rows * upload_row_bytes + (combine ? query_bytes : 0));
+        if (combine) {
+            const rkva_range_upload_attn request {upload, {RKVA_WIRE_F32, 0, {0, 0}}};
+            std::memcpy(ctx->payload_tx.data(), &request, sizeof(request));
+        } else {
+            std::memcpy(ctx->payload_tx.data(), &upload, sizeof(upload));
+        }
+        uint8_t * dst = ctx->payload_tx.data() + prefix;
+        for (const auto * source : {k, v}) {
+            for (uint32_t row = start; row < start + rows; ++row) {
+                if (native_quant) {
+                    ggml_backend_tensor_get(source, dst, (size_t) row * source->nb[1], row_bytes);
+                    dst += row_bytes;
+                    continue;
+                }
+                ggml_backend_tensor_get(source, packed.data(), (size_t) row * source->nb[1], row_bytes);
+                to_float(packed.data(), decoded.data(), width);
+                for (const float value : decoded) {
+                    const uint16_t half = f32_to_f16_bits(value);
+                    std::memcpy(dst, &half, sizeof(half));
+                    dst += sizeof(half);
+                }
+            }
+        }
+        if (combine) {
+            std::memcpy(dst, ctx->pos_scratch.data(), nq * sizeof(int32_t));
+            ggml_backend_tensor_get(q, dst + nq * sizeof(int32_t), 0, nq * out_width * sizeof(float));
+        }
+        if (!rkva_transact(ctx, combine ? RKVA_RANGE_UPLOAD_ATTN : RKVA_RANGE_UPLOAD,
+                ctx->active_session, (uint32_t) layer, combine ? (uint32_t) nq : rows,
+                ctx->payload_tx.data(), (uint32_t) ctx->payload_tx.size(), reply,
+                combine ? (uint32_t) output_bytes : 0) || (!combine && !reply.empty())) {
+            return false;
+        }
+        if (combine) {
+            attended = true;
+            ++ctx->stats.range_fused_calls;
+        }
+        ++ctx->stats.range_upload_calls;
+        ctx->stats.range_upload_rows += rows;
+        ctx->stats.range_upload_bytes += (size_t) rows * upload_row_bytes;
+        start += rows;
+    }
+    cached.epoch = ctx->range_epoch;
+    cached.rows = count;
+    if (!attended) {
+        const rkva_range_attn request {RKVA_WIRE_F32, 0, {0, 0}};
+        ctx->payload_tx.resize(sizeof(request) + (size_t) query_bytes);
+        std::memcpy(ctx->payload_tx.data(), &request, sizeof(request));
+        std::memcpy(ctx->payload_tx.data() + sizeof(request), ctx->pos_scratch.data(), nq * sizeof(int32_t));
+        ggml_backend_tensor_get(q, ctx->payload_tx.data() + sizeof(request) + nq * sizeof(int32_t),
+                0, nq * out_width * sizeof(float));
+        if (!rkva_transact(ctx, RKVA_RANGE_ATTN, ctx->active_session, (uint32_t) layer, (uint32_t) nq,
+                ctx->payload_tx.data(), (uint32_t) ctx->payload_tx.size(), reply, (uint32_t) output_bytes)) {
+            return false;
+        }
+    }
+    for (size_t offset = 0; offset < reply.size(); offset += sizeof(float)) {
+        float value;
+        std::memcpy(&value, reply.data() + offset, sizeof(value));
+        if (!std::isfinite(value)) {
+            return false; // each query sees at least its own uploaded key
+        }
+    }
+    ++ctx->stats.range_attn_calls;
+    if (ctx->stats.range_query_min < 0 || ctx->pos_scratch.front() < ctx->stats.range_query_min) {
+        ctx->stats.range_query_min = ctx->pos_scratch.front();
+    }
+    ctx->stats.range_query_max = std::max<int64_t>(ctx->stats.range_query_max, ctx->pos_scratch.back());
+    // Wire response is two planes. The graph node packs OUT+LSE per query so
+    // views can expose both outputs without a second op or another RPC.
+    auto * dst = (uint8_t *) node->data;
+    for (size_t query = 0; query < nq; ++query) {
+        std::memcpy(dst, reply.data() + query * out_width * sizeof(float), out_width * sizeof(float));
+        dst += out_width * sizeof(float);
+        std::memcpy(dst, reply.data() + (nq * out_width + query * ctx->geo.n_head) * sizeof(float),
+                ctx->geo.n_head * sizeof(float));
+        dst += ctx->geo.n_head * sizeof(float);
+    }
+    return true;
+}
+
 // Serialize Q/K/V to the chosen wire type and one RKVA attn call.
 static bool rkva_run_attn(
         ggml_backend_remote_attn_context * ctx,
         ggml_tensor * node) {
+
+    if (ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_RANGE)) {
+        return rkva_run_range(ctx, node);
+    }
 
     ggml_tensor * q   = node->src[0];   // [n_embd_head, n_head,    n_tokens] F32
     ggml_tensor * k   = node->src[1];   // [n_embd_head, n_head_kv, n_tokens] F32
@@ -768,6 +1054,16 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     }
     ctx->sock.close();
     ctx->connected = false;
+    ctx->failed = false;
+    ctx->range_configured = false;
+    ctx->range_layers.clear();
+    ctx->range_native_kvarn = false;
+    ctx->native_layers.clear();
+    ctx->native_store = nullptr;
+    ctx->range_fused = false;
+    ctx->range_profile = false;
+    ctx->range_profile_controlled = false;
+    ctx->range_kernel_mode = 0;
 
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -858,21 +1154,33 @@ bool ggml_backend_remote_attn_connected(ggml_backend_t backend) {
     return ctx->connected && !ctx->failed;
 }
 
-bool ggml_backend_remote_attn_create_session(
-        ggml_backend_t backend, uint32_t session_id, uint32_t seq_id, uint32_t capacity) {
+static bool rkva_create_session(
+        ggml_backend_t backend, uint32_t session_id, uint32_t seq_id, uint32_t capacity, bool range) {
     if (!backend) return false;
     if (ggml_backend_is_local_split(backend)) {
-        return ggml_backend_local_split_create_session(backend, session_id, seq_id, capacity);
+        return !range && ggml_backend_local_split_create_session(backend, session_id, seq_id, capacity);
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
     if (!ctx->connected || ctx->failed) {
         return false;
     }
-    rkva_session_req req { session_id, seq_id, capacity, 0 };
+    const uint32_t flags = range && (ctx->ack.reserved[0] & (RKVA_CAP_RANGE_Q4_0 | RKVA_CAP_RANGE_Q8_0)) ?
+            RKVA_SESSION_RANGE : 0;
+    rkva_session_req req { session_id, seq_id, capacity, flags };
     std::vector<uint8_t> out;
     return rkva_transact(ctx, RKVA_CREATE_SESSION, session_id, 0, 0,
                          &req, sizeof(req), out, 0);
+}
+
+bool ggml_backend_remote_attn_create_session(
+        ggml_backend_t backend, uint32_t session_id, uint32_t seq_id, uint32_t capacity) {
+    return rkva_create_session(backend, session_id, seq_id, capacity, false);
+}
+
+bool ggml_backend_remote_attn_create_range_session(
+        ggml_backend_t backend, uint32_t session_id, uint32_t seq_id, uint32_t capacity) {
+    return rkva_create_session(backend, session_id, seq_id, capacity, true);
 }
 
 bool ggml_backend_remote_attn_destroy_session(ggml_backend_t backend, uint32_t session_id) {
@@ -899,6 +1207,7 @@ bool ggml_backend_remote_attn_reset(ggml_backend_t backend, uint32_t session_id)
     if (!ctx->connected || ctx->failed) {
         return false;
     }
+    ++ctx->range_epoch;
     std::vector<uint8_t> out;
     return rkva_transact(ctx, RKVA_RESET, session_id, 0, 0, nullptr, 0, out, 0);
 }
@@ -913,9 +1222,333 @@ bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, 
     if (!ctx->connected || ctx->failed) {
         return false;
     }
+    if (ctx->range_configured) {
+        if (ctx->range_native_kvarn) {
+            if (session_id != ctx->active_session) return false;
+            for (const auto & owner : ctx->native_layers) {
+                if (owner && int64_t(pos0) < int64_t(ctx->range_origin) + owner->rows()) {
+                    ++ctx->range_epoch; // force subsequent compute to fail closed
+                    return false;
+                }
+            }
+            return true; // trimming an unoccupied suffix must not invalidate native records
+        }
+        // The host companion is authoritative; the next range op replaces each
+        // layer's history, including changes that preserve its row count.
+        ++ctx->range_epoch;
+        return session_id == ctx->active_session;
+    }
     rkva_trim_req req { pos0 };
     std::vector<uint8_t> out;
     return rkva_transact(ctx, RKVA_REWIND, session_id, 0, 0, &req, sizeof(req), out, 0);
+}
+
+// Generic opt-in is separate from the historical Q4-only setting. A server
+// must positively advertise the selected storage kernel in its control reply.
+static bool rkva_range_kernel_options(uint32_t & mode, bool & profile, bool & generic) {
+    const char * selected = std::getenv("GGML_RKVA_RANGE_KERNEL");
+    const char * legacy = std::getenv("GGML_RKVA_Q4_KERNEL");
+    const auto parse = [](const char * value, uint32_t & result) {
+        if (!value || !std::strcmp(value, "reference") || !std::strcmp(value, "0")) result = 0;
+        else if (!std::strcmp(value, "optimized") || !std::strcmp(value, "balanced") || !std::strcmp(value, "1")) result = 1;
+        else if (!std::strcmp(value, "fine") || !std::strcmp(value, "2")) result = 2;
+        else if (!std::strcmp(value, "coarse") || !std::strcmp(value, "3")) result = 3;
+        else return false;
+        return true;
+    };
+    generic = selected != nullptr;
+    if (!parse(selected ? selected : legacy, mode)) return false;
+    if (selected && legacy) {
+        uint32_t old_mode = 0;
+        if (!parse(legacy, old_mode) || old_mode != mode) return false;
+    }
+    profile = false;
+    if (const char * env = std::getenv("GGML_RKVA_PROFILE")) {
+        if (!std::strcmp(env, "1")) profile = true;
+        else if (std::strcmp(env, "0")) return false;
+    }
+    return true;
+}
+
+static bool rkva_range_apply_control(ggml_backend_remote_attn_context * ctx,
+                                     const char * storage_name, bool generic) {
+    const bool previous = ctx->range_profile_controlled;
+    ctx->range_profile_controlled = ctx->range_profile || ctx->range_kernel_mode != 0;
+    if (!ctx->range_profile_controlled && !previous) return true;
+    const rkva_range_profile control {
+        uint32_t((ctx->range_profile ? RKVA_PROFILE_ENABLE : 0) | RKVA_PROFILE_RESET),
+        ctx->range_kernel_mode, 0};
+    std::vector<uint8_t> reply;
+    if (!rkva_transact(ctx, RKVA_RANGE_PROFILE, ctx->active_session, 0, 0,
+            &control, sizeof(control), reply, 0) || reply.empty() || reply.size() > (1u << 20)) {
+        ctx->failed = true;
+        return false;
+    }
+    if (generic && ctx->range_kernel_mode) {
+        // The compact diagnostic writer emits this fixed capability object.
+        // Missing, unavailable or differently encoded reports fail closed;
+        // older servers must never silently run a reference-format benchmark.
+        const std::string report(reply.begin(), reply.end());
+        const size_t begin = report.find("\"optimized_kernels\":{");
+        const size_t end = begin == std::string::npos ? begin : report.find("},\"buckets\":{", begin);
+        const std::string field = std::string("\"") + storage_name + "\":{\"available\":true,";
+        const size_t found = begin == std::string::npos ? begin : report.find(field, begin);
+        if (found == std::string::npos || end == std::string::npos || found >= end) {
+            GGML_LOG_ERROR("%s: server does not advertise an optimized %s range kernel\n", GGML_REMOTE_ATTN_NAME, storage_name);
+            ctx->failed = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
+                                       uint32_t origin, uint32_t capacity, ggml_type source_type) {
+    const char * experimental = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    constexpr uint32_t required = (1u << RKVA_KVARN_RANGE_CONFIG) |
+                                  (1u << RKVA_KVARN_RANGE_UPLOAD) | (1u << RKVA_RANGE_ATTN);
+    if (!experimental || std::strcmp(experimental, "1") || !ctx->connected || ctx->failed ||
+            ctx->active_session == RKVA_SESSION_NONE || !(ctx->ack.reserved[0] & RKVA_CAP_RANGE_KVARN4) ||
+            (ctx->ack.supported_ops & required) != required || origin == 0 || origin % 128 || !capacity ||
+            uint64_t(origin) + capacity > INT32_MAX || ctx->geo.max_ctx != capacity ||
+            ctx->geo.head_dim != 256 || ctx->geo.n_head_kv == 0 ||
+            ctx->geo.group_tokens != 128 || ctx->geo.sinkhorn_iters == 0 ||
+            ctx->geo.tail_type != 0 || ctx->geo.has_sinks || ctx->geo.swa ||
+            (source_type != GGML_TYPE_Q4_0 && source_type != GGML_TYPE_Q8_0)) return false;
+    if (const char * fuse = std::getenv("GGML_RKVA_RANGE_FUSE")) {
+        if (std::strcmp(fuse, "auto") && std::strcmp(fuse, "0")) return false;
+    }
+    uint32_t mode = 0;
+    bool profile = false, generic = false;
+    if (!rkva_range_kernel_options(mode, profile, generic) || (mode && !generic)) return false;
+    const bool can_profile = (ctx->ack.reserved[0] & RKVA_CAP_RANGE_PROFILE) &&
+                             (ctx->ack.supported_ops & (1u << RKVA_RANGE_PROFILE));
+    if ((mode || profile) && !can_profile) return false;
+    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu) return false;
+    auto store = reinterpret_cast<ggml_backend_cpu_kvarn_store_direct_v1_t>(
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu), "ggml_backend_cpu_kvarn_store_direct_v1"));
+    if (!store) return false;
+    const rkva_kvarn_range_config descriptor {
+        origin, capacity, RKVA_RANGE_STORAGE_KVARN4, 1,
+        128, 128, 256, 2, 4, 4, 8960, 3, 2, 128, 128, 1, 1, 1};
+    std::vector<uint8_t> reply;
+    if (!rkva_transact(ctx, RKVA_KVARN_RANGE_CONFIG, ctx->active_session, 0, 0,
+            &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
+    ctx->range_configured = true;
+    ctx->range_native_kvarn = true;
+    ctx->native_store = store;
+    ctx->native_layers.clear();
+    ctx->native_layers.resize(ctx->geo.n_layer_remote);
+    ctx->range_source_type = source_type;
+    ctx->range_wire = RKVA_WIRE_F32; // Q/OUT only; op16 carries structured native bytes
+    ctx->range_origin = origin;
+    ctx->range_capacity = capacity;
+    ++ctx->range_epoch;
+    ctx->range_layers.assign(ctx->geo.n_layer_remote, {});
+    ctx->range_fused = false;
+    ctx->range_profile = profile;
+    ctx->range_kernel_mode = mode;
+    if (!rkva_range_apply_control(ctx, "kvarn4", generic)) return false;
+    GGML_LOG_WARN("%s: EXPERIMENTAL append-only native KVarN4; original F32 producer, CPU native owner, no native snapshot/rewind support\n",
+                  GGML_REMOTE_ATTN_NAME);
+    return true;
+}
+
+bool ggml_backend_remote_attn_configure_range(
+        ggml_backend_t backend, uint32_t origin, uint32_t capacity, ggml_type cache_type) {
+    if (!backend || ggml_backend_is_local_split(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (const char * storage = std::getenv("GGML_RKVA_RANGE_STORAGE")) {
+        if (!std::strcmp(storage, "kvarn4")) return rkva_configure_native_kvarn(ctx, origin, capacity, cache_type);
+    }
+    constexpr uint32_t required = (1u << RKVA_RANGE_CONFIG) | (1u << RKVA_RANGE_UPLOAD) | (1u << RKVA_RANGE_ATTN);
+    if (!ctx->connected || ctx->failed || ctx->active_session == RKVA_SESSION_NONE ||
+            (ctx->ack.supported_ops & required) != required || capacity == 0 ||
+            origin > INT32_MAX || capacity > (uint32_t) INT32_MAX - origin ||
+            ctx->geo.max_ctx != capacity || ctx->geo.n_layer_remote == 0 ||
+            ctx->geo.cache_bits_k != 0 || ctx->geo.cache_bits_v != 0 ||
+            ctx->geo.domain != GGML_REMOTE_ATTN_DOMAIN_AUTO || ctx->geo.has_sinks || ctx->geo.swa ||
+            (cache_type != GGML_TYPE_Q4_0 && cache_type != GGML_TYPE_Q8_0)) {
+        return false;
+    }
+    const bool source_q4 = cache_type == GGML_TYPE_Q4_0;
+    const uint64_t capability = source_q4 ? RKVA_CAP_RANGE_Q4_0 : RKVA_CAP_RANGE_Q8_0;
+    const bool supports_native = (ctx->ack.reserved[0] & capability) != 0;
+    const char * requested = std::getenv("GGML_RKVA_RANGE_STORAGE");
+    bool native_quant = supports_native;
+    if (requested && std::strcmp(requested, "auto") != 0) {
+        if (std::strcmp(requested, "f16") == 0) {
+            native_quant = false;
+        } else if (std::strcmp(requested, "q4_0") == 0 || std::strcmp(requested, "q8_0") == 0) {
+            if (std::strcmp(requested, ggml_type_name(cache_type)) != 0 || !supports_native) {
+                GGML_LOG_ERROR("%s: GGML_RKVA_RANGE_STORAGE=%s requires a matching host cache and server capability\n",
+                        GGML_REMOTE_ATTN_NAME, requested);
+                return false;
+            }
+            native_quant = true;
+        } else {
+            GGML_LOG_ERROR("%s: invalid GGML_RKVA_RANGE_STORAGE='%s' (expected auto, f16, q4_0 or q8_0)\n",
+                    GGML_REMOTE_ATTN_NAME, requested);
+            return false;
+        }
+    }
+    const bool can_fuse = (ctx->ack.reserved[0] & RKVA_CAP_RANGE_UPLOAD_ATTN) &&
+                          (ctx->ack.supported_ops & (1u << RKVA_RANGE_UPLOAD_ATTN));
+    bool fused = can_fuse;
+    if (const char * env = std::getenv("GGML_RKVA_RANGE_FUSE")) {
+        if (std::strcmp(env, "0") == 0) fused = false;
+        else if (std::strcmp(env, "1") == 0) {
+            if (!can_fuse) return false;
+        } else if (std::strcmp(env, "auto") != 0) return false;
+    }
+    uint32_t kernel_mode = 0;
+    bool profile = false, generic_kernel = false;
+    if (!rkva_range_kernel_options(kernel_mode, profile, generic_kernel)) return false;
+    const bool can_profile = (ctx->ack.reserved[0] & RKVA_CAP_RANGE_PROFILE) &&
+                            (ctx->ack.supported_ops & (1u << RKVA_RANGE_PROFILE));
+    if ((profile || kernel_mode) && (!can_profile ||
+            (kernel_mode && !generic_kernel && (!source_q4 || !native_quant)))) {
+        return false;
+    }
+    const uint32_t storage = native_quant ? (source_q4 ? RKVA_RANGE_STORAGE_Q4_0 : RKVA_RANGE_STORAGE_Q8_0) : 0;
+    const rkva_range_config req {origin, capacity, {storage, 0}};
+    std::vector<uint8_t> reply;
+    if (!rkva_transact(ctx, RKVA_RANGE_CONFIG, ctx->active_session, 0, 0,
+            &req, sizeof(req), reply, 0) || !reply.empty()) {
+        ctx->failed = true;
+        return false;
+    }
+    ctx->range_configured = true;
+    ctx->range_native_kvarn = false;
+    ctx->native_layers.clear();
+    ctx->range_source_type = cache_type;
+    ctx->range_wire = native_quant ? (source_q4 ? RKVA_WIRE_Q4_0 : RKVA_WIRE_Q8_0) : RKVA_WIRE_F16;
+    ctx->range_origin = origin;
+    ctx->range_capacity = capacity;
+    ++ctx->range_epoch;
+    ctx->range_layers.assign(ctx->geo.n_layer_remote, {});
+    ctx->range_fused = fused;
+    ctx->range_profile = profile;
+    ctx->range_kernel_mode = kernel_mode;
+    const char * storage_name = native_quant ? (source_q4 ? "q4_0" : "q8_0") : "f16";
+    if (!rkva_range_apply_control(ctx, storage_name, generic_kernel)) return false;
+    return true;
+}
+
+bool ggml_backend_remote_attn_disk_snapshot_enabled(ggml_backend_t backend) {
+    const char * enabled = std::getenv("GGML_RKVA_DISK_SNAPSHOTS");
+    if (!backend || ggml_backend_is_local_split(backend) || !enabled || std::strcmp(enabled, "1")) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    constexpr uint32_t ops = (1u << RKVA_SNAPSHOT_SAVE) | (1u << RKVA_SNAPSHOT_RESTORE);
+    return ctx->connected && !ctx->failed && ctx->range_configured && !ctx->range_native_kvarn &&
+        ctx->active_session != RKVA_SESSION_NONE && (ctx->ack.supported_ops & ops) == ops &&
+        (ctx->ack.reserved[0] & RKVA_CAP_DISK_SNAPSHOT);
+}
+
+bool ggml_backend_remote_attn_disk_snapshot(
+        ggml_backend_t backend, const uint8_t host_state_sha256[32], uint32_t live_rows, bool restore) {
+    if (!ggml_backend_remote_attn_disk_snapshot_enabled(backend) || !host_state_sha256 || !live_rows) {
+        return false; // absolutely no snapshot RPC below P
+    }
+    auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (live_rows > ctx->range_capacity) { return false; }
+    if (!restore) {
+        for (const auto & layer : ctx->range_layers) {
+            if (layer.epoch != ctx->range_epoch || layer.rows != live_rows) {
+                return false; // a checkpoint cannot combine different evaluated prefixes
+            }
+        }
+    } else {
+        // Host state has ALREADY committed. Every failure must make the next
+        // graph replace all server layers from the authoritative CPU companion.
+        ++ctx->range_epoch;
+    }
+#ifndef _WIN32
+    struct snapshot_timeout {
+        int fd;
+        timeval previous {};
+        bool valid = false;
+        explicit snapshot_timeout(int descriptor) : fd(descriptor) {
+            socklen_t length = sizeof(previous);
+            timeval extended { 600, 0 };
+            valid = getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &previous, &length) == 0 &&
+                    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &extended, sizeof(extended)) == 0;
+        }
+        ~snapshot_timeout() {
+            if (valid) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &previous, sizeof(previous));
+        }
+    } timeout(ctx->sock.fd);
+    if (!timeout.valid) return false;
+#endif
+    rkva_snapshot_req req {};
+    std::memcpy(req.host_state_sha256, host_state_sha256, 32);
+    req.live_rows = live_rows; req.revision = 1;
+    std::vector<uint8_t> reply;
+    int32_t status = INT32_MIN;
+    if (!rkva_transact(ctx, restore ? RKVA_SNAPSHOT_RESTORE : RKVA_SNAPSHOT_SAVE,
+            ctx->active_session, 0, 0, &req, sizeof(req), reply, sizeof(rkva_snapshot_ack), &status)) {
+        if (status == RKVA_ERR_STATE && restore && !ctx->failed) {
+            // A disk read failing after GPU mutation invalidates all layers.
+            // RESET clears readiness before the host reuploads everything.
+            std::vector<uint8_t> reset_reply;
+            if (!rkva_transact(ctx, RKVA_RESET, ctx->active_session, 0, 0,
+                    nullptr, 0, reset_reply, 0) || !reset_reply.empty()) { ctx->failed = true; }
+        } else if (status != RKVA_ERR_SNAPSHOT_MISS && status != RKVA_ERR_SNAPSHOT_IO) {
+            ctx->failed = true; // transport, invalid envelope, or unexpected server state
+        }
+        return false;
+    }
+    rkva_snapshot_ack ack {};
+    std::memcpy(&ack, reply.data(), sizeof(ack));
+    if (std::memcmp(ack.host_state_sha256, host_state_sha256, 32) ||
+            ack.live_rows != live_rows || ack.n_layers != ctx->geo.n_layer_remote ||
+            !ack.disk_bytes || ack.disk_bytes > (4ull << 30)) {
+        ctx->failed = true; return false;
+    }
+    if (restore) {
+        for (auto & layer : ctx->range_layers) { layer.epoch = ctx->range_epoch; layer.rows = live_rows; }
+    }
+    return true;
+}
+
+void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {
+    if (!backend || ggml_backend_is_local_split(backend)) {
+        return;
+    }
+    auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    ++ctx->range_epoch;
+}
+
+bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend) {
+    if (!backend || ggml_backend_is_local_split(backend)) return false;
+    const auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    return ctx->range_configured && ctx->range_native_kvarn;
+}
+
+bool ggml_backend_remote_attn_native_kvarn_has_state(ggml_backend_t backend) {
+    if (!ggml_backend_remote_attn_native_kvarn_enabled(backend)) return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    for (const auto & owner : ctx->native_layers) if (owner && owner->rows()) return true;
+    return false;
+}
+
+void ggml_remote_attn_range_set_native_sources(ggml_tensor * node, ggml_tensor * keys, ggml_tensor * values) {
+    GGML_ASSERT(node && node->op == GGML_OP_REMOTE_ATTN && keys && values);
+    GGML_ASSERT(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_RANGE));
+    GGML_ASSERT(keys->type == GGML_TYPE_F32 && values->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(keys) && ggml_is_contiguous(values));
+    GGML_ASSERT(ggml_are_same_shape(keys, values) && keys->ne[3] == 1);
+    node->src[5] = keys;
+    node->src[6] = values;
 }
 
 void ggml_backend_remote_attn_set_active_session(ggml_backend_t backend, uint32_t session_id) {
@@ -925,6 +1558,10 @@ void ggml_backend_remote_attn_set_active_session(ggml_backend_t backend, uint32_
         return;
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    if (ctx->active_session != session_id) {
+        ctx->range_configured = false;
+        ++ctx->range_epoch;
+    }
     ctx->active_session = session_id;
 }
 
@@ -944,6 +1581,15 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->range_profile_controlled && ctx->connected && !ctx->failed) {
+        const rkva_range_profile report {RKVA_PROFILE_REPORT_ONLY, 0, 0};
+        std::vector<uint8_t> profile;
+        if (rkva_transact(ctx, RKVA_RANGE_PROFILE, ctx->active_session, 0, 0,
+                &report, sizeof(report), profile, 0) && !profile.empty() && profile.size() <= (1u << 20)) {
+            const std::string json(profile.begin(), profile.end());
+            GGML_LOG_INFO("remote_attn gpu_profile %s\n", json.c_str());
+        }
+    }
     auto & s = ctx->stats;
     double avg = s.calls ? (double) s.rpc_us_sum / (double) s.calls : 0.0;
     double p50 = 0.0, p95 = 0.0;
@@ -955,17 +1601,28 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
     }
     double tx_per_call = s.calls ? (double) s.bytes_tx / (double) s.calls : 0.0;
     double rx_per_call = s.calls ? (double) s.bytes_rx / (double) s.calls : 0.0;
-    char buf[1024];
+    char buf[2048];
     snprintf(buf, sizeof(buf),
         "{\"calls\":%llu,\"bytes_tx\":%llu,\"bytes_rx\":%llu,"
         "\"avg_tx_bytes_per_call\":%.1f,\"avg_rx_bytes_per_call\":%.1f,"
         "\"rpc_us_avg\":%.1f,\"rpc_us_p50\":%.1f,\"rpc_us_p95\":%.1f,\"rpc_us_max\":%llu,"
-        "\"xbox_compute_us_avg\":%.1f,\"xbox_prepare_us_avg\":%.1f}",
+        "\"xbox_compute_us_avg\":%.1f,\"xbox_prepare_us_avg\":%.1f,"
+        "\"range_fused_calls\":%llu,\"range_kernel_mode\":%u,"
+        "\"range_upload_calls\":%llu,\"range_upload_rows\":%llu,\"range_attn_calls\":%llu,"
+        "\"range_origin\":%u,\"range_capacity\":%u,\"range_query_min\":%lld,\"range_query_max\":%lld,"
+        "\"range_cache_type\":\"%s\",\"range_source_cache_type\":\"%s\",\"range_upload_bytes\":%llu}",
         (unsigned long long) s.calls, (unsigned long long) s.bytes_tx,
         (unsigned long long) s.bytes_rx, tx_per_call, rx_per_call,
         avg, p50, p95, (unsigned long long) s.rpc_us_max,
         s.calls ? (double) s.xbox_compute_us_sum / (double) s.calls : 0.0,
-        s.calls ? (double) s.xbox_prepare_us_sum / (double) s.calls : 0.0);
+        s.calls ? (double) s.xbox_prepare_us_sum / (double) s.calls : 0.0,
+        (unsigned long long) s.range_fused_calls, ctx->range_kernel_mode,
+        (unsigned long long) s.range_upload_calls, (unsigned long long) s.range_upload_rows,
+        (unsigned long long) s.range_attn_calls, ctx->range_origin, ctx->range_capacity,
+        (long long) s.range_query_min, (long long) s.range_query_max,
+        ctx->range_native_kvarn ? "kvarn4" : ctx->range_wire == RKVA_WIRE_Q4_0 ? "q4_0" : ctx->range_wire == RKVA_WIRE_Q8_0 ? "q8_0" : "f16",
+        ctx->range_native_kvarn ? "projected_f32" : ctx->range_configured ? ggml_type_name(ctx->range_source_type) : "none",
+        (unsigned long long) s.range_upload_bytes);
     ctx->stats_json = buf;
     return ctx->stats_json.c_str();
 }

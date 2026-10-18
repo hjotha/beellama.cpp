@@ -1581,7 +1581,12 @@ ggml_tensor * build_attn_mha_paged(
             ggml_tensor * k_cur,
             ggml_tensor * v_cur,
             float kq_scale,
-            int il) const;
+            int il,
+            ggml_tensor * positions = nullptr) const;
+
+    ggml_tensor * build_attn_position_split_rpc(
+            llm_graph_input_attn_kv * inp, ggml_tensor * q, ggml_tensor * k,
+            ggml_tensor * v, float scale, int il, ggml_tensor * positions) const;
 
     // F3: crop the position-split overflow mask to n_cols (mask must be wider)
     // and materialize it contiguous. Memoized per graph build on (mask_src,

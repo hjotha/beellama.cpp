@@ -441,7 +441,8 @@ public:
             ggml_type standard_type_v = GGML_TYPE_COUNT,
             bool standard_v_trans = false,
             const layer_device_cb & standard_device_for_layer = nullptr,
-            uint32_t position_split_p = 0);
+            uint32_t position_split_p = 0,
+            bool rpc_position_split = false);
     ~llama_kv_cache_kvarn() override;
 
     llama_memory_context_ptr init_batch(
@@ -698,7 +699,7 @@ public:
     uint64_t mixed_state_owner_id() const { return state_owner_id; }
     uint64_t mixed_state_owner_epoch() const { return state_owner_epoch; }
     // [TAG_SLOT_SAVE_CHECKPOINTS] Adopt the lineage epoch carried by a durable checkpoint
-    // companion. Only the server's SLOT_RESTORE flow calls this, after the full state that
+    // companion. Server restore/handoff flows call this only after the full state that
     // produced those partial snapshots was loaded into this cache; every replay still passes
     // the fine-grained reference/identity validation.
     bool adopt_state_owner_epoch(uint64_t epoch) {
@@ -710,8 +711,8 @@ public:
     }
     // [TAG_SLOT_SAVE_CHECKPOINTS] Adopt the owner id carried by a durable
     // checkpoint companion (payloads are owner-bound; the full-state restore
-    // recreates the cells but not the process-random owner id). Only the
-    // server's SLOT_RESTORE flow calls this after loading the state the
+    // recreates the cells but not the process-random owner id). Server
+    // restore/handoff flows call this only after loading the state the
     // checkpoints were captured from; every replay still passes the
     // fine-grained cell-reference validation.
     bool adopt_state_owner_id(uint64_t owner_id) {
@@ -917,6 +918,7 @@ private:
     const uint32_t kv_size_local;
     const uint32_t kv_size_overflow;
     const uint32_t position_split_p_;
+    const bool native_kvarn_rpc_experimental_;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
     const uint32_t tail_groups;   // non-SWA scheduler span; SWA fixed local tail

@@ -417,6 +417,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     const bool p_mode = cparams.kv_position_split_p != 0;
     const bool use_position_split = p_mode && use_position_split_attention(il);
     const bool is_remote = (cparams.remote_attn_enabled && backend_remote != nullptr &&
+                            !p_mode &&
                             !use_position_split &&
                             full_attn_idx < cparams.remote_attn_layers);
 
@@ -457,7 +458,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         }
         const int first_attn_node = ggml_graph_n_nodes(gf);
         if (use_position_split) {
-            cur = build_attn_position_split(inp, Qcur, Kcur, Vcur, kq_scale, il);
+            cur = build_attn_position_split(inp, Qcur, Kcur, Vcur, kq_scale, il, inp_pos);
         } else {
             cur = build_attn(inp,
                         nullptr, nullptr, nullptr,
