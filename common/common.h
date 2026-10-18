@@ -336,6 +336,7 @@ struct common_params_speculative_draft {
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+    bool no_op_offload = false; // additionally disable host-weight op offload in the draft context only
 
     // DFlash2 explicit local split: keep the transformer on the draft device and
     // exchange only host-owned feature/hidden rows with the target-side selector.

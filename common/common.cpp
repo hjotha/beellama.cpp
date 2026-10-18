@@ -3455,11 +3455,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     }
     if (remote_cache_k && (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
             params.remote_attn_host.empty() ||
+            (!common_remote_attn_is_local_vulkan(params.remote_attn_host) && params.kv_position_split_p == 0) ||
             params.remote_attn_prefill != "remote" || params.n_parallel != 1 ||
             params.kv_tail_tokens != "0" || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
             params.no_kv_offload)) {
         throw std::invalid_argument(
-                "per-layer remote KV formats require a global KVarN cache, native Vulkan attention, "
+                "per-layer remote KV formats require a global KVarN cache, native Vulkan or TCP position-split attention, "
                 "Flash Attention, KV offload, one slot, remote prefill, and kv-tail-tokens=0");
     }
 

@@ -5400,6 +5400,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
+    // CPU-resident draft weights may need to stay on CPU without disabling
+    // host-weight operation offload in the target scheduler. Absent the draft
+    // opt-in, retain the existing global setting unchanged.
+    result.no_op_offload = params.no_op_offload || params_spec.no_op_offload;
 
     result.n_ubatch = params_spec.n_ubatch > 0 ? params_spec.n_ubatch : 128;
 
@@ -5572,10 +5576,11 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        LOG_INF("MTP K/V placement: local_attention=%s, layers=%s, prefill=%s, cuda_reserve=%.0f MiB\n",
+        LOG_INF("MTP K/V placement: local_attention=%s, layers=%s, prefill=%s, cuda_reserve=%.0f MiB, draft_op_offload=%s\n",
                 params_dft.remote_attn_host.empty() ? "off" : params_dft.remote_attn_host.c_str(),
                 params_dft.remote_attn_layers.c_str(), params_dft.remote_attn_prefill.c_str(),
-                params_dft.remote_attn_cuda_reserve / 1024.0 / 1024.0);
+                params_dft.remote_attn_cuda_reserve / 1024.0 / 1024.0,
+                cparams.op_offload ? "enabled" : "disabled");
     }
 
     // the draft context holds as many tokens per sequence as the target context

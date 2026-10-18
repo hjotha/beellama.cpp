@@ -269,6 +269,31 @@ static void test(void) {
         assert(!common_context_params_to_llama(rs_params).no_offload_rs);
     }
 
+    {
+        // Exercise the actual CLI -> draft conversion -> context parameter
+        // paths, including unchanged inheritance and target/draft isolation.
+        for (bool global_disable : {false, true}) {
+            for (bool draft_disable : {false, true}) {
+                common_params scoped;
+                argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "1"};
+                if (global_disable) argv.push_back("--no-op-offload");
+                if (draft_disable) argv.push_back("--spec-draft-no-op-offload");
+                assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), scoped, LLAMA_EXAMPLE_SERVER));
+                assert(common_context_params_to_llama(scoped).op_offload == !global_disable);
+                const auto draft = common_base_params_to_speculative(scoped);
+                assert(common_context_params_to_llama(draft).op_offload == !(global_disable || draft_disable));
+                assert(scoped.no_op_offload == global_disable);
+            }
+        }
+        // A later global enable must not undo the explicitly draft-only disable.
+        common_params scoped;
+        argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-no-op-offload",
+                "--no-op-offload", "--op-offload"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), scoped, LLAMA_EXAMPLE_SERVER));
+        assert(common_context_params_to_llama(scoped).op_offload);
+        assert(!common_context_params_to_llama(common_base_params_to_speculative(scoped)).op_offload);
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     // missing value
@@ -495,6 +520,23 @@ params = common_params();
                 LLAMA_EXAMPLE_SERVER));
         remote_endpoint.n_parallel = 1;
         assert(invalid_mixed_context(remote_endpoint));
+
+        for (const auto & name : {"q4_0", "f16"}) {
+            common_params positional;
+            std::vector<std::string> positional_argv = {
+                "binary_name", "-m", "model_file.gguf",
+                "--cache-type-k", "kvarn4", "--cache-type-v", "kvarn4",
+                "--remote-attn", "127.0.0.1:18090", "--kv-position-split-p", "512",
+                "--remote-attn-cache-type-k", name, "--remote-attn-cache-type-v", name,
+            };
+            assert(common_params_parse(positional_argv.size(), list_str_to_char(positional_argv).data(),
+                    positional, LLAMA_EXAMPLE_SERVER));
+            positional.n_parallel = 1;
+            const auto context = common_context_params_to_llama(positional);
+            assert(context.kv_position_split_p == 512);
+            assert(context.remote_attn_cache_type_k == (std::string(name) == "f16" ? GGML_TYPE_F16 : GGML_TYPE_Q4_0));
+            assert(context.remote_attn_cache_type_v == context.remote_attn_cache_type_k);
+        }
 
         common_params extra_tail;
         std::vector<std::string> extra_tail_argv = {
@@ -1324,10 +1366,12 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
         adaptive = make_adaptive();
         adaptive.remote_attn_host = "127.0.0.1";
         adaptive.remote_attn_min_ctx_size = 10;
-        expect_error(adaptive, "--remote-attn-min-context requires a local Vulkan --remote-attn backend");
+        assert(common_context_adaptive_error(adaptive).empty());
+        assert(!common_context_remote_attn_enabled(adaptive, 9));
+        assert(common_context_remote_attn_enabled(adaptive, 10));
         adaptive = make_adaptive();
         adaptive.remote_attn_host = "127.0.0.1";
-        expect_error(adaptive, "adaptive context does not support external --remote-attn HOST:PORT sessions");
+        assert(common_context_adaptive_error(adaptive).empty());
         adaptive = make_adaptive();
         adaptive.remote_attn_host = "vulkan:0";
         adaptive.remote_attn_min_ctx_size = 1001;
