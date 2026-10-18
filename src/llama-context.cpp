@@ -588,16 +588,20 @@ llama_context::llama_context(
             return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
                     type == GGML_TYPE_Q6_0 || type == GGML_TYPE_Q8_0;
         };
+        const bool formats_supported =
+                (is_qx(cparams.remote_attn_cache_type_k) && is_qx(cparams.remote_attn_cache_type_v)) ||
+                (tcp_position_split && cparams.remote_attn_cache_type_k == GGML_TYPE_F16 &&
+                 cparams.remote_attn_cache_type_v == GGML_TYPE_F16);
         if (!local_attn_dev || !cparams.remote_attn_enabled || model.arch != LLM_ARCH_QWEN35 ||
                 cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
                 cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
                 cparams.n_seq_max != 1 || params.kv_unified || params.kv_paged ||
                 !params.offload_kqv || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
-                cparams.remote_attn_prefill != 0 || !is_qx(cparams.remote_attn_cache_type_k) ||
-                !is_qx(cparams.remote_attn_cache_type_v)) {
+                cparams.remote_attn_prefill != 0 || !formats_supported) {
             throw std::invalid_argument(
                     "per-layer remote KV formats require Qwen35 target context, native Vulkan or TCP position-split, "
-                    "KVarN local cache, Q4/Q5/Q6/Q8 remote K/V, Flash Attention, KV offload, "
+                    "KVarN local cache, Q4/Q5/Q6/Q8 or matching TCP position-split F16 remote K/V, "
+                    "Flash Attention, KV offload, "
                     "one non-unified slot, and static prefill");
         }
     }
