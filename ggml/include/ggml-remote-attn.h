@@ -25,7 +25,7 @@ enum ggml_remote_attn_range_op_param {
 };
 
 // Query-only v2 overflow attention. Sources 1/2 are the companion SET_ROWS
-// results (Q4_0 or Q8_0 [D*HKV, capacity]); source3 contains global P+i IDs,
+// results (Q4_0, Q8_0 or F16 [D*HKV, capacity]); source3 contains global P+i IDs,
 // with optional trailing -1 padding. Output rows pack OUT[D*H] then LSE[H]
 // for each query. The op uploads only the changed/invalidated KV suffix.
 GGML_API struct ggml_tensor * ggml_remote_attn_range(
@@ -92,12 +92,17 @@ GGML_API bool ggml_backend_remote_attn_destroy_session(
 GGML_API bool ggml_backend_remote_attn_reset(
         ggml_backend_t backend, uint32_t session_id);
 // Remove every stored position >= pos0 (trim and speculative rewind).
+// Authorize a prefix-preserving suffix trim after host memory removal or a
+// validated resident partial restore. Standard ranges send at most one global
+// REWIND and retain acknowledged prefix coverage; arbitrary rewrites must use
+// invalidate_range instead. A false result makes the remote owner unusable.
 GGML_API bool ggml_backend_remote_attn_trim(
         ggml_backend_t backend, uint32_t session_id, int32_t pos0);
 
 // v2 compact overflow cache. Requires active session and the three RANGE ops.
 // Matching Q4_0/Q8_0 storage is selected when advertised, otherwise the same
-// quantized source expands to F16. An explicit native format must match source.
+// quantized source expands to F16. F16 companions upload their original half
+// bytes directly. An explicit native quantized format must match its source.
 // Config resets its range histories; invalidation forces full per-layer resync
 // from the authoritative host companion on the next range attention call.
 GGML_API bool ggml_backend_remote_attn_configure_range(

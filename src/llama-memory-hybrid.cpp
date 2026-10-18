@@ -440,6 +440,10 @@ void llama_memory_hybrid::clear(bool data) {
     mem_recr->clear(data);
 }
 
+bool llama_memory_hybrid::invalidate_prefix_on_write(const llama_ubatch & ubatch) {
+    return mem_attn->invalidate_prefix_on_write(ubatch);
+}
+
 bool llama_memory_hybrid::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
     const bool recr_ok = mem_recr->can_seq_rm(seq_id, p0, p1);
     const bool attn_ok = mem_attn->can_seq_rm(seq_id, p0, p1);

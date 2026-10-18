@@ -454,7 +454,9 @@ static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor *
         uint8_t * dst = ctx->payload_tx.data() + prefix;
         for (const auto * source : {k, v}) {
             for (uint32_t row = start; row < start + rows; ++row) {
-                if (native_quant) {
+                if (native_quant || ctx->range_source_type == GGML_TYPE_F16) {
+                    // Direct F16 is already the wire representation. Preserve
+                    // its bits; never route original F16 through a Q4 decoder.
                     ggml_backend_tensor_get(source, dst, (size_t) row * source->nb[1], row_bytes);
                     dst += row_bytes;
                     continue;
@@ -1212,6 +1214,36 @@ bool ggml_backend_remote_attn_reset(ggml_backend_t backend, uint32_t session_id)
     return rkva_transact(ctx, RKVA_RESET, session_id, 0, 0, nullptr, 0, out, 0);
 }
 
+// Caller holds ctx->mutex. A successful suffix-removal/owner-bound partial
+// restore guarantees bytes below pos0 are unchanged. Rewind is session-wide;
+// adjust every layer only after ACK so later layers cannot retrim earlier ones.
+static bool rkva_trim_range_locked(ggml_backend_remote_attn_context * ctx,
+        uint32_t session_id, int32_t pos0) {
+    if (session_id != ctx->active_session || pos0 < 0) return false;
+    const uint32_t keep = uint32_t(pos0) <= ctx->range_origin ? 0 :
+            std::min(uint32_t(pos0) - ctx->range_origin, ctx->range_capacity);
+    bool needed = false;
+    for (const auto & layer : ctx->range_layers) {
+        needed |= layer.epoch == ctx->range_epoch && layer.rows > keep;
+    }
+    if (!needed) return true;
+    if (!(ctx->ack.supported_ops & (1u << RKVA_REWIND))) {
+        ++ctx->range_epoch; // older server: authoritative full-upload fallback
+        return true;
+    }
+    rkva_trim_req request { pos0 };
+    std::vector<uint8_t> reply;
+    if (!rkva_transact(ctx, RKVA_REWIND, session_id, 0, 0,
+                &request, sizeof(request), reply, 0)) {
+        ctx->failed = true; // ACK failure cannot publish speculative coverage
+        return false;
+    }
+    for (auto & layer : ctx->range_layers) {
+        if (layer.epoch == ctx->range_epoch) layer.rows = std::min(layer.rows, keep);
+    }
+    return true;
+}
+
 bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, int32_t pos0) {
     if (!backend) return false;
     if (ggml_backend_is_local_split(backend)) {
@@ -1233,10 +1265,7 @@ bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, 
             }
             return true; // trimming an unoccupied suffix must not invalidate native records
         }
-        // The host companion is authoritative; the next range op replaces each
-        // layer's history, including changes that preserve its row count.
-        ++ctx->range_epoch;
-        return session_id == ctx->active_session;
+        return rkva_trim_range_locked(ctx, session_id, pos0);
     }
     rkva_trim_req req { pos0 };
     std::vector<uint8_t> out;
@@ -1372,12 +1401,12 @@ bool ggml_backend_remote_attn_configure_range(
             ctx->geo.max_ctx != capacity || ctx->geo.n_layer_remote == 0 ||
             ctx->geo.cache_bits_k != 0 || ctx->geo.cache_bits_v != 0 ||
             ctx->geo.domain != GGML_REMOTE_ATTN_DOMAIN_AUTO || ctx->geo.has_sinks || ctx->geo.swa ||
-            (cache_type != GGML_TYPE_Q4_0 && cache_type != GGML_TYPE_Q8_0)) {
+            (cache_type != GGML_TYPE_Q4_0 && cache_type != GGML_TYPE_Q8_0 && cache_type != GGML_TYPE_F16)) {
         return false;
     }
     const bool source_q4 = cache_type == GGML_TYPE_Q4_0;
     const uint64_t capability = source_q4 ? RKVA_CAP_RANGE_Q4_0 : RKVA_CAP_RANGE_Q8_0;
-    const bool supports_native = (ctx->ack.reserved[0] & capability) != 0;
+    const bool supports_native = cache_type != GGML_TYPE_F16 && (ctx->ack.reserved[0] & capability) != 0;
     const char * requested = std::getenv("GGML_RKVA_RANGE_STORAGE");
     bool native_quant = supports_native;
     if (requested && std::strcmp(requested, "auto") != 0) {
@@ -1436,6 +1465,13 @@ bool ggml_backend_remote_attn_configure_range(
     ctx->range_kernel_mode = kernel_mode;
     const char * storage_name = native_quant ? (source_q4 ? "q4_0" : "q8_0") : "f16";
     if (!rkva_range_apply_control(ctx, storage_name, generic_kernel)) return false;
+    if (cache_type == GGML_TYPE_F16) {
+        GGML_LOG_INFO("%s: range source=f16 storage=f16; direct original K/V half bytes, no quantized intermediate\n",
+                      GGML_REMOTE_ATTN_NAME);
+    } else if (!native_quant) {
+        GGML_LOG_INFO("%s: range source=%s storage=f16; quantized-source expansion does not recover precision\n",
+                      GGML_REMOTE_ATTN_NAME, ggml_type_name(cache_type));
+    }
     return true;
 }
 

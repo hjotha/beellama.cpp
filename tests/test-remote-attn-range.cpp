@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,6 +40,9 @@ struct loopback {
     rkva_range_config range {};
     std::vector<float> keys, values;
     uint32_t rows = 0;
+    struct history { std::vector<float> keys, values; uint32_t rows = 0; };
+    std::map<uint32_t, history> other_layers;
+    bool fail_trim = false;
     std::vector<rkva_range_profile> profile_controls;
     bool profile_enabled = false;
     uint32_t kernel_mode = 0;
@@ -79,6 +83,10 @@ struct loopback {
                 if (req.payload_bytes && !read_all(fd, payload.data(), payload.size())) break;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    auto & other = other_layers[req.layer_id];
+                    auto & keys = req.layer_id == 0 ? this->keys : other.keys;
+                    auto & values = req.layer_id == 0 ? this->values : other.values;
+                    auto & rows = req.layer_id == 0 ? this->rows : other.rows;
                     auto apply_upload = [&](const std::vector<uint8_t> & data) {
                             rkva_range_upload upload {}; std::memcpy(&upload, data.data(), sizeof(upload));
                             const size_t width = geometry.n_head_kv * geometry.head_dim;
@@ -150,7 +158,7 @@ struct loopback {
                             std::memcpy(&geometry, payload.data(), sizeof(geometry));
                             rkva_hello_ack ack {};
                             ack.supported_ops = (1u << RKVA_ATTN_DECODE) | (1u << RKVA_ATTN_PREFILL);
-                            if (range_ops) ack.supported_ops |= (1u << RKVA_RANGE_CONFIG) | (1u << RKVA_RANGE_UPLOAD) | (1u << RKVA_RANGE_ATTN);
+                            if (range_ops) ack.supported_ops |= (1u << RKVA_REWIND) | (1u << RKVA_RANGE_CONFIG) | (1u << RKVA_RANGE_UPLOAD) | (1u << RKVA_RANGE_ATTN);
                             if (range_ops && fused_range) ack.supported_ops |= (1u << RKVA_RANGE_UPLOAD_ATTN);
                             if (profile_support & 2) ack.supported_ops |= (1u << RKVA_RANGE_PROFILE);
                             ack.chosen_wire = RKVA_WIRE_F16;
@@ -177,7 +185,22 @@ struct loopback {
                             keys.reserve(size_t(range.capacity) * geometry.n_head_kv * geometry.head_dim);
                             values.reserve(size_t(range.capacity) * geometry.n_head_kv * geometry.head_dim);
                             rows = 0; break;
-                        case RKVA_RESET: rows = 0; break;
+                        case RKVA_RESET:
+                            rows = 0; other_layers.clear(); break;
+                        case RKVA_REWIND: {
+                            assert(payload.size() == sizeof(rkva_trim_req));
+                            rkva_trim_req trim {};
+                            std::memcpy(&trim, payload.data(), sizeof(trim));
+                            assert(trim.pos0 >= 0);
+                            if (fail_trim) {
+                                response_failure = profile_failure::server_error;
+                                break;
+                            }
+                            const uint32_t keep = uint32_t(trim.pos0) <= range.origin ? 0 :
+                                    std::min(uint32_t(trim.pos0) - range.origin, range.capacity);
+                            this->rows = std::min(this->rows, keep);
+                            for (auto & entry : other_layers) entry.second.rows = std::min(entry.second.rows, keep);
+                        } break;
                         case RKVA_RANGE_UPLOAD:
                             apply_upload(payload); break;
                         case RKVA_RANGE_ATTN:
@@ -264,10 +287,10 @@ struct loopback {
     }
 };
 
-static ggml_backend_t connect(loopback & server) {
+static ggml_backend_t connect(loopback & server, uint32_t n_layers = 1) {
     auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
     ggml_remote_attn_geometry geometry {};
-    geometry.n_layer_remote = 1; geometry.n_head = 2; geometry.n_head_kv = 1;
+    geometry.n_layer_remote = n_layers; geometry.n_head = 2; geometry.n_head_kv = 1;
     geometry.head_dim = 32; geometry.max_ctx = 8; geometry.kq_scale = 0.125f;
     assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
     return backend;
@@ -575,7 +598,8 @@ static void test_range_format_kernel() {
             assert(ggml_backend_remote_attn_connect(backend));
             assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 8));
             ggml_backend_remote_attn_set_active_session(backend, 0);
-            const auto source = !std::strcmp(format, "q8_0") ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_0;
+            const auto source = !std::strcmp(format, "q8_0") ? GGML_TYPE_Q8_0 :
+                !std::strcmp(format, "f16") ? GGML_TYPE_F16 : GGML_TYPE_Q4_0;
             assert(ggml_backend_remote_attn_configure_range(backend, 256, 8, source) == (available == 1));
             assert(ggml_backend_remote_attn_failed(backend) == (available != 1));
             {
@@ -688,15 +712,16 @@ int main() {
         { std::lock_guard<std::mutex> lock(server.mutex); assert(server.session_flags == std::vector<uint32_t>({0})); }
         ggml_backend_free(backend);
     }
-    for (const auto cache_type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+    for (const auto cache_type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
     for (bool native_quant : {false, true}) {
+    if (cache_type == GGML_TYPE_F16 && native_quant) continue;
     for (int fusion_case : {0, 1, 2}) {
     const bool supports_fusion = fusion_case != 0;
     const bool use_fusion = fusion_case == 1;
     storage_env fuse_mode(fusion_case == 2 ? "0" : "auto", "GGML_RKVA_RANGE_FUSE");
     loopback server(false, true, native_quant && cache_type == GGML_TYPE_Q4_0, false,
                     native_quant && cache_type == GGML_TYPE_Q8_0, supports_fusion);
-    auto * backend = connect(server);
+    auto * backend = connect(server, 2);
     assert(ggml_backend_remote_attn_connect(backend));
     assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 8));
     ggml_backend_remote_attn_set_active_session(backend, 0);
@@ -738,6 +763,12 @@ int main() {
                 raw_v[row * 32 + d] = ((row * 7 + d * 3) % 29 - 14) * 0.1875f;
             }
         }
+    }
+    if (cache_type == GGML_TYPE_F16) {
+        // Values with meaningful half mantissa bits would not survive Q4.
+        raw_k[1] = 1.0009765625f;
+        raw_v[3] = 0.333251953125f;
+        raw_v[33] = -0.99951171875f;
     }
     std::vector<uint8_t> quant(ggml_row_size(cache_type, 32) * 8);
     ggml_quantize_chunk(cache_type, raw_k.data(), quant.data(), 0, 8, 32, nullptr);
@@ -809,7 +840,7 @@ int main() {
         assert(server.uploads[1].start_row == 2 && server.uploads[1].n_rows == 2);
         assert(server.uploads[2].start_row == 0 && server.uploads[2].n_rows == 4);
         assert(server.uploads[3].start_row == 0 && server.uploads[3].n_rows == 2);
-        if (native_quant) {
+        if (native_quant || cache_type == GGML_TYPE_F16) {
             const size_t row_bytes = ggml_row_size(cache_type, 32);
             for (size_t upload = 0; upload < server.uploads.size(); ++upload) {
                 const auto first = server.uploads[upload].start_row * row_bytes;
@@ -821,10 +852,39 @@ int main() {
             }
         }
     }
+    // A validated suffix removal preserves both layers with one session-wide
+    // ACK. Rewriting the rejected rows uploads only the delta, never the full
+    // retained prefix. An unannounced same-count rewrite above still resyncs.
+    node->op_params[GGML_REMOTE_ATTN_PARAM_LAYER_ID] = 1;
+    run(4);
+    node->op_params[GGML_REMOTE_ATTN_PARAM_LAYER_ID] = 0;
+    run(4);
+    assert(ggml_backend_remote_attn_trim(backend, 0, 258));
+    const size_t suffix_offset = 2 * ggml_row_size(cache_type, 32);
+    const size_t suffix_bytes = 2 * ggml_row_size(cache_type, 32);
+    ggml_backend_tensor_set(k, quant_v.data() + suffix_offset, suffix_offset, suffix_bytes);
+    ggml_backend_tensor_set(v, quant_k.data() + suffix_offset, suffix_offset, suffix_bytes);
+    for (size_t i = 2 * 32; i < 4 * 32; ++i) std::swap(expected_k[i], expected_v[i]);
+    run(4);
+    node->op_params[GGML_REMOTE_ATTN_PARAM_LAYER_ID] = 1;
+    run(4);
+    assert(ggml_backend_remote_attn_trim(backend, 0, 260)); // no-op, no RPC
+    {
+        std::lock_guard<std::mutex> lock(server.mutex);
+        assert(std::count(server.packet_ops.begin(), server.packet_ops.end(), RKVA_REWIND) == 1);
+        assert(server.uploads.size() == 8 && server.attention_calls == 8);
+        for (size_t i = 6; i < 8; ++i) {
+            assert(server.uploads[i].start_row == 2 && server.uploads[i].n_rows == 2);
+        }
+    }
     // Invalid global IDs fail before transmitting any upload/attention.
     int32_t hole[4] = {256,258,-1,-1}; ggml_backend_tensor_set(ids, hole, 0, sizeof(hole));
     assert(!ggml_remote_attn_exec(node));
-    { std::lock_guard<std::mutex> lock(server.mutex); assert(server.attention_calls == 4); }
+    { std::lock_guard<std::mutex> lock(server.mutex); assert(server.attention_calls == 8); }
+    { std::lock_guard<std::mutex> lock(server.mutex); server.fail_trim = true; }
+    assert(!ggml_backend_remote_attn_trim(backend, 0, 258));
+    assert(ggml_backend_remote_attn_failed(backend));
+    assert(!ggml_remote_attn_exec(node)); // failed ACK never resumes remote compute
     ggml_remote_attn_set_active(nullptr);
     ggml_backend_buffer_free(buffers); ggml_free(ctx); ggml_backend_free(cpu); ggml_backend_free(backend);
     }

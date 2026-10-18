@@ -1891,8 +1891,9 @@ std::vector<ggml_backend_t> layer_backends;
                     throw std::runtime_error("experimental native Xbox KVarN4 requires an F16 precision tail of at most 128 tokens");
                 }
                 geo.max_ctx = cparams.n_ctx_seq - cparams.kv_position_split_p;
-                // The CPU companion encodes Q4_0 or Q8_0 once. The Xbox uses
-                // matching packed records or their F16 expansion, without WHT.
+                // The CPU companion encodes Q4_0, Q8_0 or F16 once. The Xbox
+                // receives matching native bytes (or an explicit quantized-source
+                // F16 expansion), without WHT.
                 geo.cache_bits_k = geo.cache_bits_v = 0;
                 geo.tail_tokens = geo.tail_groups = 0;
             }
@@ -1998,12 +1999,30 @@ std::vector<ggml_backend_t> layer_backends;
             // backend in the split/copy machinery corrupted tensor backend ids).
             // backend_remote only owns the RPC connection; ggml_remote_attn_exec
             // (called from the CPU compute) uses it via this active registration.
+            // Reject before warmup/prefill or a speculative append. Even an
+            // empty native owner can become live at P during verification;
+            // its CPU stages/tail and Xbox records cannot yet be rolled back.
+            if (params.mtp_reserve_enabled && remote_native_kvarn_enabled()) {
+                ggml_backend_free(backend_remote);
+                backend_remote = nullptr;
+                throw std::runtime_error("draft-MTP is unsupported with append-only native Xbox KVarN4 overflow; use Q4/Q8/F16 overflow or disable MTP");
+            }
             ggml_remote_attn_set_active(backend_remote);
 
             // RESET-on-clear: a full local cache clear (warmup, /v1/chat/completions
             // reset, slot reuse) must reset the remote session so both sides stay in
             // lockstep; otherwise the next generation starts over stale records.
             if (memory) {
+                if (cparams.remote_attn_position_split) {
+                    memory->set_on_seq_rm([this](llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+                        if (!backend_remote || remote_native_kvarn_enabled()) return true;
+                        if (seq_id != 0 || p0 < 0 || p1 >= 0) {
+                            ggml_backend_remote_attn_invalidate_range(backend_remote);
+                            return true;
+                        }
+                        return ggml_backend_remote_attn_trim(backend_remote, remote_attn_session, p0);
+                    });
+                }
                 memory->set_on_clear([this]() {
                     if (backend_remote != nullptr) {
                         if (ggml_backend_is_local_split(backend_remote)) {
@@ -3782,6 +3801,10 @@ static bool f4_sched_eval_cb(struct ggml_tensor * t, bool ask, void * user_data)
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     llama_memory_context_finish_guard memory_finish_guard(mctx);
+    if (mctx && memory && backend_remote && cparams.remote_attn_position_split &&
+            memory->invalidate_prefix_on_write(ubatch)) {
+        ggml_backend_remote_attn_invalidate_range(backend_remote);
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -6613,6 +6636,10 @@ bool llama_context::remote_disk_snapshot_enabled() const {
            ggml_backend_remote_attn_disk_snapshot_enabled(backend_remote);
 }
 
+bool llama_context::remote_native_kvarn_enabled() const {
+    return backend_remote && ggml_backend_remote_attn_native_kvarn_enabled(backend_remote);
+}
+
 bool llama_context::remote_native_kvarn_transient_active() const {
     return backend_remote && ggml_backend_remote_attn_native_kvarn_has_state(backend_remote);
 }
@@ -6633,6 +6660,10 @@ bool llama_context::remote_disk_snapshot(llama_seq_id seq_id, const uint8_t key[
 
 bool llama_remote_disk_snapshot_enabled(const llama_context * ctx) {
     return ctx && ctx->remote_disk_snapshot_enabled();
+}
+
+bool llama_remote_native_kvarn_enabled(const llama_context * ctx) {
+    return ctx && ctx->remote_native_kvarn_enabled();
 }
 
 bool llama_remote_native_kvarn_transient_active(const llama_context * ctx) {
@@ -6813,6 +6844,22 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     if (memory) {
         memory->state_read(io, seq_id, flags);
 
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
+                cparams.remote_attn_position_split && backend_remote && seq_id == 0) {
+            // Mixed partial restore already checked owner identity/generation
+            // and resident cell references. Publish a remote suffix trim only
+            // after the entire memory restore commits successfully.
+            io.on_commit([this, seq_id]() {
+                if (!memory->supports_resident_prefix_restore()) {
+                    ggml_backend_remote_attn_invalidate_range(backend_remote);
+                    return;
+                }
+                if (!ggml_backend_remote_attn_trim(backend_remote, remote_attn_session,
+                            memory->seq_pos_max(seq_id) + 1)) {
+                    throw std::runtime_error("remote KV partial-restore trim failed");
+                }
+            });
+        }
         if (!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
             // Register after memory's callbacks so failed/prepared restores do
             // not invalidate the live graph. Partial speculative checkpoints
@@ -7837,7 +7884,7 @@ bool llama_memory_seq_rm(
         return true;
     }
 
-    return mem->seq_rm(seq_id, p0, p1);
+    return mem->seq_rm(seq_id, p0, p1) && mem->run_on_seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_seq_cp(

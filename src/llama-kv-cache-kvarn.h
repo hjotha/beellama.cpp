@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama-kv-prefix-lineage.h"
+
 #include "llama-kv-mixed-state.h"
 #include "llama-kv-cache.h"
 #include "llama-kvarn.h"
@@ -457,6 +459,10 @@ public:
     llama_memory_context_ptr init_kv_batch(const std::vector<llama_ubatch> & ubatches) override;
 
     bool get_can_shift() const override;
+    bool invalidate_prefix_on_write(const llama_ubatch & ubatch) override;
+    bool supports_resident_prefix_restore() const override {
+        return position_split_enabled() && standard_cache && !native_kvarn_rpc_experimental_;
+    }
     seq_rm_capability get_seq_rm_capability() const override;
 
     void clear(bool data) override;
@@ -707,6 +713,7 @@ public:
             return false;
         }
         state_owner_epoch = epoch;
+        prefix_lineage.reset(epoch);
         return true;
     }
     // [TAG_SLOT_SAVE_CHECKPOINTS] Adopt the owner id carried by a durable
@@ -720,6 +727,7 @@ public:
             return false;
         }
         state_owner_id = owner_id;
+        prefix_lineage.reset(state_owner_epoch);
         return true;
     }
     // F4 v2: stable model/RoPE identity stamped into the position_split envelope
@@ -919,6 +927,8 @@ private:
     const uint32_t kv_size_overflow;
     const uint32_t position_split_p_;
     const bool native_kvarn_rpc_experimental_;
+    bool native_kvarn_checkpoint_unavailable() const;
+    mutable bool native_kvarn_overflow_seen_ = false;
     // Declaration order matters: stage_groups depends on tail_groups, so
     // tail_groups must be declared first (C++ initializes members in order).
     const uint32_t tail_groups;   // non-SWA scheduler span; SWA fixed local tail
@@ -936,6 +946,8 @@ private:
     ggml_type exact_tail_type;
     uint64_t state_owner_id;
     uint64_t state_owner_epoch = 1;
+    llama_kv_prefix_lineage prefix_lineage;
+    void dirty_state_prefix(llama_pos pos);
     // F4 v2: model/RoPE identity for the position_split envelope. Zero means
     // "not stamped"; a split cache refuses to save without it.
     uint64_t state_model_id = 0;

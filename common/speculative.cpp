@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-remote-snapshot.h"
 
 #include <cmath>
 #include <limits>
@@ -5786,6 +5787,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
+    }
+
+    // Also cover callers that construct common speculative params directly,
+    // without the target context's MTP memory reservation. A configured empty
+    // native owner is already ineligible: the first speculative write could
+    // cross into append-only state before any restore guard can help.
+    if (!configs.empty() && params.draft.n_max > 0 &&
+            llama_remote_native_kvarn_enabled(params.draft.ctx_tgt)) {
+        throw std::runtime_error("speculative decoding requires rollback; native Xbox KVarN4 overflow is append-only");
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};

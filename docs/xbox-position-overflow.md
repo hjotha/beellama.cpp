@@ -30,7 +30,7 @@ before those positions are reached.
 
 The initial range path supports one contiguous, unshifted, causal text
 sequence with Qwen35 dense full-attention layers, a CUDA KVarN prefix and a
-Q4_0 or Q8_0 companion (matching K and V types). It rejects holes or changed
+Q4_0, Q8_0 or F16 companion (matching K and V types). It rejects holes or changed
 absolute positions rather than silently reading a different history. SWA, attention sinks, ALiBi and softcap
 are outside this path. The initial serving and comparison workload disables
 MTP in the split profile. Only one active RPC context per server process is
@@ -50,11 +50,18 @@ than Q4_0, but remains lossy and cannot guarantee identical logits.
 `GGML_RKVA_RANGE_STORAGE` selects the remote representation:
 
 - `auto` negotiates native storage matching the host companion, otherwise F16.
+  An F16 companion always sends its half-precision bytes directly.
 - `q4_0` or `q8_0` requires the matching host cache and server capability and
   transmits the packed records directly. To use Q8_0, set both
   `--remote-attn-cache-type-k q8_0` and `--remote-attn-cache-type-v q8_0`.
-- `f16` expands the selected host Q4_0 or Q8_0 records to F16 for the remote
-  cache. It does not recover precision lost during source quantization.
+- `f16` with `--remote-attn-cache-type-k f16 --remote-attn-cache-type-v f16`
+  stores the original projected K/V directly in a CPU F16 companion and uploads
+  those exact bytes to Xbox. The CUDA prefix remains KVarN4. There is no Q4/Q8
+  intermediate. CPU F16 snapshots retain format identity and cannot be restored
+  as a Q4/Q8 overflow.
+- For explicit transport diagnostics, `f16` with a Q4/Q8 companion still expands
+  that quantized source. This older route does not recover its lost precision;
+  it must not be labeled an original-F16 quality baseline.
 
 Unknown values and missing required capabilities fail closed. With 16 layers,
 4 KV heads and head width 256, the 28672-position overflow requires

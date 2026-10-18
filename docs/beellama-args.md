@@ -395,3 +395,12 @@ tests.
 | `--spec-dflash-cross-ctx`, `--spec-branch-budget`, `--spec-draft-temp`, `GGML_DFLASH_*` | Removed with the fork ring, capture, and verifier implementation. | No direct replacement. |
 | `GGML_CUDA_FA_HALF_QUANTS` | Removed. | Use the default matrix or `GGML_CUDA_FA_ALL_QUANTS=ON`. |
 | `GGML_CUDA_KVARN_FA`, `GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS` | Removed. | Use the default-on `GGML_CUDA_KVARN`; `GGML_CUDA_FA_ALL_QUANTS` selects 15 or 36 fast-decode pairs. |
+
+
+For original-precision F16 overflow on Xbox, pair the standard companion types:
+`--remote-attn-cache-type-k f16 --remote-attn-cache-type-v f16`, with TCP
+position splitting and `GGML_RKVA_RANGE_STORAGE=f16` (or `auto`). New projected
+K/V are rounded directly to F16 once, mirrored on CPU for native state replay,
+and uploaded byte-for-byte. The local CUDA prefix remains KVarN4. Selecting
+only F16 wire storage while retaining a Q4/Q8 companion is still an expansion
+of that quantized source, not an original-F16 cache.

@@ -5025,7 +5025,7 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
     if (!backend_cuda) throw std::runtime_error("RKVA position split requires local CUDA attention");
     const uint32_t n_local = uint32_t(inp->self_kq_mask_local->ne[0]);
     auto * mask_local = inp->self_kq_mask_local_cnv;
-    // Preserve the Q4_0/Q8_0 checkpoint representation; upload only appended rows.
+    // Preserve the Q4_0/Q8_0/F16 checkpoint representation; upload only appended rows.
     auto * k_written = kvarn_ctx->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il);
     auto * v_written = kvarn_ctx->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il);
     if (!k_written || !v_written) throw std::runtime_error("missing RKVA companion stores");

@@ -96,6 +96,10 @@ public:
     void clear(bool data) override;
 
     bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
+    bool invalidate_prefix_on_write(const llama_ubatch & ubatch) override;
+    bool supports_resident_prefix_restore() const override {
+        return mem_attn->supports_resident_prefix_restore();
+    }
     bool seq_rm_plan(
             llama_seq_id seq_id, llama_pos p0, llama_pos p1,
             llama_pos & planned_p0, llama_pos & planned_p1) const override;

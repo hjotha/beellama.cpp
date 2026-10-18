@@ -438,10 +438,10 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
 
 static ggml_type parse_remote_attn_standard_cache_type(const std::string & value) {
     const ggml_type type = kv_cache_type_from_str(value);
-    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q5_0 &&
+    if (type != GGML_TYPE_F16 && type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q5_0 &&
             type != GGML_TYPE_Q6_0 && type != GGML_TYPE_Q8_0) {
         throw std::invalid_argument(
-                "remote attention cache overrides currently support q4_0, q5_0, q6_0, or q8_0");
+                "remote attention cache overrides currently support f16, q4_0, q5_0, q6_0, or q8_0");
     }
     return type;
 }
@@ -3851,15 +3851,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_LAYERS"));
     add_opt(common_arg(
         {"--remote-attn-cache-type-k"}, "TYPE",
-        "optional standard K cache type for locally remote-attended layers (q4_0, q5_0, q6_0, q8_0); "
-        "requires Vulkan or TCP position-split --remote-attn and a global KVarN cache; unset preserves the global cache format",
+        "optional standard K cache type for locally remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0); "
+        "requires Vulkan or TCP position-split --remote-attn and a global KVarN cache; f16 requires TCP position split; unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
             params.remote_attn_cache_type_k = parse_remote_attn_standard_cache_type(value);
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_K").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--remote-attn-cache-type-v"}, "TYPE",
-        "optional standard V cache type for locally remote-attended layers (q4_0, q5_0, q6_0, q8_0); "
+        "optional standard V cache type for locally remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0); "
         "unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
             params.remote_attn_cache_type_v = parse_remote_attn_standard_cache_type(value);

@@ -47,3 +47,56 @@ stage/tail wrap across a 256-token append, chronological original-domain tails,
 non-finite input refusal and replay refusal. This source regression does not
 establish model quality or Xbox throughput; those require actual device/model
 runs and their exact provenance.
+
+Append-only native overflow refuses active draft-MTP at context setup, including
+an empty owner. Common speculative callers also reject a configured native target
+before creating active speculators; a zero draft limit remains permitted. This deliberately disables speculation below P in a
+native overflow context as well; running MTP only below P needs a separate
+position-aware eligibility contract. Standard Q4/Q8/F16 overflow retains its
+existing opt-in MTP path. Native memory advertises no suffix rollback; actual
+occupied native rewinds are rejected before metadata mutation. FULL capture and
+all restore capability queries refuse occupied native overflow. Partial recurrent
+capture remains available for diagnostics, but cannot restore a live native owner.
+Once native ownership is observed, logical clear does not prove that owner reset;
+restore capability remains conservatively unavailable until a fresh context.
+
+`GGML_MTP_PROF` also enables `MTPCYCLE` records for generation (including the
+non-speculative control). Each record reports request/slot/cycle, initial anchor,
+local/overflow tier, proposed and accepted drafts, logical target query rows and
+passes including checkpoint replays, generated token count and complete wall
+microseconds through token processing. Generated counts follow server `n_gen`,
+including a stop/EOS token; they are not visible text-token counts. This cycle
+span includes queue, checkpoint, draft, target, catch-up, restore/replay and token
+processing costs. Existing phase and RKVA profile logs provide the breakdown.
+A cycle interrupted by cancellation or an error has no completed record.
+
+Standard Q4/Q8/F16 overflow can retain an unchanged prefix after successful
+suffix removal or a validated owner-bound PARTIAL restore. The context sends
+one session-wide REWIND, waits for its ACK, then clamps every cached layer's
+frontier. The next verification uploads only its new/replacement suffix. A
+no-op trim sends no RPC. Unsupported older servers retain full-upload fallback;
+an ACK failure makes the remote owner unusable. FULL restores, arbitrary range
+removals and unannounced backward/same-count rewrites retain full resynchronization.
+Overwriting an existing target position also advances the mixed owner generation,
+so a PARTIAL checkpoint cannot validate merely through matching token/position
+IDs after the prefix bytes changed. These rules use existing memory/restore
+transactions and the existing standard RKVA REWIND operation; native overflow
+continues to require a fresh context for unsupported rollback/state operations.
+
+Resident prefix tickets also record dirty suffix generations. Removing positions
+at or beyond r invalidates any saved prefix that included those positions, even
+if the same cell positions and token IDs are later reused with different bytes.
+A checkpoint ending strictly before r remains valid, including repeated restore
+and replay. Dominated suffix edits are coalesced; FULL restore and clear start a
+new lineage. This prevents token/position identity from substituting for byte
+ownership while retaining the accepted-prefix fast path.
+
+Dirty suffix history is not part of durable FULL snapshots. Position-split
+checkpoint sidecars therefore adopt the FULL save-time epoch and keep only
+tickets captured in that epoch; older/missing-epoch tickets fall back to
+reprocessing instead of being revived through epoch adoption.
+
+For positional standard companions, hybrid PARTIAL state includes the attention
+ownership envelope followed by recurrent state. Historical RS-only PARTIAL
+blobs are explicitly refused before commit; they cannot authorize remote prefix
+retention. FULL and pure FULL imports retain their existing formats.

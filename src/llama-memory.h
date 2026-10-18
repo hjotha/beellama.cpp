@@ -216,6 +216,21 @@ struct llama_memory_i {
         on_clear_ = cb;
     }
 
+    // Context-owned remote suffix synchronization, invoked once by the public
+    // sequence-removal API after all composite memory constituents succeed.
+    void set_on_seq_rm(const std::function<bool(llama_seq_id, llama_pos, llama_pos)> & cb) {
+        on_seq_rm_ = cb;
+    }
+    bool run_on_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+        return !on_seq_rm_ || on_seq_rm_(seq_id, p0, p1);
+    }
+
+    // Return true when a write invalidates resident prefix references. Called
+    // before apply() changes cells, only for the static RPC target contract.
+    virtual bool invalidate_prefix_on_write(const llama_ubatch & /* ubatch */) { return false; }
+    // Partial restore may reuse remote bytes only with owner/generation checks.
+    virtual bool supports_resident_prefix_restore() const { return false; }
+
     // invoke the registered clear hook (called by cache implementations)
     void run_on_clear() const {
         if (on_clear_) {
@@ -357,6 +372,7 @@ struct llama_memory_i {
     // is active; llama_kv_cache::clear invokes run_on_clear() so the remote
     // session resets in lockstep with the local cache. Plain struct member.
     std::function<void()> on_clear_;
+    std::function<bool(llama_seq_id, llama_pos, llama_pos)> on_seq_rm_;
 };
 
 inline llama_memory_i::seq_rm_capability llama_memory_suffix_rollback_capability(

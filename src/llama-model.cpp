@@ -3334,6 +3334,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.local_attn_backend != nullptr &&
                                     cparams.remote_attn_layers > 0 &&
                                     params.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+                            if (mixed_remote_selected &&
+                                    (params.remote_attn_cache_type_k == GGML_TYPE_F16 ||
+                                     params.remote_attn_cache_type_v == GGML_TYPE_F16) &&
+                                    !cparams.remote_attn_position_split) {
+                                throw std::invalid_argument("F16 overflow companion requires TCP position-split attention");
+                            }
                             // F3: placement físico por faixa. O KVarN local vive
                             // na CUDA (camada do modelo); o Q4 de overflow vive
                             // na Vulkan (backend de atenção local). Por padrão
@@ -3343,13 +3349,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             if (cparams.kv_position_split_p != 0) {
                                 if (!mixed_remote_selected) {
                                     throw std::invalid_argument(
-                                            "position-split KV exige cache remoto Q4_0 ou Q8_0 (tipos K/V + backend)");
+                                            "position-split KV exige cache remoto Q4_0, Q8_0 ou F16 (tipos K/V + backend)");
                                 }
                                 if ((params.remote_attn_cache_type_k != GGML_TYPE_Q4_0 &&
-                                     params.remote_attn_cache_type_k != GGML_TYPE_Q8_0) ||
+                                     params.remote_attn_cache_type_k != GGML_TYPE_Q8_0 &&
+                                     params.remote_attn_cache_type_k != GGML_TYPE_F16) ||
                                         params.remote_attn_cache_type_v != params.remote_attn_cache_type_k) {
                                     throw std::invalid_argument(
-                                            "position-split KV exige K/V remotos do mesmo tipo: Q4_0 ou Q8_0");
+                                            "position-split KV exige K/V remotos do mesmo tipo: Q4_0, Q8_0 ou F16");
                                 }
                                 // O backend de overflow é validado pelos buffers
                                 // reais no ctor do cache (todas as camadas Q4

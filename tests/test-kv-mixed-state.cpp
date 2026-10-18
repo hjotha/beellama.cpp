@@ -2855,7 +2855,7 @@ static void test_split_to_pure_import_adapter() {
     CHECK(XXH64(valid_frame.data(), valid_frame.size(), 0) == original_hash);
 }
 
-static void test_compact_qx_rows() {
+static void test_compact_qx_rows(uint16_t type = sx_q4_0) {
     // The same strict mapper is used by the native cache index setters and
     // scatter writer/reader: metadata IDs remain global, payload IDs do not.
     CHECK(qx_payload_row_for_cell(102400, 131072, 102400) == 0);
@@ -2872,17 +2872,22 @@ static void test_compact_qx_rows() {
     cells[SPLIT_P-1].pos = SPLIT_P-1; cells[SPLIT_P-1].seq_ids = {0};
     cells[SPLIT_P].pos = SPLIT_P; cells[SPLIT_P].seq_ids = {0};
     cells[SPLIT_P+2].pos = SPLIT_P+2; cells[SPLIT_P+2].seq_ids = {0};
-    std::vector<uint8_t> local_bytes(128), overflow_bytes(2*1152), metadata;
+    const uint64_t row_stride = type == sx_f16 ? 2048 : 576;
+    std::vector<uint8_t> local_bytes(128), overflow_bytes(4*row_stride), metadata;
     fill_pattern(local_bytes, 91); fill_pattern(overflow_bytes, 92);
     make_metadata(metadata, 93);
     auto local = make_kvarn_layer(1, kv4v4, 4, 4, uint8_t(kvarn_domain::rotated),
             uint32_t(cells.size()), 3, local_bytes.size());
     local.range_start = 0; local.range_end = SPLIT_P;
-    auto overflow = make_qx_layer(1, sx_q4_0, sx_q4_0, 2, overflow_bytes.size());
+    auto overflow = make_qx_layer(1, type, type, 2, overflow_bytes.size());
     overflow.layout = layout_standard_qx_compact_rows;
     overflow.owner = owner_target; overflow.v_trans = 0;
     overflow.head_dim_v = 256; overflow.v_rot_width = 256;
-    overflow.k_stride = 576; overflow.v_stride = 576;
+    overflow.k_stride = row_stride; overflow.v_stride = row_stride;
+    if (type == sx_f16) {
+        overflow.k_rot = overflow.v_rot = uint8_t(rotation::none);
+        overflow.k_rot_width = overflow.v_rot_width = 0;
+    }
     overflow.range_id = 1; overflow.range_start = SPLIT_P; overflow.range_end = SPLIT_C;
     const auto encode = [&](const layer_desc & q, const std::vector<cell_entry> & table,
                             std::vector<uint8_t> & output) {
@@ -2928,6 +2933,23 @@ static void test_compact_qx_rows() {
         state.commit(handlers);
         CHECK(stages == 2 && published == 1 && live == overflow_bytes);
         CHECK(*backing == original);
+    }
+
+    if (type == sx_f16) {
+        // Format identity is authoritative even with equal padded row sizes:
+        // a Q4 destination must never consume a native F16 snapshot.
+        auto mismatch = expected;
+        mismatch.layers[1].k_type = mismatch.layers[1].v_type = sx_q4_0;
+        auto state = snapshot::parse(compact.data(), compact.size());
+        CHECK_THROWS(state.validate_expected_snapshot(mismatch));
+        int mutations = 0;
+        commit_handlers handlers;
+        handlers.stage_metadata = [&](uint32_t, const uint8_t *, size_t) { ++mutations; return true; };
+        handlers.stage_layer = [&](uint32_t, uint32_t, const layer_desc &, const uint8_t *, size_t) { ++mutations; return true; };
+        handlers.stage_split = [&](const position_split &) { ++mutations; return true; };
+        handlers.finish = [&] { ++mutations; }; handlers.abort = [] {};
+        CHECK_THROWS(state.commit(handlers));
+        CHECK(mutations == 0);
     }
 
     // Legacy absolute-row and compact-row frames are distinct contracts even
@@ -3043,6 +3065,7 @@ int main() {
     test_pure_import_adapter();
     test_split_to_pure_import_adapter();
     test_compact_qx_rows();
+    test_compact_qx_rows(sx_f16);
     test_fingerprint_controls();
     test_spool_preflight();
     test_kms3_move_identity();

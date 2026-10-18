@@ -1491,10 +1491,34 @@ prompt_reset_after_memory_clear();
     float adaptive_draft_ms = 0.0f;
     int32_t adaptive_requested_n_max = 0;
 
+    // Opt-in complete generation-cycle wall time. Retained across checkpoint
+    // replay passes; emitted counts follow n_gen (including a stop/EOS token).
+    int64_t mtp_cycle_start_us = 0;
+    int64_t mtp_cycle_anchor = 0;
+    uint64_t mtp_cycle_id = 0;
+    uint32_t mtp_cycle_passes = 0;
+    uint32_t mtp_cycle_nq = 0;
+    uint32_t mtp_cycle_proposed = 0;
+    uint32_t mtp_cycle_accepted = 0;
+
+    void report_mtp_cycle(size_t committed, bool stopped) {
+        if (mtp_cycle_start_us == 0) {
+            return;
+        }
+        fprintf(stderr, "MTPCYCLE request=%d slot=%d cycle=%llu anchor=%lld tier=%s "
+                "proposed=%u accepted_drafts=%u target_nq=%u passes=%u committed=%zu stopped=%d wall_us=%lld\n",
+                task->id, id, (unsigned long long) mtp_cycle_id, (long long) mtp_cycle_anchor,
+                position_split_p > 0 && mtp_cycle_anchor >= position_split_p ? "overflow" : "local",
+                mtp_cycle_proposed, mtp_cycle_accepted, mtp_cycle_nq, mtp_cycle_passes, committed, int(stopped),
+                (long long) (ggml_time_us() - mtp_cycle_start_us));
+        mtp_cycle_start_us = 0;
+    }
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        mtp_cycle_start_us = 0;
 
         n_prompt_tokens_cache = 0;
         n_prompt_tokens_lcp = 0;
@@ -4291,6 +4315,11 @@ private:
         if (adopt_epoch == 0) {
             adopt_epoch = owner_epoch;
         }
+        if (slot.position_split_p > 0) {
+            // Dirty suffix history is in-memory only. A FULL reload proves the
+            // save-time generation, not an older checkpoint's resident bytes.
+            adopt_epoch = owner_epoch;
+        }
         // Owner id first: every partial payload is owner-bound and the fresh
         // process has a different (process-random) id.
         const uint64_t id_now = llama_kvarn_state_owner_id(ctx_tgt);
@@ -4316,6 +4345,12 @@ private:
         }
         std::list<std::shared_ptr<const common_prompt_checkpoint>> loaded;
         for (size_t i = 0; i < ckpt_blobs.size(); ++i) {
+            if (slot.position_split_p > 0 &&
+                    (owner_epoch == 0 || i >= ckpt_epochs.size() || ckpt_epochs[i] != owner_epoch)) {
+                // Cannot reconstruct intervening dirty suffixes from a durable
+                // sidecar. Keep only tickets captured in the FULL save epoch.
+                continue;
+            }
             auto & blob = ckpt_blobs[i];
             auto checkpoint = std::make_shared<common_prompt_checkpoint>();
             checkpoint->n_tokens           = blob.n_tokens;
@@ -9030,6 +9065,12 @@ private:
             }
 
             generating.push_back(&slot);
+            if (getenv("GGML_MTP_PROF") && slot.mtp_cycle_start_us == 0) {
+                slot.mtp_cycle_start_us = ggml_time_us();
+                slot.mtp_cycle_anchor = slot.prompt.tokens.pos_next();
+                ++slot.mtp_cycle_id;
+                slot.mtp_cycle_passes = slot.mtp_cycle_nq = slot.mtp_cycle_proposed = slot.mtp_cycle_accepted = 0;
+            }
 
             if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
                 slot.adaptive_cycle_start_us = ggml_time_us();
@@ -10583,7 +10624,13 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
+            const bool continue_generation = process_token(result, slot);
+            if (slot.mtp_cycle_start_us != 0) {
+                ++slot.mtp_cycle_passes;
+                ++slot.mtp_cycle_nq;
+            }
+            slot.report_mtp_cycle(1, !continue_generation);
+            if (!continue_generation) {
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
@@ -10610,6 +10657,13 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             const size_t n_draft = slot.spec_draft.size();
 
             GGML_ASSERT(n_draft > 0);
+            if (slot.mtp_cycle_start_us != 0) {
+                ++slot.mtp_cycle_passes;
+                slot.mtp_cycle_nq += uint32_t(slot.spec_i_batch.size());
+                if (!slot.spec_is_replay) {
+                    slot.mtp_cycle_proposed += uint32_t(n_draft);
+                }
+            }
 
             // verify and try to accept the draft
             const bool prof_mtp = getenv("GGML_MTP_PROF") != nullptr;
@@ -10762,7 +10816,8 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             // excludes the target forward (reported as MTPTGT us=) and the MTP
             // catch-up common_speculative_process (reported as MTPPHASE phase=sync),
             // both of which happen before t_verify_start. The full per-token cycle
-            // is the sum of MTPTGT + phase=draft + phase=sync + phase=verify.
+            // needs complete wall accounting; MTPCYCLE also includes checkpoint,
+            // replay, emission and queue time rather than summing phase samples.
             const float verify_ms = (float) (t_now - t_verify_start) / 1000.0f;
             if (prof_mtp) {
                 fprintf(stderr, "MTPPHASE phase=verify us=%lld sample_accept_us=%lld n_draft=%zu\n",
@@ -10776,6 +10831,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+            slot.mtp_cycle_accepted += uint32_t(n_accepted);
 
             slot.stats.update_gen_last();
 
@@ -10839,6 +10895,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 slot.stats.f5_record_token(ggml_time_us(), true);
 
                 if (!process_token(result, slot)) {
+                    slot.report_mtp_cycle(i + 1, true);
                     slot.print_timings();
                     send_final_response(slot);
                     auto_save_on_completion(slot);
@@ -10848,6 +10905,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 }
             }
             dflash_trace("emit_tokens", trace_emit_start, dflash_trace_tick_us(), (int) ids.size());
+            slot.report_mtp_cycle(ids.size(), false);
 
             slot.print_timings_tg();
 

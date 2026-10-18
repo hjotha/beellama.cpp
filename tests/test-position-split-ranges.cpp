@@ -328,6 +328,8 @@ int main() {
             }
             CHECK(validate_ranges(q8, P, C, full_layers).empty());
             q8[1].format = 3;
+            CHECK(validate_ranges(q8, P, C, full_layers).empty());
+            q8[1].format = 4;
             CHECK(!validate_ranges(q8, P, C, full_layers).empty());
         }
         // Missing overflow range.
