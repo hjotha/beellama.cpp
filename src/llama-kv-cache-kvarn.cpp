@@ -1875,9 +1875,7 @@ bool llama_kv_cache_kvarn_context::local_tail_available() const {
     // history: that is precisely the dual-range builder (plan 3.3/3.4), where
     // fa1 must produce a body+tail local O/LSE. An overflow-only ubatch has no
     // local keys at all, so it stays tail-free (plan 3.1).
-    std::vector<uint32_t> local_cells;
-    return cache->position_split_live_cells(llama_position_split::range_kind::LOCAL,
-            local_cells) && !local_cells.empty();
+    return cache->position_split_has_live_cells(llama_position_split::range_kind::LOCAL);
 }
 
 bool llama_kv_cache_kvarn_context::tail_on_layer(int32_t il) const {
@@ -4109,9 +4107,9 @@ bool llama_kv_cache_kvarn::get_can_shift() const {
 }
 
 llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() const {
-    if (native_kvarn_rpc_experimental_) {
+    if (native_kvarn_rpc_experimental_ && !native_kvarn_rewind_capable_) {
         // Capability must hold for future appends too, including the first
-        // append at P. A live native owner has no suffix rollback contract.
+        // append at P. Without negotiation there is no native rollback contract.
         return { true, false, 0 };
     }
     // Metadata can discard an unbounded suffix because KVarN owns the body, but
@@ -4174,9 +4172,13 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
         if (native_kvarn_checkpoint_unavailable() &&
                 norm_p0 <= metadata->seq_pos_max(seq_id) &&
                 effective_end > llama_pos(position_split_p_)) {
-            // Full clear above is allowed, as are trims of unoccupied suffixes.
-            // Reject a real native rewind before modifying logical metadata.
-            return false;
+            // Only a negotiated suffix rewind within retained original rows
+            // is safe. Interior edits and larger removals stay fail-closed.
+            if (!native_kvarn_rewind_capable_ || p1 >= 0 ||
+                    metadata->seq_pos_max(seq_id) - std::max(norm_p0, llama_pos(position_split_p_)) + 1 > 128 ||
+                    !native_kvarn_rewind_preflight_ || !native_kvarn_rewind_preflight_(norm_p0)) {
+                return false;
+            }
         }
 
         const auto shape = llama_position_split::classify_removal(
@@ -4519,9 +4521,9 @@ bool llama_kv_cache_kvarn::native_kvarn_checkpoint_unavailable() const {
     if (!native_kvarn_rpc_experimental_) {
         return false;
     }
-    // Metadata may precede remote execution. Once native rows have existed,
-    // a logical clear/trim cannot prove that the actual native owner reset;
-    // require a fresh context, consistently with the context-level guards.
+    // FULL persistence has no native codec. Once native rows have existed,
+    // logical metadata alone cannot authorize a FULL bookkeeping snapshot.
+    // Resident PARTIAL eligibility separately requires exact owner preflight.
     native_kvarn_overflow_seen_ = native_kvarn_overflow_seen_ ||
             metadata->seq_pos_max(0) >= int64_t(position_split_p_);
     return native_kvarn_overflow_seen_;
@@ -4558,7 +4560,8 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
 
 bool llama_kv_cache_kvarn::state_seq_can_restore(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if (seq_id < 0 || native_kvarn_checkpoint_unavailable()) {
+    if (seq_id < 0 || (native_kvarn_checkpoint_unavailable() &&
+            (!native_kvarn_rewind_capable_ || !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)))) {
         return false;
     }
     constexpr uint32_t supported = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
@@ -5341,8 +5344,23 @@ void llama_kv_cache_kvarn::state_read_mixed(
         throw kv_mixed_error(manifest_error.empty() ? "invalid mixed state I/O manifest" : manifest_error);
     }
 
+    if (partial && native_kvarn_rpc_experimental_) {
+        llama_pos frontier = 0;
+        for (const auto & cell : parsed.cells()) {
+            if (cell.pos < 0) continue; // sparse metadata placeholders are not occupied cells
+            if (cell.pos >= kv_size) throw kv_mixed_error("invalid native partial cell position");
+            frontier = std::max(frontier, llama_pos(cell.pos) + 1);
+        }
+        // Validate the exact retained-input window before metadata preparation,
+        // recurrent staging or any commit callback can mutate the destination.
+        const bool needs_native_prefix = frontier > llama_pos(position_split_p_) || native_kvarn_checkpoint_unavailable();
+        if (needs_native_prefix && (!native_kvarn_rewind_capable_ || !native_kvarn_rewind_preflight_ ||
+                !native_kvarn_rewind_preflight_(frontier))) {
+            throw kv_mixed_error("native partial restore is outside the retained original prefix window");
+        }
+    }
     const bool original_split_frame = parsed.has_split();
-    if (native_kvarn_rpc_experimental_) {
+    if (native_kvarn_rpc_experimental_ && !(partial && native_kvarn_rewind_capable_)) {
         // Validate logical extent before preparing/applying any tensor writes.
         // Only an unoccupied overflow can bootstrap the native append owner;
         // native records cannot be recovered from an older Q4/Q8 snapshot.
@@ -5531,6 +5549,9 @@ void llama_kv_cache_kvarn::state_read_mixed(
     }
     parsed.validate_expected_snapshot(expected, parse_opts);
 
+    const bool resident_refs = partial && position_split_enabled() && standard_cache;
+    std::vector<uint32_t> resident_cells;
+    if (resident_refs) resident_cells.reserve(parsed.cells().size());
     if (partial) {
         // Qx payloads in a partial snapshot are resident references. The
         // physical cell identities must still name the same live rows; an
@@ -5560,6 +5581,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
                     std::find(saved.seq_ids.begin(), saved.seq_ids.end(), int32_t(seq_id)) == saved.seq_ids.end()) {
                 throw kv_mixed_error("mixed partial snapshot sequence membership no longer matches its owner");
             }
+            if (resident_refs) resident_cells.push_back(cell_index);
         }
     }
 
@@ -5637,7 +5659,28 @@ void llama_kv_cache_kvarn::state_read_mixed(
             }
         }
     };
-    state_read_kvarn_body(reader, seq_id, flags, &restored_sinfos, sinfos_in, validate_prepared_cells);
+    llama_kv_cache::slot_info_vec_t resident_sinfos;
+    const auto * placement = sinfos_in;
+    if (resident_refs) {
+        // Resident Qx references cannot move when the raw metadata reader
+        // allocates slots. Preserve the already validated physical IDs in the
+        // same occupied-cell order used by the serialized metadata stream.
+        resident_sinfos.resize(1);
+        auto & slot = resident_sinfos[0];
+        if (!resident_cells.empty()) {
+            slot.s0 = slot.s1 = 0;
+            slot.resize(1);
+            slot.strm[0] = 0;
+            slot.idxs[0] = std::move(resident_cells);
+        }
+        if (sinfos_in && (sinfos_in->size() != 1 ||
+                (*sinfos_in)[0].strm != slot.strm || (*sinfos_in)[0].idxs != slot.idxs ||
+                (!slot.empty() && ((*sinfos_in)[0].s0 != slot.s0 || (*sinfos_in)[0].s1 != slot.s1)))) {
+            throw kv_mixed_error("mixed partial resident references cannot be remapped by mirrored placement");
+        }
+        placement = &resident_sinfos;
+    }
+    state_read_kvarn_body(reader, seq_id, flags, &restored_sinfos, placement, validate_prepared_cells);
     uint64_t restored_rows = 0;
     if (restored_sinfos.size() != 1) {
         throw kv_mixed_error("mixed KVarN metadata restored an unexpected stream count");
@@ -7173,6 +7216,28 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
         out.push_back({layer, llama_position_split::kRangeOverflow, position_split_p_, kv_size, 1, format});
     }
     return out;
+}
+
+bool llama_kv_cache_kvarn::position_split_has_live_cells(
+        llama_position_split::range_kind range) const {
+    if (!position_split_enabled() || n_seq_max != 1 ||
+            (range != llama_position_split::range_kind::LOCAL &&
+             range != llama_position_split::range_kind::OVERFLOW)) {
+        return false;
+    }
+    const auto & cells = metadata->get_cells(0);
+    const auto first = llama_position_split::range_for_pos(
+            cells.seq_pos_min(0), position_split_p_, kv_size).kind;
+    const auto last = llama_position_split::range_for_pos(
+            cells.seq_pos_max(0), position_split_p_, kv_size).kind;
+    // Both extrema must be valid: a later invalid overflow cell used to
+    // invalidate even a nonempty LOCAL query. Ignore cells owned only by other
+    // sequences, just as the list-producing helper does.
+    if (first == llama_position_split::range_kind::INVALID ||
+            last == llama_position_split::range_kind::INVALID) {
+        return false;
+    }
+    return range == llama_position_split::range_kind::LOCAL ? first == range : last == range;
 }
 
 bool llama_kv_cache_kvarn::position_split_live_cells(

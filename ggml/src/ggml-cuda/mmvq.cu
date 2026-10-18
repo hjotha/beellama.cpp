@@ -5,6 +5,8 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -365,6 +367,29 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// Q2_K MMQ uses one activation scale per 64 values, while MMVQ uses
+// per 32. Keep the serial decode representation for small verification batches.
+// The legacy Ada throughput policy remains available for profiling.
+static bool ggml_cuda_q2_k_consistent_mmvq() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_Q2_K_MMVQ");
+        if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
+            GGML_ABORT("GGML_CUDA_Q2_K_MMVQ must be 0 or 1");
+        }
+        const bool consistent = value == nullptr || std::strcmp(value, "1") == 0;
+        if (consistent) {
+            GGML_LOG_INFO("CUDA Ada dense Q2_K MMVQ enabled for batches 5..%d "
+                          "(serial per-32 activation scales; GGML_CUDA_Q2_K_MMVQ=0 restores legacy routing)\n",
+                          MMVQ_MAX_BATCH_SIZE);
+        } else {
+            GGML_LOG_INFO("CUDA Ada dense Q2_K uses legacy MMVQ ceiling 4 "
+                          "(GGML_CUDA_Q2_K_MMVQ=0)\n");
+        }
+        return consistent;
+    }();
+    return enabled;
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -383,6 +408,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
         switch (type) { // tuned on RTX 4090
             case GGML_TYPE_Q2_K:
+                if (ne11 > 4 && ne11 <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_q2_k_consistent_mmvq()) {
+                    return true;
+                }
                 return ne11 <= 4;
             case GGML_TYPE_Q3_K:
                 return ne11 <= 6;

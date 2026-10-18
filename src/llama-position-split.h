@@ -193,6 +193,26 @@ inline int64_t spec_draft_limit_at_p(int64_t anchor_pos, uint32_t p) {
     return int64_t(p) - anchor_pos - 1;
 }
 
+// Body-only KVarN reads one resident stage/record image for the verify batch.
+// A completed 128-row record must not replace staging for an earlier query.
+// The anchor may itself seal a group; the next seal strictly after it is the
+// first forbidden later query. This conservatively includes the sink group.
+// Beyond P the local body is frozen and the overflow backend owns its policy.
+// Multiple sequences can map logical positions to different physical groups:
+// fail closed to ordinary one-token decode instead of assuming this mapping.
+inline int64_t spec_draft_limit_before_kvarn_seal(
+        int64_t anchor_pos, uint32_t p, uint32_t n_seq_max) {
+    if (anchor_pos < 0 || anchor_pos > std::numeric_limits<int32_t>::max() || n_seq_max != 1) {
+        return 0;
+    }
+    if (p != 0 && uint64_t(anchor_pos) >= p) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    int64_t next_seal = anchor_pos - anchor_pos % kKvarnGroup + kKvarnGroup - 1;
+    if (next_seal == anchor_pos) next_seal += kKvarnGroup;
+    return next_seal - anchor_pos - 1;
+}
+
 // Atribuição de faixa por posição (Fase 2b): cada posição absoluta pertence
 // a exatamente uma faixa. Local [0,P) vive na CUDA (KVarN4); overflow [P,C)
 // na Vulkan0 (Q4). `index_in_range` é o índice dentro da faixa (pos no local,

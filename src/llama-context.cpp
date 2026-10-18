@@ -795,6 +795,30 @@ llama_context::llama_context(
                     swa_policy.native_exact ? "native_exact" : "overlay");
         }
     }
+    // Opt-in measurement control, resolved before allocation and graph planning.
+    // Numeric --kv-tail-tokens=0 retains its ordinary intrinsic-128 semantics.
+    // Owned Qwen MTP contexts keep their independent, ordinary cache policy.
+    const char * experimental_tail = getenv("LLAMA_KVARN_EXPERIMENTAL_TARGET_TAIL");
+    if (experimental_tail && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        if ((strcmp(experimental_tail, "0") != 0 && strcmp(experimental_tail, "128") != 0) ||
+                params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED || model.arch != LLM_ARCH_QWEN35 ||
+                hparams.n_swa > 0) {
+            throw std::invalid_argument(
+                    "LLAMA_KVARN_EXPERIMENTAL_TARGET_TAIL requires 0 or 128 and a non-SWA Qwen35 KVarN target");
+        }
+        const bool retain_intrinsic = strcmp(experimental_tail, "128") == 0;
+        const auto policy = llama_kvarn_tail_policy_for(0, cparams.n_ctx, retain_intrinsic);
+        cparams.kv_tail_tokens = policy.effective_tokens;
+        cparams.kv_tail_tokens_swa = policy.effective_tokens;
+        cparams.kv_tail_tokens_requested = policy.requested_tokens;
+        cparams.kv_tail_tokens_swa_requested = policy.requested_tokens;
+        cparams.kv_tail_native_exact = policy.native_exact;
+        cparams.kv_tail_native_exact_swa = policy.native_exact;
+        cparams.kv_tail_type = GGML_TYPE_F16;
+        LLAMA_LOG_WARN("EXPERIMENTAL Qwen35 target exact tail: effective=%u type=f16; "
+                "KVarN sink and incomplete-group F16 staging remain enabled; owned MTP policy unchanged\n",
+                policy.effective_tokens);
+    }
     if ((cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) &&
             cparams.kv_tail_rollback_tokens == 0) {
         // The common capability probe removes one suffix token. Compact
@@ -2003,13 +2027,27 @@ std::vector<ggml_backend_t> layer_backends;
             // backend in the split/copy machinery corrupted tensor backend ids).
             // backend_remote only owns the RPC connection; ggml_remote_attn_exec
             // (called from the CPU compute) uses it via this active registration.
-            // Reject before warmup/prefill or a speculative append. Even an
-            // empty native owner can become live at P during verification;
-            // its CPU stages/tail and Xbox records cannot yet be rolled back.
-            if (params.mtp_reserve_enabled && remote_native_kvarn_enabled()) {
+            // Publish negotiated resident-prefix capability to the real memory
+            // owner; the Q4 companion remains bookkeeping, not native payload.
+            if (remote_native_kvarn_enabled() && memory) {
+                llama_kv_cache_kvarn * native_cache = dynamic_cast<llama_kv_cache_kvarn *>(memory.get());
+                if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                    native_cache = dynamic_cast<llama_kv_cache_kvarn *>(hybrid->get_mem_attn_base());
+                }
+                if (!native_cache) throw std::runtime_error("native RPC owner is not a KVarN memory cache");
+                native_cache->set_native_kvarn_rewind_capable(remote_native_kvarn_can_rewind());
+                native_cache->set_native_kvarn_rewind_preflight([this](llama_pos p0) {
+                    return backend_remote && ggml_backend_remote_attn_native_kvarn_can_restore(backend_remote, p0);
+                });
+            }
+            // Reject before the first speculative write unless the live
+            // server negotiated bounded resident rollback. FULL persistence
+            // remains unsupported independently of this capability.
+            if (params.mtp_reserve_enabled && remote_native_kvarn_enabled() &&
+                    (!remote_native_kvarn_can_rewind() || params.mtp_reserve_rollback_tokens > 128)) {
                 ggml_backend_free(backend_remote);
                 backend_remote = nullptr;
-                throw std::runtime_error("draft-MTP is unsupported with append-only native Xbox KVarN4 overflow; use Q4/Q8/F16 overflow or disable MTP");
+                throw std::runtime_error("draft-MTP requires negotiated native Xbox KVarN4 bounded rewind (maximum 128 tokens)");
             }
             ggml_remote_attn_set_active(backend_remote);
 
@@ -2019,7 +2057,10 @@ std::vector<ggml_backend_t> layer_backends;
             if (memory) {
                 if (cparams.remote_attn_position_split) {
                     memory->set_on_seq_rm([this](llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-                        if (!backend_remote || remote_native_kvarn_enabled()) return true;
+                        if (!backend_remote) return true;
+                        if (remote_native_kvarn_enabled() && p0 <= 0 && p1 < 0) {
+                            return ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
+                        }
                         if (seq_id != 0 || p0 < 0 || p1 >= 0) {
                             ggml_backend_remote_attn_invalidate_range(backend_remote);
                             return true;
@@ -6662,6 +6703,10 @@ bool llama_context::remote_native_kvarn_enabled() const {
     return backend_remote && ggml_backend_remote_attn_native_kvarn_enabled(backend_remote);
 }
 
+bool llama_context::remote_native_kvarn_can_rewind() const {
+    return backend_remote && ggml_backend_remote_attn_native_kvarn_can_rewind(backend_remote);
+}
+
 bool llama_context::remote_native_kvarn_transient_active() const {
     return backend_remote && ggml_backend_remote_attn_native_kvarn_has_state(backend_remote);
 }
@@ -6686,6 +6731,10 @@ bool llama_remote_disk_snapshot_enabled(const llama_context * ctx) {
 
 bool llama_remote_native_kvarn_enabled(const llama_context * ctx) {
     return ctx && ctx->remote_native_kvarn_enabled();
+}
+
+bool llama_remote_native_kvarn_can_rewind(const llama_context * ctx) {
+    return ctx && ctx->remote_native_kvarn_can_rewind();
 }
 
 bool llama_remote_native_kvarn_transient_active(const llama_context * ctx) {
@@ -6859,7 +6908,8 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (remote_native_kvarn_transient_active()) {
+    if (remote_native_kvarn_transient_active() &&
+            (!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || !remote_native_kvarn_can_rewind())) {
         throw std::runtime_error("native KVarN4 overflow restore/rewind is unsupported; use a fresh context and pure local prefix");
     }
     nextn_decode_id = 0;
@@ -6875,6 +6925,12 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                 if (!memory->supports_resident_prefix_restore()) {
                     ggml_backend_remote_attn_invalidate_range(backend_remote);
                     return;
+                }
+                if (remote_native_kvarn_enabled() &&
+                        !ggml_backend_remote_attn_native_kvarn_can_restore(backend_remote,
+                            memory->seq_pos_max(seq_id) + 1)) {
+                    ggml_backend_remote_attn_invalidate_range(backend_remote);
+                    throw std::runtime_error("native KV partial restore lacks matching live prefix or retained original rows");
                 }
                 if (!ggml_backend_remote_attn_trim(backend_remote, remote_attn_session,
                             memory->seq_pos_max(seq_id) + 1)) {

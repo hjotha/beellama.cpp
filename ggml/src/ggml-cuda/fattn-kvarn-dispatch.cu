@@ -893,18 +893,27 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
 // n_stream * n_q_heads * n_q * n_splits * D floats; ggml_cuda_pool_vmm never
 // returns pages to the driver, so a wide verification batch at n_kv ~ 110k
 // (n_splits ~ 1728) would otherwise reserve ~226 MiB permanently and starve
-// the following kvarn prefill windows. Falling back to the generic MMA path at
-// deep n_kv matches the pre-v0.4.6 behavior with no decode TPS loss.
+// the following kvarn prefill windows. Wider batches retain direct record
+// attention through MMA, or the portable native route when LSE requires it.
 static int ggml_cuda_fattn_kvarn_split_max_q(
-        const ggml_cuda_fattn_kvarn_plan & plan, const ggml_tensor * Q) {
+        const ggml_cuda_fattn_kvarn_plan & plan, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const int qualified_max = ggml_cuda_fattn_kvarn_split_max_q(int(Q->ne[0]));
     if (const char * env = getenv("GGML_CUDA_KVARN_SPLIT_MAX_Q")) {
         const int forced = atoi(env);
         if (forced > 0) {
-            return std::min(forced, GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q);
+            return std::min(forced, qualified_max);
         }
     }
     size_t budget = size_t(64) << 20;
-    if (const char * env = getenv("GGML_CUDA_KVARN_SPLIT_PARTIAL_MB")) {
+    const char * env = getenv("GGML_CUDA_KVARN_SPLIT_PARTIAL_MB");
+    // The automatic reserve addresses position-split attention's extra LSE
+    // and remote staging pressure. Preserve the qualified query tiles for
+    // ordinary single-device attention; an explicit budget still opts it in.
+    if (env == nullptr && !ggml_cuda_fattn_lse_requested(dst)) {
+        return qualified_max;
+    }
+    if (env != nullptr) {
         const long mb = atol(env);
         if (mb > 0) {
             budget = size_t(mb) << 20;
@@ -915,16 +924,17 @@ static int ggml_cuda_fattn_kvarn_split_max_q(
     const size_t bytes_per_q = size_t(std::max(plan.n_stream, 1)) * size_t(Q->ne[2]) * n_splits *
         (size_t(Q->ne[0]) * sizeof(float) + sizeof(float2));
     if (bytes_per_q == 0) {
-        return GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q;
+        return qualified_max;
     }
-    return int(std::clamp<size_t>(budget / bytes_per_q, 1, GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q));
+    return int(std::clamp<size_t>(budget / bytes_per_q, 1, qualified_max));
 }
 
 static bool ggml_cuda_flash_attn_ext_kvarn_decode(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
         const ggml_cuda_fattn_kvarn_plan & plan) {
-    if (!ggml_cuda_flash_attn_ext_kvarn_decode_supported(plan, dst)) {
+    if (!ggml_cuda_flash_attn_ext_kvarn_decode_supported(plan, dst) ||
+            dst->src[0]->ne[1] > ggml_cuda_fattn_kvarn_split_max_q(plan, dst)) {
         return false;
     }
 
@@ -1289,7 +1299,8 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     const bool vector_eligible = capabilities.decode_vector && !prompt_prefill &&
         ggml_cuda_flash_attn_ext_kvarn_vec_supported(plan, dst);
     const bool split_eligible = capabilities.decode_split && !prompt_prefill &&
-        ggml_cuda_flash_attn_ext_kvarn_decode_supported(plan, dst);
+        ggml_cuda_flash_attn_ext_kvarn_decode_supported(plan, dst) &&
+        Q->ne[1] <= ggml_cuda_fattn_kvarn_split_max_q(plan, dst);
     const int gqa = plan.n_kv_heads > 0 && Q->ne[2] % plan.n_kv_heads == 0 ?
         int(Q->ne[2] / plan.n_kv_heads) : 0;
     const ggml_cuda_fattn_kvarn_route route = ggml_cuda_fattn_kvarn_select_route({

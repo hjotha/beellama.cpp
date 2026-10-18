@@ -4156,6 +4156,13 @@ std::string common_prompt_cache_layout(llama_context * ctx) {
     layout["type_k_aux"] = static_cast<int32_t>(p.type_k_aux);
     layout["type_v_aux"] = static_cast<int32_t>(p.type_v_aux);
     layout["kv_layout_known"] = layout_known;
+    if (kvarn && ctx->get_cparams().kv_tail_tokens == 0 &&
+            ctx->get_cparams().kv_tail_tokens_swa == 0) {
+        // Distinguish the experimental zero-overlay representation before
+        // cache selection, without invalidating existing ordinary-tail seeds.
+        // The native payload reader still checks the exact layout on restore.
+        layout["kvarn_zero_exact_tail"] = true;
+    }
     if (mixed_kv) {
         const auto & kvarn_params = ctx->get_cparams().kvarn;
         layout["mixed_kv"] = true;

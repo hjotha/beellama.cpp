@@ -644,6 +644,16 @@ static void test_exact_tail_policy() {
     require(omitted.exact_groups == 1, "omitted KVarN tail must retain one exact group");
     require(!omitted.native_exact, "partial KVarN tail must retain compressed body records");
 
+    const auto no_intrinsic = llama_kvarn_tail_policy_for(0, 4096, false);
+    require(no_intrinsic.raw_requested_tokens == 0 && no_intrinsic.requested_tokens == 0 &&
+            no_intrinsic.effective_tokens == 0 && no_intrinsic.exact_groups == 0 && !no_intrinsic.native_exact,
+            "experimental zero tail must keep compressed body without an exact overlay");
+    require(llama_kvarn_tail_policy_for(129, 4096, false).effective_tokens == 256,
+            "disabling the intrinsic floor must not discard an explicit exact-tail request");
+    require(llama_kvarn_tail_policy_for(0, 64, false).effective_tokens == 0 &&
+            !llama_kvarn_tail_policy_for(0, 64, false).native_exact,
+            "experimental short-window zero tail must not promote to native exact storage");
+
     for (uint32_t requested : { 1u, 127u, 128u }) {
         const auto policy = llama_kvarn_tail_policy_for(requested, 4096);
         require(policy.raw_requested_tokens == requested, "explicit KVarN tail request provenance changed");
@@ -2939,10 +2949,9 @@ static std::vector<float> test_native_flash_attention_output(
         std::vector<float> k_tail_ref;
         std::vector<float> v_tail_ref;
         if (exact_tail_tokens > 0) {
-            require(exact_tail_current_tokens > 0,
-                    "FP64 reference: exact-tail current arena not implemented");
             require(!exact_tail_bodyless,
                     "FP64 reference: tail-without-body is not modelled yet");
+            // With no current arena, every row comes from history.
             // Tokens [0, history) live in the history arena, tokens
             // [history, exact_tail_tokens) in the current arena. Reading every
             // token from k_tail_data over-reads the history heap buffer for the
@@ -2966,6 +2975,8 @@ static std::vector<float> test_native_flash_attention_output(
                         // Float values here: the consumer uses them directly
                         // as doubles. Storing fp16 bit patterns (as an earlier
                         // revision did) inflates every tail score by ~1e4.
+                        require(src_off < k_src.size() && src_off < v_src.size(),
+                                "FP64 reference: exact-tail source arena bounds");
                         k_tail_ref[off] = k_src[src_off];
                         v_tail_ref[off] = v_src[src_off];
                     }
@@ -4041,7 +4052,103 @@ static void test_odd_offset_record_decode_gpu() {
     ggml_backend_free(gpu_backend);
 }
 
+// Opt-in GPU regression: exercise the production environment policy and route
+// counters, then compare both attention outputs and LSE across native kernels.
+static void test_native_split_budget_gpu() {
+    ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    require(backend != nullptr, "split budget regression requires a CUDA backend");
+    const auto dev = ggml_backend_get_device(backend);
+    require(dev != nullptr && std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0,
+            "split budget regression requires CUDA native attention");
+    const auto routes = get_kvarn_route_stats_fns(backend);
+    require(routes.first != nullptr && routes.second != nullptr,
+            "split budget regression requires route counters");
+    scoped_test_env clear_max("GGML_CUDA_KVARN_SPLIT_MAX_Q", nullptr);
+    scoped_test_env clear_budget("GGML_CUDA_KVARN_SPLIT_PARTIAL_MB", nullptr);
+    scoped_test_env clear_portable("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN", nullptr);
+    scoped_test_env clear_materialize("GGML_KVARN_TEST_FORCE_MATERIALIZE_FATTN", nullptr);
+    const auto run = [&](int nq, int tail, std::vector<float> & lse, test_kvarn_route_stats & stats) {
+        routes.first();
+        auto out = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, nq, 24, 4, 4096, 5,
+                false, nullptr, false, tail, false, GGML_TYPE_F16, 0, false,
+                false, -1, true, false, false, 0, false, {}, &lse);
+        routes.second(&stats);
+        require(stats.materialize_fallback == 0, "split budget materialized native records");
+        return out;
+    };
+    for (int tail : {0, 128}) {
+    for (int nq : {1, 3}) {
+        std::vector<float> expected_lse, actual_lse;
+        auto before = make_test_kvarn_route_stats();
+        auto after = make_test_kvarn_route_stats();
+        const auto expected = run(nq, tail, expected_lse, before);
+        require(before.decode_split > 0, "default small batch left split decode");
+        std::vector<float> actual;
+        {
+            scoped_test_env force_one("GGML_CUDA_KVARN_SPLIT_MAX_Q", "1");
+            actual = run(nq, tail, actual_lse, after);
+        }
+        require(actual.size() == expected.size() && !actual.empty() &&
+                std::all_of(actual.begin(), actual.end(), [](float v) { return std::isfinite(v); }) &&
+                std::all_of(expected.begin(), expected.end(), [](float v) { return std::isfinite(v); }),
+                "split-budget OUT is non-finite or has the wrong shape");
+        require_close_f32_rmse(actual, expected, 1e-3f,
+                "split-budget native OUT differs from split decode");
+        require(actual_lse.size() == expected_lse.size(), "split-budget LSE shape changed");
+        for (size_t i = 0; i < actual_lse.size(); ++i) {
+            require(std::isfinite(actual_lse[i]) && std::isfinite(expected_lse[i]) &&
+                    std::fabs(actual_lse[i] - expected_lse[i]) <= 1e-2f,
+                    "split-budget native LSE differs from split decode");
+        }
+        if (nq == 1) {
+            require(after.decode_split > 0 && after.generic_mma == 0,
+                    "split budget changed single-query decode");
+        } else {
+            // Windowed MMA can export LSE. Other layouts deliberately decline
+            // that route and consume records directly in the portable kernel.
+            // Both must preserve the tested OUT/LSE without materialization.
+            require(after.decode_split == 0 &&
+                    after.generic_mma + after.portable_native > 0,
+                    "forced split budget did not select LSE-capable native attention");
+        }
+    }
+    }
+    // The automatic distributed-attention reserve must not change ordinary
+    // CUDA-only MTP at the production prefix length. Explicit scratch budgets
+    // still opt that path into the bounded native fallback.
+    const auto run_plain = [&](test_kvarn_route_stats & stats) {
+        routes.first();
+        auto out = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, 3, 24, 4, 72704, 5,
+                false, nullptr, false, 128, false, GGML_TYPE_F16, 0, false,
+                false, -1, true);
+        routes.second(&stats);
+        return out;
+    };
+    auto plain_default_stats = make_test_kvarn_route_stats();
+    auto plain_bounded_stats = make_test_kvarn_route_stats();
+    const auto plain_default = run_plain(plain_default_stats);
+    std::vector<float> plain_bounded;
+    {
+        scoped_test_env explicit_budget("GGML_CUDA_KVARN_SPLIT_PARTIAL_MB", "1");
+        plain_bounded = run_plain(plain_bounded_stats);
+    }
+    require(plain_default_stats.decode_split > 0 && plain_default_stats.materialize_fallback == 0,
+            "automatic split budget changed CUDA-only long-context verification");
+    require(plain_bounded_stats.decode_split == 0 && plain_bounded_stats.materialize_fallback == 0 &&
+            plain_bounded_stats.generic_mma + plain_bounded_stats.portable_native > 0,
+            "explicit CUDA-only scratch budget did not select bounded native attention");
+    require_close_f32_rmse(plain_bounded, plain_default, 1e-3f,
+            "explicit CUDA-only scratch budget changed attention output");
+    ggml_backend_free(backend);
+}
+
 static void test_d64_multi_query_split_parity_gpu() {
+    // This matrix qualifies split kernels, independently of the scratch policy
+    // exercised by test_native_split_budget_gpu. Its largest D64 case exceeds
+    // the default conservative 64 MiB estimate by 2 MiB.
+    scoped_test_env split_budget("GGML_CUDA_KVARN_SPLIT_PARTIAL_MB", "128");
     ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
     if (gpu_backend == nullptr ||
             !backend_supports_kvarn_flash_attention_shape(gpu_backend, 64)) {
@@ -6630,6 +6737,16 @@ static void test_native_flash_attention_lse_parity(enum ggml_backend_dev_type de
             { "d256-q2",         256,   2,  6, 1, false, false, 0, 0, false, true , false },
             { "d256-q256",       256, 256, 24, 4, false, false, 0, 0, false, true , false },
             { "d256-q512",       256, 512, 24, 4, false, false, 0, 0, false, true , false },
+            // MTP verification: partial query tiles and history-only local
+            // tails, in both the production Q layout and its FP64 oracle order.
+            { "d256-q3-gqa24",   256,   3, 24, 4, false, false, 0, 0, false, true , false },
+            { "d256-q5-gqa24",   256,   5, 24, 4, false, false, 0, 0, false, true , false },
+            { "d256-q3-prod",    256,   3, 24, 4, true,  false, 0, 0, false, true , false },
+            { "d256-q5-prod",    256,   5, 24, 4, true,  false, 0, 0, false, true , false },
+            { "d256-q3-tailhist",256,   3, 24, 4, false, false, 128, 0, false, true, true },
+            { "d256-q5-tailhist",256,   5, 24, 4, false, false, 128, 0, false, true, true },
+            { "d256-q3-tailprod",256,   3, 24, 4, true,  false, 128, 0, false, true, true },
+            { "d256-q5-tailprod",256,   5, 24, 4, true,  false, 128, 0, false, true, true },
             { "d256-q4-prod",    256,   4, 24, 4, true,  false, 0, 0, false, true , false },
             { "d256-q8-prod",    256,   8, 24, 4, true,  false, 0, 0, false, true , false },
             { "d128-q1-allmask", 128,   1,  6, 1, false, true,  0, 0, false, true , false },
@@ -6929,6 +7046,12 @@ int main() {
     if (std::getenv("GGML_KVARN_TEST_VULKAN_UBATCH256_STORE_ONLY") != nullptr) {
         test_vulkan_ubatch256_workspace_store();
         std::printf("test-kvarn: Vulkan ubatch256 workspace store parity OK\n");
+        return 0;
+    }
+
+    if (std::getenv("GGML_KVARN_TEST_SPLIT_BUDGET_ONLY") != nullptr) {
+        test_native_split_budget_gpu();
+        std::printf("test-kvarn: split budget native OUT/LSE parity OK\n");
         return 0;
     }
 

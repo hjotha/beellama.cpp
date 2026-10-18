@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstring>
 #include <cstdio>
+#include <random>
 #include <stdexcept>
 
 struct tiny_model final : llama_model {
@@ -93,6 +94,59 @@ static llama_ubatch batch(llama_pos pos, uint32_t count) {
     return ub;
 }
 
+static void test_position_range_presence() {
+    tiny_model model;
+    auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
+    llama_kv_cache_kvarn cache(model, model.hparams,
+            llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
+            512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,
+            [](int32_t il) { return il == 0; }, nullptr, 0, GGML_TYPE_F16, 0, 1,
+            nullptr, nullptr, [](int32_t il) { return il == 0; }, GGML_TYPE_Q4_0,
+            GGML_TYPE_Q4_0, false, cpu, 256, true);
+    // Mutate the real metadata through its ordinary cell APIs, which also
+    // maintain the per-sequence position index used by the fast predicate.
+    auto & cells = const_cast<llama_kv_cells &>(cache.get_metadata_cache()->get_cells(0));
+    const auto check = [&]() {
+        for (auto range : {llama_position_split::range_kind::LOCAL,
+                           llama_position_split::range_kind::OVERFLOW,
+                           llama_position_split::range_kind::INVALID}) {
+            std::vector<uint32_t> listed;
+            const bool present = cache.position_split_live_cells(range, listed) && !listed.empty();
+            assert(cache.position_split_has_live_cells(range) == present);
+        }
+    };
+    const auto add = [&](uint32_t cell, llama_pos pos, llama_seq_id owner) {
+        cells.pos_set(cell, pos);
+        if (owner >= 0) { cells.seq_add(cell, owner); }
+    };
+    check();
+    add(7, 255, 0); check();
+    add(2, 256, 0); check();
+    add(511, 600, 1); check(); // unrelated owner must not invalidate sequence 0
+    add(9, 512, 0); check(); // invalid later position invalidates BOTH ranges
+    cells.seq_rm(9, 0); check();
+    add(10, -2, 0); check(); // invalid lower bound, including negative positions
+    cells.seq_rm(10, 0); check();
+    cells.seq_rm(7, 0); check();
+    cells.seq_rm(2, 0); check(); // only a foreign sequence remains
+
+    std::mt19937 rng(72704);
+    for (int trial = 0; trial < 512; ++trial) {
+        cells.reset();
+        const uint32_t count = rng() % 32;
+        for (uint32_t i = 0; i < count; ++i) {
+            llama_pos pos = llama_pos(rng() % 520) - 2;
+            if (pos == -1) { pos = -2; }
+            add(i, pos, llama_seq_id(rng() % 3) - 1);
+        }
+        check();
+        for (uint32_t i = 0; i < count; ++i) {
+            if (cells.seq_has(i, 0)) { cells.seq_rm(i, 0); }
+            check();
+        }
+    }
+}
+
 // Exercise the real builder and hybrid reuse wrapper, rather than duplicating
 // their stride policy. An overflow batch reads the local tail as history only;
 // a below-P batch also appends its two current rows to that tail.
@@ -159,9 +213,156 @@ static void test_hybrid_tail_graph_reuse() {
     }
 }
 
+static void test_exact_tail_snapshot_layouts() {
+    tiny_model model;
+    auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
+    std::vector<std::unique_ptr<llama_memory_hybrid>> owners;
+    std::vector<llama_kv_cache_kvarn *> attention_owners;
+    std::vector<std::vector<uint8_t>> saved;
+    for (uint32_t tail : {0u, 128u}) {
+        auto attention = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
+                llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
+                512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,
+                [](int32_t il) { return il == 0; }, nullptr, tail, GGML_TYPE_F16, tail, 1,
+                nullptr, nullptr, [](int32_t il) { return il == 0; }, GGML_TYPE_Q4_0,
+                GGML_TYPE_Q4_0, false, cpu, 256, true);
+        attention->set_mixed_state_identity(123, 456);
+        auto state = attention->init_kv_batch({batch(0, 128)});
+        assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
+        state->graph_compute_finish(GGML_STATUS_SUCCESS);
+        auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+                false, 1, 1, 0, [](int32_t il) { return il == 1; });
+        attention_owners.push_back(attention.get());
+        owners.push_back(std::make_unique<llama_memory_hybrid>(
+                model, std::move(attention), std::move(recurrent), 256));
+        writer output;
+        owners.back()->state_write(output, 0, 0);
+        saved.push_back(std::move(output.data));
+    }
+    for (size_t destination = 0; destination < owners.size(); ++destination) {
+        for (size_t source = 0; source < saved.size(); ++source) {
+            writer before; owners[destination]->state_write(before, 0, 0);
+            bool restored = false;
+            reader input(saved[source]);
+            try {
+                owners[destination]->state_read(input, 0, 0);
+                assert(input.n_bytes() == saved[source].size());
+                input.commit(); restored = true;
+            } catch (const std::exception &) { input.cancel(); }
+            assert(restored == (source == destination));
+            writer after; owners[destination]->state_write(after, 0, 0);
+            if (!restored) { assert(before.data == after.data); }
+            // This codec fixture populates attention metadata only; the
+            // recurrent owner intentionally has no model-forward state.
+            assert(attention_owners[destination]->seq_pos_min(0) == 0 &&
+                    attention_owners[destination]->seq_pos_max(0) == 127);
+        }
+    }
+}
+
+static void test_native_resident_prefix_state() {
+#ifndef _WIN32
+    const char * old_storage = std::getenv("GGML_RKVA_RANGE_STORAGE");
+    const char * old_experimental = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    const std::string storage = old_storage ? old_storage : "";
+    const std::string experimental = old_experimental ? old_experimental : "";
+    setenv("GGML_RKVA_RANGE_STORAGE", "kvarn4", 1);
+    setenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL", "1", 1);
+    for (bool sparse : {false, true}) {
+        tiny_model model;
+        auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
+        auto attention = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
+                llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
+                512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,
+                [](int32_t il) { return il == 0; }, nullptr, 0, GGML_TYPE_F16, 0, 1,
+                nullptr, nullptr, [](int32_t il) { return il == 0; }, GGML_TYPE_Q4_0,
+                GGML_TYPE_Q4_0, false, cpu, 256, true);
+        auto * attn = attention.get();
+        assert(!attn->supports_resident_prefix_restore());
+        assert(attn->get_seq_rm_capability().suffix_rollback_tokens == 0);
+        bool prefix_resident = true;
+        auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+                false, 1, 1, 0, [](int32_t il) { return il == 1; });
+        llama_memory_hybrid hybrid(model, std::move(attention), std::move(recurrent), 256);
+        attn->set_mixed_state_identity(123, 456);
+        const auto partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        auto append = [&](llama_pos p, uint32_t n) {
+            auto state = attn->init_kv_batch({batch(p, n)});
+            assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
+            state->graph_compute_finish(GGML_STATUS_SUCCESS);
+        };
+        auto save = [&]() { writer out; hybrid.state_write(out, 0, partial); return out.data; };
+        auto restore = [&](const std::vector<uint8_t> & data, bool success) {
+            bool restored = false;
+            reader in(data);
+            try { hybrid.state_read(in, 0, partial); in.commit(); restored = true; }
+            catch (const std::exception & error) {
+                if (success) std::fprintf(stderr, "native PARTIAL sparse=%d error=%s consumed=%zu/%zu\n", int(sparse), error.what(), in.n_bytes(), data.size());
+                in.cancel();
+            }
+            assert(restored == success);
+        };
+        // Old-server append-only clients can still restore a fresh purely local
+        // PARTIAL frame: no native owner exists and no overflow payload is involved.
+        append(0, 2);
+        const auto local_anchor = save();
+        append(2, 1);
+        restore(local_anchor, true);
+        assert(attn->seq_pos_max(0) == 1);
+        append(2, 2); // restored local metadata must remain appendable
+        assert(attn->seq_pos_max(0) == 3);
+        restore(local_anchor, true);
+        hybrid.clear(false);
+        restore(local_anchor, false); // fresh owner epoch rejects an old local reference
+        assert(attn->seq_pos_max(0) == -1);
+        append(0, 2);
+        const auto fresh_local_anchor = save();
+        restore(fresh_local_anchor, true);
+        append(2, 254);
+        append(256, 1); // first native append remains possible without rewind
+        assert(attn->seq_pos_max(0) == 256);
+        assert(!attn->can_seq_rm(0, 256, -1));
+        restore(fresh_local_anchor, false); // an existing native owner needs negotiated rewind
+        assert(attn->seq_pos_max(0) == 256);
+        hybrid.clear(false);
+        attn->set_native_kvarn_rewind_capable(true);
+        attn->set_native_kvarn_rewind_preflight([&](llama_pos) { return prefix_resident; });
+        assert(attn->supports_resident_prefix_restore());
+        if (!sparse) append(0, 256);
+        append(256, sparse ? 130 : 1); // sparse: two occupied groups after empty local cells
+        const llama_pos anchor_end = sparse ? 386 : 257;
+
+        const auto anchor = save();
+        prefix_resident = false;
+        const auto unchanged = save();
+        assert(!attn->can_seq_rm(0, anchor_end - 1, -1));
+        restore(anchor, false);
+        assert(save() == unchanged); // failed preflight must precede staged writes
+        prefix_resident = true;
+        assert(attn->state_seq_can_restore(0, partial));
+        assert(!attn->state_seq_can_save(0, 0)); // never serialize Q4 as native FULL
+        append(anchor_end, 2);
+        const auto stale = save();
+        assert(!attn->can_seq_rm(0, anchor_end, anchor_end + 1)); // interior edit remains unsupported
+        assert(attn->seq_rm(0, anchor_end, -1));
+        append(anchor_end, 2); // same cells/positions/token IDs, different owner generation
+        restore(stale, false);
+        restore(anchor, true);
+        restore(anchor, true);
+        attn->set_native_kvarn_rewind_capable(false);
+        assert(!attn->state_seq_can_restore(0, partial));
+    }
+    if (old_storage) setenv("GGML_RKVA_RANGE_STORAGE", storage.c_str(), 1); else unsetenv("GGML_RKVA_RANGE_STORAGE");
+    if (old_experimental) setenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL", experimental.c_str(), 1); else unsetenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+#endif
+}
+
 int main() {
     ggml_backend_load_all();
+    test_native_resident_prefix_state();
+    test_position_range_presence();
     test_hybrid_tail_graph_reuse();
+    test_exact_tail_snapshot_layouts();
     tiny_model model;
     auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
     auto attention = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,

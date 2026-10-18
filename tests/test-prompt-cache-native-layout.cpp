@@ -35,6 +35,18 @@ int main() {
         require(!common_prompt_cache_layout_split_to_pure(pure.dump(), split.dump()), "wrong direction accepted");
         require(!common_prompt_cache_layout_split_to_pure(pure.dump(), pure.dump()), "pure source accepted as split");
         require(!common_prompt_cache_layout_split_to_pure(split.dump(), split.dump()), "mixed destination accepted as pure");
+        json pure_zero = pure;
+        json split_zero = split;
+        pure_zero["kvarn_zero_exact_tail"] = true;
+        split_zero["kvarn_zero_exact_tail"] = true;
+        require(common_prompt_cache_layout_pure_to_split(pure_zero.dump(), split_zero.dump()),
+                "matching zero-tail pure/split layouts rejected");
+        require(!common_prompt_cache_layout_pure_to_split(pure.dump(), split_zero.dump()) &&
+                !common_prompt_cache_layout_split_to_pure(split.dump(), pure_zero.dump()),
+                "cross-tail handoff must not reuse a different exact-tail representation");
+        require(!common_prompt_cache_layout_reusable(pure_zero.dump(), pure.dump()) &&
+                !common_prompt_cache_layout_convertible(pure_zero.dump(), pure.dump()),
+                "zero-tail cache must not select or convert an ordinary-tail snapshot");
         for (const char * key : {"rope_type", "rope_base", "rope_scale", "state_version", "session_version",
                                 "ctx_type", "nextn_layer", "cache_layout_version"}) {
             json mismatch = pure;

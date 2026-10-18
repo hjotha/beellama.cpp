@@ -124,6 +124,39 @@ int main() {
               "env-P fallback: MTP draft / auxiliary context is exempt");
     }
 
+    // Body-only local KVarN must not seal a record after an earlier query
+    // inside the same verify batch. Anchor-at-seal is safe; after P the local
+    // body is frozen. Check every offset, not just the observed regression.
+    {
+        const int64_t unlimited = std::numeric_limits<int64_t>::max();
+        const auto limit = [](int64_t anchor, uint32_t p = 0, uint32_t seqs = 1) {
+            return llama_position_split::spec_draft_limit_before_kvarn_seal(anchor, p, seqs);
+        };
+        check(limit(1789) == 1, "tail0: anchor125 permits one draft");
+        check(limit(1790) == 0, "tail0: anchor126 decodes alone");
+        check(limit(1791) == 127, "tail0: anchor127 may cross into next group");
+        check(limit(1792) == 126, "tail0: new group permits126 drafts");
+        check(limit(-1) == 0 && limit(1790, 0, 2) == 0 && limit(1790, 0, 0) == 0,
+                "tail0: invalid anchor/multiple-sequence mapping fails closed");
+        check(limit(int64_t(P), P) == unlimited && limit(int64_t(P) + 1, P) == unlimited,
+                "tail0: frozen local body after P adds no clamp");
+        check(std::min(limit(P - 1, P), llama_position_split::spec_draft_limit_at_p(P - 1, P)) == 0,
+                "tail0: existing P-crossing guard still wins at anchor P-1");
+        check(std::min(limit(P - 2, P), llama_position_split::spec_draft_limit_at_p(P - 2, P)) == 0,
+                "tail0: do not include the local seal immediately before P");
+        for (int64_t anchor = 128; anchor < 512; ++anchor) {
+            const int64_t n = limit(anchor);
+            check(n >= 0 && n <= 127, "tail0: bounded proposal budget");
+            bool future_seal = false;
+            for (int64_t pos = anchor + 1; pos <= anchor + n; ++pos) {
+                future_seal |= pos % llama_position_split::kKvarnGroup == 127;
+            }
+            check(!future_seal, "tail0: no later query seals a group");
+            check((anchor + n + 1) % llama_position_split::kKvarnGroup == 127,
+                    "tail0: first excluded query is exactly the next seal");
+        }
+    }
+
     // 1) draft limit: never let the verify [anchor, anchor + n_draft] cross P.
     {
         const int64_t kUnlimited = std::numeric_limits<int64_t>::max();

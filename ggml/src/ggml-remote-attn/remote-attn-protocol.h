@@ -33,8 +33,9 @@ enum rkva_op : uint16_t {
     RKVA_KVARN_RANGE_UPLOAD = 16, // native record delta + complete stage/tail snapshot
     RKVA_SNAPSHOT_SAVE = 17,      // atomic all-layer local-disk checkpoint
     RKVA_SNAPSHOT_RESTORE = 18,   // validated all-layer local-disk restore
-    RKVA_RANGE_UPLOAD_ATTN = 19, // last upload chunk plus attention in one round trip
-    RKVA_RANGE_PROFILE = 20,     // optional profiling/control, UTF-8 JSON response
+    RKVA_RANGE_UPLOAD_ATTN = 19,  // last upload chunk plus attention in one round trip
+    RKVA_RANGE_PROFILE = 20,      // optional profiling/control, UTF-8 JSON response
+    RKVA_KVARN_RANGE_REWIND = 21, // atomic bounded resident native rewind
     RKVA_RANGE_ATTN = 14,         // query-only F32, returns OUT F32 then LSE F32
 };
 
@@ -53,6 +54,10 @@ static constexpr uint64_t RKVA_CAP_RANGE_KVARN4 = 1ull << 2;
 static constexpr uint64_t RKVA_CAP_DISK_SNAPSHOT = 1ull << 3;
 static constexpr uint64_t RKVA_CAP_RANGE_UPLOAD_ATTN = 1ull << 4;
 static constexpr uint64_t RKVA_CAP_RANGE_PROFILE = 1ull << 5;
+static constexpr uint64_t RKVA_CAP_KVARN_REWIND = 1ull << 6;
+static constexpr uint64_t RKVA_CAP_KVARN_SERIAL_PREFIX = 1ull << 7;
+static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
+static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;
 static constexpr uint32_t RKVA_PROFILE_RESET = 1u << 1;
 static constexpr uint32_t RKVA_PROFILE_TRACE = 1u << 2;
@@ -118,7 +123,7 @@ enum rkva_status : int32_t {
 // HELLO request payload: the host proposes the model/cache geometry taken
 // from the live llama_hparams/cparams and the --cache-type/--kv-tail flags.
 struct rkva_hello {
-    uint32_t proto_flags;    // bit0: host supports F16 wire, bit1: F32 wire
+    uint32_t proto_flags; // bit0: F16, bit1: F32, bit16: native rewind v2, bit17: serial query prefix v3
     uint32_t n_layer_remote; // full-attention layers owned by the server
     uint32_t n_head;         // Q heads (24)
     uint32_t n_head_kv;      // KV heads (4)
@@ -233,7 +238,7 @@ struct rkva_range_profile {
 struct rkva_kvarn_range_config {
     uint32_t origin, capacity;
     uint32_t storage;        // RKVA_RANGE_STORAGE_KVARN4 only
-    uint32_t layout_version; // 1
+    uint32_t layout_version; // 1: legacy; 2: same layout + generation ACK for resident rewind
     uint32_t token_group, record_dim, head_dim, head_slices;
     uint32_t key_bits, value_bits, record_bytes;
     uint32_t stage_groups, tail_groups, sink_tokens;
@@ -257,6 +262,20 @@ struct rkva_kvarn_range_upload {
     uint32_t live_count, record_begin, record_groups, flags;
     uint32_t append_begin, append_rows;
     uint32_t reserved[2];
+};
+
+// Native resident rewind: header, then one layer header and chronological
+// K/V ORIGINAL-domain F16 rows evicted from the retained tail for every layer:
+// [max(0,new_live-tail_tokens), min(new_live,max(0,expected_live-tail_tokens))).
+// Overlapping ring rows stay resident; a depth-one rejection repairs one row.
+// All expected counts and <=128 removal bounds are validated before GPU writes;
+// one final fence precedes publication/ACK. No native records are transcoded.
+struct rkva_kvarn_range_rewind {
+    uint64_t expected_generation; // v2 config ACK seed; advances on every native mutation
+    uint32_t pos0, n_layers, tail_tokens, reserved;
+};
+struct rkva_kvarn_layer_rewind {
+    uint32_t expected_live, new_live;
 };
 
 // Snapshot key is SHA256 of the COMPLETE native host sequence file (header,
@@ -319,6 +338,8 @@ static_assert(sizeof(rkva_range_attn) == 16, "RKVA range attention wire size");
 
 static_assert(sizeof(rkva_kvarn_range_config) == 72, "KVarN descriptor wire size");
 static_assert(sizeof(rkva_kvarn_range_upload) == 32, "KVarN upload wire size");
+static_assert(sizeof(rkva_kvarn_range_rewind) == 24, "KVarN rewind wire size");
+static_assert(sizeof(rkva_kvarn_layer_rewind) == 8, "KVarN rewind layer wire size");
 
 static_assert(sizeof(rkva_snapshot_req) == 48, "snapshot request wire size");
 static_assert(sizeof(rkva_snapshot_ack) == 48, "snapshot response wire size");

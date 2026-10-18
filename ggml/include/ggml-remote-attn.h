@@ -110,9 +110,12 @@ GGML_API bool ggml_backend_remote_attn_configure_range(
 GGML_API void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend);
 
 // Explicit experimental native producer (GGML_RKVA_RANGE_STORAGE=kvarn4 and
-// GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL=1). Append-only original projected F32
-// sources; existing quantized overflow snapshots cannot initialize it.
+// GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL=1). Original projected F32 sources;
+// negotiated op21 supports <=128-row resident rollback. FULL overflow snapshots
+// cannot initialize it. Capability does not imply a native persistence codec.
 GGML_API bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_can_restore(ggml_backend_t backend, int32_t pos0);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_has_state(ggml_backend_t backend);
 GGML_API void ggml_remote_attn_range_set_native_sources(
         struct ggml_tensor * node, struct ggml_tensor * keys, struct ggml_tensor * values);

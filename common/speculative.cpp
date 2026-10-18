@@ -1,5 +1,6 @@
 #include "speculative.h"
 
+#include "../src/llama-native-kvarn-rollback.h"
 #include "../src/llama-ext.h"
 #include "common.h"
 #include "dflash-remote.h"
@@ -5796,11 +5797,17 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
     // Also cover callers that construct common speculative params directly,
     // without the target context's MTP memory reservation. A configured empty
-    // native owner is already ineligible: the first speculative write could
-    // cross into append-only state before any restore guard can help.
+    // native owner needs the negotiated rollback contract too: the first
+    // speculative write can cross P before any restore guard can help.
     if (!configs.empty() && params.draft.n_max > 0 &&
             llama_remote_native_kvarn_enabled(params.draft.ctx_tgt)) {
-        throw std::runtime_error("speculative decoding requires rollback; native Xbox KVarN4 overflow is append-only");
+        const bool mtp_only = std::all_of(configs.begin(), configs.end(), [](const common_speculative_config & config) {
+            return config.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || config.type == COMMON_SPECULATIVE_TYPE_NONE;
+        });
+        if (!mtp_only || !llama_remote_native_kvarn_can_rewind(params.draft.ctx_tgt) ||
+                !llama_native_kvarn_mtp_depth_supported(uint32_t(params.draft.n_max))) {
+            throw std::runtime_error("native Xbox KVarN4 speculative decoding requires draft-MTP, negotiated resident rewind and depth <= 127");
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};

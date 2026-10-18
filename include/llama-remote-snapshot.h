@@ -5,8 +5,10 @@ extern "C" {
 #endif
 // Optional acceleration for canonical disk snapshots; no RPC for local/CUDA.
 LLAMA_API bool llama_remote_disk_snapshot_enabled(const struct llama_context * ctx);
-// True as soon as the append-only native overflow backend is configured,
-// including an empty owner. Speculators must refuse this context before drafting.
+// True only when the live native owner negotiated bounded resident rollback.
+LLAMA_API bool llama_remote_native_kvarn_can_rewind(const struct llama_context * ctx);
+// True as soon as the native overflow backend is configured, including an empty
+// owner. Speculators must check its rollback capability before drafting.
 LLAMA_API bool llama_remote_native_kvarn_enabled(const struct llama_context * ctx);
 // Native overflow owner has no checkpoint codec yet. Callers must skip FULL
 // automatic saves while active; a Q4 bookkeeping snapshot is not native state.

@@ -171,6 +171,7 @@ struct ggml_backend_remote_attn_context {
     uint32_t    range_capacity = 0;
     uint64_t    range_epoch = 1;
     bool        range_fused = false;
+    uint32_t    prefill_query_chunk = 0;
     bool        range_profile = false;
     bool        range_profile_controlled = false;
     uint32_t    range_kernel_mode = 0;
@@ -180,6 +181,9 @@ struct ggml_backend_remote_attn_context {
     };
     std::vector<range_layer> range_layers;
     bool range_native_kvarn = false;
+    bool native_serial_prefix = false;
+    uint64_t native_generation = 0;
+    uint32_t native_tail_tokens = 128;
     ggml_backend_cpu_kvarn_store_direct_v1_t native_store = nullptr;
     std::vector<std::unique_ptr<rkva_kvarn_producer>> native_layers;
 
@@ -299,60 +303,82 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
     auto & owner = ctx->native_layers[layer];
     if ((owner && cached.epoch != ctx->range_epoch) ||
             live != (owner ? owner->rows() : 0u) + nq) {
-        GGML_LOG_ERROR("%s: native KVarN4 requires fresh append-only overflow; quantized snapshot bootstrap/rewind is unsupported\n",
-                       GGML_REMOTE_ATTN_NAME);
+        GGML_LOG_ERROR("%s: native KVarN4 requires original append sources and current resident ownership; "
+                       "quantized snapshot bootstrap is unsupported\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
     try {
         if (!owner) {
             owner.reset(new rkva_kvarn_producer(ctx->range_origin, ctx->range_capacity,
-                ctx->geo.n_head_kv, ctx->geo.sinkhorn_iters, ctx->native_store));
+                ctx->geo.n_head_kv, ctx->geo.sinkhorn_iters, ctx->native_store, ctx->native_tail_tokens));
         }
         std::vector<float> original_k(nq * width), original_v(nq * width);
         ggml_backend_tensor_get(keys, original_k.data(), 0, original_k.size() * sizeof(float));
         ggml_backend_tensor_get(values, original_v.data(), 0, original_v.size() * sizeof(float));
-        if (!owner->append(original_k.data(), original_v.data(), ctx->pos_scratch.data(),
-                            uint32_t(nq), cached.rows == 0, ctx->payload_tx)) return false;
+        // Descriptor revisions 1/2 select stage, sealed records and the exact
+        // tail from the resident high-water mark. Uploading an entire query
+        // batch first would change earlier queries across seals/tail eviction.
+        // Revision 3 explicitly negotiates query-prefix semantics. Keep its
+        // chunks within the qualified optimized kernel's nine-query bound;
+        // prefill uses eight, verification batches keep their actual shape.
+        const size_t chunk_limit = ctx->native_serial_prefix ? (nq > 9 ? 8 : nq) : 1;
+        for (size_t first = 0; first < nq; first += chunk_limit) {
+            const size_t chunk = std::min(chunk_limit, nq - first);
+            if (!owner->append(original_k.data() + first * width, original_v.data() + first * width,
+                    ctx->pos_scratch.data() + first, uint32_t(chunk), cached.rows == 0, ctx->payload_tx)) {
+                ctx->failed = true; return false;
+            }
+            std::vector<uint8_t> reply;
+            if (ctx->payload_tx.size() > (256u << 20) ||
+                    !rkva_transact(ctx, RKVA_KVARN_RANGE_UPLOAD, ctx->active_session, layer, 0,
+                        ctx->payload_tx.data(), uint32_t(ctx->payload_tx.size()), reply, 0) || !reply.empty()) {
+                ctx->failed = true; return false;
+            }
+            if (ctx->native_generation == UINT64_MAX) { ctx->failed = true; return false; }
+            ++ctx->native_generation;
+            ++ctx->stats.range_upload_calls;
+            ctx->stats.range_upload_rows += chunk;
+            ctx->stats.range_upload_bytes += ctx->payload_tx.size() - sizeof(rkva_kvarn_range_upload);
+            cached.epoch = ctx->range_epoch;
+            cached.rows = owner->rows();
+            const rkva_range_attn request {RKVA_WIRE_F32, 0, {0, 0}};
+            const size_t query_bytes = chunk * (sizeof(int32_t) + out_width * sizeof(float));
+            const size_t output_bytes = chunk * (out_width + ctx->geo.n_head) * sizeof(float);
+            ctx->payload_tx.resize(sizeof(request) + query_bytes);
+            std::memcpy(ctx->payload_tx.data(), &request, sizeof(request));
+            std::memcpy(ctx->payload_tx.data() + sizeof(request), ctx->pos_scratch.data() + first, chunk * sizeof(int32_t));
+            ggml_backend_tensor_get(node->src[0], ctx->payload_tx.data() + sizeof(request) + chunk * sizeof(int32_t),
+                    first * out_width * sizeof(float), chunk * out_width * sizeof(float));
+            if (!rkva_transact(ctx, RKVA_RANGE_ATTN, ctx->active_session, layer, uint32_t(chunk),
+                    ctx->payload_tx.data(), uint32_t(ctx->payload_tx.size()), reply, uint32_t(output_bytes))) {
+                ctx->failed = true; return false;
+            }
+            for (size_t offset = 0; offset < reply.size(); offset += sizeof(float)) {
+                float value;
+                std::memcpy(&value, reply.data() + offset, sizeof(value));
+                if (!std::isfinite(value)) { ctx->failed = true; return false; }
+            }
+            ++ctx->stats.range_attn_calls;
+            const size_t out_row_bytes = out_width * sizeof(float);
+            const size_t lse_row_bytes = ctx->geo.n_head * sizeof(float);
+            for (size_t row = 0; row < chunk; ++row) {
+                auto * dst = static_cast<uint8_t *>(node->data) + (first + row) * node->nb[1];
+                std::memcpy(dst, reply.data() + row * out_row_bytes, out_row_bytes);
+                std::memcpy(dst + out_row_bytes,
+                        reply.data() + chunk * out_row_bytes + row * lse_row_bytes, lse_row_bytes);
+            }
+        }
     } catch (const std::exception & error) {
-        GGML_LOG_ERROR("%s: native KVarN4 producer failed: %s\n", GGML_REMOTE_ATTN_NAME, error.what());
+        GGML_LOG_ERROR("%s: native KVarN4 append/query failed: %s\n", GGML_REMOTE_ATTN_NAME, error.what());
+        ctx->failed = true;
+        return false;
+    } catch (...) {
+        ctx->failed = true;
         return false;
     }
-    std::vector<uint8_t> reply;
-    if (ctx->payload_tx.size() > (256u << 20) ||
-            !rkva_transact(ctx, RKVA_KVARN_RANGE_UPLOAD, ctx->active_session, layer, 0,
-                ctx->payload_tx.data(), uint32_t(ctx->payload_tx.size()), reply, 0) || !reply.empty()) return false;
-    ++ctx->stats.range_upload_calls;
-    ctx->stats.range_upload_rows += nq;
-    ctx->stats.range_upload_bytes += ctx->payload_tx.size() - sizeof(rkva_kvarn_range_upload);
-    cached.epoch = ctx->range_epoch;
-    cached.rows = live;
-    const rkva_range_attn request {RKVA_WIRE_F32, 0, {0, 0}};
-    const size_t query_bytes = nq * (sizeof(int32_t) + out_width * sizeof(float));
-    const size_t output_bytes = nq * (out_width + ctx->geo.n_head) * sizeof(float);
-    ctx->payload_tx.resize(sizeof(request) + query_bytes);
-    std::memcpy(ctx->payload_tx.data(), &request, sizeof(request));
-    std::memcpy(ctx->payload_tx.data() + sizeof(request), ctx->pos_scratch.data(), nq * sizeof(int32_t));
-    ggml_backend_tensor_get(node->src[0], ctx->payload_tx.data() + sizeof(request) + nq * sizeof(int32_t),
-                            0, nq * out_width * sizeof(float));
-    if (!rkva_transact(ctx, RKVA_RANGE_ATTN, ctx->active_session, layer, uint32_t(nq),
-            ctx->payload_tx.data(), uint32_t(ctx->payload_tx.size()), reply, uint32_t(output_bytes))) return false;
-    for (size_t offset = 0; offset < reply.size(); offset += sizeof(float)) {
-        float value;
-        std::memcpy(&value, reply.data() + offset, sizeof(value));
-        if (!std::isfinite(value)) return false;
-    }
-    ++ctx->stats.range_attn_calls;
     if (ctx->stats.range_query_min < 0) ctx->stats.range_query_min = ctx->pos_scratch.front();
     ctx->stats.range_query_max = std::max<int64_t>(ctx->stats.range_query_max, ctx->pos_scratch.back());
-    auto * dst = static_cast<uint8_t *>(node->data);
-    for (size_t query = 0; query < nq; ++query) {
-        std::memcpy(dst, reply.data() + query * out_width * sizeof(float), out_width * sizeof(float));
-        dst += out_width * sizeof(float);
-        std::memcpy(dst, reply.data() + (nq * out_width + query * ctx->geo.n_head) * sizeof(float),
-                    ctx->geo.n_head * sizeof(float));
-        dst += ctx->geo.n_head * sizeof(float);
-    }
-    return true;
+    return cached.rows == live;
 }
 
 static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor * node) {
@@ -414,7 +440,14 @@ static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor *
         return false;
     }
     if (ctx->range_native_kvarn) {
-        return rkva_run_native_range(ctx, node, uint32_t(layer), count, nq, out_width);
+        try {
+            if (rkva_run_native_range(ctx, node, uint32_t(layer), count, nq, out_width)) return true;
+        } catch (...) {
+            // An original-domain append may have advanced the native owner or
+            // GPU before allocation/transport failed. Never resume implicitly.
+        }
+        ctx->failed = true;
+        return false;
     }
     auto & cached = ctx->range_layers[(size_t) layer];
     uint32_t start = cached.epoch == ctx->range_epoch ? cached.rows : 0;
@@ -433,6 +466,7 @@ static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor *
     const uint32_t chunk_rows = std::max<uint32_t>(1, (16u << 20) / (uint32_t) upload_row_bytes);
     const uint64_t output_bytes = nq * (out_width + ctx->geo.n_head) * sizeof(float);
     const uint64_t query_bytes = nq * (sizeof(int32_t) + out_width * sizeof(float));
+    const bool split_queries = ctx->prefill_query_chunk != 0 && nq > 9;
     if (output_bytes > (256u << 20) || query_bytes + sizeof(rkva_range_attn) > (256u << 20)) {
         return false;
     }
@@ -441,7 +475,7 @@ static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor *
     while (start < count) {
         const uint32_t rows = std::min(chunk_rows, count - start);
         rkva_range_upload upload { start, rows, ctx->range_wire, 0 };
-        const bool combine = ctx->range_fused && start + rows == count &&
+        const bool combine = !split_queries && ctx->range_fused && start + rows == count &&
                 sizeof(rkva_range_upload_attn) + (uint64_t) rows * upload_row_bytes + query_bytes <= (256u << 20);
         const size_t prefix = combine ? sizeof(rkva_range_upload_attn) : sizeof(upload);
         ctx->payload_tx.resize(prefix + (size_t) rows * upload_row_bytes + (combine ? query_bytes : 0));
@@ -491,6 +525,47 @@ static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor *
     }
     cached.epoch = ctx->range_epoch;
     cached.rows = count;
+    if (split_queries) {
+        // Keep the local CUDA graph's large batch, but bound remote query
+        // batches to the console's optimized decode kernels. Upload the whole
+        // KV delta once; per-query absolute positions mask its future rows.
+        // Native KVarN owners use the separate path above, without this option.
+        for (size_t first = 0; first < nq; first += ctx->prefill_query_chunk) {
+            const size_t queries = std::min<size_t>(ctx->prefill_query_chunk, nq - first);
+            const rkva_range_attn request {RKVA_WIRE_F32, 0, {0, 0}};
+            const size_t bytes = queries * (sizeof(int32_t) + out_width * sizeof(float));
+            ctx->payload_tx.resize(sizeof(request) + bytes);
+            std::memcpy(ctx->payload_tx.data(), &request, sizeof(request));
+            std::memcpy(ctx->payload_tx.data() + sizeof(request), ctx->pos_scratch.data() + first,
+                        queries * sizeof(int32_t));
+            ggml_backend_tensor_get(q, ctx->payload_tx.data() + sizeof(request) + queries * sizeof(int32_t),
+                                    first * out_width * sizeof(float), queries * out_width * sizeof(float));
+            const size_t result_bytes = queries * (out_width + ctx->geo.n_head) * sizeof(float);
+            if (!rkva_transact(ctx, RKVA_RANGE_ATTN, ctx->active_session, uint32_t(layer), uint32_t(queries),
+                    ctx->payload_tx.data(), uint32_t(ctx->payload_tx.size()), reply, uint32_t(result_bytes))) {
+                return false;
+            }
+            for (size_t offset = 0; offset < reply.size(); offset += sizeof(float)) {
+                float value;
+                std::memcpy(&value, reply.data() + offset, sizeof(value));
+                if (!std::isfinite(value)) { return false; }
+            }
+            auto * dst = static_cast<uint8_t *>(node->data) + first * node->nb[1];
+            for (size_t query = 0; query < queries; ++query) {
+                std::memcpy(dst, reply.data() + query * out_width * sizeof(float), out_width * sizeof(float));
+                dst += out_width * sizeof(float);
+                std::memcpy(dst, reply.data() + (queries * out_width + query * ctx->geo.n_head) * sizeof(float),
+                            ctx->geo.n_head * sizeof(float));
+                dst += ctx->geo.n_head * sizeof(float);
+            }
+            ++ctx->stats.range_attn_calls;
+        }
+        if (ctx->stats.range_query_min < 0 || ctx->pos_scratch.front() < ctx->stats.range_query_min) {
+            ctx->stats.range_query_min = ctx->pos_scratch.front();
+        }
+        ctx->stats.range_query_max = std::max<int64_t>(ctx->stats.range_query_max, ctx->pos_scratch.back());
+        return true;
+    }
     if (!attended) {
         const rkva_range_attn request {RKVA_WIRE_F32, 0, {0, 0}};
         ctx->payload_tx.resize(sizeof(request) + (size_t) query_bytes);
@@ -1019,6 +1094,15 @@ ggml_backend_t ggml_backend_remote_attn_init(const char * host, uint16_t port) {
     ggml_backend_remote_attn_init_globals();
 
     auto * ctx = new ggml_backend_remote_attn_context();
+    const char * prefill_chunk = std::getenv("GGML_RKVA_PREFILL_QUERY_CHUNK");
+    if (prefill_chunk && std::strcmp(prefill_chunk, "0") != 0) {
+        if (std::strcmp(prefill_chunk, "8") != 0) {
+            GGML_LOG_ERROR("%s: GGML_RKVA_PREFILL_QUERY_CHUNK must be 0 or 8\n", GGML_REMOTE_ATTN_NAME);
+            delete ctx;
+            return nullptr;
+        }
+        ctx->prefill_query_chunk = 8;
+    }
     ctx->host = host ? host : "";
     ctx->port = port;
 
@@ -1060,6 +1144,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->range_configured = false;
     ctx->range_layers.clear();
     ctx->range_native_kvarn = false;
+    ctx->native_serial_prefix = false;
     ctx->native_layers.clear();
     ctx->native_store = nullptr;
     ctx->range_fused = false;
@@ -1102,7 +1187,8 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
 
     // HELLO
     rkva_hello hello {};
-    hello.proto_flags    = (1u << 0) | (1u << 1);  // host supports F16 and F32
+    hello.proto_flags    = (1u << 0) | (1u << 1) | RKVA_PROTO_NATIVE_REWIND_V2 |
+                           RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3;
     hello.n_layer_remote = ctx->geo.n_layer_remote;
     hello.n_head         = ctx->geo.n_head;
     hello.n_head_kv      = ctx->geo.n_head_kv;
@@ -1211,7 +1297,17 @@ bool ggml_backend_remote_attn_reset(ggml_backend_t backend, uint32_t session_id)
     }
     ++ctx->range_epoch;
     std::vector<uint8_t> out;
-    return rkva_transact(ctx, RKVA_RESET, session_id, 0, 0, nullptr, 0, out, 0);
+    if (!rkva_transact(ctx, RKVA_RESET, session_id, 0, 0, nullptr, 0, out, 0) || !out.empty()) {
+        ctx->failed = true;
+        return false;
+    }
+    if (ctx->range_native_kvarn) {
+        if (ctx->native_generation == UINT64_MAX) { ctx->failed = true; return false; }
+        ++ctx->native_generation;
+        for (auto & owner : ctx->native_layers) owner.reset();
+        ctx->range_layers.assign(ctx->native_layers.size(), {});
+    }
+    return true;
 }
 
 // Caller holds ctx->mutex. A successful suffix-removal/owner-bound partial
@@ -1244,6 +1340,60 @@ static bool rkva_trim_range_locked(ggml_backend_remote_attn_context * ctx,
     return true;
 }
 
+// Caller owns the context mutex. Never publish host coverage before the
+// session-wide GPU tail repair has completed and its ACK was validated.
+static bool rkva_native_rewind_locked(ggml_backend_remote_attn_context * ctx,
+        uint32_t session_id, int32_t pos0) {
+    if (session_id != ctx->active_session || pos0 < 0) return false;
+    const uint32_t keep = uint32_t(pos0) <= ctx->range_origin ? 0 :
+            std::min(uint32_t(pos0) - ctx->range_origin, ctx->range_capacity);
+    bool needed = false;
+    for (size_t il = 0; il < ctx->native_layers.size(); ++il) {
+        const auto & owner = ctx->native_layers[il];
+        if (!owner) continue;
+        if (ctx->range_layers[il].epoch != ctx->range_epoch) return false;
+        if (owner->rows() > keep) {
+            needed = true;
+            if (!owner->can_rewind(keep)) return false;
+        }
+    }
+    if (!needed) return true;
+    if (!(ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) ||
+            !(ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND))) return false;
+    if (!rkva_kvarn_generation_mutable(ctx->native_generation)) return false;
+    try {
+        const rkva_kvarn_range_rewind request {ctx->native_generation, uint32_t(pos0), uint32_t(ctx->native_layers.size()), ctx->native_tail_tokens, 0};
+        std::vector<uint8_t> payload(sizeof(request));
+        std::memcpy(payload.data(), &request, sizeof(request));
+        for (const auto & owner : ctx->native_layers) {
+            const uint32_t old = owner ? owner->rows() : 0;
+            const rkva_kvarn_layer_rewind layer {old, std::min(old, keep)};
+            const auto * bytes = reinterpret_cast<const uint8_t *>(&layer);
+            payload.insert(payload.end(), bytes, bytes + sizeof(layer));
+            if (owner && !owner->rewind_tail(layer.new_live, payload)) return false;
+        }
+        std::vector<uint8_t> reply;
+        if (payload.size() > (256u << 20) || !rkva_transact(ctx, RKVA_KVARN_RANGE_REWIND,
+                    session_id, 0, 0, payload.data(), uint32_t(payload.size()), reply, 0) || !reply.empty()) {
+            ctx->failed = true;
+            return false;
+        }
+        ++ctx->native_generation;
+        for (size_t il = 0; il < ctx->native_layers.size(); ++il) {
+            auto & owner = ctx->native_layers[il];
+            if (owner && !owner->rewind(std::min(owner->rows(), keep))) {
+                ctx->failed = true;
+                return false;
+            }
+            ctx->range_layers[il].rows = owner ? owner->rows() : 0;
+        }
+        return true;
+    } catch (...) {
+        ctx->failed = true;
+        return false;
+    }
+}
+
 bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, int32_t pos0) {
     if (!backend) return false;
     if (ggml_backend_is_local_split(backend)) {
@@ -1256,14 +1406,7 @@ bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, 
     }
     if (ctx->range_configured) {
         if (ctx->range_native_kvarn) {
-            if (session_id != ctx->active_session) return false;
-            for (const auto & owner : ctx->native_layers) {
-                if (owner && int64_t(pos0) < int64_t(ctx->range_origin) + owner->rows()) {
-                    ++ctx->range_epoch; // force subsequent compute to fail closed
-                    return false;
-                }
-            }
-            return true; // trimming an unoccupied suffix must not invalidate native records
+            return rkva_native_rewind_locked(ctx, session_id, pos0);
         }
         return rkva_trim_range_locked(ctx, session_id, pos0);
     }
@@ -1358,14 +1501,33 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     auto store = reinterpret_cast<ggml_backend_cpu_kvarn_store_direct_v1_t>(
         ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu), "ggml_backend_cpu_kvarn_store_direct_v1"));
     if (!store) return false;
+    uint32_t precision_tail_tokens = 128;
+    if (const char * tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS")) {
+        if (!std::strcmp(tail, "0")) precision_tail_tokens = 0;
+        else if (std::strcmp(tail, "128")) {
+            GGML_LOG_ERROR("%s: GGML_RKVA_NATIVE_TAIL_TOKENS must be 0 or 128\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
+    }
+    const bool rewind_v2 = (ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) &&
+                           (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
+    const bool serial_prefix = rewind_v2 && (ctx->ack.reserved[0] & RKVA_CAP_KVARN_SERIAL_PREFIX);
     const rkva_kvarn_range_config descriptor {
-        origin, capacity, RKVA_RANGE_STORAGE_KVARN4, 1,
-        128, 128, 256, 2, 4, 4, 8960, 3, 2, 128, 128, 1, 1, 1};
+        origin, capacity, RKVA_RANGE_STORAGE_KVARN4, serial_prefix ? 3u : rewind_v2 ? 2u : 1u,
+        128, 128, 256, 2, 4, 4, 8960, 3, 2, 128, precision_tail_tokens, 1, 1, 1};
     std::vector<uint8_t> reply;
     if (!rkva_transact(ctx, RKVA_KVARN_RANGE_CONFIG, ctx->active_session, 0, 0,
-            &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
+            &descriptor, sizeof(descriptor), reply, rewind_v2 ? sizeof(uint64_t) : 0) ||
+            reply.size() != (rewind_v2 ? sizeof(uint64_t) : 0)) return false;
+    ctx->native_generation = 0;
+    if (rewind_v2) {
+        std::memcpy(&ctx->native_generation, reply.data(), sizeof(uint64_t));
+        if (!rkva_kvarn_generation_mutable(ctx->native_generation)) { ctx->failed = true; return false; }
+    }
     ctx->range_configured = true;
     ctx->range_native_kvarn = true;
+    ctx->native_serial_prefix = serial_prefix;
+    ctx->native_tail_tokens = precision_tail_tokens;
     ctx->native_store = store;
     ctx->native_layers.clear();
     ctx->native_layers.resize(ctx->geo.n_layer_remote);
@@ -1379,8 +1541,8 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     ctx->range_profile = profile;
     ctx->range_kernel_mode = mode;
     if (!rkva_range_apply_control(ctx, "kvarn4", generic)) return false;
-    GGML_LOG_WARN("%s: EXPERIMENTAL append-only native KVarN4; original F32 producer, CPU native owner, no native snapshot/rewind support\n",
-                  GGML_REMOTE_ATTN_NAME);
+    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN4 precision_tail=%u descriptor=%u serial_prefix=%d; original F32 producer, bounded resident rewind requires negotiated capability; FULL snapshots unsupported\n",
+                  GGML_REMOTE_ATTN_NAME, precision_tail_tokens, descriptor.layout_version, int(serial_prefix));
     return true;
 }
 
@@ -1453,6 +1615,7 @@ bool ggml_backend_remote_attn_configure_range(
     }
     ctx->range_configured = true;
     ctx->range_native_kvarn = false;
+    ctx->native_serial_prefix = false;
     ctx->native_layers.clear();
     ctx->range_source_type = cache_type;
     ctx->range_wire = native_quant ? (source_q4 ? RKVA_WIRE_Q4_0 : RKVA_WIRE_Q8_0) : RKVA_WIRE_F16;
@@ -1569,6 +1732,29 @@ bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend) {
     return ctx->range_configured && ctx->range_native_kvarn;
 }
 
+bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend) {
+    if (!ggml_backend_remote_attn_native_kvarn_enabled(backend)) return false;
+    const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
+    return ctx->connected && !ctx->failed && rkva_kvarn_generation_mutable(ctx->native_generation) &&
+           (ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) &&
+           (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
+}
+
+bool ggml_backend_remote_attn_native_kvarn_can_restore(ggml_backend_t backend, int32_t pos0) {
+    if (!ggml_backend_remote_attn_native_kvarn_can_rewind(backend) || pos0 < 0) return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    const uint32_t keep = uint32_t(pos0) <= ctx->range_origin ? 0 : uint32_t(pos0) - ctx->range_origin;
+    if (keep > ctx->range_capacity || !rkva_kvarn_generation_mutable(ctx->native_generation)) return false;
+    for (size_t il = 0; il < ctx->native_layers.size(); ++il) {
+        const auto & owner = ctx->native_layers[il];
+        if (owner && ctx->range_layers[il].epoch != ctx->range_epoch) return false;
+        if (keep && (!owner || owner->rows() < keep || !owner->can_rewind(keep))) return false;
+        if (owner && !owner->can_rewind(keep)) return false;
+    }
+    return true;
+}
+
 bool ggml_backend_remote_attn_native_kvarn_has_state(ggml_backend_t backend) {
     if (!ggml_backend_remote_attn_native_kvarn_enabled(backend)) return false;
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
@@ -1646,7 +1832,7 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
         "\"range_fused_calls\":%llu,\"range_kernel_mode\":%u,"
         "\"range_upload_calls\":%llu,\"range_upload_rows\":%llu,\"range_attn_calls\":%llu,"
         "\"range_origin\":%u,\"range_capacity\":%u,\"range_query_min\":%lld,\"range_query_max\":%lld,"
-        "\"range_cache_type\":\"%s\",\"range_source_cache_type\":\"%s\",\"range_upload_bytes\":%llu}",
+        "\"range_cache_type\":\"%s\",\"range_source_cache_type\":\"%s\",\"range_upload_bytes\":%llu,\"native_precision_tail_tokens\":%u}",
         (unsigned long long) s.calls, (unsigned long long) s.bytes_tx,
         (unsigned long long) s.bytes_rx, tx_per_call, rx_per_call,
         avg, p50, p95, (unsigned long long) s.rpc_us_max,
@@ -1658,7 +1844,7 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
         (long long) s.range_query_min, (long long) s.range_query_max,
         ctx->range_native_kvarn ? "kvarn4" : ctx->range_wire == RKVA_WIRE_Q4_0 ? "q4_0" : ctx->range_wire == RKVA_WIRE_Q8_0 ? "q8_0" : "f16",
         ctx->range_native_kvarn ? "projected_f32" : ctx->range_configured ? ggml_type_name(ctx->range_source_type) : "none",
-        (unsigned long long) s.range_upload_bytes);
+        (unsigned long long) s.range_upload_bytes, ctx->range_native_kvarn ? ctx->native_tail_tokens : 0);
     ctx->stats_json = buf;
     return ctx->stats_json.c_str();
 }

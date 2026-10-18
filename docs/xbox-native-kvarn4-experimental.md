@@ -1,8 +1,8 @@
 # Experimental native KVarN4 Xbox overflow
 
 This opt-in path keeps CUDA attention for positions `[0,P)` and consumes genuine
-native KVarN4 records on the Xbox for `[P,C)`. It is append-only and does not yet
-have a native checkpoint codec. Existing Q4/Q8 overflow snapshots cannot initialize
+native KVarN4 records on the Xbox for `[P,C)`. It supports negotiated bounded resident rollback, but does not yet
+have a native FULL checkpoint codec. Existing Q4/Q8 overflow snapshots cannot initialize
 it. Start a fresh server, restore a pure local prefix ending at or before P, and
 prefill the overflow from original projected values.
 
@@ -32,13 +32,12 @@ to match the canonical store. With C=131072 and four KV heads this adds about
 2.35 GB of host record storage across 16 attention layers, in addition to the
 existing bookkeeping companion. Only actual overflow groups cross the network.
 
-Each layer must begin with an original-data append exactly at P. Epoch changes,
-real rewinds, partial restores after native rows exist and bootstrap from occupied
-standard-cache overflow fail closed. Trimming an unoccupied suffix is a no-op.
-FULL state serialization is rejected once native overflow exists; automatic disk
-save skips that transient owner. Partial RS checkpoints may be captured, but cannot
-be restored over a live native owner. Use a new context for another independent
-run. Native disk snapshots and fused standard-cache upload/attention are disabled.
+Each layer must begin with an original-data append exactly at P. Bootstrap from
+occupied standard-cache overflow fails closed. FULL state serialization is rejected
+once native overflow exists; automatic disk save skips that transient owner.
+Native disk snapshots and fused standard-cache upload/attention remain disabled.
+Without the negotiated rewind extension, real rewinds and live PARTIAL restores
+are refused; trimming an unoccupied suffix remains a no-op.
 
 The `test-rkva-kvarn-producer` regression replays native upload packets into an
 independent console-layout image and compares completed records and stage bytes
@@ -48,17 +47,28 @@ non-finite input refusal and replay refusal. This source regression does not
 establish model quality or Xbox throughput; those require actual device/model
 runs and their exact provenance.
 
-Append-only native overflow refuses active draft-MTP at context setup, including
-an empty owner. Common speculative callers also reject a configured native target
-before creating active speculators; a zero draft limit remains permitted. This deliberately disables speculation below P in a
-native overflow context as well; running MTP only below P needs a separate
-position-aware eligibility contract. Standard Q4/Q8/F16 overflow retains its
-existing opt-in MTP path. Native memory advertises no suffix rollback; actual
-occupied native rewinds are rejected before metadata mutation. FULL capture and
-all restore capability queries refuse occupied native overflow. Partial recurrent
-capture remains available for diagnostics, but cannot restore a live native owner.
-Once native ownership is observed, logical clear does not prove that owner reset;
-restore capability remains conservatively unavailable until a fresh context.
+Native MTP requires capability bit 6, HELLO bit 16 and operation 21. The
+resident rewind transaction checks the configuration generation and every layer's
+frontier before changing state. The host retains 256 original-F32 input rows,
+rebuilds the affected incomplete group and repairs original-F16 exact-tail rows.
+A rewind can remove at most 128 rows. Draft depth is therefore capped at 127,
+including room for the verification anchor. Older servers refuse active MTP
+before the first speculative write, including when overflow is still empty.
+
+A PARTIAL restore additionally requires the same hybrid owner, dirty-prefix
+lineage and retained native coverage. These checks precede metadata/recurrent
+mutation; an uncertain transport ACK poisons the remote owner. This resident
+contract cannot import a FULL native snapshot or initialize native KV from Q4/Q8
+bookkeeping. Standard Q4/Q8/F16 overflow uses its existing rewind contract.
+
+Descriptor revision 3 additionally negotiates HELLO bit 17 and capability bit 7.
+Each query reads its own serial-equivalent stage, sealed-record boundary and exact
+tail, even when an append batch crosses a 128-token group seal. Up to nine queries
+are sent together; larger prefill batches use eight-query chunks. Revisions 1/2
+retain interleaved one-row append/query calls to preserve those semantics.
+The logical 128-row exact tail uses a 256-row physical original-F16 ring in
+revision 3. `GGML_RKVA_NATIVE_TAIL_TOKENS=0` omits that ring and tail payloads;
+it leaves record/stage storage and original-F32 rollback retention intact.
 
 `GGML_MTP_PROF` also enables `MTPCYCLE` records for generation (including the
 non-speculative control). Each record reports request/slot/cycle, initial anchor,

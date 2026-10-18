@@ -1718,6 +1718,25 @@ prompt_reset_after_memory_clear();
             }
         }
 
+        // The target context validates this experiment as non-SWA Qwen35
+        // KVarN. Without the exact overlay, sealing a record after the first
+        // query can change that earlier query's stage representation. Keep the upstream
+        // draft/verify flow and only shorten this step's proposal budget.
+        const char * target_tail = std::getenv("LLAMA_KVARN_EXPERIMENTAL_TARGET_TAIL");
+        const bool uses_mtp = std::find(task->params.speculative.types.begin(),
+                task->params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) !=
+                task->params.speculative.types.end();
+        if (n_draft_max > 0 && uses_mtp && target_tail && std::strcmp(target_tail, "0") == 0) {
+            const int64_t limit = llama_position_split::spec_draft_limit_before_kvarn_seal(
+                    prompt.tokens.pos_next(), position_split_p, llama_n_seq_max(ctx_tgt));
+            if (limit < n_draft_max) {
+                const int clamped = int(std::max<int64_t>(0, limit));
+                SLT_DBG(*this, "MTP target tail0 seal guard: anchor=%d P=%u limits draft %d -> %d\n",
+                        prompt.tokens.pos_next(), position_split_p, n_draft_max, clamped);
+                n_draft_max = clamped;
+            }
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;

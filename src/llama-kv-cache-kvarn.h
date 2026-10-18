@@ -98,13 +98,14 @@ struct llama_kvarn_tail_policy {
 
 inline llama_kvarn_tail_policy llama_kvarn_tail_policy_for(
         uint32_t raw_requested_tokens,
-        uint32_t effective_window) {
+        uint32_t effective_window,
+        bool retain_intrinsic_tail = true) {
     constexpr uint32_t group_size = 128;
     if (effective_window == 0) {
         return { raw_requested_tokens, 0, 0, 0, true };
     }
 
-    const uint32_t intrinsic = std::min(group_size, effective_window);
+    const uint32_t intrinsic = retain_intrinsic_tail ? std::min(group_size, effective_window) : 0;
     const uint64_t rounded = raw_requested_tokens == 0 ? 0 :
         ((uint64_t(raw_requested_tokens) + group_size - 1u) / group_size) * group_size;
     const uint32_t explicit_tokens = uint32_t(std::min<uint64_t>(rounded, effective_window));
@@ -461,7 +462,12 @@ public:
     bool get_can_shift() const override;
     bool invalidate_prefix_on_write(const llama_ubatch & ubatch) override;
     bool supports_resident_prefix_restore() const override {
-        return position_split_enabled() && standard_cache && !native_kvarn_rpc_experimental_;
+        return position_split_enabled() && standard_cache &&
+                (!native_kvarn_rpc_experimental_ || native_kvarn_rewind_capable_);
+    }
+    void set_native_kvarn_rewind_capable(bool capable) { native_kvarn_rewind_capable_ = capable; }
+    void set_native_kvarn_rewind_preflight(std::function<bool(llama_pos)> preflight) {
+        native_kvarn_rewind_preflight_ = std::move(preflight);
     }
     seq_rm_capability get_seq_rm_capability() const override;
 
@@ -695,6 +701,9 @@ public:
     bool position_split_live_cells(
             llama_position_split::range_kind range,
             std::vector<uint32_t> & cells_out) const;
+    // Equivalent occupancy predicate, using the sequence's maintained position
+    // extrema instead of allocating and sorting the full live-cell list.
+    bool position_split_has_live_cells(llama_position_split::range_kind range) const;
     // Additive handoff accessor: raw standard-cache storage for remote layers
     // (rawstorage token rows; the attention views are permuted).
     llama_kv_cache * get_standard_cache() const { return standard_cache.get(); }
@@ -927,6 +936,8 @@ private:
     const uint32_t kv_size_overflow;
     const uint32_t position_split_p_;
     const bool native_kvarn_rpc_experimental_;
+    bool native_kvarn_rewind_capable_ = false;
+    std::function<bool(llama_pos)> native_kvarn_rewind_preflight_;
     bool native_kvarn_checkpoint_unavailable() const;
     mutable bool native_kvarn_overflow_seen_ = false;
     // Declaration order matters: stage_groups depends on tail_groups, so
