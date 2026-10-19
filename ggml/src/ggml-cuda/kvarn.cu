@@ -829,6 +829,139 @@ static bool kvarn_convert_scratch_grow(void ** ptr, size_t & capacity, size_t ne
     return true;
 }
 
+// Bounded original-F32 producer for native RPC. The canonical stage is read
+// only, and uploaded only when an unaligned append seals an existing partial
+// group. New rotated rows and records are returned separately; chronological
+// publication to the host stage belongs to the producer's append() method.
+static __global__ void kvarn_native_rotate_kernel(
+        const float * input, half * rotated, int count, int heads) {
+    extern __shared__ float shared[];
+    const int token = blockIdx.x, head = blockIdx.y, kind = blockIdx.z;
+    const int d = threadIdx.x;
+    const size_t width = size_t(heads) * 256;
+    float values[4] = {};
+    for (int slice = 0; slice < 2; ++slice) {
+        shared[d] = input[(size_t(kind) * count + token) * width + head * 256 + slice * 128 + d];
+        kvarn_wht_128(shared);
+        values[slice] = shared[d];
+    }
+    kvarn_wht_cross_slices(values, 2);
+    for (int slice = 0; slice < 2; ++slice) {
+        rotated[(size_t(kind) * count + token) * width + head * 256 + slice * 128 + d] = __float2half_rn(values[slice]);
+    }
+}
+
+static __global__ void kvarn_native_seal_kernel(
+        const half * stage, const half * rotated, uint8_t * records,
+        uint32_t begin, int count, int heads, int groups, int iterations) {
+    extern __shared__ float shared[];
+    const int group = begin / 128 + blockIdx.x, hs = blockIdx.y, kind = blockIdx.z;
+    const int physical_heads = heads * 2;
+    const size_t width = size_t(heads) * 256;
+    // The canonical non-SWA store keeps group zero as the permanent sink;
+    // eager records are sealed only for groups greater than zero.
+    if (group == 0) {
+        uint8_t * record = records + ((size_t(kind) * groups + blockIdx.x) * physical_heads + hs) * 8960;
+        for (int i = threadIdx.x; i < 8960; i += blockDim.x) record[i] = 0;
+        return;
+    }
+    for (int i = threadIdx.x; i < KVAR_N_TILE_VALUES; i += blockDim.x) {
+        const int row = i / 128, col = i % 128;
+        const uint32_t token = group * 128 + (kind ? row : col);
+        const int dim = kind ? col : row;
+        if (token >= begin) {
+            shared[i] = __half2float(rotated[(size_t(kind) * count + token - begin) * width + hs * 128 + dim]);
+        } else {
+            const int slot = group == 0 ? 0 : 1 + (group - 1) % 2;
+            shared[i] = __half2float(stage[(size_t(kind) * 384 + slot * 128 + token % 128) * width + hs * 128 + dim]);
+        }
+    }
+    __syncthreads();
+    kvarn_quantize_tile(records + ((size_t(kind) * groups + blockIdx.x) * physical_heads + hs) * 8960,
+                        4, iterations, shared);
+}
+
+bool ggml_cuda_kvarn_native_append(
+        const float * keys, const float * values, uint32_t global_begin,
+        uint32_t count, uint32_t heads, uint32_t iterations,
+        const ggml_fp16_t * stage_k, const ggml_fp16_t * stage_v,
+        ggml_fp16_t * append_k, ggml_fp16_t * append_v,
+        void * records_k, void * records_v) {
+    if (!keys || !values || !stage_k || !stage_v || !append_k || !append_v ||
+            !count || count > 256 || !heads || heads > 32 || !iterations || iterations > 128 ||
+            uint64_t(global_begin) + count > INT32_MAX) return false;
+    const uint32_t groups = (global_begin + count) / 128 - global_begin / 128;
+    if (groups && (!records_k || !records_v)) return false;
+    // Separate scratch from the state converter; calls from different graph
+    // workers are serialized. Device identity is checked before every reuse.
+    struct scratch_t {
+        void * data = nullptr;
+        size_t bytes = 0;
+        int device = -1;
+        cudaStream_t stream = nullptr;
+    };
+    static scratch_t scratch;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> guard(mutex);
+    int device;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    if (scratch.device != device) {
+        // Do not free allocations while a different device is current.
+        if (scratch.device >= 0) {
+            if (cudaSetDevice(scratch.device) != cudaSuccess) return false;
+            if (scratch.data) cudaFree(scratch.data);
+            if (scratch.stream) cudaStreamDestroy(scratch.stream);
+            if (cudaSetDevice(device) != cudaSuccess) return false;
+        }
+        scratch = scratch_t{};
+        scratch.device = device;
+    }
+    if (!scratch.stream && cudaStreamCreateWithFlags(&scratch.stream, cudaStreamNonBlocking) != cudaSuccess) return false;
+    const size_t width = size_t(heads) * 256;
+    const size_t input_bytes = size_t(count) * width * sizeof(float);
+    const bool needs_stage = groups && global_begin % 128;
+    const size_t stage_bytes = needs_stage ? size_t(384) * width * sizeof(half) : 0;
+    const size_t append_bytes = size_t(count) * width * sizeof(half);
+    const size_t record_bytes = size_t(groups) * heads * 2 * 8960;
+    const size_t bytes = 2 * (input_bytes + stage_bytes + append_bytes + record_bytes);
+    if (!kvarn_convert_scratch_grow(&scratch.data, scratch.bytes, bytes)) return false;
+    auto * input = static_cast<float *>(scratch.data);
+    auto * stage = reinterpret_cast<half *>(reinterpret_cast<uint8_t *>(input) + 2 * input_bytes);
+    auto * rotated = reinterpret_cast<half *>(reinterpret_cast<uint8_t *>(stage) + 2 * stage_bytes);
+    auto * records = reinterpret_cast<uint8_t *>(rotated) + 2 * append_bytes;
+    const cudaStream_t stream = scratch.stream;
+    const auto upload = [&](void * dst, const void * src, size_t n) {
+        return cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+    };
+    const auto download = [&](void * dst, const void * src, size_t n) {
+        return !n || cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+    };
+    if (!upload(input, keys, input_bytes) || !upload(input + size_t(count) * width, values, input_bytes) ||
+            (needs_stage && (!upload(stage, stage_k, stage_bytes) ||
+                !upload(stage + size_t(384) * width, stage_v, stage_bytes)))) {
+        cudaStreamSynchronize(stream); return false;
+    }
+    if (groups) {
+#if defined(GGML_USE_HIP)
+    const bool attrs = hipFuncSetAttribute(reinterpret_cast<const void *>(&kvarn_native_seal_kernel),
+            hipFuncAttributeMaxDynamicSharedMemorySize, KVAR_N_SHARED_BYTES) == hipSuccess;
+#elif !defined(GGML_USE_MUSA)
+    const bool attrs = cudaFuncSetAttribute(kvarn_native_seal_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, KVAR_N_SHARED_BYTES) == cudaSuccess;
+#else
+    const bool attrs = true;
+#endif
+        if (!attrs) { cudaStreamSynchronize(stream); return false; }
+    }
+    kvarn_native_rotate_kernel<<<dim3(count, heads, 2), 128, 128 * sizeof(float), stream>>>(input, rotated, count, heads);
+    if (groups) kvarn_native_seal_kernel<<<dim3(groups, heads * 2, 2), 128, KVAR_N_SHARED_BYTES, stream>>>(
+            stage, rotated, records, global_begin, count, heads, groups, iterations);
+    const bool ok = cudaGetLastError() == cudaSuccess &&
+        download(append_k, rotated, append_bytes) && download(append_v, rotated + size_t(count) * width, append_bytes) &&
+        download(records_k, records, record_bytes) && download(records_v, records + record_bytes, record_bytes);
+    return cudaStreamSynchronize(stream) == cudaSuccess && ok;
+}
+
 static __global__ void kvarn_convert_rotate_kernel(
         const uint8_t * __restrict__ rows,
         int row_bytes,

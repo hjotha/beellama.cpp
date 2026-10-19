@@ -32,6 +32,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/kvarn-wht.cuh"
 #include "ggml-cuda/kvarn.cuh"
+#include "ggml-cuda/kvarn-native-producer.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -6800,6 +6801,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kvarn_store_route_stats_get") == 0) {
         return (void *)ggml_cuda_kvarn_store_route_stats_get;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kvarn_native_append_v1") == 0) {
+        return (void *)ggml_cuda_kvarn_native_append;
     }
     if (strcmp(name, "ggml_backend_kvarn_convert_q4_v2") == 0) {
         return (void *)ggml_cuda_kvarn_convert_q4;

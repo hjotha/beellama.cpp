@@ -182,6 +182,7 @@ struct ggml_backend_remote_attn_context {
     std::vector<range_layer> range_layers;
     bool range_native_kvarn = false;
     bool native_serial_prefix = false;
+    bool native_bulk = false;
     uint64_t native_generation = 0;
     uint32_t native_tail_tokens = 128;
     ggml_backend_cpu_kvarn_store_direct_v1_t native_store = nullptr;
@@ -315,6 +316,9 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         std::vector<float> original_k(nq * width), original_v(nq * width);
         ggml_backend_tensor_get(keys, original_k.data(), 0, original_k.size() * sizeof(float));
         ggml_backend_tensor_get(values, original_v.data(), 0, original_v.size() * sizeof(float));
+        if (!owner->prepare(original_k.data(), original_v.data(), ctx->pos_scratch.data(), uint32_t(nq))) {
+            ctx->failed = true; return false;
+        }
         // Descriptor revisions 1/2 select stage, sealed records and the exact
         // tail from the resident high-water mark. Uploading an entire query
         // batch first would change earlier queries across seals/tail eviction.
@@ -322,11 +326,38 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         // chunks within the qualified optimized kernel's nine-query bound;
         // prefill uses eight, verification batches keep their actual shape.
         const size_t chunk_limit = ctx->native_serial_prefix ? (nq > 9 ? 8 : nq) : 1;
+        std::vector<uint8_t> bulk_payload;
+        std::vector<float> bulk_queries;
+        const uint32_t segments = uint32_t((nq + chunk_limit - 1) / chunk_limit);
+        if (ctx->native_bulk) {
+            if (ctx->native_generation > UINT64_MAX - segments) { ctx->failed = true; return false; }
+            const rkva_kvarn_range_bulk header {1, segments, uint32_t(nq), 0};
+            bulk_payload.resize(sizeof(header));
+            std::memcpy(bulk_payload.data(), &header, sizeof(header));
+            bulk_queries.resize(nq * out_width);
+            ggml_backend_tensor_get(node->src[0], bulk_queries.data(), 0, bulk_queries.size() * sizeof(float));
+        }
+        uint64_t bulk_upload_bytes = 0;
         for (size_t first = 0; first < nq; first += chunk_limit) {
             const size_t chunk = std::min(chunk_limit, nq - first);
             if (!owner->append(original_k.data() + first * width, original_v.data() + first * width,
-                    ctx->pos_scratch.data() + first, uint32_t(chunk), cached.rows == 0, ctx->payload_tx)) {
+                    ctx->pos_scratch.data() + first, uint32_t(chunk), first == 0 && cached.rows == 0, ctx->payload_tx)) {
                 ctx->failed = true; return false;
+            }
+            if (ctx->native_bulk) {
+                const rkva_kvarn_range_bulk_segment segment {uint32_t(ctx->payload_tx.size()), uint32_t(chunk)};
+                const rkva_range_attn attention {RKVA_WIRE_F32, 0, {0, 0}};
+                const size_t offset = bulk_payload.size();
+                const size_t query_bytes = chunk * (sizeof(int32_t) + out_width * sizeof(float));
+                bulk_payload.resize(offset + sizeof(segment) + ctx->payload_tx.size() + sizeof(attention) + query_bytes);
+                auto * dst = bulk_payload.data() + offset;
+                std::memcpy(dst, &segment, sizeof(segment)); dst += sizeof(segment);
+                std::memcpy(dst, ctx->payload_tx.data(), ctx->payload_tx.size()); dst += ctx->payload_tx.size();
+                std::memcpy(dst, &attention, sizeof(attention)); dst += sizeof(attention);
+                std::memcpy(dst, ctx->pos_scratch.data() + first, chunk * sizeof(int32_t)); dst += chunk * sizeof(int32_t);
+                std::memcpy(dst, bulk_queries.data() + first * out_width, chunk * out_width * sizeof(float));
+                bulk_upload_bytes += ctx->payload_tx.size() - sizeof(rkva_kvarn_range_upload);
+                continue;
             }
             std::vector<uint8_t> reply;
             if (ctx->payload_tx.size() > (256u << 20) ||
@@ -367,6 +398,35 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
                 std::memcpy(dst + out_row_bytes,
                         reply.data() + chunk * out_row_bytes + row * lse_row_bytes, lse_row_bytes);
             }
+        }
+        if (ctx->native_bulk) {
+            std::vector<uint8_t> reply;
+            const size_t out_bytes = nq * out_width * sizeof(float);
+            const size_t lse_bytes = nq * ctx->geo.n_head * sizeof(float);
+            if (bulk_payload.size() > (256u << 20) ||
+                !rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, ctx->active_session, layer, uint32_t(nq),
+                    bulk_payload.data(), uint32_t(bulk_payload.size()), reply, uint32_t(out_bytes + lse_bytes))) {
+                ctx->failed = true; return false;
+            }
+            for (size_t offset = 0; offset < reply.size(); offset += sizeof(float)) {
+                float value; std::memcpy(&value, reply.data() + offset, sizeof(value));
+                if (!std::isfinite(value)) { ctx->failed = true; return false; }
+            }
+            for (size_t row = 0; row < nq; ++row) {
+                auto * dst = static_cast<uint8_t *>(node->data) + row * node->nb[1];
+                std::memcpy(dst, reply.data() + row * out_width * sizeof(float), out_width * sizeof(float));
+                std::memcpy(dst + out_width * sizeof(float), reply.data() + out_bytes + row * ctx->geo.n_head * sizeof(float),
+                            ctx->geo.n_head * sizeof(float));
+            }
+            // The producer is speculative until the single ordered server ACK.
+            // Any error above poisons the context; never publish partial history.
+            ctx->native_generation += segments;
+            cached.epoch = ctx->range_epoch;
+            cached.rows = owner->rows();
+            ctx->stats.range_upload_calls += segments;
+            ctx->stats.range_upload_rows += nq;
+            ctx->stats.range_upload_bytes += bulk_upload_bytes;
+            ctx->stats.range_attn_calls += segments;
         }
     } catch (const std::exception & error) {
         GGML_LOG_ERROR("%s: native KVarN4 append/query failed: %s\n", GGML_REMOTE_ATTN_NAME, error.what());
@@ -1145,6 +1205,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->range_layers.clear();
     ctx->range_native_kvarn = false;
     ctx->native_serial_prefix = false;
+    ctx->native_bulk = false;
     ctx->native_layers.clear();
     ctx->native_store = nullptr;
     ctx->range_fused = false;
@@ -1512,6 +1573,16 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     const bool rewind_v2 = (ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) &&
                            (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
     const bool serial_prefix = rewind_v2 && (ctx->ack.reserved[0] & RKVA_CAP_KVARN_SERIAL_PREFIX);
+    bool bulk = false;
+    if (const char * option = std::getenv("GGML_RKVA_NATIVE_BULK")) {
+        if (std::strcmp(option, "0") && std::strcmp(option, "1")) return false;
+        bulk = !std::strcmp(option, "1");
+    }
+    if (bulk && (!serial_prefix || !(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_ATTN) ||
+                 !(ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_BULK_ATTN)))) {
+        GGML_LOG_ERROR("%s: requested native bulk RPC is not supported by the negotiated server\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
     const rkva_kvarn_range_config descriptor {
         origin, capacity, RKVA_RANGE_STORAGE_KVARN4, serial_prefix ? 3u : rewind_v2 ? 2u : 1u,
         128, 128, 256, 2, 4, 4, 8960, 3, 2, 128, precision_tail_tokens, 1, 1, 1};
@@ -1527,6 +1598,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     ctx->range_configured = true;
     ctx->range_native_kvarn = true;
     ctx->native_serial_prefix = serial_prefix;
+    ctx->native_bulk = bulk;
     ctx->native_tail_tokens = precision_tail_tokens;
     ctx->native_store = store;
     ctx->native_layers.clear();
@@ -1616,6 +1688,7 @@ bool ggml_backend_remote_attn_configure_range(
     ctx->range_configured = true;
     ctx->range_native_kvarn = false;
     ctx->native_serial_prefix = false;
+    ctx->native_bulk = false;
     ctx->native_layers.clear();
     ctx->range_source_type = cache_type;
     ctx->range_wire = native_quant ? (source_q4 ? RKVA_WIRE_Q4_0 : RKVA_WIRE_Q8_0) : RKVA_WIRE_F16;

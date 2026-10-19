@@ -25,18 +25,19 @@ enum rkva_op : uint16_t {
     RKVA_TRIM = 7,         // remove positions >= pos0
     RKVA_REWIND = 8,       // alias of TRIM (speculative rollback)
     RKVA_PING = 9,
-    RKVA_GET_STATS = 10,          // response payload: UTF-8 JSON
-    RKVA_PROBE = 11,              // kernel parity harness (diagnostics only)
-    RKVA_RANGE_CONFIG = 12,       // session-global origin/capacity, clears cached rows
-    RKVA_RANGE_UPLOAD = 13,       // per-layer append/replace rows, K then V
-    RKVA_KVARN_RANGE_CONFIG = 15, // descriptor-qualified native KVarN4
-    RKVA_KVARN_RANGE_UPLOAD = 16, // native record delta + complete stage/tail snapshot
-    RKVA_SNAPSHOT_SAVE = 17,      // atomic all-layer local-disk checkpoint
-    RKVA_SNAPSHOT_RESTORE = 18,   // validated all-layer local-disk restore
-    RKVA_RANGE_UPLOAD_ATTN = 19,  // last upload chunk plus attention in one round trip
-    RKVA_RANGE_PROFILE = 20,      // optional profiling/control, UTF-8 JSON response
-    RKVA_KVARN_RANGE_REWIND = 21, // atomic bounded resident native rewind
-    RKVA_RANGE_ATTN = 14,         // query-only F32, returns OUT F32 then LSE F32
+    RKVA_GET_STATS = 10,             // response payload: UTF-8 JSON
+    RKVA_PROBE = 11,                 // kernel parity harness (diagnostics only)
+    RKVA_RANGE_CONFIG = 12,          // session-global origin/capacity, clears cached rows
+    RKVA_RANGE_UPLOAD = 13,          // per-layer append/replace rows, K then V
+    RKVA_KVARN_RANGE_CONFIG = 15,    // descriptor-qualified native KVarN4
+    RKVA_KVARN_RANGE_UPLOAD = 16,    // native record delta + complete stage/tail snapshot
+    RKVA_SNAPSHOT_SAVE = 17,         // atomic all-layer local-disk checkpoint
+    RKVA_SNAPSHOT_RESTORE = 18,      // validated all-layer local-disk restore
+    RKVA_RANGE_UPLOAD_ATTN = 19,     // last upload chunk plus attention in one round trip
+    RKVA_RANGE_PROFILE = 20,         // optional profiling/control, UTF-8 JSON response
+    RKVA_KVARN_RANGE_REWIND = 21,    // atomic bounded resident native rewind
+    RKVA_KVARN_RANGE_BULK_ATTN = 22, // ordered native upload/query segments, one reply
+    RKVA_RANGE_ATTN = 14,            // query-only F32, returns OUT F32 then LSE F32
 };
 
 // Wire element types for Q/K/V/OUT payloads.
@@ -56,6 +57,7 @@ static constexpr uint64_t RKVA_CAP_RANGE_UPLOAD_ATTN = 1ull << 4;
 static constexpr uint64_t RKVA_CAP_RANGE_PROFILE = 1ull << 5;
 static constexpr uint64_t RKVA_CAP_KVARN_REWIND = 1ull << 6;
 static constexpr uint64_t RKVA_CAP_KVARN_SERIAL_PREFIX = 1ull << 7;
+static constexpr uint64_t RKVA_CAP_KVARN_BULK_ATTN = 1ull << 8;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;
@@ -123,7 +125,8 @@ enum rkva_status : int32_t {
 // HELLO request payload: the host proposes the model/cache geometry taken
 // from the live llama_hparams/cparams and the --cache-type/--kv-tail flags.
 struct rkva_hello {
-    uint32_t proto_flags; // bit0: F16, bit1: F32, bit16: native rewind v2, bit17: serial query prefix v3
+    uint32_t
+        proto_flags; // bit0: F16, bit1: F32, bit16: native rewind v2, bit17: serial query prefix v3
     uint32_t n_layer_remote; // full-attention layers owned by the server
     uint32_t n_head;         // Q heads (24)
     uint32_t n_head_kv;      // KV heads (4)
@@ -224,7 +227,6 @@ struct rkva_range_profile {
     uint64_t reserved;
 };
 
-
 // Native KVarN4 revision 1: exact host-packed records, not a Q4_0 alias.
 // All integers little endian. Descriptor validation is mandatory before allocation.
 // Record layout: 8192 payload bytes, scale[128] F16, zero[128] F16,
@@ -258,6 +260,19 @@ struct rkva_kvarn_range_config {
 // Otherwise live_count may only advance, and records must extend the existing
 // contiguous coverage. After RESET/TRIM/REWIND a RESET_SNAPSHOT is mandatory;
 // attention fails closed until then, even when old buffers remain allocated.
+// Bulk v1 retains the exact op16/upload then op14/query image ordering.
+// Header followed by segment_count segments: segment header, upload_bytes
+// bytes (rkva_kvarn_range_upload + planes), then rkva_range_attn, positions
+// and F32 Q. Response is ALL OUT, followed by ALL LSE, in segment order.
+// Only descriptor revision 3; <=256 total queries, <=32 segments, 1..9 queries
+// per segment (8 for prefill). Envelope is validated before any GPU mutation.
+struct rkva_kvarn_range_bulk {
+    uint32_t version, segment_count, total_queries, reserved;
+};
+struct rkva_kvarn_range_bulk_segment {
+    uint32_t upload_bytes, n_queries;
+};
+
 struct rkva_kvarn_range_upload {
     uint32_t live_count, record_begin, record_groups, flags;
     uint32_t append_begin, append_rows;
