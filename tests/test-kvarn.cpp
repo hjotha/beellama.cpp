@@ -4624,7 +4624,7 @@ static void test_native_flash_attention_gpu() {
         require_close_f32_rmse(actual, expected, 1e-2f,
                 "native KVarN FlashAttention output differs from CPU reference decode");
 
-        constexpr int n_q_prefill = 64;
+        constexpr int n_q_prefill = 256;
         const std::vector<float> expected_prefill = test_native_flash_attention_output(cpu_backend, false, false, head_dim, 4, 3, n_q_prefill);
         const std::vector<float> actual_prefill   = test_native_flash_attention_output(gpu_backend, true,  false, head_dim, 4, 3, n_q_prefill);
         require_close_f32_rmse(actual_prefill, expected_prefill, 1e-2f,

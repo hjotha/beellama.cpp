@@ -43,10 +43,14 @@
 
 #define GGML_REMOTE_ATTN_NAME "RemoteAttn"
 
+#if defined(__AVX2__) && defined(__F16C__)
+#include <immintrin.h>
+#endif
+
 namespace {
 
 // ---------------------------------------------------------------------------
-// host f16 helpers (software, portable)
+// host f16 helpers (software, portable + AVX2/F16C vectorized batch)
 // ---------------------------------------------------------------------------
 
 static inline uint16_t f32_to_f16_bits(float value) {
@@ -59,6 +63,85 @@ static inline bool f16_bits_finite(uint16_t bits) {
 
 static inline float f16_bits_to_f32(uint16_t bits) {
     return ggml_fp16_to_fp32((ggml_fp16_t) bits);
+}
+
+static inline bool rkva_f32_to_f16_batch(const float * src, uint16_t * dst, size_t n) {
+#if defined(__AVX2__) && defined(__F16C__)
+    size_t i = 0;
+    const __m256 max_f16 = _mm256_set1_ps(65504.0f);
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        __m256 abs_v = _mm256_andnot_ps(sign_mask, v);
+        // Finite in FP16: abs(v) <= 65504.0f (filters out Inf, >65504, and NaN)
+        __m256 is_finite = _mm256_cmp_ps(abs_v, max_f16, _CMP_LE_OQ);
+        int mask = _mm256_movemask_ps(is_finite);
+        if (__builtin_expect(mask != 0xFF, 0)) {
+            return false;
+        }
+        __m128i h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm_storeu_si128((__m128i*)(dst + i), h);
+    }
+    for (; i < n; ++i) {
+        const float val = src[i];
+        if (!std::isfinite(val) || std::abs(val) > 65504.0f) {
+            return false;
+        }
+        const uint16_t half = f32_to_f16_bits(val);
+        if (!f16_bits_finite(half)) {
+            return false;
+        }
+        dst[i] = half;
+    }
+    return true;
+#else
+    for (size_t i = 0; i < n; ++i) {
+        const float val = src[i];
+        if (!std::isfinite(val) || std::abs(val) > 65504.0f) {
+            return false;
+        }
+        const uint16_t half = f32_to_f16_bits(val);
+        if (!f16_bits_finite(half)) {
+            return false;
+        }
+        dst[i] = half;
+    }
+    return true;
+#endif
+}
+
+static inline bool rkva_f16_to_f32_batch(const uint16_t * src, float * dst, size_t n) {
+#if defined(__AVX2__) && defined(__F16C__)
+    size_t i = 0;
+    const __m128i exp_mask = _mm_set1_epi16(0x7c00);
+    for (; i + 8 <= n; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i*)(src + i));
+        __m128i exps = _mm_and_si128(h, exp_mask);
+        __m128i is_inf_nan = _mm_cmpeq_epi16(exps, exp_mask);
+        if (__builtin_expect(!_mm_testz_si128(is_inf_nan, is_inf_nan), 0)) {
+            return false;
+        }
+        __m256 f = _mm256_cvtph_ps(h);
+        _mm256_storeu_ps(dst + i, f);
+    }
+    for (; i < n; ++i) {
+        const uint16_t half = src[i];
+        if (!f16_bits_finite(half)) {
+            return false;
+        }
+        dst[i] = f16_bits_to_f32(half);
+    }
+    return true;
+#else
+    for (size_t i = 0; i < n; ++i) {
+        const uint16_t half = src[i];
+        if (!f16_bits_finite(half)) {
+            return false;
+        }
+        dst[i] = f16_bits_to_f32(half);
+    }
+    return true;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -368,10 +451,8 @@ static bool rkva_finish_native_bulk_job(
         const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
         for (size_t row = 0; row < job.nq; ++row) {
             auto * dst = static_cast<float *>(static_cast<void *>(job.output + row * job.output_stride));
-            for (size_t col = 0; col < job.out_width; ++col) {
-                const uint16_t half = src_f16[row * job.out_width + col];
-                if (!f16_bits_finite(half)) return false;
-                dst[col] = f16_bits_to_f32(half);
+            if (!rkva_f16_to_f32_batch(src_f16 + row * job.out_width, dst, job.out_width)) {
+                return false;
             }
             for (size_t h = 0; h < ctx->geo.n_head; ++h) {
                 const float lse_val = src_lse[row * ctx->geo.n_head + h];
@@ -573,8 +654,9 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         }
         std::vector<float> original_k(nq * width), original_v(nq * width);
         ggml_backend_tensor_get(keys, original_k.data(), 0, original_k.size() * sizeof(float));
-        ggml_backend_tensor_get(values, original_v.data(), 0, original_v.size() * sizeof(float));
-        if (!owner->prepare(original_k.data(), original_v.data(), ctx->pos_scratch.data(), uint32_t(nq))) {
+        const float * dev_k = static_cast<const float *>(keys->data);
+        const float * dev_v = static_cast<const float *>(values->data);
+        if (!owner->prepare(original_k.data(), original_v.data(), ctx->pos_scratch.data(), uint32_t(nq), dev_k, dev_v)) {
             ctx->failed = true; return false;
         }
         // Descriptor revisions 1/2 select stage, sealed records and the exact
@@ -617,12 +699,8 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
                 std::memcpy(dst, ctx->pos_scratch.data() + first, chunk * sizeof(int32_t)); dst += chunk * sizeof(int32_t);
                 if (bulk_f16) {
                     uint16_t * dst_f16 = reinterpret_cast<uint16_t *>(dst);
-                    for (size_t i = 0; i < chunk * out_width; ++i) {
-                        const float val = bulk_queries[first * out_width + i];
-                        if (!std::isfinite(val)) { ctx->failed = true; return false; }
-                        const uint16_t half = f32_to_f16_bits(val);
-                        if (!f16_bits_finite(half)) { ctx->failed = true; return false; }
-                        dst_f16[i] = half;
+                    if (!rkva_f32_to_f16_batch(bulk_queries.data() + first * out_width, dst_f16, chunk * out_width)) {
+                        ctx->failed = true; return false;
                     }
                 } else {
                     std::memcpy(dst, bulk_queries.data() + first * out_width, chunk * out_width * sizeof(float));
@@ -686,10 +764,8 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
                 const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
                 for (size_t row = 0; row < nq; ++row) {
                     auto * dst = static_cast<float *>(static_cast<void *>(static_cast<uint8_t *>(node->data) + row * node->nb[1]));
-                    for (size_t col = 0; col < out_width; ++col) {
-                        const uint16_t half = src_f16[row * out_width + col];
-                        if (!f16_bits_finite(half)) { ctx->failed = true; return false; }
-                        dst[col] = f16_bits_to_f32(half);
+                    if (!rkva_f16_to_f32_batch(src_f16 + row * out_width, dst, out_width)) {
+                        ctx->failed = true; return false;
                     }
                     for (size_t h = 0; h < ctx->geo.n_head; ++h) {
                         const float lse_val = src_lse[row * ctx->geo.n_head + h];
@@ -769,8 +845,10 @@ static bool rkva_prepare_native_bulk_job(
         std::vector<float> original_k(nq * width), original_v(nq * width);
         ggml_backend_tensor_get(keys, original_k.data(), 0, original_k.size() * sizeof(float));
         ggml_backend_tensor_get(values, original_v.data(), 0, original_v.size() * sizeof(float));
+        const float * dev_k = static_cast<const float *>(keys->data);
+        const float * dev_v = static_cast<const float *>(values->data);
         if (!owner->prepare(original_k.data(), original_v.data(), ctx->pos_scratch.data(),
-                    uint32_t(nq))) {
+                    uint32_t(nq), dev_k, dev_v)) {
             ctx->failed = true;
             return false;
         }
@@ -813,12 +891,8 @@ static bool rkva_prepare_native_bulk_job(
             dst += chunk * sizeof(int32_t);
             if (bulk_f16) {
                 uint16_t * dst_f16 = reinterpret_cast<uint16_t *>(dst);
-                for (size_t i = 0; i < chunk * out_width; ++i) {
-                    const float val = bulk_queries[first * out_width + i];
-                    if (!std::isfinite(val)) { ctx->failed = true; return false; }
-                    const uint16_t half = f32_to_f16_bits(val);
-                    if (!f16_bits_finite(half)) { ctx->failed = true; return false; }
-                    dst_f16[i] = half;
+                if (!rkva_f32_to_f16_batch(bulk_queries.data() + first * out_width, dst_f16, chunk * out_width)) {
+                    ctx->failed = true; return false;
                 }
             } else {
                 std::memcpy(dst, bulk_queries.data() + first * out_width,
@@ -1020,11 +1094,11 @@ static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor *
                 }
                 ggml_backend_tensor_get(source, packed.data(), (size_t) row * source->nb[1], row_bytes);
                 to_float(packed.data(), decoded.data(), width);
-                for (const float value : decoded) {
-                    const uint16_t half = f32_to_f16_bits(value);
-                    std::memcpy(dst, &half, sizeof(half));
-                    dst += sizeof(half);
+                if (!rkva_f32_to_f16_batch(decoded.data(), reinterpret_cast<uint16_t *>(dst), width)) {
+                    ctx->failed = true;
+                    return false;
                 }
+                dst += width * sizeof(uint16_t);
             }
         }
         if (combine) {
@@ -1188,17 +1262,18 @@ static bool rkva_run_attn(
         ggml_backend_tensor_get(v, p, 0, kv_elems * 4); p += kv_elems * 4;
     } else {
         ctx->f32_scratch.resize(std::max(q_elems, kv_elems));
-        auto emit16 = [&](const ggml_tensor * t, size_t elems) {
+        auto emit16 = [&](const ggml_tensor * t, size_t elems) -> bool {
             ggml_backend_tensor_get(t, ctx->f32_scratch.data(), 0, elems * 4);
             uint16_t * dst = (uint16_t *) p;
-            for (size_t i = 0; i < elems; i++) {
-                dst[i] = f32_to_f16_bits(ctx->f32_scratch[i]);
+            if (!rkva_f32_to_f16_batch(ctx->f32_scratch.data(), dst, elems)) {
+                return false;
             }
             p += elems * 2;
+            return true;
         };
-        emit16(q, q_elems);
-        emit16(k, kv_elems);
-        emit16(v, kv_elems);
+        if (!emit16(q, q_elems) || !emit16(k, kv_elems) || !emit16(v, kv_elems)) {
+            return false;
+        }
     }
 
     const uint32_t out_elems = (uint32_t) q_elems;
@@ -1216,8 +1291,8 @@ static bool rkva_run_attn(
     float * dst = (float *) node->data;
     if (wire_f16) {
         const uint16_t * s = (const uint16_t *) out.data();
-        for (uint32_t i = 0; i < out_elems; i++) {
-            dst[i] = f16_bits_to_f32(s[i]);
+        if (!rkva_f16_to_f32_batch(s, dst, out_elems)) {
+            return false;
         }
     } else {
         std::memcpy(dst, out.data(), (size_t) out_elems * 4);

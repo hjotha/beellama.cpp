@@ -2504,15 +2504,15 @@ enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct 
     return ggml_backend_buffer_init_tensor(buffer, tensor);
 }
 
-static struct ggml_tensor * graph_copy_dup_tensor(struct ggml_hash_set hash_set, struct ggml_tensor ** node_copies,
+static struct ggml_tensor * graph_copy_dup_tensor(struct ggml_hash_set * hash_set, struct ggml_tensor ** node_copies,
     struct ggml_context * ctx_allocated, struct ggml_context * ctx_unallocated, struct ggml_tensor * src) {
 
     GGML_ASSERT(src != NULL);
     GGML_ASSERT(src->data && "graph must be allocated");
 
-    size_t id = ggml_hash_insert(&hash_set, src);
+    size_t id = ggml_hash_insert(hash_set, src);
     if (id == GGML_HASHSET_ALREADY_EXISTS) {
-        return node_copies[ggml_hash_find(&hash_set, src)];
+        return node_copies[ggml_hash_find(hash_set, src)];
     }
 
     struct ggml_tensor * dst = ggml_dup_tensor_layout(src->data && !src->view_src ? ctx_allocated : ctx_unallocated, src);
@@ -2581,6 +2581,13 @@ static void graph_copy_init_tensor(struct ggml_hash_set * hash_set, struct ggml_
         }
         graph_copy_init_tensor(hash_set, node_copies, node_init, s);
     }
+
+    if (src->op == GGML_OP_FLASH_ATTN_EXT) {
+        struct ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(src);
+        if (lse != NULL) {
+            graph_copy_init_tensor(hash_set, node_copies, node_init, lse);
+        }
+    }
 }
 
 struct ggml_backend_graph_copy ggml_backend_graph_copy(ggml_backend_t backend, struct ggml_cgraph * graph) {
@@ -2616,7 +2623,7 @@ struct ggml_backend_graph_copy ggml_backend_graph_copy(ggml_backend_t backend, s
     // dup nodes
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
-        graph_copy_dup_tensor(hash_set, node_copies, ctx_allocated, ctx_unallocated, node);
+        graph_copy_dup_tensor(&hash_set, node_copies, ctx_allocated, ctx_unallocated, node);
     }
 
     // allocate nodes

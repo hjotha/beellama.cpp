@@ -438,10 +438,12 @@ static void run_graph_copy(ggml_backend_t cpu) {
     if (cfa[0] && clse[0]) {
         CHECK(ggml_flash_attn_ext_get_lse_out(cfa[0]) == clse[0]);
         CHECK(ggml_flash_attn_ext_get_lse_out(cfa[0]) != g.lse0);
+        CHECK(clse[0]->src[0] == cfa[0]);
     }
     if (cfa[1] && clse[1]) {
         CHECK(ggml_flash_attn_ext_get_lse_out(cfa[1]) == clse[1]);
         CHECK(ggml_flash_attn_ext_get_lse_out(cfa[1]) != g.lse1);
+        CHECK(clse[1]->src[0] == cfa[1]);
     }
 
     // sentinel in the source LSE buffers: running the clone must not touch them
