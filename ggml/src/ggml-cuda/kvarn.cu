@@ -931,7 +931,24 @@ bool ggml_cuda_kvarn_native_append(
     auto * records = reinterpret_cast<uint8_t *>(rotated) + 2 * append_bytes;
     const cudaStream_t stream = scratch.stream;
     const auto upload = [&](void * dst, const void * src, size_t n) {
-        return cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+        cudaMemcpyKind kind = cudaMemcpyHostToDevice;
+#if !defined(GGML_USE_MUSA)
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, src) == cudaSuccess) {
+#if defined(GGML_USE_HIP)
+            if (attr.memoryType == hipMemoryTypeDevice && attr.device == device) {
+                kind = hipMemcpyDeviceToDevice;
+            }
+#else
+            if (attr.type == cudaMemoryTypeDevice && attr.device == device) {
+                kind = cudaMemcpyDeviceToDevice;
+            }
+#endif
+        } else {
+            cudaGetLastError();
+        }
+#endif
+        return cudaMemcpyAsync(dst, src, n, kind, stream) == cudaSuccess;
     };
     const auto download = [&](void * dst, const void * src, size_t n) {
         return !n || cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToHost, stream) == cudaSuccess;

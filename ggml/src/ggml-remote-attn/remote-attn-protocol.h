@@ -58,6 +58,7 @@ static constexpr uint64_t RKVA_CAP_RANGE_PROFILE = 1ull << 5;
 static constexpr uint64_t RKVA_CAP_KVARN_REWIND = 1ull << 6;
 static constexpr uint64_t RKVA_CAP_KVARN_SERIAL_PREFIX = 1ull << 7;
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_ATTN = 1ull << 8;
+static constexpr uint64_t RKVA_CAP_KVARN_BULK_F16 = 1ull << 9;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;
@@ -263,7 +264,9 @@ struct rkva_kvarn_range_config {
 // Bulk v1 retains the exact op16/upload then op14/query image ordering.
 // Header followed by segment_count segments: segment header, upload_bytes
 // bytes (rkva_kvarn_range_upload + planes), then rkva_range_attn, positions
-// and F32 Q. Response is ALL OUT, followed by ALL LSE, in segment order.
+// and Q (F32 by default; F16 when RKVA_CAP_KVARN_BULK_F16 is advertised and
+// every segment sets attention.wire == RKVA_WIRE_F16). Response is ALL OUT
+// (matching attention.wire, F32 or F16), followed by ALL LSE (F32), in order.
 // Only descriptor revision 3; <=256 total queries, <=32 segments, 1..9 queries
 // per segment (8 for prefill). Envelope is validated before any GPU mutation.
 struct rkva_kvarn_range_bulk {

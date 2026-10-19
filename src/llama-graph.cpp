@@ -5034,6 +5034,31 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
     ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_cpu);
     ggml_build_forward_expand(gf, k_written);
     ggml_build_forward_expand(gf, v_written);
+    int remote_layer = 0;
+    for (int l = 0; l < il; ++l) {
+        if (hparams.has_kv(l) && !hparams.is_recr(l)) ++remote_layer;
+    }
+    const bool async_overlap = ggml_backend_remote_attn_async_enabled(backend_remote);
+    auto * range = ggml_remote_attn_range(ctx0, q_cur, k_written, v_written,
+            inp->self_overflow_cell_idxs, positions, remote_layer,
+            cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
+    if (ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
+        // Preserve original projected values as independent graph operands.
+        // The Q4/Q8 companion above remains metadata/bookkeeping only for this
+        // experimental native owner; none of its quantized bytes are decoded.
+        auto * native_k = ggml_cont(ctx0, k_cur);
+        auto * native_v = ggml_cont(ctx0, v_cur);
+        ggml_remote_attn_range_set_native_sources(range, native_k, native_v);
+    }
+    ggml_backend_sched_set_tensor_backend(sched, range, backend_cpu);
+    if (async_overlap) {
+        // Submit the ordered remote bulk RPC before the local CUDA attention
+        // cluster, then join it at the wait node just before the LSE merge.
+        // The local range and the remote range are the same layer/query batch;
+        // later layers still depend on the merged output.
+        ggml_remote_attn_range_set_async(range);
+        ggml_build_forward_expand(gf, range);
+    }
     const bool native_attention = kvarn_ctx->uses_native_attention(il) &&
         llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
     const auto kvarn_plan = llama_kvarn_plan_attention(
@@ -5160,26 +5185,19 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
 
     llm_flash_attn_ext_set_kvarn_domain(fa1, kvarn_domain);
     ggml_prec_set_acc(fa1, GGML_PREC_F32);
-    int remote_layer = 0;
-    for (int l = 0; l < il; ++l) {
-        if (hparams.has_kv(l) && !hparams.is_recr(l)) ++remote_layer;
+    ggml_tensor * range_wait = nullptr;
+    ggml_tensor * remote_source = range;
+    if (async_overlap) {
+        // Completion point: blocks only when the LSE merge consumes the remote
+        // OUT/LSE. It is emitted after the local CUDA cluster and before merge.
+        range_wait = ggml_remote_attn_range_wait(ctx0, range);
+        ggml_backend_sched_set_tensor_backend(sched, range_wait, backend_cpu);
+        remote_source = range_wait;
     }
-    auto * range = ggml_remote_attn_range(ctx0, q_cur, k_written, v_written,
-            inp->self_overflow_cell_idxs, positions, remote_layer,
-            cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
-    if (ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
-        // Preserve original projected values as independent graph operands.
-        // The Q4/Q8 companion above remains metadata/bookkeeping only for this
-        // experimental native owner; none of its quantized bytes are decoded.
-        auto * native_k = ggml_cont(ctx0, k_cur);
-        auto * native_v = ggml_cont(ctx0, v_cur);
-        ggml_remote_attn_range_set_native_sources(range, native_k, native_v);
-    }
-    ggml_backend_sched_set_tensor_backend(sched, range, backend_cpu);
     const int64_t width = q_cur->ne[0]*q_cur->ne[1];
-    auto * o2 = ggml_cont(ctx0, ggml_view_2d(ctx0, range, width, q_cur->ne[2], range->nb[1], 0));
-    auto * lse2 = ggml_cont(ctx0, ggml_view_2d(ctx0, range, q_cur->ne[1], q_cur->ne[2],
-            range->nb[1], size_t(width)*sizeof(float)));
+    auto * o2 = ggml_cont(ctx0, ggml_view_2d(ctx0, remote_source, width, q_cur->ne[2], remote_source->nb[1], 0));
+    auto * lse2 = ggml_cont(ctx0, ggml_view_2d(ctx0, remote_source, q_cur->ne[1], q_cur->ne[2],
+            remote_source->nb[1], size_t(width)*sizeof(float)));
     ggml_backend_sched_set_tensor_backend(sched, o2, backend_cpu);
     ggml_backend_sched_set_tensor_backend(sched, lse2, backend_cpu);
     if (std::getenv("F4_NODE_DUMP") != nullptr) {
@@ -5188,11 +5206,13 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
         cb(o1, "diag_local_out", il);
         cb(lse1, "diag_local_lse", il);
         cb(range, "diag_rpc_range", il);
+        if (range_wait) cb(range_wait, "diag_rpc_wait", il);
         cb(o2, "diag_remote_out", il);
         cb(lse2, "diag_remote_lse", il);
     }
     ggml_build_forward_expand(gf, o1);
     ggml_build_forward_expand(gf, lse1);
+    if (range_wait) ggml_build_forward_expand(gf, range_wait);
     ggml_build_forward_expand(gf, o2);
     ggml_build_forward_expand(gf, lse2);
     const int merge_begin = ggml_graph_n_nodes(gf);

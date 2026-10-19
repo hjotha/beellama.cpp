@@ -114,7 +114,8 @@ public:
     // Precompute a complete model microbatch once, while append() continues
     // publishing only the chronological serial-prefix chunks. Preparation does
     // not mutate the authoritative stage, records, originals or live count.
-    bool prepare(const float * keys, const float * values, const int32_t * positions, uint32_t count) {
+    bool prepare(const float * keys, const float * values, const int32_t * positions, uint32_t count,
+                 const float * device_keys = nullptr, const float * device_values = nullptr) {
         if (!cuda_) return true;
         if (!keys || !values || !positions || !count || count > 256 || count > capacity_ - rows_) return false;
         for (uint32_t i = 0; i < count; ++i) {
@@ -131,7 +132,9 @@ public:
         const size_t groups = (prepared_begin_ + count) / 128 - prepared_begin_ / 128;
         prepared_rk_.resize(groups * physical_heads() * record_bytes);
         prepared_rv_.resize(prepared_rk_.size());
-        if (!cuda_(keys, values, prepared_begin_, count, heads_, iterations_, stage_k_.data(), stage_v_.data(),
+        const float * cuda_k = device_keys ? device_keys : keys;
+        const float * cuda_v = device_values ? device_values : values;
+        if (!cuda_(cuda_k, cuda_v, prepared_begin_, count, heads_, iterations_, stage_k_.data(), stage_v_.data(),
                     prepared_k_.data(), prepared_v_.data(), prepared_rk_.data(), prepared_rv_.data())) return false;
         prepared_count_ = count;
         return true;

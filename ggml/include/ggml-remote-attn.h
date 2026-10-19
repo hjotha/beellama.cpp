@@ -22,6 +22,12 @@ enum ggml_remote_attn_range_op_param {
     GGML_REMOTE_ATTN_PARAM_RANGE  = 6,
     GGML_REMOTE_ATTN_PARAM_ORIGIN = 7,
     GGML_REMOTE_ATTN_PARAM_N_LIVE = 8,
+    // Opt-in native KVarN4 bulk range: the range node submits the prepared RPC
+    // to the single ordered worker and returns without waiting for the reply.
+    GGML_REMOTE_ATTN_PARAM_ASYNC  = 9,
+    // Companion completion node: src[0] is the async range node; its output is
+    // a copy of that node's OUT/LSE once the worker has completed.
+    GGML_REMOTE_ATTN_PARAM_WAIT   = 10,
 };
 
 // Query-only v2 overflow attention. Sources 1/2 are the companion SET_ROWS
@@ -36,6 +42,15 @@ GGML_API struct ggml_tensor * ggml_remote_attn_range(
         struct ggml_tensor * overflow_cells,
         struct ggml_tensor * query_pos,
         int layer_id, uint32_t origin, uint32_t n_live, float kq_scale);
+
+// Opt-in overlap plumbing. Marking a range node async is only valid when
+// ggml_backend_remote_attn_async_enabled() is true (native KVarN4 bulk RPC).
+// The completion node must be scheduled after the local attention work and
+// before anything that reads the remote OUT/LSE. Both nodes execute on the
+// CPU backend through ggml_remote_attn_exec().
+GGML_API void ggml_remote_attn_range_set_async(struct ggml_tensor * node);
+GGML_API struct ggml_tensor * ggml_remote_attn_range_wait(
+        struct ggml_context * ctx, struct ggml_tensor * range);
 
 // KVarN attention domain negotiated in HELLO. Values mirror rkva_domain and
 // GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_*; AUTO lets the server reproduce the host
@@ -114,6 +129,9 @@ GGML_API void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend);
 // negotiated op21 supports <=128-row resident rollback. FULL overflow snapshots
 // cannot initialize it. Capability does not imply a native persistence codec.
 GGML_API bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend);
+// True when the opt-in GGML_RKVA_ASYNC_LOCAL_REMOTE=1 overlap was accepted by a
+// native KVarN4 bulk-capable server. Always false for synchronous/local modes.
+GGML_API bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_can_restore(ggml_backend_t backend, int32_t pos0);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_has_state(ggml_backend_t backend);
