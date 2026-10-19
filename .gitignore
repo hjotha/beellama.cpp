@@ -163,3 +163,6 @@ AGENTS.local.md
 /artifacts/
 /release-packages/*/
 /servers
+
+# Local benchmark runs and serialized KV snapshots
+/bench-results/

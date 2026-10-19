@@ -1,0 +1,59 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+#include "dequant_funcs.glsl"
+
+// Multi-row Q4_0 -> F16 gather. One invocation expands a 4-byte qs group of a
+// Q4_0 block into its 4 low-nibble values and the matching 4 high-nibble
+// values, and writes both as 8-byte f16 vectors. The qs bytes are therefore
+// read once (the old kernel also reads each byte once, but from a half-idle
+// workgroup per row and with 2-byte stores). Within a warp the two stores
+// cover full 32-byte sectors, so the write stream stays coalesced.
+//
+// The dispatch is a flat list of 8-value groups; the row is recovered with the
+// host-provided log2 of the groups-per-row (p.param3), which keeps the fast
+// path limited to power-of-two row widths without integer division in the
+// shader.
+//
+// Arithmetic is component-for-component the same as get_rows_quant.comp:
+//   (nibble - 8) * d + 0
+// with the same f16 conversion, so the output is bit-identical.
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 2) writeonly buffer D4 { f16vec4 data_d4[]; };
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint groups_per_row = p.ne00 / 8u;
+    const uint col = gid & (groups_per_row - 1u);
+    const uint row = gid >> p.param3;
+
+    if (row >= p.ne10) {
+        return;
+    }
+
+    const uint i01 = data_b[get_boffset() + row*p.nb10];
+
+    const uint a_offset = get_aoffset() + i01*p.nb01;
+    const uint d_offset = get_doffset() + row*p.nb21;
+
+    const uint block = a_offset + (col >> 2);
+    const uint group = col & 3u;
+    const uint base  = (col >> 2)*32u + group*4u;  // low-nibble outputs
+    const uint qs16  = group*2u;                   // 4 qs bytes = 2 uint16
+
+    const uint q0 = uint(data_a_packed16[block].qs[qs16 + 0]);
+    const uint q1 = uint(data_a_packed16[block].qs[qs16 + 1]);
+
+    const vec2 dm = get_dm(block, 0);
+    const vec4 lo = (vec4( q0        & 0xF, (q0 >>  8u) & 0xF,
+                           q1        & 0xF, (q1 >>  8u) & 0xF) - 8.0f) * dm.x + dm.y;
+    const vec4 hi = (vec4((q0 >>  4u) & 0xF, (q0 >> 12u) & 0xF,
+                          (q1 >>  4u) & 0xF, (q1 >> 12u) & 0xF) - 8.0f) * dm.x + dm.y;
+
+    data_d4[(d_offset + base     )/4u] = f16vec4(lo);
+    data_d4[(d_offset + base + 16u)/4u] = f16vec4(hi);
+}

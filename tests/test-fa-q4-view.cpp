@@ -56,43 +56,101 @@ struct result {
     std::vector<float> l_q4v, l_f16v, l_q4p, l_f16p;
 };
 
+// FP64 CPU reference for nq == 1 folded cases: masked rows (>= kv_live) are
+// invisible, so this is the single "correct" attention for BOTH the valid and
+// the padded extent. Inputs mirror what the shader sees: Q multiplied by the
+// scale in f32 then rounded to f16, K/V are the f16-dequantized stored values.
+static void attention_ref_f64(int64_t hsk, int64_t nh, int64_t nhq, int64_t kv_live,
+                              int64_t row_off,
+                              const std::vector<float> & qv,
+                              const std::vector<ggml_fp16_t> & kd16,
+                              const std::vector<ggml_fp16_t> & vd16,
+                              std::vector<double> & oref) {
+    const int64_t group = nhq / nh;
+    const double scale = 1.0 / std::sqrt((double) hsk);
+    oref.assign(size_t(hsk) * nhq, 0.0);
+    std::vector<double> q16(hsk), s(kv_live), e(kv_live);
+    for (int64_t h = 0; h < nhq; ++h) {
+        for (int64_t d = 0; d < hsk; ++d) {
+            const float qs = qv[h*hsk + d] * (float) scale;
+            q16[d] = (double) ggml_fp16_to_fp32(ggml_fp32_to_fp16(qs));
+        }
+        const int64_t kh = h / group;
+        double m = -INFINITY;
+        for (int64_t k = 0; k < kv_live; ++k) {
+            const ggml_fp16_t * kr = &kd16[size_t(row_off + k) * size_t(hsk*nh) + kh*hsk];
+            double dot = 0.0;
+            for (int64_t d = 0; d < hsk; ++d) {
+                dot += q16[d] * (double) ggml_fp16_to_fp32(kr[d]);
+            }
+            s[k] = dot;
+            m = std::max(m, dot);
+        }
+        double den = 0.0;
+        for (int64_t k = 0; k < kv_live; ++k) { e[k] = std::exp(s[k] - m); den += e[k]; }
+        for (int64_t d = 0; d < hsk; ++d) {
+            double acc = 0.0;
+            for (int64_t k = 0; k < kv_live; ++k) {
+                const ggml_fp16_t * vr = &vd16[size_t(row_off + k) * size_t(hsk*nh) + kh*hsk];
+                acc += e[k] * (double) ggml_fp16_to_fp32(vr[d]);
+            }
+            oref[h*hsk + d] = acc / den;
+        }
+    }
+}
+
+static double ref_max_err(const std::vector<float> & o, const std::vector<double> & ref) {
+    double mx = 0.0;
+    for (size_t i = 0; i < o.size() && i < ref.size(); ++i) {
+        mx = std::max(mx, std::fabs((double) o[i] - ref[i]));
+    }
+    return mx;
+}
+
 static bool run_case(ggml_backend_t backend, int64_t kv_valid, int64_t nq, int64_t pad,
                      double tol_same, int & failures, bool folded = false,
-                     int64_t hsk = 128, int64_t nh = 8, int64_t nhq = 64) {
+                     int64_t hsk = 128, int64_t nh = 8, int64_t nhq = 64,
+                     int64_t row_off = 0) {
     // Defaults are the synthetic 128/8/64 shape; the model's overflow layers use
     // hsk=256, 4 KV heads, 24 query heads (GQA 6) -- the shapes of the integrated
     // first divergence at il=7, eval 14/15.
+    // row_off simulates the production ring buffer: the view starts at a physical
+    // row != 0 inside the storage, like the packed overflow window after wrap.
     const int64_t kv_pad = kv_valid + pad;
+    const int64_t n_store = row_off + kv_pad;
 
     ggml_init_params ip = { 768u*1024u*1024u, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
 
     ggml_tensor * kq4_st = folded
-        ? ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hsk*nh, kv_pad)
-        : ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_0, hsk, kv_pad, nh, 1);
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hsk*nh, n_store)
+        : ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_0, hsk, n_store, nh, 1);
     ggml_tensor * vq4_st = folded
-        ? ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hsk*nh, kv_pad)
-        : ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_0, hsk, kv_pad, nh, 1);
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hsk*nh, n_store)
+        : ggml_new_tensor_4d(ctx, GGML_TYPE_Q4_0, hsk, n_store, nh, 1);
     ggml_tensor * kf16_st = folded
-        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*nh, kv_pad)
-        : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, kv_pad, nh, 1);
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*nh, n_store)
+        : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, n_store, nh, 1);
     ggml_tensor * vf16_st = folded
-        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*nh, kv_pad)
-        : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, kv_pad, nh, 1);
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*nh, n_store)
+        : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, n_store, nh, 1);
 
     // Folded layout = the model's: a [head_dim * n_head, rows] storage reshaped to
     // [head_dim, n_head, rows, 1], i.e. heads interleaved inside each token row.
     auto fold = [&](ggml_tensor * st, int64_t rows) {
         // [head_dim*n_head, rows] -> [head_dim, n_head, rows, 1] -> permute to the
         // FA layout [head_dim, rows, n_head, 1], exactly like build_attn_mha does.
-        return ggml_permute(ctx, ggml_reshape_4d(ctx, st, hsk, nh, rows, 1), 0, 2, 1, 3);
+        ggml_tensor * v2 = row_off > 0
+            ? ggml_view_2d(ctx, st, hsk*nh, rows, st->nb[1], size_t(row_off) * st->nb[1])
+            : st;
+        return ggml_permute(ctx, ggml_reshape_4d(ctx, v2, hsk, nh, rows, 1), 0, 2, 1, 3);
     };
     auto view_valid = [&](ggml_tensor * st) {
         if (folded) {
-            ggml_tensor * v2 = ggml_view_2d(ctx, st, hsk*nh, kv_valid, st->nb[1], 0);
+            ggml_tensor * v2 = ggml_view_2d(ctx, st, hsk*nh, kv_valid, st->nb[1], size_t(row_off) * st->nb[1]);
             return ggml_permute(ctx, ggml_reshape_4d(ctx, v2, hsk, nh, kv_valid, 1), 0, 2, 1, 3);
         }
-        return ggml_view_4d(ctx, st, hsk, kv_valid, nh, 1, st->nb[1], st->nb[2], st->nb[3], 0);
+        return ggml_view_4d(ctx, st, hsk, kv_valid, nh, 1, st->nb[1], st->nb[2], st->nb[3], size_t(row_off) * st->nb[1]);
     };
     ggml_tensor * kq4_v = view_valid(kq4_st);
     ggml_tensor * vq4_v = view_valid(vq4_st);
@@ -132,7 +190,7 @@ static bool run_case(ggml_backend_t backend, int64_t kv_valid, int64_t nq, int64
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     const int64_t row_len = folded ? hsk*nh : hsk;
-    const int64_t n_rows  = folded ? kv_pad : kv_pad*nh;
+    const int64_t n_rows  = folded ? n_store : n_store*nh;
     const size_t  n_vals  = size_t(row_len) * size_t(n_rows);
     std::vector<float> kf(n_vals), vf(n_vals);
     for (auto & x : kf) x = dist(rng);
@@ -144,13 +202,13 @@ static bool run_case(ggml_backend_t backend, int64_t kv_valid, int64_t nq, int64
     // must still match; if this fails, non-finite stale storage is the cause.
     if (pad > 0 && getenv("FA_Q4_NAN_TAIL") != nullptr) {
         for (int64_t r = kv_valid; r < std::min<int64_t>(kv_valid + 8, kv_pad); ++r) {
-            const size_t base = (folded ? size_t(r) : size_t(r)*nh) * size_t(row_len);
+            const size_t base = (folded ? size_t(r + row_off) : size_t(r + row_off)*nh) * size_t(row_len);
             if (folded) {
                 kf[base + 5] = NAN; kf[base + 7] = INFINITY;
                 vf[base + 4] = NAN; vf[base + 9] = -INFINITY;
             } else {
                 for (int64_t h = 0; h < nh; ++h) {
-                    const size_t o = size_t(row_len) * size_t(r + kv_pad*h);
+                    const size_t o = size_t(row_len) * size_t(r + row_off + n_store*h);
                     kf[o + 5] = NAN; kf[o + 7] = INFINITY;
                     vf[o + 4] = NAN; vf[o + 9] = -INFINITY;
                 }
@@ -175,18 +233,50 @@ static bool run_case(ggml_backend_t backend, int64_t kv_valid, int64_t nq, int64
     // row for the inactive tail (or zeros), while a raw storage view reads whatever
     // stale bytes are there. Reproduce that difference on the F16 reference side so
     // the comparison tests mask neutrality itself, not just the extent.
-    if (pad > 0) {
+    // FA_Q4_ZERO_TAIL mirrors production instead: the tail is zeroed in BOTH the
+    // Q4 storage and the F16 reference, so a residual q4-vs-f16 difference cannot
+    // be blamed on tail values.
+    static const bool zero_tail = [] {
+        const char * v = getenv("FA_Q4_ZERO_TAIL");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    if (pad > 0 && zero_tail) {
         const size_t row = size_t(row_len);
         if (folded) {
             for (int64_t r = kv_valid; r < kv_pad; ++r) {
-                std::memcpy(&kd16[row*size_t(r)], &kd16[0], row*sizeof(ggml_fp16_t));
-                std::memcpy(&vd16[row*size_t(r)], &vd16[0], row*sizeof(ggml_fp16_t));
+                std::memset(&kf[row*size_t(r + row_off)], 0, row*sizeof(float));
+                std::memset(&vf[row*size_t(r + row_off)], 0, row*sizeof(float));
             }
         } else {
             for (int64_t h = 0; h < nh; ++h) {
                 for (int64_t r = kv_valid; r < kv_pad; ++r) {
-                    const size_t dst = row * size_t(r + kv_pad*h);
-                    const size_t src = row * size_t(0 + kv_pad*h);
+                    const size_t o = row * size_t(r + row_off + n_store*h);
+                    std::memset(&kf[o], 0, row*sizeof(float));
+                    std::memset(&vf[o], 0, row*sizeof(float));
+                }
+            }
+        }
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, kf.data(), kq_bytes.data(), 0, n_rows, row_len, nullptr);
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, vf.data(), vq_bytes.data(), 0, n_rows, row_len, nullptr);
+        tt->to_float(kq_bytes.data(), kd.data(), (int64_t) n_vals);
+        tt->to_float(vq_bytes.data(), vd.data(), (int64_t) n_vals);
+        for (size_t i = 0; i < kd.size(); ++i) {
+            kd16[i] = ggml_fp32_to_fp16(kd[i]);
+            vd16[i] = ggml_fp32_to_fp16(vd[i]);
+        }
+    }
+    if (pad > 0 && !zero_tail) {
+        const size_t row = size_t(row_len);
+        if (folded) {
+            for (int64_t r = kv_valid; r < kv_pad; ++r) {
+                std::memcpy(&kd16[row*size_t(r + row_off)], &kd16[row*size_t(row_off)], row*sizeof(ggml_fp16_t));
+                std::memcpy(&vd16[row*size_t(r + row_off)], &vd16[row*size_t(row_off)], row*sizeof(ggml_fp16_t));
+            }
+        } else {
+            for (int64_t h = 0; h < nh; ++h) {
+                for (int64_t r = kv_valid; r < kv_pad; ++r) {
+                    const size_t dst = row * size_t(r + row_off + n_store*h);
+                    const size_t src = row * size_t(row_off + n_store*h);
                     std::memcpy(&kd16[dst], &kd16[src], row*sizeof(ggml_fp16_t));
                     std::memcpy(&vd16[dst], &vd16[src], row*sizeof(ggml_fp16_t));
                 }
@@ -254,9 +344,9 @@ static bool run_case(ggml_backend_t backend, int64_t kv_valid, int64_t nq, int64
     double mo, ro, ml, rl; int64_t io, il;
     max_abs_diff(r.o_q4v, r.o_f16v, mo, ro, io);
     max_abs_diff(r.l_q4v, r.l_f16v, ml, rl, il);
-    printf("hsk=%3lld nh=%lld nhq=%2lld kv_valid=%4lld kv_pad=%4lld nq=%3lld %-6s | q4v-vs-f16v: O max=%.3e rms=%.3e | LSE max=%.3e | %s\n",
+    printf("hsk=%3lld nh=%lld nhq=%2lld kv_valid=%4lld kv_pad=%4lld nq=%3lld row_off=%3lld %-6s | q4v-vs-f16v: O max=%.3e rms=%.3e | LSE max=%.3e | %s\n",
            (long long) hsk, (long long) nh, (long long) nhq,
-           (long long) kv_valid, (long long) kv_pad, (long long) nq, folded ? "folded" : "4d",
+           (long long) kv_valid, (long long) kv_pad, (long long) nq, (long long) row_off, folded ? "folded" : "4d",
            mo, ro, ml, (mo <= tol_same && ml <= tol_same) ? "OK" : "FAIL");
     if (mo > tol_same || ml > tol_same) { failures++; }
 
@@ -281,6 +371,47 @@ static bool run_case(ggml_backend_t backend, int64_t kv_valid, int64_t nq, int64
         printf("         TAIL-VALUE difference O  : q4p(stale) vs f16p(row0-dup) max=%.3e | LSE max=%.3e | %s\n",
                mt, lt, (mt <= tol_same && lt <= tol_same) ? "OK(mask neutral)" : "DIFFERS(mask not neutral?)");
         if (mt > tol_same || lt > tol_same) { failures++; }
+    }
+
+    // FP64 verdict (env FA_Q4_REF=1, folded, nq == 1): which arm matches the
+    // mask-neutral reference, and where the arm-vs-arm difference sits.
+    static const bool want_ref = [] {
+        const char * v = getenv("FA_Q4_REF");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    if (want_ref && folded && nq == 1) {
+        std::vector<double> oref;
+        attention_ref_f64(hsk, nh, nhq, kv_valid, row_off, qv, kd16, vd16, oref);
+        double e_q4v = ref_max_err(r.o_q4v, oref);
+        double e_f16v = ref_max_err(r.o_f16v, oref);
+        printf("         REF-fp64: q4v=%.3e f16v=%.3e", e_q4v, e_f16v);
+        double e_q4p = 0.0, e_f16p = 0.0;
+        if (pad > 0) {
+            e_q4p = ref_max_err(r.o_q4p, oref);
+            e_f16p = ref_max_err(r.o_f16p, oref);
+            printf(" q4p=%.3e f16p=%.3e", e_q4p, e_f16p);
+        }
+        printf("\n");
+        if (pad > 0) {
+            // Restrict the verdict to the elements where the padded arms differ:
+            // if the leak is real, the deviating side is the one far from fp64.
+            int64_t n_diff = 0; double w_q4p = 0.0, w_f16p = 0.0; int64_t at = -1;
+            for (size_t i = 0; i < r.o_q4p.size(); ++i) {
+                if (std::fabs((double) r.o_q4p[i] - (double) r.o_f16p[i]) > 1e-6) {
+                    ++n_diff;
+                    const double dq = std::fabs((double) r.o_q4p[i] - oref[i]);
+                    const double df = std::fabs((double) r.o_f16p[i] - oref[i]);
+                    if (df > w_f16p) { at = (int64_t) i; }
+                    w_q4p = std::max(w_q4p, dq);
+                    w_f16p = std::max(w_f16p, df);
+                }
+            }
+            if (n_diff > 0) {
+                printf("         REF-verdict: ndiff=%lld at=%lld | q4p_err=%.3e f16p_err=%.3e -> %s\n",
+                       (long long) n_diff, (long long) at, w_q4p, w_f16p,
+                       w_f16p > w_q4p ? "F16_PADDED_BAD" : (w_q4p > w_f16p ? "Q4_PADDED_BAD" : "TIE"));
+            }
+        }
     }
 
     ggml_backend_buffer_free(buf);
@@ -311,6 +442,58 @@ int main() {
         run_case(backend,  952, 256, 72, tol, failures, true, 256, 4, 24);
         run_case(backend, 1024, 256,  0, tol, failures, true, 256, 4, 24);
         run_case(backend,  896, 256,128, tol, failures, true, 256, 4, 24);
+        // Production decode geometry: single query row, long padded extent.
+        // This is the shape the raw-Q4 overflow FA runs at decode (Br=1/Bc=64,
+        // non-GQA, split-K partials + LSE reduce) and it is NOT covered by the
+        // prefill rows above.
+        run_case(backend,  1024,   1,   0, tol, failures, true, 256, 4, 24);
+        run_case(backend,  1024,   1, 128, tol, failures, true, 256, 4, 24);
+        run_case(backend, 16384,   1,   0, tol, failures, true, 256, 4, 24);
+        // Ring-buffer physical row offsets: the packed overflow view starts at a
+        // physical row != 0 (and not 256-row aligned) in production decode.
+        run_case(backend, 16384,   1,   0, tol, failures, true, 256, 4, 24,   1);
+        run_case(backend, 16384,   1,   0, tol, failures, true, 256, 4, 24, 137);
+        run_case(backend, 16384,   1, 128, tol, failures, true, 256, 4, 24, 137);
+        // Production decode extent/fill ratio: padded extent 256 with only 97 live
+        // rows (mask -inf on the rest). This is the exact small-repro state that
+        // showed deterministic q4-vs-f16 O diffs in the model at decode.
+        run_case(backend,    97,   1, 159, tol, failures, true, 256, 4, 24);
+        run_case(backend,    97,   1, 159, tol, failures, true, 256, 4, 24,   1);
+        run_case(backend,    98,   1, 158, tol, failures, true, 256, 4, 24);
+        run_case(backend,    98,   1, 158, tol, failures, true, 256, 4, 24,   1);
+        // Offset/live sweep around the op-level failure: isolate whether the
+        // divergence is tied to the view's byte offset or the live row count.
+        for (int64_t ro : {2, 3, 4, 16, 17, 32, 33, 128, 129}) {
+            run_case(backend,    97,   1, 159, tol, failures, true, 256, 4, 24, ro);
+        }
+        for (int64_t nlive : {95, 96, 99, 100, 128, 129, 192, 193}) {
+            run_case(backend, nlive,   1, 256 - nlive, tol, failures, true, 256, 4, 24, 0);
+            run_case(backend, nlive,   1, 256 - nlive, tol, failures, true, 256, 4, 24, 1);
+        }
+        // Aligned (Clamp=0) vs clamped (Clamp=1) padded extents at the same live
+        // count: 128/384 are multiples of Bc(=64) -> aligned; 300 is not. If the
+        // leak is the aligned variant's direct-V load (flash_attn_cm1.comp:497),
+        // only the aligned extents must diverge from the valid extent.
+        run_case(backend,    97,   1,  31, tol, failures, true, 256, 4, 24); // E=128 aligned
+        run_case(backend,    97,   1, 203, tol, failures, true, 256, 4, 24); // E=300 clamped
+        run_case(backend,    97,   1, 287, tol, failures, true, 256, 4, 24); // E=384 aligned
+    }
+    // Production-scale extents (env FA_Q4_BIG=1): the gate state is a 256-row
+    // stable extent with an odd live count (n_view 23395 of 23552). Sweep the
+    // live/extent parity at production kv. With FA_Q4_REF=1 the FP64 verdict says
+    // whether the padded leak contaminates the production f16 path.
+    static const bool big_cases = [] {
+        const char * v = getenv("FA_Q4_BIG");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    if (big_cases) {
+        const double tol = 2e-5;
+        run_case(backend, 23395, 1, 157, tol, failures, true, 256, 4, 24); // production-exact state
+        run_case(backend, 23394, 1, 158, tol, failures, true, 256, 4, 24); // even control
+        run_case(backend, 23551, 1,   1, tol, failures, true, 256, 4, 24); // odd live, pad 1
+        run_case(backend, 23552, 1,   0, tol, failures, true, 256, 4, 24); // full extent
+        run_case(backend, 11777, 1, 127, tol, failures, true, 256, 4, 24); // half, odd live
+        run_case(backend, 23395, 1, 157, tol, failures, true, 256, 4, 24, 137);
     }
     ggml_backend_free(backend);
     if (failures != 0) {

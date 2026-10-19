@@ -846,6 +846,12 @@ void process_shaders() {
         string_to_spv("get_rows_" + tname + "_bf16", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}}));
     }
 
+    // Multi-row Q4_0 -> F16 gather used by the position-split overflow
+    // materialization. Selected at dispatch time only for the 2-D, contiguous
+    // F16 output shape the fast kernel supports.
+    string_to_spv("get_rows_q4_0_f16vec", "get_rows_q4_0_f16vec.comp",
+        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
+
     // Bee standard KV quants are cache-only types, so generate only the row
     // movement kernels needed by the generic tail graph.  Adding them to
     // type_names would incorrectly opt them into unrelated matmul kernels.

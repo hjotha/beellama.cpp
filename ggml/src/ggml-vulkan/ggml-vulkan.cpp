@@ -51,6 +51,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -1005,6 +1006,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_bf16[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_get_rows_q4_0_f16vec;
     vk_pipeline pipeline_out_prod_quant_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_back_f32;
     vk_pipeline pipeline_acc_f32;
@@ -6085,6 +6087,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_NVFP4],   "dequant_nvfp4",   dequant_nvfp4_len,   dequant_nvfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
 
     // get_rows
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_q4_0_f16vec, "get_rows_q4_0_f16vec", get_rows_q4_0_f16vec_len, get_rows_q4_0_f16vec_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F16 ], "get_rows_f16",  get_rows_f16_len,  get_rows_f16_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_BF16], "get_rows_bf16", get_rows_bf16_len, get_rows_bf16_data, "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -14396,9 +14399,17 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
         } break;
     case GGML_OP_GET_ROWS:
-        elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
-        elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
-        elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+        if (pipeline == ctx->device->pipeline_get_rows_q4_0_f16vec) {
+            // One invocation per 8 output values; the shader splits the flat
+            // index into (row, column) using the shift in p.param3.
+            const uint64_t total = ((uint64_t) ne00 / 8) * ne10;
+            GGML_ASSERT(total <= std::numeric_limits<uint32_t>::max());
+            elements = { (uint32_t) total, 1, 1 };
+        } else {
+            elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
+            elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+            elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+        }
         break;
     case GGML_OP_OUT_PROD:
         if (src0->type == GGML_TYPE_F32) {
@@ -14686,19 +14697,85 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 }
 
+static bool ggml_vk_get_rows_q4_0_f16vec_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_VK_GET_ROWS_Q4_0_F16VEC");
+        return v == nullptr || *v == '\0' || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Preconditions for the multi-row Q4_0 -> F16 gather:
+//  - 2-D source and destination, single 1-D index list (the position-split
+//    overflow materialization shape);
+//  - row length a whole number of Q4_0 blocks whose 8-value group count is a
+//    power of two (the shader recovers the row with a shift);
+//  - contiguous destination so the 8-byte f16 vector stores are aligned.
+static bool ggml_vk_get_rows_q4_0_f16vec_params(const ggml_backend_vk_context * ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        uint32_t * row_shift) {
+    if (!ggml_vk_get_rows_q4_0_f16vec_enabled()) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q4_0 || src1->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (src0->ne[0] < 32 || src0->ne[0] % 32 != 0) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    if (dst->ne[0] != src0->ne[0] || dst->ne[1] != src1->ne[0]) {
+        return false;
+    }
+    if (src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != ggml_type_size(src1->type)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const uint64_t chunks = (uint64_t) src0->ne[0] / 8;
+    if ((chunks & (chunks - 1)) != 0) {
+        return false;
+    }
+    const uint64_t rows = (uint64_t) src1->ne[0];
+    const uint64_t total = chunks * rows;
+    if (rows == 0 || total > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    if (CEIL_DIV(total, 512) > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return false;
+    }
+    uint32_t shift = 0;
+    while ((uint64_t(1) << shift) < chunks) {
+        ++shift;
+    }
+    *row_shift = shift;
+    return true;
+}
+
 static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
 
-    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS, {
+    uint32_t row_shift = 0;
+    const bool q4_0_f16vec = ggml_vk_get_rows_q4_0_f16vec_params(ctx, src0, src1, dst, &row_shift);
+
+    vk_op_binary_push_constants pc = {
         (uint32_t)ggml_nelements(src0),
         (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
         0.0f, 0.0f, 0,
-    });
+    };
+    pc.param3 = (int32_t) row_shift;
+
+    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS,
+            std::move(pc), q4_0_f16vec ? ctx->device->pipeline_get_rows_q4_0_f16vec : nullptr);
 }
 
 static void ggml_vk_get_rows_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

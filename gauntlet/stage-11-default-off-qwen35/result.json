@@ -1,0 +1,31 @@
+{
+  "port": 19410,
+  "model": "/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf",
+  "checks": [
+    {
+      "endpoint": "/props",
+      "status": 200,
+      "model_path": "/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf",
+      "adaptive_present": false
+    },
+    {
+      "endpoint": "/models",
+      "status": 200,
+      "context_window": 512,
+      "max_context_window": 512,
+      "adaptive_present": false
+    },
+    {
+      "endpoint": "/slots",
+      "status": 200,
+      "slots": 1
+    },
+    {
+      "endpoint": "/completion",
+      "status": 200,
+      "tokens_predicted": 1
+    }
+  ],
+  "success": true,
+  "server_rc": 0
+}

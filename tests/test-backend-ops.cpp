@@ -9589,6 +9589,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
+    // Position-split overflow materialization: one 1024-value Q4_0 row per live
+    // overflow position, read back as F16 (Qwen3.8-27B, 4 KV heads x 256).
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q4_0, 1024, 23552, 23552, 1, 1, false, GGML_TYPE_F16));
     for (ggml_type type : standard_cache_types) {
         if (std::find(std::begin(all_types), std::end(all_types), type) == std::end(all_types)) {
             test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, 1, 1, false));
@@ -12382,6 +12385,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // Position-split overflow materialization at the production shape: Q4_0 K/V
+    // rows (4 KV heads x 256) gathered to F16 for the live overflow extent.
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q4_0, 1024, 24064, 24064, 1, 1, false, GGML_TYPE_F16));
 
     return test_cases;
 }
