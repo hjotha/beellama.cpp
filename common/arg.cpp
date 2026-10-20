@@ -3878,6 +3878,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_FORMAT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--remote-attn-wire-format", "--remote-attn-activation-format"}, "FORMAT",
+        "RPC activation wire format for Q upload and OUT download: 'f16'/'fp16' (default), 'fp8'/'fp8_e5m2', 'auto'",
+        [](common_params & params, const std::string & value) {
+            std::string canonical;
+            if (value == "f16" || value == "fp16") {
+                canonical = "f16";
+            } else if (value == "fp8" || value == "fp8_e5m2") {
+                canonical = "fp8";
+            } else if (value == "auto") {
+                canonical = "auto";
+            } else {
+                throw std::invalid_argument(
+                    "invalid --remote-attn-wire-format: expected 'f16', 'fp8', or 'auto'");
+            }
+            params.remote_attn_wire_format = canonical;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_WIRE_FORMAT", canonical.c_str(), 1);
+#else
+            _putenv_s("GGML_RKVA_WIRE_FORMAT", canonical.c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_WIRE_FORMAT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
         {"--split-attn-cuda-reserve", "--remote-attn-cuda-reserve"}, "SIZE",
         "CUDA VRAM safety margin to preserve during auto-placement (e.g. 350M, 500M, 1G, default: 350M)",
         [](common_params & params, const std::string & value) {

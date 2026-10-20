@@ -1,0 +1,130 @@
+diff --git a/uwp/rkva/rkva-kvarn-bulk.h b/uwp/rkva/rkva-kvarn-bulk.h
+--- a/uwp/rkva/rkva-kvarn-bulk.h
++++ b/uwp/rkva/rkva-kvarn-bulk.h
+@@ -164,22 +164,15 @@
+ }
+ 
+ inline bool splitzip_decode(const uint8_t * in, size_t in_bytes, uint16_t * dst, size_t n) {
+-    if (!in || (!dst && n > 0)) return false;
+-    if (in_bytes < sizeof(rkva_splitzip_header)) return false;
+-    const auto * hdr = reinterpret_cast<const rkva_splitzip_header*>(in);
+-    if (hdr->n_elements != n) return false;
+-
+-    const uint64_t n_u64 = uint64_t(n);
+-    const uint64_t nibble_bytes = (n_u64 + 1ULL) / 2ULL;
+-    const uint64_t required_bytes = uint64_t(sizeof(rkva_splitzip_header)) +
+-                                    n_u64 +
+-                                    2ULL * nibble_bytes +
+-                                    uint64_t(hdr->n_escapes);
+-
+-    if (uint64_t(in_bytes) < required_bytes ||
+-        uint64_t(hdr->compressed_bytes) != required_bytes) {
+-        return false;
+-    }
++    if (!in || (!dst && n > 0) || in_bytes < sizeof(rkva_splitzip_header)) return false;
++    rkva_splitzip_header header{};
++    std::memcpy(&header, in, sizeof(header));
++    const auto * hdr = &header;
++    if (hdr->n_elements != n || hdr->n_escapes > n) return false;
++    const uint64_t count = hdr->n_elements;
++    const uint64_t nibble_bytes = (count + 1) / 2;
++    const uint64_t required_bytes = sizeof(header) + count + 2 * nibble_bytes + hdr->n_escapes;
++    if (hdr->compressed_bytes != required_bytes || in_bytes < required_bytes) return false;
+ 
+     const uint8_t * p = in + sizeof(rkva_splitzip_header);
+     const uint8_t * low_bytes = p; p += n;
+@@ -237,7 +230,7 @@
+     rkva_range_attn attention{};
+     std::memcpy(&attention, data + upload_offset + seg.upload_bytes, sizeof(attention));
+     if (attention.wire != RKVA_WIRE_F32 && attention.wire != RKVA_WIRE_F16 &&
+-        attention.wire != RKVA_WIRE_FP8 && attention.wire != RKVA_WIRE_SPLITZIP) {
++        attention.wire != RKVA_WIRE_FP8) {
+         return false;
+     }
+     *out_wire = attention.wire;
+@@ -252,7 +245,7 @@
+     segments.clear();
+     if (!data || bytes < sizeof(rkva_kvarn_range_bulk) || bytes > (256u << 20) ||
+         (expected_wire != RKVA_WIRE_F32 && expected_wire != RKVA_WIRE_F16 &&
+-         expected_wire != RKVA_WIRE_FP8 && expected_wire != RKVA_WIRE_SPLITZIP) ||
++         expected_wire != RKVA_WIRE_FP8) ||
+         !rkva_kvarn_range::valid_descriptor(descriptor, 256) ||
+         !rkva_kvarn_range::serial_prefix(descriptor) || !n_head || !n_head_kv || n_head > 256 ||
+         n_head_kv > 256 || !n_queries || n_queries > 256)
+diff --git a/uwp/rkva/remote-attn.cpp b/uwp/rkva/remote-attn.cpp
+--- a/uwp/rkva/remote-attn.cpp
++++ b/uwp/rkva/remote-attn.cpp
+@@ -300,8 +300,7 @@
+             if (state.native_serial_prefix_v3_client &&
+                 state.engine->native_serial_prefix_available())
+                 ack.reserved[0] |= RKVA_CAP_KVARN_SERIAL_PREFIX | RKVA_CAP_KVARN_BULK_ATTN |
+-                                   RKVA_CAP_KVARN_BULK_F16 | RKVA_CAP_KVARN_BULK_FP8 |
+-                                   RKVA_CAP_KVARN_BULK_SPLITZIP;
++                                   RKVA_CAP_KVARN_BULK_F16 | RKVA_CAP_KVARN_BULK_FP8;
+         }
+         if (!state.native_rewind_v2_client)
+             ack.supported_ops &= ~(1u << RKVA_KVARN_RANGE_REWIND);
+diff --git a/uwp/rkva/rkva-kvarn-bulk-f16.inc b/uwp/rkva/rkva-kvarn-bulk-f16.inc
+--- a/uwp/rkva/rkva-kvarn-bulk-f16.inc
++++ b/uwp/rkva/rkva-kvarn-bulk-f16.inc
+@@ -51,7 +51,7 @@
+     uint32_t wire = RKVA_WIRE_F16;
+     if (!rkva_kvarn_bulk::peek_wire(data, bytes, &wire))
+         return ::fail(error, "native bulk f16: invalid wire");
+-    if (wire != RKVA_WIRE_F16 && wire != RKVA_WIRE_FP8 && wire != RKVA_WIRE_SPLITZIP)
++    if (wire != RKVA_WIRE_F16 && wire != RKVA_WIRE_FP8)
+         return ::fail(error, "native bulk f16: unsupported wire format");
+     std::vector<rkva_kvarn_bulk::Segment> segments;
+     if (!rkva_kvarn_bulk::validate_wire(
+diff --git a/tests/rkva_kvarn_bulk_cpu.cpp b/tests/rkva_kvarn_bulk_cpu.cpp
+--- a/tests/rkva_kvarn_bulk_cpu.cpp
++++ b/tests/rkva_kvarn_bulk_cpu.cpp
+@@ -1,4 +1,5 @@
+ #include "../uwp/rkva/rkva-kvarn-bulk.h"
++#undef NDEBUG
+ #include <cassert>
+ #include <cmath>
+ #include <cstdio>
+@@ -186,19 +187,39 @@
+     assert(!splitzip_decode(nullptr, compressed.size(), decoded.data(), decoded.size()));
+     assert(!splitzip_decode(compressed.data(), compressed.size(), nullptr, decoded.size()));
+ 
+-    std::puts("splitzip bounds, truncation and corruption safety (ASan): passed");
++    // Byte-oriented input need not have native struct alignment.
++    std::vector<uint8_t> unaligned(compressed.size() + 1);
++    std::memcpy(unaligned.data() + 1, compressed.data(), compressed.size());
++    assert(splitzip_decode(unaligned.data() + 1, compressed.size(), decoded.data(), decoded.size()));
++    assert(decoded == src);
++
++    for (size_t count : {size_t(0), size_t(1), size_t(3), size_t(65536)}) {
++        std::vector<uint16_t> input(count), output(count);
++        for (size_t i = 0; i < count; ++i) input[i] = uint16_t(i);
++        std::vector<uint8_t> frame;
++        splitzip_encode(input.data(), count, frame);
++        assert(splitzip_decode(frame.data(), frame.size(), output.data(), count));
++        assert(input == output);
++    }
++    std::puts("splitzip bounds, truncation and corruption safety: passed");
+ }
+ } // namespace
+ int main() {
+     test_f16_helpers();
+     test_fp8_contract();
+     test_splitzip();
++    for (uint32_t count : {1u, 8u, 256u}) {
++        auto data = payload(0, count, 128, RKVA_WIRE_SPLITZIP);
++        uint32_t wire = 99;
++        assert(!peek_wire(data.data(), data.size(), &wire));
++        assert(!valid(data, 0, count, 128, 1, RKVA_WIRE_SPLITZIP));
++    }
+     // Every segment's own prefix image remains authoritative across two seals,
+     // tail wrap, arbitrary unaligned live reuse, and maximum b/ub=256 for F32,
+-    // FP16, FP8, and SplitZip wire formats.
++    // FP16 and FP8 wire formats. SplitZip remains archived, never admitted.
+     for (uint32_t tail : {0u, 128u}) {
+         for (uint32_t wire : {uint32_t(RKVA_WIRE_F32), uint32_t(RKVA_WIRE_F16),
+-                              uint32_t(RKVA_WIRE_FP8), uint32_t(RKVA_WIRE_SPLITZIP)}) {
++                              uint32_t(RKVA_WIRE_FP8)}) {
+             for (uint32_t begin : {0u, 1u, 120u, 127u, 128u, 255u, 8191u}) {
+                 for (uint32_t count : {1u, 8u, 9u, 64u, 256u}) {
+                     auto data = payload(begin, count, tail, wire);

@@ -1,0 +1,64 @@
+diff --git a/uwp/rkva/remote-attn-protocol.h b/uwp/rkva/remote-attn-protocol.h
+--- a/uwp/rkva/remote-attn-protocol.h
++++ b/uwp/rkva/remote-attn-protocol.h
+@@ -63,6 +63,8 @@
+ static constexpr uint64_t RKVA_CAP_KVARN_BULK_F16 = 1ull << 9;
+ static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8 = 1ull << 10;
+ static constexpr uint64_t RKVA_CAP_KVARN_BULK_SPLITZIP = 1ull << 11;
++// Codec revision: Q rounds directly from F32; finite Q/O saturate, ties to even.
++static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8_RNE = 1ull << 12;
+ static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
+ static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
+ static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;
+diff --git a/uwp/rkva/remote-attn.cpp b/uwp/rkva/remote-attn.cpp
+--- a/uwp/rkva/remote-attn.cpp
++++ b/uwp/rkva/remote-attn.cpp
+@@ -300,7 +300,8 @@
+             if (state.native_serial_prefix_v3_client &&
+                 state.engine->native_serial_prefix_available())
+                 ack.reserved[0] |= RKVA_CAP_KVARN_SERIAL_PREFIX | RKVA_CAP_KVARN_BULK_ATTN |
+-                                   RKVA_CAP_KVARN_BULK_F16 | RKVA_CAP_KVARN_BULK_FP8;
++                                   RKVA_CAP_KVARN_BULK_F16 | RKVA_CAP_KVARN_BULK_FP8 |
++                                   RKVA_CAP_KVARN_BULK_FP8_RNE;
+         }
+         if (!state.native_rewind_v2_client)
+             ack.supported_ops &= ~(1u << RKVA_KVARN_RANGE_REWIND);
+diff --git a/uwp/rkva/rkva-kvarn-bulk.h b/uwp/rkva/rkva-kvarn-bulk.h
+--- a/uwp/rkva/rkva-kvarn-bulk.h
++++ b/uwp/rkva/rkva-kvarn-bulk.h
+@@ -102,7 +102,7 @@
+         return (h & 0x8000u) ? 0xfbu : 0x7bu;
+     }
+     const uint8_t sign_byte = (h & 0x8000u) ? 0x80u : 0x00u;
+-    const uint8_t rounded = uint8_t((mag + 0x0080u) >> 8);
++    const uint8_t rounded = uint8_t((mag + 0x007fu + ((mag >> 8) & 1u)) >> 8);
+     return sign_byte | rounded;
+ }
+ 
+diff --git a/tests/rkva_kvarn_bulk_cpu.cpp b/tests/rkva_kvarn_bulk_cpu.cpp
+--- a/tests/rkva_kvarn_bulk_cpu.cpp
++++ b/tests/rkva_kvarn_bulk_cpu.cpp
+@@ -108,14 +108,21 @@
+     assert(f16_to_fp8_bits(0x0001u) == 0x00u);
+     assert(f16_to_fp8_bits(0x8001u) == 0x80u);
+     assert(f16_to_fp8_bits(0x007fu) == 0x00u);
+-    assert(f16_to_fp8_bits(0x0080u) == 0x01u);
+-    assert(f16_to_fp8_bits(0x8080u) == 0x81u);
++    assert(f16_to_fp8_bits(0x0080u) == 0x00u);
++    assert(f16_to_fp8_bits(0x8080u) == 0x80u);
+     assert(f16_to_fp8_bits(0x0100u) == 0x01u);
+     assert(f16_to_fp8_bits(0x8100u) == 0x81u);
+     assert(f16_to_fp8_bits(0x0200u) == 0x02u);
+     assert(f16_to_fp8_bits(0x8200u) == 0x82u);
+     assert(f16_to_fp8_bits(0x0300u) == 0x03u);
+     assert(f16_to_fp8_bits(0x8300u) == 0x83u);
++
++    assert(f16_to_fp8_bits(0x0180u) == 0x02u);
++    assert(f16_to_fp8_bits(0x0280u) == 0x02u);
++    assert(f16_to_fp8_bits(0x0380u) == 0x04u);
++    assert(f16_to_fp8_bits(0x3c80u) == 0x3cu);
++    assert(f16_to_fp8_bits(0x3d80u) == 0x3eu);
++    assert(f16_to_fp8_bits(0xbc80u) == 0xbcu);
+ 
+     // Infinities and NaNs.
+     assert(f16_to_fp8_bits(0x7c00u) == 0x7cu);

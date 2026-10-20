@@ -1,0 +1,213 @@
+diff --git a/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp b/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp
+--- a/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp
++++ b/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp
+@@ -277,11 +277,15 @@
+ }
+ 
+ static bool rkva_splitzip_decode(const uint8_t * in, size_t in_bytes, uint16_t * dst, size_t n) {
+-    if (in_bytes < sizeof(rkva_splitzip_header)) return false;
+-    const auto * hdr = reinterpret_cast<const rkva_splitzip_header*>(in);
+-    if (hdr->n_elements != n || in_bytes < hdr->compressed_bytes) return false;
+-    const size_t min_bytes = sizeof(rkva_splitzip_header) + n + 2 * ((n + 1) / 2) + hdr->n_escapes;
+-    if (hdr->compressed_bytes < min_bytes || in_bytes < min_bytes) return false;
++    if (!in || (!dst && n > 0) || in_bytes < sizeof(rkva_splitzip_header)) return false;
++    rkva_splitzip_header header{};
++    std::memcpy(&header, in, sizeof(header));
++    const auto * hdr = &header;
++    if (hdr->n_elements != n || hdr->n_escapes > n) return false;
++    const uint64_t count = hdr->n_elements;
++    const uint64_t nibble_bytes = (count + 1) / 2;
++    const uint64_t required_bytes = sizeof(header) + count + 2 * nibble_bytes + hdr->n_escapes;
++    if (hdr->compressed_bytes != required_bytes || in_bytes < required_bytes) return false;
+ 
+     const uint8_t * p = in + sizeof(rkva_splitzip_header);
+     const uint8_t * low_bytes = p; p += n;
+@@ -312,6 +316,7 @@
+         uint16_t h = (sign << 15) | (exp << 10) | (top_m << 8) | lo;
+         dst[i] = h;
+     }
++    if (esc_idx != hdr->n_escapes) return false;
+     return true;
+ }
+ 
+@@ -1842,7 +1847,12 @@
+ }
+ 
+ static void ggml_backend_remote_attn_synchronize(ggml_backend_t backend) {
+-    (void) backend;  // fully synchronous
++    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
++    std::unique_lock<std::mutex> lock(ctx->async_mutex);
++    ctx->async_cv.wait(lock, [ctx] {
++        return ctx->async_state != rkva_async_state::PENDING &&
++               ctx->async_state != rkva_async_state::RUNNING;
++    });
+ }
+ 
+ static enum ggml_status ggml_backend_remote_attn_graph_compute(
+@@ -2560,17 +2570,10 @@
+             GGML_LOG_ERROR("%s: auto wire selection failed: remote server does not advertise FP8 or F16 bulk capability\n", GGML_REMOTE_ATTN_NAME);
+             return false;
+         }
+-    } else if (bulk && bulk_wire == RKVA_WIRE_FP8) {
+-        if (!(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_FP8)) {
+-            const char * strict_env = std::getenv("GGML_RKVA_WIRE_STRICT");
+-            const bool strict_wire = !strict_env || std::strcmp(strict_env, "0") != 0;
+-            if (strict_wire) {
+-                GGML_LOG_ERROR("%s: requested native bulk FP8 RPC is not supported by the negotiated server (missing RKVA_CAP_KVARN_BULK_FP8)\n", GGML_REMOTE_ATTN_NAME);
+-                return false;
+-            }
+-            GGML_LOG_WARN("%s: remote server does not advertise FP8 capability (requires xllama with RKVA_CAP_KVARN_BULK_FP8); falling back to negotiated F16 wire\n", GGML_REMOTE_ATTN_NAME);
+-            bulk_wire = RKVA_WIRE_F16;
+-        }
++    } else if (bulk && bulk_wire == RKVA_WIRE_FP8 &&
++               !(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_FP8)) {
++        GGML_LOG_ERROR("%s: requested native bulk FP8 RPC is not supported by the negotiated server (missing RKVA_CAP_KVARN_BULK_FP8)\n", GGML_REMOTE_ATTN_NAME);
++        return false;
+     }
+     if (bulk && bulk_wire == RKVA_WIRE_SPLITZIP) {
+         GGML_LOG_ERROR("%s: SplitZip wire format is deactivated; use lossless 'f16' instead\n", GGML_REMOTE_ATTN_NAME);
+@@ -2842,6 +2845,16 @@
+     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
+     return ctx->async_local_remote && ctx->connected && !ctx->failed &&
+            ctx->range_configured && ctx->range_native_kvarn && ctx->native_bulk;
++}
++
++void ggml_backend_remote_attn_drain(ggml_backend_t backend) {
++    if (!backend) return;
++    if (ggml_backend_is_local_split(backend)) {
++        ggml_backend_synchronize(backend);
++        return;
++    }
++    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
++    rkva_async_drain(ctx);
+ }
+ 
+ bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend) {
+diff --git a/ggml/include/ggml-remote-attn.h b/ggml/include/ggml-remote-attn.h
+--- a/ggml/include/ggml-remote-attn.h
++++ b/ggml/include/ggml-remote-attn.h
+@@ -132,6 +132,9 @@
+ // True when the opt-in GGML_RKVA_ASYNC_LOCAL_REMOTE=1 overlap was accepted by a
+ // native KVarN4 bulk-capable server. Always false for synchronous/local modes.
+ GGML_API bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend);
++// Terminal graph boundary: wait and discard an unconsumed completion before
++// graph tensors are recycled. Ordinary backend synchronize preserves completion.
++GGML_API void ggml_backend_remote_attn_drain(ggml_backend_t backend);
+ GGML_API bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend);
+ GGML_API bool ggml_backend_remote_attn_native_kvarn_can_restore(ggml_backend_t backend, int32_t pos0);
+ GGML_API bool ggml_backend_remote_attn_native_kvarn_has_state(ggml_backend_t backend);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2182,6 +2182,8 @@
+ 
+     // Release the scheduler before the backends it references.
+     if (backend_remote != nullptr) {
++        // An aborted graph may have submitted a range without reaching its wait.
++        ggml_backend_remote_attn_drain(backend_remote);
+         if (cparams.remote_attn_stats) {
+             const char * stats = ggml_backend_is_local_split(backend_remote) ?
+                 ggml_backend_local_split_stats_json(backend_remote) :
+@@ -5265,6 +5267,8 @@
+ 
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
++        // Finish writes into graph tensors before rollback or buffer reuse.
++        ggml_backend_remote_attn_drain(backend_remote);
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+     }
+     // New backend work is now in flight; the next synchronize() must run the barrier.
+diff --git a/tests/test-remote-attn-range.cpp b/tests/test-remote-attn-range.cpp
+--- a/tests/test-remote-attn-range.cpp
++++ b/tests/test-remote-attn-range.cpp
+@@ -53,6 +53,8 @@
+     std::vector<rkva_range_profile> profile_controls;
+     bool profile_enabled = false;
+     uint32_t kernel_mode = 0;
++    std::vector<uint8_t> fp8_query_prefix;
++    uint8_t fp8_output_byte = 0;
+     profile_failure fail_report = profile_failure::none;
+ 
+     static bool read_all(int fd, void * p, size_t n) {
+@@ -387,10 +389,13 @@
+                             const size_t lse_bytes = size_t(req.n_tokens) * geometry.n_head * sizeof(float);
+                             response.resize(out_bytes + lse_bytes, 0);
+                             if (wire_fp8) {
++                                const size_t query_offset = attn_offset + sizeof(attn) + req.n_tokens * sizeof(int32_t);
++                                assert(payload.size() >= query_offset + 8);
++                                fp8_query_prefix.assign(payload.begin() + query_offset, payload.begin() + query_offset + 8);
+                                 auto * dst_fp8 = reinterpret_cast<uint8_t *>(response.data());
+                                 auto * dst_lse = reinterpret_cast<float *>(response.data() + out_bytes);
+                                 for (uint32_t t = 0; t < req.n_tokens; ++t) {
+-                                    for (size_t d = 0; d < dh; ++d) dst_fp8[t * dh + d] = 0x00u;
++                                    for (size_t d = 0; d < dh; ++d) dst_fp8[t * dh + d] = fp8_output_byte;
+                                     for (uint32_t h = 0; h < geometry.n_head; ++h)
+                                         dst_lse[t * geometry.n_head + h] = float(std::log(double(native_counts[req.layer_id] - req.n_tokens + t + 1)));
+                                 }
+@@ -1060,6 +1065,7 @@
+                 }
+                 ggml_remote_attn_set_active(nullptr);
+                 ggml_backend_buffer_free(buffer); ggml_free(ctx);
++                ggml_backend_free(cpu); ggml_backend_free(backend);
+             }
+         }
+     }
+@@ -1139,8 +1145,9 @@
+     storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
+     storage_env precision("128", "GGML_RKVA_NATIVE_TAIL_TOKENS");
+ 
+-    // Test 1: Requested FP8 bulk without server capability fails closed by default
++    // Explicit FP8 cannot be weakened by the old strictness environment override.
+     {
++        storage_env strict_env("0", "GGML_RKVA_WIRE_STRICT");
+         storage_env bulk_env("1", "GGML_RKVA_NATIVE_BULK");
+         storage_env wire_env("fp8", "GGML_RKVA_WIRE_FORMAT");
+         loopback server(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16);
+@@ -1187,6 +1194,10 @@
+         storage_env wire_env("fp8", "GGML_RKVA_WIRE_FORMAT");
+         const uint32_t nq = 5;
+         loopback server(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32);
++        {
++            std::lock_guard<std::mutex> lock(server.mutex);
++            server.fp8_output_byte = 0x3c;
++        }
+         auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+         ggml_remote_attn_geometry geometry{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
+         assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+@@ -1226,9 +1237,15 @@
+         assert(ggml_remote_attn_exec(node));
+         const auto * out = static_cast<const float *>(node->data);
+         for (uint32_t t = 0; t < nq; ++t) {
+-            for (size_t d = 0; d < 512; ++d) assert(out[t * 514 + d] == 0.0f);
++            for (size_t d = 0; d < 512; ++d) assert(out[t * 514 + d] == 1.0f);
+             for (uint32_t h = 0; h < 2; ++h)
+                 assert(std::abs(double(out[t * 514 + 512 + h]) - std::log(double(live - nq + t + 1))) < 1e-6);
++        }
++        {
++            std::lock_guard<std::mutex> lock(server.mutex);
++            assert(server.fp8_query_prefix.size() == 8);
++            assert(server.fp8_query_prefix[0] == 0x7b && server.fp8_query_prefix[1] == 0xfb);
++            assert(server.fp8_query_prefix[2] == 0x7b && server.fp8_query_prefix[3] == 0xfb);
+         }
+         ggml_remote_attn_set_active(nullptr);
+         ggml_backend_buffer_free(buffer);
+@@ -1326,9 +1343,16 @@
+             node->op_params[GGML_REMOTE_ATTN_PARAM_N_LIVE] = int32_t(live);
+ 
+             assert(ggml_remote_attn_exec(node));
+-            assert(ggml_remote_attn_exec(wait_node));
+-
+-            const auto * out = static_cast<const float *>(wait_node->data);
++            if (iter == 2) {
++                // A terminal graph boundary may discard an unconsumed completion.
++                ggml_backend_remote_attn_drain(backend);
++            } else {
++                // Synchronization must not consume the completion needed by wait.
++                ggml_backend_synchronize(backend);
++                assert(ggml_remote_attn_exec(wait_node));
++            }
++
++            const auto * out = static_cast<const float *>((iter == 2 ? node : wait_node)->data);
+             for (uint32_t t = 0; t < nq; ++t) {
+                 for (size_t d = 0; d < 512; ++d) assert(out[t * 514 + d] == 0.0f);
+                 for (uint32_t h = 0; h < 2; ++h)

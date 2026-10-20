@@ -2182,6 +2182,8 @@ llama_context::~llama_context() {
 
     // Release the scheduler before the backends it references.
     if (backend_remote != nullptr) {
+        // An aborted graph may have submitted a range without reaching its wait.
+        ggml_backend_remote_attn_drain(backend_remote);
         if (cparams.remote_attn_stats) {
             const char * stats = ggml_backend_is_local_split(backend_remote) ?
                 ggml_backend_local_split_stats_json(backend_remote) :
@@ -5265,6 +5267,8 @@ ggml_status llama_context::graph_compute(
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
+        // Finish writes into graph tensors before rollback or buffer reuse.
+        ggml_backend_remote_attn_drain(backend_remote);
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
     // New backend work is now in flight; the next synchronize() must run the barrier.

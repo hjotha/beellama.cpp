@@ -1,0 +1,38 @@
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6819,8 +6819,9 @@
+     if (strcmp(name, "ggml_backend_cuda_memory_checkpoint") == 0) {
+         return (void *)ggml_backend_cuda_memory_checkpoint;
+     }
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+     if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_interface_v1") == 0) {
+-        return (void *)ggml_backend_cuda_remote_attn_fp8_interface();
++        return (void *)ggml_backend_cuda_remote_attn_fp8_interface;
+     }
+     if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_pack_q_v1") == 0) {
+         return (void *)ggml_cuda_remote_attn_fp8_pack_q;
+@@ -6828,6 +6829,7 @@
+     if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_unpack_out_v1") == 0) {
+         return (void *)ggml_cuda_remote_attn_fp8_unpack_out;
+     }
++#endif
+     return nullptr;
+ }
+ 
+--- a/ggml/src/ggml-cuda/remote-attn-cuda.cu
++++ b/ggml/src/ggml-cuda/remote-attn-cuda.cu
+@@ -4,6 +4,8 @@
+ #include <algorithm>
+ #include <cstdint>
+ #include <mutex>
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ 
+ static __device__ __forceinline__ uint32_t rkva_cuda_round_shift_even(uint32_t value, unsigned shift) {
+     const uint32_t base = value >> shift;
+@@ -391,3 +393,5 @@
+ const struct ggml_remote_attn_cuda_fp8_interface * ggml_backend_cuda_remote_attn_fp8_interface(void) {
+     return &s_cuda_remote_attn_fp8_interface;
+ }
++
++#endif // !GGML_USE_HIP && !GGML_USE_MUSA

@@ -1,0 +1,8 @@
+{
+  "ggml/src/ggml-remote-attn/ggml-remote-attn.cpp": "f055d244ad1ea164fd55026b2aedc1f2146b986a62943b21827f0ea3aebe2b60",
+  "ggml/src/ggml-remote-attn/rkva-kvarn-producer.h": "96c0a50052ce0a9448c87c0ef213a060a32988b143ecbaf20339658dbb961d55",
+  "ggml/include/ggml-remote-attn.h": "9ddb90f2ed350ca7f425586605ccf57a2f7ebff111d6e3b6b2db8b2ece803dbd",
+  "tests/test-remote-attn-range.cpp": "113730da41ec9c4b29d2f4378649f4e3683644314e7b8b06b276e284a7b0120a",
+  "/tmp/beellama-phase6-review/xbox-admission/rkva-kvarn-bulk.h": "aa6bf48d4aca0c10f4ac04af2446251f7000ebabcb432a9c5e7b7dda9d55ead3",
+  "/tmp/beellama-phase6-review/xbox-admission/rkva-kvarn-range.h": "fa396b273fc194df62cb391c181171a630a450c1ef682f663f6b24a4656d12be"
+}

@@ -1,0 +1,8 @@
+{
+  "/home/hjotha/xllama-qwen35-xbox/uwp/rkva/rkva-range-profile.h": "ffa5ac0cc9438bc4cacdb1d38302820c33bf449f22ed136bdec71e0decb41bdb",
+  "/home/hjotha/xllama-qwen35-xbox/uwp/rkva/remote-attn-engine.cpp": "674653cc310d4cae5315d135c8ebd1407c898c0ef366f442b91d1a4799546f2c",
+  "/home/hjotha/xllama-qwen35-xbox/shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl": "c5dde6688ef6c005fb1397da6fbc7428dcbada40c43c854025a1cf13b95c023b",
+  "/home/hjotha/xllama-qwen35-xbox/shaders/rkva/rkva_range_reduce_opt.hlsl": "8def0088dc877c29c272563f3b503269848c9b4752d04d258db911e0739fc1cb",
+  "/home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp": "45dd08db9e8637e9af374e1b0ef6368d8cc9c534019e259a7350eec30332d44e",
+  "/home/hjotha/beellama.cpp/src/llama-context.cpp": "c700b5d8eb3e461a0f236f94c038a27964d24f36b8ad82de55391dd3051a7ae3"
+}

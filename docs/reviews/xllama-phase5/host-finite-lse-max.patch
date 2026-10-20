@@ -1,0 +1,31 @@
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -5228,19 +5228,21 @@
+     GGML_ASSERT(o2->ne[0] == head_dim*n_qh && o2->ne[1] == n_q*n_b);
+     ggml_tensor * o1_4d = ggml_reshape_4d(ctx0, o1, head_dim, n_qh, n_q, n_b);
+     ggml_tensor * o2_4d = ggml_reshape_4d(ctx0, o2, head_dim, n_qh, n_q, n_b);
+-    ggml_tensor * c1 = ggml_clamp(ctx0, lse1, -1e6f, 1e30f);
+-    ggml_tensor * c2 = ggml_clamp(ctx0, lse2, -1e6f, 1e30f);
+-    ggml_tensor * mx = ggml_scale(ctx0,
+-            ggml_add(ctx0, ggml_add(ctx0, c1, c2), ggml_abs(ctx0, ggml_sub(ctx0, c1, c2))),
+-            0.5f);
++    // This RPC path admits finite LSE values for both non-empty ranges.
++    // Select an input exactly: clipping or adding large LSE values can make
++    // both exponential weights underflow/overflow despite finite inputs.
++    ggml_tensor * choose1 = ggml_step(ctx0, ggml_sub(ctx0, lse1, lse2));
++    ggml_tensor * choose2 = ggml_scale_bias(ctx0, choose1, -1.0f, 1.0f);
++    ggml_tensor * mx = ggml_add(ctx0,
++            ggml_mul(ctx0, choose1, lse1), ggml_mul(ctx0, choose2, lse2));
+     ggml_tensor * e1 = ggml_exp(ctx0, ggml_sub(ctx0, lse1, mx));
+     ggml_tensor * e2 = ggml_exp(ctx0, ggml_sub(ctx0, lse2, mx));
+     ggml_tensor * w1 = ggml_reshape_4d(ctx0, e1, 1, n_qh, n_q, n_b);
+     ggml_tensor * w2 = ggml_reshape_4d(ctx0, e2, 1, n_qh, n_q, n_b);
+     ggml_tensor * num = ggml_add(ctx0, ggml_mul(ctx0, o1_4d, w1), ggml_mul(ctx0, o2_4d, w2));
+     ggml_tensor * den = ggml_add(ctx0, e1, e2);
+-    // Both ranges are non-empty here (validated above), so den > 0 always:
+-    // plain division is exact with no epsilon, and merged LSE is exact.
++    // With finite LSE inputs, mx equals one input and one weight is exactly 1.
++    // No epsilon is needed for the positive denominator.
+     // Broadcast den as [1,H,Q,B] like the validated merge-graph pattern.
+     ggml_tensor * den_4d = ggml_reshape_4d(ctx0, den, 1, n_qh, n_q, n_b);
+     ggml_tensor * o_merged_4d = ggml_div(ctx0, num, den_4d);

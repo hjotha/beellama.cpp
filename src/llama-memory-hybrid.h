@@ -31,6 +31,9 @@ bool divide_ubatches_at_p(
 
 } // namespace llama_position_split
 
+// Slices a ubatch to the token indices in sel.
+llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int32_t> & sel);
+
 class llama_memory_hybrid : public llama_memory_i {
 public:
     llama_memory_hybrid(

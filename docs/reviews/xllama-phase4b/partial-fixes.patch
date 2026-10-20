@@ -1,0 +1,81 @@
+--- a/uwp/rkva/remote-attn-engine.cpp
++++ b/uwp/rkva/remote-attn-engine.cpp
+@@ -2545,6 +2545,8 @@
+     timer.mark(rp::kCpuAlloc);
+     const uint64_t q_heads = uint64_t(n_tokens) * geo_.n_head;
+     const uint64_t q_bytes = q_heads * geo_.head_dim * 4;
++    const uint64_t positions_offset =
++        s->range_storage == rp::kStorageKvarn4 ? 2 * q_bytes : q_bytes;
+     const uint64_t out_bytes = q_bytes + q_heads * 4;
+     const prof_clock::time_point t_map_start =
+         bulk_prof ? prof_clock::now() : prof_clock::time_point{};
+@@ -2685,7 +2687,7 @@
+         cmd_->SetComputeRootShaderResourceView(1, q_addr);
+         cmd_->SetComputeRootShaderResourceView(2, kv_addr);
+         cmd_->SetComputeRootShaderResourceView(3, kv_addr + s->half_stride);
+-        cmd_->SetComputeRootShaderResourceView(4, q_addr + q_bytes);
++        cmd_->SetComputeRootShaderResourceView(4, q_addr + positions_offset);
+         cmd_->SetComputeRootUnorderedAccessView(
+             5, range_opt_partials_.resource->GetGPUVirtualAddress());
+         cmd_->SetComputeRootUnorderedAccessView(6, range_output_.resource->GetGPUVirtualAddress());
+@@ -2703,10 +2705,7 @@
+             }
+             const uint32_t reduce_params[] = {n_tokens, geo_.n_head, geo_.head_dim, split_k};
+             cmd_->SetComputeRootSignature(range_reduce_root_.Get());
+-            ID3D12PipelineState* reduce_pso = (kvarn && range_reduce_kvarn4_pso_)
+-                                                  ? range_reduce_kvarn4_pso_.Get()
+-                                                  : range_reduce_opt_pso_.Get();
+-            cmd_->SetPipelineState(reduce_pso);
++            cmd_->SetPipelineState(range_reduce_opt_pso_.Get());
+             cmd_->SetComputeRoot32BitConstants(0, 4, reduce_params, 0);
+             cmd_->SetComputeRootShaderResourceView(
+                 1, range_opt_partials_.resource->GetGPUVirtualAddress());
+@@ -2843,7 +2842,7 @@
+         cmd_->SetComputeRootShaderResourceView(1, q_addr);
+         cmd_->SetComputeRootShaderResourceView(2, kv_addr);
+         cmd_->SetComputeRootShaderResourceView(3, kv_addr + s->half_stride);
+-        cmd_->SetComputeRootShaderResourceView(4, q_addr + q_bytes);
++        cmd_->SetComputeRootShaderResourceView(4, q_addr + positions_offset);
+         cmd_->SetComputeRootUnorderedAccessView(
+             5, range_opt_partials_.resource->GetGPUVirtualAddress());
+         cmd_->SetComputeRootUnorderedAccessView(6, range_output_.resource->GetGPUVirtualAddress());
+@@ -2937,7 +2936,7 @@
+     cmd_->SetComputeRootShaderResourceView(1, q_addr);
+     cmd_->SetComputeRootShaderResourceView(2, kv_addr);
+     cmd_->SetComputeRootShaderResourceView(3, kv_addr + s->half_stride);
+-    cmd_->SetComputeRootShaderResourceView(4, q_addr + q_bytes);
++    cmd_->SetComputeRootShaderResourceView(4, q_addr + positions_offset);
+     cmd_->SetComputeRootUnorderedAccessView(5, range_partials_.resource->GetGPUVirtualAddress());
+     cmd_->Dispatch(geo_.n_head, n_tokens, split_k);
+     uav_barrier(range_partials_);
+--- a/uwp/rkva/rkva-kvarn-bulk-f16.inc
++++ b/uwp/rkva/rkva-kvarn-bulk-f16.inc
+@@ -92,7 +92,7 @@
+             return false;
+         if (gpu_convert) {
+             const uint64_t query_upload_bytes = q_f16_bytes + pos_bytes;
+-            const uint64_t query_default_bytes = q_f32_bytes + pos_bytes;
++            const uint64_t query_default_bytes = 2 * q_f32_bytes + pos_bytes;
+             const uint64_t packed_output_bytes = q_f16_bytes + lse_bytes;
+             if ((transfer.query_f16_upload.bytes < query_upload_bytes &&
+                  !create_buffer(query_upload_bytes, D3D12_HEAP_TYPE_UPLOAD,
+@@ -114,7 +114,7 @@
+                                 &transfer.readback, error)))
+                 return false;
+         } else {
+-            const uint64_t query_bytes = q_f32_bytes + pos_bytes;
++            const uint64_t query_bytes = 2 * q_f32_bytes + pos_bytes;
+             const uint64_t output_bytes = q_f32_bytes + lse_bytes;
+             if ((transfer.query.bytes < query_bytes &&
+                  !create_buffer(query_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+--- a/shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl
++++ b/shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl
+@@ -597,6 +597,8 @@
+                                          merged_body[k] + merged_tail[k], merged_max[g], merged_den[g]);
+                         }
+                     } else {
++                        // Retire LDS reads before the next query reuses gs_* storage.
++                        GroupMemoryBarrierWithGroupSync();
+                         [unroll] for (uint k = 0; k < RKVA_ELEMS; ++k) {
+                             uint g = k / 2, d = tid + (k & 1) * 128;
+                             store_result(qi * n_head + kv_head * RKVA_GQA + g, d, split,

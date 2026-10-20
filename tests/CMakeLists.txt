@@ -850,6 +850,14 @@ target_link_libraries(test-position-split-mask-memo PRIVATE llama)
 add_test(NAME test-position-split-mask-memo WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-mask-memo>)
 set_property(TEST test-position-split-mask-memo PROPERTY LABELS main)
 
+# Fase 7: Wavefront Causal de Tiles 64/128 e Serviço Progressivo de Prefill
+add_executable(test-wavefront-pipeline test-wavefront-pipeline.cpp)
+target_include_directories(test-wavefront-pipeline PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+target_compile_features(test-wavefront-pipeline PRIVATE cxx_std_17)
+target_link_libraries(test-wavefront-pipeline PRIVATE llama ggml)
+add_test(NAME test-wavefront-pipeline WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-wavefront-pipeline>)
+set_property(TEST test-wavefront-pipeline PROPERTY LABELS main)
+
 # Phase-1 scaffold of the fused position-split span op (CPU-only, no GPU).
 add_executable(test-kvarn-split-fused-scaffold test-kvarn-split-fused-scaffold.cpp)
 target_include_directories(test-kvarn-split-fused-scaffold PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)

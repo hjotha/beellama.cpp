@@ -145,6 +145,209 @@ static inline bool rkva_f16_to_f32_batch(const uint16_t * src, float * dst, size
 #endif
 }
 
+static inline uint32_t rkva_round_shift_even(uint32_t value, unsigned shift) {
+    const uint32_t base = value >> shift;
+    const uint32_t remainder = value & ((uint32_t(1) << shift) - 1);
+    const uint32_t halfway = uint32_t(1) << (shift - 1);
+    return base + (remainder > halfway || (remainder == halfway && (base & 1)));
+}
+
+// Direct F32 to finite E5M2: nearest-even, finite saturation, signed zero.
+static inline bool rkva_f32_to_fp8_scalar(float value, uint8_t & result) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t magnitude = bits & 0x7fffffffu;
+    const uint8_t sign = uint8_t((bits >> 24) & 0x80u);
+    if (magnitude >= 0x7f800000u) return false;
+    if (magnitude >= 0x47600000u) {
+        result = sign | 0x7bu;
+        return true;
+    }
+    if (magnitude <= 0x37000000u) {
+        result = sign;
+        return true;
+    }
+    const uint32_t exponent = magnitude >> 23;
+    const uint32_t mantissa = magnitude & 0x7fffffu;
+    const uint32_t encoded = magnitude < 0x38800000u ?
+        rkva_round_shift_even(mantissa | 0x800000u, 134u - exponent) :
+        ((exponent - 112u) << 2) + rkva_round_shift_even(mantissa, 21);
+    result = sign | uint8_t(encoded);
+    return true;
+}
+
+// FP8 E5M2 wire codec: finite saturation and direct nearest-even rounding.
+static inline bool rkva_f32_to_fp8_batch(const float * src, uint8_t * dst, size_t n) {
+#if defined(__AVX2__) && defined(__F16C__)
+    size_t i = 0;
+    const __m256 max_fp8  = _mm256_set1_ps(57344.0f);
+    const __m256 min_fp8  = _mm256_set1_ps(-57344.0f);
+    const __m256 inf_ps   = _mm256_set1_ps(std::numeric_limits<float>::infinity());
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        __m256 abs_v = _mm256_andnot_ps(sign_mask, v);
+        __m256 is_finite = _mm256_cmp_ps(abs_v, inf_ps, _CMP_LT_OQ);
+        int mask = _mm256_movemask_ps(is_finite);
+        if (__builtin_expect(mask != 0xFF, 0)) return false;
+        // Explicit clamp finite values exceeding 57344.0f to 57344.0f (0x7b / 0xfb)
+        v = _mm256_min_ps(v, max_fp8);
+        v = _mm256_max_ps(v, min_fp8);
+        __m128i h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        const __m128i retained_lsb = _mm_and_si128(_mm_srli_epi16(h, 8), _mm_set1_epi16(1));
+        __m128i rounded = _mm_add_epi16(h, _mm_add_epi16(_mm_set1_epi16(0x007f), retained_lsb));
+        __m128i shifted = _mm_srli_epi16(rounded, 8);
+        __m128i packed = _mm_packus_epi16(shifted, shifted);
+        _mm_storel_epi64((__m128i*)(dst + i), packed);
+        // A first rounding can only change the FP8 decision at an F16 midpoint.
+        const __m128i midpoint = _mm_cmpeq_epi16(_mm_and_si128(h, _mm_set1_epi16(0x00ff)),
+                                               _mm_set1_epi16(0x0080));
+        const int midpoint_mask = _mm_movemask_epi8(midpoint);
+        if (__builtin_expect(midpoint_mask != 0, 0)) {
+            for (size_t lane = 0; lane < 8; ++lane) {
+                if ((midpoint_mask & (3 << (2 * lane))) &&
+                    !rkva_f32_to_fp8_scalar(src[i + lane], dst[i + lane])) return false;
+            }
+        }
+    }
+    for (; i < n; ++i) {
+        if (!rkva_f32_to_fp8_scalar(src[i], dst[i])) return false;
+    }
+    return true;
+#else
+    for (size_t i = 0; i < n; ++i) {
+        if (!rkva_f32_to_fp8_scalar(src[i], dst[i])) return false;
+    }
+    return true;
+#endif
+}
+
+static inline bool rkva_fp8_to_f32_batch(const uint8_t * src, float * dst, size_t n) {
+#if defined(__AVX2__) && defined(__F16C__)
+    size_t i = 0;
+    const __m128i exp_mask = _mm_set1_epi16(0x7c00);
+    for (; i + 8 <= n; i += 8) {
+        __m128i b = _mm_loadl_epi64((const __m128i*)(src + i));
+        __m128i h = _mm_slli_epi16(_mm_cvtepu8_epi16(b), 8);
+        __m128i exps = _mm_and_si128(h, exp_mask);
+        __m128i is_inf_nan = _mm_cmpeq_epi16(exps, exp_mask);
+        if (__builtin_expect(!_mm_testz_si128(is_inf_nan, is_inf_nan), 0)) return false;
+        __m256 f = _mm256_cvtph_ps(h);
+        _mm256_storeu_ps(dst + i, f);
+    }
+    for (; i < n; ++i) {
+        uint16_t h = uint16_t(src[i]) << 8;
+        if ((h & 0x7c00u) == 0x7c00u) return false;
+        dst[i] = f16_bits_to_f32(h);
+    }
+    return true;
+#else
+    for (size_t i = 0; i < n; ++i) {
+        uint16_t h = uint16_t(src[i]) << 8;
+        if ((h & 0x7c00u) == 0x7c00u) return false;
+        dst[i] = f16_bits_to_f32(h);
+    }
+    return true;
+#endif
+}
+
+// Option B: SplitZip FP16 lossless exponent-split codec
+static const uint8_t kSplitZipTopExponents[15] = {
+    14, 15, 13, 12, 16, 11, 10, 17, 9, 18, 8, 19, 7, 20, 6
+};
+
+struct rkva_splitzip_header {
+    uint32_t n_elements;
+    uint32_t n_escapes;
+    uint32_t compressed_bytes;
+};
+
+static size_t rkva_splitzip_encode(const uint16_t * src, size_t n, std::vector<uint8_t> & out) {
+    uint8_t exp_to_code[32];
+    std::memset(exp_to_code, 0x0F, sizeof(exp_to_code));
+    for (uint8_t code = 0; code < 15; ++code) {
+        exp_to_code[kSplitZipTopExponents[code]] = code;
+    }
+
+    std::vector<uint8_t> escapes;
+    out.resize(sizeof(rkva_splitzip_header) + n * 4 + 16);
+    auto * hdr = reinterpret_cast<rkva_splitzip_header*>(out.data());
+    hdr->n_elements = (uint32_t)n;
+    hdr->n_escapes = 0;
+
+    uint8_t * p = out.data() + sizeof(rkva_splitzip_header);
+    for (size_t i = 0; i < n; ++i) {
+        p[i] = (uint8_t)(src[i] & 0xFF);
+    }
+    p += n;
+    for (size_t i = 0; i < n; i += 2) {
+        uint8_t e0 = (src[i] >> 10) & 0x1F;
+        uint8_t c0 = exp_to_code[e0];
+        uint8_t e1 = (i + 1 < n) ? ((src[i + 1] >> 10) & 0x1F) : 0;
+        uint8_t c1 = (i + 1 < n) ? exp_to_code[e1] : 0;
+        *p++ = (c0 << 4) | (c1 & 0x0F);
+        if (c0 == 0x0F) escapes.push_back((uint8_t)((src[i] >> 8) & 0xFF));
+        if (c1 == 0x0F && i + 1 < n) escapes.push_back((uint8_t)((src[i + 1] >> 8) & 0xFF));
+    }
+    for (size_t i = 0; i < n; i += 2) {
+        uint8_t s0 = ((src[i] >> 15) & 1) << 2 | ((src[i] >> 8) & 3);
+        uint8_t s1 = (i + 1 < n) ? (((src[i + 1] >> 15) & 1) << 2 | ((src[i + 1] >> 8) & 3)) : 0;
+        *p++ = (s0 << 4) | (s1 & 0x0F);
+    }
+    if (!escapes.empty()) {
+        std::memcpy(p, escapes.data(), escapes.size());
+        p += escapes.size();
+    }
+    hdr->n_escapes = (uint32_t)escapes.size();
+    hdr->compressed_bytes = (uint32_t)(p - out.data());
+    out.resize(hdr->compressed_bytes);
+    return out.size();
+}
+
+static bool rkva_splitzip_decode(const uint8_t * in, size_t in_bytes, uint16_t * dst, size_t n) {
+    if (!in || (!dst && n > 0) || in_bytes < sizeof(rkva_splitzip_header)) return false;
+    rkva_splitzip_header header{};
+    std::memcpy(&header, in, sizeof(header));
+    const auto * hdr = &header;
+    if (hdr->n_elements != n || hdr->n_escapes > n) return false;
+    const uint64_t count = hdr->n_elements;
+    const uint64_t nibble_bytes = (count + 1) / 2;
+    const uint64_t required_bytes = sizeof(header) + count + 2 * nibble_bytes + hdr->n_escapes;
+    if (hdr->compressed_bytes != required_bytes || in_bytes < required_bytes) return false;
+
+    const uint8_t * p = in + sizeof(rkva_splitzip_header);
+    const uint8_t * low_bytes = p; p += n;
+    const uint8_t * exp_nibbles = p; p += (n + 1) / 2;
+    const uint8_t * sm_nibbles = p; p += (n + 1) / 2;
+    const uint8_t * esc_ptr = p;
+
+    size_t esc_idx = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t lo = low_bytes[i];
+        uint8_t exp_pair = exp_nibbles[i / 2];
+        uint8_t code = (i % 2 == 0) ? (exp_pair >> 4) : (exp_pair & 0x0F);
+
+        uint8_t sm_pair = sm_nibbles[i / 2];
+        uint8_t sm3 = (i % 2 == 0) ? (sm_pair >> 4) : (sm_pair & 0x0F);
+        uint16_t sign = (sm3 >> 2) & 1;
+        uint16_t top_m = sm3 & 3;
+
+        uint16_t exp;
+        if (code == 0x0F) {
+            if (esc_idx >= hdr->n_escapes) return false;
+            uint8_t raw_hi = esc_ptr[esc_idx++];
+            exp = (raw_hi >> 2) & 0x1F;
+        } else {
+            exp = kSplitZipTopExponents[code];
+        }
+
+        uint16_t h = (sign << 15) | (exp << 10) | (top_m << 8) | lo;
+        dst[i] = h;
+    }
+    if (esc_idx != hdr->n_escapes) return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // persistent socket
 // ---------------------------------------------------------------------------
@@ -274,29 +477,76 @@ struct rkva_stats {
 };
 
 // ---------------------------------------------------------------------------
-// bounded async overlap job (native KVarN4 bulk range only)
+// ---------------------------------------------------------------------------
+// 2-slot async queue with single TCP owner (native KVarN4 bulk range only)
 // ---------------------------------------------------------------------------
 
-enum class rkva_async_state {
-    IDLE,
+enum class rkva_slot_state {
+    FREE,
+    PREPARING, // slot reserved by submitter, preparing payload
     PENDING,   // submitted, worker has not started the RPC
-    RUNNING,   // worker owns the persistent stream
-    DONE_OK,
-    DONE_ERR,
+    RUNNING,   // worker owns the persistent TCP stream and runs RPC / decodes reply
+    DONE_OK,   // reply decoded into output; ready for consumer wait_node
+    DONE_ERR,  // RPC or validation failed; fail closed
 };
 
-struct rkva_async_job {
-    std::vector<uint8_t> payload;
-    uint8_t * output = nullptr;
-    size_t    output_stride = 0;
-    uint32_t  layer = 0;
-    uint32_t  nq = 0;
-    uint32_t  segments = 0;
-    uint32_t  out_width = 0;
-    uint64_t  upload_bytes = 0;
-    int32_t   first_pos = 0;
-    int32_t   last_pos = 0;
-    bool      bulk_f16 = false;
+struct rkva_async_slot {
+    uint32_t        id = 0;
+    rkva_slot_state state = rkva_slot_state::FREE;
+    uint64_t        epoch = 0;
+    uint64_t        ticket = 0;
+
+    std::vector<uint8_t>  payload;          // TX staging buffer (reusable, grow-only)
+    std::vector<uint8_t>  reply;            // RX staging buffer (reusable, grow-only)
+    std::vector<uint8_t>  segment_scratch;  // per-slot scratch for owner->append
+    std::vector<int32_t>  pos_scratch;      // positions scratch for this slot
+    std::vector<float>    f32_scratch;      // queries scratch for this slot
+    std::vector<float>    original_k;       // keys scratch for this slot
+    std::vector<float>    original_v;       // values scratch for this slot
+    std::vector<uint16_t> decode_f16;       // intermediate f16 decode scratch
+
+    struct ggml_tensor * node = nullptr;   // submitted range node
+    uint8_t *            output = nullptr;
+    size_t               output_stride = 0;
+    uint32_t             layer = 0;
+    uint32_t             nq = 0;
+    uint32_t             segments = 0;
+    uint32_t             start_rows = 0;
+    uint32_t             end_rows = 0;
+    uint32_t             out_width = 0;
+    uint64_t             upload_bytes = 0;
+    int32_t              first_pos = 0;
+    int32_t              last_pos = 0;
+    bool                 bulk_f16 = false;
+    rkva_wire            wire = RKVA_WIRE_F16;
+
+    void reset() {
+        state = rkva_slot_state::FREE;
+        epoch = 0;
+        ticket = 0;
+        node = nullptr;
+        output = nullptr;
+        output_stride = 0;
+        layer = 0;
+        nq = 0;
+        segments = 0;
+        start_rows = 0;
+        end_rows = 0;
+        out_width = 0;
+        upload_bytes = 0;
+        first_pos = 0;
+        last_pos = 0;
+        bulk_f16 = false;
+        wire = RKVA_WIRE_F16;
+        payload.clear();
+        reply.clear();
+        segment_scratch.clear();
+        pos_scratch.clear();
+        f32_scratch.clear();
+        original_k.clear();
+        original_v.clear();
+        decode_f16.clear();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -307,25 +557,23 @@ struct ggml_backend_remote_attn_context {
     std::string host;
     uint16_t    port = 0;
 
-    std::mutex  mutex;                 // serializes the single in-flight call
+    std::mutex  mutex;                 // serializes non-async calls and ACK commits
     rkva_socket sock;
     bool        connected = false;
     bool        failed = false;
     uint64_t    cycle_id = 0;
 
-    // One ordered owner of the persistent stream. The worker is the only
-    // thread that runs a submitted job; async_state is protected by
-    // async_mutex, while the job itself runs under mutex.
+    // 2-slot async queue managed by worker thread with single TCP owner.
+    // Slots decouple host preparation, staging and socket IO with deterministic backpressure.
+    static constexpr size_t RKVA_ASYNC_QUEUE_CAPACITY = 2;
     std::mutex              async_mutex;
     std::condition_variable async_cv;
     std::thread             async_worker;
-    rkva_async_state        async_state = rkva_async_state::IDLE;
     bool                    async_stop = false;
-    std::unique_ptr<rkva_async_job> async_job;
-    std::unique_ptr<rkva_async_job> async_job_reusable;
-    std::vector<uint8_t>            async_reply_buffer;
-    struct ggml_tensor *    async_node = nullptr;
+    uint64_t                async_ticket_counter = 0;
+    rkva_async_slot         async_slots[RKVA_ASYNC_QUEUE_CAPACITY];
     bool                    async_local_remote = false;
+    std::mutex              stats_mutex;
 
     ggml_remote_attn_geometry geo {};
     bool        geo_set = false;
@@ -369,6 +617,21 @@ struct ggml_backend_remote_attn_context {
     // (they may live in CUDA or be views of CUDA tensors co-located by the
     // scheduler, so we must read via ggml_backend_tensor_get, never ->data).
     std::vector<float> f32_scratch;
+
+    ggml_backend_remote_attn_context() {
+        for (size_t i = 0; i < RKVA_ASYNC_QUEUE_CAPACITY; ++i) {
+            async_slots[i].id = uint32_t(i);
+            try {
+                async_slots[i].payload.reserve(8u << 20);
+                async_slots[i].reply.reserve(4u << 20);
+                async_slots[i].segment_scratch.reserve(1u << 20);
+                async_slots[i].pos_scratch.reserve(256);
+                async_slots[i].f32_scratch.reserve(256 * 256);
+            } catch (...) {
+                // Ignore reservation failure at init; will grow on demand if needed
+            }
+        }
+    }
 };
 
 static uint64_t now_us() {
@@ -442,16 +705,19 @@ static bool rkva_transact(
     }
     const uint64_t t1 = now_us();
 
-    ctx->stats.calls++;
-    ctx->stats.bytes_tx += sizeof(req) + payload_bytes;
-    ctx->stats.bytes_rx += sizeof(rsp) + rsp.payload_bytes;
-    const uint64_t rtt = t1 - t0;
-    ctx->stats.rpc_us_sum += rtt;
-    ctx->stats.rpc_us_max = std::max(ctx->stats.rpc_us_max, rtt);
-    ctx->stats.xbox_compute_us_sum += rsp.xbox_compute_us;
-    ctx->stats.xbox_prepare_us_sum += rsp.xbox_prepare_us;
-    if (ctx->stats.rpc_us.size() < 1000000) {
-        ctx->stats.rpc_us.push_back(rtt);
+    {
+        std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+        ctx->stats.calls++;
+        ctx->stats.bytes_tx += sizeof(req) + payload_bytes;
+        ctx->stats.bytes_rx += sizeof(rsp) + rsp.payload_bytes;
+        const uint64_t rtt = t1 - t0;
+        ctx->stats.rpc_us_sum += rtt;
+        ctx->stats.rpc_us_max = std::max(ctx->stats.rpc_us_max, rtt);
+        ctx->stats.xbox_compute_us_sum += rsp.xbox_compute_us;
+        ctx->stats.xbox_prepare_us_sum += rsp.xbox_prepare_us;
+        if (ctx->stats.rpc_us.size() < 1000000) {
+            ctx->stats.rpc_us.push_back(rtt);
+        }
     }
     return true;
 }
@@ -460,49 +726,91 @@ static bool rkva_transact(
 // bounded async overlap (native KVarN4 bulk range only)
 // ---------------------------------------------------------------------------
 
-// Caller owns ctx->mutex and the single job slot. This is the only part of a
-// submitted native range that touches the ordered RPC stream.
+static bool rkva_has_free_slot(const ggml_backend_remote_attn_context * ctx) {
+    for (const auto & s : ctx->async_slots) {
+        if (s.state == rkva_slot_state::FREE) return true;
+    }
+    return false;
+}
+
+// The worker thread has sole ownership of ctx->sock. Network transmit/receive
+// and reply decoding run without ctx->mutex to prevent host CPU stall.
+// ctx->mutex is only acquired briefly to commit generation and ACK coverage.
 static bool rkva_finish_native_bulk_job(
-        ggml_backend_remote_attn_context * ctx, const rkva_async_job & job) {
-    if (job.layer >= ctx->range_layers.size() ||
-            job.layer >= ctx->native_layers.size() || !job.output) {
+        ggml_backend_remote_attn_context * ctx, rkva_async_slot & slot) {
+    if (slot.layer >= ctx->range_layers.size() ||
+            slot.layer >= ctx->native_layers.size() || !slot.output) {
         return false;
     }
-    auto & cached = ctx->range_layers[job.layer];
-    auto * owner = ctx->native_layers[job.layer].get();
+    auto & cached = ctx->range_layers[slot.layer];
+    auto * owner = ctx->native_layers[slot.layer].get();
     if (!owner) {
         return false;
     }
-    const size_t out_elem_bytes = job.bulk_f16 ? sizeof(uint16_t) : sizeof(float);
-    const size_t out_bytes = size_t(job.nq) * job.out_width * out_elem_bytes;
-    const size_t lse_bytes = size_t(job.nq) * ctx->geo.n_head * sizeof(float);
-    const size_t row_bytes = (size_t(job.out_width) + ctx->geo.n_head) * sizeof(float);
-    if (job.nq == 0 || job.out_width == 0 || job.output_stride < row_bytes ||
-            job.payload.size() > (256u << 20) ||
+    const rkva_wire wire = slot.wire;
+    const size_t out_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t) :
+                                  (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t) :
+                                  sizeof(float);
+    const size_t out_bytes = size_t(slot.nq) * slot.out_width * out_elem_bytes;
+    const size_t lse_bytes = size_t(slot.nq) * ctx->geo.n_head * sizeof(float);
+    const size_t row_bytes = (size_t(slot.out_width) + ctx->geo.n_head) * sizeof(float);
+    if (slot.nq == 0 || slot.out_width == 0 || slot.output_stride < row_bytes ||
+            slot.payload.size() > (256u << 20) ||
             out_bytes + lse_bytes > (256u << 20)) {
         return false;
     }
-    auto & reply = ctx->async_reply_buffer;
+    auto & reply = slot.reply;
     if (reply.capacity() < (4u << 20)) {
         reply.reserve(4u << 20);
     }
     if (!rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, ctx->active_session,
-                job.layer, job.nq, job.payload.data(), uint32_t(job.payload.size()),
+                slot.layer, slot.nq, slot.payload.data(), uint32_t(slot.payload.size()),
                 reply, uint32_t(out_bytes + lse_bytes))) {
         return false;
     }
-    if (job.bulk_f16) {
-        const auto * src_f16 = reinterpret_cast<const uint16_t *>(reply.data());
+    if (wire == RKVA_WIRE_FP8) {
+        const auto * src_fp8 = reinterpret_cast<const uint8_t *>(reply.data());
         const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
-        for (size_t row = 0; row < job.nq; ++row) {
-            auto * dst = static_cast<float *>(static_cast<void *>(job.output + row * job.output_stride));
-            if (!rkva_f16_to_f32_batch(src_f16 + row * job.out_width, dst, job.out_width)) {
+        for (size_t row = 0; row < slot.nq; ++row) {
+            auto * dst = static_cast<float *>(static_cast<void *>(slot.output + row * slot.output_stride));
+            if (!rkva_fp8_to_f32_batch(src_fp8 + row * slot.out_width, dst, slot.out_width)) {
                 return false;
             }
             for (size_t h = 0; h < ctx->geo.n_head; ++h) {
                 const float lse_val = src_lse[row * ctx->geo.n_head + h];
                 if (!std::isfinite(lse_val)) return false;
-                dst[job.out_width + h] = lse_val;
+                dst[slot.out_width + h] = lse_val;
+            }
+        }
+    } else if (wire == RKVA_WIRE_SPLITZIP) {
+        slot.decode_f16.resize(slot.nq * slot.out_width);
+        if (!rkva_splitzip_decode(reply.data(), out_bytes, slot.decode_f16.data(), slot.decode_f16.size())) {
+            std::memcpy(slot.decode_f16.data(), reply.data(), out_bytes);
+        }
+        const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
+        for (size_t row = 0; row < slot.nq; ++row) {
+            auto * dst = static_cast<float *>(static_cast<void *>(slot.output + row * slot.output_stride));
+            if (!rkva_f16_to_f32_batch(slot.decode_f16.data() + row * slot.out_width, dst, slot.out_width)) {
+                return false;
+            }
+            for (size_t h = 0; h < ctx->geo.n_head; ++h) {
+                const float lse_val = src_lse[row * ctx->geo.n_head + h];
+                if (!std::isfinite(lse_val)) return false;
+                dst[slot.out_width + h] = lse_val;
+            }
+        }
+    } else if (wire == RKVA_WIRE_F16) {
+        const auto * src_f16 = reinterpret_cast<const uint16_t *>(reply.data());
+        const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
+        for (size_t row = 0; row < slot.nq; ++row) {
+            auto * dst = static_cast<float *>(static_cast<void *>(slot.output + row * slot.output_stride));
+            if (!rkva_f16_to_f32_batch(src_f16 + row * slot.out_width, dst, slot.out_width)) {
+                return false;
+            }
+            for (size_t h = 0; h < ctx->geo.n_head; ++h) {
+                const float lse_val = src_lse[row * ctx->geo.n_head + h];
+                if (!std::isfinite(lse_val)) return false;
+                dst[slot.out_width + h] = lse_val;
             }
         }
     } else {
@@ -513,31 +821,38 @@ static bool rkva_finish_native_bulk_job(
                 return false;
             }
         }
-        for (size_t row = 0; row < job.nq; ++row) {
-            auto * dst = job.output + row * job.output_stride;
-            std::memcpy(dst, reply.data() + row * job.out_width * sizeof(float),
-                    job.out_width * sizeof(float));
-            std::memcpy(dst + job.out_width * sizeof(float),
+        for (size_t row = 0; row < slot.nq; ++row) {
+            auto * dst = slot.output + row * slot.output_stride;
+            std::memcpy(dst, reply.data() + row * slot.out_width * sizeof(float),
+                    slot.out_width * sizeof(float));
+            std::memcpy(dst + slot.out_width * sizeof(float),
                     reply.data() + out_bytes + row * ctx->geo.n_head * sizeof(float),
                     ctx->geo.n_head * sizeof(float));
         }
     }
-    // Publish host coverage only after the single ordered server ACK. Any
-    // failure above poisons the context before this point.
-    if (ctx->native_generation > UINT64_MAX - job.segments) {
+
+    // Publish host coverage only after the single ordered server ACK.
+    std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
+    if (slot.epoch != ctx->range_epoch) {
         return false;
     }
-    ctx->native_generation += job.segments;
-    cached.epoch = ctx->range_epoch;
-    cached.rows = owner->rows();
-    ctx->stats.range_upload_calls += job.segments;
-    ctx->stats.range_upload_rows += job.nq;
-    ctx->stats.range_upload_bytes += job.upload_bytes;
-    ctx->stats.range_attn_calls += job.segments;
-    if (ctx->stats.range_query_min < 0 || job.first_pos < ctx->stats.range_query_min) {
-        ctx->stats.range_query_min = job.first_pos;
+    if (ctx->native_generation > UINT64_MAX - slot.segments) {
+        return false;
     }
-    ctx->stats.range_query_max = std::max<int64_t>(ctx->stats.range_query_max, job.last_pos);
+    ctx->native_generation += slot.segments;
+    cached.epoch = ctx->range_epoch;
+    cached.rows = slot.end_rows;
+    {
+        std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+        ctx->stats.range_upload_calls += slot.segments;
+        ctx->stats.range_upload_rows += slot.nq;
+        ctx->stats.range_upload_bytes += slot.upload_bytes;
+        ctx->stats.range_attn_calls += slot.segments;
+        if (ctx->stats.range_query_min < 0 || slot.first_pos < ctx->stats.range_query_min) {
+            ctx->stats.range_query_min = slot.first_pos;
+        }
+        ctx->stats.range_query_max = std::max<int64_t>(ctx->stats.range_query_max, slot.last_pos);
+    }
     return true;
 }
 
@@ -545,58 +860,84 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
     std::unique_lock<std::mutex> lock(ctx->async_mutex);
     for (;;) {
         ctx->async_cv.wait(lock, [ctx] {
-            return ctx->async_stop || ctx->async_state == rkva_async_state::PENDING;
+            if (ctx->async_stop) return true;
+            for (const auto & s : ctx->async_slots) {
+                if (s.state == rkva_slot_state::PENDING) return true;
+            }
+            return false;
         });
         if (ctx->async_stop) {
             return;
         }
-        std::unique_ptr<rkva_async_job> job = std::move(ctx->async_job);
-        ctx->async_state = rkva_async_state::RUNNING;
+
+        // Strictly ordered single TCP owner: pick the pending slot with the lowest ticket
+        rkva_async_slot * slot = nullptr;
+        uint64_t min_ticket = UINT64_MAX;
+        for (auto & s : ctx->async_slots) {
+            if (s.state == rkva_slot_state::PENDING && s.ticket < min_ticket) {
+                min_ticket = s.ticket;
+                slot = &s;
+            }
+        }
+        if (!slot) {
+            continue;
+        }
+        slot->state = rkva_slot_state::RUNNING;
         lock.unlock();
 
         bool ok = false;
-        {
+        if (!ctx->failed && ctx->connected) {
+            try {
+                ok = rkva_finish_native_bulk_job(ctx, *slot);
+            } catch (const std::exception & error) {
+                GGML_LOG_ERROR("%s: async native KVarN4 RPC failed: %s\n",
+                        GGML_REMOTE_ATTN_NAME, error.what());
+            } catch (...) {
+                // Fall through to fail-closed
+            }
+        }
+        if (!ok) {
+            // An uncertain ordered-stream/GPU mutation must fail closed.
             std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
-            if (!ctx->failed && ctx->connected && job) {
-                try {
-                    ok = rkva_finish_native_bulk_job(ctx, *job);
-                } catch (const std::exception & error) {
-                    GGML_LOG_ERROR("%s: async native KVarN4 RPC failed: %s\n",
-                            GGML_REMOTE_ATTN_NAME, error.what());
-                } catch (...) {
-                    // Fall through to the fail-closed path.
-                }
-            }
-            if (!ok) {
-                // An uncertain ordered-stream/GPU mutation must fail closed.
-                ctx->failed = true;
-                ctx->connected = false;
-                ctx->sock.close();
-            }
+            ctx->failed = true;
+            ctx->connected = false;
+            ctx->sock.close();
         }
 
         lock.lock();
-        ctx->async_state = ok ? rkva_async_state::DONE_OK : rkva_async_state::DONE_ERR;
+        slot->state = ok ? rkva_slot_state::DONE_OK : rkva_slot_state::DONE_ERR;
+        if (!ok) {
+            // Error barrier: cancel any remaining pending or preparing slots
+            for (auto & s : ctx->async_slots) {
+                if (s.state == rkva_slot_state::PENDING ||
+                    s.state == rkva_slot_state::PREPARING) {
+                    s.state = rkva_slot_state::DONE_ERR;
+                }
+            }
+        }
         ctx->async_cv.notify_all();
     }
 }
 
-// Wait for any submitted job and discard a completed-but-unconsumed result.
+// Wait for any submitted jobs and discard completed-but-unconsumed results.
 // The remote session is only mutated after this returns.
 static void rkva_async_drain(ggml_backend_remote_attn_context * ctx) {
     std::unique_lock<std::mutex> lock(ctx->async_mutex);
     ctx->async_cv.wait(lock, [ctx] {
-        return ctx->async_state != rkva_async_state::PENDING &&
-               ctx->async_state != rkva_async_state::RUNNING;
-    });
-    if (ctx->async_state == rkva_async_state::DONE_OK ||
-            ctx->async_state == rkva_async_state::DONE_ERR) {
-        ctx->async_state = rkva_async_state::IDLE;
-        if (ctx->async_job) {
-            ctx->async_job->payload.clear();
-            ctx->async_job_reusable = std::move(ctx->async_job);
+        for (const auto & s : ctx->async_slots) {
+            if (s.state == rkva_slot_state::PENDING ||
+                s.state == rkva_slot_state::RUNNING ||
+                s.state == rkva_slot_state::PREPARING) {
+                return false;
+            }
         }
-        ctx->async_node = nullptr;
+        return true;
+    });
+    for (auto & s : ctx->async_slots) {
+        if (s.state == rkva_slot_state::DONE_OK ||
+            s.state == rkva_slot_state::DONE_ERR) {
+            s.reset();
+        }
     }
     lock.unlock();
     ctx->async_cv.notify_all();
@@ -612,17 +953,17 @@ static std::unique_lock<std::mutex> rkva_lock_ctx_drained(
         bool done = false;
         {
             std::lock_guard<std::mutex> alock(ctx->async_mutex);
-            busy = ctx->async_state == rkva_async_state::PENDING ||
-                   ctx->async_state == rkva_async_state::RUNNING;
-            done = ctx->async_state == rkva_async_state::DONE_OK ||
-                   ctx->async_state == rkva_async_state::DONE_ERR;
-            if (done) {
-                ctx->async_state = rkva_async_state::IDLE;
-                if (ctx->async_job) {
-                    ctx->async_job->payload.clear();
-                    ctx->async_job_reusable = std::move(ctx->async_job);
+            for (auto & s : ctx->async_slots) {
+                if (s.state == rkva_slot_state::PENDING ||
+                    s.state == rkva_slot_state::RUNNING ||
+                    s.state == rkva_slot_state::PREPARING) {
+                    busy = true;
                 }
-                ctx->async_node = nullptr;
+                if (s.state == rkva_slot_state::DONE_OK ||
+                    s.state == rkva_slot_state::DONE_ERR) {
+                    done = true;
+                    s.reset();
+                }
             }
         }
         if (!busy) {
@@ -642,41 +983,70 @@ static bool rkva_async_wait_node(
             !ggml_get_op_params_i32(node->src[0], GGML_REMOTE_ATTN_PARAM_ASYNC)) {
         return false;
     }
-    std::unique_lock<std::mutex> lock(ctx->async_mutex);
-    ctx->async_cv.wait(lock, [ctx] {
-        return ctx->async_state != rkva_async_state::PENDING &&
-               ctx->async_state != rkva_async_state::RUNNING;
-    });
     ggml_tensor * source = node->src[0];
-    bool ok = ctx->async_state == rkva_async_state::DONE_OK &&
-              ctx->async_node == source &&
-              node->data != nullptr && source->data != nullptr &&
-              source->type == node->type &&
-              source->ne[0] == node->ne[0] && source->ne[1] == node->ne[1] &&
-              source->ne[2] == node->ne[2] && source->ne[3] == node->ne[3];
-    if (ok) {
-        const size_t row_bytes = size_t(node->ne[0]) * sizeof(float);
-        for (int64_t row = 0; row < node->ne[1]; ++row) {
-            std::memcpy(static_cast<uint8_t *>(node->data) + row * node->nb[1],
-                    static_cast<const uint8_t *>(source->data) + row * source->nb[1],
-                    row_bytes);
+    const uint64_t ticket = (uint64_t(uint32_t(ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_TICKET_HI))) << 32) |
+                             uint32_t(ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_TICKET_LO));
+    const uint64_t epoch  = (uint64_t(uint32_t(ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_EPOCH_HI))) << 32) |
+                             uint32_t(ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_EPOCH_LO));
+    if (ticket == 0) {
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(ctx->async_mutex);
+
+    rkva_async_slot * slot = nullptr;
+    for (auto & s : ctx->async_slots) {
+        if (s.node == source && s.ticket == ticket && s.epoch == epoch && s.state != rkva_slot_state::FREE) {
+            slot = &s;
+            break;
         }
     }
-    ctx->async_state = rkva_async_state::IDLE;
-    if (ctx->async_job) {
-        ctx->async_job->payload.clear();
-        ctx->async_job_reusable = std::move(ctx->async_job);
+    if (!slot) {
+        return false;
     }
-    ctx->async_node = nullptr;
+
+    ctx->async_cv.wait(lock, [&] {
+        if (slot->ticket != ticket || slot->epoch != epoch || slot->node != source) {
+            return true;
+        }
+        return slot->state == rkva_slot_state::DONE_OK ||
+               slot->state == rkva_slot_state::DONE_ERR ||
+               ctx->async_stop;
+    });
+
+    if (slot->ticket != ticket || slot->epoch != epoch || slot->node != source) {
+        return false;
+    }
+
+    const bool ok = (slot->state == rkva_slot_state::DONE_OK) && !ctx->failed &&
+                    (slot->epoch == ctx->range_epoch) &&
+                    (node->data != nullptr) && (source->data != nullptr) &&
+                    (source->type == node->type) &&
+                    (source->ne[0] == node->ne[0]) && (source->ne[1] == node->ne[1]) &&
+                    (source->ne[2] == node->ne[2]) && (source->ne[3] == node->ne[3]);
+
+    if (ok) {
+        if (node->data != source->data) {
+            const size_t row_bytes = size_t(node->ne[0]) * sizeof(float);
+            for (int64_t row = 0; row < node->ne[1]; ++row) {
+                std::memcpy(static_cast<uint8_t *>(node->data) + row * node->nb[1],
+                        static_cast<const uint8_t *>(source->data) + row * source->nb[1],
+                        row_bytes);
+            }
+        }
+    }
+
+    slot->reset();
     lock.unlock();
     ctx->async_cv.notify_all();
+
     if (!ok) {
         std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
         ctx->failed = true;
         ctx->connected = false;
-        ctx->sock.close();
+        return false;
     }
-    return ok;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +1078,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         }
         std::vector<float> original_k(nq * width), original_v(nq * width);
         ggml_backend_tensor_get(keys, original_k.data(), 0, original_k.size() * sizeof(float));
+        ggml_backend_tensor_get(values, original_v.data(), 0, original_v.size() * sizeof(float));
         const float * dev_k = static_cast<const float *>(keys->data);
         const float * dev_v = static_cast<const float *>(values->data);
         if (!owner->prepare(original_k.data(), original_v.data(), ctx->pos_scratch.data(), uint32_t(nq), dev_k, dev_v)) {
@@ -721,16 +1092,16 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         // prefill uses eight, verification batches keep their actual shape.
         const size_t chunk_limit = ctx->native_serial_prefix ? (nq > 9 ? 8 : nq) : 1;
         std::vector<uint8_t> bulk_payload;
-        std::vector<float> bulk_queries;
         const uint32_t segments = uint32_t((nq + chunk_limit - 1) / chunk_limit);
         if (ctx->native_bulk) {
             if (ctx->native_generation > UINT64_MAX - segments) { ctx->failed = true; return false; }
             const rkva_kvarn_range_bulk header {1, segments, uint32_t(nq), 0};
             bulk_payload.resize(sizeof(header));
             std::memcpy(bulk_payload.data(), &header, sizeof(header));
-            bulk_queries.resize(nq * out_width);
-            ggml_backend_tensor_get(node->src[0], bulk_queries.data(), 0, bulk_queries.size() * sizeof(float));
+            ctx->f32_scratch.resize(nq * out_width);
+            ggml_backend_tensor_get(node->src[0], ctx->f32_scratch.data(), 0, ctx->f32_scratch.size() * sizeof(float));
         }
+        const auto * bulk_queries = ctx->f32_scratch.data();
         uint64_t bulk_upload_bytes = 0;
         for (size_t first = 0; first < nq; first += chunk_limit) {
             const size_t chunk = std::min(chunk_limit, nq - first);
@@ -740,9 +1111,11 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
             }
             if (ctx->native_bulk) {
                 const rkva_kvarn_range_bulk_segment segment {uint32_t(ctx->payload_tx.size()), uint32_t(chunk)};
-                const bool bulk_f16 = ctx->range_wire == RKVA_WIRE_F16;
-                const size_t q_elem_bytes = bulk_f16 ? sizeof(uint16_t) : sizeof(float);
-                const rkva_range_attn attention {bulk_f16 ? RKVA_WIRE_F16 : RKVA_WIRE_F32, 0, {0, 0}};
+                const rkva_wire wire = ctx->range_wire;
+                const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t) :
+                                            (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t) :
+                                            sizeof(float);
+                const rkva_range_attn attention {wire, 0, {0, 0}};
                 const size_t offset = bulk_payload.size();
                 const size_t query_bytes = chunk * (sizeof(int32_t) + out_width * q_elem_bytes);
                 bulk_payload.resize(offset + sizeof(segment) + ctx->payload_tx.size() + sizeof(attention) + query_bytes);
@@ -751,13 +1124,30 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
                 std::memcpy(dst, ctx->payload_tx.data(), ctx->payload_tx.size()); dst += ctx->payload_tx.size();
                 std::memcpy(dst, &attention, sizeof(attention)); dst += sizeof(attention);
                 std::memcpy(dst, ctx->pos_scratch.data() + first, chunk * sizeof(int32_t)); dst += chunk * sizeof(int32_t);
-                if (bulk_f16) {
+                if (wire == RKVA_WIRE_FP8) {
+                    uint8_t * dst_fp8 = dst;
+                    if (!rkva_f32_to_fp8_batch(bulk_queries + first * out_width, dst_fp8, chunk * out_width)) {
+                        ctx->failed = true; return false;
+                    }
+                } else if (wire == RKVA_WIRE_SPLITZIP) {
+                    std::vector<uint16_t> tmp_f16(chunk * out_width);
+                    if (!rkva_f32_to_f16_batch(bulk_queries + first * out_width, tmp_f16.data(), chunk * out_width)) {
+                        ctx->failed = true; return false;
+                    }
+                    std::vector<uint8_t> sz_out;
+                    rkva_splitzip_encode(tmp_f16.data(), tmp_f16.size(), sz_out);
+                    if (sz_out.size() <= chunk * out_width * sizeof(uint16_t)) {
+                        std::memcpy(dst, sz_out.data(), sz_out.size());
+                    } else {
+                        std::memcpy(dst, tmp_f16.data(), tmp_f16.size() * sizeof(uint16_t));
+                    }
+                } else if (wire == RKVA_WIRE_F16) {
                     uint16_t * dst_f16 = reinterpret_cast<uint16_t *>(dst);
-                    if (!rkva_f32_to_f16_batch(bulk_queries.data() + first * out_width, dst_f16, chunk * out_width)) {
+                    if (!rkva_f32_to_f16_batch(bulk_queries + first * out_width, dst_f16, chunk * out_width)) {
                         ctx->failed = true; return false;
                     }
                 } else {
-                    std::memcpy(dst, bulk_queries.data() + first * out_width, chunk * out_width * sizeof(float));
+                    std::memcpy(dst, bulk_queries + first * out_width, chunk * out_width * sizeof(float));
                 }
                 bulk_upload_bytes += ctx->payload_tx.size() - sizeof(rkva_kvarn_range_upload);
                 continue;
@@ -803,9 +1193,11 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
             }
         }
         if (ctx->native_bulk) {
-            const bool bulk_f16 = ctx->range_wire == RKVA_WIRE_F16;
+            const rkva_wire wire = ctx->range_wire;
             std::vector<uint8_t> reply;
-            const size_t out_elem_bytes = bulk_f16 ? sizeof(uint16_t) : sizeof(float);
+            const size_t out_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t) :
+                                          (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t) :
+                                          sizeof(float);
             const size_t out_bytes = nq * out_width * out_elem_bytes;
             const size_t lse_bytes = nq * ctx->geo.n_head * sizeof(float);
             if (bulk_payload.size() > (256u << 20) ||
@@ -813,7 +1205,38 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
                     bulk_payload.data(), uint32_t(bulk_payload.size()), reply, uint32_t(out_bytes + lse_bytes))) {
                 ctx->failed = true; return false;
             }
-            if (bulk_f16) {
+            if (wire == RKVA_WIRE_FP8) {
+                const auto * src_fp8 = reinterpret_cast<const uint8_t *>(reply.data());
+                const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
+                for (size_t row = 0; row < nq; ++row) {
+                    auto * dst = static_cast<float *>(static_cast<void *>(static_cast<uint8_t *>(node->data) + row * node->nb[1]));
+                    if (!rkva_fp8_to_f32_batch(src_fp8 + row * out_width, dst, out_width)) {
+                        ctx->failed = true; return false;
+                    }
+                    for (size_t h = 0; h < ctx->geo.n_head; ++h) {
+                        const float lse_val = src_lse[row * ctx->geo.n_head + h];
+                        if (!std::isfinite(lse_val)) { ctx->failed = true; return false; }
+                        dst[out_width + h] = lse_val;
+                    }
+                }
+            } else if (wire == RKVA_WIRE_SPLITZIP) {
+                std::vector<uint16_t> tmp_f16(nq * out_width);
+                if (!rkva_splitzip_decode(reply.data(), out_bytes, tmp_f16.data(), tmp_f16.size())) {
+                    std::memcpy(tmp_f16.data(), reply.data(), out_bytes);
+                }
+                const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
+                for (size_t row = 0; row < nq; ++row) {
+                    auto * dst = static_cast<float *>(static_cast<void *>(static_cast<uint8_t *>(node->data) + row * node->nb[1]));
+                    if (!rkva_f16_to_f32_batch(tmp_f16.data() + row * out_width, dst, out_width)) {
+                        ctx->failed = true; return false;
+                    }
+                    for (size_t h = 0; h < ctx->geo.n_head; ++h) {
+                        const float lse_val = src_lse[row * ctx->geo.n_head + h];
+                        if (!std::isfinite(lse_val)) { ctx->failed = true; return false; }
+                        dst[out_width + h] = lse_val;
+                    }
+                }
+            } else if (wire == RKVA_WIRE_F16) {
                 const auto * src_f16 = reinterpret_cast<const uint16_t *>(reply.data());
                 const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
                 for (size_t row = 0; row < nq; ++row) {
@@ -868,7 +1291,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
 static bool rkva_prepare_native_bulk_job(
         ggml_backend_remote_attn_context * ctx, ggml_tensor * node,
         uint32_t layer, uint32_t live, size_t nq, size_t out_width,
-        rkva_async_job & job) {
+        rkva_async_slot & slot) {
     const auto * keys = node->src[5];
     const auto * values = node->src[6];
     const size_t width = size_t(ctx->geo.n_head_kv) * 256;
@@ -895,13 +1318,18 @@ static bool rkva_prepare_native_bulk_job(
             owner.reset(new rkva_kvarn_producer(ctx->range_origin, ctx->range_capacity,
                     ctx->geo.n_head_kv, ctx->geo.sinkhorn_iters, ctx->native_store,
                     ctx->native_tail_tokens));
+            cached.epoch = ctx->range_epoch;
         }
-        std::vector<float> original_k(nq * width), original_v(nq * width);
-        ggml_backend_tensor_get(keys, original_k.data(), 0, original_k.size() * sizeof(float));
-        ggml_backend_tensor_get(values, original_v.data(), 0, original_v.size() * sizeof(float));
+        slot.start_rows = owner->rows();
+        slot.original_k.resize(nq * width);
+        slot.original_v.resize(nq * width);
+        ggml_backend_tensor_get(keys, slot.original_k.data(), 0, slot.original_k.size() * sizeof(float));
+        ggml_backend_tensor_get(values, slot.original_v.data(), 0, slot.original_v.size() * sizeof(float));
         const float * dev_k = static_cast<const float *>(keys->data);
         const float * dev_v = static_cast<const float *>(values->data);
-        if (!owner->prepare(original_k.data(), original_v.data(), ctx->pos_scratch.data(),
+        slot.pos_scratch.resize(nq);
+        ggml_backend_tensor_get(node->src[4], slot.pos_scratch.data(), 0, nq * sizeof(int32_t));
+        if (!owner->prepare(slot.original_k.data(), slot.original_v.data(), slot.pos_scratch.data(),
                     uint32_t(nq), dev_k, dev_v)) {
             ctx->failed = true;
             return false;
@@ -912,61 +1340,84 @@ static bool rkva_prepare_native_bulk_job(
             ctx->failed = true;
             return false;
         }
-        const bool bulk_f16 = ctx->range_wire == RKVA_WIRE_F16;
-        const size_t q_elem_bytes = bulk_f16 ? sizeof(uint16_t) : sizeof(float);
+        const rkva_wire wire = ctx->range_wire;
+        const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t) :
+                                    (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t) :
+                                    sizeof(float);
         const rkva_kvarn_range_bulk header {1, segments, uint32_t(nq), 0};
-        job.payload.resize(sizeof(header));
-        std::memcpy(job.payload.data(), &header, sizeof(header));
-        std::vector<float> bulk_queries(nq * out_width);
-        ggml_backend_tensor_get(node->src[0], bulk_queries.data(), 0,
-                bulk_queries.size() * sizeof(float));
+        slot.payload.resize(sizeof(header));
+        std::memcpy(slot.payload.data(), &header, sizeof(header));
+        slot.f32_scratch.resize(nq * out_width);
+        ggml_backend_tensor_get(node->src[0], slot.f32_scratch.data(), 0,
+                slot.f32_scratch.size() * sizeof(float));
+        const auto * bulk_queries = slot.f32_scratch.data();
         for (size_t first = 0; first < nq; first += chunk_limit) {
             const size_t chunk = std::min(chunk_limit, nq - first);
-            if (!owner->append(original_k.data() + first * width,
-                    original_v.data() + first * width,
-                    ctx->pos_scratch.data() + first, uint32_t(chunk),
-                    first == 0 && cached.rows == 0, ctx->payload_tx)) {
+            const bool is_bootstrap = (first == 0) && (slot.start_rows == 0);
+            if (!owner->append(slot.original_k.data() + first * width,
+                    slot.original_v.data() + first * width,
+                    slot.pos_scratch.data() + first, uint32_t(chunk),
+                    is_bootstrap, slot.segment_scratch)) {
                 ctx->failed = true;
                 return false;
             }
             const rkva_kvarn_range_bulk_segment segment {
-                uint32_t(ctx->payload_tx.size()), uint32_t(chunk)};
-            const rkva_range_attn attention {bulk_f16 ? RKVA_WIRE_F16 : RKVA_WIRE_F32, 0, {0, 0}};
-            const size_t offset = job.payload.size();
+                uint32_t(slot.segment_scratch.size()), uint32_t(chunk)};
+            const rkva_range_attn attention {wire, 0, {0, 0}};
+            const size_t offset = slot.payload.size();
             const size_t query_bytes = chunk * (sizeof(int32_t) + out_width * q_elem_bytes);
-            job.payload.resize(offset + sizeof(segment) + ctx->payload_tx.size() +
+            slot.payload.resize(offset + sizeof(segment) + slot.segment_scratch.size() +
                     sizeof(attention) + query_bytes);
-            auto * dst = job.payload.data() + offset;
+            auto * dst = slot.payload.data() + offset;
             std::memcpy(dst, &segment, sizeof(segment)); dst += sizeof(segment);
-            std::memcpy(dst, ctx->payload_tx.data(), ctx->payload_tx.size());
-            dst += ctx->payload_tx.size();
+            std::memcpy(dst, slot.segment_scratch.data(), slot.segment_scratch.size());
+            dst += slot.segment_scratch.size();
             std::memcpy(dst, &attention, sizeof(attention)); dst += sizeof(attention);
-            std::memcpy(dst, ctx->pos_scratch.data() + first, chunk * sizeof(int32_t));
+            std::memcpy(dst, slot.pos_scratch.data() + first, chunk * sizeof(int32_t));
             dst += chunk * sizeof(int32_t);
-            if (bulk_f16) {
+            if (wire == RKVA_WIRE_FP8) {
+                uint8_t * dst_fp8 = dst;
+                if (!rkva_f32_to_fp8_batch(bulk_queries + first * out_width, dst_fp8, chunk * out_width)) {
+                    ctx->failed = true; return false;
+                }
+            } else if (wire == RKVA_WIRE_SPLITZIP) {
+                slot.decode_f16.resize(chunk * out_width);
+                if (!rkva_f32_to_f16_batch(bulk_queries + first * out_width, slot.decode_f16.data(), chunk * out_width)) {
+                    ctx->failed = true; return false;
+                }
+                std::vector<uint8_t> sz_out;
+                rkva_splitzip_encode(slot.decode_f16.data(), slot.decode_f16.size(), sz_out);
+                if (sz_out.size() <= chunk * out_width * sizeof(uint16_t)) {
+                    std::memcpy(dst, sz_out.data(), sz_out.size());
+                } else {
+                    std::memcpy(dst, slot.decode_f16.data(), slot.decode_f16.size() * sizeof(uint16_t));
+                }
+            } else if (wire == RKVA_WIRE_F16) {
                 uint16_t * dst_f16 = reinterpret_cast<uint16_t *>(dst);
-                if (!rkva_f32_to_f16_batch(bulk_queries.data() + first * out_width, dst_f16, chunk * out_width)) {
+                if (!rkva_f32_to_f16_batch(bulk_queries + first * out_width, dst_f16, chunk * out_width)) {
                     ctx->failed = true; return false;
                 }
             } else {
-                std::memcpy(dst, bulk_queries.data() + first * out_width,
+                std::memcpy(dst, bulk_queries + first * out_width,
                         chunk * out_width * sizeof(float));
             }
-            job.upload_bytes += ctx->payload_tx.size() - sizeof(rkva_kvarn_range_upload);
+            slot.upload_bytes += slot.segment_scratch.size() - sizeof(rkva_kvarn_range_upload);
         }
-        if (job.payload.size() > (256u << 20)) {
+        slot.end_rows = owner->rows();
+        if (slot.payload.size() > (256u << 20)) {
             ctx->failed = true;
             return false;
         }
-        job.output = static_cast<uint8_t *>(node->data);
-        job.output_stride = node->nb[1];
-        job.layer = uint32_t(layer);
-        job.nq = uint32_t(nq);
-        job.segments = segments;
-        job.out_width = uint32_t(out_width);
-        job.first_pos = ctx->pos_scratch.front();
-        job.last_pos = ctx->pos_scratch.back();
-        job.bulk_f16 = bulk_f16;
+        slot.output = static_cast<uint8_t *>(node->data);
+        slot.output_stride = node->nb[1];
+        slot.layer = uint32_t(layer);
+        slot.nq = uint32_t(nq);
+        slot.segments = segments;
+        slot.out_width = uint32_t(out_width);
+        slot.first_pos = slot.pos_scratch.front();
+        slot.last_pos = slot.pos_scratch.back();
+        slot.wire = wire;
+        slot.bulk_f16 = (wire == RKVA_WIRE_F16);
     } catch (const std::exception & error) {
         GGML_LOG_ERROR("%s: async native KVarN4 preparation failed: %s\n",
                 GGML_REMOTE_ATTN_NAME, error.what());
@@ -979,20 +1430,13 @@ static bool rkva_prepare_native_bulk_job(
     return true;
 }
 
-// Caller holds ctx->mutex. Submit at most one bound job; any unconsumed or
-// in-flight slot is a graph ordering bug and fails closed.
+// 2-slot queue submitter. Caller holds ctx->mutex. If the queue is saturated,
+// releases ctx->mutex to allow the worker thread to commit ACKs while waiting
+// for deterministic backpressure.
 static bool rkva_async_submit_locked(
         ggml_backend_remote_attn_context * ctx, ggml_tensor * node,
-        uint32_t layer, uint32_t live, size_t nq, size_t out_width) {
-    {
-        std::lock_guard<std::mutex> alock(ctx->async_mutex);
-        if (ctx->async_state != rkva_async_state::IDLE) {
-            GGML_LOG_ERROR("%s: async range submitted while a previous job is not consumed\n",
-                    GGML_REMOTE_ATTN_NAME);
-            ctx->failed = true;
-            return false;
-        }
-    }
+        uint32_t layer, uint32_t live, size_t nq, size_t out_width,
+        std::unique_lock<std::mutex> & ctx_lock) {
     if (!ctx->async_worker.joinable()) {
         try {
             ctx->async_worker = std::thread(rkva_async_worker_main, ctx);
@@ -1001,41 +1445,79 @@ static bool rkva_async_submit_locked(
             return false;
         }
     }
-    std::unique_ptr<rkva_async_job> job;
-    if (ctx->async_job_reusable) {
-        job = std::move(ctx->async_job_reusable);
-        job->payload.clear();
-        job->output = nullptr;
-        job->output_stride = 0;
-        job->upload_bytes = 0;
-    } else {
-        try {
-            job = std::make_unique<rkva_async_job>();
-            job->payload.reserve(8u << 20);
-        } catch (...) {
+
+    const uint64_t submitted_epoch = ctx->range_epoch;
+    const uint32_t submitted_session = ctx->active_session;
+    const auto timeout = std::chrono::milliseconds([] {
+        const char * env = std::getenv("GGML_RKVA_ASYNC_TIMEOUT_MS");
+        return env ? std::max(1, std::atoi(env)) : 10000;
+    }());
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    rkva_async_slot * slot = nullptr;
+    for (;;) {
+        if (ctx->failed || ctx->async_stop || ctx->range_epoch != submitted_epoch || ctx->active_session != submitted_session) {
+            return false;
+        }
+
+        {
+            std::unique_lock<std::mutex> alock(ctx->async_mutex);
+            for (auto & s : ctx->async_slots) {
+                if (s.state == rkva_slot_state::FREE) {
+                    slot = &s;
+                    break;
+                }
+            }
+            if (slot) {
+                slot->state = rkva_slot_state::PREPARING;
+                slot->ticket = ++ctx->async_ticket_counter;
+                slot->epoch = ctx->range_epoch;
+                slot->node = node;
+                ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_LO, int32_t(slot->ticket & 0xffffffffu));
+                ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_HI, int32_t((slot->ticket >> 32) & 0xffffffffu));
+                ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_EPOCH_LO,  int32_t(slot->epoch & 0xffffffffu));
+                ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_EPOCH_HI,  int32_t((slot->epoch >> 32) & 0xffffffffu));
+                break;
+            }
+        }
+
+        // Apply deterministic backpressure: unlock ctx_lock before waiting on async_mutex
+        ctx_lock.unlock();
+        bool acquired = true;
+        {
+            std::unique_lock<std::mutex> wait_lock(ctx->async_mutex);
+            acquired = ctx->async_cv.wait_until(wait_lock, deadline, [ctx] {
+                return ctx->failed || ctx->async_stop || rkva_has_free_slot(ctx);
+            });
+        } // wait_lock is completely unlocked before acquiring ctx_lock!
+        ctx_lock.lock();
+
+        if (!acquired || ctx->failed || ctx->async_stop || ctx->range_epoch != submitted_epoch || ctx->active_session != submitted_session) {
+            GGML_LOG_ERROR("%s: async slot backpressure timeout or failure\n", GGML_REMOTE_ATTN_NAME);
             ctx->failed = true;
             return false;
         }
     }
-    if (!rkva_prepare_native_bulk_job(ctx, node, layer, live, nq, out_width, *job)) {
+
+    if (!rkva_prepare_native_bulk_job(ctx, node, layer, live, nq, out_width, *slot)) {
+        std::lock_guard<std::mutex> alock(ctx->async_mutex);
+        slot->reset();
         ctx->failed = true;
+        ctx->async_cv.notify_all();
         return false;
     }
+
     {
         std::lock_guard<std::mutex> alock(ctx->async_mutex);
-        if (ctx->async_state != rkva_async_state::IDLE) {
-            ctx->failed = true;
-            return false;
-        }
-        ctx->async_state = rkva_async_state::PENDING;
-        ctx->async_job = std::move(job);
-        ctx->async_node = node;
+        slot->state = rkva_slot_state::PENDING;
     }
     ctx->async_cv.notify_all();
     return true;
 }
 
-static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor * node) {
+static bool rkva_run_range(
+        ggml_backend_remote_attn_context * ctx, ggml_tensor * node,
+        std::unique_lock<std::mutex> & ctx_lock) {
     const auto * q = node->src[0];
     const auto * k = node->src[1];
     const auto * v = node->src[2];
@@ -1098,7 +1580,7 @@ static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor *
             // The scheduler executes local attention between this submit and
             // the companion wait node; only the ordered bulk RPC is deferred.
             return ctx->async_local_remote && rkva_async_submit_locked(
-                    ctx, node, uint32_t(layer), count, nq, out_width);
+                    ctx, node, uint32_t(layer), count, nq, out_width, ctx_lock);
         }
         try {
             if (rkva_run_native_range(ctx, node, uint32_t(layer), count, nq, out_width)) return true;
@@ -1266,10 +1748,11 @@ static bool rkva_run_range(ggml_backend_remote_attn_context * ctx, ggml_tensor *
 // Serialize Q/K/V to the chosen wire type and one RKVA attn call.
 static bool rkva_run_attn(
         ggml_backend_remote_attn_context * ctx,
-        ggml_tensor * node) {
+        ggml_tensor * node,
+        std::unique_lock<std::mutex> & ctx_lock) {
 
     if (ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_RANGE)) {
-        return rkva_run_range(ctx, node);
+        return rkva_run_range(ctx, node, ctx_lock);
     }
 
     ggml_tensor * q   = node->src[0];   // [n_embd_head, n_head,    n_tokens] F32
@@ -1559,7 +2042,18 @@ static bool ggml_backend_remote_attn_cpy_tensor_async(
 }
 
 static void ggml_backend_remote_attn_synchronize(ggml_backend_t backend) {
-    (void) backend;  // fully synchronous
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    std::unique_lock<std::mutex> lock(ctx->async_mutex);
+    ctx->async_cv.wait(lock, [ctx] {
+        for (const auto & s : ctx->async_slots) {
+            if (s.state == rkva_slot_state::PENDING ||
+                s.state == rkva_slot_state::RUNNING ||
+                s.state == rkva_slot_state::PREPARING) {
+                return false;
+            }
+        }
+        return true;
+    });
 }
 
 static enum ggml_status ggml_backend_remote_attn_graph_compute(
@@ -1589,13 +2083,20 @@ static enum ggml_status ggml_backend_remote_attn_graph_compute(
                 return GGML_STATUS_FAILED;
         }
 
-        std::lock_guard<std::mutex> lock(ctx->mutex);
+        if (ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT)) {
+            if (!rkva_async_wait_node(ctx, node)) {
+                return GGML_STATUS_ABORTED;
+            }
+            continue;
+        }
+
+        std::unique_lock<std::mutex> lock(ctx->mutex);
         if (ctx->failed || !ctx->connected) {
             GGML_LOG_ERROR("%s: backend not connected (failed=%d)\n",
                            GGML_REMOTE_ATTN_NAME, (int) ctx->failed);
             return GGML_STATUS_ABORTED;
         }
-        if (!rkva_run_attn(ctx, node)) {
+        if (!rkva_run_attn(ctx, node, lock)) {
             ctx->failed = true;
             ctx->connected = false;
             ctx->sock.close();
@@ -2200,22 +2701,64 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
                            (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
     const bool serial_prefix = rewind_v2 && (ctx->ack.reserved[0] & RKVA_CAP_KVARN_SERIAL_PREFIX);
     bool bulk = false;
-    rkva_wire bulk_wire = RKVA_WIRE_F32;
+    rkva_wire bulk_wire = RKVA_WIRE_F16;
+    bool bulk_wire_auto = false;
     if (const char * option = std::getenv("GGML_RKVA_NATIVE_BULK")) {
         if (!std::strcmp(option, "1")) {
             bulk = true;
+            bulk_wire = RKVA_WIRE_F16;
         } else if (!std::strcmp(option, "f16") || !std::strcmp(option, "fp16")) {
             bulk = true;
             bulk_wire = RKVA_WIRE_F16;
+        } else if (!std::strcmp(option, "fp8") || !std::strcmp(option, "fp8_e5m2")) {
+            bulk = true;
+            bulk_wire = RKVA_WIRE_FP8;
+        } else if (!std::strcmp(option, "auto")) {
+            bulk = true;
+            bulk_wire_auto = true;
+        } else if (!std::strcmp(option, "splitzip")) {
+            GGML_LOG_ERROR("%s: SplitZip wire format is deactivated; use lossless 'f16' instead\n", GGML_REMOTE_ATTN_NAME);
+            return false;
         } else if (std::strcmp(option, "0")) {
             return false;
         }
     }
-    if (const char * wire_env = std::getenv("GGML_RKVA_NATIVE_BULK_WIRE")) {
+    if (const char * wire_env = std::getenv("GGML_RKVA_WIRE_FORMAT")) {
+        bulk = true;
         if (!std::strcmp(wire_env, "f16") || !std::strcmp(wire_env, "fp16")) {
             bulk_wire = RKVA_WIRE_F16;
+            bulk_wire_auto = false;
+        } else if (!std::strcmp(wire_env, "fp8") || !std::strcmp(wire_env, "fp8_e5m2")) {
+            bulk_wire = RKVA_WIRE_FP8;
+            bulk_wire_auto = false;
+        } else if (!std::strcmp(wire_env, "auto")) {
+            bulk_wire_auto = true;
+        } else if (!std::strcmp(wire_env, "splitzip")) {
+            GGML_LOG_ERROR("%s: SplitZip wire format is deactivated; use lossless 'f16' instead\n", GGML_REMOTE_ATTN_NAME);
+            return false;
         } else if (!std::strcmp(wire_env, "f32") || !std::strcmp(wire_env, "fp32")) {
             bulk_wire = RKVA_WIRE_F32;
+            bulk_wire_auto = false;
+        } else {
+            GGML_LOG_ERROR("%s: unrecognized GGML_RKVA_WIRE_FORMAT '%s' (expected f16, fp8, auto, f32)\n",
+                GGML_REMOTE_ATTN_NAME, wire_env);
+            return false;
+        }
+    } else if (const char * wire_env = std::getenv("GGML_RKVA_NATIVE_BULK_WIRE")) {
+        if (!std::strcmp(wire_env, "f16") || !std::strcmp(wire_env, "fp16")) {
+            bulk_wire = RKVA_WIRE_F16;
+            bulk_wire_auto = false;
+        } else if (!std::strcmp(wire_env, "fp8") || !std::strcmp(wire_env, "fp8_e5m2")) {
+            bulk_wire = RKVA_WIRE_FP8;
+            bulk_wire_auto = false;
+        } else if (!std::strcmp(wire_env, "auto")) {
+            bulk_wire_auto = true;
+        } else if (!std::strcmp(wire_env, "splitzip")) {
+            GGML_LOG_ERROR("%s: SplitZip wire format is deactivated; use lossless 'f16' instead\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        } else if (!std::strcmp(wire_env, "f32") || !std::strcmp(wire_env, "fp32")) {
+            bulk_wire = RKVA_WIRE_F32;
+            bulk_wire_auto = false;
         } else {
             return false;
         }
@@ -2223,6 +2766,26 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     if (bulk && (!serial_prefix || !(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_ATTN) ||
                  !(ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_BULK_ATTN)))) {
         GGML_LOG_ERROR("%s: requested native bulk RPC is not supported by the negotiated server\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    const uint64_t fp8_required = RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE;
+    if (bulk && bulk_wire_auto) {
+        if ((ctx->ack.reserved[0] & fp8_required) == fp8_required) {
+            bulk_wire = RKVA_WIRE_FP8;
+        } else if (ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_F16) {
+            GGML_LOG_WARN("%s: remote server does not advertise FP8 RNE capabilities; falling back to negotiated F16 wire (auto mode)\n", GGML_REMOTE_ATTN_NAME);
+            bulk_wire = RKVA_WIRE_F16;
+        } else {
+            GGML_LOG_ERROR("%s: auto wire selection failed: remote server does not advertise FP8 or F16 bulk capability\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
+    } else if (bulk && bulk_wire == RKVA_WIRE_FP8 &&
+               (ctx->ack.reserved[0] & fp8_required) != fp8_required) {
+        GGML_LOG_ERROR("%s: requested native bulk FP8 RNE RPC is not supported by the negotiated server (missing FP8/RNE capabilities)\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    if (bulk && bulk_wire == RKVA_WIRE_SPLITZIP) {
+        GGML_LOG_ERROR("%s: SplitZip wire format is deactivated; use lossless 'f16' instead\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
     if (bulk && bulk_wire == RKVA_WIRE_F16 && !(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_F16)) {
@@ -2266,8 +2829,10 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     ctx->range_profile = profile;
     ctx->range_kernel_mode = mode;
     if (!rkva_range_apply_control(ctx, "kvarn4", generic)) return false;
-    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN4 precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d; original F32 producer, bounded resident rewind requires negotiated capability; FULL snapshots unsupported\n",
-                  GGML_REMOTE_ATTN_NAME, precision_tail_tokens, descriptor.layout_version, int(serial_prefix), int(async_overlap));
+    const char * wire_str = bulk ? (bulk_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
+                                    bulk_wire == RKVA_WIRE_F16 ? "f16" : "f32") : "f32";
+    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN4 precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d wire=%s; original F32 producer, bounded resident rewind requires negotiated capability; FULL snapshots unsupported\n",
+                  GGML_REMOTE_ATTN_NAME, precision_tail_tokens, descriptor.layout_version, int(serial_prefix), int(async_overlap), wire_str);
     return true;
 }
 
@@ -2474,8 +3039,20 @@ void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {
         return;
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
-    auto lock = rkva_lock_ctx_drained(ctx);
-    ++ctx->range_epoch;
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ++ctx->range_epoch;
+    }
+    {
+        std::lock_guard<std::mutex> alock(ctx->async_mutex);
+        for (auto & s : ctx->async_slots) {
+            if (s.state == rkva_slot_state::PENDING) {
+                s.state = rkva_slot_state::DONE_ERR;
+            }
+        }
+    }
+    ctx->async_cv.notify_all();
+    rkva_async_drain(ctx);
 }
 
 bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend) {
@@ -2489,6 +3066,34 @@ bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend) {
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
     return ctx->async_local_remote && ctx->connected && !ctx->failed &&
            ctx->range_configured && ctx->range_native_kvarn && ctx->native_bulk;
+}
+
+void ggml_backend_remote_attn_drain(ggml_backend_t backend) {
+    if (!backend) return;
+    if (ggml_backend_is_local_split(backend)) {
+        ggml_backend_synchronize(backend);
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    rkva_async_drain(ctx);
+}
+
+size_t ggml_backend_remote_attn_async_in_flight(ggml_backend_t backend) {
+    if (!backend || ggml_backend_is_local_split(backend)) return 0;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    std::lock_guard<std::mutex> alock(ctx->async_mutex);
+    size_t count = 0;
+    for (const auto & s : ctx->async_slots) {
+        if (s.state != rkva_slot_state::FREE) {
+            count++;
+        }
+    }
+    return count;
+}
+
+size_t ggml_backend_remote_attn_async_capacity(ggml_backend_t backend) {
+    if (!backend || ggml_backend_is_local_split(backend)) return 0;
+    return ggml_backend_remote_attn_context::RKVA_ASYNC_QUEUE_CAPACITY;
 }
 
 bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend) {
@@ -2585,10 +3190,15 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
-    bool async_idle = false;
+    bool async_idle = true;
     {
         std::lock_guard<std::mutex> alock(ctx->async_mutex);
-        async_idle = ctx->async_state == rkva_async_state::IDLE;
+        for (const auto & s : ctx->async_slots) {
+            if (s.state != rkva_slot_state::FREE) {
+                async_idle = false;
+                break;
+            }
+        }
     }
     if (async_idle && ctx->range_profile_controlled && ctx->connected && !ctx->failed) {
         const rkva_range_profile report {RKVA_PROFILE_REPORT_ONLY, 0, 0};
@@ -2599,6 +3209,7 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
             GGML_LOG_INFO("remote_attn gpu_profile %s\n", json.c_str());
         }
     }
+    std::lock_guard<std::mutex> slock(ctx->stats_mutex);
     auto & s = ctx->stats;
     double avg = s.calls ? (double) s.rpc_us_sum / (double) s.calls : 0.0;
     double p50 = 0.0, p95 = 0.0;
@@ -2644,6 +3255,7 @@ void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend) {
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
+    std::lock_guard<std::mutex> slock(ctx->stats_mutex);
     ctx->stats = rkva_stats {};
 }
 
@@ -2674,16 +3286,18 @@ bool ggml_remote_attn_exec(struct ggml_tensor * node) {
     if (ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT)) {
         return rkva_async_wait_node(ctx, node);
     }
-    std::lock_guard<std::mutex> lock(ctx->mutex);
+    std::unique_lock<std::mutex> lock(ctx->mutex);
     if (ctx->failed || !ctx->connected) {
         GGML_LOG_ERROR("%s: exec while not connected (failed=%d)\n",
                        GGML_REMOTE_ATTN_NAME, (int) ctx->failed);
         return false;
     }
-    if (!rkva_run_attn(ctx, node)) {
+    if (!rkva_run_attn(ctx, node, lock)) {
         ctx->failed = true;
         ctx->connected = false;
-        ctx->sock.close();
+        if (!ctx->async_worker.joinable()) {
+            ctx->sock.close();
+        }
         return false;
     }
     return true;

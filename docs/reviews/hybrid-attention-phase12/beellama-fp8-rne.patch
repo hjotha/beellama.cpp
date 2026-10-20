@@ -1,0 +1,181 @@
+diff --git a/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp b/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp
+--- a/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp
++++ b/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp
+@@ -145,7 +145,38 @@
+ #endif
+ }
+ 
+-// Option A: FP8 E5M2 activation wire codec (1 byte per element)
++static inline uint32_t rkva_round_shift_even(uint32_t value, unsigned shift) {
++    const uint32_t base = value >> shift;
++    const uint32_t remainder = value & ((uint32_t(1) << shift) - 1);
++    const uint32_t halfway = uint32_t(1) << (shift - 1);
++    return base + (remainder > halfway || (remainder == halfway && (base & 1)));
++}
++
++// Direct F32 to finite E5M2: nearest-even, finite saturation, signed zero.
++static inline bool rkva_f32_to_fp8_scalar(float value, uint8_t & result) {
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    const uint32_t magnitude = bits & 0x7fffffffu;
++    const uint8_t sign = uint8_t((bits >> 24) & 0x80u);
++    if (magnitude >= 0x7f800000u) return false;
++    if (magnitude >= 0x47600000u) {
++        result = sign | 0x7bu;
++        return true;
++    }
++    if (magnitude <= 0x37000000u) {
++        result = sign;
++        return true;
++    }
++    const uint32_t exponent = magnitude >> 23;
++    const uint32_t mantissa = magnitude & 0x7fffffu;
++    const uint32_t encoded = magnitude < 0x38800000u ?
++        rkva_round_shift_even(mantissa | 0x800000u, 134u - exponent) :
++        ((exponent - 112u) << 2) + rkva_round_shift_even(mantissa, 21);
++    result = sign | uint8_t(encoded);
++    return true;
++}
++
++// FP8 E5M2 wire codec: finite saturation and direct nearest-even rounding.
+ static inline bool rkva_f32_to_fp8_batch(const float * src, uint8_t * dst, size_t n) {
+ #if defined(__AVX2__) && defined(__F16C__)
+     size_t i = 0;
+@@ -163,32 +194,29 @@
+         v = _mm256_min_ps(v, max_fp8);
+         v = _mm256_max_ps(v, min_fp8);
+         __m128i h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+-        __m128i rounded = _mm_add_epi16(h, _mm_set1_epi16(0x0080));
++        const __m128i retained_lsb = _mm_and_si128(_mm_srli_epi16(h, 8), _mm_set1_epi16(1));
++        __m128i rounded = _mm_add_epi16(h, _mm_add_epi16(_mm_set1_epi16(0x007f), retained_lsb));
+         __m128i shifted = _mm_srli_epi16(rounded, 8);
+         __m128i packed = _mm_packus_epi16(shifted, shifted);
+         _mm_storel_epi64((__m128i*)(dst + i), packed);
++        // A first rounding can only change the FP8 decision at an F16 midpoint.
++        const __m128i midpoint = _mm_cmpeq_epi16(_mm_and_si128(h, _mm_set1_epi16(0x00ff)),
++                                               _mm_set1_epi16(0x0080));
++        const int midpoint_mask = _mm_movemask_epi8(midpoint);
++        if (__builtin_expect(midpoint_mask != 0, 0)) {
++            for (size_t lane = 0; lane < 8; ++lane) {
++                if ((midpoint_mask & (3 << (2 * lane))) &&
++                    !rkva_f32_to_fp8_scalar(src[i + lane], dst[i + lane])) return false;
++            }
++        }
+     }
+     for (; i < n; ++i) {
+-        const float val = src[i];
+-        if (!std::isfinite(val)) return false;
+-        const float clamped = std::clamp(val, -57344.0f, 57344.0f);
+-        uint16_t h = f32_to_f16_bits(clamped);
+-        uint8_t b = (uint8_t)((h + 0x0080u) >> 8);
+-        if (!std::signbit(clamped) && b > 0x7b) b = 0x7b;
+-        else if (std::signbit(clamped) && b > 0xfb) b = 0xfb;
+-        dst[i] = b;
++        if (!rkva_f32_to_fp8_scalar(src[i], dst[i])) return false;
+     }
+     return true;
+ #else
+     for (size_t i = 0; i < n; ++i) {
+-        const float val = src[i];
+-        if (!std::isfinite(val)) return false;
+-        const float clamped = std::clamp(val, -57344.0f, 57344.0f);
+-        uint16_t h = f32_to_f16_bits(clamped);
+-        uint8_t b = (uint8_t)((h + 0x0080u) >> 8);
+-        if (!std::signbit(clamped) && b > 0x7b) b = 0x7b;
+-        else if (std::signbit(clamped) && b > 0xfb) b = 0xfb;
+-        dst[i] = b;
++        if (!rkva_f32_to_fp8_scalar(src[i], dst[i])) return false;
+     }
+     return true;
+ #endif
+@@ -2560,19 +2588,20 @@
+         GGML_LOG_ERROR("%s: requested native bulk RPC is not supported by the negotiated server\n", GGML_REMOTE_ATTN_NAME);
+         return false;
+     }
++    const uint64_t fp8_required = RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE;
+     if (bulk && bulk_wire_auto) {
+-        if (ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_FP8) {
++        if ((ctx->ack.reserved[0] & fp8_required) == fp8_required) {
+             bulk_wire = RKVA_WIRE_FP8;
+         } else if (ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_F16) {
+-            GGML_LOG_WARN("%s: remote server does not advertise FP8 capability (requires xllama with RKVA_CAP_KVARN_BULK_FP8); falling back to negotiated F16 wire (auto mode)\n", GGML_REMOTE_ATTN_NAME);
++            GGML_LOG_WARN("%s: remote server does not advertise FP8 RNE capabilities; falling back to negotiated F16 wire (auto mode)\n", GGML_REMOTE_ATTN_NAME);
+             bulk_wire = RKVA_WIRE_F16;
+         } else {
+             GGML_LOG_ERROR("%s: auto wire selection failed: remote server does not advertise FP8 or F16 bulk capability\n", GGML_REMOTE_ATTN_NAME);
+             return false;
+         }
+     } else if (bulk && bulk_wire == RKVA_WIRE_FP8 &&
+-               !(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_FP8)) {
+-        GGML_LOG_ERROR("%s: requested native bulk FP8 RPC is not supported by the negotiated server (missing RKVA_CAP_KVARN_BULK_FP8)\n", GGML_REMOTE_ATTN_NAME);
++               (ctx->ack.reserved[0] & fp8_required) != fp8_required) {
++        GGML_LOG_ERROR("%s: requested native bulk FP8 RNE RPC is not supported by the negotiated server (missing FP8/RNE capabilities)\n", GGML_REMOTE_ATTN_NAME);
+         return false;
+     }
+     if (bulk && bulk_wire == RKVA_WIRE_SPLITZIP) {
+diff --git a/ggml/src/ggml-remote-attn/remote-attn-protocol.h b/ggml/src/ggml-remote-attn/remote-attn-protocol.h
+--- a/ggml/src/ggml-remote-attn/remote-attn-protocol.h
++++ b/ggml/src/ggml-remote-attn/remote-attn-protocol.h
+@@ -63,6 +63,8 @@
+ static constexpr uint64_t RKVA_CAP_KVARN_BULK_F16 = 1ull << 9;
+ static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8 = 1ull << 10;
+ static constexpr uint64_t RKVA_CAP_KVARN_BULK_SPLITZIP = 1ull << 11;
++// Codec revision: Q rounds directly from F32; finite Q/O saturate, ties to even.
++static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8_RNE = 1ull << 12;
+ static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
+ static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
+ static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;
+diff --git a/tests/test-remote-attn-range.cpp b/tests/test-remote-attn-range.cpp
+--- a/tests/test-remote-attn-range.cpp
++++ b/tests/test-remote-attn-range.cpp
+@@ -189,6 +189,8 @@
+                             }
+                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 32)) {
+                                 ack.reserved[0] |= RKVA_CAP_KVARN_BULK_FP8;
++                                if (!(native_rewind_support & 128))
++                                    ack.reserved[0] |= RKVA_CAP_KVARN_BULK_FP8_RNE;
+                             }
+                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 64)) {
+                                 ack.reserved[0] |= RKVA_CAP_KVARN_BULK_SPLITZIP;
+@@ -1160,6 +1162,21 @@
+         assert(!ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
+         ggml_backend_free(backend);
+     }
++    // An old FP8 server without the RNE codec capability is also rejected.
++    {
++        storage_env strict_env("0", "GGML_RKVA_WIRE_STRICT");
++        storage_env bulk_env("1", "GGML_RKVA_NATIVE_BULK");
++        storage_env wire_env("fp8", "GGML_RKVA_WIRE_FORMAT");
++        loopback server(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 128);
++        auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
++        ggml_remote_attn_geometry geometry{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
++        assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
++        assert(ggml_backend_remote_attn_connect(backend));
++        assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
++        ggml_backend_remote_attn_set_active_session(backend, 0);
++        assert(!ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
++        ggml_backend_free(backend);
++    }
+     // Test 2: Explicit 'auto' without FP8 server capability gracefully falls back to F16
+     {
+         storage_env bulk_env("1", "GGML_RKVA_NATIVE_BULK");
+@@ -1226,6 +1243,10 @@
+         extreme_q[1] = -60000.0f;
+         extreme_q[2] = 57344.0f;
+         extreme_q[3] = -57344.0f;
++        extreme_q[4] = 1.125f;
++        extreme_q[5] = std::nextafter(1.125f, 0.0f);
++        extreme_q[6] = std::ldexp(1.0f, -17);
++        extreme_q[7] = std::nextafter(extreme_q[6], 1.0f);
+         ggml_backend_tensor_set(q, extreme_q.data(), 0, extreme_q.size() * sizeof(float));
+         const uint32_t live = nq;
+         std::vector<int32_t> cells(512, -1), positions(nq);
+@@ -1246,6 +1267,8 @@
+             assert(server.fp8_query_prefix.size() == 8);
+             assert(server.fp8_query_prefix[0] == 0x7b && server.fp8_query_prefix[1] == 0xfb);
+             assert(server.fp8_query_prefix[2] == 0x7b && server.fp8_query_prefix[3] == 0xfb);
++            assert(server.fp8_query_prefix[4] == 0x3c && server.fp8_query_prefix[5] == 0x3c);
++            assert(server.fp8_query_prefix[6] == 0x00 && server.fp8_query_prefix[7] == 0x01);
+         }
+         ggml_remote_attn_set_active(nullptr);
+         ggml_backend_buffer_free(buffer);

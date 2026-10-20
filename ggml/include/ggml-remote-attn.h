@@ -28,6 +28,11 @@ enum ggml_remote_attn_range_op_param {
     // Companion completion node: src[0] is the async range node; its output is
     // a copy of that node's OUT/LSE once the worker has completed.
     GGML_REMOTE_ATTN_PARAM_WAIT   = 10,
+    // Unique monotonic ticket and epoch for safe completion binding & ABA protection
+    GGML_REMOTE_ATTN_PARAM_TICKET_LO = 11,
+    GGML_REMOTE_ATTN_PARAM_TICKET_HI = 12,
+    GGML_REMOTE_ATTN_PARAM_EPOCH_LO  = 13,
+    GGML_REMOTE_ATTN_PARAM_EPOCH_HI  = 14,
 };
 
 // Query-only v2 overflow attention. Sources 1/2 are the companion SET_ROWS
@@ -132,6 +137,12 @@ GGML_API bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backe
 // True when the opt-in GGML_RKVA_ASYNC_LOCAL_REMOTE=1 overlap was accepted by a
 // native KVarN4 bulk-capable server. Always false for synchronous/local modes.
 GGML_API bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend);
+// Terminal graph boundary: wait and discard an unconsumed completion before
+// graph tensors are recycled. Ordinary backend synchronize preserves completion.
+GGML_API void ggml_backend_remote_attn_drain(ggml_backend_t backend);
+// Async queue diagnostics: in-flight count and max queue capacity (2 slots).
+GGML_API size_t ggml_backend_remote_attn_async_in_flight(ggml_backend_t backend);
+GGML_API size_t ggml_backend_remote_attn_async_capacity(ggml_backend_t backend);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_can_restore(ggml_backend_t backend, int32_t pos0);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_has_state(ggml_backend_t backend);

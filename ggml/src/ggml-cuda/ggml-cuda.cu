@@ -33,6 +33,7 @@
 #include "ggml-cuda/kvarn-wht.cuh"
 #include "ggml-cuda/kvarn.cuh"
 #include "ggml-cuda/kvarn-native-producer.cuh"
+#include "ggml-cuda/remote-attn-cuda.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -6818,6 +6819,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_memory_checkpoint") == 0) {
         return (void *)ggml_backend_cuda_memory_checkpoint;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_interface_v1") == 0) {
+        return (void *)ggml_backend_cuda_remote_attn_fp8_interface;
+    }
+    if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_pack_q_v1") == 0) {
+        return (void *)ggml_cuda_remote_attn_fp8_pack_q;
+    }
+    if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_unpack_out_v1") == 0) {
+        return (void *)ggml_cuda_remote_attn_fp8_unpack_out;
+    }
+#endif
     return nullptr;
 }
 

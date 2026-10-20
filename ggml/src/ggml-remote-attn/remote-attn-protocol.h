@@ -46,6 +46,8 @@ enum rkva_wire : uint32_t {
     RKVA_WIRE_F32 = 1,
     RKVA_WIRE_Q4_0 = 2, // RANGE_UPLOAD only: ggml block_q4_0, 18 bytes / 32 values
     RKVA_WIRE_Q8_0 = 3, // RANGE_UPLOAD only: ggml block_q8_0, 34 bytes / 32 values
+    RKVA_WIRE_FP8 = 4, // Option A: 1-byte FP8 E5M2 for queries and outputs
+    RKVA_WIRE_SPLITZIP = 5, // Option B: lossless exponent-compressed FP16
 };
 
 // v2 range extensions. Native storage capabilities use ack.reserved[0].
@@ -59,6 +61,10 @@ static constexpr uint64_t RKVA_CAP_KVARN_REWIND = 1ull << 6;
 static constexpr uint64_t RKVA_CAP_KVARN_SERIAL_PREFIX = 1ull << 7;
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_ATTN = 1ull << 8;
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_F16 = 1ull << 9;
+static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8 = 1ull << 10;
+static constexpr uint64_t RKVA_CAP_KVARN_BULK_SPLITZIP = 1ull << 11;
+// Codec revision: Q rounds directly from F32; finite Q/O saturate, ties to even.
+static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8_RNE = 1ull << 12;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;

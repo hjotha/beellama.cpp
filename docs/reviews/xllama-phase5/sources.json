@@ -1,0 +1,26 @@
+{
+  "xllama": {
+    "uwp/rkva/remote-attn-engine.cpp": "d123cf9282fa54212523635e916f9c5fe3067a2bd0e1830858c3adfafad81711",
+    "uwp/rkva/rkva-kvarn-bulk-f16.inc": "7c573ccfe5c0bb3f366422134c2c56e100d80a44331b20408b8cf46186683691",
+    "uwp/rkva/rkva-kvarn-range.h": "fa396b273fc194df62cb391c181171a630a450c1ef682f663f6b24a4656d12be",
+    "shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl": "d8a6ff5adaed3d849559b3900bbcc0a1c6bb4e8f29c621d7d77566701b89af8f",
+    "shaders/rkva/rkva_range_attn_kvarn4_opt.hlsl": "c89306bd2372c44310c91794d70aa939e2c30e9312479e240b0897831f3d3a54",
+    "shaders/rkva/rkva_range_bulk_f16.hlsl": "6838a3215f753c48b22a619aa2afbad1de2a4411b449d9e50b7a3035c5030052",
+    "shaders/rkva/rkva_range_reduce_opt.hlsl": "114582c94569029c36af698336956c0c4576d6481c8076d39b6d72ca0d39e0b4",
+    "tests/rkva_range_kvarn4_opt_model.py": "538f273ba24fc911d2dd8b991c217bd56c8241eba55f5f5a365b7680b8f1bd9f",
+    "uwp/rkva/remote-attn-engine.h": "17d5f166eda2a751d443de0ebf30ae7c1347abeb2ab80316909e9717d875ec13",
+    "scripts/compile-rkva-range-shaders.sh": "bc908764604643caf42e221a00cd35f2f11dd86af74718618e6c07138d474695",
+    "shaders/generated/rkva_range_attn_kvarn4_opt_dxil.h": "33a59b6c725a74bd9a586d6d43c6eba63aa70617199648938f82d2e0ed79ad42",
+    "shaders/generated/rkva_range_attn_kvarn4_opt_prefix_dxil.h": "1def9594e5e351316a0b6e4e6b9fdeab38bb4f1ec5e213c2afa37f32621404ca",
+    "shaders/generated/rkva_range_attn_kvarn4_decode_prefix_dxil.h": "744dfa84e4a2b82cf81809fecdb908161f62f53faf3daf9fa12025b89df17e26",
+    "shaders/generated/rkva_range_attn_kvarn4_mq2_dxil.h": "053b1c43c581ddb386c142f749623e8750dd6ba9eab1835ab2f605715a40b7f3",
+    "shaders/generated/rkva_range_attn_kvarn4_mq4_dxil.h": "53b95a3875f180d1f06a34d358d816e642846923c6229f2fe14da23e5df307f9",
+    "shaders/generated/rkva_range_reduce_kvarn4_dxil.h": "be7f76ec000eaadafa3750f0a3687cdfd6e82550be7f04021f4b162eb3540680",
+    "shaders/generated/rkva_range_bulk_unpack_q_f16_dxil.h": "307da6d19790645c50072c67a3368b6c04728ec8eca87c68a9b3e071641fccaa"
+  },
+  "beellama": {
+    "src/llama-graph.cpp": "705eb4d9fa7b946908b4fc09a114789bbb2fb12ae17a7d594d39f47e01734337",
+    "ggml/src/ggml-remote-attn/ggml-remote-attn.cpp": "c4cd607bc0fc1fa4898786fc64e1b295a3f74281b151bbded39b94045e9db6d5",
+    "src/llama-position-split.h": "5c769bed2f2e98d0adf95df56f5bf93879b14cb809887d31d36b4ed7fa0b0230"
+  }
+}

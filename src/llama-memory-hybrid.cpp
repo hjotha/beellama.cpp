@@ -147,7 +147,7 @@ llama_memory_hybrid::llama_memory_hybrid(
 
 // Copies one half of an ubatch into an owning llama_ubatch. `sel` lists the
 // token indices (in ubatch order) that belong to the new ubatch.
-static llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int32_t> & sel) {
+llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int32_t> & sel) {
     GGML_ASSERT(!sel.empty() && sel.size() <= src.n_tokens);
 
     llama_ubatch out;

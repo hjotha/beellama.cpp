@@ -1,0 +1,8 @@
+{
+  "src/llama-wavefront.cpp": "335a7f4fc1d0f82fe937dc982ff01dbcc6d6156b362d3c11fd3f66a8438f9c86",
+  "src/llama-wavefront.h": "187c9b0767815be4138c20773f379dc064595af80313d0de2386b09832414d39",
+  "tests/test-wavefront-pipeline.cpp": "76b180fa4f3f66f9ba15cdf2b2b31623a24cefc6e004efec23d6a727247a06ef",
+  "src/llama-memory-hybrid.cpp": "2d6b141e50944dcba9f84eb5c6ba7ee3f116acc4f3a06978c77aa9ce40c82733",
+  "src/llama-position-split.h": "5c769bed2f2e98d0adf95df56f5bf93879b14cb809887d31d36b4ed7fa0b0230",
+  "ggml/src/ggml-cpu/ggml-cpu.c": "bc9b32f8393b919b8daf34f27a6a58518e77ddc91f0d271d2451332da4e86bf9"
+}

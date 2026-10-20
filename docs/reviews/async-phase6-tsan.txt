@@ -1,0 +1,130 @@
+Phase 6 review: observed ThreadSanitizer exit 66.
+Instrumentation: ggml-base and test; auxiliary CPU libraries reused.
+Three diagnostics from the existing test suite, without extra race injection.
+
+WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock) (pid=948372)
+  Cycle in lock order graph: M0 (0x726800000028) => M1 (0x726800000060) => M0
+
+  Mutex M1 acquired here while holding mutex M0 in main thread:
+    #0 pthread_mutex_lock <null> (libtsan.so.2+0x6555f) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 __gthread_mutex_lock(pthread_mutex_t*) /usr/include/c++/16/x86_64-pc-linux-gnu/bits/gthr-default.h:795 (test-tsan+0x236e1a) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 std::mutex::lock() /usr/include/c++/16/bits/std_mutex.h:116 (test-tsan+0x236e1a)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/16/bits/std_mutex.h:276 (test-tsan+0x236e1a)
+    #4 rkva_lock_ctx_drained /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:951 (test-tsan+0x236e1a)
+    #5 ggml_backend_remote_attn_set_geometry /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:2268 (test-tsan+0x236f54) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #6 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1437 (test-tsan+0x18aba) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #7 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+    Hint: use TSAN_OPTIONS=second_deadlock_stack=1 to get more informative warning message
+
+  Mutex M0 acquired here while holding mutex M1 in thread T63:
+    #0 pthread_mutex_lock <null> (libtsan.so.2+0x6555f) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 __gthread_mutex_lock(pthread_mutex_t*) /usr/include/c++/16/x86_64-pc-linux-gnu/bits/gthr-default.h:795 (test-tsan+0x242107) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 std::mutex::lock() /usr/include/c++/16/bits/std_mutex.h:116 (test-tsan+0x242107)
+    #3 std::unique_lock<std::mutex>::lock() /usr/include/c++/16/bits/unique_lock.h:144 (test-tsan+0x242107)
+    #4 rkva_async_submit_locked /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:1449 (test-tsan+0x242107)
+    #5 rkva_run_range /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:1554 (test-tsan+0x242107)
+    #6 rkva_run_attn /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:1727 (test-tsan+0x242107)
+    #7 ggml_remote_attn_exec /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:3255 (test-tsan+0x245ca6) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #8 operator() tests/test-remote-attn-range.cpp:1561 (test-tsan+0xc1ea) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #9 __invoke_impl<void, test_phase6_double_buffer_async()::<lambda()> > /usr/include/c++/16/bits/invoke.h:63 (test-tsan+0xc1ea)
+    #10 __invoke<test_phase6_double_buffer_async()::<lambda()> > /usr/include/c++/16/bits/invoke.h:98 (test-tsan+0xc1ea)
+    #11 _M_invoke<0> /usr/include/c++/16/bits/std_thread.h:303 (test-tsan+0xc1ea)
+    #12 operator() /usr/include/c++/16/bits/std_thread.h:310 (test-tsan+0xc1ea)
+    #13 _M_run /usr/include/c++/16/bits/std_thread.h:255 (test-tsan+0xc1ea)
+    #14 <null> <null> (libstdc++.so.6+0x105395) (BuildId: ed0778005ba03ef96f624ef8cfca20042b7f9ee8)
+
+  Thread T63 (tid=948545, running) created by main thread at:
+    #0 pthread_create <null> (libtsan.so.2+0x64351) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0x105479) (BuildId: ed0778005ba03ef96f624ef8cfca20042b7f9ee8)
+    #2 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+SUMMARY: ThreadSanitizer: lock-order-inversion (potential deadlock) /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:951 in rkva_lock_ctx_drained
+
+WARNING: ThreadSanitizer: data race (pid=948372)
+  Write of size 1 at 0x726800000054 by main thread (mutexes: write M0):
+    #0 ggml_remote_attn_exec /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:3257 (test-tsan+0x245ce3) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #1 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1623 (test-tsan+0x19ca5) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+  Previous read of size 1 at 0x726800000054 by thread T62:
+    #0 rkva_async_worker_main /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:885 (test-tsan+0x238eba) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #1 __invoke_impl<void, void (*)((anonymous namespace)::ggml_backend_remote_attn_context*), (anonymous namespace)::ggml_backend_remote_attn_context*> /usr/include/c++/16/bits/invoke.h:63 (test-tsan+0x232e4b) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 __invoke<void (*)((anonymous namespace)::ggml_backend_remote_attn_context*), (anonymous namespace)::ggml_backend_remote_attn_context*> /usr/include/c++/16/bits/invoke.h:98 (test-tsan+0x232e4b)
+    #3 _M_invoke<0, 1> /usr/include/c++/16/bits/std_thread.h:303 (test-tsan+0x232e4b)
+    #4 operator() /usr/include/c++/16/bits/std_thread.h:310 (test-tsan+0x232e4b)
+    #5 _M_run /usr/include/c++/16/bits/std_thread.h:255 (test-tsan+0x232e4b)
+    #6 <null> <null> (libstdc++.so.6+0x105395) (BuildId: ed0778005ba03ef96f624ef8cfca20042b7f9ee8)
+
+  Location is heap block of size 1320 at 0x726800000000 allocated by main thread:
+    #0 operator new(unsigned long) <null> (libtsan.so.2+0xe1944) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 ggml_backend_remote_attn_init /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:2239 (test-tsan+0x23ba49) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1435 (test-tsan+0x18927) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #3 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+  Mutex M0 (0x726800000028) created at:
+    #0 pthread_mutex_lock <null> (libtsan.so.2+0x6555f) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 __gthread_mutex_lock(pthread_mutex_t*) /usr/include/c++/16/x86_64-pc-linux-gnu/bits/gthr-default.h:795 (test-tsan+0x236dfb) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 std::mutex::lock() /usr/include/c++/16/bits/std_mutex.h:116 (test-tsan+0x236dfb)
+    #3 std::unique_lock<std::mutex>::lock() /usr/include/c++/16/bits/unique_lock.h:144 (test-tsan+0x236dfb)
+    #4 std::unique_lock<std::mutex>::unique_lock(std::mutex&) /usr/include/c++/16/bits/unique_lock.h:75 (test-tsan+0x236dfb)
+    #5 rkva_lock_ctx_drained /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:947 (test-tsan+0x236dfb)
+    #6 ggml_backend_remote_attn_set_geometry /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:2268 (test-tsan+0x236f54) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #7 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1437 (test-tsan+0x18aba) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #8 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+  Thread T62 (tid=948544, running) created by main thread at:
+    #0 pthread_create <null> (libtsan.so.2+0x64351) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0x105479) (BuildId: ed0778005ba03ef96f624ef8cfca20042b7f9ee8)
+    #2 ggml_remote_attn_exec /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:3255 (test-tsan+0x245ca6) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #3 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1497 (test-tsan+0x18d5f) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #4 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+SUMMARY: ThreadSanitizer: data race /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:3257 in ggml_remote_attn_exec
+
+WARNING: ThreadSanitizer: data race (pid=948372)
+  Write of size 8 at 0x72b0000000a0 by main thread (mutexes: write M0):
+    #0 close <null> (libtsan.so.2+0x6ad4b) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 close /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:371 (test-tsan+0x245d01) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 ggml_remote_attn_exec /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:3258 (test-tsan+0x245d01)
+    #3 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1623 (test-tsan+0x19ca5) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #4 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+  Previous read of size 8 at 0x72b0000000a0 by thread T62:
+    #0 recv <null> (libtsan.so.2+0xa1a4e) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 read_all /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:439 (test-tsan+0x237855) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 rkva_transact /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:679 (test-tsan+0x237855)
+    #3 rkva_finish_native_bulk_job /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:762 (test-tsan+0x239368) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #4 rkva_async_worker_main /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:887 (test-tsan+0x239368)
+    #5 __invoke_impl<void, void (*)((anonymous namespace)::ggml_backend_remote_attn_context*), (anonymous namespace)::ggml_backend_remote_attn_context*> /usr/include/c++/16/bits/invoke.h:63 (test-tsan+0x232e4b) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #6 __invoke<void (*)((anonymous namespace)::ggml_backend_remote_attn_context*), (anonymous namespace)::ggml_backend_remote_attn_context*> /usr/include/c++/16/bits/invoke.h:98 (test-tsan+0x232e4b)
+    #7 _M_invoke<0, 1> /usr/include/c++/16/bits/std_thread.h:303 (test-tsan+0x232e4b)
+    #8 operator() /usr/include/c++/16/bits/std_thread.h:310 (test-tsan+0x232e4b)
+    #9 _M_run /usr/include/c++/16/bits/std_thread.h:255 (test-tsan+0x232e4b)
+    #10 <null> <null> (libstdc++.so.6+0x105395) (BuildId: ed0778005ba03ef96f624ef8cfca20042b7f9ee8)
+
+  Location is file descriptor 5 created by main thread at:
+    #0 connect <null> (libtsan.so.2+0x6a6c8) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 ggml_backend_remote_attn_connect /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:2327 (test-tsan+0x23a815) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1438 (test-tsan+0x18ac6) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #3 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+  Mutex M0 (0x726800000028) created at:
+    #0 pthread_mutex_lock <null> (libtsan.so.2+0x6555f) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 __gthread_mutex_lock(pthread_mutex_t*) /usr/include/c++/16/x86_64-pc-linux-gnu/bits/gthr-default.h:795 (test-tsan+0x236dfb) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #2 std::mutex::lock() /usr/include/c++/16/bits/std_mutex.h:116 (test-tsan+0x236dfb)
+    #3 std::unique_lock<std::mutex>::lock() /usr/include/c++/16/bits/unique_lock.h:144 (test-tsan+0x236dfb)
+    #4 std::unique_lock<std::mutex>::unique_lock(std::mutex&) /usr/include/c++/16/bits/unique_lock.h:75 (test-tsan+0x236dfb)
+    #5 rkva_lock_ctx_drained /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:947 (test-tsan+0x236dfb)
+    #6 ggml_backend_remote_attn_set_geometry /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:2268 (test-tsan+0x236f54) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #7 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1437 (test-tsan+0x18aba) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #8 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+  Thread T62 (tid=948544, running) created by main thread at:
+    #0 pthread_create <null> (libtsan.so.2+0x64351) (BuildId: 39cddd66ad5c71210bae112a869b5521e906d259)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0x105479) (BuildId: ed0778005ba03ef96f624ef8cfca20042b7f9ee8)
+    #2 ggml_remote_attn_exec /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:3255 (test-tsan+0x245ca6) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #3 test_phase6_double_buffer_async tests/test-remote-attn-range.cpp:1497 (test-tsan+0x18d5f) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+    #4 main tests/test-remote-attn-range.cpp:1767 (test-tsan+0x24fc7) (BuildId: 81436f95153164da075e6c7b5403111894539103)
+
+SUMMARY: ThreadSanitizer: data race /home/hjotha/beellama.cpp/ggml/src/ggml-remote-attn/ggml-remote-attn.cpp:371 in close

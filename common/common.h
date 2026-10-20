@@ -822,6 +822,7 @@ struct common_params {
     std::string remote_attn_layers       = "auto";   // "auto" | "full" | integer N
     std::string remote_attn_prefill      = "remote"; // "remote" | "migrate" (CUDA prefill + mirrored KVarN handoff)
     std::string remote_attn_format       = "";       // upload RPC format: "kvarn4" | "fp16" | "fp32" | "q4_0" | "q8_0"
+    std::string remote_attn_wire_format  = "";       // activation wire format: "f16" | "fp8" | "auto"
     bool        remote_attn_stats        = false;
     ggml_type   remote_attn_cache_type_k = GGML_TYPE_COUNT; // opt-in Qx override on local Vulkan layers
     ggml_type   remote_attn_cache_type_v = GGML_TYPE_COUNT;

@@ -1,0 +1,13 @@
+{
+  "branch": "docs/hybrid-attention-master-review",
+  "head": "aaa63758a968577c593654d27b80de748dd15c6a",
+  "sha256": {
+    "ggml/include/ggml-remote-attn-cuda.h": "07a7325cd85650b72f1a13d650f708e341cf35ff31c82b8afa41e99654caf1e9",
+    "ggml/src/ggml-cuda/remote-attn-cuda.cuh": "8ca1f92ad70d9016b0b0966388396933123851a8441e3d294f381762a3df6101",
+    "ggml/src/ggml-cuda/remote-attn-cuda.cu": "dc4650b343faf17c6b9aa52cf7449c1e69c01f40448795f0e7d6c57aa639ddc4",
+    "ggml/src/ggml-cuda/ggml-cuda.cu": "717349981216e15ba7f841bdf166450400670b00f5a53130805f478b673cbc69",
+    "ggml/src/ggml-remote-attn/ggml-remote-attn.cpp": "c4cd607bc0fc1fa4898786fc64e1b295a3f74281b151bbded39b94045e9db6d5",
+    "ggml/src/ggml-hip/CMakeLists.txt": "69aee0b145712205058500baccea0ac3ed8da9d3d78fbf3830f1ad440af83faf",
+    "ggml/src/ggml-musa/CMakeLists.txt": "bafd557532fda674098feb3ecbdbbb7cbdadb1f3b9968adbd86790ac164f1b1a"
+  }
+}

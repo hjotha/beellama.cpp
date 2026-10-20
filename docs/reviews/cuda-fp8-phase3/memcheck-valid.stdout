@@ -1,0 +1,12 @@
+pack F32 host: 1045703 values, 0 mismatches vs NVIDIA SATFINITE/RNE
+pack F32 device: 1045703 values, 0 mismatches vs NVIDIA SATFINITE/RNE
+pack F16 host: all 63488 finite patterns, 0 mismatches
+pack F16 device: all 63488 finite patterns, 0 mismatches
+pack: 5 F32 nonfinite patterns rejected
+pack: batch of all 2048 F16 nonfinite patterns rejected
+unpack host: all 248 finite FP8 patterns exact; LSE and row padding preserved
+unpack device: all 248 finite FP8 patterns exact; LSE and row padding preserved
+unpack device: 2 protocol rows and padded stride passed
+unpack: all 8 nonfinite FP8 patterns rejected
+unpack: 3 nonfinite LSE patterns rejected
+VALID CASES PASSED
