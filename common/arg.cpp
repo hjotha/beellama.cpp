@@ -3866,6 +3866,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_V").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--remote-attn-format", "--remote-attn-upload-format"}, "FORMAT",
+        "RPC upload format for remote attention: 'kvarn4'/'kvarn', 'fp16'/'f16', 'fp32'/'f32', 'q4'/'q4_0', 'q8'/'q8_0' (default: kvarn4)",
+        [](common_params & params, const std::string & value) {
+            params.remote_attn_format = value;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_UPLOAD_FORMAT", value.c_str(), 1);
+#else
+            _putenv_s("GGML_RKVA_UPLOAD_FORMAT", value.c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_FORMAT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--split-attn-cuda-reserve", "--remote-attn-cuda-reserve"}, "SIZE",
         "CUDA VRAM safety margin to preserve during auto-placement (e.g. 350M, 500M, 1G, default: 350M)",
         [](common_params & params, const std::string & value) {

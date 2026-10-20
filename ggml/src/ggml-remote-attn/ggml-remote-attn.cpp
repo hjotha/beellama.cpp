@@ -38,6 +38,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -191,8 +192,45 @@ struct rkva_socket {
 #endif
     }
 
+    bool write_all_iov(const struct iovec * iov_in, int count) {
+#ifndef _WIN32
+        struct iovec iov[4];
+        if (count <= 0 || count > 4) return false;
+        for (int i = 0; i < count; ++i) iov[i] = iov_in[i];
+        int cur = 0;
+        while (cur < count) {
+            const ssize_t n = ::writev(fd, iov + cur, count - cur);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                return false;
+            }
+            size_t rem = (size_t) n;
+            while (cur < count && rem >= iov[cur].iov_len) {
+                rem -= iov[cur].iov_len;
+                ++cur;
+            }
+            if (cur < count && rem > 0) {
+                iov[cur].iov_base = static_cast<char *>(iov[cur].iov_base) + rem;
+                iov[cur].iov_len -= rem;
+            }
+        }
+        return true;
+#else
+        (void) iov_in; (void) count;
+        return false;
+#endif
+    }
+
     bool read_all(void * dst, size_t len) {
 #ifndef _WIN32
+#if defined(__linux__) && defined(TCP_QUICKACK)
+        if (len > 4096) {
+            int quickack = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
+        }
+#endif
         auto * p = static_cast<uint8_t *>(dst);
         while (len) {
             const ssize_t n = ::recv(fd, p, len, 0);
@@ -284,6 +322,8 @@ struct ggml_backend_remote_attn_context {
     rkva_async_state        async_state = rkva_async_state::IDLE;
     bool                    async_stop = false;
     std::unique_ptr<rkva_async_job> async_job;
+    std::unique_ptr<rkva_async_job> async_job_reusable;
+    std::vector<uint8_t>            async_reply_buffer;
     struct ggml_tensor *    async_node = nullptr;
     bool                    async_local_remote = false;
 
@@ -361,17 +401,19 @@ static bool rkva_transact(
     };
 
     const uint64_t t0 = now_us();
-    int header_flags = 0;
-#ifdef MSG_MORE
     if (payload_bytes) {
-        header_flags = MSG_MORE;
-    }
-#endif
-    if (!ctx->sock.write_all(&req, sizeof(req), header_flags)) {
-        return stream_failure();
-    }
-    if (payload_bytes && !ctx->sock.write_all(payload, payload_bytes)) {
-        return stream_failure();
+        struct iovec iov[2];
+        iov[0].iov_base = const_cast<rkva_request *>(&req);
+        iov[0].iov_len  = sizeof(req);
+        iov[1].iov_base = const_cast<void *>(payload);
+        iov[1].iov_len  = payload_bytes;
+        if (!ctx->sock.write_all_iov(iov, 2)) {
+            return stream_failure();
+        }
+    } else {
+        if (!ctx->sock.write_all(&req, sizeof(req))) {
+            return stream_failure();
+        }
     }
 
     rkva_response rsp {};
@@ -440,7 +482,10 @@ static bool rkva_finish_native_bulk_job(
             out_bytes + lse_bytes > (256u << 20)) {
         return false;
     }
-    std::vector<uint8_t> reply;
+    auto & reply = ctx->async_reply_buffer;
+    if (reply.capacity() < (4u << 20)) {
+        reply.reserve(4u << 20);
+    }
     if (!rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, ctx->active_session,
                 job.layer, job.nq, job.payload.data(), uint32_t(job.payload.size()),
                 reply, uint32_t(out_bytes + lse_bytes))) {
@@ -547,7 +592,10 @@ static void rkva_async_drain(ggml_backend_remote_attn_context * ctx) {
     if (ctx->async_state == rkva_async_state::DONE_OK ||
             ctx->async_state == rkva_async_state::DONE_ERR) {
         ctx->async_state = rkva_async_state::IDLE;
-        ctx->async_job.reset();
+        if (ctx->async_job) {
+            ctx->async_job->payload.clear();
+            ctx->async_job_reusable = std::move(ctx->async_job);
+        }
         ctx->async_node = nullptr;
     }
     lock.unlock();
@@ -570,7 +618,10 @@ static std::unique_lock<std::mutex> rkva_lock_ctx_drained(
                    ctx->async_state == rkva_async_state::DONE_ERR;
             if (done) {
                 ctx->async_state = rkva_async_state::IDLE;
-                ctx->async_job.reset();
+                if (ctx->async_job) {
+                    ctx->async_job->payload.clear();
+                    ctx->async_job_reusable = std::move(ctx->async_job);
+                }
                 ctx->async_node = nullptr;
             }
         }
@@ -612,7 +663,10 @@ static bool rkva_async_wait_node(
         }
     }
     ctx->async_state = rkva_async_state::IDLE;
-    ctx->async_job.reset();
+    if (ctx->async_job) {
+        ctx->async_job->payload.clear();
+        ctx->async_job_reusable = std::move(ctx->async_job);
+    }
     ctx->async_node = nullptr;
     lock.unlock();
     ctx->async_cv.notify_all();
@@ -948,11 +1002,20 @@ static bool rkva_async_submit_locked(
         }
     }
     std::unique_ptr<rkva_async_job> job;
-    try {
-        job = std::make_unique<rkva_async_job>();
-    } catch (...) {
-        ctx->failed = true;
-        return false;
+    if (ctx->async_job_reusable) {
+        job = std::move(ctx->async_job_reusable);
+        job->payload.clear();
+        job->output = nullptr;
+        job->output_stride = 0;
+        job->upload_bytes = 0;
+    } else {
+        try {
+            job = std::make_unique<rkva_async_job>();
+            job->payload.reserve(8u << 20);
+        } catch (...) {
+            ctx->failed = true;
+            return false;
+        }
     }
     if (!rkva_prepare_native_bulk_job(ctx, node, layer, live, nq, out_width, *job)) {
         ctx->failed = true;
@@ -2208,6 +2271,13 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     return true;
 }
 
+static const char * rkva_get_upload_format() {
+    if (const char * fmt = std::getenv("GGML_RKVA_UPLOAD_FORMAT")) return fmt;
+    if (const char * fmt = std::getenv("GGML_RKVA_FORMAT")) return fmt;
+    if (const char * fmt = std::getenv("GGML_RKVA_RANGE_STORAGE")) return fmt;
+    return nullptr;
+}
+
 bool ggml_backend_remote_attn_configure_range(
         ggml_backend_t backend, uint32_t origin, uint32_t capacity, ggml_type cache_type) {
     if (!backend || ggml_backend_is_local_split(backend)) {
@@ -2217,14 +2287,13 @@ bool ggml_backend_remote_attn_configure_range(
     auto lock = rkva_lock_ctx_drained(ctx);
     bool async_overlap = false;
     if (!rkva_async_local_remote_option(async_overlap)) return false;
-    if (const char * storage = std::getenv("GGML_RKVA_RANGE_STORAGE")) {
-        if (!std::strcmp(storage, "kvarn4")) {
-            return rkva_configure_native_kvarn(ctx, origin, capacity, cache_type, async_overlap);
-        }
+    const char * format_req = rkva_get_upload_format();
+    if (format_req && (!std::strcmp(format_req, "kvarn4") || !std::strcmp(format_req, "kvarn"))) {
+        return rkva_configure_native_kvarn(ctx, origin, capacity, cache_type, async_overlap);
     }
     if (async_overlap) {
         GGML_LOG_ERROR("%s: GGML_RKVA_ASYNC_LOCAL_REMOTE requires "
-                "GGML_RKVA_RANGE_STORAGE=kvarn4\n", GGML_REMOTE_ATTN_NAME);
+                "upload format kvarn4\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
     constexpr uint32_t required = (1u << RKVA_RANGE_CONFIG) | (1u << RKVA_RANGE_UPLOAD) | (1u << RKVA_RANGE_ATTN);
@@ -2240,20 +2309,29 @@ bool ggml_backend_remote_attn_configure_range(
     const bool source_q4 = cache_type == GGML_TYPE_Q4_0;
     const uint64_t capability = source_q4 ? RKVA_CAP_RANGE_Q4_0 : RKVA_CAP_RANGE_Q8_0;
     const bool supports_native = cache_type != GGML_TYPE_F16 && (ctx->ack.reserved[0] & capability) != 0;
-    const char * requested = std::getenv("GGML_RKVA_RANGE_STORAGE");
+    const char * requested = format_req;
     bool native_quant = supports_native;
     if (requested && std::strcmp(requested, "auto") != 0) {
-        if (std::strcmp(requested, "f16") == 0) {
+        if (!std::strcmp(requested, "f16") || !std::strcmp(requested, "fp16")) {
             native_quant = false;
-        } else if (std::strcmp(requested, "q4_0") == 0 || std::strcmp(requested, "q8_0") == 0) {
-            if (std::strcmp(requested, ggml_type_name(cache_type)) != 0 || !supports_native) {
-                GGML_LOG_ERROR("%s: GGML_RKVA_RANGE_STORAGE=%s requires a matching host cache and server capability\n",
+        } else if (!std::strcmp(requested, "f32") || !std::strcmp(requested, "fp32")) {
+            native_quant = false;
+        } else if (!std::strcmp(requested, "q4_0") || !std::strcmp(requested, "q4")) {
+            if (std::strcmp(ggml_type_name(cache_type), "q4_0") != 0 || !supports_native) {
+                GGML_LOG_ERROR("%s: upload format %s requires a matching host cache and server capability\n",
+                        GGML_REMOTE_ATTN_NAME, requested);
+                return false;
+            }
+            native_quant = true;
+        } else if (!std::strcmp(requested, "q8_0") || !std::strcmp(requested, "q8")) {
+            if (std::strcmp(ggml_type_name(cache_type), "q8_0") != 0 || !supports_native) {
+                GGML_LOG_ERROR("%s: upload format %s requires a matching host cache and server capability\n",
                         GGML_REMOTE_ATTN_NAME, requested);
                 return false;
             }
             native_quant = true;
         } else {
-            GGML_LOG_ERROR("%s: invalid GGML_RKVA_RANGE_STORAGE='%s' (expected auto, f16, q4_0 or q8_0)\n",
+            GGML_LOG_ERROR("%s: invalid upload format '%s' (expected auto, kvarn4/kvarn, fp16/f16, fp32/f32, q4/q4_0 or q8/q8_0)\n",
                     GGML_REMOTE_ATTN_NAME, requested);
             return false;
         }
@@ -2290,8 +2368,9 @@ bool ggml_backend_remote_attn_configure_range(
     ctx->native_bulk = false;
     ctx->async_local_remote = false;
     ctx->native_layers.clear();
+    const bool wire_f32 = requested && (!std::strcmp(requested, "f32") || !std::strcmp(requested, "fp32"));
     ctx->range_source_type = cache_type;
-    ctx->range_wire = native_quant ? (source_q4 ? RKVA_WIRE_Q4_0 : RKVA_WIRE_Q8_0) : RKVA_WIRE_F16;
+    ctx->range_wire = wire_f32 ? RKVA_WIRE_F32 : (native_quant ? (source_q4 ? RKVA_WIRE_Q4_0 : RKVA_WIRE_Q8_0) : RKVA_WIRE_F16);
     ctx->range_origin = origin;
     ctx->range_capacity = capacity;
     ++ctx->range_epoch;
@@ -2299,7 +2378,7 @@ bool ggml_backend_remote_attn_configure_range(
     ctx->range_fused = fused;
     ctx->range_profile = profile;
     ctx->range_kernel_mode = kernel_mode;
-    const char * storage_name = native_quant ? (source_q4 ? "q4_0" : "q8_0") : "f16";
+    const char * storage_name = wire_f32 ? "f32" : (native_quant ? (source_q4 ? "q4_0" : "q8_0") : "f16");
     if (!rkva_range_apply_control(ctx, storage_name, generic_kernel)) return false;
     if (cache_type == GGML_TYPE_F16) {
         GGML_LOG_INFO("%s: range source=f16 storage=f16; direct original K/V half bytes, no quantized intermediate\n",

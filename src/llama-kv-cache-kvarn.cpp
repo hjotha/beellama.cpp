@@ -2940,8 +2940,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     kv_size_overflow(position_split_p != 0 ? kv_size - position_split_p : kv_size),
     position_split_p_(position_split_p),
     native_kvarn_rpc_experimental_(rpc_position_split &&
-        std::getenv("GGML_RKVA_RANGE_STORAGE") &&
-        std::strcmp(std::getenv("GGML_RKVA_RANGE_STORAGE"), "kvarn4") == 0 &&
+        ([]() {
+            const char * s = std::getenv("GGML_RKVA_UPLOAD_FORMAT");
+            if (!s) s = std::getenv("GGML_RKVA_FORMAT");
+            if (!s) s = std::getenv("GGML_RKVA_RANGE_STORAGE");
+            return s && (std::strcmp(s, "kvarn4") == 0 || std::strcmp(s, "kvarn") == 0);
+        })() &&
         std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL") &&
         std::strcmp(std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL"), "1") == 0),
     // Dynamic staging: size the lossless F16 ring from position semantics.

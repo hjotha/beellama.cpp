@@ -1913,8 +1913,10 @@ std::vector<ggml_backend_t> layer_backends;
             geo.kq_scale       = model.hparams.f_attention_scale == 0.0f ?
                                  1.0f / sqrtf((float) geo.head_dim) : model.hparams.f_attention_scale;
             if (tcp_position_split) {
-                const char * storage = std::getenv("GGML_RKVA_RANGE_STORAGE");
-                if (storage && std::strcmp(storage, "kvarn4") == 0 &&
+                const char * storage = std::getenv("GGML_RKVA_UPLOAD_FORMAT");
+                if (!storage) storage = std::getenv("GGML_RKVA_FORMAT");
+                if (!storage) storage = std::getenv("GGML_RKVA_RANGE_STORAGE");
+                if (storage && (std::strcmp(storage, "kvarn4") == 0 || std::strcmp(storage, "kvarn") == 0) &&
                         (cparams.kv_tail_tokens > 128 || cparams.kv_tail_type != GGML_TYPE_F16)) {
                     throw std::runtime_error("experimental native Xbox KVarN4 requires an F16 precision tail of at most 128 tokens");
                 }
