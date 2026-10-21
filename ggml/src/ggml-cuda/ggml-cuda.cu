@@ -5331,6 +5331,23 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Strict metadata gate: no projected graphs, layout siblings, asynchronous
+// submission or WAIT. Placement remains the existing codec policy's decision.
+static bool ggml_cuda_remote_singleton_eligible(const ggml_cgraph * cgraph) {
+    if (!cgraph || cgraph->uid == 0 || cgraph->n_nodes != 1) return false;
+    const ggml_tensor * node = cgraph->nodes[0];
+    return node && node->op == GGML_OP_REMOTE_ATTN &&
+        (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+        node->type == GGML_TYPE_F32 && node->src[0] != nullptr &&
+        node->ne[1] >= 1 && node->ne[1] <= 9 && ggml_is_contiguous_rows(node) &&
+        ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_RANGE) &&
+        !ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT) &&
+        !ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC) &&
+        ggml_backend_remote_attn_cuda_enabled_for_node(node);
+}
+#endif
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_remote_attn_trace_scope host_timing("cuda_graph_host", cgraph->n_nodes ? cgraph->nodes[0] : nullptr);
@@ -5348,11 +5365,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bookkeeping.event.graph_uid = cgraph->uid;
 #ifdef USE_CUDA_GRAPH
     trace_reason = GGML_CUDA_TRACE_WARMUP;
-    graph_key = ggml_cuda_graph_get_key(cgraph);
-
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
-
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    bool remote_singleton_fastpath = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool remote_singleton_enabled = [] {
+        const char * option = std::getenv("GGML_RKVA_CUDA_SINGLETON_FASTPATH");
+        return option && strcmp(option, "1") == 0;
+    }();
+    // Keep pressure recovery on the ordinary path. Stream/concurrent state is
+    // owned by this backend, not inferred from the currently selected device.
+    remote_singleton_fastpath = remote_singleton_enabled &&
+        !cuda_ctx->disable_cuda_graphs_due_to_memory_pressure &&
+        cuda_ctx->curr_stream_no == 0 &&
+        cuda_ctx->stream_context().concurrent_events.empty() &&
+        ggml_cuda_remote_singleton_eligible(cgraph);
+#endif
+    ggml_cuda_graph * graph = nullptr;
+    if (!remote_singleton_fastpath) {
+        graph_key = ggml_cuda_graph_get_key(cgraph);
+        ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+        graph = cuda_ctx->cuda_graph(graph_key);
+    }
+    // Never bypass the allocation headroom check or its failure/cleanup path.
+    // A remote singleton cannot be captured. Skip its compute-time graph lookup;
+    // local graphs retain their original cache/recovery/eviction bookkeeping.
     const bool graph_memory_pressure_ok = cuda_ctx->check_memory_pressure_before_graph();
     if (ggml_cuda_graph_debug_enabled()) {
         fprintf(stderr,
@@ -5365,7 +5400,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         GGML_LOG_ERROR("%s: CUDA graph memory-pressure cleanup failed; refusing to continue with stale graph resources\n", __func__);
         return GGML_STATUS_FAILED;
     }
-    if (graph->is_enabled()) {
+    if (remote_singleton_fastpath) {
+        trace_reason = GGML_CUDA_TRACE_REMOTE;
+    }
+    if (graph && graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, bookkeeping.enabled ? &trace_reason : nullptr);
         if (graph_compatible) {
             // HIP-only: skip the graph path (incl. the update_required probe) for
@@ -5419,7 +5457,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (bookkeeping.enabled) {
+    if (remote_singleton_fastpath) {
+        ggml_cuda_trace_counter("cuda_remote_singleton_fastpath", cgraph);
+    }
+    if (bookkeeping.enabled && graph) {
         const bool disabled_env = std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
         if (use_cuda_graph) trace_reason = GGML_CUDA_TRACE_GRAPH;
         else if (disabled_env) trace_reason = GGML_CUDA_TRACE_ENV;
@@ -5461,6 +5502,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    // The singleton shortcut still uses the complete direct evaluator: producer
+    // events, stream ordering, remote failure retirement and status are unchanged.
+    // With use_cuda_graph=false it never dereferences the null graph_key.
     uint64_t execution_mode = 0;
     const bool ok = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
                                                        graph_key, host_timing.enabled ? &execution_mode : nullptr);
