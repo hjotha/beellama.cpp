@@ -391,6 +391,7 @@ For negotiated native KVarN4 bulk attention with FP8 on the wire,
 | `0` | CPU orchestration and codec through the existing scheduler copies. |
 | `1` or unset | Existing CUDA-capable path for all supported range sizes. |
 | `prefill` | CUDA-capable path only for whole ranges with more than nine queries; CPU for one through nine. |
+| `mapped` | Experimental CUDA path for all ranges; one through nine use a mapped-host pack/unpack extension, larger ranges use the ordinary CUDA helper. |
 
 `prefill` names the existing native serial-prefix protocol bucket; it does not
 detect the semantic request phase. A prompt tail of nine or fewer queries uses
@@ -408,6 +409,14 @@ slot buffers. Actual device-loss/destructor fault handling remains a separate
 qualification gate. Keep the setting fixed for
 the process lifetime and restart serving to change it. Explicit `prefill`
 does not change the existing `0`/`1` defaults or select a policy from timings.
+
+`mapped` requires the CUDA interface v3 and mapped-host capability on the owning
+device. An unsupported small-device operation fails; it does not silently select
+another codec. Each slot retains private grow-only mapped TX/RX storage. Small
+pack/unpack replace their seven memcpy/memset commands with mapped GPU accesses
+and CPU copies of FP8/LSE bytes. PCIe traffic remains. Producer fences, stream
+retirement, numerical validation and WAIT ordering are preserved. This is an
+explicit experiment until end-to-end decode and prefill measurements qualify it.
 
 ## Migration from earlier versions
 
@@ -433,3 +442,43 @@ K/V are rounded directly to F16 once, mirrored on CPU for native state replay,
 and uploaded byte-for-byte. The local CUDA prefix remains KVarN4. Selecting
 only F16 wire storage while retaining a Q4/Q8 companion is still an expansion
 of that quantized source, not an original-F16 cache.
+
+
+## Experimental causal wavefront serving
+
+`GGML_RKVA_WAVEFRONT_TILE=64` or `128` enables the Qwen35 dense serving
+implementation for a single sequence with contiguous positions entirely in
+remote overflow. The default is `0`. It uses one parent ubatch, graph, memory
+application and input update, with explicit convolution/GDN cache dependencies
+between tiles. It requires causal native KVarN4 RPC, position split, asynchronous
+remote support, no recurrent rollback snapshots (`n_rs_seq=0`), and no layer
+capture. Unsupported parent shapes retain the legacy graph and log the reason.
+A partial tiled-parent failure retires pending work, clears the complete hybrid
+context, and poisons that context; create a fresh context before further decode.
+
+`GGML_RKVA_WAVEFRONT_RPC_BATCH=1` is the default: at most two prepared remote
+jobs overlap local work. Explicit `4` requires wavefront tiles and negotiated
+RKVA op23/capability14. It groups one through four independent, distinct-layer
+range nodes in an envelope, with all PREPAREs before any member WAIT. The first
+member requires an empty queue. Runtime tickets/epochs bind completions; every
+entry and finite OUT/LSE body is checked before successful completion. A partial
+cohort at a terminal boundary fails closed. The serial TCP owner and existing
+per-entry Xbox GPU fences are preserved.
+
+Ranges created by this planner share one CUDA codec context per device inside
+the remote backend. Each slot retains its own payload, reply and query staging;
+the codec's mutex retires each operation before its scratch can be reused.
+Untagged ranges retain private context ownership. Switching to untagged decode
+releases retired shared leases; `prefill` mode also releases the other FREE
+slots on entering CPU decode. Active slots retain their leases until completion,
+and network staging keeps its capacity. Context/lease counters distinguish real
+context creation, slot-owner drops and last-owner drops; they are not byte-free
+or global zero-allocation measurements.
+
+These settings keep `b` and `ub` unchanged. With 16 remote layer groups and a
+256-token parent, tiles64 produce64 logical remote tasks; conservative batching
+uses19 envelopes. Tiles128 produce32 tasks and17 envelopes. The untiled baseline
+has16 remote calls. The potential benefit is overlap; this does not turn the16
+layer dependencies of a token into four, reduce aggregate wire bytes fourfold,
+or make an early prompt-prefix result a response token. These modes remain
+explicit experiments pending model-level numerical and throughput qualification.

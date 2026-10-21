@@ -354,6 +354,10 @@ private:
     const uint64_t context_instance;
 
     llama_cparams cparams;
+    std::map<std::string, uint64_t> wavefront_decisions;
+    bool wavefront_parent_active = false;
+    bool wavefront_committed = false;
+    bool wavefront_poisoned = false;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

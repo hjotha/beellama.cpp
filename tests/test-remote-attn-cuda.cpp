@@ -19,6 +19,8 @@
 
 #ifdef RKVA_CUDA_STANDALONE_TEST
 extern "C" const ggml_remote_attn_cuda_fp8_interface_v2 * ggml_backend_cuda_remote_attn_fp8_interface_v2(void);
+extern "C" const ggml_remote_attn_cuda_fp8_interface_v3 * ggml_backend_cuda_remote_attn_fp8_interface_v3(void);
+extern "C" const ggml_remote_attn_cuda_retirement_interface_v1 * ggml_backend_cuda_remote_attn_retirement_interface_v1(void);
 extern "C" const ggml_remote_attn_cuda_fp8_interface * ggml_backend_cuda_remote_attn_fp8_interface(void);
 #endif
 
@@ -49,6 +51,228 @@ static uint8_t oracle(float value) {
 #endif
 }
 
+static void test_mapped_small(const ggml_remote_attn_cuda_fp8_interface_v3 * small,
+                              const ggml_remote_attn_cuda_retirement_interface_v1 * retirement,
+                              const ggml_remote_attn_cuda_fp8_interface_v2 * api, void * context,
+                              half * dev_half, float * dev_float, uint8_t * packed,
+                              const std::vector<uint16_t> & half_values, const std::vector<float> & float_values,
+                              cudaStream_t producer, cudaEvent_t ready) {
+    REQUIRE(small && small->base == api && small->supports_small && small->pack_small && small->unpack_small);
+    REQUIRE(!small->supports_small(-1));
+    // This fixture is a qualification gate for the mapped path, not a silent
+    // success when a present device cannot execute the new implementation.
+    const bool supported = small->supports_small(0);
+    int can_map = 0, unified_addressing = 0;
+    unsigned device_flags = 0;
+    CUDA_OK(cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, 0));
+    CUDA_OK(cudaDeviceGetAttribute(&unified_addressing, cudaDevAttrUnifiedAddressing, 0));
+    CUDA_OK(cudaGetDeviceFlags(&device_flags));
+    std::printf("mapped small v3 capabilities: device=0 supported=%d can_map=%d uva=%d flags=0x%x\n",
+        int(supported), can_map, unified_addressing, device_flags);
+    REQUIRE(supported);
+    REQUIRE(small->pack_small(context, dev_half, true, 1, half_values.size(), packed, nullptr));
+    for (size_t i = 0; i < half_values.size(); ++i) REQUIRE(packed[i] == oracle(half_float(half_values[i])));
+    CUDA_OK(cudaMemcpyAsync(dev_float, float_values.data(), float_values.size() * sizeof(float), cudaMemcpyHostToDevice, producer));
+    CUDA_OK(cudaEventRecord(ready, producer));
+    REQUIRE(small->pack_small(context, dev_float, false, 1, float_values.size(), packed, ready));
+    for (size_t i = 0; i < float_values.size(); ++i) REQUIRE(packed[i] == oracle(float_values[i]));
+
+    float * output = nullptr;
+    constexpr size_t max_rows = 9, max_width = 2049, heads = 3, padding = 7;
+    constexpr size_t capacity = max_rows * (max_width + heads + padding);
+    CUDA_OK(cudaMalloc(&output, capacity * sizeof(float)));
+    std::vector<float> readback(capacity);
+    std::vector<float> values(max_rows * max_width);
+    std::vector<float> lse(max_rows * heads);
+    std::vector<uint8_t> codes;
+    for (uint32_t code = 0; code < 256; ++code) if ((code & 0x7cu) != 0x7cu) codes.push_back(uint8_t(code));
+
+    // Grow/shrink each sidecar on the same context, covering 1/9 query bounds,
+    // partial words, odd rows, inter-row word crossings, and more than one CTA.
+    for (size_t nq : {size_t(1), size_t(9), size_t(2), size_t(9), size_t(1)}) {
+        for (size_t width : {size_t(1), size_t(3), size_t(17), size_t(255), max_width}) {
+            const size_t n = nq * width;
+            const size_t stride = width + heads + padding;
+            for (size_t i = 0; i < n; ++i) values[i] = half_float(uint16_t(codes[i % codes.size()]) << 8);
+            for (size_t i = 0; i < nq * heads; ++i) lse[i] = (i & 1) ? -2097152.0f : std::numeric_limits<float>::max();
+            CUDA_OK(cudaMemcpyAsync(dev_float, values.data(), n * sizeof(float), cudaMemcpyHostToDevice, producer));
+            CUDA_OK(cudaEventRecord(ready, producer));
+            REQUIRE(small->pack_small(context, dev_float, false, nq, width, packed, ready));
+            for (size_t i = 0; i < n; ++i) REQUIRE(packed[i] == codes[i % codes.size()]);
+            std::fill(readback.begin(), readback.end(), -99.0f);
+            CUDA_OK(cudaMemcpy(output, readback.data(), readback.size() * sizeof(float), cudaMemcpyHostToDevice));
+            // Pageable H2D may return after staging, before default-stream DMA
+            // completes. The helper owns a NonBlocking stream and cannot infer
+            // this fixture's independent destination initializer dependency.
+            CUDA_OK(cudaStreamSynchronize(nullptr));
+            REQUIRE(small->unpack_small(context, packed, lse.data(), nq, width, heads, output, stride * sizeof(float)));
+            CUDA_OK(cudaMemcpy(readback.data(), output, readback.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            for (size_t row = 0; row < nq; ++row) {
+                for (size_t col = 0; col < width; ++col) {
+                    if (bits_of(readback[row * stride + col]) != bits_of(values[row * width + col])) {
+                        std::fprintf(stderr, "mapped unpack mismatch nq=%zu width=%zu row=%zu col=%zu code=%02x got=%08x expected=%08x\n",
+                            nq, width, row, col, packed[row * width + col], bits_of(readback[row * stride + col]), bits_of(values[row * width + col]));
+                    }
+                    REQUIRE(bits_of(readback[row * stride + col]) == bits_of(values[row * width + col]));
+                }
+                for (size_t h = 0; h < heads; ++h) REQUIRE(bits_of(readback[row * stride + width + h]) == bits_of(lse[row * heads + h]));
+                for (size_t col = width + heads; col < stride; ++col) REQUIRE(readback[row * stride + col] == -99.0f);
+            }
+            for (size_t i = nq * stride; i < readback.size(); ++i) REQUIRE(readback[i] == -99.0f);
+        }
+    }
+
+    // All nonfinite F32/F16 classes, including an invalid last CTA. Invalid Q
+    // must not publish any partial data into the caller's network buffer.
+    constexpr size_t error_width = 2051;
+    std::vector<float> erroneous(error_width, 1.0f);
+    for (uint32_t bad : {0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00001u, 0x7f800001u}) {
+        erroneous.back() = from_bits(bad);
+        CUDA_OK(cudaMemcpy(dev_float, erroneous.data(), erroneous.size() * sizeof(float), cudaMemcpyHostToDevice));
+        std::memset(packed, 0xa5, erroneous.size());
+        REQUIRE(!small->pack_small(context, dev_float, false, 1, erroneous.size(), packed, nullptr));
+        REQUIRE(std::all_of(packed, packed + erroneous.size(), [](uint8_t b) { return b == 0xa5; }));
+        erroneous.back() = 1.0f;
+        CUDA_OK(cudaMemcpy(dev_float, erroneous.data(), erroneous.size() * sizeof(float), cudaMemcpyHostToDevice));
+        REQUIRE(small->pack_small(context, dev_float, false, 1, erroneous.size(), packed, nullptr));
+        REQUIRE(std::all_of(packed, packed + erroneous.size(), [](uint8_t b) { return b == 0x3c; }));
+    }
+    for (uint16_t bad : {uint16_t(0x7c00), uint16_t(0xfc00), uint16_t(0x7e00), uint16_t(0x7c01)}) {
+        CUDA_OK(cudaMemcpy(dev_half, &bad, sizeof(bad), cudaMemcpyHostToDevice));
+        packed[0] = 0xa5;
+        REQUIRE(!small->pack_small(context, dev_half, true, 1, 1, packed, nullptr) && packed[0] == 0xa5);
+    }
+    for (uint32_t code = 0; code < 256; ++code) if ((code & 0x7cu) == 0x7cu) {
+        std::memset(packed, 0x3c, error_width);
+        packed[error_width - 1] = uint8_t(code);
+        REQUIRE(!small->unpack_small(context, packed, nullptr, 1, error_width, 0, output, error_width * sizeof(float)));
+        packed[error_width - 1] = 0x3c;
+        REQUIRE(small->unpack_small(context, packed, nullptr, 1, error_width, 0, output, error_width * sizeof(float)));
+    }
+    for (float bad : {INFINITY, -INFINITY, std::numeric_limits<float>::quiet_NaN()}) {
+        REQUIRE(!small->unpack_small(context, packed, &bad, 1, 3, 1, output, 16));
+    }
+    float finite_lse = -2097152.0f;
+    REQUIRE(small->unpack_small(context, packed, &finite_lse, 1, 3, 1, output, 16));
+
+    // Reject unsupported shapes/pointer ownership/overflow before queueing any
+    // work. A nq=10 call is v2 territory; v3 never silently changes algorithms.
+    REQUIRE(!small->pack_small(nullptr, dev_float, false, 1, 1, packed, nullptr));
+    REQUIRE(!small->pack_small(context, nullptr, false, 1, 1, packed, nullptr));
+    REQUIRE(!small->pack_small(context, dev_float, false, 0, 1, packed, nullptr));
+    REQUIRE(!small->pack_small(context, dev_float, false, 10, 1, packed, nullptr));
+    REQUIRE(!small->pack_small(context, dev_float, false, 1, 0, packed, nullptr));
+    REQUIRE(!small->pack_small(context, dev_float, false, 9, SIZE_MAX, packed, nullptr));
+    REQUIRE(!small->pack_small(context, dev_float, false, 1, size_t(256) << 20, packed, nullptr));
+    REQUIRE(!small->pack_small(context, values.data(), false, 1, 1, packed, nullptr));
+    REQUIRE(!small->pack_small(context, reinterpret_cast<uint8_t *>(dev_float) + 1, false, 1, 1, packed, nullptr));
+    REQUIRE(!small->pack_small(context, dev_float, false, 1, 1, reinterpret_cast<uint8_t *>(output), nullptr));
+    REQUIRE(!small->unpack_small(nullptr, packed, nullptr, 1, 1, 0, output, 4));
+    REQUIRE(!small->unpack_small(context, nullptr, nullptr, 1, 1, 0, output, 4));
+    REQUIRE(!small->unpack_small(context, packed, nullptr, 10, 1, 0, output, 4));
+    REQUIRE(!small->unpack_small(context, packed, nullptr, 0, 1, 0, output, 4));
+    REQUIRE(!small->unpack_small(context, packed, nullptr, 1, 0, 0, output, 4));
+    REQUIRE(!small->unpack_small(context, packed, nullptr, 1, 3, 1, output, 16));
+    REQUIRE(!small->unpack_small(context, packed, &finite_lse, 1, 3, 1, output, 15));
+    REQUIRE(!small->unpack_small(context, packed, &finite_lse, 1, 3, 1, output, 12));
+    REQUIRE(!small->unpack_small(context, packed, &finite_lse, 9, SIZE_MAX, 1, output, 16));
+    REQUIRE(!small->unpack_small(context, packed, &finite_lse, 1, 1, SIZE_MAX, output, 16));
+    REQUIRE(!small->unpack_small(context, packed, &finite_lse, 9, 1, 1, output, SIZE_MAX - 3));
+    REQUIRE(!small->unpack_small(context, packed, &finite_lse, 1, 3, 1, readback.data(), 16));
+    REQUIRE(!small->unpack_small(context, reinterpret_cast<uint8_t *>(dev_float), nullptr, 1, 1, 0, output, 4));
+    REQUIRE(!small->unpack_small(context, packed, output, 1, 1, 1, output, 8));
+    REQUIRE(!small->unpack_small(context, packed, nullptr, 1, 1, 0, reinterpret_cast<uint8_t *>(output) + 1, 4));
+
+    // Large -> mapped-small -> large -> mapped-small -> large on this very same
+    // context: v2 scratch is recreated without invalidating grow-only sidecars.
+    float one = 1.0f;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        REQUIRE(api->pack_q(context, float_values.data(), false, float_values.size(), packed, nullptr));
+        for (size_t i = 0; i < float_values.size(); ++i) REQUIRE(packed[i] == oracle(float_values[i]));
+        CUDA_OK(cudaMemcpy(dev_float, &one, sizeof(one), cudaMemcpyHostToDevice));
+        REQUIRE(small->pack_small(context, dev_float, false, 1, 1, packed, nullptr) && packed[0] == 0x3c);
+        REQUIRE(small->unpack_small(context, packed, nullptr, 1, 1, 0, output, sizeof(float)));
+        CUDA_OK(cudaMemcpy(readback.data(), output, sizeof(float), cudaMemcpyDeviceToHost));
+        REQUIRE(readback[0] == one);
+    }
+    REQUIRE(api->pack_q(context, float_values.data(), false, float_values.size(), packed, nullptr));
+
+    // Two private mapped TX/RX pairs run on separate context streams without
+    // sharing status or wire staging, including simultaneous pack/unpack calls.
+    void * other = api->create_context(0);
+    REQUIRE(other);
+    float * other_input = nullptr;
+    float * other_output = nullptr;
+    CUDA_OK(cudaMalloc(&other_input, 64 * sizeof(float)));
+    CUDA_OK(cudaMalloc(&other_output, 64 * sizeof(float)));
+    std::vector<float> positive(64, 1.0f), negative(64, -2.0f);
+    CUDA_OK(cudaMemcpy(dev_float, positive.data(), 64 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(other_input, negative.data(), 64 * sizeof(float), cudaMemcpyHostToDevice));
+    std::thread concurrent([&] {
+        CUDA_OK(cudaSetDevice(0));
+        std::vector<uint8_t> wire(64);
+        for (int i = 0; i < 10; ++i) {
+            REQUIRE(small->pack_small(other, other_input, false, 1, 64, wire.data(), nullptr));
+            REQUIRE(std::all_of(wire.begin(), wire.end(), [](uint8_t b) { return b == 0xc0; }));
+            REQUIRE(small->unpack_small(other, wire.data(), nullptr, 1, 64, 0, other_output, 64 * sizeof(float)));
+            REQUIRE(retirement->retire_context(other));
+            float value = 0;
+            CUDA_OK(cudaMemcpy(&value, other_output, sizeof(float), cudaMemcpyDeviceToHost));
+            REQUIRE(value == -2.0f);
+        }
+    });
+    for (int i = 0; i < 10; ++i) {
+        REQUIRE(small->pack_small(context, dev_float, false, 1, 64, packed, nullptr));
+        REQUIRE(std::all_of(packed, packed + 64, [](uint8_t b) { return b == 0x3c; }));
+        REQUIRE(small->unpack_small(context, packed, nullptr, 1, 64, 0, output, 64 * sizeof(float)));
+        REQUIRE(retirement->retire_context(context));
+        CUDA_OK(cudaMemcpy(readback.data(), output, sizeof(float), cudaMemcpyDeviceToHost));
+        REQUIRE(readback[0] == 1.0f);
+    }
+    concurrent.join();
+    api->destroy_context(other);
+    CUDA_OK(cudaFree(other_input));
+    CUDA_OK(cudaFree(other_output));
+    CUDA_OK(cudaFree(output));
+    std::puts("mapped small v3: finite F16/F32 RNE oracle, nq1/9/10, tails/strides, status reset, invalid inputs and large/small transitions passed");
+}
+
+static void test_retirement(const ggml_remote_attn_cuda_retirement_interface_v1 * retirement,
+                            const ggml_remote_attn_cuda_fp8_interface_v2 * api,
+                            const ggml_remote_attn_cuda_fp8_interface_v3 * small) {
+    REQUIRE(retirement && retirement->base == api && retirement->retire_context);
+    REQUIRE(!retirement->retire_context(nullptr));
+    void * fresh = api->create_context(0);
+    REQUIRE(fresh && retirement->retire_context(fresh));
+    api->destroy_context(fresh);
+    auto * external = static_cast<uint8_t *>(api->alloc_pinned(16));
+    REQUIRE(external);
+    float * device = nullptr;
+    CUDA_OK(cudaMalloc(&device, 4 * sizeof(float)));
+    float nan = std::numeric_limits<float>::quiet_NaN();
+    CUDA_OK(cudaMemcpy(device, &nan, sizeof(nan), cudaMemcpyHostToDevice));
+    for (bool mapped : {false, true}) {
+        void * pack = api->create_context(0);
+        REQUIRE(pack);
+        REQUIRE(!(mapped ? small->pack_small(pack, device, false, 1, 1, external, nullptr) :
+                          api->pack_q(pack, &nan, false, 1, external, nullptr)));
+        REQUIRE(retirement->retire_context(pack));
+        // Retirement proves deallocation safety, never usable numerical output
+        // or permission for the serving layer to recycle this failed slot.
+        api->destroy_context(pack);
+        void * unpack = api->create_context(0);
+        REQUIRE(unpack);
+        external[0] = 0x7c; // rejected FP8 infinity
+        REQUIRE(!(mapped ? small->unpack_small(unpack, external, nullptr, 1, 1, 0, device, sizeof(float)) :
+                          api->unpack_out(unpack, external, nullptr, 1, 1, 0, device, sizeof(float))));
+        REQUIRE(retirement->retire_context(unpack));
+        api->destroy_context(unpack);
+    }
+    CUDA_OK(cudaFree(device));
+    api->free_pinned(external);
+    std::puts("retirement v1: null rejected, fresh contexts and retired numerical failures passed; device-fault retirement not injected");
+}
+
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) {
@@ -58,6 +282,8 @@ int main() {
 #ifdef RKVA_CUDA_STANDALONE_TEST
     const auto * api = ggml_backend_cuda_remote_attn_fp8_interface_v2();
     const auto * legacy = ggml_backend_cuda_remote_attn_fp8_interface();
+    const auto * small = ggml_backend_cuda_remote_attn_fp8_interface_v3();
+    const auto * retirement = ggml_backend_cuda_remote_attn_retirement_interface_v1();
 #else
     ggml_backend_load_all();
     auto reg = ggml_backend_reg_by_name("CUDA");
@@ -66,11 +292,18 @@ int main() {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_fp8_interface_v2"));
     const auto legacy_getter = reinterpret_cast<ggml_backend_cuda_remote_attn_fp8_interface_v1_t>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_fp8_interface_v1"));
-    REQUIRE(getter && legacy_getter);
+    const auto small_getter = reinterpret_cast<ggml_backend_cuda_remote_attn_fp8_interface_v3_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_fp8_interface_v3"));
+    const auto retirement_getter = reinterpret_cast<ggml_backend_cuda_remote_attn_retirement_interface_v1_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_retirement_interface_v1"));
+    REQUIRE(getter && legacy_getter && small_getter && retirement_getter);
     const auto * api = getter();
     const auto * legacy = legacy_getter();
+    const auto * small = small_getter();
+    const auto * retirement = retirement_getter();
 #endif
-    REQUIRE(api && legacy);
+    REQUIRE(api && legacy && small && small->base == api && retirement && retirement->base == api);
+    test_retirement(retirement, api, small);
     void * context = api->create_context(0);
     REQUIRE(context);
     std::vector<uint16_t> finite_half;
@@ -163,6 +396,8 @@ int main() {
         REQUIRE(!api->unpack_out(context, packed, &bad, 1, 3, 1, dev_out, 16));
     }
     REQUIRE(api->unpack_out(context, packed, &lse, 1, 3, 1, dev_out, 16));
+
+    test_mapped_small(small, retirement, api, context, dev_half, dev_float, packed, finite_half, finite_float, producer, ready);
 
     // Separate slots execute concurrently without sharing scratch/error flags.
     void * other = api->create_context(0);

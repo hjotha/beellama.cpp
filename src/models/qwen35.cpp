@@ -3,6 +3,8 @@
 #include "llama-ext.h"
 #include "ggml-remote-attn.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-wavefront.h"
+#include <deque>
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -140,7 +142,7 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
     return std::make_unique<graph>(*this, params);
 }
 
-llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params, helper_only_tag) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -177,6 +179,15 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
             gdn_raw_gates_dev_ok = false;
         }
+    }
+
+}
+
+llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
+    graph(model, params, helper_only_tag{}) {
+    if (params.wavefront_tile_size != 0) {
+        build_wavefront(params);
+        return;
     }
 
     int sections[4];
@@ -306,6 +317,179 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_build_forward_expand(gf, cur);
 }
 
+ggml_tensor * llama_model_qwen35::graph::build_layer_finish(
+        ggml_tensor * cur, ggml_tensor * residual, int il) {
+    cur = ggml_add(ctx0, cur, residual);
+    cb(cur, "attn_residual", il);
+    auto * ffn_residual = cur;
+    cur = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "attn_post_norm", il);
+    cur = build_layer_ffn(cur, il);
+    cur = ggml_add(ctx0, cur, ffn_residual);
+    cb(cur, "post_ffn", il);
+    cur = build_cvec(cur, il);
+    cb(cur, "l_out", il);
+    return cur;
+}
+
+void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params) {
+    GGML_ASSERT(params.wavefront_tile_size == 64 || params.wavefront_tile_size == 128);
+    GGML_ASSERT(cparams.n_rs_seq == 0 && cparams.n_capture_layers == 0 && ubatch.n_seqs == 1);
+    llama_wavefront::wavefront_plan plan;
+    std::string error;
+    if (!llama_wavefront::partition_ubatch_causal_tiles(ubatch, params.wavefront_tile_size,
+            uint32_t(n_layer), cparams.kv_position_split_p, 0, plan, error)) {
+        throw std::runtime_error("wavefront graph: " + error);
+    }
+    auto * embeddings = build_inp_embd(model.tok_embd);
+    cb(embeddings, "model.input_embed", -1);
+    auto * input = build_inp_mem_hybrid();
+    auto * positions = build_inp_pos();
+    auto * out_ids = build_inp_out_ids();
+    auto * attn = input->get_attn();
+    GGML_ASSERT(attn && attn->self_overflow_cell_idxs);
+
+    std::vector<int> group_end;
+    for (int il = 0; il < n_layer; ++il) {
+        if (!hparams.is_recr(il)) group_end.push_back(il);
+    }
+    GGML_ASSERT(!group_end.empty() && group_end.back() == n_layer - 1);
+    const uint32_t groups = uint32_t(group_end.size());
+    const uint32_t tiles = plan.n_tiles;
+    std::vector<llm_graph_params> tile_params(tiles, params);
+    std::vector<std::unique_ptr<graph>> helpers;
+    std::vector<std::unique_ptr<llm_graph_input_attn_kv>> tile_inputs;
+    std::vector<ggml_tensor *> tile_pos(tiles);
+    std::vector<std::vector<ggml_tensor *>> activations(groups + 1,
+            std::vector<ggml_tensor *>(tiles, nullptr));
+    helpers.reserve(tiles);
+    tile_inputs.reserve(tiles);
+    for (uint32_t t = 0; t < tiles; ++t) {
+        const auto & tile = plan.tiles[t];
+        tile_params[t].ubatch = plan.ubatch_tiles[t];
+        tile_params[t].wavefront_tile_size = 0; // helpers never recursively build a parent graph
+        helpers.emplace_back(new graph(model, tile_params[t], helper_only_tag{}));
+        tile_inputs.push_back(build_wavefront_attn_input(attn, tile.token_offset, tile.n_tokens));
+        activations[0][t] = ggml_view_2d(ctx0, embeddings, embeddings->ne[0], tile.n_tokens,
+                embeddings->nb[1], size_t(tile.token_offset)*embeddings->nb[1]);
+        // M-RoPE positions are component-major. A flat offset would silently
+        // splice component 0 of one tile with component 1 of another tile.
+        GGML_ASSERT(positions->ne[0] % ubatch.n_tokens == 0);
+        const int64_t components = positions->ne[0] / ubatch.n_tokens;
+        tile_pos[t] = ggml_reshape_1d(ctx0, ggml_cont(ctx0,
+                ggml_view_2d(ctx0, positions, tile.n_tokens, components,
+                    size_t(ubatch.n_tokens)*positions->nb[0], size_t(tile.token_offset)*positions->nb[0])),
+                int64_t(tile.n_tokens)*components);
+    }
+    // llm_graph_context constructors bind res->params. Restore the one parent
+    // identity before allocation/reuse; the helpers never own an input setter.
+    res->set_params(params);
+    std::vector<recurrent_tile_chain> states(static_cast<size_t>(n_layer));
+    struct pending_cell {
+        position_split_rpc_packet packet;
+        attention_terms terms = {};
+        ggml_tensor * residual = nullptr;
+    };
+    std::vector<pending_cell> cells(size_t(groups)*tiles);
+    std::vector<ggml_tensor *> terminal_attn(tiles, nullptr);
+    std::vector<ggml_tensor *> terminal_residual(tiles, nullptr);
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+    const float scale = hparams.f_attention_scale == 0.0f ?
+            1.0f / sqrtf(float(hparams.n_embd_head_v())) : hparams.f_attention_scale;
+    uint32_t outstanding = 0, peak = 0, submissions = 0, envelopes = 0;
+    const uint32_t rpc_batch = cparams.rkva_wavefront_rpc_batch;
+    const auto execution = llama_wavefront::build_serving_schedule(groups, tiles, rpc_batch);
+    for (size_t si = 0; si < execution.size(); ++si) {
+        const auto & step = execution[si];
+        auto & helper = *helpers[step.tile];
+        auto & cell = cells[size_t(step.group)*tiles + step.tile];
+        const int end = group_end[step.group];
+        if (step.action == llama_wavefront::serving_step::phase::PREPARE) {
+            auto * cur = activations[step.group][step.tile];
+            GGML_ASSERT(cur && outstanding < (rpc_batch == 4 ? 4u : 2u));
+            const int first = step.group == 0 ? 0 : group_end[step.group - 1] + 1;
+            for (int il = first; il < end; ++il) {
+                GGML_ASSERT(hparams.is_recr(il));
+                auto * residual = cur;
+                cur = helper.build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+                helper.tile_chain = &states[size_t(il)];
+                cur = helper.build_layer_attn_linear(input->get_recr(), cur, il);
+                cur = helper.build_layer_finish(cur, residual, il);
+                // Commit/order is represented by graph operands, not by the
+                // construction cursor or a hidden update of the memory context.
+                ggml_build_forward_expand(gf, cur);
+            }
+            helper.tile_chain = nullptr;
+            cell.residual = cur;
+            cur = helper.build_norm(cur, model.layers[end].attn_norm, nullptr, LLM_NORM_RMS, end);
+            cell.terms = helper.build_layer_attn_terms(cur, tile_pos[step.tile], sections, end);
+            cell.packet = helper.build_attn_position_split_rpc_prepare(tile_inputs[step.tile].get(),
+                    cell.terms.q, cell.terms.k, cell.terms.v, scale, end, tile_pos[step.tile]);
+            ggml_remote_attn_range_set_wavefront(cell.packet.range);
+            if (rpc_batch == 4) {
+                size_t begin = si, end_si = si + 1;
+                while (begin && execution[begin - 1].action == llama_wavefront::serving_step::phase::PREPARE) --begin;
+                while (end_si < execution.size() && execution[end_si].action == llama_wavefront::serving_step::phase::PREPARE) ++end_si;
+                ggml_remote_attn_range_set_cohort(cell.packet.range, uint32_t(end_si - begin), uint32_t(si - begin));
+                if (begin == si) ++envelopes;
+            } else {
+                ++envelopes;
+            }
+            ++submissions;
+            peak = std::max(peak, ++outstanding);
+        } else {
+            GGML_ASSERT(outstanding > 0 && cell.packet.range);
+            auto * cur = helper.build_attn_position_split_rpc_complete(cell.packet);
+            cur = helper.build_layer_attn_finish(cur, cell.terms.gate, end);
+            if (step.group + 1 == groups) {
+                // The last layer has no successor tile task. Preserve the
+                // baseline's parent-width final FFN and output-mask placement;
+                // quantized matmul dispatch can depend on this width.
+                terminal_attn[step.tile] = cur;
+                terminal_residual[step.tile] = cell.residual;
+            } else {
+                cur = helper.build_layer_finish(cur, cell.residual, end);
+                activations[step.group + 1][step.tile] = cur;
+            }
+            ggml_build_forward_expand(gf, cur);
+            --outstanding;
+        }
+    }
+    GGML_ASSERT(outstanding == 0 && submissions == groups*tiles);
+    auto * cur = terminal_attn[0];
+    auto * residual = terminal_residual[0];
+    GGML_ASSERT(cur && residual);
+    for (uint32_t t = 1; t < tiles; ++t) {
+        GGML_ASSERT(terminal_attn[t] && terminal_residual[t]);
+        cur = ggml_concat(ctx0, cur, terminal_attn[t], 1);
+        residual = ggml_concat(ctx0, residual, terminal_residual[t], 1);
+    }
+    // Output IDs use parent numbering and may select rows from several tiles.
+    // As in the ordinary graph, gather BOTH attention and residual before the
+    // final FFN only for the masked hidden-state layout.
+    const bool final_masked = out_ids && cparams.embeddings_nextn_masked;
+    if (final_masked) {
+        cur = ggml_get_rows(ctx0, cur, out_ids);
+        residual = ggml_get_rows(ctx0, residual, out_ids);
+    }
+    const int64_t final_ffn_rows = cur->ne[1];
+    cur = build_layer_finish(cur, residual, n_layer - 1);
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+    if (out_ids && !cparams.embeddings_nextn_masked) cur = ggml_get_rows(ctx0, cur, out_ids);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+    cur = build_lora_mm(model.output, cur, model.output_s);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+    ggml_build_forward_expand(gf, cur);
+    LLAMA_LOG_INFO("RKVA wavefront graph: tile=%u tiles=%u groups=%u logical_rpc=%u envelopes=%u max_outstanding=%u parent_tokens=%u final_ffn_rows=%lld masked=%d\n",
+            params.wavefront_tile_size, tiles, groups, submissions, envelopes, peak, ubatch.n_tokens,
+            static_cast<long long>(final_ffn_rows), int(final_masked));
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
@@ -333,12 +517,8 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
     return ggml_swiglu_split(ctx0, gate, normalized);
 }
 
-ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
-        llm_graph_input_attn_kv * inp,
-        ggml_tensor *             cur,
-        ggml_tensor *             inp_pos,
-        int *                     sections,
-        int                       il) {
+llama_model_qwen35::graph::attention_terms llama_model_qwen35::graph::build_layer_attn_terms(
+        ggml_tensor * cur, ggml_tensor * inp_pos, int * sections, int il) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -404,6 +584,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
+    return { Qcur, Kcur, Vcur, gate };
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       il) {
+    auto terms = build_layer_attn_terms(cur, inp_pos, sections, il);
+    auto * Qcur = terms.q;
+    auto * Kcur = terms.k;
+    auto * Vcur = terms.v;
+    const int64_t n_embd_head = hparams.n_embd_head_v();
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -485,6 +679,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         cb(cur, "attn_pregate", il);
     }
 
+    return build_layer_attn_finish(cur, terms.gate, il);
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_layer_attn_finish(
+        ggml_tensor * cur, ggml_tensor * gate, int il) {
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
 
@@ -494,6 +693,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Local-split layers: the scheduler would otherwise extend the Vulkan split to the
     // gate ops and ship the whole Qcur_full (Q + gate) across the device boundary.
     // Keep them on the layer device so only Q/K/V go out and the attention result comes back.
+    int full_attn_idx = 0;
+    for (int l = 0; l < il; ++l) {
+        if (hparams.has_kv(l) && !hparams.is_recr(l)) ++full_attn_idx;
+    }
+    const bool is_remote = cparams.remote_attn_enabled && backend_remote && cparams.kv_position_split_p == 0 &&
+            full_attn_idx < cparams.remote_attn_layers;
     if (!is_remote && cparams.local_attn_backend && full_attn_idx < cparams.remote_attn_layers) {
         ggml_backend_dev_t layer_dev = model.dev_layer(il);
         for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
@@ -599,7 +804,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
         cb(state, "state_cache_view", il);
     } else {
-        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = tile_chain && tile_chain->gdn_commit ? tile_chain->gdn_commit :
+                build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
         state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
         cb(state, "state_predelta", il);
     }

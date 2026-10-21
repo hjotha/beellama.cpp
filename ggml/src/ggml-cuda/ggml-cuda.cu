@@ -2448,12 +2448,36 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 {
                     ggml_remote_attn_trace_scope timing("cuda_producer_sync", dst);
                     timing.event.value = ggml_get_op_params_i32(dst, GGML_REMOTE_ATTN_PARAM_WAIT) ? 1u : 0u;
-                    if (cudaStreamSynchronize(ctx.stream()) != cudaSuccess) { timing.event.flags |= 1u; return false; }
+                    const cudaError_t status = cudaStreamSynchronize(ctx.stream());
+                    if (status != cudaSuccess) {
+                        timing.event.flags |= 1u;
+                        GGML_LOG_ERROR("%s: remote producer synchronization failed for %s: %s\n",
+                                __func__, dst->name, cudaGetErrorString(status));
+                        return false;
+                    }
                 }
                 ggml_cuda_trace_collect(&ctx);
                 cudaEvent_t producer_event = ggml_cuda_remote_attn_producer_events.get();
-                if (!producer_event || cudaEventRecord(producer_event, ctx.stream()) != cudaSuccess) return false;
-                return ggml_remote_attn_exec_cuda(dst, producer_event);
+                if (!producer_event) {
+                    GGML_LOG_ERROR("%s: remote producer event unavailable for %s\n", __func__, dst->name);
+                    return false;
+                }
+                const cudaError_t event_status = cudaEventRecord(producer_event, ctx.stream());
+                if (event_status != cudaSuccess) {
+                    GGML_LOG_ERROR("%s: remote producer event record failed for %s: %s\n",
+                            __func__, dst->name, cudaGetErrorString(event_status));
+                    return false;
+                }
+                const bool ok = ggml_remote_attn_exec_cuda(dst, producer_event);
+                if (!ok) {
+                    GGML_LOG_ERROR("%s: remote execution failed node=%s layer=%d async=%d wait=%d nq=%lld\n",
+                            __func__, dst->name,
+                            ggml_get_op_params_i32(dst, GGML_REMOTE_ATTN_PARAM_LAYER_ID),
+                            ggml_get_op_params_i32(dst, GGML_REMOTE_ATTN_PARAM_ASYNC),
+                            ggml_get_op_params_i32(dst, GGML_REMOTE_ATTN_PARAM_WAIT),
+                            static_cast<long long>(dst->ne[1]));
+                }
+                return ok;
             }
 #else
             return false;
@@ -5331,6 +5355,50 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Trace-only classification: no CUDA API, tensor mutation, cache lookup or
+// execution decision. The caller never invokes this when tracing is disabled.
+static bool ggml_cuda_trace_remote_host_graph_shape(ggml_backend_cuda_context * ctx,
+        const ggml_cgraph * graph, uint32_t & remote_nodes) {
+    remote_nodes = 0;
+    if (!graph || graph->n_nodes <= 0) return false;
+    bool eligible = graph->uid != 0 && ctx->curr_stream_no == 0 &&
+            ctx->stream_context().concurrent_events.empty();
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * node = graph->nodes[i];
+        if (!node) return false;
+        switch (node->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_KVARN_VIEW:
+                continue;
+            case GGML_OP_REMOTE_ATTN: {
+                const bool range = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_RANGE) != 0;
+                const bool wait = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT) != 0;
+                const bool async = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC) != 0;
+                const auto * source = node->src[0];
+                const bool valid_wait = wait && !async && source && source->op == GGML_OP_REMOTE_ATTN &&
+                    ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_RANGE) &&
+                    ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_ASYNC) &&
+                    !ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_WAIT);
+                eligible = eligible && range && ((async && !wait) || valid_wait);
+                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) && !ggml_is_empty(node)) ++remote_nodes;
+                break;
+            }
+            default:
+                // CONT/CPY/DUP are real work even when their operands happen
+                // to be contiguous. ADD/FA/projections/fused spans stay here too.
+                eligible = false;
+                break;
+        }
+    }
+    return eligible && remote_nodes != 0;
+}
+#endif
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_remote_attn_trace_scope host_timing("cuda_graph_host", cgraph->n_nodes ? cgraph->nodes[0] : nullptr);
@@ -5348,12 +5416,44 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bookkeeping.event.graph_uid = cgraph->uid;
 #ifdef USE_CUDA_GRAPH
     trace_reason = GGML_CUDA_TRACE_WARMUP;
-    graph_key = ggml_cuda_graph_get_key(cgraph);
-
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
-
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    const bool graph_memory_pressure_ok = cuda_ctx->check_memory_pressure_before_graph();
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (bookkeeping.enabled) {
+        uint32_t remote_nodes = 0;
+        const bool eligible = ggml_cuda_trace_remote_host_graph_shape(cuda_ctx, cgraph, remote_nodes);
+        if (remote_nodes) {
+            const uint32_t flags = eligible ? 0x100u : 0u;
+            ggml_cuda_trace_counter("cuda_remote_graph_nodes", cgraph, uint64_t(cgraph->n_nodes), flags);
+            ggml_cuda_trace_counter("cuda_remote_graph_ops", cgraph, remote_nodes, flags);
+        }
+    }
+#endif
+    // No shortcut: execute the original key/cache calls in their original
+    // order. Existing eviction and pressure recovery remain inside cuda_graph().
+    ggml_cuda_graph * graph = nullptr;
+    const auto prepare_cache = [&] {
+        graph_key = ggml_cuda_graph_get_key(cgraph);
+        ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+        graph = cuda_ctx->cuda_graph(graph_key);
+    };
+    if (bookkeeping.enabled) {
+        ggml_remote_attn_trace_scope timing("cuda_graph_key_cache", cgraph->nodes[0]);
+        timing.event.graph_uid = cgraph->uid;
+        timing.event.flags |= 0x40000000u; // includes existing recovery/eviction
+        prepare_cache();
+    } else {
+        prepare_cache();
+    }
+    const auto check_guard = [&] { return cuda_ctx->check_memory_pressure_before_graph(); };
+    bool graph_memory_pressure_ok;
+    if (bookkeeping.enabled) {
+        ggml_remote_attn_trace_scope timing("cuda_graph_memory_guard", cgraph->nodes[0]);
+        timing.event.graph_uid = cgraph->uid;
+        timing.event.flags |= 0x40000000u;
+        graph_memory_pressure_ok = check_guard();
+        if (!graph_memory_pressure_ok) timing.event.flags |= 1u;
+    } else {
+        graph_memory_pressure_ok = check_guard();
+    }
     if (ggml_cuda_graph_debug_enabled()) {
         fprintf(stderr,
                 "CUDA graph memory-pressure check: context=%p pressure_disabled=%d safe=%d\n",
@@ -5470,7 +5570,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     enqueue_timing.event.value = execution_mode;
     if (ok) host_timing.event.flags &= ~1u;
     else enqueue_timing.event.flags |= 1u;
-    return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_ABORTED;
+    // This evaluator returns false for a failed remote operation, not a user
+    // abort callback. Reporting ABORTED lets serving retry an already-mutated
+    // recurrent batch as if it were a KV-capacity problem.
+    return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -7181,6 +7284,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_memory_checkpoint;
     }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_remote_attn_retirement_interface_v1") == 0) {
+        return (void *)ggml_backend_cuda_remote_attn_retirement_interface_v1;
+    }
+    if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_interface_v3") == 0) {
+        return (void *)ggml_backend_cuda_remote_attn_fp8_interface_v3;
+    }
     if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_interface_v2") == 0) {
         return (void *)ggml_backend_cuda_remote_attn_fp8_interface_v2;
     }

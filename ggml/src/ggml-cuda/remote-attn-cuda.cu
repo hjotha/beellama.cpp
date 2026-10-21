@@ -126,6 +126,76 @@ static __global__ void rkva_cuda_fp8_unpack_out_kernel(
     }
 }
 
+static __device__ __forceinline__ float rkva_small_float(float value) { return value; }
+static __device__ __forceinline__ float rkva_small_float(half value) { return __half2float(value); }
+
+// Each lane writes one naturally aligned four-byte word to mapped host memory.
+// The final word is padded locally; no source element beyond n is read. Every
+// lane participates in the CTA reduction, including lanes outside the input.
+template <typename T>
+static __global__ void rkva_cuda_fp8_pack_small_kernel(
+        const T * __restrict__ src, uint32_t * __restrict__ dst,
+        size_t n, uint32_t * __restrict__ status) {
+    const size_t word = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t first = word * 4;
+    uint32_t packed = 0;
+    bool invalid = false;
+    if (first < n) {
+        #pragma unroll
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            uint8_t byte = 0;
+            if (first + lane < n && !f32_to_fp8_e5m2_rne(rkva_small_float(src[first + lane]), byte)) {
+                invalid = true;
+            }
+            packed |= uint32_t(byte) << (8 * lane);
+        }
+        dst[word] = packed;
+    }
+    const int cta_invalid = __syncthreads_or(invalid);
+    if (threadIdx.x == 0) status[blockIdx.x] = uint32_t(cta_invalid != 0);
+}
+
+// Flattened FP8 words may cross an odd-width row: each decoded byte computes
+// its own destination row, preserving arbitrary float-aligned row padding.
+static __global__ void rkva_cuda_fp8_unpack_small_kernel(
+        const uint32_t * __restrict__ src, const float * __restrict__ lse,
+        float * __restrict__ dst, size_t n, size_t words, size_t width,
+        size_t heads, size_t n_lse, size_t stride, uint32_t * __restrict__ status) {
+    const size_t item = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    bool invalid = false;
+    if (item < words) {
+        const uint32_t packed = src[item];
+        #pragma unroll
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            const size_t index = item * 4 + lane;
+            if (index < n) {
+                float value = 0;
+                if (!fp8_e5m2_to_f32(uint8_t(packed >> (8 * lane)), value)) {
+                    invalid = true;
+                } else {
+                    dst[(index / width) * stride + index % width] = value;
+                }
+            }
+        }
+    } else if (item - words < n_lse) {
+        const size_t index = item - words;
+        const float value = lse[index];
+        if (!isfinite(value)) {
+            invalid = true;
+        } else {
+            dst[(index / heads) * stride + width + index % heads] = value;
+        }
+    }
+    const int cta_invalid = __syncthreads_or(invalid);
+    if (threadIdx.x == 0) status[blockIdx.x] = uint32_t(cta_invalid != 0);
+}
+
+struct rkva_cuda_mapped_sidecar {
+    void * host = nullptr;
+    void * device = nullptr; // cudaHostGetDevicePointer alias, never assumed equal
+    size_t capacity = 0;
+};
+
 // Each serving slot owns its scratch and stream. No CUDA operation outlives a
 // helper call, so slot reset/drain may safely reuse pinned network buffers.
 struct rkva_cuda_remote_scratch {
@@ -136,6 +206,11 @@ struct rkva_cuda_remote_scratch {
     cudaStream_t stream = nullptr;
     int device = -1;
     bool poisoned = false;
+    bool retirement_confirmed = true;
+    bool small_capability_checked = false;
+    bool small_supported = false;
+    rkva_cuda_mapped_sidecar small_tx;
+    rkva_cuda_mapped_sidecar small_rx;
     cudaEvent_t timing_events[7]{};
     bool timing_disabled = false;
     std::mutex mutex;
@@ -203,14 +278,31 @@ struct rkva_cuda_timing_trace {
 struct rkva_device_guard {
     int previous = -1;
     bool ok = false;
+    cudaError_t status = cudaSuccess;
+    const char * failed_api = nullptr;
     explicit rkva_device_guard(int device) {
-        ok = cudaGetDevice(&previous) == cudaSuccess &&
-             (previous == device || cudaSetDevice(device) == cudaSuccess);
+        status = cudaGetDevice(&previous);
+        if (status != cudaSuccess) { failed_api = "cudaGetDevice"; return; }
+        if (previous != device) {
+            status = cudaSetDevice(device);
+            if (status != cudaSuccess) { failed_api = "cudaSetDevice"; return; }
+        }
+        ok = true;
     }
     ~rkva_device_guard() {
         if (ok && previous >= 0) cudaSetDevice(previous);
     }
 };
+
+// Failure diagnostics only. -1 means a validation/capability/status condition,
+// rather than a CUDA API result. Never query/clear CUDA error state for a log.
+static bool rkva_small_failure(const char * operation, const char * stage, int device,
+                               int cuda_status = -1, size_t detail0 = 0, size_t detail1 = 0,
+                               int observed_device = -3) {
+    std::fprintf(stderr, "remote-attn CUDA mapped-small: op=%s stage=%s device=%d cuda_status=%d detail0=%zu detail1=%zu observed_device=%d\n",
+        operation, stage, device, cuda_status, detail0, detail1, observed_device);
+    return false;
+}
 
 static bool rkva_size_mul(size_t a, size_t b, size_t & result) {
     if (b && a > SIZE_MAX / b) return false;
@@ -230,7 +322,7 @@ static bool rkva_align_float(size_t value, size_t & result) {
     return true;
 }
 
-static int rkva_pointer_device(const void * ptr) {
+static int rkva_pointer_device_impl(const void * ptr, const char * failure_operation) {
     if (!ptr) return -2;
     cudaPointerAttributes attr{};
     const cudaError_t status = cudaPointerGetAttributes(&attr, ptr);
@@ -238,10 +330,19 @@ static int rkva_pointer_device(const void * ptr) {
         cudaGetLastError(); // Older runtimes report ordinary host allocations this way.
         return -1;
     }
-    if (status != cudaSuccess) return -2;
+    if (status != cudaSuccess) {
+        if (failure_operation) rkva_small_failure(failure_operation, "cudaPointerGetAttributes", -1, status);
+        return -2;
+    }
     if (attr.type == cudaMemoryTypeDevice) return attr.device;
     if (attr.type == cudaMemoryTypeHost || attr.type == cudaMemoryTypeUnregistered) return -1;
-    return -2; // Managed memory requires a separate residency/coherency contract.
+    // Managed memory requires a separate residency/coherency contract.
+    if (failure_operation) rkva_small_failure(failure_operation, "unsupported_pointer_type", attr.device, -1, size_t(attr.type));
+    return -2;
+}
+
+static int rkva_pointer_device(const void * ptr) {
+    return rkva_pointer_device_impl(ptr, nullptr);
 }
 
 static bool rkva_scratch_ensure(rkva_cuda_remote_scratch & s, size_t needed) {
@@ -272,13 +373,20 @@ struct rkva_stream_retirement {
     cudaStream_t stream;
     bool pending = false;
     const char * trace_phase = "cuda_retire_host";
+    const char * failure_operation = nullptr;
     bool finish() {
         if (!pending) return true;
         pending = false;
+        scratch.retirement_confirmed = false;
         ggml_remote_attn_trace_scope timing(trace_phase);
-        if (cudaStreamSynchronize(stream) == cudaSuccess) return true;
+        const cudaError_t status = cudaStreamSynchronize(stream);
+        if (status == cudaSuccess) {
+            scratch.retirement_confirmed = true;
+            return true;
+        }
         timing.event.flags |= 1u;
         scratch.poisoned = true;
+        if (failure_operation) rkva_small_failure(failure_operation, "cudaStreamSynchronize", scratch.device, status);
         return false;
     }
     ~rkva_stream_retirement() { finish(); }
@@ -290,6 +398,273 @@ static bool rkva_grid(size_t elements, dim3 & grid) {
     if (!blocks || blocks > 0x7fffffffu) return false;
     grid = dim3(static_cast<unsigned>(blocks));
     return true;
+}
+
+static bool rkva_supports_small(int device) {
+    if (device < 0) return rkva_small_failure("supports", "invalid_device", device);
+    rkva_device_guard guard(device);
+    if (!guard.ok) return rkva_small_failure("supports", guard.failed_api, device, guard.status);
+    int mapped = 0, uva = 0;
+    unsigned flags = 0;
+    cudaError_t status = cudaDeviceGetAttribute(&mapped, cudaDevAttrCanMapHostMemory, device);
+    if (status != cudaSuccess) return rkva_small_failure("supports", "cudaDeviceGetAttribute/can_map", device, status);
+    if (!mapped) return rkva_small_failure("supports", "can_map_false", device);
+    status = cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
+    if (status != cudaSuccess) return rkva_small_failure("supports", "cudaDeviceGetAttribute/uva", device, status);
+    if (!uva) return rkva_small_failure("supports", "uva_false", device);
+    status = cudaGetDeviceFlags(&flags);
+    if (status != cudaSuccess) return rkva_small_failure("supports", "cudaGetDeviceFlags", device, status);
+    if (!(flags & cudaDeviceMapHost)) return rkva_small_failure("supports", "device_map_host_flag_missing", device, -1, flags, cudaDeviceMapHost);
+    return true;
+}
+
+// These are wire-sized, bounded sidecars, not a second unbounded device pool.
+// TX and RX grow independently, and their status arrays are owned by the CTA
+// which rewrites them on every launch; no GPU memset or status DMA is needed.
+static constexpr size_t RKVA_SMALL_MAX_SIDECAR = size_t(256) << 20;
+
+static bool rkva_small_ensure(rkva_cuda_remote_scratch & s, rkva_cuda_mapped_sidecar & sidecar,
+                              size_t needed) {
+    if (s.poisoned) return rkva_small_failure("ensure", "poisoned", s.device);
+    if (!s.retirement_confirmed) return rkva_small_failure("ensure", "retirement_unconfirmed", s.device);
+    if (!needed || needed > RKVA_SMALL_MAX_SIDECAR) return rkva_small_failure("ensure", "sidecar_bounds", s.device, -1, needed, RKVA_SMALL_MAX_SIDECAR);
+    if (!s.small_capability_checked) {
+        s.small_supported = rkva_supports_small(s.device);
+        s.small_capability_checked = true;
+    }
+    if (!s.small_supported) return rkva_small_failure("ensure", "cached_capability_unsupported", s.device);
+    if (!s.stream) {
+        const cudaError_t status = cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking);
+        if (status != cudaSuccess) return rkva_small_failure("ensure", "cudaStreamCreateWithFlags", s.device, status);
+    }
+
+    // All previous helper work retired while holding this context mutex. Drop
+    // only the old device staging/error allocations, keeping the private stream
+    // and both mapped buffers. A later v2 call recreates ordinary device scratch.
+    if (s.dev_data || s.dev_err) {
+        ggml_remote_attn_trace_scope trim("cuda_small_scratch_release");
+        trim.event.bytes = s.dev_capacity; // allocation gauge, not PCIe or wire traffic
+        trim.event.value = 1;
+        trim.event.flags |= 1u;
+        if (s.dev_data) {
+            const cudaError_t status = cudaFree(s.dev_data);
+            if (status != cudaSuccess) { s.poisoned = true; return rkva_small_failure("ensure", "cudaFree/old_dev_data", s.device, status, s.dev_capacity); }
+            s.dev_data = nullptr;
+            s.dev_capacity = 0;
+        }
+        if (s.dev_err) {
+            const cudaError_t status = cudaFree(s.dev_err);
+            if (status != cudaSuccess) { s.poisoned = true; return rkva_small_failure("ensure", "cudaFree/old_dev_err", s.device, status); }
+            s.dev_err = nullptr;
+        }
+        trim.event.flags &= ~1u;
+    }
+    if (sidecar.capacity >= needed) return true;
+
+    ggml_remote_attn_trace_scope grow("cuda_small_map_grow");
+    grow.event.flags |= 1u;
+    const size_t capacity = std::max(needed, std::min(RKVA_SMALL_MAX_SIDECAR, sidecar.capacity * 2));
+    grow.event.bytes = capacity; // host allocation gauge; no device DMA
+    void * host = nullptr;
+    void * alias = nullptr;
+    const unsigned requested = cudaHostAllocMapped | cudaHostAllocPortable;
+    cudaError_t status = cudaHostAlloc(&host, capacity, requested);
+    if (status != cudaSuccess) return rkva_small_failure("ensure", "cudaHostAlloc", s.device, status, capacity, requested);
+    const auto discard_new_host = [&] {
+        const cudaError_t cleanup = cudaFreeHost(host);
+        if (cleanup != cudaSuccess) rkva_small_failure("ensure", "cudaFreeHost/new_cleanup", s.device, cleanup, capacity);
+    };
+    unsigned actual = 0;
+    status = cudaHostGetFlags(&actual, host);
+    if (status != cudaSuccess) {
+        rkva_small_failure("ensure", "cudaHostGetFlags", s.device, status); discard_new_host(); return false;
+    }
+    // This sidecar belongs to one device/primary context. With UVA, runtime
+    // host allocations are device-accessible independently of the Portable
+    // flag. Some real allocations report Mapped alone after requesting both.
+    // Validate the actual mapping below; flag-word equality is not proof that
+    // a usable device pointer exists (nor is Portable needed by this owner).
+    status = cudaHostGetDevicePointer(&alias, host, 0);
+    if (status != cudaSuccess) {
+        rkva_small_failure("ensure", "cudaHostGetDevicePointer", s.device, status); discard_new_host(); return false;
+    }
+    if (!alias || reinterpret_cast<uintptr_t>(host) % alignof(uint32_t) ||
+            reinterpret_cast<uintptr_t>(alias) % alignof(uint32_t)) {
+        rkva_small_failure("ensure", "mapped_alias_or_alignment", s.device, -1,
+            reinterpret_cast<uintptr_t>(host), reinterpret_cast<uintptr_t>(alias));
+        discard_new_host();
+        return false;
+    }
+    if ((actual & requested) != requested) {
+        std::fprintf(stderr,
+            "remote-attn CUDA mapped-small: validated owner-device mapping device=%d reported_flags=%u requested_flags=%u\n",
+            s.device, actual, requested);
+    }
+    if (sidecar.host) {
+        status = cudaFreeHost(sidecar.host);
+        if (status != cudaSuccess) {
+            discard_new_host();
+            s.poisoned = true;
+            return rkva_small_failure("ensure", "cudaFreeHost/old_sidecar", s.device, status, sidecar.capacity);
+        }
+    }
+    sidecar = {host, alias, capacity};
+    grow.event.flags &= ~1u;
+    return true;
+}
+
+static bool rkva_small_layout(size_t work_items, size_t payload_bytes, dim3 & grid,
+                              size_t & status_offset, size_t & needed) {
+    size_t status_bytes;
+    return rkva_grid(work_items, grid) && rkva_align_float(payload_bytes, status_offset) &&
+           rkva_size_mul(size_t(grid.x), sizeof(uint32_t), status_bytes) &&
+           rkva_size_add(status_offset, status_bytes, needed) && needed <= RKVA_SMALL_MAX_SIDECAR;
+}
+
+static bool rkva_small_status_ok(const rkva_cuda_mapped_sidecar & sidecar, size_t offset, unsigned blocks,
+                                 const char * operation, int device) {
+    const auto * status = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(sidecar.host) + offset);
+    for (unsigned block = 0; block < blocks; ++block) {
+        const uint32_t value = status[block];
+        if (value) return rkva_small_failure(operation, value == 1 ? "cta_nonfinite" : "cta_status_unexpected", device, -1, block, value);
+    }
+    return true;
+}
+
+static bool rkva_pack_small_impl(rkva_cuda_remote_scratch & s, const void * src, bool is_f16,
+                                size_t nq, size_t width, uint8_t * dst, cudaEvent_t producer) {
+    ggml_remote_attn_trace_scope timing("cuda_small_pack_host");
+    timing.event.flags |= 0x40000001u;
+    const size_t element_size = is_f16 ? sizeof(half) : sizeof(float);
+    size_t n, input_bytes, padded, status_offset, needed;
+    if (!src || !dst || nq < 1 || nq > 9 || !width)
+        return rkva_small_failure("pack", "input_arguments", s.device, -1, nq, width);
+    if (reinterpret_cast<uintptr_t>(src) % element_size)
+        return rkva_small_failure("pack", "input_alignment", s.device, -1, element_size);
+    const int src_device = rkva_pointer_device_impl(src, "pack_source");
+    if (src_device != s.device)
+        return rkva_small_failure("pack", "source_device_mismatch", s.device, -1, nq, width, src_device);
+    const int dst_device = rkva_pointer_device_impl(dst, "pack_destination");
+    if (dst_device != -1)
+        return rkva_small_failure("pack", "destination_not_host", s.device, -1, nq, width, dst_device);
+    if (!rkva_size_mul(nq, width, n) || !rkva_size_mul(n, element_size, input_bytes) ||
+        !rkva_align_float(n, padded)) return rkva_small_failure("pack", "size_overflow", s.device, -1, nq, width);
+    dim3 grid;
+    if (!rkva_small_layout(padded / 4, padded, grid, status_offset, needed))
+        return rkva_small_failure("pack", "layout_bounds", s.device, -1, padded, RKVA_SMALL_MAX_SIDECAR);
+    if (!rkva_small_ensure(s, s.small_tx, needed)) return false;
+    timing.event.bytes = n; // useful mapped PCIe payload, not zero-copy-free traffic
+    rkva_stream_retirement retire{s, s.stream, false, "cuda_small_pack_retire_host", "pack"};
+    rkva_cuda_timing_trace gpu(s, "cuda_small_pack");
+    auto * output = static_cast<uint32_t *>(s.small_tx.device);
+    auto * status = reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(s.small_tx.device) + status_offset);
+    {
+        ggml_remote_attn_trace_scope enqueue("cuda_small_pack_enqueue_host");
+        enqueue.event.bytes = padded + size_t(grid.x) * sizeof(uint32_t);
+        // Four v2 commands become one kernel (producer wait and retirement stay).
+        enqueue.event.value = 3; // CUDA memcpy/memset commands avoided, not PCIe bytes
+        retire.pending = true;
+        s.retirement_confirmed = false;
+        gpu.mark(0, s.stream);
+        if (producer) {
+            const cudaError_t wait_status = cudaStreamWaitEvent(s.stream, producer, 0);
+            if (wait_status != cudaSuccess) return rkva_small_failure("pack", "cudaStreamWaitEvent", s.device, wait_status);
+        } else {
+            const cudaError_t producer_status = cudaDeviceSynchronize();
+            if (producer_status != cudaSuccess) {
+                s.poisoned = true;
+                return rkva_small_failure("pack", "cudaDeviceSynchronize", s.device, producer_status);
+            }
+        }
+        gpu.mark(1, s.stream);
+        if (is_f16) {
+            rkva_cuda_fp8_pack_small_kernel<<<grid, 256, 0, s.stream>>>(
+                static_cast<const half *>(src), output, n, status);
+        } else {
+            rkva_cuda_fp8_pack_small_kernel<<<grid, 256, 0, s.stream>>>(
+                static_cast<const float *>(src), output, n, status);
+        }
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) return rkva_small_failure("pack", "launch/cudaGetLastError", s.device, launch_status, grid.x, n);
+        gpu.mark(2, s.stream);
+    }
+    if (!retire.finish()) return false;
+    const bool ok = rkva_small_status_ok(s.small_tx, status_offset, grid.x, "pack", s.device);
+    gpu.interval("cuda_small_pack_producer_gpu", 0, 1, 0, !ok);
+    gpu.interval("cuda_small_pack_kernel_gpu", 1, 2, padded + size_t(grid.x) * sizeof(uint32_t), !ok);
+    if (!ok) return false; // never publish even a partial wire output on invalid Q
+    {
+        ggml_remote_attn_trace_scope copy("cuda_small_pack_cpu_copy");
+        copy.event.bytes = n;
+        std::memcpy(dst, s.small_tx.host, n);
+    }
+    timing.event.flags &= ~1u;
+    return true;
+}
+
+static bool rkva_unpack_small_impl(rkva_cuda_remote_scratch & s, const uint8_t * src, const float * lse,
+                                  size_t nq, size_t width, size_t heads, void * dst, size_t stride) {
+    ggml_remote_attn_trace_scope timing("cuda_small_unpack_host");
+    timing.event.flags |= 0x40000001u;
+    size_t n, n_lse, lse_bytes, row_elements, row_bytes, extent, padded, payload, items, status_offset, needed;
+    if (!src || !dst || nq < 1 || nq > 9 || !width || (heads && !lse))
+        return rkva_small_failure("unpack", "input_arguments", s.device, -1, nq, width);
+    if (reinterpret_cast<uintptr_t>(dst) % alignof(float) || stride % sizeof(float))
+        return rkva_small_failure("unpack", "output_alignment", s.device, -1, stride);
+    const int dst_device = rkva_pointer_device_impl(dst, "unpack_destination");
+    if (dst_device != s.device)
+        return rkva_small_failure("unpack", "destination_device_mismatch", s.device, -1, nq, width, dst_device);
+    const int src_device = rkva_pointer_device_impl(src, "unpack_source");
+    if (src_device != -1)
+        return rkva_small_failure("unpack", "source_not_host", s.device, -1, nq, width, src_device);
+    if (lse) {
+        const int lse_device = rkva_pointer_device_impl(lse, "unpack_lse");
+        if (lse_device != -1)
+            return rkva_small_failure("unpack", "lse_not_host", s.device, -1, nq, heads, lse_device);
+    }
+    if (!rkva_size_mul(nq, width, n) ||
+        !rkva_size_mul(nq, heads, n_lse) || !rkva_size_mul(n_lse, sizeof(float), lse_bytes) ||
+        !rkva_size_add(width, heads, row_elements) || !rkva_size_mul(row_elements, sizeof(float), row_bytes) ||
+        stride < row_bytes || !rkva_size_mul(nq - 1, stride, extent) || !rkva_size_add(extent, row_bytes, extent) ||
+        !rkva_align_float(n, padded) || !rkva_size_add(padded, lse_bytes, payload) ||
+        !rkva_size_add(padded / 4, n_lse, items)) return rkva_small_failure("unpack", "size_or_stride_bounds", s.device, -1, nq, stride);
+    dim3 grid;
+    if (!rkva_small_layout(items, payload, grid, status_offset, needed))
+        return rkva_small_failure("unpack", "layout_bounds", s.device, -1, payload, RKVA_SMALL_MAX_SIDECAR);
+    if (!rkva_small_ensure(s, s.small_rx, needed)) return false;
+    timing.event.bytes = n + lse_bytes;
+    auto * host = static_cast<uint8_t *>(s.small_rx.host);
+    {
+        ggml_remote_attn_trace_scope copy("cuda_small_unpack_cpu_copy");
+        copy.event.bytes = n + lse_bytes;
+        std::memcpy(host, src, n);
+        // Only the final 0..3 bytes read by the word kernel need padding.
+        if (padded != n) std::memset(host + n, 0, padded - n);
+        if (lse_bytes) std::memcpy(host + padded, lse, lse_bytes);
+    }
+    rkva_stream_retirement retire{s, s.stream, false, "cuda_small_unpack_retire_host", "unpack"};
+    rkva_cuda_timing_trace gpu(s, "cuda_small_unpack");
+    auto * data = static_cast<uint8_t *>(s.small_rx.device);
+    {
+        ggml_remote_attn_trace_scope enqueue("cuda_small_unpack_enqueue_host");
+        enqueue.event.bytes = payload + size_t(grid.x) * sizeof(uint32_t);
+        enqueue.event.value = heads ? 4 : 3; // v2 memcpy/memset commands avoided
+        retire.pending = true;
+        s.retirement_confirmed = false;
+        gpu.mark(0, s.stream);
+        rkva_cuda_fp8_unpack_small_kernel<<<grid, 256, 0, s.stream>>>(
+            reinterpret_cast<const uint32_t *>(data), reinterpret_cast<const float *>(data + padded),
+            static_cast<float *>(dst), n, padded / 4, width, heads, n_lse, stride / sizeof(float),
+            reinterpret_cast<uint32_t *>(data + status_offset));
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) return rkva_small_failure("unpack", "launch/cudaGetLastError", s.device, launch_status, grid.x, n);
+        gpu.mark(1, s.stream);
+    }
+    if (!retire.finish()) return false;
+    const bool ok = rkva_small_status_ok(s.small_rx, status_offset, grid.x, "unpack", s.device);
+    gpu.interval("cuda_small_unpack_kernel_gpu", 0, 1, payload + size_t(grid.x) * sizeof(uint32_t), !ok);
+    if (ok) timing.event.flags &= ~1u;
+    return ok;
 }
 
 static bool rkva_pack_impl(rkva_cuda_remote_scratch & s, const void * src_q, bool is_f16,
@@ -456,18 +831,57 @@ static void * rkva_create_context(int device) {
     return s;
 }
 
+// Explicit lifetime-only extension for external pinned buffers. In particular,
+// a numerical helper failure may have retired successfully: poison and output
+// validity are separate from this barrier, and are never reset by it.
+static bool rkva_retire_context(void * context) {
+    auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
+    if (!s) return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    ggml_remote_attn_trace_scope timing("cuda_retirement_barrier");
+    timing.event.flags |= 1u;
+    rkva_device_guard guard(s->device);
+    if (!guard.ok) {
+        s->poisoned = true;
+        return false;
+    }
+    if (s->stream) {
+        if (cudaStreamSynchronize(s->stream) != cudaSuccess) {
+            s->retirement_confirmed = false;
+            s->poisoned = true;
+            return false;
+        }
+        s->retirement_confirmed = true;
+    }
+    // No stream exists on a fresh context (or on a failed pre-enqueue setup).
+    // Never turn an unknown state into proof without a stream synchronization.
+    const bool retired = s->retirement_confirmed;
+    timing.event.value = uint64_t(retired);
+    if (retired) timing.event.flags &= ~1u;
+    return retired;
+}
+
 static void rkva_destroy_context(void * context) {
     auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
     if (!s) return;
     {
         std::lock_guard<std::mutex> lock(s->mutex);
         rkva_device_guard guard(s->device);
+        // On an uncertain device failure, quarantine this bounded context rather
+        // than free mapped pages or stream resources a kernel may still touch.
+        // destroy_context is void in v2, so this is deliberately a fail-closed
+        // leak on device failure, never a claim that a failed sync retired work.
+        if (!guard.ok || (s->stream && cudaStreamSynchronize(s->stream) != cudaSuccess)) {
+            std::fprintf(stderr, "remote-attn CUDA: context quarantined after failed retirement (device %d)\n", s->device);
+            return;
+        }
         if (guard.ok) {
-            if (s->stream) cudaStreamSynchronize(s->stream);
             for (auto event : s->timing_events) if (event) cudaEventDestroy(event);
             if (s->dev_data) cudaFree(s->dev_data);
             if (s->dev_err) cudaFree(s->dev_err);
             if (s->host_err) cudaFreeHost(s->host_err);
+            if (s->small_tx.host) cudaFreeHost(s->small_tx.host);
+            if (s->small_rx.host) cudaFreeHost(s->small_rx.host);
             if (s->stream) cudaStreamDestroy(s->stream);
         }
     }
@@ -492,6 +906,26 @@ static bool rkva_unpack_context(void * context, const uint8_t * src_pinned_fp8, 
     rkva_device_guard guard(s->device);
     return guard.ok && rkva_unpack_impl(*s, src_pinned_fp8, src_lse, nq, out_width, n_head,
                                         dst_out, stride, nullptr, nullptr);
+}
+
+static bool rkva_pack_small_context(void * context, const void * src, bool is_f16,
+                                   size_t nq, size_t width, uint8_t * dst, void * producer_event) {
+    auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
+    if (!s) return rkva_small_failure("pack", "null_context", -1, -1, nq, width);
+    std::lock_guard<std::mutex> lock(s->mutex);
+    rkva_device_guard guard(s->device);
+    if (!guard.ok) return rkva_small_failure("pack", guard.failed_api, s->device, guard.status, nq, width);
+    return rkva_pack_small_impl(*s, src, is_f16, nq, width, dst, static_cast<cudaEvent_t>(producer_event));
+}
+
+static bool rkva_unpack_small_context(void * context, const uint8_t * src, const float * lse,
+                                     size_t nq, size_t width, size_t heads, void * dst, size_t stride) {
+    auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
+    if (!s) return rkva_small_failure("unpack", "null_context", -1, -1, nq, width);
+    std::lock_guard<std::mutex> lock(s->mutex);
+    rkva_device_guard guard(s->device);
+    if (!guard.ok) return rkva_small_failure("unpack", guard.failed_api, s->device, guard.status, nq, width);
+    return rkva_unpack_small_impl(*s, src, lse, nq, width, heads, dst, stride);
 }
 
 // Legacy ABI: use one context per CUDA device, preserving its original
@@ -616,6 +1050,26 @@ static const ggml_remote_attn_cuda_fp8_interface_v2 s_cuda_remote_attn_fp8_inter
 
 const struct ggml_remote_attn_cuda_fp8_interface_v2 * ggml_backend_cuda_remote_attn_fp8_interface_v2(void) {
     return &s_cuda_remote_attn_fp8_interface_v2;
+}
+
+static const ggml_remote_attn_cuda_fp8_interface_v3 s_cuda_remote_attn_fp8_interface_v3 = {
+    &s_cuda_remote_attn_fp8_interface_v2,
+    rkva_supports_small,
+    rkva_pack_small_context,
+    rkva_unpack_small_context,
+};
+
+const struct ggml_remote_attn_cuda_fp8_interface_v3 * ggml_backend_cuda_remote_attn_fp8_interface_v3(void) {
+    return &s_cuda_remote_attn_fp8_interface_v3;
+}
+
+static const ggml_remote_attn_cuda_retirement_interface_v1 s_cuda_remote_attn_retirement_interface_v1 = {
+    &s_cuda_remote_attn_fp8_interface_v2,
+    rkva_retire_context,
+};
+
+const struct ggml_remote_attn_cuda_retirement_interface_v1 * ggml_backend_cuda_remote_attn_retirement_interface_v1(void) {
+    return &s_cuda_remote_attn_retirement_interface_v1;
 }
 
 #endif // !GGML_USE_HIP && !GGML_USE_MUSA

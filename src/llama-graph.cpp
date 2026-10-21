@@ -2026,7 +2026,32 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
       //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+        // In the real wavefront RPC graph the general whole-cache mask is
+        // metadata only: local FA consumes the allocated [P,Q] mask and RPC
+        // consumes the allocated capacity-stable overflow prefix input. The
+        // unallocated general mask's old n_kv is not part of this topology.
+        // Keep the ordinary extent check for every allocated mask and every
+        // other graph, including legacy position-split and other architectures.
+        const uint32_t p = params.cparams.kv_position_split_p;
+        const auto * general = inp_attn->self_kq_mask;
+        const auto * local = inp_attn->self_kq_mask_local;
+        const auto * prefix = inp_attn->self_overflow_cell_idxs;
+        const bool unused_wavefront_mask =
+            (params.wavefront_tile_size == 64 || params.wavefront_tile_size == 128) &&
+            params.arch == LLM_ARCH_QWEN35 && params.backend_remote &&
+            cparams.remote_attn_position_split && params.cparams.remote_attn_position_split &&
+            cparams.kv_position_split_p == p && p > 0 && p < params.cparams.n_ctx_seq &&
+            params.ubatch.n_tokens > 0 && params.ubatch.n_seqs == 1 && params.ubatch.n_seqs_unq == 1 &&
+            params.ubatch.pos && params.ubatch.pos[0] >= int64_t(p) &&
+            general && !general->buffer && general->ne[1] == params.ubatch.n_tokens &&
+            general->ne[2] == 1 && general->ne[3] == 1 &&
+            local && local->buffer && local->ne[0] == p &&
+            local->ne[1] == params.ubatch.n_tokens && local->ne[2] == 1 && local->ne[3] == 1 &&
+            prefix && prefix->buffer && prefix->type == GGML_TYPE_I32 &&
+            prefix->ne[0] == int64_t(params.cparams.n_ctx_seq - p);
+        if (!unused_wavefront_mask) {
+            res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+        }
         // Packed overflow views are baked per graph; this path does not call
         // inp_attn->can_reuse(), so the binding is enforced here as well, against the
         // ATTENTION memory context (never the hybrid one).
@@ -5000,7 +5025,7 @@ ggml_tensor * llm_graph_context::build_ovf_mask_crop(
     return mask_cont;
 }
 
-ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
+llm_graph_context::position_split_rpc_packet llm_graph_context::build_attn_position_split_rpc_prepare(
         llm_graph_input_attn_kv * inp, ggml_tensor * q_cur, ggml_tensor * k_cur,
         ggml_tensor * v_cur, float kq_scale, int il, ggml_tensor * positions) const {
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(inp->mctx);
@@ -5188,6 +5213,27 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
 
     llm_flash_attn_ext_set_kvarn_domain(fa1, kvarn_domain);
     ggml_prec_set_acc(fa1, GGML_PREC_F32);
+    ggml_build_forward_expand(gf, o1);
+    ggml_build_forward_expand(gf, lse1);
+    ggml_backend_sched_set_tensor_backend(sched, fa1, backend_cuda);
+    ggml_backend_sched_set_tensor_backend(sched, lse1, backend_cuda);
+    if (q_local != q_cur) ggml_backend_sched_set_tensor_backend(sched, q_local, backend_cuda);
+    if (k_tail_local) ggml_backend_sched_set_tensor_backend(sched, k_tail_local, backend_cuda);
+    if (v_tail_local) ggml_backend_sched_set_tensor_backend(sched, v_tail_local, backend_cuda);
+    return { q_cur, range, o1, lse1, fa1, backend_cuda, wire_backend, il, async_overlap };
+}
+
+ggml_tensor * llm_graph_context::build_attn_position_split_rpc_complete(
+        const position_split_rpc_packet & packet) const {
+    auto * q_cur = packet.q;
+    auto * range = packet.range;
+    auto * o1 = packet.local_out;
+    auto * lse1 = packet.local_lse;
+    auto * fa1 = packet.local_fa;
+    auto * backend_cuda = packet.cuda_backend;
+    auto * wire_backend = packet.wire_backend;
+    const int il = packet.layer;
+    const bool async_overlap = packet.async;
     ggml_tensor * range_wait = nullptr;
     ggml_tensor * remote_source = range;
     if (async_overlap) {
@@ -5267,14 +5313,119 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
             ggml_backend_sched_set_tensor_backend(sched, node, backend_cuda);
         }
     }
-    ggml_backend_sched_set_tensor_backend(sched, fa1, backend_cuda);
-    ggml_backend_sched_set_tensor_backend(sched, lse1, backend_cuda);
-    if (q_local != q_cur) ggml_backend_sched_set_tensor_backend(sched, q_local, backend_cuda);
-    if (k_tail_local) ggml_backend_sched_set_tensor_backend(sched, k_tail_local, backend_cuda);
-    if (v_tail_local) ggml_backend_sched_set_tensor_backend(sched, v_tail_local, backend_cuda);
     ggml_backend_sched_set_tensor_backend(sched, o_merged, backend_cuda);
     cb(o_merged, "attn_position_split_rpc", il);
     return o_merged;
+}
+
+void llm_graph_input_wavefront_prefix::set_input(const llama_ubatch * ub) {
+    if (!ub || !ub->pos || !count || offset > ub->n_tokens || count > ub->n_tokens - offset ||
+            !parent || !tile || parent->type != GGML_TYPE_I32 || tile->type != GGML_TYPE_I32 ||
+            parent->ne[0] != tile->ne[0]) {
+        throw std::runtime_error("wavefront: invalid parent prefix input");
+    }
+    const int64_t prefix = int64_t(ub->pos[offset + count - 1]) + 1 - p;
+    if (prefix <= 0 || prefix > tile->ne[0]) throw std::runtime_error("wavefront: invalid overflow prefix");
+    staging.assign(size_t(tile->ne[0]), -1);
+    ggml_backend_tensor_get(parent, staging.data(), 0, size_t(prefix)*sizeof(int32_t));
+    for (int64_t i = 0; i < prefix; ++i) {
+        if (int64_t(staging[size_t(i)]) != int64_t(p) + i) {
+            throw std::runtime_error("wavefront: parent overflow prefix is not contiguous");
+        }
+    }
+    ggml_backend_tensor_set(tile, staging.data(), 0, staging.size()*sizeof(int32_t));
+}
+
+bool llm_graph_input_wavefront_prefix::can_reuse(const llm_graph_params & params) {
+    return params.wavefront_tile_size != 0 && params.cparams.kv_position_split_p == p &&
+            offset <= params.ubatch.n_tokens && count <= params.ubatch.n_tokens - offset;
+}
+
+// This adapter only fills metadata whose token numbering is local to a tile.
+// All K/V indices, position dimensions and masks remain views of the one
+// parent input. In particular it never calls apply()/set_input_rs() for a tile.
+class llm_graph_input_wavefront_tail final : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_kv * parent;
+    ggml_tensor * order;
+    ggml_tensor * desc;
+    ggml_tensor * mask;
+    uint32_t offset;
+    uint32_t count;
+    llm_graph_input_wavefront_tail(llm_graph_input_attn_kv * parent,
+            ggml_tensor * order, ggml_tensor * desc, ggml_tensor * mask,
+            uint32_t offset, uint32_t count) :
+        parent(parent), order(order), desc(desc), mask(mask), offset(offset), count(count) {}
+    void set_input(const llama_ubatch * ub) override {
+        std::vector<int32_t> selection(count);
+        std::iota(selection.begin(), selection.end(), int32_t(offset));
+        const auto tile = llama_ubatch_subset(*ub, selection);
+        set_tail_query_plan(order, desc, tile);
+        parent->mctx->set_input_tail_body_plan(order, desc, mask, &tile, parent->cparams.causal_attn);
+    }
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.wavefront_tile_size != 0 && offset + count <= params.ubatch.n_tokens;
+    }
+};
+
+std::unique_ptr<llm_graph_input_attn_kv> llm_graph_context::build_wavefront_attn_input(
+        llm_graph_input_attn_kv * parent, uint32_t offset, uint32_t count) const {
+    GGML_ASSERT(parent && count && offset + count <= ubatch.n_tokens);
+    auto result = std::make_unique<llm_graph_input_attn_kv>(*parent);
+    auto slice_rows = [&](ggml_tensor * tensor) -> ggml_tensor * {
+        if (!tensor) return nullptr;
+        GGML_ASSERT(tensor->ne[1] >= int64_t(offset + count) && tensor->ne[2] == 1 && tensor->ne[3] == 1);
+        return ggml_view_2d(ctx0, tensor, tensor->ne[0], count, tensor->nb[1], size_t(offset)*tensor->nb[1]);
+    };
+    auto slice_idxs = [&](ggml_tensor * tensor) -> ggml_tensor * {
+        if (!tensor) return nullptr;
+        GGML_ASSERT(tensor->ne[0] % ubatch.n_tokens == 0);
+        const int64_t width = tensor->ne[0] / ubatch.n_tokens;
+        if (width == 1) return ggml_view_1d(ctx0, tensor, count, size_t(offset)*tensor->nb[0]);
+        // Transposed V: index layout is [token, embedding], not [embedding, token].
+        auto * matrix = ggml_reshape_2d(ctx0, tensor, ubatch.n_tokens, width);
+        return ggml_reshape_1d(ctx0, ggml_cont(ctx0,
+                ggml_view_2d(ctx0, matrix, count, width, matrix->nb[1], size_t(offset)*matrix->nb[0])), count*width);
+    };
+    result->self_k_idxs = slice_idxs(parent->self_k_idxs);
+    result->self_v_idxs = slice_idxs(parent->self_v_idxs);
+    result->self_kq_mask_local = slice_rows(parent->self_kq_mask_local);
+    result->self_kq_mask_local_cnv = result->self_kq_mask_local;
+    result->self_kq_mask_tail = slice_rows(parent->self_kq_mask_tail);
+    result->self_tail_read_idxs = slice_rows(parent->self_tail_read_idxs);
+    result->self_tail_body_read_idxs = slice_rows(parent->self_tail_body_read_idxs);
+    result->self_tail_bias_read_idxs = slice_rows(parent->self_tail_bias_read_idxs);
+    // The remote owner must see only the committed prefix for THIS tile,
+    // never the padded full-parent cell list including not-yet-produced K/V.
+    result->self_overflow_cell_idxs = ggml_dup_tensor(ctx0, parent->self_overflow_cell_idxs);
+    ggml_set_input(result->self_overflow_cell_idxs);
+    ggml_backend_sched_set_tensor_backend(sched, result->self_overflow_cell_idxs, backend_cpu);
+    // Keep the parent's validated list allocated even though it is not a
+    // direct RPC operand anymore. Its normal setter checks live positions,
+    // global IDs and companion row mapping before the tile adapters run.
+    ggml_backend_sched_set_tensor_backend(sched, parent->self_overflow_cell_idxs, backend_cpu);
+    ggml_build_forward_expand(gf, parent->self_overflow_cell_idxs);
+    res->add_input(std::make_unique<llm_graph_input_wavefront_prefix>(parent->self_overflow_cell_idxs,
+            result->self_overflow_cell_idxs, cparams.kv_position_split_p, offset, count));
+    if (parent->self_tail_query_order) {
+        result->self_tail_query_order = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, count, 1);
+        result->self_tail_run_desc = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, parent->self_tail_run_desc->ne[0], 1);
+        for (auto * tensor : { result->self_tail_query_order, result->self_tail_run_desc }) {
+            ggml_set_input(tensor);
+            ggml_backend_sched_set_tensor_backend(sched, tensor, backend_cpu);
+        }
+        res->add_input(std::make_unique<llm_graph_input_wavefront_tail>(parent,
+                result->self_tail_query_order, result->self_tail_run_desc, result->self_kq_mask_local,
+                offset, count));
+    }
+    return result;
+}
+
+ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
+        llm_graph_input_attn_kv * inp, ggml_tensor * q, ggml_tensor * k,
+        ggml_tensor * v, float scale, int il, ggml_tensor * positions) const {
+    return build_attn_position_split_rpc_complete(
+            build_attn_position_split_rpc_prepare(inp, q, k, v, scale, il, positions));
 }
 
 ggml_tensor * llm_graph_context::build_attn_position_split(

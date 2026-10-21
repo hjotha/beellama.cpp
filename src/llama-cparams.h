@@ -130,6 +130,10 @@ bool kv_unified;
     // with the overflow range [P,C) handled by the second attention range.
     // 0 keeps the current per-layer placement. Fixed for the whole context.
     uint32_t  kv_position_split_p = 0;
+    // Experimental Qwen35 real graph tiling, explicit opt-in. Runtime
+    // eligibility may select the legacy graph for an unsupported ubatch.
+    uint32_t  rkva_wavefront_tile = 0;
+    uint32_t  rkva_wavefront_rpc_batch = 1;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

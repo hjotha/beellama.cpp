@@ -5,10 +5,85 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 
 namespace llama_wavefront {
+
+uint32_t parse_serving_rpc_batch(const char * value) {
+    if (!value || std::strcmp(value, "1") == 0) return 1;
+    if (std::strcmp(value, "4") == 0) return 4;
+    throw std::invalid_argument("GGML_RKVA_WAVEFRONT_RPC_BATCH expects 1 or 4");
+}
+
+uint32_t parse_serving_tile_size(const char * value) {
+    if (!value || std::strcmp(value, "0") == 0) return 0;
+    if (std::strcmp(value, "64") == 0) return 64;
+    if (std::strcmp(value, "128") == 0) return 128;
+    throw std::invalid_argument("GGML_RKVA_WAVEFRONT_TILE expects 0, 64 or 128");
+}
+
+std::vector<serving_step> build_serving_schedule(uint32_t groups, uint32_t tiles, uint32_t rpc_batch) {
+    std::vector<serving_step> steps;
+    if (rpc_batch != 1 && rpc_batch != 4) throw std::invalid_argument("invalid serving RPC batch");
+    if (!groups || !tiles) return steps;
+    if (uint64_t(groups)*tiles > UINT32_MAX/2) throw std::invalid_argument("wavefront schedule too large");
+    if (rpc_batch == 4) {
+        // Conservative complete-cell diagonals: all preceding wave outputs
+        // are available before a new cohort, and every cohort has distinct
+        // remote layer IDs. No future Q is inferred from a later same-token layer.
+        for (uint64_t wave = 0; wave < uint64_t(groups) + tiles - 1; ++wave) {
+            std::vector<serving_step> ready;
+            for (uint32_t g = 0; g < groups; ++g) {
+                if (wave >= g && wave - g < tiles) {
+                    ready.push_back({ serving_step::phase::PREPARE, g, uint32_t(wave - g) });
+                }
+            }
+            for (size_t begin = 0; begin < ready.size(); begin += 4) {
+                const size_t end = std::min(ready.size(), begin + 4);
+                for (size_t j = begin; j < end; ++j) steps.push_back(ready[j]);
+                for (size_t j = begin; j < end; ++j) {
+                    steps.push_back({ serving_step::phase::COMPLETE, ready[j].group, ready[j].tile });
+                }
+            }
+        }
+        return steps;
+    }
+
+    std::vector<bool> prepared(size_t(groups)*tiles, false), complete(prepared.size(), false);
+    std::deque<uint32_t> pending;
+    uint32_t completed = 0;
+    while (completed < prepared.size()) {
+        bool added = false;
+        if (pending.size() < 2) {
+            // Prefer advancing a ready earlier tile to the next layer group.
+            // A horizontal predecessor must have committed its recurrent state
+            // and submitted its KV append; its remote OUT need not be ready.
+            for (uint32_t g = groups; g-- > 0 && !added;) {
+                for (uint32_t t = 0; t < tiles && !added; ++t) {
+                    const uint32_t id = g*tiles + t;
+                    if (!prepared[id] && (g == 0 || complete[id - tiles]) &&
+                            (t == 0 || prepared[id - 1])) {
+                        prepared[id] = true;
+                        pending.push_back(id);
+                        steps.push_back({ serving_step::phase::PREPARE, g, t });
+                        added = true;
+                    }
+                }
+            }
+        }
+        if (!added) {
+            if (pending.empty()) throw std::logic_error("wavefront serving schedule stalled");
+            const uint32_t id = pending.front(); pending.pop_front();
+            complete[id] = true;
+            ++completed;
+            steps.push_back({ serving_step::phase::COMPLETE, id/tiles, id%tiles });
+        }
+    }
+    return steps;
+}
 
 bool validate_tile_size(uint32_t tile_size) {
     if (tile_size < kMinTileSize || tile_size > kMaxTileSize) {

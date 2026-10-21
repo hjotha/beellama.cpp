@@ -5,14 +5,19 @@
 #include "llama-wavefront.h"
 #include "llama-memory-hybrid.h"
 #include "llama-position-split.h"
+#include "llama-graph.h"
+#include "llama-model.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <stdexcept>
 #include <limits>
 #include <random>
 #include <string>
@@ -1035,9 +1040,370 @@ static void test_graph_capacity_and_scaling() {
     ggml_free(ctx);
 }
 
+static void test_serving_policy_and_two_slot_schedule() {
+    g_case = "real_serving_schedule";
+    CHECK(llama_wavefront::parse_serving_tile_size(nullptr) == 0);
+    CHECK(llama_wavefront::parse_serving_tile_size("0") == 0);
+    CHECK(llama_wavefront::parse_serving_tile_size("64") == 64);
+    CHECK(llama_wavefront::parse_serving_tile_size("128") == 128);
+    CHECK(llama_wavefront::parse_serving_rpc_batch(nullptr) == 1);
+    CHECK(llama_wavefront::parse_serving_rpc_batch("4") == 4);
+    for (const char * invalid : { "", "1", "32", "256", "64x", " 64", "-64" }) {
+        bool threw = false;
+        try { llama_wavefront::parse_serving_tile_size(invalid); } catch (const std::invalid_argument &) { threw = true; }
+        CHECK(threw);
+    }
+    for (uint32_t batch : { 1u, 4u }) {
+        for (uint32_t groups : { 1u, 3u, 16u }) {
+            for (uint32_t tiles : { 2u, 3u, 4u }) {
+                const auto execution = llama_wavefront::build_serving_schedule(groups, tiles, batch);
+                CHECK(execution.size() == 2*groups*tiles);
+                std::vector<bool> prepared(groups*tiles, false), complete(prepared.size(), false);
+                std::deque<uint32_t> outstanding;
+                uint32_t peak = 0, envelopes = 0;
+                for (size_t si = 0; si < execution.size(); ++si) {
+                    const auto & step = execution[si];
+                    const uint32_t id = step.group*tiles + step.tile;
+                    CHECK(step.group < groups && step.tile < tiles);
+                    if (step.action == llama_wavefront::serving_step::phase::PREPARE) {
+                        CHECK(!prepared[id]);
+                        CHECK(step.group == 0 || complete[id - tiles]);
+                        CHECK(step.tile == 0 || prepared[id - 1]);
+                        CHECK(outstanding.size() < (batch == 4 ? 4u : 2u));
+                        if (batch == 4) {
+                            for (uint32_t active : outstanding) CHECK(active/tiles != step.group);
+                            if (si == 0 || execution[si - 1].action == llama_wavefront::serving_step::phase::COMPLETE) {
+                                CHECK(outstanding.empty());
+                                ++envelopes;
+                            }
+                        } else ++envelopes;
+                        outstanding.push_back(id);
+                        prepared[id] = true;
+                        peak = std::max<uint32_t>(peak, uint32_t(outstanding.size()));
+                    } else {
+                        CHECK(!outstanding.empty() && outstanding.front() == id);
+                        CHECK(prepared[id] && !complete[id]);
+                        outstanding.pop_front();
+                        complete[id] = true;
+                    }
+                }
+                CHECK(outstanding.empty());
+                CHECK(std::all_of(complete.begin(), complete.end(), [](bool done) { return done; }));
+                CHECK(peak <= (batch == 4 ? 4u : 2u));
+                if (groups == 16 && tiles == 4) CHECK(envelopes == (batch == 4 ? 19u : 64u));
+                if (groups == 16 && tiles == 2) CHECK(envelopes == (batch == 4 ? 17u : 32u));
+            }
+        }
+    }
+    llm_graph_params p{};
+    p.wavefront_tile_size = 64;
+    p.ubatch = make_test_ubatch(256, 102400, 0);
+    auto q = p;
+    CHECK(p.allow_reuse(q));
+    q.wavefront_tile_size = 128;
+    CHECK(!p.allow_reuse(q));
+    q = p; q.ubatch = make_test_ubatch(256, 102656, 0);
+    CHECK(p.allow_reuse(q)); // data changed; no position is baked into tile metadata shapes
+    q = p; q.cparams.rkva_wavefront_rpc_batch = 4;
+    CHECK(!p.allow_reuse(q));
+}
+
+static void test_reused_parent_prefix_input() {
+    g_case = "reused_serving_prefix_graph";
+    constexpr uint32_t P = 1024, CAP = 3072, N = 256, TILE = 64;
+    auto * cpu = ggml_backend_cpu_init();
+    auto * ctx = ggml_init({ 1u << 20, nullptr, true });
+    CHECK(cpu && ctx);
+    auto * parent = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, CAP);
+    ggml_set_input(parent);
+    auto * gf = ggml_new_graph_custom(ctx, 256, false);
+    std::vector<std::unique_ptr<llm_graph_input_wavefront_prefix>> adapters;
+    std::vector<ggml_tensor *> outputs;
+    for (uint32_t t = 0; t < N/TILE; ++t) {
+        auto * child = ggml_dup_tensor(ctx, parent);
+        ggml_set_input(child);
+        adapters.push_back(std::make_unique<llm_graph_input_wavefront_prefix>(parent, child, P, t*TILE, TILE));
+        auto * out = ggml_cast(ctx, child, GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, out);
+        outputs.push_back(out);
+    }
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    CHECK(buffer != nullptr);
+    // Same graph, same INPUT tensors, two adjacent parent ubatches followed
+    // by a shorter restored prefix. Poison old bytes to detect stale exposure.
+    for (uint32_t old_history : { 512u, 768u, 256u }) {
+        auto ub = make_test_ubatch(N, llama_pos(P + old_history), 0);
+        std::vector<int32_t> ids(CAP, -1);
+        for (uint32_t i = 0; i < old_history + N; ++i) ids[i] = int32_t(P + i);
+        ggml_backend_tensor_set(parent, ids.data(), 0, ids.size()*sizeof(int32_t));
+        llm_graph_params params{};
+        params.ubatch = ub;
+        params.wavefront_tile_size = TILE;
+        params.cparams.kv_position_split_p = P;
+        for (auto & adapter : adapters) {
+            CHECK(adapter->can_reuse(params));
+            adapter->set_input(&ub);
+        }
+        CHECK(ggml_backend_graph_compute(cpu, gf) == GGML_STATUS_SUCCESS);
+        for (uint32_t t = 0; t < N/TILE; ++t) {
+            std::vector<float> out(CAP);
+            ggml_backend_tensor_get(outputs[t], out.data(), 0, out.size()*sizeof(float));
+            const uint32_t visible = old_history + (t + 1)*TILE;
+            for (uint32_t i = 0; i < CAP; ++i) CHECK(out[i] == (i < visible ? float(P + i) : -1.0f));
+        }
+    }
+    // A malformed validated-list fixture must fail before any RPC can run.
+    auto ub = make_test_ubatch(N, P + 256, 0);
+    std::vector<int32_t> malformed(CAP, -1);
+    for (uint32_t i = 0; i < 512; ++i) malformed[i] = int32_t(P + i);
+    malformed[10] += 1;
+    ggml_backend_tensor_set(parent, malformed.data(), 0, malformed.size()*sizeof(int32_t));
+    bool threw = false;
+    try { adapters[0]->set_input(&ub); } catch (const std::runtime_error &) { threw = true; }
+    CHECK(threw);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
+}
+
+static void test_real_hybrid_reuse_with_unallocated_general_mask() {
+    g_case = "real_hybrid_reuse_unused_general_mask";
+    constexpr uint32_t N = 256, P = 1024, C = 4096;
+    // No weights or tensor state are needed to exercise the real hybrid
+    // ownership/head/rs_z checks. The recurrent memory and hybrid context are
+    // production objects; only the KV live extent/tail policy is a test double.
+    struct no_weight_model final : llama_model {
+        no_weight_model() : llama_model(llama_model_default_params()) {}
+        void load_stats(llama_model_loader &) override {}
+        void load_hparams(llama_model_loader &) override {}
+        void load_vocab(llama_model_loader &) override {}
+        bool load_tensors(llama_model_loader &) override { return true; }
+        void load_arch_hparams(llama_model_loader &) override {}
+        void load_arch_tensors(llama_model_loader &) override {}
+        std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params &) const override { return {}; }
+    } model;
+    struct kv_extent final : llama_kv_cache_context {
+        uint32_t rows;
+        llama_ubatch ub;
+        kv_extent(uint32_t rows, const llama_ubatch & ub) :
+            llama_kv_cache_context(LLAMA_MEMORY_STATUS_SUCCESS), rows(rows), ub(ub) {}
+        bool apply() override { return true; }
+        const llama_ubatch & get_ubatch() const override { return ub; }
+        uint32_t get_n_kv() const override { return rows; }
+        uint32_t get_tail_slots() const override { return 0; }
+        ggml_type get_tail_type() const override { return GGML_TYPE_F16; }
+        uint32_t get_tail_tokens() const override { return 0; }
+        uint32_t get_tail_arena_stride() const override { return 0; }
+        uint32_t get_tail_attention_stride(uint32_t = 0) const override { return 0; }
+        uint32_t get_tail_body_execution_stride() const override { return 0; }
+        uint32_t get_tail_rollback_tokens() const override { return 0; }
+        bool has_compact_tail() const override { return false; }
+        llama_kv_tail_storage_kind get_tail_storage_kind() const override { return LLAMA_KV_TAIL_STORAGE_DISABLED; }
+        bool can_pack_tail_body(const llama_ubatch &) const override { return false; }
+    };
+    const auto make_ub = [](llama_pos pos) {
+        auto ub = make_test_ubatch(N, pos, 0);
+        for (uint32_t i = 0; i < N; ++i) ub.seq_id[i][0] = 0;
+        ub.seq_id_unq[0] = 0;
+        ub.seq_idx[5] = -1;
+        ub.seq_idx[0] = 0;
+        return ub;
+    };
+    auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+            false, 1, 1, 0, nullptr);
+    llama_memory_hybrid memory(model, nullptr, std::move(recurrent));
+    const auto context = [&](const llama_ubatch & ub, uint32_t rows) {
+        return std::make_unique<llama_memory_hybrid_context>(&memory,
+                std::make_unique<kv_extent>(rows, ub), std::vector<llama_ubatch>{ub});
+    };
+    auto warm = context(make_ub(P - N), P);
+    CHECK(warm->apply());
+    auto first_ub = make_ub(P);
+    auto first = context(first_ub, P + N);
+    CHECK(first->apply());
+    auto * cpu = ggml_backend_cpu_init();
+    auto * ctx = ggml_init({ 1u << 20, nullptr, true });
+    CHECK(cpu && ctx);
+    llama_cparams cp{};
+    cp.causal_attn = true;
+    cp.remote_attn_position_split = true;
+    cp.kv_position_split_p = P;
+    cp.n_ctx_seq = C;
+    cp.n_rs_seq = 0;
+    auto attn = std::make_unique<llm_graph_input_attn_kv>(model.hparams, cp, first->get_attn());
+    auto * attn_ptr = attn.get();
+    attn->self_k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, N);
+    attn->self_kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, P + N, N, 1, 1);
+    attn->self_kq_mask_cnv = attn->self_kq_mask;
+    attn->self_kq_mask_local = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, P, N, 1, 1);
+    attn->self_kq_mask_local_cnv = attn->self_kq_mask_local;
+    attn->self_overflow_cell_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, C - P);
+    ggml_set_input(attn->self_kq_mask_local);
+    ggml_set_input(attn->self_overflow_cell_idxs);
+    auto * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, ggml_scale(ctx, attn->self_kq_mask_local, 1.0f));
+    ggml_build_forward_expand(graph, attn->self_overflow_cell_idxs);
+    ggml_backend_t backends[] = {cpu};
+    auto * sched = ggml_backend_sched_new(backends, nullptr, 1, 64, false, true);
+    CHECK(ggml_backend_sched_alloc_graph(sched, graph));
+    CHECK(attn->self_kq_mask->buffer == nullptr); // genuinely pruned by the scheduler
+    CHECK(attn->self_kq_mask_local->buffer != nullptr);
+    CHECK(attn->self_overflow_cell_idxs->buffer != nullptr);
+    auto rs = std::make_unique<llm_graph_input_rs>(first->get_recr());
+    rs->s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, first->get_recr()->get_n_rs());
+    rs->s_copy_main = ggml_view_1d(ctx, rs->s_copy, 1, 0);
+    rs->s_copy_extra = ggml_view_1d(ctx, rs->s_copy, 0, sizeof(int32_t));
+    rs->head = first->get_recr()->get_head();
+    rs->rs_z = first->get_recr()->get_rs_z();
+    llm_graph_input_mem_hybrid input(cp, std::move(attn), std::move(rs), first.get());
+    auto next_ub = make_ub(P + N);
+    auto next = context(next_ub, P + 2*N);
+    CHECK(next->apply());
+    llm_graph_params params{};
+    params.arch = LLM_ARCH_QWEN35;
+    params.cparams = cp;
+    params.ubatch = next_ub;
+    params.mctx = next.get();
+    params.backend_remote = cpu; // opaque identity only; this test never runs an RPC
+    params.wavefront_tile_size = 64;
+    CHECK(input.inp_rs->head == next->get_recr()->get_head());
+    CHECK(input.inp_rs->rs_z == next->get_recr()->get_rs_z());
+    CHECK(input.can_reuse(params)); // old implementation fails here solely on general.ne0
+    auto changed = params;
+    changed.wavefront_tile_size = 128;
+    CHECK(input.can_reuse(changed));
+    changed = params; changed.wavefront_tile_size = 0;
+    CHECK(!input.can_reuse(changed)); // legacy still checks the complete-cache extent
+    changed = params; changed.cparams.remote_attn_position_split = false;
+    CHECK(!input.can_reuse(changed));
+    changed = params; changed.arch = LLM_ARCH_QWEN35MOE;
+    CHECK(!input.can_reuse(changed));
+    changed = params; changed.cparams.kv_position_split_p += 256;
+    CHECK(!input.can_reuse(changed));
+    changed = params; changed.ubatch.n_tokens /= 2;
+    CHECK(!input.can_reuse(changed));
+    // A changed prefix capacity must not be hidden by the unused general mask.
+    changed = params; changed.cparams.n_ctx_seq += 256;
+    CHECK(!input.can_reuse(changed));
+    // A real allocated general mask remains a topology dependency.
+    auto * mask_buffer = ggml_backend_alloc_buffer(cpu, ggml_nbytes(attn_ptr->self_kq_mask));
+    CHECK(mask_buffer != nullptr);
+    CHECK(ggml_backend_tensor_alloc(mask_buffer, attn_ptr->self_kq_mask,
+            ggml_backend_buffer_get_base(mask_buffer)) == GGML_STATUS_SUCCESS);
+    CHECK(!input.can_reuse(params));
+    changed = params; changed.mctx = first.get();
+    CHECK(input.can_reuse(changed)); // the allocated mask matches the old KV extent
+    ggml_backend_buffer_free(mask_buffer);
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
+}
+
+struct recurrent_fixture_result {
+    std::vector<float> output;
+    std::vector<float> conv_state;
+    std::vector<float> gdn_state;
+};
+
+// Actual CPU SSM_CONV + GATED_DELTA_NET operators with a nonzero initial
+// history and a shared persistent destination. The next tile consumes CPY's
+// RESULT, as the serving model does; a bare view of the cache is insufficient.
+static recurrent_fixture_result run_recurrent_commit_fixture(uint32_t tile_size, bool perturb_future) {
+    constexpr int64_t T = 256, D = 16, HV = 2, C = D*(2 + HV), K = 4;
+    auto * ctx = ggml_init({ 32u << 20, nullptr, false });
+    CHECK(ctx != nullptr);
+    auto * gf = ggml_new_graph_custom(ctx, 4096, false);
+    auto * raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, T, 1);
+    auto * kernel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, C);
+    auto * conv_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K - 1, C, 1);
+    auto * state_cache = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, D, HV, 1);
+    for (int64_t t = 0; t < T; ++t) {
+        for (int64_t c = 0; c < C; ++c) {
+            static_cast<float *>(raw->data)[t*C + c] =
+                    0.1f*std::sin(float(7*t + 3*c + 1)*0.043f) + (perturb_future && t >= 128 ? 0.7f : 0.0f);
+        }
+    }
+    for (int64_t i = 0; i < ggml_nelements(kernel); ++i) static_cast<float *>(kernel->data)[i] = float(i%7 - 3)*0.07f;
+    for (int64_t i = 0; i < ggml_nelements(conv_cache); ++i) static_cast<float *>(conv_cache->data)[i] = float(i%11 - 5)*0.01f;
+    for (int64_t i = 0; i < ggml_nelements(state_cache); ++i) static_cast<float *>(state_cache->data)[i] = float(i%13 - 6)*0.005f;
+    ggml_tensor * conv_commit = conv_cache;
+    ggml_tensor * gdn_commit = state_cache;
+    ggml_tensor * joined = nullptr;
+    for (int64_t begin = 0; begin < T; begin += tile_size) {
+        const int64_t count = std::min<int64_t>(tile_size, T - begin);
+        auto * tile = ggml_view_3d(ctx, raw, C, count, 1, raw->nb[1], raw->nb[2], size_t(begin)*raw->nb[1]);
+        auto * input = ggml_concat(ctx, ggml_reshape_3d(ctx, conv_commit, K - 1, C, 1), ggml_transpose(ctx, tile), 0);
+        auto * last = ggml_view_3d(ctx, input, K - 1, C, 1, input->nb[1], input->nb[2], size_t(count)*input->nb[0]);
+        conv_commit = ggml_cpy(ctx, last, conv_cache);
+        ggml_build_forward_expand(gf, conv_commit);
+        auto * mixed = ggml_silu(ctx, ggml_ssm_conv(ctx, input, kernel));
+        auto component = [&](int64_t dim, int64_t heads, int64_t offset) {
+            return ggml_view_4d(ctx, mixed, dim, heads, count, 1,
+                    size_t(dim)*sizeof(float), mixed->nb[1], mixed->nb[2], size_t(offset)*sizeof(float));
+        };
+        auto * q = ggml_l2_norm(ctx, component(D, 1, 0), 1e-6f);
+        auto * k = ggml_l2_norm(ctx, component(D, 1, D), 1e-6f);
+        auto * v = component(D, HV, 2*D);
+        auto * gates = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, HV, count, 1);
+        auto * beta = ggml_dup_tensor(ctx, gates);
+        for (int64_t i = 0; i < ggml_nelements(gates); ++i) {
+            static_cast<float *>(gates->data)[i] = -0.05f;
+            static_cast<float *>(beta->data)[i] = 0.25f;
+        }
+        auto * result = ggml_gated_delta_net(ctx, q, k, v, gates, beta,
+                ggml_reshape_4d(ctx, gdn_commit, D, D, HV, 1), 1);
+        auto * output = ggml_view_2d(ctx, result, D*HV, count, size_t(D*HV)*sizeof(float), 0);
+        auto * next_state = ggml_view_4d(ctx, result, D, D, HV, 1,
+                size_t(D)*sizeof(float), size_t(D*D)*sizeof(float), size_t(D*D*HV)*sizeof(float),
+                size_t(D*HV*count)*sizeof(float));
+        gdn_commit = ggml_cpy(ctx, next_state, state_cache);
+        ggml_build_forward_expand(gf, gdn_commit);
+        joined = joined ? ggml_concat(ctx, joined, output, 1) : output;
+    }
+    ggml_build_forward_expand(gf, joined);
+    CHECK(ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS);
+    recurrent_fixture_result result;
+    const auto copy = [](ggml_tensor * tensor) {
+        const auto * values = static_cast<const float *>(tensor->data);
+        return std::vector<float>(values, values + ggml_nelements(tensor));
+    };
+    result.output = copy(joined);
+    result.conv_state = copy(conv_cache);
+    result.gdn_state = copy(state_cache);
+    ggml_free(ctx);
+    return result;
+}
+
+static void test_production_recurrent_commit_causality() {
+    g_case = "production_conv_gdn_commit_chain";
+    const auto full = run_recurrent_commit_fixture(256, false);
+    for (uint32_t tile : { 64u, 128u }) {
+        const auto tiled = run_recurrent_commit_fixture(tile, false);
+        const auto future = run_recurrent_commit_fixture(tile, true);
+        const auto compare = [](const std::vector<float> & a, const std::vector<float> & b, size_t n) {
+            CHECK(a.size() == b.size());
+            for (size_t i = 0; i < n; ++i) {
+                CHECK(std::isfinite(a[i]) && std::isfinite(b[i]));
+                CHECK(std::abs(a[i] - b[i]) <= 2e-5f);
+            }
+        };
+        compare(full.output, tiled.output, full.output.size());
+        compare(full.conv_state, tiled.conv_state, full.conv_state.size());
+        compare(full.gdn_state, tiled.gdn_state, full.gdn_state.size());
+        compare(tiled.output, future.output, size_t(128*16*2));
+        bool changed = false;
+        for (size_t i = 128*16*2; i < tiled.output.size(); ++i) changed |= std::abs(tiled.output[i] - future.output[i]) > 1e-4f;
+        CHECK(changed);
+    }
+}
+
 int main() {
     std::printf("[test-wavefront-pipeline] Iniciando bateria de testes da Fase 7...\n");
 
+    test_serving_policy_and_two_slot_schedule();
+    test_reused_parent_prefix_input();
+    test_real_hybrid_reuse_with_unallocated_general_mask();
+    test_production_recurrent_commit_causality();
     test_tile_size_validation();
     test_wavefront_schedule_properties();
     test_topological_order_validation();

@@ -67,6 +67,12 @@ struct loopback {
     std::vector<uint8_t> fp8_output_data; // optional independent per-row/head/dimension fixture
     float lse_head_delta = 0.0f;
     profile_failure fail_report = profile_failure::none;
+    enum class cohort_failure { none, last_ticket, last_epoch, last_out_nan, last_lse_nan,
+                                last_length, server_suffix_error };
+    cohort_failure fail_cohort = cohort_failure::none;
+    unsigned cohort_calls = 0;
+    std::vector<uint32_t> cohort_counts, cohort_queries, cohort_layers;
+    std::vector<uint64_t> cohort_tickets, cohort_epochs;
     std::atomic<bool> pause_mode{false};
     int reply_tokens = 0;
     unsigned paused_replies = 0; // protected by pause_mutex
@@ -229,6 +235,10 @@ struct loopback {
                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 8)) {
                                 ack.reserved[0] |= RKVA_CAP_KVARN_BULK_ATTN;
                                 ack.supported_ops |= (1u << RKVA_KVARN_RANGE_BULK_ATTN);
+                            }
+                            if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 256)) {
+                                ack.reserved[0] |= RKVA_CAP_KVARN_COHORT_ATTN;
+                                ack.supported_ops |= (1u << RKVA_KVARN_RANGE_COHORT_ATTN);
                             }
                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 16)) {
                                 ack.reserved[0] |= RKVA_CAP_KVARN_BULK_F16;
@@ -405,6 +415,111 @@ struct loopback {
                             apply_attention(query_data);
                             ++fused_calls;
                         } break;
+                        case RKVA_KVARN_RANGE_COHORT_ATTN: {
+                            assert(native_kvarn && (native_rewind_support & 256));
+                            assert(req.layer_id == 0 && payload.size() >= sizeof(rkva_kvarn_cohort_header));
+                            rkva_kvarn_cohort_header header{};
+                            std::memcpy(&header, payload.data(), sizeof(header));
+                            assert(header.version == 1 && header.entry_count >= 1 && header.entry_count <= 4);
+                            assert(!header.reserved && header.total_queries == req.n_tokens && req.n_tokens <= 256);
+                            struct item {
+                                rkva_kvarn_cohort_entry entry{};
+                                uint32_t live = 0, segments = 0;
+                            };
+                            std::vector<item> items;
+                            size_t offset = sizeof(header);
+                            uint32_t queries = 0, segments = 0;
+                            uint64_t ticket = 0, epoch = 0;
+                            // Parse the complete request before simulating any KV mutation.
+                            for (uint32_t i = 0; i < header.entry_count; ++i) {
+                                assert(payload.size() - offset >= sizeof(rkva_kvarn_cohort_entry));
+                                item next;
+                                std::memcpy(&next.entry, payload.data() + offset, sizeof(next.entry));
+                                offset += sizeof(next.entry);
+                                const auto& e = next.entry;
+                                assert(e.layer < geometry.n_layer_remote && e.n_queries && !e.reserved);
+                                assert(e.ticket > ticket && e.epoch && (!i || e.epoch == epoch));
+                                assert(e.body_bytes <= payload.size() - offset);
+                                for (const auto& previous : items) assert(previous.entry.layer != e.layer);
+                                ticket = e.ticket; epoch = e.epoch;
+                                const size_t end = offset + e.body_bytes;
+                                assert(end - offset >= sizeof(rkva_kvarn_range_bulk));
+                                rkva_kvarn_range_bulk inner{};
+                                std::memcpy(&inner, payload.data() + offset, sizeof(inner));
+                                offset += sizeof(inner);
+                                assert(inner.version == 1 && !inner.reserved && inner.total_queries == e.n_queries);
+                                assert(inner.segment_count && inner.segment_count <= 32);
+                                uint32_t entry_queries = 0;
+                                for (uint32_t j = 0; j < inner.segment_count; ++j) {
+                                    assert(end - offset >= sizeof(rkva_kvarn_range_bulk_segment));
+                                    rkva_kvarn_range_bulk_segment segment{};
+                                    std::memcpy(&segment, payload.data() + offset, sizeof(segment));
+                                    offset += sizeof(segment);
+                                    assert(segment.n_queries && segment.n_queries <= 9);
+                                    assert(segment.upload_bytes >= sizeof(rkva_kvarn_range_upload) && segment.upload_bytes <= end - offset);
+                                    rkva_kvarn_range_upload upload{};
+                                    std::memcpy(&upload, payload.data() + offset, sizeof(upload));
+                                    next.live = upload.live_count;
+                                    offset += segment.upload_bytes;
+                                    assert(end - offset >= sizeof(rkva_range_attn));
+                                    rkva_range_attn attention{};
+                                    std::memcpy(&attention, payload.data() + offset, sizeof(attention));
+                                    assert(attention.wire == RKVA_WIRE_FP8 && !attention.flags && !attention.reserved[0] && !attention.reserved[1]);
+                                    offset += sizeof(attention);
+                                    const size_t query_bytes = size_t(segment.n_queries) *
+                                        (sizeof(int32_t) + size_t(geometry.n_head) * geometry.head_dim);
+                                    assert(query_bytes <= end - offset);
+                                    offset += query_bytes;
+                                    entry_queries += segment.n_queries;
+                                }
+                                assert(offset == end && entry_queries == e.n_queries);
+                                next.segments = inner.segment_count;
+                                queries += e.n_queries; segments += inner.segment_count;
+                                items.push_back(next);
+                            }
+                            assert(offset == payload.size() && queries == req.n_tokens && segments <= 32);
+                            ++cohort_calls;
+                            cohort_counts.push_back(header.entry_count);
+                            cohort_queries.push_back(queries);
+                            if (fail_cohort == cohort_failure::server_suffix_error) {
+                                response_failure = profile_failure::server_error;
+                                break; // simulated pre-admission failure, no layer is mutated
+                            }
+                            response.resize(sizeof(header));
+                            std::memcpy(response.data(), &header, sizeof(header));
+                            for (uint32_t i = 0; i < items.size(); ++i) {
+                                const auto& next = items[i];
+                                auto echo = next.entry;
+                                const size_t out_bytes = size_t(echo.n_queries) * geometry.n_head * geometry.head_dim;
+                                const size_t lse_bytes = size_t(echo.n_queries) * geometry.n_head * sizeof(float);
+                                echo.body_bytes = uint32_t(out_bytes + lse_bytes);
+                                native_counts[echo.layer] = next.live;
+                                native_ready[echo.layer] = true;
+                                native_generation += next.segments;
+                                cohort_layers.push_back(echo.layer);
+                                cohort_tickets.push_back(echo.ticket);
+                                cohort_epochs.push_back(echo.epoch);
+                                const bool last = i + 1 == items.size();
+                                if (last && fail_cohort == cohort_failure::last_ticket) ++echo.ticket;
+                                if (last && fail_cohort == cohort_failure::last_epoch) ++echo.epoch;
+                                if (last && fail_cohort == cohort_failure::last_length) ++echo.body_bytes;
+                                const size_t before = response.size();
+                                response.resize(before + sizeof(echo) + out_bytes + lse_bytes);
+                                std::memcpy(response.data() + before, &echo, sizeof(echo));
+                                uint8_t* body = response.data() + before + sizeof(echo);
+                                std::memset(body, uint8_t(0x3c + echo.layer), out_bytes);
+                                for (uint32_t q = 0; q < echo.n_queries; ++q) {
+                                    const float lse = float(std::log(double(next.live - echo.n_queries + q + 1))) + float(echo.layer) * 0.125f;
+                                    for (uint32_t h = 0; h < geometry.n_head; ++h)
+                                        std::memcpy(body + out_bytes + (size_t(q) * geometry.n_head + h) * sizeof(float), &lse, sizeof(lse));
+                                }
+                                if (last && fail_cohort == cohort_failure::last_out_nan) body[out_bytes - 1] = 0x7f;
+                                if (last && fail_cohort == cohort_failure::last_lse_nan) {
+                                    const float nan = std::numeric_limits<float>::quiet_NaN();
+                                    std::memcpy(body + out_bytes + lse_bytes - sizeof(float), &nan, sizeof(nan));
+                                }
+                            }
+                        } break;
                         case RKVA_KVARN_RANGE_BULK_ATTN: {
                             assert(native_kvarn && (native_rewind_support & 8));
                             rkva_kvarn_range_bulk header{};
@@ -509,7 +624,7 @@ struct loopback {
                         } break;
                         default: assert(false);
                     }
-                    if (pause_mode.load() && (req.op == RKVA_KVARN_RANGE_BULK_ATTN || req.op == RKVA_RANGE_ATTN || req.op == RKVA_RANGE_UPLOAD_ATTN)) {
+                    if (pause_mode.load() && (req.op == RKVA_KVARN_RANGE_BULK_ATTN || req.op == RKVA_KVARN_RANGE_COHORT_ATTN || req.op == RKVA_RANGE_ATTN || req.op == RKVA_RANGE_UPLOAD_ATTN)) {
                         std::unique_lock<std::mutex> lk(pause_mutex);
                         ++paused_replies;
                         pause_cv.notify_all();
@@ -2229,7 +2344,7 @@ static void test_cuda_fp8_serving_graph() {
             ggml_backend_tensor_set(ids, cells.data(), 0, cells.size() * sizeof(int32_t));
             ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(int32_t));
             node->op_params[GGML_REMOTE_ATTN_PARAM_N_LIVE] = 2 * nq;
-            assert(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_ABORTED);
+            assert(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_FAILED);
             assert(ggml_backend_remote_attn_failed(backend));
             { std::lock_guard<std::mutex> lock(server.mutex); assert(server.attention_calls == 1); }
             // A false CUDA helper result is conservatively non-reusable, even
@@ -2275,7 +2390,7 @@ static void test_cuda_fp8_prefill_mode_graph() {
         assert(pos != std::string::npos);
         return std::stoull(json.substr(pos + std::strlen(key) + 3));
     };
-    for (const char * policy : {"prefill", "0", "1", static_cast<const char *>(nullptr)}) {
+    for (const char * policy : {"prefill", "0", "1", "mapped", static_cast<const char *>(nullptr)}) {
     storage_env acceleration(policy, "GGML_RKVA_CUDA_FP8");
     const bool prefill_policy = policy && !std::strcmp(policy, "prefill");
     for (bool async : {false, true}) {
@@ -2291,7 +2406,7 @@ static void test_cuda_fp8_prefill_mode_graph() {
         assert(ggml_backend_remote_attn_configure_range(backend, origin, capacity, GGML_TYPE_Q4_0));
         ggml_remote_attn_set_active(backend);
         uint32_t live = 0;
-        uint64_t packs = 0, unpacks = 0, creates = 0, releases = 0;
+        uint64_t packs = 0, unpacks = 0, creates = 0, releases = 0, small_packs = 0, small_unpacks = 0;
         bool context_live = false;
         // One backend/slot pool crosses both directions of the policy boundary.
         // The17-query RPC has8+8+1 segments but exactly one GPU pack/unpack.
@@ -2397,9 +2512,15 @@ static void test_cuda_fp8_prefill_mode_graph() {
               assert(server.native_counts[0] == live + nq); }
             packs += cuda_range && q_on_gpu;
             unpacks += cuda_range;
+            if (policy && !std::strcmp(policy, "mapped") && nq <= 9) {
+                small_packs += q_on_gpu;
+                ++small_unpacks;
+            }
             const auto stats = std::string(ggml_backend_remote_attn_stats_json(backend));
             assert(counter(stats, "cuda_pack_calls") == packs);
             assert(counter(stats, "cuda_unpack_calls") == unpacks);
+            assert(counter(stats, "cuda_small_pack_calls") == small_packs);
+            assert(counter(stats, "cuda_small_unpack_calls") == small_unpacks);
             if (cuda_range && !context_live) { ++creates; context_live = true; }
             if (prefill_policy && !cuda_range && context_live) { ++releases; context_live = false; }
             assert(counter(stats, "cuda_context_creates") == creates);
@@ -2622,13 +2743,875 @@ static void test_done_epoch_invalidation_race() {
     std::printf("DONE_OK WAIT/invalidate race: 64 cases, consumed=%u invalidated=%u\n", consumed, 64 - consumed);
 }
 
+// Real host queue/codec/wire contract with a CPU-only op23 peer.
+static void test_native_cohort_async() {
+    storage_env native("kvarn4");
+    storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
+    storage_env precision("128", "GGML_RKVA_NATIVE_TAIL_TOKENS");
+    storage_env bulk("1", "GGML_RKVA_NATIVE_BULK");
+    storage_env wire("fp8", "GGML_RKVA_WIRE_FORMAT");
+    storage_env overlap("1", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+    storage_env acceleration("0", "GGML_RKVA_CUDA_FP8");
+    storage_env batching("4", "GGML_RKVA_WAVEFRONT_RPC_BATCH");
+    constexpr uint32_t support = 7 | 8 | 16 | 32 | 256;
+    constexpr float sentinel = -1234.5f;
+
+    struct fixture {
+        struct item {
+            ggml_tensor * node = nullptr, * wait = nullptr, * ids = nullptr, * pos = nullptr;
+            uint32_t nq = 0, layer = 0;
+        };
+        ggml_backend_t backend = nullptr, cpu = nullptr;
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        std::vector<item> items;
+        bool configured = false;
+        fixture(loopback& server, uint32_t count, uint32_t nq, bool expect_configure = true,
+                bool duplicate_layer = false) {
+            backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+            assert(backend);
+            ggml_remote_attn_geometry geo{4, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2,
+                                         0, 0, false, false, 1.0f / 16};
+            assert(ggml_backend_remote_attn_set_geometry(backend, &geo));
+            assert(ggml_backend_remote_attn_connect(backend));
+            assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+            ggml_backend_remote_attn_set_active_session(backend, 0);
+            configured = ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0);
+            assert(configured == expect_configure);
+            if (!configured) return;
+            assert(ggml_backend_remote_attn_cohort_enabled(backend));
+            assert(ggml_backend_remote_attn_async_capacity(backend) == 4);
+            ggml_remote_attn_set_active(backend);
+            ctx = ggml_init({8u << 20, nullptr, true});
+            assert(ctx);
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t layer = duplicate_layer ? 0 : i;
+                auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 2, nq);
+                auto * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 512);
+                auto * v = ggml_dup_tensor(ctx, k);
+                auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+                auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nq);
+                auto * original_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, nq);
+                auto * original_v = ggml_dup_tensor(ctx, original_k);
+                auto * node = ggml_remote_attn_range(ctx, q, k, v, ids, pos, layer, 1024, nq, geo.kq_scale);
+                ggml_remote_attn_range_set_native_sources(node, original_k, original_v);
+                ggml_remote_attn_range_set_async(node);
+                ggml_remote_attn_range_set_cohort(node, count, i);
+                auto * wait = ggml_remote_attn_range_wait(ctx, node);
+                items.push_back({node, wait, ids, pos, nq, layer});
+            }
+            cpu = ggml_backend_cpu_init();
+            buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+            assert(buffer);
+            ggml_backend_buffer_clear(buffer, 0);
+            inputs(1);
+        }
+        void inputs(uint32_t round) {
+            for (auto& item : items) {
+                const uint32_t live = round * item.nq;
+                assert(live <= 512);
+                std::vector<int32_t> ids(512, -1), positions(item.nq);
+                for (uint32_t i = 0; i < live; ++i) ids[i] = int32_t(1024 + i);
+                for (uint32_t i = 0; i < item.nq; ++i) positions[i] = int32_t(1024 + live - item.nq + i);
+                ggml_backend_tensor_set(item.ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+                ggml_backend_tensor_set(item.pos, positions.data(), 0, positions.size() * sizeof(int32_t));
+                item.node->op_params[GGML_REMOTE_ATTN_PARAM_N_LIVE] = int32_t(live);
+                std::vector<float> untouched(size_t(item.nq) * 514, -1234.5f);
+                ggml_backend_tensor_set(item.node, untouched.data(), 0, untouched.size() * sizeof(float));
+                ggml_backend_tensor_set(item.wait, untouched.data(), 0, untouched.size() * sizeof(float));
+            }
+        }
+        void untouched(bool sources = true) const {
+            for (const auto& item : items) {
+                const auto * wait = static_cast<const float *>(item.wait->data);
+                const auto * source = static_cast<const float *>(item.node->data);
+                for (size_t j = 0; j < size_t(item.nq) * 514; ++j) {
+                    assert(wait[j] == -1234.5f);
+                    if (sources) assert(source[j] == -1234.5f);
+                }
+            }
+        }
+        void check_values(uint32_t round) const {
+            for (const auto& item : items) {
+                const auto * out = static_cast<const float *>(item.wait->data);
+                const float expected_out = 1.0f + float(item.layer) * 0.25f;
+                for (uint32_t q = 0; q < item.nq; ++q) {
+                    for (uint32_t d = 0; d < 512; ++d) assert(out[size_t(q) * 514 + d] == expected_out);
+                    const float lse = float(std::log(double((round - 1) * item.nq + q + 1))) + float(item.layer) * 0.125f;
+                    for (uint32_t h = 0; h < 2; ++h) assert(out[size_t(q) * 514 + 512 + h] == lse);
+                }
+            }
+        }
+        ~fixture() {
+            if (backend) {
+                ggml_backend_remote_attn_drain(backend);
+                ggml_remote_attn_set_active(nullptr);
+                ggml_backend_free(backend);
+            }
+            if (buffer) ggml_backend_buffer_free(buffer);
+            if (ctx) ggml_free(ctx);
+            if (cpu) ggml_backend_free(cpu);
+        }
+    };
+
+    // Diagnostics may observe capacity while the owner reconfigures a drained
+    // backend. Even a same-value write must not race the public getter.
+    {
+        loopback server(false, true, false, false, false, false, 0, 0, true, support);
+        fixture f(server, 1, 64);
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> reads{0};
+        std::promise<void> observing;
+        auto started = observing.get_future();
+        std::thread observer([&] {
+            const auto first = ggml_backend_remote_attn_async_capacity(f.backend);
+            assert(first == 2 || first == 4);
+            ++reads;
+            observing.set_value();
+            while (!stop.load()) {
+                const auto capacity = ggml_backend_remote_attn_async_capacity(f.backend);
+                assert(capacity == 2 || capacity == 4);
+                ++reads;
+                std::this_thread::yield();
+            }
+        });
+        started.get();
+        for (unsigned round = 0; round < 32; ++round) {
+            storage_env policy(round % 2 ? "4" : "1", "GGML_RKVA_WAVEFRONT_RPC_BATCH");
+            assert(ggml_backend_remote_attn_configure_range(f.backend, 1024, 512, GGML_TYPE_Q4_0));
+            assert(ggml_backend_remote_attn_async_capacity(f.backend) == (round % 2 ? 4u : 2u));
+        }
+        stop = true;
+        observer.join(); // no observer survives destruction of the backend
+        assert(reads.load() > 0);
+    }
+
+    // Explicit opt-in must reject peers lacking the negotiated operation/capability.
+    {
+        loopback server(false, true, false, false, false, false, 0, 0, true, support & ~256u);
+        fixture f(server, 1, 64, false);
+        assert(!ggml_backend_remote_attn_cohort_enabled(f.backend));
+    }
+    unsigned positive_groups = 0;
+    for (uint32_t nq : {64u, 128u, 256u}) {
+        for (uint32_t count = 1; count <= std::min(4u, 256u / nq); ++count) {
+            loopback server(false, true, false, false, false, false, 0, 0, true, support);
+            fixture f(server, count, nq);
+            for (uint32_t round = 1; round <= 2; ++round) {
+                if (round > 1) f.inputs(round);
+                server.set_pause(true);
+                for (uint32_t i = 0; i < count; ++i) {
+                    assert(ggml_remote_attn_exec(f.items[i].node));
+                    assert(ggml_backend_remote_attn_async_in_flight(f.backend) == i + 1);
+                    if (i + 1 < count) {
+                        std::lock_guard<std::mutex> lock(server.mutex);
+                        assert(server.cohort_calls == round - 1); // incomplete group never sent
+                    }
+                }
+                assert(server.wait_until_reply_paused());
+                f.untouched();
+                auto first_wait = std::async(std::launch::async, [&] {
+                    return ggml_remote_attn_exec(f.items[0].wait);
+                });
+                assert(first_wait.wait_for(std::chrono::milliseconds(15)) == std::future_status::timeout);
+                f.untouched();
+                server.grant_reply();
+                assert(first_wait.get());
+                for (uint32_t i = 1; i < count; ++i) assert(ggml_remote_attn_exec(f.items[i].wait));
+                assert(ggml_backend_remote_attn_async_in_flight(f.backend) == 0);
+                assert(!ggml_backend_remote_attn_failed(f.backend));
+                f.check_values(round);
+                ++positive_groups;
+            }
+            server.unpause();
+            std::lock_guard<std::mutex> lock(server.mutex);
+            assert(server.cohort_calls == 2 && server.cohort_counts.size() == 2);
+            assert(server.cohort_counts[0] == count && server.cohort_queries[0] == count * nq);
+            for (size_t i = 0; i < server.cohort_tickets.size(); ++i) {
+                assert(server.cohort_tickets[i] && server.cohort_epochs[i]);
+                if (i) assert(server.cohort_tickets[i] > server.cohort_tickets[i - 1]);
+                assert(server.cohort_layers[i] == i % count);
+            }
+            assert(std::count(server.packet_ops.begin(), server.packet_ops.end(), RKVA_KVARN_RANGE_COHORT_ATTN) == 2);
+            assert(std::count(server.packet_ops.begin(), server.packet_ops.end(), RKVA_KVARN_RANGE_BULK_ATTN) == 0);
+        }
+    }
+    for (auto failure : {loopback::cohort_failure::last_ticket, loopback::cohort_failure::last_epoch,
+                         loopback::cohort_failure::last_length, loopback::cohort_failure::last_out_nan,
+                         loopback::cohort_failure::last_lse_nan, loopback::cohort_failure::server_suffix_error}) {
+        loopback server(false, true, false, false, false, false, 0, 0, true, support);
+        fixture f(server, 4, 64);
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            server.fail_cohort = failure;
+        }
+        for (const auto& item : f.items) assert(ggml_remote_attn_exec(item.node));
+        ggml_backend_synchronize(f.backend);
+        assert(ggml_backend_remote_attn_failed(f.backend));
+        f.untouched(); // bad last body cannot publish earlier raw output/WAIT
+        for (const auto& item : f.items) assert(!ggml_remote_attn_exec(item.wait));
+        f.untouched();
+        if (failure == loopback::cohort_failure::server_suffix_error) {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            for (uint32_t live : server.native_counts) assert(live == 0);
+        }
+    }
+    // Every terminal boundary cancels a partial group instead of waiting for future nodes.
+    for (unsigned boundary = 0; boundary < 4; ++boundary) {
+        loopback server(false, true, false, false, false, false, 0, 0, true, support);
+        fixture f(server, 4, 64);
+        assert(ggml_remote_attn_exec(f.items[0].node));
+        assert(ggml_remote_attn_exec(f.items[1].node));
+        auto done = std::async(std::launch::async, [&] {
+            if (boundary == 0) ggml_backend_remote_attn_drain(f.backend);
+            if (boundary == 1) ggml_backend_remote_attn_invalidate_range(f.backend);
+            if (boundary == 2) ggml_backend_synchronize(f.backend);
+            if (boundary == 3) assert(!ggml_remote_attn_exec(f.items[0].wait));
+        });
+        assert(done.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+        done.get();
+        assert(ggml_backend_remote_attn_failed(f.backend));
+        assert(!ggml_remote_attn_exec(f.items[0].wait));
+        assert(!ggml_remote_attn_exec(f.items[1].wait));
+        ggml_backend_remote_attn_drain(f.backend);
+        assert(ggml_backend_remote_attn_async_in_flight(f.backend) == 0);
+        f.untouched();
+        std::lock_guard<std::mutex> lock(server.mutex);
+        assert(server.cohort_calls == 0);
+    }
+    // Duplicated layers and total queries over256 are rejected before wire submission.
+    for (bool duplicate : {false, true}) {
+        loopback server(false, true, false, false, false, false, 0, 0, true, support);
+        fixture f(server, duplicate ? 2 : 3, duplicate ? 64 : 128, true, duplicate);
+        assert(ggml_remote_attn_exec(f.items[0].node));
+        if (!duplicate) assert(ggml_remote_attn_exec(f.items[1].node));
+        assert(!ggml_remote_attn_exec(f.items[duplicate ? 1 : 2].node));
+        assert(ggml_backend_remote_attn_failed(f.backend));
+        ggml_backend_remote_attn_drain(f.backend);
+        f.untouched();
+        std::lock_guard<std::mutex> lock(server.mutex);
+        assert(server.cohort_calls == 0);
+    }
+    // The WF ownership bit is host-local. Setter order must preserve the
+    // low16 cohort metadata and the reserved-bit admission gate.
+    {
+        loopback server(false, true, false, false, false, false, 0, 0, true, support);
+        fixture f(server, 2, 64);
+        ggml_remote_attn_range_set_wavefront(f.items[0].node);
+        ggml_set_op_params_i32(f.items[1].node, GGML_REMOTE_ATTN_PARAM_COHORT, 0);
+        ggml_remote_attn_range_set_wavefront(f.items[1].node);
+        ggml_remote_attn_range_set_cohort(f.items[1].node, 2, 1);
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t metadata = uint32_t(ggml_get_op_params_i32(f.items[i].node, GGML_REMOTE_ATTN_PARAM_COHORT));
+            assert(metadata == (GGML_REMOTE_ATTN_WAVEFRONT_SHARED_CUDA | 2u | (i << 8)));
+            assert(ggml_remote_attn_exec(f.items[i].node));
+        }
+        for (const auto & item : f.items) assert(ggml_remote_attn_exec(item.wait));
+        f.check_values(1);
+        assert(!ggml_backend_remote_attn_failed(f.backend));
+        std::lock_guard<std::mutex> lock(server.mutex);
+        assert(server.cohort_calls == 1 && server.cohort_queries[0] == 128);
+    }
+    {
+        loopback server(false, true, false, false, false, false, 0, 0, true, support);
+        fixture f(server, 1, 64);
+        ggml_set_op_params_i32(f.items[0].node, GGML_REMOTE_ATTN_PARAM_COHORT, 0);
+        ggml_remote_attn_range_set_wavefront(f.items[0].node); // marker alone is not a cohort
+        assert(ggml_remote_attn_exec(f.items[0].node));
+        assert(ggml_remote_attn_exec(f.items[0].wait));
+        assert(!ggml_backend_remote_attn_failed(f.backend));
+        std::lock_guard<std::mutex> lock(server.mutex);
+        assert(server.cohort_calls == 0);
+        assert(std::count(server.packet_ops.begin(), server.packet_ops.end(), RKVA_KVARN_RANGE_BULK_ATTN) == 1);
+    }
+    {
+        loopback server(false, true, false, false, false, false, 0, 0, true, support);
+        fixture f(server, 1, 64);
+        ggml_remote_attn_range_set_wavefront(f.items[0].node);
+        const uint32_t metadata = uint32_t(ggml_get_op_params_i32(f.items[0].node, GGML_REMOTE_ATTN_PARAM_COHORT));
+        ggml_set_op_params_i32(f.items[0].node, GGML_REMOTE_ATTN_PARAM_COHORT, int32_t(metadata | (1u << 17)));
+        assert(!ggml_remote_attn_exec(f.items[0].node));
+        assert(ggml_backend_remote_attn_failed(f.backend));
+        ggml_backend_remote_attn_drain(f.backend);
+        f.untouched();
+        std::lock_guard<std::mutex> lock(server.mutex);
+        assert(server.cohort_calls == 0);
+    }
+    std::puts("CPU WF metadata: setter order, marker-only bulk and unknown-bit rejection passed");
+    (void) sentinel;
+    std::printf("CPU op23 host cohort contracts: %u positive groups,6 bad replies,4 partial boundaries,2 local admission failures passed\n", positive_groups);
+}
+
+// Marker-only ownership must work with the ordinary two-slot op22 path,
+// including an already-warm private slot. This checks FIFO/admission/lifetime;
+// the paused wire transaction is not a measurement of CPU/GPU concurrency.
+static void test_cuda_wavefront_marker_only_two_slots() {
+    ggml_backend_load_all();
+    auto * reg = ggml_backend_reg_by_name("CUDA");
+    if (!reg || ggml_backend_reg_dev_count(reg) == 0) {
+        std::puts("CUDA WF marker-only two slots: skipped (CUDA backend unavailable)");
+        return;
+    }
+    storage_env native("kvarn4"), experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE"), bulk("1", "GGML_RKVA_NATIVE_BULK");
+    storage_env wire("fp8", "GGML_RKVA_WIRE_FORMAT"), overlap("1", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+    storage_env batching("1", "GGML_RKVA_WAVEFRONT_RPC_BATCH");
+    constexpr uint32_t heads = 24, kv_heads = 4, dim = 256, capacity = 1024, origin = 1024;
+    constexpr size_t width = size_t(heads)*dim, kv_width = size_t(kv_heads)*dim, row_width = width + heads;
+    constexpr float lse_head_delta = 0.125f;
+    // Literal, exactly-representable E5M2 values are an independent byte/value
+    // oracle. The pattern varies by stage, row, head and dimension.
+    const uint8_t codes[] = {0x00, 0x80, 0x3c, 0xbc, 0x40, 0xc0, 0x34, 0xb4};
+    const float values[] = {0.0f, -0.0f, 1.0f, -1.0f, 2.0f, -2.0f, 0.25f, -0.25f};
+    const auto fixture_index = [](uint32_t seed, uint32_t row, uint32_t head, uint32_t d) {
+        return (seed*3 + row*3 + head*5 + d*7) % 8;
+    };
+    const auto counter = [](const std::string & json, const char * key) {
+        const auto pos = json.find(std::string("\"") + key + "\":");
+        assert(pos != std::string::npos);
+        return std::stoull(json.substr(pos + std::strlen(key) + 3));
+    };
+    struct phase_case { uint32_t tails; const char * policy; };
+    const phase_case cases[] = {{0, "prefill"}, {0, "mapped"}, {2, "prefill"}, {2, "mapped"}};
+    for (const auto & test_case : cases) {
+        const uint32_t tails = test_case.tails;
+        const char * policy = test_case.policy;
+        const uint32_t large_nq = tails ? 128u : 17u;
+        const uint32_t last = 3 + tails;
+        const uint32_t small_live = (2 + tails)*large_nq + 1;
+        storage_env acceleration(policy, "GGML_RKVA_CUDA_FP8");
+        const bool mapped = std::strcmp(policy, "mapped") == 0;
+        auto * gpu = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr);
+        auto * cpu = ggml_backend_cpu_init();
+        assert(gpu && cpu);
+        // Deliberately omit the cohort capability. The bit alone must not
+        // require op23 negotiation or enlarge the legacy two-slot queue.
+        loopback server(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32);
+        auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+        ggml_remote_attn_geometry geo{2, heads, kv_heads, dim, capacity, 0, 0, 128, 3, 128, 2,
+                                      0, 0, false, false, 1.0f / 16};
+        assert(ggml_backend_remote_attn_set_geometry(backend, &geo));
+        assert(ggml_backend_remote_attn_connect(backend));
+        assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, capacity));
+        ggml_backend_remote_attn_set_active_session(backend, 0);
+        assert(ggml_backend_remote_attn_configure_range(backend, origin, capacity, GGML_TYPE_Q4_0));
+        assert(!ggml_backend_remote_attn_cohort_enabled(backend));
+        assert(ggml_backend_remote_attn_async_capacity(backend) == 2);
+        ggml_remote_attn_set_active(backend);
+        ggml_backend_remote_attn_reset_stats(backend);
+        auto * ctx = ggml_init({4u << 20, nullptr, true});
+        assert(ctx);
+        struct item {
+            ggml_tensor * node, * wait, * q, * ids, * pos, * original_k, * original_v;
+            ggml_cgraph * submit, * consume;
+            uint32_t layer, nq, live, fixture;
+        };
+        std::vector<item> items;
+        for (uint32_t i = 0; i <= last; ++i) {
+            // Private warmup, two marked slots, optional two private large
+            // tails, then unmarked small decode. The tails reproduce the real
+            // serving ownership transition missed by the direct-to-small case.
+            const uint32_t layer = i == 2 ? 1 : 0;
+            const uint32_t nq = i == last ? 1 : large_nq;
+            const uint32_t live = i == 0 || i == 2 ? large_nq : i == 1 ? 2*large_nq : i == last ? small_live : i*large_nq;
+            auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, heads, nq);
+            auto * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, kv_width, capacity);
+            auto * v = ggml_dup_tensor(ctx, k);
+            auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, capacity);
+            auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nq);
+            auto * original_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, kv_heads, nq);
+            auto * original_v = ggml_dup_tensor(ctx, original_k);
+            for (auto * tensor : {q, k, v, ids, pos, original_k, original_v}) ggml_set_input(tensor);
+            auto * node = ggml_remote_attn_range(ctx, q, k, v, ids, pos, layer, origin, live, geo.kq_scale);
+            ggml_remote_attn_range_set_native_sources(node, original_k, original_v);
+            ggml_remote_attn_range_set_async(node);
+            if (i == 1 || i == 2) ggml_remote_attn_range_set_wavefront(node);
+            assert(uint32_t(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_COHORT)) ==
+                    (i == 1 || i == 2 ? uint32_t(GGML_REMOTE_ATTN_WAVEFRONT_SHARED_CUDA) : 0u));
+            auto * wait = ggml_remote_attn_range_wait(ctx, node);
+            assert(ggml_backend_remote_attn_cuda_enabled_for_node(node) == (i != last || mapped));
+            assert((wait->view_src == node) == (i != last || mapped));
+            ggml_set_output(node);
+            ggml_set_output(wait);
+            // Operands are allocated once by the complete scheduler graph.
+            // One-op dispatches below use those ready operands and preserve the
+            // CUDA submit/WAIT bridge. Expanding WAIT recursively here would
+            // accidentally submit its source Range a second time.
+            auto * submit = ggml_new_graph_custom(ctx, 1, false);
+            auto * consume = ggml_new_graph_custom(ctx, 1, false);
+            ggml_graph_add_node(submit, node);
+            ggml_graph_add_node(consume, wait);
+            items.push_back({node, wait, q, ids, pos, original_k, original_v,
+                             submit, consume, layer, nq, live, i});
+        }
+        auto * allocation_graph = ggml_new_graph_custom(ctx, 1024, false);
+        ggml_build_forward_expand(allocation_graph, items[0].wait);
+        ggml_build_forward_expand(allocation_graph, items[1].node);
+        ggml_build_forward_expand(allocation_graph, items[2].node);
+        ggml_build_forward_expand(allocation_graph, items[1].wait);
+        ggml_build_forward_expand(allocation_graph, items[2].wait);
+        for (uint32_t i = 3; i <= last; ++i) ggml_build_forward_expand(allocation_graph, items[i].wait);
+        ggml_backend_t backends[] = {gpu, cpu};
+        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 1024, false, true);
+        assert(sched);
+        for (uint32_t i = 0; i < items.size(); ++i) {
+            const auto & item = items[i];
+            const auto selected = i != last || mapped ? gpu : cpu;
+            for (auto * tensor : {item.q, item.original_k, item.original_v, item.node, item.wait})
+                ggml_backend_sched_set_tensor_backend(sched, tensor, selected);
+            for (auto * tensor : {item.node->src[1], item.node->src[2], item.ids, item.pos})
+                ggml_backend_sched_set_tensor_backend(sched, tensor, cpu);
+        }
+        assert(ggml_backend_sched_alloc_graph(sched, allocation_graph));
+        for (const auto & item : items) {
+            std::vector<float> q(size_t(item.nq)*width), originals(size_t(item.nq)*kv_width, 0.0f);
+            for (uint32_t row = 0; row < item.nq; ++row)
+                for (uint32_t h = 0; h < heads; ++h)
+                    for (uint32_t d = 0; d < dim; ++d)
+                        q[size_t(row)*width + size_t(h)*dim + d] = values[fixture_index(item.fixture + 4, row, h, d)];
+            std::vector<int32_t> ids(capacity, -1), pos(item.nq);
+            for (uint32_t j = 0; j < item.live; ++j) ids[j] = int32_t(origin + j);
+            for (uint32_t j = 0; j < item.nq; ++j) pos[j] = int32_t(origin + item.live - item.nq + j);
+            ggml_backend_tensor_set(item.q, q.data(), 0, q.size()*sizeof(float));
+            ggml_backend_tensor_set(item.original_k, originals.data(), 0, originals.size()*sizeof(float));
+            ggml_backend_tensor_set(item.original_v, originals.data(), 0, originals.size()*sizeof(float));
+            ggml_backend_tensor_set(item.ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(item.pos, pos.data(), 0, pos.size()*sizeof(int32_t));
+        }
+        ggml_backend_synchronize(gpu);
+        const auto set_reply_pattern = [&](uint32_t seed, uint32_t nq) {
+            // Caller either owns server.mutex while idle, or pause_mutex after
+            // the reply latch and before grant. The parser then cannot advance.
+            server.fp8_output_data.resize(size_t(nq)*width);
+            for (uint32_t row = 0; row < nq; ++row)
+                for (uint32_t h = 0; h < heads; ++h)
+                    for (uint32_t d = 0; d < dim; ++d)
+                        server.fp8_output_data[size_t(row)*width + size_t(h)*dim + d] =
+                                codes[fixture_index(seed, row, h, d)];
+            server.lse_head_delta = lse_head_delta;
+        };
+        const auto check_request = [&](const item & item, unsigned packet_count) {
+            // Same explicit idle-or-paused ownership contract as above.
+            assert(server.cohort_calls == 0);
+            assert(std::count(server.packet_ops.begin(), server.packet_ops.end(), RKVA_KVARN_RANGE_BULK_ATTN) == packet_count);
+            assert(server.native_counts[item.layer] == item.live);
+            assert(server.fp8_query_data.size() == size_t(item.nq)*width);
+            assert(server.fp8_query_positions.size() == item.nq);
+            for (uint32_t row = 0; row < item.nq; ++row) {
+                assert(server.fp8_query_positions[row] == int32_t(origin + item.live - item.nq + row));
+                for (uint32_t h = 0; h < heads; ++h)
+                    for (uint32_t d = 0; d < dim; ++d)
+                        assert(server.fp8_query_data[size_t(row)*width + size_t(h)*dim + d] ==
+                                codes[fixture_index(item.fixture + 4, row, h, d)]);
+            }
+            const uint32_t chunk = item.nq > 9 ? 8 : item.nq;
+            const uint32_t nseg = (item.nq + chunk - 1) / chunk;
+            assert(server.bulk_query_segments.size() == nseg && server.bulk_live_counts.size() == nseg);
+            for (uint32_t s = 0; s < nseg; ++s) {
+                const uint32_t end = std::min(item.nq, (s + 1)*chunk);
+                assert(server.bulk_query_segments[s] == end - s*chunk);
+                assert(server.bulk_live_counts[s] == item.live - item.nq + end);
+            }
+        };
+        const auto check_output = [&](const item & item) {
+            std::vector<float> out(size_t(item.nq)*row_width);
+            ggml_backend_tensor_get(item.wait, out.data(), 0, out.size()*sizeof(float));
+            for (uint32_t row = 0; row < item.nq; ++row) {
+                for (uint32_t h = 0; h < heads; ++h) {
+                    for (uint32_t d = 0; d < dim; ++d) {
+                        const float expected = values[fixture_index(item.fixture, row, h, d)];
+                        const float value = out[size_t(row)*row_width + size_t(h)*dim + d];
+                        assert(value == expected);
+                        if (expected == 0.0f) assert(std::signbit(value) == std::signbit(expected));
+                    }
+                    const float expected_lse = float(std::log(double(item.live - item.nq + row + 1))) + float(h)*lse_head_delta;
+                    assert(out[size_t(row)*row_width + width + h] == expected_lse);
+                }
+            }
+        };
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            set_reply_pattern(0, large_nq);
+        }
+        assert(ggml_backend_graph_compute(gpu, items[0].submit) == GGML_STATUS_SUCCESS);
+        assert(ggml_backend_graph_compute(gpu, items[0].consume) == GGML_STATUS_SUCCESS);
+        assert(ggml_backend_remote_attn_async_in_flight(backend) == 0);
+        check_output(items[0]);
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            check_request(items[0], 1);
+            set_reply_pattern(1, large_nq);
+        }
+        const std::string warm = ggml_backend_remote_attn_stats_json(backend);
+        assert(counter(warm, "cuda_context_creates") == 1);
+        assert(counter(warm, "cuda_context_phase_releases") == 0);
+        assert(counter(warm, "cuda_context_shared_acquires") == 0);
+        server.set_pause(true);
+        assert(ggml_backend_graph_compute(gpu, items[1].submit) == GGML_STATUS_SUCCESS);
+        assert(server.wait_until_reply_paused());
+        {
+            // The mock holds server.mutex across its reply wait. Acquiring it
+            // here would deadlock. Its pause_cv wait released pause_mutex after
+            // parsing; holding pause_mutex with zero tokens freezes all parser
+            // fields through these reads and the next-reply configuration.
+            std::lock_guard<std::mutex> pause(server.pause_mutex);
+            assert(server.paused_replies == 1 && server.pause_mode.load() && server.reply_tokens == 0);
+            check_request(items[1], 2);
+            assert(!server.native_ready[1]); // the second marked request is not on wire yet
+            set_reply_pattern(2, large_nq);
+        }
+        assert(ggml_backend_graph_compute(gpu, items[2].submit) == GGML_STATUS_SUCCESS);
+        assert(ggml_backend_remote_attn_async_in_flight(backend) == 2);
+        const auto ticket = [](ggml_tensor * node) {
+            return uint64_t(uint32_t(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_LO))) |
+                   (uint64_t(uint32_t(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_HI))) << 32);
+        };
+        assert(ticket(items[1].node) != 0 && ticket(items[2].node) == ticket(items[1].node) + 1);
+        const std::string prepared = ggml_backend_remote_attn_stats_json(backend);
+        assert(counter(prepared, "cuda_context_creates") == 2);
+        assert(counter(prepared, "cuda_context_phase_releases") == 1); // warm private owner dropped
+        assert(counter(prepared, "cuda_context_shared_acquires") == 2);
+        assert(counter(prepared, "cuda_context_shared_releases") == 0);
+        assert(counter(prepared, "cuda_pack_calls") == 3);
+        assert(counter(prepared, "cuda_unpack_calls") == 1); // only warm reply completed
+        server.grant_reply(1);
+        assert(ggml_backend_graph_compute(gpu, items[1].consume) == GGML_STATUS_SUCCESS);
+        assert(ggml_backend_remote_attn_async_in_flight(backend) == 1);
+        check_output(items[1]);
+        assert(server.wait_until_reply_paused());
+        {
+            std::lock_guard<std::mutex> pause(server.pause_mutex);
+            assert(server.paused_replies == 1 && server.pause_mode.load() && server.reply_tokens == 0);
+            check_request(items[2], 3);
+            assert(server.native_counts[0] == 2*large_nq);
+        }
+        server.grant_reply(1);
+        assert(ggml_backend_graph_compute(gpu, items[2].consume) == GGML_STATUS_SUCCESS);
+        assert(ggml_backend_remote_attn_async_in_flight(backend) == 0);
+        server.unpause();
+        check_output(items[2]);
+        for (uint32_t i = 3; i < last; ++i) {
+            {
+                std::lock_guard<std::mutex> lock(server.mutex);
+                set_reply_pattern(i, large_nq);
+            }
+            assert(ggml_backend_graph_compute(gpu, items[i].submit) == GGML_STATUS_SUCCESS);
+            assert(ggml_backend_graph_compute(gpu, items[i].consume) == GGML_STATUS_SUCCESS);
+            assert(ggml_backend_remote_attn_async_in_flight(backend) == 0);
+            check_output(items[i]);
+            {
+                std::lock_guard<std::mutex> lock(server.mutex);
+                check_request(items[i], i + 1);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            set_reply_pattern(last, 1);
+        }
+        auto * small_backend = mapped ? gpu : cpu;
+        assert(ggml_backend_graph_compute(small_backend, items[last].submit) == GGML_STATUS_SUCCESS);
+        assert(ggml_backend_graph_compute(small_backend, items[last].consume) == GGML_STATUS_SUCCESS);
+        ggml_backend_sched_synchronize(sched);
+        assert(!ggml_backend_remote_attn_failed(backend));
+        assert(ggml_backend_remote_attn_async_in_flight(backend) == 0);
+        const std::string final = ggml_backend_remote_attn_stats_json(backend);
+        assert(counter(final, "cuda_context_creates") == (mapped || tails ? 3u : 2u));
+        assert(counter(final, "cuda_context_phase_releases") == (tails && !mapped ? 4u : 3u));
+        assert(counter(final, "cuda_context_shared_acquires") == 2);
+        assert(counter(final, "cuda_context_shared_releases") == 2);
+        assert(counter(final, "cuda_context_shared_last_releases") == 1);
+        assert(counter(final, "cuda_pack_calls") == (3u + tails + unsigned(mapped)));
+        assert(counter(final, "cuda_unpack_calls") == (3u + tails + unsigned(mapped)));
+        assert(counter(final, "cuda_small_pack_calls") == (mapped ? 1u : 0u));
+        assert(counter(final, "cuda_small_unpack_calls") == (mapped ? 1u : 0u));
+        assert(counter(final, "cohort_calls") == 0 && counter(final, "cohort_entries") == 0);
+        // Check all earlier GGML OUT/LSE again after private/shared release.
+        for (const auto & item : items) check_output(item);
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            check_request(items[last], last + 1);
+            assert(server.native_counts[0] == small_live && server.native_counts[1] == large_nq);
+        }
+        ggml_backend_remote_attn_drain(backend);
+        // A second oracle survives destruction of every codec owner. Outputs,
+        // their scheduler allocation and the GPU backend stay alive until after
+        // this overwrite is read, so a teardown-retired old write cannot hide.
+        for (const auto & item : items) {
+            std::vector<float> sentinel(size_t(item.nq)*row_width, -17.0f);
+            ggml_backend_tensor_set(item.node, sentinel.data(), 0, sentinel.size()*sizeof(float));
+            if (item.wait->data != item.node->data)
+                ggml_backend_tensor_set(item.wait, sentinel.data(), 0, sentinel.size()*sizeof(float));
+        }
+        ggml_backend_synchronize(gpu);
+        ggml_remote_attn_set_active(nullptr);
+        ggml_backend_free(backend);
+        for (const auto & item : items) {
+            for (auto * output : {item.node, item.wait}) {
+                std::vector<float> observed(size_t(item.nq)*row_width);
+                ggml_backend_tensor_get(output, observed.data(), 0, observed.size()*sizeof(float));
+                for (float value : observed) assert(value == -17.0f);
+            }
+        }
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        ggml_backend_free(cpu);
+        ggml_backend_free(gpu);
+        std::printf("CUDA WF marker-only two slots: policy=%s large_nq=%u private_tails=%u then unmarked%s1; creates=%llu phase_drops=%llu/acquires2/releases2/last1, Q/pos/OUT/LSE and post-backend overwrite passed; no physical concurrency claim\n",
+                policy, large_nq, tails, mapped ? "mappedGPU" : "CPU", counter(final, "cuda_context_creates"), counter(final, "cuda_context_phase_releases"));
+    }
+}
+
+static void test_cuda_cohort_phase_retirement() {
+    ggml_backend_load_all();
+    auto * reg = ggml_backend_reg_by_name("CUDA");
+    if (!reg || ggml_backend_reg_dev_count(reg) == 0) {
+        std::puts("CUDA cohort phase retirement: skipped (CUDA backend unavailable)");
+        return;
+    }
+    storage_env native("kvarn4"), experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE"), bulk("1", "GGML_RKVA_NATIVE_BULK");
+    storage_env wire("fp8", "GGML_RKVA_WIRE_FORMAT");
+    storage_env overlap("1", "GGML_RKVA_ASYNC_LOCAL_REMOTE"), batching("4", "GGML_RKVA_WAVEFRONT_RPC_BATCH");
+    constexpr uint32_t heads = 24, kv_heads = 4, dim = 256, capacity = 512, origin = 1024, large_nq = 17;
+    constexpr size_t width = size_t(heads)*dim, kv_width = size_t(kv_heads)*dim, row_width = width + heads;
+    for (bool shared_context : {false, true}) {
+    // 0: success; 1: bad Q before complete cohort; 2: malformed last LSE;
+    // 3: two prepared members canceled at a terminal boundary.
+    // 4: complete RUNNING cohort invalidated while its reply is paused.
+    for (unsigned failure : {0u, 1u, 2u, 3u, 4u}) {
+    for (const char * policy : {"prefill", "mapped"}) {
+    storage_env acceleration(policy, "GGML_RKVA_CUDA_FP8");
+    const bool mapped = std::strcmp(policy, "mapped") == 0;
+    auto * gpu = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr);
+    auto * cpu = ggml_backend_cpu_init();
+    assert(gpu && cpu);
+    loopback server(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 256);
+    {
+        std::lock_guard<std::mutex> lock(server.mutex);
+        server.fp8_output_byte = 0x40; // the following small-query decode returns exactly2
+        if (failure == 2) server.fail_cohort = loopback::cohort_failure::last_lse_nan;
+    }
+    auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+    ggml_remote_attn_geometry geo{4, heads, kv_heads, dim, capacity, 0, 0, 128, 3, 128, 2,
+                                  0, 0, false, false, 1.0f / 16};
+    assert(ggml_backend_remote_attn_set_geometry(backend, &geo));
+    assert(ggml_backend_remote_attn_connect(backend));
+    assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, capacity));
+    ggml_backend_remote_attn_set_active_session(backend, 0);
+    assert(ggml_backend_remote_attn_configure_range(backend, origin, capacity, GGML_TYPE_Q4_0));
+    assert(ggml_backend_remote_attn_cohort_enabled(backend));
+    ggml_remote_attn_set_active(backend);
+    ggml_backend_remote_attn_reset_stats(backend);
+    auto * ctx = ggml_init({4u << 20, nullptr, true});
+    assert(ctx);
+    struct item {
+        ggml_tensor * node, * wait, * q, * k, * v, * ids, * pos, * original_k, * original_v;
+        uint32_t layer, nq, live;
+    };
+    std::vector<item> items;
+    for (uint32_t i = 0; i < 5; ++i) {
+        const uint32_t layer = i < 4 ? i : 0;
+        const uint32_t nq = i < 4 ? large_nq : 1;
+        const uint32_t live = i < 4 ? large_nq : large_nq + 1;
+        auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, heads, nq);
+        auto * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, kv_width, capacity);
+        auto * v = ggml_dup_tensor(ctx, k);
+        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, capacity);
+        auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nq);
+        auto * original_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, kv_heads, nq);
+        auto * original_v = ggml_dup_tensor(ctx, original_k);
+        auto * node = ggml_remote_attn_range(ctx, q, k, v, ids, pos, layer, origin, live, geo.kq_scale);
+        ggml_remote_attn_range_set_native_sources(node, original_k, original_v);
+        ggml_remote_attn_range_set_async(node);
+        if (i < 4) {
+            ggml_remote_attn_range_set_cohort(node, 4, i);
+            if (shared_context) ggml_remote_attn_range_set_wavefront(node);
+        }
+        auto * wait = ggml_remote_attn_range_wait(ctx, node);
+        assert(ggml_backend_remote_attn_cuda_enabled_for_node(node) == (i < 4 || mapped));
+        assert((wait->view_src == node) == (i < 4 || mapped));
+        ggml_set_output(node);
+        ggml_set_output(wait);
+        items.push_back({node, wait, q, k, v, ids, pos, original_k, original_v, layer, nq, live});
+    }
+    auto * graph = ggml_new_graph_custom(ctx, 1024, false);
+    // Four independent GPU ranges, all four WAITs, then one small-query range.
+    // Prefill uses CPU1 and releases4 contexts. Mapped uses GPU1 and releases
+    // the other3 contexts, preserving the current context's stream/sidecars.
+    // Both policies must keep the earlier GGML GPU outputs valid after release.
+    for (uint32_t i = 0; i < 4; ++i) ggml_build_forward_expand(graph, items[i].node);
+    for (uint32_t i = 0; i < 4; ++i) ggml_build_forward_expand(graph, items[i].wait);
+    ggml_build_forward_expand(graph, items[4].node);
+    ggml_build_forward_expand(graph, items[4].wait);
+    ggml_backend_t backends[] = {gpu, cpu};
+    auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 1024, false, true);
+    for (uint32_t i = 0; i < items.size(); ++i) {
+        const auto & item = items[i];
+        for (auto * tensor : {item.q, item.original_k, item.original_v, item.node, item.wait})
+            ggml_backend_sched_set_tensor_backend(sched, tensor, i < 4 || mapped ? gpu : cpu);
+        for (auto * tensor : {item.k, item.v, item.ids, item.pos})
+            ggml_backend_sched_set_tensor_backend(sched, tensor, cpu);
+    }
+    assert(ggml_backend_sched_alloc_graph(sched, graph));
+    for (const auto & item : items) {
+        std::vector<float> q(size_t(item.nq)*width, 1.125f);
+        if (failure == 1 && item.layer == 3) q.back() = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> originals(size_t(item.nq)*kv_width, 0.0f);
+        std::vector<int32_t> ids(capacity, -1), pos(item.nq);
+        for (uint32_t j = 0; j < item.live; ++j) ids[j] = int32_t(origin + j);
+        for (uint32_t j = 0; j < item.nq; ++j) pos[j] = int32_t(origin + item.live - item.nq + j);
+        ggml_backend_tensor_set(item.q, q.data(), 0, q.size()*sizeof(float));
+        ggml_backend_tensor_set(item.original_k, originals.data(), 0, originals.size()*sizeof(float));
+        ggml_backend_tensor_set(item.original_v, originals.data(), 0, originals.size()*sizeof(float));
+        ggml_backend_tensor_set(item.ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(item.pos, pos.data(), 0, pos.size()*sizeof(int32_t));
+        std::vector<float> sentinel(size_t(item.nq)*row_width, -17.0f);
+        ggml_backend_tensor_set(item.node, sentinel.data(), 0, sentinel.size()*sizeof(float));
+        if (item.wait->data != item.node->data)
+            ggml_backend_tensor_set(item.wait, sentinel.data(), 0, sentinel.size()*sizeof(float));
+    }
+    ggml_backend_synchronize(gpu);
+    if (failure == 4) {
+        auto * submit = ggml_new_graph_custom(ctx, 1024, false);
+        for (uint32_t i = 0; i < 4; ++i) ggml_build_forward_expand(submit, items[i].node);
+        server.set_pause(true);
+        assert(ggml_backend_graph_compute(gpu, submit) == GGML_STATUS_SUCCESS);
+        assert(server.wait_until_reply_paused());
+        assert(ggml_backend_remote_attn_async_in_flight(backend) == 4);
+        std::promise<void> control_started;
+        auto control_ready = control_started.get_future();
+        auto invalidation = std::async(std::launch::async, [&] {
+            control_started.set_value();
+            ggml_backend_remote_attn_invalidate_range(backend);
+        });
+        assert(control_ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+        assert(invalidation.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+        server.unpause();
+        invalidation.get();
+    } else if (failure == 3) {
+        auto * partial = ggml_new_graph_custom(ctx, 1024, false);
+        // Allocation remains the full scheduler graph; direct submission uses
+        // these already-allocated sources, not a second scheduler allocation.
+        ggml_build_forward_expand(partial, items[0].node);
+        ggml_build_forward_expand(partial, items[1].node);
+        assert(ggml_backend_graph_compute(gpu, partial) == GGML_STATUS_SUCCESS);
+        ggml_backend_remote_attn_drain(backend);
+    } else {
+        const auto status = ggml_backend_sched_graph_compute(sched, graph);
+        assert(status == (failure ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS));
+    }
+    ggml_backend_sched_synchronize(sched);
+    const auto counter = [](const std::string & json, const char * key) {
+        const auto pos = json.find(std::string("\"") + key + "\":");
+        assert(pos != std::string::npos);
+        return std::stoull(json.substr(pos + std::strlen(key) + 3));
+    };
+    const std::string stats = ggml_backend_remote_attn_stats_json(backend);
+    if (failure) {
+        assert(ggml_backend_remote_attn_failed(backend));
+        assert(!ggml_remote_attn_exec(items[0].wait));
+        ggml_backend_remote_attn_drain(backend);
+        assert(ggml_backend_remote_attn_async_in_flight(backend) == (failure == 1 ? 1u : 0u)); // failed Q keeps its DONE_ERR slot
+        assert(counter(stats, "cuda_context_creates") == (shared_context ? 1u : failure == 3 ? 2u : 4u));
+        assert(counter(stats, "cuda_context_shared_acquires") == (shared_context ? (failure == 3 ? 2u : 4u) : 0u));
+        // Malformed cohort bodies are validated before GPU decode. Bad Q and
+        // partial cohorts never reach the server. No WAIT exposes any output.
+        if (failure == 4) {
+            for (const auto & item : items) {
+                // Stale GPU OUT may have been written before the epoch check;
+                // it must never be consumed. After retirement an overwrite
+                // must remain stable: no old shared owner may write it later.
+                std::vector<float> out(size_t(item.nq)*row_width, -17.0f);
+                ggml_backend_tensor_set(item.node, out.data(), 0, out.size()*sizeof(float));
+                ggml_backend_synchronize(gpu);
+            }
+        }
+        if (failure == 1) assert(!ggml_backend_remote_attn_connect(backend));
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            assert(server.cohort_calls == (failure == 2 || failure == 4 ? 1u : 0u));
+        }
+        // Explicit retirement/quarantine occurs before graph buffers disappear.
+        ggml_remote_attn_set_active(nullptr);
+        ggml_backend_free(backend);
+        // Keep the scheduler, tensor storage and CUDA backend alive across
+        // teardown. A late shared-context write must not escape this oracle.
+        for (const auto & item : items) {
+            std::vector<float> out(size_t(item.nq)*row_width);
+            ggml_backend_tensor_get(item.node, out.data(), 0, out.size()*sizeof(float));
+            for (float value : out) assert(value == -17.0f);
+        }
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        ggml_backend_free(cpu);
+        ggml_backend_free(gpu);
+        std::printf("CUDA WF context failure: shared=%d policy=%s case=%u failed closed; device faults not injected\n",
+                int(shared_context), policy, failure);
+        continue;
+    }
+    assert(!ggml_backend_remote_attn_failed(backend));
+    assert(ggml_backend_remote_attn_async_in_flight(backend) == 0);
+    assert(counter(stats, "cuda_pack_calls") == (mapped ? 5u : 4u));
+    assert(counter(stats, "cuda_unpack_calls") == (mapped ? 5u : 4u));
+    assert(counter(stats, "cuda_small_pack_calls") == (mapped ? 1u : 0u));
+    assert(counter(stats, "cuda_small_unpack_calls") == (mapped ? 1u : 0u));
+    assert(counter(stats, "cuda_context_creates") == (shared_context ? (mapped ? 2u : 1u) : 4u));
+    assert(counter(stats, "cuda_context_phase_releases") == (shared_context ? 4u : mapped ? 3u : 4u));
+    assert(counter(stats, "cuda_context_shared_acquires") == (shared_context ? 4u : 0u));
+    assert(counter(stats, "cuda_context_shared_releases") == (shared_context ? 4u : 0u));
+    assert(counter(stats, "cuda_context_shared_last_releases") == (shared_context ? 1u : 0u));
+    assert(counter(stats, "cohort_calls") == 1);
+    assert(counter(stats, "cohort_entries") == 4);
+    for (uint32_t i = 0; i < items.size(); ++i) {
+        const auto & item = items[i];
+        std::vector<float> out(size_t(item.nq)*row_width);
+        ggml_backend_tensor_get(item.wait, out.data(), 0, out.size()*sizeof(float));
+        const float expected_out = i < 4 ? 1.0f + float(item.layer)*0.25f : 2.0f;
+        for (uint32_t q = 0; q < item.nq; ++q) {
+            for (size_t d = 0; d < width; ++d) assert(out[size_t(q)*row_width + d] == expected_out);
+            const float lse = float(std::log(double(item.live - item.nq + q + 1))) +
+                    (i < 4 ? float(item.layer)*0.125f : 0.0f);
+            for (uint32_t h = 0; h < heads; ++h) assert(out[size_t(q)*row_width + width + h] == lse);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(server.mutex);
+        assert(server.cohort_calls == 1 && server.cohort_counts[0] == 4);
+        assert(server.cohort_queries[0] == 4*large_nq);
+        for (uint32_t i = 0; i < 4; ++i) assert(server.cohort_layers[i] == i);
+        assert(std::count(server.packet_ops.begin(), server.packet_ops.end(), RKVA_KVARN_RANGE_BULK_ATTN) == 1);
+    }
+    ggml_backend_remote_attn_drain(backend);
+    ggml_remote_attn_set_active(nullptr);
+    ggml_backend_free(backend);
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
+    ggml_backend_free(gpu);
+    std::printf("CUDA WF context ownership: shared=%d policy=%s Hq24/Hkv4/D256 GPU17 cohort, then unmarked %s1; creates=%llu lease_acquires=%llu lease_releases=%llu last_phase_owner=%llu passed\n",
+            int(shared_context), policy, mapped ? "mappedGPU" : "CPU",
+            counter(stats, "cuda_context_creates"), counter(stats, "cuda_context_shared_acquires"),
+            counter(stats, "cuda_context_shared_releases"), counter(stats, "cuda_context_shared_last_releases"));
+    }
+    }
+    }
+}
+
 int main() {
     if (std::getenv("GGML_RKVA_EPOCH_RACE_ONLY")) {
         test_done_epoch_invalidation_race();
         return 0;
     }
+    if (std::getenv("GGML_RKVA_COHORT_TEST_ONLY")) {
+        test_native_cohort_async();
+        return 0;
+    }
+    test_native_cohort_async();
     test_cuda_fp8_serving_graph();
     test_cuda_fp8_prefill_mode_graph();
+    test_cuda_cohort_phase_retirement();
+    test_cuda_wavefront_marker_only_two_slots();
     test_native_physical_peer();
     test_old_native_client_ack_compatibility();
     test_native_rewind();

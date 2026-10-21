@@ -421,6 +421,25 @@ struct llm_graph_kv_tail_identity {
             const llama_kv_cache_context * mctx) const;
 };
 
+// Tile-owned I32 metadata only: one stable-capacity graph input, filled
+// from the already-validated parent cell list on every parent set_inputs().
+// Absolute positions change data, never the graph's tensor extent.
+class llm_graph_input_wavefront_prefix final : public llm_graph_input_i {
+public:
+    llm_graph_input_wavefront_prefix(ggml_tensor * parent, ggml_tensor * tile,
+            uint32_t p, uint32_t offset, uint32_t count) :
+        parent(parent), tile(tile), p(p), offset(offset), count(count) {}
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+private:
+    ggml_tensor * parent;
+    ggml_tensor * tile;
+    uint32_t p;
+    uint32_t offset;
+    uint32_t count;
+    std::vector<int32_t> staging;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -1068,9 +1087,16 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // Chosen for this parent ubatch, after eligibility; zero is the legacy graph.
+    uint32_t wavefront_tile_size = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (cparams.rkva_wavefront_rpc_batch != other.cparams.rkva_wavefront_rpc_batch ||
+                wavefront_tile_size != other.wavefront_tile_size) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -1583,6 +1609,29 @@ ggml_tensor * build_attn_mha_paged(
             float kq_scale,
             int il,
             ggml_tensor * positions = nullptr) const;
+
+    // A real serving packet: preparation expands the submit and local branch;
+    // completion expands its WAIT and merge. It never predicts a future Q.
+    struct position_split_rpc_packet {
+        ggml_tensor * q = nullptr;
+        ggml_tensor * range = nullptr;
+        ggml_tensor * local_out = nullptr;
+        ggml_tensor * local_lse = nullptr;
+        ggml_tensor * local_fa = nullptr;
+        ggml_backend_t cuda_backend = nullptr;
+        ggml_backend_t wire_backend = nullptr;
+        int layer = -1;
+        bool async = false;
+    };
+    position_split_rpc_packet build_attn_position_split_rpc_prepare(
+            llm_graph_input_attn_kv * inp, ggml_tensor * q, ggml_tensor * k,
+            ggml_tensor * v, float scale, int il, ggml_tensor * positions) const;
+    ggml_tensor * build_attn_position_split_rpc_complete(const position_split_rpc_packet & packet) const;
+
+    // Views share the parent inputs/set_input. Only the tail query plan owns
+    // tile-local input tensors because its query indices must start at zero.
+    std::unique_ptr<llm_graph_input_attn_kv> build_wavefront_attn_input(
+            llm_graph_input_attn_kv * parent, uint32_t offset, uint32_t count) const;
 
     ggml_tensor * build_attn_position_split_rpc(
             llm_graph_input_attn_kv * inp, ggml_tensor * q, ggml_tensor * k,
