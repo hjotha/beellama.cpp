@@ -2854,7 +2854,20 @@ uint32_t common_context_seq_rm_max_rollback(llama_context * ctx) {
 
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
+    // A terminal compute failure can already have cleared local memory while
+    // leaving the remote backend poisoned. Still call seq_rm so a healthy
+    // backend performs its normal RESET; only tolerate a refused cleanup when
+    // this entire, valid sequence was empty before the call.
+    const bool was_empty_full = mem && seq_id >= 0 && uint32_t(seq_id) < llama_n_seq_max(ctx) &&
+                                p0 < 0 && p1 < 0 &&
+                                llama_memory_seq_pos_min(mem, seq_id) == -1 &&
+                                llama_memory_seq_pos_max(mem, seq_id) == -1;
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
+        if (was_empty_full) {
+            LOG_WRN("%s: refused cleanup of already empty sequence %d; backend failure remains unchanged\n",
+                    __func__, seq_id);
+            return;
+        }
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
     }
 }

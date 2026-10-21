@@ -1,5 +1,6 @@
 #include "common.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-memory.h"
 #include "server-task.h"
 #include "speculative.h"
 
@@ -9,6 +10,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+
+#if !defined(_WIN32)
+#include <cerrno>
+#include <csignal>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #define CHECK(expr) do { if (!(expr)) { fprintf(stderr, "cache check failed at %d: %s\n", __LINE__, #expr); std::abort(); } } while (0)
 
@@ -73,6 +82,124 @@ static void test_media_cache(llama_context * ctx) {
     fprintf(stderr, "cache media: 8 tokens/5 positions accepted, partial chunk refused, metadata corruption refused\n");
 }
 
+static void test_common_memory_full_cleanup(llama_context * target, llama_context * draft) {
+    auto * target_memory = llama_get_memory(target);
+    auto * draft_memory = llama_get_memory(draft);
+    CHECK(target_memory && draft_memory);
+    CHECK(llama_memory_seq_pos_max(target_memory, 0) >= 0);
+    CHECK(llama_memory_seq_pos_max(draft_memory, 0) >= 0);
+    int target_resets = 0, draft_resets = 0;
+    bool target_poisoned = false, draft_poisoned = false;
+    target_memory->set_on_seq_rm([&](llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        CHECK(seq_id == 0 && p0 == -1 && p1 == -1);
+        ++target_resets;
+        return !target_poisoned;
+    });
+    draft_memory->set_on_seq_rm([&](llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        CHECK(seq_id == 0 && p0 == -1 && p1 == -1);
+        ++draft_resets;
+        return !draft_poisoned;
+    });
+    common_memory memory;
+    memory.init(target, draft);
+    memory.seq_rm(0, -1, -1);
+    CHECK(target_resets == 1 && draft_resets == 1);
+    CHECK(llama_memory_seq_pos_min(target_memory, 0) == -1 && llama_memory_seq_pos_max(target_memory, 0) == -1);
+    CHECK(llama_memory_seq_pos_min(draft_memory, 0) == -1 && llama_memory_seq_pos_max(draft_memory, 0) == -1);
+
+    // Healthy full cleanup must still execute both RESET callbacks when empty.
+    memory.seq_rm(0, -1, -1);
+    CHECK(target_resets == 2 && draft_resets == 2);
+    target_poisoned = draft_poisoned = true;
+    memory.seq_rm(0, -1, -1);
+    CHECK(target_resets == 3 && draft_resets == 3);
+    CHECK(target_poisoned && draft_poisoned);
+    CHECK(llama_memory_seq_pos_max(target_memory, 0) == -1);
+    CHECK(llama_memory_seq_pos_max(draft_memory, 0) == -1);
+    // Avoid callbacks capturing this fixture's stack after it returns.
+    target_memory->set_on_seq_rm({});
+    draft_memory->set_on_seq_rm({});
+    fprintf(stderr, "cache cleanup CPU: populated RESET, healthy empty RESET, refused empty cleanup continues target/draft without unpoisoning passed\n");
+}
+
+static void run_cleanup_refusal(llama_context * ctx, const std::string & mode) {
+    auto * mem = llama_get_memory(ctx);
+    CHECK(mem);
+    if (mode == "cleanup-fail-nonempty") {
+        llama_tokens tokens {1, 2, 3, 4};
+        auto batch = llama_batch_get_one(tokens.data(), tokens.size());
+        CHECK(llama_decode(ctx, batch) == 0);
+        CHECK(llama_memory_seq_pos_max(mem, 0) == 3);
+    } else {
+        CHECK(llama_memory_seq_pos_min(mem, 0) == -1 && llama_memory_seq_pos_max(mem, 0) == -1);
+    }
+    mem->set_on_seq_rm([&](llama_seq_id, llama_pos, llama_pos) {
+        fprintf(stderr, "cleanup CPU fixture: RESET refusal reached (%s)\n", mode.c_str());
+        fflush(stderr);
+        return false;
+    });
+    common_memory memory;
+    memory.init(ctx, nullptr);
+    // Wildcard -1 is supported by the memory API but is deliberately outside
+    // the common helper's already-empty, valid-single-sequence exception.
+    const auto seq_id = mode == "cleanup-fail-wildcard" ? -1 : 0;
+    memory.seq_rm(seq_id, mode == "cleanup-fail-partial" ? 0 : -1,
+                  mode == "cleanup-fail-partial" ? 1 : -1);
+    CHECK(false && "cleanup refusal unexpectedly returned");
+}
+
+static void test_cleanup_refusal_deaths(const char * executable, const char * model) {
+#if !defined(_WIN32)
+    for (const char * mode : {"cleanup-fail-nonempty", "cleanup-fail-partial", "cleanup-fail-wildcard"}) {
+        int output[2];
+        CHECK(pipe(output) == 0);
+        const pid_t child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            close(output[0]);
+            if (dup2(output[1], STDERR_FILENO) < 0) { _exit(126); }
+            close(output[1]);
+            const rlimit no_core {0, 0};
+            if (setrlimit(RLIMIT_CORE, &no_core) != 0) { _exit(125); }
+            // Fresh process: never run a memory API on inherited thread pools.
+            execl(executable, executable, model, mode, (char *) nullptr);
+            _exit(127);
+        }
+        close(output[1]);
+        std::string captured;
+        char chunk[4096];
+        ssize_t bytes;
+        while ((bytes = read(output[0], chunk, sizeof(chunk))) > 0 || (bytes < 0 && errno == EINTR)) {
+            if (bytes > 0) { captured.append(chunk, size_t(bytes)); }
+        }
+        close(output[0]);
+        int status = 0;
+        pid_t waited;
+        do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+        CHECK(waited == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+        CHECK(captured.find(std::string("RESET refusal reached (") + mode + ")") != std::string::npos);
+        CHECK(captured.find("failed to remove sequence") != std::string::npos);
+        fprintf(stderr, "cache cleanup CPU death: %s preserves SIGABRT on refused non-noop removal\n", mode);
+    }
+#else
+    (void) executable;
+    (void) model;
+    fprintf(stderr, "cache cleanup CPU death: POSIX fork/exec cases skipped on Windows\n");
+#endif
+}
+
+static void test_cleanup_only(common_init_result & init, const common_params & params) {
+    // The existing architecture fixtures have no tokenizer. This regression
+    // needs real context/memory/compute, but no speculative sampler or text.
+    llama_context_ptr draft(llama_init_from_model(init.model(), common_context_params_to_llama(params)));
+    CHECK(draft);
+    llama_tokens tokens {1, 2, 3, 4};
+    auto batch = llama_batch_get_one(tokens.data(), tokens.size());
+    CHECK(llama_decode(init.context(), batch) == 0);
+    CHECK(llama_decode(draft.get(), batch) == 0);
+    test_common_memory_full_cleanup(init.context(), draft.get());
+}
+
 static void test_legacy_no_carry(common_init_result & init, const common_params & params) {
     CHECK(!llama_model_mtp_weights_get_info(init.model()).managed);
     llama_context_ptr draft(llama_init_from_model(init.model(), common_context_params_to_llama(params)));
@@ -119,9 +246,7 @@ static void test_legacy_no_carry(common_init_result & init, const common_params 
     CHECK(llama_decode(init.context(), batch) == 0);
     CHECK(llama_decode(draft.get(), batch) == 0);
     CHECK(!common_speculative_get_state(spec.get(), 0, carry));
-    common_memory memory;
-    memory.init(init.context(), draft.get());
-    memory.seq_rm(0, -1, -1);
+    test_common_memory_full_cleanup(init.context(), draft.get());
     CHECK(llama_memory_seq_pos_max(llama_get_memory(init.context()), 0) == -1);
     CHECK(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 0) == -1);
     test_media_cache(init.context());
@@ -198,8 +323,11 @@ static void test_iswa(common_init_result & init, const common_params & params) {
 }
 
 int main(int argc, char ** argv) {
-    CHECK(argc == 2 || (argc == 3 && (std::string(argv[2]) == "legacy" || std::string(argv[2]) == "iswa")));
-    const bool iswa = argc == 3 && std::string(argv[2]) == "iswa";
+    const std::string mode = argc == 3 ? argv[2] : "";
+    const bool cleanup_refusal = mode == "cleanup-fail-nonempty" || mode == "cleanup-fail-partial" || mode == "cleanup-fail-wildcard";
+    const bool cleanup_only = mode == "cleanup";
+    CHECK(argc == 2 || (argc == 3 && (mode == "legacy" || mode == "iswa" || cleanup_only || cleanup_refusal)));
+    const bool iswa = mode == "iswa";
     const bool legacy = argc == 3;
     llama_backend_init();
     common_params params;
@@ -219,11 +347,14 @@ int main(int argc, char ** argv) {
     params.n_outputs_max = params.n_outputs_max_per_seq = 32;
     auto init = common_init_from_params(params);
     CHECK(init && init->context());
+    if (cleanup_refusal) { run_cleanup_refusal(init->context(), mode); }
     if (legacy) {
-        if (iswa) { test_iswa(*init, params); }
+        if (cleanup_only) { test_cleanup_only(*init, params); }
+        else if (iswa) { test_iswa(*init, params); }
         else { test_legacy_no_carry(*init, params); }
         init.reset();
         llama_backend_free();
+        if (!iswa) { test_cleanup_refusal_deaths(argv[0], argv[1]); }
         return 0;
     }
     auto * model = init->model();
