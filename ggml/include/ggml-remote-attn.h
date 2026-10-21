@@ -137,6 +137,16 @@ GGML_API bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backe
 // True when the opt-in GGML_RKVA_ASYNC_LOCAL_REMOTE=1 overlap was accepted by a
 // native KVarN4 bulk-capable server. Always false for synchronous/local modes.
 GGML_API bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend);
+// Native FP8 serving can retain CUDA operands and output in device memory.
+// Queried by the graph builder/CUDA backend for the active remote connection.
+GGML_API bool ggml_backend_remote_attn_cuda_enabled(void);
+// Shape-specific policy for a complete range (or its WAIT), before segmentation.
+// GGML_RKVA_CUDA_FP8=prefill enables CUDA only for the existing nq>9 bucket;
+// 0 disables it, while 1/unset preserve the full CUDA capability behavior.
+// Keep this process configuration fixed while graphs/requests are alive.
+GGML_API bool ggml_backend_remote_attn_cuda_enabled_for_node(const struct ggml_tensor * node);
+// CUDA dispatcher supplies a recorded producer fence, retained until return.
+GGML_API bool ggml_remote_attn_exec_cuda(struct ggml_tensor * node, void * producer_event);
 // Terminal graph boundary: wait and discard an unconsumed completion before
 // graph tensors are recycled. Ordinary backend synchronize preserves completion.
 GGML_API void ggml_backend_remote_attn_drain(ggml_backend_t backend);
@@ -173,11 +183,10 @@ GGML_API bool ggml_backend_remote_attn_failed(ggml_backend_t backend);
 GGML_API const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend);
 GGML_API void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend);
 
-// --- CPU-pinned execution path -------------------------------------------
-// The remote attention op is computed on the CPU backend (pinned like the
-// offload_kqv path) so the scheduler's proven CUDA<->CPU copies feed Q/K/V/pos
-// and drain the output; the RPC runs inside the CPU compute. The backend object
-// still owns the connection but is NOT registered with the scheduler.
+// --- Host-orchestrated execution -----------------------------------------
+// CPU execution uses scheduler copies. Negotiated native FP8 can dispatch from
+// CUDA, retaining device Q/OUT and host cache metadata in their owning buffers.
+// The connection object itself is not registered with the scheduler.
 //
 // Registers the backend whose connection ggml_remote_attn_exec() should use
 // (MVP: one active remote connection per process). Pass NULL to clear.

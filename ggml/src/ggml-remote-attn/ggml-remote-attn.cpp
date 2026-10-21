@@ -1,15 +1,16 @@
 // ggml-remote-attn backend implementation.
 //
 // Executes GGML_OP_REMOTE_ATTN by forwarding Q/K/V/pos over a persistent TCP
-// connection to a remote KVarN attention server (RKVA protocol). All buffers
-// are plain host memory; the graph scheduler moves data between CUDA and this
-// backend using the same host-copy path as the offload_kqv CPU pinning.
+// connection to a remote KVarN attention server (RKVA protocol). Native FP8 can
+// retain CUDA Q/OUT and use pinned byte staging; other modes use host buffers.
 //
 // Only POSIX hosts are supported (the .57 station is Linux). On any other
 // platform ggml_backend_remote_attn_init returns NULL and the feature is
 // disabled, leaving the local baseline untouched.
 
 #include "ggml-remote-attn.h"
+#include "ggml-remote-attn-cuda.h"
+#include "ggml-remote-attn-trace.h"
 #include "ggml-local-split.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -23,10 +24,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,11 +47,186 @@
 
 #define GGML_REMOTE_ATTN_NAME "RemoteAttn"
 
+namespace {
+thread_local ggml_remote_attn_trace_event rkva_trace_tls{};
+std::atomic<uint64_t> rkva_trace_graph_counter{0};
+struct rkva_trace_buffer {
+    std::mutex mutex;
+    std::vector<ggml_remote_attn_trace_event> events;
+    size_t capacity = 262144;
+    uint64_t dropped = 0, written = 0;
+    std::string path;
+    rkva_trace_buffer() {
+        const char * prefix = std::getenv("GGML_RKVA_TRACE_FILE");
+        if (!prefix || !*prefix) return;
+        if (const char * count = std::getenv("GGML_RKVA_TRACE_CAPACITY"))
+            capacity = std::clamp<size_t>(std::strtoull(count, nullptr, 10), 1024, 1048576);
+#ifndef _WIN32
+        path = std::string(prefix) + "." + std::to_string(::getpid()) + ".jsonl";
+#else
+        path = std::string(prefix) + ".jsonl";
+#endif
+        try { events.reserve(capacity); } catch (...) { capacity = 0; }
+    }
+};
+rkva_trace_buffer & rkva_trace_storage() { static rkva_trace_buffer buffer; return buffer; }
+std::string rkva_trace_escape(const char * text) {
+    std::string out;
+    for (const unsigned char * p = reinterpret_cast<const unsigned char *>(text); *p; ++p) {
+        if (*p == '"' || *p == '\\') out += '\\';
+        out += *p < 32 ? ' ' : char(*p);
+    }
+    return out;
+}
+}
+
+bool ggml_remote_attn_trace_enabled(void) {
+    static const bool enabled = [] { const char * p = std::getenv("GGML_RKVA_TRACE_FILE"); return p && *p; }();
+    return enabled;
+}
+void ggml_remote_attn_trace_request(uint64_t id) {
+    if (ggml_remote_attn_trace_enabled()) rkva_trace_tls.request_id = id;
+}
+void ggml_remote_attn_trace_graph(uint64_t uid) {
+    if (!ggml_remote_attn_trace_enabled()) return;
+    rkva_trace_tls.graph_run = ++rkva_trace_graph_counter;
+    rkva_trace_tls.graph_uid = uid;
+    rkva_trace_tls.ticket = rkva_trace_tls.epoch = rkva_trace_tls.cycle = 0;
+    rkva_trace_tls.first_pos = rkva_trace_tls.last_pos = -1;
+    rkva_trace_tls.model_layer = -1;
+    rkva_trace_tls.nq = 0;
+    rkva_trace_tls.layer = UINT32_MAX;
+}
+ggml_remote_attn_trace_event ggml_remote_attn_trace_identity(const char * phase, const ggml_tensor * node) {
+    if (!ggml_remote_attn_trace_enabled()) return {};
+    ggml_remote_attn_trace_event out = rkva_trace_tls;
+    out.begin_us = out.end_us = out.bytes = out.value = out.flags = 0;
+    out.gpu_us = 0;
+    std::snprintf(out.phase, sizeof(out.phase), "%s", phase ? phase : "");
+    if (node) {
+        std::snprintf(out.node, sizeof(out.node), "%s", node->name);
+        if (node->op == GGML_OP_REMOTE_ATTN) {
+            const auto * range = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT) ? node->src[0] : node;
+            out.layer = uint32_t(ggml_get_op_params_i32(range, GGML_REMOTE_ATTN_PARAM_LAYER_ID));
+            if (range->src[0]) out.nq = uint32_t(range->src[0]->ne[2]);
+        } else if (const char * dash = std::strrchr(node->name, '-')) {
+            char * end = nullptr;
+            const long layer = std::strtol(dash + 1, &end, 10);
+            if (end != dash + 1 && !*end && layer >= 0) out.model_layer = int32_t(layer);
+        }
+    }
+    return out;
+}
+ggml_remote_attn_trace_event ggml_remote_attn_trace_context(const ggml_remote_attn_trace_event * context) {
+    const auto old = rkva_trace_tls;
+    if (context) rkva_trace_tls = *context;
+    return old;
+}
+void ggml_remote_attn_trace_record(const ggml_remote_attn_trace_event * event) {
+    if (!ggml_remote_attn_trace_enabled() || !event) return;
+    auto & trace = rkva_trace_storage();
+    std::lock_guard<std::mutex> lock(trace.mutex);
+    if (trace.events.size() < trace.capacity) trace.events.push_back(*event);
+    else ++trace.dropped;
+}
+void ggml_remote_attn_trace_flush(void) {
+    if (!ggml_remote_attn_trace_enabled()) return;
+    auto & trace = rkva_trace_storage();
+    std::lock_guard<std::mutex> lock(trace.mutex);
+    FILE * file = std::fopen(trace.path.c_str(), trace.written ? "a" : "w");
+    if (!file) { GGML_LOG_ERROR("RKVA trace: cannot open %s\n", trace.path.c_str()); return; }
+    for (const auto & e : trace.events) {
+        const auto phase = rkva_trace_escape(e.phase), node = rkva_trace_escape(e.node);
+        std::fprintf(file, "{\"schema\":\"rkva-host-trace-v1\",\"phase\":\"%s\",\"node\":\"%s\","
+            "\"begin_us\":%llu,\"end_us\":%llu,\"request\":%llu,\"graph_run\":%llu,\"graph_uid\":%llu,"
+            "\"cycle\":%llu,\"ticket\":%llu,\"epoch\":%llu,\"session\":%u,\"layer\":%u,\"nq\":%u,"
+            "\"first_pos\":%d,\"last_pos\":%d,\"model_layer\":%d,\"bytes\":%llu,\"value\":%llu,\"flags\":%u,\"gpu_us\":%.6f}\n",
+            phase.c_str(), node.c_str(), (unsigned long long)e.begin_us, (unsigned long long)e.end_us,
+            (unsigned long long)e.request_id, (unsigned long long)e.graph_run, (unsigned long long)e.graph_uid,
+            (unsigned long long)e.cycle, (unsigned long long)e.ticket, (unsigned long long)e.epoch,
+            e.session, e.layer, e.nq, e.first_pos, e.last_pos, e.model_layer, (unsigned long long)e.bytes,
+            (unsigned long long)e.value, e.flags, e.gpu_us);
+    }
+    trace.written += trace.events.size();
+    std::fprintf(file, "{\"schema\":\"rkva-host-trace-status-v1\",\"events_written\":%llu,\"dropped\":%llu}\n",
+        (unsigned long long)trace.written, (unsigned long long)trace.dropped);
+    std::fclose(file);
+    trace.events.clear();
+}
+
 #if defined(__AVX2__) && defined(__F16C__)
 #include <immintrin.h>
 #endif
 
 namespace {
+
+static bool rkva_cuda_fp8_bucket_permitted(int64_t nq) {
+    const char * option = std::getenv("GGML_RKVA_CUDA_FP8");
+    // Only the new explicit mode restricts the existing device-pointer path.
+    // Preserve the legacy runtime behavior of0/1/unset; graph placement for0
+    // continues to use the CPU backend through cuda_enabled().
+    return !option || std::strcmp(option, "prefill") || nq > 9;
+}
+
+static const ggml_remote_attn_cuda_fp8_interface_v2 * rkva_cuda_fp8_api() {
+    static std::mutex mutex;
+    static const ggml_remote_attn_cuda_fp8_interface_v2 * api = nullptr;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!api) {
+        auto * reg = ggml_backend_reg_by_name("CUDA");
+        auto getter = reg ? reinterpret_cast<ggml_backend_cuda_remote_attn_fp8_interface_v2_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_fp8_interface_v2")) : nullptr;
+        if (getter) api = getter();
+    }
+    return api;
+}
+
+static thread_local void * rkva_cuda_producer_event = nullptr;
+
+// A slot owns its pinned network/staging allocations until retirement. CPU-only
+// operation retains the ordinary vector implementation and no CUDA dependency.
+class rkva_byte_buffer {
+    std::vector<uint8_t> host;
+    const ggml_remote_attn_cuda_fp8_interface_v2 * api = nullptr;
+    uint8_t * pinned = nullptr;
+    size_t used = 0, allocated = 0;
+    uint64_t zeroed = 0;
+public:
+    rkva_byte_buffer() = default;
+    rkva_byte_buffer(const rkva_byte_buffer &) = delete;
+    rkva_byte_buffer & operator=(const rkva_byte_buffer &) = delete;
+    ~rkva_byte_buffer() { if (pinned) api->free_pinned(pinned); }
+    void use_pinned(const ggml_remote_attn_cuda_fp8_interface_v2 * value) {
+        if (api) return;
+        if (!host.empty()) throw std::logic_error("active RKVA buffer cannot change allocator");
+        api = value;
+        const size_t initial = host.capacity();
+        reserve(initial);
+        std::vector<uint8_t>().swap(host);
+    }
+    size_t size() const { return api ? used : host.size(); }
+    size_t capacity() const { return api ? allocated : host.capacity(); }
+    uint64_t zeroed_bytes() const { return zeroed; }
+    uint8_t * data() { return api ? pinned : host.data(); }
+    const uint8_t * data() const { return api ? pinned : host.data(); }
+    void reserve(size_t bytes) {
+        if (!api) { host.reserve(bytes); return; }
+        if (bytes <= allocated) return;
+        auto * replacement = static_cast<uint8_t *>(api->alloc_pinned(bytes));
+        if (!replacement) throw std::bad_alloc();
+        if (used) std::memcpy(replacement, pinned, used);
+        if (pinned) api->free_pinned(pinned);
+        pinned = replacement;
+        allocated = bytes;
+    }
+    void resize(size_t bytes) {
+        if (!api) { if (bytes > host.size()) zeroed += bytes - host.size(); host.resize(bytes); return; }
+        if (bytes > allocated) reserve(std::max(bytes, allocated <= SIZE_MAX / 2 ? allocated * 2 : bytes));
+        if (bytes > used) { std::memset(pinned + used, 0, bytes - used); zeroed += bytes - used; }
+        used = bytes;
+    }
+    void clear() { if (api) used = 0; else host.clear(); }
+};
 
 // ---------------------------------------------------------------------------
 // host f16 helpers (software, portable + AVX2/F16C vectorized batch)
@@ -353,6 +531,7 @@ static bool rkva_splitzip_decode(const uint8_t * in, size_t in_bytes, uint16_t *
 // ---------------------------------------------------------------------------
 
 struct rkva_socket {
+    std::mutex lifetime_mutex;
 #ifndef _WIN32
     int fd = -1;
 #endif
@@ -366,11 +545,29 @@ struct rkva_socket {
     }
 
     void close() {
+        std::lock_guard<std::mutex> lock(lifetime_mutex);
 #ifndef _WIN32
         if (fd >= 0) {
             ::close(fd);
             fd = -1;
         }
+#endif
+    }
+
+    // Cancellation wakes the owning recv without releasing/reusing its fd.
+    void interrupt() {
+        std::lock_guard<std::mutex> lock(lifetime_mutex);
+#ifndef _WIN32
+        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+#endif
+    }
+
+    void assign(int value) {
+        std::lock_guard<std::mutex> lock(lifetime_mutex);
+#ifndef _WIN32
+        fd = value;
+#else
+        (void) value;
 #endif
     }
 
@@ -402,7 +599,10 @@ struct rkva_socket {
         for (int i = 0; i < count; ++i) iov[i] = iov_in[i];
         int cur = 0;
         while (cur < count) {
-            const ssize_t n = ::writev(fd, iov + cur, count - cur);
+            msghdr message {};
+            message.msg_iov = iov + cur;
+            message.msg_iovlen = size_t(count - cur);
+            const ssize_t n = ::sendmsg(fd, &message, MSG_NOSIGNAL);
             if (n < 0 && errno == EINTR) {
                 continue;
             }
@@ -471,6 +671,12 @@ struct rkva_stats {
     uint64_t range_upload_bytes = 0;
     uint64_t range_attn_calls = 0;
     uint64_t range_fused_calls = 0;
+    uint64_t cuda_pack_calls = 0;
+    uint64_t cuda_unpack_calls = 0;
+    uint64_t cuda_context_creates = 0;
+    uint64_t cuda_context_phase_releases = 0;
+    uint64_t q_f32_readback_bytes_avoided = 0;
+    uint64_t out_f32_upload_bytes_avoided = 0;
     int64_t range_query_min = -1;
     int64_t range_query_max = -1;
     std::vector<uint64_t> rpc_us;  // for p50/p95
@@ -495,9 +701,19 @@ struct rkva_async_slot {
     rkva_slot_state state = rkva_slot_state::FREE;
     uint64_t        epoch = 0;
     uint64_t        ticket = 0;
+    ggml_remote_attn_trace_event trace{};
+    uint64_t pending_us = 0;
+    uint64_t response_cycle = 0; // worker writes before DONE; wait reads after acquire
 
-    std::vector<uint8_t>  payload;          // TX staging buffer (reusable, grow-only)
-    std::vector<uint8_t>  reply;            // RX staging buffer (reusable, grow-only)
+    rkva_byte_buffer payload;              // pinned TX when CUDA FP8 is active
+    rkva_byte_buffer reply;                // pinned RX when CUDA FP8 is active
+    rkva_byte_buffer query_fp8;
+    const ggml_remote_attn_cuda_fp8_interface_v2 * cuda_api = nullptr;
+    void * cuda_context = nullptr;
+    int cuda_device = -1;
+    // A failed helper cannot establish successful retirement for future reuse.
+    // Keep this across reset/reconnect, including failures that were numerical.
+    bool cuda_context_retired = true;
     std::vector<uint8_t>  segment_scratch;  // per-slot scratch for owner->append
     std::vector<int32_t>  pos_scratch;      // positions scratch for this slot
     std::vector<float>    f32_scratch;      // queries scratch for this slot
@@ -520,10 +736,38 @@ struct rkva_async_slot {
     bool                 bulk_f16 = false;
     rkva_wire            wire = RKVA_WIRE_F16;
 
+    ~rkva_async_slot() { if (cuda_context) cuda_api->destroy_context(cuda_context); }
+
+    bool prepare_cuda(int device) {
+        if (!cuda_context_retired) return false;
+        if (cuda_context && device != cuda_device) {
+            cuda_api->destroy_context(cuda_context);
+            cuda_context = nullptr;
+        }
+        if (!cuda_context) {
+            cuda_api = rkva_cuda_fp8_api();
+            if (!cuda_api) return false;
+            cuda_context = cuda_api->create_context(device);
+            if (!cuda_context) return false;
+            cuda_device = device;
+            payload.use_pinned(cuda_api);
+            reply.use_pinned(cuda_api);
+            query_fp8.use_pinned(cuda_api);
+        }
+        return true;
+    }
+
     void reset() {
+        if (!cuda_context_retired) {
+            state = rkva_slot_state::DONE_ERR;
+            return; // Do not clear/recycle pinned storage after uncertain work.
+        }
         state = rkva_slot_state::FREE;
         epoch = 0;
         ticket = 0;
+        trace = {};
+        pending_us = 0;
+        response_cycle = 0;
         node = nullptr;
         output = nullptr;
         output_stride = 0;
@@ -546,6 +790,7 @@ struct rkva_async_slot {
         original_k.clear();
         original_v.clear();
         decode_f16.clear();
+        query_fp8.clear();
     }
 };
 
@@ -559,8 +804,11 @@ struct ggml_backend_remote_attn_context {
 
     std::mutex  mutex;                 // serializes non-async calls and ACK commits
     rkva_socket sock;
-    bool        connected = false;
-    bool        failed = false;
+    std::atomic<bool> connected {false};
+    std::atomic<bool> failed {false};
+    // Holds the descriptor for an entire frame. Never wait for this while
+    // holding async_mutex; the worker releases it before publishing its ACK.
+    std::mutex socket_mutex;
     uint64_t    cycle_id = 0;
 
     // 2-slot async queue managed by worker thread with single TCP owner.
@@ -569,9 +817,10 @@ struct ggml_backend_remote_attn_context {
     std::mutex              async_mutex;
     std::condition_variable async_cv;
     std::thread             async_worker;
-    bool                    async_stop = false;
+    std::atomic<bool>        async_stop {false};
     uint64_t                async_ticket_counter = 0;
     rkva_async_slot         async_slots[RKVA_ASYNC_QUEUE_CAPACITY];
+    rkva_async_slot         synchronous_slot;
     bool                    async_local_remote = false;
     std::mutex              stats_mutex;
 
@@ -585,7 +834,9 @@ struct ggml_backend_remote_attn_context {
     rkva_wire   range_wire = RKVA_WIRE_F16;
     uint32_t    range_origin = 0;
     uint32_t    range_capacity = 0;
-    uint64_t    range_epoch = 1;
+    // WAIT observes the epoch under async_mutex; invalidation increments it
+    // under mutex before draining. The two lock domains share this atomic.
+    std::atomic<uint64_t> range_epoch {1};
     bool        range_fused = false;
     uint32_t    prefill_query_chunk = 0;
     bool        range_profile = false;
@@ -632,7 +883,34 @@ struct ggml_backend_remote_attn_context {
             }
         }
     }
+
+    void close_socket() {
+        std::lock_guard<std::mutex> lock(socket_mutex);
+        sock.close();
+    }
 };
+
+// Caller owns ctx->mutex and this retired slot: PREPARING for async, or the
+// synchronous slot. Other slots may still be RUNNING and are never inspected
+// or released here. Pinned network storage belongs to the slot, not its context.
+static bool rkva_release_cuda_phase_context(ggml_backend_remote_attn_context * ctx,
+        rkva_async_slot & slot, const ggml_tensor * node) {
+    if (!slot.cuda_context_retired) return false;
+    if (!slot.cuda_context) return true;
+    if (ctx->failed || ctx->async_stop || !slot.cuda_api || slot.cuda_device < 0 ||
+            (&slot != &ctx->synchronous_slot && slot.state != rkva_slot_state::PREPARING)) return false;
+    ggml_remote_attn_trace_scope timing("cuda_context_phase_release", node);
+    timing.event.flags = 0x40000000u;
+    timing.event.value = 1;
+    // Successful pack/unpack already retired every DMA. destroy_context owns
+    // only the private codec stream/scratch; OUT and pinned buffers stay alive.
+    slot.cuda_api->destroy_context(slot.cuda_context);
+    slot.cuda_context = nullptr;
+    slot.cuda_device = -1;
+    std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+    ++ctx->stats.cuda_context_phase_releases;
+    return true;
+}
 
 static uint64_t now_us() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
@@ -640,11 +918,15 @@ static uint64_t now_us() {
 }
 
 // low-level request/response over the persistent socket
+template<class ReplyBuffer>
 static bool rkva_transact(
         ggml_backend_remote_attn_context * ctx,
         rkva_op op, uint32_t session_id, uint32_t layer_id, uint32_t n_tokens,
         const void * payload, uint32_t payload_bytes,
-        std::vector<uint8_t> & out, uint32_t expected_bytes, int32_t * server_status = nullptr) {
+        ReplyBuffer & out, uint32_t expected_bytes, int32_t * server_status = nullptr,
+        uint64_t * out_cycle = nullptr) {
+
+    std::lock_guard<std::mutex> socket_lock(ctx->socket_mutex);
 
     // A partial frame cannot be retried on the same ordered byte stream. Valid
     // server errors with an empty body remain recoverable (snapshot fallback).
@@ -662,8 +944,20 @@ static bool rkva_transact(
         RKVA_MAGIC, RKVA_VERSION, (uint16_t) op, ++ctx->cycle_id,
         session_id, layer_id, n_tokens, payload_bytes
     };
+    if (out_cycle) *out_cycle = req.cycle_id;
+    auto trace_context = ggml_remote_attn_trace_identity("rpc", nullptr);
+    trace_context.cycle = req.cycle_id;
+    trace_context.session = session_id;
+    trace_context.layer = layer_id;
+    trace_context.nq = n_tokens;
+    ggml_remote_attn_trace_context_scope trace_owner(trace_context);
+    ggml_remote_attn_trace_scope trace_total("rpc_total");
+    trace_total.event.flags = 0x40000000u;
 
     const uint64_t t0 = now_us();
+    {
+    ggml_remote_attn_trace_scope trace_send("rpc_send");
+    trace_send.event.bytes = sizeof(req) + payload_bytes;
     if (payload_bytes) {
         struct iovec iov[2];
         iov[0].iov_base = const_cast<rkva_request *>(&req);
@@ -678,10 +972,16 @@ static bool rkva_transact(
             return stream_failure();
         }
     }
+    }
 
     rkva_response rsp {};
+    {
+    ggml_remote_attn_trace_scope trace_header("rpc_header_wait");
     if (!ctx->sock.read_all(&rsp, sizeof(rsp))) {
         return stream_failure();
+    }
+    trace_header.event.bytes = sizeof(rsp);
+    trace_header.event.value = rsp.xbox_prepare_us;
     }
     if (rsp.magic != RKVA_MAGIC || rsp.version != RKVA_VERSION ||
         rsp.op != (uint16_t) op || rsp.cycle_id != req.cycle_id) {
@@ -699,10 +999,21 @@ static bool rkva_transact(
     if (rsp.payload_bytes > 256u * 1024u * 1024u || (expected_bytes && rsp.payload_bytes != expected_bytes)) {
         return stream_failure();
     }
+    {
+    ggml_remote_attn_trace_scope trace_resize("rpc_rx_resize");
+    trace_resize.event.bytes = rsp.payload_bytes;
+    trace_resize.event.value = rsp.payload_bytes > out.size() ? rsp.payload_bytes - out.size() : 0;
     out.resize(rsp.payload_bytes);
+    }
+    {
+    ggml_remote_attn_trace_scope trace_receive("rpc_body_recv");
+    trace_receive.event.bytes = rsp.payload_bytes;
     if (rsp.payload_bytes && !ctx->sock.read_all(out.data(), rsp.payload_bytes)) {
         return stream_failure();
     }
+    }
+    trace_total.event.value = rsp.xbox_prepare_us;
+    trace_total.event.gpu_us = rsp.xbox_compute_us;
     const uint64_t t1 = now_us();
 
     {
@@ -737,7 +1048,10 @@ static bool rkva_has_free_slot(const ggml_backend_remote_attn_context * ctx) {
 // and reply decoding run without ctx->mutex to prevent host CPU stall.
 // ctx->mutex is only acquired briefly to commit generation and ACK coverage.
 static bool rkva_finish_native_bulk_job(
-        ggml_backend_remote_attn_context * ctx, rkva_async_slot & slot) {
+        ggml_backend_remote_attn_context * ctx, rkva_async_slot & slot, bool ctx_locked = false) {
+    ggml_remote_attn_trace_context_scope trace_owner(slot.trace);
+    ggml_remote_attn_trace_scope trace_finish("job_finish");
+    trace_finish.event.flags = 0x40000000u;
     if (slot.layer >= ctx->range_layers.size() ||
             slot.layer >= ctx->native_layers.size() || !slot.output) {
         return false;
@@ -763,12 +1077,32 @@ static bool rkva_finish_native_bulk_job(
     if (reply.capacity() < (4u << 20)) {
         reply.reserve(4u << 20);
     }
-    if (!rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, ctx->active_session,
+    uint64_t cycle = 0;
+    const bool transacted = rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, ctx->active_session,
                 slot.layer, slot.nq, slot.payload.data(), uint32_t(slot.payload.size()),
-                reply, uint32_t(out_bytes + lse_bytes))) {
+                reply, uint32_t(out_bytes + lse_bytes), nullptr, &cycle);
+    slot.response_cycle = cycle;
+    if (!transacted) {
         return false;
     }
-    if (wire == RKVA_WIRE_FP8) {
+    auto response_trace = slot.trace;
+    response_trace.cycle = cycle;
+    if (ggml_remote_attn_trace_enabled()) ggml_remote_attn_trace_context(&response_trace);
+    trace_finish.event.cycle = cycle;
+    const bool cuda_output = wire == RKVA_WIRE_FP8 && slot.cuda_api &&
+        slot.cuda_api->device_for_pointer(slot.output) >= 0;
+    {
+    ggml_remote_attn_trace_scope trace_unpack("out_decode");
+    trace_unpack.event.bytes = reply.size();
+    if (cuda_output) {
+        if (!slot.cuda_context_retired || !slot.cuda_context) return false;
+        slot.cuda_context_retired = false;
+        const bool unpacked = slot.cuda_api->unpack_out(slot.cuda_context, reply.data(),
+                reinterpret_cast<const float *>(reply.data() + out_bytes),
+                slot.nq, slot.out_width, ctx->geo.n_head, slot.output, slot.output_stride);
+        slot.cuda_context_retired = unpacked;
+        if (!unpacked) return false;
+    } else if (wire == RKVA_WIRE_FP8) {
         const auto * src_fp8 = reinterpret_cast<const uint8_t *>(reply.data());
         const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
         for (size_t row = 0; row < slot.nq; ++row) {
@@ -830,9 +1164,12 @@ static bool rkva_finish_native_bulk_job(
                     ctx->geo.n_head * sizeof(float));
         }
     }
+    }
 
     // Publish host coverage only after the single ordered server ACK.
-    std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
+    ggml_remote_attn_trace_scope trace_commit("ack_commit");
+    std::unique_lock<std::mutex> ctx_lock(ctx->mutex, std::defer_lock);
+    if (!ctx_locked) ctx_lock.lock();
     if (slot.epoch != ctx->range_epoch) {
         return false;
     }
@@ -848,6 +1185,10 @@ static bool rkva_finish_native_bulk_job(
         ctx->stats.range_upload_rows += slot.nq;
         ctx->stats.range_upload_bytes += slot.upload_bytes;
         ctx->stats.range_attn_calls += slot.segments;
+        if (cuda_output) {
+            ++ctx->stats.cuda_unpack_calls;
+            ctx->stats.out_f32_upload_bytes_avoided += uint64_t(slot.nq) * slot.out_width * sizeof(float);
+        }
         if (ctx->stats.range_query_min < 0 || slot.first_pos < ctx->stats.range_query_min) {
             ctx->stats.range_query_min = slot.first_pos;
         }
@@ -883,6 +1224,13 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
             continue;
         }
         slot->state = rkva_slot_state::RUNNING;
+        if (ggml_remote_attn_trace_enabled()) {
+            auto e = slot->trace;
+            std::snprintf(e.phase, sizeof(e.phase), "rpc_queue");
+            e.begin_us = slot->pending_us;
+            e.end_us = ggml_time_us();
+            ggml_remote_attn_trace_record(&e);
+        }
         lock.unlock();
 
         bool ok = false;
@@ -901,7 +1249,7 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
             std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
             ctx->failed = true;
             ctx->connected = false;
-            ctx->sock.close();
+            ctx->close_socket();
         }
 
         lock.lock();
@@ -1005,6 +1353,9 @@ static bool rkva_async_wait_node(
         return false;
     }
 
+    ggml_remote_attn_trace_context_scope trace_owner(slot->trace);
+    ggml_remote_attn_trace_scope trace_wait("range_wait", node);
+
     ctx->async_cv.wait(lock, [&] {
         if (slot->ticket != ticket || slot->epoch != epoch || slot->node != source) {
             return true;
@@ -1018,6 +1369,8 @@ static bool rkva_async_wait_node(
         return false;
     }
 
+    trace_wait.event.cycle = slot->response_cycle;
+
     const bool ok = (slot->state == rkva_slot_state::DONE_OK) && !ctx->failed &&
                     (slot->epoch == ctx->range_epoch) &&
                     (node->data != nullptr) && (source->data != nullptr) &&
@@ -1029,9 +1382,13 @@ static bool rkva_async_wait_node(
         if (node->data != source->data) {
             const size_t row_bytes = size_t(node->ne[0]) * sizeof(float);
             for (int64_t row = 0; row < node->ne[1]; ++row) {
+                auto * api = rkva_cuda_fp8_api();
+                if (api && (api->device_for_pointer(node->data) >= 0 || api->device_for_pointer(source->data) >= 0)) {
+                    ggml_backend_tensor_copy(source, node);
+                    break;
+                }
                 std::memcpy(static_cast<uint8_t *>(node->data) + row * node->nb[1],
-                        static_cast<const uint8_t *>(source->data) + row * source->nb[1],
-                        row_bytes);
+                    static_cast<const uint8_t *>(source->data) + row * source->nb[1], row_bytes);
             }
         }
     }
@@ -1053,8 +1410,35 @@ static bool rkva_async_wait_node(
 // REMOTE_ATTN execution
 // ---------------------------------------------------------------------------
 
+static bool rkva_prepare_native_bulk_job(
+        ggml_backend_remote_attn_context * ctx, ggml_tensor * node,
+        uint32_t layer, uint32_t live, size_t nq, size_t out_width,
+        rkva_async_slot & slot);
+
 static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_tensor * node,
                                   uint32_t layer, uint32_t live, size_t nq, size_t out_width) {
+    // Includes the QCPU/outputCPU fallback, which does not prepare a slot.
+    if (!ctx->synchronous_slot.cuda_context_retired) return false;
+    auto * cuda_api = ctx->range_wire == RKVA_WIRE_FP8 && ctx->native_bulk ? rkva_cuda_fp8_api() : nullptr;
+    if (cuda_api && !rkva_cuda_fp8_bucket_permitted(int64_t(nq)) &&
+            cuda_api->device_for_pointer(node->data) >= 0) {
+        // Placement must agree with the CPU codec policy. Never let CPU decode
+        // write a raw VRAM address when a caller bypasses the scheduler.
+        return false;
+    }
+    if (cuda_api && !rkva_cuda_fp8_bucket_permitted(int64_t(nq)) &&
+            cuda_api->device_for_pointer(node->data) == -1 &&
+            !rkva_release_cuda_phase_context(ctx, ctx->synchronous_slot, node)) return false;
+    if (cuda_api && node->src[5] && node->src[6] &&
+            (cuda_api->device_for_pointer(node->src[0]->data) != -1 || cuda_api->device_for_pointer(node->data) != -1)) {
+        auto & slot = ctx->synchronous_slot;
+        slot.reset();
+        slot.epoch = ctx->range_epoch;
+        const bool ok = rkva_prepare_native_bulk_job(ctx, node, layer, live, nq, out_width, slot) &&
+            rkva_finish_native_bulk_job(ctx, slot, true);
+        slot.reset();
+        return ok;
+    }
     const auto * keys = node->src[5];
     const auto * values = node->src[6];
     const size_t width = size_t(ctx->geo.n_head_kv) * 256;
@@ -1074,7 +1458,8 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
     try {
         if (!owner) {
             owner.reset(new rkva_kvarn_producer(ctx->range_origin, ctx->range_capacity,
-                ctx->geo.n_head_kv, ctx->geo.sinkhorn_iters, ctx->native_store, ctx->native_tail_tokens));
+                ctx->geo.n_head_kv, ctx->geo.sinkhorn_iters, ctx->native_store, ctx->native_tail_tokens,
+                (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) && ctx->native_serial_prefix));
         }
         std::vector<float> original_k(nq * width), original_v(nq * width);
         ggml_backend_tensor_get(keys, original_k.data(), 0, original_k.size() * sizeof(float));
@@ -1292,6 +1677,24 @@ static bool rkva_prepare_native_bulk_job(
         ggml_backend_remote_attn_context * ctx, ggml_tensor * node,
         uint32_t layer, uint32_t live, size_t nq, size_t out_width,
         rkva_async_slot & slot) {
+    // Before readback, resize or envelope writes, even after reconnect and for
+    // CPU-only jobs: an unsuccessful helper requires a fresh backend context.
+    if (!slot.cuda_context_retired) return false;
+    if (ggml_remote_attn_trace_enabled()) {
+        slot.trace = ggml_remote_attn_trace_identity("job", node);
+        slot.trace.ticket = slot.ticket;
+        slot.trace.epoch = slot.epoch;
+        slot.trace.session = ctx->active_session;
+        slot.trace.layer = layer;
+        slot.trace.nq = uint32_t(nq);
+        if (ctx->pos_scratch.size() == nq) {
+            slot.trace.first_pos = ctx->pos_scratch.front();
+            slot.trace.last_pos = ctx->pos_scratch.back();
+        }
+    }
+    ggml_remote_attn_trace_context_scope trace_owner(slot.trace);
+    ggml_remote_attn_trace_scope trace_prepare("job_prepare");
+    trace_prepare.event.flags = 0x40000000u;
     const auto * keys = node->src[5];
     const auto * values = node->src[6];
     const size_t width = size_t(ctx->geo.n_head_kv) * 256;
@@ -1317,22 +1720,41 @@ static bool rkva_prepare_native_bulk_job(
         if (!owner) {
             owner.reset(new rkva_kvarn_producer(ctx->range_origin, ctx->range_capacity,
                     ctx->geo.n_head_kv, ctx->geo.sinkhorn_iters, ctx->native_store,
-                    ctx->native_tail_tokens));
+                    ctx->native_tail_tokens,
+                    (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) && ctx->native_serial_prefix));
             cached.epoch = ctx->range_epoch;
         }
         slot.start_rows = owner->rows();
+        {
+        ggml_remote_attn_trace_scope trace_k("k_readback");
+        trace_k.event.bytes = nq * width * sizeof(float);
         slot.original_k.resize(nq * width);
-        slot.original_v.resize(nq * width);
         ggml_backend_tensor_get(keys, slot.original_k.data(), 0, slot.original_k.size() * sizeof(float));
+        }
+        {
+        ggml_remote_attn_trace_scope trace_v("v_readback");
+        trace_v.event.bytes = nq * width * sizeof(float);
+        slot.original_v.resize(nq * width);
         ggml_backend_tensor_get(values, slot.original_v.data(), 0, slot.original_v.size() * sizeof(float));
+        }
         const float * dev_k = static_cast<const float *>(keys->data);
         const float * dev_v = static_cast<const float *>(values->data);
+        {
+        ggml_remote_attn_trace_scope trace_pos("positions_readback");
+        trace_pos.event.bytes = nq * sizeof(int32_t);
         slot.pos_scratch.resize(nq);
         ggml_backend_tensor_get(node->src[4], slot.pos_scratch.data(), 0, nq * sizeof(int32_t));
+        }
+        slot.trace.first_pos = slot.pos_scratch.front();
+        slot.trace.last_pos = slot.pos_scratch.back();
+        if (ggml_remote_attn_trace_enabled()) ggml_remote_attn_trace_context(&slot.trace);
+        {
+        ggml_remote_attn_trace_scope trace_producer("kv_producer");
         if (!owner->prepare(slot.original_k.data(), slot.original_v.data(), slot.pos_scratch.data(),
                     uint32_t(nq), dev_k, dev_v)) {
             ctx->failed = true;
             return false;
+        }
         }
         const size_t chunk_limit = ctx->native_serial_prefix ? (nq > 9 ? 8 : nq) : 1;
         const uint32_t segments = uint32_t((nq + chunk_limit - 1) / chunk_limit);
@@ -1347,19 +1769,67 @@ static bool rkva_prepare_native_bulk_job(
         const rkva_kvarn_range_bulk header {1, segments, uint32_t(nq), 0};
         slot.payload.resize(sizeof(header));
         std::memcpy(slot.payload.data(), &header, sizeof(header));
-        slot.f32_scratch.resize(nq * out_width);
-        ggml_backend_tensor_get(node->src[0], slot.f32_scratch.data(), 0,
-                slot.f32_scratch.size() * sizeof(float));
+        const auto * api = wire == RKVA_WIRE_FP8 ? rkva_cuda_fp8_api() : nullptr;
+        const int q_device = api ? api->device_for_pointer(node->src[0]->data) : -1;
+        const int out_device = api ? api->device_for_pointer(node->data) : -1;
+        // Managed pointers and CUDA attribute failures have no supported host
+        // coherency contract here; never reinterpret them as ordinary CPU data.
+        if (q_device < -1 || out_device < -1) return false;
+        const bool cuda_allowed = rkva_cuda_fp8_bucket_permitted(int64_t(nq));
+        if (!cuda_allowed && out_device >= 0) return false;
+        if (!cuda_allowed && !rkva_release_cuda_phase_context(ctx, slot, node)) return false;
+        const bool cuda_pack_q = cuda_allowed && q_device >= 0;
+        // Change allocators before assembling the envelope, never while active.
+        if (cuda_pack_q || out_device >= 0) {
+            slot.payload.clear();
+            const bool creating = !slot.cuda_context || slot.cuda_device != (q_device >= 0 ? q_device : out_device);
+            ggml_remote_attn_trace_scope timing("cuda_context_prepare", node);
+            timing.event.flags = 0x40000000u;
+            if ((q_device >= 0 && out_device >= 0 && q_device != out_device) ||
+                    !slot.prepare_cuda(q_device >= 0 ? q_device : out_device)) return false;
+            if (creating) {
+                timing.event.value = 1;
+                std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+                ++ctx->stats.cuda_context_creates;
+            }
+            slot.payload.resize(sizeof(header));
+            std::memcpy(slot.payload.data(), &header, sizeof(header));
+        }
+        if (cuda_pack_q) {
+            ggml_remote_attn_trace_scope trace_q("q_pack");
+            trace_q.event.bytes = nq * out_width;
+            slot.query_fp8.resize(nq * out_width);
+            slot.cuda_context_retired = false;
+            const bool packed = api->pack_q(slot.cuda_context, node->src[0]->data, false, nq * out_width,
+                    slot.query_fp8.data(), rkva_cuda_producer_event);
+            slot.cuda_context_retired = packed;
+            if (!packed) return false;
+            std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+            ++ctx->stats.cuda_pack_calls;
+            ctx->stats.q_f32_readback_bytes_avoided += uint64_t(nq) * out_width * sizeof(float);
+        } else {
+            ggml_remote_attn_trace_scope trace_q("q_readback");
+            trace_q.event.bytes = nq * out_width * sizeof(float);
+            slot.f32_scratch.resize(nq * out_width);
+            ggml_backend_tensor_get(node->src[0], slot.f32_scratch.data(), 0,
+                    slot.f32_scratch.size() * sizeof(float));
+        }
         const auto * bulk_queries = slot.f32_scratch.data();
+        ggml_remote_attn_trace_scope trace_envelope("envelope");
+        trace_envelope.event.flags = 0x40000000u;
+        const uint64_t zeros_before = slot.payload.zeroed_bytes();
         for (size_t first = 0; first < nq; first += chunk_limit) {
             const size_t chunk = std::min(chunk_limit, nq - first);
             const bool is_bootstrap = (first == 0) && (slot.start_rows == 0);
+            {
+            ggml_remote_attn_trace_scope trace_append("kv_append");
             if (!owner->append(slot.original_k.data() + first * width,
                     slot.original_v.data() + first * width,
                     slot.pos_scratch.data() + first, uint32_t(chunk),
                     is_bootstrap, slot.segment_scratch)) {
                 ctx->failed = true;
                 return false;
+            }
             }
             const rkva_kvarn_range_bulk_segment segment {
                 uint32_t(slot.segment_scratch.size()), uint32_t(chunk)};
@@ -1377,8 +1847,16 @@ static bool rkva_prepare_native_bulk_job(
             dst += chunk * sizeof(int32_t);
             if (wire == RKVA_WIRE_FP8) {
                 uint8_t * dst_fp8 = dst;
-                if (!rkva_f32_to_fp8_batch(bulk_queries + first * out_width, dst_fp8, chunk * out_width)) {
-                    ctx->failed = true; return false;
+                if (cuda_pack_q) {
+                    ggml_remote_attn_trace_scope trace_copy("q_payload_copy");
+                    trace_copy.event.bytes = chunk * out_width;
+                    std::memcpy(dst_fp8, slot.query_fp8.data() + first * out_width, chunk * out_width);
+                } else {
+                    ggml_remote_attn_trace_scope trace_cpu_pack("q_cpu_pack");
+                    trace_cpu_pack.event.bytes = chunk * out_width;
+                    if (!rkva_f32_to_fp8_batch(bulk_queries + first * out_width, dst_fp8, chunk * out_width)) {
+                        ctx->failed = true; return false;
+                    }
                 }
             } else if (wire == RKVA_WIRE_SPLITZIP) {
                 slot.decode_f16.resize(chunk * out_width);
@@ -1403,6 +1881,8 @@ static bool rkva_prepare_native_bulk_job(
             }
             slot.upload_bytes += slot.segment_scratch.size() - sizeof(rkva_kvarn_range_upload);
         }
+        trace_envelope.event.value = slot.payload.zeroed_bytes() - zeros_before;
+        trace_envelope.event.bytes = slot.payload.size();
         slot.end_rows = owner->rows();
         if (slot.payload.size() > (256u << 20)) {
             ctx->failed = true;
@@ -1416,6 +1896,8 @@ static bool rkva_prepare_native_bulk_job(
         slot.out_width = uint32_t(out_width);
         slot.first_pos = slot.pos_scratch.front();
         slot.last_pos = slot.pos_scratch.back();
+        trace_prepare.event.first_pos = slot.first_pos;
+        trace_prepare.event.last_pos = slot.last_pos;
         slot.wire = wire;
         slot.bulk_f16 = (wire == RKVA_WIRE_F16);
     } catch (const std::exception & error) {
@@ -1509,6 +1991,7 @@ static bool rkva_async_submit_locked(
 
     {
         std::lock_guard<std::mutex> alock(ctx->async_mutex);
+        if (ggml_remote_attn_trace_enabled()) slot->pending_us = ggml_time_us();
         slot->state = rkva_slot_state::PENDING;
     }
     ctx->async_cv.notify_all();
@@ -2015,10 +2498,11 @@ static void ggml_backend_remote_attn_free(ggml_backend_t backend) {
     }
     {
         std::lock_guard<std::mutex> lock(ctx->mutex);
-        ctx->sock.close();
+        ctx->close_socket();
         ctx->connected = false;
     }
     delete ctx;
+    ggml_remote_attn_trace_flush();
     delete backend;
 }
 
@@ -2090,7 +2574,8 @@ static enum ggml_status ggml_backend_remote_attn_graph_compute(
             continue;
         }
 
-        std::unique_lock<std::mutex> lock(ctx->mutex);
+        auto lock = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC) ?
+            std::unique_lock<std::mutex>(ctx->mutex) : rkva_lock_ctx_drained(ctx);
         if (ctx->failed || !ctx->connected) {
             GGML_LOG_ERROR("%s: backend not connected (failed=%d)\n",
                            GGML_REMOTE_ATTN_NAME, (int) ctx->failed);
@@ -2099,7 +2584,8 @@ static enum ggml_status ggml_backend_remote_attn_graph_compute(
         if (!rkva_run_attn(ctx, node, lock)) {
             ctx->failed = true;
             ctx->connected = false;
-            ctx->sock.close();
+            ctx->sock.interrupt();
+            ctx->async_cv.notify_all();
             return GGML_STATUS_ABORTED;
         }
     }
@@ -2306,11 +2792,16 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
 #else
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     auto lock = rkva_lock_ctx_drained(ctx);
+    // connect() normally clears failed. Never revive storage whose codec
+    // helper failed to establish successful retirement; require a new backend.
+    bool retired = ctx->synchronous_slot.cuda_context_retired;
+    for (const auto & slot : ctx->async_slots) retired = retired && slot.cuda_context_retired;
+    if (!retired) { ctx->failed = true; return false; }
     if (!ctx->geo_set) {
         GGML_LOG_ERROR("%s: geometry not set before connect\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
-    ctx->sock.close();
+    ctx->close_socket();
     ctx->connected = false;
     ctx->failed = false;
     ctx->range_configured = false;
@@ -2331,7 +2822,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         GGML_LOG_ERROR("%s: socket failed: %s\n", GGML_REMOTE_ATTN_NAME, strerror(errno));
         return false;
     }
-    ctx->sock.fd = fd;
+    ctx->sock.assign(fd);
     const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     timeval tv { 30, 0 };
@@ -2349,13 +2840,13 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     if (::inet_pton(AF_INET, ctx->host.c_str(), &addr.sin_addr) != 1) {
         GGML_LOG_ERROR("%s: invalid host '%s' (numeric IPv4 required)\n",
                        GGML_REMOTE_ATTN_NAME, ctx->host.c_str());
-        ctx->sock.close();
+        ctx->close_socket();
         return false;
     }
     if (::connect(fd, (sockaddr *) &addr, sizeof(addr)) != 0) {
         GGML_LOG_ERROR("%s: connect to %s:%u failed: %s\n",
                        GGML_REMOTE_ATTN_NAME, ctx->host.c_str(), (unsigned) ctx->port, strerror(errno));
-        ctx->sock.close();
+        ctx->close_socket();
         return false;
     }
 
@@ -2386,7 +2877,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
                        &hello, sizeof(hello), ack_bytes, sizeof(rkva_hello_ack))) {
         GGML_LOG_ERROR("%s: HELLO handshake failed\n", GGML_REMOTE_ATTN_NAME);
         ctx->connected = false;
-        ctx->sock.close();
+        ctx->close_socket();
         return false;
     }
     std::memcpy(&ctx->ack, ack_bytes.data(), sizeof(rkva_hello_ack));
@@ -2395,7 +2886,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         GGML_LOG_ERROR("%s: server lacks ATTN ops (mask=0x%x)\n",
                        GGML_REMOTE_ATTN_NAME, ctx->ack.supported_ops);
         ctx->connected = false;
-        ctx->sock.close();
+        ctx->close_socket();
         return false;
     }
     GGML_LOG_INFO("%s: connected to %s:%u, %u remote layers, wire=%s, budget=%llu MiB\n",
@@ -2569,6 +3060,9 @@ static bool rkva_native_rewind_locked(ggml_backend_remote_attn_context * ctx,
 }
 
 bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, int32_t pos0) {
+    ggml_remote_attn_trace_scope trace_trim("control_trim");
+    trace_trim.event.session = session_id;
+    trace_trim.event.first_pos = pos0;
     if (!backend) return false;
     if (ggml_backend_is_local_split(backend)) {
         return ggml_backend_local_split_trim(backend, session_id, pos0);
@@ -2652,7 +3146,7 @@ static bool rkva_async_local_remote_option(bool & async_overlap) {
     async_overlap = false;
     if (const char * option = std::getenv("GGML_RKVA_ASYNC_LOCAL_REMOTE")) {
         if (!std::strcmp(option, "1")) async_overlap = true;
-        else if (std::strcmp(option, "0")) async_overlap = false;
+        else if (!std::strcmp(option, "0")) async_overlap = false;
         else {
             GGML_LOG_ERROR("%s: GGML_RKVA_ASYNC_LOCAL_REMOTE must be 0 or 1\n",
                     GGML_REMOTE_ATTN_NAME);
@@ -3035,6 +3529,7 @@ bool ggml_backend_remote_attn_disk_snapshot(
 }
 
 void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {
+    ggml_remote_attn_trace_scope trace_invalidate("control_invalidate");
     if (!backend || ggml_backend_is_local_split(backend)) {
         return;
     }
@@ -3149,8 +3644,8 @@ ggml_tensor * ggml_remote_attn_range_wait(
     GGML_ASSERT(ctx && range && range->op == GGML_OP_REMOTE_ATTN);
     GGML_ASSERT(ggml_get_op_params_i32(range, GGML_REMOTE_ATTN_PARAM_RANGE));
     GGML_ASSERT(ggml_get_op_params_i32(range, GGML_REMOTE_ATTN_PARAM_ASYNC));
-    ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
-            range->ne[0], range->ne[1]);
+    ggml_tensor * result = ggml_backend_remote_attn_cuda_enabled_for_node(range) ?
+        ggml_view_tensor(ctx, range) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, range->ne[0], range->ne[1]);
     result->op = GGML_OP_REMOTE_ATTN;
     result->src[0] = range;
     std::memcpy(result->op_params, range->op_params, sizeof(result->op_params));
@@ -3244,6 +3739,20 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
         ctx->range_native_kvarn ? "projected_f32" : ctx->range_configured ? ggml_type_name(ctx->range_source_type) : "none",
         (unsigned long long) s.range_upload_bytes, ctx->range_native_kvarn ? ctx->native_tail_tokens : 0);
     ctx->stats_json = buf;
+    ctx->stats_json.pop_back();
+    ctx->stats_json += ",\"wire_format\":\"" + std::string(ctx->range_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
+        ctx->range_wire == RKVA_WIRE_F16 ? "f16" : "f32") + "\",\"remote_layers\":" + std::to_string(ctx->geo.n_layer_remote) +
+        ",\"n_head\":" + std::to_string(ctx->geo.n_head) + ",\"n_head_kv\":" + std::to_string(ctx->geo.n_head_kv) +
+        ",\"server_version\":" + std::to_string(ctx->ack.server_version) +
+        ",\"compact_stage\":" + std::string(ctx->range_native_kvarn && ctx->native_serial_prefix &&
+            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) && ctx->range_origin >= 128 &&
+            ctx->native_tail_tokens == 128 ? "true" : "false") +
+        ",\"cuda_pack_calls\":" + std::to_string(s.cuda_pack_calls) +
+        ",\"cuda_unpack_calls\":" + std::to_string(s.cuda_unpack_calls) +
+        ",\"cuda_context_creates\":" + std::to_string(s.cuda_context_creates) +
+        ",\"cuda_context_phase_releases\":" + std::to_string(s.cuda_context_phase_releases) +
+        ",\"q_f32_readback_bytes_avoided\":" + std::to_string(s.q_f32_readback_bytes_avoided) +
+        ",\"out_f32_upload_bytes_avoided\":" + std::to_string(s.out_f32_upload_bytes_avoided) + "}";
     return ctx->stats_json.c_str();
 }
 
@@ -3266,6 +3775,37 @@ void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend) {
 
 static ggml_backend_t g_remote_attn_active = nullptr;
 
+bool ggml_backend_remote_attn_cuda_enabled(void) {
+    auto * backend = g_remote_attn_active;
+    if (!backend || ggml_backend_is_local_split(backend)) return false;
+    const char * option = std::getenv("GGML_RKVA_CUDA_FP8");
+    if (option && !std::strcmp(option, "0")) return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    return ctx->connected && !ctx->failed && ctx->range_configured &&
+        ctx->range_native_kvarn && ctx->native_bulk && ctx->range_wire == RKVA_WIRE_FP8 && rkva_cuda_fp8_api();
+}
+
+bool ggml_backend_remote_attn_cuda_enabled_for_node(const ggml_tensor * node) {
+    if (!node || node->op != GGML_OP_REMOTE_ATTN) return false;
+    const auto * range = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT) ? node->src[0] : node;
+    if (!range || range->op != GGML_OP_REMOTE_ATTN ||
+            !ggml_get_op_params_i32(range, GGML_REMOTE_ATTN_PARAM_RANGE) || range->ne[1] <= 0) return false;
+    // This is the native serial-prefix protocol bucket, not a measured or
+    // adaptive threshold. A prefill segment of eight queries still belongs to
+    // its original whole range, e.g.256, for this decision.
+    if (!rkva_cuda_fp8_bucket_permitted(range->ne[1])) return false;
+    return ggml_backend_remote_attn_cuda_enabled();
+}
+
+bool ggml_remote_attn_exec_cuda(struct ggml_tensor * node, void * producer_event) {
+    struct restore_event {
+        void * previous;
+        ~restore_event() { rkva_cuda_producer_event = previous; }
+    } restore {rkva_cuda_producer_event};
+    rkva_cuda_producer_event = producer_event;
+    return ggml_remote_attn_exec(node);
+}
+
 void ggml_remote_attn_set_active(ggml_backend_t backend) {
     g_remote_attn_active = backend;
     if (ggml_backend_is_local_split(backend)) {
@@ -3286,7 +3826,8 @@ bool ggml_remote_attn_exec(struct ggml_tensor * node) {
     if (ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT)) {
         return rkva_async_wait_node(ctx, node);
     }
-    std::unique_lock<std::mutex> lock(ctx->mutex);
+    auto lock = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC) ?
+        std::unique_lock<std::mutex>(ctx->mutex) : rkva_lock_ctx_drained(ctx);
     if (ctx->failed || !ctx->connected) {
         GGML_LOG_ERROR("%s: exec while not connected (failed=%d)\n",
                        GGML_REMOTE_ATTN_NAME, (int) ctx->failed);
@@ -3295,10 +3836,21 @@ bool ggml_remote_attn_exec(struct ggml_tensor * node) {
     if (!rkva_run_attn(ctx, node, lock)) {
         ctx->failed = true;
         ctx->connected = false;
-        if (!ctx->async_worker.joinable()) {
-            ctx->sock.close();
-        }
+        ctx->sock.interrupt();
+        ctx->async_cv.notify_all();
         return false;
+    }
+    if (ggml_remote_attn_trace_enabled()) {
+        auto e = ggml_remote_attn_trace_identity("active_range", node);
+        if (!ctx->pos_scratch.empty()) {
+            e.first_pos = ctx->pos_scratch.front();
+            e.last_pos = ctx->pos_scratch.back();
+        }
+        e.session = ctx->active_session;
+        e.ticket = uint64_t(uint32_t(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_LO))) |
+                   (uint64_t(uint32_t(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_HI))) << 32);
+        e.epoch = ctx->range_epoch;
+        ggml_remote_attn_trace_context(&e);
     }
     return true;
 }

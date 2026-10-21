@@ -381,6 +381,34 @@ tests.
 | `GGML_CUDA_DQ_Q6K` | Arch default (on for RDNA3.5) | Same `0`/`1`/arch-default semantics for the Q6_K dequant-float matvec arm. |
 | `GGML_CUDA_DQ_ROWS` | `1` | Rows per block for the dequant matvec kernels. Only `1`/`2`/`4`/`8` are instantiated; anything else warns and uses `1`. |
 
+## Experimental TCP FP8 codec placement
+
+For negotiated native KVarN4 bulk attention with FP8 on the wire,
+`GGML_RKVA_CUDA_FP8` selects the host codec placement:
+
+| Value | Placement |
+|---|---|
+| `0` | CPU orchestration and codec through the existing scheduler copies. |
+| `1` or unset | Existing CUDA-capable path for all supported range sizes. |
+| `prefill` | CUDA-capable path only for whole ranges with more than nine queries; CPU for one through nine. |
+
+`prefill` names the existing native serial-prefix protocol bucket; it does not
+detect the semantic request phase. A prompt tail of nine or fewer queries uses
+CPU, while a verification batch larger than nine uses CUDA. The decision uses
+the complete range before its eight-query wire segments are assembled.
+
+This option does not change the negotiated FP8 wire format, K/V producer,
+causal masks, WAIT synchronization or rollback contracts. In `prefill` mode,
+a reserved, retired slot releases its private CUDA codec context upon entering
+the CPU bucket. Pinned network buffers retain capacity; other running slots
+are untouched. A later GPU-sized request recreates that private context once.
+Scratch grows within each GPU phase. Mixed MTP bucket performance is unqualified.
+A failed codec helper requires a fresh backend; reconnect cannot recycle its
+slot buffers. Actual device-loss/destructor fault handling remains a separate
+qualification gate. Keep the setting fixed for
+the process lifetime and restart serving to change it. Explicit `prefill`
+does not change the existing `0`/`1` defaults or select a policy from timings.
+
 ## Migration from earlier versions
 
 | Earlier spelling or surface | v0.4.0 behavior | Replacement |

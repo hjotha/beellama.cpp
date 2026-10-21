@@ -11,6 +11,7 @@
 #include "server-stream.h"
 #include "server-gpu-power.h"
 #include "server-model-identity.h"
+#include "ggml-remote-attn-trace.h"
 #include "server-route-state.h"
 #if defined(LLAMA_F4_TEST_LOGIT_CAPTURE)
 #include "f4-test-logit-capture.h"
@@ -10287,6 +10288,19 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
         const int64_t prof_t0  = prof_mtp ? ggml_time_us() : 0;
         const int64_t trace_decode_start = dflash_trace_tick_us();
         queue_tasks.yield_to_queue([&]() {
+            if (ggml_remote_attn_trace_enabled()) {
+                uint64_t request_id = 0;
+                for (const auto & slot : slots) {
+                    if (!slot.is_processing() || !slot.task) continue;
+                    const uint64_t id = uint64_t(slot.task->id);
+                    if (request_id && request_id != id) { request_id = UINT64_MAX; break; }
+                    request_id = id;
+                }
+                ggml_remote_attn_trace_request(request_id);
+            }
+            ggml_remote_attn_trace_scope rkva_decode("server_decode");
+            rkva_decode.event.flags = 0x40000000u;
+            rkva_decode.event.nq = uint32_t(batch_view.n_tokens);
             const int64_t trace_compute_start = dflash_trace_tick_us();
             ret = llama_decode(ctx_tgt, batch_view);
             const int64_t trace_compute_done = dflash_trace_tick_us();
@@ -10294,6 +10308,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             if (ret == 0) {
                 // Server KV/state and speculative scheduling inspect this memory
                 // immediately after decode, including prompt-only sub-batches.
+                ggml_remote_attn_trace_scope rkva_sync("server_sync");
                 llama_synchronize(ctx_tgt);
 
                 dflash_trace("target_sync", trace_compute_done, dflash_trace_tick_us(), batch_view.n_tokens);

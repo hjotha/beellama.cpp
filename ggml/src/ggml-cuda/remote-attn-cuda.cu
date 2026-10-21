@@ -1,11 +1,18 @@
-#include "common.cuh"
 #include "remote-attn-cuda.cuh"
+#include "ggml-remote-attn-trace.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
+#include <new>
+#include <unordered_map>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 static __device__ __forceinline__ uint32_t rkva_cuda_round_shift_even(uint32_t value, unsigned shift) {
     const uint32_t base = value >> shift;
@@ -119,6 +126,8 @@ static __global__ void rkva_cuda_fp8_unpack_out_kernel(
     }
 }
 
+// Each serving slot owns its scratch and stream. No CUDA operation outlives a
+// helper call, so slot reset/drain may safely reuse pinned network buffers.
 struct rkva_cuda_remote_scratch {
     void * dev_data = nullptr;
     size_t dev_capacity = 0;
@@ -126,205 +135,406 @@ struct rkva_cuda_remote_scratch {
     int * host_err = nullptr;
     cudaStream_t stream = nullptr;
     int device = -1;
+    bool poisoned = false;
+    cudaEvent_t timing_events[7]{};
+    bool timing_disabled = false;
+    std::mutex mutex;
 };
 
-static rkva_cuda_remote_scratch g_scratch;
-static std::mutex g_scratch_mutex;
+// Timing events are private to the same context mutex/stream as the scratch.
+// They are resolved only after the helper's mandatory retirement; no profiling
+// query, synchronization or event exists on the trace-disabled path.
+struct rkva_cuda_timing_trace {
+    rkva_cuda_remote_scratch & scratch;
+    ggml_remote_attn_trace_event identity{};
+    const char * operation;
+    bool active = false;
+    unsigned recorded = 0;
 
-static bool rkva_scratch_ensure(rkva_cuda_remote_scratch & s, int dev, size_t needed) {
-    if (s.device != dev) {
-        if (s.device >= 0) {
-            cudaSetDevice(s.device);
-            if (s.dev_data) cudaFree(s.dev_data);
-            if (s.dev_err) cudaFree(s.dev_err);
-            if (s.host_err) cudaFreeHost(s.host_err);
-            if (s.stream) cudaStreamDestroy(s.stream);
-            cudaSetDevice(dev);
+    rkva_cuda_timing_trace(rkva_cuda_remote_scratch & s, const char * name) : scratch(s), operation(name) {
+        if (!ggml_remote_attn_trace_enabled() || s.timing_disabled) return;
+        identity = ggml_remote_attn_trace_identity(name, nullptr);
+        identity.begin_us = ggml_time_us();
+        active = true;
+        for (auto & event : scratch.timing_events) {
+            if (event) continue;
+            const cudaError_t status = cudaEventCreate(&event);
+            if (status != cudaSuccess) { error(status); return; }
         }
-        s = rkva_cuda_remote_scratch{};
-        s.device = dev;
     }
-    if (!s.stream) {
-        if (cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) != cudaSuccess) return false;
+
+    void error(cudaError_t status) {
+        active = false;
+        scratch.timing_disabled = true;
+        auto event = identity;
+        std::snprintf(event.phase, sizeof(event.phase), "%s_profile_error", operation);
+        event.end_us = ggml_time_us();
+        event.flags |= 1u;
+        event.value = static_cast<uint64_t>(status);
+        ggml_remote_attn_trace_record(&event);
     }
-    if (!s.dev_err) {
-        if (cudaMalloc(&s.dev_err, sizeof(int)) != cudaSuccess) return false;
+
+    void mark(unsigned index, cudaStream_t stream) {
+        if (!active) return;
+        const cudaError_t status = cudaEventRecord(scratch.timing_events[index], stream);
+        if (status != cudaSuccess) { error(status); return; }
+        recorded = index + 1;
     }
-    if (!s.host_err) {
-        if (cudaHostAlloc(&s.host_err, sizeof(int), cudaHostAllocPortable) != cudaSuccess) return false;
+
+    void interval(const char * phase, unsigned first, unsigned last, uint64_t bytes,
+                  uint64_t status, bool inclusive = false) {
+        if (!active || last >= recorded) return;
+        float elapsed_ms = 0;
+        const cudaError_t result = cudaEventElapsedTime(&elapsed_ms,
+            scratch.timing_events[first], scratch.timing_events[last]);
+        if (result != cudaSuccess) { error(result); return; }
+        auto event = identity;
+        std::strncpy(event.phase, phase, sizeof(event.phase) - 1);
+        event.phase[sizeof(event.phase) - 1] = '\0';
+        event.end_us = ggml_time_us();
+        event.gpu_us = double(elapsed_ms) * 1000.0;
+        event.bytes = bytes;
+        event.value = status;
+        event.flags |= 0x80000000u | (inclusive ? 0x40000000u : 0u) | (status ? 1u : 0u);
+        ggml_remote_attn_trace_record(&event);
     }
+};
+
+struct rkva_device_guard {
+    int previous = -1;
+    bool ok = false;
+    explicit rkva_device_guard(int device) {
+        ok = cudaGetDevice(&previous) == cudaSuccess &&
+             (previous == device || cudaSetDevice(device) == cudaSuccess);
+    }
+    ~rkva_device_guard() {
+        if (ok && previous >= 0) cudaSetDevice(previous);
+    }
+};
+
+static bool rkva_size_mul(size_t a, size_t b, size_t & result) {
+    if (b && a > SIZE_MAX / b) return false;
+    result = a * b;
+    return true;
+}
+
+static bool rkva_size_add(size_t a, size_t b, size_t & result) {
+    if (a > SIZE_MAX - b) return false;
+    result = a + b;
+    return true;
+}
+
+static bool rkva_align_float(size_t value, size_t & result) {
+    if (!rkva_size_add(value, sizeof(float) - 1, result)) return false;
+    result &= ~(sizeof(float) - 1);
+    return true;
+}
+
+static int rkva_pointer_device(const void * ptr) {
+    if (!ptr) return -2;
+    cudaPointerAttributes attr{};
+    const cudaError_t status = cudaPointerGetAttributes(&attr, ptr);
+    if (status == cudaErrorInvalidValue) {
+        cudaGetLastError(); // Older runtimes report ordinary host allocations this way.
+        return -1;
+    }
+    if (status != cudaSuccess) return -2;
+    if (attr.type == cudaMemoryTypeDevice) return attr.device;
+    if (attr.type == cudaMemoryTypeHost || attr.type == cudaMemoryTypeUnregistered) return -1;
+    return -2; // Managed memory requires a separate residency/coherency contract.
+}
+
+static bool rkva_scratch_ensure(rkva_cuda_remote_scratch & s, size_t needed) {
+    if (s.poisoned) return false;
+    if (!s.stream && cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) != cudaSuccess) return false;
+    if (!s.dev_err && cudaMalloc(&s.dev_err, sizeof(int)) != cudaSuccess) return false;
+    if (!s.host_err && cudaHostAlloc(&s.host_err, sizeof(int), cudaHostAllocPortable) != cudaSuccess) return false;
     if (s.dev_capacity < needed) {
-        if (s.dev_data) cudaFree(s.dev_data);
-        size_t alloc_sz = std::max<size_t>(needed, 4u << 20); // 4 MiB minimum
-        if (cudaMalloc(&s.dev_data, alloc_sz) != cudaSuccess) {
-            s.dev_data = nullptr;
-            s.dev_capacity = 0;
+        void * replacement = nullptr;
+        const size_t alloc_sz = std::max<size_t>(needed, 4u << 20);
+        if (cudaMalloc(&replacement, alloc_sz) != cudaSuccess) return false;
+        if (s.dev_data && cudaFree(s.dev_data) != cudaSuccess) {
+            cudaFree(replacement);
+            s.poisoned = true;
             return false;
         }
+        s.dev_data = replacement;
         s.dev_capacity = alloc_sz;
     }
     return true;
 }
 
-static bool rkva_is_device_pointer(const void * ptr, int device) {
-    if (!ptr) return false;
-#if !defined(GGML_USE_MUSA)
-    cudaPointerAttributes attr{};
-    if (cudaPointerGetAttributes(&attr, ptr) == cudaSuccess) {
-#if defined(GGML_USE_HIP)
-        if (attr.memoryType == hipMemoryTypeDevice && attr.device == device) return true;
-#else
-        if (attr.type == cudaMemoryTypeDevice && attr.device == device) return true;
-#endif
-    } else {
-        cudaGetLastError();
+// Every early exit after an enqueue retires the stream while all input/output
+// buffers and the context mutex remain owned. A failed retirement poisons the
+// context so no later call can recycle its scratch after an uncertain failure.
+struct rkva_stream_retirement {
+    rkva_cuda_remote_scratch & scratch;
+    cudaStream_t stream;
+    bool pending = false;
+    const char * trace_phase = "cuda_retire_host";
+    bool finish() {
+        if (!pending) return true;
+        pending = false;
+        ggml_remote_attn_trace_scope timing(trace_phase);
+        if (cudaStreamSynchronize(stream) == cudaSuccess) return true;
+        timing.event.flags |= 1u;
+        scratch.poisoned = true;
+        return false;
     }
-#endif
-    return false;
+    ~rkva_stream_retirement() { finish(); }
+};
+
+static bool rkva_grid(size_t elements, dim3 & grid) {
+    const size_t blocks = elements / 256 + (elements % 256 != 0);
+    // CUDA grid.x is limited to 2^31-1 on supported GPUs.
+    if (!blocks || blocks > 0x7fffffffu) return false;
+    grid = dim3(static_cast<unsigned>(blocks));
+    return true;
 }
 
-bool ggml_cuda_remote_attn_fp8_pack_q(
-        const void * src_q,
-        bool is_f16,
-        size_t n_elements,
-        uint8_t * dst_pinned_fp8,
-        void * user_stream,
-        void * user_event_done) {
+static bool rkva_pack_impl(rkva_cuda_remote_scratch & s, const void * src_q, bool is_f16,
+                          size_t n_elements, uint8_t * dst_pinned_fp8,
+                          cudaStream_t user_stream, cudaEvent_t producer_event,
+                          cudaEvent_t event_done) {
+    ggml_remote_attn_trace_scope call_timing("cuda_pack_host");
+    call_timing.event.flags |= 0x40000001u;
     if (!src_q || !dst_pinned_fp8 || !n_elements) return false;
-
-    int device;
-    if (cudaGetDevice(&device) != cudaSuccess) return false;
-
-    std::lock_guard<std::mutex> guard(g_scratch_mutex);
-
-    const bool is_dev = rkva_is_device_pointer(src_q, device);
     const size_t elem_sz = is_f16 ? sizeof(half) : sizeof(float);
-    const size_t in_bytes = is_dev ? 0 : n_elements * elem_sz;
-    const size_t out_bytes = n_elements * sizeof(uint8_t);
-    const size_t needed = in_bytes + out_bytes;
-
-    if (!rkva_scratch_ensure(g_scratch, device, needed)) return false;
-
-    cudaStream_t stream = user_stream ? static_cast<cudaStream_t>(user_stream) : g_scratch.stream;
-
-    const void * dev_src = nullptr;
-    uint8_t * dev_dst = nullptr;
-
-    if (is_dev) {
-        dev_src = src_q;
-        dev_dst = static_cast<uint8_t *>(g_scratch.dev_data);
-    } else {
-        dev_src = g_scratch.dev_data;
-        dev_dst = static_cast<uint8_t *>(g_scratch.dev_data) + in_bytes;
-        if (cudaMemcpyAsync(const_cast<void *>(dev_src), src_q, in_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
-            return false;
-        }
-    }
-
-    if (cudaMemsetAsync(g_scratch.dev_err, 0, sizeof(int), stream) != cudaSuccess) return false;
-
-    dim3 block(256);
-    dim3 grid(uint32_t((n_elements + block.x - 1) / block.x));
-
-    if (is_f16) {
-        rkva_cuda_fp8_pack_q_f16_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const half *>(dev_src), dev_dst, n_elements, g_scratch.dev_err);
-    } else {
-        rkva_cuda_fp8_pack_q_f32_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const float *>(dev_src), dev_dst, n_elements, g_scratch.dev_err);
-    }
-
-    if (cudaMemcpyAsync(dst_pinned_fp8, dev_dst, out_bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
-        return false;
-    }
-    if (cudaMemcpyAsync(g_scratch.host_err, g_scratch.dev_err, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
-        return false;
-    }
-
-    if (user_event_done) {
-        if (cudaEventRecord(static_cast<cudaEvent_t>(user_event_done), stream) != cudaSuccess) return false;
-    }
-
-    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
-
-    return (*g_scratch.host_err == 0);
-}
-
-bool ggml_cuda_remote_attn_fp8_unpack_out(
-        const uint8_t * src_pinned_fp8,
-        const float   * src_lse,
-        size_t nq,
-        size_t out_width,
-        size_t n_head,
-        void * dst_out,
-        size_t dst_stride_bytes,
-        void * user_stream,
-        void * user_event_done) {
-    if (!src_pinned_fp8 || !dst_out || !nq || !out_width) return false;
-
-    int device;
-    if (cudaGetDevice(&device) != cudaSuccess) return false;
-
-    std::lock_guard<std::mutex> guard(g_scratch_mutex);
-
-    const bool is_dev = rkva_is_device_pointer(dst_out, device);
-    const size_t fp8_bytes = nq * out_width * sizeof(uint8_t);
-    const size_t lse_bytes = src_lse ? (nq * n_head * sizeof(float)) : 0;
-    const size_t col_total = out_width + n_head;
-    const size_t f32_out_bytes = is_dev ? 0 : (nq * col_total * sizeof(float));
-    const size_t needed = fp8_bytes + lse_bytes + f32_out_bytes;
-
-    if (!rkva_scratch_ensure(g_scratch, device, needed)) return false;
-
-    cudaStream_t stream = user_stream ? static_cast<cudaStream_t>(user_stream) : g_scratch.stream;
-
-    uint8_t * dev_fp8 = static_cast<uint8_t *>(g_scratch.dev_data);
-    float * dev_lse = reinterpret_cast<float *>(dev_fp8 + fp8_bytes);
-    float * dev_f32_out = is_dev ? static_cast<float *>(dst_out)
-                                 : reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dev_lse) + lse_bytes);
-
-    if (cudaMemcpyAsync(dev_fp8, src_pinned_fp8, fp8_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
-        return false;
-    }
-    if (src_lse && lse_bytes > 0) {
-        if (cudaMemcpyAsync(dev_lse, src_lse, lse_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
-            return false;
-        }
-    }
-
-    if (cudaMemsetAsync(g_scratch.dev_err, 0, sizeof(int), stream) != cudaSuccess) return false;
-
-    const size_t dst_stride_floats = is_dev ? (dst_stride_bytes / sizeof(float)) : col_total;
-    const size_t total_elements = nq * col_total;
-    dim3 block(256);
-    dim3 grid(uint32_t((total_elements + block.x - 1) / block.x));
-
-    rkva_cuda_fp8_unpack_out_kernel<<<grid, block, 0, stream>>>(
-        dev_fp8, src_lse ? dev_lse : nullptr, dev_f32_out,
-        nq, out_width, n_head, dst_stride_floats, g_scratch.dev_err);
-
-    if (!is_dev) {
-        for (size_t row = 0; row < nq; ++row) {
-            if (cudaMemcpyAsync(static_cast<uint8_t *>(dst_out) + row * dst_stride_bytes,
-                                dev_f32_out + row * col_total,
-                                col_total * sizeof(float),
-                                cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+    if (reinterpret_cast<uintptr_t>(src_q) % elem_sz) return false;
+    const int src_device = rkva_pointer_device(src_q);
+    if (src_device < -1 || (src_device >= 0 && src_device != s.device) ||
+        rkva_pointer_device(dst_pinned_fp8) != -1) return false;
+    const bool is_dev = src_device >= 0;
+    size_t input_extent, in_bytes, needed;
+    if (!rkva_size_mul(n_elements, elem_sz, input_extent)) return false;
+    call_timing.event.bytes = input_extent;
+    in_bytes = is_dev ? 0 : input_extent;
+    if (!rkva_size_add(in_bytes, n_elements, needed)) return false;
+    dim3 grid;
+    if (!rkva_grid(n_elements, grid) || !rkva_scratch_ensure(s, needed)) return false;
+    cudaStream_t stream = user_stream ? user_stream : s.stream;
+    unsigned stream_flags;
+    if (cudaStreamGetFlags(stream, &stream_flags) != cudaSuccess) return false;
+    rkva_stream_retirement retire{s, stream, false, "cuda_pack_retire_host"};
+    rkva_cuda_timing_trace gpu_timing(s, "cuda_pack");
+    {
+        ggml_remote_attn_trace_scope enqueue_timing("cuda_pack_enqueue_host");
+        enqueue_timing.event.bytes = n_elements;
+        if (gpu_timing.active) retire.pending = true;
+        gpu_timing.mark(0, stream);
+        if (is_dev) {
+            if (producer_event) {
+                retire.pending = true;
+                if (cudaStreamWaitEvent(stream, producer_event, 0) != cudaSuccess) return false;
+            } else if (!user_stream && cudaDeviceSynchronize() != cudaSuccess) {
+                s.poisoned = true;
                 return false;
             }
+            // A supplied legacy user_stream must itself be the producer stream or
+            // already contain a wait for the producer. v2 defaults to the safe sync.
+        }
+        gpu_timing.mark(1, stream);
+        const void * dev_src = is_dev ? src_q : s.dev_data;
+        auto * dev_dst = static_cast<uint8_t *>(s.dev_data) + in_bytes;
+        retire.pending = true;
+        if (!is_dev && cudaMemcpyAsync(s.dev_data, src_q, in_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+        gpu_timing.mark(2, stream);
+        if (cudaMemsetAsync(s.dev_err, 0, sizeof(int), stream) != cudaSuccess) return false;
+        gpu_timing.mark(3, stream);
+        if (is_f16) {
+            rkva_cuda_fp8_pack_q_f16_kernel<<<grid, 256, 0, stream>>>(
+                static_cast<const half *>(dev_src), dev_dst, n_elements, s.dev_err);
+        } else {
+            rkva_cuda_fp8_pack_q_f32_kernel<<<grid, 256, 0, stream>>>(
+                static_cast<const float *>(dev_src), dev_dst, n_elements, s.dev_err);
+        }
+        if (cudaGetLastError() != cudaSuccess) return false;
+        gpu_timing.mark(4, stream);
+        if (cudaMemcpyAsync(dst_pinned_fp8, dev_dst, n_elements, cudaMemcpyDeviceToHost, stream) != cudaSuccess) return false;
+        gpu_timing.mark(5, stream);
+        if (cudaMemcpyAsync(s.host_err, s.dev_err, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess) return false;
+        gpu_timing.mark(6, stream);
+        if (event_done && cudaEventRecord(event_done, stream) != cudaSuccess) return false;
+    }
+    const bool retired = retire.finish();
+    if (retired) {
+        const uint64_t status = uint64_t(*s.host_err);
+        gpu_timing.interval("cuda_pack_producer_gpu", 0, 1, 0, status);
+        if (in_bytes) gpu_timing.interval("cuda_pack_input_h2d_gpu", 1, 2, in_bytes, status);
+        gpu_timing.interval("cuda_pack_status_reset_gpu", 2, 3, sizeof(int), status);
+        gpu_timing.interval("cuda_pack_kernel_gpu", 3, 4, input_extent, status);
+        gpu_timing.interval("cuda_pack_d2h_gpu", 4, 5, n_elements, status);
+        gpu_timing.interval("cuda_pack_status_d2h_gpu", 5, 6, sizeof(int), status);
+        gpu_timing.interval("cuda_pack_total_gpu", 0, 6, in_bytes + n_elements + sizeof(int), status, true);
+    }
+    const bool ok = retired && *s.host_err == 0;
+    if (ok) call_timing.event.flags &= ~1u;
+    return ok;
+}
+
+static bool rkva_unpack_impl(rkva_cuda_remote_scratch & s, const uint8_t * src_pinned_fp8,
+                            const float * src_lse, size_t nq, size_t out_width, size_t n_head,
+                            void * dst_out, size_t dst_stride_bytes, cudaStream_t user_stream,
+                            cudaEvent_t event_done) {
+    ggml_remote_attn_trace_scope call_timing("cuda_unpack_host");
+    call_timing.event.flags |= 0x40000001u;
+    if (!src_pinned_fp8 || !dst_out || !nq || !out_width || (n_head && !src_lse) ||
+        reinterpret_cast<uintptr_t>(dst_out) % alignof(float) ||
+        dst_stride_bytes % sizeof(float)) return false;
+    const int dst_device = rkva_pointer_device(dst_out);
+    if (dst_device < -1 || (dst_device >= 0 && dst_device != s.device) ||
+        rkva_pointer_device(src_pinned_fp8) != -1 ||
+        (src_lse && rkva_pointer_device(src_lse) != -1)) return false;
+    const bool is_dev = dst_device >= 0;
+    size_t fp8_bytes, heads, lse_bytes, col_total, row_bytes, total, out_bytes;
+    size_t dst_extent, lse_offset, out_offset, needed;
+    if (!rkva_size_mul(nq, out_width, fp8_bytes) ||
+        !rkva_size_mul(nq, n_head, heads) || !rkva_size_mul(heads, sizeof(float), lse_bytes) ||
+        !rkva_size_add(out_width, n_head, col_total) ||
+        !rkva_size_mul(col_total, sizeof(float), row_bytes) || dst_stride_bytes < row_bytes ||
+        !rkva_size_mul(nq, col_total, total) || !rkva_size_mul(total, sizeof(float), out_bytes) ||
+        !rkva_size_mul(nq - 1, dst_stride_bytes, dst_extent) || !rkva_size_add(dst_extent, row_bytes, dst_extent) ||
+        !rkva_align_float(fp8_bytes, lse_offset) || !rkva_size_add(lse_offset, lse_bytes, out_offset) ||
+        !rkva_size_add(out_offset, is_dev ? 0 : out_bytes, needed)) return false;
+    dim3 grid;
+    if (!rkva_grid(total, grid) || !rkva_scratch_ensure(s, needed)) return false;
+    cudaStream_t stream = user_stream ? user_stream : s.stream;
+    unsigned stream_flags;
+    if (cudaStreamGetFlags(stream, &stream_flags) != cudaSuccess) return false;
+    call_timing.event.bytes = fp8_bytes + lse_bytes;
+    rkva_stream_retirement retire{s, stream, false, "cuda_unpack_retire_host"};
+    rkva_cuda_timing_trace gpu_timing(s, "cuda_unpack");
+    auto * dev_fp8 = static_cast<uint8_t *>(s.dev_data);
+    auto * dev_lse = reinterpret_cast<float *>(dev_fp8 + lse_offset);
+    auto * dev_out = is_dev ? static_cast<float *>(dst_out) : reinterpret_cast<float *>(dev_fp8 + out_offset);
+    {
+        ggml_remote_attn_trace_scope enqueue_timing("cuda_unpack_enqueue_host");
+        enqueue_timing.event.bytes = fp8_bytes + lse_bytes;
+        if (gpu_timing.active) retire.pending = true;
+        gpu_timing.mark(0, stream);
+        retire.pending = true;
+        if (cudaMemcpyAsync(dev_fp8, src_pinned_fp8, fp8_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+        gpu_timing.mark(1, stream);
+        if (lse_bytes && cudaMemcpyAsync(dev_lse, src_lse, lse_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+        gpu_timing.mark(2, stream);
+        if (cudaMemsetAsync(s.dev_err, 0, sizeof(int), stream) != cudaSuccess) return false;
+        gpu_timing.mark(3, stream);
+        rkva_cuda_fp8_unpack_out_kernel<<<grid, 256, 0, stream>>>(
+            dev_fp8, lse_bytes ? dev_lse : nullptr, dev_out, nq, out_width, n_head,
+            is_dev ? dst_stride_bytes / sizeof(float) : col_total, s.dev_err);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        gpu_timing.mark(4, stream);
+        if (!is_dev && cudaMemcpy2DAsync(dst_out, dst_stride_bytes, dev_out, row_bytes,
+                                    row_bytes, nq, cudaMemcpyDeviceToHost, stream) != cudaSuccess) return false;
+        gpu_timing.mark(5, stream);
+        if (cudaMemcpyAsync(s.host_err, s.dev_err, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess) return false;
+        gpu_timing.mark(6, stream);
+        if (event_done && cudaEventRecord(event_done, stream) != cudaSuccess) return false;
+    }
+    const bool retired = retire.finish();
+    if (retired) {
+        const uint64_t status = uint64_t(*s.host_err);
+        gpu_timing.interval("cuda_unpack_fp8_h2d_gpu", 0, 1, fp8_bytes, status);
+        if (lse_bytes) gpu_timing.interval("cuda_unpack_lse_h2d_gpu", 1, 2, lse_bytes, status);
+        gpu_timing.interval("cuda_unpack_status_reset_gpu", 2, 3, sizeof(int), status);
+        gpu_timing.interval("cuda_unpack_kernel_gpu", 3, 4, out_bytes, status);
+        if (!is_dev) gpu_timing.interval("cuda_unpack_output_d2h_gpu", 4, 5, out_bytes, status);
+        gpu_timing.interval("cuda_unpack_status_d2h_gpu", 5, 6, sizeof(int), status);
+        gpu_timing.interval("cuda_unpack_total_gpu", 0, 6,
+            fp8_bytes + lse_bytes + (is_dev ? 0 : out_bytes) + sizeof(int), status, true);
+    }
+    const bool ok = retired && *s.host_err == 0;
+    if (ok) call_timing.event.flags &= ~1u;
+    return ok;
+}
+
+static void * rkva_create_context(int device) {
+    rkva_device_guard guard(device);
+    if (!guard.ok) return nullptr;
+    auto * s = new (std::nothrow) rkva_cuda_remote_scratch;
+    if (s) s->device = device;
+    return s;
+}
+
+static void rkva_destroy_context(void * context) {
+    auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
+    if (!s) return;
+    {
+        std::lock_guard<std::mutex> lock(s->mutex);
+        rkva_device_guard guard(s->device);
+        if (guard.ok) {
+            if (s->stream) cudaStreamSynchronize(s->stream);
+            for (auto event : s->timing_events) if (event) cudaEventDestroy(event);
+            if (s->dev_data) cudaFree(s->dev_data);
+            if (s->dev_err) cudaFree(s->dev_err);
+            if (s->host_err) cudaFreeHost(s->host_err);
+            if (s->stream) cudaStreamDestroy(s->stream);
         }
     }
+    delete s;
+}
 
-    if (cudaMemcpyAsync(g_scratch.host_err, g_scratch.dev_err, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
-        return false;
+static bool rkva_pack_context(void * context, const void * src_q, bool is_f16, size_t n_elements,
+                              uint8_t * dst_pinned_fp8, void * producer_event) {
+    auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
+    if (!s) return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    rkva_device_guard guard(s->device);
+    return guard.ok && rkva_pack_impl(*s, src_q, is_f16, n_elements, dst_pinned_fp8,
+                                      nullptr, static_cast<cudaEvent_t>(producer_event), nullptr);
+}
+
+static bool rkva_unpack_context(void * context, const uint8_t * src_pinned_fp8, const float * src_lse,
+                                size_t nq, size_t out_width, size_t n_head, void * dst_out, size_t stride) {
+    auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
+    if (!s) return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    rkva_device_guard guard(s->device);
+    return guard.ok && rkva_unpack_impl(*s, src_pinned_fp8, src_lse, nq, out_width, n_head,
+                                        dst_out, stride, nullptr, nullptr);
+}
+
+// Legacy ABI: use one context per CUDA device, preserving its original
+// serialized call semantics without device-switch allocation churn.
+struct rkva_legacy_contexts {
+    std::mutex mutex;
+    std::unordered_map<int, void *> contexts;
+    ~rkva_legacy_contexts() {
+        for (auto & entry : contexts) rkva_destroy_context(entry.second);
     }
+};
+static rkva_legacy_contexts g_legacy;
 
-    if (user_event_done) {
-        if (cudaEventRecord(static_cast<cudaEvent_t>(user_event_done), stream) != cudaSuccess) return false;
-    }
+static rkva_cuda_remote_scratch * rkva_legacy_context(const void * device_ptr) {
+    int device = rkva_pointer_device(device_ptr);
+    if (device < -1) return nullptr;
+    if (device == -1 && cudaGetDevice(&device) != cudaSuccess) return nullptr;
+    auto & context = g_legacy.contexts[device];
+    if (!context) context = rkva_create_context(device);
+    return static_cast<rkva_cuda_remote_scratch *>(context);
+}
 
-    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+bool ggml_cuda_remote_attn_fp8_pack_q(const void * src_q, bool is_f16, size_t n_elements,
+                                     uint8_t * dst_pinned_fp8, void * user_stream, void * event_done) {
+    std::lock_guard<std::mutex> lock(g_legacy.mutex);
+    auto * s = rkva_legacy_context(src_q);
+    if (!s) return false;
+    rkva_device_guard guard(s->device);
+    return guard.ok && rkva_pack_impl(*s, src_q, is_f16, n_elements, dst_pinned_fp8,
+                                      static_cast<cudaStream_t>(user_stream), nullptr,
+                                      static_cast<cudaEvent_t>(event_done));
+}
 
-    return (*g_scratch.host_err == 0);
+bool ggml_cuda_remote_attn_fp8_unpack_out(const uint8_t * src_pinned_fp8, const float * src_lse,
+                                         size_t nq, size_t out_width, size_t n_head, void * dst_out,
+                                         size_t stride, void * user_stream, void * event_done) {
+    std::lock_guard<std::mutex> lock(g_legacy.mutex);
+    auto * s = rkva_legacy_context(dst_out);
+    if (!s) return false;
+    rkva_device_guard guard(s->device);
+    return guard.ok && rkva_unpack_impl(*s, src_pinned_fp8, src_lse, nq, out_width, n_head,
+                                        dst_out, stride, static_cast<cudaStream_t>(user_stream),
+                                        static_cast<cudaEvent_t>(event_done));
 }
 
 void * ggml_cuda_remote_attn_alloc_pinned(size_t bytes) {
@@ -392,6 +602,20 @@ static const ggml_remote_attn_cuda_fp8_interface s_cuda_remote_attn_fp8_interfac
 
 const struct ggml_remote_attn_cuda_fp8_interface * ggml_backend_cuda_remote_attn_fp8_interface(void) {
     return &s_cuda_remote_attn_fp8_interface;
+}
+
+static const ggml_remote_attn_cuda_fp8_interface_v2 s_cuda_remote_attn_fp8_interface_v2 = {
+    rkva_pointer_device,
+    rkva_create_context,
+    rkva_destroy_context,
+    rkva_pack_context,
+    rkva_unpack_context,
+    ggml_cuda_remote_attn_alloc_pinned,
+    ggml_cuda_remote_attn_free_pinned,
+};
+
+const struct ggml_remote_attn_cuda_fp8_interface_v2 * ggml_backend_cuda_remote_attn_fp8_interface_v2(void) {
+    return &s_cuda_remote_attn_fp8_interface_v2;
 }
 
 #endif // !GGML_USE_HIP && !GGML_USE_MUSA

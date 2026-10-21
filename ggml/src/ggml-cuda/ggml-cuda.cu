@@ -1,9 +1,12 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-remote-attn.h"
+#include "ggml-remote-attn-trace.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/pool-allocation-plan.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -92,6 +95,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -450,6 +454,18 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         device(device) {
     }
 
+    bool allocation_growth(const size_t * sizes, size_t n, size_t & bytes) const override {
+        size_t free_blocks[MAX_BUFFERS] = {};
+        for (int i = 0; i < MAX_BUFFERS; ++i) {
+            // pool_size also includes live allocations. Only these free cache
+            // entries are eligible, once each, under the real BestFit policy.
+            if (buffer_pool[i].ptr != nullptr) {
+                free_blocks[i] = buffer_pool[i].size;
+            }
+        }
+        return ggml_cuda_pool_plan::legacy_growth(free_blocks, sizes, n, bytes);
+    }
+
     ~ggml_cuda_pool_leg() {
         clear_pool();
         GGML_ASSERT(pool_size == 0);
@@ -568,6 +584,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         device(device),
         physical_device(ggml_cuda_get_physical_device(device)),
         granularity(ggml_cuda_info().devices[device].vmm_granularity) {
+    }
+
+    bool allocation_growth(const size_t * sizes, size_t n, size_t & bytes) const override {
+        return ggml_cuda_pool_plan::vmm_growth(
+                pool_used, pool_size, granularity, CUDA_POOL_VMM_MAX_SIZE, sizes, n, bytes);
     }
 
     ~ggml_cuda_pool_vmm() {
@@ -2205,8 +2226,238 @@ static void ggml_cuda_op_kvarn_split_fused(ggml_backend_cuda_context & ctx, ggml
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// A host thread may execute several CUDA backend instances on the same primary
+// context. Events are reusable after the synchronous pack bridge returns, so
+// keep one per physical CUDA device without changing shared backend layouts.
+struct ggml_cuda_remote_attn_events {
+    std::unordered_map<int, cudaEvent_t> events;
+
+    cudaEvent_t get() {
+        int device;
+        if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
+        auto & event = events[device];
+        if (!event && cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) return nullptr;
+        return event;
+    }
+
+    ~ggml_cuda_remote_attn_events() {
+        int previous;
+        if (cudaGetDevice(&previous) != cudaSuccess) return;
+        for (const auto & entry : events) {
+            if (entry.second && cudaSetDevice(entry.first) == cudaSuccess) cudaEventDestroy(entry.second);
+        }
+        cudaSetDevice(previous);
+    }
+};
+static thread_local ggml_cuda_remote_attn_events ggml_cuda_remote_attn_producer_events;
+
+// Private, bounded profiling state; backend context layouts stay unchanged.
+// A single non-blocking query pass resolves old local spans at natural call
+// boundaries. Event elapsed time is a device-stream span, not summed kernel
+// busy time; it may include launch gaps. Host-driven RPC/fused splits are
+// excluded so a network wait can never be mistaken for local GPU computation.
+struct ggml_cuda_trace_pair {
+    cudaEvent_t begin = nullptr, end = nullptr;
+    cudaStream_t stream = nullptr;
+    ggml_remote_attn_trace_event event{};
+    bool busy = false, ended = false;
+};
+
+struct ggml_cuda_trace_pool {
+    static constexpr size_t capacity = 64;
+    std::array<ggml_cuda_trace_pair, capacity> pairs{};
+    int device = -1;
+    uint64_t dropped = 0;
+    bool disabled = false;
+};
+
+struct ggml_cuda_trace_storage {
+    std::mutex mutex;
+    std::unordered_map<ggml_backend_cuda_context *, std::unique_ptr<ggml_cuda_trace_pool>> pools;
+};
+
+static ggml_cuda_trace_storage & ggml_cuda_trace_pools() {
+    static ggml_cuda_trace_storage storage;
+    return storage;
+}
+
+static const ggml_tensor * ggml_cuda_trace_graph_node(const ggml_cgraph * graph) {
+    const ggml_tensor * first = graph->n_nodes ? graph->nodes[0] : nullptr;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * node = graph->nodes[i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_REMOTE_ATTN) return node;
+        if (first && first->op == GGML_OP_NONE && (node->flags & GGML_TENSOR_FLAG_COMPUTE)) first = node;
+    }
+    return first;
+}
+
+static void ggml_cuda_trace_counter(const char * phase, const ggml_cgraph * graph,
+                                    uint64_t value = 1, uint32_t flags = 0) {
+    if (!ggml_remote_attn_trace_enabled()) return;
+    auto event = ggml_remote_attn_trace_identity(phase, ggml_cuda_trace_graph_node(graph));
+    event.graph_uid = graph->uid;
+    event.begin_us = event.end_us = ggml_time_us();
+    event.value = value;
+    event.flags |= flags;
+    ggml_remote_attn_trace_record(&event);
+}
+
+static void ggml_cuda_trace_error(ggml_cuda_trace_pool & pool,
+                                  const ggml_remote_attn_trace_event & context, cudaError_t status) {
+    pool.disabled = true;
+    auto event = context;
+    std::snprintf(event.phase, sizeof(event.phase), "cuda_local_profile_error");
+    event.end_us = ggml_time_us();
+    event.value = uint64_t(status);
+    event.flags |= 1u;
+    ggml_remote_attn_trace_record(&event);
+}
+
+// Caller holds profiling storage mutex and has selected pool.device. This is
+// one bounded pass, with no retry or synchronization for incomplete events.
+static void ggml_cuda_trace_collect_locked(ggml_cuda_trace_pool & pool) {
+    for (auto & pair : pool.pairs) {
+        if (!pair.busy || !pair.ended) continue;
+        const cudaError_t status = cudaEventQuery(pair.end);
+        if (status == cudaErrorNotReady) continue;
+        if (status != cudaSuccess) {
+            ggml_cuda_trace_error(pool, pair.event, status);
+            pair.busy = false;
+            continue;
+        }
+        float elapsed_ms = 0;
+        const cudaError_t elapsed = cudaEventElapsedTime(&elapsed_ms, pair.begin, pair.end);
+        if (elapsed == cudaSuccess) {
+            pair.event.end_us = ggml_time_us(); // completion observation, not a GPU clock conversion
+            pair.event.gpu_us = double(elapsed_ms) * 1000.0;
+            ggml_remote_attn_trace_record(&pair.event);
+        } else {
+            ggml_cuda_trace_error(pool, pair.event, elapsed);
+        }
+        pair.busy = false;
+    }
+}
+
+static void ggml_cuda_trace_collect(ggml_backend_cuda_context * ctx, bool release = false) {
+    if (!ggml_remote_attn_trace_enabled()) return;
+    auto & storage = ggml_cuda_trace_pools();
+    std::lock_guard<std::mutex> lock(storage.mutex);
+    const auto found = storage.pools.find(ctx);
+    if (found == storage.pools.end()) return;
+    auto & pool = *found->second;
+    int previous;
+    if (cudaGetDevice(&previous) != cudaSuccess) return;
+    const bool switched = previous != pool.device;
+    if (switched && cudaSetDevice(pool.device) != cudaSuccess) return;
+    ggml_cuda_trace_collect_locked(pool);
+    if (release) {
+        uint64_t pending = 0;
+        for (auto & pair : pool.pairs) {
+            pending += pair.busy;
+            // CUDA defers destruction of an event still being used by a
+            // stream. No host wait is added at backend destruction.
+            if (pair.begin) cudaEventDestroy(pair.begin);
+            if (pair.end) cudaEventDestroy(pair.end);
+        }
+        auto event = ggml_remote_attn_trace_identity("cuda_local_timing_status", nullptr);
+        event.begin_us = event.end_us = ggml_time_us();
+        event.value = pool.dropped;
+        ggml_remote_attn_trace_record(&event);
+        if (pending) {
+            std::snprintf(event.phase, sizeof(event.phase), "cuda_local_timing_unresolved");
+            event.value = pending;
+            event.flags |= 1u;
+            ggml_remote_attn_trace_record(&event);
+        }
+        storage.pools.erase(found);
+    }
+    if (switched) cudaSetDevice(previous);
+}
+
+struct ggml_cuda_trace_local_span {
+    ggml_backend_cuda_context * ctx;
+    int index = -1;
+    explicit ggml_cuda_trace_local_span(ggml_backend_cuda_context * context, const ggml_cgraph * graph)
+        : ctx(context) {
+        if (!ggml_remote_attn_trace_enabled()) return;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (graph->nodes[i]->op == GGML_OP_REMOTE_ATTN || graph->nodes[i]->op == GGML_OP_KVARN_SPLIT_FUSED) return;
+        }
+        auto & storage = ggml_cuda_trace_pools();
+        std::lock_guard<std::mutex> lock(storage.mutex);
+        auto found = storage.pools.find(ctx);
+        if (found == storage.pools.end()) {
+            auto pool = std::unique_ptr<ggml_cuda_trace_pool>(new (std::nothrow) ggml_cuda_trace_pool);
+            if (!pool || cudaGetDevice(&pool->device) != cudaSuccess) return;
+            found = storage.pools.emplace(ctx, std::move(pool)).first;
+        }
+        auto & pool = *found->second;
+        ggml_cuda_trace_collect_locked(pool);
+        if (pool.disabled) return;
+        for (size_t i = 0; i < pool.pairs.size(); ++i) {
+            auto & pair = pool.pairs[i];
+            if (pair.busy) continue;
+            pair.event = ggml_remote_attn_trace_identity("cuda_local_span_gpu", ggml_cuda_trace_graph_node(graph));
+            pair.event.graph_uid = graph->uid;
+            pair.event.begin_us = ggml_time_us();
+            pair.event.flags |= 0x80000000u;
+            if (!pair.begin || !pair.end) {
+                cudaError_t status = pair.begin ? cudaSuccess : cudaEventCreate(&pair.begin);
+                if (status == cudaSuccess && !pair.end) status = cudaEventCreate(&pair.end);
+                if (status != cudaSuccess) { ggml_cuda_trace_error(pool, pair.event, status); return; }
+            }
+            pair.stream = ctx->stream();
+            const cudaError_t status = cudaEventRecord(pair.begin, pair.stream);
+            if (status != cudaSuccess) { ggml_cuda_trace_error(pool, pair.event, status); return; }
+            pair.busy = true;
+            pair.ended = false;
+            index = int(i);
+            return;
+        }
+        ++pool.dropped;
+        ggml_cuda_trace_counter("cuda_local_timing_drop", graph, 1);
+    }
+    void finish(bool ok, uint64_t mode) {
+        if (index < 0) return;
+        auto & storage = ggml_cuda_trace_pools();
+        std::lock_guard<std::mutex> lock(storage.mutex);
+        auto found = storage.pools.find(ctx);
+        if (found == storage.pools.end()) { index = -1; return; }
+        auto & pool = *found->second;
+        auto & pair = pool.pairs[size_t(index)];
+        pair.event.flags |= ok ? 0u : 1u;
+        pair.event.value = mode; // 0 direct, 1 replay, 2 capture+launch
+        const cudaError_t status = cudaEventRecord(pair.end, pair.stream);
+        if (status == cudaSuccess) pair.ended = true;
+        else ggml_cuda_trace_error(pool, pair.event, status);
+        index = -1;
+    }
+    ~ggml_cuda_trace_local_span() { finish(false, 0); }
+};
+#endif
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
+        case GGML_OP_REMOTE_ATTN:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            {
+                // K/V tensor_get must observe their producer. Pack additionally
+                // waits this reusable event rather than synchronizing unrelated
+                // GPU streams. The bridge consumes it before returning.
+                {
+                    ggml_remote_attn_trace_scope timing("cuda_producer_sync", dst);
+                    timing.event.value = ggml_get_op_params_i32(dst, GGML_REMOTE_ATTN_PARAM_WAIT) ? 1u : 0u;
+                    if (cudaStreamSynchronize(ctx.stream()) != cudaSuccess) { timing.event.flags |= 1u; return false; }
+                }
+                ggml_cuda_trace_collect(&ctx);
+                cudaEvent_t producer_event = ggml_cuda_remote_attn_producer_events.get();
+                if (!producer_event || cudaEventRecord(producer_event, ctx.stream()) != cudaSuccess) return false;
+                return ggml_remote_attn_exec_cuda(dst, producer_event);
+            }
+#else
+            return false;
+#endif
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
@@ -2603,7 +2854,11 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_trace_collect(cuda_ctx, true);
+#endif
     delete cuda_ctx;
+    ggml_remote_attn_trace_flush();
     delete backend;
 }
 
@@ -2710,6 +2965,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_trace_collect(cuda_ctx);
+#endif
 
     GGML_UNUSED(backend);
 }
@@ -2735,12 +2993,23 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_NONE;
 }
 
+// Stable trace reason values: zero means graph replay/capture was selected.
+enum ggml_cuda_trace_direct_reason : uint64_t {
+    GGML_CUDA_TRACE_GRAPH = 0, GGML_CUDA_TRACE_COMPILED_OUT = 1,
+    GGML_CUDA_TRACE_ENV = 2, GGML_CUDA_TRACE_ARCH = 3, GGML_CUDA_TRACE_PRESSURE = 4,
+    GGML_CUDA_TRACE_UID_ZERO = 5, GGML_CUDA_TRACE_REMOTE = 6, GGML_CUDA_TRACE_FUSED = 7,
+    GGML_CUDA_TRACE_PAGED = 8, GGML_CUDA_TRACE_MUL_MAT_ID = 9,
+    GGML_CUDA_TRACE_WARMUP = 10, GGML_CUDA_TRACE_CHANGED = 11, GGML_CUDA_TRACE_HIP_PREFILL = 12,
+    GGML_CUDA_TRACE_CAPTURE_FALLBACK = 13,
+};
+
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, uint64_t * trace_reason = nullptr) {
     // A zero UID deliberately means that the graph has no stable identity.
     // Projected meta graphs reuse tensor storage in place, so a first-node
     // pointer plus an incomplete property snapshot cannot make replay safe.
     if (cgraph->uid == 0) {
+        if (trace_reason) *trace_reason = GGML_CUDA_TRACE_UID_ZERO;
         return false;
     }
 
@@ -2761,6 +3030,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_PAGED_ATTN &&
                 node->src[0]->ne[2] > PAGED_ATTN_PARALLEL_MAX_TOKENS) {
             use_cuda_graph = false;
+            if (trace_reason) *trace_reason = GGML_CUDA_TRACE_PAGED;
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -2770,6 +3040,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
+                if (trace_reason) *trace_reason = GGML_CUDA_TRACE_MUL_MAT_ID;
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
@@ -2779,8 +3050,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // The fused position-split span runs a host-driven executor (pinned
         // staging copies + a Vulkan graph submission), so it synchronizes the
         // stream from inside the op; a captured graph would deadlock/error.
-        if (node->op == GGML_OP_KVARN_SPLIT_FUSED) {
+        if (node->op == GGML_OP_KVARN_SPLIT_FUSED || node->op == GGML_OP_REMOTE_ATTN) {
             use_cuda_graph = false;
+            if (trace_reason) *trace_reason = node->op == GGML_OP_REMOTE_ATTN ? GGML_CUDA_TRACE_REMOTE : GGML_CUDA_TRACE_FUSED;
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs for the fused split span\n", __func__);
 #endif
@@ -4617,8 +4889,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key,
+                                                uint64_t * trace_execution_mode = nullptr) {
     bool graph_evaluated_or_captured = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!use_cuda_graph) {
+        if (trace_execution_mode) *trace_execution_mode = 0;
+        ggml_cuda_trace_counter("cuda_graph_direct", cgraph);
+    }
+#endif
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4927,7 +5206,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                        (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
-                        if (ggml_cuda_allows_bufferless_kvarn_src(node, j, node->src[j])) {
+                        // Remote ops intentionally mix CUDA Q/output with CPU
+                        // cache metadata; their executor uses tensor_get for K/V.
+                        if (node->op == GGML_OP_REMOTE_ATTN ||
+                            ggml_cuda_allows_bufferless_kvarn_src(node, j, node->src[j])) {
                             continue;
                         }
                         assert(node->src[j]->buffer);
@@ -4942,6 +5224,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                }
+                if (!ok && node->op == GGML_OP_REMOTE_ATTN) {
+                    // Remote failure poisons its backend; retire concurrent
+                    // CUDA branches before the scheduler may recycle buffers.
+                    // Consumers of invalid remote output must never execute.
+                    cudaDeviceSynchronize();
+                    cuda_ctx->curr_stream_no = 0;
+                    for (auto it = gb10_pool_allocations.rbegin(); it != gb10_pool_allocations.rend(); ++it) {
+                        it->reset();
+                    }
+                    return false;
                 }
                 GGML_ASSERT(ok);
 
@@ -4961,6 +5254,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph->capture_count++;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            ggml_cuda_trace_counter("cuda_graph_capture", cgraph);
+#endif
             ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "capture-complete");
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
@@ -4977,17 +5273,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             if (!ggml_cuda_graph_instantiate(cuda_ctx, graph_key)) {
-                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
-                return;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                ggml_cuda_trace_counter("cuda_graph_fallback", cgraph, GGML_CUDA_TRACE_CAPTURE_FALLBACK);
+#endif
+                return ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key, trace_execution_mode);
             }
         } else if (cuda_graph_update_required) {  // Update graph executable
             if (!ggml_cuda_graph_update_executable(cuda_ctx, graph_key)) {
-                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
-                return;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                ggml_cuda_trace_counter("cuda_graph_fallback", cgraph, GGML_CUDA_TRACE_CAPTURE_FALLBACK);
+#endif
+                return ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key, trace_execution_mode);
             }
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (trace_execution_mode) *trace_execution_mode = cuda_graph_update_required ? 2 : 1;
+        ggml_cuda_trace_counter("cuda_graph_launch", cgraph);
+#endif
         if (cuda_graph_update_required) {
             ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "launch-after-capture");
         }
@@ -5002,6 +5306,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     for (auto it = gb10_pool_allocations.rbegin(); it != gb10_pool_allocations.rend(); ++it) {
         it->reset();
     }
+    return true;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -5028,14 +5333,21 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_remote_attn_trace_scope host_timing("cuda_graph_host", cgraph->n_nodes ? cgraph->nodes[0] : nullptr);
+    host_timing.event.graph_uid = cgraph->uid;
+    host_timing.event.flags |= 0x40000001u; // inclusive host interval; clear failure on success
 
     ggml_cuda_set_device(cuda_ctx->device);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+    uint64_t trace_reason = GGML_CUDA_TRACE_COMPILED_OUT;
 
+    ggml_remote_attn_trace_scope bookkeeping("cuda_graph_bookkeeping", cgraph->n_nodes ? cgraph->nodes[0] : nullptr);
+    bookkeeping.event.graph_uid = cgraph->uid;
 #ifdef USE_CUDA_GRAPH
+    trace_reason = GGML_CUDA_TRACE_WARMUP;
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -5049,11 +5361,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 (int) graph_memory_pressure_ok);
     }
     if (!graph_memory_pressure_ok) {
+        bookkeeping.event.flags |= 1u;
         GGML_LOG_ERROR("%s: CUDA graph memory-pressure cleanup failed; refusing to continue with stale graph resources\n", __func__);
         return GGML_STATUS_FAILED;
     }
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, bookkeeping.enabled ? &trace_reason : nullptr);
         if (graph_compatible) {
             // HIP-only: skip the graph path (incl. the update_required probe) for
             // multi-token (prefill) graphs. Final-tree A/B (27B Q5_K_S, kvarn6,
@@ -5064,6 +5377,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #if defined(GGML_USE_HIP)
             if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
                 use_cuda_graph = false;
+                trace_reason = GGML_CUDA_TRACE_HIP_PREFILL;
             } else {
 #else
             {
@@ -5095,6 +5409,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     graph->warmup_complete = false;
                     graph->warmup_stable_calls = 0;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    trace_reason = GGML_CUDA_TRACE_CHANGED;
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
@@ -5103,7 +5418,38 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } // else: not prefill
         }
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (bookkeeping.enabled) {
+        const bool disabled_env = std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
+        if (use_cuda_graph) trace_reason = GGML_CUDA_TRACE_GRAPH;
+        else if (disabled_env) trace_reason = GGML_CUDA_TRACE_ENV;
+        else if (cuda_ctx->disable_cuda_graphs_due_to_memory_pressure || graph->disable_due_to_memory_pressure)
+            trace_reason = GGML_CUDA_TRACE_PRESSURE;
+        else if (graph->disable_due_to_gpu_arch) trace_reason = GGML_CUDA_TRACE_ARCH;
+        // Existing state only: no additional cudaMemGetInfo is issued by trace.
+        const uint64_t state = uint64_t(disabled_env) |
+            (uint64_t(cuda_ctx->disable_cuda_graphs_due_to_memory_pressure) << 1) |
+            (uint64_t(graph->disable_due_to_gpu_arch) << 2) |
+            (uint64_t(use_cuda_graph) << 3) | (uint64_t(cuda_graph_update_required) << 4);
+        ggml_cuda_trace_counter("cuda_graph_state", cgraph, state);
+    }
+#endif
 #endif // USE_CUDA_GRAPH
+    bookkeeping.event.value = trace_reason;
+    if (bookkeeping.enabled) {
+        bookkeeping.event.end_us = ggml_time_us();
+        ggml_remote_attn_trace_record(&bookkeeping.event);
+        bookkeeping.enabled = false; // stop this scope before any capture/launch
+    }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_trace_counter("cuda_graph_decision", cgraph, trace_reason);
+    // Begin/end events are deliberately outside CUDA capture. Querying old
+    // pairs never waits, and remote host-orchestration graphs have no pair.
+    ggml_cuda_trace_local_span local_span(cuda_ctx, cgraph);
+#endif
+    ggml_remote_attn_trace_scope enqueue_timing("cuda_graph_enqueue", cgraph->n_nodes ? cgraph->nodes[0] : nullptr);
+    enqueue_timing.event.graph_uid = cgraph->uid;
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -5115,9 +5461,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-
-    return GGML_STATUS_SUCCESS;
+    uint64_t execution_mode = 0;
+    const bool ok = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
+                                                       graph_key, host_timing.enabled ? &execution_mode : nullptr);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    local_span.finish(ok, execution_mode);
+#endif
+    enqueue_timing.event.value = execution_mode;
+    if (ok) host_timing.event.flags &= ~1u;
+    else enqueue_timing.event.flags |= 1u;
+    return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_ABORTED;
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -5989,6 +6342,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     switch (op->op) {
+        case GGML_OP_REMOTE_ATTN:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            return ggml_backend_remote_attn_cuda_enabled_for_node(op) && op->type == GGML_TYPE_F32 &&
+                op->src[0] != nullptr && ggml_is_contiguous_rows(op) &&
+                ggml_get_op_params_i32(op, GGML_REMOTE_ATTN_PARAM_RANGE);
+#else
+            return false;
+#endif
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_ABS:
@@ -6820,6 +7181,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_memory_checkpoint;
     }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_interface_v2") == 0) {
+        return (void *)ggml_backend_cuda_remote_attn_fp8_interface_v2;
+    }
     if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_interface_v1") == 0) {
         return (void *)ggml_backend_cuda_remote_attn_fp8_interface;
     }

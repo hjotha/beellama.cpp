@@ -10,6 +10,9 @@ extern "C" {
 
 // CUDA proc "ggml_backend_cuda_remote_attn_fp8_interface_v1"
 // Host-side CUDA FP8 acceleration for Phase 3 hybrid attention.
+// All operations are synchronous, including error retirement. A supplied stream
+// must contain the Q producer dependency; nullptr conservatively synchronizes
+// the Q device. On false, output is invalid and must not be consumed/transmitted.
 struct ggml_remote_attn_cuda_fp8_interface {
     // Pack Q float/half to compact FP8 E5M2 RNE directly on GPU.
     // If src_q is in VRAM, packs directly on GPU before D2H to pinned dst_pinned_fp8.
@@ -55,6 +58,31 @@ struct ggml_remote_attn_cuda_fp8_interface {
 };
 
 typedef const struct ggml_remote_attn_cuda_fp8_interface * (*ggml_backend_cuda_remote_attn_fp8_interface_v1_t)(void);
+
+
+// CUDA proc "ggml_backend_cuda_remote_attn_fp8_interface_v2".
+// One context per async slot. Calls complete all CUDA work before returning,
+// including on error; callers retain their input/output buffers until return.
+// On false, output is invalid and must not be consumed or transmitted.
+struct ggml_remote_attn_cuda_fp8_interface_v2 {
+    // CUDA device owning ptr; -1 for CPU memory, -2 for unsupported pointers.
+    // Managed allocations are deliberately unsupported by this wire fast path.
+    int (*device_for_pointer)(const void * ptr);
+    void * (*create_context)(int device);
+    void (*destroy_context)(void * context);
+    // producer_event is an already-recorded CUDA event. With nullptr, synchronize
+    // the source device before reading Q. This conservative fallback preserves
+    // producer ordering even when the caller does not own its GGML CUDA stream.
+    bool (*pack_q)(void * context, const void * src_q, bool is_f16,
+                   size_t n_elements, uint8_t * dst_pinned_fp8, void * producer_event);
+    bool (*unpack_out)(void * context, const uint8_t * src_pinned_fp8,
+                       const float * src_lse, size_t nq, size_t out_width, size_t n_head,
+                       void * dst_out, size_t dst_stride_bytes);
+    void * (*alloc_pinned)(size_t bytes);
+    void (*free_pinned)(void * ptr);
+};
+typedef const struct ggml_remote_attn_cuda_fp8_interface_v2 *
+    (*ggml_backend_cuda_remote_attn_fp8_interface_v2_t)(void);
 
 #ifdef __cplusplus
 }

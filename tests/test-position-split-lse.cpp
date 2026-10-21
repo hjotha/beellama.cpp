@@ -12,11 +12,13 @@
 //
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "llama-position-split-merge.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -361,6 +363,98 @@ static void test_merge_e2e() {
     CHECK(mx <= 1e-2f);
 }
 
+// Exercise the actual non-RPC graph's maximum selector, followed by its
+// unchanged merge arithmetic. The old [-1e6,1e30] clamp zeroed BOTH weights
+// at -2097152, and overflowed weights for finite LSEs above 1e30.
+static void test_merge_lse_extremes() {
+    g_current = "merge_lse_extremes";
+    const float max_f32 = std::numeric_limits<float>::max();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    const float pairs[][2] = {
+        {-2097152.0f, -2097152.0f},
+        {-2097152.0f, -2097153.0f},
+        {-2097153.0f, -2097152.0f},
+        {max_f32, max_f32},
+        {-max_f32, -max_f32},
+        {max_f32, -max_f32},
+        {-max_f32, max_f32},
+        {max_f32, std::nextafter(max_f32, 0.0f)},
+        {2e30f, 2e30f},
+        {3.0f, -4.0f},
+        {-inf, -2097152.0f},
+        {-2097152.0f, -inf},
+        {-inf, -max_f32},
+        {-max_f32, -inf},
+        {-inf, -inf},
+        {nan, 0.0f}, {0.0f, nan}, {nan, nan},
+        {inf, 0.0f}, {0.0f, inf}, {inf, inf},
+    };
+    const int64_t count = sizeof(pairs) / sizeof(pairs[0]);
+    ggml_context * ctx = ggml_init({1u << 20, nullptr, false});
+    CHECK(ctx != nullptr);
+    if (!ctx) return;
+    auto * lse1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, count);
+    auto * lse2 = ggml_dup_tensor(ctx, lse1);
+    auto * o1 = ggml_dup_tensor(ctx, lse1);
+    auto * o2 = ggml_dup_tensor(ctx, lse1);
+    for (int64_t i = 0; i < count; ++i) {
+        static_cast<float *>(lse1->data)[i] = pairs[i][0];
+        static_cast<float *>(lse2->data)[i] = pairs[i][1];
+        // Nonzero, unequal values expose a lost or incorrect range weight.
+        static_cast<float *>(o1->data)[i] = 2.0f;
+        static_cast<float *>(o2->data)[i] = 6.0f;
+    }
+    auto * mx = llama_position_split_lse_max(ctx, lse1, lse2);
+    auto * e1 = ggml_exp(ctx, ggml_sub(ctx, lse1, mx));
+    auto * e2 = ggml_exp(ctx, ggml_sub(ctx, lse2, mx));
+    auto * den = ggml_add(ctx, e1, e2);
+    auto * num = ggml_add(ctx, ggml_mul(ctx, o1, e1), ggml_mul(ctx, o2, e2));
+    auto * out = ggml_div(ctx, num, den);
+    auto * lse = ggml_add(ctx, mx, ggml_log(ctx, den));
+    auto * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_build_forward_expand(gf, lse);
+    CHECK(ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS);
+    for (int64_t i = 0; i < count; ++i) {
+        const float a = pairs[i][0], b = pairs[i][1];
+        const float got_o = static_cast<float *>(out->data)[i];
+        const float got_lse = static_cast<float *>(lse->data)[i];
+        const float got_max = static_cast<float *>(mx->data)[i];
+        if (std::isnan(a) || std::isnan(b)) {
+            CHECK(std::isnan(got_o));
+            CHECK(std::isnan(got_lse));
+            continue;
+        }
+        if (a == inf || b == inf) {
+            CHECK(!std::isfinite(got_o));
+            CHECK(!std::isfinite(got_lse));
+            continue;
+        }
+        if (a == -inf && b == -inf) {
+            // Preserve this path's existing unsupported both-empty behavior;
+            // it must not disguise an invalid merge as a finite activation.
+            CHECK(std::isnan(got_o));
+            CHECK(got_lse == -inf);
+            continue;
+        }
+        const double ref_max = std::max(double(a), double(b));
+        const double w1 = std::exp(double(a) - ref_max);
+        const double w2 = std::exp(double(b) - ref_max);
+        const float ref_o = float((2.0 * w1 + 6.0 * w2) / (w1 + w2));
+        const float ref_lse = float(ref_max + std::log(w1 + w2));
+        CHECK(std::isfinite(got_o));
+        CHECK(std::isfinite(got_lse));
+        CHECK(got_max == float(ref_max));
+        CHECK(std::fabs(got_o - ref_o) <= 1e-6f);
+        CHECK(got_lse == ref_lse);
+        CHECK((static_cast<float *>(e1->data)[i] == 1.0f) ||
+              (static_cast<float *>(e2->data)[i] == 1.0f));
+    }
+    std::printf("  non-RPC merge: %lld extreme/empty/invalid LSE pairs\n", (long long) count);
+    ggml_free(ctx);
+}
+
 int main() {
     fa_case c;
     test_one(c, "decode_q1_f16_causal");
@@ -383,6 +477,7 @@ int main() {
     c.D = 256;
     test_one(c, "decode_q1_d256_f16");
     test_merge_e2e();
+    test_merge_lse_extremes();
     std::printf("position-split-lse: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

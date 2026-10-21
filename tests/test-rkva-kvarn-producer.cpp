@@ -12,7 +12,7 @@
 #include <cstdio>
 #include <limits>
 
-static void test_precision_tail(uint32_t precision_tail) {
+static void test_precision_tail(uint32_t precision_tail, bool compact_stage = false) {
     constexpr uint32_t origin = 1024, capacity = 640, heads = 1, count = 513;
     constexpr size_t width = heads * 256, physical_heads = heads * 2, record = 8960;
     auto * reg = ggml_backend_cpu_reg();
@@ -61,7 +61,7 @@ static void test_precision_tail(uint32_t precision_tail) {
     current->data = values.data(); stage->data = expected_sv.data(); records->data = expected_rv.data();
     assert(store(vstore));
 
-    rkva_kvarn_producer producer(origin, capacity, heads, 3, store, precision_tail);
+    rkva_kvarn_producer producer(origin, capacity, heads, 3, store, precision_tail, compact_stage);
     std::vector<uint8_t> image_rk((capacity + 127) / 128 * physical_heads * record), image_rv(image_rk.size());
     std::vector<ggml_fp16_t> image_sk(384 * width), image_sv(image_sk.size());
     std::vector<ggml_fp16_t> image_tk(128 * width), image_tv(image_tk.size());
@@ -76,7 +76,8 @@ static void test_precision_tail(uint32_t precision_tail) {
         assert(packet.size() >= sizeof(u)); std::memcpy(&u, packet.data(), sizeof(u));
         assert(u.live_count == previous + n && u.record_begin == previous / 128);
         assert(u.record_groups == u.live_count / 128 - previous / 128);
-        assert(u.flags == (previous == 0 ? 1u : 0u));
+        assert(u.flags == ((previous == 0 ? 1u : 0u) |
+            (compact_stage ? RKVA_KVARN_UPLOAD_OMIT_STAGE : 0u)));
         size_t offset = sizeof(u);
         const auto take = [&](void * destination, size_t bytes) {
             assert(offset + bytes <= packet.size());
@@ -85,8 +86,8 @@ static void test_precision_tail(uint32_t precision_tail) {
         const size_t record_bytes = size_t(u.record_groups) * physical_heads * record;
         take(image_rk.data() + size_t(u.record_begin) * physical_heads * record, record_bytes);
         take(image_rv.data() + size_t(u.record_begin) * physical_heads * record, record_bytes);
-        for (auto * image : {&image_sk, &image_sv}) {
-            if (u.flags) take(image->data(), image->size() * 2);
+        if (!compact_stage) for (auto * image : {&image_sk, &image_sv}) {
+            if (u.flags & RKVA_KVARN_UPLOAD_RESET) take(image->data(), image->size() * 2);
             else for (uint32_t t = previous; t < u.live_count; ++t) {
                 const uint32_t g = (origin + t) / 128;
                 const uint32_t slot = g == 0 ? 0 : 1 + (g - 1) % 2;
@@ -94,7 +95,7 @@ static void test_precision_tail(uint32_t precision_tail) {
             }
         }
         if (precision_tail) for (auto * image : {&image_tk, &image_tv}) {
-            const uint32_t start = u.flags ? u.live_count - std::min(u.live_count, 128u) : previous;
+            const uint32_t start = (u.flags & RKVA_KVARN_UPLOAD_RESET) ? u.live_count - std::min(u.live_count, 128u) : previous;
             for (uint32_t t = start; t < u.live_count; ++t) {
                 take(image->data() + size_t(t % 128) * width, width * 2);
             }
@@ -103,7 +104,7 @@ static void test_precision_tail(uint32_t precision_tail) {
         previous += n;
     }
     assert(previous == count && producer.rows() == count);
-    assert(image_sk == expected_sk && image_sv == expected_sv);
+    if (!compact_stage) assert(image_sk == expected_sk && image_sv == expected_sv);
     const size_t begin = size_t(origin / 128) * physical_heads * record;
     const size_t committed = size_t(count / 128) * physical_heads * record;
     assert(std::memcmp(image_rk.data(), expected_rk.data() + begin, committed) == 0);
@@ -116,7 +117,7 @@ static void test_precision_tail(uint32_t precision_tail) {
     // CPU store over the accepted prefix plus different regenerated F32 rows.
     for (const auto boundary : {std::pair<uint32_t, uint32_t>{129, 127}, {256, 128}, {257, 129}, {385, 257}}) {
         const uint32_t old = boundary.first, keep = boundary.second;
-        rkva_kvarn_producer trial(origin, capacity, heads, 3, store, precision_tail);
+        rkva_kvarn_producer trial(origin, capacity, heads, 3, store, precision_tail, compact_stage);
         for (uint32_t begin = 0; begin < old;) {
             const uint32_t n = std::min(128u, old - begin);
             assert(trial.append(keys.data() + size_t(begin) * width, values.data() + size_t(begin) * width,
@@ -191,7 +192,114 @@ static void test_precision_tail(uint32_t precision_tail) {
     std::puts("PASS native KVarN4 original-F32 producer, canonical CPU record bytes, wire stage/tail wrap, bounded original-F32 rewind/reseal, stale wire counts, refused replay/NaN");
 }
 
+static void test_compact_stage_gates() {
+    auto store = reinterpret_cast<ggml_backend_cpu_kvarn_store_direct_v1_t>(
+        ggml_backend_reg_get_proc_address(ggml_backend_cpu_reg(),
+            "ggml_backend_cpu_kvarn_store_direct_v1"));
+    assert(store);
+    std::vector<float> k(256, 0.25f), v(256, -0.5f);
+    for (uint32_t origin : {0u, 1024u}) {
+        for (uint32_t tail : {0u, 128u}) {
+            for (bool negotiated : {false, true}) {
+                rkva_kvarn_producer producer(origin, 256, 1, 3, store, tail, negotiated);
+                const int32_t pos = int32_t(origin);
+                std::vector<uint8_t> packet;
+                assert(producer.append(k.data(), v.data(), &pos, 1, true, packet));
+                rkva_kvarn_range_upload u;
+                std::memcpy(&u, packet.data(), sizeof(u));
+                const bool compact = negotiated && origin >= 128 && tail == 128;
+                assert(bool(u.flags & RKVA_KVARN_UPLOAD_OMIT_STAGE) == compact);
+                const size_t row_bytes = 256 * sizeof(ggml_fp16_t);
+                assert(packet.size() == sizeof(u) + 2 * row_bytes *
+                    ((compact ? 0u : 384u) + (tail ? 1u : 0u)));
+            }
+        }
+    }
+    std::puts("PASS compact-stage negotiation fallback, global sink and tail-zero gates");
+}
+
+static void test_append_scratch_reuse() {
+    auto store = reinterpret_cast<ggml_backend_cpu_kvarn_store_direct_v1_t>(
+        ggml_backend_reg_get_proc_address(ggml_backend_cpu_reg(),
+            "ggml_backend_cpu_kvarn_store_direct_v1"));
+    assert(store);
+    constexpr uint32_t origin = 1024, capacity = 1024, width = 256;
+    std::vector<float> k(size_t(capacity) * width), v(k.size());
+    std::vector<int32_t> positions(capacity);
+    for (uint32_t t = 0; t < capacity; ++t) {
+        positions[t] = int32_t(origin + t);
+        for (uint32_t d = 0; d < width; ++d) {
+            k[size_t(t) * width + d] = std::sin(float(t * 7 + d) * 0.01f);
+            v[size_t(t) * width + d] = std::cos(float(t + d * 3) * 0.02f);
+        }
+    }
+    for (bool compact : {false, true}) {
+        for (const uint32_t shape : {1u, 8u, 9u, 128u, 256u}) {
+            rkva_kvarn_producer producer(origin, capacity, 1, 3, store, 128, compact);
+            assert(producer.append_scratch_grows() == 0);
+            assert(producer.append_scratch_capacity_bytes() == 0);
+            std::vector<uint8_t> packet;
+            const size_t before_bytes = producer.host_bytes();
+            // Warm the maximum production shape before replaying smaller
+            // segment/query counts; this is not a whole-path allocation claim.
+            assert(producer.append(k.data(), v.data(), positions.data(), 256, true, packet));
+            const size_t warm_growth = producer.append_scratch_grows();
+            const size_t scratch_bytes = producer.append_scratch_capacity_bytes();
+            assert(warm_growth == 2);
+            assert(scratch_bytes >= 2 * size_t(256) * width * sizeof(ggml_fp16_t));
+            assert(producer.host_bytes() == before_bytes + scratch_bytes);
+            uint32_t begin = 256;
+            for (uint32_t repeat = 0; repeat < 3; ++repeat) {
+                assert(producer.append(k.data() + size_t(begin) * width,
+                    v.data() + size_t(begin) * width, positions.data() + begin,
+                    shape, false, packet));
+                assert(producer.append_scratch_grows() == warm_growth);
+                assert(producer.append_scratch_capacity_bytes() == scratch_bytes);
+                rkva_kvarn_range_upload header{};
+                std::memcpy(&header, packet.data(), sizeof(header));
+                assert(header.live_count == begin + shape);
+                assert(header.append_rows == shape);
+                const size_t records_bytes = size_t(header.record_groups) * 2 * 8960 * 2;
+                const size_t new_rows_bytes = size_t(shape) * width * sizeof(ggml_fp16_t);
+                assert(packet.size() == sizeof(header) + records_bytes +
+                    2 * new_rows_bytes * (compact ? 1 : 2));
+                // The original-domain tail is always the last two sections.
+                // A smaller shape must not emit a prior larger scratch suffix.
+                const size_t tail_offset = packet.size() - 2 * new_rows_bytes;
+                for (size_t kind = 0; kind < 2; ++kind) {
+                    const auto & source = kind ? v : k;
+                    for (size_t e = 0; e < size_t(shape) * width; ++e) {
+                        ggml_fp16_t actual;
+                        std::memcpy(&actual, packet.data() + tail_offset + kind * new_rows_bytes +
+                            e * sizeof(actual), sizeof(actual));
+                        assert(actual == ggml_fp32_to_fp16(source[size_t(begin) * width + e]));
+                    }
+                }
+                begin += shape;
+            }
+            // Rewind can internally append a smaller incomplete group. It must
+            // preserve the high-water buffers and produce the same reseal bytes
+            // already checked independently by test_precision_tail().
+            const uint32_t keep = begin - std::min(shape, 128u);
+            assert(producer.rewind(keep));
+            assert(producer.append_scratch_grows() == warm_growth);
+            assert(producer.append_scratch_capacity_bytes() == scratch_bytes);
+            assert(producer.append(k.data() + size_t(keep) * width,
+                v.data() + size_t(keep) * width, positions.data() + keep,
+                begin - keep, false, packet));
+            assert(producer.rows() == begin);
+            assert(producer.append_scratch_grows() == warm_growth);
+            assert(producer.append_scratch_capacity_bytes() == scratch_bytes);
+            std::printf("PASS append scratch compact=%d shape=%u warm_growth=%zu post_warmup_growth=%zu retained_bytes=%zu\n",
+                int(compact), shape, warm_growth, producer.append_scratch_grows() - warm_growth, scratch_bytes);
+        }
+    }
+}
+
 int main() {
+    test_compact_stage_gates();
     test_precision_tail(0);
     test_precision_tail(128);
+    test_precision_tail(128, true);
+    test_append_scratch_reuse();
 }

@@ -65,6 +65,10 @@ static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8 = 1ull << 10;
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_SPLITZIP = 1ull << 11;
 // Codec revision: Q rounds directly from F32; finite Q/O saturate, ties to even.
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8_RNE = 1ull << 12;
+// Upload flag OMIT_STAGE is supported for serial-prefix overflow with an exact 128-row tail.
+static constexpr uint64_t RKVA_CAP_KVARN_COMPACT_STAGE = 1ull << 13;
+static constexpr uint32_t RKVA_KVARN_UPLOAD_RESET = 1u;
+static constexpr uint32_t RKVA_KVARN_UPLOAD_OMIT_STAGE = 2u;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;
@@ -261,7 +265,11 @@ struct rkva_kvarn_range_config {
 // then K stage rows, V stage rows, K precision tail rows, V precision tail rows.
 // RESET snapshots contain all 3*128 physical stage rows and
 // min(live_count,precision_tail_tokens) chronological original-domain tail rows.
-// Append payloads contain append_rows stage and tail rows at positions
+// When COMPACT_STAGE was negotiated, OMIT_STAGE may omit both stage planes only
+// with descriptor revision 3, origin >= 128 and precision_tail_tokens == 128.
+// Every incomplete group is then entirely covered by the exact tail, and no
+// global group-0 sink can read stage. Records and all per-prefix tail rows stay.
+// Append payloads otherwise contain append_rows stage and tail rows at positions
 // [append_begin,live_count); the server maps these to canonical stage/tail rings.
 // RESET_SNAPSHOT flag=1: discard history and rebuild with record_begin=0.
 // Otherwise live_count may only advance, and records must extend the existing

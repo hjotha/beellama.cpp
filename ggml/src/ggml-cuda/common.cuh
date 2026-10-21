@@ -1306,6 +1306,15 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // Estimate only new physical memory for simultaneously live allocations in
+    // this exact order. The caller must own this pool while planning/allocating.
+    // No allocation, CUDA call or mutation is performed. Unknown pool policies
+    // retain the caller's conservative free-memory-only path.
+    virtual bool allocation_growth(const size_t * sizes, size_t n, size_t & bytes) const {
+        GGML_UNUSED_VARS(sizes, n, bytes);
+        return false;
+    }
 };
 
 template<typename T>

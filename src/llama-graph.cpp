@@ -20,6 +20,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-paged.h"
 #include "llama-memory-recurrent.h"
+#include "llama-position-split-merge.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -5042,6 +5043,8 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
     auto * range = ggml_remote_attn_range(ctx0, q_cur, k_written, v_written,
             inp->self_overflow_cell_idxs, positions, remote_layer,
             cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
+    const bool cuda_wire = ggml_backend_remote_attn_cuda_enabled_for_node(range);
+    ggml_backend_t wire_backend = cuda_wire ? backend_cuda : backend_cpu;
     if (ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
         // Preserve original projected values as independent graph operands.
         // The Q4/Q8 companion above remains metadata/bookkeeping only for this
@@ -5050,7 +5053,7 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
         auto * native_v = ggml_cont(ctx0, v_cur);
         ggml_remote_attn_range_set_native_sources(range, native_k, native_v);
     }
-    ggml_backend_sched_set_tensor_backend(sched, range, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, range, wire_backend);
     if (async_overlap) {
         // Submit the ordered remote bulk RPC before the local CUDA attention
         // cluster, then join it at the wait node just before the LSE merge.
@@ -5191,15 +5194,15 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc(
         // Completion point: blocks only when the LSE merge consumes the remote
         // OUT/LSE. It is emitted after the local CUDA cluster and before merge.
         range_wait = ggml_remote_attn_range_wait(ctx0, range);
-        ggml_backend_sched_set_tensor_backend(sched, range_wait, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, range_wait, wire_backend);
         remote_source = range_wait;
     }
     const int64_t width = q_cur->ne[0]*q_cur->ne[1];
     auto * o2 = ggml_cont(ctx0, ggml_view_2d(ctx0, remote_source, width, q_cur->ne[2], remote_source->nb[1], 0));
     auto * lse2 = ggml_cont(ctx0, ggml_view_2d(ctx0, remote_source, q_cur->ne[1], q_cur->ne[2],
             remote_source->nb[1], size_t(width)*sizeof(float)));
-    ggml_backend_sched_set_tensor_backend(sched, o2, backend_cpu);
-    ggml_backend_sched_set_tensor_backend(sched, lse2, backend_cpu);
+    ggml_backend_sched_set_tensor_backend(sched, o2, wire_backend);
+    ggml_backend_sched_set_tensor_backend(sched, lse2, wire_backend);
     if (std::getenv("F4_NODE_DUMP") != nullptr) {
         cb(q_cur, "diag_query", il);
         cb(fa1, "diag_local_fa", il);
@@ -6241,11 +6244,7 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     GGML_ASSERT(o2->ne[0] == head_dim*n_qh && o2->ne[1] == n_q*n_b);
     ggml_tensor * o1_4d = ggml_reshape_4d(ctx0, o1, head_dim, n_qh, n_q, n_b);
     ggml_tensor * o2_4d = ggml_reshape_4d(ctx0, o2, head_dim, n_qh, n_q, n_b);
-    ggml_tensor * c1 = ggml_clamp(ctx0, lse1, -1e6f, 1e30f);
-    ggml_tensor * c2 = ggml_clamp(ctx0, lse2, -1e6f, 1e30f);
-    ggml_tensor * mx = ggml_scale(ctx0,
-            ggml_add(ctx0, ggml_add(ctx0, c1, c2), ggml_abs(ctx0, ggml_sub(ctx0, c1, c2))),
-            0.5f);
+    ggml_tensor * mx = llama_position_split_lse_max(ctx0, lse1, lse2);
     ggml_tensor * e1 = ggml_exp(ctx0, ggml_sub(ctx0, lse1, mx));
     ggml_tensor * e2 = ggml_exp(ctx0, ggml_sub(ctx0, lse2, mx));
     ggml_tensor * w1 = ggml_reshape_4d(ctx0, e1, 1, n_qh, n_q, n_b);

@@ -3,6 +3,8 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-kvarn-case-decl.cuh"
 #include "fattn-mma-kvarn-impl.cuh"
+#include "pool-allocation-plan.h"
+#include "ggml-remote-attn-trace.h"
 
 #include <atomic>
 
@@ -369,8 +371,13 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const size_t partial_fixup_f2 = (size_t) ntiles_dst * (2 * ncols + ncols * (DV / 2));
     int window_chunk = ggml_cuda_fattn_kvarn_window_chunk(dst, plan.n_kv);
 
-    // K/V scratch and the partial merge buffer must fit at the same time.
-    // Keep graph recovery headroom and a little space for pool descriptors.
+    // Account for all simultaneously live allocations in their real order.
+    // cudaMemGetInfo excludes reusable resident pool blocks; charging those a
+    // second time shrinks the window at each capture and can force the much
+    // slower descriptor-native MMA route even though the pool already fits it.
+    size_t planned_growth = 0;
+    size_t physical_budget = 0;
+    bool used_pool_plan = false;
     {
         size_t free_bytes = 0, total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
@@ -382,21 +389,89 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             if (free_bytes > (1ull << 30)) {
                 safety_bytes = std::max<size_t>(safety_bytes, 130ull * 1024 * 1024);
             }
-            const size_t reserve_bytes = partial_bytes + safety_bytes;
-            const size_t scratch_per_token =
-                (size_t) 2 * plan.n_kv_heads * plan.n_stream * std::max(DKQ, DV) * sizeof(half);
-            const size_t alloc_per_token = scratch_per_token * 105 / 100 + 64;
-            const size_t max_chunk = free_bytes > reserve_bytes && alloc_per_token > 0 ?
-                (free_bytes - reserve_bytes) / alloc_per_token : 0;
-            if (max_chunk < 256) {
-                return false;
+            physical_budget = free_bytes > safety_bytes ? free_bytes - safety_bytes : 0;
+            auto trace_budget = [&](const char * phase, size_t bytes, size_t value, uint32_t flags = 0) {
+                if (ggml_remote_attn_trace_enabled()) {
+                    auto event = ggml_remote_attn_trace_identity(phase, dst);
+                    event.begin_us = event.end_us = ggml_time_us();
+                    event.nq = uint32_t(Q->ne[1]);
+                    event.bytes = bytes;
+                    event.value = value;
+                    event.flags = flags;
+                    ggml_remote_attn_trace_record(&event);
+                }
+            };
+            trace_budget("cuda_kvarn_window_budget", free_bytes, physical_budget);
+
+            auto growth_for_chunk = [&](int chunk, size_t & growth) {
+                const size_t n_desc = (size_t) plan.n_stream * plan.n_kv_heads;
+                size_t requests[6];
+                if (!ggml_cuda_pool_plan::multiply(n_desc, sizeof(ggml_cuda_fattn_kvarn_desc), requests[0]) ||
+                    !ggml_cuda_pool_plan::multiply(n_desc, (size_t) chunk, requests[2]) ||
+                    !ggml_cuda_pool_plan::multiply(requests[2], DKQ * sizeof(half), requests[2]) ||
+                    !ggml_cuda_pool_plan::multiply(n_desc, (size_t) chunk, requests[3]) ||
+                    !ggml_cuda_pool_plan::multiply(requests[3], DV * sizeof(half), requests[3]) ||
+                    !ggml_cuda_pool_plan::multiply((size_t) n_rows, sizeof(float2), requests[5])) {
+                    return false;
+                }
+                requests[1] = requests[0];
+                requests[4] = partial_bytes;
+                // The single-window partial/finalize path does not allocate acc_meta.
+                return pool.allocation_growth(requests, chunk >= plan.n_kv ? 5 : 6, growth);
+            };
+
+            // The >=512/no-LSE single-window branch delegates to launch_fattn,
+            // whose extra workspace is not described by this six-request plan.
+            const bool opaque_single_window = window_chunk >= plan.n_kv &&
+                Q->ne[1] >= 512 && !ggml_cuda_fattn_lse_requested(dst);
+            bool known_plan = !opaque_single_window && growth_for_chunk(window_chunk, planned_growth);
+            bool fits = known_plan && planned_growth <= physical_budget;
+            bool bounded_search = window_chunk <= GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK;
+            trace_budget("cuda_kvarn_window_requested", known_plan ? planned_growth : 0,
+                         (size_t) window_chunk, known_plan ? 0 : 2);
+            if (known_plan && !fits && bounded_search) {
+                // BestFit is not monotonic in request size. Check every smaller
+                // 256-token candidate, largest first (at most256 by default).
+                for (int candidate = ((window_chunk - 1) / 256) * 256;
+                        candidate >= 256; candidate -= 256) {
+                    if (!growth_for_chunk(candidate, planned_growth)) {
+                        known_plan = false;
+                        break;
+                    }
+                    if (planned_growth <= physical_budget) {
+                        window_chunk = candidate;
+                        fits = true;
+                        break;
+                    }
+                }
             }
-            if (max_chunk < (size_t) window_chunk) {
-                // The chunked-merge path requires a multiple of the 256-token tile.
-                const size_t aligned = (max_chunk / 256) * 256;
-                GGML_LOG_DEBUG("%s: capping KVARN window chunk %d -> %zu (free %.0f MiB, scratch %zu B/token)\n",
-                        __func__, window_chunk, aligned, free_bytes / 1024.0 / 1024.0, scratch_per_token);
-                window_chunk = (int) aligned;
+            if (known_plan && (fits || bounded_search)) {
+                trace_budget("cuda_kvarn_window_choice", planned_growth,
+                             fits ? (size_t) window_chunk : 0, fits ? 0 : 1);
+                if (!fits) {
+                    return false;
+                }
+                used_pool_plan = true;
+            } else {
+                // Unknown pool/single-window workspace or an oversized explicit
+                // override: retain the old conservative selection. Do not turn
+                // an override into an unbounded host search or silently cap it.
+                GGML_LOG_DEBUG("%s: using conservative free-memory budget (chunk=%d, known_plan=%d, opaque=%d)\n",
+                        __func__, window_chunk, int(known_plan), int(opaque_single_window));
+                const size_t reserve_bytes = partial_bytes + safety_bytes;
+                const size_t scratch_per_token =
+                    (size_t) 2 * plan.n_kv_heads * plan.n_stream * std::max(DKQ, DV) * sizeof(half);
+                const size_t alloc_per_token = scratch_per_token * 105 / 100 + 64;
+                const size_t max_chunk = free_bytes > reserve_bytes && alloc_per_token > 0 ?
+                    (free_bytes - reserve_bytes) / alloc_per_token : 0;
+                if (max_chunk < 256) {
+                    trace_budget("cuda_kvarn_window_choice", 0, 0, 1 | 2);
+                    return false;
+                }
+                if (max_chunk < (size_t) window_chunk) {
+                    window_chunk = int((max_chunk / 256) * 256);
+                }
+                trace_budget("cuda_kvarn_window_choice", 0, (size_t) window_chunk, 2);
             }
         }
     }
@@ -405,11 +480,12 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         fprintf(stderr,
             "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=KVARN_WINDOWED "
             "Q=[%lld,%lld,%lld,%lld] n_kv=%d n_kv_heads=%d n_stream=%d q_stream=%lld "
-            "chunk=%d ncols=[%d,%d] domain=%s bits=[%d,%d]\n",
+            "chunk=%d ncols=[%d,%d] domain=%s bits=[%d,%d] pool_plan=%d growth=%zu budget=%zu\n",
             (long long) Q->ne[0], (long long) Q->ne[1],
             (long long) Q->ne[2], (long long) Q->ne[3],
             plan.n_kv, plan.n_kv_heads, plan.n_stream, (long long) Q->ne[3],
-            window_chunk, ncols1, ncols2, ggml_cuda_fattn_kvarn_domain_name(dst), plan.k.bits, plan.v.bits);
+            window_chunk, ncols1, ncols2, ggml_cuda_fattn_kvarn_domain_name(dst), plan.k.bits, plan.v.bits,
+            int(used_pool_plan), planned_growth, physical_budget);
         fflush(stderr);
     }
 

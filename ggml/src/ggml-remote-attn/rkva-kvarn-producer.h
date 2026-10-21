@@ -22,8 +22,11 @@
 class rkva_kvarn_producer {
 public:
     rkva_kvarn_producer(uint32_t origin, uint32_t capacity, uint32_t heads,
-                        uint32_t iterations, ggml_backend_cpu_kvarn_store_direct_v1_t store, uint32_t precision_tail_tokens = 128)
-        : origin_(origin), capacity_(capacity), heads_(heads), iterations_(iterations), precision_tail_tokens_(precision_tail_tokens), store_(store) {
+                        uint32_t iterations, ggml_backend_cpu_kvarn_store_direct_v1_t store,
+                        uint32_t precision_tail_tokens = 128, bool compact_stage = false)
+        : origin_(origin), capacity_(capacity), heads_(heads), iterations_(iterations),
+          precision_tail_tokens_(precision_tail_tokens),
+          compact_stage_(compact_stage && origin >= 128 && precision_tail_tokens == 128), store_(store) {
         if (!store || !heads || !iterations || (precision_tail_tokens != 0 && precision_tail_tokens != 128) ||
                 origin % 128 || !capacity ||
                 uint64_t(origin) + capacity > INT32_MAX) throw std::invalid_argument("native KVarN geometry");
@@ -52,6 +55,12 @@ public:
 
     static constexpr uint32_t max_rewind = 128;
     uint32_t rows() const { return rows_; }
+    // Diagnostics count allocation growth of the two chronological append
+    // buffers only; the CPU store, payload and rewind have separate lifetimes.
+    size_t append_scratch_grows() const { return append_scratch_grows_; }
+    size_t append_scratch_capacity_bytes() const {
+        return sizeof(ggml_fp16_t) * (append_k_.capacity() + append_v_.capacity());
+    }
     bool can_rewind(uint32_t keep) const {
         if (keep > rows_ || rows_ - keep > max_rewind) return false;
         const uint32_t begin = std::min(keep / 128 * 128, keep > 128 ? keep - 128 : 0);
@@ -108,7 +117,8 @@ public:
             sizeof(float) * (original_k_.size() + original_v_.size() + prepared_keys_.size() + prepared_values_.size()) +
             prepared_rk_.size() + prepared_rv_.size() +
             sizeof(ggml_fp16_t) * (prepared_k_.size() + prepared_v_.size()) +
-            sizeof(ggml_fp16_t) * (stage_k_.size() + stage_v_.size() + tail_k_.size() + tail_v_.size());
+            sizeof(ggml_fp16_t) * (stage_k_.size() + stage_v_.size() + tail_k_.size() + tail_v_.size()) +
+            append_scratch_capacity_bytes();
     }
 
     // Precompute a complete model microbatch once, while append() continues
@@ -155,7 +165,16 @@ public:
         const uint32_t after = before + count;
         const uint32_t record_begin = reset_snapshot ? 0 : before / 128;
         const uint32_t record_groups = after / 128 - record_begin;
-        std::vector<ggml_fp16_t> append_k(size_t(count) * width()), append_v(append_k.size());
+        const size_t append_elements = size_t(count) * width();
+        // Keep the high-water size as well as capacity: smaller subsequent
+        // chunks are completely overwritten below and need no zero-fill.
+        for (auto * scratch : {&append_k_, &append_v_}) {
+            if (scratch->size() < append_elements) {
+                const size_t old_capacity = scratch->capacity();
+                scratch->resize(append_elements);
+                append_scratch_grows_ += scratch->capacity() != old_capacity;
+            }
+        }
         if (!cuda_) {
             std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
                 ggml_init({16 * ggml_tensor_overhead(), nullptr, true}), ggml_free);
@@ -190,8 +209,8 @@ public:
                 const uint32_t group = uint32_t(global) / 128;
                 const uint32_t slot = group == 0 ? 0 : 1 + (group - 1) % 2;
                 const size_t stage_offset = (size_t(slot) * 128 + uint32_t(global) % 128) * width();
-                std::memcpy(append_k.data() + size_t(i) * width(), stage_k_.data() + stage_offset, width() * 2);
-                std::memcpy(append_v.data() + size_t(i) * width(), stage_v_.data() + stage_offset, width() * 2);
+                std::memcpy(append_k_.data() + size_t(i) * width(), stage_k_.data() + stage_offset, width() * 2);
+                std::memcpy(append_v_.data() + size_t(i) * width(), stage_v_.data() + stage_offset, width() * 2);
                 const size_t tail_offset = size_t(before + i) % 128 * width();
                 for (size_t d = 0; precision_tail_tokens_ && d < width(); ++d) {
                     tail_k_[tail_offset + d] = ggml_fp32_to_fp16(keys[size_t(i) * width() + d]);
@@ -206,8 +225,8 @@ public:
             const size_t offset = size_t(global - prepared_begin_) * width();
             if (std::memcmp(keys, prepared_keys_.data() + offset, size_t(count) * width() * sizeof(float)) ||
                     std::memcmp(values, prepared_values_.data() + offset, size_t(count) * width() * sizeof(float))) return false;
-            std::copy_n(prepared_k_.data() + offset, append_k.size(), append_k.data());
-            std::copy_n(prepared_v_.data() + offset, append_v.size(), append_v.data());
+            std::copy_n(prepared_k_.data() + offset, append_elements, append_k_.data());
+            std::copy_n(prepared_v_.data() + offset, append_elements, append_v_.data());
             const size_t first_group = global / 128;
             const size_t groups = (global + count) / 128 - first_group;
             if (groups) {
@@ -221,8 +240,8 @@ public:
                 const uint32_t row = before + i, group = (origin_ + row) / 128;
                 const uint32_t slot = group == 0 ? 0 : 1 + (group - 1) % 2;
                 const size_t stage_offset = (size_t(slot) * 128 + (origin_ + row) % 128) * width();
-                std::copy_n(append_k.data() + size_t(i) * width(), width(), stage_k_.data() + stage_offset);
-                std::copy_n(append_v.data() + size_t(i) * width(), width(), stage_v_.data() + stage_offset);
+                std::copy_n(append_k_.data() + size_t(i) * width(), width(), stage_k_.data() + stage_offset);
+                std::copy_n(append_v_.data() + size_t(i) * width(), width(), stage_v_.data() + stage_offset);
                 std::copy_n(keys + size_t(i) * width(), width(), original_k_.data() + size_t(row % 256) * width());
                 std::copy_n(values + size_t(i) * width(), width(), original_v_.data() + size_t(row % 256) * width());
                 original_pos_[row % 256] = row;
@@ -233,7 +252,8 @@ public:
             }
         }
         const rkva_kvarn_range_upload header {
-            after, record_begin, record_groups, reset_snapshot ? 1u : 0u,
+            after, record_begin, record_groups, (reset_snapshot ? RKVA_KVARN_UPLOAD_RESET : 0u) |
+                (compact_stage_ ? RKVA_KVARN_UPLOAD_OMIT_STAGE : 0u),
             reset_snapshot ? 0u : before, reset_snapshot ? 0u : count, {0, 0}};
         payload.clear();
         const auto emit = [&](const void * data, size_t bytes) {
@@ -246,16 +266,23 @@ public:
         emit(records_k_.data() + record_offset, record_size);
         emit(records_v_.data() + record_offset, record_size);
         if (reset_snapshot) {
-            emit(stage_k_.data(), stage_k_.size() * 2);
-            emit(stage_v_.data(), stage_v_.size() * 2);
+            if (!compact_stage_) {
+                emit(stage_k_.data(), stage_k_.size() * 2);
+                emit(stage_v_.data(), stage_v_.size() * 2);
+            }
             for (const auto * tail : {&tail_k_, &tail_v_}) {
                 for (uint32_t row = after - std::min(after, precision_tail_tokens_); row < after; ++row) {
                     emit(tail->data() + size_t(row % 128) * width(), width() * 2);
                 }
             }
         } else {
-            emit(append_k.data(), append_k.size() * 2);
-            emit(append_v.data(), append_v.size() * 2);
+            // In overflow + exact-tail mode no attention path reads rotated stage:
+            // incomplete groups fit in the 128-row exact tail. The local stage
+            // remains authoritative for subsequent seals and bounded rewind.
+            if (!compact_stage_) {
+                emit(append_k_.data(), append_elements * sizeof(ggml_fp16_t));
+                emit(append_v_.data(), append_elements * sizeof(ggml_fp16_t));
+            }
             // Per-append original tail rows must be emitted from the original
             // input, since a >128-token append wraps the persistent tail ring.
             for (const float * source : {keys, values}) {
@@ -274,6 +301,7 @@ private:
     size_t width() const { return size_t(heads_) * 256; }
     uint32_t physical_heads() const { return heads_ * 2; }
     uint32_t origin_, capacity_, heads_, iterations_, precision_tail_tokens_, rows_ = 0;
+    bool compact_stage_ = false;
     ggml_backend_cpu_kvarn_store_direct_v1_t store_;
     ggml_backend_cuda_kvarn_native_append_v1_t cuda_ = nullptr;
     uint32_t prepared_begin_ = 0, prepared_count_ = 0;
@@ -284,4 +312,6 @@ private:
     std::vector<float> original_k_, original_v_;
     std::vector<uint32_t> original_pos_;
     std::vector<ggml_fp16_t> stage_k_, stage_v_, tail_k_, tail_v_;
+    std::vector<ggml_fp16_t> append_k_, append_v_;
+    size_t append_scratch_grows_ = 0;
 };

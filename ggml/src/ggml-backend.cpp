@@ -9,6 +9,8 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml-remote-attn.h"
+#include "ggml-remote-attn-trace.h"
 #include "ggml-backend-impl.h"
 #include "ggml-f4-counters.h"
 #include "ggml-alloc.h"
@@ -1421,7 +1423,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node
-            bool need_new_split = false;
+            // Keep host-orchestrated CUDA RPC nodes out of adjacent CUDA
+            // graphs. Their synchronization is a boundary, while local
+            // attention/FFN and consumers retain ordinary graph capture.
+            bool need_new_split = i > split->i_start && node_backend_id == cur_backend_id &&
+                std::strncmp(ggml_backend_name(sched->backends[cur_backend_id]), "CUDA", 4) == 0 &&
+                (node->op == GGML_OP_REMOTE_ATTN || graph->nodes[split->i_start]->op == GGML_OP_REMOTE_ATTN);
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 const auto check_new_split_src = [&](struct ggml_tensor * src) {
                     // check if a weight is on a different and incompatible backend
@@ -1494,6 +1501,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 // src[5]/src[6] stay the raw Vulkan row views, src[7] the
                 // (host/crop) F16 mask and src[8]/src[9] the host index lists.
                 if (node->op == GGML_OP_KVARN_SPLIT_FUSED && j >= 5 && j <= 9) {
+                    continue;
+                }
+
+                // Native FP8 remote execution is a host orchestrator dispatched
+                // by CUDA. It accesses each operand through its owning backend;
+                // copying CPU cache metadata or Q here defeats the wire codec.
+                if (node->op == GGML_OP_REMOTE_ATTN && ggml_backend_remote_attn_cuda_enabled_for_node(node) &&
+                        std::strncmp(ggml_backend_name(sched->backends[cur_backend_id]), "CUDA", 4) == 0) {
                     continue;
                 }
 
@@ -2373,6 +2388,9 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    ggml_remote_attn_trace_graph(graph->uid);
+    ggml_remote_attn_trace_scope trace_graph("graph_host");
+    trace_graph.event.flags = 0x40000000u;
     GGML_ASSERT(sched);
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);

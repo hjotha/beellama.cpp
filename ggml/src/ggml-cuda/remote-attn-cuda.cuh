@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 const struct ggml_remote_attn_cuda_fp8_interface * ggml_backend_cuda_remote_attn_fp8_interface(void);
+const struct ggml_remote_attn_cuda_fp8_interface_v2 * ggml_backend_cuda_remote_attn_fp8_interface_v2(void);
 
 bool ggml_cuda_remote_attn_fp8_pack_q(const void * src_q, bool is_f16, size_t n_elements,
                                       uint8_t * dst_pinned_fp8, void * stream, void * event_done);
