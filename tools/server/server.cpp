@@ -153,6 +153,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
             if (common_context_is_adaptive(params)) {
                 SRV_TRC("%s", "adaptive context is enabled, using n_parallel = 1\n");
                 params.n_parallel = 1;
+            } else if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED ||
+                       params.speculative.draft.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                // [FIX_KVARN_AUTO_PARALLEL] A KVarN cache serializes prompt state
+                // only under static single-stream ownership. With the upstream
+                // auto resolution (n_parallel = 4) every checkpoint capture is
+                // refused, so prompt caching silently degrades into a full
+                // reprocess for every request. Resolve auto to a single slot
+                // exactly like adaptive mode does; an explicit --parallel N is
+                // still honored, with prompt checkpoints unavailable by design
+                // in that multi-stream configuration.
+                SRV_WRN("%s", "KVarN cache: resolving auto n_parallel to 1 so prompt checkpoints can be captured "
+                              "(pass --parallel N explicitly to keep multiple slots and lose prompt reuse)\n");
+                params.n_parallel = 1;
             } else {
                 SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 
