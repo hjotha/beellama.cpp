@@ -2030,7 +2030,7 @@ struct adaptive_slot_cache_reservation {
 static constexpr std::array<uint8_t, 8> ADAPTIVE_SLOT_MAGIC = {{
     'L', 'L', 'A', 'M', 'A', 'S', 'L', 'T'
 }};
-static constexpr uint32_t ADAPTIVE_SLOT_VERSION = 1;
+static constexpr uint32_t ADAPTIVE_SLOT_VERSION = 2;
 
 class adaptive_slot_writer {
 public:
@@ -2185,6 +2185,16 @@ struct adaptive_slot_snapshot_blob {
     int32_t mtp_max_tokens = 0;
     int32_t long_ctx = 0;
     uint64_t model_instance = 0;
+    // [TAG_ADAPTIVE_SLOT_OWNER] Capture-time mixed-KVarN ownership. A partial
+    // payload replays only into the exact owner epoch/id it was serialized
+    // under; a cross-profile transition can advance the epoch and re-create a
+    // profile context with a fresh process-random owner id, so the restore
+    // adopts these values before importing. Zero when the destination cache
+    // carries no mixed state (standard q8_0/q4_0 layouts).
+    uint64_t owner_epoch_tgt = 0;
+    uint64_t owner_id_tgt = 0;
+    uint64_t owner_epoch_dft = 0;
+    uint64_t owner_id_dft = 0;
     std::string model_fingerprint;
     std::string layout_tgt;
     std::string layout_dft;
@@ -2283,6 +2293,10 @@ static std::vector<uint8_t> adaptive_slot_encode(const adaptive_slot_snapshot_bl
     writer.i32(snapshot.mtp_max_tokens);
     writer.i32(snapshot.long_ctx);
     writer.u64(snapshot.model_instance);
+    writer.u64(snapshot.owner_epoch_tgt);
+    writer.u64(snapshot.owner_id_tgt);
+    writer.u64(snapshot.owner_epoch_dft);
+    writer.u64(snapshot.owner_id_dft);
     writer.string(snapshot.model_fingerprint);
     writer.string(snapshot.layout_tgt);
     writer.string(snapshot.layout_dft);
@@ -2356,6 +2370,10 @@ static adaptive_slot_snapshot_blob adaptive_slot_decode(const std::vector<uint8_
     snapshot.mtp_max_tokens = reader.i32();
     snapshot.long_ctx = reader.i32();
     snapshot.model_instance = reader.u64();
+    snapshot.owner_epoch_tgt = reader.u64();
+    snapshot.owner_id_tgt = reader.u64();
+    snapshot.owner_epoch_dft = reader.u64();
+    snapshot.owner_id_dft = reader.u64();
     snapshot.model_fingerprint = reader.string("model identity");
     snapshot.layout_tgt = reader.string("target layout");
     snapshot.layout_dft = reader.string("draft layout");
@@ -2480,6 +2498,8 @@ static uint64_t adaptive_slot_serialized_size(const adaptive_slot_snapshot_blob 
     const auto add = [&total](uint64_t value) {
         total = adaptive_slot_saturating_add(total, value);
     };
+    // model_instance + the four capture-time mixed-KVarN ownership words
+    add(32);
     add(adaptive_slot_wire_string(snapshot.model_fingerprint.size()));
     add(adaptive_slot_wire_string(snapshot.layout_tgt.size()));
     add(adaptive_slot_wire_string(snapshot.layout_dft.size()));
@@ -2799,6 +2819,15 @@ static adaptive_slot_snapshot_blob adaptive_slot_capture(
     snapshot.layout_tgt = common_prompt_cache_layout(ctx_tgt);
     snapshot.layout_dft = ctx_dft ? common_prompt_cache_layout(ctx_dft) : "";
     snapshot.model_instance = llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt)).model_instance;
+    // [TAG_ADAPTIVE_SLOT_OWNER] Stamp the mixed-KVarN ownership this payload is
+    // bound to so a later restore into a transitioned profile context can adopt
+    // it before importing.
+    snapshot.owner_epoch_tgt = llama_kvarn_state_owner_epoch(ctx_tgt);
+    snapshot.owner_id_tgt    = llama_kvarn_state_owner_id(ctx_tgt);
+    if (ctx_dft) {
+        snapshot.owner_epoch_dft = llama_kvarn_state_owner_epoch(ctx_dft);
+        snapshot.owner_id_dft    = llama_kvarn_state_owner_id(ctx_dft);
+    }
 
     snapshot.pos_tgt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
     if (snapshot.pos_tgt < 0) {
@@ -2908,6 +2937,12 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
     auto checkpoint = std::make_shared<common_prompt_checkpoint>();
     checkpoint->n_tokens = source.n_tokens;
     checkpoint->id_task = source.id_task;
+    // [TAG_CHECKPOINT_OWNER_ADOPT] The source blobs were captured under the
+    // snapshot's owners, which the caller adopted into this context before the
+    // full-state import; stamp the same values so the checkpoints remain
+    // replayable after cross-profile transitions.
+    checkpoint->owner_epoch = llama_kvarn_state_owner_epoch(ctx_tgt);
+    checkpoint->owner_id    = llama_kvarn_state_owner_id(ctx_tgt);
     checkpoint->pos_min = source.pos_min;
     checkpoint->pos_max = source.pos_max;
     checkpoint->flags_tgt = source.flags_tgt;
@@ -2937,6 +2972,31 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
         return nullptr;
     }
     return checkpoint;
+}
+
+// [TAG_CHECKPOINT_OWNER_ADOPT] A partial checkpoint payload replays only into
+// the exact mixed-KVarN owner epoch/id it was captured under. A profile switch
+// re-creates the destination context with a fresh process-random owner id and
+// an advanced epoch, so adopt the capture-time values before the replay. The
+// fine-grained payload validation still fails closed on any mismatch.
+static void adopt_checkpoint_owner(llama_context * ctx, const common_prompt_checkpoint & checkpoint, const char * label) {
+    if (!ctx || checkpoint.owner_epoch == 0) {
+        return;
+    }
+    const uint64_t id_now = llama_kvarn_state_owner_id(ctx);
+    if (checkpoint.owner_id != 0 && id_now != 0 && checkpoint.owner_id != id_now) {
+        if (llama_kvarn_adopt_state_owner_id(ctx, checkpoint.owner_id)) {
+            SRV_INF("adopted checkpoint %s owner id %llu (was %llu)\n", label,
+                    (unsigned long long) checkpoint.owner_id, (unsigned long long) id_now);
+        }
+    }
+    const uint64_t epoch_now = llama_kvarn_state_owner_epoch(ctx);
+    if (epoch_now != 0 && checkpoint.owner_epoch != epoch_now) {
+        if (llama_kvarn_adopt_state_owner_epoch(ctx, checkpoint.owner_epoch)) {
+            SRV_INF("adopted checkpoint %s lineage epoch %llu (was %llu)\n", label,
+                    (unsigned long long) checkpoint.owner_epoch, (unsigned long long) epoch_now);
+        }
+    }
 }
 
 static bool adaptive_slot_restore(
@@ -3012,6 +3072,41 @@ static bool adaptive_slot_restore(
         return false;
     }
 
+    // [TAG_ADAPTIVE_SLOT_OWNER] A partial payload replays only into the exact
+    // mixed-KVarN owner epoch/id it was serialized under. A cross-profile
+    // transition (switch_adapt) can advance the epoch (sequence clears) and
+    // re-create a profile context with a fresh process-random owner id, which
+    // made every transitioned restore fail with "partial snapshot owner/epoch
+    // mismatch" and cold-prefill the whole prompt. Adopt the capture-time
+    // values exactly like the durable disk-checkpoint and handoff restores do;
+    // the state import keeps its fine-grained cell/reference validation, so a
+    // stale payload still fails closed to the cold-prefill fallback.
+    const auto adopt_snapshot_owner = [&](llama_context * ctx, uint64_t owner_id, uint64_t owner_epoch,
+            const char * label) -> bool {
+        if (!ctx || (owner_id == 0 && owner_epoch == 0)) {
+            return true;
+        }
+        const uint64_t id_now = llama_kvarn_state_owner_id(ctx);
+        if (owner_id != 0 && id_now != 0 && owner_id != id_now) {
+            if (!llama_kvarn_adopt_state_owner_id(ctx, owner_id)) {
+                error = std::string("adaptive slot ") + label + " owner id is not adoptable";
+                return false;
+            }
+        }
+        const uint64_t epoch_now = llama_kvarn_state_owner_epoch(ctx);
+        if (owner_epoch != 0 && epoch_now != 0 && owner_epoch != epoch_now) {
+            if (!llama_kvarn_adopt_state_owner_epoch(ctx, owner_epoch)) {
+                error = std::string("adaptive slot ") + label + " owner epoch is not adoptable";
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!adopt_snapshot_owner(ctx_tgt, snapshot.owner_id_tgt, snapshot.owner_epoch_tgt, "target") ||
+            (complete_mtp && !adopt_snapshot_owner(ctx_dft, snapshot.owner_id_dft, snapshot.owner_epoch_dft, "draft"))) {
+        return false;
+    }
+
     // Only now clear the live sequence. Any malformed file or incompatible
     // metadata has already returned, so a failed set operation leaves no
     // published prompt and no partial cache hit.
@@ -3084,6 +3179,7 @@ static bool adaptive_slot_restore(
             continue;
         }
 
+        adopt_checkpoint_owner(ctx_tgt, *checkpoint, "slot snapshot target");
         const bool target_restored = checkpoint->restore_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         const bool target_bounds = target_restored &&
             llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id) == checkpoint->pos_min &&
@@ -4376,6 +4472,7 @@ private:
             checkpoint->n_tokens           = blob.n_tokens;
             checkpoint->id_task            = blob.id_task;
             checkpoint->owner_epoch        = i < ckpt_epochs.size() ? ckpt_epochs[i] : 0;
+            checkpoint->owner_id           = owner_id;
             checkpoint->pos_min            = blob.pos_min;
             checkpoint->pos_max            = blob.pos_max;
             checkpoint->flags_tgt          = (llama_state_seq_flags) blob.flags_tgt;
@@ -7754,6 +7851,7 @@ private:
         // checkpoint creation and a later SLOT_SAVE, so the per-checkpoint value
         // is the only one a future replay must adopt.
         cur.owner_epoch = llama_kvarn_state_owner_epoch(ctx_tgt);
+        cur.owner_id    = llama_kvarn_state_owner_id(ctx_tgt);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -8334,6 +8432,9 @@ private:
                     if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
                         const auto save_ckpt = server_prompt_save_aligned_checkpoint(
                                 slot->prompt.checkpoints, (int64_t) n_saved_tokens, prompt_reuse_alignment());
+                        if (save_ckpt) {
+                            adopt_checkpoint_owner(ctx_tgt, *save_ckpt, "slot save target");
+                        }
                         if (save_ckpt && save_ckpt->restore_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                             SLT_INF(*slot, "saving aligned prompt state (%d tokens) instead of the full slot state (%zu tokens)\n",
                                     (int) save_ckpt->n_tokens, n_saved_tokens);
@@ -9807,6 +9908,7 @@ private:
                                     if (!do_reset) {
                                         // PARTIAL_ONLY leaves future attention KV present until suffix removal below.
                                         const auto & checkpoint = **it;
+                                        adopt_checkpoint_owner(ctx_tgt, checkpoint, "reuse target");
                                         do_reset = !checkpoint.restore_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         const auto draft_restore = do_reset ? common_checkpoint_restore::failed :
                                             checkpoint.restore_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);

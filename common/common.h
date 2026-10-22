@@ -1657,6 +1657,12 @@ struct common_prompt_checkpoint {
     // captured under (server-stamped at creation; 0 = unknown).
     uint64_t owner_epoch = 0;
 
+    // [TAG_CHECKPOINT_OWNER_ADOPT] mixed-KVarN cache owner id the partial
+    // payload is bound to (server-stamped at creation; 0 = unknown). A profile
+    // switch re-creates the destination context with a fresh process-random
+    // owner id, so restores adopt this value before replaying the payload.
+    uint64_t owner_id = 0;
+
     llama_pos pos_min = -1;
     llama_pos pos_max = -1;
     llama_state_seq_flags flags_tgt = LLAMA_STATE_SEQ_FLAGS_NONE;
