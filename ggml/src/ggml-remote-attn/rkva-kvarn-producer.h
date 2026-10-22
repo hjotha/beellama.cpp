@@ -6,6 +6,7 @@
 #include "../ggml-impl.h"
 #include "remote-attn-protocol.h"
 #include "rkva-kvarn-rewind.h"
+#include "rkva-native-owner.h"
 
 #include <algorithm>
 #include <cmath>
@@ -19,7 +20,7 @@
 // F32 K/V are consumed before the separate standard-cache bookkeeping store.
 // FULL native snapshots remain unsupported; resident rewinds retain original F32
 // inputs for the most recent 256 rows and support at most 128 removed rows. No already-quantized source can initialize this owner.
-class rkva_kvarn_producer {
+class rkva_kvarn_producer : public rkva_native_owner {
 public:
     rkva_kvarn_producer(uint32_t origin, uint32_t capacity, uint32_t heads,
                         uint32_t iterations, ggml_backend_cpu_kvarn_store_direct_v1_t store,
@@ -54,14 +55,14 @@ public:
     }
 
     static constexpr uint32_t max_rewind = 128;
-    uint32_t rows() const { return rows_; }
+    uint32_t rows() const override { return rows_; }
     // Diagnostics count allocation growth of the two chronological append
     // buffers only; the CPU store, payload and rewind have separate lifetimes.
     size_t append_scratch_grows() const { return append_scratch_grows_; }
     size_t append_scratch_capacity_bytes() const {
         return sizeof(ggml_fp16_t) * (append_k_.capacity() + append_v_.capacity());
     }
-    bool can_rewind(uint32_t keep) const {
+    bool can_rewind(uint32_t keep) const override {
         if (keep > rows_ || rows_ - keep > max_rewind) return false;
         const uint32_t begin = std::min(keep / 128 * 128, keep > 128 ? keep - 128 : 0);
         for (uint32_t row = begin; row < keep; ++row) {
@@ -72,7 +73,7 @@ public:
 
     // Chronological overwritten ORIGINAL-domain precision-tail rows, reconstructed without any
     // Q4/Q8 decoding. Used by the atomic all-layer rewind RPC before publication.
-    bool rewind_tail(uint32_t keep, std::vector<uint8_t> & output) const {
+    bool rewind_tail(uint32_t keep, std::vector<uint8_t> & output) const override {
         if (!can_rewind(keep)) return false;
         const auto span = rkva_kvarn_rewind_tail(rows_, keep, precision_tail_tokens_);
         for (const auto * source : {&original_k_, &original_v_}) {
@@ -87,7 +88,7 @@ public:
         return true;
     }
 
-    bool rewind(uint32_t keep) {
+    bool rewind(uint32_t keep) override {
         if (!can_rewind(keep)) return false;
         // Rebuild only the affected incomplete group through the canonical
         // original-F32 store. Earlier sealed native records are untouched.
@@ -125,7 +126,7 @@ public:
     // publishing only the chronological serial-prefix chunks. Preparation does
     // not mutate the authoritative stage, records, originals or live count.
     bool prepare(const float * keys, const float * values, const int32_t * positions, uint32_t count,
-                 const float * device_keys = nullptr, const float * device_values = nullptr) {
+                 const float * device_keys = nullptr, const float * device_values = nullptr) override {
         if (!cuda_) return true;
         if (!keys || !values || !positions || !count || count > 256 || count > capacity_ - rows_) return false;
         for (uint32_t i = 0; i < count; ++i) {
@@ -153,7 +154,7 @@ public:
     // Emits one op16 payload. Both input arrays are original-domain F32
     // [token][KV head][256]; no Q4/Q8 decoder occurs on this path.
     bool append(const float * keys, const float * values, const int32_t * positions,
-                uint32_t count, bool reset_snapshot, std::vector<uint8_t> & payload) {
+                uint32_t count, bool reset_snapshot, std::vector<uint8_t> & payload) override {
         if (!keys || !values || !positions || !count || count > capacity_ - rows_) return false;
         for (uint32_t i = 0; i < count; ++i) {
             if (positions[i] != int64_t(origin_) + rows_ + i) return false;
