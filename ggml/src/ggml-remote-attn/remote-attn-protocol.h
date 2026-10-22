@@ -67,6 +67,8 @@ static constexpr uint64_t RKVA_CAP_KVARN_BULK_SPLITZIP = 1ull << 11;
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_FP8_RNE = 1ull << 12;
 // Upload flag OMIT_STAGE is supported for serial-prefix overflow with an exact 128-row tail.
 static constexpr uint64_t RKVA_CAP_KVARN_COMPACT_STAGE = 1ull << 13;
+// layout 4: native Q4_0 overflow rows over op16/op22 (bulk + async capable server)
+static constexpr uint64_t RKVA_CAP_NATIVE_Q4_BULK = 1ull << 14;
 static constexpr uint32_t RKVA_KVARN_UPLOAD_RESET = 1u;
 static constexpr uint32_t RKVA_KVARN_UPLOAD_OMIT_STAGE = 2u;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
