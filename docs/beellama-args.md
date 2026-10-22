@@ -409,6 +409,25 @@ qualification gate. Keep the setting fixed for
 the process lifetime and restart serving to change it. Explicit `prefill`
 does not change the existing `0`/`1` defaults or select a policy from timings.
 
+`GGML_RKVA_CUDA_SINGLETON_FASTPATH=1` is a separate, default-off host
+bookkeeping experiment. Keep it fixed for the process lifetime. It only skips
+CUDA compute-time graph-state lookup for a stable-identity graph containing
+exactly one compute-marked, synchronous native FP8 REMOTE_ATTN range with one
+through nine queries. WAIT, asynchronous, mixed, projected and nondefault-stream
+graphs, or a backend with configured concurrent events, use the existing path.
+Memory-pressure checks and the existing direct
+executor (including producer events and failure cleanup) remain in place.
+
+This flag does not change codec placement: with `GGML_RKVA_CUDA_FP8=prefill`,
+one-through-nine-query ranges still run on CPU and do not qualify. Use the
+existing CUDA-capable placement only for the corresponding experimental A/B;
+do not replace the qualified hybrid baseline. Adjacent model-compute graphs,
+wire bytes and codec kernels are unchanged. Earlier graph optimization may still
+create graph state; this flag does not eliminate all graph-state creation. The trace counter
+`cuda_remote_singleton_fastpath` reports eligible dispatches; reduced bookkeeping
+is not evidence of a throughput improvement. GPU correctness and trace-off
+performance qualification are required before enabling this in serving.
+
 ## Migration from earlier versions
 
 | Earlier spelling or surface | v0.4.0 behavior | Replacement |
