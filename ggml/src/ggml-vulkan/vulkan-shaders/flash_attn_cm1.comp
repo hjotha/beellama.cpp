@@ -447,6 +447,10 @@ void main() {
         barrier();
 
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
+        // Use the same predicate for staging and consuming V. With a mask,
+        // kvsh zeroes inactive keys even when the extent is aligned; bypassing
+        // it for F16/BF16 makes P*V differ from the decoded/staged path.
+        const bool stage_v = USE_DECODE_V || KV_bounds_check || MASK_ENABLE;
 
         // Each subgroup handles HSV/4 columns
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
@@ -460,13 +464,12 @@ void main() {
             const uint v_loads_per_thread = v_total / gl_WorkGroupSize.x;
 
             // If SHMEM_STAGING is set, a Bc * HSV_pad size tile of V is loaded to shmem.
-            // If not, V is loaded directly from global memory if aligned, otherwise
-            // staged through a Bc * MatBr size staging buffer.
+            // If not, V is loaded directly from global memory if aligned and unmasked,
+            // otherwise staged through a Bc * MatBr size staging buffer.
             // If V is a quant type, then it is always staged for dequantization.
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
-            // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check || MASK_ENABLE;
+            // alignment / bounds or masking force it (otherwise we coopMatLoad direct from data_vv4).
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -504,7 +507,7 @@ void main() {
                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
 
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+                    if (!stage_v) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
