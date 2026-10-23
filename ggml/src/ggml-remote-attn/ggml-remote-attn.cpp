@@ -921,6 +921,109 @@ static uint64_t now_us() {
             std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// ---------------------------------------------------------------------------
+// Transport circuit breaker for the optional Xbox RKVA backend.
+//
+// A llama context owns one remote-attn backend and is rebuilt per request, so
+// the breaker must be process-wide. It is keyed by endpoint (host:port) so a
+// reconfigured server starts closed. Only transport failures (connect, HELLO,
+// session and range RPCs) arm the cooldown; validation and capability
+// rejections keep returning false exactly as before. When the cooldown expires
+// the next request probes the endpoint normally: fixed interval, no backoff.
+// ---------------------------------------------------------------------------
+namespace {
+struct rkva_breaker_state {
+    std::mutex mutex;
+    std::string endpoint;
+    int64_t disabled_until_us = 0; // 0 = closed (split enabled)
+    int64_t last_log_us = 0;
+    uint64_t failures = 0;
+    uint64_t fast_rejects = 0;
+};
+
+rkva_breaker_state g_rkva_breaker;
+
+// Caller holds g_rkva_breaker.mutex. A different endpoint starts from a clean
+// closed state so the counters and cooldown never leak across servers.
+void rkva_breaker_bind_endpoint_locked(const ggml_backend_remote_attn_context * ctx) {
+    std::string endpoint = ctx->host;
+    endpoint += ':';
+    endpoint += std::to_string((unsigned) ctx->port);
+    if (endpoint == g_rkva_breaker.endpoint) {
+        return;
+    }
+    g_rkva_breaker.endpoint = endpoint;
+    g_rkva_breaker.disabled_until_us = 0;
+    g_rkva_breaker.last_log_us = 0;
+    g_rkva_breaker.failures = 0;
+    g_rkva_breaker.fast_rejects = 0;
+}
+
+int64_t rkva_breaker_cooldown_us() {
+    int64_t seconds = 30;
+    if (const char * env = std::getenv("GGML_RKVA_RETRY_COOLDOWN_S")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end != env && *end == '\0') {
+            seconds = parsed;
+        } else {
+            GGML_LOG_WARN("%s: invalid GGML_RKVA_RETRY_COOLDOWN_S='%s' (expected seconds); using 30\n",
+                    GGML_REMOTE_ATTN_NAME, env);
+        }
+    }
+    return std::clamp<int64_t>(seconds, 5, 300) * 1000000;
+}
+
+// False while the cooldown is active: the caller must return without opening a
+// socket or waiting. The diagnostic is throttled to one line per second.
+bool rkva_breaker_allows_attempt(const ggml_backend_remote_attn_context * ctx) {
+    std::lock_guard<std::mutex> lock(g_rkva_breaker.mutex);
+    rkva_breaker_bind_endpoint_locked(ctx);
+    const int64_t now = (int64_t) now_us();
+    if (g_rkva_breaker.disabled_until_us == 0 || now >= g_rkva_breaker.disabled_until_us) {
+        return true;
+    }
+    ++g_rkva_breaker.fast_rejects;
+    if (now - g_rkva_breaker.last_log_us >= 1000000) {
+        g_rkva_breaker.last_log_us = now;
+        const int64_t remaining_s = (g_rkva_breaker.disabled_until_us - now + 999999) / 1000000;
+        GGML_LOG_WARN("%s: Xbox backend unavailable; tier above the split disabled for %llds "
+                "(fast fail, failures=%llu, rejects=%llu)\n",
+                GGML_REMOTE_ATTN_NAME, (long long) remaining_s,
+                (unsigned long long) g_rkva_breaker.failures,
+                (unsigned long long) g_rkva_breaker.fast_rejects);
+    }
+    return false;
+}
+
+// Transport-level failure: arm (or re-arm) the fixed cooldown. Re-arming while
+// it is already open stays silent; each probe after expiry may report once.
+void rkva_breaker_mark_down(const ggml_backend_remote_attn_context * ctx) {
+    const int64_t cooldown_us = rkva_breaker_cooldown_us();
+    std::lock_guard<std::mutex> lock(g_rkva_breaker.mutex);
+    rkva_breaker_bind_endpoint_locked(ctx);
+    const int64_t now = (int64_t) now_us();
+    const bool was_closed = g_rkva_breaker.disabled_until_us <= now;
+    g_rkva_breaker.disabled_until_us = now + cooldown_us;
+    ++g_rkva_breaker.failures;
+    if (!was_closed) return;
+    g_rkva_breaker.last_log_us = now;
+    GGML_LOG_ERROR("%s: Xbox backend marked down; retrying automatically in %llds\n",
+            GGML_REMOTE_ATTN_NAME, (long long) (cooldown_us / 1000000));
+}
+
+// A successful split configuration proves the endpoint usable again. The
+// recovery line is emitted only on the open -> closed transition.
+void rkva_breaker_note_configured(const ggml_backend_remote_attn_context * ctx) {
+    std::lock_guard<std::mutex> lock(g_rkva_breaker.mutex);
+    rkva_breaker_bind_endpoint_locked(ctx);
+    if (g_rkva_breaker.disabled_until_us == 0) return;
+    g_rkva_breaker.disabled_until_us = 0;
+    g_rkva_breaker.last_log_us = 0;
+    GGML_LOG_WARN("%s: Xbox backend recovered; split enabled\n", GGML_REMOTE_ATTN_NAME);
+}
+} // namespace
+
 // low-level request/response over the persistent socket
 template<class ReplyBuffer>
 static bool rkva_transact(
@@ -934,15 +1037,21 @@ static bool rkva_transact(
 
     // A partial frame cannot be retried on the same ordered byte stream. Valid
     // server errors with an empty body remain recoverable (snapshot fallback).
-    const auto stream_failure = [&]() {
+    // A live stream failure also means the Xbox endpoint is unreachable, so it
+    // arms the process-wide circuit breaker; an already-failed context only
+    // repeats the earlier verdict and must not extend the cooldown.
+    const auto stream_failure = [&](bool transport = true) {
         ctx->failed = true;
         ctx->connected = false;
         ctx->sock.close();
         out.clear();
+        if (transport) {
+            rkva_breaker_mark_down(ctx);
+        }
         return false;
     };
     if (ctx->failed || !ctx->sock.open()) {
-        return stream_failure();
+        return stream_failure(false);
     }
     const rkva_request req {
         RKVA_MAGIC, RKVA_VERSION, (uint16_t) op, ++ctx->cycle_id,
@@ -2810,6 +2919,10 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     return false;
 #else
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    // Fast fail while the endpoint is marked down: no socket, no timeout.
+    if (!rkva_breaker_allows_attempt(ctx)) {
+        return false;
+    }
     auto lock = rkva_lock_ctx_drained(ctx);
     // connect() normally clears failed. Never revive storage whose codec
     // helper failed to establish successful retirement; require a new backend.
@@ -2868,6 +2981,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         GGML_LOG_ERROR("%s: connect to %s:%u failed: %s\n",
                        GGML_REMOTE_ATTN_NAME, ctx->host.c_str(), (unsigned) ctx->port, strerror(errno));
         ctx->close_socket();
+        rkva_breaker_mark_down(ctx);
         return false;
     }
 
@@ -3591,21 +3705,33 @@ bool ggml_backend_remote_attn_configure_range(
         return false;
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    // The split tier is denied immediately while the endpoint cooldown is open.
+    if (!rkva_breaker_allows_attempt(ctx)) {
+        return false;
+    }
     auto lock = rkva_lock_ctx_drained(ctx);
     bool async_overlap = false;
     if (!rkva_async_local_remote_option(async_overlap)) return false;
     const char * format_req = rkva_get_upload_format();
     if (format_req && (!std::strcmp(format_req, "kvarn4") || !std::strcmp(format_req, "kvarn"))) {
-        return rkva_configure_native_kvarn(ctx, origin, capacity, cache_type, async_overlap);
+        if (!rkva_configure_native_kvarn(ctx, origin, capacity, cache_type, async_overlap)) return false;
+        rkva_breaker_note_configured(ctx);
+        return true;
     }
     if (format_req && (!std::strcmp(format_req, "q4") || !std::strcmp(format_req, "q4_0"))) {
-        if (rkva_configure_native_q4(ctx, origin, capacity, cache_type, async_overlap)) return true;
+        if (rkva_configure_native_q4(ctx, origin, capacity, cache_type, async_overlap)) {
+            rkva_breaker_note_configured(ctx);
+            return true;
+        }
         if (ctx->failed) return false;
         // Not negotiated (old server or missing bulk caps): keep the current
         // synchronous range upload path below, unchanged.
     }
     if (format_req && (!std::strcmp(format_req, "q8") || !std::strcmp(format_req, "q8_0"))) {
-        if (rkva_configure_native_q8(ctx, origin, capacity, cache_type, async_overlap)) return true;
+        if (rkva_configure_native_q8(ctx, origin, capacity, cache_type, async_overlap)) {
+            rkva_breaker_note_configured(ctx);
+            return true;
+        }
         if (ctx->failed) return false;
         // Not negotiated (old server or missing bulk caps): keep the current
         // synchronous range upload path below, unchanged.
@@ -3708,6 +3834,7 @@ bool ggml_backend_remote_attn_configure_range(
         GGML_LOG_INFO("%s: range source=%s storage=f16; quantized-source expansion does not recover precision\n",
                       GGML_REMOTE_ATTN_NAME, ggml_type_name(cache_type));
     }
+    rkva_breaker_note_configured(ctx);
     return true;
 }
 
