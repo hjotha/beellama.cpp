@@ -3207,7 +3207,9 @@ static bool rkva_range_apply_control(ggml_backend_remote_attn_context * ctx,
 }
 
 static bool rkva_async_local_remote_option(bool & async_overlap) {
-    async_overlap = false;
+    // Overlap is the default for the native bulk path; set the env to 0 to
+    // serialize local compute after the socket transaction.
+    async_overlap = true;
     if (const char * option = std::getenv("GGML_RKVA_ASYNC_LOCAL_REMOTE")) {
         if (!std::strcmp(option, "1")) async_overlap = true;
         else if (!std::strcmp(option, "0")) async_overlap = false;
@@ -3258,9 +3260,13 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     const bool rewind_v2 = (ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) &&
                            (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
     const bool serial_prefix = rewind_v2 && (ctx->ack.reserved[0] & RKVA_CAP_KVARN_SERIAL_PREFIX);
-    bool bulk = false;
+    // Native bulk RPC is the default: one ordered envelope per layer with a
+    // single submit/fence, and FP8 activations when the server advertises the
+    // RNE codec (F16 otherwise). No legacy fallback: a server without the bulk
+    // capabilities is rejected by the check below.
+    bool bulk = true;
     rkva_wire bulk_wire = RKVA_WIRE_F16;
-    bool bulk_wire_auto = false;
+    bool bulk_wire_auto = true;
     if (const char * option = std::getenv("GGML_RKVA_NATIVE_BULK")) {
         if (!std::strcmp(option, "1")) {
             bulk = true;
