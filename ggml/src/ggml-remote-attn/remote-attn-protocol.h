@@ -71,6 +71,12 @@ static constexpr uint64_t RKVA_CAP_KVARN_COMPACT_STAGE = 1ull << 13;
 static constexpr uint64_t RKVA_CAP_NATIVE_Q4_BULK = 1ull << 14;
 // layout 5: native Q8_0 overflow rows over op16/op22 (bulk + async capable server)
 static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK = 1ull << 15;
+// Capability allocation in HELLO ack.reserved[0]:
+//   0..13  range/KVarN storage and bulk features
+//   14     RKVA_CAP_NATIVE_Q4_BULK (descriptor layout 4)
+//   15     RKVA_CAP_NATIVE_Q8_BULK (descriptor layout 5)
+//   16+    reserved; experimental branches (e.g. the cohort worktree) must not
+//          reuse 14/15, otherwise a host would probe a layout the server lacks.
 static constexpr uint32_t RKVA_KVARN_UPLOAD_RESET = 1u;
 static constexpr uint32_t RKVA_KVARN_UPLOAD_OMIT_STAGE = 2u;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
