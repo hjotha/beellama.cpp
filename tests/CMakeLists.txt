@@ -1075,3 +1075,6 @@ if (GGML_CUDA AND TARGET ggml-cuda)
     add_test(NAME test-remote-attn-cuda COMMAND $<TARGET_FILE:test-remote-attn-cuda>)
     set_tests_properties(test-remote-attn-cuda PROPERTIES LABELS main SKIP_RETURN_CODE 77)
 endif()
+
+# CPU prototype: N256 lookahead executor/scheduler (no model/GPU/Xbox/RPC).
+llama_build_and_test(test-n256-lookahead-executor.cpp)
