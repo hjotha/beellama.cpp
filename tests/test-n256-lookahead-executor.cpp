@@ -93,10 +93,9 @@ Res resource_of(const Node & n) {
     return Res::Gpu;
 }
 
-int duration(Kind kind) {
-    // Logical example only; no TPS or latency inference.
-    return kind == Kind::Attn ? 2 : 1;
-}
+// Default logical durations per kind (QKV, ATTN, MERGE, FFN, STATE).
+// These are scheduling fixtures, not latency/TPS estimates.
+constexpr std::array<int, kKinds> kDefaultDurations{{1, 2, 1, 1, 1}};
 
 bool shape_ok(Kind kind, int n_tokens) {
     (void) kind;
@@ -559,6 +558,10 @@ public:
         return !res_busy_[0] && !res_busy_[1];
     }
 
+    void set_durations(const std::array<int, kKinds> & durations) {
+        durations_ = durations;
+    }
+
     bool overlap_pair(int layer) const {
         if (!is_full_layer(layer) || layer + 1 >= kLayers) return false;
         const int a = nid(Kind::Attn, layer, 1);
@@ -605,6 +608,7 @@ private:
     int fail_layer_;
     int fail_ub_;
     FailPhase fail_phase_;
+    std::array<int, kKinds> durations_{kDefaultDurations};
     int tamper_input_node_;
     uint64_t tamper_value_;
     int stale_input_node_;
@@ -745,7 +749,7 @@ private:
         op.out_slot = slot;
         op.out_gen = pool_.slot(slot).gen;
         op.start = now;
-        op.end = now + duration(n.kind);
+        op.end = now + durations_[static_cast<int>(n.kind)];
         op.status = OpState::Running;
         op.event_gen = kv_[n.layer].epoch;
         intervals_.push_back(Interval{node, now, op.end});
@@ -1118,6 +1122,90 @@ int main() {
         check(look.ops()[nid(Kind::State, 0, 0)].out_slot !=
               look.ops()[nid(Kind::State, 0, 1)].out_slot,
               "prefix and tail use distinct buffers");
+    }
+
+    // --- variable durations / simultaneous completions -------------------
+    {
+        Executor serial(Executor::Mode::Serial, u1);
+        serial.set_durations({{1, 3, 2, 1, 1}});
+        const RunResult r = serial.run();
+        check(r.outcome == RunOutcome::Completed, "variable-duration serial completes");
+        check(same_snapshot(serial.snapshot(), ref),
+              "variable-duration serial full state equals reference");
+        check(serial.pool().live_count() == 0, "variable-duration serial releases buffers");
+    }
+    {
+        Executor look(Executor::Mode::Lookahead, u1);
+        look.set_durations({{1, 3, 2, 1, 1}});
+        const RunResult r = look.run();
+        check(r.outcome == RunOutcome::Completed, "variable-duration lookahead completes");
+        check(same_snapshot(look.snapshot(), ref),
+              "variable-duration lookahead full state equals reference");
+        check(look.overlap_pair(0) && look.overlap_pair(1),
+              "variable durations preserve both legal overlaps");
+        check(look.events_processed() == kNodes && look.pool().live_count() == 0,
+              "variable durations: one event per node and buffers released");
+    }
+    {
+        Executor serial(Executor::Mode::Serial, u1);
+        serial.set_durations({{1, 1, 1, 1, 1}});
+        const RunResult r = serial.run();
+        check(r.outcome == RunOutcome::Completed, "unit-duration serial completes");
+        check(same_snapshot(serial.snapshot(), ref),
+              "unit-duration serial full state equals reference");
+        check(serial.pool().live_count() == 0, "unit-duration serial releases buffers");
+    }
+    {
+        Executor look(Executor::Mode::Lookahead, u1);
+        look.set_durations({{1, 1, 1, 1, 1}});
+        const RunResult r = look.run();
+        check(r.outcome == RunOutcome::Completed, "simultaneous-completion lookahead completes");
+        check(same_snapshot(look.snapshot(), ref),
+              "simultaneous completions preserve the complete state");
+        // With all-unit durations the lookahead may be merely adjacent; the
+        // complete state and event ordering are the discriminants here.
+        check(look.events_processed() == kNodes,
+              "simultaneous completions: one event per node");
+        check(look.pool().live_count() == 0, "simultaneous completions release buffers");
+    }
+    {
+        Executor f(Executor::Mode::Lookahead, u1, false, 0, 1, Executor::FailPhase::AfterCommit);
+        f.set_durations({{1, 1, 1, 1, 1}});
+        const RunResult r = f.run();
+        check(r.outcome == RunOutcome::SimulatedFailure,
+              "simultaneous-completion failure is terminal");
+        check(f.pool().live_count() == 0 && f.resource_free(),
+              "simultaneous-completion failure cleans buffers/resources");
+        check(!f.kv()[0].published[1], "simultaneous-completion failure keeps U1 unpublished");
+        const size_t n = f.intervals().size();
+        const Snapshot before = f.snapshot();
+        const RunResult r2 = f.run();
+        check(r2.outcome == RunOutcome::SimulatedFailure, "simultaneous failure sticky");
+        check(f.intervals().size() == n && same_snapshot(f.snapshot(), before),
+              "simultaneous failure does not dispatch or change state");
+    }
+
+    // --- old completion against a reused buffer slot ---------------------
+    {
+        BufferPool pool;
+        std::string why;
+        const int old_slot = pool.alloc(0, 1, why);
+        const uint64_t old_gen = pool.slot(old_slot).gen;
+        check(pool.publish(old_slot, old_gen, 0xaaa, why), "slot reuse: old operation publishes");
+        check(pool.consume(old_slot, old_gen, 0, why), "slot reuse: old consumer releases");
+        const int new_slot = pool.alloc(1, 0, why);
+        const uint64_t new_gen = pool.slot(new_slot).gen;
+        check(new_slot == old_slot && new_gen == old_gen + 1, "slot reuse: new operation reuses slot");
+        check(pool.publish(new_slot, new_gen, 0xbbb, why), "slot reuse: new operation publishes");
+        uint64_t value = 0;
+        check(pool.read(new_slot, new_gen, value, why) && value == 0xbbb,
+              "slot reuse: new operation value readable");
+        check(!pool.publish(old_slot, old_gen, 0xccc, why),
+              "slot reuse: old completion publication refused");
+        check(!pool.consume(old_slot, old_gen, 0, why),
+              "slot reuse: old completion consume refused");
+        check(pool.read(new_slot, new_gen, value, why) && value == 0xbbb,
+              "slot reuse: new operation value intact");
     }
 
     // --- failures between append/commit/publication in the executor ------
