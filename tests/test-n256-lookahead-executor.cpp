@@ -93,10 +93,9 @@ Res resource_of(const Node & n) {
     return Res::Gpu;
 }
 
-int duration(Kind kind) {
-    // Logical example only; no TPS or latency inference.
-    return kind == Kind::Attn ? 2 : 1;
-}
+// Default logical durations per kind (QKV, ATTN, MERGE, FFN, STATE).
+// These are scheduling fixtures, not latency/TPS estimates.
+constexpr std::array<int, kKinds> kDefaultDurations{{1, 2, 1, 1, 1}};
 
 bool shape_ok(Kind kind, int n_tokens) {
     (void) kind;
@@ -559,6 +558,19 @@ public:
         return !res_busy_[0] && !res_busy_[1];
     }
 
+    bool set_durations(const std::array<int, kKinds> & durations) {
+        for (const int d : durations) {
+            if (d <= 0) return false;
+        }
+        durations_ = durations;
+        return true;
+    }
+
+    void inject_old_event_at(int old_node, int at_node) {
+        late_old_node_ = old_node;
+        late_old_at_ = at_node;
+    }
+
     bool overlap_pair(int layer) const {
         if (!is_full_layer(layer) || layer + 1 >= kLayers) return false;
         const int a = nid(Kind::Attn, layer, 1);
@@ -605,12 +617,15 @@ private:
     int fail_layer_;
     int fail_ub_;
     FailPhase fail_phase_;
+    std::array<int, kKinds> durations_{kDefaultDurations};
     int tamper_input_node_;
     uint64_t tamper_value_;
     int stale_input_node_;
     int input_alias_node_;
     int late_during_node_;
     int duplicate_completion_node_;
+    int late_old_node_ = -1;
+    int late_old_at_ = -1;
     bool terminal_ = false;
     RunOutcome terminal_outcome_ = RunOutcome::Completed;
     std::string failure_why_;
@@ -745,7 +760,7 @@ private:
         op.out_slot = slot;
         op.out_gen = pool_.slot(slot).gen;
         op.start = now;
-        op.end = now + duration(n.kind);
+        op.end = now + durations_[static_cast<int>(n.kind)];
         op.status = OpState::Running;
         op.event_gen = kv_[n.layer].epoch;
         intervals_.push_back(Interval{node, now, op.end});
@@ -757,6 +772,11 @@ private:
         if (duplicate_completion_node_ == node) {
             // A second completion with the right generation must not double-commit.
             events_.push(Event{op.end, ++seq_, node, op.event_gen});
+        }
+        if (late_old_at_ == node && late_old_node_ >= 0) {
+            // Old completion from a previous op while the newer op occupies the
+            // reused slot; it must be ignored without touching the new value.
+            events_.push(Event{now_, ++seq_, late_old_node_, ops_[late_old_node_].event_gen});
         }
         if (mode_ == Mode::Serial) {
             lane_busy_ = true;
@@ -1120,6 +1140,146 @@ int main() {
               "prefix and tail use distinct buffers");
     }
 
+    // --- variable durations / simultaneous completions -------------------
+    {
+        Executor serial(Executor::Mode::Serial, u1);
+        serial.set_durations({{1, 3, 2, 1, 1}});
+        const RunResult r = serial.run();
+        check(r.outcome == RunOutcome::Completed, "variable-duration serial completes");
+        check(same_snapshot(serial.snapshot(), ref),
+              "variable-duration serial full state equals reference");
+        check(serial.pool().live_count() == 0, "variable-duration serial releases buffers");
+    }
+    {
+        Executor look(Executor::Mode::Lookahead, u1);
+        look.set_durations({{1, 3, 2, 1, 1}});
+        const RunResult r = look.run();
+        check(r.outcome == RunOutcome::Completed, "variable-duration lookahead completes");
+        check(same_snapshot(look.snapshot(), ref),
+              "variable-duration lookahead full state equals reference");
+        check(look.overlap_pair(0) && look.overlap_pair(1),
+              "variable durations preserve both legal overlaps");
+        check(look.events_processed() == kNodes && look.pool().live_count() == 0,
+              "variable durations: one event per node and buffers released");
+    }
+    {
+        Executor serial(Executor::Mode::Serial, u1);
+        serial.set_durations({{1, 1, 1, 1, 1}});
+        const RunResult r = serial.run();
+        check(r.outcome == RunOutcome::Completed, "unit-duration serial completes");
+        check(same_snapshot(serial.snapshot(), ref),
+              "unit-duration serial full state equals reference");
+        check(serial.pool().live_count() == 0, "unit-duration serial releases buffers");
+    }
+    {
+        Executor look(Executor::Mode::Lookahead, u1);
+        look.set_durations({{1, 1, 1, 1, 1}});
+        const RunResult r = look.run();
+        check(r.outcome == RunOutcome::Completed, "simultaneous-completion lookahead completes");
+        check(same_snapshot(look.snapshot(), ref),
+              "simultaneous completions preserve the complete state");
+        // With all-unit durations the lookahead may be merely adjacent; the
+        // complete state and event ordering are the discriminants here. The
+        // sequence tie-break is deterministic but not separately observed.
+        int max_same_end = 0;
+        for (int i = 0; i < kNodes; ++i) {
+            int same = 0;
+            for (int j = 0; j < kNodes; ++j) {
+                if (look.ops()[j].end == look.ops()[i].end) ++same;
+            }
+            max_same_end = std::max(max_same_end, same);
+        }
+        check(max_same_end >= 2,
+              "unit durations: two completions share a timestamp (seq tie-break)");
+        check(look.events_processed() == kNodes,
+              "simultaneous completions: one event per node");
+        check(look.pool().live_count() == 0, "simultaneous completions release buffers");
+    }
+    {
+        Executor f(Executor::Mode::Lookahead, u1, false, 0, 1, Executor::FailPhase::AfterCommit);
+        f.set_durations({{1, 1, 1, 3, 2}});
+        const RunResult r = f.run();
+        check(r.outcome == RunOutcome::SimulatedFailure, "in-flight failure is terminal");
+        check(f.pool().live_count() == 0 && f.resource_free(),
+              "in-flight failure cleans buffers/resources");
+        check(!f.kv()[0].published[1], "in-flight failure keeps U1 unpublished");
+        bool cancelled = false;
+        for (const auto & op : f.ops()) {
+            cancelled = cancelled || op.status == Executor::OpState::Cancelled;
+        }
+        check(cancelled, "in-flight failure has a RUNNING peer op");
+        const size_t n = f.intervals().size();
+        const Snapshot before = f.snapshot();
+        const RunResult r2 = f.run();
+        check(r2.outcome == RunOutcome::SimulatedFailure, "in-flight failure sticky");
+        check(f.intervals().size() == n && same_snapshot(f.snapshot(), before),
+              "in-flight failure does not dispatch or change state");
+    }
+
+    // --- old completion against a reused buffer slot ---------------------
+    {
+        BufferPool pool;
+        std::string why;
+        const int old_slot = pool.alloc(0, 1, why);
+        const uint64_t old_gen = pool.slot(old_slot).gen;
+        check(pool.publish(old_slot, old_gen, 0xaaa, why), "slot reuse: old operation publishes");
+        check(pool.consume(old_slot, old_gen, 0, why), "slot reuse: old consumer releases");
+        const int new_slot = pool.alloc(1, 0, why);
+        const uint64_t new_gen = pool.slot(new_slot).gen;
+        check(new_slot == old_slot && new_gen == old_gen + 1, "slot reuse: new operation reuses slot");
+        check(pool.publish(new_slot, new_gen, 0xbbb, why), "slot reuse: new operation publishes");
+        uint64_t value = 0;
+        check(pool.read(new_slot, new_gen, value, why) && value == 0xbbb,
+              "slot reuse: new operation value readable");
+        check(!pool.publish(old_slot, old_gen, 0xccc, why),
+              "slot reuse: old completion publication refused");
+        check(!pool.consume(old_slot, old_gen, 0, why),
+              "slot reuse: old completion consume refused");
+        check(pool.read(new_slot, new_gen, value, why) && value == 0xbbb,
+              "slot reuse: new operation value intact");
+    }
+    {
+        Executor bad(Executor::Mode::Serial, u1);
+        check(!bad.set_durations({{0, 1, 1, 1, 1}}), "non-positive duration refused");
+        check(bad.set_durations({{1, 2, 1, 1, 1}}), "positive durations accepted");
+    }
+    {
+        Executor base(Executor::Mode::Serial, u1);
+        const RunResult br = base.run();
+        check(br.outcome == RunOutcome::Completed, "slot reuse executor baseline completes");
+        int a = -1;
+        int b = -1;
+        for (int i = 0; i < kNodes && a < 0; ++i) {
+            if (base.ops()[i].out_slot < 0) continue;
+            for (int j = i + 1; j < kNodes; ++j) {
+                if (base.ops()[j].out_slot == base.ops()[i].out_slot) {
+                    a = i;
+                    b = j;
+                    break;
+                }
+            }
+        }
+        check(a >= 0 && b > a, "slot reuse: executor reuses an output slot");
+        if (a >= 0 && b > a) {
+            Executor re(Executor::Mode::Serial, u1);
+            re.inject_old_event_at(a, b);
+            const RunResult rr = re.run();
+            check(rr.outcome == RunOutcome::Completed,
+                  "slot reuse: old event does not abort the new run");
+            check(re.late_events() >= 1, "slot reuse: old completion is late");
+            check(re.ops()[b].out_slot == re.ops()[a].out_slot,
+                  "slot reuse: newer op occupies the reused slot");
+            check(re.ops()[b].out == base.ops()[b].out,
+                  "slot reuse: newer op value intact");
+            check(same_snapshot(re.snapshot(), ref), "slot reuse: complete state intact");
+            check(re.pool().live_count() == 0 && re.resource_free(),
+                  "slot reuse: buffers/resources released");
+            check(re.ops()[a].status == Executor::OpState::Done &&
+                  re.ops()[b].status == Executor::OpState::Done,
+                  "slot reuse: both operations complete");
+        }
+    }
+
     // --- failures between append/commit/publication in the executor ------
     {
         struct Case {
@@ -1135,6 +1295,9 @@ int main() {
         };
         for (const Case & c : cases) {
             Executor f(c.mode, u1, false, 0, c.ub, Executor::FailPhase::AfterAppend);
+            if (c.mode == Executor::Mode::Lookahead) {
+                f.set_durations({{1, 1, 1, 3, 2}});
+            }
             const RunResult r = f.run();
             check(r.outcome == RunOutcome::SimulatedFailure,
                   (std::string(c.name) + ": terminal simulated failure").c_str());
@@ -1158,8 +1321,7 @@ int main() {
                 for (const auto & op : f.ops()) {
                     cancelled = cancelled || op.status == Executor::OpState::Cancelled;
                 }
-                check(cancelled || f.events_processed() < kNodes,
-                      "lookahead failure drains in-flight work");
+                check(cancelled, "lookahead failure had an in-flight op");
             }
         }
     }
