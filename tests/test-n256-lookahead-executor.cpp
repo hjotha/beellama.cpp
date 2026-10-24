@@ -249,6 +249,7 @@ public:
         int owner = -1;
         int remaining = 0;
         uint64_t value = 0;
+        uint64_t consumed = 0; // bitmask of consumer owners (node ids)
     };
 
     int alloc(int owner, int consumers, std::string & why) {
@@ -268,6 +269,7 @@ public:
         slots_[idx].owner = owner;
         slots_[idx].remaining = consumers;
         slots_[idx].value = 0;
+        slots_[idx].consumed = 0;
         return idx;
     }
 
@@ -289,7 +291,6 @@ public:
     }
 
     bool consume(int idx, uint64_t gen, int owner, std::string & why) {
-        (void) owner;
         if (idx < 0 || idx >= kSlots) {
             why = "consume: bad buffer slot";
             return false;
@@ -301,6 +302,14 @@ public:
         if (slots_[idx].gen != gen) {
             why = "consume: stale buffer generation";
             return false;
+        }
+        if (owner >= 0 && owner < 64) {
+            const uint64_t bit = 1ULL << owner;
+            if (slots_[idx].consumed & bit) {
+                why = "consume: duplicate consumer " + std::to_string(owner);
+                return false;
+            }
+            slots_[idx].consumed |= bit;
         }
         if (slots_[idx].remaining <= 0) {
             why = "consume: consumer count underflow";
@@ -331,6 +340,59 @@ public:
         slots_[idx].owner = -1;
         slots_[idx].remaining = 0;
         return true;
+    }
+
+    bool read(int idx, uint64_t gen, uint64_t & value, std::string & why) const {
+        if (idx < 0 || idx >= kSlots) {
+            why = "read: bad buffer slot";
+            return false;
+        }
+        if (!slots_[idx].live) {
+            why = "read: buffer already free";
+            return false;
+        }
+        if (slots_[idx].gen != gen) {
+            why = "read: stale buffer generation";
+            return false;
+        }
+        value = slots_[idx].value;
+        return true;
+    }
+
+    bool tamper(int idx, uint64_t gen, uint64_t value, std::string & why) {
+        if (idx < 0 || idx >= kSlots) {
+            why = "tamper: bad buffer slot";
+            return false;
+        }
+        if (!slots_[idx].live) {
+            why = "tamper: buffer not live";
+            return false;
+        }
+        if (slots_[idx].gen != gen) {
+            why = "tamper: stale buffer generation";
+            return false;
+        }
+        slots_[idx].value = value;
+        return true;
+    }
+
+    bool force_stale(int idx, std::string & why) {
+        if (idx < 0 || idx >= kSlots || !slots_[idx].live) {
+            why = "force_stale: buffer not live";
+            return false;
+        }
+        ++slots_[idx].gen;
+        return true;
+    }
+
+    void release_all() {
+        for (Slot & s : slots_) {
+            if (s.live) {
+                s.live = false;
+                s.owner = -1;
+                s.remaining = 0;
+            }
+        }
     }
 
     void force(int idx) { forced_ = idx; }
@@ -389,6 +451,13 @@ Snapshot reference_run(uint64_t u1_tokens) {
     return s;
 }
 
+enum class RunOutcome { Completed, SimulatedFailure, Error };
+
+struct RunResult {
+    RunOutcome outcome;
+    std::string why;
+};
+
 class Executor {
 public:
     enum class Mode { Serial, Lookahead };
@@ -399,7 +468,7 @@ public:
         int end;
     };
     struct OpState {
-        enum Status { Pending = 0, Running = 1, Done = 2, Failed = 3 };
+        enum Status { Pending = 0, Running = 1, Done = 2, Failed = 3, Cancelled = 4 };
         int status = Pending;
         int start = -1;
         int end = -1;
@@ -415,39 +484,59 @@ public:
 
     Executor(Mode mode, uint64_t u1_tokens, bool inject_alias = false,
              int fail_layer = -1, int fail_ub = -1,
-             FailPhase fail_phase = FailPhase::None)
+             FailPhase fail_phase = FailPhase::None,
+             int tamper_input_node = -1, uint64_t tamper_value = 0,
+             int stale_input_node = -1, int input_alias_node = -1,
+             int late_during_node = -1, int duplicate_completion_node = -1)
         : mode_(mode), inject_alias_(inject_alias), fail_layer_(fail_layer),
-          fail_ub_(fail_ub), fail_phase_(fail_phase) {
+          fail_ub_(fail_ub), fail_phase_(fail_phase),
+          tamper_input_node_(tamper_input_node), tamper_value_(tamper_value),
+          stale_input_node_(stale_input_node), input_alias_node_(input_alias_node),
+          late_during_node_(late_during_node),
+          duplicate_completion_node_(duplicate_completion_node) {
         tokens_[0] = 0x55aa55aa55aa55aaULL;
         tokens_[1] = u1_tokens;
     }
 
-    bool run(std::string & why) {
+    RunResult run() {
+        if (terminal_) return {terminal_outcome_, failure_why_};
+        std::string why;
         while (done_ + failed_ < kNodes) {
+            if (terminal_) return {terminal_outcome_, failure_why_};
             if (mode_ == Mode::Serial) {
                 if (!lane_busy_) {
                     const int n = pick_ready(-1);
-                    if (n >= 0 && !start(n, now_, why)) return false;
+                    if (n >= 0 && !start(n, now_, why)) {
+                        terminate_error(why);
+                        return {terminal_outcome_, failure_why_};
+                    }
                 }
             } else {
                 for (int r = 0; r < 2; ++r) {
                     if (res_busy_[r]) continue;
                     const int n = pick_ready(r);
-                    if (n >= 0 && !start(n, now_, why)) return false;
+                    if (n >= 0 && !start(n, now_, why)) {
+                        terminate_error(why);
+                        return {terminal_outcome_, failure_why_};
+                    }
                 }
             }
             if (events_.empty()) {
-                why = "deadlock: no completion event";
-                return false;
+                terminate_error("deadlock: no completion event");
+                return {terminal_outcome_, failure_why_};
             }
             now_ = events_.top().time;
             while (!events_.empty() && events_.top().time == now_) {
                 const Event e = events_.top();
                 events_.pop();
-                if (!complete(e, why)) return false;
+                if (!complete(e, why)) {
+                    terminate_error(why);
+                    return {terminal_outcome_, failure_why_};
+                }
+                if (terminal_) return {terminal_outcome_, failure_why_};
             }
         }
-        return true;
+        return {RunOutcome::Completed, ""};
     }
 
     Snapshot snapshot() const {
@@ -464,6 +553,11 @@ public:
     int events_processed() const { return events_processed_; }
     int late_events() const { return late_events_; }
     int alias_rejected() const { return alias_rejected_; }
+
+    bool resource_free() const {
+        if (mode_ == Mode::Serial) return !lane_busy_;
+        return !res_busy_[0] && !res_busy_[1];
+    }
 
     bool overlap_pair(int layer) const {
         if (!is_full_layer(layer) || layer + 1 >= kLayers) return false;
@@ -511,6 +605,15 @@ private:
     int fail_layer_;
     int fail_ub_;
     FailPhase fail_phase_;
+    int tamper_input_node_;
+    uint64_t tamper_value_;
+    int stale_input_node_;
+    int input_alias_node_;
+    int late_during_node_;
+    int duplicate_completion_node_;
+    bool terminal_ = false;
+    RunOutcome terminal_outcome_ = RunOutcome::Completed;
+    std::string failure_why_;
     uint64_t tokens_[kUb]{};
     std::array<OpState, kNodes> ops_{};
     std::array<LayerKv, kLayers> kv_{};
@@ -580,7 +683,31 @@ private:
             const OpState & d = ops_[deps[i]];
             op.in_slot[i] = d.out_slot;
             op.in_gen[i] = d.out_gen;
-            op.in_val[i] = d.out;
+            if (tamper_input_node_ == node && i == 0) {
+                if (!pool_.tamper(d.out_slot, d.out_gen, tamper_value_, why)) {
+                    op.status = OpState::Failed;
+                    ++failed_;
+                    why = "tamper input: " + why;
+                    return false;
+                }
+            }
+            if (stale_input_node_ == node && i == 0) {
+                if (!pool_.force_stale(d.out_slot, why)) {
+                    op.status = OpState::Failed;
+                    ++failed_;
+                    why = "stale input injection: " + why;
+                    return false;
+                }
+            }
+            // Inputs are read by {slot, generation}; the dependent never uses
+            // a copied producer output. A stale/free/aliased input fails before
+            // any dependent publication.
+            if (!pool_.read(d.out_slot, d.out_gen, op.in_val[i], why)) {
+                op.status = OpState::Failed;
+                ++failed_;
+                why = "input handle: " + why;
+                return false;
+            }
         }
         const int consumers = dependents_of(node);
         if (inject_alias_ && node == nid(Kind::Qkv, 1, 0)) {
@@ -595,6 +722,17 @@ private:
                     why = "alias injected: " + why;
                     return false;
                 }
+            }
+        }
+        if (input_alias_node_ == node && !deps.empty()) {
+            pool_.force(op.in_slot[0]);
+            const int bad = pool_.alloc(node, consumers, why);
+            if (bad < 0) {
+                ++alias_rejected_;
+                op.status = OpState::Failed;
+                ++failed_;
+                why = "input alias: " + why;
+                return false;
             }
         }
         const int slot = pool_.alloc(node, consumers, why);
@@ -612,6 +750,14 @@ private:
         op.event_gen = kv_[n.layer].epoch;
         intervals_.push_back(Interval{node, now, op.end});
         events_.push(Event{op.end, ++seq_, node, op.event_gen});
+        if (late_during_node_ == node) {
+            // A stale completion arrives while the operation is still RUNNING.
+            events_.push(Event{now, ++seq_, node, op.event_gen + 1});
+        }
+        if (duplicate_completion_node_ == node) {
+            // A second completion with the right generation must not double-commit.
+            events_.push(Event{op.end, ++seq_, node, op.event_gen});
+        }
         if (mode_ == Mode::Serial) {
             lane_busy_ = true;
         } else {
@@ -642,6 +788,22 @@ private:
         return 0;
     }
 
+    void terminate(bool simulated, const std::string & why) {
+        terminal_ = true;
+        terminal_outcome_ = simulated ? RunOutcome::SimulatedFailure : RunOutcome::Error;
+        failure_why_ = why;
+        for (OpState & op : ops_) {
+            if (op.status == OpState::Running) op.status = OpState::Cancelled;
+        }
+        events_ = decltype(events_)();
+        pool_.release_all();
+        lane_busy_ = false;
+        res_busy_ = {false, false};
+    }
+
+    void terminate_failure(const std::string & why) { terminate(true, why); }
+    void terminate_error(const std::string & why) { terminate(false, why); }
+
     bool complete(const Event & e, std::string & why) {
         ++events_processed_;
         if (e.node < 0 || e.node >= kNodes) {
@@ -658,7 +820,9 @@ private:
             ++late_events_;
             op.status = OpState::Failed;
             ++failed_;
-            free_res(n);
+            why = "stale completion while RUNNING for " + std::string(kind_name(n.kind)) +
+                  " L" + std::to_string(n.layer) + " U" + std::to_string(n.ub);
+            terminate_error(why);
             return true;
         }
         const uint64_t out = compute(n, op);
@@ -675,8 +839,8 @@ private:
             if (er != StateError::None) {
                 op.status = OpState::Failed;
                 ++failed_;
-                free_res(n);
                 why = std::string("state append: ") + state_error_name(er);
+                terminate_error(why);
                 return true;
             }
             const bool fail_here = (fail_layer_ == n.layer && fail_ub_ == n.ub);
@@ -684,8 +848,8 @@ private:
                 layer.fail();
                 op.status = OpState::Failed;
                 ++failed_;
-                free_res(n);
                 why = "simulated failure after append";
+                terminate_failure(why);
                 return true;
             }
             const int32_t row_end = kPRuntime + (n.ub + 1) * kN;
@@ -693,32 +857,32 @@ private:
             if (er != StateError::None) {
                 op.status = OpState::Failed;
                 ++failed_;
-                free_res(n);
                 why = std::string("state commit: ") + state_error_name(er);
+                terminate_error(why);
                 return true;
             }
             if (fail_here && fail_phase_ == FailPhase::AfterCommit) {
                 layer.fail();
                 op.status = OpState::Failed;
                 ++failed_;
-                free_res(n);
                 why = "simulated failure after commit";
+                terminate_failure(why);
                 return true;
             }
             er = layer.publish(n.ub, e.gen);
             if (er != StateError::None) {
                 op.status = OpState::Failed;
                 ++failed_;
-                free_res(n);
                 why = std::string("state publish: ") + state_error_name(er);
+                terminate_error(why);
                 return true;
             }
             if (fail_here && fail_phase_ == FailPhase::AfterPublish) {
                 layer.fail();
                 op.status = OpState::Failed;
                 ++failed_;
-                free_res(n);
                 why = "simulated failure after publication";
+                terminate_failure(why);
                 return true;
             }
         }
@@ -867,6 +1031,45 @@ int main() {
         check(pool.release(s2, pool.slot(s2).gen, why), "buffer: leaf release");
     }
 
+    // --- buffer consumer identity / reuse / handle reads ------------------
+    {
+        BufferPool pool;
+        std::string why;
+        const int s = pool.alloc(0, 2, why);
+        const uint64_t g = pool.slot(s).gen;
+        check(pool.consume(s, g, 7, why), "buffer: first of two consumers");
+        check(!pool.consume(s, g, 7, why), "buffer: duplicate consumer refused");
+        check(pool.slot(s).remaining == 1, "buffer: duplicate consumer does not decrement");
+        check(pool.consume(s, g, 8, why), "buffer: second consumer releases");
+        check(!pool.slot(s).live, "buffer: two consumers release once");
+    }
+    {
+        BufferPool pool;
+        std::string why;
+        const int s = pool.alloc(0, 0, why);
+        const uint64_t g = pool.slot(s).gen;
+        check(pool.publish(s, g, 1, why), "buffer: publish before reuse");
+        check(pool.release(s, g, why), "buffer: release before reuse");
+        const int s2 = pool.alloc(1, 0, why);
+        check(s2 == s && pool.slot(s2).gen == g + 1, "buffer: reuse increments generation");
+        check(!pool.publish(s, g, 2, why), "buffer: old publication after reuse refused");
+        check(!pool.consume(s, g, 7, why), "buffer: old consume after reuse refused");
+        check(!pool.release(s, g, why), "buffer: old release after reuse refused");
+    }
+    {
+        BufferPool pool;
+        std::string why;
+        const int s = pool.alloc(0, 1, why);
+        const uint64_t g = pool.slot(s).gen;
+        uint64_t v = 0;
+        check(pool.publish(s, g, 42, why), "buffer: publish read handle");
+        check(pool.read(s, g, v, why) && v == 42, "buffer: read current handle");
+        check(pool.tamper(s, g, 99, why), "buffer: tamper current handle");
+        check(pool.read(s, g, v, why) && v == 99, "buffer: tampered value visible");
+        check(pool.force_stale(s, why), "buffer: force stale generation");
+        check(!pool.read(s, g, v, why), "buffer: stale handle read refused");
+    }
+
     // --- serial vs lookahead: complete state must match ------------------
     const uint64_t u1 = 0xaaaaaaaaaaaaaaaaULL;
     const Snapshot ref = reference_run(u1);
@@ -876,11 +1079,10 @@ int main() {
     check(ref.kv[0].publications == 2 && ref.kv[2].publications == 2,
           "reference publications: two per layer");
     {
-        std::string why;
         Executor serial(Executor::Mode::Serial, u1);
-        const bool ok = serial.run(why);
-        check(ok, "serial executor completes");
-        if (!ok) std::printf("  serial: %s\n", why.c_str());
+        const RunResult sr = serial.run();
+        check(sr.outcome == RunOutcome::Completed, "serial executor completes");
+        if (sr.outcome != RunOutcome::Completed) std::printf("  serial: %s\n", sr.why.c_str());
         const Snapshot snap = serial.snapshot();
         check(same_snapshot(snap, ref), "serial full state equals reference");
         check(!serial.overlap_pair(0) && !serial.overlap_pair(1),
@@ -892,14 +1094,17 @@ int main() {
               "serial overlap pair uses distinct buffers");
     }
     {
-        std::string why;
         Executor look(Executor::Mode::Lookahead, u1);
-        const bool ok = look.run(why);
-        check(ok, "lookahead executor completes");
-        if (!ok) std::printf("  lookahead: %s\n", why.c_str());
+        const RunResult lr = look.run();
+        check(lr.outcome == RunOutcome::Completed, "lookahead executor completes");
+        if (lr.outcome != RunOutcome::Completed) std::printf("  lookahead: %s\n", lr.why.c_str());
         const Snapshot snap = look.snapshot();
         check(same_snapshot(snap, ref), "lookahead full state equals reference");
-        check(same_snapshot(snap, reference_run(u1)), "lookahead state stable across runs");
+        Executor look2(Executor::Mode::Lookahead, u1);
+        const RunResult lr2 = look2.run();
+        check(lr2.outcome == RunOutcome::Completed, "second lookahead executor completes");
+        check(same_snapshot(snap, look2.snapshot()),
+              "two lookahead instances produce the same complete state");
         check(look.overlap_pair(0) && look.overlap_pair(1),
               "lookahead overlaps the two legal pairs");
         check(look.events_processed() == kNodes, "lookahead processes one completion per node");
@@ -917,42 +1122,184 @@ int main() {
 
     // --- failures between append/commit/publication in the executor ------
     {
+        struct Case {
+            const char * name;
+            Executor::Mode mode;
+            int ub;
+        };
+        const Case cases[] = {
+            {"U0 serial", Executor::Mode::Serial, 0},
+            {"U1 serial", Executor::Mode::Serial, 1},
+            {"U0 lookahead", Executor::Mode::Lookahead, 0},
+            {"U1 lookahead", Executor::Mode::Lookahead, 1},
+        };
+        for (const Case & c : cases) {
+            Executor f(c.mode, u1, false, 0, c.ub, Executor::FailPhase::AfterAppend);
+            const RunResult r = f.run();
+            check(r.outcome == RunOutcome::SimulatedFailure,
+                  (std::string(c.name) + ": terminal simulated failure").c_str());
+            check(f.kv()[0].retired, (std::string(c.name) + ": layer retired").c_str());
+            check(f.pool().live_count() == 0, (std::string(c.name) + ": buffers released").c_str());
+            check(f.resource_free(), (std::string(c.name) + ": resources released").c_str());
+            const size_t n_intervals = f.intervals().size();
+            const Snapshot before = f.snapshot();
+            const RunResult r2 = f.run();
+            check(r2.outcome == r.outcome, (std::string(c.name) + ": sticky terminal").c_str());
+            check(f.intervals().size() == n_intervals,
+                  (std::string(c.name) + ": no dispatch after terminal").c_str());
+            check(same_snapshot(f.snapshot(), before),
+                  (std::string(c.name) + ": state unchanged after terminal").c_str());
+            if (c.ub == 0) {
+                check(f.ops()[nid(Kind::Attn, 0, 1)].status != Executor::OpState::Done,
+                      "U0 failure invalidates the U1 predecessor");
+            }
+            if (c.mode == Executor::Mode::Lookahead) {
+                bool cancelled = false;
+                for (const auto & op : f.ops()) {
+                    cancelled = cancelled || op.status == Executor::OpState::Cancelled;
+                }
+                check(cancelled || f.events_processed() < kNodes,
+                      "lookahead failure drains in-flight work");
+            }
+        }
+    }
+    {
+        Executor f(Executor::Mode::Serial, u1, false, 0, 1, Executor::FailPhase::AfterCommit);
+        const RunResult r = f.run();
+        check(r.outcome == RunOutcome::SimulatedFailure, "failure-after-commit terminal");
+        check(f.kv()[0].retired && f.kv()[0].publications == 1,
+              "failure-after-commit: U1 unpublished");
+        check(!f.kv()[0].published[1], "failure-after-commit keeps U1 unpublished");
+        check(f.pool().live_count() == 0, "failure-after-commit releases buffers");
+        check(f.resource_free(), "failure-after-commit releases resources");
+        const size_t n = f.intervals().size();
+        const Snapshot before = f.snapshot();
+        const RunResult r2 = f.run();
+        check(r2.outcome == RunOutcome::SimulatedFailure, "failure-after-commit sticky");
+        check(f.intervals().size() == n && same_snapshot(f.snapshot(), before),
+              "failure-after-commit does not dispatch or change state");
+    }
+    {
+        Executor f(Executor::Mode::Serial, u1, false, 0, 1, Executor::FailPhase::AfterPublish);
+        const RunResult r = f.run();
+        check(r.outcome == RunOutcome::SimulatedFailure, "failure-after-publication terminal");
+        check(f.kv()[0].retired && f.kv()[0].publications == 2,
+              "failure-after-publication preserves both publications");
+        check(f.pool().live_count() == 0, "failure-after-publication releases buffers");
+        check(f.resource_free(), "failure-after-publication releases resources");
+        const size_t n = f.intervals().size();
+        const Snapshot before = f.snapshot();
+        const RunResult r2 = f.run();
+        check(r2.outcome == RunOutcome::SimulatedFailure, "failure-after-publication sticky");
+        check(f.intervals().size() == n && same_snapshot(f.snapshot(), before),
+              "failure-after-publication does not dispatch or change state");
+    }
+    {
         std::string why;
         Executor f(Executor::Mode::Serial, u1, false, 0, 1, Executor::FailPhase::AfterAppend);
-        check(f.run(why), "executor failure-after-append finishes");
-        check(f.kv()[0].retired, "executor failure-after-append retires layer");
-        check(f.kv()[0].publications == 1 && !f.kv()[0].published[1],
-              "executor failure-after-append publishes only U0");
-        check(!f.kv()[0].next_request_allowed(), "executor failure-after-append rejects next");
+        const RunResult r = f.run();
+        check(r.outcome == RunOutcome::SimulatedFailure, "post-failure late test terminal");
         f.inject_late_event(nid(Kind::State, 0, 1), 1);
-        check(f.drain_late(why), "late completion drained");
+        check(f.drain_late(why), "late completion drained after failure");
         check(f.late_events() >= 1, "late completion after failure is detected");
-    }
-    {
-        std::string why;
-        Executor f(Executor::Mode::Serial, u1, false, 0, 1, Executor::FailPhase::AfterCommit);
-        check(f.run(why), "executor failure-after-commit finishes");
-        check(f.kv()[0].retired && f.kv()[0].publications == 1,
-              "executor failure-after-commit: U1 unpublished");
-        check(!f.kv()[0].published[1], "executor failure-after-commit keeps U1 unpublished");
-    }
-    {
-        std::string why;
-        Executor f(Executor::Mode::Serial, u1, false, 0, 1, Executor::FailPhase::AfterPublish);
-        check(f.run(why), "executor failure-after-publication finishes");
-        check(f.kv()[0].retired && f.kv()[0].publications == 2,
-              "executor failure-after-publication preserves both publications");
-        check(!f.kv()[0].next_request_allowed(), "executor failure-after-publication rejects next");
+        check(f.pool().live_count() == 0, "late completion after failure keeps buffers released");
+        const size_t n = f.intervals().size();
+        const Snapshot before = f.snapshot();
+        const RunResult r2 = f.run();
+        check(r2.outcome == RunOutcome::SimulatedFailure, "post-failure terminal remains sticky");
+        check(f.intervals().size() == n && same_snapshot(f.snapshot(), before),
+              "post-failure late event does not change state");
     }
 
-    // --- alias injection and late buffer generation ----------------------
+    // --- alias / late-running / duplicate completion ---------------------
     {
-        std::string why;
         Executor alias(Executor::Mode::Lookahead, u1, true);
-        const bool ok = alias.run(why);
-        check(!ok, "executor refuses injected alias");
-        check(alias.alias_rejected() >= 1 && why.find("alias") != std::string::npos,
+        const RunResult r = alias.run();
+        check(r.outcome == RunOutcome::Error, "executor refuses injected alias");
+        check(alias.alias_rejected() >= 1 && r.why.find("alias") != std::string::npos,
               "alias rejection is explicit");
+        check(alias.pool().live_count() == 0, "alias error cleans buffers");
+        check(alias.resource_free(), "alias error frees resources");
+        const size_t n = alias.intervals().size();
+        const Snapshot before = alias.snapshot();
+        const RunResult r2 = alias.run();
+        check(r2.outcome == RunOutcome::Error, "alias terminal is sticky");
+        check(alias.intervals().size() == n && same_snapshot(alias.snapshot(), before),
+              "alias terminal does not dispatch or change state");
+    }
+    {
+        Executor late(Executor::Mode::Serial, u1, false, -1, -1, Executor::FailPhase::None,
+                      -1, 0, -1, -1, nid(Kind::Qkv, 0, 0));
+        const RunResult r = late.run();
+        check(r.outcome == RunOutcome::Error, "late event while RUNNING terminates as Error");
+        check(r.why.find("stale") != std::string::npos, "late event error names stale completion");
+        check(late.late_events() >= 1, "late event while RUNNING is detected");
+        check(late.ops()[nid(Kind::Qkv, 0, 0)].status == Executor::OpState::Failed,
+              "late completion fails the current op");
+        check(late.resource_free(), "late completion releases the resource");
+        check(late.pool().live_count() == 0, "late completion cleans buffers");
+        const size_t n = late.intervals().size();
+        const Snapshot before = late.snapshot();
+        const RunResult r2 = late.run();
+        check(r2.outcome == RunOutcome::Error, "late terminal is sticky");
+        check(late.intervals().size() == n && same_snapshot(late.snapshot(), before),
+              "late terminal does not dispatch or change state");
+    }
+    {
+        Executor dup(Executor::Mode::Serial, u1, false, -1, -1, Executor::FailPhase::None,
+                     -1, 0, -1, -1, -1, nid(Kind::Qkv, 0, 0));
+        const RunResult r = dup.run();
+        check(r.outcome == RunOutcome::Completed, "duplicate completion run completes");
+        check(dup.late_events() >= 1, "duplicate completion is detected as late");
+        check(same_snapshot(dup.snapshot(), ref),
+              "duplicate completion does not change the complete state");
+        check(dup.pool().live_count() == 0, "duplicate completion releases buffers");
+    }
+
+    // --- inputs are read through pool handles ----------------------------
+    {
+        Executor t(Executor::Mode::Serial, u1, false, -1, -1, Executor::FailPhase::None,
+                   nid(Kind::Qkv, 1, 0), 0xdeadbeefULL);
+        const RunResult r = t.run();
+        check(r.outcome == RunOutcome::Completed, "tamper run completes");
+        check(t.snapshot().out[nid(Kind::Qkv, 1, 0)] != ref.out[nid(Kind::Qkv, 1, 0)],
+              "pool content feeds the dependent computation");
+        check(!same_snapshot(t.snapshot(), ref), "tampered pool state differs from reference");
+    }
+    {
+        Executor st(Executor::Mode::Serial, u1, false, -1, -1, Executor::FailPhase::None,
+                    -1, 0, nid(Kind::Qkv, 1, 0));
+        const RunResult r = st.run();
+        check(r.outcome == RunOutcome::Error, "stale input handle rejected as error");
+        check(r.why.find("stale") != std::string::npos, "stale input error names generation");
+        check(st.ops()[nid(Kind::Qkv, 1, 0)].status != Executor::OpState::Done,
+              "stale input prevents dependent publication");
+        check(st.pool().live_count() == 0, "stale input cleans buffers");
+        check(st.resource_free(), "stale input frees resources");
+        const size_t n = st.intervals().size();
+        const Snapshot before = st.snapshot();
+        const RunResult r2 = st.run();
+        check(r2.outcome == RunOutcome::Error, "stale input terminal is sticky");
+        check(st.intervals().size() == n && same_snapshot(st.snapshot(), before),
+              "stale input terminal does not dispatch or change state");
+    }
+    {
+        Executor ia(Executor::Mode::Serial, u1, false, -1, -1, Executor::FailPhase::None,
+                    -1, 0, -1, nid(Kind::Qkv, 1, 0));
+        const RunResult r = ia.run();
+        check(r.outcome == RunOutcome::Error, "input alias rejected as error");
+        check(ia.alias_rejected() >= 1 && r.why.find("alias") != std::string::npos,
+              "input alias rejection is explicit");
+        check(ia.ops()[nid(Kind::Qkv, 1, 0)].status != Executor::OpState::Done,
+              "input alias prevents dependent publication");
+        check(ia.pool().live_count() == 0, "input alias cleans buffers");
+        check(ia.resource_free(), "input alias frees resources");
+        const size_t n = ia.intervals().size();
+        const Snapshot before = ia.snapshot();
+        const RunResult r2 = ia.run();
+        check(r2.outcome == RunOutcome::Error, "input alias terminal is sticky");
+        check(ia.intervals().size() == n && same_snapshot(ia.snapshot(), before),
+              "input alias terminal does not dispatch or change state");
     }
 
     // --- P provenance and boundaries -------------------------------------
