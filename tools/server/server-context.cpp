@@ -1447,10 +1447,12 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        mem.seq_rm(id, -1, -1);
+        if (!mem.seq_rm(id, -1, -1)) {
+            SRV_ERR("prompt_clear: failed to clear memory for slot %d; keeping prompt bookkeeping\n", id);
+            return;
+        }
         common_speculative_set_state(spec, id, {});
-
-prompt_reset_after_memory_clear();
+        prompt_reset_after_memory_clear();
         just_restored = false;
         restored_logits.clear();
         logits_last.clear();
@@ -1975,10 +1977,13 @@ server_slot_stats get_stats() const {
         return res;
     }
 
-    void copy_state_to(server_slot & other) const {
+    bool copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        mem.seq_rm(other.id,     -1, -1);
+        if (!mem.seq_rm(other.id, -1, -1)) {
+            SLT_ERR(*this, "copy_state_to: failed to clear child slot %d\n", other.id);
+            return false;
+        }
         mem.seq_cp(id, other.id, -1, -1);
 
         other.i_batch = i_batch;
@@ -1993,6 +1998,7 @@ server_slot_stats get_stats() const {
 
         other.prompt = prompt.clone();
         other.init_sampler();
+        return true;
     }
 };
 
@@ -7464,6 +7470,14 @@ private:
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
     }
 
+    // Terminal refusal: exactly one error result, then release. Never call
+    // release() on a refusal path without sending the terminal error first, or
+    // the client waits forever for a response.
+    void fail_slot(server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+        send_error(slot, error, type);
+        slot.release();
+    }
+
     void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
         SRV_ERR("task id = %d, error: %s\n", id_task, error.c_str());
 
@@ -9126,7 +9140,11 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
+                if (!slot.mem.seq_rm(slot.id, n_keep, n_keep + n_discard)) {
+                    SLT_ERR(slot, "context shift: failed to remove %d cells; aborting request\n", n_discard);
+                    fail_slot(slot, "context shift failed to remove KV cells");
+                    return;
+                }
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
@@ -9631,7 +9649,11 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
+                                            if (!slot.mem.seq_rm(slot.id, head_p, head_c)) {
+                                                SLT_ERR(slot, "%s", "context reuse: failed to move KV chunk; aborting request\n");
+                                                fail_slot(slot, "context reuse failed to move KV chunk");
+                                                return;
+                                            }
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -9958,7 +9980,11 @@ private:
                                             if (slot_was_restored) {
                                                 SLT_WRN(slot, "%s", "target-only snapshot restore discarded; no valid MTP/checkpoint suffix was available, falling back to cold prefill\n");
                                             }
-                                            slot.mem.seq_rm(slot.id, -1, -1);
+                                            if (!slot.mem.seq_rm(slot.id, -1, -1)) {
+                                                SLT_ERR(slot, "%s", "failed to clear memory before cold prefill; aborting request\n");
+                                                fail_slot(slot, "failed to clear memory before cold prefill");
+                                                return;
+                                            }
                                             common_speculative_set_state(spec.get(), slot.id, {});
                                             SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                     "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
@@ -10583,7 +10609,11 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
                     GGML_ASSERT(child->state == SLOT_STATE_WAIT_OTHER);
 
-                    slot.copy_state_to(*child);
+                    if (!slot.copy_state_to(*child)) {
+                        SLT_ERR(slot, "failed to copy prompt state to child %d; releasing child\n", child->id);
+                        fail_slot(*child, "failed to copy prompt state to child");
+                        continue;
+                    }
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }
             }
@@ -10895,11 +10925,15 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                                     slot, ckpt, slot.ctx_tgt, slot.draft_owns_state ? slot.ctx_dft : nullptr,
                                     true, use_ckpt_dft, true)) {
                             SLT_ERR(slot, "%s", "failed to restore speculative checkpoint transaction\n");
-                            slot.release();
+                            fail_slot(slot, "failed to restore speculative checkpoint transaction");
                             return;
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        if (!slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1)) {
+                            SLT_ERR(slot, "%s", "failed to trim speculative suffix after checkpoint restore; aborting request\n");
+                            fail_slot(slot, "failed to trim speculative suffix after checkpoint restore");
+                            return;
+                        }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -11011,7 +11045,11 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             const int64_t trace_kv_start = dflash_trace_tick_us();
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (!slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1)) {
+                SLT_ERR(slot, "%s", "failed to remove rejected draft suffix; aborting request\n");
+                fail_slot(slot, "failed to remove rejected draft suffix");
+                return;
+            }
             dflash_trace("kv_remove", trace_kv_start, dflash_trace_tick_us(), (int) n_draft);
 
             const int64_t trace_emit_start = dflash_trace_tick_us();

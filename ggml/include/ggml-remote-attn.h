@@ -197,6 +197,14 @@ GGML_API void ggml_remote_attn_set_active(ggml_backend_t backend);
 // buffer), read via ggml_backend_tensor_get. Returns false on RPC/GPU failure.
 GGML_API bool ggml_remote_attn_exec(struct ggml_tensor * node);
 
+// Test-only deterministic handshake for the post-transaction validation
+// window. Enable, wait until the worker reaches the barrier, inject the fault,
+// then release. The worker's internal wait is bounded (10 s); wait_reached()
+// uses timeout_ms for the test-side observation. No effect unless enabled.
+GGML_API void ggml_backend_remote_attn_test_handshake_enable(bool enable);
+GGML_API bool ggml_backend_remote_attn_test_handshake_wait_reached(int timeout_ms);
+GGML_API void ggml_backend_remote_attn_test_handshake_release();
+
 #ifdef __cplusplus
 }
 #endif

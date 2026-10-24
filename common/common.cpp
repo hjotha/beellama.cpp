@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "common-rollback.h"
 #include "json.h"
 #include "fit.h"
 #include "log.h"
@@ -2852,7 +2853,7 @@ uint32_t common_context_seq_rm_max_rollback(llama_context * ctx) {
     return capability.arbitrary_ranges ? UINT32_MAX : capability.suffix_rollback_tokens;
 }
 
-static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+static bool common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     // A terminal compute failure can already have cleared local memory while
     // leaving the remote backend poisoned. Still call seq_rm so a healthy
@@ -2862,14 +2863,17 @@ static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llam
                                 p0 < 0 && p1 < 0 &&
                                 llama_memory_seq_pos_min(mem, seq_id) == -1 &&
                                 llama_memory_seq_pos_max(mem, seq_id) == -1;
-    if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
-        if (was_empty_full) {
+    const bool removed = llama_memory_seq_rm(mem, seq_id, p0, p1);
+    if (common_seq_rm_cleanup_tolerated(removed, was_empty_full)) {
+        if (!removed) {
             LOG_WRN("%s: refused cleanup of already empty sequence %d; backend failure remains unchanged\n",
                     __func__, seq_id);
-            return;
         }
-        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+        return true;
     }
+    LOG_ERR("%s: refused cleanup of sequence %d (p0=%d, p1=%d); propagating failure without abort\n",
+            __func__, seq_id, p0, p1);
+    return false;
 }
 
 static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -2887,11 +2891,10 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
     this->ctx_dft = ctx_dft;
 }
 
-void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
-    if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
-    }
+bool common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    const bool target = common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    const bool draft  = ctx_dft ? common_context_seq_rm(ctx_dft, seq_id, p0, p1) : true;
+    return target && draft;
 }
 
 common_memory_seq_rm_result common_memory_seq_rm_suffix(

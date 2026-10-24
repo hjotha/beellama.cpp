@@ -700,6 +700,7 @@ enum class rkva_slot_state {
 
 struct rkva_async_slot {
     uint32_t        id = 0;
+    uint32_t        session = RKVA_SESSION_NONE; // captured at prepare (worker must not read ctx->active_session)
     rkva_slot_state state = rkva_slot_state::FREE;
     uint64_t        epoch = 0;
     uint64_t        ticket = 0;
@@ -808,6 +809,10 @@ struct ggml_backend_remote_attn_context {
     rkva_socket sock;
     std::atomic<bool> connected {false};
     std::atomic<bool> failed {false};
+    // Logical poison survives until every in-flight job is drained; only then
+    // are owners/vectors destroyed. Never destroy state under a job that may
+    // still reference range_layers/native_layers.
+    bool        remote_state_poisoned = false;
     // Holds the descriptor for an entire frame. Never wait for this while
     // holding async_mutex; the worker releases it before publishing its ACK.
     std::mutex socket_mutex;
@@ -1157,6 +1162,28 @@ static bool rkva_has_free_slot(const ggml_backend_remote_attn_context * ctx) {
     return false;
 }
 
+// Test-only deterministic barrier for the window between a successful
+// transaction and the epoch/publication checks. The worker signals "reached"
+// and waits (bounded) for an explicit release; production never enables it.
+struct rkva_test_handshake_state {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool enabled = false;
+    bool reached = false;
+    bool released = false;
+};
+rkva_test_handshake_state g_rkva_test_handshake;
+
+static void rkva_test_handshake_barrier() {
+    std::unique_lock<std::mutex> lock(g_rkva_test_handshake.mutex);
+    if (!g_rkva_test_handshake.enabled) return;
+    g_rkva_test_handshake.reached = true;
+    g_rkva_test_handshake.cv.notify_all();
+    g_rkva_test_handshake.cv.wait_for(lock, std::chrono::seconds(10), [] {
+        return !g_rkva_test_handshake.enabled || g_rkva_test_handshake.released;
+    });
+}
+
 // The worker thread has sole ownership of ctx->sock. Network transmit/receive
 // and reply decoding run without ctx->mutex to prevent host CPU stall.
 // ctx->mutex is only acquired briefly to commit generation and ACK coverage.
@@ -1191,11 +1218,19 @@ static bool rkva_finish_native_bulk_job(
         reply.reserve(4u << 20);
     }
     uint64_t cycle = 0;
-    const bool transacted = rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, ctx->active_session,
+    const bool transacted = rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, slot.session,
                 slot.layer, slot.nq, slot.payload.data(), uint32_t(slot.payload.size()),
                 reply, uint32_t(out_bytes + lse_bytes), nullptr, &cycle);
     slot.response_cycle = cycle;
     if (!transacted) {
+        return false;
+    }
+    // Test-only deterministic barrier; no-op unless explicitly enabled.
+    rkva_test_handshake_barrier();
+    // Validate before unpack so an invalidated job cannot publish. A poison
+    // after this check is contained: buffers stay alive until retirement and
+    // WAIT/commit reject the result (no publication of invalidated output).
+    if (slot.epoch != ctx->range_epoch || ctx->failed) {
         return false;
     }
     auto response_trace = slot.trace;
@@ -1310,6 +1345,50 @@ static bool rkva_finish_native_bulk_job(
     return true;
 }
 
+// Caller holds ctx->mutex. LOGICAL invalidation only: safe even while another
+// async job is still running and may reference range_layers/native_layers.
+// Physical teardown is deferred to rkva_destroy_poisoned_state_locked() after a
+// drain. The socket is interrupted (non-blocking cancel), not waited on.
+static void rkva_poison_remote_state_locked(ggml_backend_remote_attn_context * ctx) {
+    ++ctx->range_epoch;
+    ctx->remote_state_poisoned = true;
+    ctx->failed = true;
+    ctx->connected = false;
+    ctx->range_configured = false;
+    ctx->range_native_kvarn = false;
+    ctx->range_fused = false;
+    ctx->range_profile = false;
+    ctx->range_profile_controlled = false;
+    ctx->range_kernel_mode = 0;
+    ctx->active_session = RKVA_SESSION_NONE;
+    if (ctx->native_generation != UINT64_MAX) {
+        ++ctx->native_generation;
+    } else {
+        ctx->failed = true;
+    }
+    ctx->sock.interrupt();
+}
+
+// Caller holds ctx->mutex AND guarantees no async job is in flight
+// (rkva_lock_ctx_drained or rkva_async_drain returned). Only here may owners,
+// vectors and the socket be destroyed. Idempotent.
+static void rkva_destroy_poisoned_state_locked(ggml_backend_remote_attn_context * ctx) {
+    if (!ctx->remote_state_poisoned) return;
+    ctx->close_socket();
+    for (auto & owner : ctx->native_layers) {
+        owner.reset();
+    }
+    ctx->native_layers.clear();
+    ctx->range_layers.clear();
+    ctx->native_store = nullptr;
+    ctx->native_q4 = false;
+    ctx->native_q8 = false;
+    ctx->native_serial_prefix = false;
+    ctx->native_bulk = false;
+    ctx->async_local_remote = false;
+    ctx->remote_state_poisoned = false;
+}
+
 static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
     std::unique_lock<std::mutex> lock(ctx->async_mutex);
     for (;;) {
@@ -1358,11 +1437,11 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
             }
         }
         if (!ok) {
-            // An uncertain ordered-stream/GPU mutation must fail closed.
+            // An uncertain ordered-stream/GPU mutation must fail closed. Poison
+            // is logical only: this worker must not destroy owners/vectors that
+            // another job may still reference; the next drain tears them down.
             std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
-            ctx->failed = true;
-            ctx->connected = false;
-            ctx->close_socket();
+            rkva_poison_remote_state_locked(ctx);
         }
 
         lock.lock();
@@ -1431,6 +1510,7 @@ static std::unique_lock<std::mutex> rkva_lock_ctx_drained(
             if (done) {
                 ctx->async_cv.notify_all();
             }
+            rkva_destroy_poisoned_state_locked(ctx);
             return lock;
         }
         lock.unlock();
@@ -1450,6 +1530,8 @@ static bool rkva_async_wait_node(
     const uint64_t epoch  = (uint64_t(uint32_t(ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_EPOCH_HI))) << 32) |
                              uint32_t(ggml_get_op_params_i32(source, GGML_REMOTE_ATTN_PARAM_EPOCH_LO));
     if (ticket == 0) {
+        std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
+        rkva_poison_remote_state_locked(ctx);
         return false;
     }
 
@@ -1463,6 +1545,11 @@ static bool rkva_async_wait_node(
         }
     }
     if (!slot) {
+        // A WAIT with no live ticket is a terminal inconsistency, not a benign
+        // no-op: never let the decode fall back to the batch-retry path.
+        lock.unlock();
+        std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
+        rkva_poison_remote_state_locked(ctx);
         return false;
     }
 
@@ -1479,6 +1566,10 @@ static bool rkva_async_wait_node(
     });
 
     if (slot->ticket != ticket || slot->epoch != epoch || slot->node != source) {
+        // The slot was retired/reused under us: terminal for this request.
+        lock.unlock();
+        std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
+        rkva_poison_remote_state_locked(ctx);
         return false;
     }
 
@@ -1512,8 +1603,7 @@ static bool rkva_async_wait_node(
 
     if (!ok) {
         std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
-        ctx->failed = true;
-        ctx->connected = false;
+        rkva_poison_remote_state_locked(ctx);
         return false;
     }
     return true;
@@ -1565,6 +1655,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         auto & slot = ctx->synchronous_slot;
         slot.reset();
         slot.epoch = ctx->range_epoch;
+        slot.session = ctx->active_session;
         const bool ok = rkva_prepare_native_bulk_job(ctx, node, layer, live, nq, out_width, slot) &&
             rkva_finish_native_bulk_job(ctx, slot, true);
         slot.reset();
@@ -2082,6 +2173,7 @@ static bool rkva_async_submit_locked(
                 slot->state = rkva_slot_state::PREPARING;
                 slot->ticket = ++ctx->async_ticket_counter;
                 slot->epoch = ctx->range_epoch;
+                slot->session = submitted_session;
                 slot->node = node;
                 ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_LO, int32_t(slot->ticket & 0xffffffffu));
                 ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_HI, int32_t((slot->ticket >> 32) & 0xffffffffu));
@@ -2702,7 +2794,8 @@ static enum ggml_status ggml_backend_remote_attn_graph_compute(
             continue;
         }
 
-        auto lock = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC) ?
+        const bool is_async = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC) != 0;
+        auto lock = is_async ?
             std::unique_lock<std::mutex>(ctx->mutex) : rkva_lock_ctx_drained(ctx);
         if (ctx->failed || !ctx->connected) {
             GGML_LOG_ERROR("%s: backend not connected (failed=%d)\n",
@@ -2710,9 +2803,11 @@ static enum ggml_status ggml_backend_remote_attn_graph_compute(
             return GGML_STATUS_ABORTED;
         }
         if (!rkva_run_attn(ctx, node, lock)) {
-            ctx->failed = true;
-            ctx->connected = false;
-            ctx->sock.interrupt();
+            rkva_poison_remote_state_locked(ctx);
+            if (!is_async) {
+                // Drained lock: no job can reference owners/vectors now.
+                rkva_destroy_poisoned_state_locked(ctx);
+            }
             ctx->async_cv.notify_all();
             return GGML_STATUS_ABORTED;
         }
@@ -3092,13 +3187,18 @@ bool ggml_backend_remote_attn_reset(ggml_backend_t backend, uint32_t session_id)
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     auto lock = rkva_lock_ctx_drained(ctx);
+    // A failed/refused reset must retire every derived state: a later request
+    // must not match a stale session, range layer or native owner.
     if (!ctx->connected || ctx->failed) {
+        rkva_poison_remote_state_locked(ctx);
+        rkva_destroy_poisoned_state_locked(ctx); // drained lock: safe
         return false;
     }
     ++ctx->range_epoch;
     std::vector<uint8_t> out;
     if (!rkva_transact(ctx, RKVA_RESET, session_id, 0, 0, nullptr, 0, out, 0) || !out.empty()) {
-        ctx->failed = true;
+        rkva_poison_remote_state_locked(ctx);
+        rkva_destroy_poisoned_state_locked(ctx);
         return false;
     }
     if (ctx->range_native_kvarn) {
@@ -3131,7 +3231,8 @@ static bool rkva_trim_range_locked(ggml_backend_remote_attn_context * ctx,
     std::vector<uint8_t> reply;
     if (!rkva_transact(ctx, RKVA_REWIND, session_id, 0, 0,
                 &request, sizeof(request), reply, 0)) {
-        ctx->failed = true; // ACK failure cannot publish speculative coverage
+        rkva_poison_remote_state_locked(ctx); // ACK failure cannot publish speculative coverage
+        rkva_destroy_poisoned_state_locked(ctx);
         return false;
     }
     for (auto & layer : ctx->range_layers) {
@@ -3218,21 +3319,24 @@ static bool rkva_native_rewind_locked(ggml_backend_remote_attn_context * ctx,
         std::vector<uint8_t> reply;
         if (payload.size() > (256u << 20) || !rkva_transact(ctx, RKVA_KVARN_RANGE_REWIND,
                     session_id, 0, 0, payload.data(), uint32_t(payload.size()), reply, 0) || !reply.empty()) {
-            ctx->failed = true;
+            rkva_poison_remote_state_locked(ctx);
+            rkva_destroy_poisoned_state_locked(ctx);
             return false;
         }
         ++ctx->native_generation;
         for (size_t il = 0; il < ctx->native_layers.size(); ++il) {
             auto & owner = ctx->native_layers[il];
             if (owner && !owner->rewind(std::min(owner->rows(), keep))) {
-                ctx->failed = true;
+                rkva_poison_remote_state_locked(ctx);
+                rkva_destroy_poisoned_state_locked(ctx);
                 return false;
             }
             ctx->range_layers[il].rows = owner ? owner->rows() : 0;
         }
         return true;
     } catch (...) {
-        ctx->failed = true;
+        rkva_poison_remote_state_locked(ctx);
+        rkva_destroy_poisoned_state_locked(ctx);
         return false;
     }
 }
@@ -3320,11 +3424,13 @@ static bool rkva_range_apply_control(ggml_backend_remote_attn_context * ctx,
     return true;
 }
 
-static bool rkva_async_local_remote_option(bool & async_overlap) {
+static bool rkva_async_local_remote_option(bool & async_overlap, bool & explicitly_set) {
     // Overlap is the default for the native bulk path; set the env to 0 to
     // serialize local compute after the socket transaction.
     async_overlap = true;
+    explicitly_set = false;
     if (const char * option = std::getenv("GGML_RKVA_ASYNC_LOCAL_REMOTE")) {
+        explicitly_set = true;
         if (!std::strcmp(option, "1")) async_overlap = true;
         else if (!std::strcmp(option, "0")) async_overlap = false;
         else {
@@ -3397,8 +3503,10 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
         } else if (!std::strcmp(option, "splitzip")) {
             GGML_LOG_ERROR("%s: SplitZip wire format is deactivated; use lossless 'f16' instead\n", GGML_REMOTE_ATTN_NAME);
             return false;
-        } else if (std::strcmp(option, "0")) {
-            return false;
+        } else if (!std::strcmp(option, "0")) {
+            // Explicit opt-out for legacy-layout compatibility tests. Production
+            // default remains bulk; a non-bulk server is only used when asked.
+            bulk = false;
         }
     }
     if (const char * wire_env = std::getenv("GGML_RKVA_WIRE_FORMAT")) {
@@ -3711,7 +3819,16 @@ bool ggml_backend_remote_attn_configure_range(
     }
     auto lock = rkva_lock_ctx_drained(ctx);
     bool async_overlap = false;
-    if (!rkva_async_local_remote_option(async_overlap)) return false;
+    bool async_explicit = false;
+    if (!rkva_async_local_remote_option(async_overlap, async_explicit)) return false;
+    if (!async_explicit) {
+        // No bulk path => no overlap. This also covers the KVarN4 branch, which
+        // returns before the generic non-bulk adjustment below.
+        const char * bulk_opt = std::getenv("GGML_RKVA_NATIVE_BULK");
+        if (bulk_opt && !std::strcmp(bulk_opt, "0")) {
+            async_overlap = false;
+        }
+    }
     const char * format_req = rkva_get_upload_format();
     if (format_req && (!std::strcmp(format_req, "kvarn4") || !std::strcmp(format_req, "kvarn"))) {
         if (!rkva_configure_native_kvarn(ctx, origin, capacity, cache_type, async_overlap)) return false;
@@ -3735,6 +3852,11 @@ bool ggml_backend_remote_attn_configure_range(
         if (ctx->failed) return false;
         // Not negotiated (old server or missing bulk caps): keep the current
         // synchronous range upload path below, unchanged.
+    }
+    if (async_overlap && !async_explicit) {
+        // Auto default: overlap only on a negotiated bulk path. Non-bulk
+        // formats (f16/legacy) keep the synchronous path instead of failing.
+        async_overlap = false;
     }
     if (async_overlap) {
         GGML_LOG_ERROR("%s: GGML_RKVA_ASYNC_LOCAL_REMOTE requires "
@@ -3942,7 +4064,10 @@ void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {
 bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend) {
     if (!backend || ggml_backend_is_local_split(backend)) return false;
     const auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
-    return ctx->range_configured && ctx->range_native_kvarn;
+    // A failed/down context must never advertise native state, even before the
+    // retire path clears range_configured: the caller would build a split graph
+    // that can only abort after touching stale owners.
+    return ctx->connected && !ctx->failed && ctx->range_configured && ctx->range_native_kvarn;
 }
 
 bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend) {
@@ -3959,7 +4084,31 @@ void ggml_backend_remote_attn_drain(ggml_backend_t backend) {
         return;
     }
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
-    rkva_async_drain(ctx);
+    // rkva_lock_ctx_drained revalidates "no job in flight" under both locks and
+    // destroys a poisoned state only after that revalidation. A plain drain +
+    // lock would allow a submission to slip in between the two operations.
+    auto lock = rkva_lock_ctx_drained(ctx);
+}
+
+extern "C" void ggml_backend_remote_attn_test_handshake_enable(bool enable) {
+    std::lock_guard<std::mutex> lock(g_rkva_test_handshake.mutex);
+    g_rkva_test_handshake.enabled = enable;
+    g_rkva_test_handshake.reached = false;
+    g_rkva_test_handshake.released = false;
+    g_rkva_test_handshake.cv.notify_all();
+}
+
+extern "C" bool ggml_backend_remote_attn_test_handshake_wait_reached(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(g_rkva_test_handshake.mutex);
+    return g_rkva_test_handshake.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [] {
+        return g_rkva_test_handshake.reached;
+    });
+}
+
+extern "C" void ggml_backend_remote_attn_test_handshake_release() {
+    std::lock_guard<std::mutex> lock(g_rkva_test_handshake.mutex);
+    g_rkva_test_handshake.released = true;
+    g_rkva_test_handshake.cv.notify_all();
 }
 
 size_t ggml_backend_remote_attn_async_in_flight(ggml_backend_t backend) {
@@ -4222,7 +4371,8 @@ bool ggml_remote_attn_exec(struct ggml_tensor * node) {
     if (ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT)) {
         return rkva_async_wait_node(ctx, node);
     }
-    auto lock = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC) ?
+    const bool is_async = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC) != 0;
+    auto lock = is_async ?
         std::unique_lock<std::mutex>(ctx->mutex) : rkva_lock_ctx_drained(ctx);
     if (ctx->failed || !ctx->connected) {
         GGML_LOG_ERROR("%s: exec while not connected (failed=%d)\n",
@@ -4230,9 +4380,10 @@ bool ggml_remote_attn_exec(struct ggml_tensor * node) {
         return false;
     }
     if (!rkva_run_attn(ctx, node, lock)) {
-        ctx->failed = true;
-        ctx->connected = false;
-        ctx->sock.interrupt();
+        rkva_poison_remote_state_locked(ctx);
+        if (!is_async) {
+            rkva_destroy_poisoned_state_locked(ctx);
+        }
         ctx->async_cv.notify_all();
         return false;
     }

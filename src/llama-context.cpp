@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-ext.h"
 #include "llama-graph.h"
+#include "llama-rollback.h"
 #include "llama-impl.h"
 #include "llama-position-split.h"
 #include "llama-io.h"
@@ -2071,6 +2072,9 @@ std::vector<ggml_backend_t> layer_backends;
                     });
                 }
                 memory->set_on_clear([this]() {
+                    // Void callback: a refused remote reset poisons the backend
+                    // (stays failed, no implicit recovery); the next decode
+                    // fails closed instead of assuming this clear succeeded.
                     if (backend_remote != nullptr) {
                         if (ggml_backend_is_local_split(backend_remote)) {
                             ggml_backend_local_split_reset(backend_remote, remote_attn_session);
@@ -4490,6 +4494,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
             }
 
+            bool remote_rollback_failed = false;
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
                 if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
                     continue;
@@ -4497,11 +4502,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
 
-                memory->seq_rm(s, pos_min[s], -1);
+                const llama_rollback_result rollback = llama_rollback_sequence_after_decode_failure(
+                    [&](llama_seq_id seq, llama_pos p0, llama_pos p1) {
+                        if (p0 < 0 && p1 < 0) {
+                            return memory->seq_rm(seq, p0, p1) && memory->run_on_seq_rm(seq, p0, p1);
+                        }
+                        return memory->seq_rm(seq, p0, p1);
+                    }, s, pos_min[s]);
+                if (rollback == LLAMA_ROLLBACK_FULL) {
+                    LLAMA_LOG_WARN("%s: suffix removal refused for seq_id=%d; invalidated the whole sequence\n", __func__, s);
+                    remote_rollback_failed = true;
+                } else if (rollback == LLAMA_ROLLBACK_NONE) {
+                    LLAMA_LOG_ERROR("%s: failed to invalidate seq_id=%d after decode failure\n", __func__, s);
+                    remote_rollback_failed = true;
+                }
             }
 
+            const bool remote_backend_failed = backend_remote != nullptr &&
+                    ggml_backend_remote_attn_failed(backend_remote);
             switch (status) {
-                case GGML_STATUS_ABORTED:      return  2;
+                // A remote/rollback failure must not be retried as a batch-size
+                // issue by the server; report it as a distinct compute error.
+                // A failed remote backend is terminal even if local seq_rm
+                // succeeded, so it must not fall into the retryable path.
+                case GGML_STATUS_ABORTED:      return llama_decode_aborted_code(remote_rollback_failed, remote_backend_failed);
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");

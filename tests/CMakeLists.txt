@@ -106,6 +106,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-server-loop-guard-checkpoint-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-server-terminal-error-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-server-terminal-error-static.py)
+    set_property(TEST test-server-terminal-error-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-spec-cession-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-spec-cession-static.py)
@@ -849,6 +855,13 @@ target_compile_features(test-position-split-mask-memo PRIVATE cxx_std_17)
 target_link_libraries(test-position-split-mask-memo PRIVATE llama)
 add_test(NAME test-position-split-mask-memo WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-mask-memo>)
 set_property(TEST test-position-split-mask-memo PROPERTY LABELS main)
+
+add_executable(test-position-split-rollback test-position-split-rollback.cpp)
+target_include_directories(test-position-split-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/common)
+target_compile_features(test-position-split-rollback PRIVATE cxx_std_17)
+target_link_libraries(test-position-split-rollback PRIVATE llama)
+add_test(NAME test-position-split-rollback WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-rollback>)
+set_property(TEST test-position-split-rollback PROPERTY LABELS main)
 
 # Fase 7: Wavefront Causal de Tiles 64/128 e Serviço Progressivo de Prefill
 add_executable(test-wavefront-pipeline test-wavefront-pipeline.cpp)
