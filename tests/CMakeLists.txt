@@ -1063,6 +1063,9 @@ set_tests_properties(test-kv-mixed-destination-intact PROPERTIES ENVIRONMENT "F4
 
 llama_build_and_test(test-prompt-cache-native-layout.cpp)
 
+# CPU contract fixture for the two-ubatch N256 lookahead. No model/GPU/Xbox.
+llama_build_and_test(test-n256-lookahead-contract.cpp)
+
 if (GGML_CUDA AND TARGET ggml-cuda)
     find_package(CUDAToolkit REQUIRED)
     add_executable(test-remote-attn-cuda test-remote-attn-cuda.cpp)
