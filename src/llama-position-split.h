@@ -221,7 +221,7 @@ inline int64_t spec_draft_limit_before_kvarn_seal(
 // em INVALID: fail-closed, nunca adivinhar faixa.
 enum class range_kind : uint8_t {
     LOCAL    = 0,
-    OVERFLOW = 1,
+    OVERFLOW_RANGE = 1,
     INVALID  = 2,
 };
 
@@ -239,7 +239,7 @@ inline range_pos range_for_pos(int64_t pos, uint32_t p, uint32_t c = kCapacityC)
         out.kind = range_kind::LOCAL;
         out.index_in_range = uint32_t(pos);
     } else {
-        out.kind = range_kind::OVERFLOW;
+        out.kind = range_kind::OVERFLOW_RANGE;
         out.index_in_range = uint32_t(uint64_t(pos) - p);
     }
     return out;

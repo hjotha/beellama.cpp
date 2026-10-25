@@ -1,0 +1,131 @@
+# Install a release build on your Xbox
+
+> This reference was imported from xllama. For the integrated BeeLlama layout,
+> current build commands and the single core source root, use [BeeLlama Xbox](../README.md).
+> Historical worktree and benchmark paths describe the earlier project.
+
+Install a tagged app release or a specific CI MSVC package on an Xbox Series S|X
+in Dev Mode from a Linux/macOS host. The 2026-09-28 app release is
+[v1.6.0.0](https://github.com/gianlucamazza/xllama/releases/tag/v1.6.0.0).
+Its release notes identify the exact CI package and release validation results.
+The [releases page](https://github.com/gianlucamazza/xllama/releases) also contains
+research tags, which can be newer without containing an app MSIX.
+For building from source see the [README](../README.md#build); for Dev Mode
+activation and Device Portal basics see [device-portal.md](./device-portal.md).
+
+## Prerequisites
+
+- Xbox in **Dev Mode** with the Device Portal enabled (note IP + credentials).
+- A credentials file, e.g. `~/.config/xllama/xbox-env`:
+
+  ```bash
+  export XBOX_IP=192.168.1.x
+  export XBOX_USER=...
+  export XBOX_PASS=...
+  ```
+
+- Internet access on the console (first launch downloads the default model).
+
+## 1. Download the release assets
+
+From the GitHub Release page (or `gh release download vX.Y.Z`):
+
+- `xllama_X.Y.Z.REV_x64.msix` — the app (~19 MB, no model inside). The fourth
+  component `REV` is the CI run stamp and differs per release; local builds keep
+  `.0`. Read the real name off the release page, or let the shell below derive
+  it from the file you downloaded.
+- `xllama-test.cer` — the signing test certificate
+- `Microsoft.VCLibs.x64.14.00.appx` — runtime dependency
+
+### Use a specific CI MSVC package
+
+Main CI packages can include changes not yet attached to a release tag. Inspect
+the selected run's exact `headSha` and successful status before downloading:
+
+```bash
+# Example: verified 2026-09-28 run; choose the run for your target commit.
+XLLAMA_RUN_ID=36422945110
+gh run view "$XLLAMA_RUN_ID" --repo gianlucamazza/xllama --json headSha,conclusion
+gh run download "$XLLAMA_RUN_ID" --repo gianlucamazza/xllama \
+  --name xllama-appx --dir "/tmp/xllama-ci-${XLLAMA_RUN_ID}"
+# Locate the one MSIX under AppPackages, then use deploy.sh as in §2.
+```
+
+The unified `xllama-appx` artifact is the shipping/measurement path; see
+[crossbuild-console.md](crossbuild-console.md). A higher revision with the same
+identity updates in place and preserves LocalState. Verify `deploy.sh pfn` and
+the running process package after install; WDP can briefly retain an older
+registration alongside the updated package.
+
+`install-latest-build.sh` performs a **fresh install**: it uninstalls registered
+versions first and wipes their LocalState. Use it with backups/re-provisioning
+when a fresh installation is intended. For profile-preserving updates, download
+the chosen artifact and pass its MSIX directly to `deploy.sh`.
+
+## 2. Install the certificate, dependency, and app
+
+```bash
+source ~/.config/xllama/xbox-env
+
+# Trust cert (deploy.sh also auto-installs a .cer found next to the .msix)
+./scripts/deploy.sh install-cert xllama-test.cer
+
+# VCLibs dependency: install once via the Device Portal UI
+#   https://<XBOX_IP>:11443 → My games & apps → Install → Microsoft.VCLibs.x64.14.00.appx
+# (or add it as a dependency in the same WDP install dialog as the MSIX)
+
+# App — derive the name from what you downloaded rather than typing a
+# revision. The fourth component is a CI run stamp, so hard-coding one here
+# would be wrong for every release but the one it was written for.
+MSIX=$(ls -1 xllama_*_x64.msix | head -1)
+./scripts/deploy.sh "$MSIX"
+```
+
+Notes:
+
+- **Upgrades within the same identity**: a higher version installs over the
+  old one and **preserves** LocalState (models, settings, history). WDP
+  refuses a same-version install with different contents.
+- **Any 1.5.x → 1.5.y is a normal in-place update**: same identity, LocalState
+  (models, settings, history, KV snapshots) is preserved.
+- ⚠️ **Upgrading from ≤1.4.x to 1.5.x is NOT an in-place update.** 1.5.0.0
+  changed the package identity (`VenereLabs.xllama` → `GianlucaMazza.xllama`):
+  it installs as a **new app**, and the old app's LocalState — downloaded
+  models, chat history, settings, training output — does **not** carry over.
+  Migration steps:
+  1. Install 1.5.0.0 (this section) — the old app can stay during the switch.
+  2. **Launch the new app once** (`./scripts/deploy.sh start-app`) — its
+     LocalState does not exist until first launch, and model provisioning
+     fails without it (`"File move failed"`).
+  3. Re-provision models: in-app download, or
+     `./scripts/provision-models.sh --all-test` from a host.
+  4. When the new app works, uninstall the old `VenereLabs.xllama` package
+     (Dev Home, or WDP `DELETE /api/app/packagemanager/package`).
+- After (re)installs, check the **App type** in Dev Home (tile → View details):
+  the measured performance figures assume the **Game** designation
+  (`uwp-constraints.md §5`).
+
+## 3. First launch
+
+Launch xllama from Dev Home (or `./scripts/deploy.sh start-app`). The app
+downloads the default chat model with a progress bar, then opens the chat.
+On **unified** shipping builds (v1.1.8+) that default is
+**LFM2.5-350M** (~219 MB catalogue download); older releases used SmolLM2-360M
+INT4 (~421 MB). See
+[using-the-app.md](./using-the-app.md) from here.
+
+For image generation, the SD-Turbo model (2.4 GB) is downloaded from the
+catalogue on the first **Generate** — mind the Dev Mode disk budget (~2.2–2.5 GB
+free by default, **expandable to 90 GB** via Dev Home → Manage Dev Storage; see
+[uwp-constraints.md §9](uwp-constraints.md)). Device Portal provisioning remains available
+([../diffusion/README.md](../diffusion/README.md), runbook §7).
+
+## Troubleshooting
+
+- `0x80070070` (disk full) while installing models: the Dev Mode partition has
+  ~2.2–2.5 GB free by default — remove unused models from LocalState, or raise the
+  Dev Mode allocation (up to 90 GB, `uwp-constraints.md §9`).
+- Startup issues: `./scripts/deploy.sh diagnose-startup` prints the process
+  state, the app log, and any crash dumps in one shot.
+- Log at any time: `./scripts/deploy.sh get-log`; individual files:
+  `./scripts/deploy.sh fetch-file "$(./scripts/deploy.sh pfn)" <name> <local-out>`.

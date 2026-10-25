@@ -1,0 +1,21 @@
+{
+  "source_repository": "https://github.com/hjotha/xllama-qwen35-xbox",
+  "source_commit": "41b8f9562a456c7baa59625d2e6a2e64f02237cd",
+  "core": "../..",
+  "notes": "Xbox frontend imported without a nested llama.cpp checkout, build products, credentials, models or historical benchmark/research data.",
+  "integrated_sources": {
+    "shipping_frontend": "41b8f956",
+    "tv_dashboard": "0a50ea2638482e1df669a12886126d10af84b5c5"
+  },
+  "reviewed_193_sources": {
+    "MTP": "a595c8e37a86c7ce5bbecdbac4141a4ed94b0cbd",
+    "RKVA_native": "a04d5984db86a2862b43b031d082a4fadc7fc652",
+    "RKVA_future": "79c7a006a4c672c1b441960e860d70318c96566c"
+  },
+  "selection": "Shipping frontend retains newer state/nonce guards, RKVA endpoints, bulk op22, Q4/Q8 layouts, serial-prefix v3, compact-stage and lifetime handling. Reviewed older branch variants would remove these and were not substituted. TV dashboard merged in three ways. Standalone historical DFlash research app excluded.",
+  "excluded": "Nested core checkouts, historical standalone DFlash research app, research/release distribution assets and their standalone tests, models, credentials, build caches and packages.",
+  "shared_contracts": [
+    "ggml/src/ggml-remote-attn/remote-attn-protocol.h",
+    "ggml/src/ggml-remote-attn/rkva-kvarn-rewind.h"
+  ]
+}

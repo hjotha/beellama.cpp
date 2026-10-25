@@ -1,0 +1,19 @@
+{
+  "_comment": "LocalState override qwen35-4b experimental (Series S, GGUF direct HF, no reinstall). Upload via Device Portal to LocalState/manifest.json merge; new name appended, bundled entries stay. Single-file Q4_K_M only (no MTP) to stay near phi4-mini peak 2765 MB. Source HF unsloth/Qwen3.5-4B-GGUF, sha pinned from .57 file 2026-10-02. RAM/disk gate: Game-mode heap ceiling 4864 MB, GPU budget 3801 MB; expect OOM risk, validate via /api/pull + console bench before default.",
+  "models": [
+    {
+      "_comment": "Qwen3.5-4B Q4_K_M, arch qwen35 same engine as qwen35-0.8b. >2GB fine on GGUF direct HF (GitHub release 2GB cap does not apply).",
+      "name": "qwen35-4b",
+      "display": "Qwen3.5 4B (GGUF · CPU · 2.74 GB, experimental)",
+      "kind": "gguf",
+      "hf_base_url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main",
+      "files": [
+        {
+          "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+          "approx_bytes": 2740937888,
+          "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+        }
+      ]
+    }
+  ]
+}

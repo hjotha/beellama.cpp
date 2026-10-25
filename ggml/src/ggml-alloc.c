@@ -1037,7 +1037,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 fprintf(stderr, "F4RESERVE buf=%d buft=%s planned=%zu current=%zu n_nodes=%d n_leafs=%d\n",
                         i, ggml_backend_buft_name(galloc->bufts[i]), new_size, cur_size2,
                         graph->n_nodes, graph->n_leafs);
-                const int cap = 8192;
+                enum { cap = 8192 };
                 const struct ggml_tensor * roots[cap];
                 struct ggml_tensor * rten[cap];
                 size_t rbytes[cap];

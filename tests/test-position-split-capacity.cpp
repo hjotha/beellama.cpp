@@ -963,7 +963,7 @@ struct runner {
             require(cells.size() == uint32_t(c), "sparse metadata logical capacity differs from C");
             std::vector<uint32_t> local, overflow;
             require(attn->position_split_live_cells(llama_position_split::range_kind::LOCAL, local) &&
-                    attn->position_split_live_cells(llama_position_split::range_kind::OVERFLOW, overflow), "sparse range mapping unavailable");
+                    attn->position_split_live_cells(llama_position_split::range_kind::OVERFLOW_RANGE, overflow), "sparse range mapping unavailable");
             bool holes = true;
             for (int i = 0; i < p; ++i) { holes = holes && cells.is_empty(uint32_t(i)); }
             const auto * standard = attn->get_standard_cache();

@@ -210,7 +210,7 @@ static llama_position_split::range_kind position_split_current_ubatch_range(
         throw std::runtime_error("position-split KV encontrou ubatch cruzando P; a divisão antes do prepare falhou");
     }
     return local ? llama_position_split::range_kind::LOCAL :
-        llama_position_split::range_kind::OVERFLOW;
+        llama_position_split::range_kind::OVERFLOW_RANGE;
 }
 
 // F2b: uma leitura/gravação local só é completa se nenhum histórico de
@@ -2191,7 +2191,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
         // ubatch válido (reserva de grafo), usa a rota legada por camada.
         llama_position_split::range_kind range;
         if (current_position_split_range(range)) {
-            if (range == llama_position_split::range_kind::OVERFLOW) {
+            if (range == llama_position_split::range_kind::OVERFLOW_RANGE) {
                 if (!cache->uses_standard_layer(shared_il)) {
                     throw std::runtime_error("position-split KV sem faixa Q4 para a camada de overflow");
                 }
@@ -2252,7 +2252,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
     if (cache->position_split_enabled()) {
         llama_position_split::range_kind range;
         if (current_position_split_range(range)) {
-            if (range == llama_position_split::range_kind::OVERFLOW) {
+            if (range == llama_position_split::range_kind::OVERFLOW_RANGE) {
                 if (!cache->uses_standard_layer(shared_il)) {
                     throw std::runtime_error("position-split KV sem faixa Q4 para a camada de overflow");
                 }
@@ -2463,7 +2463,7 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs_local_impl(
 void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
-                llama_position_split::range_kind::OVERFLOW) {
+                llama_position_split::range_kind::OVERFLOW_RANGE) {
         cache->get_standard_cache()->set_input_k_idxs(dst, ubatch, current_sinfo());
         return;
     }
@@ -2497,7 +2497,7 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const lla
 void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
-                llama_position_split::range_kind::OVERFLOW) {
+                llama_position_split::range_kind::OVERFLOW_RANGE) {
         cache->get_standard_cache()->set_input_v_idxs(dst, ubatch, current_sinfo());
         return;
     }
@@ -2531,7 +2531,7 @@ void llama_kv_cache_kvarn_context::set_input_tail_body_idxs(ggml_tensor * dst) c
 void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
-                llama_position_split::range_kind::OVERFLOW) {
+                llama_position_split::range_kind::OVERFLOW_RANGE) {
         cache->get_standard_cache()->set_input_k_idxs_backend(dst, ubatch, current_sinfo());
         return;
     }
@@ -2565,7 +2565,7 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, c
 void llama_kv_cache_kvarn_context::set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
-                llama_position_split::range_kind::OVERFLOW) {
+                llama_position_split::range_kind::OVERFLOW_RANGE) {
         cache->get_standard_cache()->set_input_v_idxs_backend(dst, ubatch, current_sinfo());
         return;
     }
@@ -5133,7 +5133,7 @@ void llama_kv_cache_kvarn::state_write_mixed(
         std::vector<uint32_t> overflow_cells;
         bool empty_split_overflow = false;
         if (position_split_enabled() && !partial) {
-            if (!position_split_live_cells(llama_position_split::range_kind::OVERFLOW, overflow_cells)) {
+            if (!position_split_live_cells(llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells)) {
                 throw llama_kv_mixed::kv_mixed_error("split state writer cannot validate overflow occupancy");
             }
             empty_split_overflow = overflow_cells.empty();
@@ -7258,7 +7258,7 @@ bool llama_kv_cache_kvarn::position_split_has_live_cells(
         llama_position_split::range_kind range) const {
     if (!position_split_enabled() || n_seq_max != 1 ||
             (range != llama_position_split::range_kind::LOCAL &&
-             range != llama_position_split::range_kind::OVERFLOW)) {
+             range != llama_position_split::range_kind::OVERFLOW_RANGE)) {
         return false;
     }
     const auto & cells = metadata->get_cells(0);
@@ -7284,7 +7284,7 @@ bool llama_kv_cache_kvarn::position_split_live_cells(
         return false;
     }
     if (range != llama_position_split::range_kind::LOCAL &&
-            range != llama_position_split::range_kind::OVERFLOW) {
+            range != llama_position_split::range_kind::OVERFLOW_RANGE) {
         return false;
     }
     if (n_seq_max != 1) {

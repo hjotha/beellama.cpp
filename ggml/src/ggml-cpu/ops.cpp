@@ -9177,6 +9177,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
 
+    const char * query_policy = getenv("GGML_FLASH_ATTN_NO_QUERY_TILING");
+    const bool use_f32_qk = query_policy && query_policy[0] == '4' && query_policy[1] == '\0' &&
+                            q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
@@ -9216,7 +9220,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, DK);
+        if (!use_f32_qk) {
+            q_to_vec_dot(pq, Q_q, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -9231,7 +9237,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (use_f32_qk) {
+                float * k_f32 = (float *) Q_q;
+                ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) k_data, k_f32, DK);
+                ggml_vec_dot_f32(DK, &s, 0, pq, 0, k_f32, 0, 1);
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -9748,7 +9760,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // Keep per-query reduction identical to multi-query verification when requested.
+    const char * no_split = getenv("GGML_FLASH_ATTN_NO_SPLIT_KV");
+    const bool split_allowed = !(no_split && no_split[0] == '1' && no_split[1] == '\0');
+    const bool use_split_kv_path = split_allowed && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9805,7 +9820,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        // Explicit policies keep query-width changes from selecting a different reduction.
+        const char * query_policy = getenv("GGML_FLASH_ATTN_NO_QUERY_TILING");
+        const bool scalar_queries = query_policy &&
+                                    ((query_policy[0] == '1' && query_policy[1] == '\0') ||
+                                     (query_policy[0] == '4' && query_policy[1] == '\0' &&
+                                      q->type == GGML_TYPE_F32 &&
+                                      k->type == GGML_TYPE_F16 &&
+                                      v->type == GGML_TYPE_F16));
+        bool use_tiled = !scalar_queries && !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

@@ -2722,7 +2722,7 @@ bool llama_model::set_mtp_weights_resident(bool resident, llama_mtp_weights_faul
     }
 }
 
-llama_mtp_weights_info llama_model_mtp_weights_get_info(const llama_model * model) {
+extern "C" LLAMA_API llama_mtp_weights_info llama_model_mtp_weights_get_info(const llama_model * model) {
     return model ? model->mtp_weights_info() : llama_mtp_weights_info{};
 }
 

@@ -388,7 +388,7 @@ private:
     uint32_t current_position_split_range_id() const {
         llama_position_split::range_kind range = llama_position_split::range_kind::LOCAL;
         return current_position_split_range(range)
-                ? uint32_t(range == llama_position_split::range_kind::OVERFLOW
+                ? uint32_t(range == llama_position_split::range_kind::OVERFLOW_RANGE
                         ? llama_position_split::kRangeOverflow
                         : llama_position_split::kRangeLocal)
                 : llama_position_split::kRangeLocal;

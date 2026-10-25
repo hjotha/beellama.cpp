@@ -91,8 +91,13 @@ void fail(const std::string & message) {
 }
 
 #if !defined(__linux__)
-// used by the file-backing ctor path only (its own exactly-once boundary)
-void fault(const stream_options & opts, const std::string & message) {
+// used by the file-backing ctor path only (its own exactly-once boundary).
+// Templated on the options type: the file-backing ctor reports through
+// parse_options while stream_serialize reports through stream_options, and
+// both carry the same on_fault callback. A single stream_options overload
+// fails to compile on every non-Linux platform, where only this ctor exists.
+template <typename Opts>
+void fault(const Opts & opts, const std::string & message) {
     if (opts.on_fault) {
         opts.on_fault(message);
     }

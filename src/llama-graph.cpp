@@ -152,7 +152,7 @@ static bool split_packed_map_still_valid(
     std::vector<uint32_t> ovf;
     if (!kvarn_cache ||
         !kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::OVERFLOW, ovf)) {
+                    llama_position_split::range_kind::OVERFLOW_RANGE, ovf)) {
         return false;
     }
     // Capacity-stable extent: the live run may grow up to the baked extent while
@@ -992,7 +992,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(kvarn_cache->position_split_live_cells(
                     llama_position_split::range_kind::LOCAL, local_cells));
         GGML_ASSERT(kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::OVERFLOW, overflow_cells));
+                    llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells));
         split_local_cells = std::move(local_cells);
         split_overflow_cells = std::move(overflow_cells);
         const auto * metadata = kvarn_cache->get_metadata_cache();
@@ -1203,7 +1203,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
                 kvarn_cache->position_split_live_cells(
                     llama_position_split::range_kind::LOCAL, local_cells) &&
                 kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::OVERFLOW, overflow_cells);
+                    llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells);
         }
         const int64_t n_q = params.ubatch.n_tokens;
         split_ok = split_ok &&
@@ -5800,7 +5800,7 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
     if (ovf_packed_view) {
         std::vector<uint32_t> cells;
         ovf_use_view = kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::OVERFLOW, cells) && !cells.empty();
+                    llama_position_split::range_kind::OVERFLOW_RANGE, cells) && !cells.empty();
         // get_n_kv() can include padding/pending cells, so the LIVE cell count is the
         // authority for the view extent. Any disagreement with the padded n_ovf_used is
         // expected and handled by cropping the mask to the same extent below, instead

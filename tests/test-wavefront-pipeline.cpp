@@ -334,7 +334,7 @@ static void test_position_split_boundary_p_invariants() {
         if (entirely_local) {
             CHECK(t.range == llama_position_split::range_kind::LOCAL);
         } else {
-            CHECK(t.range == llama_position_split::range_kind::OVERFLOW);
+            CHECK(t.range == llama_position_split::range_kind::OVERFLOW_RANGE);
         }
     }
 
@@ -346,7 +346,7 @@ static void test_position_split_boundary_p_invariants() {
 
     // Tiles subsequentes começam em P
     CHECK(plan.tiles[1].pos_min == llama_pos(P));
-    CHECK(plan.tiles[1].range == llama_position_split::range_kind::OVERFLOW);
+    CHECK(plan.tiles[1].range == llama_position_split::range_kind::OVERFLOW_RANGE);
 }
 
 // 7. Preservação da janela protegida recorrente (1 + n_rs_seq)

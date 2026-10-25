@@ -15,6 +15,8 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <cstdlib>  // for getenv (diagnostic opt-in below)
+#include <atomic>   // for race-free diagnostic accounting
 
 #include "repack.h"
 
@@ -4769,6 +4771,58 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
 };
 
+// Diagnostic control for the z-0 first-divergence investigation: force the
+// scalar-row quantization + scalar gemv tail sequence (the already-running
+// B3 sequence; no novel layout mix — blocked-quantized data is never fed to
+// the scalar tail) instead of blocked quantization + blocked GEMM at small
+// diagnostic widths. Exactness under scope 1 clears both quant and
+// accumulation at that weight; it never claims activation packing is
+// globally cleared. Small batches only (nrows <= 8) so prefill/chunks keep
+// the optimized path and staged prefixes/asserts are unaffected. NOT a
+// performance solution. Default off (env absent/empty/0).
+// Diagnostic scope select (opt-in): GGML_REPACK_FORCE_GEMV — absent/empty/0/
+// other = off (baseline), 1 = exact z-0 gate weight only (reference scope),
+// 2 = every repack matmul at small widths (measured probe for the same
+// nrows>3 mechanism at other weights). Parse is strict: exactly "1" or "2"
+// enables, anything else is off, so a typo can never silently widen scope.
+static int repack_force_ctrl_scope() {
+    static const int scope = [] {
+        const char* e = std::getenv("GGML_REPACK_FORCE_GEMV");
+        if (e == nullptr || e[0] == '\0' || e[1] != '\0')
+            return 0;
+        if (e[0] == '1')
+            return 1;
+        if (e[0] == '2')
+            return 2;
+        return 0;
+    }();
+    return scope;
+}
+
+static std::atomic<int> repack_force_logged{0};
+
+// True for the exact z-0 gate weight (stable loader name + shape + quant),
+// regardless of width or env — used as the scope-1 discriminator.
+static bool repack_is_z0_weight(const ggml_tensor* op) {
+    if (op == nullptr || op->src[0] == nullptr)
+        return false;
+    const ggml_tensor* w = op->src[0];
+    return w->ne[0] == 2560 && w->ne[1] == 4096 && w->type == GGML_TYPE_Q4_K &&
+           std::strcmp(w->name, "blk.0.attn_gate.weight") == 0;
+}
+
+// The single control predicate used by BOTH sites (quantization and compute)
+// so their decisions can never drift apart: scope + width, nothing else.
+// nrows is the total token width of the matmul (ne11), not a chunk range.
+static bool repack_force_ctrl(const ggml_tensor* op, int64_t nrows) {
+    const int scope = repack_force_ctrl_scope();
+    if (scope == 0 || nrows <= 0 || nrows > 8)
+        return false;
+    if (scope == 1)
+        return repack_is_z0_weight(op);
+    return true; // scope 2: every repack matmul at small widths
+}
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
@@ -4851,13 +4905,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= (const char *) params->wdata + params->wsize);
 
+        // Diagnostic control (see declaration above): the scalar tail below
+        // is the already-running small-batch sequence, so forcing it for the
+        // exact z-0 gate matmul cannot mix layouts. Total width (not the
+        // chunk-local range) drives the predicate, matching the quant site.
+        const bool force_z0 =
+            repack_force_ctrl(op, op->src[1] != nullptr ? op->src[1]->ne[1] : 0);
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
-        if (nrows > 3) {
+        if (nrows > 3 && !force_z0) {
             gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr) + src0_start, nb1 / nb0,
                                                              src0_ptr + src0_start * nb01, src1_ptr,
                                                              nrows - (nrows % 4), ncols);
         }
-        for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
+        for (int iter = force_z0 ? 0 : nrows - (nrows % 4); iter < nrows; iter++) {
             gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
                                                              ne01, src0_ptr + src0_start * nb01,
                                                              src1_ptr + (src1_col_stride * iter), 1 /* nrows */, ncols);
@@ -4907,16 +4967,33 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
+        //
+        // z-0 diagnostic: force scalar-row quantization together with the
+        // compute control below (same predicate), so the forced B4 sequence
+        // is exactly the already-running B3 sequence (scalar quant +
+        // scalar gemv tail), never blocked data under a scalar reader.
+        const bool force_z0 = repack_force_ctrl(op, ne11);
+        // Engagement log: fires only when forced, capped race-free. For
+        // scope 2 the M/K pairs show the mechanism reaching other weights.
+        if (force_z0 && ith == 0 && repack_force_logged.fetch_add(1) < 16) {
+            GGML_LOG_WARN(
+                "[xllama] repack ctrl scope=%d M=%lld K=%lld nrows=%lld quant=scalar-all "
+                "compute=gemv-all forced=1\n",
+                repack_force_ctrl_scope(), (long long) ne01, (long long) ne00, (long long) ne11);
+        }
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
 
-            for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
-                                                            (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+            if (!force_z0) {
+                for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+                    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
+                                                                (void *) (wdata_ptr + i11 * nbw1),
+                                                                4, ne10);
+                }
             }
 
-            const int64_t i11_processed = ne11 - ne11 % 4;
+            const int64_t i11_processed = force_z0 ? 0 : ne11 - ne11 % 4;
             for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
                 from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }

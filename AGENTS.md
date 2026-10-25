@@ -168,3 +168,15 @@ candidate. Record both values with every result.
   abstractions.
 - Do not treat old benchmark notes as current evidence without rerunning them.
 - Do not commit unless the user explicitly asks.
+
+## Xbox frontend
+
+`tools/xbox/` contains the Xbox UWP frontend imported from xllama. It compiles
+this repository's root core; do not add a nested core checkout or restore a
+build-time patch step. Build instructions and source ownership are in
+`tools/xbox/README.md`. Windows MSBuild sources must track CPU/core CMake sources;
+keep object names distinct across architecture directories and C/C++ files.
+Xbox-specific UI and D3D12/RKVA live under `tools/xbox/`; portable cache/protocol
+changes belong in the root core. Host tests do not qualify Windows compilation
+or console runtime. Keep signing files, models, NuGet packages and MSIX output
+out of Git. Retain upstream notices and existing package identity for updates.

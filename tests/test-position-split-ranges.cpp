@@ -7,7 +7,16 @@
 // (P-129, P-128, P-1, P, P+1, P+128). Anything outside [0,C), or any invalid
 // P (including P == 0, mode off), fails closed as INVALID.
 
+// Windows CRT headers define OVERFLOW; the range enum must remain usable.
+#ifndef OVERFLOW
+#define OVERFLOW 3
+#define LLAMA_TEST_DEFINED_OVERFLOW
+#endif
 #include "llama-position-split.h"
+#ifdef LLAMA_TEST_DEFINED_OVERFLOW
+#undef OVERFLOW
+#undef LLAMA_TEST_DEFINED_OVERFLOW
+#endif
 
 #include <cstdio>
 #include <string>
@@ -44,15 +53,15 @@ int main() {
     }
     {
         auto r = llama_position_split::range_for_pos(P, P, C);
-        CHECK(r.kind == range_kind::OVERFLOW && r.index_in_range == 0);
+        CHECK(r.kind == range_kind::OVERFLOW_RANGE && r.index_in_range == 0);
     }
     {
         auto r = llama_position_split::range_for_pos(P + 1, P, C);
-        CHECK(r.kind == range_kind::OVERFLOW && r.index_in_range == 1);
+        CHECK(r.kind == range_kind::OVERFLOW_RANGE && r.index_in_range == 1);
     }
     {
         auto r = llama_position_split::range_for_pos(C - 1, P, C);
-        CHECK(r.kind == range_kind::OVERFLOW && r.index_in_range == C - 1 - P);
+        CHECK(r.kind == range_kind::OVERFLOW_RANGE && r.index_in_range == C - 1 - P);
     }
     {
         auto r = llama_position_split::range_for_pos(C, P, C);
@@ -75,7 +84,7 @@ int main() {
         auto r0 = llama_position_split::range_for_pos(0, PP, C);
         auto r1 = llama_position_split::range_for_pos(PP, PP, C);
         CHECK(r0.kind == range_kind::LOCAL && r0.index_in_range == 0);
-        CHECK(r1.kind == range_kind::OVERFLOW && r1.index_in_range == 0);
+        CHECK(r1.kind == range_kind::OVERFLOW_RANGE && r1.index_in_range == 0);
     }
 
     // Contiguous span splitting.
@@ -128,7 +137,7 @@ int main() {
             if (pos < int64_t(P)) {
                 CHECK(r.kind == range_kind::LOCAL && r.index_in_range == uint32_t(pos));
             } else {
-                CHECK(r.kind == range_kind::OVERFLOW && r.index_in_range == uint32_t(pos - P));
+                CHECK(r.kind == range_kind::OVERFLOW_RANGE && r.index_in_range == uint32_t(pos - P));
             }
         }
     }

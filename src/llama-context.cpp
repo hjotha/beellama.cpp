@@ -7890,6 +7890,13 @@ void llama_free(llama_context * ctx) {
     delete ctx;
 }
 
+llama_context_rope_params llama_get_context_rope_params(const llama_context * ctx) {
+    const auto & p = ctx->get_cparams();
+    return { static_cast<int32_t>(p.rope_scaling_type), p.n_ctx_orig_yarn,
+             p.rope_freq_base, p.rope_freq_scale, p.yarn_ext_factor,
+             p.yarn_attn_factor, p.yarn_beta_fast, p.yarn_beta_slow };
+}
+
 uint32_t llama_n_ctx(const llama_context * ctx) {
     return ctx->n_ctx();
 }
@@ -8017,7 +8024,7 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
-void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+extern "C" LLAMA_API void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
@@ -8051,7 +8058,7 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     return ctx->get_embeddings_nextn();
 }
 
-float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+extern "C" LLAMA_API float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
@@ -9184,7 +9191,7 @@ llama_kv_memory_stats llama_get_kv_memory_stats(const struct llama_context * ctx
     return memory ? memory->kv_memory_stats() : llama_kv_memory_stats{};
 }
 
-llama_context * llama_get_ctx_other(struct llama_context * ctx) {
+extern "C" LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
 

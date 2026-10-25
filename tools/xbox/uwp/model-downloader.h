@@ -1,0 +1,127 @@
+// Copyright (c) 2024 Gianluca Mazza
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#ifdef XLLAMA_UWP
+
+    #include "pch.h"
+
+    #include <functional>
+    #include <string>
+    #include <vector>
+
+    #include "xllama/catalog_trust.h"
+    #include "xllama/model_write.h"
+
+namespace xllama {
+
+struct ModelFile {
+    std::wstring
+        filename;        // local path under the model dir; may contain subdirs ("unet/model.onnx")
+    std::wstring remote; // asset name in the download source (release assets are flat);
+                         // empty = same as filename
+    uint64_t approx_bytes; // 0 = unknown; progress bar + skip-if-present completeness
+    // Lowercase SHA-256 of the complete file. Empty is permitted only for
+    // legacy/custom Dev Mode entries; trusted catalogue entries must provide it.
+    std::wstring sha256;
+};
+
+// Async download of a catalogue model to ApplicationData LocalFolder. When a
+// dispatcher is supplied, callbacks run on the UI thread; with nullptr, they
+// run on a background thread for callers such as the LAN API.
+class ModelDownloader {
+  public:
+    // Returns true if all files have been downloaded (marker file present).
+    static bool IsComplete(std::wstring const& local_dir);
+
+    // The ONE process-wide gate, also used by the GUI USB importer.
+    static ModelWriteGate& WriterGate();
+    static constexpr const wchar_t* kBusyError = L"another model write is in progress";
+
+    // Download all files in |files| from |hf_repo_url|/<filename> to
+    // |local_dir|/<filename>. The writer creates |local_dir| after admission.
+    // on_progress(bytes_done, bytes_total): called periodically; bytes_total
+    //   is the sum of approx_bytes across files (may be 0 if unknown).
+    // on_done(success, error_message): called exactly once when finished.
+    static winrt::Windows::Foundation::IAsyncAction
+    DownloadAsync(std::wstring hf_repo_url, std::wstring local_dir, std::vector<ModelFile> files,
+                  winrt::Windows::UI::Core::CoreDispatcher dispatcher,
+                  std::function<void(uint64_t, uint64_t)> on_progress,
+                  std::function<void(bool, std::wstring)> on_done);
+
+    // Restore the last atomically backed-up generation. The callback is invoked
+    // on |dispatcher|. Store callers must expose this only as an explicit
+    // recovery action, never as a silent background update.
+    static winrt::Windows::Foundation::IAsyncAction
+    RollbackAsync(std::wstring local_dir, std::vector<ModelFile> files,
+                  winrt::Windows::UI::Core::CoreDispatcher dispatcher,
+                  std::function<void(bool, std::wstring)> on_done);
+};
+
+// One entry of the model catalogue (models/manifest.json). An empty hf_base_url
+// means the model cannot be auto-downloaded (USB/Device-Portal provisioning only).
+// kind selects the consumer AND the backend: "ort-genai" (default, chat picker,
+// ORT GenAI backend), "diffusion" (image dialog; hidden from the chat picker), or
+// "gguf" (chat picker, llama.cpp backend). The gguf path is CPU-only on Xbox (no
+// EP routing — llama.cpp UWP build is CPU-only) but KV-reuse IS enabled via a
+// persistent llama_context (turn-2 prefill 4.07×, see docs/benchmarks.md).
+struct ManifestEntry {
+    std::wstring name;
+    std::wstring display;
+    std::wstring kind{L"ort-genai"};
+    std::wstring hf_base_url;
+    std::vector<ModelFile> files;
+    // Optional GGUF LoRA relative to the model dir (llama.cpp only). Empty = none.
+    // Catalogue publish contract for fine-tuned adapters (training pillar Lane C).
+    std::wstring lora;
+    double lora_scale = 1.0;
+    // Optional session context size (0 = kDefaultNCtx). Coding models use 4096.
+    // Clamped by resolve_n_ctx() at session open (routing_policy.h).
+    int n_ctx = 0;
+    // Optional Max-new-tokens default when the user (or autopilot) selects this
+    // model (0 = leave the UI/settings value alone). Thinking models ship 1024
+    // so a short CoT+answer fits more often than the global UI default 512 (#223).
+    int n_predict = 0;
+    // Optional workload role: "" (general chat) or "coding". Drives denser
+    // token estimates and the coding system-prompt default on the LAN API.
+    std::wstring role;
+};
+
+// Load the model catalogue: InstalledPath\models\manifest.json (bundled) is
+// the base; LocalState\manifest.json (uploadable via Device Portal, no
+// reinstall) is merged PER ENTRY on top — same-name entries replace the
+// bundled ones, new names are appended, unmentioned bundled entries stay.
+// Falls back to a built-in single-entry catalogue (the historical hardcoded
+// SmolLM2-360M) if neither parses, so the app never starts with an empty list.
+// When include_local_override is false, returns only the catalogue bundled in
+// the installed package. Network-facing model pulls use this to avoid treating
+// a Device Portal override as a publisher-approved download source.
+std::vector<ManifestEntry> LoadModelManifest(ManifestTrust* trust = nullptr,
+                                             bool include_local_override = true);
+
+// Find an entry by model dir name; nullptr-like (empty name) if absent.
+inline const ManifestEntry* FindManifestEntry(const std::vector<ManifestEntry>& m,
+                                              const std::wstring& name) {
+    for (const auto& e : m)
+        if (e.name == name)
+            return &e;
+    return nullptr;
+}
+
+// True when the model dir is usable without a download: .complete marker, a
+// WDP/USB upload (genai_config.json or *.gguf present), bundled in the MSIX,
+// or on removable storage at xllama\models\<name>. This LOOSE form accepts any
+// gguf/ORT layout and cannot tell a stale quant from the current one.
+bool IsModelProvisioned(std::wstring const& model_name);
+
+// Expected-aware form: a dir counts as provisioned only if it holds the manifest's
+// CURRENT expected files (`expected_files` = entry.files[].filename). An empty
+// list falls back to the loose behavior above. Use this so a stale-quant dir (an
+// older .gguf than the manifest now names) is re-downloaded instead of loaded.
+bool IsModelProvisioned(std::wstring const& model_name,
+                        std::vector<std::wstring> const& expected_files);
+
+} // namespace xllama
+
+#endif // XLLAMA_UWP

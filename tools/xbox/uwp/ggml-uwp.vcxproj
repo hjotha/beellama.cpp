@@ -1,0 +1,257 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!-- =====================================================================
+       ggml-uwp — static, CPU-only build of ggml + llama for the AppContainer.
+       Compiled directly from the BeeLlama repository root.
+       AppContainer compatibility is maintained in the core sources. No dynamic backend loading (the CPU backend is
+       registered statically via GGML_USE_CPU, with the repacked-weight GEMM
+       path enabled via GGML_USE_CPU_REPACK — covers Q4_0/Q4_K/Q8_0/IQ4_NL),
+       no CUDA/Metal/DML — this is the llama.cpp CPU A/B lane (ROADMAP Phase
+       3.5), built only when the app project is invoked with
+       /p:XllamaBackend=llamacpp.
+       ===================================================================== -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B7E11D2A-4C63-4A0E-9D1F-2A6C58F0AA31}</ProjectGuid>
+    <RootNamespace>ggmluwp</RootNamespace>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <AppContainerApplication>true</AppContainerApplication>
+    <ApplicationType>Windows Store</ApplicationType>
+    <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+    <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.19041.0</WindowsTargetPlatformMinVersion>
+  </PropertyGroup>
+
+  <Import Project="BeeLlama.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="iteration.props" />
+  <PropertyGroup>
+    <GgmlVersionDir>$([System.IO.Path]::Combine('$(ProjectDir)', '$(IntDir)', 'generated'))</GgmlVersionDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>
+        $(GgmlVersionDir);
+        $(BeeLlamaRoot)include;
+        $(BeeLlamaRoot)src;
+        $(BeeLlamaRoot)ggml\include;
+        $(BeeLlamaRoot)ggml\src;
+        $(BeeLlamaRoot)ggml\src\ggml-cpu;
+        %(AdditionalIncludeDirectories)
+      </AdditionalIncludeDirectories>
+      <!-- ggml/src/CMakeLists.txt adds this for every ggml TU; the UWP project
+           compiles the sources directly, so it has to be spelled out or
+           ggml-backend-meta.cpp cannot see it. Mirrors the CMake cache default
+           of 4 (ggml/CMakeLists.txt). The comment cannot sit inside
+           PreprocessorDefinitions: that element takes text nodes only, and an
+           XML comment there is silently dropped. -->
+      <PreprocessorDefinitions>
+        XLLAMA_UWP=1;
+        NOMINMAX;
+        WIN32_LEAN_AND_MEAN;
+        _CRT_SECURE_NO_WARNINGS;
+        GGML_USE_CPU;
+        GGML_USE_CPU_REPACK;
+        GGML_STATIC;
+        GGML_SCHED_MAX_COPIES=4;
+        %(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- Not C++/CX; pure C and C++ sources. -->
+      <CompileAsWinRT>false</CompileAsWinRT>
+      <!-- Preserve directory structure in .obj paths: ggml-cpu\quants.c and
+           ggml-cpu\arch\x86\quants.c (and repack.cpp) share basenames. -->
+      <ObjectFileName>$(IntDir)%(Filename)%(Extension).obj</ObjectFileName>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!-- AVX2 for Zen 2 (Xbox Series S CPU) — mirrors the main project. -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <AdditionalOptions>/arch:AVX2 /Oi /Ot /utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!-- ggml core -->
+  <ItemGroup>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml.c">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <!-- ggml.c and ggml.cpp share basename AND directory, so RelativeDir obj
+         naming still collides (the .cpp overwrote ggml.obj and dropped every
+         C-core ggml_* symbol from the lib — 169 LNK2001s). -->
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml.cpp">
+
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-alloc.c">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-backend.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-backend-dl.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-backend-meta.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-backend-reg.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <!-- ggml/src/CMakeLists.txt lists these two in the base ggml target, not
+         behind an optional backend flag, and llama-context.cpp calls them
+         unconditionally. The ..\ggml\src\*.cpp-style globs below are
+         non-recursive, so without an explicit entry the 13 ggml_backend_*
+         remote-attn / local-split entry points go missing at link time. -->
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-remote-attn\ggml-remote-attn.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-local-split\ggml-local-split.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-opt.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-quants.c">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-threading.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\gguf.cpp">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+  </ItemGroup>
+
+  <!-- ggml CPU backend (+ x86 arch kernels; AMX/KleidiAI/SpacemiT/llamafile excluded) -->
+  <ItemGroup>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\binary-ops.cpp">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\ggml-cpu.c">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <!-- same-dir basename collision with ggml-cpu.c (see ggml.cpp note above) -->
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\ggml-cpu.cpp">
+
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\hbm.cpp">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\ops.cpp">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\quants.c">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\repack.cpp">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\traits.cpp">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\unary-ops.cpp">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\vec.cpp">
+      <ObjectFileName>$(IntDir)cpu_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\arch\x86\cpu-feats.cpp">
+      <ObjectFileName>$(IntDir)x86_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\arch\x86\quants.c">
+      <ObjectFileName>$(IntDir)x86_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\arch\x86\repack.cpp">
+      <ObjectFileName>$(IntDir)x86_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\tiled\tiled.cpp">
+      <ObjectFileName>$(IntDir)tiled_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\tiled\tiled-kernel.cpp">
+      <ObjectFileName>$(IntDir)tiled_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\amx\amx.cpp">
+      <ObjectFileName>$(IntDir)amx_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-cpu\amx\mmq.cpp">
+      <ObjectFileName>$(IntDir)amx_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+  </ItemGroup>
+
+  <!-- llama -->
+  <!-- Wildcard, same rationale as src/models\*.cpp below: the fork splits the
+       KV cache into ~20 translation units (llama-kv-*, llama-kvarn, paged
+       scheduler), and a hardcoded list silently drops new ones until a link
+       error surfaces. Matches the Linux CMake glob. -->
+  <ItemGroup>
+    <ClCompile Include="$(BeeLlamaRoot)src\*.cpp">
+      <ObjectFileName>$(IntDir)llama_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+  </ItemGroup>
+
+  <!-- llama per-architecture model implementations (src/models/, one cpp per arch) -->
+  <ItemGroup>
+    <!-- Wildcard: every src/models/*.cpp (one per architecture) is picked up
+         automatically, matching the Linux CMake glob. This prevents the
+         hardcoded-list drift that broke the build on the 657e011 bump. -->
+    <ClCompile Include="$(BeeLlamaRoot)src\models\*.cpp">
+      <ObjectFileName>$(IntDir)model_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="GenerateGgmlVersion" BeforeTargets="ClCompile">
+    <Exec Command="cmake -DGGML_SOURCE_DIR=&quot;$(BeeLlamaRoot)ggml&quot; -DOUTPUT_FILE=&quot;$(GgmlVersionDir)\ggml-version.h&quot; -P &quot;$(ProjectDir)..\cmake\GenerateGgmlVersion.cmake&quot;" />
+  </Target>
+</Project>

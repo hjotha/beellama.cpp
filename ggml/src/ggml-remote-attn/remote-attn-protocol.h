@@ -7,9 +7,8 @@
 // strict request/response ordering (the 16 full-attention layers are
 // sequential, so exactly one call is in flight at a time).
 //
-// This header is duplicated verbatim on the Xbox side
-// (xllama uwp/dflash-rpc/remote-attn-protocol.h). Keep both in sync and
-// bump RKVA_VERSION on any wire change.
+// Shared by the host backend and tools/xbox/uwp/rkva.
+// Bump RKVA_VERSION on any wire change.
 
 static constexpr uint32_t RKVA_MAGIC = 0x41564B52; // "RKVA"
 static constexpr uint16_t RKVA_VERSION = 2;

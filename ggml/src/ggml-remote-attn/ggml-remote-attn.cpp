@@ -20,6 +20,10 @@
 #include "rkva-q4-producer.h"
 #include "rkva-q8-producer.h"
 
+#if defined(_WIN32)
+#include <malloc.h> // _aligned_malloc / _aligned_free
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -1077,6 +1081,7 @@ static bool rkva_transact(
     ggml_remote_attn_trace_scope trace_send("rpc_send");
     trace_send.event.bytes = sizeof(req) + payload_bytes;
     if (payload_bytes) {
+#ifndef _WIN32
         struct iovec iov[2];
         iov[0].iov_base = const_cast<rkva_request *>(&req);
         iov[0].iov_len  = sizeof(req);
@@ -1085,6 +1090,11 @@ static bool rkva_transact(
         if (!ctx->sock.write_all_iov(iov, 2)) {
             return stream_failure();
         }
+#else
+        if (!ctx->sock.write_all(&req, sizeof(req)) || !ctx->sock.write_all(payload, payload_bytes)) {
+            return stream_failure();
+        }
+#endif
     } else {
         if (!ctx->sock.write_all(&req, sizeof(req))) {
             return stream_failure();
@@ -2565,7 +2575,13 @@ struct ggml_backend_remote_attn_buffer_context {
 static void ggml_backend_remote_attn_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = (ggml_backend_remote_attn_buffer_context *) buffer->context;
     if (ctx->base) {
+        // Must pair with the allocator: the MSVC CRT requires _aligned_free
+        // on _aligned_malloc memory, and free() on it is undefined behaviour.
+#if defined(_WIN32)
+        _aligned_free(ctx->base);
+#else
         free(ctx->base);
+#endif
     }
     delete ctx;
 }
@@ -2643,11 +2659,19 @@ static ggml_backend_buffer_t ggml_backend_remote_attn_buft_alloc_buffer(
     ctx->size = size;
     if (size) {
         // 64-byte aligned host allocation
+#if defined(_WIN32)
+        void * ptr = _aligned_malloc(size, 64);
+        if (ptr == nullptr) {
+            delete ctx;
+            return nullptr;
+        }
+#else
         void * ptr = nullptr;
         if (posix_memalign(&ptr, 64, size) != 0 || ptr == nullptr) {
             delete ctx;
             return nullptr;
         }
+#endif
         memset(ptr, 0, size);
         ctx->base = ptr;
     }

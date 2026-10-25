@@ -179,7 +179,7 @@ bool partition_ubatch_causal_tiles(
         ct.pos_max      = ubatch.pos[cand - 1];
 
         if (p > 0 && ubatch.pos[curr] >= llama_pos(p)) {
-            ct.range = llama_position_split::range_kind::OVERFLOW;
+            ct.range = llama_position_split::range_kind::OVERFLOW_RANGE;
         } else {
             ct.range = llama_position_split::range_kind::LOCAL;
         }

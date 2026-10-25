@@ -48,7 +48,7 @@ enum class llama_mtp_weights_fault : uint8_t { none, allocation, upload };
 LLAMA_API bool llama_model_mtp_weights_set_resident(
         llama_model * model, bool resident, llama_mtp_weights_fault fault = llama_mtp_weights_fault::none);
 // Do not read concurrently with residency changes; publish a copy for HTTP status.
-LLAMA_API llama_mtp_weights_info llama_model_mtp_weights_get_info(const llama_model * model);
+extern "C" LLAMA_API llama_mtp_weights_info llama_model_mtp_weights_get_info(const llama_model * model);
 
 // Per-layer, per-field diagnostic of the LIVE KVarN state of one sequence.
 // One line per layer: placement (local/remote), live cells, live position range,
@@ -260,7 +260,11 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
-LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+//
+// extern "C" so an out-of-tree C caller links against these. The rest of this
+// header is C++ on purpose -- several entry points return std::map / std::vector --
+// so it cannot be wrapped at file scope. See patches/0004.
+extern "C" LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
@@ -286,7 +290,7 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
-LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+extern "C" LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
@@ -295,7 +299,7 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
-LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+extern "C" LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
 // model/context data extraction

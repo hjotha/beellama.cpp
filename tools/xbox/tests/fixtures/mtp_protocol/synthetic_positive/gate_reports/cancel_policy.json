@@ -1,0 +1,17 @@
+{
+  "gate_id": "cancel_policy",
+  "status": "PASS",
+  "scope": {
+    "package_identity": "GianlucaMazza.xllama_1.6.0.99_x64__pj67f1fcj4n14",
+    "model_file_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "config_hash": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
+  },
+  "verification": {
+    "assertions_passed": 10,
+    "assertions_total": 10,
+    "metrics": {
+      "tested_feature": "cancel_policy",
+      "result": "clean_pass"
+    }
+  }
+}

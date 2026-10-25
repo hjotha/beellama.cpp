@@ -108,7 +108,7 @@ static void test_position_range_presence() {
     auto & cells = const_cast<llama_kv_cells &>(cache.get_metadata_cache()->get_cells(0));
     const auto check = [&]() {
         for (auto range : {llama_position_split::range_kind::LOCAL,
-                           llama_position_split::range_kind::OVERFLOW,
+                           llama_position_split::range_kind::OVERFLOW_RANGE,
                            llama_position_split::range_kind::INVALID}) {
             std::vector<uint32_t> listed;
             const bool present = cache.position_split_live_cells(range, listed) && !listed.empty();

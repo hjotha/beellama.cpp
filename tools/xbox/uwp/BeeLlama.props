@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <BeeLlamaRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\..\'))</BeeLlamaRoot>
+    <UseMultiToolTask>true</UseMultiToolTask>
+    <EnforceProcessCountAcrossBuilds>true</EnforceProcessCountAcrossBuilds>
+    <MultiProcMaxCount Condition="'$(CL_MPCount)' != ''">$(CL_MPCount)</MultiProcMaxCount>
+    <MultiProcMaxCount Condition="'$(MultiProcMaxCount)' == ''">10</MultiProcMaxCount>
+    <XllamaRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\'))</XllamaRoot>
+  </PropertyGroup>
+</Project>

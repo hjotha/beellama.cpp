@@ -16,6 +16,10 @@ This repository combines [Anbeeld's BeeLlama](https://github.com/Anbeeld/beellam
 [![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
 [![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
 
+## Xbox Series S|X
+
+The Xbox app, D3D12/RKVA backend and UWP packaging are maintained in this repository and compile the same BeeLlama core. See [tools/xbox/README.md](tools/xbox/README.md) for Windows builds, host tests and the migration from xllama.
+
 ## Fork Features
 
 - **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`. Supports 64-, 128-, 256-, and 512-dimensional K/V heads.

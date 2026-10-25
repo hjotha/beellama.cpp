@@ -1,0 +1,36 @@
+name: Xbox UWP
+on:
+  workflow_dispatch:
+    inputs:
+      build_revision:
+        description: 'MSIX revision greater than the revision currently installed on the Xbox (0-65535)'
+        type: string
+        required: true
+      backend:
+        type: choice
+        options: [llamacpp, unified]
+        default: llamacpp
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NuGet/setup-nuget@v2
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build BeeLlama Xbox
+        shell: pwsh
+        env:
+          XBOX_BUILD_REVISION: ${{ inputs.build_revision }}
+          XBOX_BACKEND: ${{ inputs.backend }}
+        run: |
+          $revision = [int]$env:XBOX_BUILD_REVISION
+          ./scripts/build-xbox.ps1 -Configuration Release -Backend $env:XBOX_BACKEND -BuildRevision $revision -MaxParallel 10
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beellama-xbox-${{ inputs.backend }}
+          path: tools/xbox/uwp/AppPackages/Finalized/
+          if-no-files-found: error

@@ -8,6 +8,10 @@
 #include "ggml-impl.h"
 #include "ggml.h"
 
+#if defined(_WIN32)
+#include <malloc.h> // _aligned_malloc / _aligned_free
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -22,6 +26,29 @@
 #define GGML_LOCAL_SPLIT_NAME "LocalSplitAttn"
 
 namespace {
+
+// 64-byte aligned host allocation. The MSVC CRT has no posix_memalign, and it
+// requires _aligned_free (not free) on _aligned_malloc memory, so both halves
+// are wrapped rather than only the allocation.
+inline void * aligned_alloc_64(size_t size) {
+#if defined(_WIN32)
+    return _aligned_malloc(size, 64);
+#else
+    void * ptr = nullptr;
+    if (posix_memalign(&ptr, 64, size) != 0) {
+        return nullptr;
+    }
+    return ptr;
+#endif
+}
+
+inline void aligned_free_64(void * ptr) {
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
 
 inline uint64_t get_time_us() {
     auto now = std::chrono::steady_clock::now();
@@ -47,32 +74,32 @@ struct ring_slot {
 
     void ensure_capacity(size_t n_q, size_t n_k, size_t n_v, size_t n_out) {
         if (n_q > q_cap) {
-            if (host_q) free(host_q);
+            if (host_q) aligned_free_64(host_q);
             q_cap = n_q;
-            if (posix_memalign(&host_q, 64, q_cap) != 0) host_q = nullptr;
+            host_q = aligned_alloc_64(q_cap);
         }
         if (n_k > k_cap) {
-            if (host_k) free(host_k);
+            if (host_k) aligned_free_64(host_k);
             k_cap = n_k;
-            if (posix_memalign(&host_k, 64, k_cap) != 0) host_k = nullptr;
+            host_k = aligned_alloc_64(k_cap);
         }
         if (n_v > v_cap) {
-            if (host_v) free(host_v);
+            if (host_v) aligned_free_64(host_v);
             v_cap = n_v;
-            if (posix_memalign(&host_v, 64, v_cap) != 0) host_v = nullptr;
+            host_v = aligned_alloc_64(v_cap);
         }
         if (n_out > out_cap) {
-            if (host_out) free(host_out);
+            if (host_out) aligned_free_64(host_out);
             out_cap = n_out;
-            if (posix_memalign(&host_out, 64, out_cap) != 0) host_out = nullptr;
+            host_out = aligned_alloc_64(out_cap);
         }
     }
 
     void free_buffers() {
-        if (host_q)   { free(host_q);   host_q = nullptr;   q_cap = 0; }
-        if (host_k)   { free(host_k);   host_k = nullptr;   k_cap = 0; }
-        if (host_v)   { free(host_v);   host_v = nullptr;   v_cap = 0; }
-        if (host_out) { free(host_out); host_out = nullptr; out_cap = 0; }
+        if (host_q)   { aligned_free_64(host_q);   host_q = nullptr;   q_cap = 0; }
+        if (host_k)   { aligned_free_64(host_k);   host_k = nullptr;   k_cap = 0; }
+        if (host_v)   { aligned_free_64(host_v);   host_v = nullptr;   v_cap = 0; }
+        if (host_out) { aligned_free_64(host_out); host_out = nullptr; out_cap = 0; }
     }
 
     ~ring_slot() {
