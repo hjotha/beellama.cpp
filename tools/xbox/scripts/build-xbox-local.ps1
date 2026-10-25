@@ -1,15 +1,7 @@
 #Requires -Version 5.1
-# Local xllama UWP build with the Q5_K D3D12 kernel, for the .193 desktop session.
-#
-# Must run from a logged-on desktop. The only SSH-reachable account
-# (hpbeats\hjotha) has no interactive token, and its key store refuses every
-# key operation over SSH (New-SelfSignedCertificate NTE_PERM, signtool "no
-# certificates", GetRSAPrivateKey "Invalid provider type"). Session 1 belongs
-# to hpbeats\hjoth, where the desktop CryptoAPI context works -- the same
-# InteractiveToken scheme as the CodexXboxProbe* tasks that built here on 9/26.
-#
-# Usage (after an RDP/console logon, or via the XllamaMtpBuild task):
-#   .\scripts\run-xbox-build.ps1 -BuildRevision 120
+# BeeLlama Xbox build for the configured Windows desktop signing session.
+# Invoke through run-xbox-build.ps1 to reuse that interactive certificate context.
+# Portable Windows builds use the repository-root scripts/build-xbox.ps1 entry.
 param(
     [Parameter(Mandatory)][ValidateRange(1,65535)][int]$BuildRevision,
     [switch]$Final,

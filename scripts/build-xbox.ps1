@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 # Build the Xbox front end against this repository's BeeLlama core.
 # Examples:
 #   pwsh -File scripts/build-xbox.ps1 -Configuration Release -WindowsSdkVersion 10.0.26100.0

@@ -121,3 +121,7 @@ bench/results/**/*-snap*
 
 # Core version headers are generated in the selected MSBuild intermediate tree.
 /uwp/generated/
+
+# C++/WinRT and MIDL outputs produced by the UWP build
+/uwp/Generated Files/
+/uwp/xllama_h.h
