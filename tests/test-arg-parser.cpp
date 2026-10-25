@@ -165,12 +165,25 @@ static void test(void) {
         base.n_outputs_max_per_seq = 8;
         base.remote_attn_cache_type_k = GGML_TYPE_Q4_0;
         base.remote_attn_cache_type_v = GGML_TYPE_Q8_0;
+        base.n_ubatch = 512;
+        // Explicit upstream zero requests target inheritance; omission retains
+        // Bee's bounded default, covered by the independent-draft tests below.
+        base.speculative.draft.n_ubatch_inherit_target = true;
 
-        const auto draft = common_base_params_to_speculative(base);
-        assert(draft.n_outputs_max == 4);
-        assert(draft.n_outputs_max_per_seq == 1);
-        assert(draft.remote_attn_cache_type_k == GGML_TYPE_COUNT);
-        assert(draft.remote_attn_cache_type_v == GGML_TYPE_COUNT);
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_outputs_max == 4);
+            assert(draft.n_outputs_max_per_seq == 1);
+            assert(draft.remote_attn_cache_type_k == GGML_TYPE_COUNT);
+            assert(draft.remote_attn_cache_type_v == GGML_TYPE_COUNT);
+            assert(draft.n_ubatch == 512); // inherits the target by default
+        }
+
+        base.speculative.draft.n_ubatch = 8;
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_ubatch == 8);
+        }
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -2021,6 +2034,37 @@ static void test_draft_ubatch_configuration_is_independent() {
     assert(draft.n_batch == 2048);
     assert(draft.n_ubatch == 96);
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE");
+
+    // Positive values share the independent draft capacity. Upstream's explicit
+    // zero inherits the target; omission retains Bee's bounded workspace.
+    for (const char * value : { "0", "96", "192" }) {
+        params = common_params();
+        assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512", "--spec-draft-n-ubatch", value }));
+        draft = common_base_params_to_speculative(params);
+        assert(params.n_ubatch == 512);
+        assert(draft.n_batch == 2048);
+        assert(draft.n_ubatch == (std::stoi(value) == 0 ? 512 : std::stoi(value)));
+    }
+    params = common_params();
+    assert(parse(params, { "binary_name", "-m", "model.gguf", "-ub", "512", "--spec-draft-n-ubatch", "0", "-ubd", "96" }));
+    assert(common_base_params_to_speculative(params).n_ubatch == 96);
+    params = common_params();
+    assert(parse(params, { "binary_name", "-m", "model.gguf", "-ub", "512", "-ubd", "96", "--spec-draft-n-ubatch", "0" }));
+    assert(common_base_params_to_speculative(params).n_ubatch == 512);
+
+    params = common_params();
+    const std::string error = capture_stderr([&]() {
+        assert(!parse(params, { "binary_name", "-m", "model.gguf", "--spec-draft-n-ubatch", "-1" }));
+    });
+    assert(error.find("--spec-draft-n-ubatch") != std::string::npos);
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH", "96");
+    params = common_params();
+    assert(parse(params, { "binary_name", "-m", "model.gguf", "-b", "2048", "-ub", "512" }));
+    draft = common_base_params_to_speculative(params);
+    assert(draft.n_ubatch == 96);
+    assert(params.n_ubatch == 512);
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH");
 }
 
 static void test_draft_cache_configuration_is_independent() {
@@ -2143,7 +2187,10 @@ static void test_single_device_draft_does_not_inherit_target_tensor_split() {
 
     const common_params draft = common_base_params_to_speculative(params);
 
-    assert(draft.split_mode == LLAMA_SPLIT_MODE_LAYER);
+    assert(draft.split_mode == LLAMA_SPLIT_MODE_NONE);
+    for (float weight : draft.tensor_split) {
+        assert(weight == 0.0f);
+    }
     assert(draft.split_mode != LLAMA_SPLIT_MODE_TENSOR);
 }
 

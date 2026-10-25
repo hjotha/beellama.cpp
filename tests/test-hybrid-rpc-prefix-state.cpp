@@ -81,7 +81,7 @@ struct reader final : llama_io_read_i {
 };
 
 static llama_ubatch batch(llama_pos pos, uint32_t count) {
-    llama_ubatch ub;
+    llama_ubatch ub {};
     ub.b_equal_seqs = 1; ub.n_tokens = ub.n_seq_tokens = count;
     ub.n_seqs = ub.n_seqs_unq = 1; ub.n_pos = 4;
     auto d = std::make_shared<llama_ubatch::data_t>();

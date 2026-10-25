@@ -39,7 +39,7 @@ static std::string g_case;
 } while (0)
 
 static llama_ubatch make_test_ubatch(uint32_t n_tokens, llama_pos pos0, uint32_t n_keep_tail) {
-    llama_ubatch ub;
+    llama_ubatch ub {};
     ub.b_equal_seqs = 1;
     ub.n_tokens     = n_tokens;
     ub.n_seq_tokens = n_tokens;
@@ -81,7 +81,7 @@ static llama_ubatch make_test_ubatch(uint32_t n_tokens, llama_pos pos0, uint32_t
 
 static llama_ubatch make_test_ubatch_custom_pos(const std::vector<llama_pos> & positions, uint32_t n_keep_tail) {
     const uint32_t n_tokens = uint32_t(positions.size());
-    llama_ubatch ub;
+    llama_ubatch ub {};
     ub.b_equal_seqs = 1;
     ub.n_tokens     = n_tokens;
     ub.n_seq_tokens = n_tokens;

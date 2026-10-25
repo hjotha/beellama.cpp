@@ -135,6 +135,37 @@ bool llama_state_q4_parse(
             fail(error, "source state layer count does not match the attention cache");
         }
 
+        // Current standard-cache states carry their Hadamard widths before
+        // the per-layer payload. Older states start directly with Q4_0's type
+        // tag (2), which cannot be a valid Hadamard width.
+        const uint64_t layout_pos = src.tell();
+        require_available(src, sizeof(uint32_t), "key layout or rotation header", error);
+        const uint32_t first = read_u32(src);
+        if (first == uint32_t(GGML_TYPE_Q4_0)) {
+            src.seek(layout_pos);
+        } else {
+            require_available(src, sizeof(uint32_t), "value rotation header", error);
+            const uint32_t rotation_k = first;
+            const uint32_t rotation_v = read_u32(src);
+            const auto valid_rotation = [&](uint32_t width, bool value) {
+                if (width == 0) return true;
+                if (width < 32 || width > (1u << 20) || (width & (width - 1)) != 0) return false;
+                for (const uint32_t il : attn_layers) {
+                    const uint32_t head = value ? hparams.n_embd_head_v(il) : hparams.n_embd_head_k(il);
+                    if (head % width != 0) return false;
+                }
+                return true;
+            };
+            if (!valid_rotation(rotation_k, false) || !valid_rotation(rotation_v, true) ||
+                    out.rotation_k < 0 || out.rotation_v < 0 ||
+                    (out.rotation_k > 0 && uint32_t(out.rotation_k) != rotation_k) ||
+                    (out.rotation_v > 0 && uint32_t(out.rotation_v) != rotation_v)) {
+                fail(error, "source state rotation metadata is invalid or differs from the requested layout");
+            }
+            out.rotation_k = int32_t(rotation_k);
+            out.rotation_v = int32_t(rotation_v);
+        }
+
         out.layers.resize(n_layer);
         for (uint32_t i = 0; i < n_layer; ++i) {
             require_available(src, sizeof(int32_t) + sizeof(uint64_t), "key layout header", error);

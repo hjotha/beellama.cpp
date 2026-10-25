@@ -150,7 +150,7 @@ llama_memory_hybrid::llama_memory_hybrid(
 llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int32_t> & sel) {
     GGML_ASSERT(!sel.empty() && sel.size() <= src.n_tokens);
 
-    llama_ubatch out;
+    llama_ubatch out{};
     out.b_equal_seqs = src.b_equal_seqs;
     out.n_tokens     = uint32_t(sel.size());
     out.n_pos        = src.n_pos;
@@ -167,6 +167,7 @@ llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int
     data->n_seq_id.resize(out.n_tokens);
     data->seq_id.resize(out.n_tokens);
     data->output.resize(out.n_tokens);
+    if (src.decision_order) data->decision_order.resize(out.n_tokens);
     for (uint32_t s = 0; s < src.n_seqs_unq; ++s) {
         data->seq_id_unq.push_back(src.seq_id_unq[s]);
     }
@@ -206,6 +207,7 @@ llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int
         data->token[i] = src.token[t];
         data->n_seq_id[i] = src.n_seq_id[t];
         data->output[i]  = src.output[t];
+        if (src.decision_order) data->decision_order[i] = src.decision_order[t];
         data->seq_id[i]  = data->seq_id_data.data() + id_offset[i];
     }
     for (uint32_t s = 0; s < src.n_seqs_unq; ++s) {
@@ -225,6 +227,7 @@ llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int
     out.seq_id_unq = data->seq_id_unq.data();
     out.seq_idx    = data->seq_idx.data();
     out.output     = data->output.data();
+    out.decision_order = data->decision_order.empty() ? nullptr : data->decision_order.data();
 
     return out;
 }
@@ -265,7 +268,7 @@ bool llama_position_split::divide_ubatches_at_p(
             continue;
         }
 
-        if (ub.embd != nullptr) {
+        if (ub.embd != nullptr || ub.embd_state != nullptr || ub.token == nullptr) {
             error = "embedding ubatch crosses P: the position split is defined for token "
                     "ubatches only";
             return false;
@@ -651,6 +654,8 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (include_attn) {
         mem_attn->state_read(io, seq_id, flags);
     }
+    // Both caches stage changes until the reader commits; a failed recurrent
+    // read must not clear the live attention cache.
     mem_recr->state_read(io, seq_id, flags);
 }
 

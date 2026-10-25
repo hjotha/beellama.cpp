@@ -34,7 +34,7 @@ static void check_close(double a, double b, double tol, const std::string & what
 
 // Builds a single-sequence-set token ubatch whose positions start at pos0.
 static llama_ubatch make_ubatch(uint32_t n_tokens, llama_pos pos0, uint32_t n_keep_tail) {
-    llama_ubatch ub;
+    llama_ubatch ub {};
     ub.b_equal_seqs = 1;
     ub.n_tokens     = n_tokens;
     ub.n_seq_tokens = n_tokens;
@@ -85,7 +85,7 @@ static llama_ubatch make_ubatch(uint32_t n_tokens, llama_pos pos0, uint32_t n_ke
 // instead indexed `pos[i * n_pos]` mis-classified tokens whenever n_pos > 1.
 static llama_ubatch make_ubatch_npos4(uint32_t n_tokens, llama_pos pos0, uint32_t n_keep_tail) {
     const uint32_t n_pos = 4;
-    llama_ubatch ub;
+    llama_ubatch ub {};
     ub.b_equal_seqs = 1;
     ub.n_tokens     = n_tokens;
     ub.n_seq_tokens = n_tokens;
@@ -234,6 +234,37 @@ int main() {
                 out = std::move(moved);
             }
         }
+    }
+
+    // Optional fields stay absent when splitting token-only input; decision
+    // order remains attached to each selected token, with independent storage.
+    {
+        auto source = make_ubatch(300, 400, NKEEP);
+        source.data->decision_order.resize(source.n_tokens);
+        for (uint32_t i = 0; i < source.n_tokens; ++i) {
+            source.data->decision_order[i] = int32_t(17 + i * 3);
+        }
+        source.decision_order = source.data->decision_order.data();
+        std::vector<llama_ubatch> out;
+        std::string err;
+        check(llama_position_split::divide_ubatches_at_p({source}, P, NKEEP, out, err),
+                "decision-order token batch divides: " + err);
+        uint32_t index = 0;
+        for (const auto & half : out) {
+            check(half.type == nullptr && half.embd == nullptr && half.embd_state == nullptr,
+                    "split token batch keeps optional embedding/type pointers null");
+            check(half.decision_order != nullptr, "split decision order is present");
+            for (uint32_t i = 0; i < half.n_tokens; ++i, ++index) {
+                check(half.decision_order && half.decision_order[i] == source.decision_order[index],
+                        "split decision order matches original token");
+            }
+        }
+        check(index == source.n_tokens, "decision-order split covers every token");
+        std::vector<float> hidden(source.n_tokens, 0.5f);
+        source.embd_state = hidden.data();
+        check(!llama_position_split::divide_ubatches_at_p({source}, P, NKEEP, out, err),
+                "cross-boundary hidden-state batch is rejected without guessed stride");
+        check(out.empty() && !err.empty(), "hidden-state refusal publishes no partial batch");
     }
 
     // 3) the protected recurrent window crossing P is rejected with an

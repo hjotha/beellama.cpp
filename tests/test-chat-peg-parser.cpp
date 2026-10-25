@@ -23,6 +23,7 @@ static void test_command7_parser_compare(testing & t);
 static void test_prefix_tool_names(testing & t);
 static void test_tagged_peg_parser(testing & t);
 static void test_permute(testing & t);
+static void test_invalid_utf8(testing & t);
 
 int main(int argc, char * argv[]) {
     testing t(std::cout);
@@ -42,6 +43,7 @@ int main(int argc, char * argv[]) {
     t.test("prefix tool names", test_prefix_tool_names);
     t.test("tagged peg parser", test_tagged_peg_parser);
     t.test("permute", test_permute);
+    t.test("invalid utf8", test_invalid_utf8);
 
     return t.summary();
 }
@@ -403,14 +405,13 @@ static void test_example_native(testing & t) {
 
         auto parser = build_parser(tc);
         common_chat_parser_params parser_params;
-        parser_params.reasoning_format = tc.reasoning_format;
-        parser_params.generation_prompt = tc.generation_prompt;
+        parser_params.generation_prompt = common_chat_input(tc.generation_prompt);
 
         common_chat_msg prev;
         common_chat_msg accumulated;
         for (size_t i = 1; i <= tc.input.size(); ++i) {
             const bool is_partial = i < tc.input.size();
-            common_chat_msg msg = common_chat_peg_parse(parser, tc.input.substr(0, i), is_partial, parser_params);
+            common_chat_msg msg = common_chat_peg_parse(parser, common_chat_input(tc.input.substr(0, i)), is_partial, parser_params);
 
             std::vector<common_chat_msg_diff> diffs;
             try {
@@ -1114,5 +1115,38 @@ static void test_permute(testing & t) {
             root ::= "a" "b" "c" "d" "e" "f" "g"
             space ::= | " " | "\n"{1,2} [ \t]{0,20}
         )""", gbnf_of(parser));
+    });
+}
+
+static void test_invalid_utf8(testing & t) {
+    auto parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+        return "<think>" + p.reasoning(p.until("</think>")) + "</think>" + p.content(p.rest()) + p.end();
+    });
+
+    t.test("replaced in reasoning and content", [&](testing & t) {
+        std::string input("<think>plan\xFF\xFE</think>caf\xC3\xA9 \x80 done");
+        common_peg_parse_context ctx(input);
+        auto result = parser.parse(ctx);
+        t.assert_true("success", result.success());
+
+        common_chat_msg msg;
+        auto mapper = common_chat_peg_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+
+        t.assert_equal("reasoning", "plan\xEF\xBF\xBD\xEF\xBF\xBD", msg.reasoning_content);
+        t.assert_equal("content", "caf\xC3\xA9 \xEF\xBF\xBD done", msg.content);
+    });
+
+    t.test("partial input keeps trailing incomplete sequence out", [&](testing & t) {
+        std::string input("<think>x</think>a\x80" "b\xE4\xB8");
+        common_peg_parse_context ctx(input, COMMON_PEG_PARSE_FLAG_LENIENT);
+        auto result = parser.parse(ctx);
+        t.assert_true("not fail", !result.fail());
+
+        common_chat_msg msg;
+        auto mapper = common_chat_peg_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+
+        t.assert_equal("content", "a\xEF\xBF\xBD" "b", msg.content);
     });
 }

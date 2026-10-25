@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmf.cuh"
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -503,9 +504,8 @@ void launch_mul_mat_vec_f_cuda(
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
-        default: {
+        default:
             GGML_ABORT("fatal error");
-        } break;
     }
 }
 
@@ -602,7 +602,6 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -789,13 +788,15 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+
 bool ggml_cuda_mmvf_rhs_compatible(const ggml_tensor * src1) {
     // MMVF casts every reachable RHS row/channel/sample base to float2.
     return ggml_cuda_is_aligned(src1, 2*sizeof(float));
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb,
+bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb,
         const ggml_tensor * src1, int64_t ne11) {
+
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
@@ -829,12 +830,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
+                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, src1, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     if (ggml_cuda_batch_invariant()) {
                         return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
@@ -847,8 +852,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (fp16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (GGML_CUDA_CC_IS_RDNA(cc) && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, src1, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (fp16_mma_hardware_available(cc)) {
                     if (GGML_CUDA_CC_IS_RDNA3(cc)) {
                         return ne11 <= 3;
@@ -858,12 +866,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                     }
                     return ne11 <= 2;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
+                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, src1, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     // a few dozen rows (the qwen35 gated-delta-net gate projections) run faster as a
                     // mat-vec than through the tensor-core path at 2 to 8 columns: 3.4 vs 10.5 us on an RTX 3060
@@ -878,14 +890,17 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (bf16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (GGML_CUDA_CC_IS_RDNA(cc) && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, src1, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (bf16_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         default:
             return false;
     }

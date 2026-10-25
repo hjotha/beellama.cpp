@@ -54,7 +54,9 @@ struct llama_state_q4_info {
 // single-stream contiguous-prefix form: one stream, one cell range covering
 // cells 0..n-1 in order, positions 0..n-1 owned by a single sequence, both K
 // and V stored as untransposed q4_0 rows with the exact row sizes of the given
-// attention layers. `attn_layers` is the attention cache's layer order, in the
+// attention layers. Current states supply their serialized Hadamard widths;
+// positive caller widths must match them. Untagged legacy bodies retain the
+// caller-provided widths. `attn_layers` is the attention cache's layer order, in the
 // order the state stores them. On failure returns false and fills `error`. The
 // caller must set `out.n_tokens` to the bounded count from the outer header
 // before calling; this prevents malformed body metadata from becoming an

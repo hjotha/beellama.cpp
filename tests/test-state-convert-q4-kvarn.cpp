@@ -156,7 +156,7 @@ static kvarn_reader parse_kvarn(const std::vector<uint8_t> & bytes, uint32_t n_l
     kvarn_reader out;
     cursor cur(bytes);
     require(cur.read<uint32_t>() == 0x67677371u, "converted file magic");
-    require(cur.read<uint32_t>() == 3u, "converted file version");
+    require(cur.read<uint32_t>() == LLAMA_STATE_SEQ_VERSION, "converted file version");
     out.n_tokens = cur.read<uint32_t>();
     out.tokens.resize(out.n_tokens);
     for (auto & token : out.tokens) { token = cur.read<llama_token>(); }
@@ -197,6 +197,8 @@ static kvarn_reader parse_kvarn(const std::vector<uint8_t> & bytes, uint32_t n_l
         }
         require(cur.read<uint32_t>() == 0u, "converted metadata v_trans");
         require(cur.read<uint32_t>() == 0u, "converted metadata layer count");
+        require(cur.read<int32_t>() == 0, "converted metadata K rotation");
+        require(cur.read<int32_t>() == 0, "converted metadata V rotation");
     }
 
     require(cur.read<uint32_t>() == 0x4e52564bu, "converted KVarN magic");
@@ -356,7 +358,7 @@ static source_info parse_source(const std::string & path, const llama_hparams & 
     uint32_t n_tokens = 0;
     source.read_raw(&magic, sizeof(magic));
     require(magic == 0x67677371u && (source.read_raw(&version, sizeof(version)),
-            source.read_raw(&n_tokens, sizeof(n_tokens)), version == 3u),
+            source.read_raw(&n_tokens, sizeof(n_tokens)), version == LLAMA_STATE_SEQ_VERSION),
             "source file header");
     source.seek(3 * sizeof(uint32_t) + size_t(n_tokens) * sizeof(llama_token));
     out.info.n_tokens = n_tokens;
@@ -458,6 +460,13 @@ int main(int argc, char ** argv) {
                             &invalid_count, -1, source_rotation_v) == 0 && invalid_count == 0,
                         "invalid source rotation was accepted");
                 require(!std::filesystem::exists(invalid_path), "invalid rotation published output");
+                invalid_count = 999;
+                const int32_t mismatched_rotation = source_rotation_k == 64 ? 128 : 64;
+                require(llama_state_seq_convert_file_rotated(dest.get(), q4_path.c_str(), 0,
+                            q4_bytes.size(), 0, invalid_path.c_str(), out_tokens.data(), out_tokens.size(),
+                            &invalid_count, mismatched_rotation, source_rotation_v) == 0 && invalid_count == 0,
+                        "positive source rotation mismatch was accepted");
+                require(!std::filesystem::exists(invalid_path), "mismatched rotation published output");
             }
 
 

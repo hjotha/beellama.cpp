@@ -28,6 +28,7 @@ endfunction()
 function(ggml_get_system_arch)
     if (CMAKE_OSX_ARCHITECTURES      STREQUAL "arm64" OR
         CMAKE_GENERATOR_PLATFORM_LWR STREQUAL "arm64" OR
+        (CMAKE_GENERATOR_PLATFORM_LWR STREQUAL "arm64ec" AND MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang") OR
         (NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_GENERATOR_PLATFORM_LWR AND
             CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm.*|ARM64)$"))
         set(GGML_SYSTEM_ARCH "ARM" PARENT_SCOPE)
@@ -51,16 +52,16 @@ endfunction()
 
 # Determines which FlashAttention vector kernel template instances to compile, returns them in OUT_SRCS.
 function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
-    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16)
+    set(FA_TYPES q2_0s q2_1 q3_0 q3_1 q4_0 q4_1 q5_0 q5_1 q6_0 q6_1 q8_0 bf16 f16)
 
     string(TOLOWER "${GGML_CUDA_FA_QUANTS}" FA_QUANTS)
     string(STRIP   "${FA_QUANTS}" FA_QUANTS)
     if (GGML_CUDA_FA_ALL_QUANTS)
-        message(WARNING "GGML_CUDA_FA_ALL_QUANTS is deprecated, use GGML_CUDA_FA_QUANTS=all instead")
         set(FA_QUANTS all)
-    endif()
-    if (NOT FA_QUANTS)
-        message(FATAL_ERROR "GGML_CUDA_FA_QUANTS must not be empty")
+        add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
+    elseif (NOT FA_QUANTS)
+        ggml_cuda_get_fattn_vec_default_pairs(DEFAULT_PAIRS)
+        string(REPLACE ":" "-" FA_QUANTS "${DEFAULT_PAIRS}")
     endif()
 
     if (FA_QUANTS STREQUAL "all")

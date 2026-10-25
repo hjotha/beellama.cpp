@@ -289,6 +289,7 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
 | `--spec-draft-ubatch-size N`, `-ubd N` | `LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE` | `128` or larger for parallel DFlash/DSpark | Overrides the physical batch capacity of a model-backed draft context without changing target `-ub`. A smaller draft ubatch can reduce draft graph and workspace memory, but it can also reduce prompt catch-up throughput. |
 | `--spec-draft-no-op-offload` | — | Inherit target setting | Disables automatic host-weight operation offload in the draft context only, so CPU draft weights can stay on CPU while target operation offload remains enabled. Global `--no-op-offload` still disables both contexts. |
+| `--spec-draft-n-ubatch N` | `LLAMA_ARG_SPEC_DRAFT_N_UBATCH` | Same automatic policy when omitted | Upstream spelling for the same positive draft capacity. Explicit `0` inherits target `-ub`; it does not select Bee's omitted-option default. |
 | `--spec-draft-p-min P`, `--draft-p-min P` | `LLAMA_ARG_SPEC_DRAFT_P_MIN` | `0.0` | Stops an individual greedy draft when its probability falls below `P`; this is independent of the profit controller. |
 | `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | `profit` adapts DFlash depth from measured cycle profit; `off` keeps the resolved or explicit maximum static. Other speculative modes are unchanged. |
 | `--spec-dm-profit-min F` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN` | `0.05` | Sets the minimum margin over the no-spec baseline before clearing disable dwell. Range: `0.0` to `0.50`. |
@@ -304,7 +305,9 @@ capacity. Without an explicit `--spec-draft-ubatch-size`, draft physical size
 is 128; for DFlash/DSpark it grows to `max(128, parallel * (n_max + 1))`
 to fit merged noise blocks. An explicit value is not raised automatically.
 Existing context normalization caps it to the inherited logical size, so `-b`
-must also fit a merged block. Target `-ub/--ubatch-size` remains independent.
+must also fit a merged block. Explicit upstream `--spec-draft-n-ubatch 0`
+inherits target `-ub` without automatic draft growth; the last explicit draft
+ubatch option wins. Target `-ub/--ubatch-size` remains independent.
 N-gram-only modes do not create a draft context.
 
 ## Reasoning loop guard

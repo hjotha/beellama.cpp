@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +46,7 @@ def main() -> None:
     context = CONTEXT.read_text(encoding="utf-8")
     full_restore = function_body(context, "size_t llama_context::state_read_data(")
     seq_restore = function_body(context, "size_t llama_context::state_seq_read_data(")
-    invalidate = "io.on_commit([this]() { gf_res_prev->reset(); });"
+    invalidate = "io.on_commit([this]()"
     for body, read in (
         (full_restore, "memory->state_read(io);"),
         (seq_restore, "memory->state_read(io, seq_id, flags);"),
@@ -56,9 +57,18 @@ def main() -> None:
         assert body.index(read) < body.index(invalidate), (
             "graph invalidation must follow successful memory parsing and its commit callbacks"
         )
-        assert body.count("gf_res_prev->reset()") == 1, (
-            "failed or cancelled restores must retain the live graph"
+        callback = function_body(body, invalidate)
+        assert re.search(
+            r"for\s*\(auto\s*&\s*res\s*:\s*gf_res_prev\)\s*\{\s*if\s*\(res\)\s*res->reset\(\);\s*\}",
+            callback,
+        ), "a committed FULL restore must invalidate both cached graph arenas"
+        assert "gf_res_prev_active = nullptr;" in callback, (
+            "a committed FULL restore must clear the active graph arena"
         )
+        for reset in ("res->reset()", "gf_res_prev_active = nullptr;"):
+            assert body.count(reset) == callback.count(reset) == 1, (
+                "failed or cancelled restores must retain both live graphs and their active arena"
+            )
         assert "LLM_ARCH_DFLASH" not in body, (
             "FULL graph invalidation must apply to every model architecture"
         )

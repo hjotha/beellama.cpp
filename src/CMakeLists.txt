@@ -21,6 +21,11 @@ set(LLAMA_CORE_SOURCES
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp
+    llama-kvarn.cpp
+    llama-kv-cache-tail.cpp
+    llama-kv-tail-request.cpp
+    llama-kv-cache-placement.cpp
+    llama-kv-cache-kvarn.cpp
     llama-kv-cache.cpp
     llama-kvarn.cpp
     llama-kvarn-split-fused.cpp
@@ -44,6 +49,7 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsv4.cpp
     llama-state-q4.cpp
     llama-memory.cpp
+    llama-moe-cache.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp
@@ -94,7 +100,6 @@ configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @O
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
-target_precompile_headers (llama PRIVATE models/models.h)
 
 target_link_libraries(llama PUBLIC ggml)
 

@@ -40,7 +40,7 @@ static void check(bool ok, const std::string & what) {
 
 // Builds a single-sequence-set token ubatch whose positions start at pos0.
 static llama_ubatch make_ubatch(uint32_t n_tokens, llama_pos pos0) {
-    llama_ubatch ub;
+    llama_ubatch ub {};
     ub.b_equal_seqs = 1;
     ub.n_tokens     = n_tokens;
     ub.n_seq_tokens = n_tokens;

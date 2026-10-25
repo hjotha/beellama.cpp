@@ -215,6 +215,7 @@ bool requires_state_for_partial_restore() const override;
     //
 
     uint32_t get_size()     const;
+    uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
     uint32_t get_stream_for_seq(llama_seq_id seq_id) const;
 
@@ -231,8 +232,8 @@ bool requires_state_for_partial_restore() const override;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
-    bool uses_attn_rot_k() const { return attn_rot_k; }
-    bool uses_attn_rot_v() const { return attn_rot_v; }
+    bool uses_attn_rot_k() const { return n_rot_k != 0; }
+    bool uses_attn_rot_v() const { return n_rot_v != 0; }
     bool v_transposed() const { return v_trans; }
 
     std::vector<uint32_t> get_layer_ids() const;
@@ -246,6 +247,12 @@ bool requires_state_for_partial_restore() const override;
     bool layer_k_bias_present(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // The stream holding seq_id's cells.
+    uint32_t get_stream(llama_seq_id seq_id) const;
+
+    // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
+    void state_clear(llama_seq_id seq_id);
 
     //
     // graph_build API
@@ -450,13 +457,8 @@ bool requires_state_for_partial_restore() const override;
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
-    int32_t rotation_k() const {
-        if (!attn_rot_k) { return 0; }
-        int32_t n = 64;
-        while (n_embd_head_k_all % (n * 2) == 0) { n *= 2; }
-        return n;
-    }
-    int32_t rotation_v() const { return attn_rot_v ? 64 : 0; }
+    int32_t rotation_k() const { return n_rot_k; }
+    int32_t rotation_v() const { return n_rot_v; }
 
     // Diagnostic: per-layer live span hash for a sequence. See
     // llama_kvarn_live_layer_table; a full-tensor hash cannot exclude inactive
@@ -562,8 +564,8 @@ private:
     mutable std::atomic<uint64_t> tail_planner_timing_ns { 0 };
 
     // env: LLAMA_ATTN_ROT_DISABLE
-    bool attn_rot_k = false;
-    bool attn_rot_v = false;
+    uint32_t n_rot_k = 0;
+    uint32_t n_rot_v = 0;
 
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1
@@ -687,6 +689,8 @@ private:
 // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

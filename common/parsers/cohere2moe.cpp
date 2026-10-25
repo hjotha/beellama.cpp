@@ -68,16 +68,25 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
+        // Keep the provenance separate: template delimiters vs request-provided
+        // continued content (must not be parsed for special tokens).
+        std::vector<common_chat_prompt_part> gen_parts;
 
         data.generation_prompt = GEN_PREFIX + THINK_START + msg.reasoning_content;
+        gen_parts.push_back({GEN_PREFIX + THINK_START, false});
+        gen_parts.push_back({msg.reasoning_content, true});
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
             data.generation_prompt += THINK_END + TEXT_START + msg.render_content();
+            gen_parts.push_back({THINK_END + TEXT_START, false});
+            gen_parts.push_back({msg.render_content(), true});
         }
 
-        data.prompt += data.generation_prompt;
+        for (const auto & part : gen_parts) {
+            data.prompt.append(part.text, part.is_input);
+        }
     }
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal(GEN_PREFIX);
         auto end               = p.end();
 
@@ -124,12 +133,10 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
         return generation_prompt + reasoning + body + p.optional(p.literal(TURN_END)) + end;
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         data.grammar_triggers = {

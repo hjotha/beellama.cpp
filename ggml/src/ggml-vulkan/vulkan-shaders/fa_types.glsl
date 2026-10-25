@@ -3,14 +3,15 @@
 
 #include "ggml_type_ids.glsl"
 
-// BeeLlama KV-only formats (mirror ggml.h). These are not part of the
-// upstream ggml_type_ids.glsl set.
-#define GGML_TYPE_Q6_0   43u
-#define GGML_TYPE_Q6_1   44u
-#define GGML_TYPE_Q3_0   45u
-#define GGML_TYPE_Q3_1   46u
-#define GGML_TYPE_Q2_0S  47u
-#define GGML_TYPE_Q2_1   48u
+// Bee low-bit FA types. These mirror enum ggml_type so the host can pass the
+// type directly (keep in sync with ggml.h); ggml_type_ids.glsl does not carry
+// them yet, so they are defined here until they move upstream.
+#define GGML_TYPE_Q6_0    43u
+#define GGML_TYPE_Q6_1    44u
+#define GGML_TYPE_Q3_0    45u
+#define GGML_TYPE_Q3_1    46u
+#define GGML_TYPE_Q2_0S   47u
+#define GGML_TYPE_Q2_1    48u
 
 // Number of matrix elements per buffer block, derived from the K/V type spec
 // constant. F32 is treated as a vec4 "block" of 4 floats. F16 uses block size 1
