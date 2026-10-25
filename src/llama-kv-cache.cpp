@@ -7306,6 +7306,13 @@ llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
 }
 
+bool llama_kv_cache_context::set_ubatch_index(uint32_t index) {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || index >= ubatches.size()) return false;
+    i_cur = index;
+    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    return true;
+}
+
 bool llama_kv_cache_context::has_valid_current_ubatch() const {
     if (status != LLAMA_MEMORY_STATUS_SUCCESS) {
         return false;

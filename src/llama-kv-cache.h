@@ -733,6 +733,7 @@ public:
     // that classify the current ubatch (e.g. position-split range routing)
     // must check this first and fall back instead of dereferencing garbage.
     bool has_valid_current_ubatch() const;
+    bool set_ubatch_index(uint32_t index) override;
 
     //
     // llama_kv_cache_context specific API

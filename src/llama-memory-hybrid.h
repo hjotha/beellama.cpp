@@ -214,7 +214,8 @@ public:
     llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
         llama_memory_context_ptr   ctx_attn_in,
-        std::vector<llama_ubatch>   ubatches);
+        std::vector<llama_ubatch>   ubatches,
+                     uint32_t       n_layer = 0);
 
     ~llama_memory_hybrid_context() = default;
 
@@ -231,6 +232,20 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // Experimental indexed handles + per-layer commit cursor. Normal
+    // get_ubatch()/next() semantics are unchanged.
+    uint32_t n_ubatches() const override;
+    llama_ubatch_handle get_ubatch_handle(uint32_t index) const override;
+    const llama_ubatch * get_ubatch_at(uint32_t index) const override;
+    bool set_ubatch_index(uint32_t index) override;
+    bool layer_commit_append(const llama_ubatch_handle & handle, uint32_t layer) override;
+    bool layer_commit_commit(const llama_ubatch_handle & handle, uint32_t layer) override;
+    bool layer_commit_publish(const llama_ubatch_handle & handle, uint32_t layer) override;
+    bool layer_commit_fail(const llama_ubatch_handle & handle, uint32_t layer) override;
+    bool layer_commit_can_read(const llama_ubatch_handle & handle, uint32_t layer) const override;
+    llama_layer_commit_status layer_commit_status(
+            const llama_ubatch_handle & handle, uint32_t layer) const override;
+
     //
     // llama_memory_hybrid_context
     //
@@ -245,6 +260,18 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    // Experimental per-layer commit/publish cursor, indexed as
+    // ubatch*n_layer + layer. Epoch invalidates every old handle on rollback.
+    struct layer_commit {
+        bool appended  = false;
+        bool committed = false;
+        bool published = false;
+        bool failed    = false;
+    };
+    uint32_t n_layer = 0;
+    uint64_t ubatch_epoch = 1;
+    std::vector<layer_commit> layer_commits;
 
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;

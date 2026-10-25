@@ -68,6 +68,22 @@ llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_me
 // helper function for checking if a memory status indicates a failure
 bool llama_memory_status_is_fail(llama_memory_status status);
 
+// Experimental stable handle for an ordered ubatch in a memory context.
+// Invalid handles use index == UINT32_MAX; epoch is bumped on failure/rollback.
+struct llama_ubatch_handle {
+    uint32_t index = UINT32_MAX;
+    uint64_t epoch = 0;
+};
+
+enum llama_layer_commit_status {
+    LLAMA_LAYER_COMMIT_NONE = 0,
+    LLAMA_LAYER_COMMIT_APPENDED,
+    LLAMA_LAYER_COMMIT_COMMITTED,
+    LLAMA_LAYER_COMMIT_PUBLISHED,
+    LLAMA_LAYER_COMMIT_FAILED,
+    LLAMA_LAYER_COMMIT_INVALID,
+};
+
 // the interface for managing the memory context during batch processing
 // this interface is implemented per memory type. see:
 //   - llama_kv_cache_context
@@ -88,6 +104,25 @@ struct llama_memory_context_i {
 
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
+
+    // Experimental indexed access and per-layer commit cursors. The default
+    // implementations keep every existing memory context unchanged; only the
+    // hybrid context with a real ubatch list overrides them.
+    virtual uint32_t n_ubatches() const { return 0; }
+    virtual llama_ubatch_handle get_ubatch_handle(uint32_t /*index*/) const { return {}; }
+    virtual const llama_ubatch * get_ubatch_at(uint32_t /*index*/) const { return nullptr; }
+    // Experimental active bind for the per-layer scheduler. Normal next()/
+    // get_ubatch() callers are unchanged; the default is unsupported.
+    virtual bool set_ubatch_index(uint32_t /*index*/) { return false; }
+
+    virtual bool layer_commit_append(const llama_ubatch_handle &, uint32_t) { return false; }
+    virtual bool layer_commit_commit(const llama_ubatch_handle &, uint32_t) { return false; }
+    virtual bool layer_commit_publish(const llama_ubatch_handle &, uint32_t) { return false; }
+    virtual bool layer_commit_fail(const llama_ubatch_handle &, uint32_t) { return false; }
+    virtual bool layer_commit_can_read(const llama_ubatch_handle &, uint32_t) const { return false; }
+    virtual llama_layer_commit_status layer_commit_status(const llama_ubatch_handle &, uint32_t) const {
+        return LLAMA_LAYER_COMMIT_INVALID;
+    }
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;

@@ -12,6 +12,7 @@
 #include "llama-io-file.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-memory-hybrid.h"
+#include "models/models.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-mixed-mtp-budget.h"
@@ -33,7 +34,9 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <thread>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -4271,6 +4274,368 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+bool llama_context::n256_lookahead_available() const {
+    // Deliberately false: the production path has no per-layer two-ubatch
+    // scheduler yet. Do not return true here until the real path is connected
+    // and the failing integration test passes; this must never be used to
+    // disguise the normal serial decode as lookahead.
+    return false;
+}
+
+int llama_context::decode_n256_lookahead(llama_memory_context_i * mctx, llama_batch_allocr & balloc) {
+    if (model.arch != LLM_ARCH_QWEN35 || cparams.n_ubatch != 256 ||
+        cparams.n_seq_max != 1) {
+        return 1;
+    }
+    if (!mctx || mctx->n_ubatches() != 2) return 1;
+
+    const auto out_ids = balloc.get_out_ids();
+    if (out_ids.empty()) return 1;
+    for (const int32_t id : out_ids) {
+        if (id < 0 || id >= 512) return 1;
+    }
+    const size_t n_vocab = (size_t) model.vocab.n_tokens();
+    if (!logits.data || logits.size < out_ids.size() * n_vocab) return -3;
+
+    const auto & qmodel = static_cast<const llama_model_qwen35 &>(model);
+    if (qmodel.hparams.n_layer() != 32) return 1;
+
+    const char * fail_mode = std::getenv("LLAMA_N256_FAIL");
+    const bool n256_debug = std::getenv("LLAMA_N256_DEBUG") != nullptr;
+    const bool n256_profile = std::getenv("LLAMA_N256_PROFILE") != nullptr;
+    uint64_t prof_prepare_us = 0;
+    uint64_t prof_compute_us = 0;
+    const uint64_t prof_start_us = ggml_time_us();
+    struct prof_scope {
+        uint64_t & acc;
+        uint64_t t0;
+        explicit prof_scope(uint64_t & a) : acc(a), t0(ggml_time_us()) {}
+        ~prof_scope() { acc += ggml_time_us() - t0; }
+    };
+    auto fail_is = [&](const char * stage) {
+        return fail_mode != nullptr && std::strcmp(fail_mode, stage) == 0;
+    };
+
+    struct local_sched {
+        ggml_backend_t backend = nullptr;
+        ggml_backend_sched_t sched = nullptr;
+        bool init(size_t graph_size) {
+            backend = ggml_backend_cpu_init();
+            if (!backend) return false;
+            ggml_backend_t backends[] = { backend };
+            sched = ggml_backend_sched_new(backends, nullptr, 1, graph_size, false, true);
+            return sched != nullptr;
+        }
+        void free() {
+            if (sched) ggml_backend_sched_free(sched);
+            if (backend) ggml_backend_free(backend);
+            sched = nullptr; backend = nullptr;
+        }
+    };
+
+    struct local_job {
+        std::unique_ptr<llm_graph_result> res;
+        std::unique_ptr<llama_model_qwen35::graph> graph;
+        llm_graph_params params;
+        ggml_tensor * hidden = nullptr;
+        ggml_tensor * out = nullptr;
+        llama_ubatch u;
+        uint32_t index = 0;
+        int il = -1;
+        bool recr = false;
+        local_sched * sched = nullptr;
+    };
+
+    local_sched s0;
+    local_sched s1;
+    const size_t graph_size = graph_max_nodes(256);
+    if (!s0.init(graph_size) || !s1.init(graph_size)) {
+        s0.free(); s1.free();
+        return -3;
+    }
+
+    std::vector<float> hid[2];
+    const llama_ubatch_handle h0 = mctx->get_ubatch_handle(0);
+    const llama_ubatch_handle h1 = mctx->get_ubatch_handle(1);
+    if (h0.index != 0 || h1.index != 1 || h0.epoch != h1.epoch) return -3;
+
+    if (!mctx->set_ubatch_index(0) || !mctx->apply() ||
+        !mctx->set_ubatch_index(1) || !mctx->apply()) {
+        s0.free(); s1.free();
+        return -3;
+    }
+
+    auto prepare = [&](uint32_t index, int il, const std::vector<float> * hin,
+                       local_sched & sched, local_job & job) -> bool {
+        prof_scope prof(prof_prepare_us);
+        if (!mctx->set_ubatch_index(index)) return false;
+        if (index == 1 && !mctx->layer_commit_can_read(h1, il)) return false;
+        mctx->reset_graph_store_slots();
+        const llama_ubatch & u = mctx->get_ubatch();
+        if (u.n_tokens != 256) return false;
+
+        job = {};
+        job.u = u;
+        job.index = index;
+        job.il = il;
+        job.recr = qmodel.hparams.is_recr(il);
+        job.sched = &sched;
+        job.res = std::make_unique<llm_graph_result>(graph_max_nodes(256));
+        job.params = graph_params(job.res.get(), u, mctx, LLM_GRAPH_TYPE_DECODER);
+        job.params.n_outputs = 1;
+        job.params.sched = sched.sched;
+        job.params.backend_cpu = sched.backend;
+        job.graph = std::make_unique<llama_model_qwen35::graph>(
+                qmodel, job.params, llama_model_qwen35::graph::layer_only_tag{!job.recr});
+        job.graph->set_hybrid_input_use(!job.recr, job.recr);
+
+        ggml_tensor * inp = nullptr;
+        if (il == 0) {
+            inp = job.graph->build_input_embd_layer();
+        } else {
+            if (!hin || hin->size() != (size_t) qmodel.hparams.n_embd * 256) return false;
+            job.hidden = ggml_new_tensor_2d(job.res->get_ctx(), GGML_TYPE_F32,
+                    qmodel.hparams.n_embd, 256);
+            ggml_set_input(job.hidden);
+            inp = job.hidden;
+        }
+        ggml_tensor * pos = job.graph->build_input_pos_layer();
+        int sections[4];
+        std::copy(std::begin(qmodel.hparams.rope_sections),
+                  std::begin(qmodel.hparams.rope_sections) + 4, sections);
+        job.out = job.graph->build_layer_only(il, inp, pos, sections);
+        if (!job.out) return false;
+
+        ggml_backend_sched_reset(sched.sched);
+        if (!ggml_backend_sched_alloc_graph(sched.sched, job.res->get_gf())) return false;
+        job.res->set_inputs(&job.u);
+        if (job.hidden) {
+            ggml_backend_tensor_set(job.hidden, hin->data(), 0, hin->size() * sizeof(float));
+        }
+        return true;
+    };
+
+    auto finish = [&](local_job & job, ggml_status st, std::vector<float> & out) -> bool {
+        if (!mctx->set_ubatch_index(job.index)) return false;
+        mctx->graph_compute_finish(st);
+        mctx->graph_compute_complete(job.sched->sched, st);
+        if (st != GGML_STATUS_SUCCESS) return false;
+        out.resize(static_cast<size_t>(ggml_nelements(job.out)));
+        ggml_backend_tensor_get(job.out, out.data(), 0, out.size() * sizeof(float));
+        for (const float v : out) if (!std::isfinite(v)) return false;
+        const llama_ubatch_handle h = job.index == 0 ? h0 : h1;
+        if (!mctx->layer_commit_append(h, job.il) ||
+            !mctx->layer_commit_commit(h, job.il)) {
+            return false;
+        }
+        if (job.index == 1 && fail_is("before_publish")) return false;
+        return mctx->layer_commit_publish(h, job.il);
+    };
+
+    auto compute_one = [&](local_sched & sched, local_job & job, std::vector<float> & out) -> bool {
+        prof_scope prof(prof_compute_us);
+        if (!mctx->set_ubatch_index(job.index)) return false;
+        mctx->graph_compute_start();
+        const ggml_status st = ggml_backend_sched_graph_compute(sched.sched, job.res->get_gf());
+        ggml_backend_sched_synchronize(sched.sched);
+        return finish(job, st, out);
+    };
+
+    auto compute_pair = [&](local_job & a, local_job & b,
+                            std::vector<float> & oa, std::vector<float> & ob) -> bool {
+        prof_scope prof(prof_compute_us);
+        if (!mctx->set_ubatch_index(a.index)) return false;
+        mctx->graph_compute_start();
+        if (!mctx->set_ubatch_index(b.index)) return false;
+        mctx->graph_compute_start();
+        std::atomic<int> started{0};
+        std::atomic<int> done{0};
+        std::atomic<bool> overlap{false};
+        ggml_status sa = GGML_STATUS_FAILED;
+        ggml_status sb = GGML_STATUS_FAILED;
+        auto run = [&](local_job & job, ggml_status & st) {
+            started.fetch_add(1, std::memory_order_acq_rel);
+            while (started.load(std::memory_order_acquire) < 2) std::this_thread::yield();
+            if (done.load(std::memory_order_acquire) == 0) overlap.store(true);
+            st = ggml_backend_sched_graph_compute(job.sched->sched, job.res->get_gf());
+            ggml_backend_sched_synchronize(job.sched->sched);
+            done.fetch_add(1, std::memory_order_acq_rel);
+        };
+        std::thread ta(run, std::ref(a), std::ref(sa));
+        std::thread tb(run, std::ref(b), std::ref(sb));
+        ta.join(); tb.join();
+        if (!overlap.load()) return false;
+        if (!finish(a, sa, oa)) return false;
+        if (!finish(b, sb, ob)) return false;
+        return true;
+    };
+
+    bool ok = true;
+    {
+        local_job j;
+        ok = prepare(0, 0, nullptr, s0, j) && compute_one(s0, j, hid[0]);
+        if (ok && fail_is("after_u0_commit")) ok = false;
+    }
+    for (int l = 1; l < 32 && ok; ++l) {
+        local_job a;
+        local_job b;
+        const std::vector<float> * hin0 = &hid[0];
+        const std::vector<float> * hin1 = (l - 1 == 0) ? nullptr : &hid[1];
+        if (!prepare(0, l, hin0, s0, a)) { ok = false; break; }
+        if (!prepare(1, l - 1, hin1, s1, b)) { ok = false; break; }
+        if (l == 1 && fail_is("during_u1")) { ok = false; break; }
+        ok = compute_pair(a, b, hid[0], hid[1]);
+    }
+    if (ok) {
+        local_job last;
+        ok = prepare(1, 31, &hid[1], s1, last) && compute_one(s1, last, hid[1]);
+    }
+
+    // Final logits for every requested output row. Each row is selected from
+    // the real last-layer hidden state of U0 or U1 and projected with the real
+    // output head. Supports outputs in either ubatch; samplers still fall back
+    // to the normal serial path.
+    if (ok) {
+        const uint32_t n_embd = qmodel.hparams.n_embd;
+        std::fill(output_ids.begin(), output_ids.end(), -1);
+        n_outputs = static_cast<uint32_t>(out_ids.size());
+        output_swaps.clear();
+        for (size_t oi = 0; oi < out_ids.size() && ok; ++oi) {
+            const int32_t id = out_ids[oi];
+            const uint32_t u = id < 256 ? 0u : 1u;
+            const uint32_t row = uint32_t(id) % 256u;
+            if (hid[u].size() != (size_t) n_embd * 256) { ok = false; break; }
+            const float * src = hid[u].data() + size_t(row) * n_embd;
+            std::vector<float> one(src, src + n_embd);
+
+            struct mini_ubatch {
+                std::vector<int8_t>   output{1};
+                std::vector<int32_t>  n_seq_id{1};
+                std::vector<llama_seq_id> seq_id{0};
+                std::vector<llama_seq_id*> seq_id_ptr{seq_id.data()};
+                std::vector<llama_seq_id> seq_id_unq{0};
+                std::vector<int32_t>  seq_idx;
+                std::vector<llama_pos> pos{0};
+                llama_ubatch u{};
+                mini_ubatch() : seq_idx(LLAMA_MAX_SEQ, -1) {
+                    seq_idx[0] = 0;
+                    u.b_equal_seqs = 1;
+                    u.n_tokens = 1;
+                    u.n_seq_tokens = 1;
+                    u.n_seqs = 1;
+                    u.n_seqs_unq = 1;
+                    u.n_pos = 1;
+                    u.token = nullptr;
+                    u.embd = nullptr;
+                    u.pos = pos.data();
+                    u.n_seq_id = n_seq_id.data();
+                    u.seq_id = seq_id_ptr.data();
+                    u.seq_id_unq = seq_id_unq.data();
+                    u.seq_idx = seq_idx.data();
+                    u.output = output.data();
+                }
+            } mini;
+
+            llm_graph_result res(graph_max_nodes(1));
+            const llama_ubatch * sampling_ubatch = sampling.samplers.empty()
+                    ? mctx->get_ubatch_at(u) : &mini.u;
+            llm_graph_params params = graph_params(&res, *sampling_ubatch, mctx,
+                    LLM_GRAPH_TYPE_DECODER);
+            params.n_outputs = 1;
+            params.sched = s0.sched;
+            params.backend_cpu = s0.backend;
+            llama_model_qwen35::graph g(qmodel, params,
+                    llama_model_qwen35::graph::layer_only_tag{false});
+            g.set_hybrid_input_use(false, false);
+            ggml_tensor * inp = ggml_new_tensor_2d(res.get_ctx(), GGML_TYPE_F32, n_embd, 1);
+            ggml_set_input(inp);
+            ggml_tensor * out = g.build_output_layer(inp);
+            if (!sampling.samplers.empty()) {
+                g.build_sampling();
+            }
+            if (n256_debug) {
+                std::fprintf(stderr, "[N256DBG] out=%p samplers=%zu t_sampled=%zu\n",
+                        (void *) out, sampling.samplers.size(), res.t_sampled.size());
+            }
+            ggml_backend_sched_reset(s0.sched);
+            ok = out && ggml_backend_sched_alloc_graph(s0.sched, res.get_gf());
+            if (n256_debug) std::fprintf(stderr, "[N256DBG] alloc=%d\n", int(ok));
+            if (!ok) break;
+            res.set_inputs(sampling_ubatch);
+            ggml_backend_tensor_set(inp, one.data(), 0, one.size() * sizeof(float));
+            const ggml_status st = ggml_backend_sched_graph_compute(s0.sched, res.get_gf());
+            ggml_backend_sched_synchronize(s0.sched);
+            if (n256_debug) std::fprintf(stderr, "[N256DBG] compute=%d t0=%p\n", int(st),
+                    res.t_sampled.empty() ? nullptr : (void *) res.t_sampled[0]);
+            if (st != GGML_STATUS_SUCCESS) { ok = false; break; }
+            std::vector<float> logit_row(n_vocab);
+            ggml_backend_tensor_get(out, logit_row.data(), 0, logit_row.size() * sizeof(float));
+            std::copy(logit_row.begin(), logit_row.end(), logits.data + oi * n_vocab);
+            if (!sampling.samplers.empty()) {
+                if (res.t_sampled.empty() || !res.t_sampled[0] ||
+                    !sampling.sampled.data || oi >= sampling.sampled.size) {
+                    ok = false;
+                    break;
+                }
+                ggml_backend_tensor_get(res.t_sampled[0], &sampling.sampled.data[oi], 0,
+                        sizeof(sampling.sampled.data[oi]));
+                // Copy backend sampler side outputs when the sampler produced
+                // them (logits/probs/candidates + counts). Missing entries are
+                // left untouched, matching the normal path's per-row copies.
+                if (!res.t_sampled_logits.empty() && res.t_sampled_logits[0] &&
+                    sampling.logits.data && oi < sampling.logits_count.size()) {
+                    ggml_tensor * t = res.t_sampled_logits[0];
+                    const size_t n = static_cast<size_t>(ggml_nelements(t));
+                    if ((oi * n_vocab + n) <= sampling.logits.size) {
+                        ggml_backend_tensor_get(t, sampling.logits.data + oi * n_vocab, 0,
+                                ggml_nbytes(t));
+                        sampling.logits_count[oi] = static_cast<uint32_t>(n);
+                    }
+                }
+                if (!res.t_sampled_probs.empty() && res.t_sampled_probs[0] &&
+                    sampling.probs.data && oi < sampling.probs_count.size()) {
+                    ggml_tensor * t = res.t_sampled_probs[0];
+                    const size_t n = static_cast<size_t>(ggml_nelements(t));
+                    if ((oi * n_vocab + n) <= sampling.probs.size) {
+                        ggml_backend_tensor_get(t, sampling.probs.data + oi * n_vocab, 0,
+                                ggml_nbytes(t));
+                        sampling.probs_count[oi] = static_cast<uint32_t>(n);
+                    }
+                }
+                if (!res.t_candidates.empty() && res.t_candidates[0] &&
+                    sampling.candidates.data && oi < sampling.candidates_count.size()) {
+                    ggml_tensor * t = res.t_candidates[0];
+                    const size_t n = static_cast<size_t>(ggml_nelements(t));
+                    if ((oi * n_vocab + n) <= sampling.candidates.size) {
+                        ggml_backend_tensor_get(t, sampling.candidates.data + oi * n_vocab, 0,
+                                ggml_nbytes(t));
+                        sampling.candidates_count[oi] = static_cast<uint32_t>(n);
+                    }
+                }
+            }
+            output_ids[id] = static_cast<int32_t>(oi);
+        }
+    }
+
+    if (n256_profile) {
+        const uint64_t total = ggml_time_us() - prof_start_us;
+        std::fprintf(stderr, "[N256PROF] prepare_ms=%.3f compute_finish_ms=%.3f total_ms=%.3f prep_pct=%.1f\n",
+                prof_prepare_us / 1000.0, prof_compute_us / 1000.0, total / 1000.0,
+                total ? 100.0 * double(prof_prepare_us) / double(total) : 0.0);
+    }
+    if (!ok) {
+        // Fail closed for the experimental path: clear the partial sequence and
+        // invalidate the context cursors; a later request starts from clean
+        // memory. The normal decode path has its own rollback.
+        mctx->set_ubatch_index(0);
+        memory->seq_rm(0, 0, 512);
+        memory->run_on_seq_rm(0, 0, 512);
+    }
+    s0.free();
+    s1.free();
+    return ok ? 0 : -3;
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     nextn_decode_id = 0;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
@@ -4446,6 +4811,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    // Experimental opt-in: layer-wise 2xN256 scheduler. Default OFF; when the
+    // batch/context is not eligible it returns 1 and the normal serial path
+    // below runs unchanged.
+    const char * n256_lookahead_env = std::getenv("LLAMA_N256_LOOKAHEAD");
+    const bool n256_lookahead_enabled = n256_lookahead_env != nullptr &&
+            std::strcmp(n256_lookahead_env, "1") == 0;
+    if (n256_lookahead_enabled) {
+        const int rc = decode_n256_lookahead(mctx.get(), *balloc);
+        if (rc <= 0) return rc;
+    }
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {

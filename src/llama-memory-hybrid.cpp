@@ -396,7 +396,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         }
 
         return std::make_unique<llama_memory_hybrid_context>(
-                this, std::move(ctx_attn), std::move(ubatches));
+                this, std::move(ctx_attn), std::move(ubatches), hparams.n_layer());
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -682,8 +682,11 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
 llama_memory_hybrid_context::llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
         llama_memory_context_ptr   ctx_attn_in,
-        std::vector<llama_ubatch>   ubatches) :
+        std::vector<llama_ubatch>   ubatches,
+                     uint32_t       n_layer) :
     ubatches(std::move(ubatches)),
+    n_layer(n_layer),
+    layer_commits(this->ubatches.size() * this->n_layer),
     ctx_attn(std::move(ctx_attn_in)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
@@ -746,6 +749,115 @@ llama_memory_status llama_memory_hybrid_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+uint32_t llama_memory_hybrid_context::n_ubatches() const {
+    return static_cast<uint32_t>(ubatches.size());
+}
+
+llama_ubatch_handle llama_memory_hybrid_context::get_ubatch_handle(uint32_t index) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || index >= ubatches.size()) return {};
+    return {index, ubatch_epoch};
+}
+
+const llama_ubatch * llama_memory_hybrid_context::get_ubatch_at(uint32_t index) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || index >= ubatches.size()) return nullptr;
+    return &ubatches[index];
+}
+
+bool llama_memory_hybrid_context::set_ubatch_index(uint32_t index) {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || index >= ubatches.size()) return false;
+    if (!ctx_attn->set_ubatch_index(index)) return false;
+    if (!ctx_recr->set_ubatch_index(index)) return false;
+    i_next = index;
+    return true;
+}
+
+bool llama_memory_hybrid_context::layer_commit_can_read(
+        const llama_ubatch_handle & handle, uint32_t layer) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS ||
+        handle.index >= ubatches.size() || handle.epoch != ubatch_epoch ||
+        layer >= n_layer) {
+        return false;
+    }
+    const auto & c = layer_commits[size_t(handle.index) * n_layer + layer];
+    if (c.failed) return false;
+    if (handle.index == 0) return true;
+    // U1 may only read a layer after the preceding ubatch committed it.
+    const auto & prev = layer_commits[layer];
+    return prev.committed && !prev.failed;
+}
+
+bool llama_memory_hybrid_context::layer_commit_append(
+        const llama_ubatch_handle & handle, uint32_t layer) {
+    if (!layer_commit_can_read(handle, layer)) return false;
+    auto & c = layer_commits[size_t(handle.index) * n_layer + layer];
+    if (c.failed || c.appended || c.committed || c.published) return false;
+    c.appended = true;
+    return true;
+}
+
+bool llama_memory_hybrid_context::layer_commit_commit(
+        const llama_ubatch_handle & handle, uint32_t layer) {
+    if (!layer_commit_can_read(handle, layer)) return false;
+    auto & c = layer_commits[size_t(handle.index) * n_layer + layer];
+    if (c.failed || !c.appended || c.committed || c.published) return false;
+    c.committed = true;
+    return true;
+}
+
+bool llama_memory_hybrid_context::layer_commit_publish(
+        const llama_ubatch_handle & handle, uint32_t layer) {
+    if (!layer_commit_can_read(handle, layer)) return false;
+    auto & c = layer_commits[size_t(handle.index) * n_layer + layer];
+    if (c.failed || !c.committed || c.published) return false;
+    c.published = true;
+    return true;
+}
+
+bool llama_memory_hybrid_context::layer_commit_fail(
+        const llama_ubatch_handle & handle, uint32_t layer) {
+    if (handle.index >= ubatches.size() || handle.epoch != ubatch_epoch ||
+        layer >= n_layer || status != LLAMA_MEMORY_STATUS_SUCCESS) {
+        return false;
+    }
+    auto & c = layer_commits[size_t(handle.index) * n_layer + layer];
+    c.failed = true;
+    c.appended = false;
+    c.committed = false;
+    c.published = false;
+
+    if (handle.index == 0) {
+        // A failed U0 invalidates every U1 layer cursor. Do not let U1 read,
+        // commit or publish after this point.
+        for (uint32_t u = 1; u < ubatches.size(); ++u) {
+            for (uint32_t l = 0; l < n_layer; ++l) {
+                auto & d = layer_commits[size_t(u) * n_layer + l];
+                d.failed = true;
+                d.appended = false;
+                d.committed = false;
+                d.published = false;
+            }
+        }
+    }
+    // Invalidate all handles and force callers to obtain a new epoch.
+    ++ubatch_epoch;
+    return true;
+}
+
+llama_layer_commit_status llama_memory_hybrid_context::layer_commit_status(
+        const llama_ubatch_handle & handle, uint32_t layer) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS ||
+        handle.index >= ubatches.size() || handle.epoch != ubatch_epoch ||
+        layer >= n_layer) {
+        return LLAMA_LAYER_COMMIT_INVALID;
+    }
+    const auto & c = layer_commits[size_t(handle.index) * n_layer + layer];
+    if (c.failed)    return LLAMA_LAYER_COMMIT_FAILED;
+    if (c.published) return LLAMA_LAYER_COMMIT_PUBLISHED;
+    if (c.committed) return LLAMA_LAYER_COMMIT_COMMITTED;
+    if (c.appended)  return LLAMA_LAYER_COMMIT_APPENDED;
+    return LLAMA_LAYER_COMMIT_NONE;
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {

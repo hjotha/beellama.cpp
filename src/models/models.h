@@ -2348,10 +2348,30 @@ struct llama_model_qwen35 : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // Experimental layer-only graph for the 2xN256 CPU scheduler. It does
+        // not build the full model and does not change the normal constructor.
+        struct layer_only_tag {
+            bool with_pos = true;
+        };
+        graph(const llama_model & model, const llm_graph_params & params, layer_only_tag tag);
+        ggml_tensor * build_input_embd_layer();
+        ggml_tensor * build_input_pos_layer();
+        void set_hybrid_input_use(bool attn, bool recr);
+        ggml_tensor * build_layer_only(
+                    int          il,
+            ggml_tensor * inpL,
+            ggml_tensor * inp_pos,
+                    int * sections);
+        ggml_tensor * build_output_layer(ggml_tensor * hidden);
+        llm_graph_input_attn_kv * get_attn_input_layer() const;
+
         // device-dependent path choices, scanned once per graph build (not per layer)
         bool gdn_state_rows_dev_ok = true; // every GPU device is Metal: fused GDN may read state rows in place
         bool gdn_raw_gates_dev_ok  = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
     private:
+        void init_device_flags();
+        llm_graph_input_mem_hybrid * inp_hybrid = nullptr;
+        ggml_tensor * inp_pos_layer = nullptr;
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,

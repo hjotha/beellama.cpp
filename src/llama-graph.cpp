@@ -1990,12 +1990,14 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    if (inp_attn) {
+    if (use_attn && inp_attn) {
         inp_attn->mctx = mctx->get_attn();
         inp_attn->set_input(ubatch);
     }
 
-    inp_rs->set_input_rs(mctx->get_recr(), ubatch);
+    if (use_recr) {
+        inp_rs->set_input_rs(mctx->get_recr(), ubatch);
+    }
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {

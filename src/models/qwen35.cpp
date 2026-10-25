@@ -140,12 +140,7 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
     return std::make_unique<graph>(*this, params);
 }
 
-llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), model(model) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-
+void llama_model_qwen35::graph::init_device_flags() {
     // one pass over the devices for the per-layer path choices; ggml_backend_dev_type used to be a
     // full cudaGetDeviceProperties per call, and this ran twice per recurrent layer
     for (const auto & ldev : model.devices) {
@@ -178,6 +173,16 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             gdn_raw_gates_dev_ok = false;
         }
     }
+
+}
+
+llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
+    llm_build_delta_net_base(params), model(model) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    init_device_flags();
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -304,6 +309,80 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params, layer_only_tag tag) :
+    llm_build_delta_net_base(params), model(model) {
+    init_device_flags();
+    inp_hybrid = build_inp_mem_hybrid();
+    if (tag.with_pos) {
+        inp_pos_layer = build_inp_pos();
+    }
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_input_embd_layer() {
+    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+    cb(inp, "model.input_embed", -1);
+    return inp;
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_input_pos_layer() {
+    return inp_pos_layer;
+}
+
+void llama_model_qwen35::graph::set_hybrid_input_use(bool attn, bool recr) {
+    GGML_ASSERT(inp_hybrid != nullptr);
+    inp_hybrid->use_attn = attn;
+    inp_hybrid->use_recr = recr;
+}
+
+llm_graph_input_attn_kv * llama_model_qwen35::graph::get_attn_input_layer() const {
+    return inp_hybrid ? inp_hybrid->get_attn() : nullptr;
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_layer_only(
+        int il, ggml_tensor * inpL, ggml_tensor * inp_pos, int * sections) {
+    GGML_ASSERT(inp_hybrid != nullptr);
+    GGML_ASSERT(il >= 0 && il < n_layer);
+
+    ggml_tensor * inpSA = inpL;
+
+    ggml_tensor * cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "attn_norm", il);
+    ggml_build_forward_expand(gf, cur);
+
+    if (hparams.is_recr(il)) {
+        cur = build_layer_attn_linear(inp_hybrid->get_recr(), cur, il);
+    } else {
+        GGML_ASSERT(inp_pos != nullptr);
+        cur = build_layer_attn(inp_hybrid->get_attn(), cur, inp_pos, sections, il);
+    }
+
+    cur = ggml_add(ctx0, cur, inpSA);
+    cb(cur, "attn_residual", il);
+
+    ggml_tensor * ffn_residual = cur;
+    ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm,
+            nullptr, LLM_NORM_RMS, il);
+    cb(attn_post_norm, "attn_post_norm", il);
+    cur = build_layer_ffn(attn_post_norm, il);
+    cb(cur, "ffn_out", il);
+    cur = ggml_add(ctx0, cur, ffn_residual);
+    cb(cur, "post_ffn", il);
+    cur = build_cvec(cur, il);
+    cb(cur, "l_out", il);
+    ggml_build_forward_expand(gf, cur);
+    return cur;
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_output_layer(ggml_tensor * hidden) {
+    ggml_tensor * cur = build_norm(hidden, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "result_norm", -1);
+    cur = build_lora_mm(model.output, cur, model.output_s);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+    ggml_build_forward_expand(gf, cur);
+    return cur;
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(

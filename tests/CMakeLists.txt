@@ -1078,3 +1078,116 @@ endif()
 
 # CPU prototype: N256 lookahead executor/scheduler (no model/GPU/Xbox/RPC).
 llama_build_and_test(test-n256-lookahead-executor.cpp)
+
+# CPU harness: two real N256 ubatches, serial vs lookahead, real ggml tensors.
+llama_build_and_test(test-n256-serial-lookahead-cpu.cpp)
+
+# CPU contract: stable U0/U1 handles + per-layer commit cursors on real hybrid memory.
+llama_build_and_test(test-n256-ubatch-cursor-cpu.cpp)
+target_include_directories(test-n256-ubatch-cursor-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-ubatch-cursor-cpu PRIVATE llama)
+set_tests_properties(test-n256-ubatch-cursor-cpu PROPERTIES
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+# CPU integration: real qwen35 layer-only graph builder (full + recurrent).
+llama_build_and_test(test-n256-layer-graph-cpu.cpp)
+target_include_directories(test-n256-layer-graph-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/models)
+target_link_libraries(test-n256-layer-graph-cpu PRIVATE llama)
+set_tests_properties(test-n256-layer-graph-cpu PROPERTIES
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+# CPU experiment: layer-wise 2xN256 serial vs lookahead scheduler (real model).
+llama_build_and_test(test-n256-scheduler-cpu.cpp)
+target_include_directories(test-n256-scheduler-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/models)
+target_link_libraries(test-n256-scheduler-cpu PRIVATE llama)
+set_tests_properties(test-n256-scheduler-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+# CPU integration: production decode opt-in 2xN256 vs normal serial logits.
+llama_build_and_test(test-n256-decode-production-cpu.cpp)
+target_include_directories(test-n256-decode-production-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-decode-production-cpu PRIVATE llama)
+set_tests_properties(test-n256-decode-production-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+# CPU failure/rollback: forced scheduler failure then normal recovery.
+llama_build_and_test(test-n256-decode-failure-cpu.cpp)
+target_include_directories(test-n256-decode-failure-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-decode-failure-cpu PRIVATE llama)
+set_tests_properties(test-n256-decode-failure-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+# CPU fallback + chunked 1024-token context checks.
+llama_build_and_test(test-n256-decode-fallback-cpu.cpp)
+target_include_directories(test-n256-decode-fallback-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-decode-fallback-cpu PRIVATE llama)
+set_tests_properties(test-n256-decode-fallback-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+llama_build_and_test(test-n256-decode-chunked-cpu.cpp)
+target_include_directories(test-n256-decode-chunked-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-decode-chunked-cpu PRIVATE llama)
+set_tests_properties(test-n256-decode-chunked-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+llama_build_and_test(test-n256-decode-longctx-cpu.cpp)
+target_include_directories(test-n256-decode-longctx-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-decode-longctx-cpu PRIVATE llama)
+set_tests_properties(test-n256-decode-longctx-cpu PROPERTIES
+    TIMEOUT 3600
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+add_test(NAME test-n256-decode-longctx8192-cpu COMMAND test-n256-decode-longctx-cpu)
+set_tests_properties(test-n256-decode-longctx8192-cpu PROPERTIES
+    TIMEOUT 3600
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf;N256_LONG_CHUNKS=16")
+
+llama_build_and_test(test-n256-decode-longpos-cpu.cpp)
+target_include_directories(test-n256-decode-longpos-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-decode-longpos-cpu PRIVATE llama)
+set_tests_properties(test-n256-decode-longpos-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+add_test(NAME test-n256-decode-longpos130816-cpu COMMAND test-n256-decode-longpos-cpu)
+set_tests_properties(test-n256-decode-longpos130816-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf;N256_LONG_START=129792")
+add_test(NAME test-n256-decode-longpos131072-cpu COMMAND test-n256-decode-longpos-cpu)
+set_tests_properties(test-n256-decode-longpos131072-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf;N256_LONG_START=130048")
+
+llama_build_and_test(test-n256-flag-off-cpu.cpp)
+target_include_directories(test-n256-flag-off-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-flag-off-cpu PRIVATE llama)
+set_tests_properties(test-n256-flag-off-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+llama_build_and_test(test-n256-context-sampler-cpu.cpp)
+target_include_directories(test-n256-context-sampler-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-context-sampler-cpu PRIVATE llama)
+set_tests_properties(test-n256-context-sampler-cpu PROPERTIES
+    TIMEOUT 1800
+    ENVIRONMENT "N256_SMALL_MODEL=/home/hjotha/models/Qwen3.5-4B-Q4_K_M.gguf")
+
+
+# Failing integration gate for the production 2xN256 CPU slice. Intentionally
+# not registered in CTest: it must fail until the real path is connected.
+add_executable(test-n256-prod-cpu-slice test-n256-prod-cpu-slice.cpp)
+target_include_directories(test-n256-prod-cpu-slice PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-prod-cpu-slice PRIVATE llama-common llama)
+
+# CPU fixture: real N256 graph/tensor contract (no inference/GPU/server).
+llama_build_and_test(test-n256-graph-tensor-cpu.cpp)
+target_include_directories(test-n256-graph-tensor-cpu PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-n256-graph-tensor-cpu PRIVATE llama)
+set_tests_properties(test-n256-graph-tensor-cpu PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "N256_GRAPH_MODEL=/home/hjotha/models/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf")

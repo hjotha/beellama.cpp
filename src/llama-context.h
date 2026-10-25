@@ -174,6 +174,12 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    // Experimental integration probe for the production 2xN256 scheduler.
+    // Returns false until the per-layer two-ubatch lookahead is actually
+    // connected; the normal decode path does not depend on it. See
+    // beellama-gate/20261024/wavefront-gate-v3/N256-PROD-CPU-MAP.md.
+    bool n256_lookahead_available() const;
     void set_snapkv_prefill_end(llama_seq_id seq_id, llama_pos prefill_end);
 
     //
@@ -314,6 +320,20 @@ private:
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    // Experimental internal helper for the per-layer CPU scheduler/tests.
+    // It exposes the same graph parameters used by process_ubatch; the normal
+    // decode path keeps using its private call sites.
+    llm_graph_params graph_params(
+                        llm_graph_result * res,
+                      const llama_ubatch & ubatch,
+            const llama_memory_context_i * mctx,
+                          llm_graph_type   gtype) const;
+
+    // Experimental opt-in 2xN256 layer scheduler. Returns 1 when the batch is
+    // not eligible (the normal serial decode must continue), 0 on success and
+    // <0 on failure. Called only for qwen35 and only when the env flag is on.
+    int decode_n256_lookahead(llama_memory_context_i * mctx, llama_batch_allocr & balloc);
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
@@ -327,12 +347,6 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_params graph_params(
-                        llm_graph_result * res,
-                      const llama_ubatch & ubatch,
-            const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
-
     llm_graph_cb graph_get_cb() const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device

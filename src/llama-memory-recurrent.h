@@ -185,6 +185,8 @@ public:
     // llama_memory_recurrent_context specific API
     //
 
+    bool set_ubatch_index(uint32_t index) override;
+
     uint32_t get_n_rs() const;
     uint32_t get_n_rs_seq() const;
     uint32_t get_head() const;

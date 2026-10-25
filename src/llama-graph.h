@@ -913,6 +913,11 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_context * mctx;
+
+    // Experimental layer-only scheduler: a single-layer graph may use only one
+    // of the two hybrid memory inputs. Normal full graphs keep both true.
+    bool use_attn = true;
+    bool use_recr = true;
 };
 
 class llm_graph_input_mem_hybrid_paged : public llm_graph_input_mem_hybrid {
