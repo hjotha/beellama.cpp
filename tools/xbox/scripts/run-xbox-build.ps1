@@ -21,6 +21,7 @@ catch {
 if ($task.State -eq 2 -or $task.State -eq 4) { throw "An existing Xbox build is queued or running; preserve it." }
 $definition = $task.Definition
 $builder = Join-Path $PSScriptRoot 'build-xbox-local.ps1'
+$definition.Actions.Item(1).WorkingDirectory = (Split-Path $PSScriptRoot -Parent)
 $definition.Actions.Item(1).Arguments = '-File "{0}" -BuildRevision {1} -WorkRoot "{2}" -Backend {4}{3}' -f `
     $builder, $BuildRevision, $WorkRoot, $(if ($Final) { ' -Final' } else { '' }), $Backend
 $null = $folder.RegisterTaskDefinition('BeeLlamaXboxBuild', $definition, 4, $null, $null, 3, $null)
