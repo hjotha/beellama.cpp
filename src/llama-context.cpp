@@ -529,8 +529,9 @@ llama_context::llama_context(
     if (cparams.rkva_wavefront_rpc_batch != 1) {
         throw std::invalid_argument("wavefront RPC_BATCH=4 is unavailable; use RPC_BATCH=1");
     }
-    if (cparams.rkva_wavefront_tile == 256 && (params.n_ubatch != 512 || params.n_batch < 512)) {
-        throw std::invalid_argument("wavefront 2xN256 requires logical batch>=512 and requested ubatch=512");
+    if (cparams.rkva_wavefront_tile == 256 &&
+            ((params.n_ubatch != 512 && params.n_ubatch != 1024) || params.n_batch < params.n_ubatch)) {
+        throw std::invalid_argument("wavefront NxN256 requires requested ubatch=512 or 1024 and logical batch>=ubatch");
     }
     if (cparams.rkva_wavefront_tile) {
         LLAMA_LOG_WARN("RKVA wavefront experimental: tile=%u; eligible Qwen35 dense all-overflow single-sequence n_rs_seq=0 only; explicit RPC batching policy, no rollback after parent failure\n",
@@ -2367,9 +2368,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 }
 
 // WF256 executes ordinary prefix/fallback graphs at physical N256. Reserving
-// a dummy serial N512 graph here doubles their live workspace before any
+// a dummy serial parent-width graph here increases their live workspace before any
 // eligible wavefront parent exists. Keep the node/capacity budget at the public
-// parent size; the scheduler can grow for an actual two-tile graph on demand.
+// parent size; the scheduler can grow for an actual tiled graph on demand.
 // No-allocation fit estimates remain conservative at the requested parent size.
 static uint32_t rkva_physical_ubatch(const llama_cparams & cp) {
     return cp.rkva_wavefront_tile == 256 ? std::min(cp.n_ubatch, 256u) : cp.n_ubatch;
@@ -3992,10 +3993,12 @@ static const char * rkva_wavefront_fallback(const llm_graph_params & params, boo
             cp.ctx_type == LLAMA_CONTEXT_TYPE_MTP) return "unsupported_model_or_draft";
     if ((!input_only && !params.mctx) || !ub.pos || !ub.seq_id || !ub.n_seq_id) return "reserve_or_missing_input";
     if (cp.rkva_wavefront_tile == 256) {
-        if (cp.n_ubatch != 512 || ub.n_tokens != 512) return "requires_exact_2x256_parent";
+        if ((cp.n_ubatch != 512 && cp.n_ubatch != 1024) || ub.n_tokens != cp.n_ubatch) {
+            return "requires_exact_requested_n256_parent";
+        }
         if (cp.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cp.embeddings || cp.embeddings_nextn ||
-                cp.embeddings_nextn_masked || !params.samplers.empty()) return "2x256_output_contract";
-        if (!ub.token || ub.embd || ub.embd_state || ub.type || ub.decision_order) return "2x256_token_input_required";
+                cp.embeddings_nextn_masked || !params.samplers.empty()) return "n256_output_contract";
+        if (!ub.token || ub.embd || ub.embd_state || ub.type || ub.decision_order) return "n256_token_input_required";
     }
     if (!cp.causal_attn || params.hparams.swa_type != LLAMA_SWA_TYPE_NONE ||
             params.hparams.use_alibi || params.hparams.f_max_alibi_bias != 0.0f ||
@@ -4599,38 +4602,41 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
-    // The 2xN256 experiment coalesces only a fully eligible overflow parent.
-    // Prefix, boundary crossings, short tails and unsupported inputs retain
-    // the baseline physical N256 kernels, even with requested n_ubatch=512.
+    // The requested parent is a scheduling boundary, independent of logical B.
+    // Check each internal parent, then retain physical N256 for prefix/crossing/
+    // tail inputs. Only plain single-sequence batches may use the refining path.
     uint32_t effective_ubatch = cparams.n_ubatch;
+    auto * wavefront_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    bool refine_wavefront = false;
     if (cparams.rkva_wavefront_tile == 256) {
         effective_ubatch = 256;
         const auto & batch = balloc->get_batch();
-        llama_ubatch probe {};
-        probe.b_equal_seqs = 1;
-        probe.n_tokens = batch.n_tokens;
-        probe.n_seq_tokens = batch.n_tokens;
-        probe.n_seqs = probe.n_seqs_unq = 1;
-        probe.n_pos = model.hparams.n_pos_per_embd();
-        probe.token = batch.token;
-        probe.embd = batch.embd;
-        probe.pos = batch.pos;
-        probe.n_seq_id = batch.n_seq_id;
-        probe.seq_id = batch.seq_id;
-        const auto candidate = graph_params(nullptr, probe, nullptr, ctx_type_to_graph_type(cparams.ctx_type));
-        const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory.get());
-        const auto * kvarn = hybrid ? dynamic_cast<const llama_kv_cache_kvarn *>(hybrid->get_mem_attn_base()) : nullptr;
+        const auto * kvarn = wavefront_hybrid ?
+                dynamic_cast<const llama_kv_cache_kvarn *>(wavefront_hybrid->get_mem_attn_base()) : nullptr;
+        bool single_seq = batch.n_tokens > 0 && batch.n_seq_id && batch.seq_id && batch.seq_id[0];
+        for (int32_t i = 0; single_seq && i < batch.n_tokens; ++i) {
+            single_seq = batch.n_seq_id[i] == 1 && batch.seq_id[i] &&
+                    batch.seq_id[i][0] == batch.seq_id[0][0];
+        }
         const bool plain_tokens = std::all_of(batch_inp.tokens.begin(), batch_inp.tokens.end(),
                 [](const auto & token) { return !token.has_embd && !token.has_state && token.decision_order == 0; });
-        if (plain_tokens && kvarn && !rkva_wavefront_fallback(candidate, true)) {
-            effective_ubatch = 512;
-        } else {
-            LLAMA_LOG_INFO("RKVA wavefront prefix: requested_ubatch=512 effective_ubatch=256\n");
-        }
+        refine_wavefront = plain_tokens && single_seq && kvarn && cparams.n_rs_seq == 0;
+        if (refine_wavefront) effective_ubatch = cparams.n_ubatch;
     }
+    const auto eligible_parent = [&](const llama_ubatch & ub) {
+        const auto candidate = graph_params(nullptr, ub, nullptr, ctx_type_to_graph_type(cparams.ctx_type));
+        const char * reason = rkva_wavefront_fallback(candidate, true);
+        if (reason && ub.n_tokens > 1) {
+            LLAMA_LOG_INFO("RKVA wavefront prefix: requested_ubatch=%u effective_ubatch=256 reason=%s\n",
+                    cparams.n_ubatch, reason);
+        }
+        return reason == nullptr;
+    };
 
     while (true) {
-        mctx = memory->init_batch(*balloc, effective_ubatch, embd_all);
+        mctx = refine_wavefront ?
+                wavefront_hybrid->init_batch(*balloc, effective_ubatch, embd_all, eligible_parent) :
+                memory->init_batch(*balloc, effective_ubatch, embd_all);
         if (!mctx) {
             return -2;
         }

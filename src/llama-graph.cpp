@@ -2098,7 +2098,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         const auto * prefix = inp_attn->self_overflow_cell_idxs;
         const bool unused_wavefront_mask =
             (params.wavefront_tile_size == 64 || params.wavefront_tile_size == 128 ||
-             (params.wavefront_tile_size == 256 && params.ubatch.n_tokens == 512)) &&
+             (params.wavefront_tile_size == 256 &&
+              (params.cparams.n_ubatch == 512 || params.cparams.n_ubatch == 1024) &&
+              params.ubatch.n_tokens == params.cparams.n_ubatch)) &&
             params.arch == LLM_ARCH_QWEN35 && params.backend_remote &&
             cparams.remote_attn_position_split && params.cparams.remote_attn_position_split &&
             cparams.kv_position_split_p == p && p > 0 && p < params.cparams.n_ctx_seq &&

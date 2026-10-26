@@ -92,8 +92,10 @@ uint32_t number(const std::string & value, const char * option) {
 struct options {
     std::string model, tokens, host;
     std::string off_cuda_fp8, on_cuda_fp8;
+    std::string off_tcp_prefetch, on_tcp_prefetch;
     fs::path output;
     uint32_t p = 512, context = 2048, port = 50054;
+    uint32_t parent_tokens = 512;
     uint32_t prefix_probe_tokens = 0;
     bool control_only_pair = false;
     fs::path restore_prefix_slot, followup_tokens_file;
@@ -229,16 +231,20 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
     const bool second = std::strcmp(arm, "on") == 0 || std::strcmp(arm, "control-b") == 0;
     const auto & codec = second ? opt.on_cuda_fp8 : opt.off_cuda_fp8;
     if (!codec.empty()) set_env("GGML_RKVA_CUDA_FP8", codec.c_str());
-    set_env("GGML_RKVA_WAVEFRONT_TILE", wavefront ? "256" : "0");
+    const auto & prefetch = second ? opt.on_tcp_prefetch : opt.off_tcp_prefetch;
+    if (!prefetch.empty()) set_env("GGML_RKVA_TCP_PREFETCH", prefetch.c_str());
+    const bool enabled = wavefront || opt.parent_tokens == 1024;
+    const uint32_t requested_ubatch = opt.parent_tokens == 1024 ? (wavefront ? 1024 : 512) : (wavefront ? 512 : 256);
+    set_env("GGML_RKVA_WAVEFRONT_TILE", enabled ? "256" : "0");
     const std::string arm_tag = std::string("2xn256-live-") + arm;
     llama_f4_set_dump_tag((arm_tag + "-context-init").c_str());
-    std::fprintf(stderr, "LIVE-2XN256 arm=%s context_begin parent_batch=512 configured_ubatch=%u P=%u C=%u\n",
-            arm, wavefront ? 512u : 256u, opt.p, opt.context);
+    std::fprintf(stderr, "LIVE-2XN256 arm=%s context_begin parent_batch=%u configured_ubatch=%u P=%u C=%u\n",
+            arm, opt.parent_tokens, requested_ubatch, opt.p, opt.context);
     std::fflush(stderr);
     auto cp = llama_context_default_params();
     cp.n_ctx = opt.context;
-    cp.n_batch = 512;
-    cp.n_ubatch = wavefront ? 512 : 256;
+    cp.n_batch = opt.parent_tokens;
+    cp.n_ubatch = requested_ubatch;
     cp.n_seq_max = 1;
     cp.n_threads = cp.n_threads_batch = 8;
     cp.n_rs_seq = 0;
@@ -252,12 +258,15 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
     cp.remote_attn_cache_type_k = cp.remote_attn_cache_type_v = GGML_TYPE_Q4_0;
     llama_context_ptr ctx(llama_init_from_model(model, cp));
     require(bool(ctx), std::string("context creation failed for arm ") + arm);
-    manifest["arms"][arm]["wavefront_tile"] = wavefront ? 256 : 0;
+    manifest["arms"][arm]["wavefront_tile"] = enabled ? 256 : 0;
+    manifest["arms"][arm]["wavefront_tiles"] = enabled ? requested_ubatch / 256 : 0;
     const char * active_codec = std::getenv("GGML_RKVA_CUDA_FP8");
     manifest["arms"][arm]["cuda_fp8_mode"] = active_codec ? json(active_codec) : json(nullptr);
+    const char * active_prefetch = std::getenv("GGML_RKVA_TCP_PREFETCH");
+    manifest["arms"][arm]["tcp_prefetch"] = active_prefetch ? json(active_prefetch) : json(nullptr);
     manifest["arms"][arm]["configured_ubatch"] = llama_n_ubatch(ctx.get());
     const auto physical_ubatch = llama_n_ubatch_physical(ctx.get());
-    require(llama_n_ubatch(ctx.get()) == (wavefront ? 512u : 256u) && physical_ubatch == 256,
+    require(llama_n_ubatch(ctx.get()) == requested_ubatch && physical_ubatch == 256,
             "context logical/physical ubatch API does not match the requested 2xN256 arm");
     manifest["arms"][arm]["physical_ubatch"] = physical_ubatch;
     const size_t vocab = static_cast<size_t>(llama_vocab_n_tokens(llama_model_get_vocab(model)));
@@ -359,16 +368,23 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
         write_json(opt.output / "manifest.json", manifest);
     }
     const uint32_t prompt_end = opt.prefix_probe_tokens ? opt.prefix_probe_tokens : opt.p + opt.overflow_tokens;
-    for (uint32_t start = opt.restore_prefix_slot.empty() ? 0 : opt.p; start < prompt_end; start += 512) {
+    for (uint32_t start = opt.restore_prefix_slot.empty() ? 0 : opt.p; start < prompt_end;) {
         const bool overflow = start >= opt.p;
-        const auto label = !overflow ? "prefix-" + std::to_string(start + 512)
-            : "overflow-" + std::to_string((start - opt.p) / 512 + 1);
-        const bool final = start + 512 == prompt_end;
+        const uint32_t region_end = overflow ? prompt_end : std::min(opt.p, prompt_end);
+        const uint32_t remaining = region_end - start;
+        uint32_t count = std::min(opt.parent_tokens, remaining);
+        // Carve the final512 before choosing a logical parent, so both B1024
+        // arms retain production's final256/128/128 seam independently of UB.
+        if (opt.serving_checkpoint_seam && remaining > 512 && count == remaining) count -= 512;
+        const auto label = !overflow ? "prefix-" + std::to_string(start + count)
+            : "overflow-" + std::to_string((start + count - opt.p) / 512);
+        const bool final = start + count == prompt_end;
         const bool capture = opt.prefix_probe_tokens ? final :
-            !overflow ? start + 512 == opt.p : opt.serving_prefill ? final : (start < opt.p + 1024 || final);
+            !overflow ? start + count == opt.p : opt.serving_prefill ? final : (start < opt.p + 2 * opt.parent_tokens || final);
         const bool want_logits = !opt.serving_prefill || capture;
-        const bool final_prefix_parent = !overflow && start + 512 == std::min(opt.p, prompt_end);
+        const bool final_prefix_parent = !overflow && start + count == std::min(opt.p, prompt_end);
         if (opt.serving_checkpoint_seam && (final_prefix_parent || (overflow && final))) {
+            require(count == 512, "final production seam must contain exactly512 tokens");
             // Match the production B256/physical-N256 checkpoint cadence:
             // 256 + 128 + 128, irrespective of the arm's logical parent size.
             // All parts take the serial fallback; only the final 128 rows
@@ -379,8 +395,9 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
             decode(start + 256, 128, label + "-seam-middle-128", false, false);
             decode(start + 384, 128, label, capture, want_logits);
         } else {
-            decode(start, 512, label, capture, want_logits);
+            decode(start, count, label, capture, want_logits);
         }
+        start += count;
     }
     // All followup IDs are fixed before either arm runs. Never substitute an
     // arm's sampled argmax, which would confound state and input divergence.
@@ -407,6 +424,8 @@ int main(int argc, char ** argv) {
             "Frozen/teacher-forced: [--restore-prefix-slot PATH] [--overflow-tokens N] [--repeat-prompt]\n"
             "  [--serving-prefill] [--serving-checkpoint-seam] [--followup-tokens PATH] [--followup-capture-step N ...]\n"
             "  [--off-cuda-fp8 prefill|mapped --on-cuda-fp8 prefill|mapped] (explicit codec A/B)\n"
+            "  [--parent-tokens 1024] (B1024 both arms; control2xN256 versus candidate4xN256)\n"
+            "  [--off-tcp-prefetch 0|1 --on-tcp-prefetch 0|1] (use --control-only-pair --parent-tokens 1024 for fixed2xN256)\n"
             "Without --execute no model/GPU/network initialization occurs.\n", argv[0]);
         return execute ? 2 : 0;
     }
@@ -426,6 +445,11 @@ int main(int argc, char ** argv) {
             const std::string text = argv[++i];
             if (arg == "--restore-prefix-slot") { opt.restore_prefix_slot = text; continue; }
             if (arg == "--followup-tokens") { opt.followup_tokens_file = text; continue; }
+            if (arg == "--off-tcp-prefetch" || arg == "--on-tcp-prefetch") {
+                require(text == "0" || text == "1", "unsupported TCP prefetch mode");
+                (arg == "--off-tcp-prefetch" ? opt.off_tcp_prefetch : opt.on_tcp_prefetch) = text;
+                continue;
+            }
             if (arg == "--off-cuda-fp8" || arg == "--on-cuda-fp8") {
                 require(text == "prefill" || text == "mapped", "unsupported CUDA FP8 mode");
                 (arg == "--off-cuda-fp8" ? opt.off_cuda_fp8 : opt.on_cuda_fp8) = text;
@@ -434,6 +458,7 @@ int main(int argc, char ** argv) {
             const auto value = number(text, arg.c_str());
             if (arg == "--p") opt.p = value;
             else if (arg == "--ctx") opt.context = value;
+            else if (arg == "--parent-tokens") opt.parent_tokens = value;
             else if (arg == "--port") opt.port = value;
             else if (arg == "--overflow-tokens") opt.overflow_tokens = value;
             else if (arg == "--followup-capture-step") opt.followup_capture_steps.push_back(value);
@@ -444,7 +469,14 @@ int main(int argc, char ** argv) {
             else throw std::runtime_error("unknown option: " + arg);
         }
         require(opt.p != 0 && opt.p % 512 == 0, "P must be a positive multiple of 512");
+        require(opt.parent_tokens == 512 || opt.parent_tokens == 1024, "parent tokens must be512 or1024");
         require(opt.off_cuda_fp8.empty() == opt.on_cuda_fp8.empty(), "codec A/B requires both explicit arm modes");
+        require(opt.off_tcp_prefetch.empty() == opt.on_tcp_prefetch.empty(), "TCP prefetch A/B requires both explicit arm modes");
+        const bool tcp_pair = !opt.off_tcp_prefetch.empty();
+        require(!tcp_pair || opt.off_cuda_fp8 == opt.on_cuda_fp8,
+                "TCP prefetch A/B must keep the CUDA FP8 codec identical");
+        require(!tcp_pair || (opt.control_only_pair && opt.parent_tokens == 1024),
+                "TCP prefetch A/B requires --control-only-pair --parent-tokens 1024 to hold B1024/UB512/two N256 tiles fixed");
         require(opt.overflow_tokens >= 512 && opt.overflow_tokens % 512 == 0,
                 "overflow tokens must be a positive multiple of 512");
         require(opt.prefix_probe_tokens == 0 || (opt.prefix_probe_tokens % 512 == 0 && opt.prefix_probe_tokens <= opt.p),
@@ -452,7 +484,7 @@ int main(int argc, char ** argv) {
         require(opt.prefix_probe_tokens == 0 || (opt.restore_prefix_slot.empty() && opt.followup_tokens_file.empty()),
                 "prefix-only diagnostics cannot combine restored prefixes or followup files");
         if (!opt.restore_prefix_slot.empty()) require(fs::is_regular_file(opt.restore_prefix_slot), "prefix slot file missing");
-        const bool diagnostic = opt.prefix_probe_tokens != 0 || opt.control_only_pair;
+        const bool diagnostic = opt.prefix_probe_tokens != 0 || (opt.control_only_pair && !tcp_pair);
         require(opt.port > 0 && opt.port <= UINT16_MAX && !opt.host.empty(), "invalid Xbox endpoint");
         require(fs::is_regular_file(opt.model) && fs::is_regular_file(opt.tokens), "model/token file missing");
         auto read_ids = [](const fs::path & path, bool array_only) {
@@ -497,6 +529,9 @@ int main(int argc, char ** argv) {
         manifest["prompt_tokens"] = opt.prefix_probe_tokens ? opt.prefix_probe_tokens : prompt_end;
         manifest["fixed_followup_tokens"] = opt.prefix_probe_tokens ? 0 : followup_count;
         manifest["overflow_tokens"] = opt.overflow_tokens;
+        manifest["logical_batch"] = opt.parent_tokens;
+        manifest["comparison_geometry"] = opt.control_only_pair ? "repeat the configured control arm" :
+            opt.parent_tokens == 1024 ? "B1024 both arms: UB512/two N256 versus UB1024/four N256" : "B512: serial UB256 versus wavefront UB512/two N256";
         manifest["repeat_prompt"] = opt.repeat_prompt;
         manifest["serving_prefill"] = opt.serving_prefill;
         manifest["serving_checkpoint_seam"] = opt.serving_checkpoint_seam;
@@ -515,9 +550,14 @@ int main(int argc, char ** argv) {
         if (diagnostic) manifest["purpose"] = "prefix/repeatability diagnostic only; not WF 2xN256 qualification or a performance claim";
         manifest["P"] = opt.p; manifest["context"] = opt.context; manifest["host"] = opt.host; manifest["port"] = opt.port;
         manifest["activation_requirement"] = "Inspect arm-scoped logs: WF parent512/tile256 activation in ON overflow; prefix remains N256. Parity alone does not prove activation.";
-        if (diagnostic) manifest["activation_requirement"] = "Diagnostic only: no WF qualification; prefix probe deliberately executes no overflow, and control pair uses two WF-disabled UB256 contexts.";
+        if (opt.parent_tokens == 1024) manifest["activation_requirement"] = "Inspect arm-scoped logs: OFF tiles2,parent512 and ON tiles4,parent1024, finalFFN256,max_outstanding2 in both; prefix/tails stay physical256. Parity alone does not prove activation.";
+        if (tcp_pair) {
+            manifest["comparison_geometry"] = "B1024/UB512/two N256 tiles and codec fixed; explicit per-arm TCP prefetch";
+            manifest["activation_requirement"] = "Both arms require tiles2,parent512,finalFFN256,max_outstanding2; prefetch ON must prove max_frames2 and actual TX ahead. Parity alone does not prove overlap.";
+        }
+        if (diagnostic) manifest["activation_requirement"] = "Diagnostic only: inspect the configured geometry in each arm; prefix probe deliberately executes no overflow, and control pairs repeat the same geometry.";
         for (const char * key : {"GGML_RKVA_ASYNC_LOCAL_REMOTE", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL", "GGML_RKVA_NATIVE_BULK",
-                "GGML_RKVA_NATIVE_BULK_WIRE", "GGML_RKVA_WIRE_FORMAT", "GGML_RKVA_CUDA_FP8", "GGML_RKVA_WAVEFRONT_RPC_BATCH",
+                "GGML_RKVA_NATIVE_BULK_WIRE", "GGML_RKVA_WIRE_FORMAT", "GGML_RKVA_CUDA_FP8", "GGML_RKVA_WAVEFRONT_RPC_BATCH", "GGML_RKVA_TCP_PREFETCH",
                 "F4_NODE_DUMP", "F4_NODE_DUMP_ROLES", "F4_NODE_DUMP_OPMAP", "F4_NODE_DUMP_AUTOTAG",
                 "GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB",
                 "GGML_KVARN_WINDOW_CHUNK", "GGML_CUDA_FA_ROUTE_DEBUG"}) {
@@ -542,6 +582,7 @@ int main(int argc, char ** argv) {
         for (auto token : tokens) require(token < vocab, "development token ID exceeds model vocabulary");
         env_restore restore("GGML_RKVA_WAVEFRONT_TILE");
         env_restore codec_restore("GGML_RKVA_CUDA_FP8");
+        env_restore prefetch_restore("GGML_RKVA_TCP_PREFETCH");
         const auto off = run_arm(model.get(), opt, tokens, false, manifest,
                 opt.control_only_pair ? "control-a" : "off");
         const auto on = run_arm(model.get(), opt, tokens, !opt.control_only_pair, manifest,

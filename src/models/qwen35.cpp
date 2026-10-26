@@ -354,8 +354,8 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
             uint32_t(n_layer), cparams.kv_position_split_p, 0, plan, error)) {
         throw std::runtime_error("wavefront graph: " + error);
     }
-    if (params.wavefront_tile_size == 256 && !llama_wavefront::is_serving_2x256_plan(plan)) {
-        throw std::runtime_error("wavefront 2xN256 requires exactly two complete overflow tiles");
+    if (params.wavefront_tile_size == 256 && !llama_wavefront::is_serving_n256_plan(plan)) {
+        throw std::runtime_error("wavefront NxN256 requires exactly two or four complete overflow tiles");
     }
     auto * embeddings = build_inp_embd(model.tok_embd);
     cb(embeddings, "model.input_embed", -1);
@@ -478,7 +478,7 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
     int64_t final_ffn_rows = 0;
     if (params.wavefront_tile_size == 256) {
         // Preserve every final FFN and normalization at N256. Concatenating
-        // before the FFN would select N512 GEMM kernels and defeat the contract.
+        // before the FFN would select parent-width GEMM kernels and defeat the contract.
         final_ffn_rows = 256;
         for (uint32_t t = 0; t < tiles; ++t) {
             GGML_ASSERT(terminal_attn[t] && terminal_residual[t]);

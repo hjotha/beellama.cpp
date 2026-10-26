@@ -6,8 +6,15 @@
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 
+#include <functional>
 #include <memory>
 #include <vector>
+
+// Plain single-sequence serving only. Keep eligible scheduling parents and
+// refine every fallback to physical N256 before memory preparation.
+std::vector<llama_ubatch> llama_refine_n256_parents(
+        std::vector<llama_ubatch> parents,
+        const std::function<bool(const llama_ubatch &)> & eligible_parent);
 
 //
 // llama_memory_hybrid
@@ -83,6 +90,12 @@ public:
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
             bool embd_all) override;
+
+    // Opt-in plain single-sequence N256 serving: refine unsupported parents
+    // before either attention or recurrent state is prepared.
+    llama_memory_context_ptr init_batch(
+            llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all,
+            const std::function<bool(const llama_ubatch &)> & eligible_parent);
 
     llama_memory_context_ptr init_full() override;
 

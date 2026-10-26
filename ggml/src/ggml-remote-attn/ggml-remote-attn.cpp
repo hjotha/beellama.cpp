@@ -40,9 +40,12 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <deque>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <cerrno>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -715,6 +718,8 @@ struct rkva_stats {
     uint64_t cuda_unpack_calls = 0;
     uint64_t cuda_small_pack_calls = 0;
     uint64_t cuda_small_unpack_calls = 0;
+    uint64_t tcp_prefetch_admitted = 0, tcp_prefetch_sent = 0, tcp_prefetch_completed = 0;
+    uint64_t tcp_prefetch_ahead_sent = 0, tcp_prefetch_max_frames = 0;
     uint64_t cohort_calls = 0;
     uint64_t cohort_entries = 0;
     uint64_t cuda_context_creates = 0;
@@ -904,6 +909,45 @@ struct ggml_backend_remote_attn_context {
     // holding async_mutex; the worker releases it before publishing its ACK.
     std::mutex socket_mutex;
     uint64_t    cycle_id = 0;
+    bool prefetch_active = false; // protected by socket_mutex; blocks legacy frame interleaving
+    bool prefetch_enabled = false; // captured before worker creation
+#ifndef _WIN32
+    int prefetch_wake[2] = {-1, -1};
+#endif
+
+    bool prepare_prefetch() {
+#ifndef _WIN32
+        const char * option = std::getenv("GGML_RKVA_TCP_PREFETCH");
+        if (!option || std::strcmp(option, "1")) return true;
+        if (::pipe(prefetch_wake) != 0) return false;
+        for (int fd : prefetch_wake) {
+            const int flags = fcntl(fd, F_GETFL);
+            const int fdflags = fcntl(fd, F_GETFD);
+            if (flags < 0 || fdflags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+                    fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC) < 0) return false;
+        }
+        prefetch_enabled = true;
+        GGML_LOG_INFO("RKVA TCP prefetch experimental: max_frames=2 nq_min=10 wire=fp8 single_io_owner=1\n");
+#endif
+        return true;
+    }
+    void notify_prefetch() {
+#ifndef _WIN32
+        if (prefetch_enabled) {
+            const char wake = 1;
+            ssize_t result;
+            do { result = ::write(prefetch_wake[1], &wake, 1); } while (result < 0 && errno == EINTR);
+            // EAGAIN means the pipe already contains a wakeup. It stays alive
+            // until after the worker joins; no SIGPIPE-producing close race.
+        }
+#endif
+    }
+    ~ggml_backend_remote_attn_context() {
+#ifndef _WIN32
+        for (int fd : prefetch_wake) if (fd >= 0) ::close(fd);
+#endif
+    }
+
 
     // 2-slot async queue managed by worker thread with single TCP owner.
     // Slots decouple host preparation, staging and socket IO with deterministic backpressure.
@@ -1216,6 +1260,10 @@ static bool rkva_transact(
         uint64_t * out_cycle = nullptr) {
 
     std::lock_guard<std::mutex> socket_lock(ctx->socket_mutex);
+    if (ctx->prefetch_active) {
+        GGML_LOG_ERROR("RKVA: synchronous transaction attempted before prefetch drain\n");
+        return false;
+    }
 
     // A partial frame cannot be retried on the same ordered byte stream. Valid
     // server errors with an empty body remain recoverable (snapshot fallback).
@@ -1680,6 +1728,236 @@ static bool rkva_finish_cohort(ggml_backend_remote_attn_context * ctx,
     return true;
 }
 
+#ifndef _WIN32
+// Experimental prefill-only transport window. The existing slots own all
+// payloads and replies; this deque owns framing progress only. One worker owns
+// every send/recv, and the Xbox continues applying requests in stream order.
+static void rkva_prefetch_two_frames(
+        ggml_backend_remote_attn_context * ctx, rkva_async_slot * first) {
+    struct frame {
+        rkva_async_slot * slot;
+        rkva_request request{};
+        rkva_response response{};
+        size_t tx = 0, rx_header = 0, rx_body = 0;
+        uint64_t started_us = 0, tx_end_us = 0, rx_header_us = 0, rx_complete_us = 0;
+        bool header_valid = false;
+    };
+    std::deque<frame> frames;
+    std::unique_lock<std::mutex> socket_lock(ctx->socket_mutex);
+    ctx->prefetch_active = true;
+    bool ok = true;
+    bool transport_error = false;
+    const auto record = [&](const frame & f, const char * phase, uint64_t begin, uint64_t end,
+                            uint64_t bytes = 0, uint64_t value = 0, double gpu_us = 0) {
+        if (!ggml_remote_attn_trace_enabled()) return;
+        auto event = f.slot->trace;
+        std::snprintf(event.phase, sizeof(event.phase), "%s", phase);
+        event.begin_us = begin; event.end_us = end; event.cycle = f.request.cycle_id;
+        event.bytes = bytes; event.value = value; event.gpu_us = gpu_us;
+        event.flags = 0x20000000u; // pipelined frame: intervals can overlap another frame
+        ggml_remote_attn_trace_record(&event);
+    };
+    auto admit = [&](rkva_async_slot * slot) {
+        if (ctx->cycle_id == UINT64_MAX || slot->payload.size() > (256u << 20) ||
+                !slot->nq || !slot->out_width || slot->cohort_count || slot->wire != RKVA_WIRE_FP8 ||
+                slot->epoch != ctx->range_epoch || ctx->failed) return false;
+        frame f;
+        f.slot = slot;
+        f.request = {RKVA_MAGIC, RKVA_VERSION, RKVA_KVARN_RANGE_BULK_ATTN,
+            ++ctx->cycle_id, slot->session, slot->layer, slot->nq,
+            uint32_t(slot->payload.size())};
+        slot->response_cycle = f.request.cycle_id;
+        frames.push_back(f);
+        {
+            std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+            ++ctx->stats.tcp_prefetch_admitted;
+            ctx->stats.tcp_prefetch_max_frames = std::max<uint64_t>(ctx->stats.tcp_prefetch_max_frames, frames.size());
+        }
+        auto event = slot->trace;
+        std::snprintf(event.phase, sizeof(event.phase), "rpc_prefetch_admit");
+        event.begin_us = event.end_us = ggml_time_us();
+        event.cycle = f.request.cycle_id;
+        event.value = frames.size();
+        if (ggml_remote_attn_trace_enabled()) ggml_remote_attn_trace_record(&event);
+        return true;
+    };
+    try {
+        ok = admit(first);
+        auto last_progress = std::chrono::steady_clock::now();
+        while (ok && !frames.empty()) {
+            if (ctx->failed || ctx->async_stop) { ok = false; break; }
+            if (frames.size() < 2) {
+                std::lock_guard<std::mutex> alock(ctx->async_mutex);
+                rkva_async_slot * group[4]{};
+                const size_t count = rkva_ready_group(ctx, group);
+                if (count == 1 && !group[0]->cohort_count && group[0]->nq > 9 && group[0]->wire == RKVA_WIRE_FP8) {
+                    group[0]->state = rkva_slot_state::RUNNING;
+                    ok = admit(group[0]);
+                    if (!ok) break;
+                }
+            }
+            frame * sending = nullptr;
+            for (auto & f : frames) {
+                if (f.tx < sizeof(f.request) + f.slot->payload.size()) { sending = &f; break; }
+            }
+            auto & receiving = frames.front();
+            const bool can_receive = receiving.tx == sizeof(receiving.request) + receiving.slot->payload.size();
+            pollfd fds[2] = {
+                {ctx->sock.fd, short((can_receive ? POLLIN : 0) | (sending ? POLLOUT : 0)), 0},
+                {ctx->prefetch_wake[0], POLLIN, 0},
+            };
+            // Preserve the socket's 30-second inactivity bound; a wakeup or
+            // newly prepared slot is not network progress and cannot extend it.
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - last_progress).count();
+            if (elapsed >= 30000) { ok = false; transport_error = true; break; }
+            const int ready = ::poll(fds, 2, int(30000 - elapsed));
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready <= 0 || (fds[0].revents & (POLLERR | POLLNVAL))) {
+                ok = false; transport_error = true; break;
+            }
+            // An incomplete request cannot have a valid reply. A bare HUP
+            // otherwise makes poll return immediately until the deadline.
+            // Once TX is complete, let recv drain any final buffered reply.
+            if (!can_receive && (fds[0].revents & POLLHUP)) {
+                ok = false; transport_error = true; break;
+            }
+            if (fds[1].revents & POLLIN) {
+                char wake[64];
+                while (::read(ctx->prefetch_wake[0], wake, sizeof(wake)) > 0) {}
+            }
+            bool progressed = false;
+            // Read first so full duplex cannot deadlock when both socket
+            // buffers fill. A send/recv call handles at most64KiB per iteration.
+            if (can_receive && (fds[0].revents & (POLLIN | POLLHUP))) {
+                void * dst;
+                size_t bytes;
+                if (!receiving.header_valid) {
+                    dst = reinterpret_cast<uint8_t *>(&receiving.response) + receiving.rx_header;
+                    bytes = sizeof(receiving.response) - receiving.rx_header;
+                } else {
+                    dst = receiving.slot->reply.data() + receiving.rx_body;
+                    bytes = receiving.slot->reply.size() - receiving.rx_body;
+                }
+                const ssize_t n = ::recv(ctx->sock.fd, dst, std::min<size_t>(bytes, 65536), MSG_DONTWAIT);
+                if (n > 0) {
+                    progressed = true;
+                    if (!receiving.header_valid) receiving.rx_header += size_t(n);
+                    else receiving.rx_body += size_t(n);
+                } else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    ok = false; transport_error = true; break;
+                }
+                if (!receiving.header_valid && receiving.rx_header == sizeof(receiving.response)) {
+                    const auto & rsp = receiving.response;
+                    const auto & req = receiving.request;
+                    const size_t expected = size_t(receiving.slot->nq) *
+                        (receiving.slot->out_width + size_t(ctx->geo.n_head) * sizeof(float));
+                    if (rsp.magic != RKVA_MAGIC || rsp.version != RKVA_VERSION ||
+                            rsp.op != req.op || rsp.cycle_id != req.cycle_id ||
+                            rsp.status != RKVA_OK || rsp.payload_bytes != expected ||
+                            rsp.payload_bytes > (256u << 20)) {
+                        ok = false; transport_error = rsp.status == RKVA_OK; break;
+                    }
+                    if (receiving.slot->reply.capacity() < (4u << 20)) receiving.slot->reply.reserve(4u << 20);
+                    receiving.slot->reply.resize(rsp.payload_bytes);
+                    receiving.header_valid = true;
+                    receiving.rx_header_us = ggml_time_us();
+                    record(receiving, "rpc_header_wait", receiving.tx_end_us, receiving.rx_header_us,
+                        sizeof(receiving.response), receiving.response.xbox_prepare_us);
+#if defined(__linux__) && defined(TCP_QUICKACK)
+                    const int quickack = 1;
+                    if (rsp.payload_bytes > 4096) setsockopt(ctx->sock.fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
+#endif
+                }
+            }
+            if (receiving.header_valid && receiving.rx_body == receiving.slot->reply.size() && !receiving.rx_complete_us) {
+                receiving.rx_complete_us = ggml_time_us();
+                record(receiving, "rpc_body_recv", receiving.rx_header_us, receiving.rx_complete_us,
+                    receiving.slot->reply.size());
+            }
+            if (sending && (fds[0].revents & POLLOUT)) {
+                if (!sending->started_us) {
+                    sending->started_us = ggml_time_us();
+                    record(*sending, "rpc_queue", sending->slot->pending_us, sending->started_us);
+                }
+                const bool header = sending->tx < sizeof(sending->request);
+                const uint8_t * data = header ? reinterpret_cast<const uint8_t *>(&sending->request) + sending->tx :
+                    sending->slot->payload.data() + sending->tx - sizeof(sending->request);
+                const size_t bytes = header ? sizeof(sending->request) - sending->tx :
+                    sizeof(sending->request) + sending->slot->payload.size() - sending->tx;
+                const ssize_t n = ::send(ctx->sock.fd, data, std::min<size_t>(bytes, 65536), MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (n > 0) {
+                    sending->tx += size_t(n); progressed = true;
+                    if (sending->tx == sizeof(sending->request) + sending->slot->payload.size()) {
+                        sending->tx_end_us = ggml_time_us();
+                        const bool ahead = sending != &frames.front() && !frames.front().rx_complete_us;
+                        record(*sending, "rpc_send", sending->started_us, sending->tx_end_us,
+                            sending->tx, ahead ? 1 : 0);
+                        std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+                        ++ctx->stats.tcp_prefetch_sent;
+                        ctx->stats.tcp_prefetch_ahead_sent += ahead;
+                    }
+                }
+                else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    ok = false; transport_error = true; break;
+                }
+            }
+            if (progressed) last_progress = std::chrono::steady_clock::now();
+            if (receiving.header_valid && receiving.rx_body == receiving.slot->reply.size()) {
+                const uint64_t elapsed_us = receiving.rx_complete_us - receiving.started_us;
+                record(receiving, "rpc_total", receiving.started_us, receiving.rx_complete_us,
+                    0, receiving.response.xbox_prepare_us, receiving.response.xbox_compute_us);
+                auto * slot = receiving.slot;
+                {
+                    std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+                    ++ctx->stats.calls;
+                    ++ctx->stats.tcp_prefetch_completed;
+                    ctx->stats.bytes_tx += sizeof(receiving.request) + slot->payload.size();
+                    ctx->stats.bytes_rx += sizeof(receiving.response) + slot->reply.size();
+                    ctx->stats.rpc_us_sum += elapsed_us;
+                    ctx->stats.rpc_us_max = std::max(ctx->stats.rpc_us_max, elapsed_us);
+                    ctx->stats.xbox_compute_us_sum += receiving.response.xbox_compute_us;
+                    ctx->stats.xbox_prepare_us_sum += receiving.response.xbox_prepare_us;
+                    if (ctx->stats.rpc_us.size() < 1000000) ctx->stats.rpc_us.push_back(elapsed_us);
+                }
+                // Control calls must drain RUNNING slots. No control owns
+                // ctx->mutex while waiting for this socket/ACK to retire.
+                socket_lock.unlock();
+                ok = rkva_finish_native_bulk_job(ctx, *slot, false, true);
+                socket_lock.lock();
+                if (!ok) break;
+                frames.pop_front();
+                {
+                    std::lock_guard<std::mutex> alock(ctx->async_mutex);
+                    slot->state = rkva_slot_state::DONE_OK;
+                }
+                ctx->async_cv.notify_all();
+            }
+        }
+    } catch (...) { ok = false; }
+    ctx->prefetch_active = false;
+    socket_lock.unlock();
+    if (!ok) {
+        // Do not close/recycle the fd or buffers until every owner is retired.
+        // Already sent later frames can have executed remotely; poison the
+        // entire session and never publish their outputs or retry the stream.
+        {
+            std::lock_guard<std::mutex> lock(ctx->mutex);
+            rkva_poison_remote_state_locked(ctx);
+        }
+        if (transport_error) rkva_breaker_mark_down(ctx);
+        {
+            std::lock_guard<std::mutex> alock(ctx->async_mutex);
+            for (auto & slot : ctx->async_slots) {
+                if (slot.state == rkva_slot_state::RUNNING || slot.state == rkva_slot_state::PENDING ||
+                        slot.state == rkva_slot_state::PREPARING) slot.state = rkva_slot_state::DONE_ERR;
+            }
+        }
+        ctx->async_cv.notify_all();
+    }
+}
+#endif
+
 static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
     std::unique_lock<std::mutex> lock(ctx->async_mutex);
     for (;;) {
@@ -1706,7 +1984,9 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
         if (!count) continue;
         auto * slot = group[0];
         for (size_t i = 0; i < count; ++i) group[i]->state = rkva_slot_state::RUNNING;
-        if (ggml_remote_attn_trace_enabled()) for (size_t i = 0; i < count; ++i) {
+        const bool use_prefetch = ctx->prefetch_enabled && ctx->async_capacity == 2 && count == 1 &&
+            !slot->cohort_count && slot->wire == RKVA_WIRE_FP8 && slot->nq > 9;
+        if (!use_prefetch && ggml_remote_attn_trace_enabled()) for (size_t i = 0; i < count; ++i) {
             auto e = group[i]->trace;
             std::snprintf(e.phase, sizeof(e.phase), "rpc_queue");
             e.begin_us = group[i]->pending_us;
@@ -1714,6 +1994,13 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
             ggml_remote_attn_trace_record(&e);
         }
         lock.unlock();
+#ifndef _WIN32
+        if (use_prefetch) {
+            rkva_prefetch_two_frames(ctx, slot);
+            lock.lock();
+            continue; // pipeline owns terminal publication for every claimed slot
+        }
+#endif
 
         bool ok = false;
         if (!ctx->failed && ctx->connected) {
@@ -2480,6 +2767,7 @@ static bool rkva_async_submit_locked(
     if (cohort && (!ctx->cohort_enabled || !cohort_count ||
             cohort_count > 4 || cohort_index >= cohort_count || !nq || nq > 256)) return false;
     if (!ctx->async_worker.joinable()) {
+        if (!ctx->prepare_prefetch()) { ctx->failed = true; return false; }
         try {
             ctx->async_worker = std::thread(rkva_async_worker_main, ctx);
         } catch (...) {
@@ -2586,6 +2874,7 @@ static bool rkva_async_submit_locked(
         if (ggml_remote_attn_trace_enabled()) slot->pending_us = ggml_time_us();
         slot->state = rkva_slot_state::PENDING;
     }
+    ctx->notify_prefetch();
     ctx->async_cv.notify_all();
     return true;
 }
@@ -4757,6 +5046,12 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
         ",\"cuda_context_shared_last_releases\":" + std::to_string(s.cuda_context_shared_last_releases) +
         ",\"q_f32_readback_bytes_avoided\":" + std::to_string(s.q_f32_readback_bytes_avoided) +
         ",\"out_f32_upload_bytes_avoided\":" + std::to_string(s.out_f32_upload_bytes_avoided) + "}";
+    ctx->stats_json.pop_back();
+    ctx->stats_json += ",\"tcp_prefetch_admitted\":" + std::to_string(s.tcp_prefetch_admitted) +
+        ",\"tcp_prefetch_sent\":" + std::to_string(s.tcp_prefetch_sent) +
+        ",\"tcp_prefetch_completed\":" + std::to_string(s.tcp_prefetch_completed) +
+        ",\"tcp_prefetch_ahead_sent\":" + std::to_string(s.tcp_prefetch_ahead_sent) +
+        ",\"tcp_prefetch_max_frames\":" + std::to_string(s.tcp_prefetch_max_frames) + "}";
     return ctx->stats_json.c_str();
 }
 

@@ -203,6 +203,48 @@ class TimingTests(unittest.TestCase):
                              prompt_length=130560, wavefront_tile=256, split_p=102400)
         self.assertFalse(wrong['valid'])
 
+    def test_four_tile_marker_requires_parent1024_and_two_outstanding(self):
+        marker = 'RKVA wavefront graph: tile=256 tiles=4 parent_tokens=1024 final_ffn_rows=256 max_outstanding=2'
+        value = response()
+        value['timings'].update(prompt_n=28160, cache_n=102400)
+        def assess(line):
+            return bench.assess(value, logs() + ([line] if line else []), 256,
+                                prompt_length=130560, wavefront_tile=256, split_p=102400, wavefront_tiles=4)
+        good = assess(marker)
+        self.assertTrue(good['valid'], good)
+        self.assertTrue(good['wavefront_activation']['rkva_parent1024_tile256_confirmed'])
+        self.assertFalse(good['wavefront_activation']['rkva_parent512_tile256_confirmed'])
+        self.assertTrue(bench.wavefront_campaign_qualified([good]))
+        for bad in ['', marker.replace('tiles=4', 'tiles=2'), marker.replace('parent_tokens=1024', 'parent_tokens=512'),
+                    marker.replace('final_ffn_rows=256', 'final_ffn_rows=1024'),
+                    marker.replace('max_outstanding=2', 'max_outstanding=4'), marker.replace(' max_outstanding=2', '')]:
+            with self.subTest(marker=bad):
+                self.assertFalse(assess(bad)['valid'])
+
+    def test_four_tiles_cannot_qualify_a_short_tail(self):
+        value = response()
+        value['timings'].update(prompt_n=512, cache_n=130048)
+        point = bench.assess(value, logs(), 256, prompt_length=130560,
+                             wavefront_tile=256, split_p=102400, wavefront_tiles=4)
+        self.assertTrue(point['valid'], point)
+        self.assertFalse(bench.wavefront_campaign_qualified([point]))
+
+    def test_prefetch_requires_completed_bounded_overlap(self):
+        record = {'tcp_prefetch_admitted': 20, 'tcp_prefetch_sent': 20,
+                  'tcp_prefetch_completed': 20, 'tcp_prefetch_ahead_sent': 9,
+                  'tcp_prefetch_max_frames': 2}
+        self.assertTrue(bench.tcp_prefetch_activation([json.dumps(record)])['two_frame_overlap_confirmed'])
+        for key, value in [('tcp_prefetch_completed', 19), ('tcp_prefetch_ahead_sent', 0),
+                           ('tcp_prefetch_max_frames', 3), ('tcp_prefetch_admitted', 0)]:
+            with self.subTest(key=key):
+                bad = dict(record, **{key: value})
+                self.assertFalse(bench.tcp_prefetch_activation([json.dumps(bad)])['two_frame_overlap_confirmed'])
+        self.assertFalse(bench.tcp_prefetch_activation([
+            'RKVA TCP prefetch experimental: max_frames=2'])['two_frame_overlap_confirmed'])
+        incomplete = dict(record, tcp_prefetch_admitted=22, tcp_prefetch_sent=22, tcp_prefetch_completed=21)
+        self.assertFalse(bench.tcp_prefetch_activation([
+            json.dumps(record), json.dumps(incomplete)])['two_frame_overlap_confirmed'])
+
 
 class ProvenanceTests(unittest.TestCase):
     def setUp(self):
@@ -266,7 +308,7 @@ class ProvenanceTests(unittest.TestCase):
         self.assertFalse((self.root / 'out').exists())
 
     def test_batch_choices_and_physical_n256_are_fixed(self):
-        for extra in [['--batch-size', '128'], ['--batch-size', '1024'], ['--ubatch', '128']]:
+        for extra in [['--batch-size', '128'], ['--batch-size', '2048'], ['--ubatch', '128']]:
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
                 bench.parser().parse_args(self.arguments + extra)
             self.assertEqual(error.exception.code, 2)
@@ -314,6 +356,19 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.validate(bench.parser().parse_args(self.arguments + ['--batch-size', '512', '--ubatch', '512', '--wavefront-tile', '128']))
 
+    def test_two_four_comparison_holds_logical_batch_fixed(self):
+        common = self.arguments + ['--batch-size', '1024', '--wavefront-tile', '256']
+        control = bench.validate(bench.parser().parse_args(common + ['--ubatch', '512']))
+        candidate = bench.validate(bench.parser().parse_args(common + ['--ubatch', '1024', '--wavefront-tiles', '4']))
+        self.assertEqual(control.batch, candidate.batch)
+        self.assertEqual(bench.wavefront_campaign(control)['expected_overflow_parent_tokens'], 512)
+        self.assertEqual(bench.wavefront_campaign(candidate)['expected_overflow_parent_tokens'], 1024)
+        self.assertEqual(bench.prefix_contract(control, [1] * control.p, {'sha256': 'model'}),
+                         bench.prefix_contract(candidate, [1] * candidate.p, {'sha256': 'model'}))
+        for extra in [['--ubatch', '1024'], ['--ubatch', '512', '--wavefront-tiles', '4']]:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                bench.validate(bench.parser().parse_args(common + extra))
+
     def test_mapped_codec_mode_is_audited_but_local_prefix_is_reusable(self):
         off = bench.validate(bench.parser().parse_args(self.arguments))
         on = bench.validate(bench.parser().parse_args(self.arguments + ['--cuda-fp8', 'mapped']))
@@ -321,6 +376,18 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(bench.pinned_environment(on)['GGML_RKVA_CUDA_FP8'], 'mapped')
         self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
                          bench.prefix_contract(on, [1] * on.p, {'sha256': 'model'}))
+
+    def test_prefetch_is_explicit_and_preserves_local_prefix_contract(self):
+        common = self.arguments + ['--batch-size', '1024', '--ubatch', '512', '--wavefront-tile', '256']
+        off = bench.validate(bench.parser().parse_args(common))
+        on = bench.validate(bench.parser().parse_args(common + ['--tcp-prefetch']))
+        self.assertEqual(bench.pinned_environment(off)['GGML_RKVA_TCP_PREFETCH'], '0')
+        self.assertEqual(bench.pinned_environment(on)['GGML_RKVA_TCP_PREFETCH'], '1')
+        self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
+                         bench.prefix_contract(on, [1] * on.p, {'sha256': 'model'}))
+        for extra in [self.arguments + ['--tcp-prefetch'], common + ['--tcp-prefetch', '--no-profile']]:
+            with self.assertRaises(ValueError):
+                bench.validate(bench.parser().parse_args(extra))
 
     def test_remote_kernel_variant_is_audited_and_does_not_change_local_prefix(self):
         off = bench.validate(bench.parser().parse_args(self.arguments))
@@ -445,8 +512,8 @@ class PrefixCacheTests(unittest.TestCase):
         return bench.validate(bench.parser().parse_args(self.arguments + [
             '--prefix-snapshot', str(self.root / 'frozen.slot')] + list(extra)))
 
-    def make_cache(self):
-        args = self.cache_args()
+    def make_cache(self, extra=()):
+        args = self.cache_args(extra)
         path = Path(args.prefix_snapshot)
         path.write_bytes(b'ordinary-slot-with-SCKP')
         Path(str(path) + '.logits').write_bytes(b'logits')
@@ -470,6 +537,7 @@ class PrefixCacheTests(unittest.TestCase):
         args.batch = 512
         with self.assertRaises(ValueError):
             bench.load_prefix_snapshot(args, tokens, model)
+
         # Frozen B512 is shared between its OFF and WF256 physical-prefix256 arms.
         args.batch = 256
         args.ubatch = 512; args.wavefront_tile = 256
@@ -484,6 +552,19 @@ class PrefixCacheTests(unittest.TestCase):
         tokens[0] ^= 1
         with self.assertRaises(ValueError):
             bench.load_prefix_snapshot(args, tokens, model)
+
+
+    def test_cross_batch_reuse_requires_explicit_frozen_source_batch(self):
+        args, tokens, model, metadata = self.make_cache(['--batch-size', '512'])
+        control = self.cache_args(['--batch-size', '1024', '--ubatch', '512', '--wavefront-tile', '256'])
+        with self.assertRaises(ValueError):
+            bench.load_prefix_snapshot(control, tokens, model)
+        control = self.cache_args(['--batch-size', '1024', '--ubatch', '512', '--wavefront-tile', '256', '--frozen-prefix-batch', '512'])
+        candidate = self.cache_args(['--batch-size', '1024', '--ubatch', '1024', '--wavefront-tile', '256', '--wavefront-tiles', '4', '--frozen-prefix-batch', '512'])
+        self.assertEqual(bench.load_prefix_snapshot(control, tokens, model), metadata)
+        self.assertEqual(bench.load_prefix_snapshot(candidate, tokens, model), metadata)
+        self.assertEqual(metadata['contract']['batch'], 512)
+        self.assertEqual(candidate.batch, 1024)
 
     def test_dangling_snapshot_symlink_is_rejected_before_fresh_save(self):
         args = self.cache_args()

@@ -286,10 +286,19 @@ public:
             }
             // Per-append original tail rows must be emitted from the original
             // input, since a >128-token append wraps the persistent tail ring.
-            for (const float * source : {keys, values}) {
-                for (size_t i = 0; precision_tail_tokens_ && i < size_t(count) * width(); ++i) {
-                    const ggml_fp16_t half = ggml_fp32_to_fp16(source[i]);
-                    emit(&half, sizeof(half));
+            if (precision_tail_tokens_) {
+                const size_t offset = payload.size();
+                const size_t plane_bytes = append_elements * sizeof(ggml_fp16_t);
+                payload.resize(offset + 2 * plane_bytes);
+                uint8_t * dst = payload.data() + offset;
+                for (const float * source : {keys, values}) {
+                    // Keep the canonical scalar conversion, but reserve the
+                    // complete K/V tail once instead of inserting each half.
+                    for (size_t i = 0; i < append_elements; ++i) {
+                        const ggml_fp16_t half = ggml_fp32_to_fp16(source[i]);
+                        std::memcpy(dst + i * sizeof(half), &half, sizeof(half));
+                    }
+                    dst += plane_bytes;
                 }
             }
         }

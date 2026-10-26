@@ -168,6 +168,7 @@ llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int
     data->seq_id.resize(out.n_tokens);
     data->output.resize(out.n_tokens);
     if (src.decision_order) data->decision_order.resize(out.n_tokens);
+    if (src.data && !src.data->batch_idxs.empty()) data->batch_idxs.resize(out.n_tokens);
     for (uint32_t s = 0; s < src.n_seqs_unq; ++s) {
         data->seq_id_unq.push_back(src.seq_id_unq[s]);
     }
@@ -205,6 +206,7 @@ llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int
     for (size_t i = 0; i < sel.size(); ++i) {
         const int32_t t = sel[i];
         data->token[i] = src.token[t];
+        if (!data->batch_idxs.empty()) data->batch_idxs[i] = src.data->batch_idxs[t];
         data->n_seq_id[i] = src.n_seq_id[t];
         data->output[i]  = src.output[t];
         if (src.decision_order) data->decision_order[i] = src.decision_order[t];
@@ -230,6 +232,25 @@ llama_ubatch llama_ubatch_subset(const llama_ubatch & src, const std::vector<int
     out.decision_order = data->decision_order.empty() ? nullptr : data->decision_order.data();
 
     return out;
+}
+
+std::vector<llama_ubatch> llama_refine_n256_parents(
+        std::vector<llama_ubatch> parents,
+        const std::function<bool(const llama_ubatch &)> & eligible_parent) {
+    std::vector<llama_ubatch> physical;
+    for (auto & ub : parents) {
+        GGML_ASSERT(ub.token && !ub.embd && !ub.embd_state && ub.n_seqs == 1 && ub.n_seqs_unq == 1);
+        if (eligible_parent(ub) || ub.n_tokens <= 256) {
+            physical.push_back(std::move(ub));
+            continue;
+        }
+        for (uint32_t begin = 0; begin < ub.n_tokens; begin += 256) {
+            std::vector<int32_t> indices;
+            for (uint32_t i = begin; i < std::min(begin + 256, ub.n_tokens); ++i) indices.push_back(i);
+            physical.push_back(llama_ubatch_subset(ub, indices));
+        }
+    }
+    return physical;
 }
 
 bool llama_position_split::divide_ubatches_at_p(
@@ -335,6 +356,12 @@ bool llama_memory_hybrid::position_split_ubatches(
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    return init_batch(balloc, n_ubatch, embd_all, {});
+}
+
+llama_memory_context_ptr llama_memory_hybrid::init_batch(
+        llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all,
+        const std::function<bool(const llama_ubatch &)> & eligible_parent) {
     do {
         balloc.split_reset();
 
@@ -382,6 +409,11 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
             }
             ubatches = std::move(split);
+        }
+
+        if (eligible_parent) {
+            GGML_ASSERT(mem_recr->n_rs_seq == 0);
+            ubatches = llama_refine_n256_parents(std::move(ubatches), eligible_parent);
         }
 
         // prepare the recurrent batches first

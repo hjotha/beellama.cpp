@@ -17,6 +17,7 @@
 #include <random>
 #include <string>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 static int g_checks = 0;
@@ -184,33 +185,131 @@ static void test_serving_2x256_contract() {
     CHECK(plan.tiles.empty());
 }
 
+static void test_serving_4x256_contract() {
+    g_case = "serving_4x256_contract";
+    const uint32_t P = 1024;
+    auto ub = make_test_ubatch(1024, 103424, 0);
+    llama_wavefront::wavefront_plan plan;
+    std::string err;
+    CHECK(llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 0, plan, err));
+    CHECK(llama_wavefront::is_serving_n256_plan(plan));
+    CHECK(!llama_wavefront::is_serving_2x256_plan(plan));
+    CHECK(plan.n_tiles == 4);
+    for (uint32_t t = 0; t < 4; ++t) {
+        CHECK(plan.tiles[t].token_offset == t * 256);
+        CHECK(plan.ubatch_tiles[t].token[255] == ub.token[t * 256 + 255]);
+    }
+    const auto good = plan;
+    plan.tiles[3].n_tokens = 255;
+    CHECK(!llama_wavefront::is_serving_n256_plan(plan));
+    plan = good;
+    plan.tiles[2].token_offset = 256;
+    CHECK(!llama_wavefront::is_serving_n256_plan(plan));
+    plan = good;
+    plan.ubatch_tiles[3].n_seqs_unq = 2;
+    CHECK(!llama_wavefront::is_serving_n256_plan(plan));
+    for (uint32_t count : { 768u, 1023u, 1025u, 1280u }) {
+        auto tail = make_test_ubatch(count, 103424, 0);
+        CHECK(llama_wavefront::partition_ubatch_causal_tiles(tail, 256, 64, P, 0, plan, err));
+        CHECK(!llama_wavefront::is_serving_n256_plan(plan));
+    }
+    for (llama_pos begin : { llama_pos(P - 256), llama_pos(P - 124) }) {
+        auto crossing = make_test_ubatch(1024, begin, 0);
+        CHECK(llama_wavefront::partition_ubatch_causal_tiles(crossing, 256, 64, P, 0, plan, err));
+        CHECK(!llama_wavefront::is_serving_n256_plan(plan));
+    }
+    CHECK(llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 129, plan, err));
+    CHECK(!llama_wavefront::is_serving_n256_plan(plan));
+    auto gap = make_test_ubatch(1024, 103424, 0);
+    for (uint32_t i = 512; i < 1024; ++i) ++gap.pos[i];
+    CHECK(llama_wavefront::partition_ubatch_causal_tiles(gap, 256, 64, P, 0, plan, err));
+    CHECK(!llama_wavefront::is_serving_n256_plan(plan));
+    auto mixed = make_test_ubatch(1024, 103424, 0);
+    mixed.data->seq_id_data[800] = 9;
+    CHECK(!llama_wavefront::partition_ubatch_causal_tiles(mixed, 256, 64, P, 0, plan, err));
+    CHECK(plan.tiles.empty());
+    ub.n_seqs = 2;
+    CHECK(!llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 0, plan, err));
+}
+
+static void test_serving_n256_internal_parents() {
+    g_case = "serving_n256_internal_parents";
+    const uint32_t P = 1024;
+    // Exercise the same refinement used before hybrid memory preparation.
+    // Logical B is held at 1024 in both arms; the final 512-token seam in
+    // the UB1024 arm must stay two serial N256 graphs, never a tiled parent.
+    for (uint32_t parent : { 512u, 1024u }) {
+        const auto eligible = [&](const llama_ubatch & ub) {
+            llama_wavefront::wavefront_plan plan;
+            std::string err;
+            return ub.n_tokens == parent &&
+                llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 0, plan, err) &&
+                llama_wavefront::is_serving_n256_plan(plan);
+        };
+        for (const auto & sample : std::vector<std::pair<uint32_t, llama_pos>>{
+                {1024, 103424}, {1024, 0}, {1024, P - 256}, {1280, 103424}, {512, 103424}}) {
+            std::vector<llama_ubatch> parents;
+            for (uint32_t offset = 0; offset < sample.first; offset += parent) {
+                parents.push_back(make_test_ubatch(std::min(parent, sample.first - offset), sample.second + offset, 0));
+            }
+            std::vector<llama_ubatch> at_p;
+            std::string err;
+            CHECK(llama_position_split::divide_ubatches_at_p(parents, P, 0, at_p, err));
+            const auto physical = llama_refine_n256_parents(std::move(at_p), eligible);
+            uint32_t consumed = 0, tiled = 0;
+            for (const auto & ub : physical) {
+                CHECK(ub.pos[0] == sample.second + consumed);
+                CHECK(ub.n_tokens <= 256 || eligible(ub));
+                CHECK(ub.n_tokens != 768);
+                if (eligible(ub)) ++tiled;
+                consumed += ub.n_tokens;
+            }
+            CHECK(consumed == sample.first);
+            if (sample.first == 1024 && sample.second == 103424) {
+                CHECK(tiled == 1024 / parent);
+                CHECK(physical.size() == 1024 / parent);
+            }
+            if (sample.second == 0) CHECK(tiled == 0 && physical.size() == 4);
+            if (sample.first == 512 && parent == 1024) CHECK(tiled == 0 && physical.size() == 2);
+            if (sample.first == 1280) CHECK(physical.back().n_tokens == 256);
+        }
+    }
+}
+
 static void test_serving_2x256_schedule() {
-    g_case = "serving_2x256_schedule";
+    g_case = "serving_n256_schedule";
     // Qwen35 dense 32/64 layers have 8/16 full-attention groups.
     for (uint32_t groups : { 8u, 16u }) {
-        for (uint32_t rpc_batch : { 1u, 4u }) {
-            const auto steps = llama_wavefront::build_serving_schedule(groups, 2, rpc_batch);
-            CHECK(steps.size() == size_t(groups) * 4);
-            std::vector<bool> prepared(groups * 2, false), complete(groups * 2, false);
-            uint32_t outstanding = 0, peak = 0;
-            for (const auto & step : steps) {
-                CHECK(step.group < groups && step.tile < 2);
-                const uint32_t id = step.group * 2 + step.tile;
-                if (step.action == llama_wavefront::serving_step::phase::PREPARE) {
-                    CHECK(!prepared[id]);
-                    CHECK(step.group == 0 || complete[id - 2]);
-                    CHECK(step.tile == 0 || prepared[id - 1]);
-                    prepared[id] = true;
-                    peak = std::max(peak, ++outstanding);
-                } else {
-                    CHECK(prepared[id] && !complete[id]);
-                    complete[id] = true;
-                    CHECK(outstanding > 0);
-                    --outstanding;
+        for (uint32_t tiles : { 2u, 4u }) {
+            // Cohort4 remains a separate scheduler experiment for two tiles.
+            for (uint32_t rpc_batch : { 1u, 4u }) {
+                if (tiles == 4 && rpc_batch != 1) continue;
+                const auto steps = llama_wavefront::build_serving_schedule(groups, tiles, rpc_batch);
+                CHECK(steps.size() == size_t(groups) * tiles * 2);
+                std::vector<bool> prepared(groups * tiles, false), complete(groups * tiles, false);
+                uint32_t outstanding = 0, peak = 0;
+                for (const auto & step : steps) {
+                    CHECK(step.group < groups && step.tile < tiles);
+                    const uint32_t id = step.group * tiles + step.tile;
+                    if (step.action == llama_wavefront::serving_step::phase::PREPARE) {
+                        CHECK(!prepared[id]);
+                        CHECK(step.group == 0 || complete[id - tiles]);
+                        // PREPARE includes ordered conv/GDN commits; a later
+                        // tile may never consume its predecessor's old state.
+                        CHECK(step.tile == 0 || prepared[id - 1]);
+                        prepared[id] = true;
+                        peak = std::max(peak, ++outstanding);
+                        CHECK(outstanding <= 2);
+                    } else {
+                        CHECK(prepared[id] && !complete[id]);
+                        complete[id] = true;
+                        CHECK(outstanding > 0);
+                        --outstanding;
+                    }
                 }
+                CHECK(outstanding == 0 && peak == 2);
+                CHECK(std::all_of(complete.begin(), complete.end(), [](bool v) { return v; }));
             }
-            CHECK(outstanding == 0 && peak == 2);
-            CHECK(std::all_of(complete.begin(), complete.end(), [](bool v) { return v; }));
         }
     }
 }
@@ -1134,6 +1233,8 @@ int main() {
     std::printf("[test-wavefront-pipeline] Iniciando bateria de testes da Fase 7...\n");
 
     test_serving_2x256_contract();
+    test_serving_4x256_contract();
+    test_serving_n256_internal_parents();
     test_serving_2x256_schedule();
     test_tile_size_validation();
     test_wavefront_schedule_properties();

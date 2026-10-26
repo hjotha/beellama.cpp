@@ -989,6 +989,11 @@ llama_build_and_test(test-server-gpu-power.cpp ${PROJECT_SOURCE_DIR}/tools/serve
 target_include_directories(test-server-gpu-power PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_link_libraries(test-server-gpu-power PRIVATE ${CMAKE_DL_LIBS})
 llama_build_and_test(test-remote-attn-range.cpp)
+if (UNIX)
+    add_test(NAME test-rkva-tcp-prefetch COMMAND ${CMAKE_COMMAND} -E env
+        GGML_RKVA_TCP_PREFETCH_TEST_ONLY=1 $<TARGET_FILE:test-remote-attn-range>)
+    set_tests_properties(test-rkva-tcp-prefetch PROPERTIES LABELS main TIMEOUT 120)
+endif()
 llama_build_and_test(test-kv-prefix-lineage.cpp)
 llama_build_and_test(test-hybrid-rpc-prefix-state.cpp)
 llama_build_and_test(test-rkva-kvarn-producer.cpp)

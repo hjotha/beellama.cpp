@@ -288,21 +288,34 @@ bool partition_ubatch_causal_tiles(
     return true;
 }
 
-// Serving tile=256 is an exact 512-token parent contract, unlike the generic
-// partitioner, which also describes short tails and position-boundary splits.
-bool is_serving_2x256_plan(const wavefront_plan & plan) {
-    if (plan.tile_size != 256 || plan.n_tiles != 2 || plan.tiles.size() != 2 ||
-            plan.ubatch_tiles.size() != 2 || plan.n_layers == 0 || plan.p == 0 ||
-            plan.n_keep_tail != 0) return false;
-    for (uint32_t i = 0; i < 2; ++i) {
+// The generic partitioner also describes tails and boundary splits; serving
+// permits only complete contiguous overflow parents of two or four N256 tiles.
+bool is_serving_n256_plan(const wavefront_plan & plan) {
+    if (plan.tile_size != 256 || (plan.n_tiles != 2 && plan.n_tiles != 4) ||
+            plan.tiles.size() != plan.n_tiles || plan.ubatch_tiles.size() != plan.n_tiles ||
+            plan.n_layers == 0 || plan.p == 0 || plan.n_keep_tail != 0) return false;
+    llama_seq_id seq = -1;
+    for (uint32_t i = 0; i < plan.n_tiles; ++i) {
         const auto & tile = plan.tiles[i];
         const auto & ub = plan.ubatch_tiles[i];
         if (tile.tile_id != i || tile.token_offset != i * 256 || tile.n_tokens != 256 ||
                 tile.range != llama_position_split::range_kind::OVERFLOW_RANGE || tile.pos_min < int64_t(plan.p) ||
                 int64_t(tile.pos_max) - tile.pos_min != 255 || ub.n_tokens != 256 ||
-                ub.n_seq_tokens != 256 || ub.n_seqs != 1 || ub.n_seqs_unq != 1) return false;
+                ub.n_seq_tokens != 256 || ub.n_seqs != 1 || ub.n_seqs_unq != 1 ||
+                !ub.token || ub.embd || ub.embd_state || ub.type || ub.decision_order ||
+                !ub.pos || !ub.seq_id || !ub.n_seq_id) return false;
+        if (i && int64_t(plan.tiles[i - 1].pos_max) + 1 != tile.pos_min) return false;
+        for (uint32_t j = 0; j < 256; ++j) {
+            if (ub.n_seq_id[j] != 1 || !ub.seq_id[j]) return false;
+            if (i == 0 && j == 0) seq = ub.seq_id[j][0];
+            if (ub.seq_id[j][0] != seq || int64_t(ub.pos[j]) != int64_t(tile.pos_min) + j) return false;
+        }
     }
-    return int64_t(plan.tiles[0].pos_max) + 1 == plan.tiles[1].pos_min;
+    return true;
+}
+
+bool is_serving_2x256_plan(const wavefront_plan & plan) {
+    return plan.n_tiles == 2 && is_serving_n256_plan(plan);
 }
 
 bool validate_topological_order(

@@ -296,3 +296,129 @@ The current harness's B512 snapshot contract must not simply be removed.
 None of these larger-tile paths provides parallel autoregressiveN1 decode.
 Use the measured codec/kernel/latency path for decode optimization. Actual
 production tier migration and the older WF128 holdout remain separate gates.
+
+
+## Controlled four-tile and TCP prefetch experiments, 2026-10-26
+
+The implementation now accepts requested UB512/two or UB1024/four N256 tiles,
+with logical B at least the requested UB. Eligibility is checked per internal
+parent, so B1024/UB512 remains a real two-tile control. Unsupported parents,
+local prefix, crossings and short tails are refined to physical N256 before
+attention/recurrent preparation. Final FFN/norm remain N256; RPCbatch1 and the
+two-outstanding limit are unchanged. Four tiles do not mean four GPU requests
+running concurrently. The subset helper also preserves original batch indices.
+
+On the same frozen P102400/C131072 prefix, B1024 in both arms, serving overflow
+28160 tokens and256 fixed continuation inputs, two versus four tiles pass five
+complete-vocabulary logits and serialized recurrent checkpoints bit-exactly.
+Restored prefix states match, both runtime geometries activate, all576 observed
+window choices remain4096 and the trace loses zero events. CUDA compute buffers
+are262.5060 versus269.1144MiB; host buffers141.2618 versus281.6330MiB.
+A separate trace-free timing pair preserves all256 generated IDs:
+
+| Parent geometry | Overflow prefill t/s | Decode t/s |
+|---|---:|---:|
+| B1024/UB512, two N256 | 151.179863542242 | 17.492394581227 |
+| B1024/UB1024, four N256 | 151.336101078586 | 17.419140520480 |
+
+The +0.103% prefill difference is not an established improvement. Two N256 tiles
+remain the performance reference. The opt-in four-tile implementation is useful
+for controlled experiments, not a demonstrated throughput upgrade.
+
+Astra's producer change emits each exact F16 tail block with one vector resize
+rather than a two-byte insert per scalar. Conversion remains the same scalar
+F32-to-F16 RNE operation. Seventy-two complete payloads/17686528bytes match,
+including reset/rewind and boundary cases. Both timing arms above include this
+change, so the table does not independently attribute a producer speedup.
+
+### Bounded host TCP prefetch
+
+`GGML_RKVA_TCP_PREFETCH=1` enables an experimental POSIX host transport window.
+Default is OFF. Only FP8 native op22, async capacity2 and nq>9 use it. Decode N1,
+verification nq<=9, other codecs and cohorts keep their existing path. There is
+no Xbox packet/shader change; the installed package295 serves these tests.
+
+The existing I/O worker polls one socket and a wake pipe. It can send the next
+prepared frame while the previous reply is outstanding. At most two existing
+slots own all buffers through send, receive, validation, unpack and ordered ACK.
+Replies remain FIFO and validate magic/version/op/cycle/length before decode.
+Controls drain; cancellation/EOF/malformed replies poison the stream, interrupt
+I/O and retain owners until retirement. Partial-TX HUP fails immediately; after
+TX completion recv can drain a final buffered reply. No autoregressive future
+query is fabricated. Frame RTT intervals overlap and must not be summed as
+elapsed wall time.
+
+The causal live test holds B1024/UB512/two N256 and mapped/fine fixed, switching
+only prefetch OFF/ON. Five whole-logit/recurrent checkpoints match bit-exactly
+through130816 tokens, including identical restored prefix state. ON completes
+1776/1776 frames with1626 transmitted ahead and maximum window2. Both arms use
+5872 GPU FP8 calls and zero CPU fallback. Identical request/response byte counts
+accompany Xbox payload-receive blocking44.372885s ->18.692473s; handler time is
+94.769826s ->94.785190s. The reduction hides network waiting; it does not imply
+that the physical link became faster.
+
+A trace-free A/B/B/A campaign on the final host binary/source has these results:
+
+| Prefetch | Repetition | Overflow prefill t/s | Decode t/s |
+|---|---:|---:|---:|
+| OFF | 1 | 150.114506823389 | 17.481713270972 |
+| ON | 1 | 203.151580794520 | 17.438669737240 |
+| ON | 2 | 204.658022404065 | 17.489472023703 |
+| OFF | 2 | 149.572404312077 | 17.533690470542 |
+
+Pooled prefill is149.842965264150 ->203.902019214688t/s (+36.077%). Pooled decode
+is17.507663293031 ->17.464033935015t/s (-0.249%); no material decode improvement
+is established. Every run has256 identical generated IDs, also equal to the
+previous reference, with no errors or memory-policy warnings. Both ON runs
+complete1776 frames,1627 ahead, maximum2. The timed API reports256 outputs but
+255 timed decode intervals; pooling retains that convention.
+
+The benchmark uses explicit `--tcp-prefetch`, pins OFF otherwise, and requires
+final counters proving completed bounded overlap. An earlier successful counter
+record cannot qualify an incomplete final record. Errors during teardown also
+invalidate the run. CAPI per-arm `--off-tcp-prefetch 0 --on-tcp-prefetch 1`
+requires `--control-only-pair --parent-tokens 1024` and identical codec modes.
+`--frozen-prefix-batch 512` explicitly permits this existing B512 snapshot as a
+frozen input for B1024 continuation; default batch metadata remains strict.
+Remote-only prefetch does not alter the local-prefix codec contract. These
+measurements qualify the102400->130560 continuation, not a new cold prefix,
+production tier migration, every corpus, or the historical WF128 holdout.
+
+### Remaining bottlenecks and validation
+
+The current mapped trace attributes roughly39.24ms/decode token to local CUDA,
+including13.45ms in FA-labelled subgraphs and25.79ms elsewhere. Exposed remote
+wait is6.93ms/token. These intervals overlap. WAIT producer synchronization
+mostly waits for the same local FA work already counted; removing that wait
+would not remove an additional12.87ms. Memory guards cost about3.09ms/token but
+were preserved. Measuring kernels inside FA and matvec/GDN blocks is the next
+justified decode investigation. This is not an architectural TPS ceiling.
+
+Late Xbox prefill measurements put pass1 at65.30ms of67.55ms GPU time per
+envelope. Those late-ring samples are not a full-run average. The console is
+confirmed Series X; no conclusion about available CU occupancy follows from
+its memory budget. Network overlap, host CUDA and remote attention all matter.
+
+Linux build uses-j10. Nine selected CTests pass in7.24s, including the maintained
+TCP concurrency/failure suite;45 benchmark unit tests pass. MSVC AppContainer
+builds the entire GGML/core/model library with parallelism10:668.13s initially,
+16.60s for the final TCP delta. The optional standalone Windows desktop CTest
+setup remains unqualified: shared-DLL link and NOMINMAX/EHsc configuration
+problems are recorded; it was stopped without source changes. This does not
+constitute a desktop Windows test pass. UWP compilation and Linux live runtime
+validation are distinct gates; no new console package was installed for the
+host-only transport change.
+
+On193, cleanup reclaimed33795993600bytes (33.80GB/31.47GiB), removing67 old build
+directories and one clean linked worktree. Its unique branch and verified
+bundle/source backup remain. Fourteen source trees with unique/dirty/submodule
+state were preserved, along with183 model/key/certificate paths and five
+junctions. The current Bee checkout, build and shared caches were protected.
+
+Evidence in the20261026 artifact directory: `wf4-controlled-comparison-r1.json`,
+`wf4-cached-p102400-long-r1/manifest.json`,
+`wf4-long-runtime-verification.json`,
+`tcp-prefetch-cached-p102400-long-r1/manifest.json`,
+`tcp-prefetch-causal-transport-profile.json`, `tcp-prefetch-abba-comparison.json`,
+`tcp-host-ctest-r2.log`, `windows-4xn256-final-validation.json`,
+`decode-mapped-current-trace-analysis.txt` and `cleanup193-summary.json`.

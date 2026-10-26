@@ -47,6 +47,7 @@ PINNED_ENV = {
     'GGML_RKVA_WIRE_STRICT': '1', 'GGML_RKVA_ASYNC_LOCAL_REMOTE': '1',
     'GGML_RKVA_CUDA_FP8': 'prefill', 'GGML_RKVA_DISK_SNAPSHOTS': '0',
     'GGML_RKVA_WAVEFRONT_TILE': '0', 'GGML_RKVA_WAVEFRONT_RPC_BATCH': '1',
+    'GGML_RKVA_TCP_PREFETCH': '0',
     'LLAMA_N256_LOOKAHEAD': '0', 'LLAMA_SERVER_F5_PER_TOKEN_TIMING': '1',
 }
 
@@ -173,16 +174,20 @@ def parser():
     p.add_argument('--points', default='102400,130560', help='strictly ascending prompt lengths')
     p.add_argument('--p', type=int, default=102400)
     p.add_argument('--context', type=int, default=131072)
-    p.add_argument('--batch-size', '--batch', dest='batch', type=int, choices=(256, 512), default=256,
-                   help='logical batch: pair 512 OFF against 512 ON; 256 remains the original baseline')
-    p.add_argument('--ubatch', type=int, choices=(256, 512), default=256,
-                   help='OFF uses 256; WF256 uses parent 512 containing two N256 compute tiles')
+    p.add_argument('--batch-size', '--batch', dest='batch', type=int, choices=(256, 512, 1024), default=256,
+                   help='logical B512 baseline or common B1024 for controlled two/four N256 parents')
+    p.add_argument('--ubatch', type=int, choices=(256, 512, 1024), default=256,
+                   help='OFF uses256; WF256 uses parent512/two or1024/four N256 tiles')
     p.add_argument('--wavefront-tile', type=int, choices=(0, 128, 256), default=0,
-                   help='CUDA/RKVA: OFF UB256, WF128 parentUB256, or WF256 parentUB512; batch512 for either candidate')
+                   help='CUDA/RKVA: OFF UB256, WF128 parentUB256, or WF256 parentUB512/1024')
+    p.add_argument('--wavefront-tiles', type=int, choices=(2, 4), default=2,
+                   help='four N256 tiles require B1024/UB1024; compare two tiles at B1024/UB512, same physical N256')
     p.add_argument('--n256-lookahead', action='store_true',
                    help='qualify the 2xN256 prototype (batch-size 512); timings require explicit CUDA 2x256 runtime activation')
     p.add_argument('--cuda-fp8', choices=('prefill', 'mapped'), default='prefill',
                    help='mapped also uses CUDA mapped-host FP8 helpers for nq<=9; requires independent decode quality/TPS checks')
+    p.add_argument('--tcp-prefetch', action='store_true',
+                   help='experimental two-frame FP8 prefill transport; requires runtime overlap counters')
     p.add_argument('--range-kernel', choices=('fine', 'balanced'), default='fine',
                    help='fine uses MQ2 and finer decode splits; balanced uses MQ4 and coarser decode splits')
     p.add_argument('--n-predict', type=int, default=256)
@@ -199,6 +204,8 @@ def parser():
     p.add_argument('--startup-timeout', type=float, default=600)
     p.add_argument('--request-timeout', type=float, default=3600)
     p.add_argument('--prefix-snapshot', help='frozen local-prefix slot file; reuse if present, otherwise create before overflow')
+    p.add_argument('--frozen-prefix-batch', type=int, choices=(512,),
+                   help='explicitly reuse an existing B512 local prefix as a frozen input for B1024 continuation; no cold-prefix claim')
     p.add_argument('--prefix-only', action='store_true', help='create/restore bounded local prefix only; no throughput qualification')
     p.add_argument('--execute', action='store_true', help='run the explicitly configured GPU/RPC benchmark')
     p.add_argument('--dry-run', action='store_true', help='preview only (the default); no child process')
@@ -225,8 +232,12 @@ def validate(args):
     host, separator, port = args.xbox_host.rpartition(':')
     if not separator or not host or not port.isdigit() or not 0 < int(port) < 65536:
         raise ValueError('xbox-host must be explicit HOST:PORT')
-    if args.wavefront_tile == 256 and (args.batch != 512 or args.ubatch != 512):
-        raise ValueError('--wavefront-tile 256 requires --batch-size 512 --ubatch 512 (two compute tiles of 256)')
+    if args.wavefront_tile == 256 and (args.batch not in (512, 1024) or args.ubatch != 256 * args.wavefront_tiles):
+        raise ValueError('--wavefront-tile 256 requires UB512/two tiles or B1024/UB1024/four tiles')
+    if args.wavefront_tiles != 2 and args.wavefront_tile != 256:
+        raise ValueError('four tiles are supported only with --wavefront-tile 256')
+    if args.tcp_prefetch and (not args.wavefront_tile or not args.profile):
+        raise ValueError('--tcp-prefetch requires wavefront and profiling counters to prove overlap')
     if args.wavefront_tile == 128 and (args.batch != 512 or args.ubatch != 256):
         raise ValueError('--wavefront-tile 128 requires --batch-size 512 --ubatch 256 (two compute tiles of 128 per physical parent)')
     if args.wavefront_tile == 0 and args.ubatch != 256:
@@ -246,12 +257,16 @@ def validate(args):
         if Path(args.prefix_snapshot).is_symlink():
             raise ValueError('prefix snapshot main file must not be a symlink')
         args.prefix_snapshot = str(Path(args.prefix_snapshot).resolve())
+        if args.frozen_prefix_batch and (args.batch != 1024 or not Path(args.prefix_snapshot).is_file()):
+            raise ValueError('cross-batch frozen reuse requires B1024 and an existing B512 prefix snapshot')
         if Path(args.prefix_snapshot).name in ('', '.', '..'):
             raise ValueError('prefix snapshot must name a file')
     memory_policy()
     args.library_dir = [str(Path(p).resolve(strict=True)) for p in args.library_dir]
     if any(not Path(p).is_dir() for p in args.library_dir):
         raise ValueError('library-dir must be a directory')
+    if args.frozen_prefix_batch and not args.prefix_snapshot:
+        raise ValueError('--frozen-prefix-batch requires --prefix-snapshot')
     return args
 
 
@@ -303,32 +318,47 @@ def n256_activation(lines):
             'serial_fallback_count': len(fallbacks), 'serial_fallback_examples': fallbacks[:3]}
 
 
-def wavefront_activation(lines, tile=256):
+def wavefront_activation(lines, tile=256, tiles=2):
     records = []
     for line in lines:
         if 'RKVA wavefront graph:' not in line:
             continue
-        fields = {key: int(value) for key, value in re.findall(r'\b(tile|tiles|parent_tokens|final_ffn_rows)=(\d+)\b', line)}
+        fields = {key: int(value) for key, value in re.findall(r'\b(tile|tiles|parent_tokens|final_ffn_rows|max_outstanding)=(\d+)\b', line)}
         fields['line'] = line.rstrip()
         records.append(fields)
     def expected(record):
         return all(record.get(key) == value for key, value in
-                   [('tile', tile), ('tiles', 2), ('parent_tokens', 2 * tile), ('final_ffn_rows', 256)])
+                   [('tile', tile), ('tiles', tiles), ('parent_tokens', tiles * tile), ('final_ffn_rows', 256)]) and (tiles != 4 or record.get('max_outstanding') == 2)
     valid = [record for record in records if expected(record)]
     invalid = [record for record in records if not expected(record)]
-    return {'rkva_parent512_tile256_confirmed': tile == 256 and bool(valid) and not invalid,
+    return {'rkva_parent512_tile256_confirmed': tile == 256 and tiles == 2 and bool(valid) and not invalid,
+            'rkva_parent1024_tile256_confirmed': tile == 256 and tiles == 4 and bool(valid) and not invalid,
             'requested_geometry_confirmed': bool(valid) and not invalid,
-            'requested_tile': tile, 'requested_parent_tokens': 2 * tile,
+            'requested_tile': tile, 'requested_parent_tokens': tiles * tile,
             'activations': records, 'incompatible_activations': invalid}
+
+
+def tcp_prefetch_activation(lines):
+    records = []
+    for line in lines:
+        fields = {key: int(value) for key, value in re.findall(
+            r'"tcp_prefetch_(admitted|sent|completed|ahead_sent|max_frames)"\s*:\s*(\d+)', line)}
+        if fields:
+            records.append(fields)
+    final = records[-1] if records else {}
+    confirmed = bool(records) and all(record.get('max_frames', 0) <= 2 for record in records) and (
+        final.get('admitted', 0) == final.get('sent', 0) == final.get('completed', 0) > 0 and
+        final.get('max_frames') == 2 and 0 < final.get('ahead_sent', 0) <= final['sent'])
+    return {'two_frame_overlap_confirmed': confirmed, 'records': records}
 
 
 def wavefront_campaign_qualified(points):
     return any(point.get('valid') and point.get('wavefront_tile_requested') in (128, 256) and
-               (point.get('uncached_overflow_tokens') or 0) >= 2 * point['wavefront_tile_requested'] and
+               (point.get('uncached_overflow_tokens') or 0) >= point['wavefront_activation']['requested_parent_tokens'] and
                point['wavefront_activation']['requested_geometry_confirmed'] for point in points)
 
 
-def prefix_geometry(lines):
+def prefix_geometry(lines, parent=512):
     records = []
     for line in lines:
         if 'RKVA wavefront prefix:' not in line:
@@ -336,12 +366,12 @@ def prefix_geometry(lines):
         fields = {key: int(value) for key, value in re.findall(r'\b(requested_ubatch|effective_ubatch)=(\d+)\b', line)}
         fields['line'] = line.rstrip()
         records.append(fields)
-    return {'prefix_compute_n256_confirmed': any(r.get('requested_ubatch') == 512 and
+    return {'prefix_compute_n256_confirmed': any(r.get('requested_ubatch') == parent and
             r.get('effective_ubatch') == 256 for r in records), 'records': records}
 
 
 def assess(response, lines, expected, prompt_length=None, n256_lookahead=False, prior_n256=None,
-           wavefront_tile=0, split_p=None):
+           wavefront_tile=0, split_p=None, wavefront_tiles=2):
     errors = []
     timing = response.get('timings', {})
     predicted = timing.get('predicted_n')
@@ -387,7 +417,7 @@ def assess(response, lines, expected, prompt_length=None, n256_lookahead=False, 
             errors.append('N256 requested but CUDA 2x256 runtime activation was not confirmed (CPU/serial/ignored is not a candidate)')
         if any(r['backend'] != 'CUDA' for r in activation['activations']):
             errors.append('N256 request activated a non-CUDA backend')
-    wf_activation = wavefront_activation(lines, wavefront_tile or 256)
+    wf_activation = wavefront_activation(lines, wavefront_tile or 256, wavefront_tiles)
     overflow_processed = None
     if wavefront_tile:
         cached = timing.get('cache_n')
@@ -395,8 +425,8 @@ def assess(response, lines, expected, prompt_length=None, n256_lookahead=False, 
             errors.append(f'WF{wavefront_tile} overflow request geometry is missing')
         else:
             overflow_processed = max(0, prompt_length - max(split_p, cached))
-            if overflow_processed >= 2 * wavefront_tile and not wf_activation['requested_geometry_confirmed']:
-                errors.append(f'overflow prefill did not prove RKVA parent{2 * wavefront_tile} / two tiles{wavefront_tile} / final FFN256 activation')
+            if overflow_processed >= wavefront_tiles * wavefront_tile and not wf_activation['requested_geometry_confirmed']:
+                errors.append(f'overflow prefill did not prove RKVA parent{wavefront_tiles * wavefront_tile} / {wavefront_tiles} tiles{wavefront_tile} / final FFN256 activation')
             if wf_activation['incompatible_activations']:
                 errors.append('wavefront activation used incompatible parent/tile/FFN geometry for the requested candidate')
     f5 = response.get('f5_per_token')
@@ -523,6 +553,7 @@ def pinned_environment(args):
     values['GGML_RKVA_WAVEFRONT_TILE'] = str(args.wavefront_tile)
     values['GGML_RKVA_WAVEFRONT_RPC_BATCH'] = '1'
     values['GGML_RKVA_CUDA_FP8'] = args.cuda_fp8
+    values['GGML_RKVA_TCP_PREFETCH'] = '1' if args.tcp_prefetch else '0'
     values['GGML_RKVA_RANGE_KERNEL'] = args.range_kernel
     return values
 
@@ -536,12 +567,13 @@ def n256_capability(args):
 
 def wavefront_campaign(args):
     return {'requested_tile': args.wavefront_tile, 'requested_logical_batch': args.batch,
+            'requested_tiles': args.wavefront_tiles,
             'requested_parent_ubatch': args.ubatch, 'expected_prefix_compute_ubatch': 256,
-            'expected_overflow_parent_tokens': 2 * args.wavefront_tile if args.wavefront_tile else None,
+            'expected_overflow_parent_tokens': args.wavefront_tiles * args.wavefront_tile if args.wavefront_tile else None,
             'expected_compute_tile_tokens': args.wavefront_tile or 256, 'rpc_batch': 1,
             'cpu_n256_prototype': False if args.wavefront_tile else args.n256_lookahead,
             'runtime_activation_confirmed': False, 'production_qualified': False,
-            'pair': 'OFF B512/UB256; WF128 B512/UB256 with N128 tiles; WF256 B512/UB512 with N256 tiles; final FFN N256',
+            'pair': 'OFF B512/UB256; WF128 B512/UB256; WF256 B512/UB512 or common B1024 UB512/two versus UB1024/four; final FFN N256, max outstanding2',
             'historical_wf128': 'prior holdout rejection remains unchanged; fresh WF128 measurements require their own quality checks'}
 
 
@@ -587,10 +619,10 @@ def prefix_contract(args, tokens, model):
     prefix_env['GGML_RKVA_RANGE_KERNEL'] = 'fine'  # no remote kernel executes inside the local prefix
     return {'schema': 1, 'codec': 'llama-state-seq-file', 'model_sha256': model['sha256'],
             'requested_prefix_sha256': token_hash(tokens[:args.p]), 'P': args.p, 'context': args.context,
-            'slot': 0, 'batch': args.batch, 'physical_prefix_ubatch': 256, 'flash_attn': 'on', 'n_rs_seq': 0,
+            'slot': 0, 'batch': args.frozen_prefix_batch or args.batch, 'physical_prefix_ubatch': 256, 'flash_attn': 'on', 'n_rs_seq': 0,
             'native_kvarn_bits': 4, 'tail': 128, 'window': 4096,
             'environment': {k: v for k, v in prefix_env.items()
-                            if k not in ('GGML_RKVA_WAVEFRONT_TILE', 'LLAMA_N256_LOOKAHEAD')}}
+                            if k not in ('GGML_RKVA_WAVEFRONT_TILE', 'LLAMA_N256_LOOKAHEAD', 'GGML_RKVA_TCP_PREFETCH')}}
 
 
 def snapshot_files(path):
@@ -699,7 +731,9 @@ def run(args, tokens, stream_info):
             snapshot = load_prefix_snapshot(args, tokens, manifest['model'])
             Path(args.prefix_snapshot).parent.mkdir(parents=True, exist_ok=True)
             manifest['prefix_cache'] = {'intent': 'restore' if snapshot else 'create', 'purpose': 'frozen prefix experimental input',
-                                        'metadata': snapshot}
+                                        'metadata': snapshot, 'source_batch': args.frozen_prefix_batch or args.batch,
+                                        'continuation_batch': args.batch,
+                                        'explicit_cross_batch_reuse': args.frozen_prefix_batch is not None}
         env, manifest['environment'] = environment(args, output)
         version = subprocess.run([args.server_binary, '--version'], env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', timeout=30)
@@ -753,13 +787,13 @@ def run(args, tokens, stream_info):
                 if warm_errors:
                     raise RuntimeError('warm prefix logged an error/fallback')
                 if args.wavefront_tile == 256:
-                    warm_geometry = prefix_geometry(lines)
+                    warm_geometry = prefix_geometry(lines, args.ubatch)
                     manifest['warm_prefix_geometry'] = warm_geometry
                     if not warm_geometry['prefix_compute_n256_confirmed']:
                         if snapshot and response.get('timings', {}).get('prompt_n') == 0:
                             warm_geometry['no_compute_frozen_prefix_cache_hit'] = True
                         else:
-                            raise RuntimeError('WF256 warm local prefix did not confirm effective compute UB256 with requested parent UB512')
+                            raise RuntimeError(f'WF256 warm local prefix did not confirm compute UB256 with requested parent UB{args.ubatch}')
                 warm_activation = n256_activation(lines)
                 manifest['n256_warm_activation'] = warm_activation
                 if not args.prefix_only and args.n256_lookahead and length >= 512 and not warm_activation['cuda_2x256_confirmed']:
@@ -785,7 +819,8 @@ def run(args, tokens, stream_info):
                             raise RuntimeError('prefix repair logged an error/fallback')
             else:
                 point = assess(response, lines, count, prompt_length=length, n256_lookahead=args.n256_lookahead,
-                               prior_n256=manifest.get('n256_warm_activation'), wavefront_tile=args.wavefront_tile, split_p=args.p)
+                               prior_n256=manifest.get('n256_warm_activation'), wavefront_tile=args.wavefront_tile, split_p=args.p,
+                               wavefront_tiles=args.wavefront_tiles)
                 point.update({'prompt_tokens': length, 'wall_s': time.monotonic() - began,
                               'request_sha256': sha256(output / f'{label}.request.json')})
                 result['points'].append(point)
@@ -793,7 +828,7 @@ def run(args, tokens, stream_info):
                 if not point['valid']:
                     raise RuntimeError(f'{label} failed qualification: {point["errors"]}')
             write_json(output / 'results.json', result)
-        manifest['wavefront_run_activation'] = wavefront_activation(drain.lines, args.wavefront_tile or 256)
+        manifest['wavefront_run_activation'] = wavefront_activation(drain.lines, args.wavefront_tile or 256, args.wavefront_tiles)
         if not args.prefix_only and args.wavefront_tile and not wavefront_campaign_qualified(result['points']):
             raise RuntimeError(f'WF{args.wavefront_tile} campaign never proved its requested parent/tile activation in a measured request; no candidate throughput is qualified')
         manifest['wavefront_campaign']['runtime_activation_confirmed'] = wavefront_campaign_qualified(result['points'])
@@ -837,9 +872,15 @@ def run(args, tokens, stream_info):
             if drain.thread.is_alive():
                 result.update(status='failed', error='stdout reader did not finish after owned child exit')
             result['server_errors'], result['memory_policy_warnings'] = classify_logs(drain.lines)
+            if result['server_errors']:
+                result['status'] = 'failed'
+                result.setdefault('error', 'run-level error/fallback detected during teardown')
             result['server_log_sha256'] = sha256(output / 'server.log')
             write_json(output / 'profile-lines.json', [line.rstrip() for line in drain.lines
                        if re.search(r'gpu_profile|RemoteAttn|remote_attn|RKVA', line)])
+            manifest['tcp_prefetch_activation'] = tcp_prefetch_activation(drain.lines)
+            if args.tcp_prefetch and not args.prefix_only and not manifest['tcp_prefetch_activation']['two_frame_overlap_confirmed']:
+                result.update(status='failed', error='TCP prefetch requested but completed two-frame overlap was not proved')
         if result['status'] != 'passed':
             for point in result['points']:
                 point['authoritative_decode_tps'] = None
