@@ -80,28 +80,12 @@ runner requires `fastpath > 0` before it reports a delta.
 
 Expected saving: up to 2.8-2.9 ms/token of the measured 3.03 (**derived**).
 
-## 3. Change 2: bounded fence spin on the console (nq=1 engine)
+## 3. Console fence wait
 
-`tools/xbox/uwp/rkva/remote-attn-engine.cpp`,
-`tools/xbox/uwp/rkva/rkva-range-profile.h`.
-
-`RemoteAttnEngine::submit()` blocked on `SetEventOnCompletion` +
-`WaitForSingleObject` for every layer submission. At position 102400 the decode
-profile shows `fence_wait_cpu` 230 us against `gpu_total` 180 us, i.e. ~50 us of
-kernel-transition and scheduler overhead per layer. The engine now spins on the
-user-mode fence value (`ID3D12Fence::GetCompletedValue`) on nq1 submissions
-only, for at most 2000 us when the LocalState flag `rkva-fence-spin.flag` exists at
-HELLO (default off; desktop runs can seed it with `RKVA_FENCE_SPIN_US`; tight
-`YieldProcessor` spin for 100 us, then `SwitchToThread`), and keeps the original event wait as the fallback for a
-slow or stalled GPU. Device-removal handling is unchanged: the post-wait
-`UINT64_MAX` sentinel check still runs.
-
-New counters (`counters.fence_spin`): `hits`, `fallbacks`, `spin_us`,
-`budget_us`, so the next window can prove which path each call took and what it
-cost.
-
-Expected saving: ~30-60 us/layer = 0.5-1.0 ms/token (**estimate**; at the
-production position the console call is dominated by GPU work, see 5).
+The console uses `SetEventOnCompletion` and `WaitForSingleObject`, retaining
+terminal-failure and device-removal checks. The experimental bounded spin was
+removed after the user-reported +0.29% result fell within measurement noise.
+See [the final policy](rkva-final-optimizations.md).
 
 ## 4. Not changed, with reasons
 
@@ -136,7 +120,7 @@ recorded decode profile, GPU ~180 us). At 130560 the engine wall is 733 us/call.
 The overflow tier grows from 1 to ~28k rows, so the difference has to come from
 the nq=1 attention work on the console; no decode engine profile at the
 production position exists yet. The A/B runner collects it
-(`counters`, `transport_decode_phases`, GPU timestamps, `fence_spin`) so the
+(`counters`, `transport_decode_phases`, GPU timestamps) so the
 next phase can decide between kernel work and transport work with data.
 
 ## 6. How to measure the next phase

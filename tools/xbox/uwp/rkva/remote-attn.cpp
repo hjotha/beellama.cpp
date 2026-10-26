@@ -194,10 +194,8 @@ struct remote_state {
     bool fp8_gpu_enabled = true;
     // Opt-in INT8 QK prefill kernel (default off, NOT bit-exact): LocalState flag file.
     bool mq_i8_enabled = false;
-    // Opt-in FP32 row-per-lane QK decode (default off).
-    bool decode_rowlane_enabled = false;
-    // Opt-in nq1 fence spin (default off): LocalState flag file.
-    bool fence_spin_enabled = false;
+    // FP32 row-per-lane QK decode (default on, LocalState opt-out).
+    bool decode_rowlane_enabled = true;
     rpc_profile_counter rpc_profile[32]{};
     rkva_kvarn_bulk::Scratch bulk_scratch;
     uint64_t bulk_scratch_prepare_us = 0, bulk_engine_us = 0, bulk_output_transcode_us = 0;
@@ -327,13 +325,11 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         state.fp8_gpu_enabled =
             !std::ifstream(g_snapshot_local_folder + "\\rkva-fp8-gpu-off.flag").good();
         state.decode_rowlane_enabled =
-            std::ifstream(g_snapshot_local_folder + "\\rkva-decode-rowlane.flag").good();
+            !std::ifstream(g_snapshot_local_folder + "\\rkva-decode-rowlane-off.flag").good();
         // Opt-in, default off, and not bit-exact: see
         // docs/rkva-prefill-int8-dot4.md.
         state.mq_i8_enabled =
             std::ifstream(g_snapshot_local_folder + "\\rkva-mq-i8.flag").good();
-        state.fence_spin_enabled =
-            std::ifstream(g_snapshot_local_folder + "\\rkva-fence-spin.flag").good();
         state.geo = hello;
         state.hello_done = true;
         state.native_rewind_v2_client = (hello.proto_flags & RKVA_PROTO_NATIVE_REWIND_V2) != 0;
@@ -373,8 +369,6 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         }
         state.engine->set_mq_i8(state.mq_i8_enabled);
         state.engine->set_decode_rowlane(state.decode_rowlane_enabled);
-        if (state.fence_spin_enabled)
-            state.engine->set_fence_spin_budget_us(2000);
 
         rkva_hello_ack ack{};
         ack.supported_ops = supported_ops_mask();

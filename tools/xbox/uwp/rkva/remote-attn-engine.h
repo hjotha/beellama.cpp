@@ -174,18 +174,15 @@ class RemoteAttnEngine {
     uint32_t q4_kernel_mode() const {
         return q4_kernel_mode_;
     }
-    // Fence spin budget for nq1 submissions; 0 keeps the blocking event wait.
-    void set_fence_spin_budget_us(int64_t budget_us) {
-        fence_spin_budget_us_ = budget_us > 0 ? budget_us : 0;
-    }
     bool range_profiling() const {
         return profiling_;
     }
+    // Default-on rowlane decode; selection still requires qualified shape/PSO.
+    void set_decode_rowlane(bool enabled) { decode_rowlane_ = enabled; }
     // Opt-in INT8 QK prefill specialization (default off, NOT bit-exact): when
     // enabled and the dedicated PSO exists, nq 2..9 native KVarN4 mode-2 tiles
     // score the fast shared record tile with dot4add_i8packed instead of the
     // F32 dot. Control path only.
-    void set_decode_rowlane(bool enabled) { decode_rowlane_ = enabled; }
     void set_mq_i8(bool enabled) {
         mq_i8_ = enabled;
     }
@@ -233,8 +230,7 @@ class RemoteAttnEngine {
     void transition(Buffer& buffer, D3D12_RESOURCE_STATES state);
     void uav_barrier(Buffer& buffer);
     bool begin(std::string* error);
-    // allow_spin: spin briefly on the fence before blocking (nq1 decode only).
-    bool submit(std::string* error, bool allow_spin = false);
+    bool submit(std::string* error);
     bool create_device(std::string* error);
     bool create_pipelines(std::string* error);
     bool ensure_scratch(uint32_t n_tokens, std::string* error);
@@ -336,12 +332,11 @@ class RemoteAttnEngine {
     std::string kvarn4_decode_prefix_status_ = "not initialized";
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_decode_rowlane_pso_;
     std::string kvarn4_decode_rowlane_status_ = "not initialized";
-    bool decode_rowlane_ = false;
+    bool decode_rowlane_ = true;
 
     // Profiling (default off). Timestamp slots are fixed per stage so a future
     // fused upload+attention command list cannot alias them.
     bool profiling_ = false;
-    int64_t fence_spin_budget_us_ = 0;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamp_heap_;
     Buffer timestamp_readback_;
     uint64_t timestamp_frequency_ = 0;

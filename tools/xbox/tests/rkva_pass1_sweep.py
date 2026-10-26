@@ -121,9 +121,11 @@ def select_point(report, expected_kernel, segments, nq):
     }
 
 
-def expected_kernel_for(nq, wave_lane_min=64, tail=128):
+def expected_kernel_for(nq, wave_lane_min=64, tail=128, rowlane=False):
     """Kernel the qualified mode-2 policy must select for this call shape."""
     if nq == 1:
+        if rowlane and wave_lane_min == 64:
+            return "kvarn4_decode_rowlane"
         return "kvarn4_decode_fine" if wave_lane_min >= 64 else "kvarn4_gqa_fine"
     # The shared-record tile needs the 128-row exact tail; without it the
     # per-query optimized kernel is the qualified path.
@@ -314,9 +316,12 @@ def execute(args):
                         OP_PROFILE, struct.pack("<IIQ", PROFILE_REPORT_ONLY, 0, 0))).decode("utf-8"))
                     if run < args.warmup:
                         continue
+                    engine = report.get("engine") or {}
+                    rowlane = engine.get("kvarn4_decode_rowlane") or {}
                     expected = expected_kernel_for(
-                        nq, int(((report.get("engine") or {}).get("wave_lane_min")) or 64),
-                        args.tail)
+                        nq, int(engine.get("wave_lane_min") or 64), args.tail,
+                        rowlane=bool(rowlane.get("enabled") and rowlane.get("available") and
+                                     engine.get("wave_lane_max") == 64))
                     # The opt-in INT8 MQ2 variant replaces the fine tile only.
                     if nq == 1 and args.expect_decode_kernel:
                         expected = args.expect_decode_kernel
@@ -426,8 +431,12 @@ def self_test():
         assert "fallback" in str(exc), exc
     else:
         raise AssertionError("kernel fallback was accepted")
-    # Opt-in decode name must select its own bucket and reject the default.
+    # Default-on decode name must select its own bucket and reject fallback.
     rowlane = "kvarn4_decode_rowlane"
+    assert expected_kernel_for(1, rowlane=True) == rowlane
+    assert expected_kernel_for(1, rowlane=False) == "kvarn4_decode_fine"
+    assert expected_kernel_for(1, wave_lane_min=32, rowlane=True) == "kvarn4_gqa_fine"
+    assert expected_kernel_for(8, rowlane=True) == "kvarn4_mq2_fine"
     report = synthetic_report(1, 1)
     old = expected_kernel_for(1)
     report = json.loads(json.dumps(report).replace(old, rowlane))
@@ -482,7 +491,7 @@ def main():
     parser.add_argument("--origin", type=int, default=102400)
     parser.add_argument("--tail", type=int, default=128, choices=(0, 128))
     parser.add_argument("--expect-decode-kernel", choices=("kvarn4_decode_rowlane",),
-                        help="require the LocalState opt-in rowlane PSO for nq=1")
+                        help="require the default-on rowlane PSO for nq=1, rejecting fallback")
     parser.add_argument("--expect-mq2-kernel", choices=("kvarn4_mq2_i8",),
                         help="require this opt-in variant instead of kvarn4_mq2_fine for nq>1")
     parser.add_argument("--runs", type=int, default=3)

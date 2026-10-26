@@ -137,11 +137,11 @@ class LogParsingTest(unittest.TestCase):
         lines = [
             'remote_attn gpu_profile {"counters":{"submits":1}}',
             'other line',
-            'remote_attn gpu_profile {"counters":{"submits":7},"fence_spin":{"hits":6}}',
+            'remote_attn gpu_profile {"counters":{"submits":7},"memory":{"bytes":6}}',
         ]
         profile = runner.parse_profile_line(lines)
         self.assertEqual(profile['counters']['submits'], 7)
-        self.assertEqual(profile['fence_spin']['hits'], 6)
+        self.assertEqual(profile['memory']['bytes'], 6)
 
     def test_profile_line_absent(self):
         self.assertIsNone(runner.parse_profile_line(['no profile here']))

@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """A/B/B/A decode-path campaign for the RKVA nq=1 critical path.
 
-Two independent toggles are measured on the same frozen local prefix:
-
-  * host CUDA-graph headroom guard sampling cache
-    (GGML_CUDA_GRAPH_GUARD_SAMPLE_MS: 0 = per-submission cudaMemGetInfo, the
-    pre-change behaviour; 10 = cached sample with a 10 ms age bound)
-  * Xbox fence spin budget
-    (RKVA_FENCE_SPIN_US, compiled into the UWP app; it cannot be changed from
-    the host, so both arms must run the same installed package and the engine
-    profile's fence_spin counters prove which path the console took)
+The host CUDA-graph headroom guard sampling cache is measured on the same
+frozen local prefix (GGML_CUDA_GRAPH_GUARD_SAMPLE_MS: 0 = per-submission
+cudaMemGetInfo; 10 = cached sample with a 10 ms age bound).
 
 Everything is inert unless --execute is passed. Before launching anything the
 runner refuses to continue when the Codex benchmark session is active, because
@@ -354,7 +348,6 @@ def main(argv=None):
             entry["engine"] = {
                 "submits": counters.get("submits"),
                 "fence_blocking_waits": counters.get("fence_blocking_waits"),
-                "fence_spin": profile.get("fence_spin"),
                 "transport_decode": profile.get("transport_decode_phases"),
             }
         responses = sorted(pass_dir.glob("point-*.response.json"))
