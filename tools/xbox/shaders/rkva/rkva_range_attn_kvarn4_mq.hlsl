@@ -105,39 +105,46 @@ float decode(uint quant, float scale, float zero, float other) {
     return affine * other;
 }
 
-// In-place Bee WHT256 of the RKVA_GQA vectors in gs_vec[g * 256 + d]; identical
-// to rkva_range_attn_kvarn4_opt.hlsl (thread tid owns (g, tid) and (g, tid + 128)).
+// Ping-pong Bee WHT256 using the two 1536-float halves of gs_vec[3072].
+// Alternates source and destination between half 0 (0..1535) and half 1 (1536..3071),
+// cutting group barriers from 17 to 9. All butterfly expressions and two-stage
+// normalization stay unchanged. MQ4 Q2/Q3 are dead before either call site;
+// the group barrier before WHT retires cross-wave merge/tail reads. The return
+// barrier retires scratch before the next query or pair reuses gs_vec.
 void wht256x6(inout float v[RKVA_ELEMS], uint tid) {
     [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
         gs_vec[g * RKVA_DIM + tid] = v[2 * g];
         gs_vec[g * RKVA_DIM + tid + 128] = v[2 * g + 1];
     }
     GroupMemoryBarrierWithGroupSync();
+
+    uint src_offset = 0;
+    uint dst_offset = 1536;
+
     [unroll] for (uint stride = 1; stride < 128; stride *= 2) {
-        float own[RKVA_ELEMS], other[RKVA_ELEMS];
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-            own[2 * g] = gs_vec[g * RKVA_DIM + tid];
-            other[2 * g] = gs_vec[g * RKVA_DIM + (tid ^ stride)];
-            own[2 * g + 1] = gs_vec[g * RKVA_DIM + tid + 128];
-            other[2 * g + 1] = gs_vec[g * RKVA_DIM + (tid ^ stride) + 128];
+            float own0 = gs_vec[src_offset + g * RKVA_DIM + tid];
+            float other0 = gs_vec[src_offset + g * RKVA_DIM + (tid ^ stride)];
+            float own1 = gs_vec[src_offset + g * RKVA_DIM + tid + 128];
+            float other1 = gs_vec[src_offset + g * RKVA_DIM + (tid ^ stride) + 128];
+
+            gs_vec[dst_offset + g * RKVA_DIM + tid] =
+                (tid & stride) ? other0 - own0 : own0 + other0;
+            gs_vec[dst_offset + g * RKVA_DIM + tid + 128] =
+                (tid & stride) ? other1 - own1 : own1 + other1;
         }
         GroupMemoryBarrierWithGroupSync();
-        [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-            gs_vec[g * RKVA_DIM + tid] =
-                (tid & stride) ? other[2 * g] - own[2 * g] : own[2 * g] + other[2 * g];
-            gs_vec[g * RKVA_DIM + tid + 128] = (tid & stride) ? other[2 * g + 1] - own[2 * g + 1]
-                                                              : own[2 * g + 1] + other[2 * g + 1];
-        }
-        GroupMemoryBarrierWithGroupSync();
+        uint tmp = src_offset;
+        src_offset = dst_offset;
+        dst_offset = tmp;
     }
+
+    // After 7 iterations (strides 1, 2, 4, 8, 16, 32, 64), src_offset is 1536.
     [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-        float x = gs_vec[g * RKVA_DIM + tid] * 0.08838834764831845f;
-        float y = gs_vec[g * RKVA_DIM + tid + 128] * 0.08838834764831845f;
+        float x = gs_vec[src_offset + g * RKVA_DIM + tid] * 0.08838834764831845f;
+        float y = gs_vec[src_offset + g * RKVA_DIM + tid + 128] * 0.08838834764831845f;
         v[2 * g] = (x + y) * 0.7071067811865475f;
         v[2 * g + 1] = (x - y) * 0.7071067811865475f;
-    }
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
         gs_vec[g * RKVA_DIM + tid] = v[2 * g];
         gs_vec[g * RKVA_DIM + tid + 128] = v[2 * g + 1];
     }

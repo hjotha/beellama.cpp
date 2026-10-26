@@ -322,6 +322,14 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
                          bench.prefix_contract(on, [1] * on.p, {'sha256': 'model'}))
 
+    def test_remote_kernel_variant_is_audited_and_does_not_change_local_prefix(self):
+        off = bench.validate(bench.parser().parse_args(self.arguments))
+        on = bench.validate(bench.parser().parse_args(self.arguments + ['--range-kernel', 'balanced']))
+        self.assertEqual(bench.pinned_environment(off)['GGML_RKVA_RANGE_KERNEL'], 'fine')
+        self.assertEqual(bench.pinned_environment(on)['GGML_RKVA_RANGE_KERNEL'], 'balanced')
+        self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
+                         bench.prefix_contract(on, [1] * on.p, {'sha256': 'model'}))
+
     def test_current_readiness_log_and_private_port_are_exact(self):
         from types import SimpleNamespace
         for address, expected in [('127.0.0.1:12345', True), ('127.0.0.1:123456', False), ('0.0.0.0:12345', False)]:

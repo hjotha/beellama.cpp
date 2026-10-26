@@ -219,7 +219,10 @@ modes differ only for remote nq<=9, so the local prefix snapshot is reusable;
 the actual codec mode is retained in the run's environment. An explicit CAPI
 A/B on the same frozen prefix,1024 overflow tokens and16 fixed continuation
 inputs passes complete logits/GDN comparisons at four selected checkpoints.
-Late-context sampled generation and TPS are still pending for mapped mode.
+Late-context mapped measurements now pass all256 sampled IDs: prefill
+149.57967473984715t/s, decode17.476955434860233t/s. All4080 small-query
+pack/unpack calls used CUDA. Decode is1.375% above the earlier WF256 control
+in this single comparison; repetition is needed to establish a small gain.
 
 A read-only content audit of the old193 worktrees confirmed that FP8 bulk,
 async transport, writev/TCP_QUICKACK/pooling, D2D/SIMD and fast KVarN decode are
@@ -232,3 +235,64 @@ Evidence: `/home/hjotha/.codex/artifacts/beellama-xbox-rkva-20261026/`, includin
 `new294-native-bulk-f16.json`, `new294-native-bulk-f32.json`,
 `new294-fp8-pack.json`, `package294-verification.json`, and
 `final-phase1-ctest.log`. Historical frozen-prefix limitations above still apply.
+
+
+## MQ ping-pong validation and next wavefront experiment
+
+The new MQ WHT uses the existing two halves of LDS scratch and reduces its
+synchronizations from17 to9. MQ4's additional query vectors are dead before
+this scratch is reused. The source arithmetic and ordered compiled floating
+operations/flags/constants are unchanged; strict compilation remains specific
+to F16 query unpack. DXIL static barriers change80→48 forMQ2 and162→98 forMQ4.
+
+Package295 built and installed in place. All696 upload/query/reply records from
+both MQ modes and both tail policies match package294 exactly. The unchanged
+serial-prefix oracle passes through remote capacity58368, including its edge,
+with reference/MQ4/MQ2. F16 passes8 cases with LSE exactly equal; FP8 codec
+passes10 cases. Four complete-vocabulary and pure recurrent checkpoints per
+codec arm give16 files byte-identical to the prior model fixture.
+
+The long WF256/mapped/fine run passes all256 generated IDs with no runtime
+errors or CPU FP8 fallback: prefill150.1545776323961t/s and
+ decode17.482578610414723t/s. Against package294's149.57967473984715 and
+17.476955434860233, these are+0.384% and+0.032%. This is no established TPS gain.
+The same4112 late-context MQ2 GPU samples average2785.531us before and2786.489us
+afterward, essentially unchanged. The synchronization reduction is numerically
+qualified and shows no measured regression; do not present static barrier
+counts as demonstrated throughput gains.
+
+The balanced kernel experiment is not the selected profile:98.581502153633t/s
+prefill and17.574478053508702t/s decode, with a sampled-ID difference at206.
+It loses34.09% prefill for a0.56% decode timing increase. The harness retains
+it as an explicit diagnostic variant; fine remains its default.
+
+Evidence: `new295-mq-replay.json`, `new295-serial-prefix-full.json`,
+`new295-model-raw-comparison.json`, `mq295-comparison-r1.json`,
+`mq295-gpu-bucket-comparison.json`, `mapped-comparison-r1.json`, and
+`balanced-comparison-r1.json` in the20261026 artifact directory. The new
+`rkva_kvarn_bulk_replay.py` probe records or compares package replies only with
+explicit `--execute`; its original bulk/serial numerical oracle is unchanged.
+
+For a larger wavefront, first distinguish parent512 (the existing2xN256) from
+compute tile512. A tile512 campaign would change GEMM/FFN shapes and workspace;
+the current native bulk path also rejects query ranges above256. It needs
+transport segmentation and a separate numerical qualification.
+
+A parent1024 with4xN256 is the smaller next experiment. RetainN256 FFN/norm,
+physical prefix/tailN256, production checkpoint cadence, RPCbatch1 and at most
+two outstanding requests. The current scheduler starts tile2 only after tile0's
+last group: four tiles mostly behave as two pairs, with a possible boundary
+and executor overhead saving, not four-way concurrency. Increasing in-flight
+requests or using cohort4 is a separate transport/lifetime change.
+
+Do not merely increase B: the present coalescing probe/exact-parent guard can
+make the2tile control fall back when given1024 tokens. A causal comparison
+needs explicit512/1024 parent selection with the same logical batch, expanded
+plan/mask guards, runtime4tile markers, failure draining and ordered conv/GDN
+commits. Reuse the frozen prefix, compare long-context logits/GDN and256 IDs,
+check effective window/memory behavior, then repeat trace-free timing pairs.
+The current harness's B512 snapshot contract must not simply be removed.
+
+None of these larger-tile paths provides parallel autoregressiveN1 decode.
+Use the measured codec/kernel/latency path for decode optimization. Actual
+production tier migration and the older WF128 holdout remain separate gates.

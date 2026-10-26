@@ -183,6 +183,8 @@ def parser():
                    help='qualify the 2xN256 prototype (batch-size 512); timings require explicit CUDA 2x256 runtime activation')
     p.add_argument('--cuda-fp8', choices=('prefill', 'mapped'), default='prefill',
                    help='mapped also uses CUDA mapped-host FP8 helpers for nq<=9; requires independent decode quality/TPS checks')
+    p.add_argument('--range-kernel', choices=('fine', 'balanced'), default='fine',
+                   help='fine uses MQ2 and finer decode splits; balanced uses MQ4 and coarser decode splits')
     p.add_argument('--n-predict', type=int, default=256)
     p.add_argument('--threads', type=int, required=True)
     p.add_argument('--threads-batch', type=int)
@@ -521,6 +523,7 @@ def pinned_environment(args):
     values['GGML_RKVA_WAVEFRONT_TILE'] = str(args.wavefront_tile)
     values['GGML_RKVA_WAVEFRONT_RPC_BATCH'] = '1'
     values['GGML_RKVA_CUDA_FP8'] = args.cuda_fp8
+    values['GGML_RKVA_RANGE_KERNEL'] = args.range_kernel
     return values
 
 
@@ -581,6 +584,7 @@ def prefix_contract(args, tokens, model):
     # local-prefix codec contract is identical. Actual mode is audited in the
     # run environment; reuse never claims a new cold-prefix qualification.
     prefix_env['GGML_RKVA_CUDA_FP8'] = 'prefill'
+    prefix_env['GGML_RKVA_RANGE_KERNEL'] = 'fine'  # no remote kernel executes inside the local prefix
     return {'schema': 1, 'codec': 'llama-state-seq-file', 'model_sha256': model['sha256'],
             'requested_prefix_sha256': token_hash(tokens[:args.p]), 'P': args.p, 'context': args.context,
             'slot': 0, 'batch': args.batch, 'physical_prefix_ubatch': 256, 'flash_attn': 'on', 'n_rs_seq': 0,
