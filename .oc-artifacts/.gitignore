@@ -1,0 +1,3 @@
+test-cuda-graph-guard
+*.o
+*.bin

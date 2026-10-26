@@ -1,0 +1,383 @@
+{
+  "decode_events": 714377,
+  "decode_tokens": 512,
+  "min_pos": 130560,
+  "note": "CUDA spans overlap by design; only per-token sums of once-per-layer phases are additive.",
+  "per_token_ms": {
+    "envelope": 0.294458984375,
+    "job_finish": 21.557376953125,
+    "job_prepare": 2.155279296875,
+    "k_readback": 0.23175,
+    "kv_producer": 0.8203203125,
+    "out_decode": 0.55956640625,
+    "positions_readback": 0.001462890625,
+    "q_pack": 0.50010546875,
+    "range_wait": 6.921982421875,
+    "rpc_body_recv": 1.539205078125,
+    "rpc_header_wait": 18.951626953125,
+    "rpc_send": 0.35925390625,
+    "rpc_total": 20.912693359375,
+    "v_readback": 0.201443359375
+  },
+  "phases": {
+    "ack_commit": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 0.0,
+      "p95_us": 1,
+      "sum_us": 754
+    },
+    "control_invalidate": {
+      "gpu_p50_us": 0.0,
+      "n": 1,
+      "p50_us": 3,
+      "p95_us": 3,
+      "sum_us": 3
+    },
+    "cuda_context_lease_release": {
+      "gpu_p50_us": 0.0,
+      "n": 2,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_context_phase_release": {
+      "gpu_p50_us": 0.0,
+      "n": 2,
+      "p50_us": 931.0,
+      "p95_us": 1303,
+      "sum_us": 1862
+    },
+    "cuda_context_prepare": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 0.0,
+      "p95_us": 1,
+      "sum_us": 807
+    },
+    "cuda_graph_bookkeeping": {
+      "gpu_p50_us": 0.0,
+      "n": 47616,
+      "p50_us": 32.0,
+      "p95_us": 57,
+      "sum_us": 1781681
+    },
+    "cuda_graph_capture": {
+      "gpu_p50_us": 0.0,
+      "n": 124,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_graph_decision": {
+      "gpu_p50_us": 0.0,
+      "n": 47616,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_graph_direct": {
+      "gpu_p50_us": 0.0,
+      "n": 16368,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_graph_enqueue": {
+      "gpu_p50_us": 0.0,
+      "n": 47616,
+      "p50_us": 13.0,
+      "p95_us": 1275,
+      "sum_us": 12138616
+    },
+    "cuda_graph_host": {
+      "gpu_p50_us": 0.0,
+      "n": 47616,
+      "p50_us": 63.0,
+      "p95_us": 1307,
+      "sum_us": 14083680
+    },
+    "cuda_graph_key_cache": {
+      "gpu_p50_us": 0.0,
+      "n": 47616,
+      "p50_us": 0.0,
+      "p95_us": 1,
+      "sum_us": 61871
+    },
+    "cuda_graph_launch": {
+      "gpu_p50_us": 0.0,
+      "n": 31248,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_graph_memory_guard": {
+      "gpu_p50_us": 0.0,
+      "n": 47616,
+      "p50_us": 29.0,
+      "p95_us": 49,
+      "sum_us": 1552377
+    },
+    "cuda_graph_state": {
+      "gpu_p50_us": 0.0,
+      "n": 47616,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_local_span_gpu": {
+      "gpu_p50_us": 833.536029,
+      "n": 31744,
+      "p50_us": 846.0,
+      "p95_us": 1623,
+      "sum_us": 20087181
+    },
+    "cuda_local_timing_status": {
+      "gpu_p50_us": 0.0,
+      "n": 2,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_producer_sync": {
+      "gpu_p50_us": 0.0,
+      "n": 15872,
+      "p50_us": 782.0,
+      "p95_us": 808,
+      "sum_us": 6801789
+    },
+    "cuda_remote_graph_nodes": {
+      "gpu_p50_us": 0.0,
+      "n": 15872,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_remote_graph_ops": {
+      "gpu_p50_us": 0.0,
+      "n": 15872,
+      "p50_us": 0.0,
+      "p95_us": 0,
+      "sum_us": 0
+    },
+    "cuda_small_map_grow": {
+      "gpu_p50_us": 0.0,
+      "n": 4,
+      "p50_us": 21.5,
+      "p95_us": 56,
+      "sum_us": 112
+    },
+    "cuda_small_pack_cpu_copy": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 1.0,
+      "p95_us": 1,
+      "sum_us": 5327
+    },
+    "cuda_small_pack_enqueue_host": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 8.0,
+      "p95_us": 10,
+      "sum_us": 71545
+    },
+    "cuda_small_pack_host": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 29.0,
+      "p95_us": 40,
+      "sum_us": 246844
+    },
+    "cuda_small_pack_kernel_gpu": {
+      "gpu_p50_us": 11.264,
+      "n": 8192,
+      "p50_us": 27.0,
+      "p95_us": 37,
+      "sum_us": 227210
+    },
+    "cuda_small_pack_producer_gpu": {
+      "gpu_p50_us": 4.096,
+      "n": 8192,
+      "p50_us": 27.0,
+      "p95_us": 28,
+      "sum_us": 222478
+    },
+    "cuda_small_pack_retire_host": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 18.0,
+      "p95_us": 19,
+      "sum_us": 139221
+    },
+    "cuda_small_scratch_release": {
+      "gpu_p50_us": 0.0,
+      "n": 2,
+      "p50_us": 103.0,
+      "p95_us": 123,
+      "sum_us": 206
+    },
+    "cuda_small_unpack_cpu_copy": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 0.0,
+      "p95_us": 1,
+      "sum_us": 3090
+    },
+    "cuda_small_unpack_enqueue_host": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 11.0,
+      "p95_us": 18,
+      "sum_us": 108051
+    },
+    "cuda_small_unpack_host": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 29.0,
+      "p95_us": 50,
+      "sum_us": 273059
+    },
+    "cuda_small_unpack_kernel_gpu": {
+      "gpu_p50_us": 14.336,
+      "n": 8192,
+      "p50_us": 27.0,
+      "p95_us": 41,
+      "sum_us": 246388
+    },
+    "cuda_small_unpack_retire_host": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 15.0,
+      "p95_us": 16,
+      "sum_us": 122262
+    },
+    "envelope": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 17.0,
+      "p95_us": 27,
+      "sum_us": 150763
+    },
+    "job_finish": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 1317.0,
+      "p95_us": 1494,
+      "sum_us": 11037377
+    },
+    "job_prepare": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 125.0,
+      "p95_us": 142,
+      "sum_us": 1103503
+    },
+    "k_readback": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 14.0,
+      "p95_us": 16,
+      "sum_us": 118656
+    },
+    "kv_append": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 16.0,
+      "p95_us": 19,
+      "sum_us": 135957
+    },
+    "kv_producer": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 42.0,
+      "p95_us": 50,
+      "sum_us": 420004
+    },
+    "out_decode": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 31.0,
+      "p95_us": 52,
+      "sum_us": 286498
+    },
+    "positions_readback": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 0.0,
+      "p95_us": 1,
+      "sum_us": 749
+    },
+    "q_pack": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 30.0,
+      "p95_us": 41,
+      "sum_us": 256054
+    },
+    "q_payload_copy": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 0.0,
+      "p95_us": 1,
+      "sum_us": 1031
+    },
+    "range_wait": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 417.0,
+      "p95_us": 607,
+      "sum_us": 3544055
+    },
+    "rpc_body_recv": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 89.0,
+      "p95_us": 148,
+      "sum_us": 788073
+    },
+    "rpc_header_wait": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 1158.0,
+      "p95_us": 1319,
+      "sum_us": 9703233
+    },
+    "rpc_queue": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 9.0,
+      "p95_us": 14,
+      "sum_us": 82757
+    },
+    "rpc_rx_resize": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 0.0,
+      "p95_us": 1,
+      "sum_us": 2177
+    },
+    "rpc_send": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 21.0,
+      "p95_us": 33,
+      "sum_us": 183938
+    },
+    "rpc_total": {
+      "gpu_p50_us": 730.0,
+      "n": 8192,
+      "p50_us": 1278.0,
+      "p95_us": 1450,
+      "sum_us": 10707299
+    },
+    "v_readback": {
+      "gpu_p50_us": 0.0,
+      "n": 8192,
+      "p50_us": 13.0,
+      "p95_us": 13,
+      "sum_us": 103139
+    }
+  },
+  "scanned": 1296566,
+  "trace": "/home/hjotha/.codex/artifacts/beellama-xbox-rkva-20261026/wf4-cached-p102400-long-r1-trace.3091043.jsonl"
+}
