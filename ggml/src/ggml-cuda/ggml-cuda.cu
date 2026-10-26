@@ -221,6 +221,11 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
     } else {
         err = cudaMalloc(ptr, size);
     }
+    if (err == cudaSuccess) {
+        // Any increase in reserved device memory invalidates cached CUDA-graph
+        // headroom samples (see ggml_cuda_graph_guard).
+        ggml_cuda_graph_guard::note_device_reservation();
+    }
     return err;
 }
 
@@ -666,6 +671,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            // New physical device memory: invalidate cached headroom samples.
+            ggml_cuda_graph_guard::note_device_reservation();
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -781,6 +788,17 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#ifdef USE_CUDA_GRAPH
+    if (guard_fastpath_approvals || guard_exact_samples) {
+        // Activation evidence for the headroom-guard A/B: the fast path only
+        // runs while the cached sample proves the same decision as a query.
+        GGML_LOG_INFO("%s: headroom guard submissions fastpath=%llu queried=%llu sample_age_ms=%lld\n",
+                __func__, (unsigned long long) guard_fastpath_approvals,
+                (unsigned long long) guard_exact_samples,
+                (long long) (cuda_graph_guard_sample_max_age_us() / 1000));
+    }
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -1106,6 +1124,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+    // Compute buffers live outside the pools; the headroom guard must re-sample.
+    ggml_cuda_graph_guard::note_device_reservation();
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
@@ -3421,6 +3441,8 @@ static bool ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, co
     GGML_ASSERT(graph->instance == nullptr);
 
     const cudaError_t status = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+    // The executable itself holds device memory outside the pools.
+    ggml_cuda_graph_guard::note_device_reservation();
     if (status == cudaSuccess) {
         ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "instantiate");
         return true;
@@ -3493,6 +3515,8 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 
     graph->update_count++;
     ggml_cuda_graph_debug_log(cuda_ctx, graph_key, graph, "update-begin");
+    // An updated executable may hold different device memory.
+    ggml_cuda_graph_guard::note_device_reservation();
 
 #    if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -5674,6 +5698,8 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph->capture_count++;
+            // Capture reserves device memory for the executable-to-be.
+            ggml_cuda_graph_guard::note_device_reservation();
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             ggml_cuda_trace_counter("cuda_graph_capture", cgraph);
 #endif

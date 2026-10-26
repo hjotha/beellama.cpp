@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "graph-guard.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1581,6 +1582,12 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    // Headroom-guard sampling state. See check_memory_pressure_before_graph()
+    // and graph-guard.h. Single-threaded per context, like the graph map above.
+    ggml_cuda_graph_guard::sample guard_sample;
+    uint64_t guard_fastpath_approvals = 0; // submissions approved without a device query
+    uint64_t guard_exact_samples      = 0; // cudaMemGetInfo() calls actually issued
+
     static size_t cuda_graph_memory_headroom_bytes() {
         static const size_t safe_headroom = [] {
             const char * env = getenv("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB");
@@ -1588,6 +1595,17 @@ struct ggml_backend_cuda_context {
             return (size_t) std::max(headroom_mb, 0) * 1024 * 1024;
         }();
         return safe_headroom;
+    }
+
+    // Maximum age of a headroom sample that may approve a graph submission
+    // without a new query. 0 restores the exact per-call sampling.
+    static int64_t cuda_graph_guard_sample_max_age_us() {
+        static const int64_t max_age_us = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_GUARD_SAMPLE_MS");
+            const int64_t ms = env != nullptr ? atoll(env) : 10;
+            return std::max<int64_t>(ms, 0) * 1000;
+        }();
+        return max_age_us;
     }
 
     void check_memory_pressure_recovery() {
@@ -1702,9 +1720,25 @@ struct ggml_backend_cuda_context {
 
         ggml_cuda_set_device(device);
 
+        const size_t safe_headroom = cuda_graph_memory_headroom_bytes();
+        // A sample may approve this submission without a new device query while
+        // it is younger than the configured age and no device reservation
+        // happened since it was taken. Any rejection falls through to the exact
+        // query, so the fast path can never take a weaker decision than the
+        // per-call sampling it replaces.
+        const ggml_cuda_graph_guard::approval guarded =
+            ggml_cuda_graph_guard::approve_without_query(
+                guard_sample, ggml_cuda_graph_guard::device_reservation_now(),
+                ggml_time_us(), cuda_graph_guard_sample_max_age_us(), safe_headroom);
+        if (guarded.approved) {
+            ++guard_fastpath_approvals;
+            return true;
+        }
+
         size_t free_bytes = 0;
         size_t total_bytes = 0;
         const cudaError_t mem_stat = cudaMemGetInfo(&free_bytes, &total_bytes);
+        ++guard_exact_samples;
         if (mem_stat != cudaSuccess) {
             GGML_LOG_ERROR("%s: cannot query CUDA graph headroom: %s\n",
                           __func__, cudaGetErrorString(mem_stat));
@@ -1712,7 +1746,13 @@ struct ggml_backend_cuda_context {
             return false;
         }
 
-        const size_t safe_headroom = cuda_graph_memory_headroom_bytes();
+        // Publish the new sample before acting on it so recovery/cleanup paths
+        // and the next submission observe a consistent state.
+        guard_sample.free_bytes = free_bytes;
+        guard_sample.time_us    = ggml_time_us();
+        guard_sample.generation = ggml_cuda_graph_guard::device_reservation_now();
+        guard_sample.valid      = true;
+
         if (free_bytes < safe_headroom) {
             GGML_LOG_WARN("%s: disabling CUDA graphs before capture (%.2f MiB free < %.2f MiB headroom)\n",
                           __func__, free_bytes / (1024.0 * 1024.0), safe_headroom / (1024.0 * 1024.0));
