@@ -831,6 +831,13 @@ target_compile_features(test-server-slot-budget PRIVATE cxx_std_17)
 add_test(NAME test-server-slot-budget COMMAND $<TARGET_FILE:test-server-slot-budget>)
 set_property(TEST test-server-slot-budget PROPERTY LABELS main)
 
+add_executable(test-server-probabilities test-server-probabilities.cpp)
+target_include_directories(test-server-probabilities PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
+target_compile_features(test-server-probabilities PRIVATE cxx_std_17)
+add_test(NAME test-server-probabilities COMMAND $<TARGET_FILE:test-server-probabilities>)
+set_property(TEST test-server-probabilities PROPERTY LABELS main)
+
 if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     add_executable(test-mask-pack-cuda test-mask-pack-cuda.cpp)

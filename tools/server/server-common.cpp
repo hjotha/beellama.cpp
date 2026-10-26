@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-probabilities.h"
 #include "../../src/llama-state-rollback.h"
 
 #include <cstdlib>
@@ -1927,15 +1928,7 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
             max_l = std::max(max_l, t.logit);
         }
     }
-    float cum_sum = 0.0f;
-    for (auto & t : cur) {
-        float p = expf(t.logit - max_l);
-        t.p = p;
-        cum_sum += p;
-    }
-    for (auto & t : cur) {
-        t.p /= cum_sum;
-    }
+    server_normalize_token_probabilities(cur, max_l);
 
     return cur;
 }
