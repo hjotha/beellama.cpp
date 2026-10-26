@@ -24,15 +24,20 @@
 namespace ggml_cuda_graph_guard {
 
 // Bumped by every device reservation the guard cannot observe from the free
-// memory number itself (pools, compute buffers, graph executables).
-inline std::atomic<uint64_t> device_reservation_generation {0};
+// memory number itself (pools, compute buffers, graph executables). A
+// function-local static keeps one instance per process across translation
+// units without relying on an inline variable.
+inline std::atomic<uint64_t> & device_reservation_generation() {
+    static std::atomic<uint64_t> generation {0};
+    return generation;
+}
 
 inline void note_device_reservation() {
-    device_reservation_generation.fetch_add(1, std::memory_order_relaxed);
+    device_reservation_generation().fetch_add(1, std::memory_order_relaxed);
 }
 
 inline uint64_t device_reservation_now() {
-    return device_reservation_generation.load(std::memory_order_relaxed);
+    return device_reservation_generation().load(std::memory_order_relaxed);
 }
 
 struct sample {
