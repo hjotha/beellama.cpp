@@ -89,9 +89,10 @@ Expected saving: up to 2.8-2.9 ms/token of the measured 3.03 (**derived**).
 `WaitForSingleObject` for every layer submission. At position 102400 the decode
 profile shows `fence_wait_cpu` 230 us against `gpu_total` 180 us, i.e. ~50 us of
 kernel-transition and scheduler overhead per layer. The engine now spins on the
-user-mode fence value (`ID3D12Fence::GetCompletedValue`) for at most
-`RKVA_FENCE_SPIN_US` (default 2000 us; tight `YieldProcessor` spin for 100 us,
-then `SwitchToThread`), and keeps the original event wait as the fallback for a
+user-mode fence value (`ID3D12Fence::GetCompletedValue`) on nq1 submissions
+only, for at most 2000 us when the LocalState flag `rkva-fence-spin.flag` exists at
+HELLO (default off; desktop runs can seed it with `RKVA_FENCE_SPIN_US`; tight
+`YieldProcessor` spin for 100 us, then `SwitchToThread`), and keeps the original event wait as the fallback for a
 slow or stalled GPU. Device-removal handling is unchanged: the post-wait
 `UINT64_MAX` sentinel check still runs.
 

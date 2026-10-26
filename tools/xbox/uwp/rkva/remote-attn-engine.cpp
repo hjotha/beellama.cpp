@@ -115,14 +115,13 @@ uint64_t elapsed_ns(prof_clock::time_point from, prof_clock::time_point to) {
 // scheduler round trip on top of the GPU time; spinning on the user-mode fence
 // value avoids both. The budget bounds the burn: after it, the original event
 // wait runs unchanged, so a slow or stalled GPU keeps the exact old behaviour.
-// RKVA_FENCE_SPIN_US overrides it for desktop runs (0 = always use the event).
-int64_t fence_spin_budget_us() {
-    static const int64_t budget_us = [] {
-        const char* env = std::getenv("RKVA_FENCE_SPIN_US");
-        const int64_t value = env != nullptr ? std::atoll(env) : 2000;
-        return value > 0 ? value : 0;
-    }();
-    return budget_us;
+// Opt-in (default 0 = always use the event): the console has no environment, so
+// the listener enables it from the LocalState flag rkva-fence-spin.flag;
+// RKVA_FENCE_SPIN_US still seeds desktop runs.
+int64_t fence_spin_budget_default_us() {
+    const char* env = std::getenv("RKVA_FENCE_SPIN_US");
+    const int64_t value = env != nullptr ? std::atoll(env) : 0;
+    return value > 0 ? value : 0;
 }
 
 // Yield to the scheduler once the tight-spin phase would start competing with
@@ -425,12 +424,12 @@ bool RemoteAttnEngine::submit(std::string* error, bool allow_spin) {
         rp::Counters& c = profile_->recorder.counters;
         ++c.submits;
         ++(blocked ? c.fence_blocking_waits : c.fence_already_complete);
-        c.fence_spin_budget_us = uint64_t(fence_spin_budget_us());
+        c.fence_spin_budget_us = uint64_t(fence_spin_budget_us_);
     }
     if (blocked) {
         // Only nq1 decode waits ~0.2-0.6 ms; prefill segments run for milliseconds
         // and would just burn a console core next to the network thread.
-        const int64_t spin_budget_us = allow_spin ? fence_spin_budget_us() : 0;
+        const int64_t spin_budget_us = allow_spin ? fence_spin_budget_us_ : 0;
         bool spun_to_completion = false;
         uint64_t spin_ns = 0;
         if (spin_budget_us > 0) {
@@ -1314,6 +1313,7 @@ std::string RemoteAttnEngine::get_range_profile_json() {
 }
 
 bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
+    fence_spin_budget_us_ = fence_spin_budget_default_us();
     if (ready_) {
         return fail(error, "engine already initialized");
     }

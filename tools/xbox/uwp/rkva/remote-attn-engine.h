@@ -174,6 +174,10 @@ class RemoteAttnEngine {
     uint32_t q4_kernel_mode() const {
         return q4_kernel_mode_;
     }
+    // Fence spin budget for nq1 submissions; 0 keeps the blocking event wait.
+    void set_fence_spin_budget_us(int64_t budget_us) {
+        fence_spin_budget_us_ = budget_us > 0 ? budget_us : 0;
+    }
     bool range_profiling() const {
         return profiling_;
     }
@@ -316,6 +320,7 @@ class RemoteAttnEngine {
     // Profiling (default off). Timestamp slots are fixed per stage so a future
     // fused upload+attention command list cannot alias them.
     bool profiling_ = false;
+    int64_t fence_spin_budget_us_ = 0;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamp_heap_;
     Buffer timestamp_readback_;
     uint64_t timestamp_frequency_ = 0;
