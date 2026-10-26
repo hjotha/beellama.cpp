@@ -220,7 +220,7 @@ OK
 
 ```bash
 $ for t in tests/test-*-static.py; do python3 "$t"; done
-static python tests: pass=34 fail=0
+static python tests: pass=32 fail=0
 ```
 
 `tests/test-rkva-cuda-singleton-fastpath.py` falha, mas **já falhava antes**: a
