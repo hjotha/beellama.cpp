@@ -1,0 +1,157 @@
+{
+ "dxc_version": "dxcompiler.dll: 1.8 - 1.8.2502.11 (239921522); dxil.dll: 1.8(1.8.2502.11)",
+ "ssh_host": "hjotha@192.168.1.193",
+ "targets": [
+  {
+   "name": "cu_probe_16",
+   "source": "gpupeak_alu.hlsl",
+   "source_sha256": "01415e056a62e92a069cf3dfc26aa704bd206964d02e2c0244cb0fb19526bd85",
+   "entry": "CSCuProbe",
+   "profile": "cs_6_0",
+   "defines": [
+    "GPUPK_CU_PROBE=1",
+    "GPUPK_CU_LDS_16=1"
+   ],
+   "flags": [],
+   "dxil_bytes": 4140,
+   "dxil_sha256": "e6b26d7d6462310304943e7e0bf72715fa145fd4db12b38d4abe943dbf628e0a",
+   "header": "gpupeak_cu_probe_16_dxil.h"
+  },
+  {
+   "name": "cu_probe_32",
+   "source": "gpupeak_alu.hlsl",
+   "source_sha256": "01415e056a62e92a069cf3dfc26aa704bd206964d02e2c0244cb0fb19526bd85",
+   "entry": "CSCuProbe",
+   "profile": "cs_6_0",
+   "defines": [
+    "GPUPK_CU_PROBE=1"
+   ],
+   "flags": [],
+   "dxil_bytes": 4140,
+   "dxil_sha256": "9665a2afe6fef2125470c7430ecfb999388dc62e8d17c01e608cdc9299a4c4da",
+   "header": "gpupeak_cu_probe_32_dxil.h"
+  },
+  {
+   "name": "dot2_f16",
+   "source": "gpupeak_alu.hlsl",
+   "source_sha256": "01415e056a62e92a069cf3dfc26aa704bd206964d02e2c0244cb0fb19526bd85",
+   "entry": "CSDot2F16",
+   "profile": "cs_6_4",
+   "defines": [
+    "GPUPK_ALU_DOT2=1"
+   ],
+   "flags": [
+    "-enable-16bit-types"
+   ],
+   "dxil_bytes": 4032,
+   "dxil_sha256": "8df65fa360cf3eaad466bdb3fcfee4afd8e7645868d1e56e09a642ed787d3480",
+   "header": "gpupeak_dot2_f16_dxil.h"
+  },
+  {
+   "name": "dot4_i8",
+   "source": "gpupeak_alu.hlsl",
+   "source_sha256": "01415e056a62e92a069cf3dfc26aa704bd206964d02e2c0244cb0fb19526bd85",
+   "entry": "CSDot4I8",
+   "profile": "cs_6_4",
+   "defines": [
+    "GPUPK_ALU_DOT4=1"
+   ],
+   "flags": [],
+   "dxil_bytes": 3784,
+   "dxil_sha256": "dc8da2a71604d0779b2404b82a34cb77d71af0371b939c477785da243df8a6a9",
+   "header": "gpupeak_dot4_i8_dxil.h"
+  },
+  {
+   "name": "empty",
+   "source": "gpupeak_empty.hlsl",
+   "source_sha256": "a9dac8c6b81885921af5b7ce7fc2016e1e7507c78b1c8a583c2bd340d670235a",
+   "entry": "CSEmpty",
+   "profile": "cs_6_0",
+   "defines": [],
+   "flags": [],
+   "dxil_bytes": 3344,
+   "dxil_sha256": "43c5c30f2ff54adcee83b6384b9d582ac948df462904fb7f345d72db2b1af89d",
+   "header": "gpupeak_empty_dxil.h"
+  },
+  {
+   "name": "fma_f16",
+   "source": "gpupeak_alu.hlsl",
+   "source_sha256": "01415e056a62e92a069cf3dfc26aa704bd206964d02e2c0244cb0fb19526bd85",
+   "entry": "CSFmaF16",
+   "profile": "cs_6_2",
+   "defines": [
+    "GPUPK_ALU_F16=1"
+   ],
+   "flags": [
+    "-enable-16bit-types"
+   ],
+   "dxil_bytes": 3944,
+   "dxil_sha256": "e4e1df2034b908aac2f7038ef317de2e28102645aca96878f901e618088156e6",
+   "header": "gpupeak_fma_f16_dxil.h"
+  },
+  {
+   "name": "fma_f32",
+   "source": "gpupeak_alu.hlsl",
+   "source_sha256": "01415e056a62e92a069cf3dfc26aa704bd206964d02e2c0244cb0fb19526bd85",
+   "entry": "CSFmaF32",
+   "profile": "cs_6_0",
+   "defines": [
+    "GPUPK_ALU_F32=1"
+   ],
+   "flags": [],
+   "dxil_bytes": 3992,
+   "dxil_sha256": "37170d8e3c514fe13c73859a7031e3085158b10d1988509536172d89cdd7ee51",
+   "header": "gpupeak_fma_f32_dxil.h"
+  },
+  {
+   "name": "latency_fma",
+   "source": "gpupeak_alu.hlsl",
+   "source_sha256": "01415e056a62e92a069cf3dfc26aa704bd206964d02e2c0244cb0fb19526bd85",
+   "entry": "CSLatencyFma",
+   "profile": "cs_6_0",
+   "defines": [
+    "GPUPK_LATENCY_FMA=1"
+   ],
+   "flags": [],
+   "dxil_bytes": 3748,
+   "dxil_sha256": "187861b900b865508e588cd59d2d990b573b5ffd25bcf1a60038992a00308e0a",
+   "header": "gpupeak_latency_fma_dxil.h"
+  },
+  {
+   "name": "stream_copy",
+   "source": "gpupeak_stream.hlsl",
+   "source_sha256": "8309057ac7bc1c0399c866d8c34257989c174233f3aabb09fe01caff37a90945",
+   "entry": "CSCopy",
+   "profile": "cs_6_0",
+   "defines": [],
+   "flags": [],
+   "dxil_bytes": 3980,
+   "dxil_sha256": "ff47e82d9c9b9f74bdc3245489214415d4940fb9a776b3abf3c0c0e2e9b394f3",
+   "header": "gpupeak_stream_copy_dxil.h"
+  },
+  {
+   "name": "stream_read",
+   "source": "gpupeak_stream.hlsl",
+   "source_sha256": "8309057ac7bc1c0399c866d8c34257989c174233f3aabb09fe01caff37a90945",
+   "entry": "CSRead",
+   "profile": "cs_6_0",
+   "defines": [],
+   "flags": [],
+   "dxil_bytes": 3816,
+   "dxil_sha256": "7a7307b9db2ee5b6185904df60c53adf7e6e834636ba0252565f38198c0fb135",
+   "header": "gpupeak_stream_read_dxil.h"
+  },
+  {
+   "name": "stream_write",
+   "source": "gpupeak_stream.hlsl",
+   "source_sha256": "8309057ac7bc1c0399c866d8c34257989c174233f3aabb09fe01caff37a90945",
+   "entry": "CSWrite",
+   "profile": "cs_6_0",
+   "defines": [],
+   "flags": [],
+   "dxil_bytes": 3664,
+   "dxil_sha256": "f5598ce77661807ad3b8b60b0bcef37f9064a45fb26496e4fa18656c9289c176",
+   "header": "gpupeak_stream_write_dxil.h"
+  }
+ ]
+}
