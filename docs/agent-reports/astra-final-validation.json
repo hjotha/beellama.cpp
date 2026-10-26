@@ -1,0 +1,429 @@
+{
+  "base": "8ac3e9d10",
+  "environment": {
+    "OPENBLAS_NUM_THREADS": "1"
+  },
+  "cpu": [
+    {
+      "command": [
+        "g++",
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-pthread",
+        "tools/xbox/tests/rkva_range_profile_cpu.cpp",
+        "-o",
+        "/tmp/rkva-final-validation/rkva_range_profile_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-00.log",
+      "output": ""
+    },
+    {
+      "command": [
+        "/tmp/rkva-final-validation/rkva_range_profile_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-01.log",
+      "output": "{\"schema\":\"rkva-range-profile-v1\",\"profiling\":true,\"q4_kernel_mode\":1,\"q4_kernel_mode_name\":\"q4_gqa_balanced\",\"gpu_timestamps\":true,\"gpu_timestamp_frequency_hz\":1000000,\"gpu_timestamp_status\":\"ready \\\"quoted\\\"\\u000a\",\"q4_optimized_available\":true,\"q4_optimized_status\":\"ready\",\"wave_lane_min\":32,\"wave_lane_max\":64,\"cpu_clock\":\"std::chrono::steady_clock\",\"sample_capacity\":4,\"samples_recorded\":6,\"samples_in_ring\":4,\"samples_overwritten\":2,\"counters\":{\"upload_calls\":3,\"attention_calls\":3,\"optimized_q4_calls\":0,\"reference_q4_calls\":0,\"failed_calls\":0,\"submits\":0,\"fence_blocking_waits\":0,\"fence_already_complete\":0,\"dispatches\":0,\"copy_regions\":0,\"buffer_creates\":0,\"buffer_create_bytes\":0,\"timestamp_resolves\":0,\"timestamp_map_failures\":0,\"bulk_calls\":1,\"bulk_segments\":4,\"bulk_queries\":32},\"memory\":{\"timestamp_unix_ms\":0,\"app_available\":true,\"app_usage_bytes\":123456789,\"app_limit_bytes\":5368709120,\"gpu_local_available\":true,\"gpu_local_usage_bytes\":1075838976,\"gpu_local_budget_bytes\":3985637376},\"kvarn4_mq_qualified_precision_tail_tokens\":[128],\"kernel_mode_scope\":\"legacy name q4_kernel_mode; modes 1..3 select the optimized kernel of each storage listed available in optimized_kernels, otherwise reference; Q4_0 nq 2..9 in modes 1/2 use the q4_multi_query tile kernel when available; F16/Q8_0 nq 2..9 in modes 1/2 use the format_multi_query tile kernel when available; native KVarN4 descriptor revision 3 nq 2..9 in modes 1/2 uses the kvarn4_multi_query tile kernel when available\",\"optimized_kernels\":{\"f16\":{\"available\":false,\"status\":\"\",\"optimized_calls\":0,\"reference_calls\":2,\"fast_nq_max\":0},\"q4_0\":{\"available\":true,\"status\":\"ready\",\"optimized_calls\":0,\"reference_calls\":0,\"fast_nq_max\":9},\"q8_0\":{\"available\":false,\"status\":\"\",\"optimized_calls\":0,\"reference_calls\":0,\"fast_nq_max\":0},\"kvarn4\":{\"available\":false,\"status\":\"kvarn4 optimized pipeline state: 0x80070057\",\"optimized_calls\":5,\"reference_calls\":0,\"fast_nq_max\":0}},\"kvarn4_serial_prefix\":{\"reference\":{\"available\":true,\"status\":\"ready\"},\"optimized\":{\"available\":false,\"status\":\"kvarn4 optimized serial-prefix pipeline state: 0x80070057\"}},\"q4_multi_query\":{\"nq_min\":2,\"nq_max\":9,\"tile_rows\":64,\"mode_map\":\"1:q4_mq4_balanced 2:q4_mq2_fine 3:per-query q4_gqa_coarse\",\"mq2\":{\"available\":false,\"status\":\"q4 multi-query pipeline state: 0x80070057\",\"calls\":0},\"mq4\":{\"available\":true,\"status\":\"ready\",\"calls\":7}},\"format_multi_query\":{\"nq_min\":2,\"nq_max\":9,\"tile_rows\":64,\"mode_map\":\"1:<fmt>_mq4_balanced 2:<fmt>_mq2_fine 3:per-query <fmt>_gqa_coarse\",\"f16\":{\"mq2\":{\"available\":true,\"status\":\"ready\",\"calls\":3},\"mq4\":{\"available\":true,\"status\":\"ready\",\"calls\":0}},\"q8_0\":{\"mq2\":{\"available\":false,\"status\":\"q8 multi-query pipeline state: 0x80070057\",\"calls\":0},\"mq4\":{\"available\":true,\"status\":\"ready\",\"calls\":11}}},\"kvarn4_multi_query\":{\"nq_min\":2,\"nq_max\":9,\"descriptor_revision\":3,\"required_wave_lanes\":64,\"mode_map\":\"1:kvarn4_mq4_balanced 2:kvarn4_mq2_fine 3:per-query kvarn4_gqa_coarse\",\"mq2\":{\"available\":false,\"status\":\"requires wave lanes >= 64 (reported min 32)\",\"calls\":13},\"mq4\":{\"available\":true,\"status\":\"ready\",\"calls\":5},\"mq2_i8\":{\"available\":true,\"status\":\"ready\",\"calls\":11,\"exact\":false}},\"kvarn4_decode\":{\"nq\":1,\"descriptor_revision\":3,\"required_wave_lanes\":64,\"mode_map\":\"1:kvarn4_decode_balanced 2:kvarn4_decode_fine 3:per-query kvarn4_gqa_coarse\",\"available\":true,\"status\":\"ready\",\"calls\":7},\"kvarn4_decode_rowlane\":{\"available\":true,\"enabled\":true,\"status\":\"ready\",\"calls\":3},\"bulk\":{\"bulk_calls\":1,\"bulk_segments\":4,\"bulk_queries\":32,\"samples_recorded\":1,\"samples_in_ring\":1,\"gpu_timestamps\":true,\"fp8_gpu_calls\":0,\"fp8_cpu_fallback_calls\":0,\"timings\":{\"admission_cpu_us\":{\"n\":1,\"mean\":15.000,\"min\":15.000,\"p50\":15.000,\"p90\":15.000,\"p95\":15.000,\"p99\":15.000,\"max\":15.000,\"sum\":15.000},\"alloc_cpu_us\":{\"n\":1,\"mean\":5.000,\"min\":5.000,\"p50\":5.000,\"p90\":5.000,\"p95\":5.000,\"p99\":5.000,\"max\":5.000,\"sum\":5.000},\"map_copy_cpu_us\":{\"n\":1,\"mean\":120.000,\"min\":120.000,\"p50\":120.000,\"p90\":120.000,\"p95\":120.000,\"p99\":120.000,\"max\":120.000,\"sum\":120.000},\"record_cpu_us\":{\"n\":1,\"mean\":80.000,\"min\":80.000,\"p50\":80.000,\"p90\":80.000,\"p95\":80.000,\"p99\":80.000,\"max\":80.000,\"sum\":80.000},\"submit_cpu_us\":{\"n\":1,\"mean\":20.000,\"min\":20.000,\"p50\":20.000,\"p90\":20.000,\"p95\":20.000,\"p99\":20.000,\"max\":20.000,\"sum\":20.000},\"fence_wait_cpu_us\":{\"n\":1,\"mean\":900.000,\"min\":900.000,\"p50\":900.000,\"p90\":900.000,\"p95\":900.000,\"p99\":900.000,\"max\":900.000,\"sum\":900.000},\"readback_cpu_us\":{\"n\":1,\"mean\":40.000,\"min\":40.000,\"p50\":40.000,\"p90\":40.000,\"p95\":40.000,\"p99\":40.000,\"max\":40.000,\"sum\":40.000},\"engine_total_cpu_us\":{\"n\":1,\"mean\":1180.000,\"min\":1180.000,\"p50\":1180.000,\"p90\":1180.000,\"p95\":1180.000,\"p99\":1180.000,\"max\":1180.000,\"sum\":1180.000},\"gpu_upload_us\":{\"n\":1,\"mean\":100.000,\"min\":100.000,\"p50\":100.000,\"p90\":100.000,\"p95\":100.000,\"p99\":100.000,\"max\":100.000,\"sum\":100.000},\"gpu_unpack_wht_us\":{\"n\":1,\"mean\":20.000,\"min\":20.000,\"p50\":20.000,\"p90\":20.000,\"p95\":20.000,\"p99\":20.000,\"max\":20.000,\"sum\":20.000},\"gpu_pack_us\":{\"n\":1,\"mean\":10.000,\"min\":10.000,\"p50\":10.000,\"p90\":10.000,\"p95\":10.000,\"p99\":10.000,\"max\":10.000,\"sum\":10.000},\"gpu_pass1_us\":{\"n\":1,\"mean\":400.000,\"min\":400.000,\"p50\":400.000,\"p90\":400.000,\"p95\":400.000,\"p99\":400.000,\"max\":400.000,\"sum\":400.000},\"gpu_reduce_us\":{\"n\":1,\"mean\":50.000,\"min\":50.000,\"p50\":50.000,\"p90\":50.000,\"p95\":50.000,\"p99\":50.000,\"max\":50.000,\"sum\":50.000},\"gpu_readback_copy_us\":{\"n\":1,\"mean\":30.000,\"min\":30.000,\"p50\":30.000,\"p90\":30.000,\"p95\":30.000,\"p99\":30.000,\"max\":30.000,\"sum\":30.000},\"gpu_total_us\":{\"n\":1,\"mean\":650.000,\"min\":650.000,\"p50\":650.000,\"p90\":650.000,\"p95\":650.000,\"p99\":650.000,\"max\":650.000,\"sum\":650.000},\"queue_wait_us\":{\"n\":1,\"mean\":250.000,\"min\":250.000,\"p50\":250.000,\"p90\":250.000,\"p95\":250.000,\"p99\":250.000,\"max\":250.000,\"sum\":250.000}},\"recent_envelopes\":[{\"cycle_id\":123,\"session\":7,\"layer\":3,\"wire\":4,\"nq\":32,\"segments\":4,\"gpu_valid\":1,\"alloc_grew\":0,\"gpu_total_ticks\":650,\"cpu_ns\":[15000,5000,120000,80000,20000,900000,40000]}],\"phases\":{\"decode\":{\"admission_cpu_us\":{\"n\":0},\"alloc_cpu_us\":{\"n\":0},\"map_copy_cpu_us\":{\"n\":0},\"record_cpu_us\":{\"n\":0},\"submit_cpu_us\":{\"n\":0},\"fence_wait_cpu_us\":{\"n\":0},\"readback_cpu_us\":{\"n\":0},\"gpu_upload_us\":{\"n\":0},\"gpu_unpack_wht_us\":{\"n\":0},\"gpu_pass1_us\":{\"n\":0},\"gpu_reduce_us\":{\"n\":0},\"gpu_pack_us\":{\"n\":0},\"gpu_readback_copy_us\":{\"n\":0},\"gpu_total_us\":{\"n\":0},\"recent\":[]},\"verification\":{\"admission_cpu_us\":{\"n\":0},\"alloc_cpu_us\":{\"n\":0},\"map_copy_cpu_us\":{\"n\":0},\"record_cpu_us\":{\"n\":0},\"submit_cpu_us\":{\"n\":0},\"fence_wait_cpu_us\":{\"n\":0},\"readback_cpu_us\":{\"n\":0},\"gpu_upload_us\":{\"n\":0},\"gpu_unpack_wht_us\":{\"n\":0},\"gpu_pass1_us\":{\"n\":0},\"gpu_reduce_us\":{\"n\":0},\"gpu_pack_us\":{\"n\":0},\"gpu_readback_copy_us\":{\"n\":0},\"gpu_total_us\":{\"n\":0},\"recent\":[]},\"prefill\":{\"admission_cpu_us\":{\"n\":1,\"mean\":15.000,\"min\":15.000,\"p50\":15.000,\"p90\":15.000,\"p95\":15.000,\"p99\":15.000,\"max\":15.000,\"sum\":15.000},\"alloc_cpu_us\":{\"n\":1,\"mean\":5.000,\"min\":5.000,\"p50\":5.000,\"p90\":5.000,\"p95\":5.000,\"p99\":5.000,\"max\":5.000,\"sum\":5.000},\"map_copy_cpu_us\":{\"n\":1,\"mean\":120.000,\"min\":120.000,\"p50\":120.000,\"p90\":120.000,\"p95\":120.000,\"p99\":120.000,\"max\":120.000,\"sum\":120.000},\"record_cpu_us\":{\"n\":1,\"mean\":80.000,\"min\":80.000,\"p50\":80.000,\"p90\":80.000,\"p95\":80.000,\"p99\":80.000,\"max\":80.000,\"sum\":80.000},\"submit_cpu_us\":{\"n\":1,\"mean\":20.000,\"min\":20.000,\"p50\":20.000,\"p90\":20.000,\"p95\":20.000,\"p99\":20.000,\"max\":20.000,\"sum\":20.000},\"fence_wait_cpu_us\":{\"n\":1,\"mean\":900.000,\"min\":900.000,\"p50\":900.000,\"p90\":900.000,\"p95\":900.000,\"p99\":900.000,\"max\":900.000,\"sum\":900.000},\"readback_cpu_us\":{\"n\":1,\"mean\":40.000,\"min\":40.000,\"p50\":40.000,\"p90\":40.000,\"p95\":40.000,\"p99\":40.000,\"max\":40.000,\"sum\":40.000},\"gpu_upload_us\":{\"n\":1,\"mean\":100.000,\"min\":100.000,\"p50\":100.000,\"p90\":100.000,\"p95\":100.000,\"p99\":100.000,\"max\":100.000,\"sum\":100.000},\"gpu_unpack_wht_us\":{\"n\":1,\"mean\":20.000,\"min\":20.000,\"p50\":20.000,\"p90\":20.000,\"p95\":20.000,\"p99\":20.000,\"max\":20.000,\"sum\":20.000},\"gpu_pass1_us\":{\"n\":1,\"mean\":400.000,\"min\":400.000,\"p50\":400.000,\"p90\":400.000,\"p95\":400.000,\"p99\":400.000,\"max\":400.000,\"sum\":400.000},\"gpu_reduce_us\":{\"n\":1,\"mean\":50.000,\"min\":50.000,\"p50\":50.000,\"p90\":50.000,\"p95\":50.000,\"p99\":50.000,\"max\":50.000,\"sum\":50.000},\"gpu_pack_us\":{\"n\":1,\"mean\":10.000,\"min\":10.000,\"p50\":10.000,\"p90\":10.000,\"p95\":10.000,\"p99\":10.000,\"max\":10.000,\"sum\":10.000},\"gpu_readback_copy_us\":{\"n\":1,\"mean\":30.000,\"min\":30.000,\"p50\":30.000,\"p90\":30.000,\"p95\":30.000,\"p99\":30.000,\"max\":30.000,\"sum\":30.000},\"gpu_total_us\":{\"n\":1,\"mean\":650.000,\"min\":650.000,\"p50\":650.000,\"p90\":650.000,\"p95\":650.000,\"p99\":650.000,\"max\":650.000,\"sum\":650.000},\"recent\":[{\"cycle_id\":123,\"session\":7,\"layer\":3,\"fp8_gpu\":0,\"wire\":4,\"nq\":32,\"gpu_ticks\":[100,20,400,50,10,30,650],\"cpu_ns\":[15000,5000,120000,80000,20000,900000,40000]}]}},\"bytes\":{\"upload_bytes\":{\"n\":1,\"mean\":65536.000,\"min\":65536.000,\"p50\":65536.000,\"p90\":65536.000,\"p95\":65536.000,\"p99\":65536.000,\"max\":65536.000,\"sum\":65536.000},\"query_bytes\":{\"n\":1,\"mean\":32768.000,\"min\":32768.000,\"p50\":32768.000,\"p90\":32768.000,\"p95\":32768.000,\"p99\":32768.000,\"max\":32768.000,\"sum\":32768.000},\"output_bytes\":{\"n\":1,\"mean\":32768.000,\"min\":32768.000,\"p50\":32768.000,\"p90\":32768.000,\"p95\":32768.000,\"p99\":32768.000,\"max\":32768.000,\"sum\":32768.000},\"total_bytes\":{\"n\":1,\"mean\":131072.000,\"min\":131072.000,\"p50\":131072.000,\"p90\":131072.000,\"p95\":131072.000,\"p99\":131072.000,\"max\":131072.000,\"sum\":131072.000}},\"timing_breakdown_notes\":{\"inclusive_fence_wait\":\"fence_wait_cpu_us is inclusive host CPU wall time waiting for fence completion.\",\"exclusive_gpu_total\":\"gpu_total_us measures exclusive GPU execution duration between first and last queries.\",\"queue_wait\":\"queue_wait_us = max(0, fence_wait_cpu_us - gpu_total_us), capturing queue/driver/wakeup overhead; it is not pure GPU queue latency.\",\"cpu_copies\":\"CPU copy cost is map_copy_cpu_us + readback_cpu_us.\",\"gpu_kernel\":\"GPU kernel cost is gpu_upload_us + gpu_unpack_wht_us + gpu_pass1_us + gpu_reduce_us + gpu_pack_us + gpu_readback_copy_us.\",\"unmeasurable_network_oneway\":\"One-way network transit over LAN is strictly unmeasurable without synchronized clocks. Use transport payload_receive_us, send_enqueue_us, and host RTT minus handle_us as inclusive transport diagnostics (not pure network time).\"}},\"buckets\":{\"attention/q4_0/reference/nq1/r257-1k/warm\":{\"samples\":2,\"gpu_samples\":2,\"fence_blocked\":0,\"alloc_grew\":0,\"direct_output\":0,\"n_tokens\":{\"n\":2,\"mean\":1.000,\"min\":1.000,\"p50\":1.000,\"p90\":1.000,\"p95\":1.000,\"p99\":1.000,\"max\":1.000,\"sum\":2.000},\"active_rows\":{\"n\":2,\"mean\":1004.000,\"min\":1003.000,\"p50\":1003.000,\"p90\":1005.000,\"p95\":1005.000,\"p99\":1005.000,\"max\":1005.000,\"sum\":2008.000},\"bytes\":{\"n\":2,\"mean\":0.000,\"min\":0.000,\"p50\":0.000,\"p90\":0.000,\"p95\":0.000,\"p99\":0.000,\"max\":0.000,\"sum\":0.000},\"split_k\":{\"n\":2,\"mean\":4.000,\"min\":4.000,\"p50\":4.000,\"p90\":4.000,\"p95\":4.000,\"p99\":4.000,\"max\":4.000,\"sum\":8.000},\"pass1_groups\":{\"n\":2,\"mean\":96.000,\"min\":96.000,\"p50\":96.000,\"p90\":96.000,\"p95\":96.000,\"p99\":96.000,\"max\":96.000,\"sum\":192.000},\"gpu_us\":{\"pass1\":{\"n\":2,\"mean\":5000.000,\"min\":4000.000,\"p50\":4000.000,\"p90\":6000.000,\"p95\":6000.000,\"p99\":6000.000,\"max\":6000.000,\"sum\":10000.000},\"reduce\":{\"n\":2,\"mean\":10.000,\"min\":10.000,\"p50\":10.000,\"p90\":10.000,\"p95\":10.000,\"p99\":10.000,\"max\":10.000,\"sum\":20.000},\"readback_copy\":{\"n\":2,\"mean\":5.000,\"min\":5.000,\"p50\":5.000,\"p90\":5.000,\"p95\":5.000,\"p99\":5.000,\"max\":5.000,\"sum\":10.000},\"total\":{\"n\":2,\"mean\":5015.000,\"min\":4015.000,\"p50\":4015.000,\"p90\":6015.000,\"p95\":6015.000,\"p99\":6015.000,\"max\":6015.000,\"sum\":10030.000}},\"cpu_us\":{\"validate\":{\"n\":2,\"mean\":1.000,\"min\":1.000,\"p50\":1.000,\"p90\":1.000,\"p95\":1.000,\"p99\":1.000,\"max\":1.000,\"sum\":2.000},\"alloc\":{\"n\":2,\"mean\":2.000,\"min\":2.000,\"p50\":2.000,\"p90\":2.000,\"p95\":2.000,\"p99\":2.000,\"max\":2.000,\"sum\":4.000},\"map_copy\":{\"n\":2,\"mean\":3.000,\"min\":3.000,\"p50\":3.000,\"p90\":3.000,\"p95\":3.000,\"p99\":3.000,\"max\":3.000,\"sum\":6.000},\"record\":{\"n\":2,\"mean\":4.000,\"min\":4.000,\"p50\":4.000,\"p90\":4.000,\"p95\":4.000,\"p99\":4.000,\"max\":4.000,\"sum\":8.000},\"submit\":{\"n\":2,\"mean\":5.000,\"min\":5.000,\"p50\":5.000,\"p90\":5.000,\"p95\":5.000,\"p99\":5.000,\"max\":5.000,\"sum\":10.000},\"fence_wait\":{\"n\":2,\"mean\":6.000,\"min\":6.000,\"p50\":6.000,\"p90\":6.000,\"p95\":6.000,\"p99\":6.000,\"max\":6.000,\"sum\":12.000},\"readback\":{\"n\":2,\"mean\":7.000,\"min\":7.000,\"p50\":7.000,\"p90\":7.000,\"p95\":7.000,\"p99\":7.000,\"max\":7.000,\"sum\":14.000},\"engine_total\":{\"n\":2,\"mean\":28.000,\"min\":28.000,\"p50\":28.000,\"p90\":28.000,\"p95\":28.000,\"p99\":28.000,\"max\":28.000,\"sum\":56.000}},\"profile_overhead_us\":{\"n\":2,\"mean\":0.000,\"min\":0.000,\"p50\":0.000,\"p90\":0.000,\"p95\":0.000,\"p99\":0.000,\"max\":0.000,\"sum\":0.000}},\"upload/q4_0/nq1/r257-1k/warm\":{\"samples\":2,\"gpu_samples\":2,\"fence_blocked\":0,\"alloc_grew\":0,\"direct_output\":0,\"n_tokens\":{\"n\":2,\"mean\":1.000,\"min\":1.000,\"p50\":1.000,\"p90\":1.000,\"p95\":1.000,\"p99\":1.000,\"max\":1.000,\"sum\":2.000},\"rows\":{\"n\":2,\"mean\":1003.000,\"min\":1002.000,\"p50\":1002.000,\"p90\":1004.000,\"p95\":1004.000,\"p99\":1004.000,\"max\":1004.000,\"sum\":2006.000},\"bytes\":{\"n\":2,\"mean\":0.000,\"min\":0.000,\"p50\":0.000,\"p90\":0.000,\"p95\":0.000,\"p99\":0.000,\"max\":0.000,\"sum\":0.000},\"gpu_us\":{\"copy\":{\"n\":2,\"mean\":4000.000,\"min\":3000.000,\"p50\":3000.000,\"p90\":5000.000,\"p95\":5000.000,\"p99\":5000.000,\"max\":5000.000,\"sum\":8000.000},\"total\":{\"n\":2,\"mean\":4000.000,\"min\":3000.000,\"p50\":3000.000,\"p90\":5000.000,\"p95\":5000.000,\"p99\":5000.000,\"max\":5000.000,\"sum\":8000.000}},\"cpu_us\":{\"validate\":{\"n\":2,\"mean\":1.000,\"min\":1.000,\"p50\":1.000,\"p90\":1.000,\"p95\":1.000,\"p99\":1.000,\"max\":1.000,\"sum\":2.000},\"alloc\":{\"n\":2,\"mean\":2.000,\"min\":2.000,\"p50\":2.000,\"p90\":2.000,\"p95\":2.000,\"p99\":2.000,\"max\":2.000,\"sum\":4.000},\"map_copy\":{\"n\":2,\"mean\":3.000,\"min\":3.000,\"p50\":3.000,\"p90\":3.000,\"p95\":3.000,\"p99\":3.000,\"max\":3.000,\"sum\":6.000},\"record\":{\"n\":2,\"mean\":4.000,\"min\":4.000,\"p50\":4.000,\"p90\":4.000,\"p95\":4.000,\"p99\":4.000,\"max\":4.000,\"sum\":8.000},\"submit\":{\"n\":2,\"mean\":5.000,\"min\":5.000,\"p50\":5.000,\"p90\":5.000,\"p95\":5.000,\"p99\":5.000,\"max\":5.000,\"sum\":10.000},\"fence_wait\":{\"n\":2,\"mean\":6.000,\"min\":6.000,\"p50\":6.000,\"p90\":6.000,\"p95\":6.000,\"p99\":6.000,\"max\":6.000,\"sum\":12.000},\"engine_total\":{\"n\":2,\"mean\":28.000,\"min\":28.000,\"p50\":28.000,\"p90\":28.000,\"p95\":28.000,\"p99\":28.000,\"max\":28.000,\"sum\":56.000}},\"profile_overhead_us\":{\"n\":2,\"mean\":0.000,\"min\":0.000,\"p50\":0.000,\"p90\":0.000,\"p95\":0.000,\"p99\":0.000,\"max\":0.000,\"sum\":0.000}}}}\n",
+      "stderr": "rkva_range_profile_cpu: ok\n"
+    },
+    {
+      "command": [
+        "g++",
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-pthread",
+        "tools/xbox/tests/rkva_execution_lifetime_cpu.cpp",
+        "-o",
+        "/tmp/rkva-final-validation/rkva_execution_lifetime_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-02.log",
+      "output": ""
+    },
+    {
+      "command": [
+        "/tmp/rkva-final-validation/rkva_execution_lifetime_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-03.log",
+      "output": "execution lifetime: 14 retirement cases and retained-owner lifecycle passed\n"
+    },
+    {
+      "command": [
+        "g++",
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-pthread",
+        "tools/xbox/tests/rkva_kvarn_range_cpu.cpp",
+        "-o",
+        "/tmp/rkva-final-validation/rkva_kvarn_range_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-04.log",
+      "output": ""
+    },
+    {
+      "command": [
+        "/tmp/rkva-final-validation/rkva_kvarn_range_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-05.log",
+      "output": "KVarN descriptor, coverage, append/stage/tail ring and rewind gates passed\nKVarN revision-3 serial-prefix residency/coverage gates passed\n"
+    },
+    {
+      "command": [
+        "g++",
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-pthread",
+        "tools/xbox/tests/rkva_kvarn_bulk_cpu.cpp",
+        "-o",
+        "/tmp/rkva-final-validation/rkva_kvarn_bulk_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-06.log",
+      "output": ""
+    },
+    {
+      "command": [
+        "/tmp/rkva-final-validation/rkva_kvarn_bulk_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-07.log",
+      "output": "fp8 256 saturation patterns and numerical contract: passed\nsplitzip bounds, truncation and corruption safety: passed\nkvarn4_mq_split policy invariants: passed\ncompact exact-tail upload admission, seal edges and wire byte savings: passed\nnative bulk envelope/coverage/f16 admission: passed\n"
+    },
+    {
+      "command": [
+        "g++",
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-pthread",
+        "tools/xbox/tests/rkva_bulk_fp8_cpu.cpp",
+        "-o",
+        "/tmp/rkva-final-validation/rkva_bulk_fp8_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-08.log",
+      "output": ""
+    },
+    {
+      "command": [
+        "/tmp/rkva-final-validation/rkva_bulk_fp8_cpu"
+      ],
+      "returncode": 0,
+      "log": "cpu-09.log",
+      "output": "rkva_bulk_fp8_cpu: 63488 finite F16 patterns, 2048 rejected patterns; nearest-even composition/overflow and bounded diagnostic layouts passed\n"
+    },
+    {
+      "command": [
+        "g++",
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Iggml/src/ggml-cuda",
+        "tests/test-cuda-graph-guard.cpp",
+        "-o",
+        "/tmp/rkva-final-validation/test-cuda-graph-guard"
+      ],
+      "returncode": 0,
+      "log": "cpu-10.log",
+      "output": ""
+    },
+    {
+      "command": [
+        "/tmp/rkva-final-validation/test-cuda-graph-guard"
+      ],
+      "returncode": 0,
+      "log": "cpu-11.log",
+      "output": "graph-guard: all checks passed\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_pass1_sweep.py",
+        "--self-test"
+      ],
+      "returncode": 0,
+      "log": "cpu-12.log",
+      "output": "self-test: OK (4 shapes, 3 fail-closed paths, aggregation)\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_pass1_sweep.py",
+        "--self-test",
+        "--expect-decode-kernel",
+        "kvarn4_decode_rowlane",
+        "--expect-mq2-kernel",
+        "kvarn4_mq2_i8"
+      ],
+      "returncode": 0,
+      "log": "cpu-13.log",
+      "output": "self-test: OK (4 shapes, 3 fail-closed paths, aggregation)\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_kvarn_serial_prefix_probe.py",
+        "--self-test"
+      ],
+      "returncode": 0,
+      "log": "cpu-14.log",
+      "output": "{\"self_test\": \"ok\", \"note\": \"offline fake server; no GPU\", \"runs\": [{\"ptt\": 128, \"checks\": 18}, {\"ptt\": 0, \"checks\": 18}]}\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_decode_rowlane_model.py",
+        "--long"
+      ],
+      "returncode": 0,
+      "log": "cpu-15.log",
+      "output": "{\"case\": \"boundary\", \"live\": 1, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 1.1920928955078125e-07, \"lse_max_abs\": 1.4166793915748599e-06}\n{\"case\": \"boundary\", \"live\": 127, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.345183027609778e-06, \"lse_max_abs\": 1.0772637573097654e-06}\n{\"case\": \"boundary\", \"live\": 128, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 6.859168603767785e-06, \"lse_max_abs\": 1.2341414166172626e-06}\n{\"case\": \"boundary\", \"live\": 129, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 2.4451825924032278e-06, \"lse_max_abs\": 2.72583669769233e-06}\n{\"case\": \"boundary\", \"live\": 255, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 6.222362749497279e-06, \"lse_max_abs\": 1.8896631992504354e-06}\n{\"case\": \"boundary\", \"live\": 256, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 3.6322837408064856e-05, \"lse_max_abs\": 7.3708924812621035e-06}\n{\"case\": \"boundary\", \"live\": 257, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 2.6990981399244163e-05, \"lse_max_abs\": 7.890729518678086e-06}\n{\"case\": \"boundary\", \"live\": 511, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 7.224262266092296e-05, \"lse_max_abs\": 5.433190491288542e-06}\n{\"case\": \"boundary\", \"live\": 512, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.703285624430009e-05, \"lse_max_abs\": 4.891153709607465e-06}\n{\"case\": \"boundary\", \"live\": 513, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 0.00011549882344752405, \"lse_max_abs\": 8.461141975502073e-06}\n{\"case\": \"boundary\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 3.355630947154964e-05, \"lse_max_abs\": 1.3179556075826326e-05}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 6.231852363924872e-05, \"lse_max_abs\": 3.887103360966648e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.218627677232689e-05, \"lse_max_abs\": 7.715153961029841e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.8566682853135035e-05, \"lse_max_abs\": 4.989602546245919e-06}\n{\"case\": \"masked\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 0.0, \"lse_max_abs\": 0.0}\n{\"case\": \"rewind/reappend\", \"live\": 1027, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.0822092341130656e-05, \"lse_max_abs\": 4.741871705959966e-06}\n{\"case\": \"boundary\", \"live\": 1, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 0.0, \"lse_max_abs\": 5.318353721861513e-07}\n{\"case\": \"boundary\", \"live\": 127, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.910854371762639e-06, \"lse_max_abs\": 1.2425869684307145e-06}\n{\"case\": \"boundary\", \"live\": 128, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 4.9199257450283085e-06, \"lse_max_abs\": 1.4885896266747523e-06}\n{\"case\": \"boundary\", \"live\": 129, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.692465912446096e-06, \"lse_max_abs\": 7.16671355149856e-07}\n{\"case\": \"boundary\", \"live\": 255, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 1.5351645156869154e-05, \"lse_max_abs\": 1.1795487537824556e-06}\n{\"case\": \"boundary\", \"live\": 256, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 1.8799500853816653e-05, \"lse_max_abs\": 1.2761492449442358e-06}\n{\"case\": \"boundary\", \"live\": 257, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.7780849748637593e-05, \"lse_max_abs\": 1.1071136967188977e-06}\n{\"case\": \"boundary\", \"live\": 511, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.9478730073861925e-05, \"lse_max_abs\": 5.0570054916931895e-06}\n{\"case\": \"boundary\", \"live\": 512, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 3.7810586221098674e-05, \"lse_max_abs\": 6.960155712221194e-06}\n{\"case\": \"boundary\", \"live\": 513, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 3.3790441996472964e-05, \"lse_max_abs\": 7.921811326028205e-06}\n{\"case\": \"boundary\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 4.22197265264046e-05, \"lse_max_abs\": 4.4485164831797874e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 6.361950646027736e-05, \"lse_max_abs\": 6.628630924154777e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 7.182650433890103e-05, \"lse_max_abs\": 8.01948415940501e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.2836066701281688e-05, \"lse_max_abs\": 9.670018403795666e-06}\n{\"case\": \"masked\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 0.0, \"lse_max_abs\": 0.0}\n{\"case\": \"rewind/reappend\", \"live\": 1027, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.7075504640095005e-05, \"lse_max_abs\": 9.690996238376215e-06}\n{\"case\": \"boundary\", \"live\": 1, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 1.4901161193847656e-07, \"lse_max_abs\": 1.0910815733539136e-08}\n{\"case\": \"boundary\", \"live\": 127, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 6.461248904798822e-06, \"lse_max_abs\": 1.2153673800696652e-06}\n{\"case\": \"boundary\", \"live\": 128, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 1.7732604547404662e-05, \"lse_max_abs\": 1.2053520890731306e-05}\n{\"case\": \"boundary\", \"live\": 129, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 2.1610466049537536e-05, \"lse_max_abs\": 4.447974246701847e-06}\n{\"case\": \"boundary\", \"live\": 255, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 2.7799008487150445e-05, \"lse_max_abs\": 4.778251035730818e-06}\n{\"case\": \"boundary\", \"live\": 256, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 6.249570321781306e-05, \"lse_max_abs\": 6.6304065704514414e-06}\n{\"case\": \"boundary\", \"live\": 257, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 2.697880749380488e-05, \"lse_max_abs\": 6.067532552833654e-06}\n{\"case\": \"boundary\", \"live\": 511, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 3.364481632095462e-05, \"lse_max_abs\": 3.183379016391541e-06}\n{\"case\": \"boundary\", \"live\": 512, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 0.00010644501808698692, \"lse_max_abs\": 9.068101018527841e-06}\n{\"case\": \"boundary\", \"live\": 513, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 1.746840371419367e-05, \"lse_max_abs\": 5.205514742812056e-06}\n{\"case\": \"boundary\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 1.8488857605580833e-05, \"lse_max_abs\": 1.4017871222904432e-05}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 4.660277143386793e-05, \"lse_max_abs\": 1.059047631457588e-05}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 4.2746786842684514e-05, \"lse_max_abs\": 1.0960005909055326e-05}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 0.00012756160620597257, \"lse_max_abs\": 7.702568245449015e-06}\n{\"case\": \"masked\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 0.0, \"lse_max_abs\": 0.0}\n{\"case\": \"rewind/reappend\", \"live\": 1027, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 3.3746949677393445e-05, \"lse_max_abs\": 5.609415186569322e-06}\n{\"case\": \"boundary\", \"live\": 1, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 0.0, \"lse_max_abs\": 2.4904384332558038e-08}\n{\"case\": \"boundary\", \"live\": 127, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 6.145792834644226e-06, \"lse_max_abs\": 9.307698061178371e-07}\n{\"case\": \"boundary\", \"live\": 128, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 7.468169421542825e-06, \"lse_max_abs\": 9.692319835608032e-07}\n{\"case\": \"boundary\", \"live\": 129, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 7.133100950795779e-06, \"lse_max_abs\": 1.65903730753314e-06}\n{\"case\": \"boundary\", \"live\": 255, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 1.900578119418128e-05, \"lse_max_abs\": 2.890665157906369e-06}\n{\"case\": \"boundary\", \"live\": 256, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 1.4046177186699538e-05, \"lse_max_abs\": 7.436538833616169e-06}\n{\"case\": \"boundary\", \"live\": 257, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 2.1167758463391806e-05, \"lse_max_abs\": 3.7083032413676165e-06}\n{\"case\": \"boundary\", \"live\": 511, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 2.186810016380214e-05, \"lse_max_abs\": 3.766808127636523e-06}\n{\"case\": \"boundary\", \"live\": 512, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 3.703989819703324e-05, \"lse_max_abs\": 4.448290290781642e-06}\n{\"case\": \"boundary\", \"live\": 513, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 2.3049615261783174e-05, \"lse_max_abs\": 4.789246256464708e-06}\n{\"case\": \"boundary\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 1.46917711374428e-05, \"lse_max_abs\": 4.869595453982356e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 9.595312567611813e-06, \"lse_max_abs\": 2.942032946151585e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 2.3485984071314192e-05, \"lse_max_abs\": 8.74144337004168e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 7.126792208289601e-05, \"lse_max_abs\": 8.306267886837304e-06}\n{\"case\": \"masked\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 0.0, \"lse_max_abs\": 0.0}\n{\"case\": \"rewind/reappend\", \"live\": 1027, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 5.6589193428990825e-05, \"lse_max_abs\": 3.944807037470355e-06}\n{\"case\": \"long records\", \"live\": 28672, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 5.235957877758324e-05, \"lse_max_abs\": 7.292337972586438e-06}\nPASS cases=65 mode_runs=130 worst_out=0.000127561606 worst_lse=1.40178712e-05\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_decode_rowlane_model.py",
+        "--long",
+        "--contract"
+      ],
+      "returncode": 0,
+      "log": "cpu-16.log",
+      "output": "{\"case\": \"boundary\", \"live\": 1, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 1.1920928955078125e-07, \"lse_max_abs\": 1.4166793915748599e-06}\n{\"case\": \"boundary\", \"live\": 127, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.611818173572146e-06, \"lse_max_abs\": 1.0772637573097654e-06}\n{\"case\": \"boundary\", \"live\": 128, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 6.859168603767785e-06, \"lse_max_abs\": 1.2341414166172626e-06}\n{\"case\": \"boundary\", \"live\": 129, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 2.4451825924032278e-06, \"lse_max_abs\": 2.72583669769233e-06}\n{\"case\": \"boundary\", \"live\": 255, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 6.222362749497279e-06, \"lse_max_abs\": 1.8896631992504354e-06}\n{\"case\": \"boundary\", \"live\": 256, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 3.4415488775252356e-05, \"lse_max_abs\": 7.3708924812621035e-06}\n{\"case\": \"boundary\", \"live\": 257, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 2.6990981399244163e-05, \"lse_max_abs\": 7.890729518678086e-06}\n{\"case\": \"boundary\", \"live\": 511, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 7.224262266092296e-05, \"lse_max_abs\": 5.354885445285618e-06}\n{\"case\": \"boundary\", \"live\": 512, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.703285624430009e-05, \"lse_max_abs\": 4.891153709607465e-06}\n{\"case\": \"boundary\", \"live\": 513, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 0.00011359147481471155, \"lse_max_abs\": 9.414816291908323e-06}\n{\"case\": \"boundary\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 2.783426357311214e-05, \"lse_max_abs\": 1.3179556075826326e-05}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 6.231852363924872e-05, \"lse_max_abs\": 3.887103360966648e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.218627677232689e-05, \"lse_max_abs\": 8.668828277436091e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 5.7149751700791285e-05, \"lse_max_abs\": 5.943276862652169e-06}\n{\"case\": \"masked\", \"live\": 1025, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 0.0, \"lse_max_abs\": 0.0}\n{\"case\": \"rewind/reappend\", \"live\": 1027, \"origin\": 0, \"tail\": 0, \"out_max_abs\": 4.0822092341130656e-05, \"lse_max_abs\": 4.741871705959966e-06}\n{\"case\": \"boundary\", \"live\": 1, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 0.0, \"lse_max_abs\": 5.318353721861513e-07}\n{\"case\": \"boundary\", \"live\": 127, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.6441699816359687e-06, \"lse_max_abs\": 1.2425869684307145e-06}\n{\"case\": \"boundary\", \"live\": 128, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 4.9199257450283085e-06, \"lse_max_abs\": 1.4885896266747523e-06}\n{\"case\": \"boundary\", \"live\": 129, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.692465912446096e-06, \"lse_max_abs\": 7.16671355149856e-07}\n{\"case\": \"boundary\", \"live\": 255, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 1.5351645156869154e-05, \"lse_max_abs\": 1.1795487537824556e-06}\n{\"case\": \"boundary\", \"live\": 256, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 1.8799500853816653e-05, \"lse_max_abs\": 1.2761492449442358e-06}\n{\"case\": \"boundary\", \"live\": 257, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.7780849748637593e-05, \"lse_max_abs\": 1.1071136967188977e-06}\n{\"case\": \"boundary\", \"live\": 511, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.9478730073861925e-05, \"lse_max_abs\": 5.0570054916931895e-06}\n{\"case\": \"boundary\", \"live\": 512, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 3.7810586221098674e-05, \"lse_max_abs\": 6.960155712221194e-06}\n{\"case\": \"boundary\", \"live\": 513, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 3.3790441996472964e-05, \"lse_max_abs\": 7.921811326028205e-06}\n{\"case\": \"boundary\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 4.22197265264046e-05, \"lse_max_abs\": 4.4485164831797874e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 6.361950646027736e-05, \"lse_max_abs\": 4.721282291342277e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 7.182650433890103e-05, \"lse_max_abs\": 8.01948415940501e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 1.9975043752062938e-05, \"lse_max_abs\": 9.670018403795666e-06}\n{\"case\": \"masked\", \"live\": 1025, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 0.0, \"lse_max_abs\": 0.0}\n{\"case\": \"rewind/reappend\", \"live\": 1027, \"origin\": 0, \"tail\": 128, \"out_max_abs\": 2.7075504640095005e-05, \"lse_max_abs\": 1.0644670554782465e-05}\n{\"case\": \"boundary\", \"live\": 1, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 1.4901161193847656e-07, \"lse_max_abs\": 1.0910815733539136e-08}\n{\"case\": \"boundary\", \"live\": 127, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 6.461248904798822e-06, \"lse_max_abs\": 1.2153673800696652e-06}\n{\"case\": \"boundary\", \"live\": 128, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 1.5825255914592162e-05, \"lse_max_abs\": 1.2053520890731306e-05}\n{\"case\": \"boundary\", \"live\": 129, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 2.1610466049537536e-05, \"lse_max_abs\": 4.447974246701847e-06}\n{\"case\": \"boundary\", \"live\": 255, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 3.6382077334806695e-05, \"lse_max_abs\": 4.778251035730818e-06}\n{\"case\": \"boundary\", \"live\": 256, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 6.249570321781306e-05, \"lse_max_abs\": 6.6304065704514414e-06}\n{\"case\": \"boundary\", \"live\": 257, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 2.507145886099238e-05, \"lse_max_abs\": 6.067532552833654e-06}\n{\"case\": \"boundary\", \"live\": 511, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 3.3406397741853056e-05, \"lse_max_abs\": 3.183379016391541e-06}\n{\"case\": \"boundary\", \"live\": 512, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 0.00010453766945417442, \"lse_max_abs\": 7.160752385715341e-06}\n{\"case\": \"boundary\", \"live\": 513, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 1.7945240872396795e-05, \"lse_max_abs\": 5.205514742812056e-06}\n{\"case\": \"boundary\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 1.836964831603005e-05, \"lse_max_abs\": 1.4017871222904432e-05}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 4.660277143386793e-05, \"lse_max_abs\": 1.059047631457588e-05}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 4.1793112526278264e-05, \"lse_max_abs\": 1.0960005909055326e-05}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 0.00012756160620597257, \"lse_max_abs\": 6.748893929042765e-06}\n{\"case\": \"masked\", \"live\": 1025, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 0.0, \"lse_max_abs\": 0.0}\n{\"case\": \"rewind/reappend\", \"live\": 1027, \"origin\": 72704, \"tail\": 0, \"out_max_abs\": 3.192018284803311e-05, \"lse_max_abs\": 5.609415186569322e-06}\n{\"case\": \"boundary\", \"live\": 1, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 0.0, \"lse_max_abs\": 2.4904384332558038e-08}\n{\"case\": \"boundary\", \"live\": 127, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 6.145792834644226e-06, \"lse_max_abs\": 9.307698061178371e-07}\n{\"case\": \"boundary\", \"live\": 128, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 7.468169421542825e-06, \"lse_max_abs\": 9.692319835608032e-07}\n{\"case\": \"boundary\", \"live\": 129, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 7.133100950795779e-06, \"lse_max_abs\": 1.65903730753314e-06}\n{\"case\": \"boundary\", \"live\": 255, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 1.900578119418128e-05, \"lse_max_abs\": 2.890665157906369e-06}\n{\"case\": \"boundary\", \"live\": 256, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 1.4046177186699538e-05, \"lse_max_abs\": 5.529190200803669e-06}\n{\"case\": \"boundary\", \"live\": 257, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 2.1167758463391806e-05, \"lse_max_abs\": 3.7083032413676165e-06}\n{\"case\": \"boundary\", \"live\": 511, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 2.17137402698242e-05, \"lse_max_abs\": 4.176462088167909e-06}\n{\"case\": \"boundary\", \"live\": 512, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 3.513254956422074e-05, \"lse_max_abs\": 4.448290290781642e-06}\n{\"case\": \"boundary\", \"live\": 513, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 2.3049615261783174e-05, \"lse_max_abs\": 3.965620546608761e-06}\n{\"case\": \"boundary\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 1.46917711374428e-05, \"lse_max_abs\": 4.869595453982356e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 9.89017509844814e-06, \"lse_max_abs\": 2.942032946151585e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 2.9208029969751692e-05, \"lse_max_abs\": 8.74144337004168e-06}\n{\"case\": \"split override\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 6.459220186805226e-05, \"lse_max_abs\": 8.306267886837304e-06}\n{\"case\": \"masked\", \"live\": 1025, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 0.0, \"lse_max_abs\": 0.0}\n{\"case\": \"rewind/reappend\", \"live\": 1027, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 5.1820821846959575e-05, \"lse_max_abs\": 5.5691267917268306e-06}\n{\"case\": \"long records\", \"live\": 28672, \"origin\": 72704, \"tail\": 128, \"out_max_abs\": 5.903529899242699e-05, \"lse_max_abs\": 7.292337972586438e-06}\nPASS cases=65 mode_runs=130 worst_out=0.000127561606 worst_lse=1.40178712e-05\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_mq_i8_quality.py"
+      ],
+      "returncode": 0,
+      "log": "cpu-17.log",
+      "output": "tight live   256 dc=True  add/ref 0.076 total/ref 0.999 | rel_o_rms 9.844e-02->9.648e-02  1-cos 6.235e-03->5.960e-03  lse 1.395e-02->1.388e-02  wL1 5.522e-01->5.522e-01  PASS\ntight live   256 dc=False add/ref 0.120 total/ref 1.004 | rel_o_rms 9.844e-02->9.419e-02  1-cos 6.235e-03->5.722e-03  lse 1.395e-02->1.287e-02  wL1 5.522e-01->5.522e-01  info\nmodel live   256 dc=True  add/ref 0.076 total/ref 1.012 | rel_o_rms 1.925e-01->1.896e-01  1-cos 2.453e-02->2.393e-02  lse 1.523e-01->1.491e-01  wL1 5.649e-01->5.653e-01  PASS\nmodel live   256 dc=False add/ref 0.141 total/ref 1.014 | rel_o_rms 1.925e-01->1.899e-01  1-cos 2.453e-02->2.399e-02  lse 1.523e-01->1.471e-01  wL1 5.649e-01->5.644e-01  info\ntight live   384 dc=True  add/ref 0.070 total/ref 1.002 | rel_o_rms 1.855e-01->1.854e-01  1-cos 1.321e-02->1.331e-02  lse 5.921e-02->5.855e-02  wL1 2.546e-01->2.540e-01  PASS\ntight live   384 dc=False add/ref 0.184 total/ref 1.017 | rel_o_rms 1.855e-01->1.884e-01  1-cos 1.321e-02->1.344e-02  lse 5.921e-02->4.987e-02  wL1 2.546e-01->2.552e-01  info\nmodel live   384 dc=True  add/ref 0.071 total/ref 1.003 | rel_o_rms 2.325e-01->2.240e-01  1-cos 1.629e-02->1.683e-02  lse 2.622e-01->2.573e-01  wL1 3.970e-01->3.978e-01  PASS\nmodel live   384 dc=False add/ref 0.201 total/ref 1.025 | rel_o_rms 2.325e-01->2.557e-01  1-cos 1.629e-02->1.860e-02  lse 2.622e-01->2.827e-01  wL1 3.970e-01->3.985e-01  info\ntight live   640 dc=True  add/ref 0.062 total/ref 1.002 | rel_o_rms 2.050e-01->2.051e-01  1-cos 1.746e-02->1.766e-02  lse 3.179e-02->3.206e-02  wL1 2.085e-01->2.084e-01  PASS\ntight live   640 dc=False add/ref 0.130 total/ref 1.006 | rel_o_rms 2.050e-01->2.083e-01  1-cos 1.746e-02->1.796e-02  lse 3.179e-02->3.004e-02  wL1 2.085e-01->2.089e-01  info\nmodel live   640 dc=True  add/ref 0.066 total/ref 1.003 | rel_o_rms 2.574e-01->2.540e-01  1-cos 1.032e-02->1.042e-02  lse 9.716e-02->9.752e-02  wL1 5.136e-01->5.137e-01  PASS\nmodel live   640 dc=False add/ref 0.179 total/ref 1.005 | rel_o_rms 2.574e-01->2.871e-01  1-cos 1.032e-02->1.173e-02  lse 9.716e-02->1.043e-01  wL1 5.136e-01->5.192e-01  info\ntight live  1920 dc=True  add/ref 0.071 total/ref 1.003 | rel_o_rms 1.822e-01->1.843e-01  1-cos 1.624e-02->1.672e-02  lse 2.678e-02->2.643e-02  wL1 1.373e-01->1.386e-01  PASS\ntight live  1920 dc=False add/ref 0.185 total/ref 1.020 | rel_o_rms 1.822e-01->1.859e-01  1-cos 1.624e-02->1.634e-02  lse 2.678e-02->3.089e-02  wL1 1.373e-01->1.402e-01  info\n        - lse_abs_max grew past 1.15x the shipped error\nmodel live  1920 dc=True  add/ref 0.069 total/ref 1.004 | rel_o_rms 1.735e-01->1.698e-01  1-cos 1.749e-02->1.617e-02  lse 3.461e-01->3.328e-01  wL1 1.142e-01->1.113e-01  PASS\nmodel live  1920 dc=False add/ref 0.179 total/ref 1.018 | rel_o_rms 1.735e-01->1.695e-01  1-cos 1.749e-02->1.464e-02  lse 3.461e-01->3.467e-01  wL1 1.142e-01->1.240e-01  info\ntight live  4096 dc=True  add/ref 0.074 total/ref 1.003 | rel_o_rms 2.082e-01->2.068e-01  1-cos 1.767e-02->1.753e-02  lse 1.780e-02->1.762e-02  wL1 1.289e-01->1.295e-01  PASS\ntight live  4096 dc=False add/ref 0.200 total/ref 1.024 | rel_o_rms 2.082e-01->2.246e-01  1-cos 1.767e-02->2.054e-02  lse 1.780e-02->2.133e-02  wL1 1.289e-01->1.355e-01  info\n        - one_minus_cos grew past 1.15x the shipped error\n        - lse_abs_max grew past 1.15x the shipped error\nmodel live  4096 dc=True  add/ref 0.074 total/ref 1.003 | rel_o_rms 2.091e-01->2.131e-01  1-cos 1.346e-02->1.372e-02  lse 2.629e-01->2.666e-01  wL1 2.119e-01->2.151e-01  PASS\nmodel live  4096 dc=False add/ref 0.202 total/ref 1.020 | rel_o_rms 2.091e-01->2.228e-01  1-cos 1.346e-02->1.794e-02  lse 2.629e-01->2.385e-01  wL1 2.119e-01->2.133e-01  info\n        - one_minus_cos grew past 1.15x the shipped error\nrkva_mq_i8_quality: 10 gated cases (dc exact, 8 queries each), PASS\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_mq_i8_lane_model.py"
+      ],
+      "returncode": 0,
+      "log": "cpu-18.log",
+      "output": "tight live   256 fast=[0,128)  algebra out 2.21e-02 lse 5.95e-03\n    shipped  \"slice\"        out    4.255 lse    69.73 bias -6.25e+00   (   193x algebra)\n    fix      per_lane       out 2.21e-02 lse 5.95e-03 bias -1.16e-04   (  1.00x algebra)\n    fix      slice_split    out 2.21e-02 lse 5.95e-03\nmodel live   256 fast=[0,128)  algebra out 1.05e-01 lse 2.51e-02\n    shipped  \"slice\"        out    9.804 lse   247.33 bias +3.76e+00   (    93x algebra)\n    fix      per_lane       out 1.05e-01 lse 2.51e-02 bias -7.02e-04   (  1.00x algebra)\n    fix      slice_split    out 1.05e-01 lse 2.51e-02\ntight live   384 fast=[0,256)  algebra out 2.39e-02 lse 9.19e-03\n    shipped  \"slice\"        out    6.639 lse    78.00 bias +2.83e+00   (   278x algebra)\n    fix      per_lane       out 2.39e-02 lse 9.19e-03 bias +1.45e-04   (  1.00x algebra)\n    fix      slice_split    out 2.39e-02 lse 9.20e-03\nmodel live   384 fast=[0,256)  algebra out 3.10e-02 lse 3.80e-02\n    shipped  \"slice\"        out   22.574 lse   117.86 bias -2.71e+00   (   729x algebra)\n    fix      per_lane       out 3.10e-02 lse 3.80e-02 bias +1.77e-04   (  1.00x algebra)\n    fix      slice_split    out 3.10e-02 lse 3.80e-02\ntight live   640 fast=[0,512)  algebra out 8.33e-03 lse 3.28e-03\n    shipped  \"slice\"        out    6.220 lse    73.42 bias +1.85e+00   (   747x algebra)\n    fix      per_lane       out 8.33e-03 lse 3.28e-03 bias -1.61e-04   (  1.00x algebra)\n    fix      slice_split    out 8.33e-03 lse 3.28e-03\nmodel live   640 fast=[0,512)  algebra out 1.89e-01 lse 2.06e-02\n    shipped  \"slice\"        out   22.446 lse    84.18 bias -8.78e-01   (   119x algebra)\n    fix      per_lane       out 1.89e-01 lse 2.06e-02 bias -6.23e-06   (  1.00x algebra)\n    fix      slice_split    out 1.89e-01 lse 2.06e-02\ntight live  1920 fast=[0,1792)  algebra out 2.71e-02 lse 3.72e-03\n    shipped  \"slice\"        out    6.552 lse   140.89 bias +6.52e+00   (   241x algebra)\n    fix      per_lane       out 2.71e-02 lse 3.72e-03 bias -6.83e-05   (  1.00x algebra)\n    fix      slice_split    out 2.71e-02 lse 3.72e-03\nmodel live  1920 fast=[0,1792)  algebra out 5.54e-02 lse 6.46e-02\n    shipped  \"slice\"        out   23.394 lse   184.61 bias +1.82e-01   (   422x algebra)\n    fix      per_lane       out 5.54e-02 lse 6.46e-02 bias +1.97e-04   (  1.00x algebra)\n    fix      slice_split    out 5.54e-02 lse 6.46e-02\nrkva_mq_i8_lane_model: 8 cases, PASS\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_kvarn4_mq_partition_model.py"
+      ],
+      "returncode": 0,
+      "log": "cpu-19.log",
+      "output": "live=58128 ptt=  0 nq=3: shared record rows 58112 (99.97%), per-query residual <= 16 rows\nlive=58128 ptt=  0 nq=5: shared record rows 58112 (99.97%), per-query residual <= 16 rows\nlive=58128 ptt=  0 nq=9: shared record rows 58112 (99.97%), per-query residual <= 16 rows\nlive=58128 ptt=128 nq=3: shared record rows 57998 (99.78%), per-query residual <= 130 rows\nlive=58128 ptt=128 nq=5: shared record rows 57996 (99.77%), per-query residual <= 132 rows\nlive=58128 ptt=128 nq=9: shared record rows 57992 (99.77%), per-query residual <= 136 rows\norigin=    0 ptt=  0: worst per-query residual 263 rows\norigin=    0 ptt=128: worst per-query residual 264 rows\norigin=72704 ptt=  0: worst per-query residual 135 rows\norigin=72704 ptt=128: worst per-query residual 136 rows\n1860 tile configurations have rows whose representation differs between queries (handled per query, never shared)\nrkva_kvarn4_mq_partition_model: ok (MQ2 and MQ4 verified)\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_kvarn4_mq_split_model.py"
+      ],
+      "returncode": 0,
+      "log": "cpu-20.log",
+      "output": "MQ split oracle: passed counts=[1, 7, 8, 9, 127, 128, 129, 255, 256, 257, 513] max_scaled_O=3.481e-07 max_LSE=5.133e-07\n"
+    }
+  ],
+  "python_and_dxil": [
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/xbox/tests",
+        "-p",
+        "test_rkva*.py"
+      ],
+      "returncode": 0,
+      "output": "............................\n----------------------------------------------------------------------\nRan 28 tests in 0.010s\n\nOK\n"
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/xbox/tests",
+        "-p",
+        "test_gpupeak*.py"
+      ],
+      "returncode": 0,
+      "output": ".....\n----------------------------------------------------------------------\nRan 5 tests in 1.440s\n\nOK\n"
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/xbox/tests",
+        "-p",
+        "test_bench*.py"
+      ],
+      "returncode": 0,
+      "output": "................................................\n----------------------------------------------------------------------\nRan 48 tests in 0.054s\n\nOK\n"
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/xbox/tests",
+        "-p",
+        "test_run_rkva*.py"
+      ],
+      "returncode": 0,
+      "output": ".....................\n----------------------------------------------------------------------\nRan 21 tests in 0.001s\n\nOK\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_mq_i8_dxil_model.py",
+        "/tmp/rkva-final-validation/int8.txt",
+        "--require-uniform-reads"
+      ],
+      "returncode": 0,
+      "output": "live=256 kv=0 wave=0 fast=120 max_score_error=2.44e-06\nlive=256 kv=0 wave=1 fast=120 max_score_error=3.81e-06\nlive=256 kv=3 wave=0 fast=120 max_score_error=2.86e-06\nlive=256 kv=3 wave=1 fast=120 max_score_error=4.77e-06\nlive=384 kv=0 wave=0 fast=248 max_score_error=5.01e-06\nlive=384 kv=0 wave=1 fast=248 max_score_error=5.72e-06\nlive=384 kv=3 wave=0 fast=248 max_score_error=8.34e-06\nlive=384 kv=3 wave=1 fast=248 max_score_error=6.91e-06\nrkva_mq_i8_dxil_model: 8832 scores, max error 8.34e-06, PASS\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_decode_rowlane_dxil_audit.py",
+        "/tmp/rkva-final-validation/rowlane.txt"
+      ],
+      "returncode": 0,
+      "output": "PASS 96 broadcasts, 10 uniform index expressions; lane-dependent negative rejected\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/tests/rkva_dxil_loop_cost.py",
+        "/tmp/rkva-final-validation/int8.txt"
+      ],
+      "returncode": 0,
+      "output": "== int8.txt\n   loop header %4190  body blocks 63  dot-units/iter 96 (dot4 0, dp4a 96)  rows/iter 8\n   per-iteration (8 rows; branch arms counted statically):\n     fma_class     1586   reduce_add    144   reduce_shfl    240   sfu   120\n     cvt             74   loads          28   stores           0   barrier     0\n     LDS ops          0 (latency/bank conflicts not modeled)\n     int/misc       638   branch         87   cbuf             2   TOTAL    2919\n   per KV row:  TOTAL 364.9   fma_class 198.2   reduce 48.0   sfu 15.0   int 90.6\n   useful FMA per row (QK+PV)  96.0  => 48.4% of fma_class, 26.3% of TOTAL\n\n"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/xbox/scripts/compile-gpupeak-shaders.py",
+        "--check"
+      ],
+      "returncode": 0,
+      "output": "wave_prefix64  ok 101adfef6dff4179\nwave_multi65   ok 101adfef6dff4179\nwave_match65   ok 101adfef6dff4179\nwave_quad66    ok 101adfef6dff4179\nstream_read    ok af927db141454e30\nstream_write   ok af927db141454e30\nstream_copy    ok af927db141454e30\nfma_f32        ok d71e5c2efae1f95e\nfma_f16        ok d71e5c2efae1f95e\nfma_f16_min16  ok d71e5c2efae1f95e\ndot2_f16       ok d71e5c2efae1f95e\ndot4_i8        ok d71e5c2efae1f95e\nlatency_fma    ok d71e5c2efae1f95e\ncu_probe_32    ok d71e5c2efae1f95e\ncu_probe_16    ok d71e5c2efae1f95e\nempty          ok a9dac8c6b8188592\n"
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/xbox/tests",
+        "-p",
+        "test_*.py"
+      ],
+      "returncode": 1,
+      "output": ".....................................................E.................................................E\n======================================================================\nERROR: test_make_shape_gguf (unittest.loader._FailedTest.test_make_shape_gguf)\n----------------------------------------------------------------------\nImportError: Failed to import test module: test_make_shape_gguf\nTraceback (most recent call last):\n  File \"/usr/lib/python3.14/unittest/loader.py\", line 433, in _find_test_path\n    module = self._get_module_from_name(name)\n  File \"/usr/lib/python3.14/unittest/loader.py\", line 374, in _get_module_from_name\n    __import__(name)\n    ~~~~~~~~~~^^^^^^\n  File \"/home/hjotha/beellama-agents/final/tools/xbox/tests/test_make_shape_gguf.py\", line 15, in <module>\n    _spec.loader.exec_module(msg)\n    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^\n  File \"<frozen importlib._bootstrap_external>\", line 755, in exec_module\n  File \"<frozen importlib._bootstrap_external>\", line 892, in get_code\n  File \"<frozen importlib._bootstrap_external>\", line 950, in get_data\nFileNotFoundError: [Errno 2] No such file or directory: '/home/hjotha/beellama-agents/final/tools/xbox/scripts/make-shape-gguf.py'\n\n\n======================================================================\nERROR: test_validate_mtp_protocol (unittest.loader._FailedTest.test_validate_mtp_protocol)\n----------------------------------------------------------------------\nImportError: Failed to import test module: test_validate_mtp_protocol\nTraceback (most recent call last):\n  File \"/usr/lib/python3.14/unittest/loader.py\", line 433, in _find_test_path\n    module = self._get_module_from_name(name)\n  File \"/usr/lib/python3.14/unittest/loader.py\", line 374, in _get_module_from_name\n    __import__(name)\n    ~~~~~~~~~~^^^^^^\n  File \"/home/hjotha/beellama-agents/final/tools/xbox/tests/test_validate_mtp_protocol.py\", line 31, in <module>\n    import scripts.validate_mtp_protocol as vmp\nModuleNotFoundError: No module named 'scripts.validate_mtp_protocol'\n\n\n----------------------------------------------------------------------\nRan 104 tests in 1.394s\n\nFAILED (errors=2)\n",
+      "note": "Two pre-existing missing scripts; 102 relevant tests separately pass."
+    }
+  ],
+  "static": [
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "returncode": 0,
+      "output": ""
+    },
+    {
+      "command": [
+        "bash",
+        "-n",
+        "tools/xbox/scripts/compile-rkva-range-shaders.sh"
+      ],
+      "returncode": 0,
+      "output": ""
+    },
+    {
+      "command": [
+        "git",
+        "ls-files",
+        ".oc-artifacts"
+      ],
+      "returncode": 0,
+      "output": ""
+    },
+    {
+      "command": [
+        "git",
+        "grep",
+        "-n",
+        "-E",
+        "RESCALE_SKIP|rescale_skip|fence_spin|rkva-fence-spin|MASKED_REDUCE_PROBE|F32_PROBE|lane \\^ st([^[:alnum:]_]|$)",
+        "--",
+        ":!docs/agent-reports"
+      ],
+      "returncode": 1,
+      "output": ""
+    },
+    {
+      "command": [
+        "git",
+        "grep",
+        "-n",
+        "-E",
+        "RKVA_FENCE_SPIN|allow_spin|RKVA_EXTRA_DEFINES|RKVA_MQ_I8_MEASURE|f32-probe|rkva-decode-rowlane.flag",
+        "--",
+        ":!docs/agent-reports"
+      ],
+      "returncode": 1,
+      "output": ""
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "8ac3e9d10",
+        "--",
+        "ggml/src/ggml-cuda",
+        "tests/test-cuda-graph-guard.cpp"
+      ],
+      "returncode": 0,
+      "output": ""
+    }
+  ],
+  "final_sweep_self_tests": "self-test: OK (4 shapes, 3 fail-closed paths, aggregation)\nself-test: OK (4 shapes, 3 fail-closed paths, aggregation)\n",
+  "payload_audit": "{\"header\": \"gpupeak_wave_match65_dxil.h\", \"bytes\": 3156, \"sha256\": \"724e76718cac208ad8257aed470197f0106abf97cde1fa65f3e4d13d5d752096\", \"reference\": \"int8-codex/fix/rkva-int8-records-codex-20261026\", \"reference_identical\": true}\n{\"header\": \"gpupeak_wave_multi65_dxil.h\", \"bytes\": 3532, \"sha256\": \"d0ad1834e34bf0c63cf84899b58a12e1fd21f42e39597354960dddf0cd5bf209\", \"reference\": \"int8-codex/fix/rkva-int8-records-codex-20261026\", \"reference_identical\": true}\n{\"header\": \"gpupeak_wave_prefix64_dxil.h\", \"bytes\": 3636, \"sha256\": \"0a6254c5ac30383a32d61aeae38862769235303d29350afd959aefab96b86cd1\", \"reference\": \"int8-codex/fix/rkva-int8-records-codex-20261026\", \"reference_identical\": true}\n{\"header\": \"gpupeak_wave_quad66_dxil.h\", \"bytes\": 3728, \"sha256\": \"938ad6c7347c7fa7406d97c90137bd52451ca53a8069f73b2a6f360509ae5a40\", \"reference\": \"int8-codex/fix/rkva-int8-records-codex-20261026\", \"reference_identical\": true}\n{\"header\": \"rkva_range_attn_kvarn4_decode_rowlane_dxil.h\", \"bytes\": 49696, \"sha256\": \"0668df8afce0288fae460a2bed5e0922b88d80a07a415be1a706927fc22fa644\", \"reference\": \"decode-kernel/perf/rkva-decode-rowlane-20261026\", \"reference_identical\": true}\n{\"header\": \"rkva_range_attn_kvarn4_mq2_i8_dxil.h\", \"bytes\": 140356, \"sha256\": \"a2b66069596fe3b8111dd19d99b4b65a652b2b2e376f44014015ade13f2c2d3f\", \"base_identical\": false, \"reference\": \"int8-codex/fix/rkva-int8-records-codex-20261026\", \"reference_identical\": true}\nPASS: 101 payloads; 95 unchanged vs base; 1 intentional replacement; 5 additions equal source branches\n"
+}

@@ -71,6 +71,50 @@ nibble com os dims da lane 0); foi esse cruzamento que o expôs, não a inspeç�
 porque o quantizador fica fora do laço medido. Pendente: recompilar o pacote e
 rodar oráculo + sweep no console.
 
+## 0.2 Segunda rodada de hardware (pacote 299) — defeito NÃO resolvido
+
+O pacote 299 (correção da constante por slice) melhorou e **continua quebrado**:
+o oráculo passa todos os casos cujo tile rápido de registros fica vazio
+(`live <= 129`) e reprova os 40 casos `ptt=128` que entram nele — `out_max_abs`
+15,7–69,3 e `lse_max_abs` 12,4–50,5 (antes 31,9–77,9 / 414–831), sempre no bucket
+`kvarn4_mq2_i8`.
+
+**Não encontrei o defeito nesta rodada.** O que consegui descartar com evidência:
+
+1. **O caminho de score INT8 está provadamente certo.** O emulador lane a lane
+   reproduz a álgebra de 128 dims com 1,8e-7 sobre os registros *do próprio
+   probe*, e a álgebra reproduz o decode do registro com 0,016 de rms em scores
+   de rms 2,3 (0,7%).
+2. **A reestruturação fora do tile está certa.** Os casos `live <= 129` passam:
+   neles `fast_hi <= fast_lo` e o bloco INT8 nunca executa — então remover a Q
+   rotacionada residente, o laço por grupo e o reload direto de Q no laço
+   residual estão validados em hardware.
+3. **O artefato compilado é o fonte corrigido**: 229 `waveReadLaneAt` = 192 do
+   tile + 36 de um único reduce de 3 passos no quantizador + 1, ou seja só `mx`
+   continua reduzido.
+4. **Não é multiplicidade da constante.** Varredura k = 1,5…8 (tabela em
+   `docs/rkva-prefill-int8-dot4.md`) dá lse 13→246 e out saturado em 48,3; o
+   console dá 15,70/16,06.
+5. **Não é slice errado** para `other`/`scale`/`zero`/nibbles, nem base de dim
+   errada para a Q, nem redução de 64 lanes, nem broadcast da lane 0, nem linha
+   trocada no PV (tabela idem).
+
+O modelo tem histórico preditivo: para o defeito *anterior* (constante ×8) ele
+previu 59,2/260 em `boundary 256 nq=9` onde o console mediu 54,1/414. Agora ele
+prevê 0,199/0,111 onde o console mede 15,70/16,06 — um fator 79 que nenhuma
+perturbação de score que eu consiga construir reproduz.
+
+**Bisect de uma rodada** (entregue): reconstruir o *mesmo* PSO com o mapeamento
+16 dims/16 lanes, o laço por grupo, o caminho V/PV e o softmax intactos, mas com
+score exato em F32 (`RKVA_MQ_I8_F32_PROBE=1`). Se ficar exato no console
+(~1e-5), o mapeamento e a reestruturação estão certos e o problema é a
+aritmética int8; se reproduzir 15–70, o mapeamento ou o PV desse bloco é o
+culpado. Qualquer um dos dois resultados corta o espaço de busca pela metade.
+Comando em `docs/rkva-prefill-int8-dot4.md` §"One-run bisect".
+
+**Recomendação:** não ligar `rkva-mq-i8.flag` em build de usuário até fechar
+isto. O ganho medido (−30,7% em `pass1`) é real, mas a variante não está pronta.
+
 ## 0. Veredito curto
 
 * A variante existe e compila: PSO separado `attn_kvarn4_mq2_i8`, `cs_6_4`,
