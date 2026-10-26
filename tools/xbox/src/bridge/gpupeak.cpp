@@ -743,13 +743,8 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
 
     // --- Feature support ---------------------------------------------------
     {
-        D3D12_FEATURE_DATA_D3D12_OPTIONS options12 = {};
-        if (SUCCEEDED(drv.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options12,
-                                                      sizeof(options12)))) {
-            result.device.max_lds_bytes = options12.MaxComputeSharedMemorySize;
-        } else {
-            result.device.feature_error = "D3D12_FEATURE_D3D12_OPTIONS unavailable";
-        }
+        // D3D12 has no queryable groupshared limit: it is fixed by the API.
+        result.device.max_lds_bytes = D3D12_CS_TGSM_REGISTER_COUNT * 4u;
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1 = {};
         if (SUCCEEDED(drv.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1,
                                                       sizeof(options1)))) {
