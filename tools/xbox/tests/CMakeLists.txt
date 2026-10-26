@@ -35,6 +35,7 @@ add_executable(xllama-tests
     test_membw.cpp
     test_diskbw.cpp
     test_gpubw.cpp
+    test_gpupeak.cpp
     test_gpugemv.cpp
     test_gpustep.cpp
     test_ggml_d3d12.cpp
@@ -70,3 +71,11 @@ target_compile_definitions(xllama-tests PRIVATE
     PARITY_GOLDEN_BIN="${CMAKE_CURRENT_SOURCE_DIR}/golden/logits-smol-short.bin")
 
 add_test(NAME xllama-tests COMMAND xllama-tests)
+
+# Pure-Python roofline model for the GPU ceiling suite. No hardware, no numpy:
+# it pins the pass1 FLOP/byte accounting and the probe-JSON contract.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME xllama-ceiling-roofline
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_rkva_ceiling_roofline.py)
+endif()

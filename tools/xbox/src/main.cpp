@@ -13,6 +13,7 @@
     #include "xllama/diskbw.h"
     #include "xllama/gpubw.h"
     #include "xllama/gpugemv.h"
+    #include "xllama/gpupeak.h"
     #include "xllama/gpustep.h"
     #include "xllama/membw.h"
     #include "xllama/ramceil.h"
@@ -257,6 +258,18 @@ int main(int argc, char** argv) {
         std::printf("%s%s", xllama::gpubw_csv_header(),
                     xllama::format_gpubw_row(r, "host").c_str());
         return r.d3d12_ran && r.checksum_ok ? 0 : 0; // always 0: non-Windows is expected
+    }
+
+    // --gpupeak: GPU ceiling suite. Linux has no D3D12 device, so this prints
+    // the honest unavailable result and the exact plan the console will run.
+    if (params.run_gpupeak) {
+        const xllama::GpupeakResult r =
+            xllama::measure_gpupeak(xllama::GpupeakOptions{});
+        std::printf("gpupeak d3d12_ran=%d rows=%zu error=%s\n", r.d3d12_ran ? 1 : 0,
+                    r.rows.size(), r.error.empty() ? "-" : r.error.c_str());
+        std::printf("%s", xllama::gpupeak_options_summary(xllama::GpupeakOptions{}).c_str());
+        std::printf("\n");
+        return 0;
     }
 
     // --gpugemv: Phase 15 H6.2 (#228). Host tiny-tile wave32 TDD (Linux: d3d12 unavailable).

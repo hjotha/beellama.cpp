@@ -43,6 +43,11 @@ void run_diskbw();
 // Kill criterion 100 GB/s is documented in docs/phase15-re-opt.md — not invented here.
 void run_gpubw();
 
+// GPU ceiling suite: STREAM read/write/copy, ALU peak, empty-dispatch latency
+// and LDS-limited occupancy. Triggered by LocalFolder\gpupeak.flag; writes
+// gpupeak-result.json (+ .done). Options: LocalState\gpupeak-opts.txt.
+void run_gpupeak();
+
 // Phase 15 H6.2 (#228): Q4_K GEMV density probe (wave32 + naive A/B).
 // Triggered by LocalFolder\gpugemv.flag; writes gpugemv-result.csv (+ .done even
 // on partial PSO failure). Soft G2 40 GB/s packed, K1=8; not a product backend.

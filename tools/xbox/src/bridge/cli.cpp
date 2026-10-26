@@ -49,6 +49,9 @@ static void print_help(const char* prog) {
                  "      --gpugemv        Phase 15 H6.2 (#228) Q4_K GEMV density probe\n"
                  "                       (host: tiny-tile wave32 TDD; Linux reports d3d12\n"
                  "                       unavailable — no fake GB/s. Console A/B is gpugemv.flag)\n"
+                 "      --gpupeak        GPU ceiling suite (stream/ALU/dispatch latency/\n"
+                 "                       occupancy) with GPU timestamps; Linux reports d3d12\n"
+                 "                       unavailable. Console run is gpupeak.flag\n"
                  "      --gpu-layers <n> GGUF layers on the d3d12 backend (0 = CPU; Windows\n"
                  "                       only — Linux has no D3D12 device and stays on CPU)\n"
                  "      --gpustep        GGUF GPU decode probe D1 (docs/gguf-gpu-decode.md):\n"
@@ -127,6 +130,7 @@ bool parse_cli_args(int argc, char** argv, InferenceParams& out) {
         {"gpustep", no_argument, nullptr, 26},
         {"gpustep-verdict", required_argument, nullptr, 27},
         {"gpu-layers", required_argument, nullptr, 28},
+        {"gpupeak", no_argument, nullptr, 29},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}};
 
@@ -235,6 +239,9 @@ bool parse_cli_args(int argc, char** argv, InferenceParams& out) {
         case 28:
             out.n_gpu_layers = std::atoi(optarg);
             break;
+        case 29:
+            out.run_gpupeak = true;
+            break;
         case 'h':
             print_help(argv[0]);
             std::exit(0);
@@ -244,13 +251,16 @@ bool parse_cli_args(int argc, char** argv, InferenceParams& out) {
         }
     }
 
-    // --membw / --gpubw / --gpugemv / --gpustep / --diskbw / --ramceil / train-job / --embed:
+    // --membw / --gpubw / --gpugemv / --gpupeak / --gpustep / --diskbw / --ramceil /
+    // train-job / --embed:
     // model/prompt not required.
     if (out.run_membw)
         return true;
     if (out.run_gpubw)
         return true;
     if (out.run_gpugemv)
+        return true;
+    if (out.run_gpupeak)
         return true;
     if (out.run_gpustep || !out.gpustep_verdict_csv.empty())
         return true;

@@ -166,3 +166,6 @@ AGENTS.local.md
 
 # Local benchmark runs and serialized KV snapshots
 /bench-results/
+
+# Local agent measurement artifacts (never committed)
+.oc-artifacts/
