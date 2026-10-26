@@ -29,6 +29,12 @@
 #else
     #define RKVA_HAS_KVARN4_MQ4_DXIL 0
 #endif
+#if __has_include("rkva_range_attn_kvarn4_mq2_skip_dxil.h")
+    #include "rkva_range_attn_kvarn4_mq2_skip_dxil.h"
+    #define RKVA_HAS_KVARN4_MQ2_SKIP_DXIL 1
+#else
+    #define RKVA_HAS_KVARN4_MQ2_SKIP_DXIL 0
+#endif
 #include "rkva_range_attn_kvarn4_opt_dxil.h"
 #include "rkva_range_attn_kvarn4_opt_prefix_dxil.h"
 #if __has_include("rkva_range_attn_kvarn4_decode_prefix_dxil.h")
@@ -863,6 +869,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
                       rp::kKvarn4MqWaveLanes, wave_lane_min_);
         kvarn4_mq_status_ = text;
         kvarn4_mq4_status_ = text;
+        kvarn4_mq_skip_status_ = text;
     } else {
         D3D12_COMPUTE_PIPELINE_STATE_DESC mq = {};
         mq.pRootSignature = range_attn_fmt_opt_root_.Get();
@@ -889,6 +896,25 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         }
 #else
         kvarn4_mq4_status_ = "dxil header not generated (compile attn_kvarn4_mq4)";
+#endif
+#if RKVA_HAS_KVARN4_MQ2_SKIP_DXIL
+        // Same root signature and shape as attn_kvarn4_mq2; only the online
+        // softmax rescale is elided when the running maximum does not grow.
+        mq.pRootSignature = range_attn_fmt_opt_root_.Get();
+        mq.CS = {g_rkva_range_attn_kvarn4_mq2_skip_dxil,
+                 sizeof(g_rkva_range_attn_kvarn4_mq2_skip_dxil)};
+        hr = device_->CreateComputePipelineState(&mq,
+                                                 IID_PPV_ARGS(&range_attn_kvarn4_mq_skip_pso_));
+        if (FAILED(hr)) {
+            std::snprintf(text, sizeof(text), "kvarn4 mq2 rescale-skip pipeline state: 0x%08X",
+                          unsigned(hr));
+            range_attn_kvarn4_mq_skip_pso_.Reset();
+            kvarn4_mq_skip_status_ = text;
+        } else {
+            kvarn4_mq_skip_status_ = "ready";
+        }
+#else
+        kvarn4_mq_skip_status_ = "dxil header not generated (compile attn_kvarn4_mq2_skip)";
 #endif
     }
     // Native KVarN4 revision-3 wave64 decode kernel (nq == 1, 12 KiB LDS):
@@ -1064,6 +1090,9 @@ void RemoteAttnEngine::finish_profile_sample(rp::Sample& sample, bool timestamps
                     ++c.kvarn4_decode_calls;
                 } else if (sample.q_tile == rp::kKvarn4MqTile) {
                     ++c.kvarn4_mq_calls;
+                    if (sample.rescale_skip) {
+                        ++c.kvarn4_mq_skip_calls;
+                    }
                 } else if (sample.q_tile == rp::kKvarn4MqTileMax) {
                     ++c.kvarn4_mq4_calls;
                 }
@@ -1219,6 +1248,12 @@ std::string RemoteAttnEngine::get_range_profile_json() {
     header.kvarn4_mq4_status =
         header.kvarn4_prefix_available[1]
             ? kvarn4_mq4_status_
+            : "requires the kvarn4 serial-prefix optimized pipeline: " + kvarn4_opt_prefix_status_;
+    header.kvarn4_mq_skip_available =
+        header.kvarn4_mq_available && range_attn_kvarn4_mq_skip_pso_;
+    header.kvarn4_mq_skip_status =
+        header.kvarn4_mq_available
+            ? kvarn4_mq_skip_status_
             : "requires the kvarn4 serial-prefix optimized pipeline: " + kvarn4_opt_prefix_status_;
     header.kvarn4_decode_available =
         header.kvarn4_prefix_available[1] && range_attn_kvarn4_decode_prefix_pso_;
@@ -2312,6 +2347,7 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
         attn_sample.split_k = seg.split_k;
         attn_sample.groups = seg.groups;
         attn_sample.q_tile = seg.q_tile;
+        attn_sample.rescale_skip = seg.rescale_skip;
         attn_sample.decode_opt = seg.decode_opt;
         attn_sample.n_tokens = seg.n_queries;
         attn_sample.rows = seg.active_count;
@@ -3051,6 +3087,13 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                         ? range_attn_kvarn4_mq4_pso_.Get()
                         : (q_tile == rp::kKvarn4MqTile ? range_attn_kvarn4_mq_pso_.Get() : nullptr);
                 if (mq_pso) {
+                    // Opt-in (default off): the 2-query tile may use the bit-exact
+                    // rescale-elision PSO. It computes the same values, so the
+                    // negotiated mode and wire contract are unchanged.
+                    if (q_tile == rp::kKvarn4MqTile && mq_rescale_skip_ &&
+                        range_attn_kvarn4_mq_skip_pso_) {
+                        mq_pso = range_attn_kvarn4_mq_skip_pso_.Get();
+                    }
                     fmt_pso = mq_pso;
                 } else {
                     q_tile = 0;
@@ -3158,6 +3201,9 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             sample.groups = geo_.n_head_kv * query_groups * split_k;
             sample.q_tile = uint8_t(q_tile);
             sample.decode_opt = uint8_t(decode_opt ? 1 : 0);
+            sample.rescale_skip =
+                uint8_t(mq_rescale_skip_ && q_tile == rp::kKvarn4MqTile &&
+                        range_attn_kvarn4_mq_skip_pso_ ? 1 : 0);
         }
         if (bulk_prof) {
             auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
@@ -3167,6 +3213,9 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             seg.groups = geo_.n_head_kv * query_groups * split_k;
             seg.q_tile = uint8_t(q_tile);
             seg.decode_opt = uint8_t(decode_opt ? 1 : 0);
+            seg.rescale_skip =
+                uint8_t(mq_rescale_skip_ && q_tile == rp::kKvarn4MqTile &&
+                        range_attn_kvarn4_mq_skip_pso_ ? 1 : 0);
         }
         if (!bulk_gpu_query_) {
             cmd_->CopyBufferRegion(range_readback_.resource.Get(), 0, range_output_.resource.Get(),
