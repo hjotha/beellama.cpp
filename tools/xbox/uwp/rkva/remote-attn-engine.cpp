@@ -425,6 +425,7 @@ bool RemoteAttnEngine::submit(std::string* error) {
         rp::Counters& c = profile_->recorder.counters;
         ++c.submits;
         ++(blocked ? c.fence_blocking_waits : c.fence_already_complete);
+        c.fence_spin_budget_us = uint64_t(fence_spin_budget_us());
     }
     if (blocked) {
         const int64_t spin_budget_us = fence_spin_budget_us();
