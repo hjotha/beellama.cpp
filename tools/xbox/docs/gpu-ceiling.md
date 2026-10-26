@@ -39,16 +39,17 @@ and never as the GPU frequency.
 1. **stream** — 256 MiB by default (`stream_bytes=`, `run_big_stream=1` adds a
    1 GiB pass). Three kernels: pure read (`uint4` loads, XOR reduced), pure
    write, and copy. The write kernel stamps a deterministic pattern; a separate
-   untimed read pass XOR-folds the per-group sums on the host and compares with
-   `gpupeak_pattern_xor()`, so a read/copy rate is only reported when the whole
-   buffer provably flowed through the kernel. Copy reports `2 * bytes` of
-   traffic.
+   untimed read pass XOR-folds one accumulator per flat thread on the host and
+   compares with `gpupeak_pattern_xor()`, so a read/copy rate is only reported
+   when the whole buffer provably flowed through the kernel. Copy reports
+   `2 * bytes` of traffic.
 2. **alu** — `fma_f32` (8 independent FP32 FMA chains), `fma_f16`
-   (`-enable-16bit-types`, packed `half2`), `dot2_f16` (`dot2add`, SM 6.4),
-   `dot4_i8` (`dot4add_i8packed`, SM 6.4). Each is swept over
-   52/104/208/416/832/1664 groups of 64 threads, so the peak *and* the occupancy
-   knee are visible. A dispatch that cannot create its PSO (older shader model
-   support) is reported in `pso_errors`, never faked.
+   (`-enable-16bit-types`, packed `half2`), `fma_f16_min16` (relaxed
+   `min16float2`, `cs_6_0`, a driver-acceptance data point), `dot2_f16`
+   (`dot2add`, SM 6.4), `dot4_i8` (`dot4add_i8packed`, SM 6.4). Each is swept
+   over 52/104/208/416/832/1664 groups of 64 threads, so the peak *and* the
+   occupancy knee are visible. A dispatch that cannot create its PSO (older
+   shader model support) is reported in `pso_errors`, never faked.
 3. **latency** — a near-empty dispatch (`empty`): GPU time per dispatch
    (min/p50/p95), CPU submit+fence wall, readback `Map` cost, and the amortized
    per-dispatch GPU cost of 64 dispatches in one list. This is the per-call
@@ -60,9 +61,15 @@ and never as the GPU frequency.
    (`rkva_ceiling_roofline.fit_concurrency`) and the two estimates must agree
    within 15%, otherwise the CU count is withheld.
 
-A dependent-FMA chain (`latency_fma`) gives an *implied* shader clock using the
-documented RDNA2 4-clock VALU latency. It is labelled derived everywhere: no
-UWP API exposes the shader clock.
+The dependent-FMA chain (`latency_fma`) is a latency probe only. No clock is
+inferred from it: the old 4-clock VALU assumption does not hold for wave64.
+The roofline derives a clock from the *measured* FP32 peak divided by
+52 dual-CUs × 128 FLOP/cycle and labels it derived, never measured.
+
+A failed stream checksum no longer aborts the roofline. The stream rates become
+observations only (`stream_observed_gbs`), `bandwidth_gbs` is forced to zero,
+and the result carries `"partial": true` with the warnings while the ALU,
+latency and occupancy sections remain valid.
 
 ## Plan options (`LocalState\gpupeak-opts.txt`)
 
@@ -88,13 +95,19 @@ consumed like every other headless operator flag.
 # on a Windows host with dxc on PATH
 tools/xbox/scripts/compile-gpupeak-shaders.py
 
-# from this Linux checkout against the isolated Windows scratch dir
+# from this Linux checkout against an isolated Windows scratch dir
 tools/xbox/scripts/compile-gpupeak-shaders.py --ssh-host hjotha@192.168.1.193 \
-    --remote-root 'C:/Users/hjotha/build/oc-xbox-ceiling-20261026'
+    --remote-root 'C:/Users/hjotha/build/oc-probe-fixes-20261026'
+
+# refuse a committed header whose embedded source hash is stale
+tools/xbox/scripts/compile-gpupeak-shaders.py --check
 ```
 
 The script rewrites `shaders/generated/gpupeak_*_dxil.h` and the manifest. It
-never builds the app and never writes outside its scratch directory.
+never builds the app and never writes outside its scratch directory. `--check`
+exists because the first Series X run used a stream_read DXIL that predated the
+`mode == 1` validation store; the header and the source were in the same commit
+but the header had not been regenerated.
 
 ## pass1 sweep (production shapes)
 
@@ -158,7 +171,7 @@ roofline by a wide margin, and `bound` in the JSON says so explicitly.
 | INT8 | 48.6 TOPS | `dot4_i8` best GOPS |
 | Bandwidth | 560 GB/s (10 GB pool, 320-bit) / 336 GB/s (6 GB pool) | stream read / write / copy best GB/s |
 | Compute units | 52 dual-CU | occupancy step fit, two LDS sizes must agree |
-| Shader clock | 1.825 GHz | no UWP API exposes it: the timestamp counter frequency is recorded (a fixed counter, not the shader clock) and the implied clock is derived from the FMA chain |
+| Shader clock | 1.825 GHz | no UWP API exposes it: the timestamp counter frequency is recorded (a fixed counter, not the shader clock) and a derived clock comes from the measured FP32 peak / (52 CU × 128 FLOP/cycle) |
 | GPU budget | ~4.35 GB reported for this app | `DXGI_QUERY_VIDEO_MEMORY_INFO` budget |
 
 The nominal column is the denominator only. A measured value below it is a
@@ -172,6 +185,11 @@ tools/xbox/scripts/run-xbox-ceiling.py                     # plan only, no conne
 tools/xbox/scripts/run-xbox-ceiling.py --execute \
     --expect-pfn 'GianlucaMazza.xllama_1.6.0.296_x64__<publisher-hash>' \
     --output .oc-artifacts/xbox-ceiling-result.json
+
+# B2: probe only (no listener/sweep), with per-row checksums and the partial flag
+tools/xbox/scripts/run-gpupeak-probe.py                    # plan only
+tools/xbox/scripts/run-gpupeak-probe.py --execute --host "$XBOX_IP" \
+    --output .oc-artifacts/gpupeak-probe-result.json
 ```
 
 The package (a `beellama-xbox-*-llamacpp.msix` that contains the `gpupeak`
