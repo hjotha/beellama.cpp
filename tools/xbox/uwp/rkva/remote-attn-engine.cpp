@@ -207,6 +207,7 @@ struct BulkSegmentProfile {
     uint32_t dispatches = 0;
     uint8_t q_tile = 0;
     uint8_t decode_opt = 0;
+    uint8_t rescale_skip = 0;
     uint8_t direct_output = 0;
     uint8_t optimized = 0;
     uint64_t upload_bytes = 0;
