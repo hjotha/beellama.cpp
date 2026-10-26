@@ -9,6 +9,68 @@ CUDA. Tudo abaixo é compilação DXC isolada na máquina 193 (diretório própr
 `C:\Users\hjotha\build\oc-int8-pass1-20261026\`), contagem de instruções sobre o
 DXIL, emulação NumPy e um TU de teste CPU compilado com `g++` neste host.
 
+## 0.1 Correção pós-hardware (pacote 297) — leia primeiro
+
+O primeiro build rodou no console e **estava numericamente quebrado**, embora
+rápido: o PSO `attn_kvarn4_mq2_i8` foi selecionado e deu `pass1` **−30,7%**
+(100,0 → 69,3 ns/linha), mas o oráculo NumPy do probe reprovou **40 de 40** casos
+`ptt=128` (os `ptt=0` passam porque não usam o tile mq2), todos no bucket
+`kvarn4_mq2_i8`, com `out_max_abs` 31,9–77,9 e `lse_max_abs` 414–831. O braço OFF
+deu `out_max_abs` 1e-5..5e-5 e `lse_max_abs` 2e-6..5e-6.
+
+**Causa raiz:** a constante por slice `C_s` era reduzida sobre as 8 lanes do
+slice *antes* de entrar na soma, então cada uma das 8 lanes somava o `C_s`
+inteiro e a redução de 16 lanes colhia `8*C_0 + 8*C_1` em vez de `C_0 + C_1` —
+sete constantes a mais por slice. Não é erro de quantização: é um offset
+aditivo no score, e é por isso que o `lse` errava por centenas enquanto a
+direção da saída se mantinha.
+
+**Por que passou:** `rkva_mq_i8_quality.py` valida a *álgebra* (cada score como
+uma soma de 128 dims com `C_s` somado uma vez). Ela não consegue ver como o HLSL
+distribui essa álgebra entre lanes. A emulação era do algoritmo, não do
+programa — exatamente o risco que o relatório §7 não listou.
+
+**Correção:** `zs`, `qsum` e `sum(Q8)` passam a ficar como parciais por lane; só
+`mx` (que define `sq_s`, o multiplicador do dot parcial de cada lane) continua
+reduzido no slice. A forma correta é também mais barata: saem 2 reduções × 3
+passos por (query, head) do quantizador. DXIL novo: **141 612 B**
+(sha256 `85b2e376a9ddd807…`, era 143 620 B).
+
+**Prova (`tools/xbox/tests/rkva_mq_i8_lane_model.py`)**: emulador NumPy que
+executa o HLSL **lane a lane** — 2 waves de 64 lanes, mapeamento 16 dims/16
+lanes, quantizador por grupo, `dot4add_i8packed` como int8 COM sinal × int8 com
+sinal e wrap int32, redução `lane ^ {8,4,2,1}`, broadcast
+`WaveReadLaneAt(val, t*16)`, e a aplicação por lane de `q8scale`/`q8const`/
+`other`. Ele reproduz a falha e valida a correção em 8 casos:
+
+```
+$ python3 tools/xbox/tests/rkva_mq_i8_lane_model.py
+tight live   256 fast=[0,128)  algebra out 5.53e-03 lse 3.67e-03
+    shipped  "slice"        out    8.471 lse    71.93 bias -6.29e+00   (  1531x algebra)
+    fix      per_lane       out 5.53e-03 lse 3.67e-03 bias -1.30e-03   (  1.00x algebra)
+    fix      slice_split    out 5.53e-03 lse 3.67e-03
+model live  1920 fast=[0,1792) algebra out 5.54e-02 lse 6.46e-02
+    shipped  "slice"        out   23.394 lse   184.61 bias +1.82e-01   (   422x algebra)
+    fix      per_lane       out 5.54e-02 lse 6.46e-02 bias +1.97e-04   (  1.00x algebra)
+    fix      slice_split    out 5.54e-02 lse 6.46e-02
+rkva_mq_i8_lane_model: 8 cases, PASS
+```
+
+O modelo também confere que a forma "reduz e divide por 8" (`slice_split`) é
+numericamente equivalente à forma por lane — o que fecha o diagnóstico — e que
+toda linha rápida é visitada **exatamente uma vez** pelas duas waves.
+
+Antes de confiar no modelo, ele foi cruzado contra a álgebra já validada: o modo
+`per_lane` reproduz `rkva_mq_i8_quality.i8_scores` com rms 4,3e-7 (só
+arredondamento F32), e o modo `slice` diverge dela com rms 30,7 e viés −10,5.
+O primeiro rascunho do emulador tinha um bug próprio (montava os dwords de
+nibble com os dims da lane 0); foi esse cruzamento que o expôs, não a inspeção.
+
+`mq2`/`mq4` continuam **byte-idênticos** (`9d81c3beba4e3675…` /
+`ef2878458bd37b6f…`) e a contagem de instruções por linha não mudou (331,9),
+porque o quantizador fica fora do laço medido. Pendente: recompilar o pacote e
+rodar oráculo + sweep no console.
+
 ## 0. Veredito curto
 
 * A variante existe e compila: PSO separado `attn_kvarn4_mq2_i8`, `cs_6_4`,
@@ -18,7 +80,9 @@ DXIL, emulação NumPy e um TU de teste CPU compilado com `g++` neste host.
 * Exatidão: **não é bit-exata**. O erro que ela adiciona é **6,2–7,6% do erro
   de score que o próprio KVarN4 4-bit já introduz**; erro total de score cresce
   ≤1,2%, e saída/LSE/pesos de softmax ficam dentro de 1,15× do caminho de
-  produção em 10 casos (PASS).
+  produção em 10 casos (PASS). Isso valia para a **álgebra**; o primeiro build
+  no console reprovou por um bug de distribuição lane↔slice, corrigido em §0.1 e
+  agora coberto por um emulador lane a lane.
 * O ganho **não** vem do `dot4` em si (medido: o MAC é o mesmo), vem de o int8
   permitir 16 dims/lane, que encolhe o disco de redução cross-lane de 64 para 16
   lanes. Essa é a conclusão estrutural mais importante da tarefa.
@@ -354,9 +418,17 @@ Pendente medir:
 4. Paridade de logits/IDs no mesmo prefixo congelado (o script compara IDs e
    reporta a primeira divergência; não exige igualdade, porque a variante não é
    exata).
+5. Recompilar o pacote com o DXIL corrigido (141 612 B, sha256
+   `85b2e376a9ddd807…`) e repetir `rkva_kvarn_serial_prefix_probe.py --modes 2
+   --full`: esperado `out_max_abs` na ordem de 1e-2 a 1e-1 e `lse_max_abs` de
+   1e-2, contra 1e-5..5e-5 do braço OFF — a diferença é o erro de quantização Q8,
+   não um defeito. O `pass1` deve continuar ≈ −30%.
 
 Riscos:
 
+* **Um modelo da álgebra não qualifica um kernel distribuído por lanes.** O
+  defeito de `C_s` passou por todos os gates offline do B1 e só caiu no console.
+  `rkva_mq_i8_lane_model.py` é agora parte do gate, não um extra.
 * **Não é bit-exata.** Não pode ser default. O flag, o bucket próprio e o
   `"exact":false` no JSON existem para que nenhum número seja atribuído por
   engano ao caminho qualificado.
@@ -398,8 +470,11 @@ DXC=.oc-artifacts/dxc/dxc193.py bash tools/xbox/scripts/compile-rkva-range-shade
 # custo por linha de KV do laço quente (baseline vs variante)
 python3 tools/xbox/tests/rkva_dxil_loop_cost.py .oc-artifacts/dxc/mq2_chk.txt .oc-artifacts/dxc/mq2_i8.txt
 
-# gate de qualidade INT8
+# gate de qualidade INT8 (álgebra)
 python3 tools/xbox/tests/rkva_mq_i8_quality.py --json .oc-artifacts/i8-quality.json
+
+# gate do HLSL lane a lane (reproduz a falha do pacote 297 e valida a correção)
+python3 tools/xbox/tests/rkva_mq_i8_lane_model.py --json .oc-artifacts/lane-model.json
 
 # teste CPU de perfil/JSON
 g++ -std=c++17 -Wall -Wextra -Werror -O1 tools/xbox/tests/rkva_range_profile_cpu.cpp -o /tmp/rkva_profile

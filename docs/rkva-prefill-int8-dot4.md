@@ -67,8 +67,16 @@ part of the Q8 rounding error, so the residual is `-sum_d (Q'-sq*Q8)*(nibble-8)`
 instead of `-sum_d (Q'-sq*Q8)*nibble`. That single constant cuts the added score
 error ~2.5x at no per-position cost.
 
-`sum(Q8)` per slice is reduced at quantization time. The widest possible score
-is `256 * 15 * 126 = 483 840`, far inside int32.
+`C_s` must be **distributed over the lanes of the slice, not reduced into them**.
+`zs`, `qsum` and `sum(Q8)` are each lane's own partial; the 16-lane score
+reduction is what turns them into the slice totals. Only `sq_s` is slice-wide,
+because it multiplies the lane's own partial dot. Reducing the three partials
+first hands every lane the whole slice constant, so the score picks it up
+`RKVA_I8_SLICE_LANES` times instead of once — that was the shipped defect
+(package 297, 40 of 40 `ptt=128` oracle cases failed with `out_max_abs` 31.9-77.9
+and `lse_max_abs` 414-831), and `rkva_mq_i8_lane_model.py` now rejects a kernel
+that does it. The widest possible score is `256 * 15 * 126 = 483 840`, far
+inside int32.
 
 ## What stays exact
 
@@ -96,7 +104,21 @@ constants changes the measured loop by 37 of 4 019 instructions), amortized over
 `waveReadLaneAt` accounting plus a proper natural-loop (reverse-reachability)
 bound for this measurement.
 
-## Quality gate
+## Two independent gates
+
+`tools/xbox/tests/rkva_mq_i8_quality.py` validates the *algebra* (each score as
+one 128-dim slice sum with `C_s` added once). It cannot see how the HLSL
+distributes that algebra over lanes, which is exactly how the package-297 defect
+escaped, so `tools/xbox/tests/rkva_mq_i8_lane_model.py` executes the shipped
+program instead: two waves of 64 lanes, the 16-dim/16-lane mapping, the
+per-group quantizer, `dot4add_i8packed` as signed-int8 x signed-int8 with int32
+wraparound, the `lane ^ {8,4,2,1}` reduction, the `WaveReadLaneAt(val, t*16)`
+broadcast, and the per-lane application of `q8scale`/`q8const`/`other`. It must
+match the validated algebra path to float rounding (`1.00x`), must flag the
+constant-per-lane form as `119x..747x` worse, and must assert that every fast row
+is visited exactly once across both waves.
+
+### Quality gate
 
 `tools/xbox/tests/rkva_mq_i8_quality.py` compares three float64/float32 paths
 over the same store: GOLD (original F16 K/V), REF (the shipped 4-bit F32 kernel
@@ -117,9 +139,11 @@ the constant is worth ~2.5x.
 ## Caveats
 
 * Not bit-exact. Never a default; the flag plus this gate are the contract.
-* SM 6.4 is required for `dot4add_i8packed`; the console PSO probe accepted a
-  `dot4_i8` compute PSO, but this specific PSO has not been created on hardware
-  yet.
+* SM 6.4 is required for `dot4add_i8packed`. The PSO is created on the console
+  (package 297) and runs at 69.3 ns/KV row, -30.7% against `attn_kvarn4_mq2`.
+* **Do not trust an algebra-only model for a lane-distributed kernel.** The
+  shipped `C_s` defect passed every offline check in B1 and was only caught by
+  the console oracle; `rkva_mq_i8_lane_model.py` exists so that cannot recur.
 * The INT8 path needs exactly 64 lanes per wave (one 16-lane group per KV row of
   a half tile); other wave sizes poison the outputs like the existing shape gate.
 * VGPR pressure rises (int8 Q8 is 48 VGPRs for 12 query-head pairs, offset by
