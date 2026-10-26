@@ -1831,6 +1831,7 @@ struct ggml_backend_cuda_context {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+            ggml_cuda_graph_guard::note_device_reservation();
         }
         return streams[device][stream];
     }
@@ -1853,6 +1854,8 @@ struct ggml_backend_cuda_context {
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
+            // cublasCreate and its workspace reserve device memory outside the pools.
+            ggml_cuda_graph_guard::note_device_reservation();
         }
         return cublas_handles[device][curr_stream_no];
     }
