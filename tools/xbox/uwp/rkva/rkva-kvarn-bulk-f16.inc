@@ -391,7 +391,7 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
     }
     bulk_recording_ = false;
     const auto t_submit = prof ? prof_clock::now() : prof_clock::time_point{};
-    if (!submit(error)) {
+    if (!submit(error, n_tokens == 1)) {
         if (prof)
             profile_->bulk.active = false;
         s->valid = false;
