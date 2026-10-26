@@ -138,6 +138,10 @@ struct InferenceParams {
     /// Probe Q4_K GEMV density and exit (D3D12 CS; not a backend).
     bool run_gpugemv = false;
 
+    /// GPU ceiling suite (stream/ALU/dispatch latency/occupancy) and exit.
+    /// D3D12; non-Windows reports unavailable. Console A/B is gpupeak.flag.
+    bool run_gpupeak = false;
+
     /// GGUF GPU decode probe D1: print the cost-model projection and exit.
     bool run_gpustep = false;
 

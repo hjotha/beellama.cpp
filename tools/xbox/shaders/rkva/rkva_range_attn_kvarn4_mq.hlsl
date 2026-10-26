@@ -63,6 +63,46 @@
 #define RKVA_KIND_TAIL 1u
 #define RKVA_KIND_STAGE 2u
 #define RKVA_KIND_RECORD 3u
+// Opt-in INT8 QK specialization (separate PSO `attn_kvarn4_mq2_i8`, default 0).
+// The fast shared record tile scores K with `dot4add_i8packed` instead of a
+// 4-dim/lane F32 dot. The exact algebra is
+//     K(d,p) = (nibble(d,p) * scale_k[d] + zero_k[d]) * other_k[p]
+// with scale_k/zero_k per dim and other_k per position *and per 128-dim slice*
+// (the store kernel derives it from `best_col` of its own slice), so a score is
+//     score = kq * sum_s other_s[p] * ( sum_{d in s} Qr[d]*nibble*scale_k[d]
+//                                     + sum_{d in s} Qr[d]*zero_k[d] )
+// Qr = wht256(Q) is folded with scale_k once per (query, head, group) into an
+// int8 query Q8 with its own scale sq, which leaves one dp4a chain per score:
+//     sq_s = max_{d in s} |Qr*scale_k| / 126
+//     Q8   = clamp(round(Qr*scale_k / sq_s), -127, 127)
+//     dot  = sum_{d in s} Q8[d] * nibble(d,p)          (exact int32)
+//     C_s  = Z_s + 8*sum_d Qr*scale_k - 8*sq_s*sum_d Q8
+//     score = (float(dot) * sq_s + C_s) * other_s[p] * kq
+// C_s carries the exact DC part of the Q8 rounding error (residual is
+// -sum_d (Q'-sq*Q8)*(nibble-8), i.e. ~1/15 of the un-centred error at no
+// per-position cost). Each lane owns RKVA_I8_DIMS consecutive dims of one KV
+// row and the four 16-lane groups of a wave score four consecutive rows, so
+// one butterfly reduces four rows in 4 steps instead of 6. Tail, stage and
+// residual rows, the softmax, the WHT and the partial layout are untouched:
+// this variant is NOT bit-exact with attn_kvarn4_mq2 and stays opt-in.
+#ifndef RKVA_MQ_I8
+#define RKVA_MQ_I8 0
+#endif
+#if RKVA_MQ_I8
+#if RKVA_MQ_QT != 2
+#error "RKVA_MQ_I8 supports RKVA_MQ_QT == 2 only"
+#endif
+#define RKVA_I8_DIMS 16                     // dims per lane
+#define RKVA_I8_LANES 16                    // lanes per score
+#define RKVA_I8_SLICE_LANES 8               // lanes per 128-dim record slice
+#define RKVA_I8_MAXV 126.0f                 // |Q8| <= 126, so no clamp is needed
+// RKVA_I8_ROWS = 4 rows in flight per wave, i.e. exactly one half tile:
+// RKVA_I8_DIMS * RKVA_I8_LANES == 256 dims, RKVA_I8_DIMS * RKVA_I8_SLICE_LANES
+// == 128 dims per record slice (checked by tools/xbox/tests/rkva_mq_i8_quality.py).
+#define RKVA_I8_ROWS (RKVA_UNITS / RKVA_I8_LANES)
+// INT8 uses wave-wide slice maxima and prefix row sums exclusively.
+
+#endif
 
 cbuffer Params : register(b0) {
     uint n_query;
@@ -250,7 +290,13 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
     // Unsupported wave size (host gates the PSO on wave lanes >= 64): NaN poison
     // instead of a partial result. Direct output: O and LSE NaN; partials:
     // numerator NaN with max 0 / den 1, so the reducer propagates it.
+#if RKVA_MQ_I8
+    // The INT8 path maps one 16-lane group per KV row of a half tile, so it
+    // needs exactly RKVA_UNITS lanes per wave (the measured console is wave64).
+    if (wave_size != RKVA_UNITS) {
+#else
     if (wave_size < RKVA_UNITS || wave_size > RKVA_THREADS) {
+#endif
         uint nan_bits = 0x7fc00000u;
         uint total = n_query * n_head;
         [unroll] for (uint j = 0; j < RKVA_MQ_QT; ++j) {
@@ -322,6 +368,9 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
     // query 2 is staged in gs_vec[1536..3071] and query 3 stays in gs_vec[0..1535]
     // until the non-tail residual loop finishes (zero extra LDS).
     uint q_stride = n_query * n_head * RKVA_DIM * 4;
+#if !RKVA_MQ_I8
+    // The INT8 build keeps no F32 rotated Q: it re-quantizes per record group
+    // (q8[]/q8scale[]/q8const[]) and reloads Qr for the few residual rows.
     float4 q_lo[RKVA_PAIR_QG];
     [unroll] for (uint j = 0; j < min(2u, uint(RKVA_MQ_QT)); ++j) {
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
@@ -330,6 +379,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                 active ? asfloat(queries.Load4(q_rot_base)) : float4(0, 0, 0, 0);
         }
     }
+#endif
 #if RKVA_MQ_QT == 4
     if (wave == 0 && active) {
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
@@ -362,6 +412,193 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
 
     // ---- Shared record tiles (first, so the still-zero tail needs no rescale) ----
     uint dim = (u & 31) * 4;
+#if RKVA_MQ_I8
+    // One 16-lane group per KV row of the half tile. A lane owns RKVA_I8_DIMS
+    // consecutive dims, which stay inside one 128-dim record slice because 16
+    // divides 128, so its scale/zero/other come from a single record.
+    uint i8_slot = lane & (RKVA_I8_LANES - 1u);
+    uint i8_row = lane / RKVA_I8_LANES;
+    uint i8_dim = i8_slot * RKVA_I8_DIMS;
+    uint i8_slice = i8_dim >> 7;
+    uint i8_dlocal = i8_dim & 127u;
+    uint4 q8[RKVA_QG];
+    float q8scale[RKVA_QG], q8const[RKVA_QG];
+    if (fast_hi > fast_lo) {
+        // Group-outer so the per-group query quantization is hoisted out of the
+        // 8-row tile loop; group boundaries and fast_lo/fast_hi are 8-aligned,
+        // so no tile straddles two groups.
+        uint grp_first = fast_lo >> 7;
+        uint grp_last = (fast_hi - 1u) >> 7;
+        [loop] for (uint grp = grp_first; grp <= grp_last; ++grp) {
+            uint i8_base = (grp * n_head_kv * 2 + kv_head * 2 + i8_slice) * RKVA_RECORD;
+            uint vbase = (grp * n_head_kv * 2 + kv_head * 2 + (u >> 5)) * RKVA_RECORD;
+            float4 vother = active ? halves4(values.Load2(vbase + 8704 + dim * 2))
+                                   : float4(0, 0, 0, 0);
+            float4 ks0 = halves4(keys.Load2(i8_base + 8192 + i8_dlocal * 2 + 0));
+            float4 ks1 = halves4(keys.Load2(i8_base + 8192 + i8_dlocal * 2 + 8));
+            float4 ks2 = halves4(keys.Load2(i8_base + 8192 + i8_dlocal * 2 + 16));
+            float4 ks3 = halves4(keys.Load2(i8_base + 8192 + i8_dlocal * 2 + 24));
+            float4 kz0 = halves4(keys.Load2(i8_base + 8448 + i8_dlocal * 2 + 0));
+            float4 kz1 = halves4(keys.Load2(i8_base + 8448 + i8_dlocal * 2 + 8));
+            float4 kz2 = halves4(keys.Load2(i8_base + 8448 + i8_dlocal * 2 + 16));
+            float4 kz3 = halves4(keys.Load2(i8_base + 8448 + i8_dlocal * 2 + 24));
+            float ksv[RKVA_I8_DIMS] = {ks0.x, ks0.y, ks0.z, ks0.w, ks1.x, ks1.y, ks1.z, ks1.w,
+                                       ks2.x, ks2.y, ks2.z, ks2.w, ks3.x, ks3.y, ks3.z, ks3.w};
+            float kzv[RKVA_I8_DIMS] = {kz0.x, kz0.y, kz0.z, kz0.w, kz1.x, kz1.y, kz1.z, kz1.w,
+                                       kz2.x, kz2.y, kz2.z, kz2.w, kz3.x, kz3.y, kz3.z, kz3.w};
+            [unroll] for (uint j = 0; j < RKVA_MQ_QT; ++j) {
+                [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+                    uint i = j * RKVA_GQA + g;
+                    uint qb = q_stride + ((head0[j] + g) * RKVA_DIM + i8_dim) * 4;
+                    float4 a0 = float4(0, 0, 0, 0), a1 = a0, a2 = a0, a3 = a0;
+                    if (active) {
+                        a0 = asfloat(queries.Load4(qb + 0));
+                        a1 = asfloat(queries.Load4(qb + 16));
+                        a2 = asfloat(queries.Load4(qb + 32));
+                        a3 = asfloat(queries.Load4(qb + 48));
+                    }
+                    float qo[RKVA_I8_DIMS] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w,
+                                              a2.x, a2.y, a2.z, a2.w, a3.x, a3.y, a3.z, a3.w};
+                    float mx = 0, zs = 0, qsum = 0;
+                    float qp[RKVA_I8_DIMS];
+                    [unroll] for (uint d = 0; d < RKVA_I8_DIMS; ++d) {
+                        qp[d] = qo[d] * ksv[d];   // Q' = WHT(Q) * scale_k
+                        mx = max(mx, abs(qp[d]));
+                        zs += qo[d] * kzv[d]; // Z from the unquantized Q
+                        qsum += qp[d];
+                    }
+                    // Only the quantization scale is slice-wide: `sq` multiplies
+                    // this lane's own partial dot, so every lane of the slice
+                    // must agree on it. `zs`, `qsum` and sum(Q8) must NOT be
+                    // reduced here -- they are this lane's partials, and the
+                    // 16-lane score reduction is what turns them into the
+                    // slice totals. Reducing them first hands every lane the
+                    // whole slice constant, so the score picks it up
+                    // RKVA_I8_SLICE_LANES times instead of once.
+                    // Q/scale are repeated in the four row groups, so a max
+                    // over all copies of a slice equals the 8-lane max.
+                    float mx0 = WaveActiveMax(i8_slice == 0 ? mx : 0.0f);
+                    float mx1 = WaveActiveMax(i8_slice == 1 ? mx : 0.0f);
+                    mx = i8_slice == 0 ? mx0 : mx1;
+                    float inv = mx > 0 ? RKVA_I8_MAXV / mx : 0.0f;
+                    float sq = mx > 0 ? mx * (1.0f / RKVA_I8_MAXV) : 0.0f;
+                    int t0i = int(round(qp[0] * inv)), t1i = int(round(qp[1] * inv));
+                    int t2i = int(round(qp[2] * inv)), t3i = int(round(qp[3] * inv));
+                    int t4i = int(round(qp[4] * inv)), t5i = int(round(qp[5] * inv));
+                    int t6i = int(round(qp[6] * inv)), t7i = int(round(qp[7] * inv));
+                    int t8i = int(round(qp[8] * inv)), t9i = int(round(qp[9] * inv));
+                    int ta = int(round(qp[10] * inv)), tb = int(round(qp[11] * inv));
+                    int tc = int(round(qp[12] * inv)), td = int(round(qp[13] * inv));
+                    int te = int(round(qp[14] * inv)), tf = int(round(qp[15] * inv));
+                    int s8 = t0i + t1i + t2i + t3i + t4i + t5i + t6i + t7i + t8i + t9i +
+                             ta + tb + tc + td + te + tf;
+                    uint4 packed;
+                    packed.x = uint(t0i & 0xff) | (uint(t1i & 0xff) << 8) |
+                               (uint(t2i & 0xff) << 16) | (uint(t3i & 0xff) << 24);
+                    packed.y = uint(t4i & 0xff) | (uint(t5i & 0xff) << 8) |
+                               (uint(t6i & 0xff) << 16) | (uint(t7i & 0xff) << 24);
+                    packed.z = uint(t8i & 0xff) | (uint(t9i & 0xff) << 8) |
+                               (uint(ta & 0xff) << 16) | (uint(tb & 0xff) << 24);
+                    packed.w = uint(tc & 0xff) | (uint(td & 0xff) << 8) |
+                               (uint(te & 0xff) << 16) | (uint(tf & 0xff) << 24);
+                    q8[i] = packed;
+                    q8scale[i] = sq;
+                    // This lane's share of the exact DC part of the Q8 rounding
+                    // error: the residual is -sum_d (Q'-sq*Q8)*(nibble-8), not
+                    // -sum_d (Q'-sq*Q8)*nibble. Summed over the 16 lanes this is
+                    // C_s = Z_s + 8*sum_s(Q') - 8*sq_s*sum_s(Q8), once per slice.
+                    q8const[i] = zs + 8.0f * (qsum - sq * float(s8));
+                }
+            }
+
+            uint tile_lo = max(fast_lo, grp << 7) + wave * RKVA_TILE;
+            uint tile_hi = min(fast_hi, (grp + 1u) << 7);
+            [loop] for (uint t0 = tile_lo; t0 < tile_hi; t0 += n_waves * RKVA_TILE) {
+                uint pos0 = t0 & 127u;
+                uint nib_base = i8_base + (pos0 >> 3) * 4u + i8_dlocal * 64u;
+                uint kd[RKVA_I8_DIMS];
+                [unroll] for (uint i = 0; i < RKVA_I8_DIMS; ++i) {
+                    kd[i] = keys.Load(nib_base + i * 64u);
+                }
+                uint4 vscale_bits = values.Load4(vbase + 8192 + pos0 * 2);
+                uint4 vzero_bits = values.Load4(vbase + 8448 + pos0 * 2);
+                [unroll] for (uint h = 0; h < RKVA_TILE / RKVA_HALF; ++h) {
+                    // This lane's row of the half tile: nibbles of its 16 dims,
+                    // packed as four int8x4 words (nibbles are 0..15, already
+                    // valid non-negative int8 lanes).
+                    uint tt = h * RKVA_HALF + i8_row;
+                    uint sh = 4u * tt;
+                    uint k8[RKVA_I8_DIMS / 4];
+                    [unroll] for (uint c = 0; c < RKVA_I8_DIMS / 4; ++c) {
+                        uint b = 4u * c;
+                        k8[c] = ((kd[b + 0] >> sh) & 0x0000000fu) |
+                                (((kd[b + 1] >> sh) & 0x0000000fu) << 8) |
+                                (((kd[b + 2] >> sh) & 0x0000000fu) << 16) |
+                                (((kd[b + 3] >> sh) & 0x0000000fu) << 24);
+                    }
+                    float ak = active ? half_at(keys, i8_base + 8704 + (pos0 + tt) * 2) : 0.0f;
+                    float sll = kq_scale * ak;
+                    float4 v_half[RKVA_HALF];
+                    [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
+                        uint tz = h * RKVA_HALF + t;
+                        uint vsh = (tz & 1) * 16;
+                        float scale = f16tof32((vscale_bits[tz / 2] >> vsh) & 65535u);
+                        float zero = f16tof32((vzero_bits[tz / 2] >> vsh) & 65535u);
+                        uint index = (pos0 + tz) * 128 + dim;
+                        uint word = values.Load(vbase + (index / 8) * 4) >> ((index & 7) * 4);
+                        v_half[t].x = decode(word & 15u, scale, zero, vother.x);
+                        v_half[t].y = decode((word >> 4) & 15u, scale, zero, vother.y);
+                        v_half[t].z = decode((word >> 8) & 15u, scale, zero, vother.z);
+                        v_half[t].w = decode((word >> 12) & 15u, scale, zero, vother.w);
+                    }
+                    [unroll] for (uint j = 0; j < RKVA_MQ_QT; ++j) {
+                        [branch] if (act[j]) {
+                            [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+                                uint i = j * RKVA_GQA + g;
+                                int acc = 0;
+                                [unroll] for (uint c = 0; c < RKVA_I8_DIMS / 4; ++c) {
+                                    acc = dot4add_i8packed(k8[c], q8[i][c], acc);
+                                }
+                                float val = (float(acc) * q8scale[i] + q8const[i]) * sll;
+                                float s[RKVA_HALF];
+                                // All 64 lanes are active here (wave64 gate and
+                                // wave-uniform act[j]). Inclusive prefixes at
+                                // 15/31/47/63 delimit the four 16-lane rows.
+                                // Subtraction adds F32 cancellation, not Q8 loss.
+                                float prefix = WavePrefixSum(val) + val;
+                                float p0 = WaveReadLaneAt(prefix, 15);
+                                float p1 = WaveReadLaneAt(prefix, 31);
+                                float p2 = WaveReadLaneAt(prefix, 47);
+                                float p3 = WaveReadLaneAt(prefix, 63);
+                                s[0] = p0;
+                                s[1] = p1 - p0;
+                                s[2] = p2 - p1;
+                                s[3] = p3 - p2;
+                                float half_max = -3.402823466e38f;
+                                [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
+                                    half_max = max(half_max, s[t]);
+                                }
+                                float next_max = max(maximum[i], half_max);
+                                float old_weight = denom[i] == 0 ? 0 : exp(maximum[i] - next_max);
+                                float sum = 0;
+                                [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
+                                    s[t] = exp(s[t] - next_max);
+                                    sum += s[t];
+                                }
+                                body[i] *= old_weight;
+                                [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
+                                    body[i] += s[t] * v_half[t];
+                                }
+                                denom[i] = denom[i] * old_weight + sum;
+                                maximum[i] = next_max;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
     uint cached_group = 0xffffffffu;
     uint base = 0;
     float4 kscale = float4(0, 0, 0, 0), kzero = kscale, vother = kscale;
@@ -428,6 +665,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
             }
         }
     }
+#endif // RKVA_MQ_I8
 
     // ---- Non-tail residual rows (stage and sealed record), classified per query ----
     [loop] for (uint segment = 0; segment < 2; ++segment) {
@@ -451,7 +689,15 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                     }
                     [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
                         uint i = j * RKVA_GQA + g;
+#if RKVA_MQ_I8
+                        // The INT8 build does not keep F32 rotated Q resident;
+                        // residual rows are ~2% of a split, so reload it here.
+                        float4 qa = active ? asfloat(queries.Load4(
+                                              q_stride + ((head0[j] + g) * RKVA_DIM + u * 4) * 4))
+                                           : float4(0, 0, 0, 0);
+#else
                         float4 qa = load_rotated_q(j, g, u, active, q_lo);
+#endif
                         float s = WaveActiveSum(dot(qa, k)) * kq_scale;
                         float next_max = max(maximum[i], s);
                         float old_weight = denom[i] == 0 ? 0 : exp(maximum[i] - next_max);

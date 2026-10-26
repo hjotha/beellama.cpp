@@ -284,6 +284,10 @@ class Probe:
         self.append(2, reset=True)
         self.batch(5, 'masked below origin')
         if self.full:
+            # Exercise the opt-in nq1 record kernel at the measured decode size.
+            self.configure_fresh()
+            self.append(28672, reset=True)
+            self.batch(1, 'decode records 28672')
             self.configure_fresh()
             self.append(CAPACITY - 2, reset=True)
             self.append(2)
@@ -622,7 +626,7 @@ def main():
     parser.add_argument('--port', type=int, default=50054)
     parser.add_argument('--modes', type=int, nargs='+', default=[0, 1, 2, 3])
     parser.add_argument('--precision-tails', type=int, nargs='+', default=[128, 0])
-    parser.add_argument('--full', action='store_true', help='add the capacity-edge case')
+    parser.add_argument('--full', action='store_true', help='add 28672-row decode and capacity-edge cases')
     parser.add_argument('--seed', type=int, default=20261266)
     parser.add_argument('--output')
     args = parser.parse_args()

@@ -214,16 +214,19 @@ inline uint32_t kvarn4_mq_tile(uint32_t mode, uint32_t n_tokens, uint32_t precis
     return mode == kModeOptBalanced ? kKvarn4MqTileMax : mode == kModeOptFine ? kKvarn4MqTile : 0u;
 }
 
-inline const char* kvarn4_mq_kernel_name(uint32_t q_tile) {
+inline const char* kvarn4_mq_kernel_name(uint32_t q_tile, bool int8_dot = false) {
+    if (int8_dot && q_tile == kKvarn4MqTile) {
+        return "kvarn4_mq2_i8";
+    }
     return q_tile == kKvarn4MqTileMax ? "kvarn4_mq4_balanced"
            : q_tile == kKvarn4MqTile  ? "kvarn4_mq2_fine"
                                       : "invalid";
 }
 
 // Storage-qualified multi-query kernel name (Q4_0 keeps its 266 names).
-inline const char* mq_kernel_name(uint32_t storage, uint32_t q_tile) {
+inline const char* mq_kernel_name(uint32_t storage, uint32_t q_tile, bool int8_dot = false) {
     if (storage == kStorageKvarn4) {
-        return kvarn4_mq_kernel_name(q_tile);
+        return kvarn4_mq_kernel_name(q_tile, int8_dot);
     }
     return storage == kStorageQ4 ? q4_mq_kernel_name(q_tile)
                                  : format_mq_kernel_name(storage, q_tile);
@@ -356,8 +359,10 @@ struct Sample {
     uint8_t fence_blocked = 0;
     uint8_t alloc_grew = 0;
     uint8_t serial_prefix = 0; // native KVarN4 descriptor revision 3
-    uint8_t q_tile = 0;
-    uint8_t decode_opt = 0;   // multi-query tile (Q4_0/F16/Q8_0/KVarN4 2 or 4); 0 = per-query
+    uint8_t q_tile = 0;       // multi-query tile size; 0 = per-query
+    uint8_t decode_rowlane = 0;
+    uint8_t decode_opt = 0;    // KVarN4 wave64 nq1 decode (includes rowlane)
+    uint8_t int8_dot = 0;      // KVarN4 2-query tile used the opt-in INT8 QK PSO (not exact)
     uint8_t bulk_segment = 0; // 1 if recorded as an individual segment of native bulk op 22
     uint32_t n_tokens = 0;
     uint32_t rows = 0; // upload rows, or attention active_count
@@ -379,7 +384,9 @@ struct Counters {
     // Native KVarN4 revision-3 2-query and 4-query tile calls (subset of
     // optimized_by_storage[kvarn4]).
     uint64_t kvarn4_mq_calls = 0;
+    uint64_t kvarn4_mq_i8_calls = 0;   // subset of kvarn4_mq_calls: INT8 QK PSO (not exact)
     uint64_t kvarn4_decode_calls = 0;
+    uint64_t kvarn4_decode_rowlane_calls = 0; // subset of kvarn4_decode_calls
     uint64_t kvarn4_mq4_calls = 0;
     uint64_t optimized_by_storage[kStorageCount] = {};
     uint64_t reference_by_storage[kStorageCount] = {};
@@ -476,10 +483,16 @@ struct Header {
     // PSO).
     bool kvarn4_mq_available = false;
     std::string kvarn4_mq_status;
+    bool kvarn4_decode_rowlane_available = false;
+    bool kvarn4_decode_rowlane_enabled = false;
+    std::string kvarn4_decode_rowlane_status;
     bool kvarn4_decode_available = false;
     std::string kvarn4_decode_status;
     bool kvarn4_mq4_available = false;
     std::string kvarn4_mq4_status;
+    // Opt-in INT8 QK PSO for the 2-query tile (default off, not bit-exact).
+    bool kvarn4_mq_i8_available = false;
+    std::string kvarn4_mq_i8_status;
 };
 
 inline const char* storage_name(uint32_t storage) {
@@ -527,9 +540,10 @@ inline std::string bucket_key(const Sample& s) {
     if (s.kind == kAttention) {
         key += s.optimized ? "/optimized-" : "/reference";
         if (s.optimized) {
-            key += s.q_tile ? mq_kernel_name(s.storage, s.q_tile)
+            key += s.q_tile ? mq_kernel_name(s.storage, s.q_tile, s.int8_dot != 0)
                             : (s.storage == kStorageKvarn4 && s.decode_opt
-                                   ? kvarn4_decode_kernel_name(s.mode)
+                                   ? (s.decode_rowlane ? "kvarn4_decode_rowlane"
+                                                       : kvarn4_decode_kernel_name(s.mode))
                                    : kernel_name(s.storage, s.mode));
         }
     }
@@ -767,9 +781,15 @@ class Recorder {
                       json_escape(h.kvarn4_mq_status).c_str(), ull(c.kvarn4_mq_calls));
         o += buf;
         std::snprintf(buf, sizeof(buf),
-                      "\"mq4\":{\"available\":%s,\"status\":\"%s\",\"calls\":%llu}}",
+                      "\"mq4\":{\"available\":%s,\"status\":\"%s\",\"calls\":%llu},",
                       h.kvarn4_mq4_available ? "true" : "false",
                       json_escape(h.kvarn4_mq4_status).c_str(), ull(c.kvarn4_mq4_calls));
+        o += buf;
+        std::snprintf(buf, sizeof(buf),
+                      "\"mq2_i8\":{\"available\":%s,\"status\":\"%s\","
+                      "\"calls\":%llu,\"exact\":false}}",
+                      h.kvarn4_mq_i8_available ? "true" : "false",
+                      json_escape(h.kvarn4_mq_i8_status).c_str(), ull(c.kvarn4_mq_i8_calls));
         o += buf;
         std::snprintf(buf, sizeof(buf),
                       ",\"kvarn4_decode\":{\"nq\":1,"
@@ -779,6 +799,14 @@ class Recorder {
                       "\"available\":%s,\"status\":\"%s\",\"calls\":%llu}",
                       kKvarn4DecodeWaveLanes, h.kvarn4_decode_available ? "true" : "false",
                       json_escape(h.kvarn4_decode_status).c_str(), ull(c.kvarn4_decode_calls));
+        o += buf;
+        std::snprintf(buf, sizeof(buf),
+                      ",\"kvarn4_decode_rowlane\":{\"available\":%s,\"enabled\":%s,"
+                      "\"status\":\"%s\",\"calls\":%llu}",
+                      h.kvarn4_decode_rowlane_available ? "true" : "false",
+                      h.kvarn4_decode_rowlane_enabled ? "true" : "false",
+                      json_escape(h.kvarn4_decode_rowlane_status).c_str(),
+                      ull(c.kvarn4_decode_rowlane_calls));
         o += buf;
         o += ",\"bulk\":";
         append_bulk_json(o, h);

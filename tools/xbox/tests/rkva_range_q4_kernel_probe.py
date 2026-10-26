@@ -107,7 +107,10 @@ def execute(args):
                                      v_raw[live*ROW_BYTES:(live+rows)*ROW_BYTES], start=live)
                 live += rows
 
-        profile(client, PROFILE_RESET, 0)
+        # Start with profiling enabled and reset counters; flags=2 alone would
+        # disable the profiling the decode section needs. The mode setup below
+        # keeps ENABLE|RESET for each measured mode.
+        profile(client, PROFILE_ENABLE | PROFILE_RESET, 0)
         for checkpoint in checkpoints:
             upload_to(checkpoint)
             positions = [ORIGIN + checkpoint - 1, ORIGIN + checkpoint // 2, ORIGIN - 1]
@@ -117,7 +120,10 @@ def execute(args):
                 want = oracle(np, q, k_val, v_val, limit, scale)
                 baseline = None
                 for mode in MODES:
-                    profile(client, PROFILE_RESET, mode)
+                    # flags=2 (RESET alone) disables profiling. Keep it enabled
+                    # from the parity setup onwards; the decode measurement
+                    # below resets the counters with ENABLE|RESET anyway.
+                    profile(client, PROFILE_ENABLE | PROFILE_RESET, mode)
                     out, lse = client.attention(q.astype(np.float32).ravel().tolist(), [position])
                     got = (np.array(out, np.float64).reshape(24, 256), np.array(lse, np.float64))
                     entry = dict(rows=checkpoint, position=position, causal_rows=limit, mode=mode,

@@ -10,6 +10,7 @@
 #include "xllama/diverge.h"
 #include "xllama/gpubw.h"
 #include "xllama/gpugemv.h"
+#include "xllama/gpupeak.h"
 #include "xllama/gpustep.h"
 #include "xllama/termgate.h"
 #include "xllama/tttarget.h"
@@ -2820,7 +2821,9 @@ void run_gpubw() {
     FILE* fp = _wfopen(utf8_to_wstring(csv).c_str(), L"w");
     if (fp) {
         fputs(::xllama::gpubw_csv_header(), fp);
-        fputs(::xllama::format_gpubw_row(r, "xbox-series-s").c_str(), fp);
+        // Let format_gpubw_row derive the host from the DXGI adapter; the old
+        // fixed "xbox-series-s" label was wrong on a Series X.
+        fputs(::xllama::format_gpubw_row(r, nullptr).c_str(), fp);
         fclose(fp);
         FILE* done =
             _wfopen(utf8_to_wstring(resolve_local_path("gpubw-result.csv.done")).c_str(), L"w");
@@ -2829,6 +2832,82 @@ void run_gpubw() {
             fclose(done);
         }
         log_output("[xllama] gpubw-result.csv written\n");
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// run_gpupeak (called from UWP gpupeak.flag mode background thread)
+// ---------------------------------------------------------------------------
+
+void run_gpupeak() {
+#ifdef XLLAMA_UWP
+    log_output("[xllama] gpupeak: GPU ceiling suite (stream/ALU/latency/occupancy)\n");
+
+    // Optional plan overrides: LocalState\gpupeak-opts.txt (key=value lines).
+    // The empty file/default plan keeps two 256 MiB stream buffers + 2 MiB
+    // sink; run_big_stream=1 adds a 1 GiB pass and is opt-in.
+    ::xllama::GpupeakOptions options;
+    {
+        const std::string opts_path = resolve_local_path("gpupeak-opts.txt");
+        FILE* opts = _wfopen(utf8_to_wstring(opts_path).c_str(), L"r");
+        if (opts) {
+            std::string text;
+            char chunk[512];
+            std::size_t got = 0;
+            while ((got = fread(chunk, 1, sizeof(chunk), opts)) > 0)
+                text.append(chunk, got);
+            fclose(opts);
+            options = ::xllama::gpupeak_parse_options(text);
+        }
+    }
+    char plan[320];
+    snprintf(plan, sizeof(plan), "[xllama] gpupeak plan: %s\n",
+             ::xllama::gpupeak_options_summary(options).c_str());
+    log_output(plan);
+
+    const ::xllama::GpupeakResult r = ::xllama::measure_gpupeak(options);
+    log_output(r.d3d12_ran ? "[xllama] gpupeak: D3D12 suite completed\n"
+                           : "[xllama] gpupeak: D3D12 suite did not run\n");
+    for (const auto& row : r.rows) {
+        char lb[400];
+        const double gbs = ::xllama::gpupeak_gbs(static_cast<double>(row.bytes), row.gpu_seconds);
+        const double tflops =
+            ::xllama::gpupeak_tflops(static_cast<double>(row.flops), row.gpu_seconds);
+        const double gops =
+            ::xllama::gpupeak_gops(static_cast<double>(row.flops), row.gpu_seconds);
+        snprintf(lb, sizeof(lb),
+                 "[xllama] gpupeak: %s/%s %s gpu_us=%.1f cpu_us=%.1f gbs=%.2f tflops=%.4f "
+                 "gops=%.4f runs=%u checksum=%s err=%s\n",
+                 row.suite.c_str(), row.probe.c_str(), row.variant.c_str(),
+                 row.gpu_seconds * 1e6, row.cpu_seconds * 1e6, gbs, tflops, gops, row.runs,
+                 row.checksum_checked ? (row.checksum_ok ? "ok" : "MISMATCH") : "-",
+                 row.error.empty() ? "-" : row.error.c_str());
+        log_output(lb);
+    }
+    for (const auto& e : r.pso_errors) {
+        log_output(("[xllama] gpupeak PSO unavailable: " + e + "\n").c_str());
+    }
+    if (!r.error.empty())
+        log_output(("[xllama] gpupeak error: " + r.error + "\n").c_str());
+
+    // The JSON is the hand-off artifact; the log lines above are the quick
+    // read. Both come from the same measured rows.
+    const std::string json = ::xllama::gpupeak_json(r, options, "xbox-series-x");
+    const std::string json_path = resolve_local_path("gpupeak-result.json");
+    FILE* fp = _wfopen(utf8_to_wstring(json_path).c_str(), L"w");
+    if (fp) {
+        fputs(json.c_str(), fp);
+        fclose(fp);
+        FILE* done = _wfopen(
+            utf8_to_wstring(resolve_local_path("gpupeak-result.json.done")).c_str(), L"w");
+        if (done) {
+            fputs(r.d3d12_ran ? "done\n" : "d3d12-unavailable\n", done);
+            fclose(done);
+        }
+        log_output("[xllama] gpupeak-result.json written\n");
+    } else {
+        log_output("[xllama] gpupeak: cannot open gpupeak-result.json\n");
     }
 #endif
 }

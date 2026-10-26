@@ -1198,3 +1198,12 @@ endif()
 
 # CPU prototype: N256 lookahead executor/scheduler (no model/GPU/Xbox/RPC).
 llama_build_and_test(test-n256-lookahead-executor.cpp)
+
+# CUDA-graph VRAM headroom guard: pure decision helper, no CUDA runtime needed.
+# The guard may skip its per-submission cudaMemGetInfo() only when the cached
+# sample still proves the same decision; this pins that contract.
+add_executable(test-cuda-graph-guard test-cuda-graph-guard.cpp)
+target_include_directories(test-cuda-graph-guard PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+target_compile_features(test-cuda-graph-guard PRIVATE cxx_std_17)
+add_test(NAME test-cuda-graph-guard COMMAND $<TARGET_FILE:test-cuda-graph-guard>)
+set_property(TEST test-cuda-graph-guard PROPERTY LABELS main)

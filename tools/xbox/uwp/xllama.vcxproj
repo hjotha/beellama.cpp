@@ -326,6 +326,7 @@
     <ClCompile Include="..\src\bridge\diskbw.cpp" />
     <ClCompile Include="..\src\bridge\membw.cpp" />
     <ClCompile Include="..\src\bridge\gpubw.cpp" />
+    <ClCompile Include="..\src\bridge\gpupeak.cpp" />
     <ClCompile Include="..\src\bridge\gpugemv.cpp" />
     <ClCompile Include="..\src\bridge\gpustep.cpp" />
     <ClCompile Include="..\src\bridge\tttarget.cpp" />

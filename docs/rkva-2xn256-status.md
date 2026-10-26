@@ -4,6 +4,9 @@ The Xbox app lives in `tools/xbox/` and builds against this repository's core.
 The UWP build does not need a second xllama/llama checkout. Host RKVA and the
 console's listener remain separate processes, built from the same repository.
 
+Current optimization defaults and operator-reported hardware verdicts are in
+[RKVA optimization policy](rkva-final-optimizations.md).
+
 ## Reused implementation
 
 A content audit of 8,647 refs found two relevant implementations:

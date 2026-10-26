@@ -1,3 +1,4 @@
+#include "graph-guard.h"
 #include "kvarn.cuh"
 
 #include "dequantize.cuh"
@@ -825,6 +826,7 @@ static bool kvarn_convert_scratch_grow(void ** ptr, size_t & capacity, size_t ne
     if (need == 0 || cudaMalloc(ptr, need) != cudaSuccess) {
         return false;
     }
+    ggml_cuda_graph_guard::note_device_reservation();
     capacity = need;
     return true;
 }

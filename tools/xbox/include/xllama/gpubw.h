@@ -36,6 +36,7 @@ struct GpubwResult {
     std::uint32_t expected_checksum = 0;
     bool checksum_ok = false;
     bool d3d12_ran = false;
+    std::string adapter;   // DXGI adapter description; empty when unavailable
     std::string error_msg; // empty on full success
 };
 
@@ -86,5 +87,11 @@ inline bool gpubw_passes_kill_gate(const GpubwResult& r) {
 const char* gpubw_csv_header();
 // buffer_mb,iterations,read_gbs,checksum_ok,d3d12_ran,checksum,expected,host,date,error
 std::string format_gpubw_row(const GpubwResult& r, const char* host_label);
+
+// CSV-safe host label derived from the adapter description. Returns "unknown"
+// when the adapter is unavailable, and replaces characters that would break a
+// single-field CSV with '_'. The fixed "xbox-series-s" label was wrong on a
+// Series X and is not used anymore.
+std::string gpubw_host_label(const GpubwResult& r);
 
 } // namespace xllama
