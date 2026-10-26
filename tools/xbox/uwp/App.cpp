@@ -466,6 +466,15 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 winrt::make<HeadlessView>(&::xllama::bridge::run_gpubw, "gpubw"));
             return 0; // not reached: CoreApplication::Exit terminates the process
         }
+        std::wstring gpupeak_flag = flag_path_if_present(L"gpupeak.flag");
+        if (!gpupeak_flag.empty()) {
+            _wremove(gpupeak_flag.c_str());
+            ::xllama::log_output(
+                "[xllama] gpupeak.flag detected -> headless GPU ceiling suite\n");
+            winrt::Windows::ApplicationModel::Core::CoreApplication::Run(
+                winrt::make<HeadlessView>(&::xllama::bridge::run_gpupeak, "gpupeak"));
+            return 0; // not reached: CoreApplication::Exit terminates the process
+        }
         std::wstring gpugemv_flag = flag_path_if_present(L"gpugemv.flag");
         if (!gpugemv_flag.empty()) {
             _wremove(gpugemv_flag.c_str());
