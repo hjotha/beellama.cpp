@@ -36,6 +36,7 @@ enum rkva_op : uint16_t {
     RKVA_RANGE_PROFILE = 20,         // optional profiling/control, UTF-8 JSON response
     RKVA_KVARN_RANGE_REWIND = 21,    // atomic bounded resident native rewind
     RKVA_KVARN_RANGE_BULK_ATTN = 22, // ordered native upload/query segments, one reply
+    RKVA_KVARN_RANGE_COHORT_ATTN = 23, // negotiated independent-layer envelopes
     RKVA_RANGE_ATTN = 14,            // query-only F32, returns OUT F32 then LSE F32
 };
 
@@ -76,6 +77,28 @@ static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK = 1ull << 15;
 //   15     RKVA_CAP_NATIVE_Q8_BULK (descriptor layout 5)
 //   16+    reserved; experimental branches (e.g. the cohort worktree) must not
 //          reuse 14/15, otherwise a host would probe a layout the server lacks.
+// Reserved experimental identity only. This client refuses RPC_BATCH=4 until
+// a matching server implementation has been qualified; bits14/15 stay native.
+static constexpr uint64_t RKVA_CAP_KVARN_COHORT_ATTN = 1ull << 16;
+
+// v1 cohort extension; each entry immediately precedes its old op22 body.
+// Reply mirrors the envelope with OUT/LSE bodies and exact ticket/epoch echoes.
+struct rkva_kvarn_cohort_header {
+    uint32_t version;
+    uint32_t entry_count;
+    uint32_t total_queries;
+    uint32_t reserved;
+};
+struct rkva_kvarn_cohort_entry {
+    uint32_t layer;
+    uint32_t n_queries;
+    uint32_t body_bytes;
+    uint32_t reserved;
+    uint64_t ticket;
+    uint64_t epoch;
+};
+static_assert(sizeof(rkva_kvarn_cohort_header) == 16, "cohort header ABI");
+static_assert(sizeof(rkva_kvarn_cohort_entry) == 32, "cohort entry ABI");
 static constexpr uint32_t RKVA_KVARN_UPLOAD_RESET = 1u;
 static constexpr uint32_t RKVA_KVARN_UPLOAD_OMIT_STAGE = 2u;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;

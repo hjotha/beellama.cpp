@@ -467,15 +467,19 @@ extern "C" {
     enum ggml_flash_attn_ext_op_param {
         GGML_FLASH_ATTN_EXT_OP_PARAM_PREC         = 3,
         // Slot 4 is the generic sparse-FA n_kv_max hint, including after KVarN materialization.
-        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 9,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 12,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
         GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT      = 7,
-        // pointer-sized slot pair holding the LSE destination tensor
+        // Reserved slot pair 8/9 (including on 32-bit hosts) holding the LSE destination tensor
         // (set by ggml_flash_attn_ext_lse_out, read by backends)
         GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR      = 8,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 10,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK = 11,
+        // Backend hint for an already packed/aligned internal tail sub-pass.
+        // This must remain separate from the LSE attachment flag at slot 7.
+        GGML_FLASH_ATTN_EXT_OP_PARAM_CUDA_FORCE_VEC = 13,
+        // Slots 14/15 remain available; keep the shared layout checks in ggml.c.
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {

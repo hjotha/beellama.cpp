@@ -829,6 +829,10 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+    // Nominal physical compute tile for checkpoint cadence. Experimental RKVA
+    // 2xN256 retains a logical parent ubatch512 while computing tiles256.
+    // Prefix/tail batches may be smaller; logical batching still uses n_ubatch.
+    LLAMA_API uint32_t llama_n_ubatch_physical(const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

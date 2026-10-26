@@ -3,6 +3,14 @@ llama_add_compile_flags()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
+    # Hardware-free timing/provenance qualification for the RKVA benchmark.
+    add_test(
+        NAME test-rkva-range-benchmark-harness
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${PROJECT_SOURCE_DIR}/tools/xbox/tests -p test_bench_rkva_range.py)
+    set_tests_properties(test-rkva-range-benchmark-harness PROPERTIES LABELS main TIMEOUT 30)
+
     add_test(
         NAME test-save-load-state-result-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
@@ -779,6 +787,9 @@ target_link_libraries(test-flash-attn-ext-params PRIVATE ggml)
 add_test(NAME test-flash-attn-ext-params WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-flash-attn-ext-params>)
 set_property(TEST test-flash-attn-ext-params PROPERTY LABELS main)
 
+# Pure-host regression: KVarN domain/force-vector fields must not alias LSE pointers.
+llama_build_and_test(test-flash-attn-param-layout.cpp LINK ggml)
+
 add_executable(test-kvarn test-kvarn.cpp ../src/llama-kvarn.cpp)
 target_include_directories(test-kvarn PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(test-kvarn PRIVATE cxx_std_17)
@@ -917,13 +928,19 @@ target_link_libraries(test-position-split-rollback PRIVATE llama)
 add_test(NAME test-position-split-rollback WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-rollback>)
 set_property(TEST test-position-split-rollback PROPERTY LABELS main)
 
-# Fase 7: Wavefront Causal de Tiles 64/128 e Serviço Progressivo de Prefill
+# Host DAG/state regression for the imported CUDA/RKVA wavefront planner.
 add_executable(test-wavefront-pipeline test-wavefront-pipeline.cpp)
 target_include_directories(test-wavefront-pipeline PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
 target_compile_features(test-wavefront-pipeline PRIVATE cxx_std_17)
 target_link_libraries(test-wavefront-pipeline PRIVATE llama ggml)
 add_test(NAME test-wavefront-pipeline WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-wavefront-pipeline>)
 set_property(TEST test-wavefront-pipeline PROPERTY LABELS main)
+
+# Manual opt-in live GPU/Xbox qualification. Never registered with CTest.
+add_executable(test-rkva-wavefront-2x256-live test-rkva-wavefront-2x256-live.cpp)
+target_include_directories(test-rkva-wavefront-2x256-live PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(test-rkva-wavefront-2x256-live PRIVATE cxx_std_17)
+target_link_libraries(test-rkva-wavefront-2x256-live PRIVATE llama)
 
 # Phase-1 scaffold of the fused position-split span op (CPU-only, no GPU).
 add_executable(test-kvarn-split-fused-scaffold test-kvarn-split-fused-scaffold.cpp)

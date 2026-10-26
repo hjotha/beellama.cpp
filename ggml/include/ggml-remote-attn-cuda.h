@@ -84,6 +84,40 @@ struct ggml_remote_attn_cuda_fp8_interface_v2 {
 typedef const struct ggml_remote_attn_cuda_fp8_interface_v2 *
     (*ggml_backend_cuda_remote_attn_fp8_interface_v2_t)(void);
 
+// CUDA proc "ggml_backend_cuda_remote_attn_fp8_interface_v3".
+// Optional mapped-host extension for explicitly small batches (1 <= nq <= 9).
+// v1/v2 layouts remain unchanged. Contexts and ordinary pinned buffers are owned
+// through base. Small calls require Q/OUT in the context's device memory; their
+// CPU wire buffers need not themselves be mapped. Each context owns separate
+// grow-only mapped TX/RX sidecars and retires its stream before returning.
+// supports_small checks device capabilities; allocation/mapping can still fail.
+// A false result is a hard error, never permission to consume a partial output.
+struct ggml_remote_attn_cuda_fp8_interface_v3 {
+    const struct ggml_remote_attn_cuda_fp8_interface_v2 * base;
+    bool (*supports_small)(int device);
+    bool (*pack_small)(void * context, const void * src_q, bool is_f16,
+                       size_t nq, size_t out_width, uint8_t * dst_fp8,
+                       void * producer_event);
+    bool (*unpack_small)(void * context, const uint8_t * src_fp8,
+                         const float * src_lse, size_t nq, size_t out_width,
+                         size_t n_head, void * dst_out, size_t dst_stride_bytes);
+};
+typedef const struct ggml_remote_attn_cuda_fp8_interface_v3 *
+    (*ggml_backend_cuda_remote_attn_fp8_interface_v3_t)(void);
+
+// CUDA proc "ggml_backend_cuda_remote_attn_retirement_interface_v1".
+// Separate extension: all FP8 v1/v2/v3 table layouts remain unchanged. Applies
+// only to contexts created through base and their private serving stream.
+// This is a deallocation barrier, not an execution-success or reuse decision.
+// True permits releasing external staging buffers after previous helper calls;
+// false means they must remain alive (quarantine). Poison is never cleared.
+struct ggml_remote_attn_cuda_retirement_interface_v1 {
+    const struct ggml_remote_attn_cuda_fp8_interface_v2 * base;
+    bool (*retire_context)(void * context);
+};
+typedef const struct ggml_remote_attn_cuda_retirement_interface_v1 *
+    (*ggml_backend_cuda_remote_attn_retirement_interface_v1_t)(void);
+
 #ifdef __cplusplus
 }
 #endif

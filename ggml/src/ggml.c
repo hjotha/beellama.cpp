@@ -5641,6 +5641,29 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
+// FLASH_ATTN_EXT has one shared layout across graph builders and backends.
+// Slots 0..2 hold floats; 4 belongs to upstream sparse FA. LSE reserves two
+// words even on 32-bit hosts so backend hints never alias a pointer half.
+static_assert(sizeof(uintptr_t) == 4 || sizeof(uintptr_t) == 8, "unsupported FA attachment pointer width");
+static_assert(sizeof(uintptr_t) % sizeof(int32_t) == 0, "FA attachment pointer must occupy whole slots");
+static_assert((GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR + 2) * sizeof(int32_t) <= GGML_MAX_OP_PARAMS,
+        "FA LSE attachment exceeds op_params");
+#define GGML_FA_PARAM_BIT(slot) (UINT32_C(1) << (slot))
+static_assert((GGML_FA_PARAM_BIT(0) | GGML_FA_PARAM_BIT(1) | GGML_FA_PARAM_BIT(2) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_PREC) | GGML_FA_PARAM_BIT(4) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_OUT) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR + 1) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN) |
+        GGML_FA_PARAM_BIT(GGML_FLASH_ATTN_EXT_OP_PARAM_CUDA_FORCE_VEC)) == UINT32_C(0x3fff),
+        "FA op_params must occupy distinct slots 0..13, including both LSE pointer words");
+#undef GGML_FA_PARAM_BIT
+
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5770,6 +5793,7 @@ struct ggml_tensor * ggml_flash_attn_ext_get_lse_out(
     }
     uintptr_t ptr = 0;
     memcpy(&ptr, &a->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_LSE_PTR], sizeof(ptr));
+    GGML_ASSERT(ptr != 0 && "FA LSE flag requires an attached tensor");
     return (struct ggml_tensor *) ptr;
 }
 

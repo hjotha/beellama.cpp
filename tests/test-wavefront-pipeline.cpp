@@ -16,6 +16,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 static int g_checks = 0;
@@ -118,6 +119,100 @@ static llama_ubatch make_test_ubatch_custom_pos(const std::vector<llama_pos> & p
     ub.seq_idx    = data->seq_idx.data();
     ub.output     = data->output.data();
     return ub;
+}
+
+// The serving graph consumes one parent512 while every ordinary layer task
+// consumes a complete N256 tile. These tests cover the schedule and input
+// contract, not CUDA/RKVA numerical or performance qualification.
+static void test_serving_2x256_contract() {
+    g_case = "serving_2x256_contract";
+    CHECK(llama_wavefront::parse_serving_tile_size("256") == 256);
+    CHECK(llama_wavefront::parse_serving_tile_size("64") == 64);
+    CHECK(llama_wavefront::parse_serving_tile_size("128") == 128);
+    CHECK(llama_wavefront::parse_serving_tile_size(nullptr) == 0);
+    bool invalid = false;
+    try { llama_wavefront::parse_serving_tile_size("512"); }
+    catch (const std::invalid_argument &) { invalid = true; }
+    CHECK(invalid);
+    const uint32_t P = 1024;
+    auto ub = make_test_ubatch(512, 103424, 0);
+    llama_wavefront::wavefront_plan plan;
+    std::string err;
+    CHECK(llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 0, plan, err));
+    CHECK(llama_wavefront::is_serving_2x256_plan(plan));
+    for (uint32_t t = 0; t < 2; ++t) {
+        CHECK(plan.tiles[t].n_tokens == 256);
+        CHECK(plan.tiles[t].token_offset == t * 256);
+        CHECK(plan.ubatch_tiles[t].token[255] == ub.token[t * 256 + 255]);
+        CHECK(plan.ubatch_tiles[t].seq_id[255][0] == 5);
+        CHECK(plan.tiles[t].pos_min / 128 + 2 == (uint32_t(plan.tiles[t].pos_max) + 1) / 128);
+    }
+    for (uint32_t count : { 255u, 256u, 511u, 513u, 768u }) {
+        auto short_or_extra = make_test_ubatch(count, 103424, 0);
+        CHECK(llama_wavefront::partition_ubatch_causal_tiles(short_or_extra, 256, 64, P, 0, plan, err));
+        CHECK(!llama_wavefront::is_serving_2x256_plan(plan));
+    }
+    // Generic partitioning can represent crossing P; exact serving cannot.
+    for (llama_pos begin : { llama_pos(P - 256), llama_pos(P - 124) }) {
+        auto crossing = make_test_ubatch(512, begin, 0);
+        CHECK(llama_wavefront::partition_ubatch_causal_tiles(crossing, 256, 64, P, 0, plan, err));
+        CHECK(!llama_wavefront::is_serving_2x256_plan(plan));
+        for (const auto & tile : plan.tiles) {
+            CHECK(!(tile.pos_min < llama_pos(P) && tile.pos_max >= llama_pos(P)));
+        }
+    }
+    // A protected tail is supported by the generic planner, not this serving path.
+    CHECK(llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 129, plan, err));
+    CHECK(plan.tiles.back().n_tokens == 256 && plan.tiles.back().is_protected_window);
+    CHECK(!llama_wavefront::is_serving_2x256_plan(plan));
+    CHECK(!llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 257, plan, err));
+    CHECK(plan.tiles.empty());
+    // Strictly increasing gaps are representable, but do not satisfy N256's
+    // contiguous prefix requirement.
+    auto gap = make_test_ubatch(512, 103424, 0);
+    for (uint32_t i = 256; i < 512; ++i) ++gap.pos[i];
+    CHECK(llama_wavefront::partition_ubatch_causal_tiles(gap, 256, 64, P, 0, plan, err));
+    CHECK(!llama_wavefront::is_serving_2x256_plan(plan));
+    // Reject mixed ownership and hidden-state input before publishing a plan.
+    auto mixed = make_test_ubatch(512, 103424, 0);
+    mixed.data->seq_id_data[300] = 9;
+    CHECK(!llama_wavefront::partition_ubatch_causal_tiles(mixed, 256, 64, P, 0, plan, err));
+    CHECK(plan.tiles.empty());
+    float hidden = 0;
+    ub.embd_state = &hidden;
+    CHECK(!llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 0, plan, err));
+    CHECK(plan.tiles.empty());
+}
+
+static void test_serving_2x256_schedule() {
+    g_case = "serving_2x256_schedule";
+    // Qwen35 dense 32/64 layers have 8/16 full-attention groups.
+    for (uint32_t groups : { 8u, 16u }) {
+        for (uint32_t rpc_batch : { 1u, 4u }) {
+            const auto steps = llama_wavefront::build_serving_schedule(groups, 2, rpc_batch);
+            CHECK(steps.size() == size_t(groups) * 4);
+            std::vector<bool> prepared(groups * 2, false), complete(groups * 2, false);
+            uint32_t outstanding = 0, peak = 0;
+            for (const auto & step : steps) {
+                CHECK(step.group < groups && step.tile < 2);
+                const uint32_t id = step.group * 2 + step.tile;
+                if (step.action == llama_wavefront::serving_step::phase::PREPARE) {
+                    CHECK(!prepared[id]);
+                    CHECK(step.group == 0 || complete[id - 2]);
+                    CHECK(step.tile == 0 || prepared[id - 1]);
+                    prepared[id] = true;
+                    peak = std::max(peak, ++outstanding);
+                } else {
+                    CHECK(prepared[id] && !complete[id]);
+                    complete[id] = true;
+                    CHECK(outstanding > 0);
+                    --outstanding;
+                }
+            }
+            CHECK(outstanding == 0 && peak == 2);
+            CHECK(std::all_of(complete.begin(), complete.end(), [](bool v) { return v; }));
+        }
+    }
 }
 
 // 1. Validação de tamanho de tile
@@ -1038,6 +1133,8 @@ static void test_graph_capacity_and_scaling() {
 int main() {
     std::printf("[test-wavefront-pipeline] Iniciando bateria de testes da Fase 7...\n");
 
+    test_serving_2x256_contract();
+    test_serving_2x256_schedule();
     test_tile_size_validation();
     test_wavefront_schedule_properties();
     test_topological_order_validation();

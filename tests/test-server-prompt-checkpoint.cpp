@@ -42,6 +42,54 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(!server_draft_context_owns_state(true,  true));
 }
 
+static std::vector<int> physical_checkpoint_tail(
+        int64_t total, int batch, const server_prompt_checkpoint_cadence & cadence, bool mtp = false) {
+    const int64_t begin = total - total % 512 - 512;
+    std::vector<int> result;
+    for (int64_t pos = begin; pos < total;) {
+        int64_t end = std::min(total, pos + batch);
+        for (int offset : cadence.offsets) {
+            if ((offset == 1 && !mtp) || (offset == 4 && mtp)) continue;
+            const auto boundary = server_prompt_checkpoint_boundary(total, cadence.n_last(offset), 128);
+            if (boundary > pos && boundary < end) end = boundary;
+        }
+        for (int64_t physical = pos; physical < end;) {
+            const int n = int(std::min<int64_t>(256, end - physical));
+            result.push_back(n);
+            physical += n;
+        }
+        pos = end;
+    }
+    return result;
+}
+
+static void kvarn_checkpoint_cadence_preserves_production_compute_shapes() {
+    const server_prompt_checkpoint_cadence production(256, 256, 256, 128);
+    const server_prompt_checkpoint_cadence control(512, 256, 256, 128);
+    const server_prompt_checkpoint_cadence wavefront(512, 512, 256, 128);
+    // Legacy B512/UB256 used a logical512 cap, changing N128/N256 positions.
+    const server_prompt_checkpoint_cadence legacy_control(512, 256, 256, 1);
+    for (int64_t total : {102400, 130560}) {
+        assert((physical_checkpoint_tail(total, 256, production) == std::vector<int>{256, 128, 128}));
+        assert((physical_checkpoint_tail(total, 512, legacy_control) == std::vector<int>{128, 256, 128}));
+    }
+    for (int64_t total = 102400; total < 103424; ++total) {
+        for (bool mtp : {false, true}) {
+            const auto expected = physical_checkpoint_tail(total, 256, production, mtp);
+            assert(physical_checkpoint_tail(total, 512, control, mtp) == expected);
+            assert(physical_checkpoint_tail(total, 512, wavefront, mtp) == expected);
+        }
+        for (int64_t processed = total - 512; processed <= total; ++processed) {
+            assert(production.near_end(total, processed) == control.near_end(total, processed));
+            assert(production.near_end(total, processed) == wavefront.near_end(total, processed));
+        }
+    }
+    // Standard non-KVarN checkpointing retains its original cap and UB policy.
+    const server_prompt_checkpoint_cadence ordinary(2048, 512, 256, 1);
+    assert(ordinary.ubatch == 512 && ordinary.batch_cap == 2048);
+    assert(ordinary.n_last(516) == 516);
+}
+
 static server_prompt make_prompt(const llama_tokens & tokens) {
     server_prompt prompt;
     prompt.tokens = server_tokens(tokens, false);
@@ -517,6 +565,7 @@ static void prompt_cache_make_room_fails_when_single_state_exceeds_budget() {
 }
 
 int main() {
+    kvarn_checkpoint_cadence_preserves_production_compute_shapes();
     prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp();
     prompt_cache_does_not_restore_just_admitted_live_state();
     prompt_cache_self_contained_wins_over_native();

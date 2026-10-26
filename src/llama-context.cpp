@@ -8,6 +8,7 @@
 #include "llama-rollback.h"
 #include "llama-impl.h"
 #include "llama-position-split.h"
+#include "llama-wavefront.h"
 #include "llama-io.h"
 #include "llama-io-file.h"
 #include "llama-kv-cache-kvarn.h"
@@ -519,6 +520,21 @@ llama_context::llama_context(
         } catch (...) {
             // Vulkan unavailable; position-split will validate during setup
         }
+    }
+
+    cparams.rkva_wavefront_tile = llama_wavefront::parse_serving_tile_size(
+            std::getenv("GGML_RKVA_WAVEFRONT_TILE"));
+    cparams.rkva_wavefront_rpc_batch = llama_wavefront::parse_serving_rpc_batch(
+            std::getenv("GGML_RKVA_WAVEFRONT_RPC_BATCH"));
+    if (cparams.rkva_wavefront_rpc_batch != 1) {
+        throw std::invalid_argument("wavefront RPC_BATCH=4 is unavailable; use RPC_BATCH=1");
+    }
+    if (cparams.rkva_wavefront_tile == 256 && (params.n_ubatch != 512 || params.n_batch < 512)) {
+        throw std::invalid_argument("wavefront 2xN256 requires logical batch>=512 and requested ubatch=512");
+    }
+    if (cparams.rkva_wavefront_tile) {
+        LLAMA_LOG_WARN("RKVA wavefront experimental: tile=%u; eligible Qwen35 dense all-overflow single-sequence n_rs_seq=0 only; explicit RPC batching policy, no rollback after parent failure\n",
+                cparams.rkva_wavefront_tile);
     }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
@@ -2166,6 +2182,11 @@ std::vector<ggml_backend_t> layer_backends;
 }
 
 llama_context::~llama_context() {
+    for (const auto & entry : wavefront_decisions) {
+        LLAMA_LOG_INFO("RKVA wavefront summary: reason=%s parents=%llu\n", entry.first.c_str(),
+                (unsigned long long) entry.second);
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     // Fused position-split span: release THIS context's executor bundle (its
@@ -2345,6 +2366,19 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+// WF256 executes ordinary prefix/fallback graphs at physical N256. Reserving
+// a dummy serial N512 graph here doubles their live workspace before any
+// eligible wavefront parent exists. Keep the node/capacity budget at the public
+// parent size; the scheduler can grow for an actual two-tile graph on demand.
+// No-allocation fit estimates remain conservative at the requested parent size.
+static uint32_t rkva_physical_ubatch(const llama_cparams & cp) {
+    return cp.rkva_wavefront_tile == 256 ? std::min(cp.n_ubatch, 256u) : cp.n_ubatch;
+}
+
+static uint32_t rkva_initial_reserve_tokens(const llama_cparams & cp, bool no_alloc) {
+    return std::min(cp.n_ctx, no_alloc ? cp.n_ubatch : rkva_physical_ubatch(cp));
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -2357,9 +2391,10 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t capacity_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = rkva_initial_reserve_tokens(cparams, model.hparams.no_alloc);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(capacity_tokens);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -2816,7 +2851,7 @@ llama_memory_status llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = rkva_initial_reserve_tokens(cparams, model.hparams.no_alloc);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -3949,6 +3984,46 @@ static bool f4_sched_eval_cb(struct ggml_tensor * t, bool ask, void * user_data)
     return true;
 }
 
+static const char * rkva_wavefront_fallback(const llm_graph_params & params, bool input_only = false) {
+    const auto & ub = params.ubatch;
+    const auto & cp = params.cparams;
+    if (!cp.rkva_wavefront_tile) return "disabled";
+    if (params.arch != LLM_ARCH_QWEN35 || params.gtype == LLM_GRAPH_TYPE_DECODER_MTP ||
+            cp.ctx_type == LLAMA_CONTEXT_TYPE_MTP) return "unsupported_model_or_draft";
+    if ((!input_only && !params.mctx) || !ub.pos || !ub.seq_id || !ub.n_seq_id) return "reserve_or_missing_input";
+    if (cp.rkva_wavefront_tile == 256) {
+        if (cp.n_ubatch != 512 || ub.n_tokens != 512) return "requires_exact_2x256_parent";
+        if (cp.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cp.embeddings || cp.embeddings_nextn ||
+                cp.embeddings_nextn_masked || !params.samplers.empty()) return "2x256_output_contract";
+        if (!ub.token || ub.embd || ub.embd_state || ub.type || ub.decision_order) return "2x256_token_input_required";
+    }
+    if (!cp.causal_attn || params.hparams.swa_type != LLAMA_SWA_TYPE_NONE ||
+            params.hparams.use_alibi || params.hparams.f_max_alibi_bias != 0.0f ||
+            params.hparams.attn_soft_cap) return "attention_contract";
+    if (cp.n_rs_seq != 0) return "recurrent_rollback";
+    if (cp.n_capture_layers != 0) return "layer_capture";
+    if (std::any_of(cp.embeddings_layer_inp.begin(), cp.embeddings_layer_inp.end(),
+                [](bool enabled) { return enabled; })) return "layer_input_capture";
+    if (ub.n_tokens <= cp.rkva_wavefront_tile) return "single_tile";
+    if (ub.n_seqs != 1 || ub.n_seqs_unq != 1 || ub.n_seq_tokens != ub.n_tokens) return "multiple_sequences";
+    if (!cp.remote_attn_position_split || !cp.kv_position_split_p || !params.backend_remote ||
+            !ggml_backend_remote_attn_async_enabled(params.backend_remote) ||
+            !ggml_backend_remote_attn_native_kvarn_enabled(params.backend_remote)) return "remote_native_async_required";
+    if (cp.rkva_wavefront_rpc_batch == 4 && !ggml_backend_remote_attn_cohort_enabled(params.backend_remote)) {
+        return "remote_cohort_capability_required";
+    }
+    const auto * hybrid = dynamic_cast<const llama_memory_hybrid_context *>(params.mctx);
+    const auto * kvarn = hybrid ? dynamic_cast<const llama_kv_cache_kvarn_context *>(hybrid->get_attn()) : nullptr;
+    if (!input_only && (!kvarn || !kvarn->position_split_enabled())) return "hybrid_kvarn_required";
+    if (params.hparams.n_layer() == 0 || params.hparams.is_recr(params.hparams.n_layer() - 1)) return "trailing_recurrent_layers";
+    for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+        if (ub.n_seq_id[i] != 1 || !ub.seq_id[i] || !ub.seq_id[0] || ub.seq_id[i][0] != ub.seq_id[0][0]) return "multiple_sequences";
+        if (ub.pos[i] < int64_t(cp.kv_position_split_p)) return "not_all_overflow";
+        if (i && int64_t(ub.pos[i]) != int64_t(ub.pos[i - 1]) + 1) return "noncontiguous_positions";
+    }
+    return nullptr;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     static const bool profile_prep = [] {
         const char * value = std::getenv("LLAMA_GRAPH_PREP_PROFILE");
@@ -3974,7 +4049,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    if (cparams.rkva_wavefront_tile) {
+        const char * reason = rkva_wavefront_fallback(gparams);
+        const uint64_t count = ++wavefront_decisions[reason ? reason : "tiled_parent"];
+        if (count == 1 || count % 64 == 0) {
+            LLAMA_LOG_INFO("RKVA wavefront selection: reason=%s count=%llu nq=%u tile=%u\n",
+                    reason ? reason : "tiled_parent", (unsigned long long) count,
+                    ubatch.n_tokens, gparams.wavefront_tile_size);
+        }
+    }
 
+
+    wavefront_parent_active = gparams.wavefront_tile_size != 0;
+    try {
     const bool reused = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
     const int64_t prep_checked = profile_prep ? ggml_time_us() : 0;
     int64_t prep_reset = prep_checked, prep_built = prep_checked, prep_allocated = prep_checked;
@@ -4089,8 +4176,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     f4_dump_graph(res->get_gf());
 
     ret = GGML_STATUS_SUCCESS;
+    wavefront_committed = wavefront_committed || wavefront_parent_active;
 
     return res;
+    } catch (const std::exception & e) {
+        if (!wavefront_parent_active && !wavefront_committed) throw;
+        LLAMA_LOG_ERROR("RKVA wavefront graph/input failure: %s\n", e.what());
+    } catch (...) {
+        if (!wavefront_parent_active && !wavefront_committed) throw;
+        LLAMA_LOG_ERROR("RKVA wavefront graph/input failure: unknown exception\n");
+    }
+    // Return through decode's full-context retirement/poison path even for
+    // a thrown tile-input validation error before graph_compute() starts.
+    ret = GGML_STATUS_FAILED;
+    memory_finish_guard.finish(ret);
+    return nullptr;
 }
 
 static bool dflash2_split_block_fits(const llama_batch_ext & batch, uint32_t n_seq_max, uint32_t block_size) {
@@ -4373,6 +4473,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (wavefront_poisoned) {
+        LLAMA_LOG_ERROR("RKVA wavefront: refusing reuse of a failed tiled context\n");
+        return -3;
+    }
+
     nextn_decode_id = 0;
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -4494,8 +4599,38 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // The 2xN256 experiment coalesces only a fully eligible overflow parent.
+    // Prefix, boundary crossings, short tails and unsupported inputs retain
+    // the baseline physical N256 kernels, even with requested n_ubatch=512.
+    uint32_t effective_ubatch = cparams.n_ubatch;
+    if (cparams.rkva_wavefront_tile == 256) {
+        effective_ubatch = 256;
+        const auto & batch = balloc->get_batch();
+        llama_ubatch probe {};
+        probe.b_equal_seqs = 1;
+        probe.n_tokens = batch.n_tokens;
+        probe.n_seq_tokens = batch.n_tokens;
+        probe.n_seqs = probe.n_seqs_unq = 1;
+        probe.n_pos = model.hparams.n_pos_per_embd();
+        probe.token = batch.token;
+        probe.embd = batch.embd;
+        probe.pos = batch.pos;
+        probe.n_seq_id = batch.n_seq_id;
+        probe.seq_id = batch.seq_id;
+        const auto candidate = graph_params(nullptr, probe, nullptr, ctx_type_to_graph_type(cparams.ctx_type));
+        const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory.get());
+        const auto * kvarn = hybrid ? dynamic_cast<const llama_kv_cache_kvarn *>(hybrid->get_mem_attn_base()) : nullptr;
+        const bool plain_tokens = std::all_of(batch_inp.tokens.begin(), batch_inp.tokens.end(),
+                [](const auto & token) { return !token.has_embd && !token.has_state && token.decision_order == 0; });
+        if (plain_tokens && kvarn && !rkva_wavefront_fallback(candidate, true)) {
+            effective_ubatch = 512;
+        } else {
+            LLAMA_LOG_INFO("RKVA wavefront prefix: requested_ubatch=512 effective_ubatch=256\n");
+        }
+    }
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        mctx = memory->init_batch(*balloc, effective_ubatch, embd_all);
         if (!mctx) {
             return -2;
         }
@@ -4582,6 +4717,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            if (wavefront_parent_active || wavefront_committed) {
+                // n_rs_seq==0 commits each tile in place. A partial tiled parent
+                // cannot be rolled back to its beginning with seq_rm(). Retire
+                // all RPC/DMA and local work before clearing either state arena.
+                if (backend_remote) ggml_backend_remote_attn_drain(backend_remote);
+                ggml_backend_sched_synchronize(sched.get());
+                if (backend_remote) ggml_backend_remote_attn_invalidate_range(backend_remote);
+                memory->clear(true);
+                wavefront_poisoned = true;
+                LLAMA_LOG_ERROR("RKVA wavefront context failed: entire context cleared and poisoned; create/restore a fresh context\n");
+                // An abort after in-place recurrent commits is not a KV-space
+                // retry. This also covers the legacy tail/decode after tiles.
+                return status == GGML_STATUS_ALLOC_FAILED ? -2 : -3;
+            }
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -5230,7 +5379,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (cparams.training) {
         res *= 4;
     }
-
+    if (cparams.rkva_wavefront_tile) {
+        const uint64_t tiles = (uint64_t(n_tokens) + cparams.rkva_wavefront_tile - 1)/cparams.rkva_wavefront_tile;
+        const uint64_t expanded = uint64_t(res)*std::max<uint64_t>(1, tiles) + 64*tiles;
+        if (expanded > UINT32_MAX) throw std::runtime_error("wavefront graph node budget exceeds uint32");
+        res = uint32_t(expanded);
+    }
     return res;
 }
 
@@ -5379,7 +5533,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params result = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -5404,6 +5558,10 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+    if (!rkva_wavefront_fallback(result)) {
+        result.wavefront_tile_size = cparams.rkva_wavefront_tile;
+    }
+    return result;
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
@@ -7911,6 +8069,10 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+uint32_t llama_n_ubatch_physical(const llama_context * ctx) {
+    return rkva_physical_ubatch(ctx->get_cparams());
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

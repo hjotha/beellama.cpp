@@ -134,25 +134,56 @@ Write-Host "Using MSBuild: $MsBuild"
 # ---------------------------------------------------------------------------
 $UwpDir = Join-Path $RepoRoot "uwp"
 $CrtDlls = @("MSVCP140.dll", "MSVCP140_1.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll")
-$CrtRedistDir = Get-Item `
-    -Path "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" `
-    -ErrorAction SilentlyContinue |
-    Sort-Object FullName -Descending | Select-Object -First 1
-
-if ($CrtRedistDir) {
-    Write-Host "Found CRT redist: $($CrtRedistDir.FullName)"
-    foreach ($dll in $CrtDlls) {
-        $src = Join-Path $CrtRedistDir.FullName $dll
-        if (Test-Path $src) {
-            $dst = Join-Path $UwpDir $dll
-            if (-not (Test-Path $dst) -or (Get-FileHash $src).Hash -ne (Get-FileHash $dst).Hash) {
-                Copy-Item $src $UwpDir -Force
-                Write-Host "  Copied $dll"
+# VS Installer also registers custom installations such as C:\BuildTools.
+# The newest IDE can contain only Auxiliary metadata while another v143
+# installation has the actual redistributable payload.
+function Find-XboxCrtRedist([string[]]$VisualStudioRoots) {
+    $candidates = @(
+        foreach ($root in $VisualStudioRoots) {
+            $redist = Join-Path $root 'VC\Redist\MSVC'
+            if (-not (Test-Path -LiteralPath $redist -PathType Container)) { continue }
+            Get-ChildItem -LiteralPath $redist -Directory -Recurse -Filter 'Microsoft.VC143.CRT' |
+                Where-Object {
+                    # Exclude onecore/debug variants: the package imports the
+                    # normal desktop /MD DLLs, with their exact installed bytes.
+                    $relative = $_.FullName.Substring($redist.TrimEnd('\').Length).TrimStart('\')
+                    $relative -match '^\d+\.\d+\.\d+\\(?:Auxiliary\\)?x64\\Microsoft\.VC143\.CRT$'
+                }
+        }
+    )
+    $complete = @(
+        foreach ($candidate in $candidates) {
+            $missing = @($CrtDlls | Where-Object { -not (Test-Path -LiteralPath (Join-Path $candidate.FullName $_) -PathType Leaf) })
+            if ($missing.Count -ne 0) { continue }
+            $runtime = Get-Item -LiteralPath (Join-Path $candidate.FullName 'VCRUNTIME140.dll')
+            # v143 requires a VS 2022 runtime; never fall back to a v142 payload.
+            if ($runtime.VersionInfo.FileMajorPart -ne 14 -or $runtime.VersionInfo.FileMinorPart -lt 30) { continue }
+            [pscustomobject]@{
+                Path = $candidate.FullName
+                Version = [version]("{0}.{1}.{2}.{3}" -f $runtime.VersionInfo.FileMajorPart,
+                    $runtime.VersionInfo.FileMinorPart, $runtime.VersionInfo.FileBuildPart, $runtime.VersionInfo.FilePrivatePart)
             }
         }
+    )
+    $selected = $complete | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $selected) {
+        throw "No complete x64 VC143 CRT payload found in installed Visual Studio roots: $($VisualStudioRoots -join ', '). Install the VC++ x64 redistributable payload before packaging."
     }
-} else {
-    Write-Warning "VC++ CRT redist directory not found. onnxruntime may fail in AppContainer on Xbox."
+    return $selected.Path
+}
+$VsRoots = @(& $VsWhere -all -products '*' -property installationPath)
+if ($LASTEXITCODE -ne 0 -or $VsRoots.Count -eq 0) { throw 'vswhere could not enumerate installed Visual Studio roots for CRT discovery.' }
+$CrtRedistDir = Find-XboxCrtRedist $VsRoots
+Write-Host "Found complete x64 CRT redist: $CrtRedistDir"
+foreach ($dll in $CrtDlls) {
+    $src = Join-Path $CrtRedistDir $dll
+    $dst = Join-Path $UwpDir $dll
+    $expectedHash = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash
+    Copy-Item -LiteralPath $src -Destination $dst -Force
+    if ((Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw "Staged CRT hash differs from installed redist: $dll"
+    }
+    Write-Host "CRT $dll SHA256=$expectedHash"
 }
 
 # ---------------------------------------------------------------------------
@@ -307,7 +338,7 @@ $Msix = Get-ChildItem -Path (Join-Path $UwpDir 'AppPackages') -Filter '*.msix' -
 if (-not $Msix) { throw 'Build completed without producing a fresh MSIX outside AppPackages\Finalized.' }
 $FinalizedPackage = & (Join-Path $PSScriptRoot 'Finalize-XboxPackage.ps1') -PackagePath $Msix.FullName `
     -PfxPath $PfxPath -CerPath $CerPath -CertificatePassword $CertPwd -Backend $Backend `
-    -WindowsSdkVersion $WindowsSdkVersion -OutputDirectory $FinalizedDir
+    -WindowsSdkVersion $WindowsSdkVersion -OutputDirectory $FinalizedDir -CrtDirectory $CrtRedistDir
 Write-Host "Finalized package: $FinalizedPackage"
 
 } finally {

@@ -10581,6 +10581,8 @@ private:
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
                     const int32_t checkpoint_min_step = params_base.checkpoint_min_step;
                     const int32_t reuse_alignment = prompt_reuse_alignment();
+                    const server_prompt_checkpoint_cadence checkpoint_cadence(
+                            n_batch, n_ubatch, (int) llama_n_ubatch_physical(ctx_tgt), reuse_alignment);
                     const auto & spans = slot.task->params.message_spans;
                     // Structured chats already checkpoint user boundaries. Add
                     // periodic anchors only for raw/unstructured prompts, where
@@ -10759,14 +10761,15 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                         //    repeated scoring replays the same final batch shape.
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            const int checkpoint_offsets[] = {4 + n_ubatch, 4, 1};
-
+                            // KVarN cuts follow physical compute, retaining the production
+                            // B256/UB256 seam (256/128/128) for logical parent512 too.
+                            // Ordinary alignment1 checkpoint cadence stays unchanged.
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
+                            for (int offset : checkpoint_cadence.offsets) {
                                 if ((offset == 1 && !uses_mtp()) || (offset == 4 && uses_mtp())) {
                                     continue;
                                 }
-                                const int n_last = std::min(n_batch, offset);
+                                const int n_last = checkpoint_cadence.n_last(offset);
                                 const int32_t alignment = prompt_reuse_alignment();
                                 const int64_t checkpoint_boundary = server_prompt_checkpoint_boundary(
                                         slot.task->n_tokens(), n_last, alignment);
@@ -10786,7 +10789,8 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    const bool near_prompt_end = checkpoint_cadence.near_end(
+                            slot.task->n_tokens(), slot.prompt.n_tokens());
 
                     const bool is_user_start = reuse_alignment == 1 && spans.is_user_start(n_tokens_start);
                     // KVarN: this batch round starts at a group seam with a user message in the following

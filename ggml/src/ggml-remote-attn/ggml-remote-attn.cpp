@@ -38,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifndef _WIN32
@@ -187,6 +188,31 @@ static const ggml_remote_attn_cuda_fp8_interface_v2 * rkva_cuda_fp8_api() {
     return api;
 }
 
+static const ggml_remote_attn_cuda_fp8_interface_v3 * rkva_cuda_fp8_small_api() {
+    static std::mutex mutex;
+    static const ggml_remote_attn_cuda_fp8_interface_v3 * api = nullptr;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!api) {
+        auto * reg = ggml_backend_reg_by_name("CUDA");
+        auto getter = reg ? reinterpret_cast<ggml_backend_cuda_remote_attn_fp8_interface_v3_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_fp8_interface_v3")) : nullptr;
+        if (getter) api = getter();
+    }
+    return api;
+}
+
+static bool rkva_cuda_fp8_mapped_requested() {
+    const char * option = std::getenv("GGML_RKVA_CUDA_FP8");
+    return option && !std::strcmp(option, "mapped");
+}
+
+static const ggml_remote_attn_cuda_retirement_interface_v1 * rkva_cuda_retirement_api() {
+    auto * reg = ggml_backend_reg_by_name("CUDA");
+    auto getter = reg ? reinterpret_cast<ggml_backend_cuda_remote_attn_retirement_interface_v1_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_retirement_interface_v1")) : nullptr;
+    return getter ? getter() : nullptr;
+}
+
 static thread_local void * rkva_cuda_producer_event = nullptr;
 
 // A slot owns its pinned network/staging allocations until retirement. CPU-only
@@ -232,6 +258,14 @@ public:
         used = bytes;
     }
     void clear() { if (api) used = 0; else host.clear(); }
+    // Device failure may leave a DMA targeting these pages. Detach ownership
+    // only during destruction, when successful retirement cannot be established.
+    size_t quarantine_pinned() {
+        const size_t bytes = pinned ? allocated : 0;
+        pinned = nullptr;
+        used = allocated = 0;
+        return bytes;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -679,8 +713,17 @@ struct rkva_stats {
     uint64_t range_fused_calls = 0;
     uint64_t cuda_pack_calls = 0;
     uint64_t cuda_unpack_calls = 0;
+    uint64_t cuda_small_pack_calls = 0;
+    uint64_t cuda_small_unpack_calls = 0;
+    uint64_t cohort_calls = 0;
+    uint64_t cohort_entries = 0;
     uint64_t cuda_context_creates = 0;
-    uint64_t cuda_context_phase_releases = 0;
+    uint64_t cuda_context_phase_releases = 0; // slot-owner drops, not physical frees
+    uint64_t cuda_context_shared_acquires = 0;
+    uint64_t cuda_context_shared_releases = 0;
+    // Last strong owner dropped during an explicit phase/mode transition.
+    // Teardown drops and CUDA destroy success are deliberately not inferred.
+    uint64_t cuda_context_shared_last_releases = 0;
     uint64_t q_f32_readback_bytes_avoided = 0;
     uint64_t out_f32_upload_bytes_avoided = 0;
     int64_t range_query_min = -1;
@@ -708,6 +751,8 @@ struct rkva_async_slot {
     rkva_slot_state state = rkva_slot_state::FREE;
     uint64_t        epoch = 0;
     uint64_t        ticket = 0;
+    uint32_t        cohort_count = 0;
+    uint32_t        cohort_index = 0;
     ggml_remote_attn_trace_event trace{};
     uint64_t pending_us = 0;
     uint64_t response_cycle = 0; // worker writes before DONE; wait reads after acquire
@@ -716,7 +761,11 @@ struct rkva_async_slot {
     rkva_byte_buffer reply;                // pinned RX when CUDA FP8 is active
     rkva_byte_buffer query_fp8;
     const ggml_remote_attn_cuda_fp8_interface_v2 * cuda_api = nullptr;
-    void * cuda_context = nullptr;
+    const ggml_remote_attn_cuda_fp8_interface_v3 * cuda_small_api = nullptr;
+    bool cuda_small = false; // captured for this submission; never reread policy on worker
+    void * cuda_context = nullptr; // alias; strong lease below owns shared contexts
+    std::shared_ptr<void> cuda_shared_lease;
+    bool cuda_shared_requested = false; // captured from this submission's local bit
     int cuda_device = -1;
     // A failed helper cannot establish successful retirement for future reuse.
     // Keep this across reset/reconnect, including failures that were numerical.
@@ -743,14 +792,38 @@ struct rkva_async_slot {
     bool                 bulk_f16 = false;
     rkva_wire            wire = RKVA_WIRE_F16;
 
-    ~rkva_async_slot() { if (cuda_context) cuda_api->destroy_context(cuda_context); }
+    ~rkva_async_slot() {
+        bool retired = cuda_context_retired;
+        if (!retired && cuda_context) {
+            const auto * retirement = rkva_cuda_retirement_api();
+            retired = retirement && retirement->base == cuda_api &&
+                      retirement->retire_context(cuda_context);
+        }
+        if (!retired) {
+            const size_t quarantined = payload.quarantine_pinned() + reply.quarantine_pinned() +
+                                       query_fp8.quarantine_pinned();
+            GGML_LOG_ERROR("RKVA: quarantined %zu pinned bytes after unconfirmed CUDA retirement\n", quarantined);
+        }
+        release_cuda_owner();
+    }
+
+    void release_cuda_owner() {
+        void * previous = cuda_context;
+        cuda_context = nullptr;
+        cuda_device = -1;
+        if (cuda_shared_lease) {
+            // A RUNNING peer retains its own strong lease. The last owner alone
+            // invokes the API captured in the deleter; no backend pointer lives
+            // in that deleter or survives the backend's mutex/stat destruction.
+            cuda_shared_lease.reset();
+        } else if (previous) {
+            cuda_api->destroy_context(previous);
+        }
+    }
 
     bool prepare_cuda(int device) {
-        if (!cuda_context_retired) return false;
-        if (cuda_context && device != cuda_device) {
-            cuda_api->destroy_context(cuda_context);
-            cuda_context = nullptr;
-        }
+        if (!cuda_context_retired || cuda_shared_lease) return false;
+        if (cuda_context && device != cuda_device) release_cuda_owner();
         if (!cuda_context) {
             cuda_api = rkva_cuda_fp8_api();
             if (!cuda_api) return false;
@@ -772,6 +845,8 @@ struct rkva_async_slot {
         state = rkva_slot_state::FREE;
         epoch = 0;
         ticket = 0;
+        cohort_count = 0;
+        cohort_index = 0;
         trace = {};
         pending_us = 0;
         response_cycle = 0;
@@ -788,6 +863,9 @@ struct rkva_async_slot {
         first_pos = 0;
         last_pos = 0;
         bulk_f16 = false;
+        cuda_small = false;
+        cuda_shared_requested = false;
+        cuda_small_api = nullptr;
         wire = RKVA_WIRE_F16;
         payload.clear();
         reply.clear();
@@ -804,6 +882,11 @@ struct rkva_async_slot {
 // ---------------------------------------------------------------------------
 // backend context
 // ---------------------------------------------------------------------------
+
+struct rkva_shared_cuda_context_entry {
+    const ggml_remote_attn_cuda_fp8_interface_v2 * api = nullptr;
+    std::weak_ptr<void> context;
+};
 
 struct ggml_backend_remote_attn_context {
     std::string host;
@@ -824,7 +907,10 @@ struct ggml_backend_remote_attn_context {
 
     // 2-slot async queue managed by worker thread with single TCP owner.
     // Slots decouple host preparation, staging and socket IO with deterministic backpressure.
-    static constexpr size_t RKVA_ASYNC_QUEUE_CAPACITY = 2;
+    static constexpr size_t RKVA_ASYNC_QUEUE_CAPACITY = 4;
+    // Backpressure reads this after dropping mutex, while control can reconfigure.
+    std::atomic<size_t> async_capacity {2};
+    bool cohort_enabled = false;
     std::mutex              async_mutex;
     std::condition_variable async_cv;
     std::thread             async_worker;
@@ -832,6 +918,11 @@ struct ggml_backend_remote_attn_context {
     uint64_t                async_ticket_counter = 0;
     rkva_async_slot         async_slots[RKVA_ASYNC_QUEUE_CAPACITY];
     rkva_async_slot         synchronous_slot;
+    // Protected only by mutex. Weak entries do not prolong CUDA resources;
+    // slots own every live lease until terminal retirement and teardown.
+    std::unordered_map<int, rkva_shared_cuda_context_entry> shared_cuda_contexts;
+    rkva_byte_buffer        cohort_payload;
+    rkva_byte_buffer        cohort_reply;
     bool                    async_local_remote = false;
     std::mutex              stats_mutex;
 
@@ -885,6 +976,7 @@ struct ggml_backend_remote_attn_context {
     ggml_backend_remote_attn_context() {
         for (size_t i = 0; i < RKVA_ASYNC_QUEUE_CAPACITY; ++i) {
             async_slots[i].id = uint32_t(i);
+            if (i >= async_capacity) continue;
             try {
                 async_slots[i].payload.reserve(8u << 20);
                 async_slots[i].reply.reserve(4u << 20);
@@ -904,25 +996,106 @@ struct ggml_backend_remote_attn_context {
 };
 
 // Caller owns ctx->mutex and this retired slot: PREPARING for async, or the
-// synchronous slot. Other slots may still be RUNNING and are never inspected
-// or released here. Pinned network storage belongs to the slot, not its context.
+// synchronous slot. Explicit FREE slot release also requires async_mutex.
+// Active other slots remain untouched; pinned network storage stays with slots.
 static bool rkva_release_cuda_phase_context(ggml_backend_remote_attn_context * ctx,
-        rkva_async_slot & slot, const ggml_tensor * node) {
+        rkva_async_slot & slot, const ggml_tensor * node, bool free_idle_slot = false) {
     if (!slot.cuda_context_retired) return false;
     if (!slot.cuda_context) return true;
     if (ctx->failed || ctx->async_stop || !slot.cuda_api || slot.cuda_device < 0 ||
-            (&slot != &ctx->synchronous_slot && slot.state != rkva_slot_state::PREPARING)) return false;
+            (&slot != &ctx->synchronous_slot && slot.state != rkva_slot_state::PREPARING &&
+             !(free_idle_slot && slot.state == rkva_slot_state::FREE))) return false;
     ggml_remote_attn_trace_scope timing("cuda_context_phase_release", node);
     timing.event.flags = 0x40000000u;
     timing.event.value = 1;
-    // Successful pack/unpack already retired every DMA. destroy_context owns
-    // only the private codec stream/scratch; OUT and pinned buffers stay alive.
-    slot.cuda_api->destroy_context(slot.cuda_context);
-    slot.cuda_context = nullptr;
-    slot.cuda_device = -1;
-    std::lock_guard<std::mutex> slock(ctx->stats_mutex);
-    ++ctx->stats.cuda_context_phase_releases;
+    // Successful pack/unpack already retired this slot's DMA. Shared peers
+    // keep their own lease: dropping this owner is not a physical free claim.
+    const bool shared = bool(slot.cuda_shared_lease);
+    const bool last = shared && slot.cuda_shared_lease.use_count() == 1;
+    slot.release_cuda_owner();
+    {
+        std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+        ++ctx->stats.cuda_context_phase_releases;
+        ctx->stats.cuda_context_shared_releases += shared;
+        ctx->stats.cuda_context_shared_last_releases += last;
+    }
+    if (shared) {
+        auto event = ggml_remote_attn_trace_identity("cuda_context_lease_release", node);
+        event.value = last ? 2 : 1; // last owner vs ordinary lease drop, never bytes freed
+        event.begin_us = event.end_us = ggml_time_us();
+        ggml_remote_attn_trace_record(&event);
+    }
     return true;
+}
+
+// Caller owns ctx->mutex and this PREPARING/synchronous slot. Shared v2
+// helpers serialize their complete synchronous operation in the opaque mutex.
+// Pack/unpack scratch and status never outlive a call; wire buffers remain
+// private to the slot. Backend failure/reconnect barriers are unchanged.
+static bool rkva_prepare_cuda_context(ggml_backend_remote_attn_context * ctx,
+        rkva_async_slot & slot, const ggml_tensor * node, int device,
+        const ggml_remote_attn_cuda_fp8_interface_v2 * api, bool & created) {
+    created = false;
+    if (!slot.cuda_context_retired || !api || (slot.cuda_api && slot.cuda_api != api)) return false;
+    const bool shared = slot.cuda_shared_requested;
+    if (slot.cuda_context && (slot.cuda_device != device || slot.cuda_api != api ||
+            bool(slot.cuda_shared_lease) != shared)) {
+        if (!rkva_release_cuda_phase_context(ctx, slot, node)) return false;
+    }
+    if (!shared) {
+        const bool fresh = slot.cuda_context == nullptr;
+        if (!slot.prepare_cuda(device) || slot.cuda_api != api) return false;
+        created = fresh;
+        return true;
+    }
+    if (slot.cuda_context) return true;
+    auto & entry = ctx->shared_cuda_contexts[device];
+    auto lease = entry.context.lock();
+    if (lease && entry.api != api) return false;
+    if (!lease) {
+        void * context = api->create_context(device);
+        if (!context) return false;
+        // shared_ptr invokes this deleter on construction failure too. Capturing
+        // only api avoids touching an already-destroyed backend/stats mutex.
+        lease = std::shared_ptr<void>(context, [api](void * owned) { api->destroy_context(owned); });
+        entry.api = api;
+        entry.context = lease;
+        created = true;
+    }
+    slot.cuda_api = api;
+    slot.cuda_device = device;
+    slot.cuda_shared_lease = std::move(lease);
+    slot.cuda_context = slot.cuda_shared_lease.get();
+    slot.payload.use_pinned(api);
+    slot.reply.use_pinned(api);
+    slot.query_fp8.use_pinned(api);
+    {
+        std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+        ++ctx->stats.cuda_context_shared_acquires;
+    }
+    auto event = ggml_remote_attn_trace_identity("cuda_context_lease_acquire", node);
+    event.value = 1;
+    event.begin_us = event.end_us = ggml_time_us();
+    ggml_remote_attn_trace_record(&event);
+    return true;
+}
+
+// A tiled prefill may use every context, whereas decode reuses just one slot.
+// Caller owns mutex; async_mutex excludes new owners of other FREE contexts.
+static bool rkva_release_idle_cuda_peers(ggml_backend_remote_attn_context * ctx,
+        rkva_async_slot & current, const ggml_tensor * node) {
+    std::lock_guard<std::mutex> alock(ctx->async_mutex);
+    for (auto & slot : ctx->async_slots) {
+        if (&slot != &current && slot.state == rkva_slot_state::FREE &&
+                !rkva_release_cuda_phase_context(ctx, slot, node, true)) return false;
+    }
+    return true;
+}
+
+static bool rkva_release_cuda_cpu_phase(ggml_backend_remote_attn_context * ctx,
+        rkva_async_slot & current, const ggml_tensor * node) {
+    return rkva_release_cuda_phase_context(ctx, current, node) &&
+           rkva_release_idle_cuda_peers(ctx, current, node);
 }
 
 static uint64_t now_us() {
@@ -1167,7 +1340,7 @@ static bool rkva_transact(
 
 static bool rkva_has_free_slot(const ggml_backend_remote_attn_context * ctx) {
     for (const auto & s : ctx->async_slots) {
-        if (s.state == rkva_slot_state::FREE) return true;
+        if (s.id < ctx->async_capacity && s.state == rkva_slot_state::FREE) return true;
     }
     return false;
 }
@@ -1198,7 +1371,8 @@ static void rkva_test_handshake_barrier() {
 // and reply decoding run without ctx->mutex to prevent host CPU stall.
 // ctx->mutex is only acquired briefly to commit generation and ACK coverage.
 static bool rkva_finish_native_bulk_job(
-        ggml_backend_remote_attn_context * ctx, rkva_async_slot & slot, bool ctx_locked = false) {
+        ggml_backend_remote_attn_context * ctx, rkva_async_slot & slot, bool ctx_locked = false,
+        bool received = false) {
     ggml_remote_attn_trace_context_scope trace_owner(slot.trace);
     ggml_remote_attn_trace_scope trace_finish("job_finish");
     trace_finish.event.flags = 0x40000000u;
@@ -1227,8 +1401,9 @@ static bool rkva_finish_native_bulk_job(
     if (reply.capacity() < (4u << 20)) {
         reply.reserve(4u << 20);
     }
-    uint64_t cycle = 0;
-    const bool transacted = rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, slot.session,
+    uint64_t cycle = slot.response_cycle;
+    const bool transacted = received ? reply.size() == out_bytes + lse_bytes :
+        rkva_transact(ctx, RKVA_KVARN_RANGE_BULK_ATTN, slot.session,
                 slot.layer, slot.nq, slot.payload.data(), uint32_t(slot.payload.size()),
                 reply, uint32_t(out_bytes + lse_bytes), nullptr, &cycle);
     slot.response_cycle = cycle;
@@ -1255,7 +1430,10 @@ static bool rkva_finish_native_bulk_job(
     if (cuda_output) {
         if (!slot.cuda_context_retired || !slot.cuda_context) return false;
         slot.cuda_context_retired = false;
-        const bool unpacked = slot.cuda_api->unpack_out(slot.cuda_context, reply.data(),
+        const bool unpacked = slot.cuda_small ? slot.cuda_small_api->unpack_small(slot.cuda_context, reply.data(),
+                reinterpret_cast<const float *>(reply.data() + out_bytes),
+                slot.nq, slot.out_width, ctx->geo.n_head, slot.output, slot.output_stride) :
+            slot.cuda_api->unpack_out(slot.cuda_context, reply.data(),
                 reinterpret_cast<const float *>(reply.data() + out_bytes),
                 slot.nq, slot.out_width, ctx->geo.n_head, slot.output, slot.output_stride);
         slot.cuda_context_retired = unpacked;
@@ -1345,6 +1523,7 @@ static bool rkva_finish_native_bulk_job(
         ctx->stats.range_attn_calls += slot.segments;
         if (cuda_output) {
             ++ctx->stats.cuda_unpack_calls;
+            ctx->stats.cuda_small_unpack_calls += slot.cuda_small;
             ctx->stats.out_f32_upload_bytes_avoided += uint64_t(slot.nq) * slot.out_width * sizeof(float);
         }
         if (ctx->stats.range_query_min < 0 || slot.first_pos < ctx->stats.range_query_min) {
@@ -1399,13 +1578,117 @@ static void rkva_destroy_poisoned_state_locked(ggml_backend_remote_attn_context 
     ctx->remote_state_poisoned = false;
 }
 
+// async_mutex is held. A partial cohort never runs, and later tickets cannot
+// bypass it. Tensor sources have already been copied by each PREPARE node.
+static size_t rkva_ready_group(ggml_backend_remote_attn_context * ctx, rkva_async_slot ** group) {
+    rkva_async_slot * first = nullptr;
+    for (auto & s : ctx->async_slots) {
+        if ((s.state == rkva_slot_state::PENDING || s.state == rkva_slot_state::PREPARING) &&
+                (!first || s.ticket < first->ticket)) first = &s;
+    }
+    if (!first || first->state != rkva_slot_state::PENDING) return 0;
+    if (!first->cohort_count) { group[0] = first; return 1; }
+    if (first->cohort_index || first->cohort_count > 4) return 0;
+    for (uint32_t i = 0; i < first->cohort_count; ++i) {
+        group[i] = nullptr;
+        for (auto & s : ctx->async_slots) {
+            if (s.state == rkva_slot_state::PENDING && s.ticket == first->ticket + i &&
+                    s.epoch == first->epoch && s.cohort_count == first->cohort_count && s.cohort_index == i)
+                group[i] = &s;
+        }
+        if (!group[i]) return 0;
+    }
+    return first->cohort_count;
+}
+
+static bool rkva_finish_cohort(ggml_backend_remote_attn_context * ctx,
+        rkva_async_slot ** group, size_t count) {
+    if (!count || count > 4 || !ctx->cohort_enabled) return false;
+    ggml_remote_attn_trace_context_scope trace_owner(group[0]->trace);
+    ggml_remote_attn_trace_scope trace_cohort("cohort_total");
+    trace_cohort.event.flags = 0x40000000u;
+    trace_cohort.event.value = count;
+    size_t bytes = sizeof(rkva_kvarn_cohort_header), expected = bytes;
+    uint32_t nq = 0, segments = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const auto & s = *group[i];
+        if (bytes > (256u << 20) - sizeof(rkva_kvarn_cohort_entry) ||
+                s.wire != RKVA_WIRE_FP8 || s.nq > 256 - nq || s.segments > 32 - segments ||
+                s.payload.size() > (256u << 20) - bytes - sizeof(rkva_kvarn_cohort_entry)) return false;
+        bytes += sizeof(rkva_kvarn_cohort_entry) + s.payload.size();
+        expected += sizeof(rkva_kvarn_cohort_entry) + size_t(s.nq) * (s.out_width + ctx->geo.n_head * sizeof(float));
+        nq += s.nq; segments += s.segments;
+    }
+    if (expected > (256u << 20)) return false;
+    auto & tx = ctx->cohort_payload;
+    auto & rx = ctx->cohort_reply;
+    tx.resize(bytes);
+    const rkva_kvarn_cohort_header header {1, uint32_t(count), nq, 0};
+    std::memcpy(tx.data(), &header, sizeof(header));
+    size_t offset = sizeof(header);
+    for (size_t i = 0; i < count; ++i) {
+        const auto & s = *group[i];
+        const rkva_kvarn_cohort_entry entry {s.layer, s.nq, uint32_t(s.payload.size()), 0, s.ticket, s.epoch};
+        std::memcpy(tx.data() + offset, &entry, sizeof(entry)); offset += sizeof(entry);
+        std::memcpy(tx.data() + offset, s.payload.data(), s.payload.size()); offset += s.payload.size();
+    }
+    uint64_t cycle = 0;
+    if (!rkva_transact(ctx, RKVA_KVARN_RANGE_COHORT_ATTN, ctx->active_session, 0, nq,
+            tx.data(), uint32_t(bytes), rx, uint32_t(expected), nullptr, &cycle)) return false;
+    trace_cohort.event.cycle = cycle;
+    trace_cohort.event.bytes = bytes + expected;
+    rkva_kvarn_cohort_header reply_header{};
+    std::memcpy(&reply_header, rx.data(), sizeof(reply_header));
+    if (std::memcmp(&reply_header, &header, sizeof(header))) return false;
+    // Check every envelope/echo/length before publishing any OUT or ACK.
+    size_t offsets[4]{};
+    offset = sizeof(header);
+    for (size_t i = 0; i < count; ++i) {
+        auto & s = *group[i];
+        if (rx.size() - offset < sizeof(rkva_kvarn_cohort_entry)) return false;
+        rkva_kvarn_cohort_entry e{};
+        std::memcpy(&e, rx.data() + offset, sizeof(e)); offset += sizeof(e);
+        const size_t body = size_t(s.nq) * (s.out_width + ctx->geo.n_head * sizeof(float));
+        if (e.layer != s.layer || e.n_queries != s.nq || e.body_bytes != body || e.reserved ||
+                e.ticket != s.ticket || e.epoch != s.epoch || body > rx.size() - offset) return false;
+        offsets[i] = offset; offset += body;
+    }
+    if (offset != rx.size()) return false;
+    for (size_t i = 0; i < count; ++i) {
+        const auto & s = *group[i];
+        const size_t out_bytes = size_t(s.nq) * s.out_width;
+        const uint8_t * body = rx.data() + offsets[i];
+        for (size_t j = 0; j < out_bytes; ++j)
+            if ((body[j] & 0x7cu) == 0x7cu) return false;
+        for (size_t j = 0; j < size_t(s.nq) * ctx->geo.n_head; ++j) {
+            float lse;
+            std::memcpy(&lse, body + out_bytes + j * sizeof(float), sizeof(lse));
+            if (!std::isfinite(lse)) return false;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        auto & s = *group[i];
+        const size_t body = size_t(s.nq) * (s.out_width + ctx->geo.n_head * sizeof(float));
+        s.reply.resize(body);
+        std::memcpy(s.reply.data(), rx.data() + offsets[i], body);
+        s.response_cycle = cycle;
+        if (!rkva_finish_native_bulk_job(ctx, s, false, true)) return false;
+    }
+    std::lock_guard<std::mutex> slock(ctx->stats_mutex);
+    ++ctx->stats.cohort_calls;
+    ctx->stats.cohort_entries += count;
+    return true;
+}
+
 static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
     std::unique_lock<std::mutex> lock(ctx->async_mutex);
     for (;;) {
         ctx->async_cv.wait(lock, [ctx] {
             if (ctx->async_stop) return true;
+            rkva_async_slot * ready[4]{};
+            if (rkva_ready_group(ctx, ready)) return true;
             for (const auto & s : ctx->async_slots) {
-                if (s.state == rkva_slot_state::PENDING) return true;
+                if (ctx->failed && s.state == rkva_slot_state::PENDING) return true;
             }
             return false;
         });
@@ -1413,23 +1696,20 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
             return;
         }
 
-        // Strictly ordered single TCP owner: pick the pending slot with the lowest ticket
-        rkva_async_slot * slot = nullptr;
-        uint64_t min_ticket = UINT64_MAX;
-        for (auto & s : ctx->async_slots) {
-            if (s.state == rkva_slot_state::PENDING && s.ticket < min_ticket) {
-                min_ticket = s.ticket;
-                slot = &s;
-            }
-        }
-        if (!slot) {
+        if (ctx->failed) {
+            for (auto & s : ctx->async_slots) if (s.state == rkva_slot_state::PENDING) s.state = rkva_slot_state::DONE_ERR;
+            ctx->async_cv.notify_all();
             continue;
         }
-        slot->state = rkva_slot_state::RUNNING;
-        if (ggml_remote_attn_trace_enabled()) {
-            auto e = slot->trace;
+        rkva_async_slot * group[4]{};
+        const size_t count = rkva_ready_group(ctx, group);
+        if (!count) continue;
+        auto * slot = group[0];
+        for (size_t i = 0; i < count; ++i) group[i]->state = rkva_slot_state::RUNNING;
+        if (ggml_remote_attn_trace_enabled()) for (size_t i = 0; i < count; ++i) {
+            auto e = group[i]->trace;
             std::snprintf(e.phase, sizeof(e.phase), "rpc_queue");
-            e.begin_us = slot->pending_us;
+            e.begin_us = group[i]->pending_us;
             e.end_us = ggml_time_us();
             ggml_remote_attn_trace_record(&e);
         }
@@ -1438,7 +1718,7 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
         bool ok = false;
         if (!ctx->failed && ctx->connected) {
             try {
-                ok = rkva_finish_native_bulk_job(ctx, *slot);
+                ok = slot->cohort_count ? rkva_finish_cohort(ctx, group, count) : rkva_finish_native_bulk_job(ctx, *slot);
             } catch (const std::exception & error) {
                 GGML_LOG_ERROR("%s: async native KVarN4 RPC failed: %s\n",
                         GGML_REMOTE_ATTN_NAME, error.what());
@@ -1455,7 +1735,7 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
         }
 
         lock.lock();
-        slot->state = ok ? rkva_slot_state::DONE_OK : rkva_slot_state::DONE_ERR;
+        for (size_t i = 0; i < count; ++i) group[i]->state = ok ? rkva_slot_state::DONE_OK : rkva_slot_state::DONE_ERR;
         if (!ok) {
             // Error barrier: cancel any remaining pending or preparing slots
             for (auto & s : ctx->async_slots) {
@@ -1469,11 +1749,30 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
     }
 }
 
+// A terminal boundary with only part of a cohort cannot wait for future graph
+// nodes. No RPC has started for that cohort. Poison its producer state and
+// retire the pending members, without resetting a PREPARING/RUNNING owner.
+static void rkva_cancel_partial_cohort_locked(ggml_backend_remote_attn_context * ctx) {
+    bool partial = false;
+    for (const auto & s : ctx->async_slots) {
+        if (s.state == rkva_slot_state::PREPARING || s.state == rkva_slot_state::RUNNING) return;
+        partial |= s.state == rkva_slot_state::PENDING && s.cohort_count;
+    }
+    rkva_async_slot * ready[4]{};
+    if (!partial || rkva_ready_group(ctx, ready)) return;
+    ctx->failed = true;
+    ctx->connected = false;
+    for (auto & s : ctx->async_slots)
+        if (s.state == rkva_slot_state::PENDING) s.state = rkva_slot_state::DONE_ERR;
+    ctx->async_cv.notify_all();
+}
+
 // Wait for any submitted jobs and discard completed-but-unconsumed results.
 // The remote session is only mutated after this returns.
 static void rkva_async_drain(ggml_backend_remote_attn_context * ctx) {
     std::unique_lock<std::mutex> lock(ctx->async_mutex);
     ctx->async_cv.wait(lock, [ctx] {
+        rkva_cancel_partial_cohort_locked(ctx);
         for (const auto & s : ctx->async_slots) {
             if (s.state == rkva_slot_state::PENDING ||
                 s.state == rkva_slot_state::RUNNING ||
@@ -1491,6 +1790,7 @@ static void rkva_async_drain(ggml_backend_remote_attn_context * ctx) {
     }
     lock.unlock();
     ctx->async_cv.notify_all();
+    if (ctx->failed) ctx->close_socket();
 }
 
 // Acquire ctx->mutex with no async work in flight. The recheck under ctx->mutex
@@ -1567,6 +1867,9 @@ static bool rkva_async_wait_node(
     ggml_remote_attn_trace_scope trace_wait("range_wait", node);
 
     ctx->async_cv.wait(lock, [&] {
+        // Every member must have been prepared before any WAIT in the graph.
+        // A wiring error must not wait forever for nodes this thread cannot run.
+        if (slot->cohort_count) rkva_cancel_partial_cohort_locked(ctx);
         if (slot->ticket != ticket || slot->epoch != epoch || slot->node != source) {
             return true;
         }
@@ -1910,7 +2213,13 @@ static bool rkva_prepare_native_bulk_job(
         rkva_async_slot & slot) {
     // Before readback, resize or envelope writes, even after reconnect and for
     // CPU-only jobs: an unsuccessful helper requires a fresh backend context.
-    if (!slot.cuda_context_retired) return false;
+    const auto cuda_failure = [&](const char * stage) {
+        GGML_LOG_ERROR("%s: native CUDA preparation failed stage=%s layer=%u nq=%zu slot=%u retired=%d shared=%d small=%d\n",
+                GGML_REMOTE_ATTN_NAME, stage, layer, nq, slot.id,
+                int(slot.cuda_context_retired), int(bool(slot.cuda_shared_lease)), int(slot.cuda_small));
+        return false;
+    };
+    if (!slot.cuda_context_retired) return cuda_failure("unretired_slot");
     if (ggml_remote_attn_trace_enabled()) {
         slot.trace = ggml_remote_attn_trace_identity("job", node);
         slot.trace.ticket = slot.ticket;
@@ -2003,19 +2312,27 @@ static bool rkva_prepare_native_bulk_job(
         const int out_device = api ? api->device_for_pointer(node->data) : -1;
         // Managed pointers and CUDA attribute failures have no supported host
         // coherency contract here; never reinterpret them as ordinary CPU data.
-        if (q_device < -1 || out_device < -1) return false;
+        if (q_device < -1 || out_device < -1) return cuda_failure("pointer_device");
         const bool cuda_allowed = rkva_cuda_fp8_bucket_permitted(int64_t(nq));
-        if (!cuda_allowed && out_device >= 0) return false;
-        if (!cuda_allowed && !rkva_release_cuda_phase_context(ctx, slot, node)) return false;
+        if (!cuda_allowed && out_device >= 0) return cuda_failure("bucket_device_output");
+        if (!cuda_allowed && !rkva_release_cuda_cpu_phase(ctx, slot, node)) return cuda_failure("cpu_phase_release");
         const bool cuda_pack_q = cuda_allowed && q_device >= 0;
+        slot.cuda_small = rkva_cuda_fp8_mapped_requested() && nq <= 9 &&
+                          (cuda_pack_q || out_device >= 0);
+        slot.cuda_small_api = slot.cuda_small ? rkva_cuda_fp8_small_api() : nullptr;
+        // An explicit experimental selection is not a request to silently use
+        // the old GPU helper if the extension/device cannot map host memory.
+        if (slot.cuda_small && (!slot.cuda_small_api || slot.cuda_small_api->base != api ||
+                !slot.cuda_small_api->supports_small(q_device >= 0 ? q_device : out_device))) return cuda_failure("small_support");
+        if (slot.cuda_small && !rkva_release_idle_cuda_peers(ctx, slot, node)) return cuda_failure("idle_peer_release");
         // Change allocators before assembling the envelope, never while active.
         if (cuda_pack_q || out_device >= 0) {
             slot.payload.clear();
-            const bool creating = !slot.cuda_context || slot.cuda_device != (q_device >= 0 ? q_device : out_device);
+            bool creating = false;
             ggml_remote_attn_trace_scope timing("cuda_context_prepare", node);
             timing.event.flags = 0x40000000u;
             if ((q_device >= 0 && out_device >= 0 && q_device != out_device) ||
-                    !slot.prepare_cuda(q_device >= 0 ? q_device : out_device)) return false;
+                    !rkva_prepare_cuda_context(ctx, slot, node, q_device >= 0 ? q_device : out_device, api, creating)) return cuda_failure("context_prepare");
             if (creating) {
                 timing.event.value = 1;
                 std::lock_guard<std::mutex> slock(ctx->stats_mutex);
@@ -2029,12 +2346,15 @@ static bool rkva_prepare_native_bulk_job(
             trace_q.event.bytes = nq * out_width;
             slot.query_fp8.resize(nq * out_width);
             slot.cuda_context_retired = false;
-            const bool packed = api->pack_q(slot.cuda_context, node->src[0]->data, false, nq * out_width,
+            const bool packed = slot.cuda_small ? slot.cuda_small_api->pack_small(slot.cuda_context,
+                    node->src[0]->data, false, nq, out_width, slot.query_fp8.data(), rkva_cuda_producer_event) :
+                api->pack_q(slot.cuda_context, node->src[0]->data, false, nq * out_width,
                     slot.query_fp8.data(), rkva_cuda_producer_event);
             slot.cuda_context_retired = packed;
-            if (!packed) return false;
+            if (!packed) return cuda_failure(slot.cuda_small ? "small_pack" : "pack");
             std::lock_guard<std::mutex> slock(ctx->stats_mutex);
             ++ctx->stats.cuda_pack_calls;
+            ctx->stats.cuda_small_pack_calls += slot.cuda_small;
             ctx->stats.q_f32_readback_bytes_avoided += uint64_t(nq) * out_width * sizeof(float);
         } else {
             ggml_remote_attn_trace_scope trace_q("q_readback");
@@ -2148,6 +2468,17 @@ static bool rkva_async_submit_locked(
         ggml_backend_remote_attn_context * ctx, ggml_tensor * node,
         uint32_t layer, uint32_t live, size_t nq, size_t out_width,
         std::unique_lock<std::mutex> & ctx_lock) {
+    const uint32_t metadata = uint32_t(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_COHORT));
+    if (metadata & ~(uint32_t(GGML_REMOTE_ATTN_COHORT_WIRE_MASK) | uint32_t(GGML_REMOTE_ATTN_WAVEFRONT_SHARED_CUDA))) {
+        GGML_LOG_ERROR("%s: invalid async metadata=0x%08x layer=%u nq=%zu\n",
+                GGML_REMOTE_ATTN_NAME, metadata, layer, nq);
+        return false;
+    }
+    const bool shared_cuda = (metadata & GGML_REMOTE_ATTN_WAVEFRONT_SHARED_CUDA) != 0;
+    const uint32_t cohort = metadata & GGML_REMOTE_ATTN_COHORT_WIRE_MASK;
+    const uint32_t cohort_count = cohort & 0xffu, cohort_index = (cohort >> 8) & 0xffu;
+    if (cohort && (!ctx->cohort_enabled || !cohort_count ||
+            cohort_count > 4 || cohort_index >= cohort_count || !nq || nq > 256)) return false;
     if (!ctx->async_worker.joinable()) {
         try {
             ctx->async_worker = std::thread(rkva_async_worker_main, ctx);
@@ -2173,18 +2504,41 @@ static bool rkva_async_submit_locked(
 
         {
             std::unique_lock<std::mutex> alock(ctx->async_mutex);
+            if (cohort) {
+                uint32_t members = 0, queries = uint32_t(nq);
+                uint32_t segments = uint32_t(nq > 9 ? (nq + 7) / 8 : 1);
+                uint64_t base = 0;
+                for (const auto & s : ctx->async_slots) {
+                    if (s.state == rkva_slot_state::FREE) continue;
+                    if (!cohort_index || s.state != rkva_slot_state::PENDING ||
+                            s.cohort_count != cohort_count || s.cohort_index >= cohort_index ||
+                            s.epoch != submitted_epoch || s.layer == layer) return false;
+                    if (!members) base = s.ticket - s.cohort_index;
+                    if (s.ticket != base + s.cohort_index) return false;
+                    ++members; queries += s.nq; segments += s.segments;
+                }
+                if (members != cohort_index || queries > 256 || segments > 32 ||
+                        (cohort_index && ctx->async_ticket_counter != base + cohort_index - 1)) return false;
+            } else {
+                for (const auto & s : ctx->async_slots)
+                    if (s.state != rkva_slot_state::FREE && s.cohort_count) return false;
+            }
             for (auto & s : ctx->async_slots) {
-                if (s.state == rkva_slot_state::FREE) {
+                if (s.id < ctx->async_capacity && s.state == rkva_slot_state::FREE) {
                     slot = &s;
                     break;
                 }
             }
             if (slot) {
+                if (ctx->async_ticket_counter == UINT64_MAX) return false;
                 slot->state = rkva_slot_state::PREPARING;
                 slot->ticket = ++ctx->async_ticket_counter;
                 slot->epoch = ctx->range_epoch;
                 slot->session = submitted_session;
                 slot->node = node;
+                slot->cohort_count = cohort_count;
+                slot->cohort_index = cohort_index;
+                slot->cuda_shared_requested = shared_cuda;
                 ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_LO, int32_t(slot->ticket & 0xffffffffu));
                 ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_TICKET_HI, int32_t((slot->ticket >> 32) & 0xffffffffu));
                 ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_EPOCH_LO,  int32_t(slot->epoch & 0xffffffffu));
@@ -2221,6 +2575,14 @@ static bool rkva_async_submit_locked(
 
     {
         std::lock_guard<std::mutex> alock(ctx->async_mutex);
+        if (ctx->failed || ctx->async_stop || slot->epoch != ctx->range_epoch ||
+                slot->state != rkva_slot_state::PREPARING) {
+            GGML_LOG_ERROR("%s: async preparation invalidated layer=%u nq=%zu slot=%u state=%d failed=%d stop=%d\n",
+                    GGML_REMOTE_ATTN_NAME, layer, nq, slot->id, int(slot->state), int(ctx->failed.load()), int(ctx->async_stop.load()));
+            slot->state = rkva_slot_state::DONE_ERR;
+            ctx->async_cv.notify_all();
+            return false;
+        }
         if (ggml_remote_attn_trace_enabled()) slot->pending_us = ggml_time_us();
         slot->state = rkva_slot_state::PENDING;
     }
@@ -2242,6 +2604,11 @@ static bool rkva_run_range(
     const size_t nq = q ? (size_t) q->ne[2] : 0;
     const size_t width = (size_t) ctx->geo.n_head_kv * ctx->geo.head_dim;
     const size_t out_width = (size_t) ctx->geo.n_head * ctx->geo.head_dim;
+    const auto invalid_range = [&](const char * stage) {
+        GGML_LOG_ERROR("%s: range validation failed stage=%s layer=%d nq=%zu live=%d origin=%d\n",
+                GGML_REMOTE_ATTN_NAME, stage, layer, nq, n_live, origin);
+        return false;
+    };
     if (!ctx->range_configured || ctx->active_session == RKVA_SESSION_NONE ||
             layer < 0 || (size_t) layer >= ctx->range_layers.size() ||
             origin < 0 || (uint32_t) origin != ctx->range_origin || n_live <= 0 ||
@@ -2257,7 +2624,16 @@ static bool rkva_run_range(
             node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) ||
             node->ne[0] != (int64_t) (out_width + ctx->geo.n_head) || node->ne[1] != (int64_t) nq ||
             ggml_get_op_params_f32(node, GGML_REMOTE_ATTN_PARAM_KQ_SCALE) != ctx->geo.kq_scale) {
-        return false;
+        GGML_LOG_ERROR("%s: range geometry configured=%d session=%u source_type=%d q_type=%d q_contiguous=%d q=%lld/%lld/%lld/%lld k_type=%d k=%lld/%lld/%lld/%lld out_contiguous=%d out=%lld/%lld capacity=%u\n",
+                GGML_REMOTE_ATTN_NAME, int(ctx->range_configured), ctx->active_session,
+                int(ctx->range_source_type), q ? int(q->type) : -1, q ? int(ggml_is_contiguous(q)) : 0,
+                q ? (long long)q->ne[0] : -1LL, q ? (long long)q->ne[1] : -1LL,
+                q ? (long long)q->ne[2] : -1LL, q ? (long long)q->ne[3] : -1LL,
+                k ? int(k->type) : -1, k ? (long long)k->ne[0] : -1LL,
+                k ? (long long)k->ne[1] : -1LL, k ? (long long)k->ne[2] : -1LL,
+                k ? (long long)k->ne[3] : -1LL, int(ggml_is_contiguous(node)),
+                (long long)node->ne[0], (long long)node->ne[1], ctx->range_capacity);
+        return invalid_range("geometry");
     }
     std::vector<int32_t> ids((size_t) n_live);
     ggml_backend_tensor_get(cells, ids.data(), 0, ids.size() * sizeof(int32_t));
@@ -2268,13 +2644,13 @@ static bool rkva_run_range(
             padding = true;
         } else {
             if (padding || id < 0 || (uint32_t) id != ctx->range_origin + count) {
-                return false; // holes/reordering are not append-only range histories
+                return invalid_range("cell_history"); // holes/reordering are not append-only range histories
             }
             ++count;
         }
     }
     if (count == 0 || count > (uint64_t) k->ne[1] || count > (uint64_t) v->ne[1]) {
-        return false;
+        return invalid_range("coverage");
     }
     ctx->pos_scratch.resize(nq);
     ggml_backend_tensor_get(pos, ctx->pos_scratch.data(), 0, nq * sizeof(int32_t));
@@ -2282,11 +2658,11 @@ static bool rkva_run_range(
         const int64_t p = ctx->pos_scratch[i];
         if (p < ctx->range_origin || p >= (int64_t) ctx->range_origin + count ||
                 (i && p != (int64_t) ctx->pos_scratch[i-1] + 1)) {
-            return false;
+            return invalid_range("query_positions");
         }
     }
     if ((uint32_t) ctx->pos_scratch.back() + 1 != ctx->range_origin + count) {
-        return false;
+        return invalid_range("query_suffix");
     }
     if (ctx->range_native_kvarn) {
         if (ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC)) {
@@ -2775,6 +3151,7 @@ static void ggml_backend_remote_attn_synchronize(ggml_backend_t backend) {
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
     std::unique_lock<std::mutex> lock(ctx->async_mutex);
     ctx->async_cv.wait(lock, [ctx] {
+        rkva_cancel_partial_cohort_locked(ctx);
         for (const auto & s : ctx->async_slots) {
             if (s.state == rkva_slot_state::PENDING ||
                 s.state == rkva_slot_state::RUNNING ||
@@ -3062,6 +3439,8 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->range_native_kvarn = false;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
+    ctx->cohort_enabled = false;
+    ctx->async_capacity = 2;
     ctx->native_serial_prefix = false;
     ctx->native_bulk = false;
     ctx->async_local_remote = false;
@@ -3610,6 +3989,23 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
                 GGML_REMOTE_ATTN_NAME);
         return false;
     }
+    bool cohort_enabled = false;
+    if (const char * option = std::getenv("GGML_RKVA_WAVEFRONT_RPC_BATCH")) {
+        if (!std::strcmp(option, "4")) {
+            GGML_LOG_ERROR("%s: WF RPC batch 4 is unavailable: no qualified cohort server; use RPC batch 1\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
+        else if (std::strcmp(option, "1")) {
+            GGML_LOG_ERROR("%s: GGML_RKVA_WAVEFRONT_RPC_BATCH requires 1 or 4\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
+    }
+    if (cohort_enabled && (!async_overlap || !bulk || !serial_prefix || bulk_wire != RKVA_WIRE_FP8 ||
+            !(ctx->ack.reserved[0] & RKVA_CAP_KVARN_COHORT_ATTN) ||
+            !(ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_COHORT_ATTN)))) {
+        GGML_LOG_ERROR("%s: explicit cohort batching requires negotiated FP8 op23 and async serial-prefix\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
     const rkva_kvarn_range_config descriptor {
         origin, capacity, RKVA_RANGE_STORAGE_KVARN4, serial_prefix ? 3u : rewind_v2 ? 2u : 1u,
         128, 128, 256, 2, 4, 4, 8960, 3, 2, 128, precision_tail_tokens, 1, 1, 1};
@@ -3629,6 +4025,8 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     ctx->native_serial_prefix = serial_prefix;
     ctx->native_bulk = bulk;
     ctx->async_local_remote = async_overlap;
+    ctx->cohort_enabled = cohort_enabled;
+    ctx->async_capacity = cohort_enabled ? 4 : 2;
     ctx->native_tail_tokens = precision_tail_tokens;
     ctx->native_store = store;
     ctx->native_layers.clear();
@@ -3959,6 +4357,8 @@ bool ggml_backend_remote_attn_configure_range(
     ctx->range_native_kvarn = false;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
+    ctx->cohort_enabled = false;
+    ctx->async_capacity = 2;
     ctx->native_serial_prefix = false;
     ctx->native_bulk = false;
     ctx->async_local_remote = false;
@@ -4079,6 +4479,12 @@ void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {
         std::lock_guard<std::mutex> alock(ctx->async_mutex);
         for (auto & s : ctx->async_slots) {
             if (s.state == rkva_slot_state::PENDING) {
+                if (s.cohort_count) {
+                    // Producer state advanced while preparing these entries,
+                    // but no complete cohort was acknowledged on the peer.
+                    ctx->failed = true;
+                    ctx->connected = false;
+                }
                 s.state = rkva_slot_state::DONE_ERR;
             }
         }
@@ -4101,6 +4507,11 @@ bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend) {
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
     return ctx->async_local_remote && ctx->connected && !ctx->failed &&
            ctx->range_configured && ctx->range_native_kvarn && ctx->native_bulk;
+}
+
+bool ggml_backend_remote_attn_cohort_enabled(ggml_backend_t backend) {
+    if (!ggml_backend_remote_attn_async_enabled(backend)) return false;
+    return static_cast<ggml_backend_remote_attn_context *>(backend->context)->cohort_enabled;
 }
 
 void ggml_backend_remote_attn_drain(ggml_backend_t backend) {
@@ -4152,7 +4563,7 @@ size_t ggml_backend_remote_attn_async_in_flight(ggml_backend_t backend) {
 
 size_t ggml_backend_remote_attn_async_capacity(ggml_backend_t backend) {
     if (!backend || ggml_backend_is_local_split(backend)) return 0;
-    return ggml_backend_remote_attn_context::RKVA_ASYNC_QUEUE_CAPACITY;
+    return static_cast<ggml_backend_remote_attn_context *>(backend->context)->async_capacity;
 }
 
 bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend) {
@@ -4208,6 +4619,21 @@ void ggml_remote_attn_range_set_async(ggml_tensor * node) {
     GGML_ASSERT(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_RANGE));
     GGML_ASSERT(!ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT));
     ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_ASYNC, 1);
+}
+
+void ggml_remote_attn_range_set_cohort(ggml_tensor * node, uint32_t count, uint32_t index) {
+    GGML_ASSERT(count >= 1 && count <= 4 && index < count);
+    ggml_remote_attn_range_set_async(node);
+    const uint32_t local = uint32_t(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_COHORT)) &
+                           ~uint32_t(GGML_REMOTE_ATTN_COHORT_WIRE_MASK);
+    ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_COHORT, int32_t(local | count | (index << 8)));
+}
+
+void ggml_remote_attn_range_set_wavefront(ggml_tensor * node) {
+    ggml_remote_attn_range_set_async(node);
+    const uint32_t metadata = uint32_t(ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_COHORT));
+    ggml_set_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_COHORT,
+                          int32_t(metadata | GGML_REMOTE_ATTN_WAVEFRONT_SHARED_CUDA));
 }
 
 ggml_tensor * ggml_remote_attn_range_wait(
@@ -4320,8 +4746,15 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
             ctx->native_tail_tokens == 128 ? "true" : "false") +
         ",\"cuda_pack_calls\":" + std::to_string(s.cuda_pack_calls) +
         ",\"cuda_unpack_calls\":" + std::to_string(s.cuda_unpack_calls) +
+        ",\"cuda_small_pack_calls\":" + std::to_string(s.cuda_small_pack_calls) +
+        ",\"cuda_small_unpack_calls\":" + std::to_string(s.cuda_small_unpack_calls) +
+        ",\"cohort_calls\":" + std::to_string(s.cohort_calls) +
+        ",\"cohort_entries\":" + std::to_string(s.cohort_entries) +
         ",\"cuda_context_creates\":" + std::to_string(s.cuda_context_creates) +
         ",\"cuda_context_phase_releases\":" + std::to_string(s.cuda_context_phase_releases) +
+        ",\"cuda_context_shared_acquires\":" + std::to_string(s.cuda_context_shared_acquires) +
+        ",\"cuda_context_shared_releases\":" + std::to_string(s.cuda_context_shared_releases) +
+        ",\"cuda_context_shared_last_releases\":" + std::to_string(s.cuda_context_shared_last_releases) +
         ",\"q_f32_readback_bytes_avoided\":" + std::to_string(s.q_f32_readback_bytes_avoided) +
         ",\"out_f32_upload_bytes_avoided\":" + std::to_string(s.out_f32_upload_bytes_avoided) + "}";
     return ctx->stats_json.c_str();

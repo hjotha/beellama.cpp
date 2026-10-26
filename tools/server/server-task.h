@@ -4,6 +4,8 @@
 #include "llama.h"
 #include "server-loop-guard.h"
 
+#include <algorithm>
+#include <array>
 #include <string>
 #include <functional>
 #include <unordered_set>
@@ -85,6 +87,25 @@ static inline bool server_prompt_reuse_requires_checkpoint_search(
 static inline int32_t server_prompt_reuse_alignment(int32_t kvarn_group) {
     return kvarn_group > 0 ? kvarn_group : 1;
 }
+
+// KVarN numerical cadence follows the physical compute size, independently
+// of the logical parent batch. Alignment1 keeps the existing server policy.
+struct server_prompt_checkpoint_cadence {
+    int ubatch;
+    int batch_cap;
+    std::array<int, 3> offsets;
+
+    server_prompt_checkpoint_cadence(int batch, int requested_ubatch, int physical_ubatch, int alignment)
+        : ubatch(alignment > 1 ? physical_ubatch : requested_ubatch),
+          batch_cap(alignment > 1 ? std::min(batch, ubatch) : batch),
+          offsets{4 + ubatch, 4, 1} {
+        GGML_ASSERT(batch > 0 && requested_ubatch > 0 && physical_ubatch > 0 &&
+                    physical_ubatch <= requested_ubatch && alignment > 0);
+    }
+
+    int n_last(int offset) const { return std::min(batch_cap, offset); }
+    bool near_end(int64_t total, int64_t processed) const { return total < processed + ubatch; }
+};
 
 static inline int64_t server_prompt_checkpoint_boundary(
         int64_t n_prompt_tokens,

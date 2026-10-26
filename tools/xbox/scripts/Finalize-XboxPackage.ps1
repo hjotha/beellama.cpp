@@ -7,8 +7,34 @@ param(
     [Parameter(Mandatory)][ValidateSet('ort', 'llamacpp', 'unified')][string]$Backend,
     [string]$CertificatePassword = 'xllama-test',
     [string]$WindowsSdkVersion = '',
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [string]$CrtDirectory = ''
 )
+# The app imports these desktop /MD names even in the llama-only lane.
+# Validate root-level x64 PE payloads, not a dependency package or an old MSIX.
+function Get-XboxCrtHashes([string]$Directory, [hashtable]$ExpectedHashes = @{}) {
+    $hashes = @{}
+    foreach ($dll in @('MSVCP140.dll', 'MSVCP140_1.dll', 'VCRUNTIME140.dll', 'VCRUNTIME140_1.dll')) {
+        $path = Join-Path $Directory $dll
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required app-local CRT missing: $path" }
+        $stream = [IO.File]::OpenRead($path)
+        $reader = New-Object IO.BinaryReader($stream)
+        try {
+            if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) { throw "CRT is not a PE DLL: $path" }
+            $stream.Position = 0x3C
+            $pe = $reader.ReadUInt32()
+            if ($pe -gt $stream.Length - 24) { throw "CRT PE header is truncated: $path" }
+            $stream.Position = $pe
+            if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) { throw "CRT must be an x64 PE DLL: $path" }
+            $stream.Position = $pe + 22
+            if (($reader.ReadUInt16() -band 0x2000) -eq 0) { throw "CRT PE payload is not a DLL: $path" }
+        } finally { $reader.Dispose() }
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        if ($ExpectedHashes.ContainsKey($dll) -and $ExpectedHashes[$dll] -ne $hash) { throw "CRT hash mismatch: $dll" }
+        $hashes[$dll] = $hash
+    }
+    return $hashes
+}
 $ErrorActionPreference = 'Stop'
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Xbox package finalization requires Windows SDK tools.' }
 foreach ($required in @($PackagePath, $PfxPath, $CerPath)) {
@@ -58,6 +84,15 @@ try {
     Write-Host "Xbox finalizer SDK: $sdkTools"
     $unpack = Join-Path $temp 'unpacked'
     Assert-ToolSuccess (Invoke-PackageTool $makeappx @('unpack', '/p', $PackagePath, '/d', $unpack) 'unpack') 'makeappx unpack'
+    if ($CrtDirectory) {
+        $crtHashes = Get-XboxCrtHashes $CrtDirectory
+        foreach ($dll in $crtHashes.Keys) {
+            Copy-Item -LiteralPath (Join-Path $CrtDirectory $dll) -Destination (Join-Path $unpack $dll) -Force
+        }
+        $null = Get-XboxCrtHashes $unpack $crtHashes
+    } else {
+        $crtHashes = Get-XboxCrtHashes $unpack
+    }
     $manifest = Join-Path $unpack 'AppxManifest.xml'
     $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
     $beforeBytes = [IO.File]::ReadAllBytes($manifest)
@@ -108,6 +143,9 @@ try {
     }
     $verifyDir = Join-Path $temp 'verified'
     Assert-ToolSuccess (Invoke-PackageTool $makeappx @('unpack', '/p', $candidate, '/d', $verifyDir) 'verify-manifest') 'final package unpack'
+    # Check the signed, re-unpacked artifact before publishing any destination.
+    $null = Get-XboxCrtHashes $verifyDir $crtHashes
+    foreach ($dll in ($crtHashes.Keys | Sort-Object)) { Write-Host "Final CRT $dll SHA256=$($crtHashes[$dll])" }
     $actualBytes = [IO.File]::ReadAllBytes((Join-Path $verifyDir 'AppxManifest.xml'))
     if ([Convert]::ToBase64String($actualBytes) -ne [Convert]::ToBase64String($utf8.GetBytes($after)) -or
         (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash -ne $verifiedHash) {

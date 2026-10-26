@@ -762,7 +762,7 @@ enum best_fattn_kernel {
 // directly. The hint is applied only after the tail wrapper has produced an
 // aligned, contiguous pass that satisfies the ordinary vector eligibility
 // contract below.
-static constexpr int GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC = 7;
+static constexpr int GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC = GGML_FLASH_ATTN_EXT_OP_PARAM_CUDA_FORCE_VEC;
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE

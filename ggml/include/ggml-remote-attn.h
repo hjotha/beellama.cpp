@@ -33,6 +33,14 @@ enum ggml_remote_attn_range_op_param {
     GGML_REMOTE_ATTN_PARAM_TICKET_HI = 12,
     GGML_REMOTE_ATTN_PARAM_EPOCH_LO  = 13,
     GGML_REMOTE_ATTN_PARAM_EPOCH_HI  = 14,
+    // Optional cohort: count in bits0..7, index in bits8..15. Bit16 is
+    // host-local WF CUDA ownership metadata; it is never encoded on the wire.
+    GGML_REMOTE_ATTN_PARAM_COHORT    = 15,
+};
+
+enum ggml_remote_attn_range_local_flag {
+    GGML_REMOTE_ATTN_COHORT_WIRE_MASK = 0xffffu,
+    GGML_REMOTE_ATTN_WAVEFRONT_SHARED_CUDA = 1u << 16,
 };
 
 // Query-only v2 overflow attention. Sources 1/2 are the companion SET_ROWS
@@ -54,6 +62,15 @@ GGML_API struct ggml_tensor * ggml_remote_attn_range(
 // before anything that reads the remote OUT/LSE. Both nodes execute on the
 // CPU backend through ggml_remote_attn_exec().
 GGML_API void ggml_remote_attn_range_set_async(struct ggml_tensor * node);
+// Distinct-layer ranges in one wave, prepared consecutively before any WAIT.
+// First member requires an empty queue. Tickets bind each runtime invocation.
+// Cohort4 transport is unavailable in this integration; enabled() returns false.
+GGML_API void ggml_remote_attn_range_set_cohort(struct ggml_tensor * node, uint32_t count, uint32_t index);
+// Host-local opt-in for ranges built by the causal WF planner. Sharing does
+// not change wire batching or FP8 arithmetic. Marking/cohort setter order is
+// immaterial. Untagged nodes retain private context ownership.
+GGML_API void ggml_remote_attn_range_set_wavefront(struct ggml_tensor * node);
+GGML_API bool ggml_backend_remote_attn_cohort_enabled(ggml_backend_t backend);
 GGML_API struct ggml_tensor * ggml_remote_attn_range_wait(
         struct ggml_context * ctx, struct ggml_tensor * range);
 
@@ -143,6 +160,8 @@ GGML_API bool ggml_backend_remote_attn_cuda_enabled(void);
 // Shape-specific policy for a complete range (or its WAIT), before segmentation.
 // GGML_RKVA_CUDA_FP8=prefill enables CUDA only for the existing nq>9 bucket;
 // 0 disables it, while 1/unset preserve the full CUDA capability behavior.
+// mapped explicitly selects v3 mapped-host kernels for 1..9 queries and the
+// ordinary helper for larger ranges; unsupported small operations fail closed.
 // Keep this process configuration fixed while graphs/requests are alive.
 GGML_API bool ggml_backend_remote_attn_cuda_enabled_for_node(const struct ggml_tensor * node);
 // CUDA dispatcher supplies a recorded producer fence, retained until return.

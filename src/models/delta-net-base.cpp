@@ -489,7 +489,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    GGML_ASSERT(!tile_chain || cparams.n_rs_seq == 0);
+    ggml_tensor * conv_states = tile_chain && tile_chain->conv_commit ?
+            tile_chain->conv_commit : build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -522,7 +524,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                     (s_slot * mem_size + kv_head) * row_size);
         cb(conv_state_update, "conv_state_update", il);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+        auto * commit = ggml_cpy(ctx0, conv_state_last, conv_state_update);
+        ggml_build_forward_expand(gf, commit);
+        if (tile_chain) tile_chain->conv_commit = commit;
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // Preserve snapshots from previous batches before writing this batch's
@@ -587,10 +591,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        auto * commit = ggml_cpy(ctx0, new_state,
+                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all)));
+        ggml_build_forward_expand(gf, commit);
+        if (tile_chain) tile_chain->gdn_commit = commit;
 
         return output;
     }

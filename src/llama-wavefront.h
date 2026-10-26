@@ -47,6 +47,18 @@ struct ggml_tensor;
 
 namespace llama_wavefront {
 
+// Serving MVP policy. This selects a topology; it is not a claim of a
+// throughput gain or a reduction of the per-token remote dependency depth.
+uint32_t parse_serving_rpc_batch(const char * value); // unset/1 or 4; throws on invalid values
+uint32_t parse_serving_tile_size(const char * value); // unset/0, 64, 128 or 256; throws on invalid values
+struct serving_step {
+    enum class phase { PREPARE, COMPLETE } action;
+    uint32_t group;
+    uint32_t tile;
+};
+std::vector<serving_step> build_serving_schedule(uint32_t groups, uint32_t tiles, uint32_t rpc_batch = 1);
+
+
 inline constexpr uint32_t kDefaultTileSize = 128; // Alinhado ao grupo KVarN
 inline constexpr uint32_t kSmallTileSize   = 64;  // Alinhado a warp tiles
 inline constexpr uint32_t kMinTileSize     = 16;
@@ -95,6 +107,9 @@ struct wavefront_plan {
     std::vector<llama_ubatch> ubatch_tiles;
     wavefront_schedule schedule;
 };
+
+// Exact production shape guard for the opt-in parent512/tile256 path.
+bool is_serving_2x256_plan(const wavefront_plan & plan);
 
 // Rastreador de serviço progressivo de prefill
 struct progressive_tracker {

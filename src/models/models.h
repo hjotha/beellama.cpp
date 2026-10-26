@@ -76,6 +76,14 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // Optional n_rs_seq==0 wavefront chain. Each entry is the actual CPY
+    // result aliasing its persistent destination, not an untracked cache view.
+    struct recurrent_tile_chain {
+        ggml_tensor * conv_commit = nullptr;
+        ggml_tensor * gdn_commit = nullptr;
+    };
+    recurrent_tile_chain * tile_chain = nullptr;
+
     // Carry the older recurrent snapshots across short decode batches.
     void build_rs_history(llm_graph_input_rs * inp, ggml_tensor * states_all, int64_t state_size, int64_t n_written);
 
@@ -2477,6 +2485,13 @@ struct llama_model_qwen35 : public llama_model_base {
         bool gdn_state_rows_dev_ok = true; // every GPU device is Metal: fused GDN may read state rows in place
         bool gdn_raw_gates_dev_ok  = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
     private:
+        struct helper_only_tag {};
+        graph(const llama_model & model, const llm_graph_params & params, helper_only_tag);
+        void build_wavefront(const llm_graph_params & params);
+        struct attention_terms { ggml_tensor * q; ggml_tensor * k; ggml_tensor * v; ggml_tensor * gate; };
+        attention_terms build_layer_attn_terms(ggml_tensor * cur, ggml_tensor * pos, int * sections, int il);
+        ggml_tensor * build_layer_attn_finish(ggml_tensor * cur, ggml_tensor * gate, int il);
+        ggml_tensor * build_layer_finish(ggml_tensor * cur, ggml_tensor * residual, int il);
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
