@@ -175,15 +175,11 @@ int main() {
     assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2), "kvarn4_mq2_fine") == 0);
     assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 4), "kvarn4_mq4_balanced") == 0);
     assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 0), "invalid") == 0);
-    // Opt-in rescale-elision specialization keeps its own bucket name.
-    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, true), "kvarn4_mq2_skip") == 0);
-    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, false, true), "kvarn4_mq2_i8") == 0);
-    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, true, true), "kvarn4_mq2_i8") == 0);
-    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 4, false, true), "kvarn4_mq4_balanced") ==
-           0);
-    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, false), "kvarn4_mq2_fine") == 0);
+    // Opt-in INT8 specialization keeps its own bucket name.
+    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, true), "kvarn4_mq2_i8") == 0);
     assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 4, true), "kvarn4_mq4_balanced") == 0);
-    assert(std::strcmp(mq_kernel_name(kStorageQ4, 2, true), "q4_mq2_fine") == 0);
+    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, false), "kvarn4_mq2_fine") == 0);
+    assert(std::strcmp(mq_kernel_name(kStorageQ4, 2, false), "q4_mq2_fine") == 0);
     assert(kKvarn4MqWaveLanes == 64);
     assert(kKvarn4MqTileMax == 4);
 
@@ -335,11 +331,6 @@ int main() {
     s.q_tile = 2;
     assert(bucket_key(s) ==
            "attention/kvarn4-prefix/optimized-kvarn4_mq2_fine/nq2-16/r16k-32k/warm");
-    s.rescale_skip = 1;
-    s.int8_dot = 0;
-    assert(bucket_key(s) ==
-           "attention/kvarn4-prefix/optimized-kvarn4_mq2_skip/nq2-16/r16k-32k/warm");
-    s.rescale_skip = 0;
     s.int8_dot = 1;
     assert(bucket_key(s) ==
            "attention/kvarn4-prefix/optimized-kvarn4_mq2_i8/nq2-16/r16k-32k/warm");
@@ -508,14 +499,11 @@ int main() {
     h.kvarn4_mq_status = "requires wave lanes >= 64 (reported min 32)";
     h.kvarn4_mq4_available = true;
     h.kvarn4_mq4_status = "ready";
-    h.kvarn4_mq_skip_available = true;
-    h.kvarn4_mq_skip_status = "ready";
     h.kvarn4_mq_i8_available = true;
     h.kvarn4_mq_i8_status = "ready";
     h.kvarn4_decode_available = true;
     h.kvarn4_decode_status = "ready";
     r.counters.kvarn4_mq_calls = 13;
-    r.counters.kvarn4_mq_skip_calls = 4;
     r.counters.kvarn4_mq_i8_calls = 11;
     r.counters.kvarn4_mq4_calls = 5;
     r.counters.kvarn4_decode_calls = 7;
@@ -536,8 +524,6 @@ int main() {
                   "kvarn4_gqa_coarse\",\"mq2\":{\"available\":false,\"status\":\"requires "
                   "wave lanes >= 64 (reported min 32)\",\"calls\":13},\"mq4\":{\"available\":true,"
                   "\"status\":\"ready\",\"calls\":5},"
-                  "\"mq2_rescale_skip\":{\"available\":true,\"status\":\"ready\","
-                  "\"calls\":4},"
                   "\"mq2_i8\":{\"available\":true,\"status\":\"ready\","
                   "\"calls\":11,\"exact\":false}}") != std::string::npos);
     assert(json.find("\"kvarn4_decode\":{\"nq\":1,"

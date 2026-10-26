@@ -316,7 +316,7 @@ def execute(args):
                     expected = expected_kernel_for(
                         nq, int(((report.get("engine") or {}).get("wave_lane_min")) or 64),
                         args.tail)
-                    # Opt-in MQ2 variants (rescale-skip, INT8) replace the fine tile only.
+                    # The opt-in INT8 MQ2 variant replaces the fine tile only.
                     if args.expect_mq2_kernel and expected == "kvarn4_mq2_fine":
                         expected = args.expect_mq2_kernel
                     point = select_point(report, expected, segments, nq)
@@ -466,7 +466,7 @@ def main():
     parser.add_argument("--nq", default=DEFAULT_NQ)
     parser.add_argument("--origin", type=int, default=102400)
     parser.add_argument("--tail", type=int, default=128, choices=(0, 128))
-    parser.add_argument("--expect-mq2-kernel", choices=("kvarn4_mq2_skip", "kvarn4_mq2_i8"),
+    parser.add_argument("--expect-mq2-kernel", choices=("kvarn4_mq2_i8",),
                         help="require this opt-in variant instead of kvarn4_mq2_fine for nq>1")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)

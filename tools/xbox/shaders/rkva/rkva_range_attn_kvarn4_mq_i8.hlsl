@@ -17,9 +17,7 @@
 // Separate PSO target `attn_kvarn4_mq2_i8`; RKVA_MQ_I8 remains 0 for every
 // existing target, whose DXIL is byte-identical. Opted in through the
 // LocalState flag file `rkva-mq-i8.flag` (default off).
-// The exact rescale elision of `attn_kvarn4_mq2_skip` is deliberately NOT
-// enabled here: with both softmax arms present the static tile loop grows from
-// 331.9 to 502.4 instructions per KV row, while the elision only saves ~8% of
-// the F32 loop's instructions, so the combination is a net loss for now.
+// The INT8 variant keeps the production online-softmax update so the fast
+// shared tile loop stays at 331.9 instructions per KV row.
 #define RKVA_MQ_I8 1
 #include "rkva_range_attn_kvarn4_mq.hlsl"

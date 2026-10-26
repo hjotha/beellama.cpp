@@ -10,9 +10,9 @@ prefill). It computes the fast shared record tile's QK with
 * DXIL: `tools/xbox/shaders/generated/rkva_range_attn_kvarn4_mq2_i8_dxil.h`
   (`cs_6_4`, 143 620 B).
 * Build: `tools/xbox/scripts/compile-rkva-range-shaders.sh attn_kvarn4_mq2_i8`.
-* Flag: LocalState file `rkva-mq-i8.flag` (default off), read at HELLO next to
-  `rkva-mq-rescale-skip.flag`. Selection: `remote-attn.cpp` →
-  `RemoteAttnEngine::set_mq_i8()` → `attend_range()`.
+* Flag: LocalState file `rkva-mq-i8.flag` (default off), read at HELLO.
+  Selection: `remote-attn.cpp` → `RemoteAttnEngine::set_mq_i8()` →
+  `attend_range()`.
 * Bucket: `attention/kvarn4-prefix/optimized-kvarn4_mq2_i8/<nq>/<rows>/warm`;
   counters `kvarn4_multi_query.mq2_i8.{available,status,calls,exact:false}`.
 * Quality gate: `tools/xbox/tests/rkva_mq_i8_quality.py`.
@@ -125,9 +125,6 @@ the constant is worth ~2.5x.
 * VGPR pressure rises (int8 Q8 is 48 VGPRs for 12 query-head pairs, offset by
   dropping the resident F32 rotated Q). Occupancy has not been measured; this is
   the main hardware risk.
-* The exact rescale elision of `attn_kvarn4_mq2_skip` is deliberately not
-  combined: with both softmax arms present the static tile loop grows from 331.9
-  to 502.4 instructions per KV row, more than the elision can save.
 
 ## Hardware A/B
 

@@ -57,16 +57,6 @@
 #if RKVA_MQ_QT != 2 && RKVA_MQ_QT != 4
 #error "native KVarN4 multi-query tile supports RKVA_MQ_QT == 2 or 4 only"
 #endif
-// Opt-in bit-exact online-softmax rescale elision (separate PSO, default 0).
-// When a half tile's maximum does not grow, next_max == maximum[i], so the
-// original old_weight is exp(0) == 1.0 and both rescalings
-// (body[i] *= old_weight, denom[i] * old_weight + sum) are exact identities.
-// The elided form therefore keeps every arithmetic value bit-identical; only
-// the multiply-by-one and its exp() are skipped. RKVA_MQ_RESCALE_SKIP == 0 is
-// the production path and keeps the existing targets' DXIL byte-identical.
-#ifndef RKVA_MQ_RESCALE_SKIP
-#define RKVA_MQ_RESCALE_SKIP 0
-#endif
 #define RKVA_QG (RKVA_MQ_QT * RKVA_GQA)
 #define RKVA_PAIR_QG (2 * RKVA_GQA)
 #define RKVA_KIND_NONE 0u
@@ -593,32 +583,6 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                                     half_max = max(half_max, s[t]);
                                 }
                                 float next_max = max(maximum[i], half_max);
-#if RKVA_MQ_RESCALE_SKIP
-                                if (half_max > maximum[i]) {
-                                    float old_weight = denom[i] == 0 ? 0 : exp(maximum[i] - next_max);
-                                    float sum = 0;
-                                    [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
-                                        s[t] = exp(s[t] - next_max);
-                                        sum += s[t];
-                                    }
-                                    body[i] *= old_weight;
-                                    [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
-                                        body[i] += s[t] * v_half[t];
-                                    }
-                                    denom[i] = denom[i] * old_weight + sum;
-                                    maximum[i] = next_max;
-                                } else {
-                                    float sum = 0;
-                                    [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
-                                        s[t] = exp(s[t] - maximum[i]);
-                                        sum += s[t];
-                                    }
-                                    [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
-                                        body[i] += s[t] * v_half[t];
-                                    }
-                                    denom[i] += sum;
-                                }
-#else
                                 float old_weight = denom[i] == 0 ? 0 : exp(maximum[i] - next_max);
                                 float sum = 0;
                                 [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
@@ -631,7 +595,6 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                                 }
                                 denom[i] = denom[i] * old_weight + sum;
                                 maximum[i] = next_max;
-#endif
                             }
                         }
                     }
@@ -689,36 +652,6 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                             half_max = max(half_max, s[t]);
                         }
                         float next_max = max(maximum[i], half_max);
-#if RKVA_MQ_RESCALE_SKIP
-                        // Exact elision: `half_max > maximum[i]` reproduces the
-                        // original next_max split. In the else arm the original
-                        // old_weight is exp(0) == 1.0 and both products are exact
-                        // identities, so the remaining expressions are unchanged.
-                        if (half_max > maximum[i]) {
-                            float old_weight = denom[i] == 0 ? 0 : exp(maximum[i] - next_max);
-                            float sum = 0;
-                            [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
-                                s[t] = exp(s[t] - next_max);
-                                sum += s[t];
-                            }
-                            body[i] *= old_weight;
-                            [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
-                                body[i] += s[t] * v_half[t];
-                            }
-                            denom[i] = denom[i] * old_weight + sum;
-                            maximum[i] = next_max;
-                        } else {
-                            float sum = 0;
-                            [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
-                                s[t] = exp(s[t] - maximum[i]);
-                                sum += s[t];
-                            }
-                            [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
-                                body[i] += s[t] * v_half[t];
-                            }
-                            denom[i] += sum;
-                        }
-#else
                         float old_weight = denom[i] == 0 ? 0 : exp(maximum[i] - next_max);
                         float sum = 0;
                         [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
@@ -731,7 +664,6 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                         }
                         denom[i] = denom[i] * old_weight + sum;
                         maximum[i] = next_max;
-#endif
                     }
                 }
             }

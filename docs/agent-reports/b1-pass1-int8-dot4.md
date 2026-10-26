@@ -142,7 +142,7 @@ quatro lane-groups de uma wave64 pontuam quatro linhas de KV ao mesmo tempo:
 
 Seleção no engine: `remote-attn.cpp` lê o flag no HELLO,
 `RemoteAttnEngine::set_mq_i8()`, e `attend_range()` prefere o PSO i8 ao
-`attn_kvarn4_mq2_skip` quando os dois flags estão ligados. Bucket próprio
+`attn_kvarn4_mq2` quando o flag está ligado. Bucket próprio
 `…optimized-kvarn4_mq2_i8/…`, contador `kvarn4_multi_query.mq2_i8.calls` e
 `"exact":false` no JSON de perfil.
 
@@ -203,9 +203,9 @@ o menor corpo que cobre o tile inteiro.
 * Build de medição sem o quantizador (`RKVA_MQ_I8_MEASURE_NOQUANT=1`, nunca
   embarcado): laço medido muda 4 019 → 3 982 instruções, provando que a
   quantização por grupo está fora do laço quente.
-* `RKVA_MQ_RESCALE_SKIP` foi deliberadamente **não** combinado: com os dois braços
-  de softmax presentes o laço estático sobe de 331,9 para 502,4 instr/linha
-  (medido), mais do que a elisão de A2 pode economizar.
+* A elisão de rescale do A2 foi deliberadamente **não** combinada: com os dois
+  braços de softmax presentes o laço estático sobe de 331,9 para 502,4
+  instr/linha (medido), mais do que a elisão pode economizar.
 
 ## 3. Emulação de qualidade / gate (Passo 2)
 
@@ -362,12 +362,11 @@ Riscos:
   engano ao caminho qualificado.
 * O flag é lido no HELLO a partir de `g_snapshot_local_folder`; se a pasta
   estiver vazia nesse ponto o flag não é visto (mesmo comportamento de
-  `rkva-fp8-gpu-off.flag` e `rkva-mq-rescale-skip.flag`). Validar no primeiro run.
+  `rkva-fp8-gpu-off.flag`). Validar no primeiro run.
 * O app UWP **não foi compilado** (sem MSVC nesta máquina, build UWP do Claude
   rodando na 193). As mudanças de C++ espelham o padrão do A2 (PSO opcional +
-  status + contador + JSON) e o `BulkSegmentProfile` recebeu `int8_dot` além do
-  `rescale_skip` que o Claude já tinha adicionado, mas **compilação do app é
-  pendência**.
+  status + contador + JSON) e o `BulkSegmentProfile` recebeu o campo `int8_dot`,
+  mas **compilação do app é pendência**.
 * A variante exige exatamente 64 lanes por wave (uma lane-group de 16 por linha
   de KV do half tile). Outros tamanhos envenenam a saída com NaN, como o gate de
   shape já fazia.
@@ -383,7 +382,7 @@ Riscos:
   os pesos de softmax em int8 (escala por (query,head,tile)) adicionaria erro
   direto na saída, com risco bem maior que o do QK. Registrado como rejeitado,
   com a álgebra acima.
-* Não combinei `RKVA_MQ_RESCALE_SKIP` (§2, medido: 331,9 → 502,4 estático).
+* Não combinei a elisão de rescale do A2 (§2, medido: 331,9 → 502,4 estático).
 * Não promovi nada a default.
 
 ## 9. Comandos de reprodução

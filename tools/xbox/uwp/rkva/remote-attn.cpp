@@ -192,8 +192,6 @@ struct remote_state {
     bool profile_enabled = false;
     bool trace_requests = false;
     bool fp8_gpu_enabled = true;
-    // Opt-in bit-exact prefill kernel (default off): LocalState flag file.
-    bool mq_rescale_skip_enabled = false;
     // Opt-in INT8 QK prefill kernel (default off, NOT bit-exact): LocalState flag file.
     bool mq_i8_enabled = false;
     // Opt-in nq1 fence spin (default off): LocalState flag file.
@@ -326,10 +324,6 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         state.bulk_dispatch_stored = {};
         state.fp8_gpu_enabled =
             !std::ifstream(g_snapshot_local_folder + "\\rkva-fp8-gpu-off.flag").good();
-        // Opt-in, default off. Bit-exact specialization; see
-        // docs/rkva-prefill-rescale-skip.md.
-        state.mq_rescale_skip_enabled =
-            std::ifstream(g_snapshot_local_folder + "\\rkva-mq-rescale-skip.flag").good();
         // Opt-in, default off, and not bit-exact: see
         // docs/rkva-prefill-int8-dot4.md.
         state.mq_i8_enabled =
@@ -373,7 +367,6 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             event_engine_error(engine_error);
             return RKVA_ERR_GPU;
         }
-        state.engine->set_mq_rescale_skip(state.mq_rescale_skip_enabled);
         state.engine->set_mq_i8(state.mq_i8_enabled);
         if (state.fence_spin_enabled)
             state.engine->set_fence_spin_budget_us(2000);
