@@ -921,6 +921,8 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
         dup->nb[i] = tensor->nb[i];
     }
+    // Transport intent only: do not inherit INPUT/OUTPUT residency flags.
+    dup->flags |= tensor->flags & GGML_TENSOR_FLAG_BINARY_MASK;
     return dup;
 }
 

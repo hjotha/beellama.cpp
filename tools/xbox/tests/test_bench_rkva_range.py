@@ -411,6 +411,19 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
                          bench.prefix_contract(on, [1] * on.p, {'sha256': 'model'}))
 
+    def test_lossless_mask_transport_has_explicit_controls_and_true_default(self):
+        off = bench.validate(bench.parser().parse_args(self.arguments))
+        self.assertEqual(bench.pinned_environment(off)['GGML_CUDA_MASK_PACK'], '0')
+        for mode in ('on', 'default'):
+            args = bench.validate(bench.parser().parse_args(self.arguments + ['--mask-pack', mode]))
+            env = bench.pinned_environment(args)
+            if mode == 'default':
+                self.assertNotIn('GGML_CUDA_MASK_PACK', env)
+            else:
+                self.assertEqual(env['GGML_CUDA_MASK_PACK'], '1')
+            self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
+                             bench.prefix_contract(args, [1] * args.p, {'sha256': 'model'}))
+
     def test_remote_kernel_variant_is_audited_and_does_not_change_local_prefix(self):
         off = bench.validate(bench.parser().parse_args(self.arguments))
         on = bench.validate(bench.parser().parse_args(self.arguments + ['--range-kernel', 'balanced']))

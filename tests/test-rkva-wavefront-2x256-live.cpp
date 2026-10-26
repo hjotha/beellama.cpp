@@ -95,6 +95,7 @@ struct options {
     std::string off_cuda_fp8, on_cuda_fp8;
     std::string off_tcp_prefetch, on_tcp_prefetch;
     std::string off_local_input_reuse, on_local_input_reuse;
+    std::string off_mask_pack, on_mask_pack;
     fs::path output;
     uint32_t p = 512, context = 2048, port = 50054;
     uint32_t parent_tokens = 512;
@@ -244,6 +245,8 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
     if (!prefetch.empty()) set_env("GGML_RKVA_TCP_PREFETCH", prefetch.c_str());
     const auto & reuse = second ? opt.on_local_input_reuse : opt.off_local_input_reuse;
     if (!reuse.empty()) set_env("GGML_RKVA_LOCAL_INPUT_REUSE", reuse.c_str());
+    const auto & mask_pack = second ? opt.on_mask_pack : opt.off_mask_pack;
+    if (!mask_pack.empty()) set_env("GGML_CUDA_MASK_PACK", mask_pack == "default" ? nullptr : mask_pack.c_str());
     const bool enabled = wavefront || opt.parent_tokens == 1024;
     const uint32_t requested_ubatch = opt.parent_tokens == 1024 ? (wavefront ? 1024 : 512) : (wavefront ? 512 : opt.serial_ubatch);
     set_env("GGML_RKVA_WAVEFRONT_TILE", enabled ? "256" : "0");
@@ -277,6 +280,8 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
     manifest["arms"][arm]["tcp_prefetch"] = active_prefetch ? json(active_prefetch) : json(nullptr);
     const char * active_reuse = std::getenv("GGML_RKVA_LOCAL_INPUT_REUSE");
     manifest["arms"][arm]["local_input_reuse"] = active_reuse ? json(active_reuse) : json(nullptr);
+    const char * active_mask_pack = std::getenv("GGML_CUDA_MASK_PACK");
+    manifest["arms"][arm]["mask_pack_environment"] = active_mask_pack ? json(active_mask_pack) : json(nullptr);
     manifest["arms"][arm]["configured_ubatch"] = llama_n_ubatch(ctx.get());
     const auto physical_ubatch = llama_n_ubatch_physical(ctx.get());
     require(llama_n_ubatch(ctx.get()) == requested_ubatch && physical_ubatch == (enabled ? 256u : opt.serial_ubatch),
@@ -397,16 +402,16 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
         const bool want_logits = !opt.serving_prefill || capture;
         const bool final_prefix_parent = !overflow && start + count == std::min(opt.p, prompt_end);
         if (opt.serving_checkpoint_seam && (final_prefix_parent || (overflow && final))) {
-            require(count == 512, "final production seam must contain exactly512 tokens");
+            require(count == 512 || (count == 256 && opt.parent_tokens == 256), "invalid final production seam");
             // Match the production B256/physical-N256 checkpoint cadence:
             // 256 + 128 + 128, irrespective of the arm's logical parent size.
             // All parts take the serial fallback; only the final 128 rows
             // request the final sample's logits. No older R3 seam is assumed.
-            std::fprintf(stderr, "LIVE-2XN256 arm=%s checkpoint=%s logical_parent_start=%u seam=256,128,128 final_sample_end=%u\n",
-                    arm, label.c_str(), start, start + 512);
-            decode(start, 256, label + "-seam-head-256", false, false);
-            decode(start + 256, 128, label + "-seam-middle-128", false, false);
-            decode(start + 384, 128, label, capture, want_logits);
+            std::fprintf(stderr, "LIVE-2XN256 arm=%s checkpoint=%s logical_parent_start=%u seam=%s final_sample_end=%u\n",
+                    arm, label.c_str(), start, count == 512 ? "256,128,128" : "128,128", start + count);
+            if (count == 512) decode(start, 256, label + "-seam-head-256", false, false);
+            decode(start + count - 256, 128, label + "-seam-middle-128", false, false);
+            decode(start + count - 128, 128, label, capture, want_logits);
         } else {
             decode(start, count, label, capture, want_logits);
         }
@@ -473,6 +478,11 @@ int main(int argc, char ** argv) {
             const std::string text = argv[++i];
             if (arg == "--restore-prefix-slot") { opt.restore_prefix_slot = text; continue; }
             if (arg == "--followup-tokens") { opt.followup_tokens_file = text; continue; }
+            if (arg == "--off-mask-pack" || arg == "--on-mask-pack") {
+                require(text == "0" || text == "1" || text == "default", "unsupported mask-pack mode");
+                (arg == "--off-mask-pack" ? opt.off_mask_pack : opt.on_mask_pack) = text;
+                continue;
+            }
             if (arg == "--off-local-input-reuse" || arg == "--on-local-input-reuse") {
                 require(text == "0" || text == "1", "unsupported local input reuse mode");
                 (arg == "--off-local-input-reuse" ? opt.off_local_input_reuse : opt.on_local_input_reuse) = text;
@@ -503,7 +513,8 @@ int main(int argc, char ** argv) {
             else throw std::runtime_error("unknown option: " + arg);
         }
         require(opt.p != 0 && opt.p % 512 == 0, "P must be a positive multiple of 512");
-        require(opt.parent_tokens == 512 || opt.parent_tokens == 1024, "parent tokens must be512 or1024");
+        require(opt.parent_tokens == 256 || opt.parent_tokens == 512 || opt.parent_tokens == 1024, "parent tokens must be256/512/1024");
+        require(opt.parent_tokens != 256 || opt.control_only_pair, "B256 requires a serial control pair");
         require(opt.serial_ubatch == 128 || opt.serial_ubatch == 256, "serial ubatch must be128 or256");
         require(opt.serial_ubatch == 256 || (opt.control_only_pair && opt.parent_tokens == 512),
                 "serial ubatch128 requires a serial control pair with parent512");
@@ -512,6 +523,11 @@ int main(int argc, char ** argv) {
         const bool tcp_pair = !opt.off_tcp_prefetch.empty();
         require(opt.off_local_input_reuse.empty() == opt.on_local_input_reuse.empty(), "local input reuse A/B requires both arm modes");
         const bool reuse_pair = !opt.off_local_input_reuse.empty();
+        require(opt.off_mask_pack.empty() == opt.on_mask_pack.empty(), "mask-pack A/B requires both arm modes");
+        const bool mask_pair = !opt.off_mask_pack.empty();
+        require(!mask_pair || (opt.control_only_pair && opt.off_cuda_fp8 == opt.on_cuda_fp8 &&
+                    opt.off_tcp_prefetch == opt.on_tcp_prefetch && opt.off_local_input_reuse == opt.on_local_input_reuse),
+                "mask-pack A/B must hold geometry, codec, transport and residency fixed");
         require(!reuse_pair || (opt.control_only_pair && opt.off_cuda_fp8 == opt.on_cuda_fp8 &&
                     opt.off_tcp_prefetch == opt.on_tcp_prefetch),
                 "local input reuse A/B must hold control geometry, codec and TCP prefetch fixed");
@@ -526,7 +542,7 @@ int main(int argc, char ** argv) {
         require(opt.prefix_probe_tokens == 0 || (opt.restore_prefix_slot.empty() && opt.followup_tokens_file.empty()),
                 "prefix-only diagnostics cannot combine restored prefixes or followup files");
         if (!opt.restore_prefix_slot.empty()) require(fs::is_regular_file(opt.restore_prefix_slot), "prefix slot file missing");
-        const bool diagnostic = opt.prefix_probe_tokens != 0 || (opt.control_only_pair && !tcp_pair && !reuse_pair);
+        const bool diagnostic = opt.prefix_probe_tokens != 0 || (opt.control_only_pair && !tcp_pair && !reuse_pair && !mask_pair);
         require(opt.port > 0 && opt.port <= UINT16_MAX && !opt.host.empty(), "invalid Xbox endpoint");
         require(fs::is_regular_file(opt.model) && fs::is_regular_file(opt.tokens), "model/token file missing");
         auto read_ids = [](const fs::path & path, bool array_only) {
@@ -603,10 +619,14 @@ int main(int argc, char ** argv) {
             manifest["activation_requirement"] = "Inspect per-arm input-cache counters: ON must reuse bytes after actual CUDA copies; equality alone does not prove activation.";
         }
         manifest["local_input_reuse_scope"] = "local I64 maps; serial/two-tile local masks; four-tile prefill masks retain ordinary copies to preserve workspace aliasing; N1 masks remain eligible";
+        if (mask_pair) {
+            manifest["purpose"] = "fixed-geometry lossless binary-mask transport exact logits/recurrent parity";
+            manifest["activation_requirement"] = "Inspect per-arm ggml_cuda_mask_pack counters; DEFAULT must actually pack and OFF must not";
+        }
         manifest["skip_hybrid_diagnostics"] = opt.skip_hybrid_diagnostics;
         if (diagnostic) manifest["activation_requirement"] = "Diagnostic only: inspect the configured geometry in each arm; prefix probe deliberately executes no overflow, and control pairs repeat the same geometry.";
         for (const char * key : {"GGML_RKVA_ASYNC_LOCAL_REMOTE", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL", "GGML_RKVA_NATIVE_BULK",
-                "GGML_RKVA_NATIVE_BULK_WIRE", "GGML_RKVA_WIRE_FORMAT", "GGML_RKVA_CUDA_FP8", "GGML_RKVA_WAVEFRONT_RPC_BATCH", "GGML_RKVA_TCP_PREFETCH", "GGML_RKVA_LOCAL_INPUT_REUSE",
+                "GGML_RKVA_NATIVE_BULK_WIRE", "GGML_RKVA_WIRE_FORMAT", "GGML_RKVA_CUDA_FP8", "GGML_RKVA_WAVEFRONT_RPC_BATCH", "GGML_RKVA_TCP_PREFETCH", "GGML_RKVA_LOCAL_INPUT_REUSE", "GGML_CUDA_MASK_PACK",
                 "F4_NODE_DUMP", "F4_NODE_DUMP_ROLES", "F4_NODE_DUMP_OPMAP", "F4_NODE_DUMP_AUTOTAG",
                 "GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB",
                 "GGML_KVARN_WINDOW_CHUNK", "GGML_CUDA_FA_ROUTE_DEBUG"}) {
@@ -633,6 +653,7 @@ int main(int argc, char ** argv) {
         env_restore codec_restore("GGML_RKVA_CUDA_FP8");
         env_restore prefetch_restore("GGML_RKVA_TCP_PREFETCH");
         env_restore local_input_restore("GGML_RKVA_LOCAL_INPUT_REUSE");
+        env_restore mask_pack_restore("GGML_CUDA_MASK_PACK");
         const auto off = run_arm(model.get(), opt, tokens, false, manifest,
                 opt.control_only_pair ? "control-a" : "off");
         const auto on = run_arm(model.get(), opt, tokens, !opt.control_only_pair, manifest,

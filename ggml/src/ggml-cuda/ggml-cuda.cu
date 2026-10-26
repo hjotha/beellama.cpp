@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-remote-attn.h"
 #include "ggml-remote-attn-trace.h"
+#include "../ggml-mask-pack.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -802,10 +803,88 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __device__ __forceinline__ uint32_t ggml_cuda_binary_mask_pair(uint32_t bits) {
+    return ((bits & 1u) ? 0xfc00u : 0u) | ((bits & 2u) ? 0xfc000000u : 0u);
+}
+
+// No floating-point arithmetic: reconstruct exactly +0 / -inf raw half bits.
+static __global__ void ggml_cuda_unpack_binary_mask(const uint32_t * packed, uint16_t * dst, size_t n) {
+    const size_t i = (size_t(blockIdx.x)*blockDim.x + threadIdx.x)*8;
+    if (i >= n) return;
+    const uint32_t bits = packed[i/32] >> (i%32);
+    if ((reinterpret_cast<uintptr_t>(dst) & 15u) == 0 && n - i >= 8) {
+        reinterpret_cast<uint4 *>(dst)[i/8] = make_uint4(
+                ggml_cuda_binary_mask_pair(bits), ggml_cuda_binary_mask_pair(bits >> 2),
+                ggml_cuda_binary_mask_pair(bits >> 4), ggml_cuda_binary_mask_pair(bits >> 6));
+    } else {
+        for (size_t j = 0; j < 8 && j < n - i; ++j) dst[i + j] = ((bits >> j) & 1u) ? 0xfc00u : 0u;
+    }
+}
+
+struct ggml_cuda_mask_pack_state {
+    static constexpr size_t capacity = size_t(8) << 20;
+    std::mutex mutex;
+    uint32_t * host = nullptr;
+    uint32_t * mapped = nullptr;
+    bool initialized = false;
+    uint64_t eligible_calls = 0, packed_calls = 0, raw_bytes = 0, payload_bytes = 0;
+    uint64_t disabled_calls = 0, nonbinary_calls = 0, unavailable_calls = 0;
+
+    bool ensure(int device) {
+        if (initialized) return mapped != nullptr;
+        initialized = true;
+        int can_map = 0, unified_addressing = 0;
+        const int physical_device = ggml_cuda_get_physical_device(device);
+        CUDA_CHECK(cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, physical_device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&unified_addressing, cudaDevAttrUnifiedAddressing, physical_device));
+        if (!can_map || !unified_addressing) return false;
+        void * pointer = nullptr;
+        cudaError_t status = cudaHostAlloc(&pointer, capacity, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (status == cudaErrorMemoryAllocation) {
+            const cudaError_t pending = cudaGetLastError();
+            if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) CUDA_CHECK(pending);
+            return false;
+        }
+        CUDA_CHECK(status);
+        host = static_cast<uint32_t *>(pointer);
+        CUDA_CHECK(cudaHostGetDevicePointer(&pointer, host, 0));
+        if (pointer && (reinterpret_cast<uintptr_t>(pointer) & 3u) == 0) {
+            mapped = static_cast<uint32_t *>(pointer);
+            // No device scratch allocation or input lifetime extension.
+            cudaFuncAttributes attributes {};
+            CUDA_CHECK(cudaFuncGetAttributes(&attributes, ggml_cuda_unpack_binary_mask));
+            // Retire lazy first-launch initialization before using the staging.
+            ggml_cuda_unpack_binary_mask<<<1, 1, 0, cudaStreamPerThread>>>(mapped, nullptr, 0);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            return true;
+        }
+        CUDA_CHECK(cudaFreeHost(host)); host = mapped = nullptr;
+        return false;
+    }
+
+    ~ggml_cuda_mask_pack_state() {
+        // All users synchronize their per-thread stream before releasing mutex.
+        if (host) CUDA_CHECK(cudaFreeHost(host));
+        if (eligible_calls) {
+            GGML_LOG_INFO("ggml_cuda_mask_pack: {\"eligible_calls\":%llu,\"packed_calls\":%llu,\"raw_bytes\":%llu,\"payload_bytes\":%llu,\"disabled_calls\":%llu,\"nonbinary_calls\":%llu,\"unavailable_calls\":%llu}\n",
+                    (unsigned long long) eligible_calls, (unsigned long long) packed_calls,
+                    (unsigned long long) raw_bytes, (unsigned long long) payload_bytes,
+                    (unsigned long long) disabled_calls, (unsigned long long) nonbinary_calls,
+                    (unsigned long long) unavailable_calls);
+        }
+    }
+};
+#endif
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_mask_pack_state mask_pack;
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -825,6 +904,19 @@ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
 static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Private registry diagnostic: no ownership transfer and no device work.
+static bool ggml_backend_cuda_mask_pack_stats(ggml_backend_buffer_t buffer, uint64_t * values, size_t count) {
+    if (!buffer || !values || count < 7 || !ggml_backend_buffer_is_cuda(buffer)) return false;
+    auto & pack = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context)->mask_pack;
+    std::lock_guard<std::mutex> lock(pack.mutex);
+    const uint64_t result[7] = {pack.eligible_calls, pack.packed_calls, pack.raw_bytes, pack.payload_bytes,
+        pack.disabled_calls, pack.nonbinary_calls, pack.unavailable_calls};
+    std::memcpy(values, result, sizeof(result));
+    return true;
+}
+#endif
 
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
@@ -865,6 +957,45 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if ((tensor->flags & GGML_TENSOR_FLAG_BINARY_MASK) && tensor->type == GGML_TYPE_F16 &&
+            ggml_is_contiguous(tensor) && tensor->ne[1] > 9 && offset == 0 &&
+            (reinterpret_cast<uintptr_t>(tensor->data) & 1u) == 0 &&
+            size == ggml_nbytes(tensor) && size >= (size_t(128) << 10) &&
+            ggml_mask_pack_f16_words(size/2) <= ggml_cuda_mask_pack_state::capacity/sizeof(uint32_t)) {
+        auto & pack = ctx->mask_pack;
+        std::lock_guard<std::mutex> lock(pack.mutex);
+        ++pack.eligible_calls;
+        const char * mode = std::getenv("GGML_CUDA_MASK_PACK");
+        const bool enabled = !mode || std::strcmp(mode, "1") == 0;
+        if (!enabled) ++pack.disabled_calls;
+        else {
+            const size_t n = size/2;
+            const size_t payload = ggml_mask_pack_f16_words(n)*sizeof(uint32_t);
+            // Validate the first mask BEFORE allocating mapped/driver resources.
+            // Nonbinary masks and OFF keep the classic resource footprint.
+            std::unique_ptr<uint32_t, decltype(&std::free)> first(nullptr, &std::free);
+            if (!pack.initialized) first.reset(static_cast<uint32_t *>(std::malloc(payload)));
+            uint32_t * output = pack.initialized ? pack.host : first.get();
+            if (!output) ++pack.unavailable_calls;
+            else if (!ggml_mask_pack_f16(data, n, output)) ++pack.nonbinary_calls;
+            else if (!pack.ensure(ctx->device)) ++pack.unavailable_calls;
+            else {
+                if (first) std::memcpy(pack.host, first.get(), payload);
+                first.reset();
+                const unsigned blocks = unsigned((n + 2047)/2048);
+                ggml_cuda_unpack_binary_mask<<<blocks, 256, 0, cudaStreamPerThread>>>(
+                        pack.mapped, static_cast<uint16_t *>(tensor->data), n);
+                // After enqueue, never fall back into a concurrent writer. Match
+                // the existing CUDA failure policy and tensor_set completion fence.
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+                ++pack.packed_calls; pack.raw_bytes += size; pack.payload_bytes += payload;
+                return;
+            }
+        }
+    }
+#endif
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -7609,6 +7740,11 @@ static bool ggml_backend_cuda_kv_tail_segmented_attention_supported(
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_mask_pack_stats") == 0) {
+        return (void *) ggml_backend_cuda_mask_pack_stats;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

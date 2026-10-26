@@ -819,6 +819,28 @@ target_compile_features(test-position-split-merge PRIVATE cxx_std_17)
 add_test(NAME test-position-split-merge WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-position-split-merge>)
 set_property(TEST test-position-split-merge PROPERTY LABELS main)
 
+add_executable(test-mask-pack test-mask-pack.cpp)
+target_include_directories(test-mask-pack PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+target_compile_features(test-mask-pack PRIVATE cxx_std_17)
+add_test(NAME test-mask-pack COMMAND $<TARGET_FILE:test-mask-pack>)
+set_property(TEST test-mask-pack PROPERTY LABELS main)
+
+add_executable(test-server-slot-budget test-server-slot-budget.cpp)
+target_include_directories(test-server-slot-budget PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-slot-budget PRIVATE cxx_std_17)
+add_test(NAME test-server-slot-budget COMMAND $<TARGET_FILE:test-server-slot-budget>)
+set_property(TEST test-server-slot-budget PROPERTY LABELS main)
+
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(test-mask-pack-cuda test-mask-pack-cuda.cpp)
+    target_include_directories(test-mask-pack-cuda PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+    target_compile_features(test-mask-pack-cuda PRIVATE cxx_std_17)
+    target_link_libraries(test-mask-pack-cuda PRIVATE ggml ggml-cuda CUDA::cudart)
+    add_test(NAME test-mask-pack-cuda COMMAND $<TARGET_FILE:test-mask-pack-cuda>)
+    set_property(TEST test-mask-pack-cuda PROPERTY LABELS main)
+endif()
+
 add_executable(test-position-split-lse test-position-split-lse.cpp)
 target_include_directories(test-position-split-lse PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/ggml/include)
 target_compile_features(test-position-split-lse PRIVATE cxx_std_17)
@@ -947,6 +969,11 @@ add_executable(test-rkva-wavefront-2x256-live test-rkva-wavefront-2x256-live.cpp
 target_include_directories(test-rkva-wavefront-2x256-live PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(test-rkva-wavefront-2x256-live PRIVATE cxx_std_17)
 target_link_libraries(test-rkva-wavefront-2x256-live PRIVATE llama)
+
+add_executable(test-mask-pack-model-live test-mask-pack-model-live.cpp)
+target_include_directories(test-mask-pack-model-live PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(test-mask-pack-model-live PRIVATE cxx_std_17)
+target_link_libraries(test-mask-pack-model-live PRIVATE llama)
 
 # Phase-1 scaffold of the fused position-split span op (CPU-only, no GPU).
 add_executable(test-kvarn-split-fused-scaffold test-kvarn-split-fused-scaffold.cpp)

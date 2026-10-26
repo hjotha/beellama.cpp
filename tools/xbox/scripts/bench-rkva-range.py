@@ -49,6 +49,7 @@ PINNED_ENV = {
     'GGML_RKVA_WAVEFRONT_TILE': '0', 'GGML_RKVA_WAVEFRONT_RPC_BATCH': '1',
     'GGML_RKVA_TCP_PREFETCH': '0',
     'GGML_RKVA_LOCAL_INPUT_REUSE': '0',
+    'GGML_CUDA_MASK_PACK': '0',
     'LLAMA_N256_LOOKAHEAD': '0', 'LLAMA_SERVER_F5_PER_TOKEN_TIMING': '1',
 }
 
@@ -191,6 +192,8 @@ def parser():
                    help='experimental two-frame FP8 prefill transport; requires runtime overlap counters')
     p.add_argument('--local-input-reuse', action='store_true',
                    help='reuse byte-identical local masks/indices on device; requires actual skipped-copy counters')
+    p.add_argument('--mask-pack', choices=('off', 'on', 'default'), default='off',
+                   help='lossless CUDA binary-F16 mask transport; controls pin OFF, default removes the core override')
     p.add_argument('--range-kernel', choices=('fine', 'balanced'), default='fine',
                    help='fine uses MQ2 and finer decode splits; balanced uses MQ4 and coarser decode splits')
     p.add_argument('--n-predict', type=int, default=256)
@@ -580,6 +583,9 @@ def pinned_environment(args):
     values['GGML_RKVA_CUDA_FP8'] = args.cuda_fp8
     values['GGML_RKVA_TCP_PREFETCH'] = '1' if args.tcp_prefetch else '0'
     values['GGML_RKVA_LOCAL_INPUT_REUSE'] = '1' if args.local_input_reuse else '0'
+    values.pop('GGML_CUDA_MASK_PACK', None)
+    if args.mask_pack != 'default':
+        values['GGML_CUDA_MASK_PACK'] = '0' if args.mask_pack == 'off' else '1'
     values['GGML_RKVA_RANGE_KERNEL'] = args.range_kernel
     return values
 
@@ -649,7 +655,7 @@ def prefix_contract(args, tokens, model):
             'native_kvarn_bits': 4, 'tail': 128, 'window': 4096,
             'environment': {k: v for k, v in prefix_env.items()
                             if k not in ('GGML_RKVA_WAVEFRONT_TILE', 'LLAMA_N256_LOOKAHEAD', 'GGML_RKVA_TCP_PREFETCH',
-                                         'GGML_RKVA_LOCAL_INPUT_REUSE')}}
+                                         'GGML_RKVA_LOCAL_INPUT_REUSE', 'GGML_CUDA_MASK_PACK')}}
 
 
 def snapshot_files(path):

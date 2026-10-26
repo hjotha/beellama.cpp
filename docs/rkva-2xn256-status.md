@@ -502,3 +502,180 @@ Evidence under `20261026/local-input-reuse/`: `short-matrix-summary.json`,
 `cupti-copy-comparison.json`, `host-ctest-r1.log` and
 `windows/final-validation.json`. The long raw manifest is
 `20261026/reuse-cached-p102400-long-r1/manifest.json`.
+
+### Lossless binary-mask transport for local and RKVA prefill
+
+`GGML_CUDA_MASK_PACK` selects a lossless CUDA transport for explicitly marked,
+contiguous F16 prefill masks. Unset defaults to ON; `1` enables it and `0`
+(or any other value) retains the classic copy. This is separate from
+`GGML_RKVA_LOCAL_INPUT_REUSE`, which remains experimental and OFF by default.
+
+The CPU validates every raw half word before packing +0/-infinity into one
+bit. A CUDA integer-only kernel reads mapped pinned host staging and restores
+the exact half bits in the existing device allocation. No mask is retained
+across graph plans and allocator lifetimes are unchanged. The payload is
+1/16 of F16, with last-word padding. Staging is bounded to8MiB per CUDA buffer;
+eligible masks are128KiB through128MiB, with more than9 query rows. Nonbinary
+values, unsupported placement/shape, partial writes, odd byte alignment and
+unavailable mapped staging take the classic path before any device enqueue.
+Unexpected CUDA errors after enqueue remain fatal rather than permitting a
+concurrent fallback writer. HIP/MUSA and Xbox shaders are unchanged.
+
+This specifically covers the normal Qwen35 local-tier masks as well as the
+marked position-split and wavefront masks. It is not a claim that every
+architecture or mask builder is covered. Decode shapes with at most9 queries
+are excluded. The first mapped-kernel use measured2MiB of driver/device
+footprint; no device-data scratch is allocated. Performance comparisons must
+include CPU packing, staging initialization, mapped reads and device unpack.
+
+Validation: Linux13/13 selected CTests,48 benchmark unit tests; SSE2, scalar
+and sanitizer codec checks; real CUDA raw-bit round trips including50MiB
+RKVA masks and128MiB maximum raw masks. Local target-only Qwen35 quality
+checks compare complete248320-word logits and pure convolution/GDN state at
+four checkpoints. MSVC AppContainer/UWP core build passes at parallelism10;
+this host-only change requires no new console package.
+
+All TPS comparisons use fresh OFF/default/default/OFF server processes, one
+GPU job at a time, the same binary within each ABBA, and an immutable saved prefix. DEFAULT is
+the actual unset environment value. The timers include CPU validation/packing,
+first staging allocation, mapped transfer and integer unpack; startup warmup is
+disabled. Rates pool tokens/time across two repetitions, with 255 timed decode
+intervals for 256 generated outputs. This is one descriptive ABBA per profile,
+without confidence bounds. Every arm must retain identical cached/prefill work,
+all 256 greedy output IDs, normal process exit, zero unavailable staging and
+positive DEFAULT/zero OFF packing counters.
+
+| Profile | Prefill OFF -> default (t/s) | Change | Decode OFF -> default (t/s) | Change |
+|---|---:|---:|---:|---:|
+| S, C24576, B/UB256, MTP6 | 564.5481 -> 574.9609 | +1.8445% | 37.8112 -> 37.8865 | +0.1992% |
+| M, C38912, B/UB256, MTP4 | 498.8604 -> 509.0656 | +2.0457% | 43.9089 -> 44.3143 | +0.9234% |
+| L, C56320, B/UB256, MTP2 | 430.1231 -> 442.6921 | +2.9222% | 34.5508 -> 34.7385 | +0.5431% |
+| XL, C72704, B/UB128, MTP2 | 350.5574 -> 370.3801 | +5.6546% | 33.8180 -> 34.2023 | +1.1363% |
+| Fixed XXL, C102400, B/UB256, no MTP | 347.7347 -> 354.1730 | +1.8515% | 24.8004 -> 24.6599 | -0.5666% |
+| XXXL RKVA, C131072, B1024/UB512, 2xN256 | 215.8965 -> 217.7212 | +0.8452% | 17.9837 -> 17.9369 | -0.2603% |
+
+S/M/L/XL use the actual production tier geometry and MTP depths. The target and
+draft KV remain KVarN4, Flash Attention is on, GPU layers99 and parallelism1.
+The local tests retain production repeat1.1/frequency0.3 penalties, but use
+greedy sampling and private children: cache RAM16384MiB rather than4096MiB,
+CUDA graph guard128MiB rather than the live service's18MiB, window4096, verbosity4,
+no automatic save and no remote attention. Local prompts end at C-2048 and the
+measured suffix contains4081 tokens after the warm16 saved prefix. No production
+service/configuration was restarted or rewritten. XL's two OFF prefill rates
+were340.2851 and361.4691t/s, versus370.5215 and370.2388 default; its +5.65% is
+especially sensitive to control variation and is not a guaranteed gain.
+Decode changes are small and mixed across profiles; no consistent decode
+benefit is demonstrated, and the cause of the fixed XXL decrease is not
+established.
+
+Fixed XXL measures the same main64 target layers without MTP, but its attention
+tail has rollback reserve1 versus adaptive XXL's6 (320KiB less storage; both
+retain exact F16 tail128 and execution rows round to256). Thus it qualifies
+fixed target rendering, not exact production cache layout, adaptive admission
+or migration. It uses the existing bounded native routing save/restore path,
+which serializes full target KV and recurrent state with flags0. The immutable
+1922513548-byte snapshot contains96256 evaluated tokens; all arms restore it and
+process4096 suffix tokens. Native checksum/model/layout/token/position validation
+and real save->erase->restore readback pass. The adaptive five-copy RAM guard
+is unchanged. Exact initial-load warnings for15 unused block64 MTP tensors are
+audited separately; changed names/sizes/layers, duplicates and late occurrences
+fail the external rig. They do not mask target-layer or inference failures.
+
+RKVA uses the real Series X at192.168.1.200:50054 with mapped FP8 bulk async,
+fine range kernels, two N256 tiles and TCP prefetch enabled. It is the development
+B1024/UB512 profile, not the production XXXL B/UB256 geometry. All four arms
+restore the frozen102400-token local prefix, warm with no prompt replay, then
+process28160 overflow tokens to130560 and generate256 outputs. Repeat penalty
+is1.0 in this existing helper, unlike the local MTP campaigns. DEFAULT packs111
+masks per arm,5767168000 raw bytes ->360448000 payload bytes; OFF packs0. Runtime
+proof confirms GPU FP8 bulk with zero CPU fallback, two-tile activation and
+completed two-frame TCP overlap. Window4096 and graph guard128MiB are configured;
+these uninstrumented timing logs do not directly record each selected N256
+staging window. The original campaign was interrupted by orchestration during
+arm2 and is preserved separately; only the complete restarted ABBA is pooled.
+
+Model: `Huihui-Qwen3.8-27B-abliterated-Swift-1.5-GSQ-RCO-IQ3_XXS-mtp.gguf`,
+SHA256 `a7e8962f16a84945b2277663da41824b936d40ae90d55852718ac389431c9166`.
+Raw IDs come from `/home/hjotha/beellama-gate/20261017/tokens-prompt120k-t2.json`;
+the RKVA helper repeats that stream to reach130560. Local MTP requests retain
+the15 actually evaluated warm-generated prefix IDs before the original suffix;
+the complete request vectors and hashes are preserved in each manifest. Host is the RTX4070 eGPU
+machine; Xbox is Series X. Measurements bind base
+`40f22aa6b47ce4eef22402fa180f8417a743d6a3` plus these uncommitted transport/server
+changes using source diff, executable and every shared-library SHA in each
+manifest. They are not measurements of bare40f. The CUDA/core/llama libraries
+are unchanged across local campaigns; S/XL/XXL/RKVA use the final server fixes,
+while M/L retain their recorded pre-save-hook server build provenance. The
+optional explicit-save hook is outside those timed paths.
+
+The production-profile validation also exposed three existing server defects.
+A complete native MTP slot restore lost its ready carry before the first new
+suffix batch; exact full-prefix continuations now retain it only when the
+managed MTP implementation proves matching target/draft/carry positions.
+Target-only bootstrap and other existing fallback paths are unchanged.
+Linux slot budgeting now uses strictly parsed MemAvailable, with the existing
+25% reserve, configured cap and five-copy allowance preserved; invalid/missing
+measurements retain the old fallback. Finally, every recreated adaptive
+context reinitializes the context-dependent batch descriptor, including
+equal/smaller batches and successful rollback. Previously S->M with B256
+retained a pointer into freed S memory and crashed on its first decode.
+
+A real disk regression uses three sequential server lifetimes: save, restore A,
+restore B. Both continuations reuse exactly1039 cached tokens, process the
+same512-token suffix, engage MTP and emit identical32-token outputs. Native
+snapshot/logits hashes remain unchanged and all children exit normally.
+The budget parser/cap test passes36 checks. A separate low-threshold live
+cycle covers equal/shrinking/growing batch sizes and actual decoding after an
+injected transition failure successfully rolls back. Its small contexts and
+XXL B512 are test-only and are not performance measurements.
+
+Cold full-prefill is not a bit-exact oracle for the MTP disk regression: it
+rebatches autoregressively generated prefix tokens into prefill kernels. The
+initial attempted comparison differed at index24 (25th output); the artifact is retained.
+Cadence is a plausible explanation, not a proven sole cause. The regression
+qualifies reproducible restored continuation, not cold-prefill equivalence.
+
+Likewise, a two-arm long CAPI test shares one CUDA process. Both OFF/default
+and default/default reproduced exactly42MiB less free VRAM in the second arm
+and a32768->30976 N256 window choice. This42MiB/window discrepancy also occurs without changing the toggle, so it
+does not isolate a mask-pack effect; its earlier attribution to pinning was
+not established. The
+causal comparison uses first arms from separate fresh processes, includes
+actual initialization cost and leaves window selection natural. All five
+whole-vocabulary checkpoints, five complete recurrent snapshots and restored
+prefix match bit-for-bit. Both internally mismatching pair manifests remain
+FAIL evidence; they are not relabeled successful.
+
+
+`LLAMA_ADAPTIVE_SLOT_SAVE_CHECKPOINTS=0` is an explicit-save-only option for
+omitting auxiliary rollback snapshots. Default/unset retains them. Full target,
+draft and speculative carry are captured before that optional section; runtime
+`ctx-checkpoints=1`, rollback capture and all file/RAM guards remain unchanged.
+XL uses this option to fit the native full snapshot on the current host. The
+three-process disk regression also passes with this option: native auxiliary
+count0, positive full target/draft/carry payloads, identical restored outputs and
+unchanged snapshot/logits hashes. Fresh or erased readback avoids the separate
+RAM expense of capturing an already dirty destination for rollback; rollback
+safety itself is not weakened.
+
+Successful adaptive restores can discard old auxiliary history after an epoch
+mismatch, then reimport full target/draft/carry and publish complete_mtp=1,
+bootstrap=0. External audits allow only the exact native-header/log-matched
+sequence within a successful restore. A few canceled non-inference request IDs
+have unknown origins: the rig bounds them to64 unique IDs inside an HTTP/log
+verified idle native interval, before successful publication, and excludes every
+ID launched for inference anywhere in the complete log. All other diagnostic
+occurrences remain fatal. These are benchmark audit exceptions, not runtime
+suppression or a claim to have fixed their origin.
+
+Evidence under `20261026/local-input-reuse-default/mask-pack/`:
+`prod-tier-S-abba-r4/`, `prod-tier-M-abba-r3/`, `prod-tier-L-abba-r2/`,
+`prod-tier-XL-abba-r3/`, `prod-tier-XXL-stream-abba/`, `rkva-mask-abba-r2/`,
+`tier-comparison-progress.json`, `mask-serial-cached-p102400-long-r1/fresh-process-off-vs-default-control-a.json`,
+`mtp-restore-regression-small-r2/`, `mtp-restore-regression-no-aux-r1/`,
+`adaptive-batch-rebind-qual-r1/`, `raw-cuda-large-r2.log` and `windows/candidate2-validation.json`.
+Per-run requests, command vectors, effective INIs, environments, SHA bindings,
+full native state proof, raw responses and failure manifests remain preserved.
+The two long same-process FAIL manifests and the initial cold-prefill MTP
+comparison remain diagnostic evidence. No new Xbox package is required for this
+host CUDA/server change; the compiled UWP inputs remain byte-identical.

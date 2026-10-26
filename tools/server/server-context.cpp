@@ -12,6 +12,7 @@
 #include "server-stream.h"
 #include "server-gpu-power.h"
 #include "server-model-identity.h"
+#include "server-slot-budget.h"
 #include "ggml-remote-attn-trace.h"
 #include "server-route-state.h"
 #if defined(LLAMA_F4_TEST_LOGIT_CAPTURE)
@@ -2523,16 +2524,25 @@ static uint64_t adaptive_slot_ram_budget(int32_t cache_ram_mib) {
     }
 
     uint64_t available = FALLBACK;
+    bool measured = false;
 #ifndef _WIN32
-    const long pages = sysconf(_SC_AVPHYS_PAGES);
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page_size > 0) {
-        available = adaptive_slot_saturating_mul((uint64_t) pages, (uint64_t) page_size);
-        // Leave one quarter of currently available RAM for the server and allocator.
-        available -= available / 4;
+#if defined(__linux__)
+    // Free pages exclude reclaimable file cache. Reading a model or a saved
+    // slot must not make an otherwise identical restore exceed its RAM budget.
+    std::ifstream meminfo("/proc/meminfo");
+    measured = server_slot_parse_mem_available(meminfo, available);
+#endif
+    if (!measured) {
+        const long pages = sysconf(_SC_AVPHYS_PAGES);
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && page_size > 0) {
+            available = adaptive_slot_saturating_mul((uint64_t) pages, (uint64_t) page_size);
+            measured = true;
+        }
     }
 #endif
-    return configured ? std::min(configured, available) : available;
+    // Retain the quarter reserve and configured cap for either measurement.
+    return server_slot_cap_ram_budget(available, configured, measured);
 }
 
 static uint64_t adaptive_slot_vector_storage(const std::vector<uint8_t> & value) {
@@ -6342,6 +6352,12 @@ private:
             slot.bootstrap_pending = false;
             slot.clear_context_on_release = elastic_paged_context;
         }
+        // The extended batch caches the context's memory pointer. Rebind even
+        // when capacity is unchanged or smaller: the previous context has been
+        // destroyed. This also runs when a failed transition restores the old
+        // profile in a newly created context.
+        batch.init(ctx_tgt, std::max({batch.n_tokens_alloc, (int32_t) llama_n_batch(ctx_tgt),
+                params_base.n_parallel}), llama_model_n_embd_inp(model_tgt));
     }
 
     bool rebuild_active_speculation(common_context_profile profile) {
@@ -6812,10 +6828,6 @@ private:
             SRV_INF("adaptive context KVarN conversion: %s, conversion_ms=%.3f\n",
                     converted ? "completed" : "no cached state converted",
                     (ggml_time_us() - conversion_start_us) / 1000.0);
-        }
-        const int32_t target_batch = (int32_t) llama_n_batch(ctx_tgt);
-        if (target_batch > batch.n_tokens_alloc) {
-            batch.init(ctx_tgt, std::max(target_batch, batch.n_tokens_alloc), llama_model_n_embd_inp(model_tgt));
         }
         const auto mtp_info = llama_model_mtp_weights_get_info(model_tgt);
         SRV_INF("adaptive context transition complete: %s, n_ctx=%d, transition_ms=%.3f, MTP_GPU=%zu, MTP_HOST=%zu, MTP_ALLOC=%zu, model_instance=%" PRIu64
@@ -8779,10 +8791,17 @@ private:
                             if (!reservation.acquire(prompt_cache.get(), adaptive_slot_working_bytes(max_file_bytes))) {
                                 throw std::runtime_error("adaptive slot snapshot exceeds the global RAM cache budget");
                             }
+                            // Omit only auxiliary rollback snapshots when explicitly
+                            // requested. Full target, draft and MTP carry stay intact;
+                            // runtime checkpoint cadence and memory guards are unchanged.
+                            const char * checkpoint_policy = std::getenv("LLAMA_ADAPTIVE_SLOT_SAVE_CHECKPOINTS");
+                            const bool include_checkpoints = !checkpoint_policy || std::strcmp(checkpoint_policy, "0") != 0;
                             const auto snapshot = adaptive_slot_capture(
                                 *slot, ctx_tgt, ctx_dft, spec.get(), *adaptive_model_identity,
                                 active_context_profile, params_base.ctx_size_mtp,
-                                params_base.mtp_max_tokens, adaptive_long_ctx, max_file_bytes);
+                                params_base.mtp_max_tokens, adaptive_long_ctx, max_file_bytes, include_checkpoints);
+                            SLT_INF(*slot, "adaptive slot save auxiliary checkpoints=%zu requested=%d\n",
+                                    snapshot.checkpoints.size(), int(include_checkpoints));
                             const auto encoded = adaptive_slot_encode(snapshot, max_file_bytes);
                             const size_t nwrite = adaptive_slot_write_file(filepath, encoded);
                             if (nwrite > 0 && !slot->logits_last.empty() && slot->logits_last_n_tokens == (int32_t) snapshot.n_tokens) {
@@ -10407,8 +10426,22 @@ private:
                                             // prefix was missing. Keep the live prefix instead of
                                             // cold-fallback re-prefilling; the suffix removal
                                             // below trims the cells beyond the planned boundary.
-                                            SLT_WRN(slot, "restored prefix is resident in the KV cache; reusing n_past = %d without a checkpoint\n", n_past);
-                                            common_speculative_set_state(spec.get(), slot.id, {});
+                                            const bool preserve_mtp_carry = uses_mtp() &&
+                                                llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt)).managed &&
+                                                has_new_suffix && n_past == slot.prompt.n_tokens() &&
+                                                !slot.bootstrap_pending &&
+                                                common_speculative_is_ready(spec.get(), slot.id, pos_next);
+                                            if (preserve_mtp_carry) {
+                                                // The first new token at pos_next needs the saved
+                                                // hidden state at pos_next-1. A complete native
+                                                // restore already supplied it; clearing it here
+                                                // makes the first suffix batch fail. Readiness
+                                                // checks the carry and target/draft positions.
+                                                SLT_INF(slot, "restored full MTP prefix is ready; preserving carry at suffix position %d\n", pos_next);
+                                            } else {
+                                                SLT_WRN(slot, "restored prefix is resident in the KV cache; reusing n_past = %d without a checkpoint\n", n_past);
+                                                common_speculative_set_state(spec.get(), slot.id, {});
+                                            }
                                         } else {
                                             if (slot_was_restored) {
                                                 SLT_WRN(slot, "%s", "target-only snapshot restore discarded; no valid MTP/checkpoint suffix was available, falling back to cold prefill\n");

@@ -748,6 +748,7 @@ extern "C" {
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         GGML_TENSOR_FLAG_INPUT_CACHEABLE = 32, // explicit host-input copy reuse intent; see ggml_set_input_cacheable
+        GGML_TENSOR_FLAG_BINARY_MASK = 64, // optional lossless transport; backend validates raw +0/-inf F16 bits, no lifetime change
     };
 
     enum ggml_tri_type {

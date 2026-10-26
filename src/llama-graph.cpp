@@ -116,6 +116,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
+    if (type == GGML_TYPE_F16) res->flags |= GGML_TENSOR_FLAG_BINARY_MASK;
 
     return res;
 }
@@ -4487,6 +4488,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                     inp->self_kq_mask->ne[2], inp->self_kq_mask->ne[3]);
             ggml_set_input(inp->self_kq_mask_standard);
             ggml_set_name(inp->self_kq_mask_standard, "attn_inp_kq_mask_standard_qx");
+            if (inp->self_kq_mask_standard->type == GGML_TYPE_F16) inp->self_kq_mask_standard->flags |= GGML_TENSOR_FLAG_BINARY_MASK;
             inp->self_kq_mask_standard_cnv = inp->self_kq_mask_standard;
         }
         inp->self_kvarn_rot_64  = kvarn->build_input_kvarn_rot(ctx0, 64);
@@ -4517,6 +4519,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                         int64_t(p), n_q, 1, n_stream);
                 ggml_set_input(inp->self_kq_mask_local);
                 ggml_set_name(inp->self_kq_mask_local, "attn_inp_kq_mask_local");
+                if (inp->self_kq_mask_local->type == GGML_TYPE_F16) inp->self_kq_mask_local->flags |= GGML_TENSOR_FLAG_BINARY_MASK;
                 const char * reuse_local_inputs = std::getenv("GGML_RKVA_LOCAL_INPUT_REUSE");
                 const bool cache_local_inputs = cparams.remote_attn_position_split &&
                         reuse_local_inputs && std::strcmp(reuse_local_inputs, "1") == 0;
@@ -4532,6 +4535,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                         int64_t(c - p), n_q, 1, n_stream);
                 ggml_set_input(inp->self_kq_mask_overflow);
                 ggml_set_name(inp->self_kq_mask_overflow, "attn_inp_kq_mask_overflow");
+                if (inp->self_kq_mask_overflow->type == GGML_TYPE_F16) inp->self_kq_mask_overflow->flags |= GGML_TENSOR_FLAG_BINARY_MASK;
                 inp->self_kq_mask_overflow_cnv = inp->self_kq_mask_overflow;
                 inp->self_kvarn_mat_idxs_local = ggml_new_tensor_1d(ctx0,
                         GGML_TYPE_I64, int64_t(p));
@@ -5617,7 +5621,9 @@ std::unique_ptr<llm_graph_input_attn_kv> llm_graph_context::build_wavefront_attn
     auto slice_rows = [&](ggml_tensor * tensor) -> ggml_tensor * {
         if (!tensor) return nullptr;
         GGML_ASSERT(tensor->ne[1] >= int64_t(offset + count) && tensor->ne[2] == 1 && tensor->ne[3] == 1);
-        return ggml_view_2d(ctx0, tensor, tensor->ne[0], count, tensor->nb[1], size_t(offset)*tensor->nb[1]);
+        auto * view = ggml_view_2d(ctx0, tensor, tensor->ne[0], count, tensor->nb[1], size_t(offset)*tensor->nb[1]);
+        view->flags |= tensor->flags & GGML_TENSOR_FLAG_BINARY_MASK;
+        return view;
     };
     auto slice_idxs = [&](ggml_tensor * tensor) -> ggml_tensor * {
         if (!tensor) return nullptr;
