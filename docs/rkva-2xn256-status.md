@@ -422,3 +422,83 @@ Evidence in the20261026 artifact directory: `wf4-controlled-comparison-r1.json`,
 `tcp-prefetch-causal-transport-profile.json`, `tcp-prefetch-abba-comparison.json`,
 `tcp-host-ctest-r2.log`, `windows-4xn256-final-validation.json`,
 `decode-mapped-current-trace-analysis.txt` and `cleanup193-summary.json`.
+
+### Exact local split-input reuse (experimental)
+
+`GGML_RKVA_LOCAL_INPUT_REUSE=1` enables reuse of the local I64 prefix indices
+and F16 attention masks in position-split RKVA. Default is OFF. The benchmark
+requires explicit `--local-input-reuse` and proves activation using final
+copied/skipped-byte counters. The frozen prefix, FP8 mapped bulk async, fine
+range kernel, TCP prefetch, CUDA graph policy and numerical operations remain
+the same in the comparisons below.
+
+Inputs carry explicit cache intent. Only contiguous CPU-host INPUT roots and
+explicitly marked views are eligible; computed roots and host weights are
+excluded. The scheduler retains the destination against allocator reuse and
+compares the complete final source bytes after the input writers finish. A hit
+skips the copy while preserving ownership fences. A miss completes the copy
+before taking a private snapshot. Snapshots are bounded to256MiB/128entries
+and invalidated on planning/allocation/reset/failure and ordinary fallback
+writes. The API requires inputs and aliases to remain immutable during compute.
+
+Four-tile prefill masks retain ordinary copies: pinning all four would defeat
+workspace aliasing and can cross the128MiB graph guard on a12GiB GPU. Their I64
+indices and N1 masks remain eligible. Serial and two-tile masks are eligible.
+This fallback was exercised by the live two-versus-four-tile comparison.
+
+Validation passes10/10 Linux CTests, including the new fake-device scheduler
+regressions, and47 benchmark unit tests. Regression coverage includes allocator
+clobbering, changed bytes, views, graph/arena reuse, copy slots, allocation and
+compute failure, unmark/normal-copy/re-mark, and stateful host-weight callbacks.
+MSVC AppContainer compiles the complete GGML/core/model library at parallelism10:
+374.75s for the full corrected candidate and13.06s for the final backend delta;
+all ten source hashes match Linux. No console package change is needed.
+
+Live short comparisons pass for serial N128, serial N256, two N256 OFF/ON and
+two-versus-four N256 with reuse ON. Selected complete logits and pure recurrent
+state are byte-identical. The long causal OFF/ON run restores the same102400
+prefix and continues28160 overflow tokens plus256 teacher inputs. All five
+248320-logit checkpoints and full serialized convolution/GDN states match
+bit-exactly, including the restored prefix state. The ON arm records669hits,
+11misses and5861990400skipped bytes. Both arms retain262.5060MiB CUDA compute
+allocation; all416 observed window choices are4096, all71090 graph guards
+pass, and trace drops/pressure states are zero. The explicit guard is128MiB.
+
+A trace-free same-binary OFF/ON/ON/OFF campaign, with TCP prefetch ON throughout:
+
+| Local reuse | Repetition | Overflow prefill t/s | Decode t/s |
+|---|---:|---:|---:|
+| OFF | 1 | 202.295097 | 17.376769 |
+| ON | 1 | 204.740716 | 17.178116 |
+| ON | 2 | 207.042458 | 17.333898 |
+| OFF | 2 | 203.179099 | 17.391206 |
+
+Pooled prefill is202.736134 ->205.885154t/s (+1.553%). Pooled decode is
+17.383984 ->17.255656t/s (-0.738%); both ON measurements are below both OFF
+measurements. There is no demonstrated decode benefit or general latency win.
+These are descriptive results from two repetitions per condition, without a
+confidence bound. The cause of the decode decrease has not been established.
+All four runs generate the same256 IDs as the previous reference, with zero
+errors or memory-policy warnings. Source, binary and library hashes are fixed.
+Decode pooling uses255 timed intervals for the API's256 generated outputs.
+
+CUPTI confirms the intended H2D removal. Prefill copies of52428800bytes fall
+from109 to3 and819200-byte copies from57 to4; the two26214400-byte seam copies
+remain. Decode819200-byte and204800-byte copies each fall from255 to1. Their
+total reduction is5860966400bytes, exactly matching the benchmark cache
+counter. No other H2D/D2H/D2D size-count changes occur within those stage
+windows. Tensor attribution uses exact dimensions and source inspection;
+CUPTI does not name tensors. The historical main064 baseline is used only for
+copy traffic; TPS comes from the same-new-binary ABBA. Both trace and CUPTI
+report zero drops; generated IDs match and windows/graph policy are preserved.
+
+The qualified scope is frozen-prefix continuation in this development profile,
+not cold prefix, production tier migration, all tiers/corpora or the historical
+WF128 holdout. Keep the feature experimental and OFF by default. Prefill-only
+reuse is a separate future A/B; it has not been implemented or qualified here.
+
+Evidence under `20261026/local-input-reuse/`: `short-matrix-summary.json`,
+`long-runtime-verification.json`, `abba-comparison.json`,
+`cupti-copy-comparison.json`, `host-ctest-r1.log` and
+`windows/final-validation.json`. The long raw manifest is
+`20261026/reuse-cached-p102400-long-r1/manifest.json`.

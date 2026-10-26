@@ -245,6 +245,20 @@ class TimingTests(unittest.TestCase):
         self.assertFalse(bench.tcp_prefetch_activation([
             json.dumps(record), json.dumps(incomplete)])['two_frame_overlap_confirmed'])
 
+    def test_local_input_reuse_requires_real_copy_and_reuse_counters(self):
+        record = {'hits': 3, 'misses': 2, 'copied_bytes': 1024, 'skipped_bytes': 2048}
+        def lines(value):
+            return ['ggml_input_cache: ' + json.dumps(value)]
+        self.assertTrue(bench.local_input_reuse_activation(lines(record))['actual_reuse_confirmed'])
+        for key in record:
+            with self.subTest(key=key):
+                self.assertFalse(bench.local_input_reuse_activation(lines(dict(record, **{key: 0})))['actual_reuse_confirmed'])
+        self.assertFalse(bench.local_input_reuse_activation(['ggml_input_cache: enabled'])['actual_reuse_confirmed'])
+        self.assertFalse(bench.local_input_reuse_activation(lines(record) + lines(dict(record, hits=0)))['actual_reuse_confirmed'])
+        for malformed in ['not json', '[]', '{"hits":true}', '{"hits":3}']:
+            self.assertFalse(bench.local_input_reuse_activation(
+                lines(record) + ['ggml_input_cache: ' + malformed])['actual_reuse_confirmed'])
+
 
 class ProvenanceTests(unittest.TestCase):
     def setUp(self):
@@ -388,6 +402,14 @@ class ProvenanceTests(unittest.TestCase):
         for extra in [self.arguments + ['--tcp-prefetch'], common + ['--tcp-prefetch', '--no-profile']]:
             with self.assertRaises(ValueError):
                 bench.validate(bench.parser().parse_args(extra))
+
+    def test_local_input_reuse_is_explicit_and_keeps_prefix_codec(self):
+        off = bench.validate(bench.parser().parse_args(self.arguments))
+        on = bench.validate(bench.parser().parse_args(self.arguments + ['--local-input-reuse']))
+        self.assertEqual(bench.pinned_environment(off)['GGML_RKVA_LOCAL_INPUT_REUSE'], '0')
+        self.assertEqual(bench.pinned_environment(on)['GGML_RKVA_LOCAL_INPUT_REUSE'], '1')
+        self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
+                         bench.prefix_contract(on, [1] * on.p, {'sha256': 'model'}))
 
     def test_remote_kernel_variant_is_audited_and_does_not_change_local_prefix(self):
         off = bench.validate(bench.parser().parse_args(self.arguments))

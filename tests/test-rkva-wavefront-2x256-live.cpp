@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "ggml-backend.h"
+#include "../src/llama-context.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-memory-recurrent.h"
 #include "../src/llama-io.h"
@@ -93,14 +94,17 @@ struct options {
     std::string model, tokens, host;
     std::string off_cuda_fp8, on_cuda_fp8;
     std::string off_tcp_prefetch, on_tcp_prefetch;
+    std::string off_local_input_reuse, on_local_input_reuse;
     fs::path output;
     uint32_t p = 512, context = 2048, port = 50054;
     uint32_t parent_tokens = 512;
+    uint32_t serial_ubatch = 256;
     uint32_t prefix_probe_tokens = 0;
     bool control_only_pair = false;
     fs::path restore_prefix_slot, followup_tokens_file;
     uint32_t overflow_tokens = 1024;
     bool repeat_prompt = false, serving_prefill = false, serving_checkpoint_seam = false;
+    bool skip_hybrid_diagnostics = false;
     std::vector<uint32_t> followup_capture_steps;
 };
 struct checkpoint {
@@ -154,7 +158,8 @@ public:
         return written;
     }
 };
-void dump_state(llama_context * ctx, const fs::path & output, const std::string & stem, json & record) {
+void dump_state(llama_context * ctx, const fs::path & output, const std::string & stem, json & record,
+                bool hybrid_diagnostics = true) {
     // KVarN can require attention data even for PARTIAL_ONLY. Serialize the
     // recurrent owner directly so this strict comparison contains convolution
     // and GDN state plus their own metadata, never attention cache metadata.
@@ -175,6 +180,10 @@ void dump_state(llama_context * ctx, const fs::path & output, const std::string 
     record["recurrent_file"] = recurrent_file;
     record["recurrent_bytes"] = recurrent_bytes;
     record["recurrent_format"] = "llama_memory_recurrent::state_write(seq_id=0,flags=0); convolution/GDN and recurrent metadata only; exact serialized comparison";
+    if (!hybrid_diagnostics) {
+        record["hybrid_diagnostics_skipped"] = "explicitly disabled; complete pure recurrent state is still compared";
+        return;
+    }
 
     // Public hybrid snapshots are diagnostic artifacts only: PARTIAL_ONLY
     // may still contain KVarN attention data and is not a GDN-only contract.
@@ -233,8 +242,10 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
     if (!codec.empty()) set_env("GGML_RKVA_CUDA_FP8", codec.c_str());
     const auto & prefetch = second ? opt.on_tcp_prefetch : opt.off_tcp_prefetch;
     if (!prefetch.empty()) set_env("GGML_RKVA_TCP_PREFETCH", prefetch.c_str());
+    const auto & reuse = second ? opt.on_local_input_reuse : opt.off_local_input_reuse;
+    if (!reuse.empty()) set_env("GGML_RKVA_LOCAL_INPUT_REUSE", reuse.c_str());
     const bool enabled = wavefront || opt.parent_tokens == 1024;
-    const uint32_t requested_ubatch = opt.parent_tokens == 1024 ? (wavefront ? 1024 : 512) : (wavefront ? 512 : 256);
+    const uint32_t requested_ubatch = opt.parent_tokens == 1024 ? (wavefront ? 1024 : 512) : (wavefront ? 512 : opt.serial_ubatch);
     set_env("GGML_RKVA_WAVEFRONT_TILE", enabled ? "256" : "0");
     const std::string arm_tag = std::string("2xn256-live-") + arm;
     llama_f4_set_dump_tag((arm_tag + "-context-init").c_str());
@@ -264,9 +275,11 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
     manifest["arms"][arm]["cuda_fp8_mode"] = active_codec ? json(active_codec) : json(nullptr);
     const char * active_prefetch = std::getenv("GGML_RKVA_TCP_PREFETCH");
     manifest["arms"][arm]["tcp_prefetch"] = active_prefetch ? json(active_prefetch) : json(nullptr);
+    const char * active_reuse = std::getenv("GGML_RKVA_LOCAL_INPUT_REUSE");
+    manifest["arms"][arm]["local_input_reuse"] = active_reuse ? json(active_reuse) : json(nullptr);
     manifest["arms"][arm]["configured_ubatch"] = llama_n_ubatch(ctx.get());
     const auto physical_ubatch = llama_n_ubatch_physical(ctx.get());
-    require(llama_n_ubatch(ctx.get()) == requested_ubatch && physical_ubatch == 256,
+    require(llama_n_ubatch(ctx.get()) == requested_ubatch && physical_ubatch == (enabled ? 256u : opt.serial_ubatch),
             "context logical/physical ubatch API does not match the requested 2xN256 arm");
     manifest["arms"][arm]["physical_ubatch"] = physical_ubatch;
     const size_t vocab = static_cast<size_t>(llama_vocab_n_tokens(llama_model_get_vocab(model)));
@@ -302,7 +315,7 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
             {"packed_words", packed_count}, {"token_format", server_v1 ? "server-text-v1" : "legacy-raw-token-ids"},
             {"token_ids_match", true}, {"logits_available", false}, {"repair_tokens", opt.p - restored_tokens},
             {"scope", "frozen prefix restore, not a new end-to-end prefill qualification"}};
-        dump_state(ctx.get(), opt.output, std::string(arm) + "-" + label, restored);
+        dump_state(ctx.get(), opt.output, std::string(arm) + "-" + label, restored, !opt.skip_hybrid_diagnostics);
         manifest["arms"][arm]["prefix_restore"] = std::move(restored);
         write_json(opt.output / "manifest.json", manifest);
         std::fprintf(stderr, "LIVE-2XN256 arm=%s restored_prefix=%u n_read=%zu logits=unavailable\n", arm, restored_tokens, read);
@@ -350,7 +363,7 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
         write_bytes(opt.output / (stem + ".logits.f32.bin"), record.logits.data(), vocab * sizeof(float));
         record.metadata = {{"label", label}, {"f4_tag", dump_tag}, {"start", start}, {"tokens", count}, {"argmax", argmax},
             {"vocab", vocab}, {"logits_file", stem + ".logits.f32.bin"}, {"finite", true}};
-        dump_state(ctx.get(), opt.output, stem, record.metadata);
+        dump_state(ctx.get(), opt.output, stem, record.metadata, !opt.skip_hybrid_diagnostics);
         manifest["arms"][arm]["checkpoints"].push_back(record.metadata);
         write_json(opt.output / "manifest.json", manifest);
         result.push_back(std::move(record));
@@ -408,6 +421,17 @@ arm_result run_arm(llama_model * model, const options & opt, const std::vector<l
             decode(prompt_end + step - 1, 1, "followup-" + std::to_string(step), capture, true);
         }
     }
+    ggml_backend_sched_input_cache_stats cache_stats {};
+    ggml_backend_sched_get_input_cache_stats(ctx->get_sched(), &cache_stats);
+    manifest["arms"][arm]["local_input_cache"] = {
+        {"hits", cache_stats.hits}, {"misses", cache_stats.misses},
+        {"copied_bytes", cache_stats.copied_bytes}, {"skipped_bytes", cache_stats.skipped_bytes}};
+    if (!reuse.empty() && !opt.prefix_probe_tokens) {
+        if (reuse == "1") require(cache_stats.hits > 0 && cache_stats.skipped_bytes > 0 &&
+                cache_stats.copied_bytes > 0, "local input reuse requested but no actual reuse was proved");
+        else require(cache_stats.hits == 0 && cache_stats.skipped_bytes == 0,
+                "local input reuse OFF arm unexpectedly reused inputs");
+    }
     std::fprintf(stderr, "LIVE-2XN256 arm=%s context_end\n", arm);
     std::fflush(stderr);
     return result;
@@ -426,6 +450,9 @@ int main(int argc, char ** argv) {
             "  [--off-cuda-fp8 prefill|mapped --on-cuda-fp8 prefill|mapped] (explicit codec A/B)\n"
             "  [--parent-tokens 1024] (B1024 both arms; control2xN256 versus candidate4xN256)\n"
             "  [--off-tcp-prefetch 0|1 --on-tcp-prefetch 0|1] (use --control-only-pair --parent-tokens 1024 for fixed2xN256)\n"
+            "  [--off-local-input-reuse 0|1 --on-local-input-reuse 0|1] (requires --control-only-pair)\n"
+            "  [--serial-ubatch 128|256] (serial control pair with parent512)\n"
+            "  [--skip-hybrid-diagnostics] (retain full pure recurrent/logit comparisons)\n"
             "Without --execute no model/GPU/network initialization occurs.\n", argv[0]);
         return execute ? 2 : 0;
     }
@@ -441,10 +468,16 @@ int main(int argc, char ** argv) {
             if (arg == "--repeat-prompt") { opt.repeat_prompt = true; continue; }
             if (arg == "--serving-prefill") { opt.serving_prefill = true; continue; }
             if (arg == "--serving-checkpoint-seam") { opt.serving_checkpoint_seam = true; continue; }
+            if (arg == "--skip-hybrid-diagnostics") { opt.skip_hybrid_diagnostics = true; continue; }
             require(i + 1 < argc, "option value missing");
             const std::string text = argv[++i];
             if (arg == "--restore-prefix-slot") { opt.restore_prefix_slot = text; continue; }
             if (arg == "--followup-tokens") { opt.followup_tokens_file = text; continue; }
+            if (arg == "--off-local-input-reuse" || arg == "--on-local-input-reuse") {
+                require(text == "0" || text == "1", "unsupported local input reuse mode");
+                (arg == "--off-local-input-reuse" ? opt.off_local_input_reuse : opt.on_local_input_reuse) = text;
+                continue;
+            }
             if (arg == "--off-tcp-prefetch" || arg == "--on-tcp-prefetch") {
                 require(text == "0" || text == "1", "unsupported TCP prefetch mode");
                 (arg == "--off-tcp-prefetch" ? opt.off_tcp_prefetch : opt.on_tcp_prefetch) = text;
@@ -459,6 +492,7 @@ int main(int argc, char ** argv) {
             if (arg == "--p") opt.p = value;
             else if (arg == "--ctx") opt.context = value;
             else if (arg == "--parent-tokens") opt.parent_tokens = value;
+            else if (arg == "--serial-ubatch") opt.serial_ubatch = value;
             else if (arg == "--port") opt.port = value;
             else if (arg == "--overflow-tokens") opt.overflow_tokens = value;
             else if (arg == "--followup-capture-step") opt.followup_capture_steps.push_back(value);
@@ -470,9 +504,17 @@ int main(int argc, char ** argv) {
         }
         require(opt.p != 0 && opt.p % 512 == 0, "P must be a positive multiple of 512");
         require(opt.parent_tokens == 512 || opt.parent_tokens == 1024, "parent tokens must be512 or1024");
+        require(opt.serial_ubatch == 128 || opt.serial_ubatch == 256, "serial ubatch must be128 or256");
+        require(opt.serial_ubatch == 256 || (opt.control_only_pair && opt.parent_tokens == 512),
+                "serial ubatch128 requires a serial control pair with parent512");
         require(opt.off_cuda_fp8.empty() == opt.on_cuda_fp8.empty(), "codec A/B requires both explicit arm modes");
         require(opt.off_tcp_prefetch.empty() == opt.on_tcp_prefetch.empty(), "TCP prefetch A/B requires both explicit arm modes");
         const bool tcp_pair = !opt.off_tcp_prefetch.empty();
+        require(opt.off_local_input_reuse.empty() == opt.on_local_input_reuse.empty(), "local input reuse A/B requires both arm modes");
+        const bool reuse_pair = !opt.off_local_input_reuse.empty();
+        require(!reuse_pair || (opt.control_only_pair && opt.off_cuda_fp8 == opt.on_cuda_fp8 &&
+                    opt.off_tcp_prefetch == opt.on_tcp_prefetch),
+                "local input reuse A/B must hold control geometry, codec and TCP prefetch fixed");
         require(!tcp_pair || opt.off_cuda_fp8 == opt.on_cuda_fp8,
                 "TCP prefetch A/B must keep the CUDA FP8 codec identical");
         require(!tcp_pair || (opt.control_only_pair && opt.parent_tokens == 1024),
@@ -484,7 +526,7 @@ int main(int argc, char ** argv) {
         require(opt.prefix_probe_tokens == 0 || (opt.restore_prefix_slot.empty() && opt.followup_tokens_file.empty()),
                 "prefix-only diagnostics cannot combine restored prefixes or followup files");
         if (!opt.restore_prefix_slot.empty()) require(fs::is_regular_file(opt.restore_prefix_slot), "prefix slot file missing");
-        const bool diagnostic = opt.prefix_probe_tokens != 0 || (opt.control_only_pair && !tcp_pair);
+        const bool diagnostic = opt.prefix_probe_tokens != 0 || (opt.control_only_pair && !tcp_pair && !reuse_pair);
         require(opt.port > 0 && opt.port <= UINT16_MAX && !opt.host.empty(), "invalid Xbox endpoint");
         require(fs::is_regular_file(opt.model) && fs::is_regular_file(opt.tokens), "model/token file missing");
         auto read_ids = [](const fs::path & path, bool array_only) {
@@ -555,9 +597,16 @@ int main(int argc, char ** argv) {
             manifest["comparison_geometry"] = "B1024/UB512/two N256 tiles and codec fixed; explicit per-arm TCP prefetch";
             manifest["activation_requirement"] = "Both arms require tiles2,parent512,finalFFN256,max_outstanding2; prefetch ON must prove max_frames2 and actual TX ahead. Parity alone does not prove overlap.";
         }
+        if (reuse_pair) {
+            manifest["purpose"] = "fixed-geometry local input reuse exact logits/recurrent parity; not throughput or tier migration qualification";
+            manifest["comparison_geometry"] = "fixed control parent/ubatch/codec/transport; explicit per-arm local input reuse";
+            manifest["activation_requirement"] = "Inspect per-arm input-cache counters: ON must reuse bytes after actual CUDA copies; equality alone does not prove activation.";
+        }
+        manifest["local_input_reuse_scope"] = "local I64 maps; serial/two-tile local masks; four-tile prefill masks retain ordinary copies to preserve workspace aliasing; N1 masks remain eligible";
+        manifest["skip_hybrid_diagnostics"] = opt.skip_hybrid_diagnostics;
         if (diagnostic) manifest["activation_requirement"] = "Diagnostic only: inspect the configured geometry in each arm; prefix probe deliberately executes no overflow, and control pairs repeat the same geometry.";
         for (const char * key : {"GGML_RKVA_ASYNC_LOCAL_REMOTE", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL", "GGML_RKVA_NATIVE_BULK",
-                "GGML_RKVA_NATIVE_BULK_WIRE", "GGML_RKVA_WIRE_FORMAT", "GGML_RKVA_CUDA_FP8", "GGML_RKVA_WAVEFRONT_RPC_BATCH", "GGML_RKVA_TCP_PREFETCH",
+                "GGML_RKVA_NATIVE_BULK_WIRE", "GGML_RKVA_WIRE_FORMAT", "GGML_RKVA_CUDA_FP8", "GGML_RKVA_WAVEFRONT_RPC_BATCH", "GGML_RKVA_TCP_PREFETCH", "GGML_RKVA_LOCAL_INPUT_REUSE",
                 "F4_NODE_DUMP", "F4_NODE_DUMP_ROLES", "F4_NODE_DUMP_OPMAP", "F4_NODE_DUMP_AUTOTAG",
                 "GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB",
                 "GGML_KVARN_WINDOW_CHUNK", "GGML_CUDA_FA_ROUTE_DEBUG"}) {
@@ -583,6 +632,7 @@ int main(int argc, char ** argv) {
         env_restore restore("GGML_RKVA_WAVEFRONT_TILE");
         env_restore codec_restore("GGML_RKVA_CUDA_FP8");
         env_restore prefetch_restore("GGML_RKVA_TCP_PREFETCH");
+        env_restore local_input_restore("GGML_RKVA_LOCAL_INPUT_REUSE");
         const auto off = run_arm(model.get(), opt, tokens, false, manifest,
                 opt.control_only_pair ? "control-a" : "off");
         const auto on = run_arm(model.get(), opt, tokens, !opt.control_only_pair, manifest,

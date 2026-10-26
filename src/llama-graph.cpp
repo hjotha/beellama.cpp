@@ -4517,6 +4517,15 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                         int64_t(p), n_q, 1, n_stream);
                 ggml_set_input(inp->self_kq_mask_local);
                 ggml_set_name(inp->self_kq_mask_local, "attn_inp_kq_mask_local");
+                const char * reuse_local_inputs = std::getenv("GGML_RKVA_LOCAL_INPUT_REUSE");
+                const bool cache_local_inputs = cparams.remote_attn_position_split &&
+                        reuse_local_inputs && std::strcmp(reuse_local_inputs, "1") == 0;
+                // Four-tile parents reuse mask workspace between tile pairs.
+                // Keeping all four copies resident would defeat that aliasing
+                // and can cross the CUDA graph headroom guard on a 12 GiB GPU.
+                if (cache_local_inputs && (!cparams.rkva_wavefront_tile || n_q <= 512)) {
+                    ggml_set_input_cacheable(inp->self_kq_mask_local);
+                }
                 inp->self_kq_mask_local_cnv = inp->self_kq_mask_local;
                 inp->self_kq_mask_overflow = ggml_new_tensor_4d(ctx0,
                         inp->self_kq_mask->type,
@@ -4528,6 +4537,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                         GGML_TYPE_I64, int64_t(p));
                 ggml_set_input(inp->self_kvarn_mat_idxs_local);
                 ggml_set_name(inp->self_kvarn_mat_idxs_local, "attn_inp_kvarn_mat_idxs_local");
+                if (cache_local_inputs) {
+                    ggml_set_input_cacheable(inp->self_kvarn_mat_idxs_local);
+                }
                 inp->self_overflow_cell_idxs = ggml_new_tensor_1d(ctx0,
                         GGML_TYPE_I32, int64_t(c - p));
                 ggml_set_input(inp->self_overflow_cell_idxs);
@@ -5621,6 +5633,13 @@ std::unique_ptr<llm_graph_input_attn_kv> llm_graph_context::build_wavefront_attn
     result->self_v_idxs = slice_idxs(parent->self_v_idxs);
     result->self_kq_mask_local = slice_rows(parent->self_kq_mask_local);
     result->self_kq_mask_local_cnv = result->self_kq_mask_local;
+    // Views need explicit intent; the scheduler still compares the final host
+    // bytes after the parent and tile tail writers have both finished.
+    const char * reuse_local_inputs = std::getenv("GGML_RKVA_LOCAL_INPUT_REUSE");
+    if (ubatch.n_tokens <= 512 && cparams.remote_attn_position_split && reuse_local_inputs &&
+            std::strcmp(reuse_local_inputs, "1") == 0) {
+        ggml_set_input_cacheable(result->self_kq_mask_local);
+    }
     result->self_kq_mask_tail = slice_rows(parent->self_kq_mask_tail);
     result->self_tail_read_idxs = slice_rows(parent->self_tail_read_idxs);
     result->self_tail_body_read_idxs = slice_rows(parent->self_tail_body_read_idxs);

@@ -728,6 +728,12 @@ target_include_directories(test-kv-tail-request PRIVATE ${PROJECT_SOURCE_DIR}/sr
 
 llama_build_and_test(test-fit-kvarn-tail.cpp ../common/fit-kvarn-tail.cpp)
 target_include_directories(test-fit-kvarn-tail PRIVATE ${PROJECT_SOURCE_DIR}/common)
+if (TARGET ggml-cpu)
+    add_executable(test-backend-input-cache test-backend-input-cache.cpp)
+    target_link_libraries(test-backend-input-cache PRIVATE ggml ggml-cpu)
+    llama_test(test-backend-input-cache)
+endif()
+
 add_executable(test-meta-graph-reuse test-meta-graph-reuse.cpp)
 target_link_libraries(test-meta-graph-reuse PRIVATE ggml)
 llama_test(test-meta-graph-reuse)

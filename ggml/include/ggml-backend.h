@@ -397,6 +397,22 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // Declare the same opt-in intent as ggml_set_input_cacheable. This does
+    // not insert a scheduler hash/registration entry, so intent survives an
+    // automatic reset before allocation without stale pointer registrations.
+    GGML_API void ggml_backend_sched_set_tensor_input_cacheable(ggml_backend_sched_t sched, struct ggml_tensor * tensor);
+
+    struct ggml_backend_sched_input_cache_stats {
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t copied_bytes;
+        uint64_t skipped_bytes;
+    };
+    // Counters cover eligible cross-backend input copies and accumulate across
+    // plan resets. Resetting counters does not change cached residency.
+    GGML_API void ggml_backend_sched_get_input_cache_stats(ggml_backend_sched_t sched, struct ggml_backend_sched_input_cache_stats * stats);
+    GGML_API void ggml_backend_sched_reset_input_cache_stats(ggml_backend_sched_t sched);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 

@@ -747,6 +747,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_INPUT_CACHEABLE = 32, // explicit host-input copy reuse intent; see ggml_set_input_cacheable
     };
 
     enum ggml_tri_type {
@@ -973,6 +974,14 @@ extern "C" {
 
     // Tensor flags
     GGML_API void ggml_set_input(struct ggml_tensor * tensor);
+    // Opt in a contiguous host input (or contiguous view of an INPUT root) to
+    // byte-exact scheduler copy reuse. The caller must keep its bytes stable
+    // throughout graph execution and must not make the input or any alias a
+    // graph write destination (CPY, SET_ROWS, etc.). This intent belongs to this tensor only;
+    // newly created views must be marked separately. Residency never survives
+    // scheduler reset/reallocation. Declare intent before graph allocation;
+    // unsupported or already allocated unpinned inputs retain ordinary copies.
+    GGML_API void ggml_set_input_cacheable(struct ggml_tensor * tensor);
     GGML_API void ggml_set_output(struct ggml_tensor * tensor);
     GGML_API void ggml_set_param(struct ggml_tensor * tensor);
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);

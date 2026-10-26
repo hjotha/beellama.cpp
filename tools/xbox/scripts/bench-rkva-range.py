@@ -48,6 +48,7 @@ PINNED_ENV = {
     'GGML_RKVA_CUDA_FP8': 'prefill', 'GGML_RKVA_DISK_SNAPSHOTS': '0',
     'GGML_RKVA_WAVEFRONT_TILE': '0', 'GGML_RKVA_WAVEFRONT_RPC_BATCH': '1',
     'GGML_RKVA_TCP_PREFETCH': '0',
+    'GGML_RKVA_LOCAL_INPUT_REUSE': '0',
     'LLAMA_N256_LOOKAHEAD': '0', 'LLAMA_SERVER_F5_PER_TOKEN_TIMING': '1',
 }
 
@@ -188,6 +189,8 @@ def parser():
                    help='mapped also uses CUDA mapped-host FP8 helpers for nq<=9; requires independent decode quality/TPS checks')
     p.add_argument('--tcp-prefetch', action='store_true',
                    help='experimental two-frame FP8 prefill transport; requires runtime overlap counters')
+    p.add_argument('--local-input-reuse', action='store_true',
+                   help='reuse byte-identical local masks/indices on device; requires actual skipped-copy counters')
     p.add_argument('--range-kernel', choices=('fine', 'balanced'), default='fine',
                    help='fine uses MQ2 and finer decode splits; balanced uses MQ4 and coarser decode splits')
     p.add_argument('--n-predict', type=int, default=256)
@@ -350,6 +353,28 @@ def tcp_prefetch_activation(lines):
         final.get('admitted', 0) == final.get('sent', 0) == final.get('completed', 0) > 0 and
         final.get('max_frames') == 2 and 0 < final.get('ahead_sent', 0) <= final['sent'])
     return {'two_frame_overlap_confirmed': confirmed, 'records': records}
+
+
+def local_input_reuse_activation(lines):
+    records = []
+    malformed = False
+    for line in lines:
+        if 'ggml_input_cache: ' not in line:
+            continue
+        try:
+            record = json.loads(line.split('ggml_input_cache: ', 1)[1])
+        except (ValueError, TypeError):
+            malformed = True
+            continue
+        if isinstance(record, dict) and all(type(record.get(k)) is int and record[k] >= 0
+               for k in ('hits', 'misses', 'copied_bytes', 'skipped_bytes')):
+            records.append(record)
+        else:
+            malformed = True
+    final = records[-1] if records else {}
+    return {'actual_reuse_confirmed': not malformed and all(final.get(k, 0) > 0
+            for k in ('hits', 'misses', 'copied_bytes', 'skipped_bytes')), 'records': records,
+            'malformed_records': malformed}
 
 
 def wavefront_campaign_qualified(points):
@@ -554,6 +579,7 @@ def pinned_environment(args):
     values['GGML_RKVA_WAVEFRONT_RPC_BATCH'] = '1'
     values['GGML_RKVA_CUDA_FP8'] = args.cuda_fp8
     values['GGML_RKVA_TCP_PREFETCH'] = '1' if args.tcp_prefetch else '0'
+    values['GGML_RKVA_LOCAL_INPUT_REUSE'] = '1' if args.local_input_reuse else '0'
     values['GGML_RKVA_RANGE_KERNEL'] = args.range_kernel
     return values
 
@@ -622,7 +648,8 @@ def prefix_contract(args, tokens, model):
             'slot': 0, 'batch': args.frozen_prefix_batch or args.batch, 'physical_prefix_ubatch': 256, 'flash_attn': 'on', 'n_rs_seq': 0,
             'native_kvarn_bits': 4, 'tail': 128, 'window': 4096,
             'environment': {k: v for k, v in prefix_env.items()
-                            if k not in ('GGML_RKVA_WAVEFRONT_TILE', 'LLAMA_N256_LOOKAHEAD', 'GGML_RKVA_TCP_PREFETCH')}}
+                            if k not in ('GGML_RKVA_WAVEFRONT_TILE', 'LLAMA_N256_LOOKAHEAD', 'GGML_RKVA_TCP_PREFETCH',
+                                         'GGML_RKVA_LOCAL_INPUT_REUSE')}}
 
 
 def snapshot_files(path):
@@ -715,7 +742,12 @@ def run(args, tokens, stream_info):
                 'decode_timing_semantics': 'predicted_n - 1 timed steps; first token from prefill',
                 'comparison': 'fresh baseline only; no historical TPS equivalence is asserted',
                 'memory_policy': memory_policy(), 'n256_capability': n256_capability(args),
-                'wavefront_campaign': wavefront_campaign(args)}
+                'wavefront_campaign': wavefront_campaign(args),
+                'local_input_reuse_scope': {
+                    'requested': args.local_input_reuse,
+                    'indices': 'local I64 map; byte-exact final host contents',
+                    'masks': 'serial/two-tile inputs; N1 at all geometries; four-tile prefill retains ordinary copies',
+                    'four_tile_prefill_masks_cacheable': False}}
     result = {'status': 'failed', 'points': []}
     try:
         print(f'{now()} freezing model/binary/token/source hashes before starting any server', flush=True)
@@ -877,10 +909,13 @@ def run(args, tokens, stream_info):
                 result.setdefault('error', 'run-level error/fallback detected during teardown')
             result['server_log_sha256'] = sha256(output / 'server.log')
             write_json(output / 'profile-lines.json', [line.rstrip() for line in drain.lines
-                       if re.search(r'gpu_profile|RemoteAttn|remote_attn|RKVA', line)])
+                       if re.search(r'gpu_profile|RemoteAttn|remote_attn|RKVA|ggml_input_cache', line)])
             manifest['tcp_prefetch_activation'] = tcp_prefetch_activation(drain.lines)
             if args.tcp_prefetch and not args.prefix_only and not manifest['tcp_prefetch_activation']['two_frame_overlap_confirmed']:
                 result.update(status='failed', error='TCP prefetch requested but completed two-frame overlap was not proved')
+            manifest['local_input_reuse_activation'] = local_input_reuse_activation(drain.lines)
+            if args.local_input_reuse and not args.prefix_only and not manifest['local_input_reuse_activation']['actual_reuse_confirmed']:
+                result.update(status='failed', error='local input reuse requested but actual skipped copies were not proved')
         if result['status'] != 'passed':
             for point in result['points']:
                 point['authoritative_decode_tps'] = None

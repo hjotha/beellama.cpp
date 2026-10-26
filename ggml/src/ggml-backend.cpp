@@ -49,6 +49,7 @@ GGML_BACKEND_API void ggml_f4_counters_dump_and_reset(const char * tag) {
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <unordered_map>
 #include <vector>
 
@@ -988,9 +989,84 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// Scheduler itself is calloc-allocated: keep C++ ownership in a separately
+// constructed object, never inline a vector/map in ggml_backend_sched.
+struct ggml_backend_input_cache_entry {
+    ggml_tensor * tensor = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    void * data = nullptr;
+    uint64_t epoch = 0;
+    uint8_t * bytes = nullptr;
+    size_t size = 0;
+    ggml_backend_input_cache_entry * next = nullptr;
+    ~ggml_backend_input_cache_entry() { free(bytes); }
+};
+
+struct ggml_backend_input_cache {
+    static constexpr size_t max_snapshot_bytes = size_t(256) << 20;
+    static constexpr size_t max_entries = 128;
+    ggml_backend_input_cache_entry * entries = nullptr;
+    size_t snapshot_bytes = 0;
+    size_t n_entries = 0;
+    ggml_backend_sched_input_cache_stats stats = {};
+    uint64_t epoch = 0;
+    bool used = false;
+
+    ~ggml_backend_input_cache() { invalidate(); }
+    void invalidate() {
+        while (entries) {
+            auto * next = entries->next;
+            delete entries;
+            entries = next;
+        }
+        snapshot_bytes = 0;
+        n_entries = 0;
+        ++epoch;
+    }
+    ggml_backend_input_cache_entry * find(ggml_tensor * tensor) {
+        for (auto * entry = entries; entry; entry = entry->next) {
+            if (entry->tensor == tensor) return entry;
+        }
+        return nullptr;
+    }
+    ggml_backend_input_cache_entry * insert(ggml_tensor * tensor) {
+        if (n_entries == max_entries) return nullptr;
+        auto * entry = new (std::nothrow) ggml_backend_input_cache_entry;
+        if (entry) {
+            entry->tensor = tensor;
+            entry->next = entries;
+            entries = entry;
+            ++n_entries;
+        }
+        return entry;
+    }
+};
+
+// Allocation-time eligibility must not require an already allocated input.
+// Marked contiguous views are accepted only over an actual user INPUT root;
+// merely marking a computed intermediate never makes it cacheable.
+static bool ggml_backend_input_cache_requested(const ggml_tensor * tensor) {
+    if (!(tensor->flags & GGML_TENSOR_FLAG_INPUT_CACHEABLE) || !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+    const ggml_tensor * root = tensor;
+    size_t offset = 0;
+    while (root->view_src) {
+        if (root->view_offs > SIZE_MAX - offset) return false;
+        offset += root->view_offs;
+        root = root->view_src;
+    }
+    const size_t root_bytes = ggml_nbytes(root);
+    const size_t bytes = ggml_nbytes(tensor);
+    return root->op == GGML_OP_NONE && (root->flags & GGML_TENSOR_FLAG_INPUT) &&
+            offset <= root_bytes && bytes <= root_bytes - offset;
+}
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+
+    ggml_backend_input_cache * input_cache;
 
     int n_backends;
 
@@ -1052,6 +1128,20 @@ struct ggml_backend_sched {
 
     int debug_realloc;
 };
+
+static bool ggml_backend_input_cache_can_pin(ggml_backend_sched_t sched, const ggml_tensor * tensor, int backend_id) {
+    if (!sched->input_cache || !ggml_backend_input_cache_requested(tensor) ||
+            ggml_backend_dev_type(ggml_backend_get_device(sched->backends[backend_id])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+    const ggml_tensor * root = tensor;
+    while (root->view_src) root = root->view_src;
+    const auto buffer = tensor->buffer ? tensor->buffer : root->buffer;
+    // Host-weight copy callbacks may transform bytes using external state;
+    // source equality cannot establish their destination contents.
+    return !buffer || (!ggml_backend_buffer_is_meta(buffer) && ggml_backend_buffer_is_host(buffer) &&
+            ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+}
 
 // note: this inserts the tensor into the hash set, so the scheduler can no longer be
 // considered reset - otherwise the next ggml_backend_sched_reset() would skip the clear
@@ -1295,6 +1385,8 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // Public graph splitting also replaces the arena that owns copy keys.
+    if (sched->input_cache) sched->input_cache->invalidate();
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1690,7 +1782,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             for (int c = 0; c < sched->n_copies; c++) {
                                 struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, dep_src);
                                 ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), dep_src->name, c);
-                                if (sched->n_copies > 1) {
+                                if (sched->n_copies > 1 || ggml_backend_input_cache_can_pin(sched, dep_src, dep_src_backend_id)) {
                                     ggml_set_input(tensor_copy);
                                     ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                                 }
@@ -1730,7 +1822,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            if (sched->n_copies > 1 || ggml_backend_input_cache_can_pin(sched, src, src_backend_id)) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -1956,6 +2048,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    // A new allocation plan may recycle exactly the same addresses.
+    if (sched->input_cache) sched->input_cache->invalidate();
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -2077,6 +2171,74 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+    if (sched->input_cache && ggml_backend_input_cache_requested(input) && input->buffer && input->data &&
+            !ggml_backend_sched_is_host_weight(input) &&
+            (input_cpy->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) ==
+                    (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT) &&
+            !ggml_backend_buffer_is_meta(input->buffer) && ggml_backend_buffer_is_host(input->buffer) &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            ggml_is_contiguous(input_cpy)) {
+        // Match the original INPUT path's ownership fence before inspecting
+        // bytes, including for views that carry no INPUT flag themselves.
+        // The source fence also retires a producer of a host-resident view.
+        ggml_backend_synchronize(input_backend);
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(split_backend);
+        }
+        auto & cache = *sched->input_cache;
+        cache.used = true;
+        auto * entry = cache.find(input_cpy);
+        const size_t bytes = ggml_nbytes(input);
+        if (entry && entry->epoch == cache.epoch && entry->buffer == input_cpy->buffer &&
+                entry->data == input_cpy->data && entry->size == bytes &&
+                std::memcmp(entry->bytes, input->data, bytes) == 0) {
+            ++cache.stats.hits;
+            cache.stats.skipped_bytes += bytes;
+            return;
+        }
+        ++cache.stats.misses;
+        if (entry) {
+            entry->buffer = nullptr;
+            entry->data = nullptr;
+        }
+        ggml_f4_count_copy(bytes, ggml_f4_dev_is_vulkan(input_backend), ggml_f4_dev_is_vulkan(split_backend));
+        ggml_backend_tensor_copy(input, input_cpy);
+        ggml_backend_synchronize(split_backend);
+        cache.stats.copied_bytes += bytes;
+        // Cache allocation is optional: an OOM must leave the ordinary copy
+        // valid and must never throw through this C API.
+        if (!entry) entry = cache.insert(input_cpy);
+        if (entry) {
+            if (entry->size != bytes) {
+                cache.snapshot_bytes -= entry->size;
+                free(entry->bytes);
+                entry->bytes = bytes <= cache.max_snapshot_bytes - cache.snapshot_bytes ?
+                        static_cast<uint8_t *>(malloc(bytes)) : nullptr;
+                entry->size = entry->bytes ? bytes : 0;
+                cache.snapshot_bytes += entry->size;
+            }
+            if (entry->bytes) {
+                std::memcpy(entry->bytes, input->data, bytes);
+                entry->buffer = input_cpy->buffer;
+                entry->data = input_cpy->data;
+                entry->epoch = cache.epoch;
+            }
+        }
+        return;
+    }
+
+    // Eligibility/intent may change between executions. Every ordinary copy
+    // below, including a copy callback or an asynchronous fallback, can replace
+    // a formerly cached destination. Retire its snapshot before any such write.
+    if (sched->input_cache) {
+        if (auto * entry = sched->input_cache->find(input_cpy)) {
+            entry->buffer = nullptr;
+            entry->data = nullptr;
+        }
+    }
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2271,6 +2433,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
 
                     if (!sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                        if (sched->input_cache) sched->input_cache->invalidate();
                         break;
                     }
                 }
@@ -2302,6 +2465,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+    sched->input_cache = new (std::nothrow) ggml_backend_input_cache;
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -2366,6 +2530,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    if (sched->input_cache && sched->input_cache->used) {
+        const auto & stats = sched->input_cache->stats;
+        GGML_LOG_INFO("ggml_input_cache: {\"hits\":%llu,\"misses\":%llu,\"copied_bytes\":%llu,\"skipped_bytes\":%llu}\n",
+                (unsigned long long) stats.hits, (unsigned long long) stats.misses,
+                (unsigned long long) stats.copied_bytes, (unsigned long long) stats.skipped_bytes);
+    }
+    delete sched->input_cache;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2393,6 +2564,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (sched->input_cache) sched->input_cache->invalidate();
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2419,6 +2591,7 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
+    if (sched->input_cache) sched->input_cache->invalidate();
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
     ggml_backend_sched_synchronize(sched);
@@ -2474,7 +2647,16 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    // Also invalidate on exception unwinding, without imposing try/catch on
+    // builds that disable exceptions.
+    struct cache_guard {
+        ggml_backend_input_cache * cache;
+        bool success = false;
+        ~cache_guard() { if (!success && cache) cache->invalidate(); }
+    } guard { sched->input_cache };
+    const auto status = ggml_backend_sched_compute_splits(sched);
+    guard.success = status == GGML_STATUS_SUCCESS;
+    return status;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
@@ -2488,6 +2670,22 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_tensor_input_cacheable(ggml_backend_sched_t sched, ggml_tensor * tensor) {
+    GGML_ASSERT(sched && tensor);
+    ggml_set_input_cacheable(tensor);
+    if (sched->input_cache) sched->input_cache->used = true;
+}
+
+void ggml_backend_sched_get_input_cache_stats(ggml_backend_sched_t sched, ggml_backend_sched_input_cache_stats * stats) {
+    GGML_ASSERT(sched && stats);
+    *stats = sched->input_cache ? sched->input_cache->stats : ggml_backend_sched_input_cache_stats {};
+}
+
+void ggml_backend_sched_reset_input_cache_stats(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (sched->input_cache) sched->input_cache->stats = {};
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
