@@ -88,6 +88,10 @@ Orçamento por linha de KV (lane), derivado dessa contagem:
 | cvt F16→F32 / int→F32 | 12,5 | 2,4% |
 | branch/cbuf/loads | 14,4 | 2,8% |
 
+Composição do laço por bloco (DXIL, por iteração de 8 linhas = 2.872 instruções): dequant das
+duas metades 575 (20,0%), 24 blocos de cabeça (dot+redução+softmax+PV) 24×81 = 1.944 (67,7%),
+header com os 87 `phi` 87 (3,0%), demais 266 (9,3%).
+
 Conclusões:
 
 1. **Não é banda**: o laço lê/dequantiza uma linha de KV uma vez por (kv_head, par de queries)
@@ -111,9 +115,12 @@ Conclusões:
 4. **WHT/barreiras e `split_k` não são o gargalo**: os blocos de WHT+merge somam ~3.260
    instruções por grupo contra ~127.000 do laço de linhas (≈2,5%), o que explica o ganho nulo
    ao reduzir as barreiras do WHT de 17→9. Reduzir `split_k` só mexe nos 2,1% de `reduce`.
-5. **VGPR não é observável offline**: DXIL/DXC não expõem a alocação de VGPR (isso acontece no
-   compilador do driver, na criação do PSO). Registro como pendência; o modelo acima usa apenas
-   LDS estático (12.384 B, verificável) e contagem de instruções.
+5. **Pressão de registradores é visível no DXIL, a alocação não**: o header do laço
+   (`; <label>:993`) tem **87 nós `phi`** — 87 valores vivos que atravessam a iteração
+   (`body` 12×4 = 48, `maximum` 12, `denom` 12, mais endereços/contadores). Isso é o piso
+   arquitetural de VGPRs e é o que fixa 4 dims/lane (8 dims/lane exigiria 96 só de `body`).
+   A alocação final de VGPR (e a ocupação) acontece no compilador do driver na criação do PSO e
+   **não** é exposta por DXC/DXIL: fica como pendência de hardware (RGA ou equivalente na 193).
 
 Reuso de KV: cada linha é dequantizada 1× por (kv_head, par de queries) → 4× por segmento de 8
 queries → **128× por envelope de 256 queries** (mesma camada). É o que motiva o tile de queries;
