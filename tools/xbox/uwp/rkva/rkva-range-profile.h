@@ -392,6 +392,11 @@ struct Counters {
     uint64_t submits = 0;
     uint64_t fence_blocking_waits = 0;
     uint64_t fence_already_complete = 0;
+    // Bounded user-mode spin before the blocking fence wait (nq1 decode path).
+    uint64_t fence_spin_hits = 0;      // fence reached the value during the spin
+    uint64_t fence_spin_fallbacks = 0; // spin budget exhausted, event wait used
+    uint64_t fence_spin_us = 0;        // CPU time spent spinning, microseconds
+    uint64_t fence_spin_budget_us = 0; // configured budget (0 = event wait only)
     uint64_t dispatches = 0;
     uint64_t copy_regions = 0;
     uint64_t buffer_creates = 0;
@@ -702,6 +707,11 @@ class Recorder {
                       ull(c.buffer_creates), ull(c.buffer_create_bytes), ull(c.timestamp_resolves),
                       ull(c.timestamp_map_failures), ull(c.bulk_calls), ull(c.bulk_segments),
                       ull(c.bulk_queries));
+        o += buf;
+        std::snprintf(buf, sizeof(buf),
+                      ",\"fence_spin\":{\"hits\":%llu,\"fallbacks\":%llu,\"spin_us\":%llu,\"budget_us\":%llu}",
+                      ull(c.fence_spin_hits), ull(c.fence_spin_fallbacks), ull(c.fence_spin_us),
+                      ull(c.fence_spin_budget_us));
         o += buf;
         o += ",\"memory\":" + memory_json(h.memory);
         o += ",\"kvarn4_mq_qualified_precision_tail_tokens\":[128]";

@@ -79,8 +79,10 @@ static const size_t kRkvaFlashAttnSplitKReduceDxilSize =
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <intrin.h>
 #include <limits>
 #include <new>
 
@@ -112,6 +114,25 @@ uint64_t elapsed_ns(prof_clock::time_point from, prof_clock::time_point to) {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
 }
+
+// The nq1 decode kernel needs ~0.2 ms of GPU time per layer call, so every one
+// of the 16 per-token submissions blocks on a fence for about that long.
+// SetEventOnCompletion + WaitForSingleObject costs a kernel transition plus a
+// scheduler round trip on top of the GPU time; spinning on the user-mode fence
+// value avoids both. The budget bounds the burn: after it, the original event
+// wait runs unchanged, so a slow or stalled GPU keeps the exact old behaviour.
+// Opt-in (default 0 = always use the event): the console has no environment, so
+// the listener enables it from the LocalState flag rkva-fence-spin.flag;
+// RKVA_FENCE_SPIN_US still seeds desktop runs.
+int64_t fence_spin_budget_default_us() {
+    const char* env = std::getenv("RKVA_FENCE_SPIN_US");
+    const int64_t value = env != nullptr ? std::atoll(env) : 0;
+    return value > 0 ? value : 0;
+}
+
+// Yield to the scheduler once the tight-spin phase would start competing with
+// the D3D12 submission thread of this process.
+constexpr int64_t kFenceTightSpinUs = 100;
 
 // Disjoint consecutive CPU spans; inactive (no clock reads) unless profiling.
 struct SpanTimer {
@@ -374,7 +395,7 @@ bool RemoteAttnEngine::begin(std::string* error) {
     return true;
 }
 
-bool RemoteAttnEngine::submit(std::string* error) {
+bool RemoteAttnEngine::submit(std::string* error, bool allow_spin) {
     if (bulk_recording_)
         return true;
     if (terminal_failure_ || unconfirmed_submission_) {
@@ -409,16 +430,56 @@ bool RemoteAttnEngine::submit(std::string* error) {
         rp::Counters& c = profile_->recorder.counters;
         ++c.submits;
         ++(blocked ? c.fence_blocking_waits : c.fence_already_complete);
+        c.fence_spin_budget_us = uint64_t(fence_spin_budget_us_);
     }
     if (blocked) {
-        hr = fence_->SetEventOnCompletion(value, fence_event_);
-        if (FAILED(hr)) {
-            terminal_failure_ = true;
-            return fail(error, "Fence SetEventOnCompletion", hr);
+        // Only nq1 decode waits ~0.2-0.6 ms; prefill segments run for milliseconds
+        // and would just burn a console core next to the network thread.
+        const int64_t spin_budget_us = allow_spin ? fence_spin_budget_us_ : 0;
+        bool spun_to_completion = false;
+        uint64_t spin_ns = 0;
+        if (spin_budget_us > 0) {
+            const prof_clock::time_point spin_start = prof_clock::now();
+            for (;;) {
+                // User-mode read of the fence value: no kernel transition.
+                if (fence_->GetCompletedValue() >= value) {
+                    spun_to_completion = true;
+                    break;
+                }
+                spin_ns = elapsed_ns(spin_start, prof_clock::now());
+                if (spin_ns >= uint64_t(spin_budget_us) * 1000ull) {
+                    break;
+                }
+                if (spin_ns < uint64_t(kFenceTightSpinUs) * 1000ull) {
+                    YieldProcessor();
+                } else {
+                    SwitchToThread();
+                }
+            }
+            spin_ns = elapsed_ns(spin_start, prof_clock::now());
         }
-        if (WaitForSingleObject(fence_event_, 60000) != WAIT_OBJECT_0) {
-            terminal_failure_ = true;
-            return fail(error, "GPU fence wait failed");
+        if (prof) {
+            rp::Counters& c = profile_->recorder.counters;
+            c.fence_spin_us += spin_ns / 1000ull;
+            if (spun_to_completion) {
+                ++c.fence_spin_hits;
+            } else if (spin_budget_us > 0) {
+                ++c.fence_spin_fallbacks;
+            }
+        }
+        // Unchanged fallback: a fence that already reached the value signals the
+        // event immediately, so this only pays the kernel path when the budget
+        // was exhausted (or spinning was disabled).
+        if (!spun_to_completion) {
+            hr = fence_->SetEventOnCompletion(value, fence_event_);
+            if (FAILED(hr)) {
+                terminal_failure_ = true;
+                return fail(error, "Fence SetEventOnCompletion", hr);
+            }
+            if (WaitForSingleObject(fence_event_, 60000) != WAIT_OBJECT_0) {
+                terminal_failure_ = true;
+                return fail(error, "GPU fence wait failed");
+            }
         }
     }
     const uint64_t completed = fence_->GetCompletedValue();
@@ -1287,6 +1348,7 @@ std::string RemoteAttnEngine::get_range_profile_json() {
 }
 
 bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
+    fence_spin_budget_us_ = fence_spin_budget_default_us();
     if (ready_) {
         return fail(error, "engine already initialized");
     }
@@ -2574,7 +2636,7 @@ bool RemoteAttnEngine::attend_kvarn_bulk(uint32_t id, uint32_t layer, uint32_t n
 
     const prof_clock::time_point t_submit_start =
         prof ? prof_clock::now() : prof_clock::time_point{};
-    if (!submit(error)) {
+    if (!submit(error, n_tokens == 1)) {
         if (prof) {
             profile_->bulk.active = false;
             ++profile_->recorder.counters.failed_calls;
@@ -2765,7 +2827,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         }
     }
     bulk_recording_ = false;
-    if (!submit(error)) {
+    if (!submit(error, n_tokens == 1)) {
         s->valid = false;
         return false;
     }

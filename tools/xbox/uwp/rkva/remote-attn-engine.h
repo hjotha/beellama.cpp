@@ -174,6 +174,10 @@ class RemoteAttnEngine {
     uint32_t q4_kernel_mode() const {
         return q4_kernel_mode_;
     }
+    // Fence spin budget for nq1 submissions; 0 keeps the blocking event wait.
+    void set_fence_spin_budget_us(int64_t budget_us) {
+        fence_spin_budget_us_ = budget_us > 0 ? budget_us : 0;
+    }
     bool range_profiling() const {
         return profiling_;
     }
@@ -227,7 +231,8 @@ class RemoteAttnEngine {
     void transition(Buffer& buffer, D3D12_RESOURCE_STATES state);
     void uav_barrier(Buffer& buffer);
     bool begin(std::string* error);
-    bool submit(std::string* error);
+    // allow_spin: spin briefly on the fence before blocking (nq1 decode only).
+    bool submit(std::string* error, bool allow_spin = false);
     bool create_device(std::string* error);
     bool create_pipelines(std::string* error);
     bool ensure_scratch(uint32_t n_tokens, std::string* error);
@@ -331,6 +336,7 @@ class RemoteAttnEngine {
     // Profiling (default off). Timestamp slots are fixed per stage so a future
     // fused upload+attention command list cannot alias them.
     bool profiling_ = false;
+    int64_t fence_spin_budget_us_ = 0;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamp_heap_;
     Buffer timestamp_readback_;
     uint64_t timestamp_frequency_ = 0;
