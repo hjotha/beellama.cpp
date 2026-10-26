@@ -287,3 +287,34 @@ docs(xbox): report the ceiling probe design, evidence and open risks
 Nenhum arquivo fora de `tools/xbox/` e do `.gitignore` foi tocado; nada foi escrito em
 `/home/hjotha/beellama.cpp`, no Xbox ou em `~/.codex`. Artefatos locais (desmontagens
 DXIL) estão em `.oc-artifacts/`, ignorado pelo git.
+
+## 11. Primeira execução real no Series X (2026-10-26, pacote 902, revisão do Claude)
+
+Pacote lado a lado `HJotha.BeeCeilingProbe_1.6.0.902` (o 295 de produção ficou intacto e foi
+religado no fim; listener :50054 confirmado). Três correções foram necessárias para o C++
+compilar e rodar: include de `d3d12_compute.h`, limite fixo de groupshared
+(`D3D12_CS_TGSM_REGISTER_COUNT*4`) e views *raw* (`R32_TYPELESS` + `FLAG_RAW`) — as views
+UNKNOWN/stride 0 removiam o device e todos os PSOs falhavam com `0x887A0005`.
+
+Medido (JSON bruto em `tools/xbox/docs/results/`):
+
+| Grandeza | Medido | Nominal | % |
+| --- | ---: | ---: | ---: |
+| FP32 FMA (1664 grupos wave64) | 11,09 TFLOP/s | 12,15 | 91% |
+| INT8 `dot4add_i8packed` | 37,57 TOPS | 48,6 | 77% |
+| FP16 nativo / `dot2add` | PSO rejeitado (`E_INVALIDARG`) | 24,3 | — |
+| Banda leitura (gpubw, 1 GiB, checksum OK) | 267,35 GB/s | 560 | 48% |
+| Banda leitura / escrita / cópia (gpupeak, 256 MiB) | 280 / 300 / 149 (cópia contando 1×) | 560 | ~50% |
+| WGPs ativos (degraus LDS 32 KiB=104, 16 KiB=208 grupos) | 26 WGP = 52 CU | 52 | 100% |
+| Dispatch vazio (GPU) | 3,1 µs | — | — |
+| Submit + fence vazio (CPU) p50 / p95 | 41,8 / 52,8 µs | — | — |
+| Map de readback | 2,5 µs | — | — |
+
+Conclusões: o app UWP recebe a GPU inteira (52 CU, clock nominal). O piso fixo D3D12 por
+chamada é ~42 µs, logo ~90% dos ~0,5 ms/camada de overhead não-GPU do decode são atacáveis
+(frente A3). Sem FP16 nativo no sandbox; INT8 dot4 (37,6 TOPS) é o recurso ocioso.
+
+Bugs restantes da sonda (não bloqueiam os números acima): validação de checksum de
+`stream read/copy` reporta mismatch (o `gpubw` independente valida a leitura), o roofline
+aborta por causa disso, e o "clock implícito" pela cadeia dependente (260,7 MHz) é inválido —
+a premissa de 4 ciclos de latência não vale para wave64; descartar.
