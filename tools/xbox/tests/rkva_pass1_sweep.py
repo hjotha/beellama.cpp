@@ -313,12 +313,13 @@ def execute(args):
                         OP_PROFILE, struct.pack("<IIQ", PROFILE_REPORT_ONLY, 0, 0))).decode("utf-8"))
                     if run < args.warmup:
                         continue
-                    point = select_point(
-                        report,
-                        expected_kernel_for(
-                            nq, int(((report.get("engine") or {}).get("wave_lane_min")) or 64),
-                            args.tail),
-                        segments, nq)
+                    expected = expected_kernel_for(
+                        nq, int(((report.get("engine") or {}).get("wave_lane_min")) or 64),
+                        args.tail)
+                    # Opt-in MQ2 variants (rescale-skip, INT8) replace the fine tile only.
+                    if args.expect_mq2_kernel and expected == "kvarn4_mq2_fine":
+                        expected = args.expect_mq2_kernel
+                    point = select_point(report, expected, segments, nq)
                     points.append(point)
                     print("rows=%d nq=%d run=%d pass1=%.1fus kernel=%s" %
                           (rows, nq, run, point["pass1_us"], point["kernel"]), flush=True)
@@ -465,6 +466,8 @@ def main():
     parser.add_argument("--nq", default=DEFAULT_NQ)
     parser.add_argument("--origin", type=int, default=102400)
     parser.add_argument("--tail", type=int, default=128, choices=(0, 128))
+    parser.add_argument("--expect-mq2-kernel", choices=("kvarn4_mq2_skip", "kvarn4_mq2_i8"),
+                        help="require this opt-in variant instead of kvarn4_mq2_fine for nq>1")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--upload-chunk", type=int, default=2048)

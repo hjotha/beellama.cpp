@@ -310,3 +310,16 @@ g++ -std=c++17 -Wall -Wextra -Werror -O1 tools/xbox/tests/rkva_range_profile_cpu
 # A/B de hardware (inerte sem --execute)
 python3 tools/xbox/scripts/run-rkva-prefill-kernel-ab.py --help
 ```
+
+## 10. Validação em hardware (2026-10-26, pacote 296, revisão do Claude)
+
+* **Bit-exatidão: PASSOU.** `tests/rkva_kvarn_bulk_replay.py` com `rkva-mq-rescale-skip.flag`
+  contra o 296 sem flag: `ok: true`, 696 registros (requests, OUT e LSE com hash idêntico). O 296
+  sem flag também é idêntico à referência do 295 (`new295-mq-replay.json`). Ativação provada pelo
+  bucket `optimized-kvarn4_mq2_skip/nq2-16/...` no perfil (o contador `mq2_rescale_skip.calls` do
+  caminho bulk não era incrementado — corrigido em `0acd8e8c2`).
+* **Desempenho: REJEITADO.** `tests/rkva_pass1_sweep.py` (28672 linhas, nq 256, 5 execuções por
+  braço, ordem OFF/ON/ON/OFF, `--expect-mq2-kernel kvarn4_mq2_skip` no ON):
+  `pass1` OFF 99,89 ns/linha/segmento (mediana, n=10) vs ON 101,56 (n=10) → **+1,67% mais lento**,
+  dispersão < 1%. A contagem estática (−7,4%) não captura o custo do desvio divergente em wave64
+  (risco 4 da §7). A variante fica opt-in, default OFF, e não deve ser promovida.
