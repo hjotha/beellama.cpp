@@ -44,6 +44,8 @@ TARGETS = [
     ("fma_f32", "gpupeak_alu.hlsl", "CSFmaF32", "cs_6_0", [], ["GPUPK_ALU_F32=1"]),
     ("fma_f16", "gpupeak_alu.hlsl", "CSFmaF16", "cs_6_2", ["-enable-16bit-types"],
      ["GPUPK_ALU_F16=1"]),
+    ("fma_f16_min16", "gpupeak_alu.hlsl", "CSFmaF16Min16", "cs_6_0", [],
+     ["GPUPK_ALU_F16_MIN16=1"]),
     ("dot2_f16", "gpupeak_alu.hlsl", "CSDot2F16", "cs_6_4", ["-enable-16bit-types"],
      ["GPUPK_ALU_DOT2=1"]),
     ("dot4_i8", "gpupeak_alu.hlsl", "CSDot4I8", "cs_6_4", [], ["GPUPK_ALU_DOT4=1"]),
@@ -153,12 +155,36 @@ def main():
                         help="isolated scratch dir on the Windows host")
     parser.add_argument("--only", nargs="*", default=None, help="target names")
     parser.add_argument("--list", action="store_true", help="print targets and exit")
+    parser.add_argument("--check", action="store_true",
+                        help="verify every committed header matches its source hash and exit")
     args = parser.parse_args()
 
     if args.list:
         for name, source, entry, profile, flags, defines in TARGETS:
             print("%-14s %-22s %-14s %-6s %s" % (name, source, entry, profile,
                                                  " ".join(defines + flags)))
+        return 0
+
+    if args.check:
+        stale = []
+        for name, source_name, _entry, _profile, _flags, _defines in TARGETS:
+            source = SHADERS / source_name
+            header = GENERATED / ("gpupeak_%s_dxil.h" % name)
+            want = hashlib.sha256(source.read_bytes()).hexdigest()
+            got = None
+            if header.exists():
+                for line in header.read_text().splitlines():
+                    if line.startswith("// Source SHA256: "):
+                        got = line.split(": ", 1)[1].strip()
+                        break
+            if got != want:
+                stale.append(name)
+                print("%-14s STALE header source %s != %s" % (name, got, want))
+            else:
+                print("%-14s ok %s" % (name, want[:16]))
+        if stale:
+            sys.stderr.write("stale DXIL headers: " + ", ".join(stale) + "\n")
+            return 1
         return 0
 
     only = ALLOWED_ONLY

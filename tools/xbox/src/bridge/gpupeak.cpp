@@ -36,6 +36,7 @@
     #include "gpupeak_dot4_i8_dxil.h"
     #include "gpupeak_empty_dxil.h"
     #include "gpupeak_fma_f16_dxil.h"
+    #include "gpupeak_fma_f16_min16_dxil.h"
     #include "gpupeak_fma_f32_dxil.h"
     #include "gpupeak_latency_fma_dxil.h"
     #include "gpupeak_stream_copy_dxil.h"
@@ -342,16 +343,6 @@ std::string gpupeak_json(const GpupeakResult& result, const GpupeakOptions& opti
                   d.timestamp_us_per_tick, json_escape(d.feature_error).c_str());
     o += buf;
 
-    o += ",\"derived\":{\"implied_clock_mhz\":";
-    std::snprintf(buf, sizeof(buf), "%.1f,\"implied_clock_seconds_per_fma\":%.12f,"
-                                    "\"implied_clock_note\":\"derived from a dependent FP32 FMA "
-                                    "chain assuming the documented RDNA2 4-clock VALU latency; "
-                                    "not a measured clock\","
-                                    "\"catalog_frequency_mhz\":%u}",
-                  result.implied_clock_mhz, result.implied_clock_seconds_per_fma,
-                  result.catalog_frequency_mhz);
-    o += buf;
-
     o += ",\"pso_errors\":[";
     for (std::size_t i = 0; i < result.pso_errors.size(); ++i) {
         if (i)
@@ -373,7 +364,8 @@ std::string gpupeak_json(const GpupeakResult& result, const GpupeakOptions& opti
                       "\"flops\":%llu,\"gpu_seconds\":%.9f,\"gpu_seconds_median\":%.9f,"
                       "\"cpu_seconds\":%.9f,\"readback_seconds\":%.9f,\"gbs\":%.3f,"
                       "\"tflops\":%.4f,\"gops\":%.4f,\"groups\":%u,\"threads\":%u,\"runs\":%u,"
-                      "\"iters\":%llu,\"gpu_valid\":%s,\"checksum_checked\":%s,"
+                      "\"iters\":%llu,\"checksum\":%u,\"expected_checksum\":%u,"
+                      "\"gpu_valid\":%s,\"checksum_checked\":%s,"
                       "\"checksum_ok\":%s,\"error\":\"%s\"}",
                       json_escape(r.suite).c_str(), json_escape(r.probe).c_str(),
                       json_escape(r.variant).c_str(),
@@ -381,6 +373,7 @@ std::string gpupeak_json(const GpupeakResult& result, const GpupeakOptions& opti
                       static_cast<unsigned long long>(r.flops), r.gpu_seconds,
                       r.gpu_seconds_median, r.cpu_seconds, r.readback_seconds, gbs, tflops, gops,
                       r.groups, r.threads, r.runs, static_cast<unsigned long long>(r.iters),
+                      r.checksum, r.expected_checksum,
                       r.gpu_valid ? "true" : "false", r.checksum_checked ? "true" : "false",
                       r.checksum_ok ? "true" : "false", json_escape(r.error).c_str());
         o += buf;
@@ -416,6 +409,10 @@ constexpr std::uint64_t kAluIters = 1024;
 constexpr std::uint64_t kLatencyIters = 65536;
 constexpr std::uint64_t kOccupancyIters = 200000;
 constexpr std::uint32_t kSinkGroups = 8192; // 8192 * 64 * 4 B = 2 MiB
+// CSRead publishes one accumulator per flat stream thread, so the Sink UAV
+// must hold every thread of the largest stream dispatch.
+static_assert(kSinkGroups * kThreadsAlu >= kStreamGroups * kThreadsStream,
+              "stream validation sink is smaller than one accumulator per thread");
 
 struct PsoEntry {
     const char* name = nullptr;
@@ -666,8 +663,19 @@ bool build_descriptors(Driver& drv) {
 
 bool validate_stream(Driver& drv, ID3D12DescriptorHeap* heap, ID3D12Resource* source,
                      ID3D12PipelineState* read_pso, std::uint64_t n_vec, std::uint32_t gx,
-                     std::uint32_t gy, bool* ok) {
+                     std::uint32_t gy, bool* ok, std::uint32_t* observed,
+                     std::uint32_t* expected) {
     *ok = false;
+    if (observed)
+        *observed = 0;
+    const std::uint64_t threads =
+        static_cast<std::uint64_t>(gx) * gy * kThreadsStream;
+    const std::uint64_t sink_words = static_cast<std::uint64_t>(kSinkGroups) * kThreadsAlu;
+    if (threads == 0 || threads > sink_words)
+        return false;
+    if (expected)
+        *expected = gpupeak_pattern_xor(n_vec, gx, gy, 0);
+
     drv.write_params(static_cast<std::uint32_t>(n_vec), gx, gy, /*mode=*/1);
     drv.begin_graphics(read_pso, heap);
     drv.transition(source, D3D12_RESOURCE_STATE_COMMON,
@@ -678,23 +686,33 @@ bool validate_stream(Driver& drv, ID3D12DescriptorHeap* heap, ID3D12Resource* so
     drv.end_list();
     if (!drv.submit_and_wait(nullptr)) // the read dispatch must run before any reset
         return false;
-    // Copy the whole sink and fold it on the host.
+    // Copy the per-thread sink slots and fold them on the host. Sink is a UAV
+    // resource: a copy is only defined after an explicit transition to
+    // COPY_SOURCE (without it the readback is undefined and was the source of
+    // the "pattern checksum mismatch" on the console).
+    const std::uint64_t copy_bytes = threads * sizeof(std::uint32_t);
     drv.alloc->Reset();
     drv.list->Reset(drv.alloc.Get(), nullptr);
-    drv.list->CopyResource(drv.sink_readback.Get(), drv.sink.Get());
+    drv.transition(drv.sink.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+    drv.list->CopyBufferRegion(drv.sink_readback.Get(), 0, drv.sink.Get(), 0, copy_bytes);
+    drv.transition(drv.sink.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     drv.list->Close();
     if (!drv.submit_and_wait(nullptr))
         return false;
     void* mapped = nullptr;
-    const D3D12_RANGE range = {0, static_cast<SIZE_T>(gx) * gy * sizeof(std::uint32_t)};
+    const D3D12_RANGE range = {0, static_cast<SIZE_T>(copy_bytes)};
     if (FAILED(drv.sink_readback->Map(0, &range, &mapped)) || !mapped)
         return false;
     const auto* words = static_cast<const std::uint32_t*>(mapped);
     std::uint32_t folded = 0;
-    for (std::uint32_t i = 0; i < gx * gy; ++i)
+    for (std::uint64_t i = 0; i < threads; ++i)
         folded ^= words[i];
     drv.sink_readback->Unmap(0, nullptr);
-    *ok = folded == gpupeak_pattern_xor(n_vec, gx, gy, 0);
+    if (observed)
+        *observed = folded;
+    *ok = folded == (expected ? *expected : gpupeak_pattern_xor(n_vec, gx, gy, 0));
     return true;
 }
 
@@ -841,6 +859,8 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
                          g_gpupeak_stream_copy_dxil_size, nullptr};
     PsoEntry fma_f32{"fma_f32", g_gpupeak_fma_f32_dxil, g_gpupeak_fma_f32_dxil_size, nullptr};
     PsoEntry fma_f16{"fma_f16", g_gpupeak_fma_f16_dxil, g_gpupeak_fma_f16_dxil_size, nullptr};
+    PsoEntry fma_f16_min16{"fma_f16_min16", g_gpupeak_fma_f16_min16_dxil,
+                           g_gpupeak_fma_f16_min16_dxil_size, nullptr};
     PsoEntry dot2_f16{"dot2_f16", g_gpupeak_dot2_f16_dxil, g_gpupeak_dot2_f16_dxil_size, nullptr};
     PsoEntry dot4_i8{"dot4_i8", g_gpupeak_dot4_i8_dxil, g_gpupeak_dot4_i8_dxil_size, nullptr};
     PsoEntry latency_fma{"latency_fma", g_gpupeak_latency_fma_dxil,
@@ -850,9 +870,9 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
     PsoEntry cu_probe_16{"cu_probe_16", g_gpupeak_cu_probe_16_dxil,
                          g_gpupeak_cu_probe_16_dxil_size, nullptr};
     PsoEntry empty{"empty", g_gpupeak_empty_dxil, g_gpupeak_empty_dxil_size, nullptr};
-    PsoEntry* all[] = {&stream_read, &stream_write, &stream_copy, &fma_f32,   &fma_f16,
-                       &dot2_f16,    &dot4_i8,      &latency_fma, &cu_probe_32, &cu_probe_16,
-                       &empty};
+    PsoEntry* all[] = {&stream_read, &stream_write, &stream_copy, &fma_f32,
+                       &fma_f16,     &fma_f16_min16, &dot2_f16,  &dot4_i8,
+                       &latency_fma, &cu_probe_32,   &cu_probe_16, &empty};
     for (PsoEntry* entry : all)
         drv.create_pso(entry);
 
@@ -886,8 +906,10 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
             if (!drv.submit_and_wait(&cpu_sec))
                 continue;
             bool ok = false;
+            std::uint32_t observed = 0;
+            std::uint32_t expected = 0;
             if (validate_stream(drv, drv.heap_a.Get(), drv.buf_a.Get(), stream_read.pso.Get(), n_vec,
-                                gx, gy, &ok)) {
+                                gx, gy, &ok, &observed, &expected)) {
                 GpupeakRow row;
                 row.suite = "stream";
                 row.probe = "read";
@@ -895,7 +917,15 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
                 row.bytes = pass.bytes;
                 row.checksum_checked = true;
                 row.checksum_ok = ok;
-                row.error = ok ? "" : "pattern checksum mismatch";
+                row.checksum = observed;
+                row.expected_checksum = expected;
+                if (!ok) {
+                    char detail[160];
+                    std::snprintf(detail, sizeof(detail),
+                                  "pattern checksum mismatch: got 0x%08x want 0x%08x", observed,
+                                  expected);
+                    row.error = detail;
+                }
                 result.rows.push_back(row);
             }
 
@@ -967,8 +997,10 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
             // Validate the copy destination too: B must now hold the pattern.
             if (stream_copy.pso) {
                 bool copy_ok = false;
+                std::uint32_t observed = 0;
+                std::uint32_t expected = 0;
                 if (validate_stream(drv, drv.heap_b.Get(), drv.buf_b.Get(), stream_read.pso.Get(),
-                                    n_vec, gx, gy, &copy_ok)) {
+                                    n_vec, gx, gy, &copy_ok, &observed, &expected)) {
                     GpupeakRow row;
                     row.suite = "stream";
                     row.probe = "copy";
@@ -976,7 +1008,15 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
                     row.bytes = pass.bytes;
                     row.checksum_checked = true;
                     row.checksum_ok = copy_ok;
-                    row.error = copy_ok ? "" : "copied pattern checksum mismatch";
+                    row.checksum = observed;
+                    row.expected_checksum = expected;
+                    if (!copy_ok) {
+                        char detail[160];
+                        std::snprintf(detail, sizeof(detail),
+                                      "copied pattern checksum mismatch: got 0x%08x want 0x%08x",
+                                      observed, expected);
+                        row.error = detail;
+                    }
                     result.rows.push_back(row);
                 }
             }
@@ -990,6 +1030,7 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
             const char* name;
         } probes[] = {{&fma_f32, "fma_f32"},
                       {&fma_f16, "fma_f16"},
+                      {&fma_f16_min16, "fma_f16_min16"},
                       {&dot2_f16, "dot2_f16"},
                       {&dot4_i8, "dot4_i8"}};
         const std::uint32_t sweep[] = {52, 104, 208, 416, 832, 1664};
@@ -1040,7 +1081,10 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
             }
         }
 
-        // Dependent chain: latency, and the implied clock from it.
+        // Dependent chain: latency only. No clock is inferred here: a dependent
+        // FMA chain measures VALU latency, which is not the shader clock and
+        // the old 4-clock assumption does not hold for wave64. The roofline
+        // derives a clock from the measured FP32 peak instead.
         if (latency_fma.pso) {
             std::vector<double> per_fma;
             for (int it = 0; it < 2; ++it) {
@@ -1059,8 +1103,6 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
             }
             if (!per_fma.empty()) {
                 const double best = *std::min_element(per_fma.begin(), per_fma.end());
-                result.implied_clock_seconds_per_fma = best;
-                result.implied_clock_mhz = gpupeak_implied_clock_mhz(best);
                 GpupeakRow row;
                 row.suite = "alu";
                 row.probe = "latency_fma";
@@ -1106,8 +1148,13 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
             drv.alloc->Reset();
             drv.list->Reset(drv.alloc.Get(), nullptr);
             // Four bytes are enough: the cost under test is the Map/wake-up
-            // path, not the copy volume.
+            // path, not the copy volume. Sink is a UAV resource, so transition
+            // it explicitly around the copy (same rule as validate_stream).
+            drv.transition(drv.sink.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_COPY_SOURCE);
             drv.list->CopyBufferRegion(drv.sink_readback.Get(), 0, drv.sink.Get(), 0, 4);
+            drv.transition(drv.sink.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             drv.list->Close();
             if (!drv.submit_and_wait(nullptr)) {
                 valid = false;

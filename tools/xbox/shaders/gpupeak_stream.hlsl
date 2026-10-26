@@ -40,6 +40,12 @@ uint gpupk_flat_group(uint3 gid) {
 // loaded word, so no load can be eliminated and the store is never taken for
 // the probe's own pattern. mode == 1 forces the reduction to be written so the
 // host can XOR-fold it and prove the whole buffer was read (validation pass).
+//
+// The accumulator goes to its own flat-thread slot. Storing it in
+// Sink[flat_group] would make all 256 threads of a group race on one plain
+// (non-atomic) store: the slot would keep an arbitrary thread's accumulator,
+// not the group XOR. The host folds groups_x * groups_y * 256 slots, and the
+// Sink UAV has exactly that many elements for the 2048-group stream plan.
 [numthreads(GPUPK_THREADS, 1, 1)]
 void CSRead(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
     const uint stride = groups_x * groups_y * GPUPK_THREADS;
@@ -49,7 +55,7 @@ void CSRead(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
         acc ^= v.x ^ v.y ^ v.z ^ v.w;
     }
     if (mode == 1u || acc == 0x9e3779b9u) {
-        Sink[gpupk_flat_group(gid)] = acc;
+        Sink[gpupk_flat_thread(dtid)] = acc;
     }
 }
 
@@ -77,6 +83,6 @@ void CSCopy(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
         acc ^= v.x ^ v.y ^ v.z ^ v.w;
     }
     if (acc == 0x9e3779b9u) {
-        Sink[gpupk_flat_group(gid)] = acc;
+        Sink[gpupk_flat_thread(dtid)] = acc;
     }
 }

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cwchar>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,21 @@ const char* gpubw_csv_header() {
            "error\n";
 }
 
+std::string gpubw_host_label(const GpubwResult& r) {
+    if (r.adapter.empty())
+        return "unknown";
+    std::string out;
+    out.reserve(r.adapter.size());
+    for (char c : r.adapter) {
+        const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        out.push_back(safe ? c : '_');
+    }
+    while (!out.empty() && out.back() == '_')
+        out.pop_back();
+    return out.empty() ? "unknown" : out;
+}
+
 std::string format_gpubw_row(const GpubwResult& r, const char* host_label) {
     char date_buf[32];
     std::time_t now = std::time(nullptr);
@@ -123,11 +139,12 @@ std::string format_gpubw_row(const GpubwResult& r, const char* host_label) {
     if (err.empty())
         err = "-";
 
+    const std::string host = host_label ? std::string(host_label) : gpubw_host_label(r);
     char buf[512];
     std::snprintf(buf, sizeof(buf), "%zu,%d,%.2f,%d,%d,%u,%u,%s,%s,%s\n",
                   r.buffer_bytes / (1024 * 1024), r.iterations, r.read_gbs, r.checksum_ok ? 1 : 0,
                   r.d3d12_ran ? 1 : 0, r.checksum, r.expected_checksum,
-                  host_label ? host_label : "unknown", date_buf, err.c_str());
+                  host.c_str(), date_buf, err.c_str());
     return std::string(buf);
 }
 
@@ -291,6 +308,25 @@ GpubwResult measure_gpubw(std::size_t buffer_bytes, int iterations) {
         if (FAILED(hr)) {
             throw_if_failed(hr, "D3D12CreateDevice", r);
             return r;
+        }
+    }
+
+    // The CSV host column must describe the adapter this device actually uses,
+    // not a hardcoded console model. Query by LUID so the fallback path and a
+    // multi-adapter host cannot label the row with the wrong GPU.
+    {
+        ComPtr<IDXGIAdapter1> adapter_desc;
+        if (SUCCEEDED(factory->EnumAdapterByLuid(device->GetAdapterLuid(),
+                                                 IID_PPV_ARGS(&adapter_desc)))) {
+            DXGI_ADAPTER_DESC1 desc = {};
+            if (SUCCEEDED(adapter_desc->GetDesc1(&desc))) {
+                const std::size_t len = wcslen(desc.Description);
+                std::string name;
+                name.reserve(len);
+                for (std::size_t i = 0; i < len; ++i)
+                    name.push_back(static_cast<char>(desc.Description[i]));
+                r.adapter = name;
+            }
         }
     }
 

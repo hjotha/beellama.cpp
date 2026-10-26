@@ -120,6 +120,7 @@ TEST_CASE("gpupeak: FLOP accounting matches the shader sources") {
     const std::uint64_t threads = static_cast<std::uint64_t>(groups) * 64u;
     CHECK(gpupeak_alu_flops("fma_f32", groups, iters) == threads * iters * 8u * 2u);
     CHECK(gpupeak_alu_flops("fma_f16", groups, iters) == threads * iters * 4u * 4u);
+    CHECK(gpupeak_alu_flops("fma_f16_min16", groups, iters) == threads * iters * 4u * 4u);
     CHECK(gpupeak_alu_flops("dot2_f16", groups, iters) == threads * iters * 4u * 4u);
     CHECK(gpupeak_alu_flops("dot4_i8", groups, iters) == threads * iters * 4u * 8u);
     CHECK(gpupeak_alu_flops("unknown", groups, iters) == 0u);
@@ -132,9 +133,6 @@ TEST_CASE("gpupeak: metric helpers refuse to divide by zero") {
     CHECK(gpupeak_gops(1e9, 0.5) == doctest::Approx(2.0));
     CHECK(gpupeak_fraction(6.0, 12.0) == doctest::Approx(50.0));
     CHECK(gpupeak_fraction(6.0, 0.0) == 0.0);
-    // 4 clocks at 0.7 ns per dependent FMA -> 1/0.175 GHz... 4/0.7e-9 = 5.71 GHz
-    CHECK(gpupeak_implied_clock_mhz(0.7e-9) == doctest::Approx(4.0 / 0.7e-9 / 1e6));
-    CHECK(gpupeak_implied_clock_mhz(0.0) == 0.0);
 }
 
 TEST_CASE("gpupeak: median and percentile use nearest-rank") {
@@ -196,7 +194,6 @@ TEST_CASE("gpupeak: JSON carries schema, nominal table and every row") {
     result.device.local_budget = 4348654388ull;
     result.device.wave_lane_min = 64;
     result.device.wave_lane_max = 64;
-    result.implied_clock_mhz = 1234.5;
     result.pso_errors.push_back("dot4_i8: CreateComputePipelineState hr=0x80070057");
 
     GpupeakRow row;
@@ -234,6 +231,9 @@ TEST_CASE("gpupeak: JSON carries schema, nominal table and every row") {
     CHECK(json.find("\"probe\":\"empty_dispatch_gpu\"") != std::string::npos);
     CHECK(json.find("hr=0x80070057") != std::string::npos);
     CHECK(json.find("\"checksum_ok\":true") != std::string::npos);
+    // No clock is inferred from the dependent FMA chain anymore.
+    CHECK(json.find("implied_clock") == std::string::npos);
+    CHECK(json.find("\"derived\"") == std::string::npos);
     // Two rows + one closing bracket, and the document is balanced.
     std::size_t commas = 0;
     for (char c : json)
