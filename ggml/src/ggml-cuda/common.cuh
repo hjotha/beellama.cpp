@@ -1721,6 +1721,10 @@ struct ggml_backend_cuda_context {
         ggml_cuda_set_device(device);
 
         const size_t safe_headroom = cuda_graph_memory_headroom_bytes();
+        // Generation is read before the query: a reservation that races with the
+        // query then leaves a stale generation in the published sample, so the
+        // next submission re-queries instead of trusting a pre-reservation value.
+        const uint64_t generation = ggml_cuda_graph_guard::device_reservation_now();
         // A sample may approve this submission without a new device query while
         // it is younger than the configured age and no device reservation
         // happened since it was taken. Any rejection falls through to the exact
@@ -1728,8 +1732,8 @@ struct ggml_backend_cuda_context {
         // per-call sampling it replaces.
         const ggml_cuda_graph_guard::approval guarded =
             ggml_cuda_graph_guard::approve_without_query(
-                guard_sample, ggml_cuda_graph_guard::device_reservation_now(),
-                ggml_time_us(), cuda_graph_guard_sample_max_age_us(), safe_headroom);
+                guard_sample, generation, ggml_time_us(),
+                cuda_graph_guard_sample_max_age_us(), safe_headroom);
         if (guarded.approved) {
             ++guard_fastpath_approvals;
             return true;
@@ -1750,7 +1754,7 @@ struct ggml_backend_cuda_context {
         // and the next submission observe a consistent state.
         guard_sample.free_bytes = free_bytes;
         guard_sample.time_us    = ggml_time_us();
-        guard_sample.generation = ggml_cuda_graph_guard::device_reservation_now();
+        guard_sample.generation = generation;
         guard_sample.valid      = true;
 
         if (free_bytes < safe_headroom) {
