@@ -21,6 +21,7 @@ import pathlib
 import re
 import sys
 
+DP4A = 'dx.op.dot4AddPacked.i32'  # dot4add_i8packed / dot4add_u8packed
 OPS = set('''add fadd sub fsub mul fmul fma fdiv udiv sdiv urem srem shl lshr ashr and or xor
 icmp fcmp select br ret phi call unreachable load store getelementptr zext sext trunc fptrunc
 fpext bitcast extractvalue insertvalue alloca sitofp uitofp fptosi fptoui frem'''.split())
@@ -93,20 +94,46 @@ def dominators(order, blocks, succ, preds):
     return dom
 
 
+def reverse_reachable(succ, blocks, header):
+    """Nodes that can reach `header` (a natural loop only contains those)."""
+    rev = {}
+    for label, outs in succ.items():
+        for o in outs:
+            rev.setdefault(o, []).append(label)
+    seen = {header}
+    work = [header]
+    while work:
+        cur = work.pop()
+        for prev in rev.get(cur, []):
+            if prev not in seen and prev in blocks:
+                seen.add(prev)
+                work.append(prev)
+    return seen
+
+
 def natural_loop(order, blocks, succ, header):
+    """Natural loop: header + every successor-reachable node that reaches header."""
+    reaches = reverse_reachable(succ, blocks, header)
     body = {header}
     work = [header]
     while work:
         cur = work.pop()
         for nxt in succ.get(cur, []):
-            if nxt not in body and nxt in blocks and order.index(nxt) > order.index(header):
+            if nxt not in body and nxt in blocks and order.index(nxt) > order.index(header) \
+                    and nxt in reaches:
                 body.add(nxt)
                 work.append(nxt)
     return body
 
 
 def main():
-    for path in sys.argv[1:]:
+    paths = [a for a in sys.argv[1:] if not a.startswith('--')]
+    rows_override = None
+    verbose = '--verbose' in sys.argv[1:]
+    for a in sys.argv[1:]:
+        if a.startswith('--rows='):
+            rows_override = float(a.split('=', 1)[1])
+    for path in paths:
         order, blocks, succ = parse(path)
         # back edges: successor appears earlier and points at a loop header
         headers = set()
@@ -122,42 +149,60 @@ def main():
         best = None
         for h in headers:
             body = {b for b in natural_loop(order, blocks, succ, h) if h in dom.get(b, set())}
-            dots = sum(blocks[b]['ops'].count('dx.op.dot4.f32') for b in body)
-            if best is None or dots > best[1]:
-                best = (h, dots, body)
-        header, dots, body = best
+            # A score costs either one dot4.f32 (4 F32 MACs) or a chain of
+            # dot4add_i8packed (4 int8 MACs each); both are counted as "dot units"
+            # so the same 12-units-per-row baseline works for both kernels.
+            dots = sum(blocks[b]['ops'].count('dx.op.dot4.f32') +
+                       blocks[b]['ops'].count(DP4A) for b in body)
+            # Steady state: among the loops that cover the whole 8-row tile, take
+            # the smallest body (the innermost loop), not an enclosing one.
+            key = (dots, -len(body))
+            if best is None or key > best[0]:
+                best = (key, h, dots, body)
+        _, header, dots, body = best
         counters = collections.Counter()
         for b in body:
             for op in blocks[b]['ops']:
                 if op:
                     counters[op] += 1
-        rows = dots / 12.0 if dots else 1.0
+        rows = rows_override if rows_override else (dots / 12.0 if dots else 1.0)
+        dp4a = counters[DP4A]
+        # One dot unit is 4 MACs, hence 4 issue slots of FMA work in the F32
+        # model; an i8 dot unit is one op, but it still represents 4 MACs.
         fma_class = (counters['fmul'] + counters['fadd'] + counters['fsub'] + counters['fma'] +
-                     4 * counters['dx.op.dot4.f32'])
+                     4 * counters['dx.op.dot4.f32'] + dp4a)
+        # waveActiveOp is a full-wave butterfly: six cross-lane moves + six adds
+        # in the wave64 model. waveReadLaneAt is a single permute (its add is a
+        # separately counted `fadd`), so it costs one slot.
         reduce_add = 6 * counters['dx.op.waveActiveOp.f32']
-        reduce_shfl = 6 * counters['dx.op.waveActiveOp.f32']
+        reduce_shfl = (6 * counters['dx.op.waveActiveOp.f32'] +
+                       counters['dx.op.waveReadLaneAt.f32'])
         sfu = counters['dx.op.unary.f32']
-        cvt = counters['dx.op.legacyF16ToF32'] + counters['uitofp'] + counters['sitofp']
-        loads = counters['dx.op.bufferLoad.i32']
-        stores = counters['dx.op.bufferStore.i32']
+        cvt = counters['dx.op.legacyF16ToF32'] + counters['uitofp'] + counters['sitofp'] + \
+            counters['fptosi']
+        loads = counters['dx.op.bufferLoad.i32'] + counters['dx.op.rawBufferLoad.i32']
+        stores = counters['dx.op.bufferStore.i32'] + counters['dx.op.rawBufferStore.i32']
         barriers = counters['dx.op.barrier']
         ints = sum(counters[o] for o in ('add', 'mul', 'and', 'or', 'xor', 'shl', 'lshr', 'ashr',
                                         'icmp', 'select', 'getelementptr', 'zext', 'sext', 'trunc',
-                                        'extractvalue', 'phi', 'bitcast'))
+                                        'extractvalue', 'phi', 'bitcast', 'fptoui'))
         brs = counters['br'] + counters['fcmp']
         cbuf = counters['dx.op.cbufferLoadLegacy.i32'] + counters['dx.op.cbufferLoadLegacy.f32']
         total = (fma_class + reduce_add + reduce_shfl + sfu + cvt + loads + stores + barriers +
                  ints + brs + cbuf)
         print('==', pathlib.Path(path).name)
-        print('   loop header %%%s  body blocks %d  dots/iter %d  rows/iter %.0f'
-              % (header, len(body), dots, rows))
-        print('   per-tile (8 rows, %d queries x 6 heads):' % 2)
+        print('   loop header %%%s  body blocks %d  dot-units/iter %d (dot4 %d, dp4a %d)  '
+              'rows/iter %.0f' % (header, len(body), dots, counters['dx.op.dot4.f32'], dp4a, rows))
+        print('   per-tile (8 rows, 2 queries x 6 heads):')
         print('     fma_class   %6d   reduce_add %6d   reduce_shfl %6d   sfu %5d'
               % (fma_class, reduce_add, reduce_shfl, sfu))
         print('     cvt         %6d   loads      %6d   stores      %6d   barrier %5d'
               % (cvt, loads, stores, barriers))
         print('     int/misc    %6d   branch     %6d   cbuf        %6d   TOTAL  %6d'
               % (ints, brs, cbuf, total))
+        if verbose:
+            for k, v in counters.most_common(14):
+                print('       %6d %s' % (v, k))
         print('   per KV row:  TOTAL %.1f   fma_class %.1f   reduce %.1f   sfu %.1f   int %.1f'
               % (total / rows, fma_class / rows, (reduce_add + reduce_shfl) / rows, sfu / rows,
                  (ints + brs) / rows))
