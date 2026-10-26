@@ -38,6 +38,13 @@ DEFAULT_DXC = r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.
 
 # name, source, entry, profile, extra dxc args, extra defines
 TARGETS = [
+    ("wave_prefix64", "gpupeak_wave_caps.hlsl", "CSWaveCaps", "cs_6_4", [], []),
+    ("wave_multi65", "gpupeak_wave_caps.hlsl", "CSWaveCaps", "cs_6_5", [],
+     ["GPUPK_WAVE_MULTI_PREFIX=1"]),
+    ("wave_match65", "gpupeak_wave_caps.hlsl", "CSWaveCaps", "cs_6_5", [],
+     ["GPUPK_WAVE_MATCH=1"]),
+    ("wave_quad66", "gpupeak_wave_caps.hlsl", "CSWaveCaps", "cs_6_6", [],
+     ["GPUPK_WAVE_QUAD=1"]),
     ("stream_read", "gpupeak_stream.hlsl", "CSRead", "cs_6_0", [], []),
     ("stream_write", "gpupeak_stream.hlsl", "CSWrite", "cs_6_0", [], []),
     ("stream_copy", "gpupeak_stream.hlsl", "CSCopy", "cs_6_0", [], []),
@@ -148,6 +155,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dxc", default=None, help="path to dxc (default: dxc on PATH)")
+    parser.add_argument("--dxc-version", default=None,
+                        help="record this compiler provenance instead of invoking --version (wrappers)")
     parser.add_argument("--ssh-host", default=None,
                         help="compile on this Windows host instead of locally")
     parser.add_argument("--remote-root",
@@ -198,7 +207,7 @@ def main():
     scratch = ROOT / ".gpupeak-dxil"
     scratch.mkdir(exist_ok=True)
     dxc = args.dxc or (DEFAULT_DXC if args.ssh_host else "dxc")
-    version = dxc_version(dxc, args.ssh_host, args.remote_root)
+    version = args.dxc_version or dxc_version(dxc, args.ssh_host, args.remote_root)
     print("dxc: " + version.replace("\n", " | "))
 
     manifest = {"dxc_version": version, "ssh_host": args.ssh_host, "targets": []}

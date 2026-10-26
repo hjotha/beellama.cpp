@@ -34,6 +34,10 @@
     #include "gpupeak_cu_probe_32_dxil.h"
     #include "gpupeak_dot2_f16_dxil.h"
     #include "gpupeak_dot4_i8_dxil.h"
+    #include "gpupeak_wave_prefix64_dxil.h"
+    #include "gpupeak_wave_multi65_dxil.h"
+    #include "gpupeak_wave_match65_dxil.h"
+    #include "gpupeak_wave_quad66_dxil.h"
     #include "gpupeak_empty_dxil.h"
     #include "gpupeak_fma_f16_dxil.h"
     #include "gpupeak_fma_f16_min16_dxil.h"
@@ -875,6 +879,25 @@ GpupeakResult measure_gpupeak(const GpupeakOptions& options) {
                        &latency_fma, &cu_probe_32,   &cu_probe_16, &empty};
     for (PsoEntry* entry : all)
         drv.create_pso(entry);
+
+    // Acceptance only: these shaders are deliberately not timed or dispatched.
+    // A successful PSO is not evidence of correct wave lowering on the console.
+    PsoEntry wave_caps[] = {
+        {"wave_prefix64", g_gpupeak_wave_prefix64_dxil, g_gpupeak_wave_prefix64_dxil_size, nullptr},
+        {"wave_multi65", g_gpupeak_wave_multi65_dxil, g_gpupeak_wave_multi65_dxil_size, nullptr},
+        {"wave_match65", g_gpupeak_wave_match65_dxil, g_gpupeak_wave_match65_dxil_size, nullptr},
+        {"wave_quad66", g_gpupeak_wave_quad66_dxil, g_gpupeak_wave_quad66_dxil_size, nullptr},
+    };
+    for (PsoEntry& entry : wave_caps) {
+        const bool accepted = drv.create_pso(&entry);
+        GpupeakRow row;
+        row.suite = "capability";
+        row.probe = entry.name;
+        row.variant = accepted ? "pso_accepted_not_executed" : "pso_rejected";
+        if (!accepted)
+            row.error = result.pso_errors.back();
+        result.rows.push_back(row);
+    }
 
     // --- Stream suite ------------------------------------------------------
     if (options.run_stream && stream_write.pso && stream_read.pso) {
