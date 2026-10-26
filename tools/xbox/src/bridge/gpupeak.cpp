@@ -41,7 +41,7 @@
     #include "gpupeak_stream_copy_dxil.h"
     #include "gpupeak_stream_read_dxil.h"
     #include "gpupeak_stream_write_dxil.h"
-    #include "xllama/d3d12_compute.h"
+    #include "d3d12_compute.h"
     #include "xllama/d3d12_dyn.h"
 
 using Microsoft::WRL::ComPtr;
