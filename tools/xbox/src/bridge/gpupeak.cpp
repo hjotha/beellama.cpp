@@ -637,11 +637,14 @@ bool build_descriptors(Driver& drv) {
         D3D12_CPU_DESCRIPTOR_HANDLE cpu_srv = cpu;
         cpu_srv.ptr += incr;
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        srv.Format = DXGI_FORMAT_UNKNOWN;
+        // ByteAddressBuffer: a raw view must be R32_TYPELESS + RAW. An UNKNOWN
+        // stride-0 view is invalid and removes the console device (no debug layer).
+        srv.Format = DXGI_FORMAT_R32_TYPELESS;
         srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Buffer.NumElements = static_cast<UINT>(drv.max_bytes / 4);
         srv.Buffer.StructureByteStride = 0;
+        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         drv.device->CreateShaderResourceView(binding.srv, &srv, cpu_srv);
 
         D3D12_CPU_DESCRIPTOR_HANDLE cpu_sink = cpu;
@@ -651,10 +654,11 @@ bool build_descriptors(Driver& drv) {
         D3D12_CPU_DESCRIPTOR_HANDLE cpu_raw = cpu;
         cpu_raw.ptr += 3 * static_cast<SIZE_T>(incr);
         D3D12_UNORDERED_ACCESS_VIEW_DESC raw_uav = {};
-        raw_uav.Format = DXGI_FORMAT_UNKNOWN;
+        raw_uav.Format = DXGI_FORMAT_R32_TYPELESS;
         raw_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         raw_uav.Buffer.NumElements = static_cast<UINT>(drv.max_bytes / 4);
         raw_uav.Buffer.StructureByteStride = 0;
+        raw_uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         drv.device->CreateUnorderedAccessView(binding.uav, nullptr, &raw_uav, cpu_raw);
     }
     return true;
