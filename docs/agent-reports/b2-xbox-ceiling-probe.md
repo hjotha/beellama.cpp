@@ -338,3 +338,6 @@ compila nada; só usa o pacote já instalado.
 * `tools/xbox/tests/rkva_range_q4_kernel_probe.py` — flags de profiling.
 * `tools/xbox/scripts/run-gpupeak-probe.py` — runner inerte/`--execute`.
 * `tools/xbox/docs/gpu-ceiling.md` — documentação atualizada.
+* `tools/xbox/uwp/rkva/remote-attn-engine.cpp` — commit separado apenas com
+  `uint8_t rescale_skip = 0;` em `BulkSegmentProfile`, a correção C2039 que o
+  integrador aplicou no clone; o campo já era lido/escrito pelo caminho A2.
