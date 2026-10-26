@@ -280,10 +280,7 @@ class TraceAnalysis:
         self.group_positions = {}                # group key -> (first_pos, last_pos, model_layer)
         self.tokens = defaultdict(list)          # (session, graph_run, first_pos) -> spans
         self.token_layers = defaultdict(set)     # token key -> layer ids
-        self.group_origins = {}                  # group key -> origin tuple
         self.group_windows = {}                  # group key -> (min begin, max end)
-        self.group_session = {}                  # group key -> session or None
-        self.group_origin_mixed = set()
         self.origin_fields_seen = set()
         self.session_field_seen = False
         self.conflicted_groups = set()
@@ -370,7 +367,10 @@ class TraceAnalysis:
             self.counts["events_without_identity"] += 1
             self.unattributed_spans.append(span)
             return
-        key = (session, graph_run, layer)
+        # The origin is part of the layer/token identity: two processes may
+        # legitimately reuse session 0, graph_run 1, layer 0 at the same
+        # position, and they must never be merged into one token.
+        key = (session, origin, graph_run, layer)
         known = self.group_positions.get(key)
         if key in self.conflicted_groups or (known and
                                              (known[0] != first_pos or known[1] != last_pos)):
@@ -386,28 +386,13 @@ class TraceAnalysis:
             self.unattributed_spans.append(span)
             return
         self.group_positions[key] = (first_pos, last_pos, model_layer)
-        if key in self.group_origins and self.group_origins[key] != origin:
-            # Conflicting origin metadata inside one layer group is not a
-            # correlation we may guess around.
-            self.group_origin_mixed.add(key)
-        else:
-            self.group_origins[key] = origin
-        current_session = session if session_present else None
-        if key not in self.group_session:
-            self.group_session[key] = current_session
-        else:
-            previous = self.group_session[key]
-            if previous is None and current_session is not None:
-                self.group_session[key] = current_session
-            elif (previous is not None and current_session is not None
-                  and previous != current_session):
-                self.group_origin_mixed.add(key)
         window = self.group_windows.get(key)
         self.group_windows[key] = ((min(window[0], begin), max(window[1], end))
                                    if window else (begin, end))
         self.groups[key].append(span)
-        self.token_layers[(session, graph_run, first_pos)].add(layer)
-        self.tokens[(session, graph_run, first_pos)].append(span)
+        token_key = (session, origin, graph_run, first_pos)
+        self.token_layers[token_key].add(layer)
+        self.tokens[token_key].append(span)
 
     def _tokenize(self):
         for spans in self.groups.values():
@@ -467,19 +452,31 @@ class TraceAnalysis:
         return phases
 
     def parent_child_report(self):
+        """Overlap per (parent, child phase), not per sibling set.
+
+        Only children of the same phase are unioned inside their own parent.
+        Two different child phases under one parent contribute their own
+        independently clipped ranges (e.g. send 10 us, header wait 30 us), so
+        the sum of pair overlaps is not the parent residual.
+        """
         pairs = defaultdict(lambda: {"count": 0, "overlap_us": 0.0, "parent_total_us": 0.0})
         for spans in self.groups.values():
+            children_by_parent = defaultdict(list)
             for span in spans:
-                if span.parent is None:
-                    continue
-                key = (span.parent.phase, span.phase)
-                children = [other for other in spans if other.parent is span.parent]
-                clipped = union_within((span.parent.begin, span.parent.end),
-                                       [(c.begin, c.end) for c in children])
-                entry = pairs[key]
-                entry["count"] += 1
-                entry["overlap_us"] += clipped
-                entry["parent_total_us"] += span.parent.duration
+                if span.parent is not None:
+                    children_by_parent[span.parent].append(span)
+            for parent, children in children_by_parent.items():
+                by_phase = defaultdict(list)
+                for child in children:
+                    by_phase[child.phase].append(child)
+                for phase, group in by_phase.items():
+                    # Same-phase siblings may overlap: union is the method.
+                    clipped = union_within((parent.begin, parent.end),
+                                           [(c.begin, c.end) for c in group])
+                    entry = pairs[(parent.phase, phase)]
+                    entry["count"] += len(group)
+                    entry["overlap_us"] += clipped
+                    entry["parent_total_us"] += parent.duration
         report = {}
         for (parent, child), entry in sorted(pairs.items()):
             ratio = entry["overlap_us"] / entry["parent_total_us"] if entry["parent_total_us"] else None
@@ -506,9 +503,21 @@ class TraceAnalysis:
     def token_report(self):
         totals = list(self.token_totals.values())
         layers = [entry["layers"] for entry in totals]
+        origins = {key[1] for key in self.tokens}
+        position_origins = defaultdict(set)
+        for key in self.tokens:
+            position_origins[(key[0], key[3])].add(key[1])
         return {
             "tokens": len(totals),
             "layer_groups": len(self.groups),
+            "origin": {
+                "qualified": any(origins),
+                "key": ["session", "origin", "graph_run", "position"],
+                "distinct": len(origins),
+                "fields_seen": sorted(self.origin_fields_seen),
+                "positions_with_multiple_origins":
+                    sum(1 for value in position_origins.values() if len(value) > 1),
+            },
             "layers_per_token": {
                 "min": min(layers) if layers else 0,
                 "max": max(layers) if layers else 0,
@@ -541,7 +550,6 @@ class TraceAnalysis:
         """
         composite_groups = defaultdict(set)
         groups_with = groups_without = mixed = 0
-        origin_mixed = 0
         for key, spans in self.groups.items():
             cycles = {span.cycle for span in spans if span.cycle > 0}
             if not cycles:
@@ -551,11 +559,9 @@ class TraceAnalysis:
                 mixed += 1
                 continue
             groups_with += 1
-            if key in self.group_origin_mixed:
-                origin_mixed += 1
-                continue
-            composite = (self.group_session.get(key), self.group_origins.get(key),
-                         next(iter(cycles)))
+            # The group key already contains (session, origin, graph_run,
+            # layer), so the composite is exact and origins never mix.
+            composite = (key[0], key[1], next(iter(cycles)))
             composite_groups[composite].add(key)
 
         duplicated = {composite: keys for composite, keys in composite_groups.items()
@@ -573,14 +579,12 @@ class TraceAnalysis:
                 reused_groups += len(keys)
 
         origin_available = self.session_field_seen or bool(self.origin_fields_seen)
-        failed = bool(mixed or origin_mixed or ambiguous_groups)
+        failed = bool(mixed or ambiguous_groups)
         reasons = []
         if groups_without:
             reasons.append(f"{groups_without} layer groups carry no cycle id")
         if mixed:
             reasons.append(f"{mixed} layer groups mix several cycle ids")
-        if origin_mixed:
-            reasons.append(f"{origin_mixed} layer groups carry conflicting origin metadata")
         if ambiguous_groups:
             reasons.append(f"{ambiguous_groups} groups share one composite "
                            "(origin, cycle) key inside overlapping windows")
@@ -606,7 +610,7 @@ class TraceAnalysis:
             },
             "groups_with_correlation": groups_with,
             "groups_without_correlation": groups_without,
-            "groups_with_mixed_correlation": mixed + origin_mixed,
+            "groups_with_mixed_correlation": mixed,
             "duplicate_ids": len(duplicated),
             "ambiguous_groups": ambiguous_groups,
             "reused_in_independent_windows": reused_groups,
@@ -741,8 +745,41 @@ def load_samples(path):
     }
 
 
+def _explicit_window(data):
+    """Return (window, error). Absence and invalidity are different answers."""
+    raw = data.get("window")
+    if raw is None:
+        return None, "missing"
+    if not isinstance(raw, dict):
+        return None, "invalid"
+    low = raw.get("min_position")
+    high = raw.get("max_position")
+    for value in (low, high):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None, "invalid"
+        if not math.isfinite(value):
+            return None, "invalid"
+    low, high = int(low), int(high)
+    if low < 0 or high < low:
+        return None, "invalid"
+    return {"min_position": low, "max_position": high}, None
+
+
+def _explicit_op(data):
+    """A concrete operation name is required; it is never defaulted."""
+    op = data.get("op")
+    if not isinstance(op, str) or not op.strip():
+        return None, "missing"
+    return op.strip(), None
+
+
 def compare_samples(cpu, gpu):
-    """Compare CPU engine and GPU samples only when both are congruent."""
+    """Compare CPU engine and GPU samples only when both are congruent.
+
+    Absent window/op are not evidence of equality: without explicit, finite and
+    equal windows and an explicit equal operation the result is unknown (or
+    failed when the declared values are invalid or contradictory).
+    """
     result = {
         "comparable": False,
         "reason": None,
@@ -760,6 +797,33 @@ def compare_samples(cpu, gpu):
                 result["reason"] = f"{side} has a non-finite or negative sample"
                 result["scope"] = "failed"
                 return result
+    windows = []
+    ops = []
+    for side, data in (("cpu", cpu), ("gpu", gpu)):
+        window, window_error = _explicit_window(data)
+        op, op_error = _explicit_op(data)
+        if window_error == "invalid" or op_error == "invalid":
+            result["reason"] = f"{side} declares an invalid window or operation"
+            result["scope"] = "failed"
+            return result
+        if window_error or op_error:
+            missing = []
+            if window_error:
+                missing.append("window")
+            if op_error:
+                missing.append("operation")
+            result["reason"] = f"{side} lacks an explicit {' and '.join(missing)}"
+            return result
+        windows.append(window)
+        ops.append(op)
+    if windows[0] != windows[1]:
+        result["reason"] = f"window mismatch: cpu={windows[0]} gpu={windows[1]}"
+        result["scope"] = "failed"
+        return result
+    if ops[0] != ops[1]:
+        result["reason"] = f"op mismatch: cpu={ops[0]} gpu={ops[1]}"
+        result["scope"] = "failed"
+        return result
     result["cpu"] = summarize(cpu["samples_us"])
     result["gpu"] = summarize(gpu["samples_us"])
     if len(cpu["samples_us"]) != len(gpu["samples_us"]):
@@ -767,19 +831,12 @@ def compare_samples(cpu, gpu):
                             f"gpu={len(gpu['samples_us'])}")
         result["scope"] = "failed"
         return result
-    if cpu.get("window") != gpu.get("window"):
-        result["reason"] = (f"window mismatch: cpu={cpu.get('window')} "
-                            f"gpu={gpu.get('window')}")
-        result["scope"] = "failed"
-        return result
-    if (cpu.get("op") or "rpc_total") != (gpu.get("op") or "rpc_total"):
-        result["reason"] = f"op mismatch: cpu={cpu.get('op')} gpu={gpu.get('op')}"
-        result["scope"] = "failed"
-        return result
     delta = [c - g for c, g in zip(cpu["samples_us"], gpu["samples_us"])]
     result.update({
         "comparable": True,
         "scope": "ok",
+        "window": windows[0],
+        "op": ops[0],
         "delta_us": summarize(delta),
         "delta_p50_ratio": (result["cpu"]["p50"] / result["gpu"]["p50"]
                             if result["gpu"]["p50"] else None),

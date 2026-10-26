@@ -14,7 +14,7 @@ Xbox neste commit**: `--execute` segue proposto para o root, depois do
 ## Entregues
 
 * `tools/xbox/scripts/rkva-latency-audit.py` — CLI com três modos.
-* `tools/xbox/tests/test_rkva_latency_audit.py` — 54 testes CPU, com doubles de
+* `tools/xbox/tests/test_rkva_latency_audit.py` — 59 testes CPU, com doubles de
   socket/`/proc`/runner; nenhum hardware.
 * `docs/agent-reports/rkva-latency-audit.md` — este relatório.
 
@@ -26,24 +26,33 @@ Nenhum outro arquivo do repositório foi alterado; scratch em `/tmp/opencode/`.
    reais do header, não as durações. A sequência enviada e a recebida têm de
    bater 1:1 e em ordem (`verify_cycle_sequence`); durações idênticas com IDs
    distintos são válidas. ID repetido de verdade falha.
-2. **Trace offline**: a correlação usa chave composta
-   `(session, origin, cycle)`. `origin` vem de metadados opcionais
-   (`pid/process/origin/arm/run_id/trace_id/instance/host`) quando existem.
-   Reuso de ID em **janelas independentes** vira `unknown`, não falha; reuso
-   sobreposto ou IDs misturados no mesmo grupo falha. Sem `session`/`origin`,
-   o escopo é `unknown` — nunca `ok` falso.
+2. **Trace offline / origem**: `origin` (de
+   `pid/process/origin/arm/run_id/trace_id/instance/host`) faz parte da chave de
+   layer **e** de token, além de `session`. Dois processos podem reusar
+   `session 0, graph_run 1, layer 0, pos 130560, cycle 7` sem serem fundidos:
+   viram 2 tokens, gap 0, e o relatório expõe `per_token.origin` com
+   `key`, `distinct`, `positions_with_multiple_origins`. Sem `session`/`origin` o rótulo
+   é `unknown`; origens distintas nunca são misturadas.
 3. **PING sem body**: o header é validado por inteiro antes de qualquer leitura
    de body. `payload_bytes != 0` em PING falha sem `recv` de body; o único op
    com body (`GET_STATS`) tem teto de 1 MiB aplicado ao header antes da leitura.
    `session` é validado no request (o `rkva_response` não carrega session).
-4. **Parent/child**: `job_finish`, `rpc_total` e `out_decode` publicam
-   `residual_total_us` (resto não coberto), nunca `exposed_total_us`. Espera
-   exposta só existe para spans de espera (`rpc_header_wait`, `range_wait`, ...).
-   Comparação CPU/GPU com contagem, janela ou op diferentes é `failed`
-   (exit 2), não um número aproximado.
-5. **Rede**: fatos locais (`r8152` USB, 1000 Mb/s, MTU 1500, `rx-usecs=15000`)
+4. **Parent/child por fase**: a união de filhos é calculada **por fase dentro
+   de cada pai**, não com todos os irmãos. Reprodução exata: pai 0..100 µs com
+   `rpc_send` 10..20 e `rpc_header_wait` 30..60 reporta 10 µs e 30 µs (não 40
+   µs para os dois); o residual do pai é 100 − (10+30) = 60 µs. Filhos da mesma
+   fase continuam unidos (10..20 + 15..25 = 15 µs). Containers publicam
+   `residual_total_us`, nunca `exposed_total_us`; espera exposta só existe para
+   spans de espera.
+5. **Comparação CPU/GPU explícita**: janela finita e op concreta são
+   obrigatórias nos dois lados. Ausência vira `unknown`; janela/op inválidos,
+   diferentes, ou contagem diferente viram `failed` (exit 2). Nunca há default
+   assumido para op ou janela.
+6. **Rede**: fatos locais (`r8152` USB, 1000 Mb/s, MTU 1500, `rx-usecs=15000`)
    são reportados sem conclusão causal. O tool e o JSON dizem explicitamente
    que esses dados não atribuem latência RKVA.
+7. **ResourceWarning**: todos os JSON/testes usam `with`/`Path.read_text`;
+   a suíte roda com `-W error::ResourceWarning -X dev` sem warnings.
 
 ## CLI
 
@@ -124,6 +133,9 @@ correlation: scope=unknown valid=1312 absent=0 duplicate_ids=656 mixed=0 reused_
 ```
 
 `malformed_lines=0`, `identity_conflicts=0`, `events_without_identity=0`.
+`per_token.origin = {qualified: false, distinct: 1, fields_seen: []}`: este
+trace não carrega `pid`/`origin`, então a origem fica explicitamente não
+qualificada; nada é assumido.
 Fases principais no mesmo recorte (coluna `resid/exp` = residual para
 containers, exposto para waits):
 
@@ -140,8 +152,9 @@ containers, exposto para waits):
 Leitura correta:
 
 * Containers aparecem no relatório, **nunca** somados com filhos.
-  `parent_child.job_finish.rpc_total` tem `overlap_ratio = 0,9713`; somar os dois
-  inflaria ~21 ms/token. Container não é espera: seu resto é `residual`.
+  `parent_child.job_finish.rpc_total` tem `overlap_ratio = 0,9653` (união
+  por fase); somar os dois inflaria ~21 ms/token. Container não é espera: seu
+  resto é `residual`.
 * `attributed_ms` é a **união** dos spans de fronteira (wall coberto), não a
   soma de trabalhos; `envelope - attributed` = `unattributed_gap` (≈0,67 ms/token).
 * Espera exposta é wall range de span de espera: `rpc_header_wait` 6,423 ms/token
@@ -186,8 +199,9 @@ derivada.
 ## Testes CPU (reais)
 
 ```bash
-$ nice -n 19 python3 -m unittest tools/xbox/tests/test_rkva_latency_audit.py
-Ran 54 tests in 0.078s
+$ nice -n 19 python3 -W error::ResourceWarning -X dev \
+      -m unittest tools/xbox/tests/test_rkva_latency_audit.py
+Ran 59 tests in 0.086s
 OK
 
 $ python3 -m py_compile tools/xbox/scripts/rkva-latency-audit.py \
@@ -203,9 +217,11 @@ validada antes do envio; EOF/timeout fecham o socket; `GET_STATS` acima de 1 MiB
 falha antes do body; containers publicam residual e não entram em
 `exposed_wait`; reuso de ID em janelas independentes é `unknown`; reuso
 sobreposto é `failed`; origens distintas (session/`origin`) resolvem `ok`; sem
-origem é `unknown`; `origin` conflitante no mesmo grupo falha; comparação com
-contagem/janela/op diferentes é `failed`; comparação sem amostras é `unknown`
-(exit 2 com `--strict`); e os 39 testes anteriores continuam válidos.
+origem é `unknown`; um `origin` parcial separa grupos em vez de fundir; novo
+teste exato de origem (graph_run/sessão/posição/ciclo iguais, `pid` distintos)
+produz 2 tokens e gap 0; overlap por fase 10/30 µs e união de mesma fase 15 µs;
+comparação sem janela/op é `unknown` (sem default), inválida/diferente é
+`failed`; e os 39 testes anteriores continuam válidos.
 
 Flake8 não está instalado no host (`flake8 not installed`); validei
 `py_compile` e limite de 125 colunas.

@@ -8,13 +8,16 @@ Run: python3 -m unittest tools/xbox/tests/test_rkva_latency_audit.py
 """
 
 import ast
+import contextlib
 import importlib.util
+import io
 import json
 import math
 import os
 import socket
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -134,6 +137,66 @@ class TraceAttributionTest(TraceCase):
         self.assertGreater(rr["residual_total_us"], 0.0)
         self.assertNotIn("rpc_total", report["exposed_wait"]["wait_phases"])
 
+    def test_parent_child_overlap_is_per_child_phase(self):
+        # Exact reproduction: parent 0..100 us, send 10..20 us, wait 30..60 us.
+        # Each pair must report its own clipped union (10 and 30), never the
+        # sibling union (40) for both.
+        events = [
+            event("job_finish", 0, 100, 0, 1),
+            event("rpc_send", 10, 20, 0, 1),
+            event("rpc_header_wait", 30, 60, 0, 1),
+        ]
+        write_trace(self.trace, events)
+        report = self.analyze()
+        pairs = report["parent_child"]["job_finish"]
+        self.assertEqual(pairs["rpc_send"]["overlap_us"], 10.0)
+        self.assertEqual(pairs["rpc_header_wait"]["overlap_us"], 30.0)
+        self.assertAlmostEqual(pairs["rpc_send"]["overlap_ratio"], 0.10)
+        self.assertAlmostEqual(pairs["rpc_header_wait"]["overlap_ratio"], 0.30)
+        # The parent residual is the union of all direct children: 100 - 40.
+        self.assertEqual(report["phases"]["job_finish"]["residual_total_us"], 60.0)
+
+    def test_parent_child_same_phase_children_are_unioned(self):
+        events = [
+            event("job_finish", 0, 100, 0, 1),
+            event("rpc_send", 10, 20, 0, 1),
+            event("rpc_send", 15, 25, 0, 1),
+        ]
+        write_trace(self.trace, events)
+        report = self.analyze()
+        pair = report["parent_child"]["job_finish"]["rpc_send"]
+        self.assertEqual(pair["count"], 2)
+        self.assertEqual(pair["overlap_us"], 15.0)  # union 10..25
+        self.assertEqual(report["phases"]["job_finish"]["residual_total_us"], 85.0)
+
+    def test_origin_metadata_separates_same_position_tokens(self):
+        # Exact reproduction: processes A/B, same session 0, graph_run 1,
+        # layer 0, position 130560, same cycle; A at 0..100, B at 1000..1100.
+        # Without origin in the key this merges into one token with a 900 us gap.
+        first = event("job_finish", 0, 100, 0, 7, graph_run=1)
+        second = event("job_finish", 1000, 1100, 0, 7, graph_run=1)
+        first["pid"] = 111
+        second["pid"] = 222
+        write_trace(self.trace, [first, second])
+        report = self.analyze()
+        self.assertEqual(report["counts"]["tokens"], 2)
+        self.assertEqual(report["counts"]["layer_groups"], 2)
+        self.assertEqual(report["per_token"]["origin"]["distinct"], 2)
+        self.assertEqual(report["per_token"]["origin"]["positions_with_multiple_origins"], 1)
+        self.assertEqual(report["per_token"]["unattributed_gap_ms"]["total"], 0.0)
+        self.assertEqual(report["per_token"]["envelope_ms"]["p50"], 0.1)
+        self.assertNotEqual(report["correlation"]["scope"], "failed")
+
+    def test_missing_origin_metadata_is_labelled_unknown(self):
+        first = event("job_finish", 0, 100, 0, 7, graph_run=1)
+        second = event("job_finish", 1000, 1100, 0, 7, graph_run=1)
+        for item in (first, second):
+            item.pop("session", None)
+        write_trace(self.trace, [first, second])
+        report = self.analyze()
+        self.assertFalse(report["per_token"]["origin"]["qualified"])
+        self.assertEqual(report["correlation"]["scope"], "unknown")
+
     def test_exposed_wait_uses_span_ranges_not_rpc_total(self):
         report = self.analyze()
         wait = report["exposed_wait"]
@@ -215,14 +278,15 @@ class TraceAttributionTest(TraceCase):
         self.assertIn("origin", correlation["origin"]["fields_seen"])
         self.assertEqual(correlation["duplicate_ids"], 0)
 
-    def test_conflicting_origin_metadata_in_one_group_fails(self):
+    def test_origin_conflict_splits_groups_instead_of_merging(self):
         events = golden_events(tokens=1, layers=1)
-        events[0]["origin"] = "arm-a"  # only one span of this group carries it
+        events[0]["origin"] = "arm-a"  # only one span of this layer is labelled
         write_trace(self.trace, events)
         report = self.analyze()
-        correlation = report["correlation"]
-        self.assertEqual(correlation["scope"], "failed")
-        self.assertGreater(correlation["groups_with_mixed_correlation"], 0)
+        # The labelled span forms its own qualified group; nothing is merged.
+        self.assertEqual(report["counts"]["layer_groups"], 2)
+        self.assertEqual(report["counts"]["tokens"], 2)
+        self.assertEqual(report["per_token"]["origin"]["distinct"], 2)
 
     def test_missing_origin_context_is_unknown_not_ok(self):
         events = golden_events(tokens=1, layers=1)
@@ -317,6 +381,33 @@ class ComparisonGateTest(unittest.TestCase):
         return {"source": "x", "op": op,
                 "window": {"min_position": window[0], "max_position": window[1]},
                 "samples_us": values}
+
+    def test_missing_window_or_op_is_not_proven_equality(self):
+        no_window = {"source": "x", "op": "rpc_total", "samples_us": [10.0]}
+        no_op = {"source": "x", "samples_us": [10.0],
+                 "window": {"min_position": 130560, "max_position": 160000}}
+        both_missing = {"source": "x", "samples_us": [10.0]}
+        for left, right in ((no_window, no_window), (no_op, no_op),
+                            (both_missing, both_missing),
+                            (no_window, self.samples([10.0])),
+                            (no_op, self.samples([10.0]))):
+            result = audit.compare_samples(left, right)
+            self.assertFalse(result["comparable"], (left, right))
+            self.assertEqual(result["scope"], "unknown")
+            self.assertIn("lacks an explicit", result["reason"])
+
+        invalid_window = {"source": "x", "op": "rpc_total", "samples_us": [10.0],
+                          "window": {"min_position": 160000, "max_position": 130560}}
+        result = audit.compare_samples(invalid_window, self.samples([10.0]))
+        self.assertFalse(result["comparable"])
+        self.assertEqual(result["scope"], "failed")
+        self.assertIn("invalid", result["reason"])
+
+        invalid_op = {"source": "x", "op": "  ", "samples_us": [10.0],
+                      "window": {"min_position": 130560, "max_position": 160000}}
+        result = audit.compare_samples(invalid_op, self.samples([10.0]))
+        self.assertFalse(result["comparable"])
+        self.assertEqual(result["scope"], "unknown")
 
     def test_congruent_samples_compare(self):
         result = audit.compare_samples(self.samples([10.0, 12.0, 14.0]),
@@ -678,6 +769,13 @@ class CliTest(unittest.TestCase):
         self.trace = os.path.join(self.tmp.name, "trace.jsonl")
         write_trace(self.trace, golden_events(tokens=1, layers=1))
 
+    def run_main(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = audit.main(argv)
+        self.last_output = stdout.getvalue() + stderr.getvalue()
+        return code
+
     def test_defaults_are_offline_and_capped(self):
         args = audit.parse_args(["--trace", self.trace])
         self.assertFalse(args.execute)
@@ -699,8 +797,8 @@ class CliTest(unittest.TestCase):
             audit.parse_endpoint("192.168.1.200")
         with mock.patch.object(audit.socket, "create_connection",
                                side_effect=AssertionError("dialled")):
-            self.assertEqual(audit.main(["--execute", "--host", "192.168.1.200:50054"]), 1)
-            self.assertEqual(audit.main(["--execute", "--empty-rtt",
+            self.assertEqual(self.run_main(["--execute", "--host", "192.168.1.200:50054"]), 1)
+            self.assertEqual(self.run_main(["--execute", "--empty-rtt",
                                          "--host", "192.168.1.200"]), 1)
 
     def test_trace_mode_creates_only_the_requested_file_and_never_a_socket(self):
@@ -712,28 +810,28 @@ class CliTest(unittest.TestCase):
                                   new=mock.MagicMock(side_effect=AssertionError("socket"))), \
                 mock.patch.object(audit.subprocess, "run",
                                   side_effect=AssertionError("subprocess")):
-            code = audit.main(["--trace", self.trace, "--out", out])
+            code = self.run_main(["--trace", self.trace, "--out", out])
         self.assertEqual(code, 0)
         self.assertEqual(set(os.listdir(self.tmp.name)) - before, {"report.json"})
-        report = json.load(open(out, encoding="utf-8"))
+        report = json.loads(Path(out).read_text(encoding="utf-8"))
         self.assertEqual(report["schema"], audit.SCHEMA)
         self.assertEqual(report["mode"], "trace")
         self.assertEqual(report["counts"]["tokens"], 1)
 
     def test_trace_mode_without_out_writes_nothing(self):
         before = set(os.listdir(self.tmp.name))
-        code = audit.main(["--trace", self.trace])
+        code = self.run_main(["--trace", self.trace])
         self.assertEqual(code, 0)
         self.assertEqual(set(os.listdir(self.tmp.name)), before)
 
     def test_independent_window_reuse_is_not_a_default_failure(self):
         write_trace(self.trace, golden_events(unique_cycles=False))
-        self.assertEqual(audit.main(["--trace", self.trace]), 0)
-        self.assertEqual(audit.main(["--trace", self.trace, "--strict"]), 2)
+        self.assertEqual(self.run_main(["--trace", self.trace]), 0)
+        self.assertEqual(self.run_main(["--trace", self.trace, "--strict"]), 2)
         out = os.path.join(self.tmp.name, "report.json")
-        code = audit.main(["--trace", self.trace, "--out", out])
+        code = self.run_main(["--trace", self.trace, "--out", out])
         self.assertEqual(code, 0)
-        report = json.load(open(out, encoding="utf-8"))
+        report = json.loads(Path(out).read_text(encoding="utf-8"))
         self.assertEqual(report["correlation"]["scope"], "unknown")
         self.assertGreater(report["correlation"]["reused_in_independent_windows"], 0)
 
@@ -742,8 +840,8 @@ class CliTest(unittest.TestCase):
         for item in events:
             item["cycle"] = 0
         write_trace(self.trace, events)
-        self.assertEqual(audit.main(["--trace", self.trace]), 0)
-        self.assertEqual(audit.main(["--trace", self.trace, "--strict"]), 2)
+        self.assertEqual(self.run_main(["--trace", self.trace]), 0)
+        self.assertEqual(self.run_main(["--trace", self.trace, "--strict"]), 2)
 
     def test_comparison_gate_is_wired_into_the_report(self):
         cpu = os.path.join(self.tmp.name, "cpu.json")
@@ -755,10 +853,10 @@ class CliTest(unittest.TestCase):
             json.dump({"op": "rpc_total", "samples_us": [9.0, 12.0],
                        "window": {"min_position": 130560, "max_position": 130560}}, handle)
         out = os.path.join(self.tmp.name, "report.json")
-        code = audit.main(["--trace", self.trace, "--cpu-samples", cpu,
+        code = self.run_main(["--trace", self.trace, "--cpu-samples", cpu,
                            "--gpu-samples", gpu, "--out", out])
         self.assertEqual(code, 2)
-        report = json.load(open(out, encoding="utf-8"))
+        report = json.loads(Path(out).read_text(encoding="utf-8"))
         self.assertFalse(report["comparison"]["comparable"])
         self.assertEqual(report["comparison"]["scope"], "failed")
         self.assertEqual(report["unknown"]["comparison_scope"], "failed")
@@ -773,11 +871,11 @@ class CliTest(unittest.TestCase):
             json.dump({"op": "rpc_total", "samples_us": [9.0],
                        "window": {"min_position": 130560, "max_position": 160000}}, handle)
         argv = ["--trace", self.trace, "--cpu-samples", cpu, "--gpu-samples", gpu]
-        self.assertEqual(audit.main(argv), 0)
-        self.assertEqual(audit.main(argv + ["--strict"]), 2)
+        self.assertEqual(self.run_main(argv), 0)
+        self.assertEqual(self.run_main(argv + ["--strict"]), 2)
 
     def test_source_parses_and_help_is_clear(self):
-        source = open(SCRIPT, encoding="utf-8").read()
+        source = Path(SCRIPT).read_text(encoding="utf-8")
         ast.parse(source)
         parser = audit.build_parser()
         text = parser.format_help()
