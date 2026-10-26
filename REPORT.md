@@ -32,8 +32,9 @@ python3 tools/xbox/scripts/analyze-rkva-decode-trace.py \
 Saída literal (recortada; 512 tokens de decode, `first_pos >= 130560`):
 
 ```
-scanned=... decode_events=... decode_tokens=512
+scanned=1296566 decode_events=714377 decode_tokens=512
 phase                              n     p50_us     p95_us     sum_ms  gpu_p50_us
+cuda_local_span_gpu            31744        846       1623  20087.181     833.536
 cuda_graph_host                47616         63       1307  14083.680       0.000
 cuda_graph_bookkeeping         47616         32         57   1781.681       0.000
 cuda_graph_memory_guard        47616         29         49   1552.377       0.000
@@ -61,11 +62,12 @@ per-token milliseconds:
   out_decode                        0.560
 ```
 
-Isso confirma, contra os artefatos: RTT 20,913 ms/token (o texto de origem diz
-20,914), espera exposta `range_wait` 6,922 ms (origem: 6,934), preparo nativo
-2,155 ms (origem: 2,057), output decode 0,560 (origem: 0,544) e **memory guard
-3,032 ms/token** (`1552,377 / 512`; origem: 3,089) em 93 chamadas/token de
-~29–32 µs.
+`cuda_local_span_gpu` = 20.087,181/512 = **39,233 ms/token**, contra os 39,244
+ms/token da análise publicada (span CUDA local). Isso confirma, contra os
+artefatos: RTT 20,913 ms/token (origem 20,914), espera exposta `range_wait`
+6,922 ms (origem 6,934), preparo nativo 2,155 ms (origem 2,057), output decode
+0,560 (origem 0,544) e **memory guard 3,032 ms/token** (`1552,377 / 512`;
+origem 3,089) em 93 chamadas/token de ~29–32 µs.
 
 Números novos, que a análise de origem não separava:
 
@@ -287,3 +289,18 @@ ms/camada são rede/console.
   `tools/xbox/tests/test_run_rkva_decode_host_ab.py` (novo)
 * `docs/rkva-decode-critical-path.md` (novo)
 * `.oc-artifacts/` (bench do WHT, resumo do trace, binário do teste ignorado)
+
+## 10. Commits
+
+```
+0c3531869 perf: keep the guard reservation generation in a function-local static
+947396ff7 perf: read the reservation generation before the headroom query
+02522f19b docs: record the RKVA nq1 decode critical path and A3 results
+d4efeb284 test: add RKVA decode A/B campaign runner and trace attribution
+928e77e21 perf: spin briefly on the console fence before the blocking wait
+c538b85ca perf: cache CUDA graph headroom samples between device reservations
+```
+
+Nenhum shader foi alterado, então o diretório
+`C:\Users\hjotha\build\oc-decode-host-20261026\` na 193 não foi criado nem usado
+(sem DXC). Nenhum pacote UWP foi compilado, instalado, iniciado ou parado.
