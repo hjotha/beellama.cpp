@@ -1,3 +1,4 @@
+#include "graph-guard.h"
 #include "remote-attn-cuda.cuh"
 #include "ggml-remote-attn-trace.h"
 
@@ -354,6 +355,7 @@ static bool rkva_scratch_ensure(rkva_cuda_remote_scratch & s, size_t needed) {
         void * replacement = nullptr;
         const size_t alloc_sz = std::max<size_t>(needed, 4u << 20);
         if (cudaMalloc(&replacement, alloc_sz) != cudaSuccess) return false;
+        ggml_cuda_graph_guard::note_device_reservation();
         if (s.dev_data && cudaFree(s.dev_data) != cudaSuccess) {
             cudaFree(replacement);
             s.poisoned = true;

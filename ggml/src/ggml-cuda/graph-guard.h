@@ -53,18 +53,22 @@ struct approval {
 };
 
 // Approve a graph submission without a new device query only when the sampled
-// free memory still clears `headroom_bytes`. Every rejection keeps the caller
-// on the exact query path.
+// free memory still clears `headroom_bytes` plus `slack_bytes`. The slack
+// absorbs small reservations that bypass note_device_reservation() (lazy
+// scratch growth, driver-internal allocations) during the sample's lifetime;
+// below it every submission queries exactly as before. Every rejection keeps
+// the caller on the exact query path.
 inline approval approve_without_query(const sample & last, uint64_t generation_now,
                                       int64_t now_us, int64_t max_age_us,
-                                      size_t headroom_bytes) {
+                                      size_t headroom_bytes, size_t slack_bytes = 0) {
     approval result;
     if (!last.valid || max_age_us <= 0 || generation_now != last.generation ||
             now_us - last.time_us < 0 || now_us - last.time_us > max_age_us) {
         return result;
     }
     result.free_bound_bytes = last.free_bytes;
-    result.approved         = result.free_bound_bytes >= headroom_bytes;
+    result.approved         = result.free_bound_bytes >= headroom_bytes &&
+                              result.free_bound_bytes - headroom_bytes >= slack_bytes;
     return result;
 }
 

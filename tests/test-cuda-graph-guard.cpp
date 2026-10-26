@@ -129,7 +129,22 @@ void test_generation_counter_is_monotonic() {
 
 } // namespace
 
+// Slack: a sample inside headroom+slack must query; at or above it may approve.
+void test_slack_requires_margin_above_headroom() {
+    const size_t headroom = 128 * MiB, slack = 64 * MiB;
+    const sample thin = fresh_sample(headroom + slack - 1, 0, 2);
+    check(!ggml_cuda_graph_guard::approve_without_query(thin, 2, 0, 10'000, headroom, slack).approved,
+          "free within the slack falls back to the exact query");
+    const sample roomy = fresh_sample(headroom + slack, 0, 2);
+    check(ggml_cuda_graph_guard::approve_without_query(roomy, 2, 0, 10'000, headroom, slack).approved,
+          "free == headroom + slack approves");
+    const sample under = fresh_sample(headroom - 1, 0, 2);
+    check(!ggml_cuda_graph_guard::approve_without_query(under, 2, 0, 10'000, headroom, slack).approved,
+          "free below headroom never wraps into an approval");
+}
+
 int main() {
+    test_slack_requires_margin_above_headroom();
     test_fresh_comfortable_sample_approves();
     test_headroom_boundary_is_inclusive();
     test_pressure_sample_rejects();

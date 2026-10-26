@@ -1608,6 +1608,17 @@ struct ggml_backend_cuda_context {
         return max_age_us;
     }
 
+    // Extra free memory a cached sample must show above the headroom before it may
+    // approve without a query (absorbs untracked small reservations).
+    static size_t cuda_graph_guard_slack_bytes() {
+        static const size_t slack = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_GUARD_SLACK_MB");
+            const long long mb = env != nullptr ? atoll(env) : 64;
+            return static_cast<size_t>(std::max<long long>(mb, 0)) * 1024 * 1024;
+        }();
+        return slack;
+    }
+
     void check_memory_pressure_recovery() {
         if (!disable_cuda_graphs_due_to_memory_pressure || cuda_graphs_memory_cleanup_failed || cuda_graphs_memory_check_failed) {
             return;
@@ -1733,7 +1744,8 @@ struct ggml_backend_cuda_context {
         const ggml_cuda_graph_guard::approval guarded =
             ggml_cuda_graph_guard::approve_without_query(
                 guard_sample, generation, ggml_time_us(),
-                cuda_graph_guard_sample_max_age_us(), safe_headroom);
+                cuda_graph_guard_sample_max_age_us(), safe_headroom,
+                cuda_graph_guard_slack_bytes());
         if (guarded.approved) {
             ++guard_fastpath_approvals;
             return true;
