@@ -77,6 +77,21 @@ TEST_CASE("gpubw: CSV row matches header column count") {
     CHECK(row.back() == '\n');
 }
 
+TEST_CASE("gpubw: host label comes from the adapter, never a fixed console name") {
+    GpubwResult r;
+    r.buffer_bytes = 64 * 1024 * 1024;
+    r.iterations = 1;
+    r.adapter = "SraKmd_arden";
+    CHECK(gpubw_host_label(r) == "SraKmd_arden");
+    CHECK(format_gpubw_row(r, nullptr).find(",SraKmd_arden,") != std::string::npos);
+    // Commas/newlines cannot break the single-field CSV.
+    r.adapter = "GPU, rev\n2";
+    CHECK(gpubw_host_label(r) == "GPU__rev_2");
+    r.adapter.clear();
+    CHECK(gpubw_host_label(r) == "unknown");
+    CHECK(format_gpubw_row(r, nullptr).find(",unknown,") != std::string::npos);
+}
+
 TEST_CASE("gpubw: measure_gpubw on non-D3D12 host reports unavailable") {
     // On Linux CI this exercises the shipped entry point without claiming a
     // GPU bandwidth number (hardware-dependent; console is the gate).

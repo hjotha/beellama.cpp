@@ -2821,7 +2821,9 @@ void run_gpubw() {
     FILE* fp = _wfopen(utf8_to_wstring(csv).c_str(), L"w");
     if (fp) {
         fputs(::xllama::gpubw_csv_header(), fp);
-        fputs(::xllama::format_gpubw_row(r, "xbox-series-s").c_str(), fp);
+        // Let format_gpubw_row derive the host from the DXGI adapter; the old
+        // fixed "xbox-series-s" label was wrong on a Series X.
+        fputs(::xllama::format_gpubw_row(r, nullptr).c_str(), fp);
         fclose(fp);
         FILE* done =
             _wfopen(utf8_to_wstring(resolve_local_path("gpubw-result.csv.done")).c_str(), L"w");
