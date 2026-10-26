@@ -2410,6 +2410,7 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
         attn_sample.groups = seg.groups;
         attn_sample.q_tile = seg.q_tile;
         attn_sample.decode_opt = seg.decode_opt;
+        attn_sample.int8_dot = seg.int8_dot;
         attn_sample.n_tokens = seg.n_queries;
         attn_sample.rows = seg.active_count;
         attn_sample.bytes = seg.query_bytes + seg.out_bytes;
