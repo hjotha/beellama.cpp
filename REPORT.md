@@ -159,6 +159,21 @@ a próxima janela provar que caminho cada chamada usou.
   engine na posição de produção.
 * **Protocolo RKVA.** Intocado (sem HELLO/capabilities novo).
 
+### 4.1 Frente 2 (preparo do host): por que não há mudança
+
+O caminho assíncrono já faz o que a tarefa sugeria: `rkva_async_submit_locked()`
+prepara o job no thread do scheduler e o worker envia **antes** de a FA local ser
+enfileirada, então o remoto já começa mais cedo que a FA local (é por isso que
+dos 1,307 ms de RTT só 0,417 ms ficam expostos). O que sobra no caminho serial é
+o `job_prepare` (2,155 ms/token): 0,82 ms de quantização KVarN4 do novo row
+(`kv_producer`, precisa acontecer antes do envio porque o segmento vai no
+payload), 0,50 ms de pack FP8 da query, 0,43 ms de readback K/V (0,027 ms por
+camada) e 0,29 ms de envelope. Não há cópia redundante óbvia: o K/V do host é a
+cópia canônica que sustenta rewind/snapshot, e o `GGML_RKVA_NATIVE_PRODUCER=cuda`
+já é o default do harness de benchmark — ele move a quantização para a GPU mas
+não elimina o espelho no host, por desenho. Mexer nisso é redesenho, não
+otimização de caminho quente, e ficou fora do escopo desta tarefa.
+
 ## 5. Validação offline (com saídas reais)
 
 Ambiente: `gokaya`, Ryzen Z1 Extreme, sem toolkit CUDA (`/usr/local/cuda` não
