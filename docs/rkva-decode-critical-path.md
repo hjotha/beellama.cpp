@@ -95,8 +95,9 @@ then `SwitchToThread`), and keeps the original event wait as the fallback for a
 slow or stalled GPU. Device-removal handling is unchanged: the post-wait
 `UINT64_MAX` sentinel check still runs.
 
-New counters (`counters.fence_spin`): `hits`, `fallbacks`, `spin_us`, so the
-next window can prove which path each call took and what it cost.
+New counters (`counters.fence_spin`): `hits`, `fallbacks`, `spin_us`,
+`budget_us`, so the next window can prove which path each call took and what it
+cost.
 
 Expected saving: ~30-60 us/layer = 0.5-1.0 ms/token (**estimate**; at the
 production position the console call is dominated by GPU work, see 5).

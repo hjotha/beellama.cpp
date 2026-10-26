@@ -130,8 +130,9 @@ depois `SwitchToThread`) e **mantém** o caminho antigo por evento como fallback
 quando o orçamento acaba (ou quando `RKVA_FENCE_SPIN_US=0`). O tratamento de
 device-removal é o mesmo (o `UINT64_MAX` continua sendo validado depois).
 
-Contadores novos em `counters.fence_spin` (`hits`, `fallbacks`, `spin_us`), para
-a próxima janela provar que caminho cada chamada usou.
+Contadores novos em `counters.fence_spin` (`hits`, `fallbacks`, `spin_us`,
+`budget_us`), para a próxima janela provar que caminho cada chamada usou e qual
+orçamento estava configurado.
 
 ## 4. O que NÃO foi mudado (e por quê)
 
