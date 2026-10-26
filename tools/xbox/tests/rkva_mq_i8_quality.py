@@ -33,11 +33,17 @@ with the column scale folded into the query once per (query, head, group):
     Q8  = clamp(rint(Q' / sq), -127, 127)        (int8)
     Z   = sum_{d in slice} WHT(Q)[d] * zero_k[d] (F32, unquantized Q)
 
-and `dot_s(Q8)` the exact int32 sum of `Q8*(nibble - 8)` over the 128 dims of
-the slice (the `+8*sum(Q8)` constant is folded into `Z`). Nibbles are 0..15, so
-they are already valid non-negative int8 lanes; `dot4add_i8packed` therefore
-needs no offset term. `--check-dp4a` proves the 4-lane int8 chain equals the
-int64 sum and that the widest lane group stays inside int32.
+and `dot_s(Q8)` the exact int32 sum of `Q8*nibble` over the 128 dims of the
+slice. Nibbles are 0..15, so they are already valid non-negative int8 lanes and
+`dot4add_i8packed` needs no offset term. The constant keeps the exact DC part of
+the Q8 rounding error:
+
+    C_s = Z_s + 8*sum_d Q' - 8*sq_s*sum_d Q8
+
+so the residual is `-sum_d (Q'-sq_s*Q8)*(nibble-8)` and not
+`-sum_d (Q'-sq_s*Q8)*nibble` (which is ~2.5x worse; pass `dc_exact=False` to
+measure that). `check_dp4a()` runs on every invocation and proves the 4-lane
+int8 chain equals the int64 sum and that the widest score stays inside int32.
 
 Stage rows, the ORIGINAL-F16 tail, the softmax, the WHT and the partial layout
 are untouched: they keep the exact F32 path in REF and in I8, so they cannot
