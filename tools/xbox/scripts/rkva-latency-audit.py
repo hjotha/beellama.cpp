@@ -35,7 +35,8 @@ Three independent modes (all offline unless --execute is passed):
      Reads the route/interface, sysfs link facts and ethtool show commands.
      No sudo, no writes, no IRQ/MTU/offload/sysctl change, and it never
      contacts the target. Missing privilege is reported as "unavailable",
-     never as a fake zero.
+     never as a fake zero. These are local link facts only: they do not prove
+     causality for RKVA latency.
 
 Safety rules enforced here:
   * No socket is opened unless --execute --empty-rtt is passed explicitly.
@@ -81,6 +82,8 @@ MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
 
 MAX_RTT_TIMEOUT_S = 3.0
 MAX_RTT_REPS = 1000
+# GET_STATS is the only control op with a body; cap it before reading.
+MAX_CONTROL_PAYLOAD = 1 << 20
 
 BUSY_EXACT_NAMES = frozenset({
     "llama-server", "llama-cli", "llama-bench", "llama-perplexity",
@@ -94,6 +97,11 @@ CONTAINER_PHASES = frozenset({"job_finish", "rpc_total", "out_decode", "envelope
 # Wait-like spans are reported on their own wall range, never inferred from a
 # container such as rpc_total.
 WAIT_PHASES = frozenset({"rpc_header_wait", "range_wait", "job_prepare", "rpc_queue"})
+# Optional trace metadata that identifies the origin of a cycle-id sequence.
+# Cycle ids are only unique inside one origin; a composite key keeps independent
+# processes/arms from looking like a duplicate.
+ORIGIN_FIELDS = ("pid", "process", "origin", "arm", "run_id", "trace_id",
+                 "instance", "host")
 
 READONLY_ETHTOOL_FLAGS = frozenset({"-i", "-k", "-c", "-S", "-g", "-a", "-T", "--version"})
 READONLY_IP_ACTIONS = frozenset({"route", "link", "addr", "address", "neigh"})
@@ -272,6 +280,12 @@ class TraceAnalysis:
         self.group_positions = {}                # group key -> (first_pos, last_pos, model_layer)
         self.tokens = defaultdict(list)          # (session, graph_run, first_pos) -> spans
         self.token_layers = defaultdict(set)     # token key -> layer ids
+        self.group_origins = {}                  # group key -> origin tuple
+        self.group_windows = {}                  # group key -> (min begin, max end)
+        self.group_session = {}                  # group key -> session or None
+        self.group_origin_mixed = set()
+        self.origin_fields_seen = set()
+        self.session_field_seen = False
         self.conflicted_groups = set()
         self.unattributed_spans = []             # spans without usable identity
         self.counts = {
@@ -334,7 +348,18 @@ class TraceAnalysis:
         graph_run = _as_int(event.get("graph_run", 0), "graph_run", line_no)
         layer = _as_int(event.get("layer", -1), "layer", line_no)
         session = _as_int(event.get("session", 0), "session", line_no)
+        session_present = "session" in event
         model_layer = _as_int(event.get("model_layer", -1), "model_layer", line_no)
+        origin_parts = []
+        for name in ORIGIN_FIELDS:
+            value = event.get(name)
+            if value in (None, "", 0):
+                continue
+            origin_parts.append((name, str(value)))
+            self.origin_fields_seen.add(name)
+        origin = tuple(sorted(origin_parts))
+        if session_present:
+            self.session_field_seen = True
 
         self.counts["decode_events"] += 1
         span = Span(phase, begin, end, cycle, gpu_us)
@@ -361,6 +386,25 @@ class TraceAnalysis:
             self.unattributed_spans.append(span)
             return
         self.group_positions[key] = (first_pos, last_pos, model_layer)
+        if key in self.group_origins and self.group_origins[key] != origin:
+            # Conflicting origin metadata inside one layer group is not a
+            # correlation we may guess around.
+            self.group_origin_mixed.add(key)
+        else:
+            self.group_origins[key] = origin
+        current_session = session if session_present else None
+        if key not in self.group_session:
+            self.group_session[key] = current_session
+        else:
+            previous = self.group_session[key]
+            if previous is None and current_session is not None:
+                self.group_session[key] = current_session
+            elif (previous is not None and current_session is not None
+                  and previous != current_session):
+                self.group_origin_mixed.add(key)
+        window = self.group_windows.get(key)
+        self.group_windows[key] = ((min(window[0], begin), max(window[1], end))
+                                   if window else (begin, end))
         self.groups[key].append(span)
         self.token_layers[(session, graph_run, first_pos)].add(layer)
         self.tokens[(session, graph_run, first_pos)].append(span)
@@ -401,10 +445,18 @@ class TraceAnalysis:
         for phase in sorted(self.phase_values):
             stats = summarize(self.phase_values[phase])
             self_values = self.phase_self.get(phase, [])
-            stats["exposed_total_us"] = math.fsum(self_values)
-            stats["overlapped_total_us"] = stats["total"] - stats["exposed_total_us"]
+            residual_us = math.fsum(self_values)
             stats["container"] = phase in CONTAINER_PHASES
             stats["wait_span"] = phase in WAIT_PHASES
+            if stats["container"]:
+                # A container (job_finish/rpc_total/out_decode) is not a wait:
+                # its uncovered remainder is a residual, never "exposed" work.
+                stats["residual_total_us"] = residual_us
+                stats["exposed_total_us"] = None
+            else:
+                stats["residual_total_us"] = None
+                stats["exposed_total_us"] = residual_us
+            stats["overlapped_total_us"] = stats["total"] - residual_us
             gpu = self.phase_gpu.get(phase, [])
             stats["gpu_us"] = summarize(gpu) if gpu else None
             stats["per_token_us"] = None
@@ -476,9 +528,20 @@ class TraceAnalysis:
                 stats[key] = stats[key] / 1000.0
         return stats
 
+    def _windows_overlap(self, left, right):
+        return left[0] < right[1] and right[0] < left[1]
+
     def correlation_report(self):
-        cycle_groups = defaultdict(set)
+        """Resolve cycle ids only inside a proven origin.
+
+        Cycle ids are local to one origin (process/session/arm). The composite
+        key includes the session and any origin metadata the trace carries.
+        Reuse in independent windows is reported as unknown, not as a failure;
+        only an ambiguous overlap or mixed ids inside one group fails.
+        """
+        composite_groups = defaultdict(set)
         groups_with = groups_without = mixed = 0
+        origin_mixed = 0
         for key, spans in self.groups.items():
             cycles = {span.cycle for span in spans if span.cycle > 0}
             if not cycles:
@@ -488,39 +551,70 @@ class TraceAnalysis:
                 mixed += 1
                 continue
             groups_with += 1
-            cycle_groups[next(iter(cycles))].add(key)
-        duplicate_ids = {cycle: keys for cycle, keys in cycle_groups.items() if len(keys) > 1}
-        ambiguous_groups = sum(len(keys) for keys in duplicate_ids.values())
-        # A duplicated or mixed correlation id is a hard failure: joining those
-        # groups would invent an association the trace does not carry. Missing
-        # ids are only unknown, never guessed.
-        failed = bool(mixed or duplicate_ids)
-        if failed:
-            scope = "failed"
-        elif groups_without:
-            scope = "unknown"
-        else:
-            scope = "ok"
+            if key in self.group_origin_mixed:
+                origin_mixed += 1
+                continue
+            composite = (self.group_session.get(key), self.group_origins.get(key),
+                         next(iter(cycles)))
+            composite_groups[composite].add(key)
+
+        duplicated = {composite: keys for composite, keys in composite_groups.items()
+                      if len(keys) > 1}
+        reused_groups = 0
+        ambiguous_groups = 0
+        for keys in duplicated.values():
+            windows = [self.group_windows[key] for key in keys]
+            overlapping = any(self._windows_overlap(windows[i], windows[j])
+                              for i in range(len(windows))
+                              for j in range(i + 1, len(windows)))
+            if overlapping:
+                ambiguous_groups += len(keys)
+            else:
+                reused_groups += len(keys)
+
+        origin_available = self.session_field_seen or bool(self.origin_fields_seen)
+        failed = bool(mixed or origin_mixed or ambiguous_groups)
         reasons = []
         if groups_without:
             reasons.append(f"{groups_without} layer groups carry no cycle id")
         if mixed:
             reasons.append(f"{mixed} layer groups mix several cycle ids")
-        if duplicate_ids:
-            reasons.append(
-                f"{len(duplicate_ids)} cycle ids map to more than one layer group "
-                f"({ambiguous_groups} groups); the trace reuses ids across runs")
+        if origin_mixed:
+            reasons.append(f"{origin_mixed} layer groups carry conflicting origin metadata")
+        if ambiguous_groups:
+            reasons.append(f"{ambiguous_groups} groups share one composite "
+                           "(origin, cycle) key inside overlapping windows")
+        if reused_groups:
+            reasons.append(f"{reused_groups} groups reuse a cycle id in independent "
+                           "windows; treated as unknown, not as a failure")
+        if not origin_available:
+            reasons.append("the trace carries no process/session origin; cycle ids "
+                           "cannot be resolved across runs")
+        if failed:
+            scope = "failed"
+        elif groups_without or reused_groups or not origin_available:
+            scope = "unknown"
+        else:
+            scope = "ok"
         return {
             "scope": scope,
+            "origin": {
+                "available": origin_available,
+                "session_field": self.session_field_seen,
+                "fields_seen": sorted(self.origin_fields_seen),
+                "composite_key": ["session", "origin", "cycle"],
+            },
             "groups_with_correlation": groups_with,
             "groups_without_correlation": groups_without,
-            "groups_with_mixed_correlation": mixed,
-            "duplicate_ids": len(duplicate_ids),
+            "groups_with_mixed_correlation": mixed + origin_mixed,
+            "duplicate_ids": len(duplicated),
             "ambiguous_groups": ambiguous_groups,
+            "reused_in_independent_windows": reused_groups,
             "reasons": reasons,
-            "note": ("Correlation ids are only used when they identify exactly one "
-                     "layer group. Duplicated or absent ids are reported as unknown; "
-                     "they are never invented, merged or joined across runs."),
+            "note": ("A cycle id resolves only when its composite (session, origin, "
+                     "cycle) key identifies exactly one layer group. Reuse across "
+                     "independent windows is unknown; overlapping reuse is a failure; "
+                     "ids are never invented, merged or joined across runs."),
         }
 
     def report(self):
@@ -664,19 +758,23 @@ def compare_samples(cpu, gpu):
         for value in samples:
             if not math.isfinite(value) or value < 0:
                 result["reason"] = f"{side} has a non-finite or negative sample"
+                result["scope"] = "failed"
                 return result
     result["cpu"] = summarize(cpu["samples_us"])
     result["gpu"] = summarize(gpu["samples_us"])
     if len(cpu["samples_us"]) != len(gpu["samples_us"]):
         result["reason"] = (f"sample count mismatch: cpu={len(cpu['samples_us'])} "
                             f"gpu={len(gpu['samples_us'])}")
+        result["scope"] = "failed"
         return result
     if cpu.get("window") != gpu.get("window"):
         result["reason"] = (f"window mismatch: cpu={cpu.get('window')} "
                             f"gpu={gpu.get('window')}")
+        result["scope"] = "failed"
         return result
     if (cpu.get("op") or "rpc_total") != (gpu.get("op") or "rpc_total"):
         result["reason"] = f"op mismatch: cpu={cpu.get('op')} gpu={gpu.get('op')}"
+        result["scope"] = "failed"
         return result
     delta = [c - g for c, g in zip(cpu["samples_us"], gpu["samples_us"])]
     result.update({
@@ -819,7 +917,48 @@ def _recv_exact(sock, size):
     return b"".join(chunks)
 
 
-def _validate_ping(response, cycle_id, payload):
+def _validate_control_request(op, session, allowed=(RKVA_PING,)):
+    """Validate the request we are about to send, before it leaves the process."""
+    if op not in allowed:
+        raise ProbeError(f"refusing to send op {op}: only {allowed} are safe here")
+    if session != RKVA_SESSION_NONE:
+        raise ProbeError("refusing to send a session-bound request in --empty-rtt mode")
+
+
+def _read_control_response(sock, expected_op, expected_cycle, allow_payload=False,
+                           max_payload=0):
+    """Validate the whole header before reading any body.
+
+    PING is a zero-payload op: a non-zero payload_bytes is a protocol fault and
+    is refused without allocating or reading a body. No response field is
+    trusted before magic/version/op/cycle/status/payload_bytes are checked.
+    """
+    header = parse_response(_recv_exact(sock, RESPONSE_BYTES))
+    if header["magic"] != RKVA_MAGIC:
+        raise ProbeError("bad magic in response")
+    if header["version"] not in (RKVA_VERSION, RKVA_VERSION_LEGACY):
+        raise ProbeError(f"unexpected protocol version {header['version']}")
+    if header["op"] != expected_op:
+        raise ProbeError(f"response op {header['op']} does not echo the request")
+    if header["cycle_id"] != (expected_cycle & 0xFFFFFFFFFFFFFFFF):
+        raise ProbeError("response cycle id does not echo the request")
+    if header["status"] != 0:
+        raise ProbeError(f"server returned status {header['status']}")
+    if not allow_payload and header["payload_bytes"] != 0:
+        raise ProbeError(f"{expected_op} response declares "
+                         f"{header['payload_bytes']} payload bytes; PING must be empty, "
+                         "refusing to read a body")
+    if header["payload_bytes"] > max_payload:
+        raise ProbeError(f"response payload {header['payload_bytes']} exceeds the "
+                         f"{max_payload}-byte cap")
+    payload = b""
+    if header["payload_bytes"]:
+        payload = _recv_exact(sock, header["payload_bytes"])
+    return header, payload
+
+
+def _validate_ping(response, cycle_id):
+    """Header-only PING validation (kept as the single-op entry point)."""
     if response["magic"] != RKVA_MAGIC:
         raise ProbeError("bad magic in response")
     if response["version"] not in (RKVA_VERSION, RKVA_VERSION_LEGACY):
@@ -830,8 +969,26 @@ def _validate_ping(response, cycle_id, payload):
         raise ProbeError("response cycle id does not echo the request")
     if response["status"] != 0:
         raise ProbeError(f"server returned status {response['status']}")
-    if response["payload_bytes"] != len(payload):
-        raise ProbeError(f"payload length {response['payload_bytes']} != {len(payload)}")
+    if response["payload_bytes"] != 0:
+        raise ProbeError("PING response must not carry a payload")
+
+
+def verify_cycle_sequence(sent, received):
+    """Prove the received cycle ids are exactly the sent ones, in order.
+
+    Duration equality is irrelevant: two samples with identical wall times but
+    distinct ids are valid. A repeated id in the received sequence is a real
+    correlation fault and fails.
+    """
+    if len(sent) != len(received):
+        raise ProbeError(f"cycle sequence length mismatch: sent {len(sent)}, "
+                         f"received {len(received)}")
+    for index, (want, got) in enumerate(zip(sent, received)):
+        if want != got:
+            raise ProbeError(f"cycle id mismatch at sample {index}: sent {want}, got {got}")
+    if len(set(received)) != len(received):
+        raise ProbeError("duplicate cycle ids in the received sequence")
+    return True
 
 
 def probe_empty_rtt(host, port, reps=50, warmup=5, timeout=1.0,
@@ -855,8 +1012,12 @@ def probe_empty_rtt(host, port, reps=50, warmup=5, timeout=1.0,
         connector = socket.create_connection
     sock = None
     samples = []
+    sent_cycles = []
+    received_cycles = []
     response_echo = {"status_ok": True, "cycle_ids_unique": True,
-                     "payload_bytes": 0, "versions": []}
+                     "payload_bytes": 0, "versions": [],
+                     "session_checked_on_request": True,
+                     "session_on_wire": False}
     stats_payload = None
     try:
         sock = connector((host, port), timeout)
@@ -866,37 +1027,40 @@ def probe_empty_rtt(host, port, reps=50, warmup=5, timeout=1.0,
             pass
         cycle = 1
         if get_stats:
+            _validate_control_request(RKVA_GET_STATS, RKVA_SESSION_NONE,
+                                      allowed=(RKVA_GET_STATS,))
             sock.sendall(struct.pack(REQUEST_FMT, RKVA_MAGIC, RKVA_VERSION,
                                      RKVA_GET_STATS, cycle, RKVA_SESSION_NONE,
                                      0, 0, 0))
-            header = parse_response(_recv_exact(sock, RESPONSE_BYTES))
-            payload = _recv_exact(sock, header["payload_bytes"]) \
-                if header["payload_bytes"] else b""
-            if header["magic"] != RKVA_MAGIC or header["op"] != RKVA_GET_STATS:
-                raise ProbeError("GET_STATS response did not echo the request")
-            if header["status"] != 0:
-                raise ProbeError(f"GET_STATS returned status {header['status']}")
+            header, payload = _read_control_response(
+                sock, RKVA_GET_STATS, cycle, allow_payload=True,
+                max_payload=MAX_CONTROL_PAYLOAD)
             try:
                 stats_payload = json.loads(payload.decode("utf-8", "replace"))
             except json.JSONDecodeError:
                 stats_payload = {"raw_bytes": len(payload), "parse": "failed"}
             cycle += 1
         for index in range(warmup + reps):
+            _validate_control_request(RKVA_PING, RKVA_SESSION_NONE)
             request = build_ping_request(cycle)
             started = clock()
             sock.sendall(request)
-            header_bytes = _recv_exact(sock, RESPONSE_BYTES)
-            header = parse_response(header_bytes)
-            payload = _recv_exact(sock, header["payload_bytes"]) \
-                if header["payload_bytes"] else b""
+            # Header is fully validated, including payload_bytes == 0, before
+            # any body read; PING never has a body.
+            header, _payload = _read_control_response(sock, RKVA_PING, cycle)
             elapsed = (clock() - started) * 1e6
-            _validate_ping(header, cycle, payload)
+            sent_cycles.append(cycle)
+            received_cycles.append(header["cycle_id"])
+            _validate_ping(header, cycle)
             response_echo["versions"].append(header["version"])
             if index >= warmup:
                 samples.append(elapsed)
             cycle += 1
-        unique = len({sample for sample in samples}) == len(samples)
-        response_echo["cycle_ids_unique"] = unique
+        verify_cycle_sequence(sent_cycles, received_cycles)
+        # Uniqueness is about the actual protocol ids, never about wall times:
+        # two samples with identical durations are valid.
+        response_echo["cycle_ids_unique"] = len(set(received_cycles)) == len(received_cycles)
+        response_echo["cycle_id_count"] = len(received_cycles)
         if not samples:
             raise ProbeError("no sample was collected")
         stats = summarize(samples)
@@ -943,6 +1107,8 @@ def probe_empty_rtt(host, port, reps=50, warmup=5, timeout=1.0,
             "server_stats": stats_payload,
             "notes": [
                 "Wall time includes both hosts' scheduling; it is not GPU time.",
+                "Cycle ids are validated as an exact send/receive sequence; equal "
+                "wall times are valid and never used as an id check.",
                 "A new connection resets the server's engine/session state by design.",
                 "No deploy, no flag change, no restart was performed.",
             ],
@@ -1099,6 +1265,8 @@ def network_info(target=None, runner=_default_runner):
             "Read-only: no sudo, no ethtool -s/-K/-C/-G, no ip set, no sysctl write.",
             "Local addresses, MACs and IPv6 privacy addresses are not reported.",
             "The remote host is never contacted by --network-info.",
+            "These facts do not establish causality for RKVA latency; only an "
+            "aligned trace/probe can attribute the delay.",
         ],
     }
     if not iface:
@@ -1250,13 +1418,15 @@ def _print_trace_summary(report):
           f"{report['window']['max_position']} events={counts['decode_events']} "
           f"tokens={counts['tokens']} layer_groups={counts['layer_groups']}")
     print(f"{'phase':28s} {'n':>6s} {'min_us':>9s} {'p50_us':>9s} {'p95_us':>9s} "
-          f"{'total_ms':>9s} {'per_tok_ms':>10s} {'self_ms':>8s} class")
+          f"{'total_ms':>9s} {'per_tok_ms':>10s} {'resid/exp_ms':>13s} class")
     for phase, stats in sorted(report["phases"].items(),
                                key=lambda item: -item[1]["total"]):
         kind = "container" if stats["container"] else ("wait" if stats["wait_span"] else "span")
+        remainder = (stats["residual_total_us"] if stats["container"]
+                     else stats["exposed_total_us"])
         print(f"{phase:28s} {stats['count']:6d} {stats['min']:9.0f} {stats['p50']:9.0f} "
               f"{stats['p95']:9.0f} {stats['total'] / 1000.0:9.3f} "
-              f"{stats['per_token_us'] / 1000.0:10.3f} {stats['exposed_total_us'] / 1000.0:8.3f} "
+              f"{stats['per_token_us'] / 1000.0:10.3f} {remainder / 1000.0:13.3f} "
               f"{kind}")
     token = report["per_token"]
     print(f"\nper token ({token['tokens']} tokens, "
@@ -1271,7 +1441,9 @@ def _print_trace_summary(report):
     corr = report["correlation"]
     print(f"correlation: scope={corr['scope']} valid={corr['groups_with_correlation']} "
           f"absent={corr['groups_without_correlation']} "
-          f"duplicate_ids={corr['duplicate_ids']} mixed={corr['groups_with_mixed_correlation']}")
+          f"duplicate_ids={corr['duplicate_ids']} mixed={corr['groups_with_mixed_correlation']} "
+          f"reused_windows={corr['reused_in_independent_windows']} "
+          f"ambiguous={corr['ambiguous_groups']}")
     for reason in corr["reasons"]:
         print(f"  unknown: {reason}")
 
@@ -1345,10 +1517,14 @@ def main(argv=None):
                 comparison = compare_samples(cpu, gpu)
                 trace["comparison"] = comparison
                 trace["unknown"]["comparison_scope"] = comparison["scope"]
-                if not comparison["comparable"]:
+                if comparison["scope"] == "failed":
                     trace["scope"] = "partial" if trace["scope"] == "ok" else trace["scope"]
                     trace["scope_reasons"].append(
-                        f"CPU/GPU not comparable: {comparison['reason']}")
+                        f"CPU/GPU comparison failed: {comparison['reason']}")
+            if trace.get("comparison", {}).get("scope") == "failed":
+                print("error: CPU/GPU comparison failed: "
+                      f"{trace['comparison']['reason']}", file=sys.stderr)
+                exit_code = 2
             report = trace
             if args.network_info:
                 report["network"] = network_info(args.host.split(":")[0] if args.host else None)
@@ -1365,7 +1541,8 @@ def main(argv=None):
                       "cycle ids (see report.correlation.reasons)", file=sys.stderr)
                 exit_code = 2
             if args.strict and (report["scope"] != "ok"
-                                or report["correlation"]["scope"] != "ok"):
+                                or report["correlation"]["scope"] != "ok"
+                                or report["unknown"]["comparison_scope"] == "unknown"):
                 exit_code = 2
         elif args.execute:
             if not args.empty_rtt:

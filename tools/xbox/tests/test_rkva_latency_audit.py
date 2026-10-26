@@ -125,9 +125,14 @@ class TraceAttributionTest(TraceCase):
         self.assertLess(token["attributed_ms"]["p50"], token["envelope_ms"]["p50"] + 1e-9)
         self.assertGreater(token["rpc_total_ms_container"]["p50"], 0.0)
         rr = report["phases"]["rpc_total"]
+        # A container is not a wait: it publishes a residual, never "exposed".
+        self.assertIsNone(rr["exposed_total_us"])
+        self.assertIsNotNone(rr["residual_total_us"])
         self.assertAlmostEqual(rr["overlapped_total_us"],
-                               rr["total"] - rr["exposed_total_us"])
+                               rr["total"] - rr["residual_total_us"])
         self.assertGreater(rr["overlapped_total_us"], 0.0)
+        self.assertGreater(rr["residual_total_us"], 0.0)
+        self.assertNotIn("rpc_total", report["exposed_wait"]["wait_phases"])
 
     def test_exposed_wait_uses_span_ranges_not_rpc_total(self):
         report = self.analyze()
@@ -160,17 +165,76 @@ class TraceAttributionTest(TraceCase):
             self.analyze(min_position=200, max_position=100)
         self.assertEqual(audit.CONTEXT_CAP, 160000)
 
-    def test_duplicate_cycle_ids_are_unknown_not_merged(self):
+    def test_duplicate_cycle_ids_in_independent_windows_are_unknown(self):
         write_trace(self.trace, golden_events(unique_cycles=False))
         report = self.analyze()
         correlation = report["correlation"]
-        self.assertEqual(correlation["scope"], "failed")
+        # The fixture tokens are 20 ms apart: reuse is not a transfer failure.
+        self.assertEqual(correlation["scope"], "unknown")
         self.assertGreater(correlation["duplicate_ids"], 0)
-        self.assertGreater(correlation["ambiguous_groups"], 0)
-        self.assertTrue(any("more than one layer group" in line
+        self.assertGreater(correlation["reused_in_independent_windows"], 0)
+        self.assertEqual(correlation["ambiguous_groups"], 0)
+        self.assertTrue(any("independent windows" in line
                             for line in correlation["reasons"]))
-        self.assertEqual(report["counts"]["duplicate_cycle_events"],
-                         correlation["ambiguous_groups"])
+        self.assertEqual(report["counts"]["duplicate_cycle_events"], 0)
+
+    def test_duplicate_cycle_ids_in_overlapping_windows_fail(self):
+        events = golden_events(tokens=1, layers=1)
+        # One extra group reusing the same session/cycle while time overlaps.
+        events += [
+            event("job_finish", 1_000_500, 1_004_000, 0, 1, graph_run=99),
+            event("rpc_total", 1_000_510, 1_001_990, 0, 1, graph_run=99),
+        ]
+        write_trace(self.trace, events)
+        report = self.analyze()
+        correlation = report["correlation"]
+        self.assertEqual(correlation["scope"], "failed")
+        self.assertGreater(correlation["ambiguous_groups"], 0)
+        self.assertTrue(any("overlapping windows" in line
+                            for line in correlation["reasons"]))
+
+    def test_distinct_origins_with_the_same_cycle_are_ok(self):
+        events = golden_events(tokens=2, layers=1, unique_cycles=False)
+        for item in events:
+            item["session"] = 1 if item["graph_run"] == 7 else 2
+        write_trace(self.trace, events)
+        report = self.analyze()
+        correlation = report["correlation"]
+        self.assertEqual(correlation["scope"], "ok")
+        self.assertEqual(correlation["duplicate_ids"], 0)
+        self.assertTrue(correlation["origin"]["available"])
+
+    def test_explicit_origin_metadata_is_part_of_the_composite_key(self):
+        events = golden_events(tokens=2, layers=1, unique_cycles=False)
+        for item in events:
+            item["origin"] = "arm-a" if item["graph_run"] == 7 else "arm-b"
+        write_trace(self.trace, events)
+        report = self.analyze()
+        correlation = report["correlation"]
+        self.assertEqual(correlation["scope"], "ok")
+        self.assertIn("origin", correlation["origin"]["fields_seen"])
+        self.assertEqual(correlation["duplicate_ids"], 0)
+
+    def test_conflicting_origin_metadata_in_one_group_fails(self):
+        events = golden_events(tokens=1, layers=1)
+        events[0]["origin"] = "arm-a"  # only one span of this group carries it
+        write_trace(self.trace, events)
+        report = self.analyze()
+        correlation = report["correlation"]
+        self.assertEqual(correlation["scope"], "failed")
+        self.assertGreater(correlation["groups_with_mixed_correlation"], 0)
+
+    def test_missing_origin_context_is_unknown_not_ok(self):
+        events = golden_events(tokens=1, layers=1)
+        for item in events:
+            item.pop("session", None)
+        write_trace(self.trace, events)
+        report = self.analyze()
+        correlation = report["correlation"]
+        self.assertEqual(correlation["scope"], "unknown")
+        self.assertFalse(correlation["origin"]["available"])
+        self.assertTrue(any("no process/session origin" in line
+                            for line in correlation["reasons"]))
 
     def test_absent_cycle_ids_are_unknown(self):
         events = golden_events()
@@ -266,27 +330,31 @@ class ComparisonGateTest(unittest.TestCase):
                                        self.samples([8.0]))
         self.assertFalse(result["comparable"])
         self.assertIn("sample count mismatch", result["reason"])
-        self.assertEqual(result["scope"], "unknown")
+        self.assertEqual(result["scope"], "failed")
 
     def test_window_mismatch_is_rejected(self):
         result = audit.compare_samples(self.samples([10.0], (130560, 160000)),
                                        self.samples([9.0], (130560, 131072)))
         self.assertFalse(result["comparable"])
         self.assertIn("window mismatch", result["reason"])
+        self.assertEqual(result["scope"], "failed")
 
     def test_op_mismatch_and_missing_samples_are_rejected(self):
         result = audit.compare_samples(self.samples([10.0], op="rpc_total"),
                                        self.samples([9.0], op="out_decode"))
         self.assertFalse(result["comparable"])
         self.assertIn("op mismatch", result["reason"])
+        self.assertEqual(result["scope"], "failed")
         result = audit.compare_samples(self.samples([]), self.samples([9.0]))
         self.assertFalse(result["comparable"])
         self.assertIn("no samples", result["reason"])
+        self.assertEqual(result["scope"], "unknown")
 
     def test_non_finite_comparison_input_is_rejected(self):
         result = audit.compare_samples(self.samples([10.0]),
                                        self.samples([float("nan")]))
         self.assertFalse(result["comparable"])
+        self.assertEqual(result["scope"], "failed")
 
 
 class ProcessGuardTest(unittest.TestCase):
@@ -337,12 +405,14 @@ class ProcessGuardTest(unittest.TestCase):
 class FakeSocket:
     """Deterministic socket double; records every frame and closes exactly once."""
 
-    def __init__(self, timeout_at=None, mutate=None, payload=b""):
+    def __init__(self, timeout_at=None, mutate=None, payload=b"", echo_cycle=None):
         self.sent = []
         self.closed = 0
         self.timeout_at = timeout_at
         self.mutate = mutate or (lambda frame: frame)
         self.payload = payload
+        self.echo_cycle = echo_cycle
+        self.recv_calls = 0
         self._pending = b""
         self._samples = 0
 
@@ -355,12 +425,15 @@ class FakeSocket:
         if self.timeout_at is not None and self._samples == self.timeout_at:
             raise socket.timeout("simulated timeout")
         fields = audit.struct.unpack(audit.REQUEST_FMT, data)
+        cycle = fields[3] if self.echo_cycle is None else self.echo_cycle
+        body = self.payload if fields[2] == audit.RKVA_GET_STATS else b""
         header = audit.struct.pack(
             audit.RESPONSE_FMT, audit.RKVA_MAGIC, audit.RKVA_VERSION, fields[2],
-            fields[3], 0, len(self.payload), 100, 200, 300, 400)
-        self._pending = self.mutate(header) + self.payload
+            cycle, 0, len(body), 100, 200, 300, 400)
+        self._pending = self.mutate(header) + body
 
     def recv(self, size):
+        self.recv_calls += 1
         chunk, self._pending = self._pending[:size], self._pending[size:]
         return chunk
 
@@ -393,11 +466,106 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(report["bytes"]["request"], audit.REQUEST_BYTES * 4)
         self.assertEqual(report["bytes"]["response"], audit.RESPONSE_BYTES * 4)
         self.assertGreater(report["samples_us"]["p50"], 0.0)
+        self.assertTrue(report["response_echo"]["cycle_ids_unique"])
+        self.assertEqual(report["response_echo"]["cycle_id_count"], 4)
+
+    def test_identical_durations_with_unique_ids_are_valid(self):
+        sock = FakeSocket()
+        report = self.probe(sock, clock=lambda: 42.0)
+        self.assertEqual(report["samples_us"]["count"], 3)
+        self.assertEqual(len(set(report["samples"])), 1)
+        self.assertTrue(report["response_echo"]["cycle_ids_unique"])
+        self.assertEqual(report["scope"], "ok")
+
+    def test_repeated_cycle_ids_fail_even_with_distinct_durations(self):
+        sock = FakeSocket(echo_cycle=7)
+        with self.assertRaises(audit.ProbeError) as ctx:
+            self.probe(sock, reps=3, warmup=0)
+        self.assertIn("cycle", str(ctx.exception))
+        self.assertEqual(sock.closed, 1)
+
+    def test_cycle_sequence_requires_exact_send_order(self):
+        self.assertTrue(audit.verify_cycle_sequence([1, 2, 3], [1, 2, 3]))
+        with self.assertRaises(audit.ProbeError):
+            audit.verify_cycle_sequence([1, 2, 3], [1, 3, 2])
+        with self.assertRaises(audit.ProbeError):
+            audit.verify_cycle_sequence([1, 1], [1, 1])
+        with self.assertRaises(audit.ProbeError):
+            audit.verify_cycle_sequence([1, 2], [1])
+
+    def test_header_payload_bytes_is_checked_before_any_body_read(self):
+        def huge_payload(frame):
+            fields = list(audit.struct.unpack(audit.RESPONSE_FMT, frame))
+            fields[5] = 0xFFFFFFFF  # UINT32_MAX declared, no body follows
+            return audit.struct.pack(audit.RESPONSE_FMT, *fields)
+
+        sock = FakeSocket(mutate=huge_payload)
+        with self.assertRaises(audit.ProbeError) as ctx:
+            self.probe(sock, reps=1, warmup=0)
+        self.assertIn("payload", str(ctx.exception))
+        self.assertEqual(sock.recv_calls, 1)  # header only, no body recv
+        self.assertEqual(sock.closed, 1)
+
+    def test_header_mutations_fail_closed(self):
+        mutations = {
+            "magic": (0, audit.RKVA_MAGIC ^ 1),
+            "version": (1, 99),
+            "op": (2, audit.RKVA_GET_STATS),
+            "cycle": (3, 123456),
+            "status": (4, -5),
+            "payload": (5, 8),
+        }
+        for name, (index, value) in mutations.items():
+            def mutate(frame, index=index, value=value):
+                fields = list(audit.struct.unpack(audit.RESPONSE_FMT, frame))
+                fields[index] = value
+                return audit.struct.pack(audit.RESPONSE_FMT, *fields)
+
+            sock = FakeSocket(mutate=mutate)
+            with self.assertRaises(audit.ProbeError, msg=name):
+                self.probe(sock, reps=1, warmup=0)
+            self.assertEqual(sock.closed, 1, name)
+
+    def test_request_session_is_validated_before_send(self):
+        audit._validate_control_request(audit.RKVA_PING, audit.RKVA_SESSION_NONE)
+        audit._validate_control_request(audit.RKVA_GET_STATS, audit.RKVA_SESSION_NONE,
+                                        allowed=(audit.RKVA_GET_STATS,))
+        for op, session in ((4, audit.RKVA_SESSION_NONE),
+                            (audit.RKVA_PING, 3),
+                            (audit.RKVA_GET_STATS, 3)):
+            with self.assertRaises(audit.ProbeError):
+                audit._validate_control_request(op, session)
+        with self.assertRaises(audit.ProbeError):
+            audit._validate_control_request(audit.RKVA_GET_STATS,
+                                            audit.RKVA_SESSION_NONE,
+                                            allowed=(audit.RKVA_PING,))
+
+    def test_ping_header_rejects_any_payload(self):
+        header = audit.parse_response(audit.struct.pack(
+            audit.RESPONSE_FMT, audit.RKVA_MAGIC, audit.RKVA_VERSION,
+            audit.RKVA_PING, 1, 0, 4, 0, 0, 0, 0))
+        with self.assertRaises(audit.ProbeError):
+            audit._validate_ping(header, 1)
+        header = audit.parse_response(audit.struct.pack(
+            audit.RESPONSE_FMT, audit.RKVA_MAGIC, audit.RKVA_VERSION,
+            audit.RKVA_PING, 1, 0, 0, 0, 0, 0, 0))
+        audit._validate_ping(header, 1)
 
     def test_timeout_is_reported_and_socket_is_closed(self):
         sock = FakeSocket(timeout_at=1)
         with self.assertRaises(socket.timeout):
             self.probe(sock)
+        self.assertEqual(sock.closed, 1)
+
+    def test_eof_before_header_fails_and_closes(self):
+        class ClosedSocket(FakeSocket):
+            def recv(self, size):
+                self.recv_calls += 1
+                return b""
+
+        sock = ClosedSocket()
+        with self.assertRaises(audit.ProbeError):
+            self.probe(sock, reps=1, warmup=0)
         self.assertEqual(sock.closed, 1)
 
     def test_bad_echo_fails_closed(self):
@@ -433,12 +601,21 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(audit.MAX_RTT_REPS, 1000)
         self.assertEqual(audit.MAX_RTT_TIMEOUT_S, 3.0)
 
-    def test_get_stats_is_sent_before_the_samples(self):
+    def test_get_stats_oversized_payload_fails_before_body(self):
+        sock = FakeSocket(payload=b"x" * (audit.MAX_CONTROL_PAYLOAD + 1))
+        with self.assertRaises(audit.ProbeError) as ctx:
+            self.probe(sock, get_stats=True, reps=1, warmup=0)
+        self.assertIn("cap", str(ctx.exception))
+        self.assertEqual(sock.recv_calls, 1)
+        self.assertEqual(sock.closed, 1)
+
+    def test_get_stats_body_is_capped_and_read_after_header(self):
         sock = FakeSocket(payload=b'{"service":"rkva"}')
         report = self.probe(sock, get_stats=True, reps=1, warmup=0)
         ops = [audit.struct.unpack(audit.REQUEST_FMT, frame)[2] for frame in sock.sent]
         self.assertEqual(ops, [audit.RKVA_GET_STATS, audit.RKVA_PING])
         self.assertEqual(report["server_stats"], {"service": "rkva"})
+        self.assertEqual(audit.MAX_CONTROL_PAYLOAD, 1 << 20)
 
 
 class NetworkHelperTest(unittest.TestCase):
@@ -549,14 +726,16 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(set(os.listdir(self.tmp.name)), before)
 
-    def test_duplicate_correlation_fails_without_strict(self):
+    def test_independent_window_reuse_is_not_a_default_failure(self):
         write_trace(self.trace, golden_events(unique_cycles=False))
-        self.assertEqual(audit.main(["--trace", self.trace]), 2)
+        self.assertEqual(audit.main(["--trace", self.trace]), 0)
+        self.assertEqual(audit.main(["--trace", self.trace, "--strict"]), 2)
         out = os.path.join(self.tmp.name, "report.json")
         code = audit.main(["--trace", self.trace, "--out", out])
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 0)
         report = json.load(open(out, encoding="utf-8"))
-        self.assertEqual(report["correlation"]["scope"], "failed")
+        self.assertEqual(report["correlation"]["scope"], "unknown")
+        self.assertGreater(report["correlation"]["reused_in_independent_windows"], 0)
 
     def test_strict_returns_nonzero_for_unknown_correlation(self):
         events = golden_events()
@@ -578,10 +757,24 @@ class CliTest(unittest.TestCase):
         out = os.path.join(self.tmp.name, "report.json")
         code = audit.main(["--trace", self.trace, "--cpu-samples", cpu,
                            "--gpu-samples", gpu, "--out", out])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
         report = json.load(open(out, encoding="utf-8"))
         self.assertFalse(report["comparison"]["comparable"])
-        self.assertEqual(report["unknown"]["comparison_scope"], "unknown")
+        self.assertEqual(report["comparison"]["scope"], "failed")
+        self.assertEqual(report["unknown"]["comparison_scope"], "failed")
+
+    def test_strict_fails_when_comparison_has_no_samples(self):
+        cpu = os.path.join(self.tmp.name, "cpu.json")
+        gpu = os.path.join(self.tmp.name, "gpu.json")
+        with open(cpu, "w", encoding="utf-8") as handle:
+            json.dump({"op": "rpc_total", "samples_us": [],
+                       "window": {"min_position": 130560, "max_position": 160000}}, handle)
+        with open(gpu, "w", encoding="utf-8") as handle:
+            json.dump({"op": "rpc_total", "samples_us": [9.0],
+                       "window": {"min_position": 130560, "max_position": 160000}}, handle)
+        argv = ["--trace", self.trace, "--cpu-samples", cpu, "--gpu-samples", gpu]
+        self.assertEqual(audit.main(argv), 0)
+        self.assertEqual(audit.main(argv + ["--strict"]), 2)
 
     def test_source_parses_and_help_is_clear(self):
         source = open(SCRIPT, encoding="utf-8").read()
