@@ -9,7 +9,7 @@ DXC="${DXC:-dxc}"
 ALL_TARGETS=(attn attn_q4 attn_q8 attn_kvarn4 reduce attn_q4_opt reduce_opt reduce_kvarn4
     attn_f16_opt attn_q8_opt attn_kvarn4_opt attn_kvarn4_prefix attn_kvarn4_opt_prefix
     attn_q4_mq2 attn_q4_mq4 attn_f16_mq2 attn_f16_mq4 attn_q8_mq2 attn_q8_mq4
-    attn_kvarn4_mq2 attn_kvarn4_mq4 bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix)
+    attn_kvarn4_mq2 attn_kvarn4_mq4 bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix attn_kvarn4_mq2_skip)
 if [[ $# -gt 0 ]]; then
     TARGETS=("$@")
 else
@@ -101,6 +101,13 @@ for target in "${TARGETS[@]}"; do
         entry=CSRangeAttnKvarn4Mq
         source="$ROOT/shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl"
         defines=(-D RKVA_MQ_QT="${target#attn_kvarn4_mq}")
+    fi
+    # Opt-in bit-exact rescale-elision specialization of the 2-query KVarN4 tile.
+    # Separate PSO so the qualified attn_kvarn4_mq2 target keeps its DXIL.
+    if [[ "$target" == attn_kvarn4_mq2_skip ]]; then
+        entry=CSRangeAttnKvarn4Mq
+        source="$ROOT/shaders/rkva/rkva_range_attn_kvarn4_mq_skip.hlsl"
+        defines=(-D RKVA_MQ_QT=2)
     fi
     if [[ "$target" == bulk_unpack_q_f16 ]]; then
         entry=CSBulkUnpackQF16

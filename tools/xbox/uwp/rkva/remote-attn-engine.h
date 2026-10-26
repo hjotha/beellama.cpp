@@ -177,6 +177,15 @@ class RemoteAttnEngine {
     bool range_profiling() const {
         return profiling_;
     }
+    // Opt-in bit-exact prefill specialization (default off): when enabled and the
+    // dedicated PSO exists, nq 2..9 native KVarN4 mode-2 tiles use the
+    // rescale-elision kernel instead of attn_kvarn4_mq2. Control path only.
+    void set_mq_rescale_skip(bool enabled) {
+        mq_rescale_skip_ = enabled;
+    }
+    bool mq_rescale_skip() const {
+        return mq_rescale_skip_;
+    }
 
     // Diagnostics / parity harness support.
     uint64_t allocated_bytes() const {
@@ -305,8 +314,15 @@ class RemoteAttnEngine {
     // per-query prefix kernel.
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_mq_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_mq4_pso_;
+    // Opt-in bit-exact rescale-elision specialization of the 2-query tile
+    // (rkva_range_attn_kvarn4_mq_skip.hlsl). Opted in through the LocalState
+    // flag file `rkva-mq-rescale-skip.flag`; default off, and a missing PSO
+    // keeps the qualified attn_kvarn4_mq2 pipeline.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_mq_skip_pso_;
     std::string kvarn4_mq_status_ = "not initialized";
     std::string kvarn4_mq4_status_ = "not initialized";
+    std::string kvarn4_mq_skip_status_ = "not initialized";
+    bool mq_rescale_skip_ = false;
     std::string kvarn4_opt_prefix_status_ = "not initialized";
     // Native KVarN4 revision-3 wave64 decode specialization (nq == 1).
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_decode_prefix_pso_;
