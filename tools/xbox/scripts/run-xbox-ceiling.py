@@ -313,11 +313,15 @@ def main():
         ceiling = roofline["ceiling_measured"]
         journal.note("roofline",
                      bandwidth_gbs=round(ceiling["bandwidth_gbs"], 2),
+                     bandwidth_verified=ceiling.get("bandwidth_verified"),
                      fp32_tflops=round(ceiling["fp32_tflops"], 3),
                      fp16_tflops=round(ceiling["fp16_tflops"], 3),
+                     fp16_min16_tflops=round(ceiling.get("fp16_min16_tflops", 0.0), 3),
                      dot4_i8_tops=round(ceiling["dot4_i8_tops"], 3),
                      dual_cu=roofline["compute_units"]["dual_cu"],
-                     pass1_points=len(roofline["pass1_points"]))
+                     pass1_points=len(roofline["pass1_points"]),
+                     partial=roofline.get("partial"),
+                     warnings=len(roofline.get("warnings") or []))
         status = 0
     finally:
         result["journal"] = journal.entries
