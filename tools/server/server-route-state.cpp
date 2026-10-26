@@ -146,6 +146,9 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     if (tokens.empty() || tokens.size() != size_t(position) + 1 || tokens.size() > llama_n_ctx_seq(ctx)) {
         throw std::runtime_error("router state tokens do not cover evaluated target");
     }
+    if (llama_remote_native_kvarn_transient_active(ctx)) {
+        throw std::runtime_error("native KVarN4 overflow FULL snapshots are not implemented; refusing Q4 bookkeeping state");
+    }
     const size_t native_data = llama_state_seq_get_size(ctx, seq);
     uint64_t logits_bytes = 0;
     uint32_t logits_vocab = 0;
