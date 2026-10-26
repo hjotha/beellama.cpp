@@ -17,7 +17,7 @@
 // Separate PSO target `attn_kvarn4_mq2_i8`; RKVA_MQ_I8 remains 0 for every
 // existing target, whose DXIL is byte-identical. Opted in through the
 // LocalState flag file `rkva-mq-i8.flag` (default off).
-// The INT8 variant keeps the production online-softmax update so the fast
-// shared tile loop stays at 331.9 instructions per KV row.
+// The record scores use WavePrefixSum and constant-index row boundaries.
+// This is the sole INT8 reduction; the runtime flag remains default off.
 #define RKVA_MQ_I8 1
 #include "rkva_range_attn_kvarn4_mq.hlsl"

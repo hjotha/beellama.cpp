@@ -7,10 +7,10 @@ different program, and this module executes that program instead:
 
   * 128 threads as two waves of 64 lanes (`lane`, `wave = tid / 64`);
   * the 16-dim / 16-lane mapping (`slot = lane & 15`, `row = lane / 16`);
-  * the per-group int8 query quantizer with its slice-local `lane ^ st` reduce;
+  * the per-group int8 query quantizer with wave-wide slice maxima;
   * `dot4add_i8packed` as signed-int8 x signed-int8, four bytes, int32 wrap;
-  * the 16-lane `lane ^ {8,4,2,1}` reduction and the `WaveReadLaneAt(val, t*16)`
-    broadcast that hands row `t` of the half tile to every lane;
+  * inclusive F32 prefixes and constant endpoints 15/31/47/63, whose
+    differences hand the four row scores to every lane;
   * the per-lane application of `q8scale`/`q8const`/`other`, which is where the
     shipped kernel and the fix differ.
 
@@ -71,33 +71,15 @@ def dot4add_i8packed(a, b, c):
     return total
 
 
-def read_lane_at(v, src):
-    """dx.op.waveReadLaneAt over the 64-lane wave."""
-    return np.asarray(v)[np.asarray(src, np.int64)]
-
-
 def reduce_add(v, masks):
-    lane = np.arange(WAVE)
-    out = np.array(v, np.float64)
-    for st in masks:
-        out = out + out[lane ^ st]
-    return out
-
-
-def reduce_max(v, masks):
-    lane = np.arange(WAVE)
-    out = np.array(v, np.float64)
-    for st in masks:
-        out = np.maximum(out, out[lane ^ st])
-    return out
+    """Grouped reference sum for the slice-constant negative control."""
+    width = max(masks) * 2
+    groups = np.asarray(v, np.float64).reshape(-1, width)
+    return np.repeat(groups.sum(axis=1), width)
 
 
 def reduce_add_int(v, masks):
-    lane = np.arange(WAVE)
-    out = np.asarray(v, np.int64).copy()
-    for st in masks:
-        out = int32(out + out[lane ^ st])
-    return out
+    return int32(reduce_add(v, masks))
 
 
 def pack4(values):
@@ -161,7 +143,10 @@ def shader_scores(store, qrot, live, const_mode):
             for g in range(n_heads):
                 qo = qrot[g][dim[:, None] + ar[None, :]]
                 qp = qo * ksv
-                mx = reduce_max(np.abs(qp).max(axis=1), [4, 2, 1])   # slice-local
+                partial_max = np.abs(qp).max(axis=1)
+                mx0 = np.max(np.where(sl == 0, partial_max, 0.0))
+                mx1 = np.max(np.where(sl == 1, partial_max, 0.0))
+                mx = np.where(sl == 0, mx0, mx1)
                 zs = (qo * kzv).sum(axis=1)
                 qsum = qp.sum(axis=1)
                 inv = np.where(mx > 0, I8_MAXV / np.where(mx > 0, mx, 1.0), 0.0)
@@ -215,11 +200,13 @@ def shader_scores(store, qrot, live, const_mode):
                         for c in range(4):
                             acc = dot4add_i8packed(k8[c], q8[g, c], acc)
                         val = (acc.astype(np.float64) * sq_lane[g] + c_lane[g]) * sll
-                        val = reduce_add(val, [8, 4, 2, 1])     # 16-lane reduction
+                        # One legal F32 prefix order; DXIL VM separately checks
+                        # the emitted program. Hardware may use a different tree.
+                        prefix = np.cumsum(val.astype(F32), dtype=F32)
+                        endpoints = prefix[[15, 31, 47, 63]]
+                        scores = np.diff(np.concatenate([np.zeros(1, F32), endpoints]))
                         for t in range(4):
-                            # WaveReadLaneAt(val, t*16): every lane reads the
-                            # reduced value that lane group t holds.
-                            s_t = float(val[t * I8_LANES])
+                            s_t = float(scores[t])
                             r = t0 + h * 4 + t
                             if r < fast_hi:
                                 out[g][r] = s_t

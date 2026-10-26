@@ -100,12 +100,8 @@
 // RKVA_I8_DIMS * RKVA_I8_LANES == 256 dims, RKVA_I8_DIMS * RKVA_I8_SLICE_LANES
 // == 128 dims per record slice (checked by tools/xbox/tests/rkva_mq_i8_quality.py).
 #define RKVA_I8_ROWS (RKVA_UNITS / RKVA_I8_LANES)
-// Measurement-only build switch (never shipped, never selected at runtime):
-// replaces the per-group query quantizer with constants so
-// rkva_dxil_loop_cost.py can measure the steady-state tile loop on its own.
-#ifndef RKVA_MQ_I8_MEASURE_NOQUANT
-#define RKVA_MQ_I8_MEASURE_NOQUANT 0
-#endif
+// INT8 uses wave-wide slice maxima and prefix row sums exclusively.
+
 #endif
 
 cbuffer Params : register(b0) {
@@ -450,16 +446,6 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                                        ks2.x, ks2.y, ks2.z, ks2.w, ks3.x, ks3.y, ks3.z, ks3.w};
             float kzv[RKVA_I8_DIMS] = {kz0.x, kz0.y, kz0.z, kz0.w, kz1.x, kz1.y, kz1.z, kz1.w,
                                        kz2.x, kz2.y, kz2.z, kz2.w, kz3.x, kz3.y, kz3.z, kz3.w};
-#if RKVA_MQ_I8_MEASURE_NOQUANT
-            [unroll] for (uint i = 0; i < RKVA_QG; ++i) {
-                // Group-dependent so the dp4a chain survives (a constant
-                // operand would be strength-reduced), but no quantizer work.
-                q8[i] = uint4(i8_base + i, i8_base ^ 0x01010101u, i8_base + 2u * i,
-                              i8_base + 3u * i);
-                q8scale[i] = 1.0f;
-                q8const[i] = 0.0f;
-            }
-#else
             [unroll] for (uint j = 0; j < RKVA_MQ_QT; ++j) {
                 [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
                     uint i = j * RKVA_GQA + g;
@@ -489,9 +475,11 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                     // slice totals. Reducing them first hands every lane the
                     // whole slice constant, so the score picks it up
                     // RKVA_I8_SLICE_LANES times instead of once.
-                    [unroll] for (uint st = RKVA_I8_SLICE_LANES / 2; st > 0; st >>= 1) {
-                        mx = max(mx, WaveReadLaneAt(mx, lane ^ st));
-                    }
+                    // Q/scale are repeated in the four row groups, so a max
+                    // over all copies of a slice equals the 8-lane max.
+                    float mx0 = WaveActiveMax(i8_slice == 0 ? mx : 0.0f);
+                    float mx1 = WaveActiveMax(i8_slice == 1 ? mx : 0.0f);
+                    mx = i8_slice == 0 ? mx0 : mx1;
                     float inv = mx > 0 ? RKVA_I8_MAXV / mx : 0.0f;
                     float sq = mx > 0 ? mx * (1.0f / RKVA_I8_MAXV) : 0.0f;
                     int t0i = int(round(qp[0] * inv)), t1i = int(round(qp[1] * inv));
@@ -522,7 +510,6 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                     q8const[i] = zs + 8.0f * (qsum - sq * float(s8));
                 }
             }
-#endif // RKVA_MQ_I8_MEASURE_NOQUANT
 
             uint tile_lo = max(fast_lo, grp << 7) + wave * RKVA_TILE;
             uint tile_hi = min(fast_hi, (grp + 1u) << 7);
@@ -573,15 +560,20 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                                     acc = dot4add_i8packed(k8[c], q8[i][c], acc);
                                 }
                                 float val = (float(acc) * q8scale[i] + q8const[i]) * sll;
-                                // 4 steps reduce four rows at once.
-                                [unroll] for (uint st = RKVA_I8_LANES / 2; st > 0; st >>= 1) {
-                                    val += WaveReadLaneAt(val, lane ^ st);
-                                }
                                 float s[RKVA_HALF];
-                                s[0] = WaveReadLaneAt(val, 0 * RKVA_I8_LANES);
-                                s[1] = WaveReadLaneAt(val, 1 * RKVA_I8_LANES);
-                                s[2] = WaveReadLaneAt(val, 2 * RKVA_I8_LANES);
-                                s[3] = WaveReadLaneAt(val, 3 * RKVA_I8_LANES);
+                                // All 64 lanes are active here (wave64 gate and
+                                // wave-uniform act[j]). Inclusive prefixes at
+                                // 15/31/47/63 delimit the four 16-lane rows.
+                                // Subtraction adds F32 cancellation, not Q8 loss.
+                                float prefix = WavePrefixSum(val) + val;
+                                float p0 = WaveReadLaneAt(prefix, 15);
+                                float p1 = WaveReadLaneAt(prefix, 31);
+                                float p2 = WaveReadLaneAt(prefix, 47);
+                                float p3 = WaveReadLaneAt(prefix, 63);
+                                s[0] = p0;
+                                s[1] = p1 - p0;
+                                s[2] = p2 - p1;
+                                s[3] = p3 - p2;
                                 float half_max = -3.402823466e38f;
                                 [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
                                     half_max = max(half_max, s[t]);

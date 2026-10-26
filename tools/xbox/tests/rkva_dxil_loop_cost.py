@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Loop-body instruction accounting for the RKVA KVarN4 MQ tile entry function.
 
-Usage: rkva_dxil_loop_cost.py file.txt [file.txt ...]
+Usage: rkva_dxil_loop_cost.py file.txt [file.txt ...] [--rows=8]
 
 Produce the input with the Windows DXC (cs_6_0) that builds the RKVA shaders:
   dxc -T cs_6_0 -E CSRangeAttnKvarn4Mq -D RKVA_MQ_QT=2 -Fc out.txt shader.hlsl -Fo out.dxil
@@ -9,9 +9,12 @@ The DXIL text is pre-ISA; see the class notes below for the wave64 cost model.
 
 Parses the DXIL text dump, finds the natural loop that owns the 96 `dot4` calls
 (the 8-row fast shared-tile loop of CSRangeAttnKvarn4Mq), and reports the
-execution-weighted instruction mix of ONE loop iteration, i.e. one 8-row tile
+static instruction estimate of ONE loop iteration, i.e. one 8-row tile
 covering RKVA_MQ_QT=2 queries x RKVA_GQA=6 heads. Blocks that are only reachable
 through a runtime-constant branch arm must be measured with a forced build.
+It does not price spills, occupancy, LDS banks or barrier latency. Nested loops
+are not trip-count weighted. Phi/extractvalue counts are DXIL proxies, not ISA
+counts.
 
 Class costs are RDNA2 wave64 issue slots: `dot4` is four FMA, `waveActiveOp` is
 a 64-lane butterfly (six cross-lane moves + six adds).
@@ -174,14 +177,20 @@ def main():
         # waveActiveOp is a full-wave butterfly: six cross-lane moves + six adds
         # in the wave64 model. waveReadLaneAt is a single permute (its add is a
         # separately counted `fadd`), so it costs one slot.
-        reduce_add = 6 * counters['dx.op.waveActiveOp.f32']
-        reduce_shfl = (6 * counters['dx.op.waveActiveOp.f32'] +
-                       counters['dx.op.waveReadLaneAt.f32'])
+        # Prefix cost is an estimate, not measured ISA. A full-wave scan has
+        # six stages; segmented scan lowering can cost more than this floor.
+        stages = (6 * counters['dx.op.waveActiveOp.f32'] +
+                  6 * counters['dx.op.wavePrefixOp.f32'] +
+                  4 * counters['dx.op.waveMultiPrefixOp.f32'])
+        reduce_add = stages
+        reduce_shfl = (stages + counters['dx.op.waveReadLaneAt.f32'] +
+                       counters['dx.op.quadOp.f32'])
         sfu = counters['dx.op.unary.f32']
         cvt = counters['dx.op.legacyF16ToF32'] + counters['uitofp'] + counters['sitofp'] + \
             counters['fptosi']
         loads = counters['dx.op.bufferLoad.i32'] + counters['dx.op.rawBufferLoad.i32']
         stores = counters['dx.op.bufferStore.i32'] + counters['dx.op.rawBufferStore.i32']
+        lds = counters['load'] + counters['store']
         barriers = counters['dx.op.barrier']
         ints = sum(counters[o] for o in ('add', 'mul', 'and', 'or', 'xor', 'shl', 'lshr', 'ashr',
                                         'icmp', 'select', 'getelementptr', 'zext', 'sext', 'trunc',
@@ -189,15 +198,16 @@ def main():
         brs = counters['br'] + counters['fcmp']
         cbuf = counters['dx.op.cbufferLoadLegacy.i32'] + counters['dx.op.cbufferLoadLegacy.f32']
         total = (fma_class + reduce_add + reduce_shfl + sfu + cvt + loads + stores + barriers +
-                 ints + brs + cbuf)
+                 ints + brs + cbuf + lds)
         print('==', pathlib.Path(path).name)
         print('   loop header %%%s  body blocks %d  dot-units/iter %d (dot4 %d, dp4a %d)  '
               'rows/iter %.0f' % (header, len(body), dots, counters['dx.op.dot4.f32'], dp4a, rows))
-        print('   per-tile (8 rows, 2 queries x 6 heads):')
+        print('   per-iteration (%.0f rows; branch arms counted statically):' % rows)
         print('     fma_class   %6d   reduce_add %6d   reduce_shfl %6d   sfu %5d'
               % (fma_class, reduce_add, reduce_shfl, sfu))
         print('     cvt         %6d   loads      %6d   stores      %6d   barrier %5d'
               % (cvt, loads, stores, barriers))
+        print('     LDS ops     %6d (latency/bank conflicts not modeled)' % lds)
         print('     int/misc    %6d   branch     %6d   cbuf        %6d   TOTAL  %6d'
               % (ints, brs, cbuf, total))
         if verbose:

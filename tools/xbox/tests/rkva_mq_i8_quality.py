@@ -212,15 +212,6 @@ def ref_scores(qrot, ksrc):
     return (wave_sum_f32(part) * F32(KQ_SCALE)).astype(F32)
 
 
-def slice_reduce_max(v):
-    """Max over the 8 lanes that share one 128-dim slice (xor 4,2,1)."""
-    a = v.astype(F32)
-    lane = np.arange(16)
-    for stride in (4, 2, 1):
-        a = np.maximum(a, a[..., lane ^ stride])
-    return a
-
-
 def i8_scores(qrot, store, dc_exact=False):
     """INT8 record score, exact int32 dot per slice, slice-local Q8 scale.
 
