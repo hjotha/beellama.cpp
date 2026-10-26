@@ -2469,6 +2469,12 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
                 ++c.kvarn4_decode_calls;
             } else if (seg.q_tile == rp::kKvarn4MqTile) {
                 ++c.kvarn4_mq_calls;
+                if (seg.rescale_skip) {
+                    ++c.kvarn4_mq_skip_calls;
+                }
+                if (seg.int8_dot) {
+                    ++c.kvarn4_mq_i8_calls;
+                }
             } else if (seg.q_tile == rp::kKvarn4MqTileMax) {
                 ++c.kvarn4_mq4_calls;
             }
