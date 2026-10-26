@@ -5,16 +5,17 @@
 // instruction throughput, not a dead-code-eliminated no-op.
 //
 // Entry points and their shader models (see compile-gpupeak-shaders.py):
-//   CSFmaF32      cs_6_0                     8 independent FP32 FMA chains
-//   CSFmaF16      cs_6_2 -enable-16bit-types 4 packed half2 FMA chains
-//   CSDot2F16     cs_6_4 -enable-16bit-types dot2add (2x F16 MAC -> F32)
-//   CSDot4I8      cs_6_4                     dot4add_i8packed (4x I8 MAC -> I32)
-//   CSLatencyFma  cs_6_0                     one serial FP32 FMA chain
-//   CSCuProbe     cs_6_0                     40 KiB LDS: one group per CU
+//   CSFmaF32       cs_6_0                     8 independent FP32 FMA chains
+//   CSFmaF16       cs_6_2 -enable-16bit-types 4 packed half2 FMA chains
+//   CSFmaF16Min16  cs_6_0                     4 min16float2 chains (relaxed)
+//   CSDot2F16      cs_6_4 -enable-16bit-types dot2add (2x F16 MAC -> F32)
+//   CSDot4I8       cs_6_4                     dot4add_i8packed (4x I8 MAC -> I32)
+//   CSLatencyFma   cs_6_0                     one serial FP32 FMA chain
+//   CSCuProbe      cs_6_0                     40 KiB LDS: one group per CU
 //
-// The dependent-FMA chain is a latency probe, not a throughput probe: the
-// implied clock it yields is derived from the documented RDNA2 VALU FMA
-// latency and is reported as derived, never as a measured clock.
+// The dependent-FMA chain is a latency probe, not a throughput probe. No clock
+// is derived from it: the 4-clock VALU assumption does not hold for wave64.
+// The roofline derives a clock from the measured FP32 peak instead.
 
 cbuffer Params : register(b0) {
     uint iters;     // FMA iterations per accumulator chain
@@ -76,6 +77,30 @@ void CSFmaF16(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
         acc3 = acc3 * a + b;
     }
     const float16_t2 folded = (acc0 + acc1) + (acc2 + acc3);
+    Sink[gpupk_flat_group(gid) * 64u + dtid.x] =
+        asuint(float(folded.x)) ^ asuint(float(folded.y));
+}
+
+#elif defined(GPUPK_ALU_F16_MIN16)
+
+// Relaxed FP16 probe: min16float in a cs_6_0 profile, without
+// -enable-16bit-types. The DXIL is allowed to promote the operations to FP32;
+// the value of this row is precisely whether the console PSO accepts the
+// relaxed half type at all (the native float16_t variants are rejected with
+// E_INVALIDARG). It is a data point, not a claim of packed-half throughput.
+[numthreads(64, 1, 1)]
+void CSFmaF16Min16(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
+    const min16float2 a = min16float2(gpupk_seed(dtid.x), gpupk_seed(dtid.x + 1u));
+    const min16float2 b = min16float2(gpupk_seed(dtid.x + 2u), gpupk_seed(dtid.x + 3u));
+    min16float2 acc0 = a, acc1 = b, acc2 = a + b, acc3 = a - b;
+    [loop]
+    for (uint i = 0u; i < iters; ++i) {
+        acc0 = acc0 * b + a;
+        acc1 = acc1 * a + b;
+        acc2 = acc2 * b + a;
+        acc3 = acc3 * a + b;
+    }
+    const min16float2 folded = (acc0 + acc1) + (acc2 + acc3);
     Sink[gpupk_flat_group(gid) * 64u + dtid.x] =
         asuint(float(folded.x)) ^ asuint(float(folded.y));
 }

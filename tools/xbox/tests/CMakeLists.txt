@@ -78,4 +78,8 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(NAME xllama-ceiling-roofline
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_rkva_ceiling_roofline.py)
+    add_test(NAME xllama-gpupeak-stream-model
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_gpupeak_stream_model.py)
+    add_test(NAME xllama-gpupeak-dxil-fresh
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/compile-gpupeak-shaders.py --check)
 endif()

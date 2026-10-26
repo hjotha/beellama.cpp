@@ -44,10 +44,6 @@ inline constexpr double kGpupeakNominalFastGbs = 560.0;
 inline constexpr double kGpupeakNominalSlowGbs = 336.0;
 inline constexpr uint32_t kGpupeakNominalDualCu = 52;
 
-// Documented RDNA2 VALU FMA latency in clocks. Only used to turn the dependent
-// FMA chain into an *implied* clock; the probe never reports it as measured.
-inline constexpr double kGpupeakRdna2FmaLatencyClocks = 4.0;
-
 // Default plan. The 1 GiB pass is opt-in through gpupeak-opts.txt because two
 // 1 GiB committed buffers plus the host pattern vector are close to the
 // reported 4.35 GB GPU budget once the app's own allocations exist.
@@ -90,7 +86,7 @@ GpupeakGrid gpupeak_plan_grid(std::uint32_t total_groups);
 // shader's grid-stride mapping exactly:
 //   flat = i % (gx*gy*256); dtid.x = flat % (gx*256); gid.x = dtid.x / 256
 //   words = (dtid.x + 1, gid.x + 1, n_vec, mode)
-// The read validation pass folds the per-group XOR the shader wrote and must
+// The read validation pass folds one accumulator per flat thread and must
 // equal this value, which proves every 16-byte vector was actually loaded.
 std::uint32_t gpupeak_pattern_xor(std::uint64_t n_vec, std::uint32_t groups_x,
                                   std::uint32_t groups_y, std::uint32_t mode);
@@ -135,20 +131,13 @@ inline std::uint64_t gpupeak_alu_flops(const char* probe, std::uint32_t groups,
     const std::string name = probe ? probe : "";
     if (name == "fma_f32")
         return threads * iters * 8u * static_cast<std::uint64_t>(kGpupeakFlopPerFmaF32);
-    if (name == "fma_f16")
+    if (name == "fma_f16" || name == "fma_f16_min16")
         return threads * iters * 4u * static_cast<std::uint64_t>(kGpupeakFlopPerFmaF16x2);
     if (name == "dot2_f16")
         return threads * iters * 4u * static_cast<std::uint64_t>(kGpupeakFlopPerDot2F16);
     if (name == "dot4_i8")
         return threads * iters * 4u * static_cast<std::uint64_t>(kGpupeakOpsPerDot4I8);
     return 0u;
-}
-
-// The dependent chain issues one FMA per iteration on one lane per thread; the
-// implied clock assumes the documented 4-clock latency and is labelled
-// derived wherever it is printed.
-inline double gpupeak_implied_clock_mhz(double seconds_per_fma) {
-    return seconds_per_fma > 0.0 ? kGpupeakRdna2FmaLatencyClocks / seconds_per_fma / 1e6 : 0.0;
 }
 
 // One probe row. Every timed row keeps its own GPU and CPU seconds so the
@@ -167,6 +156,8 @@ struct GpupeakRow {
     std::uint32_t threads = 0;
     std::uint32_t runs = 0;
     std::uint64_t iters = 0;
+    std::uint32_t checksum = 0;          // observed fold (validation rows only)
+    std::uint32_t expected_checksum = 0; // analytic fold (validation rows only)
     bool gpu_valid = false;
     bool checksum_ok = false;
     bool checksum_checked = false;
@@ -213,9 +204,6 @@ struct GpupeakResult {
     GpupeakDeviceInfo device;
     std::vector<GpupeakRow> rows;
     std::vector<std::string> pso_errors; // "probe: hr=0x..." — absent PSOs, no fake rows
-    std::uint32_t catalog_frequency_mhz = 0; // 0 when the API exposes nothing
-    double implied_clock_mhz = 0.0;          // derived from the dependent chain
-    double implied_clock_seconds_per_fma = 0.0;
     bool d3d12_ran = false;
     std::string error;
 };
