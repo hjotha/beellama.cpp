@@ -48,7 +48,7 @@ sensitivity gate: a one-ulp change to `denom` must be detected.
 ## Expected effect (estimate, not measured on hardware)
 
 DXIL instruction accounting of the fast shared-tile loop (8 KV rows,
-2 queries × 6 heads, `tools/xbox/.oc-artifacts` helpers in the A2 branch):
+2 queries × 6 heads, `tools/xbox/tests/rkva_dxil_loop_cost.py`):
 
 | per KV row per lane | production | fast arm | delta |
 | --- | --- | --- | --- |
@@ -83,5 +83,6 @@ build is active.
 ## Related
 
 * `docs/rkva-2xn256-status.md` – range qualification and measured throughput.
-* `docs/rkva-range-profiling.md` – profile schema and bucket names.
 * `docs/xbox-position-overflow.md` – kernel-selection modes and split policies.
+* `tools/xbox/uwp/rkva/rkva-range-profile.h` – profile schema, bucket names and the
+  `kvarn4_mq2_skip` bucket added here.
