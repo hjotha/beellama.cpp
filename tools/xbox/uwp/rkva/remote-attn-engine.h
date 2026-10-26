@@ -185,6 +185,7 @@ class RemoteAttnEngine {
     // enabled and the dedicated PSO exists, nq 2..9 native KVarN4 mode-2 tiles
     // score the fast shared record tile with dot4add_i8packed instead of the
     // F32 dot. Control path only.
+    void set_decode_rowlane(bool enabled) { decode_rowlane_ = enabled; }
     void set_mq_i8(bool enabled) {
         mq_i8_ = enabled;
     }
@@ -333,6 +334,9 @@ class RemoteAttnEngine {
     // Native KVarN4 revision-3 wave64 decode specialization (nq == 1).
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_decode_prefix_pso_;
     std::string kvarn4_decode_prefix_status_ = "not initialized";
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_decode_rowlane_pso_;
+    std::string kvarn4_decode_rowlane_status_ = "not initialized";
+    bool decode_rowlane_ = false;
 
     // Profiling (default off). Timestamp slots are fixed per stage so a future
     // fused upload+attention command list cannot alias them.

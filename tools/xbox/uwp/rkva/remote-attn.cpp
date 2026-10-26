@@ -194,6 +194,8 @@ struct remote_state {
     bool fp8_gpu_enabled = true;
     // Opt-in INT8 QK prefill kernel (default off, NOT bit-exact): LocalState flag file.
     bool mq_i8_enabled = false;
+    // Opt-in FP32 row-per-lane QK decode (default off).
+    bool decode_rowlane_enabled = false;
     // Opt-in nq1 fence spin (default off): LocalState flag file.
     bool fence_spin_enabled = false;
     rpc_profile_counter rpc_profile[32]{};
@@ -324,6 +326,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         state.bulk_dispatch_stored = {};
         state.fp8_gpu_enabled =
             !std::ifstream(g_snapshot_local_folder + "\\rkva-fp8-gpu-off.flag").good();
+        state.decode_rowlane_enabled =
+            std::ifstream(g_snapshot_local_folder + "\\rkva-decode-rowlane.flag").good();
         // Opt-in, default off, and not bit-exact: see
         // docs/rkva-prefill-int8-dot4.md.
         state.mq_i8_enabled =
@@ -368,6 +372,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             return RKVA_ERR_GPU;
         }
         state.engine->set_mq_i8(state.mq_i8_enabled);
+        state.engine->set_decode_rowlane(state.decode_rowlane_enabled);
         if (state.fence_spin_enabled)
             state.engine->set_fence_spin_budget_us(2000);
 

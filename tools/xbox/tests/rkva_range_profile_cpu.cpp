@@ -353,6 +353,13 @@ int main() {
     s.mode = 2;
     assert(bucket_key(s) ==
            "attention/kvarn4-prefix/optimized-kvarn4_decode_fine/nq1/r16k-32k/warm");
+    s.decode_rowlane = 1;
+    assert(bucket_key(s) ==
+           "attention/kvarn4-prefix/optimized-kvarn4_decode_rowlane/nq1/r16k-32k/warm");
+    s.bulk_segment = 1;
+    assert(bucket_key(s).find("optimized-kvarn4_decode_rowlane/") != std::string::npos);
+    s.bulk_segment = 0;
+    s.decode_rowlane = 0;
     s.decode_opt = 0;
     s.mode = 1;
     s.n_tokens = 3;
@@ -501,6 +508,10 @@ int main() {
     h.kvarn4_mq4_status = "ready";
     h.kvarn4_mq_i8_available = true;
     h.kvarn4_mq_i8_status = "ready";
+    h.kvarn4_decode_rowlane_available = true;
+    h.kvarn4_decode_rowlane_enabled = true;
+    h.kvarn4_decode_rowlane_status = "ready";
+    r.counters.kvarn4_decode_rowlane_calls = 3;
     h.kvarn4_decode_available = true;
     h.kvarn4_decode_status = "ready";
     r.counters.kvarn4_mq_calls = 13;
@@ -526,6 +537,8 @@ int main() {
                   "\"status\":\"ready\",\"calls\":5},"
                   "\"mq2_i8\":{\"available\":true,\"status\":\"ready\","
                   "\"calls\":11,\"exact\":false}}") != std::string::npos);
+    assert(json.find("\"kvarn4_decode_rowlane\":{\"available\":true,\"enabled\":true,"
+                     "\"status\":\"ready\",\"calls\":3}") != std::string::npos);
     assert(json.find("\"kvarn4_decode\":{\"nq\":1,"
                      "\"descriptor_revision\":3,\"required_wave_lanes\":64,"
                      "\"mode_map\":\"1:kvarn4_decode_balanced 2:kvarn4_decode_fine "
@@ -612,6 +625,7 @@ int main() {
     assert(r.counters.calls[kAttention] == 0);
     assert(r.counters.bulk_calls == 0);
     assert(r.counters.kvarn4_decode_calls == 0);
+    assert(r.counters.kvarn4_decode_rowlane_calls == 0);
     const std::string empty = Recorder().json(Header{});
     assert(empty.find("\"buckets\":{}") != std::string::npos);
     std::fprintf(stderr, "rkva_range_profile_cpu: ok\n");
