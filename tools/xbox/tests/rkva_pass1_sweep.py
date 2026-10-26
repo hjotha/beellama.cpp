@@ -242,7 +242,8 @@ def execute(args):
     points = []
     sessions = []
     meta = {"hello": {}, "rows": rows_targets, "nq": nq_targets, "seed": args.seed,
-            "wire": "fp8", "mode": 2, "tail": args.tail, "segment_queries": SEGMENT_QUERIES}
+            "wire": "fp8", "mode": 2, "tail": args.tail, "segment_queries": SEGMENT_QUERIES,
+            "expect_decode_kernel": args.expect_decode_kernel}
     try:
         flags = PROTO_F16 | PROTO_F32 | PROTO_NATIVE_REWIND_V2 | PROTO_SERIAL_PREFIX
         capacity_probe = max(rows_targets) + slack
@@ -317,6 +318,8 @@ def execute(args):
                         nq, int(((report.get("engine") or {}).get("wave_lane_min")) or 64),
                         args.tail)
                     # The opt-in INT8 MQ2 variant replaces the fine tile only.
+                    if nq == 1 and args.expect_decode_kernel:
+                        expected = args.expect_decode_kernel
                     if args.expect_mq2_kernel and expected == "kvarn4_mq2_fine":
                         expected = args.expect_mq2_kernel
                     point = select_point(report, expected, segments, nq)
@@ -423,6 +426,18 @@ def self_test():
         assert "fallback" in str(exc), exc
     else:
         raise AssertionError("kernel fallback was accepted")
+    # Opt-in decode name must select its own bucket and reject the default.
+    rowlane = "kvarn4_decode_rowlane"
+    report = synthetic_report(1, 1)
+    old = expected_kernel_for(1)
+    report = json.loads(json.dumps(report).replace(old, rowlane))
+    assert select_point(report, rowlane, 1, 1)["kernel"] == rowlane
+    try:
+        select_point(synthetic_report(1, 1), rowlane, 1, 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("rowlane fallback was accepted")
     # Missing GPU timestamps must be rejected.
     bad = synthetic_report(8, 1)
     bad["engine"]["gpu_timestamps"] = False
@@ -466,6 +481,8 @@ def main():
     parser.add_argument("--nq", default=DEFAULT_NQ)
     parser.add_argument("--origin", type=int, default=102400)
     parser.add_argument("--tail", type=int, default=128, choices=(0, 128))
+    parser.add_argument("--expect-decode-kernel", choices=("kvarn4_decode_rowlane",),
+                        help="require the LocalState opt-in rowlane PSO for nq=1")
     parser.add_argument("--expect-mq2-kernel", choices=("kvarn4_mq2_i8",),
                         help="require this opt-in variant instead of kvarn4_mq2_fine for nq>1")
     parser.add_argument("--runs", type=int, default=3)
@@ -491,6 +508,7 @@ def main():
         "execute": False,
         "plan": {"host": args.host, "port": args.port, "origin": args.origin,
                  "tail": args.tail, "runs": args.runs, "warmup": args.warmup,
+                 "expect_decode_kernel": args.expect_decode_kernel,
                  "segment_queries": SEGMENT_QUERIES, "rows": rows_targets, "nq": nq_targets},
         "model_table": table,
         "note": "FLOP/bytes are the model, not a measurement; --execute records GPU timestamps",

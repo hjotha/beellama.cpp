@@ -44,9 +44,9 @@ def opcode(line):
     return tokens[-1] if tokens else None
 
 
-def parse(path):
+def parse(path, entry="CSRangeAttnKvarn4Mq"):
     lines = pathlib.Path(path).read_text().splitlines()
-    start = next(i for i, l in enumerate(lines) if l.startswith('define void @CSRangeAttnKvarn4Mq'))
+    start = next(i for i, l in enumerate(lines) if l.startswith('define void @' + entry + '('))
     order, blocks = [], {}
     cur = None
     for l in lines[start:]:
@@ -69,7 +69,7 @@ def parse(path):
         term = b['term'] or ''
         m = re.match(r'br i1 .*label %(\S+), label %(\S+)', term)
         if m:
-            succ[label] = [m.group(1).rstrip(','), m.group(2)]
+            succ[label] = [m.group(1).rstrip(','), m.group(2).rstrip(',')]
         else:
             m = re.match(r'br label %(\S+)', term)
             succ[label] = [m.group(1)] if m else []
