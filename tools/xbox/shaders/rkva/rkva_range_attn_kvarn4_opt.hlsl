@@ -35,7 +35,7 @@
 // is unchanged token for token.
 //
 // RKVA_DECODE_OPT=1 (descriptor revision 3, nq=1 wave64 decode PSO,
-// entry CSRangeAttnKvarn4Decode): opt-in specialization for Xbox Series X wave64
+// entry CSRangeAttnKvarn4Decode): specialization for Xbox Series X wave64
 // (128 threads = 2 waves of 64 lanes, one 4-dim unit per lane). Halves LDS from
 // 4 wave slots (24 KiB) to 2 wave slots (12 KiB) to double CU/WGP occupancy,
 // removes the dead wave32 second-unit accumulators (q1/body1/tail1), ping-pongs
@@ -46,10 +46,10 @@
 // WaveActiveSum, and runs aligned record tiles before residual/tail rows so
 // tail accumulators stay zero throughout the record-tile loop and original Q is
 // loaded at most once per split when exact-tail rows are present.
-// RKVA_DECODE_ROWLANE=1 (with SERIAL_PREFIX and DECODE_OPT): separate opt-in
-// PSO using one KV row per lane for record QK, uniform-index broadcasts of
+// RKVA_DECODE_ROWLANE=1 (with SERIAL_PREFIX and DECODE_OPT): separate default-on
+// PSO (LocalState opt-out) using one KV row per lane for record QK, uniform-index broadcasts of
 // Q*scale and softmax weights, and the existing residual/tail/merge contract.
-// See rkva_decode_rowlane.hlsli. Default targets retain identical DXIL.
+// See rkva_decode_rowlane.hlsli. Other targets retain identical DXIL.
 #ifndef RKVA_SERIAL_PREFIX
 #define RKVA_SERIAL_PREFIX 0
 #endif
