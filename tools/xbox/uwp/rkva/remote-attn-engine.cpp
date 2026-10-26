@@ -390,7 +390,7 @@ bool RemoteAttnEngine::begin(std::string* error) {
     return true;
 }
 
-bool RemoteAttnEngine::submit(std::string* error) {
+bool RemoteAttnEngine::submit(std::string* error, bool allow_spin) {
     if (bulk_recording_)
         return true;
     if (terminal_failure_ || unconfirmed_submission_) {
@@ -428,7 +428,9 @@ bool RemoteAttnEngine::submit(std::string* error) {
         c.fence_spin_budget_us = uint64_t(fence_spin_budget_us());
     }
     if (blocked) {
-        const int64_t spin_budget_us = fence_spin_budget_us();
+        // Only nq1 decode waits ~0.2-0.6 ms; prefill segments run for milliseconds
+        // and would just burn a console core next to the network thread.
+        const int64_t spin_budget_us = allow_spin ? fence_spin_budget_us() : 0;
         bool spun_to_completion = false;
         uint64_t spin_ns = 0;
         if (spin_budget_us > 0) {
@@ -2598,7 +2600,7 @@ bool RemoteAttnEngine::attend_kvarn_bulk(uint32_t id, uint32_t layer, uint32_t n
 
     const prof_clock::time_point t_submit_start =
         prof ? prof_clock::now() : prof_clock::time_point{};
-    if (!submit(error)) {
+    if (!submit(error, n_tokens == 1)) {
         if (prof) {
             profile_->bulk.active = false;
             ++profile_->recorder.counters.failed_calls;
@@ -2789,7 +2791,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         }
     }
     bulk_recording_ = false;
-    if (!submit(error)) {
+    if (!submit(error, n_tokens == 1)) {
         s->valid = false;
         return false;
     }

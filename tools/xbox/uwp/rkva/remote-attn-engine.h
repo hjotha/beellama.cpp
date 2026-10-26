@@ -218,7 +218,8 @@ class RemoteAttnEngine {
     void transition(Buffer& buffer, D3D12_RESOURCE_STATES state);
     void uav_barrier(Buffer& buffer);
     bool begin(std::string* error);
-    bool submit(std::string* error);
+    // allow_spin: spin briefly on the fence before blocking (nq1 decode only).
+    bool submit(std::string* error, bool allow_spin = false);
     bool create_device(std::string* error);
     bool create_pipelines(std::string* error);
     bool ensure_scratch(uint32_t n_tokens, std::string* error);
