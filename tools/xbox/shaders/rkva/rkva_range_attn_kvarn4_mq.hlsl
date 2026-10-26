@@ -481,11 +481,16 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                         zs += qo[d] * kzv[d]; // Z from the unquantized Q
                         qsum += qp[d];
                     }
-                    // Reduce over the 8 lanes that share this 128-dim slice.
+                    // Only the quantization scale is slice-wide: `sq` multiplies
+                    // this lane's own partial dot, so every lane of the slice
+                    // must agree on it. `zs`, `qsum` and sum(Q8) must NOT be
+                    // reduced here -- they are this lane's partials, and the
+                    // 16-lane score reduction is what turns them into the
+                    // slice totals. Reducing them first hands every lane the
+                    // whole slice constant, so the score picks it up
+                    // RKVA_I8_SLICE_LANES times instead of once.
                     [unroll] for (uint st = RKVA_I8_SLICE_LANES / 2; st > 0; st >>= 1) {
                         mx = max(mx, WaveReadLaneAt(mx, lane ^ st));
-                        zs += WaveReadLaneAt(zs, lane ^ st);
-                        qsum += WaveReadLaneAt(qsum, lane ^ st);
                     }
                     float inv = mx > 0 ? RKVA_I8_MAXV / mx : 0.0f;
                     float sq = mx > 0 ? mx * (1.0f / RKVA_I8_MAXV) : 0.0f;
@@ -499,9 +504,6 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                     int te = int(round(qp[14] * inv)), tf = int(round(qp[15] * inv));
                     int s8 = t0i + t1i + t2i + t3i + t4i + t5i + t6i + t7i + t8i + t9i +
                              ta + tb + tc + td + te + tf;
-                    [unroll] for (uint st = RKVA_I8_SLICE_LANES / 2; st > 0; st >>= 1) {
-                        s8 += WaveReadLaneAt(s8, lane ^ st);
-                    }
                     uint4 packed;
                     packed.x = uint(t0i & 0xff) | (uint(t1i & 0xff) << 8) |
                                (uint(t2i & 0xff) << 16) | (uint(t3i & 0xff) << 24);
@@ -513,8 +515,10 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                                (uint(te & 0xff) << 16) | (uint(tf & 0xff) << 24);
                     q8[i] = packed;
                     q8scale[i] = sq;
-                    // Exact DC part of the Q8 rounding error: the residual is
-                    // -sum_d (Q'-sq*Q8)*(nibble-8), not -sum_d (Q'-sq*Q8)*nibble.
+                    // This lane's share of the exact DC part of the Q8 rounding
+                    // error: the residual is -sum_d (Q'-sq*Q8)*(nibble-8), not
+                    // -sum_d (Q'-sq*Q8)*nibble. Summed over the 16 lanes this is
+                    // C_s = Z_s + 8*sum_s(Q') - 8*sq_s*sum_s(Q8), once per slice.
                     q8const[i] = zs + 8.0f * (qsum - sq * float(s8));
                 }
             }
