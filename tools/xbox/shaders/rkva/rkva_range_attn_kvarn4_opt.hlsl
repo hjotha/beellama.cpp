@@ -46,8 +46,15 @@
 // WaveActiveSum, and runs aligned record tiles before residual/tail rows so
 // tail accumulators stay zero throughout the record-tile loop and original Q is
 // loaded at most once per split when exact-tail rows are present.
+// RKVA_DECODE_ROWLANE=1 (with SERIAL_PREFIX and DECODE_OPT): separate opt-in
+// PSO using one KV row per lane for record QK, uniform-index broadcasts of
+// Q*scale and softmax weights, and the existing residual/tail/merge contract.
+// See rkva_decode_rowlane.hlsli. Default targets retain identical DXIL.
 #ifndef RKVA_SERIAL_PREFIX
 #define RKVA_SERIAL_PREFIX 0
+#endif
+#ifndef RKVA_DECODE_ROWLANE
+#define RKVA_DECODE_ROWLANE 0
 #endif
 #ifndef RKVA_DECODE_OPT
 #define RKVA_DECODE_OPT 0
@@ -630,13 +637,22 @@ void CSRangeAttnKvarn4Decode(uint tid : SV_GroupIndex, uint3 group : SV_GroupID)
     // Record-backed body rows: complete groups, excluding the origin-0 sink group.
     uint record_lo = origin == 0 ? 128 : 0;
     uint record_hi = RKVA_WINDOW & ~127u;
+#if RKVA_DECODE_ROWLANE
+    // A full group supplies 64 rows to each wave; boundaries use the residual path.
+    uint fast_lo = (max(begin, record_lo) + 127u) & ~127u;
+    uint fast_hi = min(min(end, record_hi), tail_begin) & ~127u;
+#else
     uint fast_lo = (max(begin, record_lo) + RKVA_TILE - 1) & ~(RKVA_TILE - 1);
     uint fast_hi = min(min(end, record_hi), tail_begin) & ~(RKVA_TILE - 1);
+#endif
     if (fast_hi <= fast_lo) {
         fast_lo = end;
         fast_hi = end;
     }
 
+#if RKVA_DECODE_ROWLANE
+#include "rkva_decode_rowlane.hlsli"
+#else
     // Phase 1: Record tiles (8 aligned tokens of one complete record group per iteration).
     // Tail is guaranteed 0 during this phase. Hoist group metadata across the 128-token group.
     uint cached_rgroup = 0xFFFFFFFFu;
@@ -714,6 +730,8 @@ void CSRangeAttnKvarn4Decode(uint tid : SV_GroupIndex, uint3 group : SV_GroupID)
             }
         }
     }
+
+#endif
 
     // Phase 2: Residual body rows (stage rows and unaligned split edges).
     // Tail is still 0 during this phase; no branch on exactness.
