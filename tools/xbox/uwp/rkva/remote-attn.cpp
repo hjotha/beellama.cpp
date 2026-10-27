@@ -396,7 +396,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                 ack.reserved[0] |= RKVA_CAP_KVARN_SERIAL_PREFIX | RKVA_CAP_KVARN_BULK_ATTN |
                                    RKVA_CAP_KVARN_BULK_F16 | RKVA_CAP_KVARN_BULK_FP8 |
                                    RKVA_CAP_KVARN_BULK_FP8_RNE | RKVA_CAP_KVARN_COMPACT_STAGE |
-                                   RKVA_CAP_NATIVE_Q4_BULK | RKVA_CAP_NATIVE_Q8_BULK;
+                                   RKVA_CAP_NATIVE_Q4_BULK | RKVA_CAP_NATIVE_Q8_BULK |
+                                   RKVA_CAP_KVARN_BULK_512;
         }
         if (!state.native_rewind_v2_client)
             ack.supported_ops &= ~(1u << RKVA_KVARN_RANGE_REWIND);
@@ -810,7 +811,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         return RKVA_OK;
     }
     case RKVA_KVARN_RANGE_BULK_ATTN: {
-        if (req.version != RKVA_VERSION || !req.n_tokens || req.n_tokens > 256 ||
+        if (req.version != RKVA_VERSION || !req.n_tokens || req.n_tokens > 512 ||
             req.layer_id >= state.geo.n_layer_remote)
             return RKVA_ERR_BAD_PAYLOAD;
         auto it = state.sessions.find(req.session_id);
@@ -827,6 +828,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         if (it->second.native_q8 && it->second.range_storage != RKVA_RANGE_STORAGE_Q8_0)
             return RKVA_ERR_BAD_SESSION;
         if (it->second.native_q4 || it->second.native_q8) {
+            if (req.n_tokens > 256) return RKVA_ERR_BAD_PAYLOAD;
             // Layouts 4/5: ordered native row uploads plus queries in one round
             // trip. The host defers only the socket transaction (async overlap),
             // so the upload and the attention keep their wire order. Q/OUT may be

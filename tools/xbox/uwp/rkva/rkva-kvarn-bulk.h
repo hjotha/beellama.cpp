@@ -224,7 +224,7 @@ inline bool peek_wire(const uint8_t* data, size_t bytes, uint32_t* out_wire) {
     }
     rkva_kvarn_range_bulk header{};
     std::memcpy(&header, data, sizeof(header));
-    if (header.version != 1 || !header.segment_count || header.segment_count > 32 ||
+    if (header.version != 1 || !header.segment_count || header.segment_count > 64 ||
         header.reserved) {
         return false;
     }
@@ -257,11 +257,11 @@ inline bool validate_wire(const uint8_t* data, size_t bytes, uint32_t n_queries,
          expected_wire != RKVA_WIRE_FP8) ||
         !rkva_kvarn_range::valid_descriptor(descriptor, 256) ||
         !rkva_kvarn_range::serial_prefix(descriptor) || !n_head || !n_head_kv || n_head > 256 ||
-        n_head_kv > 256 || !n_queries || n_queries > 256)
+        n_head_kv > 256 || !n_queries || n_queries > 512)
         return false;
     rkva_kvarn_range_bulk header{};
     std::memcpy(&header, data, sizeof(header));
-    if (header.version != 1 || !header.segment_count || header.segment_count > 32 ||
+    if (header.version != 1 || !header.segment_count || header.segment_count > 64 ||
         header.total_queries != n_queries || header.reserved ||
         generation > UINT64_MAX - header.segment_count)
         return false;

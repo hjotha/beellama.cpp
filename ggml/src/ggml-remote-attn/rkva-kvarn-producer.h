@@ -131,7 +131,7 @@ public:
     bool prepare(const float * keys, const float * values, const int32_t * positions, uint32_t count,
                  const float * device_keys = nullptr, const float * device_values = nullptr) override {
         if (!cuda_) return true;
-        if (!keys || !values || !positions || !count || count > 256 || count > capacity_ - rows_) return false;
+        if (!keys || !values || !positions || !count || count > 512 || count > capacity_ - rows_) return false;
         for (uint32_t i = 0; i < count; ++i) {
             if (positions[i] != int64_t(origin_) + rows_ + i) return false;
         }

@@ -110,6 +110,7 @@ struct wavefront_plan {
 
 // Exact production shape guards for opt-in parent512/1024, physical tile256.
 bool is_serving_n256_plan(const wavefront_plan & plan);
+bool is_serving_n512_plan(const wavefront_plan & plan);
 bool is_serving_2x256_plan(const wavefront_plan & plan);
 
 // Rastreador de serviço progressivo de prefill

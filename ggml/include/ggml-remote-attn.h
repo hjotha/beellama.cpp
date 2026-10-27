@@ -154,6 +154,8 @@ GGML_API bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backe
 // True when the opt-in GGML_RKVA_ASYNC_LOCAL_REMOTE=1 overlap was accepted by a
 // native KVarN4 bulk-capable server. Always false for synchronous/local modes.
 GGML_API bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend);
+// True only when the connected native KVarN4 peer advertises 512-query bulk.
+GGML_API bool ggml_backend_remote_attn_kvarn_bulk_512_enabled(ggml_backend_t backend);
 // Native FP8 serving can retain CUDA operands and output in device memory.
 // Queried by the graph builder/CUDA backend for the active remote connection.
 GGML_API bool ggml_backend_remote_attn_cuda_enabled(void);

@@ -527,7 +527,7 @@ llama_context::llama_context(
     // An adaptive server first creates its local/MTP contexts. A global N256
     // request applies only to the remote target without recurrent rollback;
     // otherwise it must not impose UB512 on the local tier (e.g. XL UB128).
-    if (cparams.rkva_wavefront_tile == 256 &&
+    if ((cparams.rkva_wavefront_tile == 256 || cparams.rkva_wavefront_tile == 512) &&
             (!tcp_position_split || params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.n_rs_seq != 0)) {
         cparams.rkva_wavefront_tile = 0;
     }
@@ -539,6 +539,11 @@ llama_context::llama_context(
     if (cparams.rkva_wavefront_tile == 256 &&
             ((params.n_ubatch != 512 && params.n_ubatch != 1024) || params.n_batch < params.n_ubatch)) {
         throw std::invalid_argument("wavefront NxN256 requires requested ubatch=512 or 1024 and logical batch>=ubatch");
+    }
+    if (cparams.rkva_wavefront_tile == 512 &&
+            (params.n_ubatch < 1024 || params.n_ubatch > 4096 || params.n_ubatch % 512 != 0 ||
+             params.n_batch < params.n_ubatch)) {
+        throw std::invalid_argument("wavefront Nx512 requires ubatch a multiple of 512 from 1024 to 4096 and logical batch>=ubatch");
     }
     if (cparams.rkva_wavefront_tile) {
         LLAMA_LOG_WARN("RKVA wavefront experimental: tile=%u; eligible Qwen35 dense all-overflow single-sequence n_rs_seq=0 only; explicit RPC batching policy, no rollback after parent failure\n",
@@ -2380,7 +2385,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 // parent size; the scheduler can grow for an actual tiled graph on demand.
 // No-allocation fit estimates remain conservative at the requested parent size.
 static uint32_t rkva_physical_ubatch(const llama_cparams & cp) {
-    return cp.rkva_wavefront_tile == 256 ? std::min(cp.n_ubatch, 256u) : cp.n_ubatch;
+    return (cp.rkva_wavefront_tile == 256 || cp.rkva_wavefront_tile == 512) ? std::min(cp.n_ubatch, 256u) : cp.n_ubatch;
 }
 
 static uint32_t rkva_initial_reserve_tokens(const llama_cparams & cp, bool no_alloc) {
@@ -3999,8 +4004,14 @@ static const char * rkva_wavefront_fallback(const llm_graph_params & params, boo
     if (params.arch != LLM_ARCH_QWEN35 || params.gtype == LLM_GRAPH_TYPE_DECODER_MTP ||
             cp.ctx_type == LLAMA_CONTEXT_TYPE_MTP) return "unsupported_model_or_draft";
     if ((!input_only && !params.mctx) || !ub.pos || !ub.seq_id || !ub.n_seq_id) return "reserve_or_missing_input";
-    if (cp.rkva_wavefront_tile == 256) {
-        if ((cp.n_ubatch != 512 && cp.n_ubatch != 1024) || ub.n_tokens != cp.n_ubatch) {
+    if (cp.rkva_wavefront_tile == 128 &&
+            (ub.n_tokens != 256 || cp.embeddings || cp.embeddings_nextn || cp.embeddings_nextn_masked)) {
+        return "wf128_requires_complete_n256_parent";
+    }
+    if (cp.rkva_wavefront_tile == 256 || cp.rkva_wavefront_tile == 512) {
+        if ((cp.rkva_wavefront_tile == 256 && cp.n_ubatch != 512 && cp.n_ubatch != 1024) ||
+                (cp.rkva_wavefront_tile == 512 && (cp.n_ubatch < 1024 || cp.n_ubatch > 4096 || cp.n_ubatch % 512 != 0)) ||
+                ub.n_tokens != cp.n_ubatch) {
             return "requires_exact_requested_n256_parent";
         }
         if (cp.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cp.embeddings || cp.embeddings_nextn ||
@@ -4019,6 +4030,10 @@ static const char * rkva_wavefront_fallback(const llm_graph_params & params, boo
     if (!cp.remote_attn_position_split || !cp.kv_position_split_p || !params.backend_remote ||
             !ggml_backend_remote_attn_async_enabled(params.backend_remote) ||
             !ggml_backend_remote_attn_native_kvarn_enabled(params.backend_remote)) return "remote_native_async_required";
+    if (cp.rkva_wavefront_tile == 512 &&
+            !ggml_backend_remote_attn_kvarn_bulk_512_enabled(params.backend_remote)) {
+        return "remote_kvarn_bulk_512_required";
+    }
     if (cp.rkva_wavefront_rpc_batch == 4 && !ggml_backend_remote_attn_cohort_enabled(params.backend_remote)) {
         return "remote_cohort_capability_required";
     }
@@ -4615,7 +4630,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     uint32_t effective_ubatch = cparams.n_ubatch;
     auto * wavefront_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
     bool refine_wavefront = false;
-    if (cparams.rkva_wavefront_tile == 256) {
+    if (cparams.rkva_wavefront_tile == 256 || cparams.rkva_wavefront_tile == 512) {
         effective_ubatch = 256;
         const auto & batch = balloc->get_batch();
         const auto * kvarn = wavefront_hybrid ?

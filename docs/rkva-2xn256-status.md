@@ -682,3 +682,24 @@ full native state proof, raw responses and failure manifests remain preserved.
 The two long same-process FAIL manifests and the initial cold-prefill MTP
 comparison remain diagnostic evidence. No new Xbox package is required for this
 host CUDA/server change; the compiled UWP inputs remain byte-identical.
+
+## Experimental N128 and N512 serving
+
+`GGML_RKVA_WAVEFRONT_TILE=128` uses two ordered 128-query remote requests
+for a complete 256-token parent, while keeping the Qwen3.5 local model and
+attention computation at N256. Incomplete parents and embedding modes use the
+ordinary path. This remains opt-in: in one paired 129024-token benchmark it
+was slower on prefill than the production 2xN256 configuration.
+
+`GGML_RKVA_WAVEFRONT_TILE=512` permits 2–8 complete 512-token overflow tiles
+per parent (requested ubatch 1024–4096 in multiples of 512). It requires a
+connected asynchronous KVarN4 peer advertising `RKVA_CAP_KVARN_BULK_512`;
+otherwise the host refines to physical N256 before applying the batch. On the
+qualified RTX 4070 setup, 2xN512 caused VRAM pressure and CUDA graph eviction.
+
+`GGML_RKVA_WAVEFRONT_LOCAL_SPLIT=1` is an additional opt-in experiment for
+N512: one 512-query remote submission is joined with two local N256 attention
+computations using the same wait. It is off by default; the measured variant
+used more CUDA buffer memory and had lower prefill throughput. These paths do
+not change the production default. The hardware parity checks cover selected
+contexts and inputs, not every parent shape or supported configuration.

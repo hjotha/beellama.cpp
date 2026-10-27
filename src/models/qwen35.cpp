@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
 #include "llama-ext.h"
 #include "ggml-remote-attn.h"
 #include "llama-kv-cache-kvarn.h"
@@ -346,7 +347,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_finish(
 }
 
 void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params) {
-    GGML_ASSERT(params.wavefront_tile_size == 64 || params.wavefront_tile_size == 128 || params.wavefront_tile_size == 256);
+    GGML_ASSERT(params.wavefront_tile_size == 64 || params.wavefront_tile_size == 128 || params.wavefront_tile_size == 256 || params.wavefront_tile_size == 512);
     GGML_ASSERT(cparams.n_rs_seq == 0 && cparams.n_capture_layers == 0 && ubatch.n_seqs == 1);
     llama_wavefront::wavefront_plan plan;
     std::string error;
@@ -356,6 +357,9 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
     }
     if (params.wavefront_tile_size == 256 && !llama_wavefront::is_serving_n256_plan(plan)) {
         throw std::runtime_error("wavefront NxN256 requires exactly two or four complete overflow tiles");
+    }
+    if (params.wavefront_tile_size == 512 && !llama_wavefront::is_serving_n512_plan(plan)) {
+        throw std::runtime_error("wavefront Nx512 requires 2 to 8 complete overflow tiles");
     }
     auto * embeddings = build_inp_embd(model.tok_embd);
     cb(embeddings, "model.input_embed", -1);
@@ -372,10 +376,19 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
     GGML_ASSERT(!group_end.empty() && group_end.back() == n_layer - 1);
     const uint32_t groups = uint32_t(group_end.size());
     const uint32_t tiles = plan.n_tiles;
+    const char * split_option = std::getenv("GGML_RKVA_WAVEFRONT_LOCAL_SPLIT");
+    const bool split_local_512 = params.wavefront_tile_size == 512 && split_option &&
+            std::strcmp(split_option, "1") == 0;
     std::vector<llm_graph_params> tile_params(tiles, params);
     std::vector<std::unique_ptr<graph>> helpers;
+    // A 512-query RPC may contain two independent N256 local computations.
+    // Keep these params alive as long as their helper graph objects.
+    std::vector<llm_graph_params> half_params(tiles * 2, params);
+    std::vector<std::unique_ptr<graph>> half_helpers(tiles * 2);
     std::vector<std::unique_ptr<llm_graph_input_attn_kv>> tile_inputs;
+    std::vector<std::unique_ptr<llm_graph_input_attn_kv>> half_inputs(tiles * 2);
     std::vector<ggml_tensor *> tile_pos(tiles);
+    std::vector<ggml_tensor *> half_pos(tiles * 2, nullptr);
     std::vector<std::vector<ggml_tensor *>> activations(groups + 1,
             std::vector<ggml_tensor *>(tiles, nullptr));
     helpers.reserve(tiles);
@@ -385,6 +398,19 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
         tile_params[t].ubatch = plan.ubatch_tiles[t];
         tile_params[t].wavefront_tile_size = 0; // helpers never recursively build a parent graph
         helpers.emplace_back(new graph(model, tile_params[t], helper_only_tag{}));
+        if (params.wavefront_tile_size == 512) {
+            for (uint32_t half = 0; half < 2; ++half) {
+                std::vector<int32_t> selection(256);
+                for (uint32_t i = 0; i < 256; ++i) selection[i] = int32_t(half * 256 + i);
+                auto & hp = half_params[t * 2 + half];
+                hp.ubatch = llama_ubatch_subset(plan.ubatch_tiles[t], selection);
+                hp.wavefront_tile_size = 0;
+                half_helpers[t * 2 + half].reset(new graph(model, hp, helper_only_tag{}));
+                if (split_local_512) {
+                    half_inputs[t * 2 + half] = build_wavefront_attn_input(attn, tile.token_offset + half * 256, 256, true);
+                }
+            }
+        }
         tile_inputs.push_back(build_wavefront_attn_input(attn, tile.token_offset, tile.n_tokens));
         activations[0][t] = ggml_view_2d(ctx0, embeddings, embeddings->ne[0], tile.n_tokens,
                 embeddings->nb[1], size_t(tile.token_offset)*embeddings->nb[1]);
@@ -396,13 +422,76 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
                 ggml_view_2d(ctx0, positions, tile.n_tokens, components,
                     size_t(ubatch.n_tokens)*positions->nb[0], size_t(tile.token_offset)*positions->nb[0])),
                 int64_t(tile.n_tokens)*components);
+        if (params.wavefront_tile_size == 512) {
+            auto * matrix = ggml_reshape_2d(ctx0, tile_pos[t], 512, components);
+            for (uint32_t half = 0; half < 2; ++half) {
+                auto * view = ggml_view_2d(ctx0, matrix, 256, components, matrix->nb[1],
+                        size_t(half * 256) * matrix->nb[0]);
+                half_pos[t * 2 + half] = ggml_reshape_1d(ctx0, ggml_cont(ctx0, view), 256 * components);
+            }
+        }
     }
     // llm_graph_context constructors bind res->params. Restore the one parent
     // identity before allocation/reuse; the helpers never own an input setter.
     res->set_params(params);
+    if (params.wavefront_tile_size == 128 && ubatch.n_tokens == 256 && tiles == 2 &&
+            !cparams.embeddings && !cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+        // Keep all local Qwen operations at the serial N256 width. Only the
+        // remote/local split attention is divided into two 128-query RPCs.
+        // Two ordered submissions overlap while retaining same-layer history.
+        auto * current = embeddings;
+        int sections[4];
+        std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+        const float scale = hparams.f_attention_scale == 0.0f ?
+                1.0f / sqrtf(float(hparams.n_embd_head_v())) : hparams.f_attention_scale;
+        uint32_t submissions = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            auto * residual = current;
+            current = build_norm(current, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            if (hparams.is_recr(il)) {
+                current = build_layer_attn_linear(input->get_recr(), current, il);
+            } else {
+                auto terms = build_layer_attn_terms(current, positions, sections, il);
+                position_split_rpc_packet packets[2];
+                for (uint32_t t = 0; t < 2; ++t) {
+                    auto slice = [&](ggml_tensor * value) {
+                        auto * view = ggml_view_3d(ctx0, value, value->ne[0], value->ne[1], 128,
+                                value->nb[1], value->nb[2], size_t(t * 128) * value->nb[2]);
+                        return ggml_cont(ctx0, view);
+                    };
+                    packets[t] = helpers[t]->build_attn_position_split_rpc_prepare(tile_inputs[t].get(),
+                            slice(terms.q), slice(terms.k), slice(terms.v), scale, il, tile_pos[t], true);
+                    ggml_remote_attn_range_set_wavefront(packets[t].range);
+                    ++submissions;
+                }
+                // Both remote ranges are already submitted. Build the N256
+                // local attention once, then merge only after both waits.
+                auto local = build_attn_position_split_rpc_prepare(attn, terms.q, terms.k, terms.v,
+                        scale, il, positions, false, &packets[0]);
+                current = build_attn_position_split_rpc_complete(local, &packets[1]);
+                current = build_layer_attn_finish(current, terms.gate, il);
+            }
+            current = build_layer_finish(current, residual, il);
+            ggml_build_forward_expand(gf, current);
+        }
+        current = build_norm(current, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(current, "h_nextn", -1);
+        res->t_h_nextn = current;
+        if (out_ids && !cparams.embeddings_nextn_masked) current = ggml_get_rows(ctx0, current, out_ids);
+        cb(current, "result_norm", -1);
+        res->t_embd = current;
+        current = build_lora_mm(model.output, current, model.output_s);
+        cb(current, "result_output", -1);
+        res->t_logits = current;
+        ggml_build_forward_expand(gf, current);
+        LLAMA_LOG_INFO("RKVA wavefront graph: tile=128 tiles=2 groups=%u logical_rpc=%u envelopes=%u max_outstanding=2 parent_tokens=256 final_ffn_rows=256 masked=0\n",
+                groups, submissions, submissions);
+        return;
+    }
     std::vector<recurrent_tile_chain> states(static_cast<size_t>(n_layer));
     struct pending_cell {
         position_split_rpc_packet packet;
+        position_split_rpc_packet local_halves[2];
         attention_terms terms = {};
         ggml_tensor * residual = nullptr;
     };
@@ -427,22 +516,64 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
             const int first = step.group == 0 ? 0 : group_end[step.group - 1] + 1;
             for (int il = first; il < end; ++il) {
                 GGML_ASSERT(hparams.is_recr(il));
-                auto * residual = cur;
-                cur = helper.build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
-                helper.tile_chain = &states[size_t(il)];
-                cur = helper.build_layer_attn_linear(input->get_recr(), cur, il);
-                cur = helper.build_layer_finish(cur, residual, il);
-                // Commit/order is represented by graph operands, not by the
-                // construction cursor or a hidden update of the memory context.
-                ggml_build_forward_expand(gf, cur);
+                if (params.wavefront_tile_size == 512) {
+                    ggml_tensor * combined = nullptr;
+                    for (uint32_t half = 0; half < 2; ++half) {
+                        auto & local = *half_helpers[step.tile * 2 + half];
+                        auto * residual = ggml_view_2d(ctx0, cur, cur->ne[0], 256, cur->nb[1],
+                                size_t(half * 256) * cur->nb[1]);
+                        auto * part = local.build_norm(residual, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+                        local.tile_chain = &states[size_t(il)];
+                        part = local.build_layer_attn_linear(input->get_recr(), part, il);
+                        local.tile_chain = nullptr;
+                        part = local.build_layer_finish(part, residual, il);
+                        ggml_build_forward_expand(gf, part);
+                        combined = combined ? ggml_concat(ctx0, combined, part, 1) : part;
+                    }
+                    cur = combined;
+                } else {
+                    auto * residual = cur;
+                    cur = helper.build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+                    helper.tile_chain = &states[size_t(il)];
+                    cur = helper.build_layer_attn_linear(input->get_recr(), cur, il);
+                    cur = helper.build_layer_finish(cur, residual, il);
+                    ggml_build_forward_expand(gf, cur);
+                }
             }
             helper.tile_chain = nullptr;
             cell.residual = cur;
-            cur = helper.build_norm(cur, model.layers[end].attn_norm, nullptr, LLM_NORM_RMS, end);
-            cell.terms = helper.build_layer_attn_terms(cur, tile_pos[step.tile], sections, end);
+            if (params.wavefront_tile_size == 512) {
+                attention_terms halves[2];
+                for (uint32_t half = 0; half < 2; ++half) {
+                    auto & local = *half_helpers[step.tile * 2 + half];
+                    auto * part = ggml_view_2d(ctx0, cur, cur->ne[0], 256, cur->nb[1],
+                            size_t(half * 256) * cur->nb[1]);
+                    part = local.build_norm(part, model.layers[end].attn_norm, nullptr, LLM_NORM_RMS, end);
+                    halves[half] = local.build_layer_attn_terms(part, half_pos[step.tile * 2 + half], sections, end);
+                }
+                cell.terms = { ggml_concat(ctx0, halves[0].q, halves[1].q, 2),
+                               ggml_concat(ctx0, halves[0].k, halves[1].k, 2),
+                               ggml_concat(ctx0, halves[0].v, halves[1].v, 2),
+                               ggml_concat(ctx0, halves[0].gate, halves[1].gate, 1) };
+            } else {
+                cur = helper.build_norm(cur, model.layers[end].attn_norm, nullptr, LLM_NORM_RMS, end);
+                cell.terms = helper.build_layer_attn_terms(cur, tile_pos[step.tile], sections, end);
+            }
+            const bool split_local = split_local_512;
             cell.packet = helper.build_attn_position_split_rpc_prepare(tile_inputs[step.tile].get(),
-                    cell.terms.q, cell.terms.k, cell.terms.v, scale, end, tile_pos[step.tile]);
+                    cell.terms.q, cell.terms.k, cell.terms.v, scale, end, tile_pos[step.tile], split_local);
             ggml_remote_attn_range_set_wavefront(cell.packet.range);
+            if (split_local) {
+                auto slice_first = [&](ggml_tensor * value) {
+                    return ggml_cont(ctx0, ggml_view_3d(ctx0, value, value->ne[0], value->ne[1], 256,
+                            value->nb[1], value->nb[2], 0));
+                };
+                auto & local = *half_helpers[step.tile * 2];
+                cell.local_halves[0] = local.build_attn_position_split_rpc_prepare(
+                        half_inputs[step.tile * 2].get(), slice_first(cell.terms.q),
+                        slice_first(cell.terms.k), slice_first(cell.terms.v), scale, end,
+                        half_pos[step.tile * 2], false, &cell.packet);
+            }
             if (rpc_batch == 4) {
                 size_t begin = si, end_si = si + 1;
                 while (begin && execution[begin - 1].action == llama_wavefront::serving_step::phase::PREPARE) --begin;
@@ -456,8 +587,47 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
             peak = std::max(peak, ++outstanding);
         } else {
             GGML_ASSERT(outstanding > 0 && cell.packet.range);
-            auto * cur = helper.build_attn_position_split_rpc_complete(cell.packet);
-            cur = helper.build_layer_attn_finish(cur, cell.terms.gate, end);
+            ggml_tensor * cur = nullptr;
+            if (params.wavefront_tile_size == 512) {
+                ggml_tensor * shared_wait = nullptr;
+                if (split_local_512) {
+                    shared_wait = ggml_remote_attn_range_wait(ctx0, cell.packet.range);
+                    ggml_backend_sched_set_tensor_backend(sched, shared_wait, cell.packet.wire_backend);
+                    ggml_build_forward_expand(gf, shared_wait);
+                } else {
+                    cur = helper.build_attn_position_split_rpc_complete(cell.packet);
+                }
+                ggml_tensor * combined = nullptr;
+                for (uint32_t half = 0; half < 2; ++half) {
+                    auto & local = *half_helpers[step.tile * 2 + half];
+                    if (split_local_512 && half == 1) {
+                        auto slice_second = [&](ggml_tensor * value) {
+                            return ggml_cont(ctx0, ggml_view_3d(ctx0, value, value->ne[0], value->ne[1], 256,
+                                    value->nb[1], value->nb[2], size_t(256) * value->nb[2]));
+                        };
+                        cell.local_halves[half] = local.build_attn_position_split_rpc_prepare(
+                                half_inputs[step.tile * 2 + half].get(), slice_second(cell.terms.q),
+                                slice_second(cell.terms.k), slice_second(cell.terms.v), scale, end,
+                                half_pos[step.tile * 2 + half], false, &cell.packet);
+                    }
+                    auto * part = split_local_512 ? local.build_attn_position_split_rpc_complete(
+                            cell.local_halves[half], nullptr, shared_wait, half * 256) :
+                            ggml_view_2d(ctx0, cur, cur->ne[0], 256, cur->nb[1], size_t(half * 256) * cur->nb[1]);
+                    auto * gate = ggml_view_2d(ctx0, cell.terms.gate, cell.terms.gate->ne[0], 256,
+                            cell.terms.gate->nb[1], size_t(half * 256) * cell.terms.gate->nb[1]);
+                    part = local.build_layer_attn_finish(part, gate, end);
+                    if (step.group + 1 != groups) {
+                        auto * residual = ggml_view_2d(ctx0, cell.residual, cell.residual->ne[0], 256,
+                                cell.residual->nb[1], size_t(half * 256) * cell.residual->nb[1]);
+                        part = local.build_layer_finish(part, residual, end);
+                    }
+                    combined = combined ? ggml_concat(ctx0, combined, part, 1) : part;
+                }
+                cur = combined;
+            } else {
+                cur = helper.build_attn_position_split_rpc_complete(cell.packet);
+                cur = helper.build_layer_attn_finish(cur, cell.terms.gate, end);
+            }
             if (step.group + 1 == groups) {
                 // The last layer has no successor tile task. Preserve the
                 // baseline's parent-width final FFN and output-mask placement;
@@ -465,7 +635,7 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
                 terminal_attn[step.tile] = cur;
                 terminal_residual[step.tile] = cell.residual;
             } else {
-                cur = helper.build_layer_finish(cur, cell.residual, end);
+                if (params.wavefront_tile_size != 512) cur = helper.build_layer_finish(cur, cell.residual, end);
                 activations[step.group + 1][step.tile] = cur;
             }
             ggml_build_forward_expand(gf, cur);
@@ -476,16 +646,26 @@ void llama_model_qwen35::graph::build_wavefront(const llm_graph_params & params)
     ggml_tensor * cur = nullptr;
     bool final_masked = false;
     int64_t final_ffn_rows = 0;
-    if (params.wavefront_tile_size == 256) {
+    if (params.wavefront_tile_size == 256 || params.wavefront_tile_size == 512) {
         // Preserve every final FFN and normalization at N256. Concatenating
         // before the FFN would select parent-width GEMM kernels and defeat the contract.
         final_ffn_rows = 256;
         for (uint32_t t = 0; t < tiles; ++t) {
             GGML_ASSERT(terminal_attn[t] && terminal_residual[t]);
-            auto * tile = helpers[t]->build_layer_finish(terminal_attn[t], terminal_residual[t], n_layer - 1);
-            GGML_ASSERT(tile->ne[1] == 256);
-            tile = helpers[t]->build_norm(tile, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-            cur = cur ? ggml_concat(ctx0, cur, tile, 1) : tile;
+            GGML_ASSERT(terminal_attn[t]->ne[1] == params.wavefront_tile_size &&
+                        terminal_residual[t]->ne[1] == params.wavefront_tile_size);
+            for (uint32_t offset = 0; offset < params.wavefront_tile_size; offset += 256) {
+                auto * attention = params.wavefront_tile_size == 256 ? terminal_attn[t] :
+                        ggml_view_2d(ctx0, terminal_attn[t], terminal_attn[t]->ne[0], 256,
+                                terminal_attn[t]->nb[1], size_t(offset) * terminal_attn[t]->nb[1]);
+                auto * residual = params.wavefront_tile_size == 256 ? terminal_residual[t] :
+                        ggml_view_2d(ctx0, terminal_residual[t], terminal_residual[t]->ne[0], 256,
+                                terminal_residual[t]->nb[1], size_t(offset) * terminal_residual[t]->nb[1]);
+                auto * tile = helpers[t]->build_layer_finish(attention, residual, n_layer - 1);
+                GGML_ASSERT(tile->ne[1] == 256);
+                tile = helpers[t]->build_norm(tile, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+                cur = cur ? ggml_concat(ctx0, cur, tile, 1) : tile;
+            }
         }
     } else {
         cur = terminal_attn[0];

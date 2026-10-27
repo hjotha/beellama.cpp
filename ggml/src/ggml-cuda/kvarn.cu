@@ -890,7 +890,7 @@ bool ggml_cuda_kvarn_native_append(
         ggml_fp16_t * append_k, ggml_fp16_t * append_v,
         void * records_k, void * records_v) {
     if (!keys || !values || !stage_k || !stage_v || !append_k || !append_v ||
-            !count || count > 256 || !heads || heads > 32 || !iterations || iterations > 128 ||
+            !count || count > 512 || !heads || heads > 32 || !iterations || iterations > 128 ||
             uint64_t(global_begin) + count > INT32_MAX) return false;
     const uint32_t groups = (global_begin + count) / 128 - global_begin / 128;
     if (groups && (!records_k || !records_v)) return false;
