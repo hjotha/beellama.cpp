@@ -24,6 +24,8 @@ RKVA_MQ_GQA2_BASE environment variable). Override the preprocessor with CPP.
 Run: python3 tools/xbox/tests/test_rkva_mq_gqa2_layout.py
 """
 import os
+import hashlib
+import importlib.util
 import pathlib
 import re
 import shutil
@@ -34,6 +36,21 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 SHADER = ROOT / "tools/xbox/shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl"
 WRAPPER = SHADER.with_name("rkva_range_attn_kvarn4_mq_gqa2.hlsl")
+GENERATED = ROOT / "tools/xbox/shaders/generated"
+GQA2_HEADER = GENERATED / "rkva_range_attn_kvarn4_mq2_gqa2_dxil.h"
+GQA2_DXIL_SHA256 = "b26dd85cb5512225dcb10333fc53a7a7b52676ccac2d480ed237fdcf92565a99"
+GQA2_DXIL_BYTES = 47924
+# Generated headers for the shipped variants must stay byte-identical; any
+# intentional regeneration has to update these pins and the review record.
+DEFAULT_HEADER_SHA256 = {
+    "rkva_range_attn_kvarn4_mq2_dxil.h":
+        "82e20e0d80616c7d35e64ff4409dc549d154a2f5d7eee2c335a9e9b43c16b179",
+    "rkva_range_attn_kvarn4_mq4_dxil.h":
+        "d5b3a63cb4d2e4450ac964e7178db27c78e0d35911bdbce1f3e9eda21598b512",
+    "rkva_range_attn_kvarn4_mq2_i8_dxil.h":
+        "734bfd28fa58b10e643de3f4ddec601d9f6cf9f7f92a8b341cf588bdedce3168",
+}
+
 BASE_SHA = os.environ.get(
     "RKVA_MQ_GQA2_BASE", "8bad8e84e67e9fcd43d12f637962b87685e0fecc"
 )
@@ -247,6 +264,50 @@ class Gqa2CompileContractTest(unittest.TestCase):
                 proc = preprocess(probe)
                 self.assertNotEqual(proc.returncode, 0, proc.stdout)
                 self.assertIn(message, proc.stderr)
+
+
+def embedded_header(path):
+    text = path.read_text()
+    match = re.search(r"static const uint8_t g_(rkva_range_\w+_dxil)\[\] = \{(.*?)\};",
+                      text, re.S)
+    if match is None:
+        raise AssertionError(f"no embedded DXIL array in {path}")
+    values = [int(value, 16) for value in re.findall(r"0x([0-9a-fA-F]{2})", match.group(2))]
+    return match.group(1), bytes(values), text
+
+
+class GeneratedDxilTest(unittest.TestCase):
+    def test_candidate_header_embeds_the_real_dxil(self):
+        symbol, data, text = embedded_header(GQA2_HEADER)
+        self.assertEqual(symbol, "rkva_range_attn_kvarn4_mq2_gqa2_dxil")
+        self.assertEqual(len(data), GQA2_DXIL_BYTES)
+        self.assertEqual(hashlib.sha256(data).hexdigest(), GQA2_DXIL_SHA256)
+        self.assertIn("// Target specialization: attn_kvarn4_mq2_gqa2", text)
+        self.assertIn(
+            "// Source SHA256: " + hashlib.sha256(WRAPPER.read_bytes()).hexdigest(), text)
+        self.assertIn(
+            '// Included "rkva_range_attn_kvarn4_mq.hlsl" SHA256: ' +
+            hashlib.sha256(SHADER.read_bytes()).hexdigest(), text)
+
+    def test_project_renderer_reproduces_the_candidate_header(self):
+        renderer_path = ROOT / "tools/xbox/scripts/render-rkva-dxil-header.py"
+        spec = importlib.util.spec_from_file_location("rkva_dxil_render", renderer_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _, data, text = embedded_header(GQA2_HEADER)
+        with tempfile.TemporaryDirectory(prefix="rkva-gqa2-header-") as temporary:
+            binary = pathlib.Path(temporary) / "gqa2.dxil"
+            binary.write_bytes(data)
+            rendered, rendered_data = module.render(
+                binary, WRAPPER, "attn_kvarn4_mq2_gqa2", "cs_6_0", "")
+        self.assertEqual(rendered_data, data)
+        self.assertEqual(rendered, text)
+
+    def test_shipped_generated_headers_are_unchanged(self):
+        for name, expected in DEFAULT_HEADER_SHA256.items():
+            with self.subTest(header=name):
+                path = GENERATED / name
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected)
 
 
 if __name__ == "__main__":

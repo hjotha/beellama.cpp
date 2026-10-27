@@ -35,6 +35,12 @@
 #else
     #define RKVA_HAS_KVARN4_MQ2_I8_DXIL 0
 #endif
+#if __has_include("rkva_range_attn_kvarn4_mq2_gqa2_dxil.h")
+    #include "rkva_range_attn_kvarn4_mq2_gqa2_dxil.h"
+    #define RKVA_HAS_KVARN4_MQ2_GQA2_DXIL 1
+#else
+    #define RKVA_HAS_KVARN4_MQ2_GQA2_DXIL 0
+#endif
 #include "rkva_range_attn_kvarn4_opt_dxil.h"
 #include "rkva_range_attn_kvarn4_opt_prefix_dxil.h"
 #if __has_include("rkva_range_attn_kvarn4_decode_rowlane_dxil.h")
@@ -196,6 +202,7 @@ struct BulkSegmentProfile {
     uint8_t decode_opt = 0;
     uint8_t decode_rowlane = 0;
     uint8_t int8_dot = 0;
+    uint8_t gqa2 = 0;
     uint8_t direct_output = 0;
     uint8_t optimized = 0;
     uint64_t upload_bytes = 0;
@@ -779,6 +786,8 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         kvarn4_opt_prefix_status_ = why;
         kvarn4_mq_status_ = why;
         kvarn4_mq4_status_ = why;
+        kvarn4_mq_i8_status_ = why;
+        kvarn4_mq_gqa2_status_ = why;
         kvarn4_decode_prefix_status_ = why;
         kvarn4_decode_rowlane_status_ = why;
         for (uint32_t i = 0; i < 2; ++i) {
@@ -826,6 +835,8 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         kvarn4_opt_prefix_status_ = text;
         kvarn4_mq_status_ = text;
         kvarn4_mq4_status_ = text;
+        kvarn4_mq_i8_status_ = text;
+        kvarn4_mq_gqa2_status_ = text;
         kvarn4_decode_prefix_status_ = text;
         kvarn4_decode_rowlane_status_ = text;
         for (uint32_t i = 0; i < 2; ++i) {
@@ -882,6 +893,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         kvarn4_mq_status_ = text;
         kvarn4_mq4_status_ = text;
         kvarn4_mq_i8_status_ = text;
+        kvarn4_mq_gqa2_status_ = text;
     } else {
         D3D12_COMPUTE_PIPELINE_STATE_DESC mq = {};
         mq.pRootSignature = range_attn_fmt_opt_root_.Get();
@@ -928,6 +940,26 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         }
 #else
         kvarn4_mq_i8_status_ = "dxil header not generated (compile attn_kvarn4_mq2_i8)";
+#endif
+#if RKVA_HAS_KVARN4_MQ2_GQA2_DXIL
+        // Same root signature, bindings, 12 constants, reducer and partial
+        // layout as attn_kvarn4_mq2; only the local head count and host
+        // DispatchX change. Separate opt-in PSO, never the default path.
+        mq.pRootSignature = range_attn_fmt_opt_root_.Get();
+        mq.CS = {g_rkva_range_attn_kvarn4_mq2_gqa2_dxil,
+                 sizeof(g_rkva_range_attn_kvarn4_mq2_gqa2_dxil)};
+        hr =
+            device_->CreateComputePipelineState(&mq, IID_PPV_ARGS(&range_attn_kvarn4_mq_gqa2_pso_));
+        if (FAILED(hr)) {
+            std::snprintf(text, sizeof(text), "kvarn4 mq2 gqa2 pipeline state: 0x%08X",
+                          unsigned(hr));
+            range_attn_kvarn4_mq_gqa2_pso_.Reset();
+            kvarn4_mq_gqa2_status_ = text;
+        } else {
+            kvarn4_mq_gqa2_status_ = "ready";
+        }
+#else
+        kvarn4_mq_gqa2_status_ = "dxil header not generated (compile attn_kvarn4_mq2_gqa2)";
 #endif
     }
     // Native KVarN4 revision-3 wave64 decode kernel (nq == 1, 12 KiB LDS):
@@ -1109,37 +1141,7 @@ void RemoteAttnEngine::finish_profile_sample(rp::Sample& sample, bool timestamps
     ++c.calls[sample.kind];
     c.copy_regions += copy_regions;
     c.dispatches += dispatches;
-    if (sample.kind == rp::kAttention && sample.storage < rp::kStorageCount) {
-        if (sample.optimized) {
-            ++c.optimized_by_storage[sample.storage];
-            if (sample.storage == rp::kStorageQ4) {
-                ++c.optimized_calls;
-                if (sample.q_tile == 2 || sample.q_tile == 4) {
-                    ++c.q4_mq_calls[sample.q_tile / 4];
-                }
-            } else if ((sample.storage == rp::kStorageF16 || sample.storage == rp::kStorageQ8) &&
-                       (sample.q_tile == 2 || sample.q_tile == 4)) {
-                ++c.fmt_mq_calls[sample.storage][sample.q_tile / 4];
-            } else if (sample.storage == rp::kStorageKvarn4 && sample.serial_prefix) {
-                if (sample.decode_opt) {
-                    ++c.kvarn4_decode_calls;
-                    if (sample.decode_rowlane) ++c.kvarn4_decode_rowlane_calls;
-                } else if (sample.q_tile == rp::kKvarn4MqTile) {
-                    ++c.kvarn4_mq_calls;
-                    if (sample.int8_dot) {
-                        ++c.kvarn4_mq_i8_calls;
-                    }
-                } else if (sample.q_tile == rp::kKvarn4MqTileMax) {
-                    ++c.kvarn4_mq4_calls;
-                }
-            }
-        } else {
-            ++c.reference_by_storage[sample.storage];
-            if (sample.storage == rp::kStorageQ4) {
-                ++c.reference_q4_calls;
-            }
-        }
-    }
+    rp::count_attention(c, sample);
     sample.overhead_ns = elapsed_ns(start, prof_clock::now());
     profile_->recorder.record(sample);
 }
@@ -1289,6 +1291,18 @@ std::string RemoteAttnEngine::get_range_profile_json() {
         header.kvarn4_mq_available && range_attn_kvarn4_mq_i8_pso_;
     header.kvarn4_mq_i8_status =
         header.kvarn4_mq_available ? kvarn4_mq_i8_status_ : kvarn4_mq_status_;
+    header.kvarn4_mq_gqa2_available = header.kvarn4_mq_available && range_attn_kvarn4_mq_gqa2_pso_;
+    header.kvarn4_mq_gqa2_enabled = mq_gqa2_ && !mq_gqa2_conflict_;
+    if (mq_gqa2_conflict_) {
+        header.kvarn4_mq_gqa2_status = rp::mq_gqa2_arm_reason(rp::MqGqa2Arm::kConflict);
+    } else if (!mq_gqa2_) {
+        header.kvarn4_mq_gqa2_status = rp::mq_gqa2_arm_reason(rp::MqGqa2Arm::kOff);
+    } else if (!header.kvarn4_mq_available) {
+        header.kvarn4_mq_gqa2_status =
+            "requires the kvarn4 serial-prefix optimized pipeline: " + kvarn4_opt_prefix_status_;
+    } else {
+        header.kvarn4_mq_gqa2_status = kvarn4_mq_gqa2_status_;
+    }
     header.kvarn4_decode_rowlane_available =
         header.kvarn4_prefix_available[1] && range_attn_kvarn4_decode_rowlane_pso_;
     header.kvarn4_decode_rowlane_status = kvarn4_decode_rowlane_status_;
@@ -2388,6 +2402,7 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
         attn_sample.decode_opt = seg.decode_opt;
         attn_sample.decode_rowlane = seg.decode_rowlane;
         attn_sample.int8_dot = seg.int8_dot;
+        attn_sample.gqa2 = seg.gqa2;
         attn_sample.n_tokens = seg.n_queries;
         attn_sample.rows = seg.active_count;
         attn_sample.bytes = seg.query_bytes + seg.out_bytes;
@@ -2404,22 +2419,7 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
         ++c.calls[rp::kAttention];
         c.dispatches += seg.dispatches;
         c.copy_regions += 1;
-        if (seg.optimized) {
-            ++c.optimized_by_storage[rp::kStorageKvarn4];
-            if (seg.decode_opt) {
-                ++c.kvarn4_decode_calls;
-                if (seg.decode_rowlane) ++c.kvarn4_decode_rowlane_calls;
-            } else if (seg.q_tile == rp::kKvarn4MqTile) {
-                ++c.kvarn4_mq_calls;
-                if (seg.int8_dot) {
-                    ++c.kvarn4_mq_i8_calls;
-                }
-            } else if (seg.q_tile == rp::kKvarn4MqTileMax) {
-                ++c.kvarn4_mq4_calls;
-            }
-        } else {
-            ++c.reference_by_storage[rp::kStorageKvarn4];
-        }
+        rp::count_attention(c, attn_sample);
     }
 
     envelope.cpu_ns[rp::kCpuMapCopy] = total_map_copy_ns;
@@ -3119,6 +3119,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         uint32_t q_tile = 0;
         bool decode_opt = false;
         bool rowlane = false;
+        bool gqa2 = false;
         if (kvarn && prefix) {
             if (n_tokens == 1 && decode_rowlane_ && wave_lane_min_ == 64 && wave_lane_max_ == 64 &&
                 rp::kvarn4_decode_opt(q4_kernel_mode_, wave_lane_min_) &&
@@ -3143,6 +3144,15 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                     if (q_tile == rp::kKvarn4MqTile && mq_i8_ &&
                         range_attn_kvarn4_mq_i8_pso_) {
                         mq_pso = range_attn_kvarn4_mq_i8_pso_.Get();
+                    } else if (rp::kvarn4_gqa2_supported(
+                                   mq_gqa2_, mq_i8_, q4_kernel_mode_, prefix, storage, q_tile,
+                                   n_tokens, geo_.n_head, geo_.n_head_kv, geo_.head_dim,
+                                   s->precision_tail_tokens, wave_lane_min_, wave_lane_max_,
+                                   range_attn_kvarn4_mq_gqa2_pso_ != nullptr)) {
+                        // Two local heads per group; DispatchX below becomes
+                        // 3 * n_head_kv. Same partial buffer and reducer.
+                        mq_pso = range_attn_kvarn4_mq_gqa2_pso_.Get();
+                        gqa2 = true;
                     }
                     fmt_pso = mq_pso;
                 } else {
@@ -3173,6 +3183,10 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             rows = mq.split_rows;
         }
         const uint32_t query_groups = q_tile ? (n_tokens + q_tile - 1) / q_tile : n_tokens;
+        const uint32_t dispatch_x =
+            gqa2 ? rp::kvarn4_gqa2_dispatch_x(geo_.n_head_kv) : geo_.n_head_kv;
+        const bool int8_selected =
+            !gqa2 && mq_i8_ && q_tile == rp::kKvarn4MqTile && range_attn_kvarn4_mq_i8_pso_;
         const bool direct = split_k == 1;
         Buffer& kv = s->layer_kv[layer];
         transition(kv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -3204,7 +3218,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         cmd_->SetComputeRootUnorderedAccessView(
             5, range_opt_partials_.resource->GetGPUVirtualAddress());
         cmd_->SetComputeRootUnorderedAccessView(6, range_output_.resource->GetGPUVirtualAddress());
-        cmd_->Dispatch(geo_.n_head_kv, query_groups, split_k);
+        cmd_->Dispatch(dispatch_x, query_groups, split_k);
         if (!direct) {
             uav_barrier(range_opt_partials_);
             transition(range_opt_partials_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -3248,26 +3262,24 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             sample.optimized = 1;
             sample.direct_output = direct;
             sample.split_k = split_k;
-            sample.groups = geo_.n_head_kv * query_groups * split_k;
+            sample.groups = dispatch_x * query_groups * split_k;
             sample.q_tile = uint8_t(q_tile);
             sample.decode_opt = uint8_t(decode_opt ? 1 : 0);
             sample.decode_rowlane = uint8_t(rowlane);
-            sample.int8_dot =
-                uint8_t(mq_i8_ && q_tile == rp::kKvarn4MqTile &&
-                        range_attn_kvarn4_mq_i8_pso_ ? 1 : 0);
+            sample.int8_dot = uint8_t(int8_selected ? 1 : 0);
+            sample.gqa2 = uint8_t(gqa2 ? 1 : 0);
         }
         if (bulk_prof) {
             auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
             seg.optimized = 1;
             seg.direct_output = direct ? 1 : 0;
             seg.split_k = split_k;
-            seg.groups = geo_.n_head_kv * query_groups * split_k;
+            seg.groups = dispatch_x * query_groups * split_k;
             seg.q_tile = uint8_t(q_tile);
             seg.decode_opt = uint8_t(decode_opt ? 1 : 0);
             seg.decode_rowlane = uint8_t(rowlane);
-            seg.int8_dot =
-                uint8_t(mq_i8_ && q_tile == rp::kKvarn4MqTile &&
-                        range_attn_kvarn4_mq_i8_pso_ ? 1 : 0);
+            seg.int8_dot = uint8_t(int8_selected ? 1 : 0);
+            seg.gqa2 = uint8_t(gqa2 ? 1 : 0);
         }
         if (!bulk_gpu_query_) {
             cmd_->CopyBufferRegion(range_readback_.resource.Get(), 0, range_output_.resource.Get(),

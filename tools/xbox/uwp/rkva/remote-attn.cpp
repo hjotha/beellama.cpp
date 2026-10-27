@@ -194,6 +194,9 @@ struct remote_state {
     bool fp8_gpu_enabled = true;
     // Opt-in INT8 QK prefill kernel (default off, NOT bit-exact): LocalState flag file.
     bool mq_i8_enabled = false;
+    // Opt-in GQA2 two-local-head prefill kernel (default off): LocalState flag
+    // file. Mutually exclusive with the INT8 flag; a conflict is fail-closed.
+    rkva_rprof::MqGqa2Arm mq_gqa2_arm = rkva_rprof::MqGqa2Arm::kOff;
     // FP32 row-per-lane QK decode (default on, LocalState opt-out).
     bool decode_rowlane_enabled = true;
     rpc_profile_counter rpc_profile[32]{};
@@ -330,6 +333,11 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         // docs/rkva-prefill-int8-dot4.md.
         state.mq_i8_enabled =
             std::ifstream(g_snapshot_local_folder + "\\rkva-mq-i8.flag").good();
+        // Opt-in, default off, mutually exclusive with INT8: a conflict keeps
+        // GQA2 off (fail-closed) and is reported in the engine profile.
+        const bool mq_gqa2_flag =
+            std::ifstream(g_snapshot_local_folder + "\\rkva-mq-gqa2.flag").good();
+        state.mq_gqa2_arm = rkva_rprof::mq_gqa2_arm(mq_gqa2_flag, state.mq_i8_enabled);
         state.geo = hello;
         state.hello_done = true;
         state.native_rewind_v2_client = (hello.proto_flags & RKVA_PROTO_NATIVE_REWIND_V2) != 0;
@@ -368,6 +376,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             return RKVA_ERR_GPU;
         }
         state.engine->set_mq_i8(state.mq_i8_enabled);
+        state.engine->set_mq_gqa2(state.mq_gqa2_arm == rkva_rprof::MqGqa2Arm::kOn,
+                                  state.mq_gqa2_arm == rkva_rprof::MqGqa2Arm::kConflict);
         state.engine->set_decode_rowlane(state.decode_rowlane_enabled);
 
         rkva_hello_ack ack{};

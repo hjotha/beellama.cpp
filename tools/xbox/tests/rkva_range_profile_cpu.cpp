@@ -183,6 +183,112 @@ int main() {
     assert(kKvarn4MqWaveLanes == 64);
     assert(kKvarn4MqTileMax == 4);
 
+    // Opt-in GQA2 candidate: default-off flag, INT8 conflict fail-closed,
+    // rev3/native-KVarN4/fine-MQ2/tail128/GQA6/dim256/wave64/PSO gate and the
+    // candidate-only DispatchX = 3 * n_head_kv mapping.
+    assert(kKvarn4Gqa2HeadsPerGroup == 2);
+    assert(kKvarn4Gqa2GroupsPerKvHead == 3);
+    for (uint32_t nkv = 1; nkv <= 8; ++nkv) {
+        assert(kvarn4_gqa2_dispatch_x(nkv) == 3 * nkv);
+    }
+    assert(mq_gqa2_arm(false, false) == MqGqa2Arm::kOff);    // default off
+    assert(mq_gqa2_arm(true, false) == MqGqa2Arm::kOn);      // opt-in
+    assert(mq_gqa2_arm(false, true) == MqGqa2Arm::kOff);     // INT8 only
+    assert(mq_gqa2_arm(true, true) == MqGqa2Arm::kConflict); // fail-closed
+    assert(std::strcmp(mq_gqa2_arm_reason(MqGqa2Arm::kOff),
+                       "disabled (rkva-mq-gqa2.flag absent)") == 0);
+    assert(std::strcmp(mq_gqa2_arm_reason(MqGqa2Arm::kConflict),
+                       "disabled: conflicts with rkva-mq-i8.flag (fail-closed)") == 0);
+    assert(std::strcmp(mq_gqa2_arm_reason(MqGqa2Arm::kOn), "enabled") == 0);
+    const auto gqa2_ok = [](bool enabled, bool i8, uint32_t mode, bool rev3, uint32_t storage,
+                            uint32_t q_tile, uint32_t nq, uint32_t nh, uint32_t nkv, uint32_t dim,
+                            uint32_t tail, uint32_t wmin, uint32_t wmax, bool pso) {
+        return kvarn4_gqa2_supported(enabled, i8, mode, rev3, storage, q_tile, nq, nh, nkv, dim,
+                                     tail, wmin, wmax, pso);
+    };
+    for (uint32_t nq = 2; nq <= kOptMaxQueries; ++nq) {
+        assert(gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, nq, 24, 4, 256, 128, 64,
+                       64, true));
+    }
+    for (uint32_t nkv : {1u, 2u, 4u, 8u}) {
+        assert(gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 6 * nkv, nkv, 256,
+                       128, 64, 64, true));
+    }
+    assert(!gqa2_ok(false, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // opt-out
+    assert(!gqa2_ok(true, true, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // INT8 conflict
+    assert(!gqa2_ok(true, false, kModeOptBalanced, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64,
+                    64, true));
+    assert(!gqa2_ok(true, false, kModeOptCoarse, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64,
+                    64, true));
+    assert(!gqa2_ok(true, false, kModeOptFine, false, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // descriptor rev1/2
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageF16, 2, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // not KVarN4
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 4, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // not the MQ2 tile
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 1, 24, 4, 256, 128, 64, 64,
+                    true)); // decode nq1
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 10, 24, 4, 256, 128, 64, 64,
+                    true)); // over 9
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 128, 128, 64, 64,
+                    true)); // head_dim
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 32, 4, 256, 128, 64, 64,
+                    true)); // GQA 8
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 0, 256, 128, 64, 64,
+                    true)); // no KV head
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 0, 64, 64,
+                    true)); // zero tail
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 64, 64, 64,
+                    true)); // other tail
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 32, 128,
+                    true)); // not fixed wave64
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 128,
+                    true)); // not fixed wave64
+    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                    false)); // PSO missing
+    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, false, true), "kvarn4_mq2_gqa2") == 0);
+    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 4, false, true), "kvarn4_mq4_balanced") == 0);
+    assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, true, true), "kvarn4_mq2_i8") == 0);
+    assert(std::strcmp(mq_kernel_name(kStorageQ4, 2, false, true), "q4_mq2_fine") == 0);
+
+    // Counter classification is shared by ordinary and bulk samples: GQA2 is
+    // a subset of mq2 calls, never an INT8 call, and the default sample is
+    // unchanged.
+    {
+        Counters counts;
+        Sample g;
+        g.kind = kAttention;
+        g.storage = kStorageKvarn4;
+        g.serial_prefix = 1;
+        g.optimized = 1;
+        g.mode = kModeOptFine;
+        g.q_tile = kKvarn4MqTile;
+        g.gqa2 = 1;
+        count_attention(counts, g);
+        assert(counts.kvarn4_mq_calls == 1);
+        assert(counts.kvarn4_mq_gqa2_calls == 1);
+        assert(counts.kvarn4_mq_i8_calls == 0);
+        g.gqa2 = 0;
+        g.int8_dot = 1;
+        count_attention(counts, g);
+        assert(counts.kvarn4_mq_calls == 2);
+        assert(counts.kvarn4_mq_gqa2_calls == 1);
+        assert(counts.kvarn4_mq_i8_calls == 1);
+        g.int8_dot = 0;
+        count_attention(counts, g);
+        assert(counts.kvarn4_mq_calls == 3);
+        assert(counts.kvarn4_mq_gqa2_calls == 1);
+        assert(counts.kvarn4_mq_i8_calls == 1);
+        g.q_tile = 0;
+        g.decode_opt = 1;
+        g.decode_rowlane = 1;
+        count_attention(counts, g);
+        assert(counts.kvarn4_decode_calls == 1);
+        assert(counts.kvarn4_decode_rowlane_calls == 1);
+    }
+
     // Native KVarN4 wave64 decode kernel and split policy (nq == 1):
     assert(kKvarn4DecodeWaveLanes == 64);
     assert(kvarn4_decode_opt(kModeOptBalanced, 64));
@@ -335,6 +441,10 @@ int main() {
     assert(bucket_key(s) ==
            "attention/kvarn4-prefix/optimized-kvarn4_mq2_i8/nq2-16/r16k-32k/warm");
     s.int8_dot = 0;
+    s.gqa2 = 1;
+    assert(bucket_key(s) ==
+           "attention/kvarn4-prefix/optimized-kvarn4_mq2_gqa2/nq2-16/r16k-32k/warm");
+    s.gqa2 = 0;
     s.mode = 1;
     s.q_tile = 4;
     assert(bucket_key(s) ==
@@ -508,6 +618,9 @@ int main() {
     h.kvarn4_mq4_status = "ready";
     h.kvarn4_mq_i8_available = true;
     h.kvarn4_mq_i8_status = "ready";
+    h.kvarn4_mq_gqa2_available = true;
+    h.kvarn4_mq_gqa2_enabled = true;
+    h.kvarn4_mq_gqa2_status = "ready";
     h.kvarn4_decode_rowlane_available = true;
     h.kvarn4_decode_rowlane_enabled = true;
     h.kvarn4_decode_rowlane_status = "ready";
@@ -516,6 +629,7 @@ int main() {
     h.kvarn4_decode_status = "ready";
     r.counters.kvarn4_mq_calls = 13;
     r.counters.kvarn4_mq_i8_calls = 11;
+    r.counters.kvarn4_mq_gqa2_calls = 6;
     r.counters.kvarn4_mq4_calls = 5;
     r.counters.kvarn4_decode_calls = 7;
     h.memory.app_available = true;
@@ -536,7 +650,10 @@ int main() {
                   "wave lanes >= 64 (reported min 32)\",\"calls\":13},\"mq4\":{\"available\":true,"
                   "\"status\":\"ready\",\"calls\":5},"
                   "\"mq2_i8\":{\"available\":true,\"status\":\"ready\","
-                  "\"calls\":11,\"exact\":false}}") != std::string::npos);
+                  "\"calls\":11,\"exact\":false},"
+                  "\"mq2_gqa2\":{\"available\":true,\"enabled\":true,\"status\":\"ready\","
+                  "\"calls\":6,\"heads_per_group\":2,\"dispatch\":\"3*n_head_kv\"}}") !=
+        std::string::npos);
     assert(json.find("\"kvarn4_decode_rowlane\":{\"available\":true,\"enabled\":true,"
                      "\"status\":\"ready\",\"calls\":3}") != std::string::npos);
     assert(json.find("\"kvarn4_decode\":{\"nq\":1,"
@@ -626,8 +743,12 @@ int main() {
     assert(r.counters.bulk_calls == 0);
     assert(r.counters.kvarn4_decode_calls == 0);
     assert(r.counters.kvarn4_decode_rowlane_calls == 0);
+    assert(r.counters.kvarn4_mq_gqa2_calls == 0);
     const std::string empty = Recorder().json(Header{});
     assert(empty.find("\"buckets\":{}") != std::string::npos);
+    assert(empty.find("\"mq2_gqa2\":{\"available\":false,\"enabled\":false,"
+                      "\"status\":\"\",\"calls\":0,"
+                      "\"heads_per_group\":2,\"dispatch\":\"3*n_head_kv\"}") != std::string::npos);
     std::fprintf(stderr, "rkva_range_profile_cpu: ok\n");
     return 0;
 }

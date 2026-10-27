@@ -204,6 +204,65 @@ constexpr uint32_t kKvarn4MqTile = 2;
 constexpr uint32_t kKvarn4MqTileMax = 4;
 constexpr uint32_t kKvarn4MqWaveLanes = 64; // one 4-dim unit per lane
 
+// Native KVarN4 descriptor v1 shapes the optimized kernel reads directly:
+// 128-aligned origin and a 0 or 128 token precision tail.
+constexpr uint32_t kKvarnGroup = 128;
+constexpr uint32_t kKvarnTile = 8;
+
+// Opt-in GQA2 candidate (rkva_range_attn_kvarn4_mq_gqa2.hlsl): the same global
+// 24Q/4KV shape and [split][query * n_head + head][258] partials, but each
+// group computes only two local Q heads. The host dispatches three consecutive
+// x groups per KV head (DispatchX == 3 * n_head_kv) so every global head is
+// still written exactly once. It reloads each K/V row for three groups instead
+// of one; profitability is UNKNOWN and this remains opt-in.
+constexpr uint32_t kKvarn4Gqa2HeadsPerGroup = 2;
+constexpr uint32_t kKvarn4Gqa2GroupsPerKvHead = kOptGqa / kKvarn4Gqa2HeadsPerGroup;
+
+inline uint32_t kvarn4_gqa2_dispatch_x(uint32_t n_head_kv) {
+    return kKvarn4Gqa2GroupsPerKvHead * n_head_kv;
+}
+
+// Fail-closed selection for the GQA2 candidate. Requires the opt-in arm, no
+// INT8 arm (the two specializations are mutually exclusive), descriptor
+// revision 3, native KVarN4, the fine 2-query tile, nq 2..9, head_dim 256,
+// GQA 6, a 128-token exact tail, fixed wave64 and the dedicated PSO. Every
+// other call keeps the qualified default kernel.
+inline bool kvarn4_gqa2_supported(bool enabled, bool i8_enabled, uint32_t mode, bool serial_prefix,
+                                  uint32_t storage, uint32_t q_tile, uint32_t n_tokens,
+                                  uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+                                  uint32_t precision_tail_tokens, uint32_t wave_lane_min,
+                                  uint32_t wave_lane_max, bool pso_available) {
+    return enabled && !i8_enabled && serial_prefix && storage == kStorageKvarn4 &&
+           mode == kModeOptFine && q_tile == kKvarn4MqTile && n_tokens >= 2 &&
+           n_tokens <= kOptMaxQueries && head_dim == kOptHeadDim && n_head_kv > 0 &&
+           n_head == kOptGqa * n_head_kv && precision_tail_tokens == kKvarnGroup &&
+           wave_lane_min == kKvarn4MqWaveLanes && wave_lane_max == kKvarn4MqWaveLanes &&
+           pso_available;
+}
+
+// LocalState arming: `rkva-mq-gqa2.flag` is opt-in and default off. If the
+// INT8 flag is also present the pair is ambiguous, so GQA2 stays off and the
+// profile reports the conflict; INT8 keeps its own existing selection.
+enum class MqGqa2Arm : uint8_t { kOff = 0, kOn = 1, kConflict = 2 };
+
+inline MqGqa2Arm mq_gqa2_arm(bool gqa2_flag, bool i8_flag) {
+    if (!gqa2_flag) {
+        return MqGqa2Arm::kOff;
+    }
+    return i8_flag ? MqGqa2Arm::kConflict : MqGqa2Arm::kOn;
+}
+
+inline const char* mq_gqa2_arm_reason(MqGqa2Arm arm) {
+    switch (arm) {
+    case MqGqa2Arm::kOn:
+        return "enabled";
+    case MqGqa2Arm::kConflict:
+        return "disabled: conflicts with rkva-mq-i8.flag (fail-closed)";
+    default:
+        return "disabled (rkva-mq-gqa2.flag absent)";
+    }
+}
+
 // Zero exact tails retain the qualified per-query arithmetic. The shared tiles
 // require a 128-token original-F16 tail; raw FP64 parity alone does not
 // establish the same speculative cache trajectory without that tail.
@@ -214,9 +273,15 @@ inline uint32_t kvarn4_mq_tile(uint32_t mode, uint32_t n_tokens, uint32_t precis
     return mode == kModeOptBalanced ? kKvarn4MqTileMax : mode == kModeOptFine ? kKvarn4MqTile : 0u;
 }
 
-inline const char* kvarn4_mq_kernel_name(uint32_t q_tile, bool int8_dot = false) {
+inline const char* kvarn4_mq_kernel_name(uint32_t q_tile, bool int8_dot = false,
+                                         bool gqa2 = false) {
+    // INT8 keeps its existing precedence: the two opt-ins are mutually
+    // exclusive, so a name is only ambiguous if the caller ignores the gate.
     if (int8_dot && q_tile == kKvarn4MqTile) {
         return "kvarn4_mq2_i8";
+    }
+    if (gqa2 && q_tile == kKvarn4MqTile) {
+        return "kvarn4_mq2_gqa2";
     }
     return q_tile == kKvarn4MqTileMax ? "kvarn4_mq4_balanced"
            : q_tile == kKvarn4MqTile  ? "kvarn4_mq2_fine"
@@ -224,18 +289,14 @@ inline const char* kvarn4_mq_kernel_name(uint32_t q_tile, bool int8_dot = false)
 }
 
 // Storage-qualified multi-query kernel name (Q4_0 keeps its 266 names).
-inline const char* mq_kernel_name(uint32_t storage, uint32_t q_tile, bool int8_dot = false) {
+inline const char* mq_kernel_name(uint32_t storage, uint32_t q_tile, bool int8_dot = false,
+                                  bool gqa2 = false) {
     if (storage == kStorageKvarn4) {
-        return kvarn4_mq_kernel_name(q_tile, int8_dot);
+        return kvarn4_mq_kernel_name(q_tile, int8_dot, gqa2);
     }
     return storage == kStorageQ4 ? q4_mq_kernel_name(q_tile)
                                  : format_mq_kernel_name(storage, q_tile);
 }
-
-// Native KVarN4 descriptor v1 shapes the optimized kernel reads directly:
-// 128-aligned origin and a 0 or 128 token precision tail.
-constexpr uint32_t kKvarnGroup = 128;
-constexpr uint32_t kKvarnTile = 8;
 
 inline bool optimized_kvarn4_supported(uint32_t mode, uint32_t storage, uint32_t n_tokens,
                                        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
@@ -363,6 +424,7 @@ struct Sample {
     uint8_t decode_rowlane = 0;
     uint8_t decode_opt = 0;    // KVarN4 wave64 nq1 decode (includes rowlane)
     uint8_t int8_dot = 0;      // KVarN4 2-query tile used the opt-in INT8 QK PSO (not exact)
+    uint8_t gqa2 = 0;          // KVarN4 2-query tile used the opt-in two-local-head PSO
     uint8_t bulk_segment = 0; // 1 if recorded as an individual segment of native bulk op 22
     uint32_t n_tokens = 0;
     uint32_t rows = 0; // upload rows, or attention active_count
@@ -385,6 +447,7 @@ struct Counters {
     // optimized_by_storage[kvarn4]).
     uint64_t kvarn4_mq_calls = 0;
     uint64_t kvarn4_mq_i8_calls = 0;   // subset of kvarn4_mq_calls: INT8 QK PSO (not exact)
+    uint64_t kvarn4_mq_gqa2_calls = 0; // subset of kvarn4_mq_calls: two-local-head PSO
     uint64_t kvarn4_decode_calls = 0;
     uint64_t kvarn4_decode_rowlane_calls = 0; // subset of kvarn4_decode_calls
     uint64_t kvarn4_mq4_calls = 0;
@@ -405,6 +468,48 @@ struct Counters {
     uint64_t bulk_queries = 0;
     uint64_t fp8_gpu_calls = 0, fp8_cpu_fallback_calls = 0;
 };
+
+// Single classification of an attention Sample. The ordinary call path and
+// the native-bulk segment path must agree on every kernel identity, including
+// the opt-in INT8/GQA2 subsets, so both call this helper after recording.
+inline void count_attention(Counters& c, const Sample& s) {
+    if (s.kind != kAttention || s.storage >= kStorageCount) {
+        return;
+    }
+    if (s.optimized) {
+        ++c.optimized_by_storage[s.storage];
+        if (s.storage == kStorageQ4) {
+            ++c.optimized_calls;
+            if (s.q_tile == 2 || s.q_tile == 4) {
+                ++c.q4_mq_calls[s.q_tile / 4];
+            }
+        } else if ((s.storage == kStorageF16 || s.storage == kStorageQ8) &&
+                   (s.q_tile == 2 || s.q_tile == 4)) {
+            ++c.fmt_mq_calls[s.storage][s.q_tile / 4];
+        } else if (s.storage == kStorageKvarn4 && s.serial_prefix) {
+            if (s.decode_opt) {
+                ++c.kvarn4_decode_calls;
+                if (s.decode_rowlane) {
+                    ++c.kvarn4_decode_rowlane_calls;
+                }
+            } else if (s.q_tile == kKvarn4MqTile) {
+                ++c.kvarn4_mq_calls;
+                if (s.int8_dot) {
+                    ++c.kvarn4_mq_i8_calls;
+                } else if (s.gqa2) {
+                    ++c.kvarn4_mq_gqa2_calls;
+                }
+            } else if (s.q_tile == kKvarn4MqTileMax) {
+                ++c.kvarn4_mq4_calls;
+            }
+        }
+    } else {
+        ++c.reference_by_storage[s.storage];
+        if (s.storage == kStorageQ4) {
+            ++c.reference_q4_calls;
+        }
+    }
+}
 
 struct BulkEnvelopeSample {
     uint64_t cycle_id = 0;
@@ -493,6 +598,12 @@ struct Header {
     // Opt-in INT8 QK PSO for the 2-query tile (default off, not bit-exact).
     bool kvarn4_mq_i8_available = false;
     std::string kvarn4_mq_i8_status;
+    // Opt-in GQA2 two-local-head PSO for the 2-query tile (default off).
+    // `available` reports the PSO; `enabled` reports the armed flag after the
+    // INT8 conflict check, so a disabled candidate is explicit in the report.
+    bool kvarn4_mq_gqa2_available = false;
+    bool kvarn4_mq_gqa2_enabled = false;
+    std::string kvarn4_mq_gqa2_status;
 };
 
 inline const char* storage_name(uint32_t storage) {
@@ -540,7 +651,7 @@ inline std::string bucket_key(const Sample& s) {
     if (s.kind == kAttention) {
         key += s.optimized ? "/optimized-" : "/reference";
         if (s.optimized) {
-            key += s.q_tile ? mq_kernel_name(s.storage, s.q_tile, s.int8_dot != 0)
+            key += s.q_tile ? mq_kernel_name(s.storage, s.q_tile, s.int8_dot != 0, s.gqa2 != 0)
                             : (s.storage == kStorageKvarn4 && s.decode_opt
                                    ? (s.decode_rowlane ? "kvarn4_decode_rowlane"
                                                        : kvarn4_decode_kernel_name(s.mode))
@@ -717,7 +828,8 @@ class Recorder {
              "kernel when available; F16/Q8_0 nq 2..9 in modes 1/2 use the "
              "format_multi_query tile kernel when available; native KVarN4 descriptor "
              "revision 3 nq 2..9 in modes 1/2 uses the kvarn4_multi_query tile kernel when "
-             "available\"";
+             "available; an armed rkva-mq-gqa2.flag may replace the qualified fine 2-query "
+             "tile with the two-local-head PSO\"";
         o += ",\"optimized_kernels\":{";
         for (uint32_t st = 0; st < kStorageCount; ++st) {
             std::snprintf(
@@ -787,9 +899,17 @@ class Recorder {
         o += buf;
         std::snprintf(buf, sizeof(buf),
                       "\"mq2_i8\":{\"available\":%s,\"status\":\"%s\","
-                      "\"calls\":%llu,\"exact\":false}}",
+                      "\"calls\":%llu,\"exact\":false},",
                       h.kvarn4_mq_i8_available ? "true" : "false",
                       json_escape(h.kvarn4_mq_i8_status).c_str(), ull(c.kvarn4_mq_i8_calls));
+        o += buf;
+        std::snprintf(buf, sizeof(buf),
+                      "\"mq2_gqa2\":{\"available\":%s,\"enabled\":%s,\"status\":\"%s\","
+                      "\"calls\":%llu,\"heads_per_group\":%u,\"dispatch\":\"3*n_head_kv\"}}",
+                      h.kvarn4_mq_gqa2_available ? "true" : "false",
+                      h.kvarn4_mq_gqa2_enabled ? "true" : "false",
+                      json_escape(h.kvarn4_mq_gqa2_status).c_str(), ull(c.kvarn4_mq_gqa2_calls),
+                      kKvarn4Gqa2HeadsPerGroup);
         o += buf;
         std::snprintf(buf, sizeof(buf),
                       ",\"kvarn4_decode\":{\"nq\":1,"

@@ -11,6 +11,9 @@ prefill). It computes the fast shared record tile's QK with
   (`cs_6_4`, 140 356 B).
 * Build: `tools/xbox/scripts/compile-rkva-range-shaders.sh attn_kvarn4_mq2_i8`.
 * Flag: LocalState file `rkva-mq-i8.flag` (default off), read at HELLO.
+  It is mutually exclusive with `rkva-mq-gqa2.flag`: if both exist, INT8 keeps
+  this selection and the GQA2 candidate stays off (see
+  [the GQA2 candidate](rkva-prefill-gqa2.md)).
   Selection: `remote-attn.cpp` → `RemoteAttnEngine::set_mq_i8()` →
   `attend_range()`.
 * Bucket: `attention/kvarn4-prefix/optimized-kvarn4_mq2_i8/<nq>/<rows>/warm`;

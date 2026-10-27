@@ -20,6 +20,10 @@ Flags are files under the app's **LocalState**, sampled at each RKVA HELLO:
 
 - `rkva-decode-rowlane-off.flag`: presence disables rowlane. Absent means enabled.
 - `rkva-mq-i8.flag`: presence enables INT8 prefill. Absent means disabled.
+- `rkva-mq-gqa2.flag`: presence arms the unqualified GQA2 two-local-head
+  prefill candidate when its PSO exists. Absent means disabled; a simultaneous
+  `rkva-mq-i8.flag` keeps GQA2 off (fail-closed). This candidate is not part of
+  the accepted optimization set and has no hardware result yet.
 
 Rowlane still requires native KVarN4 descriptor revision 3, nq=1, the optimized
 kernel selection, fixed wave64, the qualified dense 256-dimensional shape and

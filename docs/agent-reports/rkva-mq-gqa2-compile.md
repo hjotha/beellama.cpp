@@ -3,6 +3,9 @@
 Status: **prepared and CPU-tested offline; no DXC, Windows, GPU or device result
 exists yet.** This report does not claim a speedup, a TPS delta or bit-exact
 output. It scopes a candidate PSO for the root to compile and inspect later.
+Follow-up: `docs/agent-reports/rkva-mq-gqa2-integration.md` now wires the
+candidate behind the default-off `rkva-mq-gqa2.flag`; the DXC artifact and CPU
+checks there supersede phase 1 only.
 
 ## Scope and ownership
 

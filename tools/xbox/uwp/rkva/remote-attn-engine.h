@@ -189,6 +189,18 @@ class RemoteAttnEngine {
     bool mq_i8() const {
         return mq_i8_;
     }
+    // Opt-in GQA2 two-local-head prefill specialization (default off): when
+    // armed and the dedicated PSO exists, the qualified fine 2-query tile uses
+    // DispatchX = 3 * n_head_kv. Mutually exclusive with the INT8 arm; a flag
+    // conflict is fail-closed and reported in the profile header. Control path
+    // only.
+    void set_mq_gqa2(bool enabled, bool i8_conflict) {
+        mq_gqa2_ = enabled;
+        mq_gqa2_conflict_ = i8_conflict;
+    }
+    bool mq_gqa2() const {
+        return mq_gqa2_;
+    }
 
     // Diagnostics / parity harness support.
     uint64_t allocated_bytes() const {
@@ -326,6 +338,14 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_mq_i8_pso_;
     std::string kvarn4_mq_i8_status_ = "not initialized";
     bool mq_i8_ = false;
+    // Opt-in GQA2 two-local-head specialization of the fine 2-query tile
+    // (rkva_range_attn_kvarn4_mq_gqa2.hlsl). Flag file `rkva-mq-gqa2.flag`;
+    // default off, and a missing PSO keeps the qualified attn_kvarn4_mq2
+    // pipeline. Selection also requires fixed wave64.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_mq_gqa2_pso_;
+    std::string kvarn4_mq_gqa2_status_ = "not initialized";
+    bool mq_gqa2_ = false;
+    bool mq_gqa2_conflict_ = false;
     std::string kvarn4_opt_prefix_status_ = "not initialized";
     // Native KVarN4 revision-3 wave64 decode specialization (nq == 1).
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_decode_prefix_pso_;
