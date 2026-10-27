@@ -1318,6 +1318,11 @@ extern "C" {
 // the source sequence is removed and may remap physical cells on restore.
 #define LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED 8
 
+// Internal: the caller appends the negotiated native RKVK trailer after the
+// standard local body. This permits a native FULL save through the guards that
+// refuse a bookkeeping-only FULL snapshot once native rows exist.
+#define LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL 16
+
     LLAMA_API bool llama_memory_state_seq_can_save_ext(
             llama_memory_t mem,
               llama_seq_id seq_id,

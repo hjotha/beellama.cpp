@@ -5042,7 +5042,8 @@ void llama_kv_cache_kvarn::state_write_kvarn_body(
 
 void llama_kv_cache_kvarn::state_write_mixed(
         llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if (native_kvarn_rpc_experimental_ && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+    if (native_kvarn_rpc_experimental_ &&
+            !(flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL))) {
         const auto & cells = metadata->get_cells(uint32_t(0));
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.is_empty(i) && cells.pos_get(i) >= int64_t(position_split_p_)) {
@@ -5060,7 +5061,7 @@ void llama_kv_cache_kvarn::state_write_mixed(
                 " (and an overflow companion in split mode)");
     }
     constexpr uint32_t supported_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
-            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL;
     if ((uint32_t(flags) & ~supported_flags) != 0 ||
             ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
              (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {

@@ -7505,7 +7505,12 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
         throw std::runtime_error("native KVarN4 overflow FULL snapshots require the negotiated revision-3 disk snapshot capability; refusing Q4 bookkeeping state");
     }
     if (memory) {
-        memory->state_write(io, seq_id, flags);
+        // The native FULL export appends the RKVK trailer after this body. Mark
+        // the memory write so the native-row guard does not reject the local
+        // body that the trailer completes.
+        const llama_state_seq_flags memory_flags = (!partial && native_active)
+            ? llama_state_seq_flags(flags | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) : flags;
+        memory->state_write(io, seq_id, memory_flags);
     }
     if (!partial && native_active) {
         if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
