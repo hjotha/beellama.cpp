@@ -212,8 +212,10 @@ fails with the destination unchanged.
 
 Admission is cumulative and uses `adaptive_slot_ram_budget`: the smaller of
 the configured `cache-ram` limit and measured `MemAvailable` after the server's
-existing 25% reserve. The bounded streaming workspace is reserved first; the
-RKVK staged/owner peak is then admitted against the remaining hard limit.
+existing 25% reserve. The bounded streaming workspace is reserved first; the RKVK staged/owner peak is then admitted
+against the remaining hard limit. SAVE reserves its own `16 MiB + C*16`
+workspace under the same cumulative cap before synchronization, size probing,
+token copies or route-state publication.
 `prompt_cache.reserve_transient` still enforces its own configured cap. If
 either limit fails, nothing is allocated, restored or published.
 

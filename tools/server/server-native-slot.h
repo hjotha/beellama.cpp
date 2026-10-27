@@ -107,6 +107,13 @@ inline bool restore_fits(uint64_t peak, uint64_t budget) {
 // workspace plus the native staged/owner shadow. The server budget is the
 // smaller of the configured cache-ram limit and measured MemAvailable after
 // the existing 25% reserve.
+inline uint64_t save_workspace_bytes(uint64_t n_ctx) {
+    constexpr uint64_t base = 16ull << 20;
+    if (n_ctx > (UINT64_MAX - base) / 16ull)
+        return UINT64_MAX;
+    return base + n_ctx * 16ull;
+}
+
 inline bool cumulative_fits(uint64_t workspace, uint64_t native_peak,
                             uint64_t budget, uint64_t * total = nullptr) {
     if (native_peak == UINT64_MAX || workspace > UINT64_MAX - native_peak)

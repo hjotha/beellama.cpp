@@ -8261,6 +8261,17 @@ private:
             if (!native_stream_eligible(task, slot, true, error)) {
                 throw std::runtime_error(error);
             }
+            if (!prompt_cache) {
+                throw std::runtime_error("native streaming save RAM budget is unavailable");
+            }
+            native_slot_cache_reservation reservation(prompt_cache.get(),
+                    adaptive_slot_ram_budget(params_base.cache_ram_mib));
+            const uint64_t save_workspace = server_native_slot::save_workspace_bytes(
+                    llama_n_ctx_seq(ctx_tgt));
+            if (save_workspace == UINT64_MAX || save_workspace > SIZE_MAX ||
+                    !native_slot_cache_reservation::reserve(&reservation, size_t(save_workspace))) {
+                throw std::runtime_error("native streaming save workspace exceeds the RAM cache budget");
+            }
             llama_synchronize(ctx_tgt);
             const auto position = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             const size_t evaluated = slot.prompt.tokens.size_up_to_pos(position + 1);

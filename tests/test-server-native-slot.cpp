@@ -121,6 +121,16 @@ void test_restore_peak_16_layers() {
     // measured MemAvailable after the server's 25% reserve. This is the real
     // 16-layer peak plus the bounded streaming workspace.
     constexpr uint64_t mib = 1024ull * 1024ull;
+    const uint64_t save_workspace = server_native_slot::save_workspace_bytes(131072);
+    assert(save_workspace == 16ull * mib + 131072ull * 16ull);
+    assert(server_native_slot::save_workspace_bytes(UINT64_MAX) == UINT64_MAX);
+    const uint64_t save_budget_low = server_slot_cap_ram_budget(16ull * mib, 4ull << 30, true);
+    assert(save_budget_low == 12ull * mib);
+    uint64_t save_total = 0;
+    assert(!server_native_slot::cumulative_fits(save_workspace, 0, save_budget_low, &save_total));
+    assert(save_total == save_workspace);
+    const uint64_t save_budget_fit = server_slot_cap_ram_budget(1ull << 30, 4ull << 30, true);
+    assert(server_native_slot::cumulative_fits(save_workspace, 0, save_budget_fit));
     const uint64_t workspace = 48ull * mib + 131072ull * 512ull;
     std::istringstream meminfo("MemAvailable: 1048576 kB\n");
     uint64_t measured_available = 0;
