@@ -196,9 +196,10 @@ a missing `scripts.validate_mtp_protocol`); no other failure was reported.
 `rkva-quality-gate.py` now treats `rkva-mq-gqa2.flag` as a managed LocalState
 flag. `LocalStateFlags` captures it with INT8 and rowlane, clears it for every
 existing INT8/rowlane arm, restores the exact original state in the existing
-`finally`/`restore()` path, and rejects `INT8 && GQA2` before mutating the
-device. Future GQA2 A/B can use `flags.arm(False, gqa2_on=True)` without
-changing the existing `flags.arm(True/False)` callers.
+`finally`/`restore()` path, and validates `INT8 && GQA2` before entering the
+restore scope, so a conflicting arm makes no device read, upload or delete.
+Future GQA2 A/B can use `flags.arm(False, gqa2_on=True)` without changing the
+existing `flags.arm(True/False)` callers.
 
 Offline coverage added to `test_rkva_quality_gate.py`:
 
@@ -208,9 +209,10 @@ Ran 86 tests ... OK
 
 The new cases prove: GQA2-only arm sets only `rkva-mq-gqa2.flag`; INT8-only arm
 clears a stale GQA2 flag; the original GQA2 presence is restored after each arm;
-the INT8+GQA2 conflict raises `ValueError` without touching LocalState; and a
-legacy two-flag `flags-original.json` is migrated by capturing the current GQA2
-presence, so resumable runs started before this change remain valid.
+the INT8+GQA2 conflict raises `ValueError` with an exactly unchanged device-call
+log (no list/upload/delete) before any restore; and a legacy two-flag
+`flags-original.json` is migrated by capturing the current GQA2 presence, so
+resumable runs started before this change remain valid.
 
 ## CPU build with CUDA and Vulkan disabled
 

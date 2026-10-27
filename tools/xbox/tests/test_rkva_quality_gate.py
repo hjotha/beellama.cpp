@@ -525,15 +525,20 @@ class FlagTests(unittest.TestCase):
                 self.assertEqual(fake.files, {qg.INT8_FLAG})
             self.assertEqual(fake.files, {qg.GQA2_FLAG})
 
-    def test_int8_and_gqa2_arm_conflict_is_rejected_before_mutation(self):
+    def test_int8_and_gqa2_arm_conflict_makes_no_device_calls(self):
         with tempfile.TemporaryDirectory() as temporary:
             fake = self.FakeDeploy(files={qg.INT8_FLAG})
             client = self.deploy(temporary, fake)
             flags = qg.LocalStateFlags(client, client.pfn(), temporary)
             flags.capture_original()
+            calls_before = list(fake.calls)
             with self.assertRaises(ValueError):
                 with flags.arm(True, gqa2_on=True):
                     pass
+            self.assertEqual(fake.calls, calls_before)
+            with self.assertRaises(ValueError):
+                flags.apply(True, True)
+            self.assertEqual(fake.calls, calls_before)
             self.assertEqual(fake.files, {qg.INT8_FLAG})
 
     def test_legacy_two_flag_original_map_adopts_gqa2(self):

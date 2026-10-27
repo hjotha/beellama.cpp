@@ -115,8 +115,9 @@ K/V row three times.
 
 `rkva-quality-gate.py` now includes `rkva-mq-gqa2.flag` in its managed LocalState
 set. Existing INT8/rowlane arms clear it, the original presence is restored by
-the existing `finally` path, and an INT8+GQA2 arm is rejected before touching
-the device. Future GQA2 A/B can call `flags.arm(False, gqa2_on=True)`. A
+the existing `finally` path, and an INT8+GQA2 arm is rejected before entering
+the restore scope, so it performs no LocalState read/upload/delete. Future GQA2
+A/B can call `flags.arm(False, gqa2_on=True)`. A
 `flags-original.json` written by an older two-flag run is migrated by reading
 the current GQA2 state, without invalidating resumable runs.
 

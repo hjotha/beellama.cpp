@@ -156,7 +156,8 @@ exige o controle e nunca qualifica a matriz.
   também é capturada: todo braço INT8/rowlane existente a remove, o estado
   original é restaurado no mesmo `finally` e um mapa antigo de duas flags é
   migrado lendo o estado atual. Arm com INT8+GQA2 juntos é rejeitado antes de
-  tocar no console. Delete 404 é idempotente; 403/transporte/erro real é fatal. A
+  entrar no `try`/restore, sem nenhuma chamada de leitura, upload ou delete no
+  console. Delete 404 é idempotente; 403/transporte/erro real é fatal. A
   restauração é verificada por uma nova listagem e gravada em
   `flags-restored.json`.
 - A ferramenta nunca chama `start-app`/`stop-app`/`systemctl`, não altera tier ou

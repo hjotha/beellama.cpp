@@ -1598,14 +1598,18 @@ class LocalStateFlags:
         return present
 
     def apply(self, int8_on, gqa2_on=False):
-        if int8_on and gqa2_on:
-            # The engine treats this pair as a fail-closed conflict; never arm
-            # an ambiguous control arm in the harness either.
-            raise ValueError('INT8 and GQA2 flags are mutually exclusive')
+        self._validate_arm(int8_on, gqa2_on)
         self.set(INT8_FLAG, int8_on)
         self.set(GQA2_FLAG, gqa2_on)
         # rowlane must be ON: the opt-out flag is absent.
         self.set(ROWLAND_OPT_OUT_FLAG, False)
+
+    @staticmethod
+    def _validate_arm(int8_on, gqa2_on):
+        if int8_on and gqa2_on:
+            # The engine treats this pair as a fail-closed conflict; never arm
+            # an ambiguous control arm in the harness either.
+            raise ValueError('INT8 and GQA2 flags are mutually exclusive')
 
     def restore(self):
         if self.original is None:
@@ -1628,6 +1632,9 @@ class LocalStateFlags:
 
     @contextlib.contextmanager
     def arm(self, int8_on, gqa2_on=False):
+        # Validate before entering the try/restore scope: a conflicting arm must
+        # not perform any LocalState read, upload or delete on the device.
+        self._validate_arm(int8_on, gqa2_on)
         try:
             self.apply(int8_on, gqa2_on)
             yield
