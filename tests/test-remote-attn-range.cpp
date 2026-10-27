@@ -239,6 +239,9 @@ struct loopback {
                                 ack.reserved[0] |= RKVA_CAP_KVARN_BULK_ATTN;
                                 ack.supported_ops |= (1u << RKVA_KVARN_RANGE_BULK_ATTN);
                             }
+                            if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 512)) {
+                                ack.reserved[0] |= RKVA_CAP_KVARN_BULK_512;
+                            }
                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 256)) {
                                 ack.reserved[0] |= RKVA_CAP_KVARN_COHORT_ATTN;
                                 ack.supported_ops |= (1u << RKVA_KVARN_RANGE_COHORT_ATTN);
@@ -1660,6 +1663,23 @@ static void test_phase6_double_buffer_async(uint32_t nq = 4) {
     storage_env wire_env("fp8", "GGML_RKVA_WIRE_FORMAT");
     storage_env async_env("1", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
 
+    // An older peer must never advertise the enlarged envelope; a matching
+    // peer may advertise it only for the configured native async KVarN path.
+    assert(!ggml_backend_remote_attn_kvarn_bulk_512_enabled(nullptr));
+    {
+        loopback extended(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 512);
+        auto * peer = ggml_backend_remote_attn_init("127.0.0.1", extended.port);
+        ggml_remote_attn_geometry geo{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
+        assert(ggml_backend_remote_attn_set_geometry(peer, &geo));
+        assert(ggml_backend_remote_attn_connect(peer));
+        assert(!ggml_backend_remote_attn_kvarn_bulk_512_enabled(peer)); // not configured
+        assert(ggml_backend_remote_attn_create_range_session(peer, 0, 0, 512));
+        ggml_backend_remote_attn_set_active_session(peer, 0);
+        assert(ggml_backend_remote_attn_configure_range(peer, 1024, 512, GGML_TYPE_Q4_0));
+        assert(ggml_backend_remote_attn_kvarn_bulk_512_enabled(peer));
+        ggml_backend_free(peer);
+    }
+
     loopback server(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32);
     auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
     ggml_remote_attn_geometry geometry{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
@@ -1669,6 +1689,7 @@ static void test_phase6_double_buffer_async(uint32_t nq = 4) {
     ggml_backend_remote_attn_set_active_session(backend, 0);
     assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
     assert(ggml_backend_remote_attn_async_enabled(backend));
+    assert(!ggml_backend_remote_attn_kvarn_bulk_512_enabled(backend));
     assert(ggml_backend_remote_attn_async_capacity(backend) == 2);
     assert(ggml_backend_remote_attn_async_in_flight(backend) == 0);
     ggml_remote_attn_set_active(backend);

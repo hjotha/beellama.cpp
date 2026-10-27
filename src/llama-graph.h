@@ -1670,13 +1670,17 @@ ggml_tensor * build_attn_mha_paged(
     };
     position_split_rpc_packet build_attn_position_split_rpc_prepare(
             llm_graph_input_attn_kv * inp, ggml_tensor * q, ggml_tensor * k,
-            ggml_tensor * v, float scale, int il, ggml_tensor * positions) const;
-    ggml_tensor * build_attn_position_split_rpc_complete(const position_split_rpc_packet & packet) const;
+            ggml_tensor * v, float scale, int il, ggml_tensor * positions,
+            bool remote_only = false, const position_split_rpc_packet * submitted = nullptr) const;
+    ggml_tensor * build_attn_position_split_rpc_complete(const position_split_rpc_packet & packet,
+            const position_split_rpc_packet * second = nullptr,
+            ggml_tensor * shared_wait = nullptr, uint32_t query_offset = 0) const;
 
     // Views share the parent inputs/set_input. Only the tail query plan owns
     // tile-local input tensors because its query indices must start at zero.
     std::unique_ptr<llm_graph_input_attn_kv> build_wavefront_attn_input(
-            llm_graph_input_attn_kv * parent, uint32_t offset, uint32_t count) const;
+            llm_graph_input_attn_kv * parent, uint32_t offset, uint32_t count,
+            bool local_only = false) const;
 
     ggml_tensor * build_attn_position_split_rpc(
             llm_graph_input_attn_kv * inp, ggml_tensor * q, ggml_tensor * k,

@@ -23,7 +23,8 @@ uint32_t parse_serving_tile_size(const char * value) {
     if (std::strcmp(value, "64") == 0) return 64;
     if (std::strcmp(value, "128") == 0) return 128;
     if (std::strcmp(value, "256") == 0) return 256;
-    throw std::invalid_argument("GGML_RKVA_WAVEFRONT_TILE expects 0, 64, 128 or 256");
+    if (std::strcmp(value, "512") == 0) return 512;
+    throw std::invalid_argument("GGML_RKVA_WAVEFRONT_TILE expects 0, 64, 128, 256 or 512");
 }
 
 std::vector<serving_step> build_serving_schedule(uint32_t groups, uint32_t tiles, uint32_t rpc_batch) {
@@ -289,29 +290,40 @@ bool partition_ubatch_causal_tiles(
 }
 
 // The generic partitioner also describes tails and boundary splits; serving
-// permits only complete contiguous overflow parents of two or four N256 tiles.
-bool is_serving_n256_plan(const wavefront_plan & plan) {
-    if (plan.tile_size != 256 || (plan.n_tiles != 2 && plan.n_tiles != 4) ||
+// permits complete contiguous overflow parents, with bounded tile counts.
+static bool is_serving_complete_plan(const wavefront_plan & plan) {
+    const uint32_t width = plan.tile_size;
+    if ((width != 256 && width != 512) ||
+            (width == 256 ? (plan.n_tiles != 2 && plan.n_tiles != 4) : (plan.n_tiles < 2 || plan.n_tiles > 8)) ||
             plan.tiles.size() != plan.n_tiles || plan.ubatch_tiles.size() != plan.n_tiles ||
             plan.n_layers == 0 || plan.p == 0 || plan.n_keep_tail != 0) return false;
     llama_seq_id seq = -1;
     for (uint32_t i = 0; i < plan.n_tiles; ++i) {
         const auto & tile = plan.tiles[i];
         const auto & ub = plan.ubatch_tiles[i];
-        if (tile.tile_id != i || tile.token_offset != i * 256 || tile.n_tokens != 256 ||
+        if (tile.tile_id != i || tile.token_offset != i * width || tile.n_tokens != width ||
                 tile.range != llama_position_split::range_kind::OVERFLOW_RANGE || tile.pos_min < int64_t(plan.p) ||
-                int64_t(tile.pos_max) - tile.pos_min != 255 || ub.n_tokens != 256 ||
-                ub.n_seq_tokens != 256 || ub.n_seqs != 1 || ub.n_seqs_unq != 1 ||
+                int64_t(tile.pos_max) - tile.pos_min != int64_t(width - 1) || ub.n_tokens != width ||
+                ub.n_seq_tokens != width || ub.n_seqs != 1 || ub.n_seqs_unq != 1 ||
                 !ub.token || ub.embd || ub.embd_state || ub.type || ub.decision_order ||
                 !ub.pos || !ub.seq_id || !ub.n_seq_id) return false;
         if (i && int64_t(plan.tiles[i - 1].pos_max) + 1 != tile.pos_min) return false;
-        for (uint32_t j = 0; j < 256; ++j) {
+        for (uint32_t j = 0; j < width; ++j) {
             if (ub.n_seq_id[j] != 1 || !ub.seq_id[j]) return false;
             if (i == 0 && j == 0) seq = ub.seq_id[j][0];
             if (ub.seq_id[j][0] != seq || int64_t(ub.pos[j]) != int64_t(tile.pos_min) + j) return false;
         }
     }
     return true;
+}
+
+
+bool is_serving_n256_plan(const wavefront_plan & plan) {
+    return plan.tile_size == 256 && is_serving_complete_plan(plan);
+}
+
+bool is_serving_n512_plan(const wavefront_plan & plan) {
+    return plan.tile_size == 512 && is_serving_complete_plan(plan);
 }
 
 bool is_serving_2x256_plan(const wavefront_plan & plan) {

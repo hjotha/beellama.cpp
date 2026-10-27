@@ -132,7 +132,8 @@ static void test_serving_2x256_contract() {
     CHECK(llama_wavefront::parse_serving_tile_size("128") == 128);
     CHECK(llama_wavefront::parse_serving_tile_size(nullptr) == 0);
     bool invalid = false;
-    try { llama_wavefront::parse_serving_tile_size("512"); }
+    CHECK(llama_wavefront::parse_serving_tile_size("512") == 512);
+    try { llama_wavefront::parse_serving_tile_size("513"); }
     catch (const std::invalid_argument &) { invalid = true; }
     CHECK(invalid);
     const uint32_t P = 1024;
@@ -230,6 +231,38 @@ static void test_serving_4x256_contract() {
     CHECK(plan.tiles.empty());
     ub.n_seqs = 2;
     CHECK(!llama_wavefront::partition_ubatch_causal_tiles(ub, 256, 64, P, 0, plan, err));
+}
+
+static void test_serving_n512_contract() {
+    g_case = "serving_n512_contract";
+    const uint32_t P = 1024;
+    llama_wavefront::wavefront_plan plan;
+    std::string err;
+    for (uint32_t count : {1024u, 1536u, 2048u, 4096u}) {
+        auto ub = make_test_ubatch(count, 103424, 0);
+        CHECK(llama_wavefront::partition_ubatch_causal_tiles(ub, 512, 64, P, 0, plan, err));
+        CHECK(llama_wavefront::is_serving_n512_plan(plan));
+        CHECK(!llama_wavefront::is_serving_n256_plan(plan));
+        CHECK(plan.n_tiles == count / 512);
+        auto good = plan;
+        plan.tiles.back().n_tokens = 511;
+        CHECK(!llama_wavefront::is_serving_n512_plan(plan));
+        plan = good;
+        plan.ubatch_tiles.back().n_seqs_unq = 2;
+        CHECK(!llama_wavefront::is_serving_n512_plan(plan));
+    }
+    for (uint32_t count : {512u, 1023u, 1025u, 4608u}) {
+        auto ub = make_test_ubatch(count, 103424, 0);
+        CHECK(llama_wavefront::partition_ubatch_causal_tiles(ub, 512, 64, P, 0, plan, err));
+        CHECK(!llama_wavefront::is_serving_n512_plan(plan));
+    }
+    auto crossing = make_test_ubatch(1024, P - 256, 0);
+    CHECK(llama_wavefront::partition_ubatch_causal_tiles(crossing, 512, 64, P, 0, plan, err));
+    CHECK(!llama_wavefront::is_serving_n512_plan(plan));
+    auto gap = make_test_ubatch(1024, 103424, 0);
+    for (uint32_t i = 512; i < 1024; ++i) ++gap.pos[i];
+    CHECK(llama_wavefront::partition_ubatch_causal_tiles(gap, 512, 64, P, 0, plan, err));
+    CHECK(!llama_wavefront::is_serving_n512_plan(plan));
 }
 
 static void test_serving_n256_internal_parents() {
@@ -1234,6 +1267,7 @@ int main() {
 
     test_serving_2x256_contract();
     test_serving_4x256_contract();
+    test_serving_n512_contract();
     test_serving_n256_internal_parents();
     test_serving_2x256_schedule();
     test_tile_size_validation();

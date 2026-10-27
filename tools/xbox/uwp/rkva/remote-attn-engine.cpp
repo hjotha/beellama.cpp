@@ -157,11 +157,11 @@ struct FailedCallGuard {
 // Timestamp slots layout per set. Non-bulk uses slots 0..5.
 // Bulk uses:
 //   Slot 0: envelope begin
-//   Segments 0..31: 8 slots each starting at slot 1 + i * 8:
+//   Segments 0..63: 8 slots each starting at slot 1 + i * 8:
 //     upload_begin, upload_end, attn_begin, attn_pass1, attn_reduce, attn_end,
 //     pack_end, copy_end. upload_end..attn_begin includes bulk unpack/WHT.
 //   Slot 1 + segment_count * 8: envelope end
-// Total max slots for 32 segments: 2 + 32 * 8 = 258 <= 512.
+// Total max slots for 64 segments: 2 + 64 * 8 = 514 <= 1024.
 constexpr uint32_t kTsUploadBegin = 0;
 constexpr uint32_t kTsUploadEnd = 1;
 constexpr uint32_t kTsAttnBegin = 2;
@@ -179,9 +179,11 @@ constexpr uint32_t kTsBulkAttnCopy = 5;
 constexpr uint32_t kTsBulkPackEnd = 6;
 constexpr uint32_t kTsBulkCopyEnd = 7;
 constexpr uint32_t kTsBulkSlotsPerSegment = 8;
-constexpr uint32_t kTsBulkMaxSegments = 32;
+constexpr uint32_t kTsBulkMaxSegments = 64;
 
-constexpr uint32_t kTsPerSet = 512;
+constexpr uint32_t kTsPerSet = 1024;
+static_assert(2 + kTsBulkMaxSegments * kTsBulkSlotsPerSegment <= kTsPerSet,
+              "bulk timestamp capacity must cover every segment");
 constexpr uint32_t kTsSets = 4;
 
 struct BulkSegmentProfile {

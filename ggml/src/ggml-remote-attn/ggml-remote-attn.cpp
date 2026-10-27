@@ -2529,7 +2529,8 @@ static bool rkva_prepare_native_bulk_job(
             values->type != GGML_TYPE_F32 || !ggml_is_contiguous(keys) ||
             !ggml_is_contiguous(values) || !ggml_are_same_shape(keys, values) ||
             keys->ne[0] != 256 || keys->ne[1] != ctx->geo.n_head_kv ||
-            keys->ne[2] != int64_t(nq) || keys->ne[3] != 1 || nq == 0 || nq > 256 ||
+            keys->ne[2] != int64_t(nq) || keys->ne[3] != 1 || nq == 0 || nq > 512 ||
+            (nq > 256 && (!(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_512) || !ctx->native_store)) ||
             (!ctx->native_store && !ctx->native_q4 && !ctx->native_q8) ||
             (size_t) layer >= ctx->range_layers.size() ||
             (size_t) layer >= ctx->native_layers.size() || live == 0) {
@@ -4796,6 +4797,13 @@ bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend) {
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
     return ctx->async_local_remote && ctx->connected && !ctx->failed &&
            ctx->range_configured && ctx->range_native_kvarn && ctx->native_bulk;
+}
+
+bool ggml_backend_remote_attn_kvarn_bulk_512_enabled(ggml_backend_t backend) {
+    if (!ggml_backend_remote_attn_async_enabled(backend)) return false;
+    const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
+    return ctx->native_store && !ctx->native_q4 && !ctx->native_q8 &&
+           (ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_512);
 }
 
 bool ggml_backend_remote_attn_cohort_enabled(ggml_backend_t backend) {

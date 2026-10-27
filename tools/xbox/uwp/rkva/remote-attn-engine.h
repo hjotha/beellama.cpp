@@ -349,7 +349,7 @@ class RemoteAttnEngine {
     Buffer snapshot_upload_;
     Buffer snapshot_readback_;
     // Native bulk: distinct transfer regions survive the single final fence.
-    // Grow-only bounded pool (32 segments), also retained on unconfirmed submit.
+    // Grow-only bounded pool (64 native KVarN4 segments), also retained on unconfirmed submit.
     struct BulkTransfer {
         Buffer upload, query, readback;
         Buffer query_f16_upload, query_f32_default, packed_out_f16;

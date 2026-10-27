@@ -80,6 +80,8 @@ static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK = 1ull << 15;
 // Reserved experimental identity only. This client refuses RPC_BATCH=4 until
 // a matching server implementation has been qualified; bits14/15 stay native.
 static constexpr uint64_t RKVA_CAP_KVARN_COHORT_ATTN = 1ull << 16;
+// Native KVarN4 bulk supports up to 512 queries / 64 serial-prefix segments.
+static constexpr uint64_t RKVA_CAP_KVARN_BULK_512 = 1ull << 17;
 
 // v1 cohort extension; each entry immediately precedes its old op22 body.
 // Reply mirrors the envelope with OUT/LSE bodies and exact ticket/epoch echoes.

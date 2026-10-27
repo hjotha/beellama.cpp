@@ -29,7 +29,7 @@ static float record_value(const uint8_t * p, uint32_t row, uint32_t col) {
     return (q * half_at(p + 8192 + row * 2) + half_at(p + 8448 + row * 2)) * half_at(p + 8704 + col * 2);
 }
 
-static void test(uint32_t tail) {
+static void test(uint32_t tail, bool extended) {
     constexpr uint32_t origin = 1024, capacity = 768, heads = 4, total = 640;
     constexpr size_t width = heads * 256, record = 8960, physical = heads * 2;
     const auto store = reinterpret_cast<ggml_backend_cpu_kvarn_store_direct_v1_t>(
@@ -49,7 +49,7 @@ static void test(uint32_t tail) {
         }
     }
     const char * fixture_dir = std::getenv("GGML_RKVA_GPU_PACKET_DIR");
-    const std::string fixture = fixture_dir ? std::string(fixture_dir) + "/tail-" + std::to_string(tail) : "";
+    const std::string fixture = fixture_dir ? std::string(fixture_dir) + "/tail-" + std::to_string(tail) + (extended ? "-batch512" : "") : "";
     const auto export_bytes = [&](const std::string & name, const void * data, size_t bytes) {
         if (!fixture_dir) return;
         std::ofstream out(fixture + name, std::ios::binary); assert(out);
@@ -70,7 +70,8 @@ static void test(uint32_t tail) {
     uint32_t at = 0;
     // Unaligned preparations exercise closing groups that contain both old
     // stage rows and newly rotated rows, and cross both ping-pong slots.
-    for (uint32_t batch : {120u, 256u, 256u, 8u}) {
+    for (uint32_t batch : (extended ? std::vector<uint32_t>{120u, 512u, 8u} :
+                                      std::vector<uint32_t>{120u, 256u, 256u, 8u})) {
         const auto start = std::chrono::steady_clock::now();
         assert(gpu.prepare(k.data() + at * width, v.data() + at * width, pos.data() + at, batch));
         gpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -178,7 +179,8 @@ int main() {
     ggml_backend_load_all();
     assert(ggml_backend_reg_by_name("CUDA"));
     if (std::getenv("GGML_RKVA_GPU_MICRO_ONLY")) { benchmark_decode(false); return 0; }
-    test(0); test(128);
+    test(0, false); test(128, false);
+    test(0, true); test(128, true);
     benchmark_decode(true);
     mode("cpu");
 }

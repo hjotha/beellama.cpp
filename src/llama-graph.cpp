@@ -2099,8 +2099,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         const auto * prefix = inp_attn->self_overflow_cell_idxs;
         const bool unused_wavefront_mask =
             (params.wavefront_tile_size == 64 || params.wavefront_tile_size == 128 ||
-             (params.wavefront_tile_size == 256 &&
-              (params.cparams.n_ubatch == 512 || params.cparams.n_ubatch == 1024) &&
+             ((params.wavefront_tile_size == 256 || params.wavefront_tile_size == 512) &&
+              ((params.wavefront_tile_size == 256 && (params.cparams.n_ubatch == 512 || params.cparams.n_ubatch == 1024)) ||
+               (params.wavefront_tile_size == 512 && params.cparams.n_ubatch >= 1024 && params.cparams.n_ubatch <= 4096 && params.cparams.n_ubatch % 512 == 0)) &&
               params.ubatch.n_tokens == params.cparams.n_ubatch)) &&
             params.arch == LLM_ARCH_QWEN35 && params.backend_remote &&
             cparams.remote_attn_position_split && params.cparams.remote_attn_position_split &&
@@ -5273,7 +5274,8 @@ ggml_tensor * llm_graph_context::build_ovf_mask_crop(
 
 llm_graph_context::position_split_rpc_packet llm_graph_context::build_attn_position_split_rpc_prepare(
         llm_graph_input_attn_kv * inp, ggml_tensor * q_cur, ggml_tensor * k_cur,
-        ggml_tensor * v_cur, float kq_scale, int il, ggml_tensor * positions) const {
+        ggml_tensor * v_cur, float kq_scale, int il, ggml_tensor * positions,
+        bool remote_only, const position_split_rpc_packet * submitted) const {
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(inp->mctx);
     if (!kvarn_ctx || !kvarn_ctx->position_split_enabled() || !positions ||
             !backend_remote || !backend_cpu || !cparams.causal_attn ||
@@ -5295,43 +5297,62 @@ llm_graph_context::position_split_rpc_packet llm_graph_context::build_attn_posit
     if (!backend_cuda) throw std::runtime_error("RKVA position split requires local CUDA attention");
     const uint32_t n_local = uint32_t(inp->self_kq_mask_local->ne[0]);
     auto * mask_local = inp->self_kq_mask_local_cnv;
-    // Preserve the Q4_0/Q8_0/F16 checkpoint representation; upload only appended rows.
-    auto * k_written = kvarn_ctx->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il);
-    auto * v_written = kvarn_ctx->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il);
-    if (!k_written || !v_written) throw std::runtime_error("missing RKVA companion stores");
-    ggml_backend_sched_set_tensor_backend(sched, k_written, backend_cpu);
-    ggml_backend_sched_set_tensor_backend(sched, v_written, backend_cpu);
-    ggml_backend_sched_set_tensor_backend(sched, inp->self_overflow_cell_idxs, backend_cpu);
-    ggml_backend_sched_set_tensor_backend(sched, inp->self_kvarn_mat_idxs_local, backend_cpu);
-    ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_cpu);
-    ggml_build_forward_expand(gf, k_written);
-    ggml_build_forward_expand(gf, v_written);
-    int remote_layer = 0;
-    for (int l = 0; l < il; ++l) {
-        if (hparams.has_kv(l) && !hparams.is_recr(l)) ++remote_layer;
+    ggml_tensor * range = nullptr;
+    ggml_backend_t wire_backend = nullptr;
+    bool async_overlap = false;
+    if (submitted) {
+        if (remote_only || !submitted->range || !submitted->async || submitted->layer != il ||
+                submitted->cuda_backend != backend_cuda || !submitted->wire_backend) {
+            throw std::runtime_error("invalid pre-submitted RKVA range");
+        }
+        range = submitted->range;
+        wire_backend = submitted->wire_backend;
+        async_overlap = submitted->async;
+        ggml_backend_sched_set_tensor_backend(sched, inp->self_kvarn_mat_idxs_local, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_cpu);
+    } else {
+        // Preserve the Q4_0/Q8_0/F16 checkpoint representation; upload only appended rows.
+        auto * k_written = kvarn_ctx->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il);
+        auto * v_written = kvarn_ctx->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il);
+        if (!k_written || !v_written) throw std::runtime_error("missing RKVA companion stores");
+        ggml_backend_sched_set_tensor_backend(sched, k_written, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, v_written, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, inp->self_overflow_cell_idxs, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, inp->self_kvarn_mat_idxs_local, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_cpu);
+        ggml_build_forward_expand(gf, k_written);
+        ggml_build_forward_expand(gf, v_written);
+        int remote_layer = 0;
+        for (int l = 0; l < il; ++l) {
+            if (hparams.has_kv(l) && !hparams.is_recr(l)) ++remote_layer;
+        }
+        async_overlap = ggml_backend_remote_attn_async_enabled(backend_remote);
+        range = ggml_remote_attn_range(ctx0, q_cur, k_written, v_written,
+                inp->self_overflow_cell_idxs, positions, remote_layer,
+                cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
+        const bool cuda_wire = ggml_backend_remote_attn_cuda_enabled_for_node(range);
+        wire_backend = cuda_wire ? backend_cuda : backend_cpu;
+        if (ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
+            // Preserve original projected values as independent graph operands.
+            // The Q4/Q8 companion above remains metadata/bookkeeping only for this
+            // experimental native owner; none of its quantized bytes are decoded.
+            auto * native_k = ggml_cont(ctx0, k_cur);
+            auto * native_v = ggml_cont(ctx0, v_cur);
+            ggml_remote_attn_range_set_native_sources(range, native_k, native_v);
+        }
+        ggml_backend_sched_set_tensor_backend(sched, range, wire_backend);
+        if (async_overlap) {
+            // Submit the ordered remote bulk RPC before the local CUDA attention
+            // cluster, then join it at the wait node just before the LSE merge.
+            // The local range and the remote range are the same layer/query batch;
+            // later layers still depend on the merged output.
+            ggml_remote_attn_range_set_async(range);
+            ggml_build_forward_expand(gf, range);
+        }
     }
-    const bool async_overlap = ggml_backend_remote_attn_async_enabled(backend_remote);
-    auto * range = ggml_remote_attn_range(ctx0, q_cur, k_written, v_written,
-            inp->self_overflow_cell_idxs, positions, remote_layer,
-            cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
-    const bool cuda_wire = ggml_backend_remote_attn_cuda_enabled_for_node(range);
-    ggml_backend_t wire_backend = cuda_wire ? backend_cuda : backend_cpu;
-    if (ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
-        // Preserve original projected values as independent graph operands.
-        // The Q4/Q8 companion above remains metadata/bookkeeping only for this
-        // experimental native owner; none of its quantized bytes are decoded.
-        auto * native_k = ggml_cont(ctx0, k_cur);
-        auto * native_v = ggml_cont(ctx0, v_cur);
-        ggml_remote_attn_range_set_native_sources(range, native_k, native_v);
-    }
-    ggml_backend_sched_set_tensor_backend(sched, range, wire_backend);
-    if (async_overlap) {
-        // Submit the ordered remote bulk RPC before the local CUDA attention
-        // cluster, then join it at the wait node just before the LSE merge.
-        // The local range and the remote range are the same layer/query batch;
-        // later layers still depend on the merged output.
-        ggml_remote_attn_range_set_async(range);
-        ggml_build_forward_expand(gf, range);
+    if (remote_only) {
+        if (!async_overlap) throw std::runtime_error("paired RKVA ranges require asynchronous transport");
+        return { q_cur, range, nullptr, nullptr, nullptr, backend_cuda, wire_backend, il, true };
     }
     const bool native_attention = kvarn_ctx->uses_native_attention(il) &&
         llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
@@ -5470,7 +5491,12 @@ llm_graph_context::position_split_rpc_packet llm_graph_context::build_attn_posit
 }
 
 ggml_tensor * llm_graph_context::build_attn_position_split_rpc_complete(
-        const position_split_rpc_packet & packet) const {
+        const position_split_rpc_packet & packet, const position_split_rpc_packet * second,
+        ggml_tensor * shared_wait, uint32_t query_offset) const {
+    if (!packet.q || !packet.range || !packet.local_out || !packet.local_lse || !packet.local_fa ||
+            !packet.cuda_backend || !packet.wire_backend) {
+        throw std::runtime_error("invalid RKVA completion packet");
+    }
     auto * q_cur = packet.q;
     auto * range = packet.range;
     auto * o1 = packet.local_out;
@@ -5480,19 +5506,46 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc_complete(
     auto * wire_backend = packet.wire_backend;
     const int il = packet.layer;
     const bool async_overlap = packet.async;
-    ggml_tensor * range_wait = nullptr;
+    const int64_t width = q_cur->ne[0]*q_cur->ne[1];
+    if (range->type != GGML_TYPE_F32 || range->ne[0] != width + q_cur->ne[1] || range->ne[1] <= 0 ||
+            (shared_wait && (second || !async_overlap || shared_wait->src[0] != range ||
+                    query_offset > uint64_t(range->ne[1]) ||
+                    uint64_t(q_cur->ne[2]) > uint64_t(range->ne[1]) - query_offset)) ||
+            (!shared_wait && (query_offset || (!second && range->ne[1] != q_cur->ne[2])))) {
+        throw std::runtime_error("invalid RKVA range completion shape");
+    }
+    ggml_tensor * range_wait = shared_wait;
     ggml_tensor * remote_source = range;
     if (async_overlap) {
-        // Completion point: blocks only when the LSE merge consumes the remote
-        // OUT/LSE. It is emitted after the local CUDA cluster and before merge.
-        range_wait = ggml_remote_attn_range_wait(ctx0, range);
+        if (!range_wait) range_wait = ggml_remote_attn_range_wait(ctx0, range);
         ggml_backend_sched_set_tensor_backend(sched, range_wait, wire_backend);
         remote_source = range_wait;
     }
-    const int64_t width = q_cur->ne[0]*q_cur->ne[1];
-    auto * o2 = ggml_cont(ctx0, ggml_view_2d(ctx0, remote_source, width, q_cur->ne[2], remote_source->nb[1], 0));
-    auto * lse2 = ggml_cont(ctx0, ggml_view_2d(ctx0, remote_source, q_cur->ne[1], q_cur->ne[2],
-            remote_source->nb[1], size_t(width)*sizeof(float)));
+    const int64_t first_queries = shared_wait ? q_cur->ne[2] : range->ne[1];
+    const size_t row_offset = size_t(query_offset) * remote_source->nb[1];
+    auto * o2 = ggml_cont(ctx0, ggml_view_2d(ctx0, remote_source, width, first_queries, remote_source->nb[1], row_offset));
+    auto * lse2 = ggml_cont(ctx0, ggml_view_2d(ctx0, remote_source, q_cur->ne[1], first_queries,
+            remote_source->nb[1], row_offset + size_t(width)*sizeof(float)));
+    ggml_tensor * second_wait = nullptr;
+    if (second) {
+        ggml_backend_sched_set_tensor_backend(sched, o2, wire_backend);
+        ggml_backend_sched_set_tensor_backend(sched, lse2, wire_backend);
+        if (!async_overlap || !second->async || !second->range || second->range == range ||
+                second->range->type != GGML_TYPE_F32 || second->range->ne[0] != width + q_cur->ne[1] ||
+                second->range->ne[1] <= 0 || second->layer != il || second->cuda_backend != backend_cuda ||
+                second->wire_backend != wire_backend || first_queries + second->range->ne[1] != q_cur->ne[2]) {
+            throw std::runtime_error("invalid paired RKVA completion");
+        }
+        second_wait = ggml_remote_attn_range_wait(ctx0, second->range);
+        ggml_backend_sched_set_tensor_backend(sched, second_wait, wire_backend);
+        auto * o_second = ggml_cont(ctx0, ggml_view_2d(ctx0, second_wait, width, second->range->ne[1], second_wait->nb[1], 0));
+        auto * lse_second = ggml_cont(ctx0, ggml_view_2d(ctx0, second_wait, q_cur->ne[1], second->range->ne[1],
+                second_wait->nb[1], size_t(width)*sizeof(float)));
+        ggml_backend_sched_set_tensor_backend(sched, o_second, wire_backend);
+        ggml_backend_sched_set_tensor_backend(sched, lse_second, wire_backend);
+        o2 = ggml_concat(ctx0, o2, o_second, 1);
+        lse2 = ggml_concat(ctx0, lse2, lse_second, 1);
+    }
     ggml_backend_sched_set_tensor_backend(sched, o2, wire_backend);
     ggml_backend_sched_set_tensor_backend(sched, lse2, wire_backend);
     if (std::getenv("F4_NODE_DUMP") != nullptr) {
@@ -5502,12 +5555,15 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc_complete(
         cb(lse1, "diag_local_lse", il);
         cb(range, "diag_rpc_range", il);
         if (range_wait) cb(range_wait, "diag_rpc_wait", il);
+        if (second) cb(second->range, "diag_rpc_range_second", il);
+        if (second_wait) cb(second_wait, "diag_rpc_wait_second", il);
         cb(o2, "diag_remote_out", il);
         cb(lse2, "diag_remote_lse", il);
     }
     ggml_build_forward_expand(gf, o1);
     ggml_build_forward_expand(gf, lse1);
     if (range_wait) ggml_build_forward_expand(gf, range_wait);
+    if (second_wait) ggml_build_forward_expand(gf, second_wait);
     ggml_build_forward_expand(gf, o2);
     ggml_build_forward_expand(gf, lse2);
     const int merge_begin = ggml_graph_n_nodes(gf);
@@ -5615,7 +5671,7 @@ public:
 };
 
 std::unique_ptr<llm_graph_input_attn_kv> llm_graph_context::build_wavefront_attn_input(
-        llm_graph_input_attn_kv * parent, uint32_t offset, uint32_t count) const {
+        llm_graph_input_attn_kv * parent, uint32_t offset, uint32_t count, bool local_only) const {
     GGML_ASSERT(parent && count && offset + count <= ubatch.n_tokens);
     auto result = std::make_unique<llm_graph_input_attn_kv>(*parent);
     auto slice_rows = [&](ggml_tensor * tensor) -> ggml_tensor * {
@@ -5650,18 +5706,20 @@ std::unique_ptr<llm_graph_input_attn_kv> llm_graph_context::build_wavefront_attn
     result->self_tail_read_idxs = slice_rows(parent->self_tail_read_idxs);
     result->self_tail_body_read_idxs = slice_rows(parent->self_tail_body_read_idxs);
     result->self_tail_bias_read_idxs = slice_rows(parent->self_tail_bias_read_idxs);
-    // The remote owner must see only the committed prefix for THIS tile,
-    // never the padded full-parent cell list including not-yet-produced K/V.
-    result->self_overflow_cell_idxs = ggml_dup_tensor(ctx0, parent->self_overflow_cell_idxs);
-    ggml_set_input(result->self_overflow_cell_idxs);
-    ggml_backend_sched_set_tensor_backend(sched, result->self_overflow_cell_idxs, backend_cpu);
-    // Keep the parent's validated list allocated even though it is not a
-    // direct RPC operand anymore. Its normal setter checks live positions,
-    // global IDs and companion row mapping before the tile adapters run.
-    ggml_backend_sched_set_tensor_backend(sched, parent->self_overflow_cell_idxs, backend_cpu);
-    ggml_build_forward_expand(gf, parent->self_overflow_cell_idxs);
-    res->add_input(std::make_unique<llm_graph_input_wavefront_prefix>(parent->self_overflow_cell_idxs,
-            result->self_overflow_cell_idxs, cparams.kv_position_split_p, offset, count));
+    if (!local_only) {
+        // The remote owner must see only the committed prefix for THIS tile,
+        // never the padded full-parent cell list including not-yet-produced K/V.
+        result->self_overflow_cell_idxs = ggml_dup_tensor(ctx0, parent->self_overflow_cell_idxs);
+        ggml_set_input(result->self_overflow_cell_idxs);
+        ggml_backend_sched_set_tensor_backend(sched, result->self_overflow_cell_idxs, backend_cpu);
+        // Keep the parent's validated list allocated even though it is not a
+        // direct RPC operand anymore. Its normal setter checks live positions,
+        // global IDs and companion row mapping before the tile adapters run.
+        ggml_backend_sched_set_tensor_backend(sched, parent->self_overflow_cell_idxs, backend_cpu);
+        ggml_build_forward_expand(gf, parent->self_overflow_cell_idxs);
+        res->add_input(std::make_unique<llm_graph_input_wavefront_prefix>(parent->self_overflow_cell_idxs,
+                result->self_overflow_cell_idxs, cparams.kv_position_split_p, offset, count));
+    }
     if (parent->self_tail_query_order) {
         result->self_tail_query_order = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, count, 1);
         result->self_tail_run_desc = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, parent->self_tail_run_desc->ne[0], 1);

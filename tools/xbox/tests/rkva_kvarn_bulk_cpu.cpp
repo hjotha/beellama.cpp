@@ -363,6 +363,19 @@ int main() {
         assert(!validate(data.data(), data.size(), 256, wrong_revision, 24, 4, 120, 0, true,
                          rkva_kvarn_range::coverage_after_reset(120, tail), 1, segments));
 
+        // Extended envelope: 512 queries, 64 ordered segments, fail closed on
+        // corruption in the second half and on over-limit query/segment counts.
+        auto extended = payload(120, 512, tail, RKVA_WIRE_FP8);
+        std::vector<Segment> extended_segments;
+        assert(validate_wire(extended.data(), extended.size(), 512, descriptor(tail), 24, 4,
+                             120, 0, true, rkva_kvarn_range::coverage_after_reset(120, tail),
+                             1, RKVA_WIRE_FP8, extended_segments));
+        assert(extended_segments.size() == 64);
+        int32_t invalid_position = -1;
+        std::memcpy(extended.data() + extended_segments.back().positions_offset, &invalid_position, 4);
+        assert(!valid(extended, 120, 512, tail, 1, RKVA_WIRE_FP8));
+        auto too_many = payload(120, 520, tail, RKVA_WIRE_FP8);
+        assert(!valid(too_many, 120, 520, tail, 1, RKVA_WIRE_FP8));
         // FP16 bulk admission: NaN/Inf in any segment Q or mixed segment wire is rejected.
         auto data_f16 = payload(120, 256, tail, RKVA_WIRE_F16);
         std::vector<Segment> segs_f16;
