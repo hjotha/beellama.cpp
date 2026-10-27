@@ -369,6 +369,8 @@ private:
                                 bool * native_sha256_valid = nullptr);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags,
                                 uint32_t evaluated_tokens = 0);
+    bool commit_pending_native_restore(const uint8_t prefix_sha256[32]);
+    void abort_pending_native_restore();
 
     //
     // members
@@ -411,6 +413,14 @@ private:
     uint64_t nextn_decode_serial = 0;
     uint64_t nextn_decode_id = 0;
     std::vector<std::pair<llama_token, llama_pos>> nextn_decoded_batch;
+
+    // Native FULL restore transaction: the trailer is parsed into backend
+    // shadow state, but the Xbox snapshot is not touched until the caller has
+    // hashed the complete host prefix through the RKVK frame.
+    bool native_restore_pending = false;
+    bool native_restore_committed = false;
+    uint32_t native_restore_rows = 0;
+    uint64_t native_restore_saved_generation = 0;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

@@ -31,7 +31,7 @@
 #include <unistd.h>
 
 struct loopback {
-    enum class profile_failure { none, cycle, version, oversized, truncated, server_error, short_header };
+    enum class profile_failure { none, cycle, version, oversized, truncated, server_error, short_header, snapshot_miss };
     int listener = -1;
     std::atomic<int> client {-1};
     uint16_t port = 0;
@@ -347,11 +347,14 @@ struct loopback {
                                 native_snapshot_rows = snapshot.live_rows;
                                 native_ack.generation = native_generation;
                             } else {
-                                assert(native_snapshot_saved);
-                                assert(native.saved_generation == native_snapshot_generation);
-                                assert(snapshot.live_rows == native_snapshot_rows);
-                                assert(std::memcmp(native_snapshot_hash.data(),
-                                                   snapshot.host_state_sha256, 32) == 0);
+                                if (!native_snapshot_saved ||
+                                    native.saved_generation != native_snapshot_generation ||
+                                    snapshot.live_rows != native_snapshot_rows ||
+                                    std::memcmp(native_snapshot_hash.data(),
+                                                snapshot.host_state_sha256, 32) != 0) {
+                                    response_failure = profile_failure::snapshot_miss;
+                                    break;
+                                }
                                 ++native_generation;
                                 std::fill(native_counts.begin(), native_counts.end(),
                                           snapshot.live_rows);
@@ -717,6 +720,11 @@ struct loopback {
                     if (response_failure == profile_failure::oversized) rsp.payload_bytes = (256u << 20) + 1;
                     if (response_failure == profile_failure::server_error) {
                         rsp.status = RKVA_ERR_STATE;
+                        rsp.payload_bytes = 0;
+                        response.clear();
+                    }
+                    if (response_failure == profile_failure::snapshot_miss) {
+                        rsp.status = RKVA_ERR_SNAPSHOT_MISS;
                         rsp.payload_bytes = 0;
                         response.clear();
                     }
@@ -1373,13 +1381,29 @@ static void test_native_snapshot_transport() {
         }, &owner_state, owner_key));
     assert(!owner_state.empty());
     // The server appends its SCKP checkpoint block after the llama state. The
-    // native key is the RKVK digest, so these trailing bytes must neither be
-    // consumed by the owner parser nor alter the key.
+    // native key binds the complete host prefix through the RKVK frame, so
+    // these trailing bytes must neither be consumed by the owner parser nor
+    // alter the key.
     std::vector<uint8_t> framed_state = owner_state;
     const uint32_t sckp[3] = {0x504b4353u, 1u, 0u};
     framed_state.insert(framed_state.end(), reinterpret_cast<const uint8_t *>(sckp),
                         reinterpret_cast<const uint8_t *>(sckp) + sizeof(sckp));
-    assert(ggml_backend_remote_attn_native_kvarn_remote_save(backend, owner_key, 130));
+    // Simulated host prefix (server header, tokens and local KV/recurrent
+    // state) precedes RKVK in the real file. A same-size flip here must change
+    // the key while leaving RKVK byte-identical.
+    std::vector<uint8_t> local_prefix(137, 0x33);
+    const auto prefix_key = [](const std::vector<uint8_t> & prefix,
+                               const std::vector<uint8_t> & frame) {
+        std::vector<uint8_t> bytes = prefix;
+        bytes.insert(bytes.end(), frame.begin(), frame.end());
+        return rkva_snapshot::digest(bytes.data(), bytes.size());
+    };
+    const auto good_key = prefix_key(local_prefix, owner_state);
+    auto mutated_local = local_prefix;
+    mutated_local[7] ^= 0x01;
+    const auto bad_local_key = prefix_key(mutated_local, owner_state);
+    assert(std::memcmp(good_key.data(), bad_local_key.data(), good_key.size()) != 0);
+    assert(ggml_backend_remote_attn_native_kvarn_remote_save(backend, good_key.data(), 130));
 
     // Fresh resident session (empty counts/coverage), same connection.
     assert(ggml_backend_remote_attn_reset(backend, 0));
@@ -1400,8 +1424,24 @@ static void test_native_snapshot_transport() {
     assert(std::memcmp(restored_key, owner_key, sizeof(owner_key)) == 0);
     uint64_t new_generation = 0;
     assert(rows == 130);
+    // A corrupted local prefix preserves the RKVK frame but changes the key;
+    // the Xbox must reject the restore and leave the fresh destination empty.
+    assert(!ggml_backend_remote_attn_native_kvarn_remote_restore(
+        backend, bad_local_key.data(), rows, saved_generation, &new_generation));
+    assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));
+    ggml_backend_remote_attn_native_kvarn_state_abort(backend);
+    // Retry the valid prefix into the same new session.
+    source_state.second = 0;
+    assert(ggml_backend_remote_attn_native_kvarn_state_read(
+        backend, [](void * user, void * data, size_t bytes) {
+            auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
+            if (bytes > source->first->size() - source->second) return false;
+            std::memcpy(data, source->first->data() + source->second, bytes);
+            source->second += bytes;
+            return true;
+        }, &source_state, &rows, &saved_generation, restored_key));
     assert(ggml_backend_remote_attn_native_kvarn_remote_restore(
-        backend, restored_key, rows, saved_generation, &new_generation));
+        backend, good_key.data(), rows, saved_generation, &new_generation));
     assert(ggml_backend_remote_attn_native_kvarn_state_commit(backend, new_generation));
     assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
 
@@ -1410,6 +1450,44 @@ static void test_native_snapshot_transport() {
     assert(ggml_backend_remote_attn_native_kvarn_can_restore(backend, 1024 + 132));
     assert(ggml_backend_remote_attn_trim(backend, 0, 1024 + 128));
     run(130, 0); run(130, 1);
+
+    // Same-size trailer mutation must fail the owner checksum before any
+    // transport restore; the fresh destination remains empty.
+    assert(ggml_backend_remote_attn_reset(backend, 0));
+    auto mutated_trailer = owner_state;
+    mutated_trailer[mutated_trailer.size() / 2] ^= 0x01;
+    std::pair<const std::vector<uint8_t> *, size_t> bad_source{&mutated_trailer, 0};
+    uint8_t ignored_key[32] = {};
+    assert(!ggml_backend_remote_attn_native_kvarn_state_read(
+        backend, [](void * user, void * data, size_t bytes) {
+            auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
+            if (bytes > source->first->size() - source->second) return false;
+            std::memcpy(data, source->first->data() + source->second, bytes);
+            source->second += bytes;
+            return true;
+        }, &bad_source, &rows, &saved_generation, ignored_key));
+    assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));
+
+    // Unknown/invalid bytes after RKVK are not part of the owner frame. A
+    // valid owner frame followed by junk still parses and restores under the
+    // same prefix key; the server rejects the appendix separately.
+    std::vector<uint8_t> bad_scpk = owner_state;
+    const uint8_t junk[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    bad_scpk.insert(bad_scpk.end(), junk, junk + sizeof(junk));
+    std::pair<const std::vector<uint8_t> *, size_t> junk_source{&bad_scpk, 0};
+    assert(ggml_backend_remote_attn_native_kvarn_state_read(
+        backend, [](void * user, void * data, size_t bytes) {
+            auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
+            if (bytes > source->first->size() - source->second) return false;
+            std::memcpy(data, source->first->data() + source->second, bytes);
+            source->second += bytes;
+            return true;
+        }, &junk_source, &rows, &saved_generation, ignored_key));
+    assert(junk_source.second == owner_state.size());
+    assert(ggml_backend_remote_attn_native_kvarn_remote_restore(
+        backend, good_key.data(), rows, saved_generation, &new_generation));
+    assert(ggml_backend_remote_attn_native_kvarn_state_commit(backend, new_generation));
+    assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
 
     ggml_remote_attn_set_active(nullptr);
     ggml_backend_buffer_free(buffers); ggml_free(ctx); ggml_backend_free(cpu); ggml_backend_free(backend);

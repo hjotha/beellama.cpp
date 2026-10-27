@@ -5,10 +5,15 @@
 // path conversion can be unit-tested on the host.
 
 #include "ggml.h"
+#include "llama-mmap.h"
+#include "rkva-snapshot-digest.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -18,6 +23,27 @@
 #endif
 
 namespace llama_native_save {
+
+inline bool hash_file_prefix(llama_file & file, size_t end, uint8_t out_sha256[32]) {
+    const size_t position = file.tell();
+    const size_t size = file.size();
+    if (end > size || position > size) {
+        return false;
+    }
+    rkva_snapshot::Sha256 hash;
+    std::vector<uint8_t> buffer(1u << 20);
+    file.seek(0, SEEK_SET);
+    for (size_t left = end; left;) {
+        const size_t count = std::min(left, buffer.size());
+        file.read_raw(buffer.data(), count);
+        hash.update(buffer.data(), count);
+        left -= count;
+    }
+    file.seek(position, SEEK_SET);
+    const auto digest = hash.finish();
+    std::memcpy(out_sha256, digest.data(), digest.size());
+    return true;
+}
 
 inline std::string temporary_path(const char * filepath) {
     static std::atomic<uint64_t> nonce{0};

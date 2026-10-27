@@ -12,6 +12,7 @@
 #include "llama-io.h"
 #include "llama-io-file.h"
 #include "llama-native-save-file.h"
+#include "llama-state-framing.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cache-iswa.h"
@@ -6858,6 +6859,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
         try {
             nread = state_seq_read_data(io, seq_id, 0, loaded_token_count);
         } catch (...) {
+            abort_pending_native_restore();
             if (!native_before && remote_native_kvarn_transient_active() && backend_remote) {
                 ggml_backend_remote_attn_native_kvarn_discard(backend_remote);
                 (void) ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
@@ -6866,13 +6868,23 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
         }
         const size_t state_end = file.tell();
         if (!nread || nread > state_size || state_end < state_begin || state_end - state_begin != nread) {
+            abort_pending_native_restore();
             LLAMA_LOG_ERROR("%s: failed to restore sequence state (read %zu of %zu bytes)\n",
                     __func__, nread, state_size);
             return 0;
         }
         try {
+            if (native_restore_pending) {
+                uint8_t prefix_sha256[32] = {};
+                if (!llama_native_save::hash_file_prefix(file, state_end, prefix_sha256) ||
+                        !commit_pending_native_restore(prefix_sha256)) {
+                    abort_pending_native_restore();
+                    throw std::runtime_error("native KVarN4 overflow host prefix does not match the Xbox snapshot");
+                }
+            }
             io.commit();
         } catch (...) {
+            abort_pending_native_restore();
             if (!native_before && remote_native_kvarn_transient_active() && backend_remote) {
                 ggml_backend_remote_attn_native_kvarn_discard(backend_remote);
                 (void) ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
@@ -6917,10 +6929,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 
     // save the context state using stream saving
     llama_io_write_file io(&file);
-    uint8_t native_key[32] = {};
-    bool native_key_valid = false;
-    state_seq_write_data(io, seq_id, 0, native_active ? native_key : nullptr,
-            &native_key_valid);
+    state_seq_write_data(io, seq_id, 0);
 
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
@@ -6929,11 +6938,15 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     if (native_active) {
         // Direct slot saves bypass server_route_state_save. Pair them with the
         // Xbox snapshot here so a published host file is never left without
-        // its GPU state. The key is the SHA-256 of the canonical RKVK owner
-        // set, not the enclosing file, so appended SCKP checkpoints do not
-        // change it. The staging file is already closed before publication.
-        if (!native_key_valid)
-            throw std::runtime_error("native KVarN4 overflow owner-state digest missing");
+        // its GPU state. The key binds the complete host prefix through the
+        // RKVK trailer; the server may append SCKP afterwards but that is not
+        // part of the key. The staging file is already closed.
+        uint8_t native_key[32] = {};
+        {
+            llama_file input(write_path, "rb");
+            if (!llama_native_save::hash_file_prefix(input, input.size(), native_key))
+                throw std::runtime_error("native KVarN4 overflow host prefix hash failed");
+        }
         const uint32_t live_rows = uint32_t(n_token_count - cparams.kv_position_split_p);
         if (!ggml_backend_remote_attn_native_kvarn_remote_save(backend_remote, native_key, live_rows)) {
             throw std::runtime_error("native KVarN4 overflow Xbox snapshot save failed");
@@ -7312,8 +7325,8 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         const bool remote_disk = remote_disk_snapshot_enabled();
         const bool native_remote = remote_native_kvarn_enabled();
         // Only the legacy range accelerator keys by the complete host file.
-        // Native revision-3 snapshots key by the canonical RKVK owner-set
-        // digest, so an appended server checkpoint cannot change the key.
+        // Native revision-3 snapshots key by the host prefix through the end
+        // of the RKVK frame; a server SCKP append is excluded.
         const bool legacy_remote_disk = remote_disk && !native_remote;
         rkva_snapshot::Sha256 remote_hash;
         rkva_snapshot::Digest remote_key{};
@@ -7351,6 +7364,15 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         }
         io.read(tokens_out, size_t(header[2])*sizeof(llama_token));
         state_seq_read_data(io, seq_id, 0, header[2]);
+        const size_t state_end = size_t(file.tell());
+        if (native_restore_pending) {
+            uint8_t prefix_sha256[32] = {};
+            if (!llama_native_save::hash_file_prefix(file, state_end, prefix_sha256) ||
+                    !commit_pending_native_restore(prefix_sha256)) {
+                abort_pending_native_restore();
+                throw std::runtime_error("native KVarN4 overflow host prefix does not match the Xbox snapshot");
+            }
+        }
         if (io.n_bytes() != state_size || io.checksum() != checksum) {
             // Which half failed matters: logical extent vs content digest.
             throw std::runtime_error(
@@ -7379,6 +7401,7 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
     } catch (const std::exception & error) {
         // Also covers a throwing publication callback. Tensor bytes become
         // unreachable, so a partial restore can never be advertised as a hit.
+        abort_pending_native_restore();
         memory->clear(false);
         if (!native_before && backend_remote && remote_native_kvarn_enabled()) {
             ggml_backend_remote_attn_native_kvarn_discard(backend_remote);
@@ -7492,6 +7515,36 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
     return io.n_bytes();
 }
 
+void llama_context::abort_pending_native_restore() {
+    if (native_restore_pending && backend_remote) {
+        ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
+    }
+    native_restore_pending = false;
+    native_restore_committed = false;
+    native_restore_rows = 0;
+    native_restore_saved_generation = 0;
+}
+
+bool llama_context::commit_pending_native_restore(const uint8_t prefix_sha256[32]) {
+    if (!native_restore_pending) {
+        return true;
+    }
+    if (!prefix_sha256 || !backend_remote) {
+        abort_pending_native_restore();
+        return false;
+    }
+    uint64_t new_generation = 0;
+    if (!ggml_backend_remote_attn_native_kvarn_remote_restore(backend_remote, prefix_sha256,
+                native_restore_rows, native_restore_saved_generation, &new_generation) ||
+            !ggml_backend_remote_attn_native_kvarn_state_commit(backend_remote, new_generation)) {
+        abort_pending_native_restore();
+        return false;
+    }
+    native_restore_pending = false;
+    native_restore_committed = true;
+    return true;
+}
+
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
         uint32_t evaluated_tokens) {
     const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
@@ -7499,7 +7552,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
         throw std::runtime_error("native KVarN4 overflow non-sequence restore is unsupported; use the sequence state file API");
     }
     nextn_decode_id = 0;
-    bool native_full_restored = false;
+    abort_pending_native_restore();
     if (memory) {
         memory->state_read(io, seq_id, flags);
 
@@ -7547,16 +7600,30 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                             ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
                             throw std::runtime_error("native KVarN4 overflow trailer rows do not match the evaluated prefix");
                         }
-                        uint64_t new_generation = 0;
-                        if (!ggml_backend_remote_attn_native_kvarn_remote_restore(backend_remote,
-                                    state_key, live_rows, saved_generation, &new_generation)) {
-                            ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
-                            throw std::runtime_error("native KVarN4 overflow Xbox snapshot restore failed");
+                        (void) state_key;
+                        native_restore_pending = true;
+                        native_restore_rows = live_rows;
+                        native_restore_saved_generation = saved_generation;
+                        if (io.remaining()) {
+                            // Only the server's SCKP checkpoint appendix is
+                            // recognized after RKVK. Unknown native trailing
+                            // bytes fail closed; legacy non-native trailers
+                            // remain opaque for compatibility.
+                            if (io.remaining() < sizeof(uint32_t)) {
+                                abort_pending_native_restore();
+                                throw std::runtime_error("truncated native snapshot appendix");
+                            }
+                            uint8_t tail[4] = {};
+                            if (!io.peek(tail, sizeof(tail))) {
+                                abort_pending_native_restore();
+                                throw std::runtime_error("native snapshot appendix cannot be inspected");
+                            }
+                            if (llama_state_framing::classify(tail, sizeof(tail)) !=
+                                    llama_state_framing::trailing::slot_checkpoint) {
+                                abort_pending_native_restore();
+                                throw std::runtime_error("unrecognized native snapshot trailing section");
+                            }
                         }
-                        if (!ggml_backend_remote_attn_native_kvarn_state_commit(backend_remote, new_generation)) {
-                            throw std::runtime_error("native KVarN4 overflow owner-state commit failed");
-                        }
-                        native_full_restored = true;
                     }
                 } else if (evaluated_tokens > cparams.kv_position_split_p &&
                            remote_native_kvarn_enabled()) {
@@ -7596,14 +7663,14 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
             // Register after memory's callbacks so failed/prepared restores do
             // not invalidate the live graph. Partial speculative checkpoints
             // retain their existing graph-reuse behavior.
-            io.on_commit([this, native_full_restored]() {
+            io.on_commit([this]() {
                 for (auto & res : gf_res_prev) { if (res) res->reset(); }
             gf_res_prev_active = nullptr;
-                // A native FULL restore has already installed owner rows and a
-                // fresh epoch together with the remote snapshot. Invalidating
-                // here would make the first native append reject the restored
-                // owner. Standard FULL restores still force a full resync.
-                if (!native_full_restored && cparams.remote_attn_position_split && backend_remote) {
+                // A committed native FULL restore has already installed owner
+                // rows and a fresh epoch together with the remote snapshot.
+                // Invalidating here would make the first native append reject
+                // the restored owner. Standard FULL restores still resync.
+                if (!native_restore_committed && cparams.remote_attn_position_split && backend_remote) {
                     ggml_backend_remote_attn_invalidate_range(backend_remote);
                 }
             });
