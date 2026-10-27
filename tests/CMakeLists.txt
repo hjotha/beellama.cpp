@@ -1038,6 +1038,7 @@ llama_build_and_test(test-kv-prefix-lineage.cpp)
 llama_build_and_test(test-hybrid-rpc-prefix-state.cpp)
 llama_build_and_test(test-rkva-kvarn-producer.cpp)
 llama_build_and_test(test-rkva-kvarn-gpu-producer.cpp)
+llama_build_and_test(test-rkva-kvarn-record-storage.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)

@@ -40,10 +40,13 @@ public:
             if (!cuda_) throw std::runtime_error("native KVarN CUDA producer unavailable");
         }
         const size_t groups = (uint64_t(origin) + capacity + 127) / 128;
-        // Full global addressing is intentionally retained for this first
-        // implementation so the canonical CPU store sees the true group ID.
-        // Only overflow record groups are ever sent to the console.
-        records_k_.resize(groups * physical_heads() * record_bytes);
+        // The canonical CPU store addresses records by global group ID, so it
+        // keeps the full global span. CUDA preparation already returns compact
+        // closed-group records relative to the prepared prefix, so only groups
+        // that can still be published need host storage. Wire groups and the
+        // protocol header keep their global numbering either way.
+        record_base_group_ = cuda_ ? origin_ / 128 : 0;
+        records_k_.resize((groups - record_base_group_) * physical_heads() * record_bytes);
         records_v_.resize(records_k_.size());
         stage_k_.resize(size_t(384) * width());
         stage_v_.resize(stage_k_.size());
@@ -166,6 +169,15 @@ public:
         const uint32_t after = before + count;
         const uint32_t record_begin = reset_snapshot ? 0 : before / 128;
         const uint32_t record_groups = after / 128 - record_begin;
+        // Validate the CUDA append destination and the replay span before any
+        // copy or emission so rejected appends leave rows, records and payload
+        // untouched, and so compact base subtraction cannot underflow.
+        const uint64_t first_global = uint64_t(origin_) + before;
+        const uint64_t last_global = first_global + count;
+        if (!record_span_valid(first_global / 128, last_global / 128 - first_global / 128) ||
+                !record_span_valid(uint64_t(origin_) / 128 + record_begin, record_groups)) return false;
+        const size_t record_offset =
+            size_t(origin_ / 128 + record_begin - record_base_group_) * physical_heads() * record_bytes;
         const size_t append_elements = size_t(count) * width();
         // Keep the high-water size as well as capacity: smaller subsequent
         // chunks are completely overwritten below and need no zero-fill.
@@ -231,7 +243,7 @@ public:
             const size_t first_group = global / 128;
             const size_t groups = (global + count) / 128 - first_group;
             if (groups) {
-                const size_t dst = first_group * physical_heads() * record_bytes;
+                const size_t dst = (first_group - record_base_group_) * physical_heads() * record_bytes;
                 const size_t src = (first_group - prepared_begin_ / 128) * physical_heads() * record_bytes;
                 const size_t bytes = groups * physical_heads() * record_bytes;
                 std::memcpy(records_k_.data() + dst, prepared_rk_.data() + src, bytes);
@@ -262,7 +274,6 @@ public:
             payload.insert(payload.end(), begin, begin + bytes);
         };
         emit(&header, sizeof(header));
-        const size_t record_offset = size_t(origin_ / 128 + record_begin) * physical_heads() * record_bytes;
         const size_t record_size = size_t(record_groups) * physical_heads() * record_bytes;
         emit(records_k_.data() + record_offset, record_size);
         emit(records_v_.data() + record_offset, record_size);
@@ -310,10 +321,19 @@ private:
     static constexpr size_t record_bytes = 8960;
     size_t width() const { return size_t(heads_) * 256; }
     uint32_t physical_heads() const { return heads_ * 2; }
+    // Wire and protocol groups stay global; only the host sink may start at a
+    // compact base on the CUDA path.
+    bool record_span_valid(uint64_t first_group, uint64_t group_count) const {
+        if (first_group < record_base_group_) return false;
+        const uint64_t first = first_group - record_base_group_;
+        const uint64_t groups = records_k_.size() / (record_bytes * size_t(physical_heads()));
+        return first <= groups && group_count <= groups - first;
+    }
     uint32_t origin_, capacity_, heads_, iterations_, precision_tail_tokens_, rows_ = 0;
     bool compact_stage_ = false;
     ggml_backend_cpu_kvarn_store_direct_v1_t store_;
     ggml_backend_cuda_kvarn_native_append_v1_t cuda_ = nullptr;
+    uint32_t record_base_group_ = 0;
     uint32_t prepared_begin_ = 0, prepared_count_ = 0;
     std::vector<float> prepared_keys_, prepared_values_;
     std::vector<ggml_fp16_t> prepared_k_, prepared_v_;
