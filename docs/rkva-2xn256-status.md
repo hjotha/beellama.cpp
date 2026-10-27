@@ -449,6 +449,18 @@ workspace aliasing and can cross the128MiB graph guard on a12GiB GPU. Their I64
 indices and N1 masks remain eligible. Serial and two-tile masks are eligible.
 This fallback was exercised by the live two-versus-four-tile comparison.
 
+`GGML_RKVA_LOCAL_INPUT_REUSE=decode` is the stricter opt-in added on this
+branch. Local mask and I64 index cache intent is set only when
+`remote_attn_position_split` is active and the real/parent batch has exactly one
+query (N1 decode). The variable absent, empty, `0`, and unknown values keep the
+original OFF behavior; the exact value `1` keeps the all-batch behavior above.
+Wavefront tile views consult the parent batch query count, so a one-token tile
+of a prefill parent is not marked, and the existing512-query four-tile mask
+guard is unchanged. No CPU/offline test qualifies decode gain or parity: both
+require a real-model, same-binary A/B with matched `-b`/`-ub`, exact prompt and
+sampling settings, hardware and commit ID. Astra must review this mode before
+any merge. This branch makes no hardware claim and does not change the default.
+
 Validation passes10/10 Linux CTests, including the new fake-device scheduler
 regressions, and47 benchmark unit tests. Regression coverage includes allocator
 clobbering, changed bytes, views, graph/arena reuse, copy slots, allocation and
@@ -511,7 +523,8 @@ Evidence under `20261026/local-input-reuse/`: `short-matrix-summary.json`,
 `GGML_CUDA_MASK_PACK` selects a lossless CUDA transport for explicitly marked,
 contiguous F16 prefill masks. Unset defaults to ON; `1` enables it and `0`
 (or any other value) retains the classic copy. This is separate from
-`GGML_RKVA_LOCAL_INPUT_REUSE`, which remains experimental and OFF by default.
+`GGML_RKVA_LOCAL_INPUT_REUSE` (`1` = all batches, `decode` = N1 only), which
+remains experimental and OFF by default.
 
 The CPU validates every raw half word before packing +0/-infinity into one
 bit. A CUDA integer-only kernel reads mapped pinned host staging and restores

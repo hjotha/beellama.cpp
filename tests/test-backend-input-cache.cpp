@@ -290,6 +290,42 @@ static void test_unmarked_write_invalidates(bool views, bool callback) {
     if (callback) CHECK(callback_copies > 0);
 }
 
+static void test_decode_n1_and_prefill_policy_alternation() {
+    fixture f;
+    // N1 decode input. The decode-only policy marks this input; a prefill
+    // batch runs it unmarked. The shape stays N1 because the scheduler cache
+    // is keyed by the destination tensor/plan, while the query-count gate
+    // itself is covered by test-rkva-local-input-reuse. A real shape change
+    // rebuilds and invalidates the allocation plan before this path matters.
+    test_graph g(f.cpu, f.arena.data(), f.arena.size(), 1, false, true);
+    f.place(g);
+    f.run(g); // N1 decode, cacheable: first copy
+    CHECK(f.stats().misses == 1 && f.stats().hits == 0);
+    f.run(g); // repeated N1 decode: hit
+    CHECK(f.stats().misses == 1 && f.stats().hits == 1);
+
+    // Changed N1 bytes must miss and refresh the snapshot.
+    static_cast<float *>(g.root->data)[0] += 1.0f;
+    f.run(g);
+    CHECK(f.stats().misses == 2 && f.stats().hits == 1);
+
+    // Prefill uses an unmarked input. Its ordinary copy must retire the N1
+    // snapshot before overwriting the same retained destination.
+    g.input->flags &= ~GGML_TENSOR_FLAG_INPUT_CACHEABLE;
+    static_cast<float *>(g.root->data)[0] += 1.0f;
+    f.run(g);
+    CHECK(f.stats().misses == 2 && f.stats().hits == 1);
+
+    // Back to N1 cacheable with the original A after A -> B -> C(true prefill
+    // write). This must copy A again, never hit the stale A snapshot.
+    ggml_set_input_cacheable(g.input);
+    static_cast<float *>(g.root->data)[0] -= 2.0f;
+    f.run(g);
+    CHECK(f.stats().misses == 3 && f.stats().hits == 1);
+    f.run(g);
+    CHECK(f.stats().misses == 3 && f.stats().hits == 2);
+}
+
 static void test_weight_callback_state(bool weights_from_allocation) {
     fixture f;
     test_graph g(f.cpu, f.arena.data(), f.arena.size(), 128, true);
@@ -532,6 +568,7 @@ int main() {
     test_unmarked_write_invalidates(false, false);
     test_unmarked_write_invalidates(true, false);
     test_unmarked_write_invalidates(true, true);
+    test_decode_n1_and_prefill_policy_alternation();
     test_weight_callback_state(false);
     test_weight_callback_state(true);
     test_reset_replan_slots();

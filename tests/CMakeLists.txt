@@ -734,6 +734,10 @@ if (TARGET ggml-cpu)
     llama_test(test-backend-input-cache)
 endif()
 
+add_executable(test-rkva-local-input-reuse test-rkva-local-input-reuse.cpp)
+target_include_directories(test-rkva-local-input-reuse PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-rkva-local-input-reuse)
+
 add_executable(test-meta-graph-reuse test-meta-graph-reuse.cpp)
 target_link_libraries(test-meta-graph-reuse PRIVATE ggml)
 llama_test(test-meta-graph-reuse)
