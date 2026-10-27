@@ -2113,12 +2113,16 @@ struct adaptive_slot_cache_reservation {
 struct native_slot_cache_reservation {
     server_prompt_cache * cache = nullptr;
     size_t bytes = 0;
+    uint64_t hard_limit = 0;
 
-    explicit native_slot_cache_reservation(server_prompt_cache * value) : cache(value) {}
+    native_slot_cache_reservation(server_prompt_cache * value, uint64_t limit)
+        : cache(value), hard_limit(limit) {}
 
     static bool reserve(void * user, size_t amount) {
         auto * self = static_cast<native_slot_cache_reservation *>(user);
         if (!self || !self->cache || amount == 0 ||
+                self->bytes > self->hard_limit ||
+                uint64_t(amount) > self->hard_limit - self->bytes ||
                 amount > std::numeric_limits<size_t>::max() - self->bytes ||
                 !self->cache->reserve_transient(amount)) {
             return false;
@@ -8354,13 +8358,15 @@ private:
             }
             llama_tokens loaded(file.tokens.size());
             size_t count = 0;
-            native_slot_cache_reservation reservation(prompt_cache.get());
+            native_slot_cache_reservation reservation(prompt_cache.get(),
+                    adaptive_slot_ram_budget(params_base.cache_ram_mib));
             if (!prompt_cache) {
                 throw std::runtime_error("native streaming RAM budget is unavailable");
             }
             const uint64_t workspace = 48ULL * 1024 * 1024 +
                     uint64_t(llama_n_ctx_seq(ctx_tgt)) * 512;
-            if (!native_slot_cache_reservation::reserve(&reservation, size_t(workspace))) {
+            if (workspace > SIZE_MAX ||
+                    !native_slot_cache_reservation::reserve(&reservation, size_t(workspace))) {
                 throw std::runtime_error("native streaming workspace exceeds the RAM cache budget");
             }
             struct reservation_guard {
@@ -8435,9 +8441,10 @@ private:
             // explicit adaptive snapshot's separate five-copy guard unchanged.
             const uint64_t workspace = (save ? 16ULL : 48ULL)*1024*1024 +
                     uint64_t(llama_n_ctx_seq(ctx_tgt))*(save ? 16 : 512);
-            adaptive_slot_cache_reservation reservation;
-            if (workspace > adaptive_slot_ram_budget(params_base.cache_ram_mib) ||
-                    !reservation.acquire(prompt_cache.get(), size_t(workspace))) {
+            const uint64_t ram_budget = adaptive_slot_ram_budget(params_base.cache_ram_mib);
+            native_slot_cache_reservation reservation(prompt_cache.get(), ram_budget);
+            if (!prompt_cache || workspace > SIZE_MAX ||
+                    !native_slot_cache_reservation::reserve(&reservation, size_t(workspace))) {
                 throw std::runtime_error("router streaming workspace exceeds RAM budget");
             }
             const uint64_t max_bytes = params_base.slot_save_max_bytes > 0 ?
@@ -8561,7 +8568,6 @@ private:
                 // The fixed workspace reservation above does not cover the
                 // materialized RKVK trailer. Reserve the measured staged+owner
                 // peak before the loader allocates it.
-                native_slot_cache_reservation native_reservation(prompt_cache.get());
                 if (!prompt_cache) {
                     throw std::runtime_error("router native streaming RAM budget is unavailable");
                 }
@@ -8572,7 +8578,7 @@ private:
                     }
                 } native_guard{ctx_tgt};
                 llama_state_seq_set_native_restore_reservation(ctx_tgt,
-                        &native_slot_cache_reservation::reserve, &native_reservation);
+                        &native_slot_cache_reservation::reserve, &reservation);
                 const size_t read = llama_state_seq_load_file_streaming(ctx_tgt, restore_path.c_str(),
                         slot.id, loaded.data(), loaded.size(), &count, file.state_bytes, file.state_checksum);
                 restored_memory = read != 0;

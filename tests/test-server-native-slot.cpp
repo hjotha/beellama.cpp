@@ -1,12 +1,14 @@
 // CPU/offline contract for the explicit adaptive native streaming slot API and
 // its bounded restore RAM estimator. No model, GPU or remote peer.
 #include "../tools/server/server-native-slot.h"
+#include "../tools/server/server-slot-budget.h"
 #include "../ggml/include/rkva-native-state.h"
 
 #undef NDEBUG
 #include <cassert>
 #include <cstdio>
 #include <limits>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -114,6 +116,27 @@ void test_restore_peak_16_layers() {
     assert(server_native_slot::restore_peak_bytes(header) != 0);
     header.layers = 0;
     assert(server_native_slot::restore_peak_bytes(header) == UINT64_MAX);
+
+    // Cumulative admission uses the smaller of configured cache-ram and
+    // measured MemAvailable after the server's 25% reserve. This is the real
+    // 16-layer peak plus the bounded streaming workspace.
+    constexpr uint64_t mib = 1024ull * 1024ull;
+    const uint64_t workspace = 48ull * mib + 131072ull * 512ull;
+    std::istringstream meminfo("MemAvailable: 1048576 kB\n");
+    uint64_t measured_available = 0;
+    assert(server_slot_parse_mem_available(meminfo, measured_available));
+    assert(measured_available == (1ull << 30));
+    const uint64_t budget_low = server_slot_cap_ram_budget(measured_available, 4ull << 30, true);
+    assert(budget_low == 3ull * 256ull * mib); // 768 MiB
+    uint64_t total = 0;
+    assert(!server_native_slot::cumulative_fits(workspace, peak, budget_low, &total));
+    assert(total == workspace + peak);
+    const uint64_t budget_fit = server_slot_cap_ram_budget(8ull << 30, 4ull << 30, true);
+    assert(budget_fit == (4ull << 30));
+    assert(server_native_slot::cumulative_fits(workspace, peak, budget_fit));
+    assert(!server_native_slot::cumulative_fits(UINT64_MAX - 1, 2, budget_fit));
+    assert(!server_native_slot::cumulative_fits(workspace, peak, 0));
+    assert(server_slot_cap_ram_budget(0, 4ull << 30, true) == 0);
 }
 
 } // namespace

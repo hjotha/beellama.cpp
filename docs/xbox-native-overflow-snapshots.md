@@ -210,6 +210,13 @@ and reserves the measured staged-RKVK + owner-allocation peak against the real
 prompt-cache RAM budget before allocating the trailer; insufficient reservation
 fails with the destination unchanged.
 
+Admission is cumulative and uses `adaptive_slot_ram_budget`: the smaller of
+the configured `cache-ram` limit and measured `MemAvailable` after the server's
+existing 25% reserve. The bounded streaming workspace is reserved first; the
+RKVK staged/owner peak is then admitted against the remaining hard limit.
+`prompt_cache.reserve_transient` still enforces its own configured cap. If
+either limit fails, nothing is allocated, restored or published.
+
 The RKVK header is peeked before `read_set` allocates. The estimator adds:
 
 - staged `RKVK` bytes (`header + payload + footer`);

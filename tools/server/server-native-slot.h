@@ -103,4 +103,18 @@ inline bool restore_fits(uint64_t peak, uint64_t budget) {
     return peak != UINT64_MAX && peak <= budget;
 }
 
+// Cumulative admission for the real restore peak: local bounded-streaming
+// workspace plus the native staged/owner shadow. The server budget is the
+// smaller of the configured cache-ram limit and measured MemAvailable after
+// the existing 25% reserve.
+inline bool cumulative_fits(uint64_t workspace, uint64_t native_peak,
+                            uint64_t budget, uint64_t * total = nullptr) {
+    if (native_peak == UINT64_MAX || workspace > UINT64_MAX - native_peak)
+        return false;
+    const uint64_t sum = workspace + native_peak;
+    if (total)
+        *total = sum;
+    return sum <= budget;
+}
+
 } // namespace server_native_slot
