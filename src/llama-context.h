@@ -254,6 +254,7 @@ struct llama_context {
     bool remote_native_kvarn_enabled() const;
     bool remote_native_kvarn_can_rewind() const;
     bool remote_native_kvarn_transient_active() const;
+    bool remote_native_kvarn_snapshot_supported() const;
     bool remote_disk_snapshot(llama_seq_id seq_id, const uint8_t key[32],
                               size_t evaluated_tokens, bool restore);
 
@@ -364,7 +365,9 @@ private:
     size_t state_read_data (llama_io_read_i  & io);
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
-    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                const uint8_t * remote_snapshot_key = nullptr,
+                                uint32_t evaluated_tokens = 0);
 
     //
     // members

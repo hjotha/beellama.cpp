@@ -99,6 +99,7 @@ public:
 
     void cancel() override { operations.clear(); callbacks.clear(); staged.clear(); }
     size_t n_bytes() override { return consumed; }
+    size_t remaining() const override { return size - consumed; }
     uint64_t checksum() const { return XXH64_digest(&hash); }
 
 private:

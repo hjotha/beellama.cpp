@@ -58,6 +58,10 @@ struct loopback {
     std::vector<bool> native_ready;
     rkva_kvarn_range_config native_descriptor {};
     uint64_t native_generation = 17;
+    bool native_snapshot_saved = false;
+    rkva_snapshot::Digest native_snapshot_hash{};
+    uint64_t native_snapshot_generation = 0;
+    uint32_t native_snapshot_rows = 0;
     std::vector<rkva_range_profile> profile_controls;
     bool profile_enabled = false;
     uint32_t kernel_mode = 0;
@@ -254,6 +258,12 @@ struct loopback {
                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 64)) {
                                 ack.reserved[0] |= RKVA_CAP_KVARN_BULK_SPLITZIP;
                             }
+                            if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4) &&
+                                (native_rewind_support & 512)) {
+                                ack.reserved[0] |= RKVA_CAP_NATIVE_KVARN_SNAPSHOT;
+                                ack.supported_ops |= (1u << RKVA_SNAPSHOT_SAVE) |
+                                                     (1u << RKVA_SNAPSHOT_RESTORE);
+                            }
                             if (profile_support & 1) ack.reserved[0] |= RKVA_CAP_RANGE_PROFILE;
                             response.resize(sizeof(ack)); std::memcpy(response.data(), &ack, sizeof(ack));
                         } break;
@@ -309,6 +319,54 @@ struct loopback {
                                     native_ready[il] = native_counts[il] != 0;
                                 }
                             }
+                        } break;
+                        case RKVA_SNAPSHOT_SAVE:
+                        case RKVA_SNAPSHOT_RESTORE: {
+                            assert(payload.size() == sizeof(rkva_snapshot_req) +
+                                                           sizeof(rkva_native_snapshot_req));
+                            rkva_snapshot_req snapshot {};
+                            rkva_native_snapshot_req native {};
+                            std::memcpy(&snapshot, payload.data(), sizeof(snapshot));
+                            std::memcpy(&native, payload.data() + sizeof(snapshot), sizeof(native));
+                            assert(snapshot.revision == RKVA_SNAPSHOT_REVISION_NATIVE);
+                            assert(snapshot.flags == 0 && snapshot.reserved == 0);
+                            assert(native.format_version == RKVA_NATIVE_SNAPSHOT_FORMAT);
+                            assert(native.flags == 0);
+                            assert(native.expected_generation == native_generation);
+                            rkva_snapshot_ack ack {};
+                            rkva_native_snapshot_ack native_ack {};
+                            if (req.op == RKVA_SNAPSHOT_SAVE) {
+                                assert(native.saved_generation == native_generation);
+                                assert(snapshot.live_rows);
+                                for (size_t il = 0; il < native_counts.size(); ++il)
+                                    assert(native_counts[il] == snapshot.live_rows && native_ready[il]);
+                                native_snapshot_saved = true;
+                                std::memcpy(native_snapshot_hash.data(),
+                                            snapshot.host_state_sha256, 32);
+                                native_snapshot_generation = native_generation;
+                                native_snapshot_rows = snapshot.live_rows;
+                                native_ack.generation = native_generation;
+                            } else {
+                                assert(native_snapshot_saved);
+                                assert(native.saved_generation == native_snapshot_generation);
+                                assert(snapshot.live_rows == native_snapshot_rows);
+                                assert(std::memcmp(native_snapshot_hash.data(),
+                                                   snapshot.host_state_sha256, 32) == 0);
+                                ++native_generation;
+                                std::fill(native_counts.begin(), native_counts.end(),
+                                          snapshot.live_rows);
+                                std::fill(native_ready.begin(), native_ready.end(), true);
+                                native_ack.generation = native_generation;
+                            }
+                            std::memcpy(ack.host_state_sha256, snapshot.host_state_sha256, 32);
+                            ack.live_rows = snapshot.live_rows;
+                            ack.n_layers = geometry.n_layer_remote;
+                            ack.disk_bytes = 1;
+                            native_ack.layers = geometry.n_layer_remote;
+                            response.resize(sizeof(ack) + sizeof(native_ack));
+                            std::memcpy(response.data(), &ack, sizeof(ack));
+                            std::memcpy(response.data() + sizeof(ack), &native_ack,
+                                        sizeof(native_ack));
                         } break;
                         case RKVA_RANGE_CONFIG:
                             assert(payload.size() == sizeof(range));
@@ -1248,6 +1306,104 @@ static void test_native_rewind() {
       }
     }
     }
+}
+
+// Host-side transport/state regression for the revision-2 native snapshot
+// envelope: save, reset to an empty resident session, parse the canonical owner
+// trailer, restore, continue, and rewind. This exercises the real request/ACK
+// parser and the staged owner commit over TCP; the Xbox disk codec remains in
+// the MSVC/D3D12 build.
+static void test_native_snapshot_transport() {
+    storage_env native("kvarn4");
+    storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
+    storage_env legacy_bulk("0", "GGML_RKVA_NATIVE_BULK");
+    storage_env legacy_async("0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+    storage_env precision("128", "GGML_RKVA_NATIVE_TAIL_TOKENS");
+    storage_env snapshots("1", "GGML_RKVA_DISK_SNAPSHOTS");
+    ggml_backend_load_all();
+    loopback server(false, true, false, false, false, false, 0, 0, true, 3u | 4u | 512u);
+    auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+    ggml_remote_attn_geometry geometry {};
+    geometry.n_layer_remote = 2; geometry.n_head = 2; geometry.n_head_kv = 1;
+    geometry.head_dim = 256; geometry.max_ctx = 512; geometry.kq_scale = 0.0625f;
+    geometry.group_tokens = 128; geometry.sinkhorn_iters = 3;
+    assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+    assert(ggml_backend_remote_attn_connect(backend));
+    assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+    ggml_backend_remote_attn_set_active_session(backend, 0);
+    assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
+    assert(ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend));
+    ggml_remote_attn_set_active(backend);
+
+    auto * ctx = ggml_init({1u << 20, nullptr, true});
+    auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 2, 2);
+    auto * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 512);
+    auto * v = ggml_dup_tensor(ctx, k);
+    auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+    auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+    auto * original_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 2);
+    auto * original_v = ggml_dup_tensor(ctx, original_k);
+    auto * node = ggml_remote_attn_range(ctx, q, k, v, ids, pos, 0, 1024, 2, geometry.kq_scale);
+    ggml_remote_attn_range_set_native_sources(node, original_k, original_v);
+    auto * cpu = ggml_backend_cpu_init();
+    auto * buffers = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    assert(buffers); ggml_backend_buffer_clear(buffers, 0);
+    auto run = [&](uint32_t live, uint32_t layer) {
+        std::vector<int32_t> cells(512, -1);
+        for (uint32_t i = 0; i < live; ++i) cells[i] = 1024 + i;
+        const int32_t positions[2] = {int32_t(1024 + live - 2), int32_t(1024 + live - 1)};
+        ggml_backend_tensor_set(ids, cells.data(), 0, cells.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(pos, positions, 0, sizeof(positions));
+        node->op_params[GGML_REMOTE_ATTN_PARAM_N_LIVE] = int32_t(live);
+        node->op_params[GGML_REMOTE_ATTN_PARAM_LAYER_ID] = int32_t(layer);
+        assert(ggml_remote_attn_exec(node));
+    };
+    for (uint32_t live = 2; live <= 130; live += 2) { run(live, 0); run(live, 1); }
+    assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
+
+    std::vector<uint8_t> owner_state;
+    assert(ggml_backend_remote_attn_native_kvarn_state_write(
+        backend, [](void * user, const void * data, size_t bytes) {
+            auto * out = static_cast<std::vector<uint8_t> *>(user);
+            const auto * begin = static_cast<const uint8_t *>(data);
+            out->insert(out->end(), begin, begin + bytes);
+            return true;
+        }, &owner_state));
+    assert(!owner_state.empty());
+    std::array<uint8_t, 32> hash{};
+    for (size_t i = 0; i < hash.size(); ++i) hash[i] = uint8_t(0x40 + i);
+    assert(ggml_backend_remote_attn_native_kvarn_remote_save(backend, hash.data(), 130));
+
+    // Fresh resident session (empty counts/coverage), same connection.
+    assert(ggml_backend_remote_attn_reset(backend, 0));
+    assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));
+    uint32_t rows = 0;
+    uint64_t saved_generation = 0;
+    std::pair<const std::vector<uint8_t> *, size_t> source_state{&owner_state, 0};
+    assert(ggml_backend_remote_attn_native_kvarn_state_read(
+        backend, [](void * user, void * data, size_t bytes) {
+            auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
+            if (bytes > source->first->size() - source->second) return false;
+            std::memcpy(data, source->first->data() + source->second, bytes);
+            source->second += bytes;
+            return true;
+        }, &source_state, &rows, &saved_generation));
+    uint64_t new_generation = 0;
+    assert(rows == 130);
+    assert(ggml_backend_remote_attn_native_kvarn_remote_restore(
+        backend, hash.data(), rows, saved_generation, &new_generation));
+    assert(ggml_backend_remote_attn_native_kvarn_state_commit(backend, new_generation));
+    assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
+
+    // Owner rows and epoch must remain coherent for the first continuation.
+    run(132, 0); run(132, 1);
+    assert(ggml_backend_remote_attn_native_kvarn_can_restore(backend, 1024 + 132));
+    assert(ggml_backend_remote_attn_trim(backend, 0, 1024 + 128));
+    run(130, 0); run(130, 1);
+
+    ggml_remote_attn_set_active(nullptr);
+    ggml_backend_buffer_free(buffers); ggml_free(ctx); ggml_backend_free(cpu); ggml_backend_free(backend);
 }
 
 // Verify negotiated batching, chunk boundaries and OUT/LSE row assembly on the
@@ -3684,6 +3840,7 @@ int main() {
     test_native_physical_peer();
     test_old_native_client_ack_compatibility();
     test_native_rewind();
+    test_native_snapshot_transport();
     test_failure_retirement();
     test_async_failure_two_slots();
     test_native_query_prefix_chunks();

@@ -80,6 +80,10 @@ static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK = 1ull << 15;
 // Reserved experimental identity only. This client refuses RPC_BATCH=4 until
 // a matching server implementation has been qualified; bits14/15 stay native.
 static constexpr uint64_t RKVA_CAP_KVARN_COHORT_ATTN = 1ull << 16;
+// Descriptor revision-3 FULL native overflow snapshots (ops 17/18 revision 2).
+// Additive: old servers reject revision 2 before touching state, and old hosts
+// never send it because the HELLO bit/capability are both absent.
+static constexpr uint64_t RKVA_CAP_NATIVE_KVARN_SNAPSHOT = 1ull << 18;
 
 // v1 cohort extension; each entry immediately precedes its old op22 body.
 // Reply mirrors the envelope with OUT/LSE bodies and exact ticket/epoch echoes.
@@ -103,6 +107,9 @@ static constexpr uint32_t RKVA_KVARN_UPLOAD_RESET = 1u;
 static constexpr uint32_t RKVA_KVARN_UPLOAD_OMIT_STAGE = 2u;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
+static constexpr uint32_t RKVA_PROTO_NATIVE_SNAPSHOT_V4 = 1u << 18;
+static constexpr uint32_t RKVA_SNAPSHOT_REVISION_NATIVE = 2;
+static constexpr uint32_t RKVA_NATIVE_SNAPSHOT_FORMAT = 1;
 static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;
 static constexpr uint32_t RKVA_PROFILE_RESET = 1u << 1;
 static constexpr uint32_t RKVA_PROFILE_TRACE = 1u << 2;
@@ -364,6 +371,23 @@ struct rkva_snapshot_ack {
     uint64_t disk_bytes; // native stored payload bytes, no LAN KV transfer
 };
 
+// Revision 2 native extension, appended after rkva_snapshot_req/ack. Old
+// servers reject revision 2 before touching state. expected_generation
+// authenticates the currently configured resident session; saved_generation
+// binds the on-disk manifest to the host trailer that was restored.
+struct rkva_native_snapshot_req {
+    uint64_t expected_generation;
+    uint64_t saved_generation;
+    uint32_t format_version; // RKVA_NATIVE_SNAPSHOT_FORMAT
+    uint32_t flags;          // 0
+};
+struct rkva_native_snapshot_ack {
+    uint64_t generation;       // new resident generation after RESTORE
+    uint64_t payload_checksum; // canonical manifest checksum
+    uint32_t layers;
+    uint32_t reserved;
+};
+
 // TRIM / REWIND request payload: remove every stored position >= pos0.
 struct rkva_trim_req {
     int32_t pos0;
@@ -409,6 +433,8 @@ static_assert(sizeof(rkva_kvarn_layer_rewind) == 8, "KVarN rewind layer wire siz
 
 static_assert(sizeof(rkva_snapshot_req) == 48, "snapshot request wire size");
 static_assert(sizeof(rkva_snapshot_ack) == 48, "snapshot response wire size");
+static_assert(sizeof(rkva_native_snapshot_req) == 24, "native snapshot request wire size");
+static_assert(sizeof(rkva_native_snapshot_ack) == 24, "native snapshot response wire size");
 
 static_assert(sizeof(rkva_range_upload_attn) == 32, "fused range request wire size");
 static_assert(sizeof(rkva_range_profile) == 16, "range profile control wire size");

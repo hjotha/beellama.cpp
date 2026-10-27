@@ -155,7 +155,9 @@ class RemoteAttnEngine {
 
     // LocalState path comes only from serve_remote_attn, never from the wire.
     bool disk_snapshot(uint32_t session_id, const std::string& local_folder,
-                       const rkva_snapshot_req& request, bool restore, rkva_snapshot_ack* ack,
+                       const rkva_snapshot_req& request,
+                       const rkva_native_snapshot_req* native_request, bool restore,
+                       rkva_snapshot_ack* ack, rkva_native_snapshot_ack* native_ack,
                        std::string* error);
 
     // Range-attention profiling and Q4 kernel selection (control path only; call

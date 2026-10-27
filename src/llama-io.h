@@ -47,6 +47,10 @@ public:
 
     // bytes read so far
     virtual size_t n_bytes() = 0;
+    // Optional frame extent. Readers that know their logical end expose the
+    // remaining bytes; opaque readers return 0 and cannot host an optional
+    // native trailer.
+    virtual size_t remaining() const { return 0; }
 
     void read_string(std::string & str);
 };
@@ -104,6 +108,9 @@ public:
     }
     size_t n_bytes() override {
         return m_inner.n_bytes();
+    }
+    size_t remaining() const override {
+        return m_inner.remaining();
     }
 
 private:

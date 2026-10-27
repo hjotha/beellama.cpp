@@ -184,6 +184,7 @@ struct remote_state {
     bool hello_done = false;
     bool native_rewind_v2_client = false;
     bool native_serial_prefix_v3_client = false;
+    bool native_snapshot_client = false;
     rkva_hello geo{};
     std::map<uint32_t, remote_session> sessions;
     std::unique_ptr<RemoteAttnEngine> engine;
@@ -336,6 +337,9 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         state.native_serial_prefix_v3_client =
             state.native_rewind_v2_client &&
             (hello.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) != 0;
+        state.native_snapshot_client =
+            state.native_serial_prefix_v3_client &&
+            (hello.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4) != 0;
 
         evict_local_session();
 
@@ -397,6 +401,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                                    RKVA_CAP_KVARN_BULK_F16 | RKVA_CAP_KVARN_BULK_FP8 |
                                    RKVA_CAP_KVARN_BULK_FP8_RNE | RKVA_CAP_KVARN_COMPACT_STAGE |
                                    RKVA_CAP_NATIVE_Q4_BULK | RKVA_CAP_NATIVE_Q8_BULK;
+            if (state.native_snapshot_client)
+                ack.reserved[0] |= RKVA_CAP_NATIVE_KVARN_SNAPSHOT;
         }
         if (!state.native_rewind_v2_client)
             ack.supported_ops &= ~(1u << RKVA_KVARN_RANGE_REWIND);
@@ -1226,23 +1232,42 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
     }
     case RKVA_SNAPSHOT_SAVE:
     case RKVA_SNAPSHOT_RESTORE: {
-        if (input.size() != sizeof(rkva_snapshot_req) || req.n_tokens || req.layer_id)
+        if (req.n_tokens || req.layer_id)
             return RKVA_ERR_BAD_PAYLOAD;
         auto it = state.sessions.find(req.session_id);
         if (it == state.sessions.end() || !state.engine || !it->second.valid ||
             !it->second.range_configured)
             return RKVA_ERR_BAD_SESSION;
+        if (input.size() < sizeof(rkva_snapshot_req))
+            return RKVA_ERR_BAD_PAYLOAD;
         rkva_snapshot_req snapshot{};
         std::memcpy(&snapshot, input.data(), sizeof(snapshot));
-        if (snapshot.revision != 1 || snapshot.flags || snapshot.reserved || !snapshot.live_rows ||
+        rkva_native_snapshot_req native{};
+        const bool native_revision = snapshot.revision == RKVA_SNAPSHOT_REVISION_NATIVE;
+        if (snapshot.revision != 1 && !native_revision)
+            return RKVA_ERR_BAD_PAYLOAD;
+        if (snapshot.flags || snapshot.reserved || !snapshot.live_rows ||
             snapshot.live_rows > it->second.capacity)
             return RKVA_ERR_BAD_PAYLOAD;
+        if (native_revision) {
+            if (input.size() != sizeof(snapshot) + sizeof(native) ||
+                !state.native_snapshot_client ||
+                !(state.engine->geometry().cache_bits_k == 16))
+                return RKVA_ERR_UNSUPPORTED_OP;
+            std::memcpy(&native, input.data() + sizeof(snapshot), sizeof(native));
+            if (native.format_version != RKVA_NATIVE_SNAPSHOT_FORMAT || native.flags)
+                return RKVA_ERR_BAD_PAYLOAD;
+        } else if (input.size() != sizeof(snapshot)) {
+            return RKVA_ERR_BAD_PAYLOAD;
+        }
         rkva_snapshot_ack ack{};
+        rkva_native_snapshot_ack native_ack{};
         std::string error;
         const bool restoring = req.op == RKVA_SNAPSHOT_RESTORE;
         const auto start = clock_type::now();
         if (!state.engine->disk_snapshot(req.session_id, g_snapshot_local_folder, snapshot,
-                                         restoring, &ack, &error)) {
+                                         native_revision ? &native : nullptr, restoring, &ack,
+                                         native_revision ? &native_ack : nullptr, &error)) {
             event_engine_error(error);
             if (state.engine->session_invalid(req.session_id)) {
                 it->second.valid = false;
@@ -1254,8 +1279,14 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         it->second.high_water = -1; // absolute range origin is owned by the engine
         compute_us = elapsed_us(start);
         prepare_us = elapsed_us(t0);
-        output.resize(sizeof(ack));
-        std::memcpy(output.data(), &ack, sizeof(ack));
+        if (native_revision) {
+            output.resize(sizeof(ack) + sizeof(native_ack));
+            std::memcpy(output.data(), &ack, sizeof(ack));
+            std::memcpy(output.data() + sizeof(ack), &native_ack, sizeof(native_ack));
+        } else {
+            output.resize(sizeof(ack));
+            std::memcpy(output.data(), &ack, sizeof(ack));
+        }
         return RKVA_OK;
     }
     case RKVA_PROBE: {

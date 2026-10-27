@@ -59,6 +59,88 @@ public:
 
     static constexpr uint32_t max_rewind = 128;
     uint32_t rows() const override { return rows_; }
+
+    // Exports only authoritative, non-transient state. The record view starts
+    // at the remote origin group regardless of the host's compact/global
+    // address layout; prepared_* buffers are intentionally excluded.
+    bool state_export(uint64_t generation, rkva_native_state::View & view) const override {
+        view = {};
+        const uint32_t groups = rows_ / 128;
+        const uint32_t origin_group = origin_ / 128;
+        if (origin_group < record_base_group_) return false;
+        const size_t group_bytes = size_t(physical_heads()) * record_bytes;
+        const size_t record_offset = size_t(origin_group - record_base_group_) * group_bytes;
+        if (record_offset + size_t(groups) * group_bytes > records_k_.size()) return false;
+        view.layout = rkva_native_state::Layout{
+            origin_, capacity_, heads_, iterations_, precision_tail_tokens_,
+            compact_stage_ ? 1u : 0u, rows_, record_base_group_, generation};
+        view.records_k = records_k_.data() + record_offset;
+        view.records_v = records_v_.data() + record_offset;
+        view.stage_k = reinterpret_cast<const uint8_t *>(stage_k_.data());
+        view.stage_v = reinterpret_cast<const uint8_t *>(stage_v_.data());
+        view.tail_k = reinterpret_cast<const uint8_t *>(tail_k_.data());
+        view.tail_v = reinterpret_cast<const uint8_t *>(tail_v_.data());
+        view.original_k = reinterpret_cast<const uint8_t *>(original_k_.data());
+        view.original_v = reinterpret_cast<const uint8_t *>(original_v_.data());
+        view.original_pos = original_pos_.data();
+        return true;
+    }
+
+    // Installs a fully validated shadow state. All size/layout checks precede
+    // the only writes; no allocation or fallible copy happens after the first
+    // mutation. Transient preparation and append scratch are discarded.
+    bool state_import(rkva_native_state::Storage & state, std::string * error) override {
+        const auto reject = [&](const char * message) {
+            if (error) *error = message;
+            return false;
+        };
+        if (!state.valid) return reject("native state: unvalidated source");
+        if (!rkva_native_state::valid_layout(state.layout, error))
+            return false;
+        if (!rkva_native_state::valid_ring(state, error))
+            return false;
+        const auto & layout = state.layout;
+        if (layout.origin != origin_ || layout.capacity != capacity_ || layout.heads != heads_ ||
+                layout.iterations != iterations_ ||
+                layout.precision_tail_tokens != precision_tail_tokens_ ||
+                layout.compact_stage != (compact_stage_ ? 1u : 0u) ||
+                layout.rows > capacity_) return reject("native state: producer geometry mismatch");
+        const size_t group_bytes = size_t(physical_heads()) * record_bytes;
+        const uint32_t groups = layout.rows / 128;
+        const size_t record_offset = size_t(origin_ / 128 - record_base_group_) * group_bytes;
+        const size_t record_bytes = size_t(groups) * group_bytes;
+        if (state.records_k.size() != record_bytes || state.records_v.size() != record_bytes ||
+                state.stage_k.size() != stage_k_.size() || state.stage_v.size() != stage_v_.size() ||
+                state.tail_k.size() != tail_k_.size() || state.tail_v.size() != tail_v_.size() ||
+                state.original_k.size() != original_k_.size() ||
+                state.original_v.size() != original_v_.size() ||
+                state.original_pos.size() != original_pos_.size() ||
+                record_offset > records_k_.size() || record_bytes > records_k_.size() - record_offset)
+            return reject("native state: producer storage size mismatch");
+        std::memcpy(records_k_.data() + record_offset, state.records_k.data(), record_bytes);
+        std::memcpy(records_v_.data() + record_offset, state.records_v.data(), record_bytes);
+        stage_k_.swap(state.stage_k);
+        stage_v_.swap(state.stage_v);
+        tail_k_.swap(state.tail_k);
+        tail_v_.swap(state.tail_v);
+        original_k_.swap(state.original_k);
+        original_v_.swap(state.original_v);
+        original_pos_.swap(state.original_pos);
+        rows_ = layout.rows;
+        prepared_begin_ = 0;
+        prepared_count_ = 0;
+        prepared_keys_.clear();
+        prepared_values_.clear();
+        prepared_k_.clear();
+        prepared_v_.clear();
+        prepared_rk_.clear();
+        prepared_rv_.clear();
+        append_k_.clear();
+        append_v_.clear();
+        append_scratch_grows_ = 0;
+        if (error) error->clear();
+        return true;
+    }
     // Diagnostics count allocation growth of the two chronological append
     // buffers only; the CPU store, payload and rewind have separate lifetimes.
     size_t append_scratch_grows() const { return append_scratch_grows_; }

@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -149,7 +150,7 @@ GGML_API void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend);
 // Explicit experimental native producer (GGML_RKVA_RANGE_STORAGE=kvarn4 and
 // GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL=1). Original projected F32 sources;
 // negotiated op21 supports <=128-row resident rollback. FULL overflow snapshots
-// cannot initialize it. Capability does not imply a native persistence codec.
+// require the separate revision-3 disk snapshot capability and host opt-in.
 GGML_API bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend);
 // True when the opt-in GGML_RKVA_ASYNC_LOCAL_REMOTE=1 overlap was accepted by a
 // native KVarN4 bulk-capable server. Always false for synchronous/local modes.
@@ -187,6 +188,31 @@ GGML_API bool ggml_backend_remote_attn_disk_snapshot_enabled(ggml_backend_t back
 GGML_API bool ggml_backend_remote_attn_disk_snapshot(
         ggml_backend_t backend, const uint8_t host_state_sha256[32],
         uint32_t live_rows, bool restore);
+
+// Descriptor revision-3 FULL native overflow persistence. The host trailer is
+// a canonical little-endian owner-state set; disk restore first validates the
+// trailer into shadow producers, restores the Xbox snapshot, and only then
+// commits producer state. Callbacks must transfer exactly the requested bytes.
+// Snapshot support requires opt-in disk snapshots plus both native snapshot
+// capability and operations 17/18 from HELLO. Other native layouts return false
+// and retain the pre-existing guards.
+typedef bool (*ggml_remote_attn_native_write_fn)(void * user, const void * data, size_t size);
+typedef bool (*ggml_remote_attn_native_read_fn)(void * user, void * data, size_t size);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_snapshot_supported(ggml_backend_t backend);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_state_write(
+        ggml_backend_t backend, ggml_remote_attn_native_write_fn write, void * user);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_state_read(
+        ggml_backend_t backend, ggml_remote_attn_native_read_fn read, void * user,
+        uint32_t * live_rows, uint64_t * saved_generation);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_remote_save(
+        ggml_backend_t backend, const uint8_t host_state_sha256[32], uint32_t live_rows);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_remote_restore(
+        ggml_backend_t backend, const uint8_t host_state_sha256[32], uint32_t live_rows,
+        uint64_t saved_generation, uint64_t * new_generation);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_state_commit(
+        ggml_backend_t backend, uint64_t new_generation);
+GGML_API void ggml_backend_remote_attn_native_kvarn_state_abort(ggml_backend_t backend);
+GGML_API void ggml_backend_remote_attn_native_kvarn_discard(ggml_backend_t backend);
 
 // Selects the session used by subsequent graph_compute calls (the graph nodes
 // carry only the layer id).

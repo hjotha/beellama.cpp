@@ -5063,8 +5063,9 @@ private:
     // format. Invariant 1: first statement is the gate; invariant 5: only called on slot
     // release/reassign, never during generation.
     void auto_save_slot_if_useful(server_slot & slot, const char * reason = "discard") {
-        if (llama_remote_native_kvarn_transient_active(ctx_tgt)) {
-            SLT_DBG(slot, "%s", "auto-save skipped: experimental native KVarN overflow has no snapshot codec\n");
+        if (llama_remote_native_kvarn_transient_active(ctx_tgt) &&
+                !llama_remote_native_kvarn_snapshot_supported(ctx_tgt)) {
+            SLT_DBG(slot, "%s", "auto-save skipped: native KVarN overflow snapshot capability is unavailable\n");
             return;
         }
         if (!auto_cache_enabled()) {

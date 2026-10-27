@@ -893,6 +893,14 @@ struct rkva_shared_cuda_context_entry {
     std::weak_ptr<void> context;
 };
 
+// Staged native FULL restore. Parsed and validated before the Xbox restore;
+// installed into live producers only after the remote snapshot commits.
+struct rkva_pending_native_state {
+    std::vector<rkva_native_state::Storage> layers;
+    uint32_t rows = 0;
+    uint64_t saved_generation = 0;
+};
+
 struct ggml_backend_remote_attn_context {
     std::string host;
     uint16_t    port = 0;
@@ -999,9 +1007,11 @@ struct ggml_backend_remote_attn_context {
     bool native_serial_prefix = false;
     bool native_bulk = false;
     uint64_t native_generation = 0;
+    rkva_kvarn_range_config native_descriptor {};
     uint32_t native_tail_tokens = 128;
     ggml_backend_cpu_kvarn_store_direct_v1_t native_store = nullptr;
     std::vector<std::unique_ptr<rkva_native_owner>> native_layers;
+    std::unique_ptr<rkva_pending_native_state> pending_native_state;
 
     // reusable pinned-ish staging (grow-only; never freed per token)
     std::vector<uint8_t> payload_tx;
@@ -3777,7 +3787,8 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     // HELLO
     rkva_hello hello {};
     hello.proto_flags    = (1u << 0) | (1u << 1) | RKVA_PROTO_NATIVE_REWIND_V2 |
-                           RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3;
+                           RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 |
+                           RKVA_PROTO_NATIVE_SNAPSHOT_V4;
     hello.n_layer_remote = ctx->geo.n_layer_remote;
     hello.n_head         = ctx->geo.n_head;
     hello.n_head_kv      = ctx->geo.n_head_kv;
@@ -4311,6 +4322,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     ctx->range_native_kvarn = true;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
+    ctx->native_descriptor = descriptor;
     ctx->native_serial_prefix = serial_prefix;
     ctx->native_bulk = bulk;
     ctx->async_local_remote = async_overlap;
@@ -4319,6 +4331,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     ctx->native_tail_tokens = precision_tail_tokens;
     ctx->native_store = store;
     ctx->native_layers.clear();
+    ctx->pending_native_state.reset();
     ctx->native_layers.resize(ctx->geo.n_layer_remote);
     ctx->range_source_type = source_type;
     ctx->range_wire = bulk ? bulk_wire : RKVA_WIRE_F32; // Q/OUT only; op16 carries structured native bytes
@@ -4332,7 +4345,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     if (!rkva_range_apply_control(ctx, "kvarn4", generic)) return false;
     const char * wire_str = bulk ? (bulk_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
                                     bulk_wire == RKVA_WIRE_F16 ? "f16" : "f32") : "f32";
-    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN4 precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d wire=%s; original F32 producer, bounded resident rewind requires negotiated capability; FULL snapshots unsupported\n",
+    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN4 precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d wire=%s; original F32 producer, bounded resident rewind and paired FULL snapshots require negotiated capability\n",
                   GGML_REMOTE_ATTN_NAME, precision_tail_tokens, descriptor.layout_version, int(serial_prefix), int(async_overlap), wire_str);
     return true;
 }
@@ -4682,9 +4695,12 @@ bool ggml_backend_remote_attn_disk_snapshot_enabled(ggml_backend_t backend) {
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     constexpr uint32_t ops = (1u << RKVA_SNAPSHOT_SAVE) | (1u << RKVA_SNAPSHOT_RESTORE);
-    return ctx->connected && !ctx->failed && ctx->range_configured && !ctx->range_native_kvarn &&
-        ctx->active_session != RKVA_SESSION_NONE && (ctx->ack.supported_ops & ops) == ops &&
-        (ctx->ack.reserved[0] & RKVA_CAP_DISK_SNAPSHOT);
+    if (!ctx->connected || ctx->failed || !ctx->range_configured ||
+            ctx->active_session == RKVA_SESSION_NONE || (ctx->ack.supported_ops & ops) != ops)
+        return false;
+    if (ctx->range_native_kvarn)
+        return ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend);
+    return (ctx->ack.reserved[0] & RKVA_CAP_DISK_SNAPSHOT) != 0;
 }
 
 bool ggml_backend_remote_attn_disk_snapshot(
@@ -4693,6 +4709,9 @@ bool ggml_backend_remote_attn_disk_snapshot(
         return false; // absolutely no snapshot RPC below P
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    // Revision-3 native state uses the revision-2 native envelope and the
+    // owner-state trailer; never send it through the legacy disk opcode.
+    if (ctx->range_native_kvarn) return false;
     auto lock = rkva_lock_ctx_drained(ctx);
     if (live_rows > ctx->range_capacity) { return false; }
     if (!restore) {
@@ -4752,6 +4771,307 @@ bool ggml_backend_remote_attn_disk_snapshot(
         for (auto & layer : ctx->range_layers) { layer.epoch = ctx->range_epoch; layer.rows = live_rows; }
     }
     return true;
+}
+
+bool ggml_backend_remote_attn_native_kvarn_snapshot_supported(ggml_backend_t backend) {
+    if (!backend || ggml_backend_is_local_split(backend)) return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    const char * snapshots = std::getenv("GGML_RKVA_DISK_SNAPSHOTS");
+    constexpr uint32_t ops = (1u << RKVA_SNAPSHOT_SAVE) | (1u << RKVA_SNAPSHOT_RESTORE);
+    return snapshots && !std::strcmp(snapshots, "1") &&
+           ggml_backend_remote_attn_native_kvarn_enabled(backend) &&
+           ctx->native_serial_prefix && !ctx->native_q4 && !ctx->native_q8 &&
+           (ctx->native_tail_tokens == 0 || ctx->native_tail_tokens == 128) &&
+           ctx->native_descriptor.layout_version == 3 &&
+           (ctx->ack.supported_ops & ops) == ops &&
+           (ctx->ack.reserved[0] & RKVA_CAP_NATIVE_KVARN_SNAPSHOT);
+}
+
+bool ggml_backend_remote_attn_native_kvarn_state_write(
+        ggml_backend_t backend, ggml_remote_attn_native_write_fn write, void * user) {
+    if (!backend || ggml_backend_is_local_split(backend) || !write ||
+            !ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend))
+        return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    auto lock = rkva_lock_ctx_drained(ctx);
+    try {
+    if (ctx->native_layers.size() != ctx->geo.n_layer_remote ||
+            !rkva_kvarn_generation_mutable(ctx->native_generation))
+        return false;
+    std::vector<rkva_native_state::View> views;
+    views.reserve(ctx->native_layers.size());
+    uint32_t rows = 0;
+    for (const auto & owner : ctx->native_layers) {
+        if (!owner) return false;
+        rkva_native_state::View view;
+        if (!owner->state_export(ctx->native_generation, view) || !view.layout.rows)
+            return false;
+        if (!rows) rows = view.layout.rows;
+        if (view.layout.rows != rows) return false;
+        views.push_back(view);
+    }
+    class sink_adapter final : public rkva_native_state::Sink {
+      public:
+        sink_adapter(ggml_remote_attn_native_write_fn fn, void * user) : fn_(fn), user_(user) {}
+        bool write(const void * data, size_t bytes) override {
+            try { return fn_(user_, data, bytes); } catch (...) { return false; }
+        }
+      private:
+        ggml_remote_attn_native_write_fn fn_;
+        void * user_;
+    } sink(write, user);
+    std::string error;
+    if (!rkva_native_state::write_set(views, sink, &error)) {
+        GGML_LOG_ERROR("%s: native state write failed: %s\n", GGML_REMOTE_ATTN_NAME, error.c_str());
+        return false;
+    }
+    return true;
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: native state write exception: %s\n", GGML_REMOTE_ATTN_NAME, error.what());
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool ggml_backend_remote_attn_native_kvarn_state_read(
+        ggml_backend_t backend, ggml_remote_attn_native_read_fn read, void * user,
+        uint32_t * live_rows, uint64_t * saved_generation) {
+    if (!backend || ggml_backend_is_local_split(backend) || !read || !live_rows || !saved_generation ||
+            !ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend))
+        return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    auto lock = rkva_lock_ctx_drained(ctx);
+    try {
+    class source_adapter final : public rkva_native_state::Source {
+      public:
+        source_adapter(ggml_remote_attn_native_read_fn fn, void * user) : fn_(fn), user_(user) {}
+        bool read(void * data, size_t bytes) override {
+            try { return fn_(user_, data, bytes); } catch (...) { return false; }
+        }
+      private:
+        ggml_remote_attn_native_read_fn fn_;
+        void * user_;
+    } source(read, user);
+    auto pending = std::make_unique<rkva_pending_native_state>();
+    std::string error;
+    if (!rkva_native_state::read_set(source, pending->layers, &error)) {
+        GGML_LOG_ERROR("%s: native state read failed: %s\n", GGML_REMOTE_ATTN_NAME, error.c_str());
+        return false;
+    }
+    if (pending->layers.size() != ctx->geo.n_layer_remote) return false;
+    const uint32_t rows = pending->layers.front().layout.rows;
+    const uint64_t generation = pending->layers.front().layout.saved_generation;
+    const bool compact = (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) &&
+                         ctx->native_serial_prefix && ctx->range_origin >= 128 &&
+                         ctx->native_tail_tokens == 128;
+    for (const auto & state : pending->layers) {
+        const auto & layout = state.layout;
+        if (!state.valid || layout.origin != ctx->range_origin ||
+                layout.capacity != ctx->range_capacity ||
+                layout.heads != ctx->geo.n_head_kv ||
+                layout.iterations != ctx->geo.sinkhorn_iters ||
+                layout.precision_tail_tokens != ctx->native_tail_tokens ||
+                layout.compact_stage != (compact ? 1u : 0u) ||
+                layout.rows != rows || layout.saved_generation != generation ||
+                !layout.rows || layout.rows > layout.capacity)
+            return false;
+    }
+    if (!rkva_kvarn_generation_mutable(generation)) return false;
+    pending->rows = rows;
+    pending->saved_generation = generation;
+    ctx->pending_native_state = std::move(pending);
+    *live_rows = rows;
+    *saved_generation = generation;
+    return true;
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("%s: native state read exception: %s\n", GGML_REMOTE_ATTN_NAME, error.what());
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool ggml_backend_remote_attn_native_kvarn_remote_save(
+        ggml_backend_t backend, const uint8_t host_state_sha256[32], uint32_t live_rows) {
+    if (!host_state_sha256 || !live_rows ||
+            !ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend))
+        return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    auto lock = rkva_lock_ctx_drained(ctx);
+    if (ctx->failed || ctx->active_session == RKVA_SESSION_NONE ||
+            live_rows > ctx->range_capacity ||
+            !rkva_kvarn_generation_mutable(ctx->native_generation) ||
+            ctx->native_layers.size() != ctx->geo.n_layer_remote)
+        return false;
+    for (size_t il = 0; il < ctx->native_layers.size(); ++il) {
+        const auto & owner = ctx->native_layers[il];
+        if (!owner || owner->rows() != live_rows || ctx->range_layers[il].epoch != ctx->range_epoch ||
+                ctx->range_layers[il].rows != live_rows)
+            return false;
+    }
+    rkva_snapshot_req request {};
+    std::memcpy(request.host_state_sha256, host_state_sha256, 32);
+    request.live_rows = live_rows;
+    request.revision = RKVA_SNAPSHOT_REVISION_NATIVE;
+    const rkva_native_snapshot_req native {
+        ctx->native_generation, ctx->native_generation, RKVA_NATIVE_SNAPSHOT_FORMAT, 0};
+    std::vector<uint8_t> payload(sizeof(request) + sizeof(native));
+    std::memcpy(payload.data(), &request, sizeof(request));
+    std::memcpy(payload.data() + sizeof(request), &native, sizeof(native));
+    std::vector<uint8_t> reply;
+    int32_t status = INT32_MIN;
+    if (!rkva_transact(ctx, RKVA_SNAPSHOT_SAVE, ctx->active_session, 0, 0,
+            payload.data(), uint32_t(payload.size()), reply,
+            sizeof(rkva_snapshot_ack) + sizeof(rkva_native_snapshot_ack), &status))
+        return false;
+    if (status != RKVA_OK) return false;
+    if (reply.size() != sizeof(rkva_snapshot_ack) + sizeof(rkva_native_snapshot_ack))
+        return false;
+    rkva_snapshot_ack ack {};
+    rkva_native_snapshot_ack native_ack {};
+    std::memcpy(&ack, reply.data(), sizeof(ack));
+    std::memcpy(&native_ack, reply.data() + sizeof(ack), sizeof(native_ack));
+    if (std::memcmp(ack.host_state_sha256, host_state_sha256, 32) ||
+            ack.live_rows != live_rows || ack.n_layers != ctx->geo.n_layer_remote ||
+            !ack.disk_bytes || ack.disk_bytes > (4ull << 30) ||
+            native_ack.generation != ctx->native_generation ||
+            native_ack.layers != ctx->geo.n_layer_remote || native_ack.reserved) {
+        ctx->failed = true;
+        return false;
+    }
+    return true;
+}
+
+bool ggml_backend_remote_attn_native_kvarn_remote_restore(
+        ggml_backend_t backend, const uint8_t host_state_sha256[32], uint32_t live_rows,
+        uint64_t saved_generation, uint64_t * new_generation) {
+    if (!host_state_sha256 || !new_generation || !live_rows || !saved_generation ||
+            !ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend))
+        return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    auto lock = rkva_lock_ctx_drained(ctx);
+    if (ctx->failed || ctx->active_session == RKVA_SESSION_NONE ||
+            live_rows > ctx->range_capacity ||
+            !rkva_kvarn_generation_mutable(ctx->native_generation))
+        return false;
+    rkva_snapshot_req request {};
+    std::memcpy(request.host_state_sha256, host_state_sha256, 32);
+    request.live_rows = live_rows;
+    request.revision = RKVA_SNAPSHOT_REVISION_NATIVE;
+    const rkva_native_snapshot_req native {
+        ctx->native_generation, saved_generation, RKVA_NATIVE_SNAPSHOT_FORMAT, 0};
+    std::vector<uint8_t> payload(sizeof(request) + sizeof(native));
+    std::memcpy(payload.data(), &request, sizeof(request));
+    std::memcpy(payload.data() + sizeof(request), &native, sizeof(native));
+    std::vector<uint8_t> reply;
+    int32_t status = INT32_MIN;
+    if (!rkva_transact(ctx, RKVA_SNAPSHOT_RESTORE, ctx->active_session, 0, 0,
+            payload.data(), uint32_t(payload.size()), reply,
+            sizeof(rkva_snapshot_ack) + sizeof(rkva_native_snapshot_ack), &status)) {
+        // A restore that fails after GPU mutation must not leave a usable
+        // session. Missing snapshots are safe: the session was not published.
+        if (status == RKVA_ERR_STATE || status == RKVA_ERR_GPU) ctx->failed = true;
+        return false;
+    }
+    if (status != RKVA_OK) {
+        if (status == RKVA_ERR_STATE || status == RKVA_ERR_GPU) ctx->failed = true;
+        return false;
+    }
+    if (reply.size() != sizeof(rkva_snapshot_ack) + sizeof(rkva_native_snapshot_ack)) {
+        ctx->failed = true;
+        return false;
+    }
+    rkva_snapshot_ack ack {};
+    rkva_native_snapshot_ack native_ack {};
+    std::memcpy(&ack, reply.data(), sizeof(ack));
+    std::memcpy(&native_ack, reply.data() + sizeof(ack), sizeof(native_ack));
+    if (std::memcmp(ack.host_state_sha256, host_state_sha256, 32) ||
+            ack.live_rows != live_rows || ack.n_layers != ctx->geo.n_layer_remote ||
+            !ack.disk_bytes || ack.disk_bytes > (4ull << 30) ||
+            native_ack.layers != ctx->geo.n_layer_remote || native_ack.reserved ||
+            !rkva_kvarn_generation_mutable(native_ack.generation) ||
+            native_ack.generation <= ctx->native_generation) {
+        ctx->failed = true;
+        return false;
+    }
+    *new_generation = native_ack.generation;
+    return true;
+}
+
+bool ggml_backend_remote_attn_native_kvarn_state_commit(
+        ggml_backend_t backend, uint64_t new_generation) {
+    if (!backend || ggml_backend_is_local_split(backend) ||
+            !rkva_kvarn_generation_mutable(new_generation))
+        return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    auto lock = rkva_lock_ctx_drained(ctx);
+    if (!ctx->pending_native_state || ctx->pending_native_state->layers.size() != ctx->geo.n_layer_remote ||
+            ctx->native_layers.size() != ctx->geo.n_layer_remote)
+        return false;
+    auto & pending = *ctx->pending_native_state;
+    // Allocate missing owners before the first state mutation. Import then
+    // cannot fail for a validated set; if it does, drop every owner and poison
+    // the connection rather than publish a mixed image.
+    try {
+        for (auto & owner : ctx->native_layers)
+            if (!owner) owner = rkva_new_native_owner(ctx);
+    } catch (...) {
+        ctx->pending_native_state.reset();
+        ctx->failed = true;
+        return false;
+    }
+    try {
+        for (size_t il = 0; il < ctx->native_layers.size(); ++il) {
+            std::string error;
+            if (!ctx->native_layers[il] ||
+                    !ctx->native_layers[il]->state_import(pending.layers[il], &error)) {
+                GGML_LOG_ERROR("%s: native state import failed: %s\n", GGML_REMOTE_ATTN_NAME,
+                        error.empty() ? "owner unavailable" : error.c_str());
+                ctx->native_layers.clear();
+                ctx->native_layers.resize(ctx->geo.n_layer_remote);
+                ctx->pending_native_state.reset();
+                ctx->failed = true;
+                return false;
+            }
+        }
+    } catch (...) {
+        ctx->native_layers.clear();
+        ctx->native_layers.resize(ctx->geo.n_layer_remote);
+        ctx->pending_native_state.reset();
+        ctx->failed = true;
+        return false;
+    }
+    ctx->native_generation = new_generation;
+    ++ctx->range_epoch;
+    ctx->range_layers.assign(ctx->geo.n_layer_remote, {});
+    for (auto & layer : ctx->range_layers) {
+        layer.epoch = ctx->range_epoch;
+        layer.rows = pending.rows;
+    }
+    ctx->pending_native_state.reset();
+    return true;
+}
+
+void ggml_backend_remote_attn_native_kvarn_state_abort(ggml_backend_t backend) {
+    if (!backend || ggml_backend_is_local_split(backend)) return;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    ctx->pending_native_state.reset();
+}
+
+void ggml_backend_remote_attn_native_kvarn_discard(ggml_backend_t backend) {
+    if (!backend || ggml_backend_is_local_split(backend)) return;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    auto lock = rkva_lock_ctx_drained(ctx);
+    ctx->pending_native_state.reset();
+    ctx->native_layers.clear();
+    ctx->native_layers.resize(ctx->geo.n_layer_remote);
+    // Keep the generation namespace intact. Callers that also RESET the remote
+    // session advance both sides together; forcing zero here would desync the
+    // next rewind/save ACK check.
+    ++ctx->range_epoch;
+    ctx->range_layers.assign(ctx->geo.n_layer_remote, {});
 }
 
 void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {

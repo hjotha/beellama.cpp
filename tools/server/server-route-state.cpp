@@ -146,8 +146,9 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     if (tokens.empty() || tokens.size() != size_t(position) + 1 || tokens.size() > llama_n_ctx_seq(ctx)) {
         throw std::runtime_error("router state tokens do not cover evaluated target");
     }
-    if (llama_remote_native_kvarn_transient_active(ctx)) {
-        throw std::runtime_error("native KVarN4 overflow FULL snapshots are not implemented; refusing Q4 bookkeeping state");
+    if (llama_remote_native_kvarn_transient_active(ctx) &&
+            !llama_remote_native_kvarn_snapshot_supported(ctx)) {
+        throw std::runtime_error("native KVarN4 overflow FULL snapshots require the negotiated revision-3 disk snapshot capability; refusing Q4 bookkeeping state");
     }
     const size_t native_data = llama_state_seq_get_size(ctx, seq);
     uint64_t logits_bytes = 0;
@@ -187,6 +188,7 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     temporary_file temporary(path);
     const size_t written = llama_state_seq_save_file(ctx, temporary.path.c_str(), seq, tokens.data(), tokens.size());
     if (!written) { throw std::runtime_error("router native state save failed"); }
+    const bool native_remote = llama_remote_native_kvarn_transient_active(ctx);
     const bool remote_disk = llama_remote_disk_snapshot_enabled(ctx);
     rkva_snapshot::Sha256 remote_hash;
     XXH64_state_t hash;
@@ -322,10 +324,12 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         }
         throw;
     }
-    if (remote_disk) {
+    if (remote_disk && !native_remote) {
         const auto key = remote_hash.finish();
-        // Host publication/retention is authoritative. Xbox save is optional;
-        // failure leaves the validated GAMES file and upload fallback usable.
+        // Standard Q4 bookkeeping is an optional accelerator: failure leaves
+        // the validated host file and full-upload fallback usable. Native
+        // revision-3 snapshots are paired before publication by
+        // llama_state_seq_save_file and have no such fallback.
         (void) llama_state_seq_remote_disk_snapshot_save(ctx, seq, key.data(), tokens.size());
     }
     return total;
