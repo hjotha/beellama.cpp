@@ -196,16 +196,19 @@ The option is rejected unless all of the following hold:
 - SAVE: native overflow resident and a complete evaluated text prefix;
 - RESTORE: empty target slot and no occupied sequence state;
 - no `route_state_transfer`, `route_target_no_mtp` or `route_state_reuse`;
-- text-only prompt and `--slot-save-max-mb` bounds.
+- text-only prompt, verified model identity, no LoRA/control vectors and
+  `--slot-save-max-mb` bounds.
 
 Without `native_stream`, the legacy/adaptive API behavior is byte-for-byte
 unchanged. `ADAPTIVE_SLOT_WORKING_COPIES` remains five for `LLAMASLT`;
 `native_stream` does not change or bypass that guard, and never creates an
-automatic cache entry. SAVE streams the existing
-owner vectors and publishes the host file only after the Xbox pair succeeds.
-RESTORE reserves the measured staged-RKVK + owner-allocation peak against the
-real prompt-cache RAM budget before allocating the trailer; insufficient
-reservation fails with the destination unchanged.
+automatic cache entry. SAVE uses the unified checksummed route-state envelope:
+its manifest records the model fingerprint and complete prompt-cache layout, and
+the host/Xbox pair is published only after the Xbox save succeeds. RESTORE uses
+the bounded streaming reader, validates model/layout/adapters before mutation,
+and reserves the measured staged-RKVK + owner-allocation peak against the real
+prompt-cache RAM budget before allocating the trailer; insufficient reservation
+fails with the destination unchanged.
 
 The RKVK header is peeked before `read_set` allocates. The estimator adds:
 
@@ -262,6 +265,15 @@ The preliminary review found and this branch fixes:
    through the RKVK frame, not only the trailer. A same-size mutation in the
    local state changes the key; the Xbox restore is refused before the local
    destination commits. Server SCKP bytes remain outside the key.
+8. The explicit adaptive slot uses the checksummed route-state manifest, so the
+   complete model fingerprint and prompt-cache layout are validated before the
+   memory transaction. LoRA, control vectors, multimodal contexts and a missing
+   model identity are rejected.
+9. Explicit RESTORE uses the bounded streaming reader, not the direct
+   `llama_io_read_file` materialization. Its workspace plus the measured native
+   staged/owner peak is reserved before allocation.
+10. Preflight rejection no longer clears an occupied slot; only a tracked
+    mutation triggers rollback/clear.
 
 ## CPU validation
 

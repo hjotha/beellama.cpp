@@ -19,6 +19,9 @@ server_native_slot::Eligibility valid_save() {
     e.one_sequence = true;
     e.snapshot_supported = true;
     e.native_active = true;
+    e.identity_available = true;
+    e.unmodified_model = true;
+    e.text_only = true;
     e.slot_empty = true;
     e.all_sequences_empty = true;
     return e;
@@ -48,6 +51,9 @@ void test_eligibility() {
     assert(reject([](auto & x) { x.native_active = false; }));
     assert(reject([](auto & x) { x.incompatible_route_flags = true; }));
     assert(reject([](auto & x) { x.media = true; }));
+    assert(reject([](auto & x) { x.identity_available = false; }));
+    assert(reject([](auto & x) { x.unmodified_model = false; }));
+    assert(reject([](auto & x) { x.text_only = false; }));
 
     auto restore = valid_save();
     restore.native_active = false;

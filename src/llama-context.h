@@ -204,7 +204,7 @@ struct llama_context {
 
     size_t state_seq_load_file_streaming(llama_seq_id seq_id, const char * filepath,
             llama_token * tokens_out, size_t capacity, size_t * count_out,
-            size_t state_size, uint64_t checksum);
+            size_t state_size, uint64_t checksum, bool require_native = false);
 
     size_t state_seq_convert_seq_stream(
             llama_state_q4_source & src, const llama_state_q4_info & info,

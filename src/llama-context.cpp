@@ -7312,7 +7312,8 @@ bool llama_state_seq_remote_disk_snapshot_save(
 }
 
 size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const char * filepath,
-        llama_token * tokens_out, size_t capacity, size_t * count_out, size_t state_size, uint64_t checksum) {
+        llama_token * tokens_out, size_t capacity, size_t * count_out, size_t state_size, uint64_t checksum,
+        bool require_native) {
     if (!count_out) { return 0; }
     *count_out = 0;
     if (!tokens_out || !memory || seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max ||
@@ -7374,7 +7375,7 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
             throw std::runtime_error("invalid sequence state file header");
         }
         io.read(tokens_out, size_t(header[2])*sizeof(llama_token));
-        state_seq_read_data(io, seq_id, 0, header[2]);
+        state_seq_read_data(io, seq_id, 0, header[2], require_native);
         const size_t state_end = size_t(file.tell());
         if (native_restore_pending) {
             uint8_t prefix_sha256[32] = {};
@@ -8985,7 +8986,17 @@ size_t llama_state_seq_load_file_streaming(llama_context * ctx, const char * fil
         llama_token * tokens_out, size_t capacity, size_t * count_out, size_t state_size, uint64_t checksum) {
     if (!ctx || !filepath) { return 0; }
     ctx->synchronize();
-    return ctx->state_seq_load_file_streaming(seq_id, filepath, tokens_out, capacity, count_out, state_size, checksum);
+    return ctx->state_seq_load_file_streaming(seq_id, filepath, tokens_out, capacity, count_out,
+            state_size, checksum, false);
+}
+
+size_t llama_state_seq_load_file_streaming_native(llama_context * ctx, const char * filepath,
+        llama_seq_id seq_id, llama_token * tokens_out, size_t capacity, size_t * count_out,
+        size_t state_size, uint64_t checksum) {
+    if (!ctx || !filepath) { return 0; }
+    ctx->synchronize();
+    return ctx->state_seq_load_file_streaming(seq_id, filepath, tokens_out, capacity, count_out,
+            state_size, checksum, true);
 }
 
 size_t llama_state_seq_convert_file(llama_context * ctx, const char * src_filepath, size_t src_offset, size_t src_size,

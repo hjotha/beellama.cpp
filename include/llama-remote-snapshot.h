@@ -36,6 +36,11 @@ LLAMA_API bool llama_state_seq_restore_was_native(const struct llama_context * c
 LLAMA_API size_t llama_state_seq_load_file_native(
         struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id,
         llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out);
+// Bounded streaming variant used by the explicit adaptive slot API.
+LLAMA_API size_t llama_state_seq_load_file_streaming_native(
+        struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id,
+        llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out,
+        size_t state_size, uint64_t checksum);
 #ifdef __cplusplus
 }
 #endif

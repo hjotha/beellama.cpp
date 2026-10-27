@@ -24,6 +24,9 @@ struct Eligibility {
     bool slot_empty = false;        // RESTORE only
     bool all_sequences_empty = false; // RESTORE only
     bool media = false;
+    bool identity_available = false;
+    bool unmodified_model = false;
+    bool text_only = false;
 };
 
 inline bool save_allowed(const Eligibility & e, std::string * error) {
@@ -45,6 +48,12 @@ inline bool save_allowed(const Eligibility & e, std::string * error) {
         return reject("native streaming peer/geometry is not qualified");
     if (!e.native_active)
         return reject("native overflow is not resident in this slot");
+    if (!e.identity_available)
+        return reject("native streaming slots require a verified model identity");
+    if (!e.unmodified_model)
+        return reject("native streaming slots require an unmodified model without LoRA or control vectors");
+    if (!e.text_only)
+        return reject("native streaming slots support text-only requests");
     if (e.incompatible_route_flags)
         return reject("native_stream cannot be combined with route_state_transfer, route_target_no_mtp or route_state_reuse");
     if (e.media)
@@ -71,6 +80,12 @@ inline bool restore_allowed(const Eligibility & e, std::string * error) {
         return reject("native streaming peer/geometry is not qualified");
     if (e.native_active)
         return reject("native streaming restore requires cleared native owner state");
+    if (!e.identity_available)
+        return reject("native streaming slots require a verified model identity");
+    if (!e.unmodified_model)
+        return reject("native streaming slots require an unmodified model without LoRA or control vectors");
+    if (!e.text_only)
+        return reject("native streaming slots support text-only requests");
     if (e.incompatible_route_flags)
         return reject("native_stream cannot be combined with route_state_transfer, route_target_no_mtp or route_state_reuse");
     if (!e.slot_empty || !e.all_sequences_empty)

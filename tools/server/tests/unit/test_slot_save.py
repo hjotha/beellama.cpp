@@ -957,6 +957,21 @@ def test_native_stream_is_explicit_and_does_not_auto_save(tmp_path):
     assert res.status_code != 200
     assert "native streaming" in res.body["error"]["message"]
 
+    # A preflight rejection must not clear an occupied slot. Slot 1 still has
+    # the first prompt, so repeating it reuses the cached prefix.
+    res = server.make_request("POST", "/slots/1?action=restore", data={
+        "filename": "legacy.slot",
+        "native_stream": True,
+    })
+    assert res.status_code != 200
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] == 1
+
     # Auto-save is off: the only new state file is the explicit legacy save.
     names = set(os.listdir(tmp_path))
     assert "native.slot" not in names
