@@ -2,6 +2,7 @@
 #include "kvarn.cuh"
 
 #include "dequantize.cuh"
+#include "cpy-utils.cuh"
 
 #include <algorithm>
 #include <array>
@@ -979,6 +980,85 @@ bool ggml_cuda_kvarn_native_append(
         download(append_k, rotated, append_bytes) && download(append_v, rotated + size_t(count) * width, append_bytes) &&
         download(records_k, records, record_bytes) && download(records_v, records + record_bytes, record_bytes);
     return cudaStreamSynchronize(stream) == cudaSuccess && ok;
+}
+
+// Uses the exact GGML Q8_0 per-32 block format and rounding routine.
+static __global__ void q8_native_prepare_kernel(const float * input, block_q8_0 * output, size_t blocks) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= blocks) return;
+    const float * x = input + i * QK8_0;
+    float amax = 0.0f;
+    for (int j = 0; j < QK8_0; ++j) amax = fmaxf(amax, fabsf(x[j]));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // The CPU reference performs two separately rounded F32 divisions. Avoid
+    // fast-math reciprocal approximations, which change values at Q8 ties.
+    const float d = __fdiv_rn(amax, 127.0f);
+    const float inverse = d ? __fdiv_rn(1.0f, d) : 0.0f;
+#else
+    const float d = amax / 127.0f;
+    const float inverse = d ? 1.0f / d : 0.0f;
+#endif
+    output[i].d = d;
+    for (int j = 0; j < QK8_0; ++j) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const float scaled = __fmul_rn(x[j], inverse);
+#else
+        const float scaled = x[j] * inverse;
+#endif
+        output[i].qs[j] = static_cast<int8_t>(roundf(scaled));
+    }
+}
+
+bool ggml_cuda_q8_native_prepare(const float * keys, const float * values,
+        uint32_t count, uint32_t heads, void * packed_keys, void * packed_values) {
+    if (!keys || !values || !packed_keys || !packed_values || !count || count > 512 || !heads || heads > 32) return false;
+    struct scratch_t { void * data = nullptr; size_t bytes = 0; int device = -1; cudaStream_t stream = nullptr; };
+    static scratch_t scratch;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    int device;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    if (scratch.device != device) {
+        if (scratch.device >= 0) {
+            if (cudaSetDevice(scratch.device) != cudaSuccess) return false;
+            if (scratch.data) cudaFree(scratch.data);
+            if (scratch.stream) cudaStreamDestroy(scratch.stream);
+            if (cudaSetDevice(device) != cudaSuccess) return false;
+        }
+        scratch = scratch_t{};
+        scratch.device = device;
+    }
+    if (!scratch.stream && cudaStreamCreateWithFlags(&scratch.stream, cudaStreamNonBlocking) != cudaSuccess) return false;
+    const size_t blocks = size_t(count) * heads * 8;
+    const size_t input_bytes = blocks * QK8_0 * sizeof(float);
+    const size_t output_bytes = blocks * sizeof(block_q8_0);
+    if (!kvarn_convert_scratch_grow(&scratch.data, scratch.bytes, 2 * (input_bytes + output_bytes))) return false;
+    auto * input = static_cast<float *>(scratch.data);
+    auto * packed = reinterpret_cast<block_q8_0 *>(reinterpret_cast<uint8_t *>(input) + 2 * input_bytes);
+    const auto upload = [&](void * dst, const void * src, size_t bytes) {
+        cudaMemcpyKind kind = cudaMemcpyHostToDevice;
+#if !defined(GGML_USE_MUSA)
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, src) == cudaSuccess) {
+#if defined(GGML_USE_HIP)
+            if (attr.memoryType == hipMemoryTypeDevice && attr.device == device) kind = hipMemcpyDeviceToDevice;
+#else
+            if (attr.type == cudaMemoryTypeDevice && attr.device == device) kind = cudaMemcpyDeviceToDevice;
+#endif
+        } else { cudaGetLastError(); }
+#endif
+        return cudaMemcpyAsync(dst, src, bytes, kind, scratch.stream) == cudaSuccess;
+    };
+    if (!upload(input, keys, input_bytes) || !upload(input + blocks * QK8_0, values, input_bytes)) {
+        cudaStreamSynchronize(scratch.stream); return false;
+    }
+    const uint32_t grid = uint32_t((blocks + 127) / 128);
+    q8_native_prepare_kernel<<<grid, 128, 0, scratch.stream>>>(input, packed, blocks);
+    q8_native_prepare_kernel<<<grid, 128, 0, scratch.stream>>>(input + blocks * QK8_0, packed + blocks, blocks);
+    const bool ok = cudaGetLastError() == cudaSuccess &&
+        cudaMemcpyAsync(packed_keys, packed, output_bytes, cudaMemcpyDeviceToHost, scratch.stream) == cudaSuccess &&
+        cudaMemcpyAsync(packed_values, packed + blocks, output_bytes, cudaMemcpyDeviceToHost, scratch.stream) == cudaSuccess;
+    return cudaStreamSynchronize(scratch.stream) == cudaSuccess && ok;
 }
 
 static __global__ void kvarn_convert_rotate_kernel(

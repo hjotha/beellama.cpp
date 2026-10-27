@@ -228,6 +228,7 @@ inline const char* mq_kernel_name(uint32_t storage, uint32_t q_tile, bool int8_d
     if (storage == kStorageKvarn4) {
         return kvarn4_mq_kernel_name(q_tile, int8_dot);
     }
+    if (storage == kStorageQ8 && q_tile == 2 && int8_dot) return "q8_mq2_i8";
     return storage == kStorageQ4 ? q4_mq_kernel_name(q_tile)
                                  : format_mq_kernel_name(storage, q_tile);
 }
@@ -369,6 +370,10 @@ struct Sample {
     uint32_t split_k = 0;
     uint32_t groups = 0; // pass-1 threadgroups
     uint64_t bytes = 0;  // upload payload, or attention Q+positions in / OUT+LSE out
+    // Native-row routes only: Q wire decoded to F32 on the CPU (FP8/F16). Zero
+    // for the F32 wire (memcpy passthrough) and for GPU-decoded routes.
+    uint64_t q_unpack_ns = 0;
+    uint64_t q_unpack_bytes = 0;
     uint64_t gpu_ticks[kGpuStageCount] = {};
     uint64_t cpu_ns[kCpuSpanCount] = {};
     uint64_t overhead_ns = 0;
@@ -381,6 +386,7 @@ struct Counters {
     uint64_t q4_mq_calls[2] = {}; // subset of optimized_calls: [0] 2-query, [1] 4-query tile
     // F16/Q8_0 multi-query tile calls (subset of optimized_by_storage), [storage][tile/4].
     uint64_t fmt_mq_calls[kStorageCount][2] = {};
+    uint64_t q8_mq_i8_calls = 0;
     // Native KVarN4 revision-3 2-query and 4-query tile calls (subset of
     // optimized_by_storage[kvarn4]).
     uint64_t kvarn4_mq_calls = 0;
@@ -403,12 +409,72 @@ struct Counters {
     uint64_t bulk_calls = 0;
     uint64_t bulk_segments = 0;
     uint64_t bulk_queries = 0;
+    // Layout-4/5 native-row envelopes (op 22). Separate from the KVarN bulk
+    // counters so a Q4_0/Q8_0 row route never looks like a KVarN GPU codec path.
+    uint64_t native_rows_calls = 0;
+    uint64_t native_rows_q8_gpu_fp8_calls = 0;
+    uint64_t cpu_q_unpack_calls = 0, cpu_q_unpack_bytes = 0, cpu_q_unpack_ns = 0;
     uint64_t fp8_gpu_calls = 0, fp8_cpu_fallback_calls = 0;
 };
+
+// Per-attention-sample counter update shared by the individual and the bulk
+// envelope routes. KVarN4-only counters require a native KVarN4 storage (and,
+// for the kernel specializations, its serial-prefix descriptor), so native
+// Q4_0/Q8_0 rows never increment them.
+inline void count_attention_sample(Counters& c, const Sample& s) {
+    if (s.kind != kAttention || s.storage >= kStorageCount) {
+        return;
+    }
+    if (s.optimized) {
+        ++c.optimized_by_storage[s.storage];
+        if (s.storage == kStorageQ4) {
+            ++c.optimized_calls;
+            if (s.q_tile == 2 || s.q_tile == 4) {
+                ++c.q4_mq_calls[s.q_tile / 4];
+            }
+        } else if ((s.storage == kStorageF16 || s.storage == kStorageQ8) &&
+                   (s.q_tile == 2 || s.q_tile == 4)) {
+            ++c.fmt_mq_calls[s.storage][s.q_tile / 4];
+            if (s.storage == kStorageQ8 && s.q_tile == 2 && s.int8_dot) ++c.q8_mq_i8_calls;
+        } else if (s.storage == kStorageKvarn4 && s.serial_prefix) {
+            if (s.decode_opt) {
+                ++c.kvarn4_decode_calls;
+                if (s.decode_rowlane) ++c.kvarn4_decode_rowlane_calls;
+            } else if (s.q_tile == kKvarn4MqTile) {
+                ++c.kvarn4_mq_calls;
+                if (s.int8_dot) {
+                    ++c.kvarn4_mq_i8_calls;
+                }
+            } else if (s.q_tile == kKvarn4MqTileMax) {
+                ++c.kvarn4_mq4_calls;
+            }
+        }
+    } else {
+        ++c.reference_by_storage[s.storage];
+        if (s.storage == kStorageQ4) {
+            ++c.reference_q4_calls;
+        }
+    }
+}
+
+// CopyBufferRegions a bulk envelope segment records for its upload. Layout-4/5
+// native rows upload one K and one V plane copy (2 regions); KVarN keeps its
+// historical one-region accounting; a query-only segment records none.
+inline uint32_t bulk_upload_copy_regions(uint32_t storage, bool has_upload) {
+    if (!has_upload) {
+        return 0;
+    }
+    return storage == kStorageQ4 || storage == kStorageQ8 ? 2u : 1u;
+}
 
 struct BulkEnvelopeSample {
     uint64_t cycle_id = 0;
     uint32_t session_id = 0, layer = 0, wire = 0;
+    // Envelope route identity: KVarN bulk envelopes are storage 3 with the
+    // serial-prefix descriptor; native-row envelopes carry their real Q4_0/Q8_0
+    // storage and serial_prefix 0. Defaults preserve the KVarN schema.
+    uint8_t storage = kStorageKvarn4;
+    uint8_t serial_prefix = 1;
     uint32_t segment_count = 0;
     uint32_t total_queries = 0;
     uint8_t gpu_valid = 0;
@@ -418,6 +484,7 @@ struct BulkEnvelopeSample {
     uint64_t upload_bytes = 0;
     uint64_t query_bytes = 0;
     uint64_t output_bytes = 0;
+    uint64_t q_unpack_ns = 0; // native-row CPU decode, separate from map/copy
     uint64_t cpu_ns[kCpuSpanCount] = {};
     uint64_t gpu_upload_ticks = 0;
     uint64_t gpu_unpack_ticks = 0;
@@ -477,6 +544,8 @@ struct Header {
     bool q4_mq_available[2] = {};
     std::string q4_mq_status[2];
     // F16 / Q8_0 multi-query tile pipelines, [storage][0] 2-query, [storage][1] 4-query.
+    bool q8_mq_i8_available = false, q8_mq_i8_enabled = false;
+    std::string q8_mq_i8_status;
     bool fmt_mq_available[kStorageCount][2] = {};
     std::string fmt_mq_status[kStorageCount][2];
     // Native KVarN4 revision-3 2-query and 4-query tile pipelines (require the optimized prefix
@@ -765,10 +834,18 @@ class Recorder {
                           json_escape(h.fmt_mq_status[st][0]).c_str(), ull(c.fmt_mq_calls[st][0]));
             o += buf;
             std::snprintf(buf, sizeof(buf),
-                          "\"mq4\":{\"available\":%s,\"status\":\"%s\",\"calls\":%llu}}",
+                          "\"mq4\":{\"available\":%s,\"status\":\"%s\",\"calls\":%llu}",
                           h.fmt_mq_available[st][1] ? "true" : "false",
                           json_escape(h.fmt_mq_status[st][1]).c_str(), ull(c.fmt_mq_calls[st][1]));
             o += buf;
+            if (st == kStorageQ8) {
+                std::snprintf(buf, sizeof(buf),
+                              ",\"mq2_i8\":{\"available\":%s,\"enabled\":%s,\"status\":\"%s\",\"calls\":%llu,\"exact\":false}",
+                              h.q8_mq_i8_available ? "true" : "false", h.q8_mq_i8_enabled ? "true" : "false",
+                              json_escape(h.q8_mq_i8_status).c_str(), ull(c.q8_mq_i8_calls));
+                o += buf;
+            }
+            o += '}';
         }
         o += '}';
         std::snprintf(buf, sizeof(buf),
@@ -908,6 +985,12 @@ class Recorder {
             o += ',';
             collect([](const Sample& s) { return double(s.groups); });
             append_stats(o, "pass1_groups", v);
+            o += ',';
+            collect([](const Sample& s) { return double(s.q_unpack_ns) / 1000.0; });
+            append_stats(o, "cpu_q_unpack_us", v);
+            o += ',';
+            collect([](const Sample& s) { return double(s.q_unpack_bytes); });
+            append_stats(o, "q_unpack_bytes", v);
         }
         o += ",\"gpu_us\":{";
         if (h.gpu_timestamp_frequency) {
@@ -975,6 +1058,14 @@ class Recorder {
         o += buf;
         o += ",\"fp8_gpu_calls\":" + std::to_string(counters.fp8_gpu_calls) +
              ",\"fp8_cpu_fallback_calls\":" + std::to_string(counters.fp8_cpu_fallback_calls);
+        o += ",\"native_rows_calls\":" + std::to_string(counters.native_rows_calls);
+        o += ",\"native_rows_q8_gpu_fp8_calls\":" + std::to_string(counters.native_rows_q8_gpu_fp8_calls);
+        std::snprintf(buf, sizeof(buf),
+                      ",\"native_rows_cpu_q_unpack\":{\"calls\":%llu,\"bytes\":%llu,"
+                      "\"duration_us\":%.3f}",
+                      ull(counters.cpu_q_unpack_calls), ull(counters.cpu_q_unpack_bytes),
+                      double(counters.cpu_q_unpack_ns) / 1000.0);
+        o += buf;
 
         std::vector<double> v_val, v_alloc, v_mc, v_rec, v_sub, v_fw, v_rb, v_tot;
         std::vector<double> v_gpu_u, v_gpu_unp, v_gpu_pack, v_gpu_p1, v_gpu_red, v_gpu_cp,
@@ -997,7 +1088,7 @@ class Recorder {
             const double fw_us = double(b.cpu_ns[kCpuFenceWait]) / 1000.0;
             v_fw.push_back(fw_us);
             v_rb.push_back(double(b.cpu_ns[kCpuReadback]) / 1000.0);
-            uint64_t cpu_tot = 0;
+            uint64_t cpu_tot = b.q_unpack_ns;
             for (uint32_t sp = 0; sp < kCpuSpanCount; ++sp) {
                 cpu_tot += b.cpu_ns[sp];
             }
@@ -1064,9 +1155,11 @@ class Recorder {
                 o += ',';
             std::snprintf(buf, sizeof(buf),
                           "{\"cycle_id\":%llu,\"session\":%u,\"layer\":%u,\"wire\":%u,\"nq\":%u,"
+                          "\"storage\":%u,\"serial_prefix\":%u,"
                           "\"segments\":%u,\"gpu_valid\":%u,\"alloc_grew\":%u,\"gpu_total_ticks\":%"
                           "llu,\"cpu_ns\":[",
                           ull(b.cycle_id), b.session_id, b.layer, b.wire, b.total_queries,
+                          unsigned(b.storage), unsigned(b.serial_prefix),
                           b.segment_count, unsigned(b.gpu_valid), unsigned(b.alloc_grew),
                           ull(b.gpu_total_ticks));
             o += buf;

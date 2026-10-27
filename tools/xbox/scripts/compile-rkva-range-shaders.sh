@@ -9,7 +9,7 @@ DXC="${DXC:-dxc}"
 ALL_TARGETS=(attn attn_q4 attn_q8 attn_kvarn4 reduce attn_q4_opt reduce_opt reduce_kvarn4
     attn_f16_opt attn_q8_opt attn_kvarn4_opt attn_kvarn4_prefix attn_kvarn4_opt_prefix
     attn_q4_mq2 attn_q4_mq4 attn_f16_mq2 attn_f16_mq4 attn_q8_mq2 attn_q8_mq4
-    attn_kvarn4_mq2 attn_kvarn4_mq4 bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8)
+    attn_kvarn4_mq2 attn_kvarn4_mq4 attn_q8_mq2_i8 bulk_unpack_q_fp8_raw bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8)
 if [[ $# -gt 0 ]]; then
     TARGETS=("$@")
 else
@@ -104,6 +104,14 @@ for target in "${TARGETS[@]}"; do
         if [[ "${BASH_REMATCH[1]}" == q8 ]]; then storage=2; fi
         defines=(-D RKVA_OPT_STORAGE="$storage" -D RKVA_MQ_QT="${BASH_REMATCH[2]}")
     fi
+    # Separate experimental Q8_0/INT8 dot-product PSO. Existing Q8 targets
+    # stay SM6.0 and retain their qualified behavior.
+    if [[ "$target" == attn_q8_mq2_i8 ]]; then
+        entry=CSRangeAttnFmtMq
+        source="$ROOT/shaders/rkva/rkva_range_attn_fmt_mq.hlsl"
+        defines=(-D RKVA_OPT_STORAGE=2 -D RKVA_MQ_QT=2 -D RKVA_Q8_INT8_DOT=1)
+        profile=cs_6_4
+    fi
     # Native KVarN4 descriptor-3 multi-query tile (nq 2..9): 2 or 4 queries share
     # each record/stage/tail K/V decode; every query keeps its own serial prefix.
     if [[ "$target" == attn_kvarn4_mq2 || "$target" == attn_kvarn4_mq4 ]]; then
@@ -118,6 +126,11 @@ for target in "${TARGETS[@]}"; do
         source="$ROOT/shaders/rkva/rkva_range_attn_kvarn4_mq_i8.hlsl"
         defines=(-D RKVA_MQ_QT=2)
         profile=cs_6_4
+    fi
+    if [[ "$target" == bulk_unpack_q_fp8_raw ]]; then
+        entry=CSBulkUnpackQFP8Raw
+        source="$ROOT/shaders/rkva/rkva_range_bulk_q8_fp8.hlsl"
+        defines=()
     fi
     if [[ "$target" == bulk_unpack_q_f16 ]]; then
         entry=CSBulkUnpackQF16

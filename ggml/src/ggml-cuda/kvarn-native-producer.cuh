@@ -9,3 +9,7 @@ bool ggml_cuda_kvarn_native_append(
     const ggml_fp16_t * stage_k, const ggml_fp16_t * stage_v,
     ggml_fp16_t * append_k, ggml_fp16_t * append_v,
     void * records_k, void * records_v);
+
+// Q8_0 raw-domain counterpart, independent of KVarN record format.
+bool ggml_cuda_q8_native_prepare(const float * keys, const float * values,
+        uint32_t count, uint32_t heads, void * packed_keys, void * packed_values);

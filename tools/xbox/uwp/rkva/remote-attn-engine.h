@@ -125,15 +125,24 @@ class RemoteAttnEngine {
     // Layout-4 Q4_0 envelope: every segment upload and attention is recorded in
     // ONE command list and published by a single submit/fence, then each
     // segment's OUT/LSE is read back. Q wire may be F32, F16 or FP8.
+    // cycle_id is the host request id and is stored in the profile envelope so
+    // op-22 profiling correlates with the client's cycle (no default: the
+    // transport must forward it).
     bool attend_q4_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
-                        size_t bytes, float* out, float* lse, std::string* error);
+                        size_t bytes, float* out, float* lse, std::string* error,
+                        uint64_t cycle_id);
     bool attend_q8_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
-                        size_t bytes, float* out, float* lse, std::string* error);
+                        size_t bytes, float* out, float* lse, std::string* error,
+                        uint64_t cycle_id);
     // Shared layout-4/5 implementation: storage selects the row format and
     // row_bytes is the per-token plane stride (heads * 144 or heads * 272).
     bool attend_native_rows(uint32_t id, uint32_t layer, uint32_t n_tokens, uint32_t storage,
                             uint64_t row_bytes, const uint8_t* data, size_t bytes, float* out,
-                            float* lse, std::string* error);
+                            float* lse, std::string* error, uint64_t cycle_id, uint8_t* out_fp8 = nullptr);
+    bool ensure_q8_fp8_gpu_pipelines();
+    bool attend_q8_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
+                            size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
+                            uint64_t cycle_id);
     bool attend_kvarn_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                            size_t bytes, float* out, float* lse, std::string* error,
                            uint64_t cycle_id = 0);
@@ -183,6 +192,8 @@ class RemoteAttnEngine {
     // enabled and the dedicated PSO exists, nq 2..9 native KVarN4 mode-2 tiles
     // score the fast shared record tile with dot4add_i8packed instead of the
     // F32 dot. Control path only.
+    // Experimental Q8_0 query-quantized INT8 dot path, default off.
+    void set_q8_mq_i8(bool enabled) { q8_mq_i8_ = enabled; }
     void set_mq_i8(bool enabled) {
         mq_i8_ = enabled;
     }
@@ -326,6 +337,9 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_mq_i8_pso_;
     std::string kvarn4_mq_i8_status_ = "not initialized";
     bool mq_i8_ = false;
+    bool q8_mq_i8_ = false;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q8_mq_i8_pso_;
+    std::string q8_mq_i8_status_ = "not initialized";
     std::string kvarn4_opt_prefix_status_ = "not initialized";
     // Native KVarN4 revision-3 wave64 decode specialization (nq == 1).
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_decode_prefix_pso_;
@@ -363,6 +377,8 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_pack_out_f16_pso_;
     std::string bulk_f16_status_ = "not initialized";
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_fp8_pso_, bulk_pack_out_fp8_pso_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_fp8_raw_pso_;
+    std::string q8_fp8_gpu_status_ = "not initialized";
     std::string bulk_fp8_status_ = "not initialized";
     Buffer bulk_probe_upload_, bulk_probe_packed_, bulk_probe_readback_;
     Buffer range_upload_;

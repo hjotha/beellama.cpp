@@ -194,11 +194,18 @@ struct remote_state {
     bool fp8_gpu_enabled = true;
     // Opt-in INT8 QK prefill kernel (default off, NOT bit-exact): LocalState flag file.
     bool mq_i8_enabled = false;
+    bool q8_mq_i8_enabled = false;
+    bool q8_fp8_gpu_enabled = true;
     // FP32 row-per-lane QK decode (default on, LocalState opt-out).
     bool decode_rowlane_enabled = true;
     rpc_profile_counter rpc_profile[32]{};
     rkva_kvarn_bulk::Scratch bulk_scratch;
     uint64_t bulk_scratch_prepare_us = 0, bulk_engine_us = 0, bulk_output_transcode_us = 0;
+    // Layout-4/5 native-row CPU OUT pack (F32->F16/FP8). Additive transport
+    // telemetry: it never feeds the KVarN GPU-codec counters.
+    uint64_t native_rows_pack_calls = 0, native_rows_pack_bytes = 0, native_rows_pack_us = 0;
+    uint64_t native_rows_pack_fp8_calls = 0, native_rows_pack_f16_calls = 0,
+             native_rows_pack_f32_calls = 0;
     std::array<bulk_dispatch_sample, 256> bulk_dispatch_ring{};
     std::array<size_t, 2> bulk_dispatch_next{}, bulk_dispatch_stored{};
 };
@@ -266,6 +273,13 @@ std::string rpc_profile_json(const remote_state& state) {
     }
     return text + "],\"bulk_dispatch_phases\":" + phases + ",\"bulk_dispatch_recent\":" + recent +
            "],\"bulk_scratch\":" + state.bulk_scratch.json() +
+           ",\"native_rows_cpu_out_pack\":{\"calls\":" +
+           std::to_string(state.native_rows_pack_calls) +
+           ",\"bytes\":" + std::to_string(state.native_rows_pack_bytes) +
+           ",\"duration_us\":" + std::to_string(state.native_rows_pack_us) +
+           ",\"wire_fp8_calls\":" + std::to_string(state.native_rows_pack_fp8_calls) +
+           ",\"wire_f16_calls\":" + std::to_string(state.native_rows_pack_f16_calls) +
+           ",\"wire_f32_calls\":" + std::to_string(state.native_rows_pack_f32_calls) + "}" +
            ",\"bulk_dispatch_us\":{\"scratch_prepare\":" +
            std::to_string(state.bulk_scratch_prepare_us) +
            ",\"engine\":" + std::to_string(state.bulk_engine_us) +
@@ -320,6 +334,9 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             counter = {};
         state.bulk_scratch.reset_counters();
         state.bulk_scratch_prepare_us = state.bulk_engine_us = state.bulk_output_transcode_us = 0;
+        state.native_rows_pack_calls = state.native_rows_pack_bytes = state.native_rows_pack_us = 0;
+        state.native_rows_pack_fp8_calls = state.native_rows_pack_f16_calls =
+            state.native_rows_pack_f32_calls = 0;
         state.bulk_dispatch_next = {};
         state.bulk_dispatch_stored = {};
         state.fp8_gpu_enabled =
@@ -330,6 +347,10 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         // docs/rkva-prefill-int8-dot4.md.
         state.mq_i8_enabled =
             std::ifstream(g_snapshot_local_folder + "\\rkva-mq-i8.flag").good();
+        state.q8_mq_i8_enabled =
+            std::ifstream(g_snapshot_local_folder + "\\rkva-q8-mq-i8.flag").good();
+        state.q8_fp8_gpu_enabled =
+            !std::ifstream(g_snapshot_local_folder + "\\rkva-q8-fp8-gpu-off.flag").good();
         state.geo = hello;
         state.hello_done = true;
         state.native_rewind_v2_client = (hello.proto_flags & RKVA_PROTO_NATIVE_REWIND_V2) != 0;
@@ -368,6 +389,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             return RKVA_ERR_GPU;
         }
         state.engine->set_mq_i8(state.mq_i8_enabled);
+        state.engine->set_q8_mq_i8(state.q8_mq_i8_enabled);
         state.engine->set_decode_rowlane(state.decode_rowlane_enabled);
 
         rkva_hello_ack ack{};
@@ -922,6 +944,24 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                 if (vq != req.n_tokens)
                     return q4_bad("query total", header.segment_count, vq, req.n_tokens);
             }
+            // Q8 raw-domain GPU codec is independent of the KVarN codec flag.
+            // Keep the CPU path available when this device lacks the PSOs.
+            if (q8_rows && reply_wire == RKVA_WIRE_FP8 && state.q8_fp8_gpu_enabled &&
+                state.engine->ensure_q8_fp8_gpu_pipelines()) {
+                output.resize(size_t(total + heads * sizeof(float)));
+                std::string error;
+                const auto start = clock_type::now();
+                const bool ok = state.engine->attend_q8_bulk_fp8(
+                        req.session_id, req.layer_id, req.n_tokens, input.data(), input.size(),
+                        output.data(), reinterpret_cast<float*>(output.data() + total), &error, req.cycle_id);
+                if (!ok) {
+                    event_engine_error(error);
+                    return state.engine->session_invalid(req.session_id) ? RKVA_ERR_GPU : RKVA_ERR_BAD_PAYLOAD;
+                }
+                compute_us = elapsed_us(start);
+                prepare_us = elapsed_us(t0);
+                return RKVA_OK;
+            }
             // One command list / one submit for every segment of the layer.
             std::vector<float> out_f32(size_t(total), 0.0f);
             std::vector<float> lse_f32(size_t(heads), 0.0f);
@@ -930,16 +970,18 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             const bool bulk_ok = q8_rows
                 ? state.engine->attend_q8_bulk(req.session_id, req.layer_id, req.n_tokens,
                                                input.data(), input.size(), out_f32.data(),
-                                               lse_f32.data(), &error)
+                                               lse_f32.data(), &error, req.cycle_id)
                 : state.engine->attend_q4_bulk(req.session_id, req.layer_id, req.n_tokens,
                                                input.data(), input.size(), out_f32.data(),
-                                               lse_f32.data(), &error);
+                                               lse_f32.data(), &error, req.cycle_id);
             if (!bulk_ok) {
                 event_engine_error(error);
                 return state.engine->session_invalid(req.session_id) ? RKVA_ERR_GPU
                                                                      : RKVA_ERR_BAD_PAYLOAD;
             }
             compute_us = elapsed_us(start);
+            const auto t_pack =
+                state.profile_enabled ? clock_type::now() : clock_type::time_point{};
             output.resize(size_t(total * out_elem + heads * sizeof(float)));
             uint8_t * out_bytes = output.data();
             std::memcpy(output.data() + total * out_elem, lse_f32.data(), heads * sizeof(float));
@@ -953,6 +995,19 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                     o16[e] = rkva_kvarn_bulk::f32_to_f16_bits(out_f32[e]);
             } else {
                 std::memcpy(out_bytes, out_f32.data(), total * sizeof(float));
+            }
+            // CPU OUT codec actually used by this native-row response. Separate
+            // from the KVarN GPU codec counters (no fp8_gpu/fallback claim).
+            if (state.profile_enabled) {
+                ++state.native_rows_pack_calls;
+                state.native_rows_pack_bytes += total * out_elem;
+                state.native_rows_pack_us += elapsed_us(t_pack);
+                if (reply_wire == RKVA_WIRE_FP8)
+                    ++state.native_rows_pack_fp8_calls;
+                else if (reply_wire == RKVA_WIRE_F16)
+                    ++state.native_rows_pack_f16_calls;
+                else
+                    ++state.native_rows_pack_f32_calls;
             }
             prepare_us = elapsed_us(t0);
             return RKVA_OK;
@@ -1150,6 +1205,10 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                 state.bulk_scratch.reset_counters();
                 state.bulk_scratch_prepare_us = state.bulk_engine_us =
                     state.bulk_output_transcode_us = 0;
+                state.native_rows_pack_calls = state.native_rows_pack_bytes =
+                    state.native_rows_pack_us = 0;
+                state.native_rows_pack_fp8_calls = state.native_rows_pack_f16_calls =
+                    state.native_rows_pack_f32_calls = 0;
                 state.bulk_dispatch_next = {};
                 state.bulk_dispatch_stored = {};
             }

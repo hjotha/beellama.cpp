@@ -13,6 +13,12 @@
 #include "rkva-kvarn-bulk.h"
 #include "rkva-kvarn-range.h"
 #include "rkva-kvarn-rewind.h"
+#if __has_include("rkva_range_bulk_unpack_q_fp8_raw_dxil.h")
+    #include "rkva_range_bulk_unpack_q_fp8_raw_dxil.h"
+    #define RKVA_HAS_Q8_RAW_FP8_DXIL 1
+#else
+    #define RKVA_HAS_Q8_RAW_FP8_DXIL 0
+#endif
 #include "rkva-range-profile.h"
 #include "rkva_flash_attn_dxil.h"
 #include "rkva_flash_attn_kvarn4_dxil.h"
@@ -56,6 +62,12 @@
 #include "rkva_range_attn_q4_opt_dxil.h"
 #include "rkva_range_attn_q8_dxil.h"
 #include "rkva_range_attn_q8_mq2_dxil.h"
+#if __has_include("rkva_range_attn_q8_mq2_i8_dxil.h")
+    #include "rkva_range_attn_q8_mq2_i8_dxil.h"
+    #define RKVA_HAS_Q8_MQ2_I8_DXIL 1
+#else
+    #define RKVA_HAS_Q8_MQ2_I8_DXIL 0
+#endif
 #include "rkva_range_attn_q8_mq4_dxil.h"
 #include "rkva_range_attn_q8_opt_dxil.h"
 #include "rkva_range_reduce_dxil.h"
@@ -200,6 +212,12 @@ struct BulkSegmentProfile {
     uint8_t int8_dot = 0;
     uint8_t direct_output = 0;
     uint8_t optimized = 0;
+    // Route identity of the segment. Defaults are the KVarN bulk envelope;
+    // native-row callers overwrite both from their actual storage/callpath.
+    uint8_t storage = rp::kStorageKvarn4;
+    uint8_t serial_prefix = 1;
+    uint8_t wire = RKVA_WIRE_F32; // native-row Q wire; KVarN packs it per envelope
+    uint8_t has_upload = 0;       // segment recorded upload copies
     uint64_t upload_bytes = 0;
     uint64_t query_bytes = 0;
     uint64_t out_bytes = 0;
@@ -208,12 +226,29 @@ struct BulkSegmentProfile {
     uint64_t record_upload_ns = 0;
     uint64_t record_attn_ns = 0;
     uint64_t readback_ns = 0;
+    // Native-row CPU Q expansion to F32 (FP8/F16 wire only).
+    uint64_t q_unpack_ns = 0;
+    uint64_t q_unpack_bytes = 0;
 };
 
 struct BulkSessionProfiling {
     bool active = false;
     uint32_t segment_index = 0;
     std::vector<BulkSegmentProfile> segments;
+};
+
+// Clears the deferred bulk-recording window on every early return. The success
+// path finalizes the envelope after the existing submit/fence (finish_bulk_profile
+// also clears active), so this guard is only about error paths.
+struct BulkWindowGuard {
+    bool* recording = nullptr;
+    BulkSessionProfiling* bulk = nullptr;
+    ~BulkWindowGuard() {
+        if (recording)
+            *recording = false;
+        if (bulk)
+            bulk->active = false;
+    }
 };
 
 } // namespace
@@ -1010,6 +1045,23 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
             fmt_mq_status_[k.storage][k.index] = "ready";
         }
     }
+#if RKVA_HAS_Q8_MQ2_I8_DXIL
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = range_attn_fmt_opt_root_.Get();
+        pso.CS = {g_rkva_range_attn_q8_mq2_i8_dxil, sizeof(g_rkva_range_attn_q8_mq2_i8_dxil)};
+        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_q8_mq_i8_pso_));
+        if (FAILED(hr)) {
+            std::snprintf(text, sizeof(text), "q8 int8 multi-query pipeline state: 0x%08X", unsigned(hr));
+            range_attn_q8_mq_i8_pso_.Reset();
+            q8_mq_i8_status_ = text;
+        } else {
+            q8_mq_i8_status_ = "ready";
+        }
+    }
+#else
+    q8_mq_i8_status_ = "header not built (compile attn_q8_mq2_i8)";
+#endif
 }
 
 // Timestamp heap + readback ring, created once from the control path. A failure
@@ -1111,37 +1163,7 @@ void RemoteAttnEngine::finish_profile_sample(rp::Sample& sample, bool timestamps
     ++c.calls[sample.kind];
     c.copy_regions += copy_regions;
     c.dispatches += dispatches;
-    if (sample.kind == rp::kAttention && sample.storage < rp::kStorageCount) {
-        if (sample.optimized) {
-            ++c.optimized_by_storage[sample.storage];
-            if (sample.storage == rp::kStorageQ4) {
-                ++c.optimized_calls;
-                if (sample.q_tile == 2 || sample.q_tile == 4) {
-                    ++c.q4_mq_calls[sample.q_tile / 4];
-                }
-            } else if ((sample.storage == rp::kStorageF16 || sample.storage == rp::kStorageQ8) &&
-                       (sample.q_tile == 2 || sample.q_tile == 4)) {
-                ++c.fmt_mq_calls[sample.storage][sample.q_tile / 4];
-            } else if (sample.storage == rp::kStorageKvarn4 && sample.serial_prefix) {
-                if (sample.decode_opt) {
-                    ++c.kvarn4_decode_calls;
-                    if (sample.decode_rowlane) ++c.kvarn4_decode_rowlane_calls;
-                } else if (sample.q_tile == rp::kKvarn4MqTile) {
-                    ++c.kvarn4_mq_calls;
-                    if (sample.int8_dot) {
-                        ++c.kvarn4_mq_i8_calls;
-                    }
-                } else if (sample.q_tile == rp::kKvarn4MqTileMax) {
-                    ++c.kvarn4_mq4_calls;
-                }
-            }
-        } else {
-            ++c.reference_by_storage[sample.storage];
-            if (sample.storage == rp::kStorageQ4) {
-                ++c.reference_q4_calls;
-            }
-        }
-    }
+    rp::count_attention_sample(c, sample);
     sample.overhead_ns = elapsed_ns(start, prof_clock::now());
     profile_->recorder.record(sample);
 }
@@ -1318,6 +1340,9 @@ std::string RemoteAttnEngine::get_range_profile_json() {
                                                     " optimized pipeline: " + fmt_opt_status_[st];
         }
     }
+    header.q8_mq_i8_available = header.fmt_mq_available[rp::kStorageQ8][0] && range_attn_q8_mq_i8_pso_;
+    header.q8_mq_i8_enabled = q8_mq_i8_;
+    header.q8_mq_i8_status = q8_mq_i8_status_;
     std::string json = profile_ ? profile_->recorder.json(header) : rp::Recorder().json(header);
     json.pop_back();
     return json + ",\"bulk_scratch\":" + bulk_scratch_.json() +
@@ -2155,6 +2180,9 @@ bool RemoteAttnEngine::upload_kvarn_range(uint32_t id, uint32_t layer,
         seg.upload_bytes = bytes;
         seg.append_rows = u.append_rows;
         seg.live_count = u.live_count;
+        seg.has_upload = 1;
+        seg.storage = rp::kStorageKvarn4;
+        seg.serial_prefix = 1;
     }
     timer.mark(rp::kCpuRecord);
     if (!submit(error)) {
@@ -2195,6 +2223,7 @@ bool RemoteAttnEngine::upload_range(uint32_t id, uint32_t layer, uint32_t start_
     // timestamp readback would run before the GPU; bulk profiling collects
     // upload timings from the envelope instead.
     const bool prof = profiling_ && profile_ && !bulk_recording_;
+    const bool bulk_prof = profiling_ && profile_ && bulk_recording_ && profile_->bulk.active;
     rp::Sample sample;
     SpanTimer timer;
     timer.start(prof, sample.cpu_ns);
@@ -2217,6 +2246,8 @@ bool RemoteAttnEngine::upload_range(uint32_t id, uint32_t layer, uint32_t start_
         return false;
     }
     timer.mark(rp::kCpuAlloc);
+    const prof_clock::time_point t_map_start =
+        bulk_prof ? prof_clock::now() : prof_clock::time_point{};
     void* mapped = nullptr;
     HRESULT hr = range_upload_.resource->Map(0, nullptr, &mapped);
     if (FAILED(hr)) {
@@ -2226,12 +2257,23 @@ bool RemoteAttnEngine::upload_range(uint32_t id, uint32_t layer, uint32_t start_
     std::memcpy(static_cast<uint8_t*>(mapped) + bytes, v, bytes);
     range_upload_.resource->Unmap(0, nullptr);
     timer.mark(rp::kCpuMapCopy);
+    if (bulk_prof) {
+        profile_->bulk.segments[profile_->bulk.segment_index].map_copy_upload_ns +=
+            elapsed_ns(t_map_start, prof_clock::now());
+    }
     if (!begin(error)) {
         return false;
     }
+    const prof_clock::time_point t_rec_start =
+        bulk_prof ? prof_clock::now() : prof_clock::time_point{};
     const bool ts = prof && timestamp_heap_;
     if (ts) {
         timestamp(kTsUploadBegin);
+    }
+    if (bulk_prof && timestamp_heap_) {
+        const uint32_t slot =
+            1 + profile_->bulk.segment_index * kTsBulkSlotsPerSegment + kTsBulkUploadBegin;
+        timestamp(slot);
     }
     Buffer& dst = s->layer_kv[layer];
     transition(dst, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2243,6 +2285,21 @@ bool RemoteAttnEngine::upload_range(uint32_t id, uint32_t layer, uint32_t start_
     if (ts) {
         timestamp(kTsUploadEnd);
         resolve_timestamps(kTsUploadBegin, 2);
+    }
+    if (bulk_prof) {
+        if (timestamp_heap_) {
+            const uint32_t slot =
+                1 + profile_->bulk.segment_index * kTsBulkSlotsPerSegment + kTsBulkUploadEnd;
+            timestamp(slot);
+        }
+        auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
+        seg.record_upload_ns += elapsed_ns(t_rec_start, prof_clock::now());
+        seg.upload_bytes = 2 * bytes;
+        seg.append_rows = n_rows;
+        seg.live_count = start_row + n_rows;
+        seg.has_upload = 1;
+        seg.storage = uint8_t(s->range_storage);
+        seg.serial_prefix = 0;
     }
     timer.mark(rp::kCpuRecord);
     if (!submit(error)) {
@@ -2302,6 +2359,7 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
     }
 
     uint64_t total_map_copy_ns = 0;
+    uint64_t total_q_unpack_ns = 0;
     uint64_t total_record_ns = 0;
     uint64_t total_upload_bytes = 0;
     uint64_t total_query_bytes = 0;
@@ -2318,16 +2376,25 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
     ++c.bulk_calls;
     c.bulk_segments += envelope.segment_count;
     c.bulk_queries += envelope.total_queries;
-    if (envelope.wire == RKVA_WIRE_FP8) {
-        if (envelope.fp8_gpu)
-            ++c.fp8_gpu_calls;
-        else
-            ++c.fp8_cpu_fallback_calls;
+    // Route identity comes from the envelope, not a hardcoded KVarN value: a
+    // Q4_0/Q8_0 native-row envelope is not a KVarN GPU codec call.
+    const bool kvarn_route = envelope.storage == rp::kStorageKvarn4;
+    if (kvarn_route) {
+        if (envelope.wire == RKVA_WIRE_FP8) {
+            if (envelope.fp8_gpu)
+                ++c.fp8_gpu_calls;
+            else
+                ++c.fp8_cpu_fallback_calls;
+        }
+    } else {
+        ++c.native_rows_calls;
+        if (envelope.storage == rp::kStorageQ8 && envelope.fp8_gpu) ++c.native_rows_q8_gpu_fp8_calls;
     }
 
     for (size_t i = 0; i < envelope.segment_count; ++i) {
         const auto& seg = profile_->bulk.segments[i];
         total_map_copy_ns += (seg.map_copy_upload_ns + seg.map_copy_query_ns);
+        total_q_unpack_ns += seg.q_unpack_ns;
         total_record_ns += (seg.record_upload_ns + seg.record_attn_ns);
         total_upload_bytes += seg.upload_bytes;
         total_query_bytes += seg.query_bytes;
@@ -2353,32 +2420,38 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
             env_gpu_copy_ticks += cp_ticks;
         }
 
-        // Per-segment upload Sample
-        rp::Sample up_sample;
-        up_sample.kind = rp::kUpload;
-        up_sample.storage = 3;
-        up_sample.serial_prefix = 1;
-        up_sample.mode = uint8_t(q4_kernel_mode_);
-        up_sample.alloc_grew = 0;
-        up_sample.bulk_segment = 1;
-        up_sample.n_tokens = seg.append_rows;
-        up_sample.rows = seg.append_rows;
-        up_sample.bytes = seg.upload_bytes;
-        up_sample.cpu_ns[rp::kCpuMapCopy] = seg.map_copy_upload_ns;
-        up_sample.cpu_ns[rp::kCpuRecord] = seg.record_upload_ns;
-        if (gpu_valid) {
-            up_sample.gpu_ticks[0] = u_ticks;
-            up_sample.gpu_valid = 1;
+        // Per-segment upload Sample. Native-row envelopes may carry a
+        // query-only segment (append_rows == 0) with no upload copies.
+        if (seg.has_upload) {
+            rp::Sample up_sample;
+            up_sample.kind = rp::kUpload;
+            up_sample.storage = seg.storage;
+            up_sample.serial_prefix = seg.serial_prefix;
+            up_sample.mode = uint8_t(q4_kernel_mode_);
+            up_sample.alloc_grew = 0;
+            up_sample.bulk_segment = 1;
+            up_sample.n_tokens = seg.append_rows;
+            up_sample.rows = seg.append_rows;
+            up_sample.bytes = seg.upload_bytes;
+            up_sample.cpu_ns[rp::kCpuMapCopy] = seg.map_copy_upload_ns;
+            up_sample.cpu_ns[rp::kCpuRecord] = seg.record_upload_ns;
+            if (gpu_valid) {
+                up_sample.gpu_ticks[0] = u_ticks;
+                up_sample.gpu_valid = 1;
+            }
+            profile_->recorder.record(up_sample);
+            ++c.calls[rp::kUpload];
         }
-        profile_->recorder.record(up_sample);
-        ++c.calls[rp::kUpload];
-        c.copy_regions += 1;
+        // Actual upload copies of this segment: native rows record K and V
+        // separately, KVarN keeps the historical single-region accounting and a
+        // query-only segment contributes none.
+        c.copy_regions += rp::bulk_upload_copy_regions(seg.storage, seg.has_upload != 0);
 
         // Per-segment attention Sample
         rp::Sample attn_sample;
         attn_sample.kind = rp::kAttention;
-        attn_sample.storage = 3;
-        attn_sample.serial_prefix = 1;
+        attn_sample.storage = seg.storage;
+        attn_sample.serial_prefix = seg.serial_prefix;
         attn_sample.mode = uint8_t(q4_kernel_mode_);
         attn_sample.alloc_grew = 0;
         attn_sample.bulk_segment = 1;
@@ -2393,6 +2466,8 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
         attn_sample.n_tokens = seg.n_queries;
         attn_sample.rows = seg.active_count;
         attn_sample.bytes = seg.query_bytes + seg.out_bytes;
+        attn_sample.q_unpack_ns = seg.q_unpack_ns;
+        attn_sample.q_unpack_bytes = seg.q_unpack_bytes;
         attn_sample.cpu_ns[rp::kCpuMapCopy] = seg.map_copy_query_ns;
         attn_sample.cpu_ns[rp::kCpuRecord] = seg.record_attn_ns;
         attn_sample.cpu_ns[rp::kCpuReadback] = seg.readback_ns;
@@ -2406,25 +2481,16 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
         ++c.calls[rp::kAttention];
         c.dispatches += seg.dispatches;
         c.copy_regions += 1;
-        if (seg.optimized) {
-            ++c.optimized_by_storage[rp::kStorageKvarn4];
-            if (seg.decode_opt) {
-                ++c.kvarn4_decode_calls;
-                if (seg.decode_rowlane) ++c.kvarn4_decode_rowlane_calls;
-            } else if (seg.q_tile == rp::kKvarn4MqTile) {
-                ++c.kvarn4_mq_calls;
-                if (seg.int8_dot) {
-                    ++c.kvarn4_mq_i8_calls;
-                }
-            } else if (seg.q_tile == rp::kKvarn4MqTileMax) {
-                ++c.kvarn4_mq4_calls;
-            }
-        } else {
-            ++c.reference_by_storage[rp::kStorageKvarn4];
+        rp::count_attention_sample(c, attn_sample);
+        if (seg.q_unpack_bytes || seg.q_unpack_ns) {
+            ++c.cpu_q_unpack_calls;
+            c.cpu_q_unpack_bytes += seg.q_unpack_bytes;
+            c.cpu_q_unpack_ns += seg.q_unpack_ns;
         }
     }
 
     envelope.cpu_ns[rp::kCpuMapCopy] = total_map_copy_ns;
+    envelope.q_unpack_ns = total_q_unpack_ns;
     if (!envelope.cpu_ns[rp::kCpuRecord])
         envelope.cpu_ns[rp::kCpuRecord] = total_record_ns;
     envelope.upload_bytes = total_upload_bytes;
@@ -2460,6 +2526,8 @@ bool RemoteAttnEngine::attend_kvarn_bulk(uint32_t id, uint32_t layer, uint32_t n
     envelope.session_id = id;
     envelope.layer = layer;
     envelope.wire = RKVA_WIRE_F32;
+    envelope.storage = rp::kStorageKvarn4;
+    envelope.serial_prefix = 1;
     rkva_kvarn_bulk::ScratchCall scratch_call(bulk_scratch_, n_tokens, RKVA_WIRE_F32);
 
     Session* s = find_session(id);
@@ -2674,18 +2742,56 @@ bool RemoteAttnEngine::attend_kvarn_bulk(uint32_t id, uint32_t layer, uint32_t n
     return true;
 }
 
+bool RemoteAttnEngine::ensure_q8_fp8_gpu_pipelines() {
+    if (bulk_unpack_q_fp8_raw_pso_) return true;
+    if (!ensure_bulk_fp8_gpu_pipelines()) return false;
+#if RKVA_HAS_Q8_RAW_FP8_DXIL
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = range_reduce_root_.Get();
+    pso.CS = {g_rkva_range_bulk_unpack_q_fp8_raw_dxil, sizeof(g_rkva_range_bulk_unpack_q_fp8_raw_dxil)};
+    const HRESULT hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&bulk_unpack_q_fp8_raw_pso_));
+    if (FAILED(hr)) {
+        char text[96]; std::snprintf(text, sizeof(text), "Q8 raw FP8 PSO 0x%08X", unsigned(hr));
+        q8_fp8_gpu_status_ = text;
+        bulk_unpack_q_fp8_raw_pso_.Reset();
+        return false;
+    }
+    q8_fp8_gpu_status_ = "ready";
+    return true;
+#else
+    q8_fp8_gpu_status_ = "raw FP8 header not generated";
+    return false;
+#endif
+}
+
 bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t n_tokens,
                                           uint32_t storage, uint64_t row_bytes,
                                           const uint8_t* data, size_t bytes, float* out,
-                                          float* lse, std::string* error) {
+                                          float* lse, std::string* error, uint64_t cycle_id, uint8_t* out_fp8) {
+    const bool gpu_fp8 = out_fp8 != nullptr;
     struct q4_segment {
         size_t up_off, pos_off, q_off;
         uint32_t up_bytes, append_begin, append_rows, n_queries, wire;
     };
+    // Native-row envelopes use the same bulk-envelope profiler as the KVarN
+    // bulk op: one envelope per call, one segment per wire segment. Profiling
+    // off keeps every added branch behind `prof`.
+    const bool prof = profiling_ && profile_ && !bulk_recording_;
+    const prof_clock::time_point t_val_start = prof ? prof_clock::now() : prof_clock::time_point{};
+    rp::BulkEnvelopeSample envelope;
+    envelope.total_queries = n_tokens;
+    envelope.cycle_id = cycle_id;
+    envelope.session_id = id;
+    envelope.layer = layer;
+    envelope.storage = uint8_t(storage);
+    envelope.serial_prefix = 0;
+    envelope.wire = RKVA_WIRE_F32;
+    FailedCallGuard guard{prof ? &profile_->recorder.counters.failed_calls : nullptr};
     Session* s = find_session(id);
     if (!ready_ || !s || !s->valid || !s->range_configured ||
         s->range_storage != storage || layer >= s->layer_kv.size() ||
-        !data || !out || !lse || bulk_recording_ || !n_tokens || n_tokens > 256) {
+        !data || (!out && !out_fp8) || !lse || bulk_recording_ || !n_tokens || n_tokens > 256 ||
+        (gpu_fp8 && (storage != RKVA_RANGE_STORAGE_Q8_0 || !ensure_q8_fp8_gpu_pipelines()))) {
         return ::fail(error, "q4 bulk: invalid session/arguments");
     }
     std::vector<q4_segment> segments;
@@ -2725,6 +2831,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         std::memcpy(&attn, data + off, sizeof(attn));
         off += sizeof(attn);
         qs.wire = attn.wire;
+        if (gpu_fp8 && attn.wire != RKVA_WIRE_FP8) return ::fail(error, "Q8 GPU codec requires FP8 wire");
         if (!qs.n_queries || qs.n_queries > n_tokens - sum_queries || attn.flags ||
             attn.reserved[0] || attn.reserved[1] ||
             (attn.wire != RKVA_WIRE_F32 && attn.wire != RKVA_WIRE_F16 &&
@@ -2738,6 +2845,12 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
             return ::fail(error, "q4 bulk: short query payload");
         qs.pos_off = off;
         qs.q_off = off + pos_bytes;
+        if (gpu_fp8) {
+            for (uint64_t e = 0; e < elements; ++e) {
+                if ((data[qs.q_off + e] & 0x7cu) == 0x7cu)
+                    return ::fail(error, "Q8 GPU codec rejects non-finite FP8 query");
+            }
+        }
         off += pos_bytes + q_bytes;
         sum_queries += qs.n_queries;
         segments.push_back(qs);
@@ -2745,80 +2858,268 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
     if (off != bytes || sum_queries != n_tokens)
         return ::fail(error, "q4 bulk: trailing bytes/query total");
 
+    // The envelope wire is the first segment's real wire; per-segment wires are
+    // kept in the bulk segments so a mixed envelope is still reported truthfully.
+    envelope.segment_count = static_cast<uint32_t>(segments.size());
+    envelope.wire = segments.front().wire;
+    envelope.fp8_gpu = gpu_fp8 ? 1 : 0;
+    if (prof) {
+        envelope.cpu_ns[rp::kCpuValidate] = elapsed_ns(t_val_start, prof_clock::now());
+    }
+
+    const prof_clock::time_point t_alloc_start =
+        prof ? prof_clock::now() : prof_clock::time_point{};
+    bool alloc_grew = false;
     uint32_t max_queries = 0;
     for (const auto& segment : segments)
         max_queries = std::max(max_queries, segment.n_queries);
+    alloc_grew = range_scratch_tokens_ < max_queries;
     if (!ensure_range_scratch(max_queries, error)) return false;
-    if (bulk_transfers_.size() < segments.size()) bulk_transfers_.resize(segments.size());
+    if (gpu_fp8) {
+        const uint64_t stage_bytes = uint64_t(max_queries) * geo_.n_head * (256 * 4 + 4);
+        if (bulk_f16_stage_out_.bytes < stage_bytes) {
+            alloc_grew = true;
+            if (!create_buffer(stage_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+                               D3D12_RESOURCE_STATE_COPY_DEST, &bulk_f16_stage_out_, error)) return false;
+        }
+    }
+    if (bulk_transfers_.size() < segments.size()) {
+        alloc_grew = true;
+        bulk_transfers_.resize(segments.size());
+    }
     for (size_t i = 0; i < segments.size(); ++i) {
         auto& transfer = bulk_transfers_[i];
         const uint64_t q_bytes = uint64_t(segments[i].n_queries) * geo_.n_head * 256 * 4;
         const uint64_t query_bytes = 2 * q_bytes + segments[i].n_queries * 4;
         const uint64_t output_bytes = q_bytes + uint64_t(segments[i].n_queries) * geo_.n_head * 4;
-        if (transfer.upload.bytes < segments[i].up_bytes &&
-            !create_buffer(segments[i].up_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
-                           D3D12_RESOURCE_STATE_GENERIC_READ, &transfer.upload, error)) return false;
-        if (transfer.query.bytes < query_bytes &&
-            !create_buffer(query_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
-                           D3D12_RESOURCE_STATE_GENERIC_READ, &transfer.query, error)) return false;
-        if (transfer.readback.bytes < output_bytes &&
-            !create_buffer(output_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
-                           D3D12_RESOURCE_STATE_COPY_DEST, &transfer.readback, error)) return false;
+        if (transfer.upload.bytes < segments[i].up_bytes) {
+            alloc_grew = true;
+            if (!create_buffer(segments[i].up_bytes, D3D12_HEAP_TYPE_UPLOAD,
+                               D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                               &transfer.upload, error))
+                return false;
+        }
+        if (gpu_fp8) {
+            const uint32_t heads = segments[i].n_queries * geo_.n_head;
+            const uint32_t elements = heads * 256;
+            const uint64_t upload_bytes = uint64_t(elements) + uint64_t(segments[i].n_queries) * 4;
+            const uint64_t raw_bytes = uint64_t(elements) * 4 + uint64_t(segments[i].n_queries) * 4;
+            const uint64_t packed_bytes = rkva_bulk_fp8::readback_bytes(elements, heads);
+            if (transfer.query_f16_upload.bytes < upload_bytes || transfer.query_f32_default.bytes < raw_bytes ||
+                    transfer.packed_out_f16.bytes < packed_bytes || transfer.readback.bytes < packed_bytes) alloc_grew = true;
+            if ((transfer.query_f16_upload.bytes < upload_bytes &&
+                 !create_buffer(upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                D3D12_RESOURCE_STATE_GENERIC_READ, &transfer.query_f16_upload, error)) ||
+                (transfer.query_f32_default.bytes < raw_bytes &&
+                 !create_buffer(raw_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &transfer.query_f32_default, error)) ||
+                (transfer.packed_out_f16.bytes < packed_bytes &&
+                 !create_buffer(packed_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &transfer.packed_out_f16, error)) ||
+                (transfer.readback.bytes < packed_bytes &&
+                 !create_buffer(packed_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                                D3D12_RESOURCE_STATE_COPY_DEST, &transfer.readback, error))) return false;
+        } else {
+            if (transfer.query.bytes < query_bytes) {
+                alloc_grew = true;
+                if (!create_buffer(query_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                   D3D12_RESOURCE_STATE_GENERIC_READ, &transfer.query, error)) return false;
+            }
+            if (transfer.readback.bytes < output_bytes) {
+                alloc_grew = true;
+                if (!create_buffer(output_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                                   D3D12_RESOURCE_STATE_COPY_DEST, &transfer.readback, error)) return false;
+            }
+        }
+    }
+    if (prof) {
+        envelope.cpu_ns[rp::kCpuAlloc] = elapsed_ns(t_alloc_start, prof_clock::now());
+        envelope.alloc_grew = alloc_grew ? 1 : 0;
     }
     if (!begin(error)) return false;
+    const bool ts_bulk = prof && timestamp_heap_ && (segments.size() <= kTsBulkMaxSegments);
+    if (prof) {
+        profile_->bulk.active = true;
+        profile_->bulk.segment_index = 0;
+        profile_->bulk.segments.clear();
+        profile_->bulk.segments.resize(segments.size());
+    }
+    // Armed only once this call owns the window: the refused-call path above
+    // returns before this point and must never clear a foreign recording state.
+    BulkWindowGuard window{&bulk_recording_, prof ? &profile_->bulk : nullptr};
+    if (ts_bulk) {
+        timestamp(kTsBulkEnvelopeBegin);
+    }
     bulk_recording_ = true;
     std::vector<float> q_f32;
     for (size_t i = 0; i < segments.size(); ++i) {
         const auto& seg = segments[i];
         auto& transfer = bulk_transfers_[i];
-        std::swap(range_upload_, transfer.upload);
-        std::swap(range_query_, transfer.query);
-        std::swap(range_readback_, transfer.readback);
+        if (prof) {
+            profile_->bulk.segment_index = static_cast<uint32_t>(i);
+            auto& p = profile_->bulk.segments[i];
+            p.storage = uint8_t(storage);
+            p.serial_prefix = 0;
+            p.wire = uint8_t(seg.wire);
+            p.has_upload = seg.append_rows ? 1 : 0;
+        }
         const uint8_t* up = data + seg.up_off;
         const uint64_t plane = uint64_t(seg.append_rows) * row;
         const uint8_t* kp = up;
         const uint8_t* vp = up + plane;
         const uint64_t elements = uint64_t(seg.n_queries) * geo_.n_head * geo_.head_dim;
-        q_f32.resize(elements);
         const uint8_t* qsrc = data + seg.q_off;
-        if (seg.wire == RKVA_WIRE_FP8) {
-            for (uint64_t e = 0; e < elements; ++e)
-                q_f32[e] = rkva_kvarn_bulk::f16_bits_to_f32(
-                        rkva_kvarn_bulk::fp8_to_f16_bits(qsrc[e]));
-        } else if (seg.wire == RKVA_WIRE_F16) {
-            const uint16_t* q16 = reinterpret_cast<const uint16_t*>(qsrc);
-            for (uint64_t e = 0; e < elements; ++e)
-                q_f32[e] = rkva_kvarn_bulk::f16_bits_to_f32(q16[e]);
-        } else {
-            std::memcpy(q_f32.data(), qsrc, elements * sizeof(float));
+        if (ts_bulk && !seg.append_rows) {
+            const uint32_t base = 1 + uint32_t(i) * kTsBulkSlotsPerSegment;
+            timestamp(base + kTsBulkUploadBegin);
+            timestamp(base + kTsBulkUploadEnd);
         }
-        const bool ok = (seg.append_rows == 0 ||
-                         upload_range(id, layer, seg.append_begin, seg.append_rows,
-                                      reinterpret_cast<const uint16_t*>(kp),
-                                      reinterpret_cast<const uint16_t*>(vp), error)) &&
-                        attend_range(id, layer, seg.n_queries,
-                                     reinterpret_cast<const int32_t*>(data + seg.pos_off),
-                                     q_f32.data(), out, lse, error);
-        std::swap(range_upload_, transfer.upload);
-        std::swap(range_query_, transfer.query);
-        std::swap(range_readback_, transfer.readback);
+        bool ok = false;
+        if (gpu_fp8) {
+            const auto t_map = prof ? prof_clock::now() : prof_clock::time_point{};
+            void* mapped = nullptr;
+            const HRESULT map_hr = transfer.query_f16_upload.resource->Map(0, nullptr, &mapped);
+            if (FAILED(map_hr) || !mapped) {
+                s->valid = false; terminal_failure_ = true;
+                return fail(error, "Map Q8 FP8 upload", map_hr);
+            }
+            std::memcpy(mapped, qsrc, size_t(elements));
+            std::memcpy(static_cast<uint8_t*>(mapped) + elements, data + seg.pos_off, size_t(seg.n_queries) * 4);
+            transfer.query_f16_upload.resource->Unmap(0, nullptr);
+            if (prof) profile_->bulk.segments[i].map_copy_query_ns += elapsed_ns(t_map, prof_clock::now());
+            std::swap(range_upload_, transfer.upload);
+            ok = seg.append_rows == 0 || upload_range(id, layer, seg.append_begin, seg.append_rows,
+                    reinterpret_cast<const uint16_t*>(kp), reinterpret_cast<const uint16_t*>(vp), error);
+            std::swap(range_upload_, transfer.upload);
+            if (ok) {
+                const auto t_unpack_record = prof ? prof_clock::now() : prof_clock::time_point{};
+                const uint32_t q_pairs = uint32_t(elements / 2);
+                const uint32_t unpack_params[4] = {q_pairs, seg.n_queries, 0u, 0u};
+                transition(transfer.query_f32_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                cmd_->SetComputeRootSignature(range_reduce_root_.Get());
+                cmd_->SetPipelineState(bulk_unpack_q_fp8_raw_pso_.Get());
+                cmd_->SetComputeRoot32BitConstants(0, 4, unpack_params, 0);
+                cmd_->SetComputeRootShaderResourceView(1, transfer.query_f16_upload.resource->GetGPUVirtualAddress());
+                cmd_->SetComputeRootUnorderedAccessView(2, transfer.query_f32_default.resource->GetGPUVirtualAddress());
+                cmd_->Dispatch((std::max(q_pairs, seg.n_queries) + 255u) / 256u, 1, 1);
+                uav_barrier(transfer.query_f32_default);
+                transition(transfer.query_f32_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(bulk_f16_stage_out_, D3D12_RESOURCE_STATE_COPY_DEST);
+                if (prof) profile_->bulk.segments[i].record_attn_ns += elapsed_ns(t_unpack_record, prof_clock::now());
+                std::swap(range_query_, transfer.query_f32_default);
+                std::swap(range_readback_, bulk_f16_stage_out_);
+                bulk_gpu_query_ = true;
+                float dummy = 0.0f;
+                ok = attend_range(id, layer, seg.n_queries, reinterpret_cast<const int32_t*>(data + seg.pos_off),
+                                  &dummy, &dummy, lse, error);
+                bulk_gpu_query_ = false;
+                std::swap(range_query_, transfer.query_f32_default);
+                std::swap(range_readback_, bulk_f16_stage_out_);
+                if (prof && ok) {
+                    auto& sample = profile_->bulk.segments[i];
+                    sample.query_bytes = elements + uint64_t(seg.n_queries) * 4;
+                    sample.out_bytes = elements + uint64_t(seg.n_queries) * geo_.n_head * 4;
+                    sample.dispatches += 2; // raw unpack and FP8 output pack
+                }
+            }
+            if (ok) {
+                const auto t_pack_record = prof ? prof_clock::now() : prof_clock::time_point{};
+                const uint32_t heads = seg.n_queries * geo_.n_head;
+                const uint32_t q_pairs = uint32_t(elements / 2);
+                const uint32_t pack_params[4] = {q_pairs, heads, 0u, 0u};
+                transition(range_output_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(transfer.packed_out_f16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                cmd_->SetComputeRootSignature(range_reduce_root_.Get());
+                cmd_->SetPipelineState(bulk_pack_out_fp8_pso_.Get());
+                cmd_->SetComputeRoot32BitConstants(0, 4, pack_params, 0);
+                cmd_->SetComputeRootShaderResourceView(1, range_output_.resource->GetGPUVirtualAddress());
+                cmd_->SetComputeRootUnorderedAccessView(2, transfer.packed_out_f16.resource->GetGPUVirtualAddress());
+                cmd_->Dispatch((std::max(q_pairs / 2, heads) + 255u) / 256u, 1, 1);
+                uav_barrier(transfer.packed_out_f16);
+                transition(transfer.packed_out_f16, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                if (ts_bulk) timestamp(1 + uint32_t(i) * kTsBulkSlotsPerSegment + kTsBulkPackEnd);
+                cmd_->CopyBufferRegion(transfer.readback.resource.Get(), 0, transfer.packed_out_f16.resource.Get(), 0,
+                                       rkva_bulk_fp8::readback_bytes(uint32_t(elements), heads));
+                if (ts_bulk) timestamp(1 + uint32_t(i) * kTsBulkSlotsPerSegment + kTsBulkCopyEnd);
+                if (prof) profile_->bulk.segments[i].record_attn_ns += elapsed_ns(t_pack_record, prof_clock::now());
+            }
+        } else {
+            std::swap(range_upload_, transfer.upload);
+            std::swap(range_query_, transfer.query);
+            std::swap(range_readback_, transfer.readback);
+            q_f32.resize(elements);
+            // Only a real CPU expansion (FP8/F16 -> F32) is timed; the F32 wire is a
+            // memcpy passthrough and reports no unpack work.
+            const prof_clock::time_point t_unpack =
+                (prof && seg.wire != RKVA_WIRE_F32) ? prof_clock::now() : prof_clock::time_point{};
+            if (seg.wire == RKVA_WIRE_FP8) {
+                for (uint64_t e = 0; e < elements; ++e)
+                    q_f32[e] = rkva_kvarn_bulk::f16_bits_to_f32(
+                            rkva_kvarn_bulk::fp8_to_f16_bits(qsrc[e]));
+            } else if (seg.wire == RKVA_WIRE_F16) {
+                const uint16_t* q16 = reinterpret_cast<const uint16_t*>(qsrc);
+                for (uint64_t e = 0; e < elements; ++e)
+                    q_f32[e] = rkva_kvarn_bulk::f16_bits_to_f32(q16[e]);
+            } else {
+                std::memcpy(q_f32.data(), qsrc, elements * sizeof(float));
+            }
+            if (prof && seg.wire != RKVA_WIRE_F32) {
+                auto& p = profile_->bulk.segments[i];
+                p.q_unpack_ns += elapsed_ns(t_unpack, prof_clock::now());
+                p.q_unpack_bytes = elements * (seg.wire == RKVA_WIRE_FP8 ? 1u : 2u);
+            }
+            ok = (seg.append_rows == 0 ||
+                             upload_range(id, layer, seg.append_begin, seg.append_rows,
+                                          reinterpret_cast<const uint16_t*>(kp),
+                                          reinterpret_cast<const uint16_t*>(vp), error)) &&
+                            attend_range(id, layer, seg.n_queries,
+                                         reinterpret_cast<const int32_t*>(data + seg.pos_off),
+                                         q_f32.data(), out, lse, error);
+            std::swap(range_upload_, transfer.upload);
+            std::swap(range_query_, transfer.query);
+            std::swap(range_readback_, transfer.readback);
+            if (ts_bulk && ok) {
+                const uint32_t base = 1 + uint32_t(i) * kTsBulkSlotsPerSegment;
+                timestamp(base + kTsBulkPackEnd);
+                timestamp(base + kTsBulkCopyEnd);
+            }
+        }
         if (!ok) {
-            bulk_recording_ = false;
             s->valid = false;
             terminal_failure_ = true;
             return false;
         }
     }
+    if (ts_bulk) {
+        const uint32_t total_slots =
+            2 + static_cast<uint32_t>(segments.size()) * kTsBulkSlotsPerSegment;
+        timestamp(1 + static_cast<uint32_t>(segments.size()) * kTsBulkSlotsPerSegment);
+        resolve_timestamps(0, total_slots);
+    }
     bulk_recording_ = false;
+    const prof_clock::time_point t_submit_start =
+        prof ? prof_clock::now() : prof_clock::time_point{};
     if (!submit(error)) {
         s->valid = false;
         return false;
     }
+    if (prof) {
+        const uint64_t submit_fence_ns = elapsed_ns(t_submit_start, prof_clock::now());
+        const uint64_t exec_ns = std::min(last_submit_exec_ns_, submit_fence_ns);
+        envelope.cpu_ns[rp::kCpuSubmit] = exec_ns;
+        envelope.cpu_ns[rp::kCpuFenceWait] = submit_fence_ns - exec_ns;
+        envelope.fence_blocked = last_submit_blocked_ ? 1 : 0;
+    }
+    const prof_clock::time_point t_rb_total_start =
+        prof ? prof_clock::now() : prof_clock::time_point{};
     size_t row_out = 0;
     for (size_t i = 0; i < segments.size(); ++i) {
+        const prof_clock::time_point t_seg_rb = prof ? prof_clock::now() : prof_clock::time_point{};
         const uint64_t heads = uint64_t(segments[i].n_queries) * geo_.n_head;
         const uint64_t q_bytes = heads * 256 * 4;
-        const uint64_t output_bytes = q_bytes + heads * 4;
+        const uint64_t elements = heads * 256;
+        const uint64_t lse_bytes = heads * 4;
+        const uint64_t output_bytes = gpu_fp8 ? rkva_bulk_fp8::readback_bytes(uint32_t(elements), uint32_t(heads)) : q_bytes + lse_bytes;
         void* mapped = nullptr;
         D3D12_RANGE range{0, static_cast<SIZE_T>(output_bytes)};
         const HRESULT hr = bulk_transfers_[i].readback.resource->Map(0, &range, &mapped);
@@ -2826,30 +3127,66 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
             s->valid = false;
             return fail(error, "Map q4 bulk readback", hr);
         }
-        std::memcpy(out + row_out * geo_.n_head * 256, mapped, q_bytes);
-        std::memcpy(lse + row_out * geo_.n_head, static_cast<const uint8_t*>(mapped) + q_bytes,
-                    heads * 4);
+        if (gpu_fp8) {
+            const auto* packed = static_cast<const uint8_t*>(mapped);
+            const uint32_t groups = rkva_bulk_fp8::pack_groups(uint32_t(elements), uint32_t(heads));
+            uint32_t status_all = 0;
+            for (uint32_t g = 0; g < groups; ++g) {
+                uint32_t status = 0;
+                std::memcpy(&status, packed + elements + lse_bytes + uint64_t(g) * 4, 4);
+                status_all |= status;
+            }
+            const auto& seg = segments[i];
+            if ((status_all & ~2u) || ((status_all & 2u) &&
+                !rkva_kvarn_bulk::q8_fp8_lse_valid(packed + elements, data + seg.pos_off,
+                    seg.n_queries, geo_.n_head, s->range_origin, seg.append_begin + seg.append_rows))) {
+                D3D12_RANGE empty{0, 0}; bulk_transfers_[i].readback.resource->Unmap(0, &empty);
+                s->valid = false; return ::fail(error, "Q8 GPU codec rejected non-finite output");
+            }
+            std::memcpy(out_fp8 + row_out * geo_.n_head * 256, packed, elements);
+            std::memcpy(lse + row_out * geo_.n_head, packed + elements, lse_bytes);
+        } else {
+            std::memcpy(out + row_out * geo_.n_head * 256, mapped, q_bytes);
+            std::memcpy(lse + row_out * geo_.n_head, static_cast<const uint8_t*>(mapped) + q_bytes, lse_bytes);
+        }
         D3D12_RANGE empty{0, 0};
         bulk_transfers_[i].readback.resource->Unmap(0, &empty);
         row_out += segments[i].n_queries;
+        if (prof) {
+            profile_->bulk.segments[i].readback_ns = elapsed_ns(t_seg_rb, prof_clock::now());
+        }
+    }
+    if (prof) {
+        envelope.cpu_ns[rp::kCpuReadback] = elapsed_ns(t_rb_total_start, prof_clock::now());
+        guard.done = true;
+        // Readback of the bulk timestamps only; no new submit/fence/RPC.
+        finish_bulk_profile(envelope, ts_bulk);
     }
     return true;
 }
 
 bool RemoteAttnEngine::attend_q4_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens,
                                       const uint8_t* data, size_t bytes, float* out, float* lse,
-                                      std::string* error) {
+                                      std::string* error, uint64_t cycle_id) {
     return attend_native_rows(id, layer, n_tokens, RKVA_RANGE_STORAGE_Q4_0,
                               rkva_kvarn_range::q4_row_bytes(geo_.head_dim, geo_.n_head_kv),
-                              data, bytes, out, lse, error);
+                              data, bytes, out, lse, error, cycle_id);
 }
 
 bool RemoteAttnEngine::attend_q8_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens,
                                       const uint8_t* data, size_t bytes, float* out, float* lse,
-                                      std::string* error) {
+                                      std::string* error, uint64_t cycle_id) {
     return attend_native_rows(id, layer, n_tokens, RKVA_RANGE_STORAGE_Q8_0,
                               rkva_kvarn_range::q8_row_bytes(geo_.head_dim, geo_.n_head_kv),
-                              data, bytes, out, lse, error);
+                              data, bytes, out, lse, error, cycle_id);
+}
+
+bool RemoteAttnEngine::attend_q8_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens,
+                                           const uint8_t* data, size_t bytes, uint8_t* out_fp8,
+                                           float* lse, std::string* error, uint64_t cycle_id) {
+    return attend_native_rows(id, layer, n_tokens, RKVA_RANGE_STORAGE_Q8_0,
+                             rkva_kvarn_range::q8_row_bytes(geo_.head_dim, geo_.n_head_kv),
+                             data, bytes, nullptr, lse, error, cycle_id, out_fp8);
 }
 
 bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_tokens,
@@ -2951,6 +3288,8 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         if (bulk_recording_) {
             if (bulk_prof) {
                 auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
+                seg.storage = uint8_t(s->range_storage);
+                seg.serial_prefix = prefix ? 1 : 0;
                 seg.record_attn_ns += elapsed_ns(t_rec_start, prof_clock::now());
                 seg.dispatches = dispatches;
                 seg.n_queries = n_tokens;
@@ -3121,6 +3460,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         uint32_t q_tile = 0;
         bool decode_opt = false;
         bool rowlane = false;
+        bool selected_int8_dot = false;
         if (kvarn && prefix) {
             if (n_tokens == 1 && decode_rowlane_ && wave_lane_min_ == 64 && wave_lane_max_ == 64 &&
                 rp::kvarn4_decode_opt(q4_kernel_mode_, wave_lane_min_) &&
@@ -3145,6 +3485,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                     if (q_tile == rp::kKvarn4MqTile && mq_i8_ &&
                         range_attn_kvarn4_mq_i8_pso_) {
                         mq_pso = range_attn_kvarn4_mq_i8_pso_.Get();
+                        selected_int8_dot = true;
                     }
                     fmt_pso = mq_pso;
                 } else {
@@ -3155,6 +3496,10 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             q_tile = rp::format_mq_tile(q4_kernel_mode_, storage, n_tokens);
             if (q_tile && range_attn_fmt_mq_pso_[storage][q_tile / 4]) {
                 fmt_pso = range_attn_fmt_mq_pso_[storage][q_tile / 4].Get();
+                if (storage == rp::kStorageQ8 && q_tile == 2 && q8_mq_i8_ && range_attn_q8_mq_i8_pso_) {
+                    fmt_pso = range_attn_q8_mq_i8_pso_.Get();
+                    selected_int8_dot = true;
+                }
             } else {
                 q_tile = 0;
             }
@@ -3254,9 +3599,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             sample.q_tile = uint8_t(q_tile);
             sample.decode_opt = uint8_t(decode_opt ? 1 : 0);
             sample.decode_rowlane = uint8_t(rowlane);
-            sample.int8_dot =
-                uint8_t(mq_i8_ && q_tile == rp::kKvarn4MqTile &&
-                        range_attn_kvarn4_mq_i8_pso_ ? 1 : 0);
+            sample.int8_dot = uint8_t(selected_int8_dot ? 1 : 0);
         }
         if (bulk_prof) {
             auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
@@ -3267,9 +3610,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             seg.q_tile = uint8_t(q_tile);
             seg.decode_opt = uint8_t(decode_opt ? 1 : 0);
             seg.decode_rowlane = uint8_t(rowlane);
-            seg.int8_dot =
-                uint8_t(mq_i8_ && q_tile == rp::kKvarn4MqTile &&
-                        range_attn_kvarn4_mq_i8_pso_ ? 1 : 0);
+            seg.int8_dot = uint8_t(selected_int8_dot ? 1 : 0);
         }
         if (!bulk_gpu_query_) {
             cmd_->CopyBufferRegion(range_readback_.resource.Get(), 0, range_output_.resource.Get(),

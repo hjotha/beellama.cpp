@@ -8,6 +8,25 @@
 // Pure, bounded admission. No live metadata or GPU resource is changed until
 // every segment has passed descriptor, coverage, size and finite-query checks.
 namespace rkva_kvarn_bulk {
+// The FP8 pack shader reports every non-finite LSE. Negative infinity is
+// nevertheless the defined result for a query with no visible remote rows.
+// Validate against the original positions before accepting that status.
+inline bool q8_fp8_lse_valid(const uint8_t* lse, const uint8_t* positions,
+                              uint32_t n_queries, uint32_t n_heads,
+                              uint32_t origin, uint32_t live_rows) {
+    for (uint32_t q = 0; q < n_queries; ++q) {
+        int32_t pos;
+        std::memcpy(&pos, positions + size_t(q) * 4, 4);
+        const bool empty = pos >= 0 && (uint32_t(pos) < origin || live_rows == 0);
+        for (uint32_t h = 0; h < n_heads; ++h) {
+            uint32_t bits;
+            std::memcpy(&bits, lse + (size_t(q) * n_heads + h) * 4, 4);
+            if ((bits & 0x7f800000u) == 0x7f800000u && !(empty && bits == 0xff800000u))
+                return false;
+        }
+    }
+    return true;
+}
 struct Segment {
     rkva_kvarn_range_upload upload{};
     uint32_t n_queries = 0;

@@ -309,6 +309,29 @@ void test_kvarn4_mq_split() {
 }
 } // namespace
 int main() {
+    {
+        const int32_t positions[] = {99, 100};
+        const uint32_t good[] = {0xff800000u, 0xff800000u, 0x3f800000u, 0x40000000u};
+        uint32_t lse[4];
+        std::memcpy(lse, good, sizeof(lse));
+        auto valid_lse = [&]() { return q8_fp8_lse_valid(
+            reinterpret_cast<const uint8_t*>(lse), reinterpret_cast<const uint8_t*>(positions),
+            2, 2, 100, 3); };
+        assert(valid_lse());
+        lse[2] = 0xff800000u; assert(!valid_lse());
+        lse[2] = 0x7f800000u; assert(!valid_lse());
+        lse[2] = 0x7fc00000u; assert(!valid_lse());
+        std::memcpy(lse, good, sizeof(lse)); lse[0] = 0x7f800000u; assert(!valid_lse());
+        lse[0] = 0x7fc00000u; assert(!valid_lse());
+        const int32_t zero_origin[] = {0, -1};
+        const uint32_t minus_inf[] = {0xff800000u, 0xff800000u};
+        assert(q8_fp8_lse_valid(reinterpret_cast<const uint8_t*>(minus_inf),
+               reinterpret_cast<const uint8_t*>(zero_origin), 1, 1, 0, 0));
+        assert(!q8_fp8_lse_valid(reinterpret_cast<const uint8_t*>(minus_inf),
+                reinterpret_cast<const uint8_t*>(zero_origin), 1, 1, 0, 1));
+        assert(!q8_fp8_lse_valid(reinterpret_cast<const uint8_t*>(minus_inf),
+                reinterpret_cast<const uint8_t*>(zero_origin + 1), 1, 1, 0, 0));
+    }
     test_f16_helpers();
     test_fp8_contract();
     test_splitzip();

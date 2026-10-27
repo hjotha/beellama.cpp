@@ -550,7 +550,8 @@ int main() {
                      "\"ready\",\"calls\":3},\"mq4\":{\"available\":true,\"status\":\"ready\","
                      "\"calls\":0}},\"q8_0\":{\"mq2\":{\"available\":false,\"status\":\"q8 "
                      "multi-query pipeline state: 0x80070057\",\"calls\":0},\"mq4\":{"
-                     "\"available\":true,\"status\":\"ready\",\"calls\":11}}}") !=
+                     "\"available\":true,\"status\":\"ready\",\"calls\":11},"
+                     "\"mq2_i8\":{\"available\":false,\"enabled\":false,\"status\":\"\",\"calls\":0,\"exact\":false}}}") !=
            std::string::npos);
     assert(json.find("\"q4_multi_query\":{\"nq_min\":2,\"nq_max\":9,\"tile_rows\":64,"
                      "\"mode_map\":\"1:q4_mq4_balanced 2:q4_mq2_fine 3:per-query "
@@ -626,6 +627,27 @@ int main() {
     assert(r.counters.bulk_calls == 0);
     assert(r.counters.kvarn4_decode_calls == 0);
     assert(r.counters.kvarn4_decode_rowlane_calls == 0);
+    // The Q8 INT8 count reflects the PSO actually used, never the KVarN flag.
+    Counters q8_counts;
+    Sample q8_sample;
+    q8_sample.kind = kAttention;
+    q8_sample.storage = kStorageQ8;
+    q8_sample.optimized = 1;
+    q8_sample.q_tile = 2;
+    q8_sample.int8_dot = 1;
+    assert(std::strcmp(mq_kernel_name(kStorageQ8, 2, true), "q8_mq2_i8") == 0);
+    count_attention_sample(q8_counts, q8_sample);
+    assert(q8_counts.q8_mq_i8_calls == 1 && q8_counts.kvarn4_mq_i8_calls == 0);
+    q8_sample.int8_dot = 0;
+    count_attention_sample(q8_counts, q8_sample);
+    assert(q8_counts.q8_mq_i8_calls == 1 && q8_counts.fmt_mq_calls[kStorageQ8][0] == 2);
+    Recorder q8_recorder;
+    q8_recorder.counters = q8_counts;
+    Header q8_header;
+    q8_header.q8_mq_i8_available = true;
+    q8_header.q8_mq_i8_enabled = true;
+    q8_header.q8_mq_i8_status = "ready";
+    assert(q8_recorder.json(q8_header).find("\"mq2_i8\":{\"available\":true,\"enabled\":true,\"status\":\"ready\",\"calls\":1") != std::string::npos);
     const std::string empty = Recorder().json(Header{});
     assert(empty.find("\"buckets\":{}") != std::string::npos);
     std::fprintf(stderr, "rkva_range_profile_cpu: ok\n");
