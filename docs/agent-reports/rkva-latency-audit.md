@@ -258,3 +258,24 @@ flush totals, and marks retained attribution partial when capture or local CUDA
 timing reports loss. A status-only window stays unknown with zero tokens.
 Missing legacy footers remain explicitly unreported, rather than asserting zero
 loss. No latency attribution is claimed from those truncated ABBA traces.
+
+Complete captures exposed two additional clock/identity distinctions. CUDA events
+marked `0x80000000` have a measured `gpu_us` duration, but their host `end_us` is
+when completion was observed later. They are now retained as duration-only GPU
+measurements, never host intervals, nesting, gaps or exposed waits. Their sums
+are not a latency component that can be subtracted or added across devices.
+
+The current producer constructs `server_decode` before `llama_process` establishes
+the new graph/position. It therefore inherits the previous token's identity.
+These nq=1 outer scopes remain available as unassigned host intervals across the
+trace, without position reassignment or token attribution. The report marks this
+limitation partial. In the real NIC baseline, the old 100.639ms token envelope
+included the next token's outer scope; the corrected observed host envelope is
+48.232ms, while127 unassigned server decode intervals average52.655ms. Neither
+is silently substituted for the independent server response timing.
+
+The trace's legacy `rpc_total.gpu_us` is actually the response protocol's
+`xbox_compute_us`, filled from the peer's CPU steady-clock work interval. It can
+include CPU/fence work and is not a device GPU timestamp. Existing JSON keys are
+preserved, with explicit clock labels and a `peer_compute_ms` alias. Historical
+reports remain preserved; corrected reports use separate filenames.

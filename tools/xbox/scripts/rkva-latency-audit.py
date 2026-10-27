@@ -300,6 +300,8 @@ class TraceAnalysis:
         self.phase_gpu = defaultdict(list)
         self.capture_status = []
         self.local_timing_status = []
+        self.gpu_duration_events = []
+        self.unassigned_host_scopes = []
 
     def load(self):
         with open(self.path, "r", encoding="utf-8", errors="replace") as handle:
@@ -332,6 +334,23 @@ class TraceAnalysis:
                     self.local_timing_status.append({"phase": event["phase"], "value": value})
                     continue
                 if _as_int(event.get("nq", 0), "nq", line_no) != 1:
+                    continue
+                if event.get("phase") == "server_decode" and not (
+                        _as_int(event.get("flags", 0), "flags", line_no) & 0x80000000):
+                    # This outer scope is constructed before llama_process
+                    # establishes its graph/position. Current producers inherit
+                    # the previous token's identity; do not guess a reassignment.
+                    begin = _as_int(event.get("begin_us"), "begin_us", line_no)
+                    end = _as_int(event.get("end_us"), "end_us", line_no)
+                    if end < begin:
+                        raise TraceFormatError(f"line {line_no}: invalid server_decode interval")
+                    self.unassigned_host_scopes.append({
+                        "phase": "server_decode", "begin_us": begin, "end_us": end,
+                        "duration_us": end - begin,
+                        "inherited_identity": {key: event.get(key) for key in
+                                               ("request", "graph_run", "graph_uid", "session",
+                                                "layer", "first_pos", "last_pos")},
+                    })
                     continue
                 self._ingest(event, line_no)
         self._tokenize()
@@ -371,8 +390,22 @@ class TraceAnalysis:
             if value in (None, "", 0):
                 continue
             origin_parts.append((name, str(value)))
-            self.origin_fields_seen.add(name)
         origin = tuple(sorted(origin_parts))
+        flags = _as_int(event.get("flags", 0), "flags", line_no)
+        if phase == "cuda_local_span_gpu" or flags & 0x80000000:
+            # end_us is when the host observed a completed CUDA event. It is
+            # not a GPU timestamp mapped to the host clock (ggml-cuda.cu).
+            if event.get("gpu_us") is None:
+                raise TraceFormatError(f"line {line_no}: GPU duration measurement is missing gpu_us")
+            self.gpu_duration_events.append({
+                "phase": phase, "gpu_us": gpu_us, "session": session,
+                "origin": origin, "graph_run": graph_run,
+                "graph_uid": _as_int(event.get("graph_uid", 0), "graph_uid", line_no),
+                "cycle": cycle, "layer": layer, "model_layer": model_layer,
+                "first_pos": first_pos, "last_pos": last_pos, "flags": flags,
+            })
+            return
+        self.origin_fields_seen.update(name for name, _ in origin_parts)
         if session_present:
             self.session_field_seen = True
 
@@ -462,6 +495,8 @@ class TraceAnalysis:
             stats["overlapped_total_us"] = stats["total"] - residual_us
             gpu = self.phase_gpu.get(phase, [])
             stats["gpu_us"] = summarize(gpu) if gpu else None
+            if phase == "rpc_total":
+                stats["gpu_us_clock_domain"] = "legacy field: peer xbox_compute_us steady-clock work interval, not a GPU timestamp"
             stats["per_token_us"] = None
             phases[phase] = stats
         tokens = max(1, len(self.token_totals))
@@ -545,6 +580,7 @@ class TraceAnalysis:
             "unattributed_gap_ms": self._ms(entry["gap_us"] for entry in totals),
             "rpc_total_ms_container": self._ms(entry["rpc_total_us"] for entry in totals),
             "peer_gpu_ms": self._ms(entry["peer_gpu_us"] for entry in totals),
+            "peer_compute_ms": self._ms(entry["peer_gpu_us"] for entry in totals),
         }
 
     @staticmethod
@@ -639,6 +675,29 @@ class TraceAnalysis:
                      "ids are never invented, merged or joined across runs."),
         }
 
+    def gpu_duration_report(self):
+        per_phase = defaultdict(list)
+        per_token = defaultdict(float)
+        unassigned = 0
+        for event in self.gpu_duration_events:
+            per_phase[event["phase"]].append(event["gpu_us"])
+            key = (event["session"], event["origin"], event["graph_run"], event["first_pos"])
+            if key in self.tokens:
+                per_token[key] += event["gpu_us"]
+            else:
+                unassigned += 1
+        return {
+            "clock_domain": "CUDA event elapsed duration; host timeline alignment unknown",
+            "host_intervals_used": False,
+            "duration_us": summarize(event["gpu_us"] for event in self.gpu_duration_events),
+            "per_phase_us": {phase: summarize(values) for phase, values in per_phase.items()},
+            "sum_durations_per_covered_token_us": summarize(per_token.values()),
+            "covered_host_tokens": len(per_token), "host_tokens": len(self.tokens),
+            "samples_without_host_token": unassigned,
+            "samples": self.gpu_duration_events,
+            "limitation": "Sums of observed durations are not exposed time, host overlap, or a subtractable latency component.",
+        }
+
     def report(self):
         phases = self.phase_report()
         tokens = self.token_report()
@@ -671,6 +730,14 @@ class TraceAnalysis:
             if scope == "ok":
                 scope = "partial"
             reasons.append("CUDA local timing reports dropped, unresolved, or failed samples")
+        if any(event["flags"] & 1 for event in self.gpu_duration_events):
+            if scope == "ok":
+                scope = "partial"
+            reasons.append("GPU duration measurements include a failed graph execution")
+        if self.unassigned_host_scopes:
+            if scope == "ok":
+                scope = "partial"
+            reasons.append("server_decode outer scopes have inherited, unqualified token identities")
         exposed = {
             "definition": ("wall-clock ranges inside each token envelope that no recorded "
                            "span covers; rpc_total is a container and is never used as a wait"),
@@ -687,6 +754,18 @@ class TraceAnalysis:
             "scope": scope,
             "scope_reasons": reasons,
             "trace": self.path,
+            "gpu_duration_measurements": self.gpu_duration_report(),
+            "unassigned_host_scopes": {
+                "window_qualified": False,
+                "scope": "all nq=1 server_decode intervals in the trace; original positions are not trusted",
+                "duration_us": summarize(item["duration_us"] for item in self.unassigned_host_scopes),
+                "samples": self.unassigned_host_scopes,
+            },
+            "clock_domains": {
+                "host_spans": "host monotonic begin/end, excluding deferred GPU observations",
+                "rpc_total.gpu_us": "rkva_response.xbox_compute_us: peer steady-clock work interval including CPU/fence work, not a GPU timestamp",
+                "per_token.peer_gpu_ms": "legacy alias of peer_compute_ms, not device GPU time",
+            },
             "capture": {"status_reported": bool(self.capture_status),
                         "dropped_events": dropped if self.capture_status else None,
                         "status_records": len(self.capture_status),
@@ -717,8 +796,8 @@ class TraceAnalysis:
             "evidence": [
                 {"metric": "phase durations", "class": "measured",
                  "source": "trace begin_us/end_us per event"},
-                {"metric": "device GPU compute", "class": "measured",
-                 "source": "peer-reported gpu_us, only where the peer emitted it"},
+                {"metric": "peer compute work interval", "class": "measured",
+                 "source": "peer xbox_compute_us, stored in legacy gpu_us; includes peer CPU/fence work"},
                 {"metric": "per-token attributed/overlap", "class": "derived",
                  "source": "union of root spans and strict containment"},
                 {"metric": "CPU engine vs GPU", "class": "unknown",
@@ -732,6 +811,8 @@ class TraceAnalysis:
                 "A container (rpc_total, job_finish, out_decode) is reported, never summed with children.",
                 "Peer gpu_us is comparable only when the peer counts and window match this trace.",
                 "Duplicate cycle ids are not joined: per-correlation attribution is unknown.",
+                "Host envelopes cover recorded identity-qualified spans, not necessarily the entire server decode.",
+                "Legacy server_decode intervals are unassigned; their inherited token identity is not used.",
             ],
         }
 
@@ -1521,7 +1602,7 @@ def _print_trace_summary(report):
           f"layers/token {token['layers_per_token']['min']}"
           f"..{token['layers_per_token']['max']}):")
     for key in ("envelope_ms", "attributed_ms", "unattributed_gap_ms",
-                "rpc_total_ms_container", "peer_gpu_ms"):
+                "rpc_total_ms_container", "peer_compute_ms"):
         stats = token[key]
         if stats["count"]:
             print(f"  {key:24s} p50={stats['p50']:8.3f} p95={stats['p95']:8.3f} "

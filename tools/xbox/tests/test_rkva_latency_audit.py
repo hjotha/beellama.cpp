@@ -103,6 +103,68 @@ class TraceCase(unittest.TestCase):
 
 
 class TraceAttributionTest(TraceCase):
+    def test_server_decode_with_previous_identity_cannot_expand_token(self):
+        baseline = self.analyze()
+        stale = event("server_decode", 99_000_000, 99_050_000, 0, 0)
+        stale["flags"] = 0x40000000
+        write_trace(self.trace, golden_events() + [stale])
+        report = self.analyze()
+        self.assertEqual(report["per_token"], baseline["per_token"])
+        self.assertEqual(report["scope"], "partial")
+        self.assertEqual(report["unassigned_host_scopes"]["duration_us"]["total"], 50000)
+        self.assertFalse(report["unassigned_host_scopes"]["window_qualified"])
+        self.assertNotIn("server_decode", report["phases"])
+
+    def test_delayed_gpu_observation_cannot_expand_host_envelope(self):
+        baseline = self.analyze()
+        gpu = event("cuda_local_span_gpu", 1, 99_000_000, 0, 1, gpu_us=1234.5)
+        gpu["flags"] = 0x80000000
+        write_trace(self.trace, golden_events() + [gpu])
+        report = self.analyze()
+        self.assertEqual(report["per_token"], baseline["per_token"])
+        self.assertEqual(report["parent_child"], baseline["parent_child"])
+        self.assertNotIn("cuda_local_span_gpu", report["phases"])
+        measured = report["gpu_duration_measurements"]
+        self.assertEqual(measured["duration_us"]["total"], 1234.5)
+        self.assertEqual(measured["covered_host_tokens"], 1)
+        self.assertEqual(measured["samples"][0]["cycle"], 1)
+        self.assertFalse(measured["host_intervals_used"])
+
+    def test_gpu_measurement_alone_never_creates_host_tokens(self):
+        gpu = event("cuda_local_span_gpu", 1, 99_000_000, 0, 1, gpu_us=1000)
+        write_trace(self.trace, [gpu])
+        report = self.analyze()
+        self.assertEqual(report["scope"], "unknown")
+        self.assertEqual(report["counts"]["tokens"], 0)
+        self.assertEqual(report["counts"]["decode_events"], 0)
+        self.assertEqual(report["gpu_duration_measurements"]["duration_us"]["total"], 1000)
+        self.assertEqual(report["gpu_duration_measurements"]["samples_without_host_token"], 1)
+
+    def test_gpu_domain_flag_is_not_a_host_span_for_future_phase(self):
+        gpu = event("future_gpu_measurement", 1, 99_000_000, 0, 1, gpu_us=1000)
+        gpu["flags"] = 0x80000000
+        write_trace(self.trace, golden_events() + [gpu])
+        report = self.analyze()
+        self.assertNotIn("future_gpu_measurement", report["phases"])
+        self.assertEqual(report["gpu_duration_measurements"]["duration_us"]["count"], 1)
+        self.assertEqual(report["counts"]["tokens"], 2)
+
+    def test_missing_or_nonfinite_gpu_duration_fails_closed(self):
+        for value in (None, -1, math.nan, math.inf):
+            with self.subTest(value=value):
+                gpu = event("cuda_local_span_gpu", 1, 1000, 0, 1, gpu_us=value)
+                write_trace(self.trace, [gpu])
+                with self.assertRaises(audit.TraceFormatError):
+                    self.analyze()
+
+    def test_failed_gpu_graph_does_not_qualify_complete_attribution(self):
+        gpu = event("cuda_local_span_gpu", 1, 99_000_000, 0, 1, gpu_us=1000)
+        gpu["flags"] = 0x80000001
+        write_trace(self.trace, golden_events() + [gpu])
+        report = self.analyze()
+        self.assertEqual(report["scope"], "partial")
+        self.assertEqual(report["counts"]["tokens"], 2)
+
     def test_dropped_trace_cannot_report_complete_window(self):
         write_trace(self.trace, golden_events() + [
             {"schema": "rkva-host-trace-status-v1", "events_written": 100, "dropped": 7},
@@ -157,6 +219,9 @@ class TraceAttributionTest(TraceCase):
     def test_counts_tokens_layers_and_phases(self):
         report = self.analyze()
         self.assertEqual(report["scope"], "ok")
+        self.assertEqual(report["per_token"]["peer_compute_ms"],
+                         report["per_token"]["peer_gpu_ms"])
+        self.assertIn("not a GPU timestamp", report["clock_domains"]["rpc_total.gpu_us"])
         self.assertEqual(report["counts"]["tokens"], 2)
         self.assertEqual(report["counts"]["layer_groups"], 4)
         self.assertEqual(report["counts"]["malformed_lines"], 0)
