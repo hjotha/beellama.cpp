@@ -33,6 +33,14 @@ public:
     virtual ~llama_io_read_i() = default;
 
     virtual void read(void * dst, size_t size) = 0;
+    // Optional non-consuming lookahead. Readers that cannot inspect without
+    // advancing return false; native FULL restore then fails closed when a
+    // trailer might be present.
+    virtual bool peek(void * dst, size_t size) {
+        (void) dst;
+        (void) size;
+        return false;
+    }
     virtual void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
 
     // State restore is a transaction. Tensor writes and publication callbacks
@@ -111,6 +119,13 @@ public:
     }
     size_t remaining() const override {
         return m_inner.remaining();
+    }
+    bool peek(void * dst, size_t size) override {
+        if (m_offset + size > m_prefix.size()) {
+            return false;
+        }
+        std::memcpy(dst, m_prefix.data() + m_offset, size);
+        return true;
     }
 
 private:

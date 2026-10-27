@@ -4788,7 +4788,8 @@ bool ggml_backend_remote_attn_native_kvarn_snapshot_supported(ggml_backend_t bac
 }
 
 bool ggml_backend_remote_attn_native_kvarn_state_write(
-        ggml_backend_t backend, ggml_remote_attn_native_write_fn write, void * user) {
+        ggml_backend_t backend, ggml_remote_attn_native_write_fn write, void * user,
+        uint8_t out_sha256[32]) {
     if (!backend || ggml_backend_is_local_split(backend) || !write ||
             !ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend))
         return false;
@@ -4821,10 +4822,12 @@ bool ggml_backend_remote_attn_native_kvarn_state_write(
         void * user_;
     } sink(write, user);
     std::string error;
-    if (!rkva_native_state::write_set(views, sink, &error)) {
+    rkva_snapshot::Digest digest{};
+    if (!rkva_native_state::write_set(views, sink, &error, &digest)) {
         GGML_LOG_ERROR("%s: native state write failed: %s\n", GGML_REMOTE_ATTN_NAME, error.c_str());
         return false;
     }
+    if (out_sha256) std::memcpy(out_sha256, digest.data(), digest.size());
     return true;
     } catch (const std::exception & error) {
         GGML_LOG_ERROR("%s: native state write exception: %s\n", GGML_REMOTE_ATTN_NAME, error.what());
@@ -4836,7 +4839,7 @@ bool ggml_backend_remote_attn_native_kvarn_state_write(
 
 bool ggml_backend_remote_attn_native_kvarn_state_read(
         ggml_backend_t backend, ggml_remote_attn_native_read_fn read, void * user,
-        uint32_t * live_rows, uint64_t * saved_generation) {
+        uint32_t * live_rows, uint64_t * saved_generation, uint8_t out_sha256[32]) {
     if (!backend || ggml_backend_is_local_split(backend) || !read || !live_rows || !saved_generation ||
             !ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend))
         return false;
@@ -4855,7 +4858,8 @@ bool ggml_backend_remote_attn_native_kvarn_state_read(
     } source(read, user);
     auto pending = std::make_unique<rkva_pending_native_state>();
     std::string error;
-    if (!rkva_native_state::read_set(source, pending->layers, &error)) {
+    rkva_snapshot::Digest digest{};
+    if (!rkva_native_state::read_set(source, pending->layers, &error, &digest)) {
         GGML_LOG_ERROR("%s: native state read failed: %s\n", GGML_REMOTE_ATTN_NAME, error.c_str());
         return false;
     }
@@ -4883,6 +4887,7 @@ bool ggml_backend_remote_attn_native_kvarn_state_read(
     ctx->pending_native_state = std::move(pending);
     *live_rows = rows;
     *saved_generation = generation;
+    if (out_sha256) std::memcpy(out_sha256, digest.data(), digest.size());
     return true;
     } catch (const std::exception & error) {
         GGML_LOG_ERROR("%s: native state read exception: %s\n", GGML_REMOTE_ATTN_NAME, error.what());

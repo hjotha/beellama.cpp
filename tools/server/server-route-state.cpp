@@ -190,6 +190,7 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     if (!written) { throw std::runtime_error("router native state save failed"); }
     const bool native_remote = llama_remote_native_kvarn_transient_active(ctx);
     const bool remote_disk = llama_remote_disk_snapshot_enabled(ctx);
+    const bool legacy_remote_disk = remote_disk && !native_remote;
     rkva_snapshot::Sha256 remote_hash;
     XXH64_state_t hash;
     XXH64_reset(&hash, 0);
@@ -200,7 +201,7 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
             const size_t count = std::min(left, buffer.size());
             read_exact(input, buffer.data(), count);
             XXH64_update(&hash, buffer.data(), count);
-            if (remote_disk) remote_hash.update(buffer.data(), count);
+            if (legacy_remote_disk) remote_hash.update(buffer.data(), count);
             left -= count;
         }
     }
@@ -324,7 +325,7 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         }
         throw;
     }
-    if (remote_disk && !native_remote) {
+    if (legacy_remote_disk) {
         const auto key = remote_hash.finish();
         // Standard Q4 bookkeeping is an optional accelerator: failure leaves
         // the validated host file and full-upload fallback usable. Native

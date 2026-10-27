@@ -190,9 +190,12 @@ GGML_API bool ggml_backend_remote_attn_disk_snapshot(
         uint32_t live_rows, bool restore);
 
 // Descriptor revision-3 FULL native overflow persistence. The host trailer is
-// a canonical little-endian owner-state set; disk restore first validates the
-// trailer into shadow producers, restores the Xbox snapshot, and only then
-// commits producer state. Callbacks must transfer exactly the requested bytes.
+// a canonical little-endian owner-state set. Its SHA-256 (header+payload, the
+// same digest stored in the trailer footer) is the Xbox snapshot key, so an
+// appended server checkpoint (SCKP) never changes the key. Disk restore first
+// validates the trailer into shadow producers, restores the Xbox snapshot, and
+// only then commits producer state. Callbacks must transfer exactly the
+// requested bytes.
 // Snapshot support requires opt-in disk snapshots plus both native snapshot
 // capability and operations 17/18 from HELLO. Other native layouts return false
 // and retain the pre-existing guards.
@@ -200,14 +203,15 @@ typedef bool (*ggml_remote_attn_native_write_fn)(void * user, const void * data,
 typedef bool (*ggml_remote_attn_native_read_fn)(void * user, void * data, size_t size);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_snapshot_supported(ggml_backend_t backend);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_state_write(
-        ggml_backend_t backend, ggml_remote_attn_native_write_fn write, void * user);
+        ggml_backend_t backend, ggml_remote_attn_native_write_fn write, void * user,
+        uint8_t out_sha256[32]);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_state_read(
         ggml_backend_t backend, ggml_remote_attn_native_read_fn read, void * user,
-        uint32_t * live_rows, uint64_t * saved_generation);
+        uint32_t * live_rows, uint64_t * saved_generation, uint8_t out_sha256[32]);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_remote_save(
-        ggml_backend_t backend, const uint8_t host_state_sha256[32], uint32_t live_rows);
+        ggml_backend_t backend, const uint8_t owner_set_sha256[32], uint32_t live_rows);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_remote_restore(
-        ggml_backend_t backend, const uint8_t host_state_sha256[32], uint32_t live_rows,
+        ggml_backend_t backend, const uint8_t owner_set_sha256[32], uint32_t live_rows,
         uint64_t saved_generation, uint64_t * new_generation);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_state_commit(
         ggml_backend_t backend, uint64_t new_generation);

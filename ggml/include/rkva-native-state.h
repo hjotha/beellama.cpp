@@ -361,7 +361,8 @@ inline bool read_section(Source& source, rkva_snapshot::Sha256& hash, uint8_t* d
 
 // Writes one self-contained set. The caller supplies one view per remote layer;
 // all views must share the same layout and live row count. No view is mutated.
-inline bool write_set(const std::vector<View>& views, Sink& sink, std::string* error) {
+inline bool write_set(const std::vector<View>& views, Sink& sink, std::string* error,
+                      rkva_snapshot::Digest* out_digest = nullptr) {
     if (views.empty() || views.size() > kMaxLayers) {
         if (error)
             *error = "native state: invalid layer count";
@@ -418,10 +419,13 @@ inline bool write_set(const std::vector<View>& views, Sink& sink, std::string* e
             *error = "native state: footer write failed";
         return false;
     }
+    if (out_digest)
+        *out_digest = digest;
     return true;
 }
 
-inline bool read_set(Source& source, std::vector<Storage>& out, std::string* error) {
+inline bool read_set(Source& source, std::vector<Storage>& out, std::string* error,
+                     rkva_snapshot::Digest* out_digest = nullptr) {
     out.clear();
     uint8_t encoded[kHeaderBytes];
     if (!source.read(encoded, sizeof(encoded))) {
@@ -472,11 +476,14 @@ inline bool read_set(Source& source, std::vector<Storage>& out, std::string* err
             *error = "native state: truncated footer";
         return false;
     }
-    if (hash.finish() != stored) {
+    const auto digest = hash.finish();
+    if (digest != stored) {
         if (error)
             *error = "native state: checksum mismatch";
         return false;
     }
+    if (out_digest)
+        *out_digest = digest;
     for (auto& storage : candidate)
         storage.valid = true;
     out = std::move(candidate);
@@ -485,17 +492,17 @@ inline bool read_set(Source& source, std::vector<Storage>& out, std::string* err
 
 // Buffer helper used by CPU tests and adapters that already own a bounded blob.
 inline bool write_set(const std::vector<View>& views, std::vector<uint8_t>& out,
-                      std::string* error) {
+                      std::string* error, rkva_snapshot::Digest* out_digest = nullptr) {
     VectorSink sink;
-    if (!write_set(views, sink, error))
+    if (!write_set(views, sink, error, out_digest))
         return false;
     out = std::move(sink.bytes);
     return true;
 }
 inline bool read_set(const std::vector<uint8_t>& bytes, std::vector<Storage>& out,
-                     std::string* error) {
+                     std::string* error, rkva_snapshot::Digest* out_digest = nullptr) {
     VectorSource source(bytes);
-    return read_set(source, out, error);
+    return read_set(source, out, error, out_digest);
 }
 
 } // namespace rkva_native_state

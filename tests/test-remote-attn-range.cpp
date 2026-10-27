@@ -1363,24 +1363,31 @@ static void test_native_snapshot_transport() {
     assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
 
     std::vector<uint8_t> owner_state;
+    uint8_t owner_key[32] = {};
     assert(ggml_backend_remote_attn_native_kvarn_state_write(
         backend, [](void * user, const void * data, size_t bytes) {
             auto * out = static_cast<std::vector<uint8_t> *>(user);
             const auto * begin = static_cast<const uint8_t *>(data);
             out->insert(out->end(), begin, begin + bytes);
             return true;
-        }, &owner_state));
+        }, &owner_state, owner_key));
     assert(!owner_state.empty());
-    std::array<uint8_t, 32> hash{};
-    for (size_t i = 0; i < hash.size(); ++i) hash[i] = uint8_t(0x40 + i);
-    assert(ggml_backend_remote_attn_native_kvarn_remote_save(backend, hash.data(), 130));
+    // The server appends its SCKP checkpoint block after the llama state. The
+    // native key is the RKVK digest, so these trailing bytes must neither be
+    // consumed by the owner parser nor alter the key.
+    std::vector<uint8_t> framed_state = owner_state;
+    const uint32_t sckp[3] = {0x504b4353u, 1u, 0u};
+    framed_state.insert(framed_state.end(), reinterpret_cast<const uint8_t *>(sckp),
+                        reinterpret_cast<const uint8_t *>(sckp) + sizeof(sckp));
+    assert(ggml_backend_remote_attn_native_kvarn_remote_save(backend, owner_key, 130));
 
     // Fresh resident session (empty counts/coverage), same connection.
     assert(ggml_backend_remote_attn_reset(backend, 0));
     assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));
     uint32_t rows = 0;
     uint64_t saved_generation = 0;
-    std::pair<const std::vector<uint8_t> *, size_t> source_state{&owner_state, 0};
+    std::pair<const std::vector<uint8_t> *, size_t> source_state{&framed_state, 0};
+    uint8_t restored_key[32] = {};
     assert(ggml_backend_remote_attn_native_kvarn_state_read(
         backend, [](void * user, void * data, size_t bytes) {
             auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
@@ -1388,11 +1395,13 @@ static void test_native_snapshot_transport() {
             std::memcpy(data, source->first->data() + source->second, bytes);
             source->second += bytes;
             return true;
-        }, &source_state, &rows, &saved_generation));
+        }, &source_state, &rows, &saved_generation, restored_key));
+    assert(source_state.second == owner_state.size());
+    assert(std::memcmp(restored_key, owner_key, sizeof(owner_key)) == 0);
     uint64_t new_generation = 0;
     assert(rows == 130);
     assert(ggml_backend_remote_attn_native_kvarn_remote_restore(
-        backend, hash.data(), rows, saved_generation, &new_generation));
+        backend, restored_key, rows, saved_generation, &new_generation));
     assert(ggml_backend_remote_attn_native_kvarn_state_commit(backend, new_generation));
     assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
 

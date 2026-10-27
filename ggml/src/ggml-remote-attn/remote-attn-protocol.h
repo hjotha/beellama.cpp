@@ -351,10 +351,13 @@ struct rkva_kvarn_layer_rewind {
     uint32_t expected_live, new_live;
 };
 
-// Snapshot key is SHA256 of the COMPLETE native host sequence file (header,
-// token IDs, KV payload), not a path or user label. Host validates/restores its
-// authoritative snapshot before RESTORE, never skips its CPU mirror. Only call
-// at a quiescent evaluated checkpoint, with all layers at the same live_rows.
+// Revision 1 key is SHA256 of the COMPLETE native host sequence file (header,
+// token IDs, KV payload), not a path or user label. Revision 2 native snapshots
+// key by the SHA256 of the canonical RKVK owner set (header+payload), so server
+// SCKP checkpoint bytes appended after the llama state do not change it. Host
+// validates/restores its authoritative snapshot before RESTORE and never skips
+// its CPU mirror. Only call at a quiescent evaluated checkpoint, with all
+// layers at the same live_rows.
 // SAVE/RESTORE are optional, NEVER sent for live_rows==0 or positions below P.
 // Revision 1 has no per-token save; host must opt in explicitly.
 struct rkva_snapshot_req {

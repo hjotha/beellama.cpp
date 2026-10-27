@@ -191,6 +191,33 @@ int main(int argc, char ** argv) {
                 llama_memory_seq_pos_max(llama_get_memory(legacy_truncated.get()), 0) == -1,
                 "truncated sequence state committed or asserted instead of returning failure");
         std::cout << "PASS: legacy sequence file rejects truncated header, tokens, and state before commit\n";
+        // The server appends an optional SCKP checkpoint appendix after the
+        // llama state. A normal (non-native) FULL load must stop at the end of
+        // the state payload, leave SCKP unconsumed, and return that exact end
+        // offset so the server can read the appendix afterwards.
+        const std::string appended_path = dir + "/legacy-with-sckp.bin";
+        std::filesystem::copy_file(legacy_seq_path, appended_path);
+        {
+            std::ofstream out(appended_path, std::ios::binary | std::ios::app);
+            const uint32_t sckp[3] = {0x504b4353u, 1u, 0u};
+            require(bool(out.write(reinterpret_cast<const char *>(sckp), sizeof(sckp))),
+                    "SCKP append write failed");
+            out.flush();
+            require(out.good(), "SCKP append flush failed");
+        }
+        llama_context_ptr appended_ctx(llama_init_from_model(model.get(), params));
+        require(bool(appended_ctx), "SCKP appendix load context failed");
+        llama_tokens appended_tokens(tokens.size());
+        size_t appended_count = 0;
+        const size_t appended_read = llama_state_seq_load_file(appended_ctx.get(),
+                appended_path.c_str(), 0, appended_tokens.data(), appended_tokens.size(),
+                &appended_count);
+        require(appended_read == legacy_seq_size && appended_count == tokens.size() &&
+                appended_tokens == tokens &&
+                llama_memory_seq_pos_max(llama_get_memory(appended_ctx.get()), 0) ==
+                    (llama_pos) tokens.size() - 1,
+                "non-native FULL load rejected or mis-framed the SCKP appendix");
+        std::cout << "PASS: non-native FULL load preserves the SCKP appendix framing\n";
 
         const auto identity = server_model_identity::prepare(argv[1], {});
         const std::string path = dir + "/route.bin";

@@ -364,9 +364,10 @@ private:
     size_t state_write_data(llama_io_write_i & io, llama_state_seq_flags flags = 0);
     size_t state_read_data (llama_io_read_i  & io);
 
-    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                uint8_t native_sha256[32] = nullptr,
+                                bool * native_sha256_valid = nullptr);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags,
-                                const uint8_t * remote_snapshot_key = nullptr,
                                 uint32_t evaluated_tokens = 0);
 
     //

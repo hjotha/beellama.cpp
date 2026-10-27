@@ -5972,6 +5972,13 @@ public:
     size_t remaining() const override {
         return buf_size;
     }
+    bool peek(void * dst, size_t size) override {
+        if (size > buf_size) {
+            return false;
+        }
+        memcpy(dst, ptr, size);
+        return true;
+    }
 
 private:
     const uint8_t * ptr;
@@ -6135,6 +6142,16 @@ public:
         const size_t position = file->tell();
         const size_t end = file->size();
         return position <= end ? end - position : 0;
+    }
+    bool peek(void * dst, size_t size) override {
+        const size_t position = file->tell();
+        const size_t end = file->size();
+        if (position > end || size > end - position) {
+            return false;
+        }
+        file->read_raw(dst, size);
+        file->seek(position, SEEK_SET);
+        return true;
     }
 
 private:
@@ -6835,30 +6852,11 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     {
         const size_t state_size = file.size() - file.tell();
         const size_t state_begin = file.tell();
-        const bool native_remote = remote_native_kvarn_enabled();
         const bool native_before = remote_native_kvarn_transient_active();
-        rkva_snapshot::Digest remote_key{};
-        if (native_remote) {
-            // The optional native trailer is bound to the complete host file.
-            // Hash before parsing so the Xbox restore uses the same key that
-            // save published, then return to the memory-state cursor.
-            rkva_snapshot::Sha256 hash;
-            file.seek(0, SEEK_SET);
-            std::vector<uint8_t> buffer(LLAMA_STATE_FILE_BUFFER_SIZE);
-            for (size_t left = file.size(); left;) {
-                const size_t count = std::min(left, buffer.size());
-                file.read_raw(buffer.data(), count);
-                hash.update(buffer.data(), count);
-                left -= count;
-            }
-            remote_key = hash.finish();
-            file.seek(state_begin, SEEK_SET);
-        }
         llama_io_read_file io(&file);
         size_t nread = 0;
         try {
-            nread = state_seq_read_data(io, seq_id, 0,
-                    native_remote ? remote_key.data() : nullptr, loaded_token_count);
+            nread = state_seq_read_data(io, seq_id, 0, loaded_token_count);
         } catch (...) {
             if (!native_before && remote_native_kvarn_transient_active() && backend_remote) {
                 ggml_backend_remote_attn_native_kvarn_discard(backend_remote);
@@ -6919,7 +6917,10 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 
     // save the context state using stream saving
     llama_io_write_file io(&file);
-    state_seq_write_data(io, seq_id, 0);
+    uint8_t native_key[32] = {};
+    bool native_key_valid = false;
+    state_seq_write_data(io, seq_id, 0, native_active ? native_key : nullptr,
+            &native_key_valid);
 
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
@@ -6928,25 +6929,13 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     if (native_active) {
         // Direct slot saves bypass server_route_state_save. Pair them with the
         // Xbox snapshot here so a published host file is never left without
-        // its GPU state. The key is SHA-256 of the complete host file.
-        rkva_snapshot::Digest key{};
-        {
-            // Close the input before publication. Windows without
-            // FILE_SHARE_DELETE must not keep the staging file open across the
-            // rename/MoveFileExW.
-            rkva_snapshot::Sha256 hash;
-            llama_file input(write_path, "rb");
-            std::vector<uint8_t> buffer(LLAMA_STATE_FILE_BUFFER_SIZE);
-            for (size_t left = input.size(); left;) {
-                const size_t count = std::min(left, buffer.size());
-                input.read_raw(buffer.data(), count);
-                hash.update(buffer.data(), count);
-                left -= count;
-            }
-            key = hash.finish();
-        }
+        // its GPU state. The key is the SHA-256 of the canonical RKVK owner
+        // set, not the enclosing file, so appended SCKP checkpoints do not
+        // change it. The staging file is already closed before publication.
+        if (!native_key_valid)
+            throw std::runtime_error("native KVarN4 overflow owner-state digest missing");
         const uint32_t live_rows = uint32_t(n_token_count - cparams.kv_position_split_p);
-        if (!ggml_backend_remote_attn_native_kvarn_remote_save(backend_remote, key.data(), live_rows)) {
+        if (!ggml_backend_remote_attn_native_kvarn_remote_save(backend_remote, native_key, live_rows)) {
             throw std::runtime_error("native KVarN4 overflow Xbox snapshot save failed");
         }
         if (!llama_native_save::publish(temporary_path, filepath)) {
@@ -7322,9 +7311,12 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
     try {
         const bool remote_disk = remote_disk_snapshot_enabled();
         const bool native_remote = remote_native_kvarn_enabled();
+        // Only the legacy range accelerator keys by the complete host file.
+        // Native revision-3 snapshots key by the canonical RKVK owner-set
+        // digest, so an appended server checkpoint cannot change the key.
+        const bool legacy_remote_disk = remote_disk && !native_remote;
         rkva_snapshot::Sha256 remote_hash;
         rkva_snapshot::Digest remote_key{};
-        bool have_remote_key = false;
         llama_file file(filepath, "rb");
         if (state_size > file.size() || state_size < 3*sizeof(uint32_t)) {
             throw std::runtime_error("invalid sequence state file size");
@@ -7339,16 +7331,15 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
                 const size_t count = std::min(left, buffer.size());
                 file.read_raw(buffer.data(), count);
                 XXH64_update(&hash, buffer.data(), count);
-                if (remote_disk) remote_hash.update(buffer.data(), count);
+                if (legacy_remote_disk) remote_hash.update(buffer.data(), count);
                 left -= count;
             }
             if (XXH64_digest(&hash) != checksum) {
                 throw std::runtime_error("sequence state file checksum mismatch");
             }
         }
-        if (remote_disk) {
+        if (legacy_remote_disk) {
             remote_key = remote_hash.finish();
-            have_remote_key = true;
         }
         file.seek(0, SEEK_SET);
         llama_io_read_file_stream io(file, state_size);
@@ -7359,8 +7350,7 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
             throw std::runtime_error("invalid sequence state file header");
         }
         io.read(tokens_out, size_t(header[2])*sizeof(llama_token));
-        state_seq_read_data(io, seq_id, 0, have_remote_key ? remote_key.data() : nullptr,
-                header[2]);
+        state_seq_read_data(io, seq_id, 0, header[2]);
         if (io.n_bytes() != state_size || io.checksum() != checksum) {
             // Which half failed matters: logical extent vs content digest.
             throw std::runtime_error(
@@ -7377,7 +7367,7 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         if (memory->seq_pos_max(seq_id) >= int64_t(cparams.n_ctx_seq)) {
             throw std::runtime_error("sequence state position exceeds context");
         }
-        if (remote_disk && !native_remote) {
+        if (legacy_remote_disk) {
             // CPU/CUDA parsing committed and invalidated the RPC epoch before
             // this optimization. A miss retains full-upload fallback. Native
             // overflow was restored by the trailer path above; it has no
@@ -7463,7 +7453,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     return io.n_bytes();
 }
 
-size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+        uint8_t native_sha256[32], bool * native_sha256_valid) {
+    if (native_sha256_valid) *native_sha256_valid = false;
     const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
     const bool native_active = remote_native_kvarn_transient_active();
     if (!partial && native_active && !remote_native_kvarn_snapshot_supported()) {
@@ -7491,16 +7483,17 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
         if (!ggml_backend_remote_attn_native_kvarn_state_write(backend_remote,
                     [](void * user, const void * data, size_t bytes) {
                         return static_cast<sink_adapter *>(user)->write(data, bytes);
-                    }, &sink)) {
+                    }, &sink, native_sha256)) {
             throw std::runtime_error("native KVarN4 overflow owner-state serialization failed");
         }
+        if (native_sha256_valid) *native_sha256_valid = true;
     }
 
     return io.n_bytes();
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
-        const uint8_t * remote_snapshot_key, uint32_t evaluated_tokens) {
+        uint32_t evaluated_tokens) {
     const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
     if (remote_native_kvarn_transient_active() && (!partial || !remote_native_kvarn_can_rewind())) {
         throw std::runtime_error("native KVarN4 overflow non-sequence restore is unsupported; use the sequence state file API");
@@ -7518,63 +7511,62 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
             const size_t remaining = io.remaining();
             bool native_trailer = false;
             if (remaining) {
-                if (remaining < 4) {
-                    throw std::runtime_error("truncated native state trailer");
-                }
+                // Peek only the optional native trailer. Any other appendix
+                // (notably the server SCKP checkpoint block) is opaque to the
+                // llama state payload and must remain unconsumed.
                 uint8_t prefix[4] = {};
-                io.read(prefix, sizeof(prefix));
-                const uint32_t magic = uint32_t(prefix[0]) | (uint32_t(prefix[1]) << 8) |
-                                       (uint32_t(prefix[2]) << 16) | (uint32_t(prefix[3]) << 24);
-                if (magic != rkva_native_state::kMagic) {
-                    throw std::runtime_error("unsupported sequence state trailing section");
+                const bool peeked = io.peek(prefix, sizeof(prefix));
+                if (peeked) {
+                    const uint32_t magic = uint32_t(prefix[0]) | (uint32_t(prefix[1]) << 8) |
+                                           (uint32_t(prefix[2]) << 16) | (uint32_t(prefix[3]) << 24);
+                    if (magic == rkva_native_state::kMagic) {
+                        io.read(prefix, sizeof(prefix));
+                        native_trailer = true;
+                        llama_io_read_replay replay(io, prefix, sizeof(prefix));
+                        if (!remote_native_kvarn_snapshot_supported()) {
+                            ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
+                            throw std::runtime_error("native KVarN4 overflow snapshot is not supported by the negotiated server");
+                        }
+                        uint32_t live_rows = 0;
+                        uint64_t saved_generation = 0;
+                        uint8_t state_key[32] = {};
+                        if (!ggml_backend_remote_attn_native_kvarn_state_read(backend_remote,
+                                    [](void * user, void * data, size_t bytes) {
+                                        try {
+                                            static_cast<llama_io_read_replay *>(user)->read(data, bytes);
+                                            return true;
+                                        } catch (...) {
+                                            return false;
+                                        }
+                                    }, &replay, &live_rows, &saved_generation, state_key)) {
+                            throw std::runtime_error("native KVarN4 overflow owner-state trailer is invalid");
+                        }
+                        if (!evaluated_tokens || evaluated_tokens > cparams.n_ctx_seq ||
+                                evaluated_tokens <= cparams.kv_position_split_p ||
+                                uint64_t(evaluated_tokens - cparams.kv_position_split_p) != live_rows) {
+                            ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
+                            throw std::runtime_error("native KVarN4 overflow trailer rows do not match the evaluated prefix");
+                        }
+                        uint64_t new_generation = 0;
+                        if (!ggml_backend_remote_attn_native_kvarn_remote_restore(backend_remote,
+                                    state_key, live_rows, saved_generation, &new_generation)) {
+                            ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
+                            throw std::runtime_error("native KVarN4 overflow Xbox snapshot restore failed");
+                        }
+                        if (!ggml_backend_remote_attn_native_kvarn_state_commit(backend_remote, new_generation)) {
+                            throw std::runtime_error("native KVarN4 overflow owner-state commit failed");
+                        }
+                        native_full_restored = true;
+                    }
+                } else if (evaluated_tokens > cparams.kv_position_split_p &&
+                           remote_native_kvarn_enabled()) {
+                    throw std::runtime_error("native KVarN4 overflow state reader cannot inspect the optional trailer");
                 }
-                native_trailer = true;
-                llama_io_read_replay replay(io, prefix, sizeof(prefix));
-                if (!remote_native_kvarn_snapshot_supported()) {
-                    ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
-                    throw std::runtime_error("native KVarN4 overflow snapshot is not supported by the negotiated server");
-                }
-                if (!remote_snapshot_key) {
-                    ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
-                    throw std::runtime_error("native KVarN4 overflow FULL restore requires a verified disk snapshot key");
-                }
-                uint32_t live_rows = 0;
-                uint64_t saved_generation = 0;
-                if (!ggml_backend_remote_attn_native_kvarn_state_read(backend_remote,
-                            [](void * user, void * data, size_t bytes) {
-                                try {
-                                    static_cast<llama_io_read_replay *>(user)->read(data, bytes);
-                                    return true;
-                                } catch (...) {
-                                    return false;
-                                }
-                            }, &replay, &live_rows, &saved_generation)) {
-                    throw std::runtime_error("native KVarN4 overflow owner-state trailer is invalid");
-                }
-                if (!evaluated_tokens || evaluated_tokens > cparams.n_ctx_seq ||
-                        evaluated_tokens <= cparams.kv_position_split_p ||
-                        uint64_t(evaluated_tokens - cparams.kv_position_split_p) != live_rows) {
-                    ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
-                    throw std::runtime_error("native KVarN4 overflow trailer rows do not match the evaluated prefix");
-                }
-                uint64_t new_generation = 0;
-                if (!ggml_backend_remote_attn_native_kvarn_remote_restore(backend_remote,
-                            remote_snapshot_key, live_rows, saved_generation, &new_generation)) {
-                    ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
-                    throw std::runtime_error("native KVarN4 overflow Xbox snapshot restore failed");
-                }
-                if (!ggml_backend_remote_attn_native_kvarn_state_commit(backend_remote, new_generation)) {
-                    throw std::runtime_error("native KVarN4 overflow owner-state commit failed");
-                }
-                native_full_restored = true;
             }
             if (!native_trailer && remote_native_kvarn_enabled() &&
                     ((evaluated_tokens && evaluated_tokens > cparams.kv_position_split_p) ||
                      memory->seq_pos_max(seq_id) >= int64_t(cparams.kv_position_split_p))) {
                 throw std::runtime_error("native KVarN4 overflow restore requires a native state trailer; refusing Q4 bookkeeping state");
-            }
-            if (io.remaining() != 0) {
-                throw std::runtime_error("native KVarN4 overflow trailer has trailing bytes");
             }
         }
 

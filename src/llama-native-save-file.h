@@ -57,14 +57,25 @@ inline bool publish(const std::string & temporary, const char * destination) {
 }
 #endif
 
+inline bool remove_path(const std::string & path) {
+#ifndef _WIN32
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return !ec;
+#else
+    std::wstring wide;
+    if (!utf8_to_wide(path, wide))
+        return false;
+    return DeleteFileW(wide.c_str()) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND;
+#endif
+}
+
 struct remove_guard {
     std::string path;
     bool released = false;
     ~remove_guard() {
-        if (!released && !path.empty()) {
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-        }
+        if (!released && !path.empty())
+            (void) remove_path(path);
     }
 };
 

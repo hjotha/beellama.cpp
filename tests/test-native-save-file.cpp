@@ -33,31 +33,36 @@ int main() {
     fs::create_directories(root, ec);
     assert(!ec);
     const fs::path destination = root / fs::u8path("slot-\xce\xb4-\xe6\x96\x87\xe4\xbb\xb6.bin");
+    const auto destination_u8 = destination.u8string();
+    const std::string destination_utf8(
+        reinterpret_cast<const char *>(destination_u8.data()), destination_u8.size());
     write_file(destination, "old-pair");
     assert(read_file(destination) == "old-pair");
 
-    const std::string temporary = llama_native_save::temporary_path(destination.string().c_str());
+    const std::string temporary = llama_native_save::temporary_path(destination_utf8.c_str());
     write_file(fs::u8path(temporary), "new-pair");
-    assert(llama_native_save::publish(temporary, destination.string().c_str()));
+    assert(llama_native_save::publish(temporary, destination_utf8.c_str()));
     assert(!fs::exists(fs::u8path(temporary)));
     assert(read_file(destination) == "new-pair");
 
-    const std::string second = llama_native_save::temporary_path(destination.string().c_str());
+    const std::string second = llama_native_save::temporary_path(destination_utf8.c_str());
     write_file(fs::u8path(second), "newer-pair-\xe6\x96\x87\xe4\xbb\xb6");
-    assert(llama_native_save::publish(second, destination.string().c_str()));
+    assert(llama_native_save::publish(second, destination_utf8.c_str()));
     assert(read_file(destination) == "newer-pair-\xe6\x96\x87\xe4\xbb\xb6");
 
     // A missing staging file must not destroy the published destination.
-    const std::string missing = llama_native_save::temporary_path(destination.string().c_str());
-    assert(!llama_native_save::publish(missing, destination.string().c_str()));
+    const std::string missing = llama_native_save::temporary_path(destination_utf8.c_str());
+    assert(!llama_native_save::publish(missing, destination_utf8.c_str()));
     assert(read_file(destination) == "newer-pair-\xe6\x96\x87\xe4\xbb\xb6");
 
-    // The guard removes an uncommitted staging file but never the destination.
+    // The guard removes an uncommitted staging file but never the destination,
+    // including a real UTF-8 path (the Windows branch uses DeleteFileW).
+    const std::string guarded = llama_native_save::temporary_path(destination_utf8.c_str());
     {
-        const std::string guarded = llama_native_save::temporary_path(destination.string().c_str());
         write_file(fs::u8path(guarded), "orphan");
         llama_native_save::remove_guard guard{guarded};
     }
+    assert(!fs::exists(fs::u8path(guarded)));
     assert(read_file(destination) == "newer-pair-\xe6\x96\x87\xe4\xbb\xb6");
 
     fs::remove_all(root, ec);

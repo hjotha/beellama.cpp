@@ -86,7 +86,7 @@ The trailer exists only for a non-empty native overflow. A pure local prefix
 ## Xbox disk snapshot
 
 The existing LocalState store is reused with a new namespace
-`rkva-snapshots-v2/<host-state-sha256>/`. A native snapshot is one immutable
+`rkva-snapshots-v2/<owner-set-sha256>/`. A native snapshot is one immutable
 directory:
 
 - `manifest-v2.bin`: canonical manifest (`RKVS` magic, version 1, geometry,
@@ -100,8 +100,11 @@ directory:
   Incomplete `tmp-*` directories are removed. The legacy `rkva-snapshots-v1`
   format keeps its historical eviction policy.
 
-The snapshot is bound to the complete host sequence-state SHA-256, the exact
+The snapshot is bound to the SHA-256 of the canonical RKVK owner set
+(header+payload, identical to the trailer footer), the exact
 geometry/descriptor, the live row count and the host-recorded generation.
+Server SCKP checkpoint bytes appended after the RKVK frame are not part of the
+key.
 Restore validates the manifest, every extent and every chunk digest before the
 first GPU copy, rechecks each chunk on the copy pass, records all copies, and
 publishes the new coverage/counts only after the final fence. Any failure marks
@@ -147,9 +150,9 @@ Save:
 
 1. `llama_state_seq_save_file` writes the token/state payload including the
    native owner trailer.
-2. It hashes the complete host file and asks the Xbox for snapshot op17 with
-   revision 2. Failure removes the temporary host file; the previous slot is
-   untouched.
+2. It uses the RKVK owner-set digest produced while writing the trailer and
+   asks the Xbox for snapshot op17 with revision 2. Failure removes the
+   temporary host file; the previous slot is untouched.
 3. `server_route_state_save` publishes the host file only after the Xbox
    snapshot succeeds (native path). The Xbox directory is content-addressed and
    immutable.
@@ -159,8 +162,9 @@ Restore in a fresh host process / fresh HELLO / empty Xbox session:
 1. The host verifies the state-file checksum, parses target memory into the
    normal staging transaction and parses the native trailer into shadow
    producers.
-2. It asks the Xbox for op18 with the same file hash, live rows, current session
-   generation and the trailer's saved generation.
+2. It asks the Xbox for op18 with the digest recomputed from the restored RKVK
+   frame, live rows, current session generation and the trailer's saved
+   generation.
 3. The Xbox validates everything, uploads into the empty session, fences, and
    publishes coverage; it returns the new generation.
 4. Only then does the host commit memory and producer state. A later append,
@@ -206,6 +210,11 @@ multi-layer sets, wraps, rewind 128/re-append, 129 rejection, corruption and
 short I/O, manifest geometry/coverage/chunk validation, same-size chunk bit
 flips, quota admission, UTF-8 file publication/replacement, and the real TCP
 revision-2 save/reset/restore/continue/rewind path against the loopback server.
+It also appends a real SCKP appendix to the server sequence file and verifies
+that a non-native FULL load stops at the state end and preserves the appendix;
+the native TCP path appends SCKP after the RKVK frame, verifies the owner parser
+leaves it unconsumed, and confirms save/restore keys are the RKVK digest rather
+than a file hash.
 
 ## Source map
 
