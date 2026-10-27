@@ -270,6 +270,42 @@ struct SetHeader {
     uint64_t layer_bytes = 0;
 };
 
+inline uint64_t saturating_mul(uint64_t a, uint64_t b) {
+    if (a != 0 && b > UINT64_MAX / a)
+        return UINT64_MAX;
+    return a * b;
+}
+inline uint64_t saturating_add(uint64_t a, uint64_t b) {
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+// Full-capacity producer allocation for a target restore. The source header
+// may have been written with compact records, but the destination owner can
+// use the global layout; the larger bound is safe for a reservation.
+inline uint64_t owner_storage_bytes(const Layout& layout) {
+    const uint64_t groups = (uint64_t(layout.origin) + layout.capacity + 127) / 128;
+    const uint64_t records = saturating_mul(groups, record_group_bytes(layout));
+    const uint64_t planes = saturating_add(
+        saturating_add(records, stage_bytes(layout)),
+        saturating_add(tail_bytes(layout), original_bytes(layout)));
+    return saturating_add(saturating_mul(2, planes), positions_bytes());
+}
+
+// Peak simultaneous RAM during a native FULL restore: the staged RKVK set
+// (header + payload + footer) plus the owner allocations created before the
+// staged vectors are swapped in. A bounded allocator margin is included.
+inline uint64_t restore_peak_bytes(const SetHeader& header) {
+    if (!header.layers || header.layers > kMaxLayers)
+        return UINT64_MAX;
+    const uint64_t staged = saturating_add(
+        saturating_add(uint64_t(kHeaderBytes), header.payload_bytes), 32);
+    const uint64_t owners = saturating_mul(owner_storage_bytes(header.layout),
+                                           header.layers);
+    const uint64_t margin = saturating_add(8ull << 20,
+                                           saturating_mul(header.layers, 1ull << 20));
+    return saturating_add(saturating_add(staged, owners), margin);
+}
+
 inline bool encode_header(const SetHeader& header, uint8_t out[kHeaderBytes], std::string* error) {
     if (!valid_layout(header.layout, error) || !valid_payload_size(header.layout, header.layers) ||
         header.flags || header.payload_bytes != payload_bytes(header.layout, header.layers) ||

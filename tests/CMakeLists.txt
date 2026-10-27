@@ -1046,6 +1046,10 @@ target_include_directories(test-rkva-native-snapshot PRIVATE
 llama_build_and_test(test-native-save-file.cpp)
 target_include_directories(test-native-save-file PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-server-native-slot.cpp)
+target_include_directories(test-server-native-slot PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/server
+    ${PROJECT_SOURCE_DIR}/ggml/include)
 llama_build_and_test(test-rkva-kvarn-gpu-producer.cpp)
 llama_build_and_test(test-rkva-kvarn-record-storage.cpp)
 llama_build_and_test(test-model-resolution.cpp)

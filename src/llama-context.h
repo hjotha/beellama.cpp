@@ -79,6 +79,8 @@ struct llama_context {
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max()  const;
     uint32_t block_size() const;
+    void set_native_restore_reservation(bool (*reserve)(void *, size_t), void * user);
+    bool restore_was_native() const;
     void set_n_ctx(uint32_t n_ctx);
 
     uint32_t n_threads()       const;
@@ -242,7 +244,8 @@ struct llama_context {
             const char * filepath,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
-                size_t * n_token_count_out);
+                size_t * n_token_count_out,
+                    bool   require_native = false);
 
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
@@ -368,7 +371,7 @@ private:
                                 uint8_t native_sha256[32] = nullptr,
                                 bool * native_sha256_valid = nullptr);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags,
-                                uint32_t evaluated_tokens = 0);
+                                uint32_t evaluated_tokens = 0, bool require_native = false);
     bool commit_pending_native_restore(const uint8_t prefix_sha256[32]);
     void abort_pending_native_restore();
 
@@ -421,6 +424,8 @@ private:
     bool native_restore_committed = false;
     uint32_t native_restore_rows = 0;
     uint64_t native_restore_saved_generation = 0;
+    bool (*native_restore_reserve)(void *, size_t) = nullptr;
+    void * native_restore_reserve_user = nullptr;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

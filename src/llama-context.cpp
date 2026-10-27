@@ -6791,7 +6791,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     return true;
 }
 
-size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, bool require_native) {
     llama_file file(filepath, "rb");
     if (!n_token_count_out) {
         LLAMA_LOG_ERROR("%s: token count output is required\n", __func__);
@@ -6857,7 +6857,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
         llama_io_read_file io(&file);
         size_t nread = 0;
         try {
-            nread = state_seq_read_data(io, seq_id, 0, loaded_token_count);
+            nread = state_seq_read_data(io, seq_id, 0, loaded_token_count, require_native);
         } catch (...) {
             abort_pending_native_restore();
             if (!native_before && remote_native_kvarn_transient_active() && backend_remote) {
@@ -7295,6 +7295,17 @@ bool llama_remote_native_kvarn_snapshot_supported(const llama_context * ctx) {
     return ctx && ctx->remote_native_kvarn_snapshot_supported();
 }
 
+void llama_state_seq_set_native_restore_reservation(llama_context * ctx,
+        bool (*reserve)(void *, size_t), void * user) {
+    if (ctx) {
+        ctx->set_native_restore_reservation(reserve, user);
+    }
+}
+
+bool llama_state_seq_restore_was_native(const llama_context * ctx) {
+    return ctx && ctx->restore_was_native();
+}
+
 bool llama_state_seq_remote_disk_snapshot_save(
         llama_context * ctx, llama_seq_id seq_id, const uint8_t key[32], size_t evaluated_tokens) {
     return ctx && ctx->remote_disk_snapshot(seq_id, key, evaluated_tokens, false);
@@ -7515,6 +7526,15 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
     return io.n_bytes();
 }
 
+void llama_context::set_native_restore_reservation(bool (*reserve)(void *, size_t), void * user) {
+    native_restore_reserve = reserve;
+    native_restore_reserve_user = user;
+}
+
+bool llama_context::restore_was_native() const {
+    return native_restore_committed;
+}
+
 void llama_context::abort_pending_native_restore() {
     if (native_restore_pending && backend_remote) {
         ggml_backend_remote_attn_native_kvarn_state_abort(backend_remote);
@@ -7546,7 +7566,7 @@ bool llama_context::commit_pending_native_restore(const uint8_t prefix_sha256[32
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
-        uint32_t evaluated_tokens) {
+        uint32_t evaluated_tokens, bool require_native) {
     const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
     if (remote_native_kvarn_transient_active() && (!partial || !remote_native_kvarn_can_rewind())) {
         throw std::runtime_error("native KVarN4 overflow non-sequence restore is unsupported; use the sequence state file API");
@@ -7573,6 +7593,20 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                     const uint32_t magic = uint32_t(prefix[0]) | (uint32_t(prefix[1]) << 8) |
                                            (uint32_t(prefix[2]) << 16) | (uint32_t(prefix[3]) << 24);
                     if (magic == rkva_native_state::kMagic) {
+                        uint8_t native_header[rkva_native_state::kHeaderBytes];
+                        rkva_native_state::SetHeader header;
+                        std::string header_error;
+                        if (remaining < sizeof(native_header) ||
+                                !io.peek(native_header, sizeof(native_header)) ||
+                                !rkva_native_state::decode_header(native_header, header, &header_error)) {
+                            throw std::runtime_error("native KVarN4 overflow trailer header is invalid");
+                        }
+                        const uint64_t peak = rkva_native_state::restore_peak_bytes(header);
+                        if (peak == UINT64_MAX || peak > SIZE_MAX ||
+                                (native_restore_reserve &&
+                                 !native_restore_reserve(native_restore_reserve_user, size_t(peak)))) {
+                            throw std::runtime_error("native KVarN4 overflow restore RAM reservation rejected");
+                        }
                         io.read(prefix, sizeof(prefix));
                         native_trailer = true;
                         llama_io_read_replay replay(io, prefix, sizeof(prefix));
@@ -7629,6 +7663,9 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                            remote_native_kvarn_enabled()) {
                     throw std::runtime_error("native KVarN4 overflow state reader cannot inspect the optional trailer");
                 }
+            }
+            if (require_native && !native_trailer) {
+                throw std::runtime_error("native streaming slot is not a native KVarN4 snapshot");
             }
             if (!native_trailer && remote_native_kvarn_enabled() &&
                     ((evaluated_tokens && evaluated_tokens > cparams.kv_position_split_p) ||
@@ -9502,9 +9539,26 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
     ctx->synchronize();
 
     try {
-        return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
+        return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity,
+                n_token_count_out, false);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_load_file_native(llama_context * ctx, const char * filepath,
+        llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity,
+        size_t * n_token_count_out) {
+    if (!ctx) {
+        return 0;
+    }
+    ctx->synchronize();
+    try {
+        return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity,
+                n_token_count_out, true);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading native sequence state file: %s\n", __func__, err.what());
         return 0;
     }
 }

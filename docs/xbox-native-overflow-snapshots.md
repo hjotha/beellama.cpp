@@ -173,6 +173,73 @@ Restore in a fresh host process / fresh HELLO / empty Xbox session:
 
 No path falls back to cold prefill, Q4/Q8 bookkeeping or a half-restored owner.
 
+## Explicit adaptive streaming slot API
+
+The normal adaptive `LLAMASLT` path still uses `llama_state_seq_get_data` /
+`set_data` in RAM. It is unchanged and does not activate the native Xbox pair.
+Native streaming slots are explicit opt-in:
+
+```http
+POST /slots/0?action=save
+{"filename":"native-xxxl.slot","native_stream":true}
+
+POST /slots/0?action=restore
+{"filename":"native-xxxl.slot","native_stream":true}
+```
+
+The option is rejected unless all of the following hold:
+
+- adaptive server, active profile `xxxl`;
+- target-only context: no draft/MTP context and no speculative slot;
+- one sequence;
+- a qualified native revision-3 peer and geometry;
+- SAVE: native overflow resident and a complete evaluated text prefix;
+- RESTORE: empty target slot and no occupied sequence state;
+- no `route_state_transfer`, `route_target_no_mtp` or `route_state_reuse`;
+- text-only prompt and `--slot-save-max-mb` bounds.
+
+Without `native_stream`, the legacy/adaptive API behavior is byte-for-byte
+unchanged. `ADAPTIVE_SLOT_WORKING_COPIES` remains five for `LLAMASLT`;
+`native_stream` does not change or bypass that guard, and never creates an
+automatic cache entry. SAVE streams the existing
+owner vectors and publishes the host file only after the Xbox pair succeeds.
+RESTORE reserves the measured staged-RKVK + owner-allocation peak against the
+real prompt-cache RAM budget before allocating the trailer; insufficient
+reservation fails with the destination unchanged.
+
+The RKVK header is peeked before `read_set` allocates. The estimator adds:
+
+- staged `RKVK` bytes (`header + payload + footer`);
+- one full-capacity owner allocation per layer (the destination is empty, and
+  owners are created before the staged vectors are swapped in);
+- a bounded allocator margin.
+
+For the real 16-layer fixture (`origin=102400`, `capacity=26624`, `heads=4`,
+payload `544,227,328` bytes) the owner bound is `148,702,208` bytes/layer and
+the restore peak is about `2.95 GiB` including margin. It fits a 4096 MiB
+prompt-cache budget but is rejected in full by a 2 GiB budget. The same hook is
+installed by the explicit slot handler and by the existing router streaming
+restore, so its fixed ~112 MiB workspace is no longer the only reservation for
+a native trailer.
+
+### Selecting xxxl without a large prefill
+
+1. Start the adaptive server with the intended `--slot-save-path`, the xxxl
+   profile configured, `--cache-ram 4096`, and slot auto-save disabled.
+2. Send one very small completion request with a large output reserve so the
+   computed `prompt + n_predict` budget exceeds the xxlong limit. The profile
+   switch runs before scheduling; only the tiny prompt is prefilled. Wait for
+   the request to finish and all slots to become idle.
+3. Erase the target slot: `POST /slots/{id}?action=erase`.
+4. Use the `native_stream` requests above. RESTORE requires the same xxxl
+   profile, an empty target slot and no resident native owner rows. If the
+   snapshot was saved in the same resident xxxl context, re-enter the profile
+   (or restart/recreate the context) so the Xbox owner is cleared; emptying the
+   prompt alone does not erase native owner rows.
+
+Do not claim the default adaptive slot path covers native snapshots: the
+`native_stream` marker is mandatory.
+
 ## Review corrections
 
 The preliminary review found and this branch fixes:

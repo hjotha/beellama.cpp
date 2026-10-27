@@ -298,6 +298,9 @@ struct server_task {
         bool route_state_transfer = false;
         bool route_target_no_mtp = false;
         bool route_state_reuse = false;
+        // Explicit opt-in: target-only native streaming slot save/restore via
+        // slot-save-path. Never implied by the legacy LLAMASLT/adaptive path.
+        bool native_stream = false;
     };
     slot_action slot_action;
 
