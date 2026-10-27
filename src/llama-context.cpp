@@ -524,6 +524,13 @@ llama_context::llama_context(
 
     cparams.rkva_wavefront_tile = llama_wavefront::parse_serving_tile_size(
             std::getenv("GGML_RKVA_WAVEFRONT_TILE"));
+    // An adaptive server first creates its local/MTP contexts. A global N256
+    // request applies only to the remote target without recurrent rollback;
+    // otherwise it must not impose UB512 on the local tier (e.g. XL UB128).
+    if (cparams.rkva_wavefront_tile == 256 &&
+            (!tcp_position_split || params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.n_rs_seq != 0)) {
+        cparams.rkva_wavefront_tile = 0;
+    }
     cparams.rkva_wavefront_rpc_batch = llama_wavefront::parse_serving_rpc_batch(
             std::getenv("GGML_RKVA_WAVEFRONT_RPC_BATCH"));
     if (cparams.rkva_wavefront_rpc_batch != 1) {

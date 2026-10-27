@@ -494,9 +494,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    uint64_t & epoch;
+    bool & capture_active;
+    bool & deferred_pending;
+    std::vector<ggml_cuda_buffer> deferred_frees;
 
-    explicit ggml_cuda_pool_leg(int device) :
-        device(device) {
+    explicit ggml_cuda_pool_leg(int device, uint64_t & epoch, bool & capture_active, bool & deferred_pending) :
+        device(device), epoch(epoch), capture_active(capture_active), deferred_pending(deferred_pending) {
     }
 
     bool allocation_growth(const size_t * sizes, size_t n, size_t & bytes) const override {
@@ -512,6 +516,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     ~ggml_cuda_pool_leg() {
+        release_deferred_frees();
         clear_pool();
         GGML_ASSERT(pool_size == 0);
     }
@@ -522,6 +527,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
                 CUDA_CHECK(cudaFree(b.ptr));
+                ++epoch;
                 pool_size -= b.size;
                 b.ptr  = nullptr;
                 b.size = 0;
@@ -574,6 +580,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
+            // A genuine allocation failure cannot be recovered by synchronizing
+            // or freeing scratch while capture is active. Preserve the allocation
+            // error rather than invalidate the in-progress capture with a flush.
+            if (capture_active) CUDA_CHECK(err);
             const size_t cached_bytes = pool_size;
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
@@ -604,9 +614,30 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             }
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
+        // A capture may still be recording users of this scratch address.
+        // Keep it alive through its first launch instead of cudaFree in capture.
+        if (capture_active) {
+            deferred_frees.push_back({ptr, size});
+            deferred_pending = true;
+            return;
+        }
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
+        ++epoch;
         pool_size -= size;
+    }
+
+    bool has_deferred_frees() const override { return !deferred_frees.empty(); }
+
+    void release_deferred_frees() override {
+        GGML_ASSERT(!capture_active);
+        ggml_cuda_set_device(device);
+        for (const auto & b : deferred_frees) {
+            CUDA_CHECK(cudaFree(b.ptr));
+            ++epoch;
+            pool_size -= b.size;
+        }
+        deferred_frees.clear();
     }
 };
 
@@ -775,7 +806,7 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
         return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
     }
 #endif // defined(GGML_USE_VMM)
-    return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
+    return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device, pool_epoch, pool_capture_active, pool_deferred_frees));
 }
 
 // destroying a cuBLAS handle while a graph is being captured in a different thread can result in a CUDA error
@@ -3471,6 +3502,25 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    if (graph->instance != nullptr && graph->pool_epoch != cuda_ctx->pool_epoch) {
+        // Legacy OOM/cache eviction can release scratch without changing any
+        // tensor binding or graph UID. Never replay those stale kernel arguments.
+        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        graph->instance = nullptr;
+        if (graph->graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+            graph->graph = nullptr;
+        }
+        graph->warmup_complete = false;
+        graph->warmup_stable_calls = 0;
+        graph->uid = 0;
+        if (ggml_cuda_graph_debug_enabled()) {
+            fprintf(stderr, "CUDA graph scratch invalidated: key=%p captured_epoch=%llu current_epoch=%llu\n",
+                    graph_key, (unsigned long long) graph->pool_epoch,
+                    (unsigned long long) cuda_ctx->pool_epoch);
+        }
+    }
+
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         if (ggml_cuda_graph_debug_enabled()) {
@@ -5333,6 +5383,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static void ggml_cuda_release_deferred_pool_frees(ggml_backend_cuda_context * ctx);
+
 static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key,
                                                 uint64_t * trace_execution_mode = nullptr) {
     bool graph_evaluated_or_captured = false;
@@ -5697,6 +5749,8 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            cuda_ctx->pool_capture_active = false;
+            graph->pool_epoch = cuda_ctx->pool_epoch;
             graph->capture_count++;
             // Capture reserves device memory for the executable-to-be.
             ggml_cuda_graph_guard::note_device_reservation();
@@ -5719,6 +5773,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             if (!ggml_cuda_graph_instantiate(cuda_ctx, graph_key)) {
+                ggml_cuda_release_deferred_pool_frees(cuda_ctx);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
                 ggml_cuda_trace_counter("cuda_graph_fallback", cgraph, GGML_CUDA_TRACE_CAPTURE_FALLBACK);
 #endif
@@ -5726,6 +5781,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
         } else if (cuda_graph_update_required) {  // Update graph executable
             if (!ggml_cuda_graph_update_executable(cuda_ctx, graph_key)) {
+                ggml_cuda_release_deferred_pool_frees(cuda_ctx);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
                 ggml_cuda_trace_counter("cuda_graph_fallback", cgraph, GGML_CUDA_TRACE_CAPTURE_FALLBACK);
 #endif
@@ -5835,6 +5891,27 @@ static bool ggml_cuda_trace_remote_host_graph_shape(ggml_backend_cuda_context * 
     return eligible && remote_nodes != 0;
 }
 #endif
+
+static void ggml_cuda_release_deferred_pool_frees(ggml_backend_cuda_context * ctx) {
+    if (!ctx->pool_deferred_frees) return;
+    GGML_ASSERT(!ctx->pool_capture_active);
+    // Includes all auxiliary streams/devices participating in the first launch.
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        auto & device_pools = ctx->pools[device];
+        bool pending = false;
+        for (const auto & pool : device_pools) {
+            pending = pending || (pool && pool->has_deferred_frees());
+        }
+        if (!pending) continue;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        for (auto & pool : device_pools) {
+            if (pool) pool->release_deferred_frees();
+        }
+    }
+    ggml_cuda_set_device(ctx->device);
+    ctx->pool_deferred_frees = false;
+}
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -6015,6 +6092,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        cuda_ctx->pool_capture_active = true;
     }
 
     // The singleton shortcut still uses the complete direct evaluator: producer
@@ -6023,6 +6101,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     uint64_t execution_mode = 0;
     const bool ok = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
                                                        graph_key, host_timing.enabled ? &execution_mode : nullptr);
+    ggml_cuda_release_deferred_pool_frees(cuda_ctx);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     local_span.finish(ok, execution_mode);
 #endif

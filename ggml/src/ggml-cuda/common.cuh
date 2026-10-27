@@ -1302,6 +1302,8 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    virtual bool has_deferred_frees() const { return false; }
+    virtual void release_deferred_frees() {}
 
     // Estimate only new physical memory for simultaneously live allocations in
     // this exact order. The caller must own this pool while planning/allocating.
@@ -1391,6 +1393,7 @@ struct ggml_cuda_graph {
     size_t                       capture_count           = 0;
     size_t                       update_count            = 0;
     uint64_t uid = 0;
+    uint64_t pool_epoch = 0;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1873,9 +1876,14 @@ struct ggml_backend_cuda_context {
     }
 
     // pool
+    // Captured kernels also reference pool scratch, which tensor properties do
+    // not describe. Physical releases invalidate every capture in this context.
+    uint64_t pool_epoch = 1;
+    bool pool_capture_active = false;
+    bool pool_deferred_frees = false;
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
-    static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
+    std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
 
     ggml_cuda_pool & pool(int device) {
         if (pools[device][curr_stream_no] == nullptr) {
