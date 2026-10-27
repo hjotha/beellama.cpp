@@ -6898,8 +6898,16 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
-    if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory ||
-            !memory->state_seq_can_save(seq_id, 0) || n_token_count > UINT32_MAX ||
+    // A negotiated native FULL save is the only save path that persists the
+    // revision-3 owner state. The legacy guard deliberately refuses a FULL
+    // bookkeeping snapshot once native rows exist; allow the selective path
+    // only when the native disk-snapshot capability was negotiated.
+    const bool native_full_ok = remote_native_kvarn_transient_active() &&
+            remote_native_kvarn_snapshot_supported();
+    const bool can_save = seq_id >= 0 && uint32_t(seq_id) < cparams.n_seq_max && memory &&
+            (memory->state_seq_can_save(seq_id, 0) ||
+             (native_full_ok && memory->state_seq_can_save(seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)));
+    if (!can_save || n_token_count > UINT32_MAX ||
             (n_token_count && !tokens)) { return 0; }
     if (llama_memory_status_is_fail(memory_update(false))) {
         return 0;

@@ -151,6 +151,9 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         throw std::runtime_error("native KVarN4 overflow FULL snapshots require the negotiated revision-3 disk snapshot capability; refusing Q4 bookkeeping state");
     }
     const size_t native_data = llama_state_seq_get_size(ctx, seq);
+    const bool native_size_unavailable = native_data == 0 &&
+            llama_remote_native_kvarn_transient_active(ctx) &&
+            llama_remote_native_kvarn_snapshot_supported(ctx);
     uint64_t logits_bytes = 0;
     uint32_t logits_vocab = 0;
     uint64_t logits_checksum = 0;
@@ -173,16 +176,22 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         result = a + b;
         return true;
     };
-    uint64_t worst_case = native_data;
+    uint64_t worst_case = native_size_unavailable ? 0 : native_data;
     const uint64_t token_bytes = tokens.size() > UINT64_MAX / sizeof(llama_token)
         ? UINT64_MAX : uint64_t(tokens.size()) * sizeof(llama_token);
-    if (!native_data || token_bytes == UINT64_MAX ||
-            !checked_add(worst_case, logits_bytes, worst_case) ||
-            !checked_add(worst_case, sizeof(uint32_t), worst_case) ||
-            !checked_add(worst_case, token_bytes, worst_case) ||
-            !checked_add(worst_case, max_manifest, worst_case) ||
-            !checked_add(worst_case, footer_size, worst_case) ||
-            worst_case > max_bytes) {
+    if (!native_size_unavailable) {
+        if (!native_data || token_bytes == UINT64_MAX ||
+                !checked_add(worst_case, logits_bytes, worst_case) ||
+                !checked_add(worst_case, sizeof(uint32_t), worst_case) ||
+                !checked_add(worst_case, token_bytes, worst_case) ||
+                !checked_add(worst_case, max_manifest, worst_case) ||
+                !checked_add(worst_case, footer_size, worst_case) ||
+                worst_case > max_bytes) {
+            throw std::runtime_error("router state exceeds disk size budget");
+        }
+    } else if (token_bytes == UINT64_MAX) {
+        // The native trailer size is known only after serialization. The
+        // temporary file is bounded by the final total > max_bytes check below.
         throw std::runtime_error("router state exceeds disk size budget");
     }
     temporary_file temporary(path);

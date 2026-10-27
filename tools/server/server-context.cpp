@@ -8280,7 +8280,10 @@ private:
             }
             const size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id,
                     LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (!state_size) {
+            const bool native_full = !state_size &&
+                    llama_remote_native_kvarn_transient_active(ctx_tgt) &&
+                    llama_remote_native_kvarn_snapshot_supported(ctx_tgt);
+            if (!state_size && !native_full) {
                 throw std::runtime_error("native streaming target serialization is empty");
             }
             auto tokens = slot.prompt.tokens.get_text_tokens();
