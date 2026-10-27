@@ -187,3 +187,11 @@ No GPU, model, Xbox, LAN, SSH, systemctl, MSVC or CUDA compilation was used.
 
 Root/Astra should review the constructor base resolution, the two intentional
 subtractions, and that both spans are validated before mutation.
+
+Astra found a fixture naming collision before any GPU GOLD was recorded:
+Hkv1/Hkv4 at P102400 used the same tag. The tag now includes heads; the CPU
+startup check builds the actual GPU scenario list and verifies all15 tags are
+unique. Packet names and loaded manifests reject duplicates; record mode refuses
+nonempty output directories. Root CPU checks recorded/compared820 packets and
+confirmed that nonempty-directory and duplicate-manifest negative controls fail
+without overwriting the original manifest. No ambiguous GPU baseline was used.

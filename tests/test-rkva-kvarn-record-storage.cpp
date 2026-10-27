@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -59,7 +60,8 @@ struct scenario {
 
 static std::string tag(const scenario & s) {
     return "o" + std::to_string(s.origin) + "-c" + std::to_string(s.capacity) +
-        "-t" + std::to_string(s.tail) + "-s" + std::to_string(unsigned(s.compact_stage));
+        "-h" + std::to_string(s.heads) + "-t" + std::to_string(s.tail) +
+        "-s" + std::to_string(unsigned(s.compact_stage));
 }
 
 static std::string geometry(const scenario & s) {
@@ -83,20 +85,30 @@ struct sink {
     bool compare = false;
     std::vector<std::pair<std::string, size_t>> manifest;
     std::vector<std::string> memory_lines;
+    std::set<std::string> packet_names;
     size_t next = 0, memory_next = 0, packets = 0, scenarios = 0;
 
     sink(std::string path, bool compare_) : dir(std::move(path)), compare(compare_) {
         if (dir.empty()) return;
-        std::filesystem::create_directories(dir);
-        if (!compare) return;
+        if (!compare) {
+            assert(!std::filesystem::exists(dir) || std::filesystem::is_empty(dir));
+            std::filesystem::create_directories(dir);
+            return;
+        }
+        assert(std::filesystem::is_directory(dir));
         std::ifstream in(dir + "/manifest.txt"); assert(in);
         std::string name; size_t bytes = 0;
-        while (in >> name >> bytes) manifest.emplace_back(name, bytes);
+        std::set<std::string> reference_names;
+        while (in >> name >> bytes) {
+            assert(reference_names.insert(name).second);
+            manifest.emplace_back(name, bytes);
+        }
         std::ifstream memory(dir + "/memory.txt"); assert(memory);
         for (std::string line; std::getline(memory, line);) memory_lines.push_back(line);
     }
 
     void packet(const std::string & name, const std::vector<uint8_t> & bytes) {
+        assert(packet_names.insert(name).second);
         ++packets;
         if (dir.empty()) return;
         if (!compare) {
@@ -227,26 +239,41 @@ static void drive(const scenario & s, sink & out, expect_memory expect) {
     assert(producer.rows() == 513);
 }
 
-static void run_grid(sink & out, bool gpu, expect_memory expect) {
+static std::vector<scenario> grid(bool gpu) {
+    std::vector<scenario> result;
     for (const uint32_t origin : {0u, 128u}) {
         for (const uint32_t tail : {0u, 128u}) {
             for (const bool compact_stage : {false, true}) {
-                drive({origin, 640, 1, tail, compact_stage}, out, expect);
+                result.push_back({origin, 640, 1, tail, compact_stage});
             }
         }
     }
     if (gpu) {
         for (const uint32_t tail : {0u, 128u}) {
             for (const bool compact_stage : {false, true}) {
-                drive({102400, 640, 1, tail, compact_stage}, out, expect);
+                result.push_back({102400, 640, 1, tail, compact_stage});
             }
         }
         // Production width (Hkv=4) at the task origin: the old header holds
         // 800 unnecessary prefix groups, the compact span drops them.
-        drive({102400, 640, 4, 128, true}, out, expect);
+        result.push_back({102400, 640, 4, 128, true});
     }
-    drive({1024, 513, 1, 128, false}, out, expect);          // non-multiple 128 span
-    drive({1024, 513, 1, 128, true}, out, expect);
+    result.push_back({1024, 513, 1, 128, false});          // non-multiple 128 span
+    result.push_back({1024, 513, 1, 128, true});
+    return result;
+}
+
+static void run_grid(sink & out, bool gpu, expect_memory expect) {
+    for (const auto & s : grid(gpu)) drive(s, out, expect);
+}
+
+static void test_grid_names() {
+    std::set<std::string> names;
+    const auto scenarios = grid(true);
+    assert(scenarios.size() == 15);
+    for (const auto & s : scenarios) assert(names.insert(tag(s)).second);
+    assert(names.size() == 15);
+    std::puts("PASS all 15 GPU scenario names are unique, including Hkv1/Hkv4");
 }
 
 static void cpu_allocation() {
@@ -313,6 +340,7 @@ static void cpu_reference() {
 }
 
 int main(int argc, char ** argv) {
+    test_grid_names();
     std::string record_dir, compare_dir;
     expect_memory expect = expect_memory::none;
     for (int i = 1; i < argc; ++i) {
