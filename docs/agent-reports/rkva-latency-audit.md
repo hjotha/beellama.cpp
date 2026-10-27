@@ -248,3 +248,13 @@ Flake8 não está instalado no host (`flake8 not installed`); validei
    `--cpu-samples/--gpu-samples`; sem congruência o resultado é `failed`.
 3. Só depois de 3 formatos de KV e QA avaliar mudança de overhead de engine;
    esta ferramenta não propõe nem aplica fix.
+
+The transport ABBA trace at 130560 exposed capture truncation: the footer
+reported 262145 events written and 201335 dropped. A final
+`cuda_local_timing_status` inherited the last decode position; it is metadata,
+not a surviving decode sample. The reader now excludes CUDA status/error
+records from spans, reports cumulative footer loss without summing repeated
+flush totals, and marks retained attribution partial when capture or local CUDA
+timing reports loss. A status-only window stays unknown with zero tokens.
+Missing legacy footers remain explicitly unreported, rather than asserting zero
+loss. No latency attribution is claimed from those truncated ABBA traces.

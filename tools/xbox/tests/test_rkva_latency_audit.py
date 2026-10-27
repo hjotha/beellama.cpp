@@ -103,6 +103,57 @@ class TraceCase(unittest.TestCase):
 
 
 class TraceAttributionTest(TraceCase):
+    def test_dropped_trace_cannot_report_complete_window(self):
+        write_trace(self.trace, golden_events() + [
+            {"schema": "rkva-host-trace-status-v1", "events_written": 100, "dropped": 7},
+            {"schema": "rkva-host-trace-status-v1", "events_written": 101, "dropped": 7}])
+        report = self.analyze()
+        self.assertEqual(report["scope"], "partial")
+        self.assertEqual(report["capture"]["dropped_events"], 7)  # cumulative, not 14
+        self.assertEqual(report["counts"]["tokens"], 2)
+
+    def test_metadata_after_truncated_prefill_is_not_a_decode_token(self):
+        status = event("cuda_local_timing_status", 100, 100, 0, 0)
+        status["value"] = 0
+        write_trace(self.trace, [status,
+            {"schema": "rkva-host-trace-status-v1", "events_written": 262145,
+             "dropped": 201335}])
+        report = self.analyze()
+        self.assertEqual(report["scope"], "unknown")
+        self.assertEqual(report["counts"]["tokens"], 0)
+        self.assertEqual(report["counts"]["decode_events"], 0)
+        self.assertNotIn("cuda_local_timing_status", report["phases"])
+
+    def test_complete_footer_and_zero_local_status_preserve_spans(self):
+        metadata = event("cuda_local_timing_status", 100, 100, 0, 0)
+        metadata["value"] = 0
+        write_trace(self.trace, golden_events() + [metadata,
+            {"schema": "rkva-host-trace-status-v1", "events_written": 100, "dropped": 0}])
+        report = self.analyze()
+        self.assertEqual(report["scope"], "ok")
+        self.assertEqual(report["counts"]["tokens"], 2)
+        self.assertEqual(report["capture"]["dropped_events"], 0)
+
+    def test_invalid_footer_is_refused(self):
+        for value in (-1, True, 1.5, "1", None):
+            with self.subTest(value=value):
+                write_trace(self.trace, golden_events() + [
+                    {"schema": "rkva-host-trace-status-v1", "events_written": 100,
+                     "dropped": value}])
+                with self.assertRaises(audit.TraceFormatError):
+                    self.analyze()
+
+    def test_cuda_timing_loss_is_metadata_and_partial(self):
+        for phase in ("cuda_local_timing_status", "cuda_local_timing_unresolved",
+                      "cuda_local_profile_error"):
+            with self.subTest(phase=phase):
+                status = event(phase, 100, 100, 0, 0)
+                status["value"] = 1
+                write_trace(self.trace, golden_events() + [status])
+                report = self.analyze()
+                self.assertEqual(report["scope"], "partial")
+                self.assertEqual(report["counts"]["tokens"], 2)
+
     def test_counts_tokens_layers_and_phases(self):
         report = self.analyze()
         self.assertEqual(report["scope"], "ok")

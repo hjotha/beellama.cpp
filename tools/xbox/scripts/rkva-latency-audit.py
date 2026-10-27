@@ -298,6 +298,8 @@ class TraceAnalysis:
         self.phase_values = defaultdict(list)
         self.phase_self = defaultdict(list)
         self.phase_gpu = defaultdict(list)
+        self.capture_status = []
+        self.local_timing_status = []
 
     def load(self):
         with open(self.path, "r", encoding="utf-8", errors="replace") as handle:
@@ -312,6 +314,22 @@ class TraceAnalysis:
                     continue
                 if not isinstance(event, dict):
                     self.counts["malformed_lines"] += 1
+                    continue
+                if event.get("schema") == "rkva-host-trace-status-v1":
+                    for field in ("events_written", "dropped"):
+                        if type(event.get(field)) is not int or event[field] < 0:
+                            raise TraceFormatError(f"line {line_no}: invalid trace status {field}")
+                    self.capture_status.append(event)
+                    continue
+                if event.get("phase") in ("cuda_local_timing_status",
+                                          "cuda_local_timing_unresolved",
+                                          "cuda_local_profile_error"):
+                    # These inherit the last token's identity but are metadata,
+                    # never a decode span or evidence that its window survived.
+                    value = _as_int(event.get("value", 0), "value", line_no)
+                    if value < 0:
+                        raise TraceFormatError(f"line {line_no}: negative CUDA timing status")
+                    self.local_timing_status.append({"phase": event["phase"], "value": value})
                     continue
                 if _as_int(event.get("nq", 0), "nq", line_no) != 1:
                     continue
@@ -644,6 +662,15 @@ class TraceAnalysis:
         else:
             scope = "ok"
             reasons = []
+        dropped = max((item["dropped"] for item in self.capture_status), default=0)
+        if dropped:
+            if scope == "ok":
+                scope = "partial"
+            reasons.append(f"trace capture dropped {dropped} events; window coverage is incomplete")
+        if any(item["value"] for item in self.local_timing_status):
+            if scope == "ok":
+                scope = "partial"
+            reasons.append("CUDA local timing reports dropped, unresolved, or failed samples")
         exposed = {
             "definition": ("wall-clock ranges inside each token envelope that no recorded "
                            "span covers; rpc_total is a container and is never used as a wait"),
@@ -660,6 +687,10 @@ class TraceAnalysis:
             "scope": scope,
             "scope_reasons": reasons,
             "trace": self.path,
+            "capture": {"status_reported": bool(self.capture_status),
+                        "dropped_events": dropped if self.capture_status else None,
+                        "status_records": len(self.capture_status),
+                        "cuda_local_timing_status": self.local_timing_status},
             "window": {
                 "min_position": self.min_position,
                 "max_position": self.max_position,
