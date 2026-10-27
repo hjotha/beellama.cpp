@@ -32,6 +32,17 @@
 // Partial rows are written for every real query, including splits it does not
 // reach (den 0, max -FLT_MAX), exactly like the per-query kernel.
 //
+// Compile-time local-head scope: RKVA_MQ_HEADS_PER_GROUP keeps the shipped 6
+// heads per group (24 query heads over 4 KV heads) and adds an opt-in 2-head
+// build. The 2-head build is compile-only for now: it keeps the global head
+// stride (RKVA_GQA stays 6) and the same per-query split/reducer axes, but is
+// proposed to be dispatched as three consecutive x groups per KV head
+// (DispatchX = 3 * n_head_kv, kv_head = x / 3, head_base = 2 * (x % 3)), so
+// each global head still writes exactly one [split][query * n_head + head][258]
+// partial row. It reloads and dequantizes each K/V row for three groups instead
+// of one; whether that trade is profitable is UNKNOWN until the compiled DXIL is
+// inspected and replayed on hardware.
+//
 // Supported shape (host-gated): head_dim 256, n_head == RKVA_GQA * n_head_kv,
 // origin % 128 == 0, precision_tail_tokens 0 or 128, descriptor revision 3,
 // 2..9 queries, RKVA_MQ_QT in {2, 4}, wave size 64..128 (one 4-dim unit per
@@ -49,7 +60,23 @@
 #define RKVA_TILE 8
 #define RKVA_HALF 4
 #define RKVA_RECORD 8960
+// Local Q heads this group computes. The shipped tile keeps 6; the opt-in
+// RKVA_MQ_HEADS_PER_GROUP == 2 build is a compile-only experiment (three groups
+// per KV head) that does not change the global Q/KV strides or partial layout.
+#ifndef RKVA_MQ_HEADS_PER_GROUP
+#define RKVA_MQ_HEADS_PER_GROUP 6
+#endif
+#if RKVA_MQ_HEADS_PER_GROUP == 6
+#define RKVA_LH RKVA_GQA
 #define RKVA_ELEMS 12 // (GQA * DIM) / THREADS output elements per thread
+#define RKVA_WHT_HALF 1536
+#elif RKVA_MQ_HEADS_PER_GROUP == 2
+#define RKVA_LH 2
+#define RKVA_ELEMS 4 // (LH * DIM) / THREADS output elements per thread
+#define RKVA_WHT_HALF 512
+#else
+#error "RKVA_MQ_HEADS_PER_GROUP supports 2 or 6 only"
+#endif
 #define RKVA_TAIL_MASK 255u
 #ifndef RKVA_MQ_QT
 #define RKVA_MQ_QT 2
@@ -57,8 +84,17 @@
 #if RKVA_MQ_QT != 2 && RKVA_MQ_QT != 4
 #error "native KVarN4 multi-query tile supports RKVA_MQ_QT == 2 or 4 only"
 #endif
-#define RKVA_QG (RKVA_MQ_QT * RKVA_GQA)
-#define RKVA_PAIR_QG (2 * RKVA_GQA)
+#define RKVA_QG (RKVA_MQ_QT * RKVA_LH)
+#define RKVA_PAIR_QG (2 * RKVA_LH)
+// Global head index of local head h: the shipped six-head tile keeps the old
+// expression token-for-token; the two-head build adds its dispatch head_base.
+#if RKVA_MQ_HEADS_PER_GROUP == 2
+#define RKVA_MQ_HEAD_OFF(h) head_base + (h)
+#define RKVA_MQ_HEAD0_OFFSET + head_base
+#else
+#define RKVA_MQ_HEAD_OFF(h) h
+#define RKVA_MQ_HEAD0_OFFSET
+#endif
 #define RKVA_KIND_NONE 0u
 #define RKVA_KIND_TAIL 1u
 #define RKVA_KIND_STAGE 2u
@@ -103,6 +139,16 @@
 // INT8 uses wave-wide slice maxima and prefix row sums exclusively.
 
 #endif
+// The two-head compile variant is F32 2-query only: every other combination is
+// rejected here, before any HLSL is parsed.
+#if RKVA_MQ_HEADS_PER_GROUP == 2
+#if RKVA_MQ_QT != 2
+#error "RKVA_MQ_HEADS_PER_GROUP == 2 supports RKVA_MQ_QT == 2 only"
+#endif
+#if RKVA_MQ_I8
+#error "RKVA_MQ_HEADS_PER_GROUP == 2 requires RKVA_MQ_I8 == 0"
+#endif
+#endif
 
 cbuffer Params : register(b0) {
     uint n_query;
@@ -125,10 +171,10 @@ ByteAddressBuffer positions : register(t3);
 RWByteAddressBuffer partials : register(u0);
 RWByteAddressBuffer output : register(u1);
 
-groupshared float gs_max[RKVA_MAX_WAVES * RKVA_GQA];
-groupshared float gs_den[RKVA_MAX_WAVES * RKVA_GQA];
+groupshared float gs_max[RKVA_MAX_WAVES * RKVA_LH];
+groupshared float gs_den[RKVA_MAX_WAVES * RKVA_LH];
 // Rotated Q, then per-wave numerators (body, then tail), then the WHT scratch.
-groupshared float gs_vec[RKVA_MAX_WAVES * RKVA_GQA * RKVA_DIM];
+groupshared float gs_vec[RKVA_MAX_WAVES * RKVA_LH * RKVA_DIM];
 
 float half_at(ByteAddressBuffer buffer, uint byte_offset) {
     uint bits = buffer.Load(byte_offset & ~3u);
@@ -145,24 +191,25 @@ float decode(uint quant, float scale, float zero, float other) {
     return affine * other;
 }
 
-// Ping-pong Bee WHT256 using the two 1536-float halves of gs_vec[3072].
-// Alternates source and destination between half 0 (0..1535) and half 1 (1536..3071),
+// Ping-pong Bee WHT256 using the two RKVA_WHT_HALF-float halves of gs_vec
+// (1536/3072 floats at six local heads, 512/1024 at two).
+// Alternates source and destination between half 0 and half RKVA_WHT_HALF,
 // cutting group barriers from 17 to 9. All butterfly expressions and two-stage
 // normalization stay unchanged. MQ4 Q2/Q3 are dead before either call site;
 // the group barrier before WHT retires cross-wave merge/tail reads. The return
 // barrier retires scratch before the next query or pair reuses gs_vec.
 void wht256x6(inout float v[RKVA_ELEMS], uint tid) {
-    [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+    [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
         gs_vec[g * RKVA_DIM + tid] = v[2 * g];
         gs_vec[g * RKVA_DIM + tid + 128] = v[2 * g + 1];
     }
     GroupMemoryBarrierWithGroupSync();
 
     uint src_offset = 0;
-    uint dst_offset = 1536;
+    uint dst_offset = RKVA_WHT_HALF;
 
     [unroll] for (uint stride = 1; stride < 128; stride *= 2) {
-        [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+        [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
             float own0 = gs_vec[src_offset + g * RKVA_DIM + tid];
             float other0 = gs_vec[src_offset + g * RKVA_DIM + (tid ^ stride)];
             float own1 = gs_vec[src_offset + g * RKVA_DIM + tid + 128];
@@ -179,8 +226,8 @@ void wht256x6(inout float v[RKVA_ELEMS], uint tid) {
         dst_offset = tmp;
     }
 
-    // After 7 iterations (strides 1, 2, 4, 8, 16, 32, 64), src_offset is 1536.
-    [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+    // After 7 iterations (strides 1, 2, 4, 8, 16, 32, 64), src_offset is RKVA_WHT_HALF.
+    [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
         float x = gs_vec[src_offset + g * RKVA_DIM + tid] * 0.08838834764831845f;
         float y = gs_vec[src_offset + g * RKVA_DIM + tid + 128] * 0.08838834764831845f;
         v[2 * g] = (x + y) * 0.7071067811865475f;
@@ -273,17 +320,23 @@ void store_result(uint qh, uint d, uint split, float numerator, float merged_max
 float4 load_rotated_q(uint j, uint g, uint u, bool active, float4 q_lo[RKVA_PAIR_QG]) {
 #if RKVA_MQ_QT == 4
     if (j >= 2) {
-        uint b = ((3 - j) * RKVA_GQA + g) * RKVA_DIM + u * 4;
+        uint b = ((3 - j) * RKVA_LH + g) * RKVA_DIM + u * 4;
         return active ? float4(gs_vec[b], gs_vec[b + 1], gs_vec[b + 2], gs_vec[b + 3])
                       : float4(0, 0, 0, 0);
     }
 #endif
-    return q_lo[j * RKVA_GQA + g];
+    return q_lo[j * RKVA_LH + g];
 }
 
 [numthreads(RKVA_THREADS, 1, 1)]
 void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
     uint kv_head = group.x, q_first = group.y * RKVA_MQ_QT, split = group.z;
+#if RKVA_MQ_HEADS_PER_GROUP == 2
+    // Planned two-head dispatch: three consecutive x groups per KV head.
+    uint head_groups = RKVA_GQA / RKVA_LH;
+    kv_head = group.x / head_groups;
+    uint head_base = RKVA_LH * (group.x % head_groups);
+#endif
     uint wave_size = WaveGetLaneCount();
     uint lane = WaveGetLaneIndex();
 
@@ -303,7 +356,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
             uint qi = q_first + j;
             if (qi < n_query) {
                 [unroll] for (uint k = 0; k < RKVA_ELEMS; ++k) {
-                    uint qh = qi * n_head + kv_head * RKVA_GQA + k / 2;
+                    uint qh = qi * n_head + kv_head * RKVA_GQA + RKVA_MQ_HEAD_OFF(k / 2);
                     uint d = tid + (k & 1) * 128;
                     if (direct_output != 0) {
                         output.Store((qh * RKVA_DIM + d) * 4, nan_bits);
@@ -348,7 +401,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
         act[j] = end > split_begin;
         end_q[j] = act[j] ? end : 0;
         body_end_q[j] = min(end_q[j], tail_begin[j]);
-        head0[j] = qc * n_head + kv_head * RKVA_GQA;
+        head0[j] = qc * n_head + kv_head * RKVA_GQA RKVA_MQ_HEAD0_OFFSET;
         if (act[j]) {
             any_active = true;
             body_end_max = max(body_end_max, body_end_q[j]);
@@ -364,28 +417,29 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
 
     // Hoisted / pre-computed Q WHT: Q_rotated is staged at offset q_stride in the
     // queries ByteAddressBuffer, while exact original Q resides at offset 0 for tail.
-    // Queries 0..1 stay in q_lo (48 VGPRs); for RKVA_MQ_QT == 4, rotated Q for
-    // query 2 is staged in gs_vec[1536..3071] and query 3 stays in gs_vec[0..1535]
-    // until the non-tail residual loop finishes (zero extra LDS).
+    // Queries 0..1 stay in q_lo (48 VGPRs at six local heads, 16 at two); for
+    // RKVA_MQ_QT == 4, rotated Q for query 2 is staged in the upper gs_vec half
+    // and query 3 in the lower half until the non-tail residual loop finishes
+    // (zero extra LDS).
     uint q_stride = n_query * n_head * RKVA_DIM * 4;
 #if !RKVA_MQ_I8
     // The INT8 build keeps no F32 rotated Q: it re-quantizes per record group
     // (q8[]/q8scale[]/q8const[]) and reloads Qr for the few residual rows.
     float4 q_lo[RKVA_PAIR_QG];
     [unroll] for (uint j = 0; j < min(2u, uint(RKVA_MQ_QT)); ++j) {
-        [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+        [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
             uint q_rot_base = q_stride + ((head0[j] + g) * RKVA_DIM + u * 4) * 4;
-            q_lo[j * RKVA_GQA + g] =
+            q_lo[j * RKVA_LH + g] =
                 active ? asfloat(queries.Load4(q_rot_base)) : float4(0, 0, 0, 0);
         }
     }
 #endif
 #if RKVA_MQ_QT == 4
     if (wave == 0 && active) {
-        [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+        [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
             uint q_rot_base2 = q_stride + ((head0[2] + g) * RKVA_DIM + u * 4) * 4;
             float4 q2 = asfloat(queries.Load4(q_rot_base2));
-            uint b2 = (RKVA_GQA + g) * RKVA_DIM + u * 4;
+            uint b2 = (RKVA_LH + g) * RKVA_DIM + u * 4;
             gs_vec[b2 + 0] = q2.x;
             gs_vec[b2 + 1] = q2.y;
             gs_vec[b2 + 2] = q2.z;
@@ -638,8 +692,8 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
             }
             [unroll] for (uint j = 0; j < RKVA_MQ_QT; ++j) {
                 [branch] if (act[j]) {
-                    [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-                        uint i = j * RKVA_GQA + g;
+                    [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
+                        uint i = j * RKVA_LH + g;
                         float4 qa = load_rotated_q(j, g, u, active, q_lo);
                         float s[RKVA_HALF];
                         float half_max = -3.402823466e38f;
@@ -687,8 +741,8 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                         }
                         loaded = kind;
                     }
-                    [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-                        uint i = j * RKVA_GQA + g;
+                    [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
+                        uint i = j * RKVA_LH + g;
 #if RKVA_MQ_I8
                         // The INT8 build does not keep F32 rotated Q resident;
                         // residual rows are ~2% of a split, so reload it here.
@@ -742,9 +796,9 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                             x = load_tail4(values, row, kv_head, u);
                             loaded = true;
                         }
-                        [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-                            uint i = j * RKVA_GQA + g;
-                            uint ti = p * RKVA_GQA + g;
+                        [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
+                            uint i = j * RKVA_LH + g;
+                            uint ti = p * RKVA_LH + g;
                             float4 qa =
                                 active ? asfloat(queries.Load4(((head0[j] + g) * RKVA_DIM + u * 4) * 4))
                                        : float4(0, 0, 0, 0);
@@ -766,12 +820,12 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
             uint j = j0 + p;
             uint qi = q_first + j;
             [branch] if (qi < n_query) { // group-uniform
-                [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-                    uint i = j * RKVA_GQA + g;
-                    uint slot = wave * RKVA_GQA + g;
+                [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
+                    uint i = j * RKVA_LH + g;
+                    uint slot = wave * RKVA_LH + g;
                     // Reject the whole wave state before a zero merge weight can hide it.
                     bool invalid_state = !isfinite(denom[i]) || denom[i] < 0 ||
-                        (denom[i] != 0 && (!isfinite(maximum[i]) || !(all(isfinite(body[i])) && all(isfinite(tail_pair[p * RKVA_GQA + g])))));
+                        (denom[i] != 0 && (!isfinite(maximum[i]) || !(all(isfinite(body[i])) && all(isfinite(tail_pair[p * RKVA_LH + g])))));
                     bool invalid_wave = WaveActiveAnyTrue(invalid_state);
                     if (lane == 0) {
                         gs_max[slot] = invalid_wave ? asfloat(0x7fc00000u) : maximum[i];
@@ -785,16 +839,16 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                     }
                 }
                 GroupMemoryBarrierWithGroupSync();
-                float merged_max[RKVA_GQA], merged_den[RKVA_GQA], weight[RKVA_MAX_WAVES * RKVA_GQA];
-                [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+                float merged_max[RKVA_LH], merged_den[RKVA_LH], weight[RKVA_MAX_WAVES * RKVA_LH];
+                [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
                     merged_max[g] = -3.402823466e38f;
                     for (uint w = 0; w < n_waves; ++w) {
-                        if (gs_den[w * RKVA_GQA + g] != 0)
-                            merged_max[g] = max(merged_max[g], gs_max[w * RKVA_GQA + g]);
+                        if (gs_den[w * RKVA_LH + g] != 0)
+                            merged_max[g] = max(merged_max[g], gs_max[w * RKVA_LH + g]);
                     }
                     merged_den[g] = 0;
                     [unroll] for (uint w = 0; w < RKVA_MAX_WAVES; ++w) {
-                        uint slot = w * RKVA_GQA + g;
+                        uint slot = w * RKVA_LH + g;
                         weight[slot] = 0;
                         if (w < n_waves && gs_den[slot] != 0) {
                             weight[slot] = exp(gs_max[slot] - merged_max[g]);
@@ -808,7 +862,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                     merged_body[k] = 0;
                     merged_tail[k] = 0;
                     [unroll] for (uint w = 0; w < RKVA_MAX_WAVES; ++w) {
-                        uint slot = w * RKVA_GQA + g;
+                        uint slot = w * RKVA_LH + g;
                         if (weight[slot] != 0)
                             merged_body[k] += gs_vec[slot * RKVA_DIM + d] * weight[slot];
                     }
@@ -816,9 +870,9 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                 bool has_tail = end_q[j] > max(split_begin, tail_begin[j]); // group-uniform
                 if (has_tail) {
                     GroupMemoryBarrierWithGroupSync();
-                    [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-                        uint ti = p * RKVA_GQA + g;
-                        uint slot = wave * RKVA_GQA + g;
+                    [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
+                        uint ti = p * RKVA_LH + g;
+                        uint slot = wave * RKVA_LH + g;
                         if (active) {
                             gs_vec[slot * RKVA_DIM + u * 4 + 0] = tail_pair[ti].x;
                             gs_vec[slot * RKVA_DIM + u * 4 + 1] = tail_pair[ti].y;
@@ -830,7 +884,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                     [unroll] for (uint k = 0; k < RKVA_ELEMS; ++k) {
                         uint g = k / 2, d = tid + (k & 1) * 128;
                         [unroll] for (uint w = 0; w < RKVA_MAX_WAVES; ++w) {
-                            uint slot = w * RKVA_GQA + g;
+                            uint slot = w * RKVA_LH + g;
                             if (weight[slot] != 0)
                                 merged_tail[k] += gs_vec[slot * RKVA_DIM + d] * weight[slot];
                         }
@@ -841,7 +895,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                     wht256x6(merged_body, tid); // linear: WHT(sum of wave bodies) == sum of WHT(wave bodies)
                     [unroll] for (uint k = 0; k < RKVA_ELEMS; ++k) {
                         uint g = k / 2, d = tid + (k & 1) * 128;
-                        store_result(qi * n_head + kv_head * RKVA_GQA + g, d, split,
+                        store_result(qi * n_head + kv_head * RKVA_GQA + RKVA_MQ_HEAD_OFF(g), d, split,
                                      merged_body[k] + merged_tail[k], merged_max[g], merged_den[g]);
                     }
                 } else {
@@ -850,7 +904,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                         wht256x6(merged_tail, tid);
                         [unroll] for (uint k = 0; k < RKVA_ELEMS; ++k) {
                             uint g = k / 2, d = tid + (k & 1) * 128;
-                            store_result(qi * n_head + kv_head * RKVA_GQA + g, d, split,
+                            store_result(qi * n_head + kv_head * RKVA_GQA + RKVA_MQ_HEAD_OFF(g), d, split,
                                          merged_body[k] + merged_tail[k], merged_max[g], merged_den[g]);
                         }
                     } else {
@@ -858,7 +912,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
                         GroupMemoryBarrierWithGroupSync();
                         [unroll] for (uint k = 0; k < RKVA_ELEMS; ++k) {
                             uint g = k / 2, d = tid + (k & 1) * 128;
-                            store_result(qi * n_head + kv_head * RKVA_GQA + g, d, split,
+                            store_result(qi * n_head + kv_head * RKVA_GQA + RKVA_MQ_HEAD_OFF(g), d, split,
                                          merged_body[k], merged_max[g], merged_den[g]);
                         }
                     }
