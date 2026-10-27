@@ -200,54 +200,78 @@ int main() {
     assert(std::strcmp(mq_gqa2_arm_reason(MqGqa2Arm::kConflict),
                        "disabled: conflicts with rkva-mq-i8.flag (fail-closed)") == 0);
     assert(std::strcmp(mq_gqa2_arm_reason(MqGqa2Arm::kOn), "enabled") == 0);
-    const auto gqa2_ok = [](bool enabled, bool i8, uint32_t mode, bool rev3, uint32_t storage,
-                            uint32_t q_tile, uint32_t nq, uint32_t nh, uint32_t nkv, uint32_t dim,
-                            uint32_t tail, uint32_t wmin, uint32_t wmax, bool pso) {
-        return kvarn4_gqa2_supported(enabled, i8, mode, rev3, storage, q_tile, nq, nh, nkv, dim,
+    const auto gqa2_ok = [](bool enabled, bool i8, uint32_t mode, uint32_t revision,
+                            uint32_t storage, uint32_t q_tile, uint32_t nq, uint32_t nh,
+                            uint32_t nkv, uint32_t dim, uint32_t tail, uint32_t wmin, uint32_t wmax,
+                            bool pso) {
+        return kvarn4_gqa2_supported(enabled, i8, mode, revision, storage, q_tile, nq, nh, nkv, dim,
                                      tail, wmin, wmax, pso);
     };
     for (uint32_t nq = 2; nq <= kOptMaxQueries; ++nq) {
-        assert(gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, nq, 24, 4, 256, 128, 64,
-                       64, true));
+        assert(gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, nq, 24, 4, 256, 128, 64, 64,
+                       true));
     }
     for (uint32_t nkv : {1u, 2u, 4u, 8u}) {
-        assert(gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 6 * nkv, nkv, 256,
-                       128, 64, 64, true));
+        assert(gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 6 * nkv, nkv, 256, 128,
+                       64, 64, true));
     }
-    assert(!gqa2_ok(false, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+    assert(!gqa2_ok(false, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
                     true)); // opt-out
-    assert(!gqa2_ok(true, true, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+    assert(!gqa2_ok(true, true, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
                     true)); // INT8 conflict
-    assert(!gqa2_ok(true, false, kModeOptBalanced, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64,
-                    64, true));
-    assert(!gqa2_ok(true, false, kModeOptCoarse, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64,
-                    64, true));
-    assert(!gqa2_ok(true, false, kModeOptFine, false, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
-                    true)); // descriptor rev1/2
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageF16, 2, 4, 24, 4, 256, 128, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptBalanced, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // balanced mode
+    assert(!gqa2_ok(true, false, kModeOptCoarse, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // coarse mode
+    assert(!gqa2_ok(true, false, kModeOptFine, 1, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // descriptor rev1
+    assert(!gqa2_ok(true, false, kModeOptFine, 2, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                    true)); // descriptor rev2
+    assert(gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+                   true)); // descriptor rev3
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageF16, 2, 4, 24, 4, 256, 128, 64, 64,
                     true)); // not KVarN4
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 4, 4, 24, 4, 256, 128, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 4, 4, 24, 4, 256, 128, 64, 64,
                     true)); // not the MQ2 tile
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 1, 24, 4, 256, 128, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 1, 24, 4, 256, 128, 64, 64,
                     true)); // decode nq1
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 10, 24, 4, 256, 128, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 10, 24, 4, 256, 128, 64, 64,
                     true)); // over 9
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 128, 128, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 128, 128, 64, 64,
                     true)); // head_dim
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 32, 4, 256, 128, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 32, 4, 256, 128, 64, 64,
                     true)); // GQA 8
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 0, 256, 128, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 0, 256, 128, 64, 64,
                     true)); // no KV head
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 0, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 0, 64, 64,
                     true)); // zero tail
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 64, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 64, 64, 64,
                     true)); // other tail
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 32, 128,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 32, 128,
                     true)); // not fixed wave64
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 128,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 128,
                     true)); // not fixed wave64
-    assert(!gqa2_ok(true, false, kModeOptFine, true, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
+    assert(!gqa2_ok(true, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64,
                     false)); // PSO missing
+
+    // Engine plan: selection drives both DispatchX and the reported group
+    // count. Ineligible calls keep the default n_head_kv dispatch exactly.
+    for (uint32_t nq = 0; nq <= kOptMaxQueries + 1; ++nq) {
+        const Kvarn4Gqa2Plan plan = kvarn4_gqa2_plan(true, false, kModeOptFine, 3, kStorageKvarn4,
+                                                     2, nq, 24, 4, 256, 128, 64, 64, true);
+        const bool want = nq >= 2 && nq <= kOptMaxQueries;
+        assert(plan.selected == want);
+        assert(plan.dispatch_x == (want ? 12u : 4u));
+    }
+    const Kvarn4Gqa2Plan gqa2_plan = kvarn4_gqa2_plan(true, false, kModeOptFine, 3, kStorageKvarn4,
+                                                      2, 4, 24, 4, 256, 128, 64, 64, true);
+    assert(gqa2_plan.selected && gqa2_plan.dispatch_x == 12);
+    assert(kvarn4_gqa2_groups(gqa2_plan, 3, 8) == 12 * 3 * 8);
+    assert(kvarn4_gqa2_groups(gqa2_plan, 3, 8) == 3 * kvarn4_gqa2_groups({false, 4}, 3, 8));
+    const Kvarn4Gqa2Plan default_plan = kvarn4_gqa2_plan(
+        false, false, kModeOptFine, 3, kStorageKvarn4, 2, 4, 24, 4, 256, 128, 64, 64, true);
+    assert(!default_plan.selected && default_plan.dispatch_x == 4);
+    assert(kvarn4_gqa2_groups(default_plan, 3, 8) == 4 * 3 * 8);
     assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, false, true), "kvarn4_mq2_gqa2") == 0);
     assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 4, false, true), "kvarn4_mq4_balanced") == 0);
     assert(std::strcmp(mq_kernel_name(kStorageKvarn4, 2, true, true), "kvarn4_mq2_i8") == 0);

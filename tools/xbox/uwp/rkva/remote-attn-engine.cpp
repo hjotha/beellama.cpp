@@ -3119,7 +3119,6 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         uint32_t q_tile = 0;
         bool decode_opt = false;
         bool rowlane = false;
-        bool gqa2 = false;
         if (kvarn && prefix) {
             if (n_tokens == 1 && decode_rowlane_ && wave_lane_min_ == 64 && wave_lane_max_ == 64 &&
                 rp::kvarn4_decode_opt(q4_kernel_mode_, wave_lane_min_) &&
@@ -3141,18 +3140,18 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                     // Opt-in (default off): the 2-query tile may use the INT8 QK
                     // PSO. It is not bit-exact, so the qualified attn_kvarn4_mq2
                     // pipeline remains the default.
+                    const rp::Kvarn4Gqa2Plan gqa2_candidate = rp::kvarn4_gqa2_plan(
+                        mq_gqa2_, mq_i8_, q4_kernel_mode_, s->range_descriptor.layout_version,
+                        storage, q_tile, n_tokens, geo_.n_head, geo_.n_head_kv, geo_.head_dim,
+                        s->precision_tail_tokens, wave_lane_min_, wave_lane_max_,
+                        range_attn_kvarn4_mq_gqa2_pso_ != nullptr);
                     if (q_tile == rp::kKvarn4MqTile && mq_i8_ &&
                         range_attn_kvarn4_mq_i8_pso_) {
                         mq_pso = range_attn_kvarn4_mq_i8_pso_.Get();
-                    } else if (rp::kvarn4_gqa2_supported(
-                                   mq_gqa2_, mq_i8_, q4_kernel_mode_, prefix, storage, q_tile,
-                                   n_tokens, geo_.n_head, geo_.n_head_kv, geo_.head_dim,
-                                   s->precision_tail_tokens, wave_lane_min_, wave_lane_max_,
-                                   range_attn_kvarn4_mq_gqa2_pso_ != nullptr)) {
+                    } else if (gqa2_candidate.selected) {
                         // Two local heads per group; DispatchX below becomes
                         // 3 * n_head_kv. Same partial buffer and reducer.
                         mq_pso = range_attn_kvarn4_mq_gqa2_pso_.Get();
-                        gqa2 = true;
                     }
                     fmt_pso = mq_pso;
                 } else {
@@ -3167,6 +3166,10 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                 q_tile = 0;
             }
         }
+        const rp::Kvarn4Gqa2Plan gqa2_plan = rp::kvarn4_gqa2_plan(
+            mq_gqa2_, mq_i8_, q4_kernel_mode_, s->range_descriptor.layout_version, storage, q_tile,
+            n_tokens, geo_.n_head, geo_.n_head_kv, geo_.head_dim, s->precision_tail_tokens,
+            wave_lane_min_, wave_lane_max_, range_attn_kvarn4_mq_gqa2_pso_ != nullptr);
         uint32_t split_k = rp::optimized_split_k(active_count, q4_kernel_mode_);
         uint32_t rows = rp::split_rows(active_count, split_k);
         if (kvarn) {
@@ -3183,10 +3186,9 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             rows = mq.split_rows;
         }
         const uint32_t query_groups = q_tile ? (n_tokens + q_tile - 1) / q_tile : n_tokens;
-        const uint32_t dispatch_x =
-            gqa2 ? rp::kvarn4_gqa2_dispatch_x(geo_.n_head_kv) : geo_.n_head_kv;
-        const bool int8_selected =
-            !gqa2 && mq_i8_ && q_tile == rp::kKvarn4MqTile && range_attn_kvarn4_mq_i8_pso_;
+        const uint32_t dispatch_x = gqa2_plan.dispatch_x;
+        const bool int8_selected = !gqa2_plan.selected && mq_i8_ && q_tile == rp::kKvarn4MqTile &&
+                                   range_attn_kvarn4_mq_i8_pso_;
         const bool direct = split_k == 1;
         Buffer& kv = s->layer_kv[layer];
         transition(kv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -3262,24 +3264,24 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             sample.optimized = 1;
             sample.direct_output = direct;
             sample.split_k = split_k;
-            sample.groups = dispatch_x * query_groups * split_k;
+            sample.groups = rp::kvarn4_gqa2_groups(gqa2_plan, query_groups, split_k);
             sample.q_tile = uint8_t(q_tile);
             sample.decode_opt = uint8_t(decode_opt ? 1 : 0);
             sample.decode_rowlane = uint8_t(rowlane);
             sample.int8_dot = uint8_t(int8_selected ? 1 : 0);
-            sample.gqa2 = uint8_t(gqa2 ? 1 : 0);
+            sample.gqa2 = uint8_t(gqa2_plan.selected ? 1 : 0);
         }
         if (bulk_prof) {
             auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
             seg.optimized = 1;
             seg.direct_output = direct ? 1 : 0;
             seg.split_k = split_k;
-            seg.groups = dispatch_x * query_groups * split_k;
+            seg.groups = rp::kvarn4_gqa2_groups(gqa2_plan, query_groups, split_k);
             seg.q_tile = uint8_t(q_tile);
             seg.decode_opt = uint8_t(decode_opt ? 1 : 0);
             seg.decode_rowlane = uint8_t(rowlane);
             seg.int8_dot = uint8_t(int8_selected ? 1 : 0);
-            seg.gqa2 = uint8_t(gqa2 ? 1 : 0);
+            seg.gqa2 = uint8_t(gqa2_plan.selected ? 1 : 0);
         }
         if (!bulk_gpu_query_) {
             cmd_->CopyBufferRegion(range_readback_.resource.Get(), 0, range_output_.resource.Get(),

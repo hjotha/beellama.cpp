@@ -28,11 +28,18 @@ Changed files:
   shared counter classifier, JSON)
 - `tools/xbox/tests/rkva_range_profile_cpu.cpp`
 - `tools/xbox/tests/test_rkva_mq_gqa2_layout.py`
+- `tools/xbox/tests/test_rkva_gqa2_engine_policy.py` (new source contract)
 - `tools/xbox/tests/test_rkva_decode_rowlane_profile.py` (updated for the shared
   counter classifier; behavior unchanged)
+- `tools/xbox/scripts/rkva-quality-gate.py` and
+  `tools/xbox/tests/test_rkva_quality_gate.py` (GQA2 flag ownership)
+- `tools/xbox/shaders/generated/rkva_range_attn_kvarn4_mq{2,4}_dxil.h` and
+  `rkva_range_attn_kvarn4_mq2_i8_dxil.h` (metadata-only provenance update)
 - `docs/rkva-prefill-gqa2.md`, `docs/rkva-final-optimizations.md`, this report
 
-The MQ2/MQ4/INT8 HLSL wrappers and generated headers were not edited.
+The MQ2/MQ4/INT8 HLSL wrappers were not edited. The three shipped generated
+headers received a metadata-only update; their embedded DXIL arrays are
+byte-identical (hashes below).
 
 ## Supplied artifact verification
 
@@ -93,12 +100,27 @@ The header records `Target: attn_kvarn4_mq2_gqa2`, wrapper SHA256
 `045bc3...`, included kernel SHA256 `f8f5f6...`. The Python suite reconstructs
 the 47 924 bytes and rechecks the pinned SHA-256.
 
-The shipped MQ2/MQ4/INT8 headers were **not** regenerated. Their recorded source
-hash still names the pre-experiment kernel (`e52f25...`); the real-DXC blobs
-proved byte-identical, and the default preprocessing token stream is unchanged.
-A Windows-side regeneration may therefore change only that provenance line, but
-it must be verified rather than assumed. The Python suite pins the current bytes
-so an accidental regeneration fails loudly.
+The shipped MQ2/MQ4/INT8 headers were re-rendered from the same validated DXC
+blobs with the current kernel provenance. Only the metadata block changed; every
+embedded DXIL array is byte-identical to the previous headers:
+
+```text
+header                                  header SHA-256
+rkva_range_attn_kvarn4_mq2_dxil.h       7119a24ed39ef605a1b47a63157daadc5a45a9e2da8a60cc10b1fe86f4b82857
+rkva_range_attn_kvarn4_mq4_dxil.h       22e5f166d4c588d8dd635d826d962b67c527b2b25d062bd45aa42b6c35592662
+rkva_range_attn_kvarn4_mq2_i8_dxil.h    887cbcc80a2c80db411991c282b09a437dbc38f518548bddd2f4ec536056a205
+
+array payload                           bytes     DXIL SHA-256
+mq2                                    118452    9d81c3beba4e36756c89c6bc70c5807cedb990be67fba683fc714ff7a1c5b431
+mq4                                    236896    ef2878458bd37b6f702fec19f36e674a836803d300915cf2604bfd801dfb48bb
+i8                                     140356    a2b66069596fe3b8111dd19d99b4b65a652b2b2e376f44014015ade13f2c2d3f
+```
+
+The Python suite pins both the full headers and the embedded arrays; it fails if
+a future regeneration changes the DXIL payload or the default preprocessing
+contract. The smaller candidate blob and its reduced LDS are **not** evidence of
+a TPS gain: the candidate triples the pass-1 groups and reloads/dequantizes each
+K/V row three times.
 
 ### Compile-script wiring check (not a compilation)
 
@@ -120,7 +142,7 @@ Commands and real results:
 
 ```bash
 python3 tools/xbox/tests/test_rkva_mq_gqa2_layout.py
-# Ran 9 tests ... OK
+# Ran 11 tests ... OK
 
 g++ -std=c++17 -Wall -Wextra -Werror -O1 \
   tools/xbox/tests/rkva_range_profile_cpu.cpp -o /tmp/opencode/gqa2/bin/rkva_range_profile_cpu
@@ -138,17 +160,24 @@ done
 # all exit 0
 ```
 
-The C++ suite covers eligibility for nq 2..9, every boundary (nq1/nq10, mode
-1/3, rev1/2, non-KVarN4, MQ4, head_dim, GQA, zero/other tail, non-wave64,
-missing PSO), opt-out, INT8 conflict, `DispatchX = 3 * n_head_kv`, kernel name,
-bucket key, counters (including real bulk classification) and the unchanged
-default JSON (`enabled:false`, zero GQA2 calls).
+The C++ suite covers engine selection for flag OFF/ON, nq 1/2..9/10, both
+tails, fine/balanced/coarse, descriptor revisions 1/2/3, non-KVarN4, MQ4,
+head_dim, GQA, zero/other tail, wave-lane variants, missing PSO, opt-out and
+INT8 conflict. It also checks the engine plan: `DispatchX = 3 * n_head_kv`,
+ineligible calls keep `n_head_kv`, and the reported pass-1 groups are exactly
+three times the default for a selected plan. `attend_range()` now uses that
+plan for PSO selection and group reporting, so the test covers the same policy
+the engine executes. A source contract
+(`test_rkva_gqa2_engine_policy.py`) additionally keeps the D3D12 engine on the
+tested plan and the HELLO arm/conflict path. Kernel names, bucket keys, counters
+(including real bulk classification) and the unchanged default JSON
+(`enabled:false`, zero GQA2 calls) are covered.
 
 Python discovery:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 python3 -m unittest discover -s tools/xbox/tests -p 'test_rkva*.py'
-# Ran 301 tests ... OK
+# Ran 309 tests ... OK
 
 OPENBLAS_NUM_THREADS=1 python3 -m unittest discover -s tools/xbox/tests -p 'test_run_rkva*.py'
 # Ran 21 tests ... OK
@@ -157,10 +186,31 @@ OPENBLAS_NUM_THREADS=1 python3 -m unittest discover -s tools/xbox/tests -p 'test
 # Ran 5 tests ... OK
 ```
 
-The broad `test_*.py` discovery runs 377 tests and still reports the two known
+The broad `test_*.py` discovery runs 385 tests and still reports the two known
 unrelated errors (`test_make_shape_gguf.py` cannot find
 `tools/xbox/scripts/make-shape-gguf.py`; `test_validate_mtp_protocol.py` imports
 a missing `scripts.validate_mtp_protocol`); no other failure was reported.
+
+### Quality-gate flag ownership
+
+`rkva-quality-gate.py` now treats `rkva-mq-gqa2.flag` as a managed LocalState
+flag. `LocalStateFlags` captures it with INT8 and rowlane, clears it for every
+existing INT8/rowlane arm, restores the exact original state in the existing
+`finally`/`restore()` path, and rejects `INT8 && GQA2` before mutating the
+device. Future GQA2 A/B can use `flags.arm(False, gqa2_on=True)` without
+changing the existing `flags.arm(True/False)` callers.
+
+Offline coverage added to `test_rkva_quality_gate.py`:
+
+```text
+Ran 86 tests ... OK
+```
+
+The new cases prove: GQA2-only arm sets only `rkva-mq-gqa2.flag`; INT8-only arm
+clears a stale GQA2 flag; the original GQA2 presence is restored after each arm;
+the INT8+GQA2 conflict raises `ValueError` without touching LocalState; and a
+legacy two-flag `flags-original.json` is migrated by capturing the current GQA2
+presence, so resumable runs started before this change remain valid.
 
 ## CPU build with CUDA and Vulkan disabled
 
@@ -196,9 +246,13 @@ with `--target xllama-tests -j2` under `nice -n 19`:
 3. **PSO creation**: `CreateComputePipelineState` for
    `attn_kvarn4_mq2_gqa2` must succeed on the console; only then does
    `mq2_gqa2.available` become true.
-4. **Numerical/hardware qualification**: OUT/LSE parity against the default MQ2
-   tile, then pass1 timing/prefill throughput and stability on the Xbox. No
-   speedup, TPS delta or bit-exactness is claimed here.
+4. **Numerical/hardware qualification**: future GPU replay must compare OUT/LSE
+   against both the default MQ2 reference and the baseline, including odd query
+   counts and the 128-token/seam/split boundaries, and compare full-vocabulary
+   logits plus recurrent state. Only then may pass1 timing/prefill throughput and
+   stability be measured on the Xbox. No speedup, TPS delta or bit-exactness is
+   claimed here; the smaller blob and reduced LDS do not establish a gain
+   because the candidate triples groups and K/V row reloads.
 
 ## Non-claims
 

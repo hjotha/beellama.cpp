@@ -44,11 +44,21 @@ GQA2_DXIL_BYTES = 47924
 # intentional regeneration has to update these pins and the review record.
 DEFAULT_HEADER_SHA256 = {
     "rkva_range_attn_kvarn4_mq2_dxil.h":
-        "82e20e0d80616c7d35e64ff4409dc549d154a2f5d7eee2c335a9e9b43c16b179",
+        "7119a24ed39ef605a1b47a63157daadc5a45a9e2da8a60cc10b1fe86f4b82857",
     "rkva_range_attn_kvarn4_mq4_dxil.h":
-        "d5b3a63cb4d2e4450ac964e7178db27c78e0d35911bdbce1f3e9eda21598b512",
+        "22e5f166d4c588d8dd635d826d962b67c527b2b25d062bd45aa42b6c35592662",
     "rkva_range_attn_kvarn4_mq2_i8_dxil.h":
-        "734bfd28fa58b10e643de3f4ddec601d9f6cf9f7f92a8b341cf588bdedce3168",
+        "887cbcc80a2c80db411991c282b09a437dbc38f518548bddd2f4ec536056a205",
+}
+# Embedded DXIL payloads, independent of the header metadata block. These are
+# the real-DXC blobs from the supplied mq2/mq4/i8 artifacts.
+DEFAULT_DXIL_SHA256 = {
+    "rkva_range_attn_kvarn4_mq2_dxil.h":
+        ("9d81c3beba4e36756c89c6bc70c5807cedb990be67fba683fc714ff7a1c5b431", 118452),
+    "rkva_range_attn_kvarn4_mq4_dxil.h":
+        ("ef2878458bd37b6f702fec19f36e674a836803d300915cf2604bfd801dfb48bb", 236896),
+    "rkva_range_attn_kvarn4_mq2_i8_dxil.h":
+        ("a2b66069596fe3b8111dd19d99b4b65a652b2b2e376f44014015ade13f2c2d3f", 140356),
 }
 
 BASE_SHA = os.environ.get(
@@ -308,6 +318,31 @@ class GeneratedDxilTest(unittest.TestCase):
             with self.subTest(header=name):
                 path = GENERATED / name
                 self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected)
+
+    def test_shipped_dxil_arrays_are_unchanged(self):
+        for name, (expected, size) in DEFAULT_DXIL_SHA256.items():
+            with self.subTest(header=name):
+                _, data, _ = embedded_header(GENERATED / name)
+                self.assertEqual(len(data), size)
+                self.assertEqual(hashlib.sha256(data).hexdigest(), expected)
+
+    def test_shipped_headers_record_current_source_provenance(self):
+        i8_wrapper = SHADER.with_name("rkva_range_attn_kvarn4_mq_i8.hlsl")
+        cases = (
+            ("rkva_range_attn_kvarn4_mq2_dxil.h", SHADER, None),
+            ("rkva_range_attn_kvarn4_mq4_dxil.h", SHADER, None),
+            ("rkva_range_attn_kvarn4_mq2_i8_dxil.h", i8_wrapper, SHADER),
+        )
+        for name, source, included in cases:
+            with self.subTest(header=name):
+                text = (GENERATED / name).read_text()
+                self.assertIn(
+                    "// Source SHA256: " + hashlib.sha256(source.read_bytes()).hexdigest(),
+                    text)
+                if included is not None:
+                    self.assertIn(
+                        '// Included "rkva_range_attn_kvarn4_mq.hlsl" SHA256: ' +
+                        hashlib.sha256(included.read_bytes()).hexdigest(), text)
 
 
 if __name__ == "__main__":

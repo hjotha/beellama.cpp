@@ -485,7 +485,8 @@ class FlagTests(unittest.TestCase):
             pfn = client.pfn()
             flags = qg.LocalStateFlags(client, pfn, temporary)
             original = flags.capture_original()
-            self.assertEqual(original, {qg.INT8_FLAG: True, qg.ROWLAND_OPT_OUT_FLAG: True})
+            self.assertEqual(original, {qg.INT8_FLAG: True, qg.ROWLAND_OPT_OUT_FLAG: True,
+                                        qg.GQA2_FLAG: False})
             with flags.arm(False):
                 self.assertEqual(fake.files, set())
             self.assertEqual(fake.files, {qg.INT8_FLAG, qg.ROWLAND_OPT_OUT_FLAG})
@@ -493,6 +494,62 @@ class FlagTests(unittest.TestCase):
                 self.assertEqual(fake.files, {qg.INT8_FLAG})
             self.assertEqual(fake.files, {qg.INT8_FLAG, qg.ROWLAND_OPT_OUT_FLAG})
             self.assertTrue((Path(temporary) / 'flags-restored.json').is_file())
+            restored = json.loads((Path(temporary) / 'flags-restored.json').read_text())
+            self.assertEqual(restored['present'], original)
+
+    def test_gqa2_arm_is_isolated_and_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = self.FakeDeploy()
+            client = self.deploy(temporary, fake)
+            flags = qg.LocalStateFlags(client, client.pfn(), temporary)
+            original = flags.capture_original()
+            self.assertEqual(original, {qg.INT8_FLAG: False, qg.ROWLAND_OPT_OUT_FLAG: False,
+                                        qg.GQA2_FLAG: False})
+            with flags.arm(False, gqa2_on=True):
+                self.assertEqual(fake.files, {qg.GQA2_FLAG})
+            self.assertEqual(fake.files, set())
+            with flags.arm(True):
+                self.assertEqual(fake.files, {qg.INT8_FLAG})
+            self.assertEqual(fake.files, set())
+
+    def test_stale_gqa2_flag_does_not_contaminate_int8_arms(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = self.FakeDeploy(files={qg.GQA2_FLAG})
+            client = self.deploy(temporary, fake)
+            flags = qg.LocalStateFlags(client, client.pfn(), temporary)
+            flags.capture_original()
+            with flags.arm(False):
+                self.assertEqual(fake.files, set())
+            self.assertEqual(fake.files, {qg.GQA2_FLAG})
+            with flags.arm(True):
+                self.assertEqual(fake.files, {qg.INT8_FLAG})
+            self.assertEqual(fake.files, {qg.GQA2_FLAG})
+
+    def test_int8_and_gqa2_arm_conflict_is_rejected_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = self.FakeDeploy(files={qg.INT8_FLAG})
+            client = self.deploy(temporary, fake)
+            flags = qg.LocalStateFlags(client, client.pfn(), temporary)
+            flags.capture_original()
+            with self.assertRaises(ValueError):
+                with flags.arm(True, gqa2_on=True):
+                    pass
+            self.assertEqual(fake.files, {qg.INT8_FLAG})
+
+    def test_legacy_two_flag_original_map_adopts_gqa2(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = self.FakeDeploy(files={qg.INT8_FLAG, qg.GQA2_FLAG})
+            client = self.deploy(temporary, fake)
+            flags = qg.LocalStateFlags(client, client.pfn(), temporary)
+            legacy = {qg.INT8_FLAG: True, qg.ROWLAND_OPT_OUT_FLAG: False}
+            merged = flags.adopt_original(legacy)
+            self.assertEqual(merged, {qg.INT8_FLAG: True, qg.ROWLAND_OPT_OUT_FLAG: False,
+                                      qg.GQA2_FLAG: True})
+            persisted = json.loads((Path(temporary) / 'flags-original.json').read_text())
+            self.assertEqual(persisted['present'], merged)
+            self.assertEqual(tuple(persisted['names']), qg.MANAGED_FLAGS)
+            flags.restore()
+            self.assertEqual(fake.files, {qg.INT8_FLAG, qg.GQA2_FLAG})
 
     def test_absent_flag_delete_404_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:

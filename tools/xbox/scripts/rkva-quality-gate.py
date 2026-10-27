@@ -71,8 +71,12 @@ WAVEFRONT_TILE = 256
 WAVEFRONT_TILES = 2
 
 INT8_FLAG = 'rkva-mq-i8.flag'
+GQA2_FLAG = 'rkva-mq-gqa2.flag'
 ROWLAND_OPT_OUT_FLAG = 'rkva-decode-rowlane-off.flag'
-MANAGED_FLAGS = (INT8_FLAG, ROWLAND_OPT_OUT_FLAG)
+# Every experimental engine flag this harness touches must be captured and
+# restored, even when the current arm does not enable it: a stale GQA2 flag
+# would otherwise contaminate INT8/rowlane controls.
+MANAGED_FLAGS = (INT8_FLAG, ROWLAND_OPT_OUT_FLAG, GQA2_FLAG)
 PFN_PREFIX = 'GianlucaMazza.xllama_'
 
 # server-task.cpp: logarithm(0) returns std::numeric_limits<float>::lowest().
@@ -1528,7 +1532,7 @@ class DeployClient:
 
 
 class LocalStateFlags:
-    """Temporary two-flag owner with exact original-state restoration."""
+    """Temporary experimental-flag owner with exact original-state restoration."""
 
     def __init__(self, deploy, pfn, output, names=MANAGED_FLAGS):
         self.deploy = deploy
@@ -1552,6 +1556,26 @@ class LocalStateFlags:
         })
         return dict(self.original)
 
+    def adopt_original(self, present):
+        """Adopt a persisted original-state map, migrating older two-flag runs.
+
+        A run started before GQA2 became managed has no key for it. Read the
+        current device state once and persist the complete map so the existing
+        restore/verify path stays exact and old resumable runs remain valid.
+        """
+        if not isinstance(present, dict):
+            raise GateError('stored original flag state is invalid')
+        current = self.read()
+        merged = {name: bool(present[name]) if name in present else name in current
+                  for name in self.names}
+        if merged != present:
+            write_json(self.output / 'flags-original.json', {
+                'pfn': self.pfn, 'names': self.names, 'present': merged,
+                'captured': now(), 'migrated': now(),
+            })
+        self.original = merged
+        return dict(merged)
+
     def set(self, name, present):
         if name not in self.names:
             raise ValueError(f'unmanaged flag: {name}')
@@ -1573,8 +1597,13 @@ class LocalStateFlags:
             raise GateError(f'flag {name} did not reach the requested state')
         return present
 
-    def apply(self, int8_on):
+    def apply(self, int8_on, gqa2_on=False):
+        if int8_on and gqa2_on:
+            # The engine treats this pair as a fail-closed conflict; never arm
+            # an ambiguous control arm in the harness either.
+            raise ValueError('INT8 and GQA2 flags are mutually exclusive')
         self.set(INT8_FLAG, int8_on)
+        self.set(GQA2_FLAG, gqa2_on)
         # rowlane must be ON: the opt-out flag is absent.
         self.set(ROWLAND_OPT_OUT_FLAG, False)
 
@@ -1598,9 +1627,9 @@ class LocalStateFlags:
         return actual
 
     @contextlib.contextmanager
-    def arm(self, int8_on):
+    def arm(self, int8_on, gqa2_on=False):
         try:
-            self.apply(int8_on)
+            self.apply(int8_on, gqa2_on)
             yield
         finally:
             self.restore()
@@ -3252,10 +3281,13 @@ def execute(args):
         if stored.get('pfn') != pfn:
             raise RefuseError(
                 'installed package changed since the original flag state was captured')
-        flags.original = stored.get('present')
-        if not isinstance(flags.original, dict):
+        stored_present = stored.get('present')
+        if not isinstance(stored_present, dict):
             raise RefuseError('stored original flag state is invalid')
-        # Reconcile a prior crash before doing any new work.
+        # Adopt the persisted map, adding flags introduced after that run (for
+        # example GQA2) from the current device state, then reconcile a prior
+        # crash before doing any new work.
+        flags.adopt_original(stored_present)
         flags.restore()
     else:
         flags.capture_original()

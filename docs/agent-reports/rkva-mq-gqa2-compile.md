@@ -1,11 +1,32 @@
 # RKVA KVarN4 MQ two-local-head compile experiment
 
-Status: **prepared and CPU-tested offline; no DXC, Windows, GPU or device result
-exists yet.** This report does not claim a speedup, a TPS delta or bit-exact
-output. It scopes a candidate PSO for the root to compile and inspect later.
+Status (phase 1, historical): **prepared and CPU-tested offline; no DXC,
+Windows, GPU or device result existed at that time.** This report does not claim
+a speedup, a TPS delta or bit-exact output. It scopes a candidate PSO for the
+root to compile and inspect later.
 Follow-up: `docs/agent-reports/rkva-mq-gqa2-integration.md` now wires the
 candidate behind the default-off `rkva-mq-gqa2.flag`; the DXC artifact and CPU
 checks there supersede phase 1 only.
+
+## Phase 2 update (2026-10-27, supersedes the DXC status above)
+
+A real DXC 1.8.2502.11 / Windows SDK 26100 artifact now exists for the candidate
+(47 924 B, SHA-256 `b26dd85cb5512225dcb10333fc53a7a7b52676ccac2d480ed237fdcf92565a99`)
+and is embedded through the project renderer. The same artifact set proves the
+three shipped DXIL arrays are unchanged. Their headers were re-rendered with the
+validated DXC metadata (`Included`/`Source` hashes updated to the experiment
+kernel `f8f5f6...`) while the embedded arrays stayed byte-identical:
+
+```text
+rkva_range_attn_kvarn4_mq2_dxil.h     array 118452 B  9d81c3be...
+rkva_range_attn_kvarn4_mq4_dxil.h     array 236896 B  ef287845...
+rkva_range_attn_kvarn4_mq2_i8_dxil.h  array 140356 B  a2b66069...
+```
+
+The smaller candidate blob and reduced LDS are not evidence of a TPS gain: the
+candidate triples the groups and reloads/dequantizes each K/V row three times.
+No performance or quality claim is made until the GPU replay described in the
+integration report is executed.
 
 ## Scope and ownership
 
@@ -111,6 +132,11 @@ preprocess identically, but existing generated headers keep recording the old
 hash until the root regenerates. Regeneration is expected to change only the
 recorded hash if DXC output is deterministic, which the root must verify rather
 than assume. No generated header was touched in this phase.
+
+Phase 2 note: the root regeneration was performed from the validated DXC
+artifacts. The metadata now records the experiment kernel `f8f5f6...`, and the
+three embedded arrays are byte-identical to phase 1 (`9d81c3be...`,
+`ef287845...`, `a2b66069...`).
 
 ## Pending (root / Windows)
 

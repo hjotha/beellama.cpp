@@ -99,8 +99,26 @@ python3 tools/xbox/scripts/render-rkva-dxil-header.py \
 ```
 
 The header records the wrapper hash, the included kernel hash and the target.
-Regenerating the shipped MQ2/MQ4/INT8 headers was deliberately avoided; their
-bytes are pinned by `tools/xbox/tests/test_rkva_mq_gqa2_layout.py`.
+The shipped MQ2/MQ4/INT8 headers were re-rendered from the same validated DXC
+blobs with the current provenance; their embedded arrays stayed byte-identical:
+
+```text
+mq2 118452 B  9d81c3beba4e36756c89c6bc70c5807cedb990be67fba683fc714ff7a1c5b431
+mq4 236896 B  ef2878458bd37b6f702fec19f36e674a836803d300915cf2604bfd801dfb48bb
+i8  140356 B  a2b66069596fe3b8111dd19d99b4b65a652b2b2e376f44014015ade13f2c2d3f
+```
+
+`tools/xbox/tests/test_rkva_mq_gqa2_layout.py` pins both the full headers and
+the embedded DXIL payloads. The smaller candidate blob and reduced LDS are not
+evidence of a TPS gain: the candidate triples the pass-1 groups and reloads each
+K/V row three times.
+
+`rkva-quality-gate.py` now includes `rkva-mq-gqa2.flag` in its managed LocalState
+set. Existing INT8/rowlane arms clear it, the original presence is restored by
+the existing `finally` path, and an INT8+GQA2 arm is rejected before touching
+the device. Future GQA2 A/B can call `flags.arm(False, gqa2_on=True)`. A
+`flags-original.json` written by an older two-flag run is migrated by reading
+the current GQA2 state, without invalidating resumable runs.
 
 CPU/offline checks (no GPU, Windows, LAN or SSH):
 
@@ -117,6 +135,9 @@ python3 -m json.tool /tmp/rkva_profile.json > /dev/null
 1. Compile the wrapper with the real DXC on the Windows build host and compare
    its DXIL hash/output with the embedded artifact (determinism is not assumed).
 2. Compile the UWP target with MSVC and confirm the PSO is created at HELLO.
-3. On the Xbox, verify OUT/LSE quality against the default MQ2 kernel before any
-   timing comparison, then measure pass1 time and prefill throughput.
-4. Keep the flag off in user builds until those results are accepted.
+3. On the Xbox, compare OUT/LSE against the default MQ2 reference and the
+   baseline for odd query counts and 128-token/seam/split boundaries, then
+   compare full-vocabulary logits and recurrent state. Only after that measure
+   pass1 time and prefill throughput.
+4. Keep the flag off in user builds until those results are accepted. No TPS or
+   quality result is claimed before the GPU replay is executed.
