@@ -1524,6 +1524,7 @@ struct server_slot {
     int64_t adaptive_cycle_start_us = 0;
     float adaptive_draft_ms = 0.0f;
     int32_t adaptive_requested_n_max = 0;
+    int32_t adaptive_proposed_n = 0;
     float p_min = -1.0f;
 
     // Opt-in complete generation-cycle wall time. Retained across checkpoint
@@ -1570,6 +1571,7 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stop_detail    = "";
         p_min          = -1.0f;
+        adaptive_proposed_n = 0;
         loop_guard.reset();
         loop_guard_interventions = 0;
         loop_guard_event = {};
@@ -9698,7 +9700,7 @@ private:
                 slot.mtp_cycle_passes = slot.mtp_cycle_nq = slot.mtp_cycle_proposed = slot.mtp_cycle_accepted = 0;
             }
 
-            if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
+            if (!slot.spec_is_replay && slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
                 slot.adaptive_cycle_start_us = ggml_time_us();
                 slot.adaptive_draft_ms = 0.0f;
                 slot.adaptive_requested_n_max = 0;
@@ -9713,7 +9715,7 @@ private:
                 const int n_draft_max = slot.get_n_draft_max(params_base.ctx_shift);
 
                 if (n_draft_max > 0) {
-                    if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
+                    if (!slot.spec_is_replay && slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
                         slot.adaptive_requested_n_max = n_draft_max;
                     }
                     GGML_ASSERT(slot.can_speculate());
@@ -11473,6 +11475,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 apply_adaptive_profit_decision(slot);
                 slot.adaptive_cycle_start_us = 0;
                 slot.adaptive_requested_n_max = 0;
+                slot.adaptive_proposed_n = 0;
             }
 
             slot.stats.n_gen += 1;
@@ -11638,6 +11641,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.adaptive_proposed_n = (int32_t) n_draft;
                         slot.spec_draft = std::move(accepted);
                         slot.spec_dists.clear();
 
@@ -11738,12 +11742,13 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 const int n_accepted_adaptive = std::max(0, (int) ids.size() - 1);
                 const float cycle_ms = std::max(0.001f,
                         (float) (t_now - slot.adaptive_cycle_start_us) / 1000.0f);
-                slot.adaptive_dm.observe_profit_acceptance((int) n_draft, n_accepted_adaptive);
+                const int proposal_count = slot.adaptive_proposed_n > 0 ? slot.adaptive_proposed_n : (int) n_draft;
+                slot.adaptive_dm.observe_profit_acceptance(proposal_count, n_accepted_adaptive);
                 slot.adaptive_dm.observe_profit_timing(
                         slot.adaptive_requested_n_max > 0
                             ? slot.adaptive_requested_n_max
-                            : (int) n_draft,
-                        (int) n_draft,
+                            : proposal_count,
+                        proposal_count,
                         n_accepted_adaptive,
                         slot.adaptive_draft_ms,
                         verify_ms,
@@ -11752,6 +11757,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 apply_adaptive_profit_decision(slot);
                 slot.adaptive_cycle_start_us = 0;
                 slot.adaptive_requested_n_max = 0;
+                slot.adaptive_proposed_n = 0;
             }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;

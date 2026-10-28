@@ -326,6 +326,7 @@ struct server_adaptive_dm_state {
     int32_t profit_baseline_probe_resume_n = -1;
     int32_t profit_off_probe_failures = 0;
     int32_t profit_off_probe_next_n = -1;
+    int32_t profit_cycles_in_off_state = 0;
     int32_t profit_active_episode_n = -1;
     int32_t profit_active_episode_start_samples = 0;
     double  profit_active_episode_start_output_tokens = 0.0;
@@ -408,6 +409,7 @@ struct server_adaptive_dm_state {
         profit_baseline_probe_resume_n = -1;
         profit_off_probe_failures = 0;
         profit_off_probe_next_n = -1;
+        profit_cycles_in_off_state = 0;
         profit_active_episode_n = -1;
         profit_active_episode_start_samples = 0;
         profit_active_episode_start_output_tokens = 0.0;
@@ -1219,8 +1221,13 @@ struct server_adaptive_dm_state {
         if (requested_n_max <= 0) {
             profit_cycles_since_baseline = 0;
             profit_baseline_probe_pending = false;
+            profit_cycles_in_off_state++;
         } else if (profit_baseline_ready()) {
             profit_cycles_since_baseline++;
+            profit_cycles_in_off_state = 0;
+            const float cand_score = server_adaptive_dm_score(output_tokens, cycle_ms);
+            const bool profitable = cand_score >= profit_score_for_depth(0) * (1.0f + dm_profit_min);
+            profit_note_off_probe_result(requested_n_max, PROFIT_DEPTHS - 1, profitable);
         }
     }
 
@@ -1275,6 +1282,14 @@ struct server_adaptive_dm_state {
 
         if (current_n == 0 && profit_baseline_probe_resume_n <= 0) {
             profit_current_score = baseline_score;
+            if (profit_cycles_in_off_state >= profit_off_probe_interval()) {
+                profit_cycles_in_off_state = 0;
+                const int probe_depth = profit_next_off_probe_depth(base_n_max, base_n_max);
+                if (probe_depth > 0) {
+                    profit_last_recommended_n = probe_depth;
+                    return probe_depth;
+                }
+            }
             profit_last_recommended_n = 0;
             return 0;
         }
