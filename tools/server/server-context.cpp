@@ -1734,7 +1734,7 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    int get_n_draft_max(bool ctx_shift = false) const {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
@@ -1743,8 +1743,8 @@ struct server_slot {
 
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
-        //       also, need to leave space for 1 extra token to allow context shifts
-        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
+        //       also, need to leave space for 1 extra token to allow context shifts only if ctx_shift is enabled
+        int n_draft_max = n_ctx - prompt.n_tokens() - (ctx_shift ? 2 : 1);
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
@@ -7455,7 +7455,7 @@ private:
         }
     }
 
-    bool process_token(completion_token_output & result, server_slot & slot) {
+    bool process_token(completion_token_output & result, server_slot & slot, bool is_last_in_batch = true) {
         const bool stopped_before_process = slot.stop != STOP_TYPE_NONE && !slot.has_next_token;
 
         // remember which tokens were sampled - used for repetition penalties during sampling
@@ -7507,8 +7507,17 @@ private:
             slot.has_next_token = true;
         }
 
-        // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        // check the limits first: if budget is fulfilled, generation completed successfully!
+        if (slot.stats.n_gen > 0 && slot.has_next_token && !slot.has_budget()) {
+            slot.stop           = STOP_TYPE_LIMIT;
+            slot.stop_detail    = "token_limit";
+            slot.has_next_token = false;
+
+            SLT_DBG(slot, "stopped by limit, n_gen = %d, n_predict = %d\n", (int) slot.stats.n_gen, slot.task->params.n_predict);
+        }
+
+        // if context shifting is disabled, check if context capacity is reached for subsequent decoding
+        if (is_last_in_batch && slot.has_next_token && !params_base.ctx_shift && slot.prompt.n_tokens() >= slot.n_ctx) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.stop_detail    = "context_limit";
@@ -7516,15 +7525,6 @@ private:
 
             SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
                     slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
-        }
-
-        // check the limits
-        if (slot.stats.n_gen > 0 && slot.has_next_token && !slot.has_budget()) {
-            slot.stop           = STOP_TYPE_LIMIT;
-            slot.stop_detail    = "token_limit";
-            slot.has_next_token = false;
-
-            SLT_DBG(slot, "stopped by limit, n_gen = %d, n_predict = %d\n", (int) slot.stats.n_gen, slot.task->params.n_predict);
         }
 
         if (slot.has_new_line) {
@@ -9526,7 +9526,10 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+            const bool ctx_full = params_base.ctx_shift
+                ? (slot.prompt.n_tokens() + 1 >= slot.n_ctx)
+                : (slot.prompt.n_tokens() >= slot.n_ctx);
+            if (slot.state == SLOT_STATE_GENERATING && ctx_full) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -9647,7 +9650,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = slot.get_n_draft_max(params_base.ctx_shift);
 
                 if (n_draft_max > 0) {
                     if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive) {
@@ -11715,7 +11718,8 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                 // rejects per-token p95 unless every iteration yielded exactly 1 token.
                 slot.stats.f5_record_token(ggml_time_us(), true);
 
-                if (!process_token(result, slot)) {
+                const bool is_last = (i + 1 == ids.size());
+                if (!process_token(result, slot, is_last)) {
                     slot.report_mtp_cycle(i + 1, true);
                     slot.print_timings();
                     send_final_response(slot);
