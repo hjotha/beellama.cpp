@@ -6105,8 +6105,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // events, stream ordering, remote failure retirement and status are unchanged.
     // With use_cuda_graph=false it never dereferences the null graph_key.
     uint64_t execution_mode = 0;
+#ifdef USE_CUDA_GRAPH
     const uint64_t pool_malloc_count_before = cuda_ctx->pool_malloc_count;
     const uint64_t pool_epoch_before = cuda_ctx->pool_epoch;
+#endif
     const bool ok = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
                                                        graph_key, host_timing.enabled ? &execution_mode : nullptr);
 #ifdef USE_CUDA_GRAPH
