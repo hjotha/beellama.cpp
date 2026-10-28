@@ -11739,7 +11739,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             slot.stats.n_draft_verif_steps += 1;
 
             if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive && slot.adaptive_cycle_start_us > 0) {
-                const int n_accepted_adaptive = std::max(0, (int) ids.size() - 1);
+                const int n_accepted_adaptive = std::max(0, (int) n_accepted);
                 const float cycle_ms = std::max(0.001f,
                         (float) (t_now - slot.adaptive_cycle_start_us) / 1000.0f);
                 const int proposal_count = slot.adaptive_proposed_n > 0 ? slot.adaptive_proposed_n : (int) n_draft;
