@@ -6108,6 +6108,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const uint64_t pool_epoch_before = cuda_ctx->pool_epoch;
     const bool ok = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
                                                        graph_key, host_timing.enabled ? &execution_mode : nullptr);
+#ifdef USE_CUDA_GRAPH
     if (graph) {
         if (cuda_ctx->pool_malloc_count != pool_malloc_count_before || cuda_ctx->pool_epoch != pool_epoch_before) {
             // Scratch was allocated or pool was cleared during this call; reset warmup to ensure pool stability before capture
@@ -6117,6 +6118,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         graph->last_pool_epoch = cuda_ctx->pool_epoch;
         graph->last_pool_malloc_count = cuda_ctx->pool_malloc_count;
     }
+#endif // USE_CUDA_GRAPH
     ggml_cuda_release_deferred_pool_frees(cuda_ctx);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     local_span.finish(ok, execution_mode);

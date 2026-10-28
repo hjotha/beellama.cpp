@@ -3666,6 +3666,7 @@ private:
     int32_t adaptive_cache_kvarn_bits_k_xxxlong = 4;
     int32_t adaptive_cache_kvarn_bits_v_xxxlong = 4;
 
+    float adaptive_p_min_base    = -1.0f;
     float adaptive_p_min_short   = -1.0f;
     float adaptive_p_min_medium  = -1.0f;
     float adaptive_p_min_long    = -1.0f;
@@ -3793,15 +3794,17 @@ private:
     }
 
     float adaptive_p_min_for_profile(common_context_profile profile) const {
+        float p = -1.0f;
         switch (profile) {
-            case COMMON_CONTEXT_PROFILE_MTP_SHORT: return adaptive_p_min_short >= 0.0f ? adaptive_p_min_short : params_base.speculative.draft.p_min;
-            case COMMON_CONTEXT_PROFILE_MTP:       return adaptive_p_min_medium >= 0.0f ? adaptive_p_min_medium : params_base.speculative.draft.p_min;
-            case COMMON_CONTEXT_PROFILE_LONG:      return adaptive_p_min_long >= 0.0f ? adaptive_p_min_long : params_base.speculative.draft.p_min;
-            case COMMON_CONTEXT_PROFILE_XLONG:     return adaptive_p_min_xlong >= 0.0f ? adaptive_p_min_xlong : params_base.speculative.draft.p_min;
-            case COMMON_CONTEXT_PROFILE_XXLONG:    return adaptive_p_min_xxlong >= 0.0f ? adaptive_p_min_xxlong : params_base.speculative.draft.p_min;
-            case COMMON_CONTEXT_PROFILE_XXXLONG:   return adaptive_p_min_xxxlong >= 0.0f ? adaptive_p_min_xxxlong : params_base.speculative.draft.p_min;
-            default:                               return params_base.speculative.draft.p_min;
+            case COMMON_CONTEXT_PROFILE_MTP_SHORT: p = adaptive_p_min_short; break;
+            case COMMON_CONTEXT_PROFILE_MTP:       p = adaptive_p_min_medium; break;
+            case COMMON_CONTEXT_PROFILE_LONG:      p = adaptive_p_min_long; break;
+            case COMMON_CONTEXT_PROFILE_XLONG:     p = adaptive_p_min_xlong; break;
+            case COMMON_CONTEXT_PROFILE_XXLONG:    p = adaptive_p_min_xxlong; break;
+            case COMMON_CONTEXT_PROFILE_XXXLONG:   p = adaptive_p_min_xxxlong; break;
+            default: break;
         }
+        return p >= 0.0f ? p : (adaptive_p_min_base >= 0.0f ? adaptive_p_min_base : params_base.speculative.draft.p_min);
     }
 
     void apply_profile_params(common_context_profile profile) {
@@ -5377,6 +5380,7 @@ private:
             return false;
         }
 
+        adaptive_p_min_base = params.speculative.draft.p_min;
         if (adaptive) {
             adaptive_draft_n_medium = params.speculative.draft.n_max;
             adaptive_draft_n_short  = params.spec_draft_n_max_short;
@@ -7302,7 +7306,12 @@ private:
                 task.params.speculative.types.begin(),
                 task.params.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != task.params.speculative.types.end();
-        if (slot.can_speculate() && task_uses_dflash) {
+        const bool task_uses_draft_mtp = std::find(
+                task.params.speculative.types.begin(),
+                task.params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != task.params.speculative.types.end();
+        const bool task_uses_adaptive_spec = task_uses_dflash || task_uses_draft_mtp;
+        if (slot.can_speculate() && task_uses_adaptive_spec) {
             if (common_speculative_adaptive_dm_supported(slot.spec)) {
                 slot.adaptive_dm.configure(task.params.speculative);
                 const int base_n_max = common_speculative_n_max(&task.params.speculative);
