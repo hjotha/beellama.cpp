@@ -195,6 +195,7 @@ struct remote_state {
     // Opt-in INT8 QK prefill kernel (default off, NOT bit-exact): LocalState flag file.
     bool mq_i8_enabled = false;
     bool q8_mq_i8_enabled = false;
+    bool q8_paired_reduce_enabled = false;
     bool q8_fp8_gpu_enabled = true;
     // FP32 row-per-lane QK decode (default on, LocalState opt-out).
     bool decode_rowlane_enabled = true;
@@ -349,6 +350,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             std::ifstream(g_snapshot_local_folder + "\\rkva-mq-i8.flag").good();
         state.q8_mq_i8_enabled =
             std::ifstream(g_snapshot_local_folder + "\\rkva-q8-mq-i8.flag").good();
+        state.q8_paired_reduce_enabled =
+            std::ifstream(g_snapshot_local_folder + "\\rkva-q8-reduce-paired.flag").good();
         state.q8_fp8_gpu_enabled =
             !std::ifstream(g_snapshot_local_folder + "\\rkva-q8-fp8-gpu-off.flag").good();
         state.geo = hello;
@@ -390,6 +393,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         }
         state.engine->set_mq_i8(state.mq_i8_enabled);
         state.engine->set_q8_mq_i8(state.q8_mq_i8_enabled);
+        state.engine->set_q8_paired_reduce(state.q8_paired_reduce_enabled);
         state.engine->set_decode_rowlane(state.decode_rowlane_enabled);
 
         rkva_hello_ack ack{};

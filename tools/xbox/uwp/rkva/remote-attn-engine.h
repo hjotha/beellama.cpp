@@ -194,6 +194,7 @@ class RemoteAttnEngine {
     // F32 dot. Control path only.
     // Experimental Q8_0 query-quantized INT8 dot path, default off.
     void set_q8_mq_i8(bool enabled) { q8_mq_i8_ = enabled; }
+    void set_q8_paired_reduce(bool enabled);
     void set_mq_i8(bool enabled) {
         mq_i8_ = enabled;
     }
@@ -338,6 +339,9 @@ class RemoteAttnEngine {
     std::string kvarn4_mq_i8_status_ = "not initialized";
     bool mq_i8_ = false;
     bool q8_mq_i8_ = false;
+    bool q8_paired_reduce_ = false;
+    std::string q8_paired_reduce_status_ = "disabled";
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> q8_paired_reduce_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q8_mq_i8_pso_;
     std::string q8_mq_i8_status_ = "not initialized";
     std::string kvarn4_opt_prefix_status_ = "not initialized";
@@ -371,6 +375,7 @@ class RemoteAttnEngine {
     std::vector<BulkTransfer> bulk_transfers_;
     rkva_kvarn_bulk::Scratch bulk_scratch_;
     bool bulk_recording_ = false;
+    uint32_t bulk_parent_n_tokens_ = 0;
     bool bulk_gpu_query_ = false;
     Buffer bulk_f16_stage_out_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_f16_pso_;

@@ -62,6 +62,12 @@
 #include "rkva_range_attn_q4_opt_dxil.h"
 #include "rkva_range_attn_q8_dxil.h"
 #include "rkva_range_attn_q8_mq2_dxil.h"
+#if __has_include("rkva_range_reduce_q8_paired_dxil.h")
+    #include "rkva_range_reduce_q8_paired_dxil.h"
+    #define RKVA_HAS_Q8_PAIRED_REDUCE_DXIL 1
+#else
+    #define RKVA_HAS_Q8_PAIRED_REDUCE_DXIL 0
+#endif
 #if __has_include("rkva_range_attn_q8_mq2_i8_dxil.h")
     #include "rkva_range_attn_q8_mq2_i8_dxil.h"
     #define RKVA_HAS_Q8_MQ2_I8_DXIL 1
@@ -209,6 +215,7 @@ struct BulkSegmentProfile {
     uint8_t q_tile = 0;
     uint8_t decode_opt = 0;
     uint8_t decode_rowlane = 0;
+    uint8_t q8_paired_reduce = 0;
     uint8_t int8_dot = 0;
     uint8_t direct_output = 0;
     uint8_t optimized = 0;
@@ -243,11 +250,14 @@ struct BulkSessionProfiling {
 struct BulkWindowGuard {
     bool* recording = nullptr;
     BulkSessionProfiling* bulk = nullptr;
+    uint32_t* parent_tokens = nullptr;
     ~BulkWindowGuard() {
         if (recording)
             *recording = false;
         if (bulk)
             bulk->active = false;
+        if (parent_tokens)
+            *parent_tokens = 0;
     }
 };
 
@@ -1064,6 +1074,33 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
 #endif
 }
 
+void RemoteAttnEngine::set_q8_paired_reduce(bool enabled) {
+    q8_paired_reduce_ = false;
+    q8_paired_reduce_pso_.Reset();
+    q8_paired_reduce_status_ = enabled ? "unavailable" : "disabled";
+    if (!enabled) return;
+#if RKVA_HAS_Q8_PAIRED_REDUCE_DXIL
+    if (!device_ || !range_reduce_root_ || !range_reduce_opt_pso_) {
+        q8_paired_reduce_status_ = "missing optimized reduction prerequisite";
+        return;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature = range_reduce_root_.Get();
+    pso.CS = {g_rkva_range_reduce_q8_paired_dxil, sizeof(g_rkva_range_reduce_q8_paired_dxil)};
+    const HRESULT hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&q8_paired_reduce_pso_));
+    if (FAILED(hr)) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "Q8 paired reducer pipeline: 0x%08X", unsigned(hr));
+        q8_paired_reduce_status_ = text;
+        return;
+    }
+    q8_paired_reduce_status_ = "ready";
+    q8_paired_reduce_ = true;
+#else
+    q8_paired_reduce_status_ = "paired reducer header unavailable";
+#endif
+}
+
 // Timestamp heap + readback ring, created once from the control path. A failure
 // leaves CPU span profiling available and reports gpu_timestamps=false.
 bool RemoteAttnEngine::ensure_profile_resources(std::string* error) {
@@ -1343,6 +1380,9 @@ std::string RemoteAttnEngine::get_range_profile_json() {
     header.q8_mq_i8_available = header.fmt_mq_available[rp::kStorageQ8][0] && range_attn_q8_mq_i8_pso_;
     header.q8_mq_i8_enabled = q8_mq_i8_;
     header.q8_mq_i8_status = q8_mq_i8_status_;
+    header.q8_paired_reduce_available = q8_paired_reduce_pso_ && range_reduce_root_;
+    header.q8_paired_reduce_enabled = q8_paired_reduce_;
+    header.q8_paired_reduce_status = q8_paired_reduce_status_;
     std::string json = profile_ ? profile_->recorder.json(header) : rp::Recorder().json(header);
     json.pop_back();
     return json + ",\"bulk_scratch\":" + bulk_scratch_.json() +
@@ -2462,6 +2502,7 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
         attn_sample.q_tile = seg.q_tile;
         attn_sample.decode_opt = seg.decode_opt;
         attn_sample.decode_rowlane = seg.decode_rowlane;
+        attn_sample.q8_paired_reduce = seg.q8_paired_reduce;
         attn_sample.int8_dot = seg.int8_dot;
         attn_sample.n_tokens = seg.n_queries;
         attn_sample.rows = seg.active_count;
@@ -2946,7 +2987,8 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
     }
     // Armed only once this call owns the window: the refused-call path above
     // returns before this point and must never clear a foreign recording state.
-    BulkWindowGuard window{&bulk_recording_, prof ? &profile_->bulk : nullptr};
+    BulkWindowGuard window{&bulk_recording_, prof ? &profile_->bulk : nullptr, &bulk_parent_n_tokens_};
+    bulk_parent_n_tokens_ = n_tokens;
     if (ts_bulk) {
         timestamp(kTsBulkEnvelopeBegin);
     }
@@ -3521,6 +3563,9 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         }
         const uint32_t query_groups = q_tile ? (n_tokens + q_tile - 1) / q_tile : n_tokens;
         const bool direct = split_k == 1;
+        const bool q8_paired_reduce = rp::q8_paired_reduce_selected(
+            storage, n_tokens, q4_kernel_mode_, geo_.n_head, geo_.n_head_kv, geo_.head_dim,
+            direct, bulk_recording_, bulk_parent_n_tokens_, q8_paired_reduce_ && q8_paired_reduce_pso_);
         Buffer& kv = s->layer_kv[layer];
         transition(kv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transition(range_opt_partials_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3565,9 +3610,8 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             }
             const uint32_t reduce_params[] = {n_tokens, geo_.n_head, geo_.head_dim, split_k};
             cmd_->SetComputeRootSignature(range_reduce_root_.Get());
-            ID3D12PipelineState* reduce_pso = (kvarn && range_reduce_kvarn4_pso_)
-                                                  ? range_reduce_kvarn4_pso_.Get()
-                                                  : range_reduce_opt_pso_.Get();
+            ID3D12PipelineState* reduce_pso = q8_paired_reduce ? q8_paired_reduce_pso_.Get() :
+                (kvarn && range_reduce_kvarn4_pso_) ? range_reduce_kvarn4_pso_.Get() : range_reduce_opt_pso_.Get();
             cmd_->SetPipelineState(reduce_pso);
             cmd_->SetComputeRoot32BitConstants(0, 4, reduce_params, 0);
             cmd_->SetComputeRootShaderResourceView(
@@ -3599,6 +3643,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             sample.q_tile = uint8_t(q_tile);
             sample.decode_opt = uint8_t(decode_opt ? 1 : 0);
             sample.decode_rowlane = uint8_t(rowlane);
+            sample.q8_paired_reduce = uint8_t(q8_paired_reduce);
             sample.int8_dot = uint8_t(selected_int8_dot ? 1 : 0);
         }
         if (bulk_prof) {
@@ -3610,6 +3655,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             seg.q_tile = uint8_t(q_tile);
             seg.decode_opt = uint8_t(decode_opt ? 1 : 0);
             seg.decode_rowlane = uint8_t(rowlane);
+            seg.q8_paired_reduce = uint8_t(q8_paired_reduce);
             seg.int8_dot = uint8_t(selected_int8_dot ? 1 : 0);
         }
         if (!bulk_gpu_query_) {

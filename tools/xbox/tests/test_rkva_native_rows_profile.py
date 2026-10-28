@@ -434,7 +434,7 @@ class GuardSemantics(unittest.TestCase):
         engine = read(ENGINE_CPP)
         guard = "struct BulkWindowGuard " + function_body(engine, "struct BulkWindowGuard {")
         source = (
-            "#include <cstdio>\n"
+            "#include <cstdio>\n#include <cstdint>\n"
             "struct BulkSessionProfiling { bool active = false; };\n"
             + guard
             + ";\n"
@@ -447,11 +447,12 @@ int main() {
     foreign.active = true;
     if (!recording || !foreign.active) return 1;
 
-    // The call that owns the window clears both on any exit.
+    // The call that owns the window clears its flags and parent on exit.
+    uint32_t parent_tokens = 256;
     {
-        BulkWindowGuard owned{&recording, &foreign};
+        BulkWindowGuard owned{&recording, &foreign, &parent_tokens};
     }
-    if (recording || foreign.active) return 2;
+    if (recording || foreign.active || parent_tokens != 0) return 2;
 
     // Profiling-off windows own the recording flag only.
     bool recording_off = true;

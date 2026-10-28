@@ -169,6 +169,14 @@ inline bool optimized_format_supported(uint32_t mode, uint32_t storage, uint32_t
            optimized_shape_supported(mode, n_tokens, n_head, n_head_kv, head_dim);
 }
 
+inline bool q8_paired_reduce_selected(uint32_t storage, uint32_t n_tokens, uint32_t mode,
+                                       uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+                                       bool direct, bool bulk, uint32_t parent_tokens, bool enabled) {
+    return enabled && storage == kStorageQ8 && n_tokens == 1 && mode == kModeOptFine &&
+           n_head == 24 && n_head_kv == 4 && head_dim == 256 && !direct &&
+           (!bulk || parent_tokens == 1);
+}
+
 // F16 / Q8_0 multi-query tile kernel (rkva_range_attn_fmt_mq.hlsl, 267): the
 // Q4_0 multi-query algorithm with the storage's own K/V decode. Same legacy
 // mode mapping and split as Q4_0 (mode 1 -> 4-query tile, mode 2 -> 2-query
@@ -362,6 +370,7 @@ struct Sample {
     uint8_t serial_prefix = 0; // native KVarN4 descriptor revision 3
     uint8_t q_tile = 0;       // multi-query tile size; 0 = per-query
     uint8_t decode_rowlane = 0;
+    uint8_t q8_paired_reduce = 0;
     uint8_t decode_opt = 0;    // KVarN4 wave64 nq1 decode (includes rowlane)
     uint8_t int8_dot = 0;      // KVarN4 2-query tile used the opt-in INT8 QK PSO (not exact)
     uint8_t bulk_segment = 0; // 1 if recorded as an individual segment of native bulk op 22
@@ -387,6 +396,7 @@ struct Counters {
     // F16/Q8_0 multi-query tile calls (subset of optimized_by_storage), [storage][tile/4].
     uint64_t fmt_mq_calls[kStorageCount][2] = {};
     uint64_t q8_mq_i8_calls = 0;
+    uint64_t q8_paired_reduce_calls = 0;
     // Native KVarN4 revision-3 2-query and 4-query tile calls (subset of
     // optimized_by_storage[kvarn4]).
     uint64_t kvarn4_mq_calls = 0;
@@ -427,6 +437,7 @@ inline void count_attention_sample(Counters& c, const Sample& s) {
     }
     if (s.optimized) {
         ++c.optimized_by_storage[s.storage];
+        if (s.storage == kStorageQ8 && s.q8_paired_reduce) ++c.q8_paired_reduce_calls;
         if (s.storage == kStorageQ4) {
             ++c.optimized_calls;
             if (s.q_tile == 2 || s.q_tile == 4) {
@@ -546,6 +557,8 @@ struct Header {
     // F16 / Q8_0 multi-query tile pipelines, [storage][0] 2-query, [storage][1] 4-query.
     bool q8_mq_i8_available = false, q8_mq_i8_enabled = false;
     std::string q8_mq_i8_status;
+    bool q8_paired_reduce_available = false, q8_paired_reduce_enabled = false;
+    std::string q8_paired_reduce_status;
     bool fmt_mq_available[kStorageCount][2] = {};
     std::string fmt_mq_status[kStorageCount][2];
     // Native KVarN4 revision-3 2-query and 4-query tile pipelines (require the optimized prefix
@@ -609,7 +622,8 @@ inline std::string bucket_key(const Sample& s) {
     if (s.kind == kAttention) {
         key += s.optimized ? "/optimized-" : "/reference";
         if (s.optimized) {
-            key += s.q_tile ? mq_kernel_name(s.storage, s.q_tile, s.int8_dot != 0)
+            key += s.q8_paired_reduce ? "q8_gqa_fine_reduce_paired" :
+                   s.q_tile ? mq_kernel_name(s.storage, s.q_tile, s.int8_dot != 0)
                             : (s.storage == kStorageKvarn4 && s.decode_opt
                                    ? (s.decode_rowlane ? "kvarn4_decode_rowlane"
                                                        : kvarn4_decode_kernel_name(s.mode))
@@ -843,6 +857,12 @@ class Recorder {
                               ",\"mq2_i8\":{\"available\":%s,\"enabled\":%s,\"status\":\"%s\",\"calls\":%llu,\"exact\":false}",
                               h.q8_mq_i8_available ? "true" : "false", h.q8_mq_i8_enabled ? "true" : "false",
                               json_escape(h.q8_mq_i8_status).c_str(), ull(c.q8_mq_i8_calls));
+                o += buf;
+                std::snprintf(buf, sizeof(buf),
+                              ",\"paired_reduce\":{\"available\":%s,\"enabled\":%s,\"status\":\"%s\",\"calls\":%llu}",
+                              h.q8_paired_reduce_available ? "true" : "false",
+                              h.q8_paired_reduce_enabled ? "true" : "false",
+                              json_escape(h.q8_paired_reduce_status).c_str(), ull(c.q8_paired_reduce_calls));
                 o += buf;
             }
             o += '}';

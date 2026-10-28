@@ -15,6 +15,15 @@ change of floating-point arithmetic order is not guaranteed bit-exact on all
 inputs or devices. Profile `format_multi_query.q8_0.mq2_i8.calls` counts PSO
 selection, not the fraction of blocks that avoid F32 fallback.
 
+The optional Q8 one-query paired reducer is disabled by default. Create
+`rkva-q8-reduce-paired.flag` in LocalState before connecting to opt in. It
+keeps the existing Q8 attention shader and split policy, and pairs the two
+output dimensions handled by each reducer lane. Selection requires fine-mode
+Q8 decode, the 24/4/256 geometry, multiple splits, and a one-query parent
+envelope. Unsupported shapes and missing pipelines use the existing reducer.
+The initial performance qualification covers the long-context Xbox/RTX 4070
+configuration; it does not establish a gain for shorter contexts.
+
 The host Q8 producer defaults to CPU. `GGML_RKVA_Q8_PRODUCER=cuda` opts into
 experimental CUDA preparation. It currently requires `GGML_CUDA_KVARN`, the
 current CUDA device, and synchronous inputs; multi-device, HIP, and MUSA are

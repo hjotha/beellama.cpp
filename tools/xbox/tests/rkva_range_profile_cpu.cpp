@@ -12,6 +12,27 @@
 using namespace rkva_rprof;
 
 int main() {
+    // Only genuine Q8 one-query fine decode can select the paired reducer.
+    assert(q8_paired_reduce_selected(kStorageQ8, 1, kModeOptFine, 24, 4, 256, false, false, 0, true));
+    assert(q8_paired_reduce_selected(kStorageQ8, 1, kModeOptFine, 24, 4, 256, false, true, 1, true));
+    assert(!q8_paired_reduce_selected(kStorageQ8, 1, kModeOptFine, 24, 4, 256, false, true, 9, true));
+    assert(!q8_paired_reduce_selected(kStorageQ8, 2, kModeOptFine, 24, 4, 256, false, false, 0, true));
+    assert(!q8_paired_reduce_selected(kStorageQ8, 1, kModeOptFine, 24, 4, 256, true, false, 0, true));
+    assert(!q8_paired_reduce_selected(kStorageQ8, 1, kModeOptFine, 24, 4, 256, false, false, 0, false));
+    assert(!q8_paired_reduce_selected(kStorageKvarn4, 1, kModeOptFine, 24, 4, 256, false, false, 0, true));
+    assert(!q8_paired_reduce_selected(kStorageQ8, 1, kModeOptCoarse, 24, 4, 256, false, false, 0, true));
+    {
+        Counters counters;
+        Sample paired;
+        paired.kind = kAttention;
+        paired.storage = kStorageQ8;
+        paired.optimized = 1;
+        paired.n_tokens = 1;
+        paired.q8_paired_reduce = 1;
+        count_attention_sample(counters, paired);
+        assert(counters.q8_paired_reduce_calls == 1);
+        assert(bucket_key(paired).find("q8_gqa_fine_reduce_paired") != std::string::npos);
+    }
     // Mode validation and names.
     for (uint32_t m = 0; m < kModeCount; ++m) {
         assert(valid_mode(m));
@@ -551,7 +572,8 @@ int main() {
                      "\"calls\":0}},\"q8_0\":{\"mq2\":{\"available\":false,\"status\":\"q8 "
                      "multi-query pipeline state: 0x80070057\",\"calls\":0},\"mq4\":{"
                      "\"available\":true,\"status\":\"ready\",\"calls\":11},"
-                     "\"mq2_i8\":{\"available\":false,\"enabled\":false,\"status\":\"\",\"calls\":0,\"exact\":false}}}") !=
+                     "\"mq2_i8\":{\"available\":false,\"enabled\":false,\"status\":\"\",\"calls\":0,\"exact\":false},"
+                     "\"paired_reduce\":{\"available\":false,\"enabled\":false,\"status\":\"\",\"calls\":0}}}") !=
            std::string::npos);
     assert(json.find("\"q4_multi_query\":{\"nq_min\":2,\"nq_max\":9,\"tile_rows\":64,"
                      "\"mode_map\":\"1:q4_mq4_balanced 2:q4_mq2_fine 3:per-query "
