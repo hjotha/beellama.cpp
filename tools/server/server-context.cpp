@@ -1569,6 +1569,7 @@ struct server_slot {
         truncated      = false;
         stop           = STOP_TYPE_NONE;
         stop_detail    = "";
+        p_min          = -1.0f;
         loop_guard.reset();
         loop_guard_interventions = 0;
         loop_guard_event = {};
@@ -7301,6 +7302,8 @@ private:
         }
 
         slot.loop_guard.configure(task.params.reasoning_loop_guard);
+
+        slot.p_min = adaptive_p_min_for_profile(active_context_profile);
 
         const bool task_uses_dflash = std::find(
                 task.params.speculative.types.begin(),
