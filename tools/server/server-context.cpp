@@ -5372,6 +5372,7 @@ private:
             adaptive_remote_attn_prefill = params.remote_attn_prefill;
             adaptive_remote_attn_cache_type_k = params.remote_attn_cache_type_k;
             adaptive_remote_attn_cache_type_v = params.remote_attn_cache_type_v;
+            adaptive_p_min_base = params.speculative.draft.p_min;
         }
         if (!common_speculative_resolve_dflash_draft_n_max(
                     params_base.speculative,
@@ -5380,7 +5381,6 @@ private:
             return false;
         }
 
-        adaptive_p_min_base = params.speculative.draft.p_min;
         if (adaptive) {
             adaptive_draft_n_medium = params.speculative.draft.n_max;
             adaptive_draft_n_short  = params.spec_draft_n_max_short;
@@ -7313,10 +7313,23 @@ private:
         const bool task_uses_adaptive_spec = task_uses_dflash || task_uses_draft_mtp;
         if (slot.can_speculate() && task_uses_adaptive_spec) {
             if (common_speculative_adaptive_dm_supported(slot.spec)) {
-                slot.adaptive_dm.configure(task.params.speculative);
-                const int base_n_max = common_speculative_n_max(&task.params.speculative);
+                common_params_speculative effective_spec = params_base.speculative;
+                effective_spec.dm_controller = task.params.speculative.dm_controller;
+                effective_spec.dm_profit_min = task.params.speculative.dm_profit_min;
+                effective_spec.dm_profit_raise_margin = task.params.speculative.dm_profit_raise_margin;
+                effective_spec.dm_profit_lower_margin = task.params.speculative.dm_profit_lower_margin;
+                effective_spec.dm_profit_ewma_alpha = task.params.speculative.dm_profit_ewma_alpha;
+                effective_spec.dm_profit_min_samples = task.params.speculative.dm_profit_min_samples;
+                effective_spec.dm_profit_warmup = task.params.speculative.dm_profit_warmup;
+                effective_spec.dm_profit_baseline_interval = task.params.speculative.dm_profit_baseline_interval;
+                if (slot.p_min >= 0.0f) {
+                    effective_spec.draft.p_min = slot.p_min;
+                }
+
+                slot.adaptive_dm.configure(effective_spec);
+                const int base_n_max = common_speculative_n_max(&effective_spec);
                 slot.adaptive_dm.reset_profit_if_config_changed(
-                        task.params.speculative, base_n_max, slot.prompt.n_tokens(), &task.params.sampling);
+                        effective_spec, base_n_max, slot.prompt.n_tokens(), &task.params.sampling);
                 slot.adaptive_dm.reset_request_state();
                 if (slot.adaptive_dm.dm_adaptive) {
                     slot.adaptive_dm.apply_profit_recommendation(
@@ -7486,7 +7499,7 @@ private:
             return;
         }
 
-        const int base_n_max = common_speculative_n_max(&slot.task->params.speculative);
+        const int base_n_max = common_speculative_n_max(&params_base.speculative);
         const int previous_n_max = slot.adaptive_dm.adaptive_n_max;
         const int recommended_n_max = slot.adaptive_dm.decide_profit_n_max(base_n_max);
         slot.adaptive_dm.apply_profit_recommendation(recommended_n_max);
@@ -11437,12 +11450,26 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
-            if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive &&
-                    slot.adaptive_requested_n_max == 0 && slot.adaptive_cycle_start_us > 0) {
+            if (slot.uses_adaptive_dflash() && slot.adaptive_dm.dm_adaptive && slot.adaptive_cycle_start_us > 0) {
                 const float cycle_ms = std::max(0.001f,
                         (float) (t_now - slot.adaptive_cycle_start_us) / 1000.0f);
-                slot.adaptive_dm.observe_profit_timing(0, 0, 0, 0.0f, cycle_ms, 0.0f, cycle_ms);
+                if (slot.adaptive_requested_n_max == 0) {
+                    slot.adaptive_dm.observe_profit_timing(0, 0, 0, 0.0f, cycle_ms, 0.0f, cycle_ms);
+                } else {
+                    // Empty draft attempt: requested positive depth, but 0 drafted and 0 accepted tokens
+                    slot.adaptive_dm.observe_profit_acceptance(0, 0);
+                    slot.adaptive_dm.observe_profit_timing(
+                            slot.adaptive_requested_n_max,
+                            0,
+                            0,
+                            slot.adaptive_draft_ms,
+                            cycle_ms,
+                            0.0f,
+                            cycle_ms);
+                }
                 apply_adaptive_profit_decision(slot);
+                slot.adaptive_cycle_start_us = 0;
+                slot.adaptive_requested_n_max = 0;
             }
 
             slot.stats.n_gen += 1;
@@ -11720,6 +11747,8 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                         0.0f,
                         cycle_ms);
                 apply_adaptive_profit_decision(slot);
+                slot.adaptive_cycle_start_us = 0;
+                slot.adaptive_requested_n_max = 0;
             }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
