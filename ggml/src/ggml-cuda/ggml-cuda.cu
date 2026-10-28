@@ -497,10 +497,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     uint64_t & epoch;
     bool & capture_active;
     bool & deferred_pending;
+    uint64_t & malloc_count;
     std::vector<ggml_cuda_buffer> deferred_frees;
 
-    explicit ggml_cuda_pool_leg(int device, uint64_t & epoch, bool & capture_active, bool & deferred_pending) :
-        device(device), epoch(epoch), capture_active(capture_active), deferred_pending(deferred_pending) {
+    explicit ggml_cuda_pool_leg(int device, uint64_t & epoch, bool & capture_active, bool & deferred_pending, uint64_t & malloc_count) :
+        device(device), epoch(epoch), capture_active(capture_active), deferred_pending(deferred_pending), malloc_count(malloc_count) {
     }
 
     bool allocation_growth(const size_t * sizes, size_t n, size_t & bytes) const override {
@@ -595,6 +596,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             }
         }
         CUDA_CHECK(err);
+        ++malloc_count;
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
@@ -806,7 +808,7 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
         return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
     }
 #endif // defined(GGML_USE_VMM)
-    return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device, pool_epoch, pool_capture_active, pool_deferred_frees));
+    return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device, pool_epoch, pool_capture_active, pool_deferred_frees, pool_malloc_count));
 }
 
 // destroying a cuBLAS handle while a graph is being captured in a different thread can result in a CUDA error
@@ -6000,21 +6002,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             // measurable difference, so this is currently perf-neutral; the
             // earlier ~6.7% dev-tree reading did not reproduce and is scheduled
             // for investigation. Decode (ne[1]==1, stable shape) keeps replay.
-#if defined(GGML_USE_HIP)
+            // Skip graph path (incl. the update_required probe) for
+            // multi-token (prefill) graphs. Decode (ne[1]==1, stable shape) keeps replay.
             if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
                 use_cuda_graph = false;
                 trace_reason = GGML_CUDA_TRACE_HIP_PREFILL;
             } else {
-#else
-            {
-#endif
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool pool_mutated = (graph->last_pool_epoch != 0) &&
+                (graph->last_pool_epoch != cuda_ctx->pool_epoch || graph->last_pool_malloc_count != cuda_ctx->pool_malloc_count);
 
             if (!graph->warmup_complete) {
                 // Avoid capturing short-lived prefill shapes. Traditional KV commonly changes
                 // n_kv every few ubatches; requiring several matching calls keeps CUDA graphs
                 // for stable decode without repeatedly recapturing them during prefill.
-                if (properties_changed) {
+                // Also require scratch pool stability: if any device_malloc or clear_pool occurred,
+                // do not consider this call stable.
+                if (properties_changed || pool_mutated) {
                     graph->warmup_stable_calls = 0;
                 } else {
                     graph->warmup_stable_calls++;
@@ -6032,13 +6036,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or the graph is not stable yet - execute directly
             } else {
                 // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
+                if (properties_changed || pool_mutated) {
+                    // Properties changed or scratch evicted - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     graph->warmup_stable_calls = 0;
                     trace_reason = GGML_CUDA_TRACE_CHANGED;
                     if (ggml_cuda_graph_debug_enabled()) {
-                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset (prop_changed=%d, pool_mutated=%d)\n",
+                                       __func__, (int) properties_changed, (int) pool_mutated);
                     }
                 } else {
                     use_cuda_graph = true;
@@ -6099,8 +6104,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // events, stream ordering, remote failure retirement and status are unchanged.
     // With use_cuda_graph=false it never dereferences the null graph_key.
     uint64_t execution_mode = 0;
+    const uint64_t pool_malloc_count_before = cuda_ctx->pool_malloc_count;
+    const uint64_t pool_epoch_before = cuda_ctx->pool_epoch;
     const bool ok = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
                                                        graph_key, host_timing.enabled ? &execution_mode : nullptr);
+    if (graph) {
+        if (cuda_ctx->pool_malloc_count != pool_malloc_count_before || cuda_ctx->pool_epoch != pool_epoch_before) {
+            // Scratch was allocated or pool was cleared during this call; reset warmup to ensure pool stability before capture
+            graph->warmup_complete = false;
+            graph->warmup_stable_calls = 0;
+        }
+        graph->last_pool_epoch = cuda_ctx->pool_epoch;
+        graph->last_pool_malloc_count = cuda_ctx->pool_malloc_count;
+    }
     ggml_cuda_release_deferred_pool_frees(cuda_ctx);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     local_span.finish(ok, execution_mode);

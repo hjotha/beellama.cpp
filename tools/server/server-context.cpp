@@ -1524,6 +1524,7 @@ struct server_slot {
     int64_t adaptive_cycle_start_us = 0;
     float adaptive_draft_ms = 0.0f;
     int32_t adaptive_requested_n_max = 0;
+    float p_min = -1.0f;
 
     // Opt-in complete generation-cycle wall time. Retained across checkpoint
     // replay passes; emitted counts follow n_gen (including a stop/EOS token).
@@ -1716,8 +1717,15 @@ struct server_slot {
                 COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != task->params.speculative.types.end();
     }
 
+    bool uses_draft_mtp() const {
+        return task && std::find(
+                task->params.speculative.types.begin(),
+                task->params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != task->params.speculative.types.end();
+    }
+
     bool uses_adaptive_dflash() const {
-        return uses_dflash() && common_speculative_adaptive_dm_supported(spec);
+        return (uses_dflash() || uses_draft_mtp()) && common_speculative_adaptive_dm_supported(spec);
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -3658,6 +3666,13 @@ private:
     int32_t adaptive_cache_kvarn_bits_k_xxxlong = 4;
     int32_t adaptive_cache_kvarn_bits_v_xxxlong = 4;
 
+    float adaptive_p_min_short   = -1.0f;
+    float adaptive_p_min_medium  = -1.0f;
+    float adaptive_p_min_long    = -1.0f;
+    float adaptive_p_min_xlong   = -1.0f;
+    float adaptive_p_min_xxlong  = -1.0f;
+    float adaptive_p_min_xxxlong = -1.0f;
+
     // Per-tier KV cache for the resident MTP draft context. Each tier inherits
     // the global --spec-draft-type-k/-v unless overridden by
     // --spec-draft-type-k/-v-{s,m,l,xl,xxl,xxxl}.
@@ -3777,6 +3792,18 @@ private:
         }
     }
 
+    float adaptive_p_min_for_profile(common_context_profile profile) const {
+        switch (profile) {
+            case COMMON_CONTEXT_PROFILE_MTP_SHORT: return adaptive_p_min_short >= 0.0f ? adaptive_p_min_short : params_base.speculative.draft.p_min;
+            case COMMON_CONTEXT_PROFILE_MTP:       return adaptive_p_min_medium >= 0.0f ? adaptive_p_min_medium : params_base.speculative.draft.p_min;
+            case COMMON_CONTEXT_PROFILE_LONG:      return adaptive_p_min_long >= 0.0f ? adaptive_p_min_long : params_base.speculative.draft.p_min;
+            case COMMON_CONTEXT_PROFILE_XLONG:     return adaptive_p_min_xlong >= 0.0f ? adaptive_p_min_xlong : params_base.speculative.draft.p_min;
+            case COMMON_CONTEXT_PROFILE_XXLONG:    return adaptive_p_min_xxlong >= 0.0f ? adaptive_p_min_xxlong : params_base.speculative.draft.p_min;
+            case COMMON_CONTEXT_PROFILE_XXXLONG:   return adaptive_p_min_xxxlong >= 0.0f ? adaptive_p_min_xxxlong : params_base.speculative.draft.p_min;
+            default:                               return params_base.speculative.draft.p_min;
+        }
+    }
+
     void apply_profile_params(common_context_profile profile) {
         const int32_t draft_n = adaptive_draft_n_for_profile(profile);
         const int32_t draft_n_max = std::max({
@@ -3785,6 +3812,7 @@ private:
             adaptive_draft_n_xxxlong
         });
         params_base.speculative.draft.n_max = draft_n;
+        params_base.speculative.draft.p_min = adaptive_p_min_for_profile(profile);
         params_base.speculative.n_rs_seq_target = draft_n_max > 0 ? uint32_t(draft_n_max) : 0u;
         params_base.speculative.types = draft_n > 0
             ? std::vector<enum common_speculative_type>{ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }
@@ -5353,6 +5381,12 @@ private:
             adaptive_draft_n_medium = params.speculative.draft.n_max;
             adaptive_draft_n_short  = params.spec_draft_n_max_short;
             adaptive_draft_n_long   = params.spec_draft_n_max_long;
+            adaptive_p_min_short    = params.spec_draft_p_min_short;
+            adaptive_p_min_medium   = params.spec_draft_p_min_medium;
+            adaptive_p_min_long     = params.spec_draft_p_min_long;
+            adaptive_p_min_xlong    = params.spec_draft_p_min_xlong;
+            adaptive_p_min_xxlong   = params.spec_draft_p_min_xxlong;
+            adaptive_p_min_xxxlong  = params.spec_draft_p_min_xxxlong;
             adaptive_batch_short    = params.batch_size_short > 0 ? params.batch_size_short : params.n_batch;
             adaptive_ubatch_short   = params.ubatch_size_short > 0 ? params.ubatch_size_short : params.n_ubatch;
             adaptive_cache_type_k_short = params.cache_type_k_short;
@@ -7333,6 +7367,7 @@ private:
         slot.n_ctx_reservation = elastic_paged_context ? get_context_reservation(task) : 0;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.p_min = adaptive_p_min_for_profile(active_context_profile);
         common_speculative_shadow_new_request(spec.get(), slot.id, slot.task->id);
         if (dflash_shadow_trace_enabled()) {
             dflash_shadow_trace({{"event", "begin"}, {"request", slot.task->id}, {"slot", slot.id},
@@ -9705,6 +9740,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .p_min    = */ slot.p_min,
                         };
 
                         drafting.push_back(&slot);

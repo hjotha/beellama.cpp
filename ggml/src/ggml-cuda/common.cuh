@@ -1394,6 +1394,8 @@ struct ggml_cuda_graph {
     size_t                       update_count            = 0;
     uint64_t uid = 0;
     uint64_t pool_epoch = 0;
+    uint64_t last_pool_epoch = 0;
+    uint64_t last_pool_malloc_count = 0;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1879,6 +1881,7 @@ struct ggml_backend_cuda_context {
     // Captured kernels also reference pool scratch, which tensor properties do
     // not describe. Physical releases invalidate every capture in this context.
     uint64_t pool_epoch = 1;
+    uint64_t pool_malloc_count = 0;
     bool pool_capture_active = false;
     bool pool_deferred_frees = false;
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];

@@ -654,6 +654,14 @@ struct common_params {
     int32_t spec_draft_kvarn_bits_k_xxxlong = 0;
     int32_t spec_draft_kvarn_bits_v_xxxlong = 0;
     llama_kvarn_params spec_draft_kvarn_xxxlong{};
+    // Per-tier minimum speculative decoding probability (greedy)
+    // (< 0 = inherit global --spec-draft-p-min)
+    float spec_draft_p_min_short   = -1.0f;
+    float spec_draft_p_min_medium  = -1.0f;
+    float spec_draft_p_min_long    = -1.0f;
+    float spec_draft_p_min_xlong   = -1.0f;
+    float spec_draft_p_min_xxlong  = -1.0f;
+    float spec_draft_p_min_xxxlong = -1.0f;
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt

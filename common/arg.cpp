@@ -6092,6 +6092,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-p-min-s", "--spec-draft-p-min-short"}, "P",
+        string_format("speculative decoding p_min for adaptive short profile (default: %.2f)", (double)params.spec_draft_p_min_short),
+        [](common_params & params, const std::string & value) {
+            params.spec_draft_p_min_short = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_SHORT"));
+    add_opt(common_arg(
+        {"--spec-draft-p-min-m", "--spec-draft-p-min-medium"}, "P",
+        string_format("speculative decoding p_min for adaptive medium profile (default: %.2f)", (double)params.spec_draft_p_min_medium),
+        [](common_params & params, const std::string & value) {
+            params.spec_draft_p_min_medium = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_MEDIUM"));
+    add_opt(common_arg(
+        {"--spec-draft-p-min-l", "--spec-draft-p-min-long"}, "P",
+        string_format("speculative decoding p_min for adaptive long profile (default: %.2f)", (double)params.spec_draft_p_min_long),
+        [](common_params & params, const std::string & value) {
+            params.spec_draft_p_min_long = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_LONG"));
+    add_opt(common_arg(
+        {"--spec-draft-p-min-xl", "--spec-draft-p-min-xlong"}, "P",
+        string_format("speculative decoding p_min for adaptive xlong profile (default: %.2f)", (double)params.spec_draft_p_min_xlong),
+        [](common_params & params, const std::string & value) {
+            params.spec_draft_p_min_xlong = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_XLONG"));
+    add_opt(common_arg(
+        {"--spec-draft-p-min-xxl", "--spec-draft-p-min-xxlong"}, "P",
+        string_format("speculative decoding p_min for adaptive xxlong profile (default: %.2f)", (double)params.spec_draft_p_min_xxlong),
+        [](common_params & params, const std::string & value) {
+            params.spec_draft_p_min_xxlong = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_XXLONG"));
+    add_opt(common_arg(
+        {"--spec-draft-p-min-xxxl", "--spec-draft-p-min-xxxlong"}, "P",
+        string_format("speculative decoding p_min for adaptive xxxlong profile (default: %.2f)", (double)params.spec_draft_p_min_xxxlong),
+        [](common_params & params, const std::string & value) {
+            params.spec_draft_p_min_xxxlong = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_XXXLONG"));
+    add_opt(common_arg(
         {"--spec-draft-no-op-offload"},
         "disable host-weight operation offload in the draft context only (default: inherit target setting)",
         [](common_params & params) {

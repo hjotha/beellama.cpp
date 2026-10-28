@@ -1208,7 +1208,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                const float p_min_effective = (dparams.at(seq_id).p_min >= 0.0f) ? dparams.at(seq_id).p_min : params.p_min;
+                if (cur_p->data[0].p < p_min_effective) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -4052,6 +4053,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
+    bool adaptive_dm_supported() const override {
+        return true;
+    }
+
     common_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
@@ -4552,7 +4557,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                const float p_min_effective = (dparams.at(seq_id).p_min >= 0.0f) ? dparams.at(seq_id).p_min : params.p_min;
+                if (cur_p->data[0].p < p_min_effective) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
