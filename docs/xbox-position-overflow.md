@@ -214,7 +214,8 @@ prefill overflow from the model's original projections.
 Version 1.6.0.266 has device numerical coverage for revision-3 query prefixes,
 both exact-tail settings and a 58,368-row overflow capacity. Raw GPU numerical
 coverage and functional MTP checks are separate from long-context model quality
-and throughput measurements. FULL native disk snapshots remain unsupported.
+and throughput measurements. FULL native disk snapshots are available only
+behind the negotiated revision-3 capability and the host disk-snapshot opt-in.
 
 ## Storage-qualified kernel selection
 
@@ -228,9 +229,9 @@ The default remains reference. Profiling can be enabled separately.
 Native KVarN4 has an experimental host producer consuming the
 original projected F32 K/V, before the separate standard bookkeeping cache.
 It preserves genuine CPU-produced native records, rotated F16 stage and the
-original-domain F16 precision tail. It cannot resume a Q4/Q8 overflow snapshot
-and has no native full-state snapshot codec yet. Automatic full saves are
-skipped once native overflow exists; explicit full saves/restores fail closed.
+original-domain F16 precision tail. It cannot resume a Q4/Q8 overflow snapshot.
+Paired FULL snapshots require the negotiated revision-3 capability; without it,
+automatic full saves are skipped and explicit full saves/restores fail closed.
 Bounded resident rewinds require the negotiated extension described below. See [the native experiment](xbox-native-kvarn4-experimental.md)
 for the opt-in flags and memory cost. This is separate from general model
 quality qualification and from the standard Q4/Q8 snapshot path.
@@ -256,4 +257,4 @@ The TCP client regressions cover old-server serial fallback, partial capability
 masks, revision-3 batches of 1/2/3/5/9/20, chunk assembly across group seals,
 tail 0/128 and rewind failure poisoning. These are transport/state checks;
 revision-3 shader and full-model MTP qualification must be recorded separately.
-Native FULL disk snapshots are still unsupported and must fail closed.
+Unnegotiated native FULL disk snapshots still fail closed.

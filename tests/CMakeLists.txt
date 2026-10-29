@@ -1037,6 +1037,19 @@ endif()
 llama_build_and_test(test-kv-prefix-lineage.cpp)
 llama_build_and_test(test-hybrid-rpc-prefix-state.cpp)
 llama_build_and_test(test-rkva-kvarn-producer.cpp)
+llama_build_and_test(test-rkva-native-state.cpp)
+target_include_directories(test-rkva-native-state PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn)
+llama_build_and_test(test-rkva-native-snapshot.cpp)
+target_include_directories(test-rkva-native-snapshot PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn)
+llama_build_and_test(test-native-save-file.cpp)
+target_include_directories(test-native-save-file PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-server-native-slot.cpp)
+target_include_directories(test-server-native-slot PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/server
+    ${PROJECT_SOURCE_DIR}/ggml/include)
 llama_build_and_test(test-rkva-kvarn-gpu-producer.cpp)
 llama_build_and_test(test-rkva-q8-gpu-producer.cpp)
 llama_build_and_test(test-rkva-kvarn-record-storage.cpp)

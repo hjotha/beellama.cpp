@@ -79,6 +79,8 @@ struct llama_context {
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max()  const;
     uint32_t block_size() const;
+    void set_native_restore_reservation(bool (*reserve)(void *, size_t), void * user);
+    bool restore_was_native() const;
     void set_n_ctx(uint32_t n_ctx);
 
     uint32_t n_threads()       const;
@@ -202,7 +204,7 @@ struct llama_context {
 
     size_t state_seq_load_file_streaming(llama_seq_id seq_id, const char * filepath,
             llama_token * tokens_out, size_t capacity, size_t * count_out,
-            size_t state_size, uint64_t checksum);
+            size_t state_size, uint64_t checksum, bool require_native = false);
 
     size_t state_seq_convert_seq_stream(
             llama_state_q4_source & src, const llama_state_q4_info & info,
@@ -242,18 +244,23 @@ struct llama_context {
             const char * filepath,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
-                size_t * n_token_count_out);
+                size_t * n_token_count_out,
+                    bool   require_native = false);
 
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
             const char * filepath,
      const llama_token * tokens,
-                size_t   n_token_count);
+                size_t   n_token_count,
+ llama_state_seq_save_preflight_fn preflight = nullptr,
+                  void * user = nullptr);
 
     bool remote_disk_snapshot_enabled() const;
     bool remote_native_kvarn_enabled() const;
+    bool remote_native_kvarn_records_enabled() const;
     bool remote_native_kvarn_can_rewind() const;
     bool remote_native_kvarn_transient_active() const;
+    bool remote_native_kvarn_snapshot_supported() const;
     bool remote_disk_snapshot(llama_seq_id seq_id, const uint8_t key[32],
                               size_t evaluated_tokens, bool restore);
 
@@ -363,8 +370,13 @@ private:
     size_t state_write_data(llama_io_write_i & io, llama_state_seq_flags flags = 0);
     size_t state_read_data (llama_io_read_i  & io);
 
-    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
-    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                uint8_t native_sha256[32] = nullptr,
+                                bool * native_sha256_valid = nullptr);
+    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+                                uint32_t evaluated_tokens = 0, bool require_native = false);
+    bool commit_pending_native_restore(const uint8_t prefix_sha256[32]);
+    void abort_pending_native_restore();
 
     //
     // members
@@ -407,6 +419,16 @@ private:
     uint64_t nextn_decode_serial = 0;
     uint64_t nextn_decode_id = 0;
     std::vector<std::pair<llama_token, llama_pos>> nextn_decoded_batch;
+
+    // Native FULL restore transaction: the trailer is parsed into backend
+    // shadow state, but the Xbox snapshot is not touched until the caller has
+    // hashed the complete host prefix through the RKVK frame.
+    bool native_restore_pending = false;
+    bool native_restore_committed = false;
+    uint32_t native_restore_rows = 0;
+    uint64_t native_restore_saved_generation = 0;
+    bool (*native_restore_reserve)(void *, size_t) = nullptr;
+    void * native_restore_reserve_user = nullptr;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

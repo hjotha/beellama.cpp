@@ -473,6 +473,7 @@ llama_memory_i::seq_rm_capability llama_memory_hybrid::get_seq_rm_capability() c
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
+    run_on_clear();
 }
 
 bool llama_memory_hybrid::invalidate_prefix_on_write(const llama_ubatch & ubatch) {

@@ -4,6 +4,8 @@
 #include "ggml-cpp.h"
 #include "gguf.h"
 #include "server-route-state.h"
+#include "llama-remote-snapshot.h"
+#include "rkva-native-state.h"
 #include "../src/llama-io-file.h"
 
 #include <cmath>
@@ -191,12 +193,125 @@ int main(int argc, char ** argv) {
                 llama_memory_seq_pos_max(llama_get_memory(legacy_truncated.get()), 0) == -1,
                 "truncated sequence state committed or asserted instead of returning failure");
         std::cout << "PASS: legacy sequence file rejects truncated header, tokens, and state before commit\n";
+        // The server appends an optional SCKP checkpoint appendix after the
+        // llama state. A normal (non-native) FULL load must stop at the end of
+        // the state payload, leave SCKP unconsumed, and return that exact end
+        // offset so the server can read the appendix afterwards.
+        const std::string appended_path = dir + "/legacy-with-sckp.bin";
+        std::filesystem::copy_file(legacy_seq_path, appended_path);
+        {
+            std::ofstream out(appended_path, std::ios::binary | std::ios::app);
+            const uint32_t sckp[3] = {0x504b4353u, 1u, 0u};
+            require(bool(out.write(reinterpret_cast<const char *>(sckp), sizeof(sckp))),
+                    "SCKP append write failed");
+            out.flush();
+            require(out.good(), "SCKP append flush failed");
+        }
+        llama_context_ptr appended_ctx(llama_init_from_model(model.get(), params));
+        require(bool(appended_ctx), "SCKP appendix load context failed");
+        llama_tokens appended_tokens(tokens.size());
+        size_t appended_count = 0;
+        const size_t appended_read = llama_state_seq_load_file(appended_ctx.get(),
+                appended_path.c_str(), 0, appended_tokens.data(), appended_tokens.size(),
+                &appended_count);
+        require(appended_read == legacy_seq_size && appended_count == tokens.size() &&
+                appended_tokens == tokens &&
+                llama_memory_seq_pos_max(llama_get_memory(appended_ctx.get()), 0) ==
+                    (llama_pos) tokens.size() - 1,
+                "non-native FULL load rejected or mis-framed the SCKP appendix");
+        std::cout << "PASS: non-native FULL load preserves the SCKP appendix framing\n";
+
+        // An explicit native snapshot may be discovered by the ordinary
+        // automatic index. A generic reader must reject its native trailer
+        // before reserving or allocating the remote owner, even if the
+        // context happens to have a reservation callback installed.
+        rkva_native_state::SetHeader native_header;
+        native_header.layers = 16;
+        native_header.layout.origin = 102400;
+        native_header.layout.capacity = 26624;
+        native_header.layout.heads = 4;
+        native_header.layout.iterations = 3;
+        native_header.layout.precision_tail_tokens = 128;
+        native_header.layout.rows = native_header.layout.capacity;
+        native_header.layout.saved_generation = 0x900000001ull;
+        native_header.payload_bytes = rkva_native_state::payload_bytes(native_header.layout, native_header.layers);
+        native_header.layer_bytes = rkva_native_state::layer_bytes(native_header.layout);
+        uint8_t encoded_native[rkva_native_state::kHeaderBytes] = {};
+        std::string native_error;
+        require(rkva_native_state::encode_header(native_header, encoded_native, &native_error),
+                "native header fixture was invalid");
+        const std::string generic_native_path = dir + "/generic-with-native.bin";
+        std::filesystem::copy_file(legacy_seq_path, generic_native_path);
+        {
+            std::ofstream out(generic_native_path, std::ios::binary | std::ios::app);
+            require(bool(out.write(reinterpret_cast<const char *>(encoded_native), sizeof(encoded_native))),
+                    "native header fixture append failed");
+        }
+        llama_context_ptr generic_native(llama_init_from_model(model.get(), params));
+        require(bool(generic_native), "generic native guard context failed");
+        int reservation_calls = 0;
+        llama_state_seq_set_native_restore_reservation(generic_native.get(),
+                [](void * user, size_t) { ++*static_cast<int *>(user); return true; }, &reservation_calls);
+        llama_tokens generic_tokens(tokens.size());
+        size_t generic_count = 99;
+        require(llama_state_seq_load_file(generic_native.get(), generic_native_path.c_str(), 0,
+                    generic_tokens.data(), generic_tokens.size(), &generic_count) == 0 &&
+                generic_count == 0 && reservation_calls == 0 &&
+                llama_memory_seq_pos_max(llama_get_memory(generic_native.get()), 0) == -1,
+                "generic reader accepted or reserved a native trailer");
+        generic_count = 99;
+        std::ifstream generic_input(generic_native_path, std::ios::binary);
+        std::vector<char> generic_bytes(legacy_seq_size + sizeof(encoded_native));
+        require(bool(generic_input.read(generic_bytes.data(), generic_bytes.size())),
+                "native fixture checksum read failed");
+        const uint64_t generic_checksum = XXH64(generic_bytes.data(), generic_bytes.size(), 0);
+        require(llama_state_seq_load_file_streaming(generic_native.get(), generic_native_path.c_str(), 0,
+                    generic_tokens.data(), generic_tokens.size(), &generic_count,
+                    generic_bytes.size(), generic_checksum) == 0 &&
+                generic_count == 0 && reservation_calls == 0 &&
+                llama_memory_seq_pos_max(llama_get_memory(generic_native.get()), 0) == -1,
+                "generic streaming reader accepted or reserved a native trailer");
+        std::cout << "PASS: generic sequence reader rejects native trailer before reservation\n";
 
         const auto identity = server_model_identity::prepare(argv[1], {});
         const std::string path = dir + "/route.bin";
         const size_t written = server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX);
         const auto file = server_route_state_read(path, SIZE_MAX, 1024);
         require(file.file_bytes == written && file.tokens == tokens, "manifest roundtrip failed");
+
+        // Admission runs after staging the sequence body but before replacing
+        // the previous host snapshot. The accepted size must be the exact
+        // final envelope size, not a max-manifest approximation.
+        int prepare_calls = 0, commit_calls = 0;
+        uint64_t admitted_bytes = 0;
+        bool admission_rejected = false;
+        try {
+            server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX, 0, nullptr,
+                [&](uint64_t size) {
+                    ++prepare_calls;
+                    admitted_bytes = size;
+                    require(std::filesystem::file_size(path) == written, "old host file disappeared before admission");
+                    return false;
+                }, [&]() { ++commit_calls; return true; });
+        } catch (...) { admission_rejected = true; }
+        const auto unchanged_after_admission = server_route_state_read(path, SIZE_MAX, 1024);
+        require(admission_rejected && prepare_calls == 1 && commit_calls == 0 && admitted_bytes == written &&
+                unchanged_after_admission.state_checksum == file.state_checksum && unchanged_after_admission.tokens == tokens,
+                "rejected store admission did not preserve the old host snapshot");
+        prepare_calls = 0;
+        admission_rejected = false;
+        try {
+            server_route_state_save(source.get(), 0, tokens, identity, path, 1, 0, nullptr,
+                [&](uint64_t) { ++prepare_calls; return true; });
+        } catch (...) { admission_rejected = true; }
+        require(admission_rejected && prepare_calls == 0 &&
+                server_route_state_read(path, SIZE_MAX, 1024).state_checksum == file.state_checksum,
+                "byte-cap rejection did not preserve the old host snapshot");
+        prepare_calls = 0;
+        const size_t readmitted_written = server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX, 0, nullptr,
+            [&](uint64_t size) { ++prepare_calls; admitted_bytes = size; return true; });
+        require(prepare_calls == 1 && admitted_bytes == readmitted_written && readmitted_written == written,
+                "store admission did not receive the exact published size once");
 
         // The managed-MTP auto-cache path persists the evaluated prefix at
         // N-1, not a full N state that would later need an unpersisted
