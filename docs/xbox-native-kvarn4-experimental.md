@@ -1,10 +1,11 @@
 # Experimental native KVarN4 Xbox overflow
 
 This opt-in path keeps CUDA attention for positions `[0,P)` and consumes genuine
-native KVarN4 records on the Xbox for `[P,C)`. It supports negotiated bounded resident rollback, but does not yet
-have a native FULL checkpoint codec. Existing Q4/Q8 overflow snapshots cannot initialize
-it. Start a fresh server, restore a pure local prefix ending at or before P, and
-prefill the overflow from original projected values.
+native KVarN4 records on the Xbox for `[P,C)`. It supports negotiated bounded resident rollback
+and, when both peers advertise `RKVA_CAP_NATIVE_KVARN_SNAPSHOT`, paired FULL
+snapshots through revision-3 host trailers and the Xbox `rkva-snapshots-v2`
+store. Unnegotiated peers and native Q4/Q8 rows keep the old guards. Existing
+Q4/Q8 overflow snapshots cannot initialize native state.
 
 The explicit environment controls are:
 
@@ -33,9 +34,10 @@ to match the canonical store. With C=131072 and four KV heads this adds about
 existing bookkeeping companion. Only actual overflow groups cross the network.
 
 Each layer must begin with an original-data append exactly at P. Bootstrap from
-occupied standard-cache overflow fails closed. FULL state serialization is rejected
-once native overflow exists; automatic disk save skips that transient owner.
-Native disk snapshots and fused standard-cache upload/attention remain disabled.
+occupied standard-cache overflow fails closed. Without the negotiated snapshot
+capability, FULL state serialization is rejected and automatic disk save skips
+that transient owner. Native Q4/Q8 row layouts and fused standard-cache
+upload/attention remain disabled.
 Without the negotiated rewind extension, real rewinds and live PARTIAL restores
 are refused; trimming an unoccupied suffix remains a no-op.
 
@@ -57,9 +59,11 @@ before the first speculative write, including when overflow is still empty.
 
 A PARTIAL restore additionally requires the same hybrid owner, dirty-prefix
 lineage and retained native coverage. These checks precede metadata/recurrent
-mutation; an uncertain transport ACK poisons the remote owner. This resident
-contract cannot import a FULL native snapshot or initialize native KV from Q4/Q8
-bookkeeping. Standard Q4/Q8/F16 overflow uses its existing rewind contract.
+mutation; an uncertain transport ACK poisons the remote owner. Resident rewinds
+are separate from FULL disk snapshots. A FULL revision-3 snapshot is restored in
+a fresh process/session from the paired host trailer and Xbox manifest; Q4/Q8
+bookkeeping cannot initialize native KV. Standard Q4/Q8/F16 overflow uses its
+existing rewind contract.
 
 Descriptor revision 3 additionally negotiates HELLO bit 17 and capability bit 7.
 Each query reads its own serial-equivalent stage, sealed-record boundary and exact

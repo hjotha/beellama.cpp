@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -146,10 +147,14 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     if (tokens.empty() || tokens.size() != size_t(position) + 1 || tokens.size() > llama_n_ctx_seq(ctx)) {
         throw std::runtime_error("router state tokens do not cover evaluated target");
     }
-    if (llama_remote_native_kvarn_transient_active(ctx)) {
-        throw std::runtime_error("native KVarN4 overflow FULL snapshots are not implemented; refusing Q4 bookkeeping state");
+    if (llama_remote_native_kvarn_transient_active(ctx) &&
+            !llama_remote_native_kvarn_snapshot_supported(ctx)) {
+        throw std::runtime_error("native KVarN4 overflow FULL snapshots require the negotiated revision-3 disk snapshot capability; refusing Q4 bookkeeping state");
     }
     const size_t native_data = llama_state_seq_get_size(ctx, seq);
+    const bool native_size_unavailable = native_data == 0 &&
+            llama_remote_native_kvarn_transient_active(ctx) &&
+            llama_remote_native_kvarn_snapshot_supported(ctx);
     uint64_t logits_bytes = 0;
     uint32_t logits_vocab = 0;
     uint64_t logits_checksum = 0;
@@ -172,36 +177,89 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         result = a + b;
         return true;
     };
-    uint64_t worst_case = native_data;
+    uint64_t worst_case = native_size_unavailable ? 0 : native_data;
     const uint64_t token_bytes = tokens.size() > UINT64_MAX / sizeof(llama_token)
         ? UINT64_MAX : uint64_t(tokens.size()) * sizeof(llama_token);
-    if (!native_data || token_bytes == UINT64_MAX ||
-            !checked_add(worst_case, logits_bytes, worst_case) ||
-            !checked_add(worst_case, sizeof(uint32_t), worst_case) ||
-            !checked_add(worst_case, token_bytes, worst_case) ||
-            !checked_add(worst_case, max_manifest, worst_case) ||
-            !checked_add(worst_case, footer_size, worst_case) ||
-            worst_case > max_bytes) {
+    if (!native_size_unavailable) {
+        if (!native_data || token_bytes == UINT64_MAX ||
+                !checked_add(worst_case, logits_bytes, worst_case) ||
+                !checked_add(worst_case, sizeof(uint32_t), worst_case) ||
+                !checked_add(worst_case, token_bytes, worst_case) ||
+                !checked_add(worst_case, max_manifest, worst_case) ||
+                !checked_add(worst_case, footer_size, worst_case) ||
+                worst_case > max_bytes) {
+            throw std::runtime_error("router state exceeds disk size budget");
+        }
+    } else if (token_bytes == UINT64_MAX) {
+        // The native trailer size is known only after serialization. The
+        // temporary file is bounded by the final total > max_bytes check below.
         throw std::runtime_error("router state exceeds disk size budget");
     }
     temporary_file temporary(path);
-    const size_t written = llama_state_seq_save_file(ctx, temporary.path.c_str(), seq, tokens.data(), tokens.size());
-    if (!written) { throw std::runtime_error("router native state save failed"); }
-    const bool remote_disk = llama_remote_disk_snapshot_enabled(ctx);
+    // The native sequence writer can now expose its closed staged body before
+    // issuing the Xbox SAVE RPC. Build the exact manifest and perform store
+    // admission at that boundary, while the store lock is held. A rejection
+    // leaves both the previous host file and the remote store untouched.
+    bool legacy_remote_disk = false;
     rkva_snapshot::Sha256 remote_hash;
-    XXH64_state_t hash;
-    XXH64_reset(&hash, 0);
-    {
-        std::ifstream input(temporary.path, std::ios::binary);
+    std::string metadata;
+    uint64_t admitted_total = 0;
+    struct preflight_callback {
+        std::function<void(const char *, size_t)> run;
+        std::exception_ptr failure;
+        bool invoked = false;
+    } callback;
+    callback.run = [&](const char * staged_path, size_t staged_bytes) {
+        identity.verify_sources();
+        const bool native_remote = llama_remote_native_kvarn_transient_active(ctx);
+        legacy_remote_disk = llama_remote_disk_snapshot_enabled(ctx) && !native_remote;
+        XXH64_state_t hash;
+        XXH64_reset(&hash, 0);
+        std::ifstream input(staged_path, std::ios::binary);
+        if (!input) { throw std::runtime_error("router staged state open failed"); }
         std::vector<char> buffer(buffer_size);
-        for (size_t left = written; left;) {
+        for (size_t left = staged_bytes; left;) {
             const size_t count = std::min(left, buffer.size());
             read_exact(input, buffer.data(), count);
             XXH64_update(&hash, buffer.data(), count);
-            if (remote_disk) remote_hash.update(buffer.data(), count);
+            if (legacy_remote_disk) remote_hash.update(buffer.data(), count);
             left -= count;
         }
-    }
+        metadata = json{
+            {"version", 1}, {"model", identity.fingerprint()}, {"layout", common_prompt_cache_layout(ctx)},
+            {"source_ctx", llama_n_ctx_seq(ctx)}, {"position", position}, {"n_tokens", tokens.size()},
+            {"state_bytes", staged_bytes}, {"state_checksum", XXH64_digest(&hash)},
+            {"logits_offset", logits_bytes ? staged_bytes : 0}, {"logits_bytes", logits_bytes},
+            {"logits_checksum", logits_checksum}, {"logits_vocab", logits_vocab},
+            {"logits_tokens", logits_bytes ? tokens.size() : 0},
+            {"index_block", index_block ? index_block : canonical_index_block}
+        }.dump();
+        if (metadata.size() > max_manifest) { throw std::runtime_error("router manifest exceeds budget"); }
+        admitted_total = staged_bytes;
+        if (!checked_add(admitted_total, logits_bytes, admitted_total) ||
+                !checked_add(admitted_total, metadata.size(), admitted_total) ||
+                !checked_add(admitted_total, footer_size, admitted_total) ||
+                admitted_total > max_bytes || admitted_total > SIZE_MAX) {
+            throw std::runtime_error("router state exceeds disk size budget");
+        }
+        if (before_publish && !before_publish(admitted_total)) {
+            throw std::runtime_error("router snapshot store budget rejected publication");
+        }
+    };
+    const size_t written = llama_state_seq_save_file_preflight(ctx, temporary.path.c_str(), seq, tokens.data(), tokens.size(),
+        [](void * opaque, const char * staged_path, size_t staged_bytes) {
+            auto & callback = *static_cast<preflight_callback *>(opaque);
+            callback.invoked = true;
+            try {
+                callback.run(staged_path, staged_bytes);
+                return true;
+            } catch (...) {
+                callback.failure = std::current_exception();
+                return false;
+            }
+        }, &callback);
+    if (callback.failure) { std::rethrow_exception(callback.failure); }
+    if (!written || !callback.invoked) { throw std::runtime_error("router native state save failed"); }
     if (logits_bytes) {
         std::ofstream output(temporary.path, std::ios::binary | std::ios::app);
         if (!output) {
@@ -213,16 +271,6 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
             throw std::runtime_error("router snapshot logits write failed");
         }
     }
-    const std::string metadata = json{
-        {"version", 1}, {"model", identity.fingerprint()}, {"layout", common_prompt_cache_layout(ctx)},
-        {"source_ctx", llama_n_ctx_seq(ctx)}, {"position", position}, {"n_tokens", tokens.size()},
-        {"state_bytes", written}, {"state_checksum", XXH64_digest(&hash)},
-        {"logits_offset", logits_bytes ? written : 0}, {"logits_bytes", logits_bytes},
-        {"logits_checksum", logits_checksum}, {"logits_vocab", logits_vocab},
-        {"logits_tokens", logits_bytes ? tokens.size() : 0},
-        {"index_block", index_block ? index_block : canonical_index_block}
-    }.dump();
-    if (metadata.size() > max_manifest) { throw std::runtime_error("router manifest exceeds budget"); }
     std::array<char, footer_size> footer;
     put_u64(footer.data(), metadata.size());
     put_u64(footer.data() + 8, XXH64(metadata.data(), metadata.size(), 0));
@@ -243,11 +291,8 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         throw std::runtime_error("injected router state publication failure");
     }
     const size_t total = written + (size_t) logits_bytes + metadata.size() + footer.size();
-    if (std::filesystem::file_size(temporary.path) != total || total > max_bytes) {
+    if (std::filesystem::file_size(temporary.path) != total || total != admitted_total || total > max_bytes) {
         throw std::runtime_error("router state file size mismatch");
-    }
-    if (before_publish && !before_publish(total)) {
-        throw std::runtime_error("router snapshot store budget rejected publication");
     }
     // Keep the previous state and both historical auxiliaries out of the way
     // only while the global store lock is held. If retention commit fails, the
@@ -322,10 +367,12 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         }
         throw;
     }
-    if (remote_disk) {
+    if (legacy_remote_disk) {
         const auto key = remote_hash.finish();
-        // Host publication/retention is authoritative. Xbox save is optional;
-        // failure leaves the validated GAMES file and upload fallback usable.
+        // Standard Q4 bookkeeping is an optional accelerator: failure leaves
+        // the validated host file and full-upload fallback usable. Native
+        // revision-3 snapshots are paired before publication by
+        // llama_state_seq_save_file and have no such fallback.
         (void) llama_state_seq_remote_disk_snapshot_save(ctx, seq, key.data(), tokens.size());
     }
     return total;

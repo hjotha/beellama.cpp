@@ -31,7 +31,7 @@
 #include <unistd.h>
 
 struct loopback {
-    enum class profile_failure { none, cycle, version, oversized, truncated, server_error, short_header };
+    enum class profile_failure { none, cycle, version, oversized, truncated, server_error, short_header, snapshot_miss };
     int listener = -1;
     std::atomic<int> client {-1};
     uint16_t port = 0;
@@ -50,6 +50,7 @@ struct loopback {
     struct history { std::vector<float> keys, values; uint32_t rows = 0; };
     std::map<uint32_t, history> other_layers;
     bool fail_trim = false;
+    std::atomic<bool> fail_reset{false};
     std::atomic<bool> fail_attention{false}; // fail the next native/range attention reply (valid server error, framed)
     std::atomic<bool> drop_attention{false}; // close the stream instead of replying to the next attention call
     std::atomic<profile_failure> fail_bulk_reply{profile_failure::none};
@@ -58,6 +59,10 @@ struct loopback {
     std::vector<bool> native_ready;
     rkva_kvarn_range_config native_descriptor {};
     uint64_t native_generation = 17;
+    bool native_snapshot_saved = false;
+    rkva_snapshot::Digest native_snapshot_hash{};
+    uint64_t native_snapshot_generation = 0;
+    uint32_t native_snapshot_rows = 0;
     std::vector<rkva_range_profile> profile_controls;
     bool profile_enabled = false;
     uint32_t kernel_mode = 0;
@@ -232,6 +237,8 @@ struct loopback {
                             ack.chosen_wire = RKVA_WIRE_F16;
                             ack.reserved[0] = (native_q4 ? RKVA_CAP_RANGE_Q4_0 : 0) | (native_q8 ? RKVA_CAP_RANGE_Q8_0 : 0) |
                                               (fused_range ? RKVA_CAP_RANGE_UPLOAD_ATTN : 0);
+                            if (native_q4) ack.reserved[0] |= RKVA_CAP_NATIVE_Q4_BULK;
+                            if (native_q8) ack.reserved[0] |= RKVA_CAP_NATIVE_Q8_BULK;
                             if (native_kvarn) ack.reserved[0] |= RKVA_CAP_RANGE_KVARN4;
                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_REWIND_V2) && (native_rewind_support & 1)) ack.reserved[0] |= RKVA_CAP_KVARN_REWIND;
                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 4)) ack.reserved[0] |= RKVA_CAP_KVARN_SERIAL_PREFIX;
@@ -257,6 +264,12 @@ struct loopback {
                             if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) && (native_rewind_support & 64)) {
                                 ack.reserved[0] |= RKVA_CAP_KVARN_BULK_SPLITZIP;
                             }
+                            if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4) &&
+                                (native_rewind_support & 512)) {
+                                ack.reserved[0] |= RKVA_CAP_NATIVE_KVARN_SNAPSHOT;
+                                ack.supported_ops |= (1u << RKVA_SNAPSHOT_SAVE) |
+                                                     (1u << RKVA_SNAPSHOT_RESTORE);
+                            }
                             if (profile_support & 1) ack.reserved[0] |= RKVA_CAP_RANGE_PROFILE;
                             response.resize(sizeof(ack)); std::memcpy(response.data(), &ack, sizeof(ack));
                         } break;
@@ -274,9 +287,10 @@ struct loopback {
                             native_counts.assign(geometry.n_layer_remote, 0);
                             native_ready.assign(geometry.n_layer_remote, false);
                             ++native_generation;
-                            assert(native_descriptor.layout_version == 1 || (geometry.proto_flags & RKVA_PROTO_NATIVE_REWIND_V2));
+                            assert(native_descriptor.layout_version == 1 || native_descriptor.layout_version >= 4 ||
+                                   (geometry.proto_flags & RKVA_PROTO_NATIVE_REWIND_V2));
                             assert(native_descriptor.layout_version != 3 || (geometry.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3));
-                            if (native_descriptor.layout_version >= 2) {
+                            if (native_descriptor.layout_version == 2 || native_descriptor.layout_version == 3) {
                                 response.resize(sizeof(native_generation));
                                 std::memcpy(response.data(), &native_generation, sizeof(native_generation));
                             }
@@ -313,6 +327,57 @@ struct loopback {
                                 }
                             }
                         } break;
+                        case RKVA_SNAPSHOT_SAVE:
+                        case RKVA_SNAPSHOT_RESTORE: {
+                            assert(payload.size() == sizeof(rkva_snapshot_req) +
+                                                           sizeof(rkva_native_snapshot_req));
+                            rkva_snapshot_req snapshot {};
+                            rkva_native_snapshot_req native {};
+                            std::memcpy(&snapshot, payload.data(), sizeof(snapshot));
+                            std::memcpy(&native, payload.data() + sizeof(snapshot), sizeof(native));
+                            assert(snapshot.revision == RKVA_SNAPSHOT_REVISION_NATIVE);
+                            assert(snapshot.flags == 0 && snapshot.reserved == 0);
+                            assert(native.format_version == RKVA_NATIVE_SNAPSHOT_FORMAT);
+                            assert(native.flags == 0);
+                            assert(native.expected_generation == native_generation);
+                            rkva_snapshot_ack ack {};
+                            rkva_native_snapshot_ack native_ack {};
+                            if (req.op == RKVA_SNAPSHOT_SAVE) {
+                                assert(native.saved_generation == native_generation);
+                                assert(snapshot.live_rows);
+                                for (size_t il = 0; il < native_counts.size(); ++il)
+                                    assert(native_counts[il] == snapshot.live_rows && native_ready[il]);
+                                native_snapshot_saved = true;
+                                std::memcpy(native_snapshot_hash.data(),
+                                            snapshot.host_state_sha256, 32);
+                                native_snapshot_generation = native_generation;
+                                native_snapshot_rows = snapshot.live_rows;
+                                native_ack.generation = native_generation;
+                            } else {
+                                if (!native_snapshot_saved ||
+                                    native.saved_generation != native_snapshot_generation ||
+                                    snapshot.live_rows != native_snapshot_rows ||
+                                    std::memcmp(native_snapshot_hash.data(),
+                                                snapshot.host_state_sha256, 32) != 0) {
+                                    response_failure = profile_failure::snapshot_miss;
+                                    break;
+                                }
+                                ++native_generation;
+                                std::fill(native_counts.begin(), native_counts.end(),
+                                          snapshot.live_rows);
+                                std::fill(native_ready.begin(), native_ready.end(), true);
+                                native_ack.generation = native_generation;
+                            }
+                            std::memcpy(ack.host_state_sha256, snapshot.host_state_sha256, 32);
+                            ack.live_rows = snapshot.live_rows;
+                            ack.n_layers = geometry.n_layer_remote;
+                            ack.disk_bytes = 1;
+                            native_ack.layers = geometry.n_layer_remote;
+                            response.resize(sizeof(ack) + sizeof(native_ack));
+                            std::memcpy(response.data(), &ack, sizeof(ack));
+                            std::memcpy(response.data() + sizeof(ack), &native_ack,
+                                        sizeof(native_ack));
+                        } break;
                         case RKVA_RANGE_CONFIG:
                             assert(payload.size() == sizeof(range));
                             std::memcpy(&range, payload.data(), sizeof(range));
@@ -326,6 +391,10 @@ struct loopback {
                             values.reserve(size_t(range.capacity) * geometry.n_head_kv * geometry.head_dim);
                             rows = 0; break;
                         case RKVA_RESET:
+                            if (fail_reset) {
+                                response_failure = profile_failure::server_error;
+                                break;
+                            }
                             rows = 0; other_layers.clear();
                             if (native_kvarn) {
                                 ++native_generation;
@@ -662,6 +731,11 @@ struct loopback {
                     if (response_failure == profile_failure::oversized) rsp.payload_bytes = (256u << 20) + 1;
                     if (response_failure == profile_failure::server_error) {
                         rsp.status = RKVA_ERR_STATE;
+                        rsp.payload_bytes = 0;
+                        response.clear();
+                    }
+                    if (response_failure == profile_failure::snapshot_miss) {
+                        rsp.status = RKVA_ERR_SNAPSHOT_MISS;
                         rsp.payload_bytes = 0;
                         response.clear();
                     }
@@ -1251,6 +1325,183 @@ static void test_native_rewind() {
       }
     }
     }
+}
+
+// Host-side transport/state regression for the revision-2 native snapshot
+// envelope: save, reset to an empty resident session, parse the canonical owner
+// trailer, restore, continue, and rewind. This exercises the real request/ACK
+// parser and the staged owner commit over TCP; the Xbox disk codec remains in
+// the MSVC/D3D12 build.
+static void test_native_snapshot_transport() {
+    storage_env native("kvarn4");
+    storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
+    storage_env legacy_bulk("0", "GGML_RKVA_NATIVE_BULK");
+    storage_env legacy_async("0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+    storage_env precision("128", "GGML_RKVA_NATIVE_TAIL_TOKENS");
+    storage_env snapshots("1", "GGML_RKVA_DISK_SNAPSHOTS");
+    ggml_backend_load_all();
+    loopback server(false, true, false, false, false, false, 0, 0, true, 3u | 4u | 512u);
+    auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+    ggml_remote_attn_geometry geometry {};
+    geometry.n_layer_remote = 2; geometry.n_head = 2; geometry.n_head_kv = 1;
+    geometry.head_dim = 256; geometry.max_ctx = 512; geometry.kq_scale = 0.0625f;
+    geometry.group_tokens = 128; geometry.sinkhorn_iters = 3;
+    assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+    assert(ggml_backend_remote_attn_connect(backend));
+    assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+    ggml_backend_remote_attn_set_active_session(backend, 0);
+    assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
+    assert(ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend));
+    ggml_remote_attn_set_active(backend);
+
+    auto * ctx = ggml_init({1u << 20, nullptr, true});
+    auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 2, 2);
+    auto * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 512);
+    auto * v = ggml_dup_tensor(ctx, k);
+    auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+    auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+    auto * original_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 2);
+    auto * original_v = ggml_dup_tensor(ctx, original_k);
+    auto * node = ggml_remote_attn_range(ctx, q, k, v, ids, pos, 0, 1024, 2, geometry.kq_scale);
+    ggml_remote_attn_range_set_native_sources(node, original_k, original_v);
+    auto * cpu = ggml_backend_cpu_init();
+    auto * buffers = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    assert(buffers); ggml_backend_buffer_clear(buffers, 0);
+    auto run = [&](uint32_t live, uint32_t layer) {
+        std::vector<int32_t> cells(512, -1);
+        for (uint32_t i = 0; i < live; ++i) cells[i] = 1024 + i;
+        const int32_t positions[2] = {int32_t(1024 + live - 2), int32_t(1024 + live - 1)};
+        ggml_backend_tensor_set(ids, cells.data(), 0, cells.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(pos, positions, 0, sizeof(positions));
+        node->op_params[GGML_REMOTE_ATTN_PARAM_N_LIVE] = int32_t(live);
+        node->op_params[GGML_REMOTE_ATTN_PARAM_LAYER_ID] = int32_t(layer);
+        assert(ggml_remote_attn_exec(node));
+    };
+    for (uint32_t live = 2; live <= 130; live += 2) { run(live, 0); run(live, 1); }
+    assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
+
+    std::vector<uint8_t> owner_state;
+    uint8_t owner_key[32] = {};
+    assert(ggml_backend_remote_attn_native_kvarn_state_write(
+        backend, [](void * user, const void * data, size_t bytes) {
+            auto * out = static_cast<std::vector<uint8_t> *>(user);
+            const auto * begin = static_cast<const uint8_t *>(data);
+            out->insert(out->end(), begin, begin + bytes);
+            return true;
+        }, &owner_state, owner_key));
+    assert(!owner_state.empty());
+    // The server appends its SCKP checkpoint block after the llama state. The
+    // native key binds the complete host prefix through the RKVK frame, so
+    // these trailing bytes must neither be consumed by the owner parser nor
+    // alter the key.
+    std::vector<uint8_t> framed_state = owner_state;
+    const uint32_t sckp[3] = {0x504b4353u, 1u, 0u};
+    framed_state.insert(framed_state.end(), reinterpret_cast<const uint8_t *>(sckp),
+                        reinterpret_cast<const uint8_t *>(sckp) + sizeof(sckp));
+    // Simulated host prefix (server header, tokens and local KV/recurrent
+    // state) precedes RKVK in the real file. A same-size flip here must change
+    // the key while leaving RKVK byte-identical.
+    std::vector<uint8_t> local_prefix(137, 0x33);
+    const auto prefix_key = [](const std::vector<uint8_t> & prefix,
+                               const std::vector<uint8_t> & frame) {
+        std::vector<uint8_t> bytes = prefix;
+        bytes.insert(bytes.end(), frame.begin(), frame.end());
+        return rkva_snapshot::digest(bytes.data(), bytes.size());
+    };
+    const auto good_key = prefix_key(local_prefix, owner_state);
+    auto mutated_local = local_prefix;
+    mutated_local[7] ^= 0x01;
+    const auto bad_local_key = prefix_key(mutated_local, owner_state);
+    assert(std::memcmp(good_key.data(), bad_local_key.data(), good_key.size()) != 0);
+    assert(ggml_backend_remote_attn_native_kvarn_remote_save(backend, good_key.data(), 130));
+
+    // Fresh resident session (empty counts/coverage), same connection.
+    assert(ggml_backend_remote_attn_reset(backend, 0));
+    assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));
+    uint32_t rows = 0;
+    uint64_t saved_generation = 0;
+    std::pair<const std::vector<uint8_t> *, size_t> source_state{&framed_state, 0};
+    uint8_t restored_key[32] = {};
+    assert(ggml_backend_remote_attn_native_kvarn_state_read(
+        backend, [](void * user, void * data, size_t bytes) {
+            auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
+            if (bytes > source->first->size() - source->second) return false;
+            std::memcpy(data, source->first->data() + source->second, bytes);
+            source->second += bytes;
+            return true;
+        }, &source_state, &rows, &saved_generation, restored_key));
+    assert(source_state.second == owner_state.size());
+    assert(std::memcmp(restored_key, owner_key, sizeof(owner_key)) == 0);
+    uint64_t new_generation = 0;
+    assert(rows == 130);
+    // A corrupted local prefix preserves the RKVK frame but changes the key;
+    // the Xbox must reject the restore and leave the fresh destination empty.
+    assert(!ggml_backend_remote_attn_native_kvarn_remote_restore(
+        backend, bad_local_key.data(), rows, saved_generation, &new_generation));
+    assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));
+    ggml_backend_remote_attn_native_kvarn_state_abort(backend);
+    // Retry the valid prefix into the same new session.
+    source_state.second = 0;
+    assert(ggml_backend_remote_attn_native_kvarn_state_read(
+        backend, [](void * user, void * data, size_t bytes) {
+            auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
+            if (bytes > source->first->size() - source->second) return false;
+            std::memcpy(data, source->first->data() + source->second, bytes);
+            source->second += bytes;
+            return true;
+        }, &source_state, &rows, &saved_generation, restored_key));
+    assert(ggml_backend_remote_attn_native_kvarn_remote_restore(
+        backend, good_key.data(), rows, saved_generation, &new_generation));
+    assert(ggml_backend_remote_attn_native_kvarn_state_commit(backend, new_generation));
+    assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
+
+    // Owner rows and epoch must remain coherent for the first continuation.
+    run(132, 0); run(132, 1);
+    assert(ggml_backend_remote_attn_native_kvarn_can_restore(backend, 1024 + 132));
+    assert(ggml_backend_remote_attn_trim(backend, 0, 1024 + 128));
+    run(130, 0); run(130, 1);
+
+    // Same-size trailer mutation must fail the owner checksum before any
+    // transport restore; the fresh destination remains empty.
+    assert(ggml_backend_remote_attn_reset(backend, 0));
+    auto mutated_trailer = owner_state;
+    mutated_trailer[mutated_trailer.size() / 2] ^= 0x01;
+    std::pair<const std::vector<uint8_t> *, size_t> bad_source{&mutated_trailer, 0};
+    uint8_t ignored_key[32] = {};
+    assert(!ggml_backend_remote_attn_native_kvarn_state_read(
+        backend, [](void * user, void * data, size_t bytes) {
+            auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
+            if (bytes > source->first->size() - source->second) return false;
+            std::memcpy(data, source->first->data() + source->second, bytes);
+            source->second += bytes;
+            return true;
+        }, &bad_source, &rows, &saved_generation, ignored_key));
+    assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));
+
+    // Unknown/invalid bytes after RKVK are not part of the owner frame. A
+    // valid owner frame followed by junk still parses and restores under the
+    // same prefix key; the server rejects the appendix separately.
+    std::vector<uint8_t> bad_scpk = owner_state;
+    const uint8_t junk[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    bad_scpk.insert(bad_scpk.end(), junk, junk + sizeof(junk));
+    std::pair<const std::vector<uint8_t> *, size_t> junk_source{&bad_scpk, 0};
+    assert(ggml_backend_remote_attn_native_kvarn_state_read(
+        backend, [](void * user, void * data, size_t bytes) {
+            auto * source = static_cast<std::pair<const std::vector<uint8_t> *, size_t> *>(user);
+            if (bytes > source->first->size() - source->second) return false;
+            std::memcpy(data, source->first->data() + source->second, bytes);
+            source->second += bytes;
+            return true;
+        }, &junk_source, &rows, &saved_generation, ignored_key));
+    assert(junk_source.second == owner_state.size());
+    assert(ggml_backend_remote_attn_native_kvarn_remote_restore(
+        backend, good_key.data(), rows, saved_generation, &new_generation));
+    assert(ggml_backend_remote_attn_native_kvarn_state_commit(backend, new_generation));
+    assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
+
+    ggml_remote_attn_set_active(nullptr);
+    ggml_backend_buffer_free(buffers); ggml_free(ctx); ggml_backend_free(cpu); ggml_backend_free(backend);
 }
 
 // Verify negotiated batching, chunk boundaries and OUT/LSE row assembly on the
@@ -2866,6 +3117,34 @@ static void test_done_epoch_invalidation_race() {
     std::printf("DONE_OK WAIT/invalidate race: 64 cases, consumed=%u invalidated=%u\n", consumed, 64 - consumed);
 }
 
+// The native bulk pipeline also carries ordinary Q4/Q8 rows (layouts 4/5).
+// Only KVarN records may select the RKVK owner-trailer restore policy.
+static void test_native_record_mode_classification() {
+    storage_env wire("fp8", "GGML_RKVA_WIRE_FORMAT");
+    storage_env bulk("auto", "GGML_RKVA_NATIVE_BULK");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
+    storage_env profile("0", "GGML_RKVA_PROFILE");
+    for (const bool q8 : {false, true}) {
+        storage_env format(q8 ? "q8_0" : "q4_0");
+        loopback server(false, true, !q8, false, q8, false, 0, 0, true, 8 | 32);
+        auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+        ggml_remote_attn_geometry geo {};
+        geo.n_layer_remote = 1; geo.n_head = 2; geo.n_head_kv = 1;
+        geo.head_dim = 256; geo.max_ctx = 512; geo.kq_scale = 0.0625f;
+        geo.group_tokens = 128; geo.sinkhorn_iters = 3;
+        assert(backend && ggml_backend_remote_attn_set_geometry(backend, &geo));
+        assert(ggml_backend_remote_attn_connect(backend));
+        assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+        ggml_backend_remote_attn_set_active_session(backend, 0);
+        assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_0));
+        assert(ggml_backend_remote_attn_native_kvarn_enabled(backend));
+        assert(!ggml_backend_remote_attn_native_kvarn_records_enabled(backend));
+        assert(!ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend));
+        assert(server.native_descriptor.layout_version == (q8 ? 5u : 4u));
+        ggml_backend_free(backend);
+    }
+}
+
 // P0-D: a failed remote transaction must retire every derived state, reject
 // the next request without retrying on the broken ordered stream, and only a
 // fresh backend/session may serve again. Runs entirely on loopback (no Xbox).
@@ -2930,6 +3209,28 @@ static void test_failure_retirement() {
             assert(ggml_remote_attn_exec(node));
         }
     };
+
+    // A successful erase drains and resets both owner and peer. On a refused
+    // RESET the backend is poisoned; has_state alone is not a health test.
+    {
+        fixture f;
+        f.run(2, 0);
+        f.run(2, 1);
+        assert(ggml_backend_remote_attn_native_kvarn_enabled(f.backend));
+        assert(ggml_backend_remote_attn_native_kvarn_records_enabled(f.backend));
+        assert(ggml_backend_remote_attn_native_kvarn_has_state(f.backend));
+        assert(ggml_backend_remote_attn_reset(f.backend, 0));
+        assert(ggml_backend_remote_attn_native_kvarn_enabled(f.backend));
+        assert(!ggml_backend_remote_attn_native_kvarn_has_state(f.backend));
+        f.run(2, 0);
+        f.run(2, 1);
+        assert(ggml_backend_remote_attn_native_kvarn_has_state(f.backend));
+        f.server.fail_reset = true;
+        assert(!ggml_backend_remote_attn_reset(f.backend, 0));
+        assert(ggml_backend_remote_attn_failed(f.backend));
+        assert(!ggml_backend_remote_attn_native_kvarn_enabled(f.backend));
+        assert(!ggml_backend_remote_attn_native_kvarn_has_state(f.backend));
+    }
 
     // Failure path: every derived state is retired, the next request is
     // rejected, and reset/trim cannot revive the broken stream or publish a
@@ -3702,9 +4003,11 @@ int main() {
     test_cuda_fp8_prefill_mode_graph();
     test_cuda_wavefront_marker_only_two_slots();
     test_native_tail_serialization();
+    test_native_record_mode_classification();
     test_native_physical_peer();
     test_old_native_client_ack_compatibility();
     test_native_rewind();
+    test_native_snapshot_transport();
     test_failure_retirement();
     test_async_failure_two_slots();
     test_native_query_prefix_chunks();
