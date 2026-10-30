@@ -13,6 +13,7 @@
 #include "llama-state-q4.h"
 #include "llama-kv-mixed-io.h"
 #include "llama-kv-mixed-state.h"
+#include "llama-native-prefix-validation.h"
 #include "llama-kv-mixed-state-stream.h"
 #include "ggml-cpp.h"
 
@@ -4166,6 +4167,7 @@ void llama_kv_cache_kvarn::clear(bool data) {
         }
     }
     migration_mirror_stale = !data;
+    run_on_clear();
 }
 
 bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
@@ -4584,6 +4586,15 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
 
 bool llama_kv_cache_kvarn::state_seq_can_restore(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (flags == LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) {
+        // This only admits the outer, authenticated native file path. A
+        // logical clear does not clear the historical native-owner latch, but
+        // it can prepare an empty destination for an independently restored
+        // owner. The context must also prove the remote owner is absent.
+        return native_kvarn_rpc_experimental_ && position_split_enabled() && seq_id == 0 &&
+               metadata->seq_pos_max(0) < 0 && !has_pending_stream_copies() &&
+               stream_is_exclusive_for(seq_id);
+    }
     if (seq_id < 0 || (native_kvarn_checkpoint_unavailable() &&
             (!native_kvarn_rewind_capable_ || !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)))) {
         return false;
@@ -5042,7 +5053,8 @@ void llama_kv_cache_kvarn::state_write_kvarn_body(
 
 void llama_kv_cache_kvarn::state_write_mixed(
         llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if (native_kvarn_rpc_experimental_ && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+    if (native_kvarn_rpc_experimental_ &&
+            !(flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL))) {
         const auto & cells = metadata->get_cells(uint32_t(0));
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.is_empty(i) && cells.pos_get(i) >= int64_t(position_split_p_)) {
@@ -5060,7 +5072,7 @@ void llama_kv_cache_kvarn::state_write_mixed(
                 " (and an overflow companion in split mode)");
     }
     constexpr uint32_t supported_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
-            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL;
     if ((uint32_t(flags) & ~supported_flags) != 0 ||
             ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
              (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
@@ -5151,6 +5163,9 @@ void llama_kv_cache_kvarn::state_write_mixed(
 
     uint32_t payload_rows = 0;
     auto cells = mixed_state_cells(metadata.get(), seq_id, payload_rows);
+    if (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) {
+        llama_validate_native_prefix(cells, io.native_expected_tokens(), metadata->get_size(), position_split_p_);
+    }
     const uint32_t payload_cells = uint32_t(cells.size());
     // F4 v2: the manifest now keys payload sizes by the packed range key
     std::unordered_map<uint64_t, uint64_t> payload_sizes;
@@ -5269,13 +5284,18 @@ void llama_kv_cache_kvarn::state_read_mixed(
                 " (and an overflow companion in split mode)");
     }
     constexpr uint32_t supported_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
-            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+            LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL;
     if ((uint32_t(flags) & ~supported_flags) != 0 ||
             ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
              (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
         throw std::invalid_argument("mixed state restore supports host full, partial-only, or self-contained snapshots only");
     }
     const bool requested_partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
+    const bool native_full = (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) != 0;
+    if (native_full && (!native_kvarn_rpc_experimental_ || !position_split_enabled() ||
+            requested_partial || (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) || seq_id != 0)) {
+        throw std::invalid_argument("native FULL memory restore requires a single native split sequence");
+    }
     if (seq_id < -1 || (requested_partial && seq_id < 0) ||
             ((flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && seq_id < 0) ||
             (seq_id >= 0 && uint32_t(seq_id) >= n_seq_max)) {
@@ -5373,6 +5393,10 @@ void llama_kv_cache_kvarn::state_read_mixed(
         throw kv_mixed_error("self-contained mixed state restore requires a destination sequence");
     }
 
+    if (native_full) {
+        llama_validate_native_prefix(parsed.cells(), io.native_expected_tokens(), metadata->get_size(), position_split_p_);
+    }
+
     mixed_manifest manifest;
     std::string manifest_error;
     if (!mixed_manifest_parse(parsed.metadata_blob(), parsed.metadata_size(), manifest, &manifest_error)) {
@@ -5395,7 +5419,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
         }
     }
     const bool original_split_frame = parsed.has_split();
-    if (native_kvarn_rpc_experimental_ && !(partial && native_kvarn_rewind_capable_)) {
+    if (native_kvarn_rpc_experimental_ && !native_full && !(partial && native_kvarn_rewind_capable_)) {
         // Validate logical extent before preparing/applying any tensor writes.
         // Only an unoccupied overflow can bootstrap the native append owner;
         // native records cannot be recovered from an older Q4/Q8 snapshot.
@@ -5845,6 +5869,9 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         if (leading == MIXED_KV_STATE_ENVELOPE_MAGIC) {
             state_read_mixed(io, seq_id, flags, sinfos_out, sinfos_in, leading);
             return;
+        }
+        if (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) {
+            throw std::runtime_error("native FULL restore requires a split mixed state envelope");
         }
         if (position_split_enabled() && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
             throw std::runtime_error("positional mixed PARTIAL restore requires its owner-bound attention envelope; legacy RS-only snapshots are unsupported");

@@ -1,6 +1,9 @@
 #pragma once
 
+#include "rkva-native-state.h"
+
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // Host-side owner of the authoritative native KV history for one remote layer.
@@ -27,4 +30,17 @@ public:
     virtual bool can_rewind(uint32_t keep) const = 0;
     virtual bool rewind_tail(uint32_t keep, std::vector<uint8_t> & output) const = 0;
     virtual bool rewind(uint32_t keep) = 0;
+
+    // Native KVarN4 FULL persistence. Other native row layouts keep the
+    // existing refusal: their standard Q4/Q8 snapshot path is separate.
+    virtual bool state_export(uint64_t generation, rkva_native_state::View & view) const {
+        (void) generation;
+        (void) view;
+        return false;
+    }
+    virtual bool state_import(rkva_native_state::Storage & state, std::string * error) {
+        (void) state;
+        (void) error;
+        return false;
+    }
 };

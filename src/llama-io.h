@@ -24,7 +24,13 @@ public:
     // bytes written so far
     virtual size_t n_bytes() = 0;
 
+    uint32_t native_expected_tokens() const { return native_expected_tokens_; }
+    void set_native_expected_tokens(uint32_t count) { native_expected_tokens_ = count; }
+
     void write_string(const std::string & str);
+
+private:
+    uint32_t native_expected_tokens_ = 0;
 };
 
 class llama_io_read_i {
@@ -33,6 +39,14 @@ public:
     virtual ~llama_io_read_i() = default;
 
     virtual void read(void * dst, size_t size) = 0;
+    // Optional non-consuming lookahead. Readers that cannot inspect without
+    // advancing return false; native FULL restore then fails closed when a
+    // trailer might be present.
+    virtual bool peek(void * dst, size_t size) {
+        (void) dst;
+        (void) size;
+        return false;
+    }
     virtual void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
 
     // State restore is a transaction. Tensor writes and publication callbacks
@@ -47,8 +61,21 @@ public:
 
     // bytes read so far
     virtual size_t n_bytes() = 0;
+    // Optional frame extent. Readers that know their logical end expose the
+    // remaining bytes; opaque readers return 0 and cannot host an optional
+    // native trailer.
+    virtual size_t remaining() const { return 0; }
+
+    // File readers set this only while staging a native FULL memory body.
+    // The mixed cache uses it to bind every occupied position to the exact
+    // evaluated-token prefix, before the outer RKVK trailer is validated.
+    virtual uint32_t native_expected_tokens() const { return native_expected_tokens_; }
+    virtual void set_native_expected_tokens(uint32_t count) { native_expected_tokens_ = count; }
 
     void read_string(std::string & str);
+
+private:
+    uint32_t native_expected_tokens_ = 0;
 };
 
 // F4 §3.6: replays a short prefix that was already consumed from `inner` and
@@ -104,6 +131,18 @@ public:
     }
     size_t n_bytes() override {
         return m_inner.n_bytes();
+    }
+    size_t remaining() const override {
+        return m_inner.remaining();
+    }
+    uint32_t native_expected_tokens() const override { return m_inner.native_expected_tokens(); }
+    void set_native_expected_tokens(uint32_t count) override { m_inner.set_native_expected_tokens(count); }
+    bool peek(void * dst, size_t size) override {
+        if (m_offset + size > m_prefix.size()) {
+            return false;
+        }
+        std::memcpy(dst, m_prefix.data() + m_offset, size);
+        return true;
     }
 
 private:

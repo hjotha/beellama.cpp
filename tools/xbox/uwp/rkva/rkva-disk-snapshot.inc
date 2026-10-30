@@ -1,6 +1,7 @@
 // Copyright (c) 2024 Gianluca Mazza
 // SPDX-License-Identifier: MIT
 // Included in remote-attn-engine.cpp after Session is complete. No hot-path I/O.
+#include "rkva-native-snapshot.h"
 #include "rkva-snapshot-digest.h"
 #include <filesystem>
 #include <fstream>
@@ -37,6 +38,9 @@ inline bool opaque_name(const std::string& name) {
 inline fs::path chunk_path(const fs::path& dir, size_t index) {
     return dir / (std::to_string(index) + ".kv");
 }
+inline fs::path native_chunk_path(const fs::path& dir, size_t index) {
+    return dir / ("n-" + std::to_string(index) + ".kv");
+}
 inline void read_exact(std::ifstream& file, void* dst, size_t bytes) {
     if (!file.read(static_cast<char*>(dst), std::streamsize(bytes)))
         throw std::runtime_error("snapshot: truncated/unreadable file");
@@ -51,6 +55,16 @@ inline void write_exact(const fs::path& path, const void* data, size_t bytes) {
     file.close();
     if (!file)
         throw std::runtime_error("snapshot: disk close failed");
+}
+inline std::vector<uint8_t> read_bounded(const fs::path& path, uint64_t limit) {
+    if (fs::is_symlink(fs::symlink_status(path)) || !fs::is_regular_file(path) ||
+        fs::file_size(path) > limit)
+        throw std::runtime_error("snapshot: invalid manifest file");
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        throw std::runtime_error("snapshot: unreadable manifest file");
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(file),
+                                std::istreambuf_iterator<char>());
 }
 inline void check_regular(const fs::path& path, uint64_t bytes) {
     if (fs::is_symlink(fs::symlink_status(path)) || !fs::is_regular_file(path) ||
@@ -130,19 +144,325 @@ inline void make_room(const fs::path& root, const fs::path& destination, uint64_
     if (total + requested > store_limit || count >= retained_snapshots)
         throw std::runtime_error("snapshot: quota exhausted");
 }
+// Native snapshots are host/Xbox pairs. Never evict a published directory in
+// this path: a failure after victim selection would leave the older host slot
+// pointing at deleted Xbox data. Only incomplete tmp-* directories are removed;
+// a full store fails explicitly.
+inline void check_native_room(const fs::path& root, const fs::path& destination,
+                              uint64_t requested) {
+    rkva_native_snapshot::StoreBudget used{};
+    size_t scanned = 0;
+    for (const auto& entry : fs::directory_iterator(root)) {
+        if (++scanned > 64)
+            throw std::runtime_error("snapshot: directory entry limit");
+        const std::string name = entry.path().filename().string();
+        if (fs::is_symlink(entry.symlink_status()))
+            continue;
+        if (name.size() == 68 && name.compare(0, 4, "tmp-") == 0 && opaque_name(name.substr(4))) {
+            fs::remove_all(entry.path());
+            continue;
+        }
+        if (!opaque_name(name) || !entry.is_directory() || entry.path() == destination)
+            continue;
+        uint64_t size = 0;
+        size_t files = 0;
+        for (const auto& file : fs::directory_iterator(entry.path())) {
+            if (++files > max_chunks + 1 || fs::is_symlink(file.symlink_status()) ||
+                !file.is_regular_file())
+                throw std::runtime_error("snapshot: invalid store entry");
+            size += file.file_size();
+            if (size > snapshot_limit + (1ull << 20))
+                throw std::runtime_error("snapshot: oversized entry");
+        }
+        if (used.bytes > UINT64_MAX - size)
+            throw std::runtime_error("snapshot: store size overflow");
+        used.bytes += size;
+        ++used.snapshots;
+    }
+    std::string error;
+    if (!rkva_native_snapshot::admit_snapshot_store(used, requested, store_limit,
+                                                    uint32_t(retained_snapshots), &error))
+        throw std::runtime_error(error);
+}
 } // namespace rkva_snapshot
 
 bool RemoteAttnEngine::disk_snapshot(uint32_t id, const std::string& local_folder,
-                                     const rkva_snapshot_req& request, bool restore,
-                                     rkva_snapshot_ack* ack, std::string* error) {
+                                     const rkva_snapshot_req& request,
+                                     const rkva_native_snapshot_req* native_request, bool restore,
+                                     rkva_snapshot_ack* ack, rkva_native_snapshot_ack* native_ack,
+                                     std::string* error) {
     namespace snap = rkva_snapshot;
     Session* s = find_session(id);
-    // The native codec stores the revision 1/2 128-row tail ring. Revision 3
-    // (256-row ring + per-layer prefix coverage) has no disk codec yet: refuse
-    // save and restore before any mutation instead of reusing the old layout.
+    if (native_request != nullptr) {
+        // Descriptor revision-3 native owner. The host trailer and this manifest
+        // are paired by the complete host state checksum and the saved
+        // generation. No legacy Q4/Q8 blob is reinterpreted here.
+        if (!ready_ || !s || !s->valid || !s->range_configured || s->range_storage != 3 ||
+            !rkva_kvarn_range::serial_prefix(s->range_descriptor) || local_folder.empty() ||
+            !ack || !native_ack)
+            return ::fail(error, "snapshot: native invalid session/request");
+        if (request.revision != RKVA_SNAPSHOT_REVISION_NATIVE || request.flags || request.reserved ||
+            !request.live_rows || request.live_rows > s->capacity ||
+            native_request->format_version != RKVA_NATIVE_SNAPSHOT_FORMAT ||
+            native_request->flags ||
+            !rkva_kvarn_generation_mutable(s->native_generation) ||
+            native_request->expected_generation != s->native_generation ||
+            (!restore && native_request->saved_generation != s->native_generation) ||
+            std::all_of(std::begin(request.host_state_sha256), std::end(request.host_state_sha256),
+                        [](uint8_t b) { return b == 0; }))
+            return ::fail(error, "snapshot: native stale/invalid generation or request");
+        const uint32_t rows = request.live_rows;
+        rkva_native_snapshot::Geometry geometry{};
+        geometry.n_head = geo_.n_head;
+        geometry.n_head_kv = geo_.n_head_kv;
+        geometry.head_dim = geo_.head_dim;
+        geometry.head_slices = geo_.head_slices;
+        geometry.max_ctx = geo_.max_ctx;
+        geometry.n_layers = geo_.n_layers;
+        rkva_native_snapshot::Descriptor descriptor{};
+        descriptor.origin = s->range_descriptor.origin;
+        descriptor.capacity = s->range_descriptor.capacity;
+        descriptor.storage = s->range_descriptor.storage;
+        descriptor.layout_version = s->range_descriptor.layout_version;
+        descriptor.token_group = s->range_descriptor.token_group;
+        descriptor.record_dim = s->range_descriptor.record_dim;
+        descriptor.head_dim = s->range_descriptor.head_dim;
+        descriptor.head_slices = s->range_descriptor.head_slices;
+        descriptor.key_bits = s->range_descriptor.key_bits;
+        descriptor.value_bits = s->range_descriptor.value_bits;
+        descriptor.record_bytes = s->range_descriptor.record_bytes;
+        descriptor.stage_groups = s->range_descriptor.stage_groups;
+        descriptor.tail_groups = s->range_descriptor.tail_groups;
+        descriptor.sink_tokens = s->range_descriptor.sink_tokens;
+        descriptor.precision_tail_tokens = s->range_descriptor.precision_tail_tokens;
+        descriptor.wht_version = s->range_descriptor.wht_version;
+        descriptor.domain = s->range_descriptor.domain;
+        descriptor.record_policy = s->range_descriptor.record_policy;
+        // Save validates the resident checkpoint. Restore must not: a fresh
+        // empty session has no counts/ready state; the manifest is the
+        // authority and is validated before any mutation below.
+        std::vector<rkva_native_snapshot::LayerCoverage> layers;
+        rkva_native_snapshot::Manifest manifest;
+        std::vector<uint8_t> encoded;
+        uint64_t ack_payload_bytes = 0;
+        if (!restore) {
+            layers.resize(s->layer_kv.size());
+            for (size_t il = 0; il < layers.size(); ++il) {
+                layers[il].tail_begin = s->prefix_coverage[il].tail_begin;
+                layers[il].stage_begin = s->prefix_coverage[il].stage_begin;
+                layers[il].record_groups = s->range_record_groups[il];
+                layers[il].ready = 1;
+            }
+            if (!rkva_native_snapshot::validate_resident_layers(
+                    descriptor, rows, s->range_counts, s->range_ready,
+                    s->range_record_groups, layers, error))
+                return ::fail(error, "snapshot: native layers are not at one checkpoint");
+            if (!rkva_native_snapshot::build(geometry, descriptor, rows, s->native_generation,
+                                             request.host_state_sha256, layers, manifest, error) ||
+                !rkva_native_snapshot::encode(manifest, encoded, error))
+                return false;
+            ack_payload_bytes = manifest.payload_bytes;
+        }
+        const auto root = snap::fs::u8path(local_folder) / "rkva-snapshots-v2";
+        const auto key = snap::hex(request.host_state_sha256);
+        const auto destination = root / key;
+        const auto temporary = root / ("tmp-" + key);
+        const auto manifest_path = destination / "manifest-v2.bin";
+        std::vector<uint8_t> ack_manifest;
+        bool mutated = false;
+        try {
+            if (snap::fs::is_symlink(snap::fs::symlink_status(root)))
+                throw std::runtime_error("snapshot: invalid native root");
+            if (snap::fs::exists(destination) &&
+                (snap::fs::is_symlink(snap::fs::symlink_status(destination)) ||
+                 !snap::fs::is_directory(destination)))
+                throw std::runtime_error("snapshot: invalid native destination");
+            if (restore) {
+                const auto stored_bytes = snap::read_bounded(manifest_path,
+                                                              rkva_native_snapshot::kMaxManifestBytes);
+                rkva_native_snapshot::Manifest stored;
+                if (!rkva_native_snapshot::decode(stored_bytes, stored, error) ||
+                    !rkva_native_snapshot::validate(stored, geometry, descriptor, rows,
+                                                    native_request->saved_generation,
+                                                    request.host_state_sha256, error))
+                    return false;
+                ack_manifest = stored_bytes;
+                ack_payload_bytes = stored.payload_bytes;
+                // Validate every extent and digest before the first mutation,
+                // then recheck each chunk on the transfer pass.
+                std::vector<uint8_t> buffer(static_cast<size_t>(snap::chunk_bytes));
+                for (size_t i = 0; i < stored.chunks.size(); ++i) {
+                    const auto& chunk = stored.chunks[i];
+                    const auto file = snap::native_chunk_path(destination, i);
+                    snap::check_regular(file, chunk.bytes);
+                    std::ifstream input(file, std::ios::binary);
+                    snap::read_exact(input, buffer.data(), chunk.bytes);
+                    if (!rkva_native_snapshot::verify_chunk(chunk, buffer.data(), chunk.bytes, error))
+                        throw std::runtime_error(error ? *error : "snapshot: native chunk checksum mismatch");
+                }
+                Buffer& upload = snapshot_upload_;
+                if (!upload.resource &&
+                    !create_buffer(snap::chunk_bytes, D3D12_HEAP_TYPE_UPLOAD,
+                                   D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                   &upload, error))
+                    return false;
+                if (!rkva_kvarn_generation_mutable(s->native_generation) ||
+                    !rkva_kvarn_generation_mutable(s->native_generation + 1))
+                    return ::fail(error, "snapshot: native generation exhausted");
+                mutated = true;
+                s->valid = false;
+                for (size_t i = 0; i < stored.chunks.size(); ++i) {
+                    const auto& chunk = stored.chunks[i];
+                    if (chunk.layer >= s->layer_kv.size() ||
+                        chunk.offset > s->layer_stride ||
+                        chunk.bytes > s->layer_stride - chunk.offset)
+                        throw std::runtime_error("snapshot: native chunk outside layer");
+                    std::ifstream input(snap::native_chunk_path(destination, i), std::ios::binary);
+                    snap::read_exact(input, buffer.data(), chunk.bytes);
+                    if (!rkva_native_snapshot::verify_chunk(chunk, buffer.data(), chunk.bytes, error))
+                        throw std::runtime_error(error ? *error : "snapshot: native file changed during restore");
+                    void* mapped = nullptr;
+                    const HRESULT hr = upload.resource->Map(0, nullptr, &mapped);
+                    if (FAILED(hr))
+                        return fail(error, "snapshot: native map upload", hr);
+                    std::memcpy(mapped, buffer.data(), chunk.bytes);
+                    upload.resource->Unmap(0, nullptr);
+                    if (!begin(error))
+                        return false;
+                    auto& target = s->layer_kv[chunk.layer];
+                    transition(target, D3D12_RESOURCE_STATE_COPY_DEST);
+                    cmd_->CopyBufferRegion(target.resource.Get(), chunk.offset,
+                                           upload.resource.Get(), 0, chunk.bytes);
+                    transition(target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    if (!submit(error))
+                        return false;
+                }
+                ++s->native_generation;
+                for (size_t il = 0; il < s->layer_kv.size(); ++il) {
+                    s->prefix_coverage[il].tail_begin = stored.layers[il].tail_begin;
+                    s->prefix_coverage[il].stage_begin = stored.layers[il].stage_begin;
+                    s->range_record_groups[il] = stored.layers[il].record_groups;
+                    s->range_counts[il] = rows;
+                    s->range_ready[il] = true;
+                }
+                s->high_water = int32_t(s->range_origin + rows - 1);
+                s->valid = true;
+                native_ack->generation = s->native_generation;
+                native_ack->layers = uint32_t(s->layer_kv.size());
+                native_ack->reserved = 0;
+            } else {
+                snap::fs::create_directories(root);
+                if (snap::fs::exists(destination)) {
+                    const auto existing = snap::read_bounded(manifest_path,
+                                                             rkva_native_snapshot::kMaxManifestBytes);
+                    rkva_native_snapshot::Manifest stored;
+                    if (!rkva_native_snapshot::decode(existing, stored, error) ||
+                        !rkva_native_snapshot::validate(stored, geometry, descriptor, rows,
+                                                        s->native_generation,
+                                                        request.host_state_sha256, error))
+                        throw std::runtime_error("snapshot: existing native layout mismatch");
+                    std::vector<uint8_t> verify(static_cast<size_t>(snap::chunk_bytes));
+                    for (size_t i = 0; i < stored.chunks.size(); ++i) {
+                        const auto file = snap::native_chunk_path(destination, i);
+                        snap::check_regular(file, stored.chunks[i].bytes);
+                        std::ifstream input(file, std::ios::binary);
+                        snap::read_exact(input, verify.data(), stored.chunks[i].bytes);
+                        if (!rkva_native_snapshot::verify_chunk(stored.chunks[i], verify.data(),
+                                                                stored.chunks[i].bytes, error))
+                            throw std::runtime_error(error ? *error :
+                                "snapshot: existing native chunk checksum mismatch");
+                    }
+                    ack_manifest = existing;
+                } else {
+                    snap::check_native_room(root, destination,
+                                        manifest.payload_bytes + encoded.size() + (1ull << 20));
+                    snap::fs::create_directory(temporary);
+                    Buffer& readback = snapshot_readback_;
+                    if (!readback.resource &&
+                        !create_buffer(snap::chunk_bytes, D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                                       &readback, error)) {
+                        snap::fs::remove_all(temporary);
+                        return false;
+                    }
+                    for (size_t i = 0; i < manifest.chunks.size(); ++i) {
+                        const auto& chunk = manifest.chunks[i];
+                        if (!begin(error)) {
+                            snap::fs::remove_all(temporary);
+                            return false;
+                        }
+                        auto& source = s->layer_kv[chunk.layer];
+                        const auto previous = source.state;
+                        transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        cmd_->CopyBufferRegion(readback.resource.Get(), 0, source.resource.Get(),
+                                               chunk.offset, chunk.bytes);
+                        transition(source, previous);
+                        if (!submit(error)) {
+                            s->valid = false;
+                            snap::fs::remove_all(temporary);
+                            return false;
+                        }
+                        void* mapped = nullptr;
+                        D3D12_RANGE range{0, chunk.bytes};
+                        const HRESULT hr = readback.resource->Map(0, &range, &mapped);
+                        if (FAILED(hr)) {
+                            snap::fs::remove_all(temporary);
+                            return fail(error, "snapshot: native map readback", hr);
+                        }
+                        manifest.chunks[i].digest = snap::digest(mapped, chunk.bytes);
+                        try {
+                            snap::write_exact(snap::native_chunk_path(temporary, i), mapped,
+                                              chunk.bytes);
+                        } catch (...) {
+                            D3D12_RANGE empty{0, 0};
+                            readback.resource->Unmap(0, &empty);
+                            throw;
+                        }
+                        D3D12_RANGE empty{0, 0};
+                        readback.resource->Unmap(0, &empty);
+                    }
+                    if (!rkva_native_snapshot::encode(manifest, encoded, error)) {
+                        snap::fs::remove_all(temporary);
+                        return false;
+                    }
+                    snap::write_exact(temporary / "manifest-v2.bin", encoded.data(),
+                                      encoded.size());
+                    snap::fs::rename(temporary, destination);
+                    ack_manifest = encoded;
+                }
+                native_ack->generation = s->native_generation;
+                native_ack->layers = uint32_t(s->layer_kv.size());
+                native_ack->reserved = 0;
+            }
+            if (ack_manifest.empty())
+                throw std::runtime_error("snapshot: native manifest was not published");
+            const auto checksum = snap::digest(ack_manifest.data(), ack_manifest.size());
+            std::memcpy(ack->host_state_sha256, request.host_state_sha256, 32);
+            ack->live_rows = rows;
+            ack->n_layers = geo_.n_layers;
+            ack->disk_bytes = ack_payload_bytes;
+            native_ack->payload_checksum =
+                uint64_t(checksum[0]) | (uint64_t(checksum[1]) << 8) |
+                (uint64_t(checksum[2]) << 16) | (uint64_t(checksum[3]) << 24) |
+                (uint64_t(checksum[4]) << 32) | (uint64_t(checksum[5]) << 40) |
+                (uint64_t(checksum[6]) << 48) | (uint64_t(checksum[7]) << 56);
+            return true;
+        } catch (const std::exception& exception) {
+            if (mutated)
+                s->valid = false;
+            if (!restore) {
+                std::error_code ignored;
+                snap::fs::remove_all(temporary, ignored);
+            }
+            if (error)
+                *error = exception.what();
+            return false;
+        }
+    }
+    // The legacy Q4/Q8/F16 format has no descriptor-3 representation.
     if (s && s->range_configured && s->range_storage == 3 &&
         rkva_kvarn_range::serial_prefix(s->range_descriptor))
-        return ::fail(error, "snapshot: native descriptor revision 3 has no disk codec");
+        return ::fail(error, "snapshot: native descriptor revision 3 has no legacy disk codec");
     if (!ready_ || !s || !s->valid || !s->range_configured || local_folder.empty() || !ack ||
         !request.live_rows || request.live_rows > s->capacity || request.revision != 1 ||
         request.flags || request.reserved || s->range_storage > 3 ||
