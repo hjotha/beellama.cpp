@@ -3,6 +3,7 @@
 #include "../src/llama-kv-cache-kvarn.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-io.h"
+#include "../src/llama-native-prefix-validation.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
@@ -262,6 +263,19 @@ static void test_exact_tail_snapshot_layouts() {
 
 static void test_native_resident_prefix_state() {
 #ifndef _WIN32
+    // Validate identical save/restore policy, including duplicate positions.
+    {
+        std::vector<llama_kv_mixed::cell_entry> cells(3);
+        for (int i = 0; i < 3; ++i) { cells[i].pos = i; cells[i].seq_ids = {0}; }
+        llama_validate_native_prefix(cells, 3, 10, 1);
+        const auto rejects = [](const auto & c) {
+            try { llama_validate_native_prefix(c, 3, 10, 1); } catch (const std::exception &) { return true; }
+            return false;
+        };
+        auto duplicate = cells; duplicate[2].pos = 1; assert(rejects(duplicate));
+        auto gap = cells; gap[1].pos = -1; assert(rejects(gap));
+        auto wrong_owner = cells; wrong_owner[1].seq_ids = {1}; assert(rejects(wrong_owner));
+    }
     const char * old_storage = std::getenv("GGML_RKVA_RANGE_STORAGE");
     const char * old_experimental = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     const std::string storage = old_storage ? old_storage : "";
@@ -331,6 +345,68 @@ static void test_native_resident_prefix_state() {
         if (!sparse) append(0, 256);
         append(256, sparse ? 130 : 1); // sparse: two occupied groups after empty local cells
         const llama_pos anchor_end = sparse ? 386 : 257;
+
+        // Exercise the actual mixed-memory body, including overflow metadata.
+        // This is not an RKVK/Xbox roundtrip: the flag is an internal promise
+        // that the outer file reader must independently enforce before commit.
+        writer native_body;
+        native_body.set_native_expected_tokens(uint32_t(anchor_end));
+        bool saved = false;
+        try { hybrid.state_write(native_body, 0, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL); saved = true; }
+        catch (const std::exception &) {}
+        assert(saved == !sparse); // a gap must never be published as a valid snapshot
+        if (!sparse) {
+            auto dest_attn = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
+                    llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
+                    512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,
+                    [](int32_t il) { return il == 0; }, nullptr, 0, GGML_TYPE_F16, 0, 1,
+                    nullptr, nullptr, [](int32_t il) { return il == 0; }, GGML_TYPE_Q4_0,
+                    GGML_TYPE_Q4_0, false, cpu, 256, true);
+            dest_attn->set_mixed_state_identity(123, 456);
+            auto * dest_cache = dest_attn.get();
+            auto dest_recr = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+                    false, 1, 1, 0, [](int32_t il) { return il == 1; });
+            llama_memory_hybrid dest(model, std::move(dest_attn), std::move(dest_recr), 256);
+            int hybrid_clears = 0, cache_clears = 0;
+            dest.set_on_clear([&]() { ++hybrid_clears; });
+            dest_cache->set_on_clear([&]() { ++cache_clears; });
+            auto read_body = [&](const std::vector<uint8_t> & bytes, llama_state_seq_flags flags, bool ok,
+                                 uint32_t expected_count = 0) {
+                reader in(bytes);
+                in.set_native_expected_tokens(expected_count);
+                bool accepted = false;
+                try {
+                    dest.state_read(in, 0, flags);
+                    assert(in.n_bytes() == bytes.size());
+                    assert(dest_cache->seq_pos_max(0) == -1); // staged, not yet published
+                    in.commit();
+                    accepted = true;
+                } catch (const std::exception & error) {
+                    if (ok) std::fprintf(stderr, "native FULL sparse=%d error=%s consumed=%zu/%zu\n",
+                            int(sparse), error.what(), in.n_bytes(), bytes.size());
+                    in.cancel();
+                }
+                assert(accepted == ok);
+            };
+            read_body(native_body.data, 0, false); // ordinary body cannot impersonate native
+            assert(dest_cache->seq_pos_max(0) == -1);
+            auto truncated = native_body.data;
+            truncated.pop_back();
+            read_body(truncated, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL, false, uint32_t(anchor_end));
+            assert(dest_cache->seq_pos_max(0) == -1);
+            read_body(native_body.data, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL, false, uint32_t(anchor_end + 1));
+            assert(dest_cache->seq_pos_max(0) == -1);
+            read_body(native_body.data, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL, true, uint32_t(anchor_end));
+            assert(dest_cache->seq_pos_max(0) == anchor_end - 1);
+            dest.clear(false);
+            assert(hybrid_clears == 1 && cache_clears == 1);
+            dest_cache->clear(false);
+            assert(hybrid_clears == 1 && cache_clears == 2);
+            assert(!dest_cache->state_seq_can_restore(0, 0)); // prior native owner remains guarded
+            assert(dest_cache->state_seq_can_restore(0, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL));
+            read_body(native_body.data, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL, true, uint32_t(anchor_end));
+            assert(dest_cache->seq_pos_max(0) == anchor_end - 1);
+        }
 
         const auto anchor = save();
         prefix_resident = false;

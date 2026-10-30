@@ -9,9 +9,45 @@
 #include <cstdio>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 namespace {
+
+void test_failed_restore_cleanup() {
+    struct slot {
+        bool memory_cleared = false;
+        bool expect_memory_cleared = true;
+        bool prompt_present = true;
+        bool logits_present = true;
+        int speculative_resets = 0;
+        void prompt_forget_memory() {
+            if (expect_memory_cleared) assert(memory_cleared);
+            prompt_present = false;
+            logits_present = false;
+            ++speculative_resets;
+        }
+    } s;
+    int memory_clears = 0;
+    int remote_resets = 0;
+    server_native_slot::clear_failed_restore(s, [&]() {
+        ++memory_clears;
+        ++remote_resets; // actual memory clear invokes the remote reset hook
+        s.memory_cleared = true;
+    });
+    assert(memory_clears == 1 && remote_resets == 1);
+    assert(!s.prompt_present && !s.logits_present && s.speculative_resets == 1);
+
+    slot failed;
+    failed.expect_memory_cleared = false;
+    bool thrown = false;
+    try {
+        server_native_slot::clear_failed_restore(failed, [&]() {
+            throw std::runtime_error("memory clear failed");
+        });
+    } catch (const std::runtime_error &) { thrown = true; }
+    assert(thrown && !failed.prompt_present && !failed.logits_present && failed.speculative_resets == 1);
+}
 
 server_native_slot::Eligibility valid_save() {
     server_native_slot::Eligibility e;
@@ -153,6 +189,7 @@ void test_restore_peak_16_layers() {
 
 int main() {
     test_eligibility();
+    test_failed_restore_cleanup();
     test_restore_peak_16_layers();
     std::printf("server native streaming slot CPU regression: ok\n");
     return 0;
