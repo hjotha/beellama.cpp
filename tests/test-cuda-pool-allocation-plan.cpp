@@ -102,6 +102,41 @@ static void test_low_free_resident_window() {
     assert(std::equal(std::begin(cache), std::end(cache), before.begin()));
 }
 
+static void test_stream_k_workspace_budget() {
+    size_t mask = 0, meta = 0;
+    assert(plan::stream_k_workspace_upper_bound(64, 1, 46, 2, 64, 256, 8,
+                                                true, mask, meta));
+    assert(mask == 256);
+    assert(meta == 46 * 2 * 64 * (2 + 256 / 2) * 8);
+    size_t exact_fixup = 0;
+    assert(plan::stream_k_fixup_bytes(80, 64, 256, 8, exact_fixup));
+    assert(exact_fixup == 80 * 64 * (2 + 256 / 2) * 8 && exact_fixup <= meta);
+    // A rounded stream-K launch can use fewer than 46*2 blocks, never more.
+    assert(meta >= 80 * 64 * (2 + 256 / 2) * 8);
+    assert(plan::stream_k_workspace_upper_bound(64, 1, 46, 2, 64, 256, 8,
+                                                false, mask, meta) && mask == 0);
+
+    // A pool can have enough resident blocks for the safe single-window
+    // partial path, yet lack the larger stream-K fixup allocation. Counting
+    // only the former would incorrectly allow the fast path at zero headroom.
+    const size_t blocks[] = {1024, 1024, 1024 * 1024, 1024 * 1024, 4096};
+    const size_t safe[] = {1024, 1024, 1024 * 1024, 1024 * 1024, 4096};
+    const size_t fast[] = {1024, 1024, 1024 * 1024, 1024 * 1024, meta};
+    size_t safe_growth = 0, fast_growth = 0;
+    assert(plan::legacy_growth(blocks, safe, 5, safe_growth) && safe_growth == 0);
+    assert(plan::legacy_growth(blocks, fast, 5, fast_growth) && fast_growth > 0);
+
+    const size_t max = std::numeric_limits<size_t>::max();
+    assert(!plan::stream_k_fixup_bytes(max, 64, 256, 8, exact_fixup));
+    assert(!plan::stream_k_fixup_bytes(0, 64, 256, 8, exact_fixup));
+    assert(!plan::stream_k_workspace_upper_bound(64, 1, max, 2, 64, 256, 8,
+                                                 false, mask, meta));
+    assert(!plan::stream_k_workspace_upper_bound(64, 1, 46, 2, 64, 255, 8,
+                                                 false, mask, meta));
+    assert(!plan::stream_k_workspace_upper_bound(max, 2, 46, 2, 64, 256, 8,
+                                                 true, mask, meta));
+}
+
 static void test_legacy_differential() {
     std::mt19937 rng(0x504f4f4c);
     for (int trial = 0; trial < 5000; ++trial) {
@@ -154,6 +189,7 @@ static void test_overflow_and_invalid_input() {
 int main() {
     test_legacy_cache();
     test_low_free_resident_window();
+    test_stream_k_workspace_budget();
     test_legacy_differential();
     test_vmm();
     test_overflow_and_invalid_input();

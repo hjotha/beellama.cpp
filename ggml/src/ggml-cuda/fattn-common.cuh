@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "pool-allocation-plan.h"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -1557,6 +1558,32 @@ static __global__ void flash_attn_combine_results(
     }
 }
 
+// A stream-K fixup is optional: if its extra pool growth would consume the
+// safety margin, a whole-tile launch can compute the same attention without it.
+static bool ggml_cuda_fattn_fixup_fits(ggml_backend_cuda_context & ctx,
+        ggml_cuda_pool & pool, size_t bytes) {
+    size_t growth = 0;
+    if (!bytes || !pool.allocation_growth(&bytes, 1, growth)) {
+        return false;
+    }
+    if (growth == 0) {
+        return true;
+    }
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        return false;
+    }
+    size_t reserve = 2ull * 1024 * 1024;
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_cuda_pool_plan::add(reserve, ctx.cuda_graph_memory_headroom_bytes(), reserve)) {
+        return false;
+    }
+#else
+    GGML_UNUSED(ctx);
+#endif
+    return free_bytes >= reserve && growth <= free_bytes - reserve;
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1767,7 +1794,22 @@ void launch_fattn(
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            size_t fixup_bytes = 0;
+            const bool fits = ggml_cuda_pool_plan::stream_k_fixup_bytes(
+                    size_t(blocks_num.x), size_t(ncols), size_t(DV), sizeof(float2), fixup_bytes) &&
+                ggml_cuda_fattn_fixup_fits(ctx, pool, fixup_bytes);
+            if (fits) {
+                dst_tmp_meta.alloc(fixup_bytes / sizeof(float2));
+            } else {
+                // One complete output tile per block never needs split-K
+                // fixup storage; preserve exact attention instead of aborting.
+                blocks_num.x = ntiles_dst;
+                if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
+                    fprintf(stderr, "CUDA_FA_STREAM_K_FIXUP_FALLBACK tiles=%d bytes=%zu\n",
+                            ntiles_dst, fixup_bytes);
+                    fflush(stderr);
+                }
+            }
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:

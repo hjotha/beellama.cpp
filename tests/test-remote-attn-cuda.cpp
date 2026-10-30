@@ -303,6 +303,32 @@ int main() {
     const auto * retirement = retirement_getter();
 #endif
     REQUIRE(api && legacy && small && small->base == api && retirement && retirement->base == api);
+    if (std::getenv("GGML_RKVA_TEST_SCRATCH_PRESSURE_ONLY")) {
+        constexpr size_t n = 1u << 20;
+        void * ctx = api->create_context(0);
+        REQUIRE(ctx);
+        float * input = nullptr;
+        CUDA_OK(cudaMalloc(&input, n * sizeof(float)));
+        CUDA_OK(cudaMemset(input, 0, n * sizeof(float)));
+        auto * output = static_cast<uint8_t *>(api->alloc_pinned(n));
+        REQUIRE(output);
+        size_t free_bytes = 0, total_bytes = 0;
+        CUDA_OK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        constexpr size_t keep_bytes = 3u << 20;
+        REQUIRE(free_bytes > keep_bytes);
+        void * pressure = nullptr;
+        CUDA_OK(cudaMalloc(&pressure, free_bytes - keep_bytes));
+        CUDA_OK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        REQUIRE(free_bytes < (4u << 20) && free_bytes > n);
+        REQUIRE(api->pack_q(ctx, input, false, n, output, nullptr));
+        REQUIRE(std::all_of(output, output + n, [](uint8_t v) { return v == 0; }));
+        CUDA_OK(cudaFree(pressure));
+        api->free_pinned(output);
+        CUDA_OK(cudaFree(input));
+        api->destroy_context(ctx);
+        std::puts("remote-attn scratch pressure parity OK");
+        return 0;
+    }
     test_retirement(retirement, api, small);
     void * context = api->create_context(0);
     REQUIRE(context);

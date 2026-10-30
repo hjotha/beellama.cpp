@@ -378,6 +378,10 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     size_t planned_growth = 0;
     size_t physical_budget = 0;
     bool used_pool_plan = false;
+    // The optional generic F16 fast path allocates additional stream-K
+    // workspaces. Until those allocations are accounted for, use the
+    // single-window partial/finalize path, which has a known pool plan.
+    bool use_generic_f16 = false;
     {
         size_t free_bytes = 0, total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
@@ -420,11 +424,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
                 return pool.allocation_growth(requests, chunk >= plan.n_kv ? 5 : 6, growth);
             };
 
-            // The >=512/no-LSE single-window branch delegates to launch_fattn,
-            // whose extra workspace is not described by this six-request plan.
-            const bool opaque_single_window = window_chunk >= plan.n_kv &&
-                Q->ne[1] >= 512 && !ggml_cuda_fattn_lse_requested(dst);
-            bool known_plan = !opaque_single_window && growth_for_chunk(window_chunk, planned_growth);
+            bool known_plan = growth_for_chunk(window_chunk, planned_growth);
             bool fits = known_plan && planned_growth <= physical_budget;
             bool bounded_search = window_chunk <= GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK;
             trace_budget("cuda_kvarn_window_requested", known_plan ? planned_growth : 0,
@@ -453,11 +453,11 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
                 }
                 used_pool_plan = true;
             } else {
-                // Unknown pool/single-window workspace or an oversized explicit
-                // override: retain the old conservative selection. Do not turn
+                // Unknown pool accounting or an oversized explicit override:
+                // retain the old conservative selection. Do not turn
                 // an override into an unbounded host search or silently cap it.
-                GGML_LOG_DEBUG("%s: using conservative free-memory budget (chunk=%d, known_plan=%d, opaque=%d)\n",
-                        __func__, window_chunk, int(known_plan), int(opaque_single_window));
+                GGML_LOG_DEBUG("%s: using conservative free-memory budget (chunk=%d, known_plan=%d)\n",
+                        __func__, window_chunk, int(known_plan));
                 const size_t reserve_bytes = partial_bytes + safety_bytes;
                 const size_t scratch_per_token =
                     (size_t) 2 * plan.n_kv_heads * plan.n_stream * std::max(DKQ, DV) * sizeof(half);
@@ -476,16 +476,58 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         }
     }
 
+    if (used_pool_plan && window_chunk >= plan.n_kv && Q->ne[1] >= 512 &&
+            !ggml_cuda_fattn_lse_requested(dst)) {
+        // launch_fattn(stream_k=true, use_sparse=false) can allocate mask-scan
+        // and stream-K fixup buffers in addition to the four live descriptor
+        // and dequant buffers. Plan them together, preserving pool BestFit
+        // order and the same physical headroom used by the partial path.
+        fattn_kernel_t f16_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
+        cudaError_t attr_status = cudaSuccess;
+#if !defined(GGML_USE_MUSA)
+        attr_status = cudaFuncSetAttribute(
+            reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(f16_kernel),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+#endif
+        int occupancy = 0;
+        size_t mask_bytes = 0, meta_bytes = 0, desc_count = 0, desc_bytes = 0, k_bytes = 0, v_bytes = 0;
+        const bool scan_mask = mask && plan.n_kv % FATTN_KQ_STRIDE == 0 &&
+            (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+        const auto & device = ggml_cuda_info().devices[ctx.device];
+        if (attr_status == cudaSuccess && device.nsm > 0 &&
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, f16_kernel,
+                    warp_size_host * nwarps, nbytes_shared_total) == cudaSuccess && occupancy > 0 &&
+                ggml_cuda_pool_plan::stream_k_workspace_upper_bound(
+                    (size_t) ntiles_x, (size_t) Q->ne[3], (size_t) device.nsm,
+                    (size_t) occupancy, (size_t) ncols, (size_t) DV, sizeof(float2),
+                    scan_mask, mask_bytes, meta_bytes) &&
+                ggml_cuda_pool_plan::multiply((size_t) plan.n_stream, (size_t) plan.n_kv_heads, desc_count) &&
+                ggml_cuda_pool_plan::multiply(desc_count, sizeof(ggml_cuda_fattn_kvarn_desc), desc_bytes) &&
+                ggml_cuda_pool_plan::multiply(desc_count, (size_t) window_chunk, k_bytes) &&
+                ggml_cuda_pool_plan::multiply(k_bytes, DKQ * sizeof(half), k_bytes) &&
+                ggml_cuda_pool_plan::multiply(desc_count, (size_t) window_chunk, v_bytes) &&
+                ggml_cuda_pool_plan::multiply(v_bytes, DV * sizeof(half), v_bytes)) {
+            size_t requests[6] = { desc_bytes, desc_bytes, k_bytes, v_bytes, 0, 0 };
+            size_t count = 4, fast_growth = 0;
+            if (mask_bytes) {
+                requests[count++] = mask_bytes;
+            }
+            requests[count++] = meta_bytes;
+            use_generic_f16 = pool.allocation_growth(requests, count, fast_growth) &&
+                fast_growth <= physical_budget;
+        }
+    }
+
     if (getenv("GGML_CUDA_FA_ROUTE_DEBUG") != nullptr) {
         fprintf(stderr,
             "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=KVARN_WINDOWED "
             "Q=[%lld,%lld,%lld,%lld] n_kv=%d n_kv_heads=%d n_stream=%d q_stream=%lld "
-            "chunk=%d ncols=[%d,%d] domain=%s bits=[%d,%d] pool_plan=%d growth=%zu budget=%zu\n",
+            "chunk=%d ncols=[%d,%d] domain=%s bits=[%d,%d] pool_plan=%d growth=%zu budget=%zu generic_f16=%d\n",
             (long long) Q->ne[0], (long long) Q->ne[1],
             (long long) Q->ne[2], (long long) Q->ne[3],
             plan.n_kv, plan.n_kv_heads, plan.n_stream, (long long) Q->ne[3],
             window_chunk, ncols1, ncols2, ggml_cuda_fattn_kvarn_domain_name(dst), plan.k.bits, plan.v.bits,
-            int(used_pool_plan), planned_growth, physical_budget);
+            int(used_pool_plan), planned_growth, physical_budget, int(use_generic_f16));
         fflush(stderr);
     }
 
@@ -544,7 +586,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         // finalizers, so it would accept the op and leave the LSE buffer
         // untouched. With LSE requested, fall through to the partials+finalize
         // route below, which publishes O and LSE together.
-        if (Q->ne[1] >= 512 && !ggml_cuda_fattn_lse_requested(dst)) {
+        if (use_generic_f16) {
             ggml_tensor k_win = *dst->src[1];
             ggml_tensor v_win = *dst->src[2];
 

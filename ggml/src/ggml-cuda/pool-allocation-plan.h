@@ -23,6 +23,45 @@ inline bool multiply(size_t a, size_t b, size_t & out) {
     return true;
 }
 
+// Conservative bounds for the additional pool allocations made by the
+// stream-K launch_fattn path after K/V have already been materialized.  The
+// maximum number of stream-K blocks is occupancy_per_sm * number_of_sms;
+// using that bound even when launch_fattn rounds down or needs no fixup keeps
+// the preflight independent of its exact scheduling heuristic.
+inline bool stream_k_fixup_bytes(size_t blocks, size_t ncols, size_t value_dim,
+        size_t meta_element_bytes, size_t & bytes) {
+    if (!blocks || !ncols || !value_dim || value_dim % 2 || !meta_element_bytes) {
+        return false;
+    }
+    size_t fields, result;
+    if (!add(2, value_dim / 2, fields) || !multiply(blocks, ncols, result) ||
+            !multiply(result, fields, result) || !multiply(result, meta_element_bytes, result)) {
+        return false;
+    }
+    bytes = result;
+    return true;
+}
+
+inline bool stream_k_workspace_upper_bound(size_t query_tiles, size_t sequences,
+        size_t number_of_sms, size_t occupancy_per_sm, size_t ncols,
+        size_t value_dim, size_t meta_element_bytes, bool scan_mask,
+        size_t & mask_bytes, size_t & meta_bytes) {
+    if (!query_tiles || !sequences || !number_of_sms || !occupancy_per_sm ||
+            !ncols || !value_dim || value_dim % 2 || !meta_element_bytes) {
+        return false;
+    }
+    size_t mask = 0, blocks, meta;
+    if ((scan_mask && (!multiply(query_tiles, sequences, mask) ||
+                       !multiply(mask, sizeof(int), mask))) ||
+            !multiply(number_of_sms, occupancy_per_sm, blocks) ||
+            !stream_k_fixup_bytes(blocks, ncols, value_dim, meta_element_bytes, meta)) {
+        return false;
+    }
+    mask_bytes = mask;
+    meta_bytes = meta;
+    return true;
+}
+
 inline bool align(size_t size, size_t alignment, size_t & out) {
     size_t rounded;
     if (alignment == 0 || !add(size, alignment - 1, rounded)) {

@@ -348,13 +348,31 @@ static int rkva_pointer_device(const void * ptr) {
 
 static bool rkva_scratch_ensure(rkva_cuda_remote_scratch & s, size_t needed) {
     if (s.poisoned) return false;
-    if (!s.stream && cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) != cudaSuccess) return false;
-    if (!s.dev_err && cudaMalloc(&s.dev_err, sizeof(int)) != cudaSuccess) return false;
-    if (!s.host_err && cudaHostAlloc(&s.host_err, sizeof(int), cudaHostAllocPortable) != cudaSuccess) return false;
+    cudaError_t status = cudaSuccess;
+    if (!s.stream && (status = cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking)) != cudaSuccess)
+        return rkva_small_failure("scratch", "cudaStreamCreateWithFlags", s.device, status);
+    if (!s.dev_err && (status = cudaMalloc(&s.dev_err, sizeof(int))) != cudaSuccess)
+        return rkva_small_failure("scratch", "cudaMalloc/dev_err", s.device, status);
+    if (!s.host_err && (status = cudaHostAlloc(&s.host_err, sizeof(int), cudaHostAllocPortable)) != cudaSuccess)
+        return rkva_small_failure("scratch", "cudaHostAlloc/host_err", s.device, status);
     if (s.dev_capacity < needed) {
         void * replacement = nullptr;
-        const size_t alloc_sz = std::max<size_t>(needed, 4u << 20);
-        if (cudaMalloc(&replacement, alloc_sz) != cudaSuccess) return false;
+        size_t alloc_sz = std::max<size_t>(needed, 4u << 20);
+        status = cudaMalloc(&replacement, alloc_sz);
+        if (status == cudaErrorMemoryAllocation && alloc_sz > needed) {
+            // The 4 MiB minimum is an allocation amortization, not a
+            // requirement. Under VRAM pressure the exact scratch size may fit.
+            const cudaError_t last = cudaGetLastError();
+            if (last != cudaSuccess && last != cudaErrorMemoryAllocation)
+                return rkva_small_failure("scratch", "cudaGetLastError", s.device, last);
+            alloc_sz = needed;
+            status = cudaMalloc(&replacement, alloc_sz);
+            if (status == cudaSuccess && std::getenv("GGML_RKVA_SCRATCH_DEBUG")) {
+                std::fprintf(stderr, "RKVA_CUDA_SCRATCH_EXACT_FALLBACK bytes=%zu\n", alloc_sz);
+            }
+        }
+        if (status != cudaSuccess)
+            return rkva_small_failure("scratch", "cudaMalloc/data", s.device, status, alloc_sz);
         ggml_cuda_graph_guard::note_device_reservation();
         if (s.dev_data && cudaFree(s.dev_data) != cudaSuccess) {
             cudaFree(replacement);
@@ -745,6 +763,10 @@ static bool rkva_pack_impl(rkva_cuda_remote_scratch & s, const void * src_q, boo
         gpu_timing.interval("cuda_pack_total_gpu", 0, 6, in_bytes + n_elements + sizeof(int), status, true);
     }
     const bool ok = retired && *s.host_err == 0;
+    if (!ok) {
+        return rkva_small_failure("pack", retired ? "nonfinite_input" : "stream_retirement",
+                                  s.device, retired ? *s.host_err : -1, n_elements);
+    }
     if (ok) call_timing.event.flags &= ~1u;
     return ok;
 }

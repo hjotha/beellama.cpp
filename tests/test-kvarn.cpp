@@ -7504,6 +7504,60 @@ int main() {
         return 0;
     }
 
+    if (std::getenv("GGML_KVARN_TEST_SINGLE_WINDOW_PRESSURE_ONLY") != nullptr) {
+        ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+        require(backend != nullptr, "single-window pressure test requires a GPU backend");
+        const ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        require(dev && std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0,
+                "single-window pressure test requires CUDA");
+        // Q=512, D=256, KVarN4 and a single 512-token window exercise the
+        // prefill branch that may delegate to stream-K launch_fattn. Compare
+        // the same deterministic input before and under external VRAM pressure.
+        const auto expected = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, 512, 6, 1, 512, 3,
+                false, nullptr, false, 0, true);
+        // Start with an empty CUDA pool: otherwise the first run can leave a
+        // reusable stream-K buffer and the pressure run never exercises the
+        // fallback we need to qualify.
+        ggml_backend_free(backend);
+        backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+        require(backend != nullptr, "single-window pressure test could not reinitialize CUDA");
+        g_test_cuda_pressure_free_mib = 11;
+        const auto actual = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, 512, 6, 1, 512, 3,
+                false, nullptr, false, 0, true);
+        g_test_cuda_pressure_free_mib = 0;
+        require_close_f32_rmse(actual, expected, 1e-3f,
+                "single-window attention changed under VRAM pressure");
+        ggml_backend_free(backend);
+        std::printf("test-kvarn: single-window pressure parity OK\n");
+        return 0;
+    }
+
+    if (std::getenv("GGML_KVARN_TEST_F16_TAIL_PRESSURE_ONLY") != nullptr) {
+        ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+        require(backend != nullptr, "F16 tail pressure test requires a GPU backend");
+        const ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        require(dev && std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0,
+                "F16 tail pressure test requires CUDA");
+        const auto expected = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, 512, 6, 1, 512, 3,
+                false, nullptr, false, 128, true);
+        ggml_backend_free(backend);
+        backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+        require(backend != nullptr, "F16 tail pressure test could not reinitialize CUDA");
+        g_test_cuda_pressure_free_mib = 11;
+        const auto actual = test_native_flash_attention_output(
+                backend, true, true, 256, 4, 4, 512, 6, 1, 512, 3,
+                false, nullptr, false, 128, true);
+        g_test_cuda_pressure_free_mib = 0;
+        require_close_f32_rmse(actual, expected, 1e-3f,
+                "F16 tail attention changed under VRAM pressure");
+        ggml_backend_free(backend);
+        std::printf("test-kvarn: F16 tail pressure parity OK\n");
+        return 0;
+    }
+
     if (std::getenv("GGML_KVARN_TEST_FA_PARAMS_ONLY") != nullptr) {
         test_flash_attn_kvarn_domain_isolated_gpu(4096);
         test_flash_attn_kvarn_domain_isolated_gpu(16384);
