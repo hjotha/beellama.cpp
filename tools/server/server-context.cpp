@@ -13,6 +13,7 @@
 #include "server-gpu-power.h"
 #include "server-model-identity.h"
 #include "server-slot-budget.h"
+#include "server-native-slot.h"
 #include "ggml-remote-attn-trace.h"
 #include "server-route-state.h"
 #if defined(LLAMA_F4_TEST_LOGIT_CAPTURE)
@@ -1475,13 +1476,9 @@ struct server_slot {
         return result == server_prompt_cache_result::hit || result == server_prompt_cache_result::unchanged;
     }
 
-    void prompt_clear() {
-        SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
-
-        if (!mem.seq_rm(id, -1, -1)) {
-            SRV_ERR("prompt_clear: failed to clear memory for slot %d; keeping prompt bookkeeping\n", id);
-            return;
-        }
+    // The caller already cleared the whole memory, including the remote
+    // owner. Only reset the associated speculative/prompt bookkeeping here.
+    void prompt_forget_memory() {
         common_speculative_set_state(spec, id, {});
         prompt_reset_after_memory_clear();
         just_restored = false;
@@ -1489,6 +1486,16 @@ struct server_slot {
         logits_last.clear();
         logits_last_n_tokens = -1;
         bootstrap_pending = false;
+    }
+
+    void prompt_clear() {
+        SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+
+        if (!mem.seq_rm(id, -1, -1)) {
+            SRV_ERR("prompt_clear: failed to clear memory for slot %d; keeping prompt bookkeeping\n", id);
+            return;
+        }
+        prompt_forget_memory();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -2112,6 +2119,37 @@ struct adaptive_slot_cache_reservation {
 
     ~adaptive_slot_cache_reservation() {
         if (cache) {
+            cache->release_transient(bytes);
+        }
+    }
+};
+
+// On-demand reservation for the native trailer restore peak. The callback is
+// invoked by llama_state_seq_load_file before the RKVK payload is allocated;
+// ownership remains here until the restore transaction finishes.
+struct native_slot_cache_reservation {
+    server_prompt_cache * cache = nullptr;
+    size_t bytes = 0;
+    uint64_t hard_limit = 0;
+
+    native_slot_cache_reservation(server_prompt_cache * value, uint64_t limit)
+        : cache(value), hard_limit(limit) {}
+
+    static bool reserve(void * user, size_t amount) {
+        auto * self = static_cast<native_slot_cache_reservation *>(user);
+        if (!self || !self->cache || amount == 0 ||
+                self->bytes > self->hard_limit ||
+                uint64_t(amount) > self->hard_limit - self->bytes ||
+                amount > std::numeric_limits<size_t>::max() - self->bytes ||
+                !self->cache->reserve_transient(amount)) {
+            return false;
+        }
+        self->bytes += amount;
+        return true;
+    }
+
+    ~native_slot_cache_reservation() {
+        if (cache && bytes) {
             cache->release_transient(bytes);
         }
     }
@@ -5098,7 +5136,10 @@ private:
     // release/reassign, never during generation.
     void auto_save_slot_if_useful(server_slot & slot, const char * reason = "discard") {
         if (llama_remote_native_kvarn_transient_active(ctx_tgt)) {
-            SLT_DBG(slot, "%s", "auto-save skipped: experimental native KVarN overflow has no snapshot codec\n");
+            // The automatic restore path has no native-restore RAM reservation
+            // or native owner admission. Keep this explicit-only until both
+            // sides of the automatic path are qualified.
+            SLT_DBG(slot, "%s", "auto-save skipped: native KVarN overflow requires explicit native streaming slots\n");
             return;
         }
         if (!auto_cache_enabled()) {
@@ -8248,6 +8289,222 @@ private:
         return result.success;
     }
 
+    bool native_stream_eligible(const server_task & task, const server_slot & slot, bool save,
+            std::string & error) const {
+        if (!ctx_tgt) {
+            error = "native streaming target context is unavailable";
+            return false;
+        }
+        server_native_slot::Eligibility e;
+        e.native_stream = task.slot_action.native_stream;
+        e.adaptive = common_context_is_adaptive(params_base);
+        e.profile_xxxl = active_context_profile == COMMON_CONTEXT_PROFILE_XXXLONG;
+        e.one_sequence = llama_n_seq_max(ctx_tgt) == 1;
+        e.snapshot_supported = llama_remote_native_kvarn_snapshot_supported(ctx_tgt);
+        e.native_active = llama_remote_native_kvarn_transient_active(ctx_tgt);
+        e.draft_present = ctx_dft != nullptr;
+        e.can_speculate = slot.can_speculate();
+        e.incompatible_route_flags = task.slot_action.route_state_transfer ||
+                task.slot_action.route_target_no_mtp || task.slot_action.route_state_reuse;
+        e.slot_empty = slot.prompt.tokens.empty() && slot.prompt.checkpoints.empty() &&
+                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) < 0;
+        e.all_sequences_empty = true;
+        for (uint32_t seq = 0; seq < llama_n_seq_max(ctx_tgt); ++seq) {
+            if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq) >= 0) {
+                e.all_sequences_empty = false;
+                break;
+            }
+        }
+        e.media = slot.prompt.tokens.has_media();
+        e.identity_available = adaptive_model_identity.has_value();
+        e.unmodified_model = params_base.lora_adapters.empty() && slot.lora.empty() &&
+                params_base.control_vectors.empty();
+        e.text_only = mctx == nullptr;
+        return save ? server_native_slot::save_allowed(e, &error) :
+                      server_native_slot::restore_allowed(e, &error);
+    }
+
+    void save_native_stream_slot(const server_task & task, server_slot & slot) {
+        const int64_t started = ggml_time_us();
+        try {
+            std::string error;
+            if (!native_stream_eligible(task, slot, true, error)) {
+                throw std::runtime_error(error);
+            }
+            if (!prompt_cache) {
+                throw std::runtime_error("native streaming save RAM budget is unavailable");
+            }
+            native_slot_cache_reservation reservation(prompt_cache.get(),
+                    adaptive_slot_ram_budget(params_base.cache_ram_mib));
+            const uint64_t save_workspace = server_native_slot::save_workspace_bytes(
+                    llama_n_ctx_seq(ctx_tgt));
+            if (save_workspace == UINT64_MAX || save_workspace > SIZE_MAX ||
+                    !native_slot_cache_reservation::reserve(&reservation, size_t(save_workspace))) {
+                throw std::runtime_error("native streaming save workspace exceeds the RAM cache budget");
+            }
+            llama_synchronize(ctx_tgt);
+            const auto position = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            const size_t evaluated = slot.prompt.tokens.size_up_to_pos(position + 1);
+            if (position < 0 || slot.prompt.tokens.pos_next(evaluated) != position + 1) {
+                throw std::runtime_error("native streaming slot has no complete evaluated text prefix");
+            }
+            const size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id,
+                    LLAMA_STATE_SEQ_FLAGS_NONE);
+            const bool native_full = !state_size &&
+                    llama_remote_native_kvarn_transient_active(ctx_tgt) &&
+                    llama_remote_native_kvarn_snapshot_supported(ctx_tgt);
+            if (!state_size && !native_full) {
+                throw std::runtime_error("native streaming target serialization is empty");
+            }
+            auto tokens = slot.prompt.tokens.get_text_tokens();
+            tokens.resize(evaluated);
+            const uint64_t max_bytes = params_base.slot_save_max_bytes > 0
+                    ? uint64_t(params_base.slot_save_max_bytes) : SIZE_MAX;
+            const uint64_t token_bytes = uint64_t(evaluated) * sizeof(llama_token);
+            const uint64_t overhead = 3 * sizeof(uint32_t);
+            if (uint64_t(state_size) > max_bytes || token_bytes > max_bytes - uint64_t(state_size) ||
+                    overhead > max_bytes - uint64_t(state_size) - token_bytes) {
+                throw std::runtime_error("native streaming slot exceeds --slot-save-max-mb");
+            }
+            const std::string slot_store = std::filesystem::path(task.slot_action.filepath).parent_path().string();
+            if (slot_store.empty()) {
+                throw std::runtime_error("native streaming slot state directory is unavailable");
+            }
+            server_route_state_store_lock store(slot_store,
+                    server_route_state_store_lock_mode::exclusive);
+            if (!store.acquired()) {
+                throw std::runtime_error("native streaming slot store is busy");
+            }
+            auto limit_plan = std::make_shared<unified_snapshot_limit_plan>();
+            limit_plan->dir = slot_store;
+            limit_plan->just_written = task.slot_action.filepath;
+            limit_plan->max_count = params_base.slot_save_max_count;
+            limit_plan->max_bytes = params_base.slot_save_max_bytes;
+            const size_t nwrite = server_route_state_save(ctx_tgt, slot.id, tokens,
+                    *adaptive_model_identity, task.slot_action.filepath, max_bytes, 0, nullptr,
+                    [limit_plan](uint64_t incoming) { return limit_plan->prepare(incoming); },
+                    [limit_plan]() { return limit_plan->commit(); }, &store, nullptr);
+            if (!nwrite) {
+                throw std::runtime_error("native streaming host/Xbox pair save failed");
+            }
+            auto res = std::make_unique<server_task_result_slot_save_load>();
+            res->id       = task.id;
+            res->id_slot  = task.slot_action.id_slot;
+            res->filename = task.slot_action.filename;
+            res->is_save  = true;
+            res->n_tokens = evaluated;
+            res->n_bytes  = nwrite;
+            res->t_ms     = (ggml_time_us() - started) / 1000.0;
+            queue_results.send(std::move(res));
+        } catch (const std::bad_alloc &) {
+            send_error(task, "Unable to save slot: native streaming allocation failed", ERROR_TYPE_SERVER);
+        } catch (const std::exception & err) {
+            send_error(task, std::string("Unable to save slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+        }
+    }
+
+    void restore_native_stream_slot(const server_task & task, server_slot & slot) {
+        const int64_t started = ggml_time_us();
+        bool mutated = false;
+        try {
+            std::string error;
+            if (!native_stream_eligible(task, slot, false, error)) {
+                throw std::runtime_error(error);
+            }
+            const auto path = std::filesystem::u8path(task.slot_action.filepath);
+            std::error_code ec;
+            const auto status = std::filesystem::symlink_status(path, ec);
+            if (ec || std::filesystem::is_symlink(status) ||
+                    !std::filesystem::is_regular_file(status)) {
+                throw std::runtime_error("native streaming slot is not a regular file");
+            }
+            const uint64_t max_bytes = params_base.slot_save_max_bytes > 0
+                    ? uint64_t(params_base.slot_save_max_bytes) : SIZE_MAX;
+            server_route_state_lease reference(task.slot_action.filepath,
+                    server_route_state_lock_mode::reference);
+            if (!reference.acquired()) {
+                throw std::runtime_error("native streaming slot is busy");
+            }
+            auto file = server_route_state_read(task.slot_action.filepath, max_bytes, slot.n_ctx, false);
+            if (!adaptive_model_identity.has_value() || file.model != adaptive_model_identity->fingerprint()) {
+                throw std::runtime_error("native streaming slot model identity differs");
+            }
+            if (file.layout != common_prompt_cache_layout(ctx_tgt)) {
+                throw std::runtime_error("native streaming slot layout differs");
+            }
+            if (!file.tokens.size() || file.tokens.size() > (size_t) slot.n_ctx ||
+                    file.position < 0 || uint64_t(file.position) + 1 != file.tokens.size()) {
+                throw std::runtime_error("native streaming slot tokens are invalid");
+            }
+            server_tokens restored(file.tokens, mctx != nullptr);
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("native streaming slot tokens do not validate");
+            }
+            llama_tokens loaded(file.tokens.size());
+            size_t count = 0;
+            native_slot_cache_reservation reservation(prompt_cache.get(),
+                    adaptive_slot_ram_budget(params_base.cache_ram_mib));
+            if (!prompt_cache) {
+                throw std::runtime_error("native streaming RAM budget is unavailable");
+            }
+            const uint64_t workspace = 48ULL * 1024 * 1024 +
+                    uint64_t(llama_n_ctx_seq(ctx_tgt)) * 512;
+            if (workspace > SIZE_MAX ||
+                    !native_slot_cache_reservation::reserve(&reservation, size_t(workspace))) {
+                throw std::runtime_error("native streaming workspace exceeds the RAM cache budget");
+            }
+            struct reservation_guard {
+                llama_context * ctx;
+                ~reservation_guard() {
+                    llama_state_seq_set_native_restore_reservation(ctx, nullptr, nullptr);
+                }
+            } guard{ctx_tgt};
+            llama_state_seq_set_native_restore_reservation(ctx_tgt,
+                    &native_slot_cache_reservation::reserve, &reservation);
+            const size_t read = llama_state_seq_load_file_streaming_native(ctx_tgt,
+                    task.slot_action.filepath.c_str(), slot.id, loaded.data(), loaded.size(),
+                    &count, file.state_bytes, file.state_checksum);
+            mutated = read != 0;
+            if (read != file.state_bytes || count != file.tokens.size() || loaded != file.tokens ||
+                    !llama_state_seq_restore_was_native(ctx_tgt) ||
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != file.position) {
+                throw std::runtime_error("native streaming host/Xbox pair restore failed or was not native");
+            }
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+            slot.just_restored = true;
+            slot.bootstrap_pending = false;
+            slot.logits_last.clear();
+            slot.logits_last_n_tokens = -1;
+            slot.restored_logits.clear();
+            auto res = std::make_unique<server_task_result_slot_save_load>();
+            res->id       = task.id;
+            res->id_slot  = task.slot_action.id_slot;
+            res->filename = task.slot_action.filename;
+            res->is_save  = false;
+            res->n_tokens = count;
+            res->n_bytes  = file.file_bytes;
+            res->t_ms     = (ggml_time_us() - started) / 1000.0;
+            queue_results.send(std::move(res));
+        } catch (const std::bad_alloc &) {
+            if (mutated) {
+                server_native_slot::clear_failed_restore(slot, [&]() {
+                    llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                });
+            }
+            send_error(task, "Unable to restore slot: native streaming allocation failed",
+                    ERROR_TYPE_INVALID_REQUEST);
+        } catch (const std::exception & err) {
+            if (mutated) {
+                server_native_slot::clear_failed_restore(slot, [&]() {
+                    llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                });
+            }
+            send_error(task, std::string("Unable to restore slot: ") + err.what(),
+                    ERROR_TYPE_INVALID_REQUEST);
+        }
+    }
+
     void route_slot_state(const server_task & task, server_slot & slot, bool save) {
         const int64_t started = ggml_time_us();
         bool restored_memory = false;
@@ -8270,9 +8527,10 @@ private:
             // explicit adaptive snapshot's separate five-copy guard unchanged.
             const uint64_t workspace = (save ? 16ULL : 48ULL)*1024*1024 +
                     uint64_t(llama_n_ctx_seq(ctx_tgt))*(save ? 16 : 512);
-            adaptive_slot_cache_reservation reservation;
-            if (workspace > adaptive_slot_ram_budget(params_base.cache_ram_mib) ||
-                    !reservation.acquire(prompt_cache.get(), size_t(workspace))) {
+            const uint64_t ram_budget = adaptive_slot_ram_budget(params_base.cache_ram_mib);
+            native_slot_cache_reservation reservation(prompt_cache.get(), ram_budget);
+            if (!prompt_cache || workspace > SIZE_MAX ||
+                    !native_slot_cache_reservation::reserve(&reservation, size_t(workspace))) {
                 throw std::runtime_error("router streaming workspace exceeds RAM budget");
             }
             const uint64_t max_bytes = params_base.slot_save_max_bytes > 0 ?
@@ -8393,6 +8651,20 @@ private:
                     throw std::runtime_error("router state tokens are invalid");
                 }
                 llama_tokens loaded(file.tokens.size());
+                // The fixed workspace reservation above does not cover the
+                // materialized RKVK trailer. Reserve the measured staged+owner
+                // peak before the loader allocates it.
+                if (!prompt_cache) {
+                    throw std::runtime_error("router native streaming RAM budget is unavailable");
+                }
+                struct native_reservation_guard {
+                    llama_context * ctx;
+                    ~native_reservation_guard() {
+                        llama_state_seq_set_native_restore_reservation(ctx, nullptr, nullptr);
+                    }
+                } native_guard{ctx_tgt};
+                llama_state_seq_set_native_restore_reservation(ctx_tgt,
+                        &native_slot_cache_reservation::reserve, &reservation);
                 const size_t read = llama_state_seq_load_file_streaming(ctx_tgt, restore_path.c_str(),
                         slot.id, loaded.data(), loaded.size(), &count, file.state_bytes, file.state_checksum);
                 restored_memory = read != 0;
@@ -8819,6 +9091,23 @@ private:
                         break;
                     }
 
+                    // Explicit target-only native streaming slot. The legacy
+                    // LLAMASLT/adaptive path is untouched when the marker is
+                    // absent.
+                    if (task.slot_action.native_stream) {
+                        save_native_stream_slot(task, *slot);
+                        break;
+                    }
+
+                    // Every other slot and router format uses the generic
+                    // reader, which cannot restore an RKVK owner. Refuse
+                    // before checkpoint rollback or publication so these
+                    // APIs cannot create a file they cannot read back.
+                    if (llama_remote_native_kvarn_transient_active(ctx_tgt)) {
+                        send_error(task, "Native KVarN4 overflow save requires native_stream", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
                     // The streaming route format is selected by the target-only
                     // marker. The automatic-cache reuse marker only selects it
                     // when that cache is actually enabled; otherwise the legacy
@@ -9066,6 +9355,11 @@ private:
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    if (task.slot_action.native_stream) {
+                        restore_native_stream_slot(task, *slot);
                         break;
                     }
 
@@ -13283,6 +13577,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.route_state_transfer = route_state_transfer;
         task.slot_action.route_target_no_mtp = request_data.value("route_target_no_mtp", false);
         task.slot_action.route_state_reuse = request_data.value("route_state_reuse", false);
+        task.slot_action.native_stream = request_data.value("native_stream", false);
         rd.post_task(std::move(task));
     }
 
@@ -13328,6 +13623,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         task.slot_action.route_state_transfer = route_state_transfer;
         task.slot_action.route_target_no_mtp = request_data.value("route_target_no_mtp", false);
         task.slot_action.route_state_reuse = request_data.value("route_state_reuse", false);
+        task.slot_action.native_stream = request_data.value("native_stream", false);
         rd.post_task(std::move(task));
     }
 

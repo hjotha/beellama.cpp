@@ -1,4 +1,7 @@
 #pragma once
+
+#ifndef RKVA_SNAPSHOT_DIGEST_H
+#define RKVA_SNAPSHOT_DIGEST_H
 // Copyright (c) 2024 Gianluca Mazza
 // SPDX-License-Identifier: MIT
 // Small streaming SHA-256. Shared byte-for-byte with the optional Bee client.
@@ -114,3 +117,4 @@ inline std::string hex(const uint8_t* digest) {
     return s;
 }
 } // namespace rkva_snapshot
+#endif // RKVA_SNAPSHOT_DIGEST_H

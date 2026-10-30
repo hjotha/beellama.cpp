@@ -1227,6 +1227,19 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
+    // Optional preflight sees the closed staged sequence file before a native
+    // remote snapshot is created. Returning false aborts publication. The path
+    // is borrowed for the duration of the callback and must not be modified.
+    typedef bool (*llama_state_seq_save_preflight_fn)(void * user, const char * staged_path, size_t staged_bytes);
+    LLAMA_API size_t llama_state_seq_save_file_preflight(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+ llama_state_seq_save_preflight_fn preflight,
+                            void * user);
+
     // If tokens_out is NULL, only the token count is reported through n_token_count_out and no state is loaded
     LLAMA_API size_t llama_state_seq_load_file(
             struct llama_context * ctx,
@@ -1317,6 +1330,11 @@ extern "C" {
 // Unlike PARTIAL_ONLY, this representation owns every payload required after
 // the source sequence is removed and may remap physical cells on restore.
 #define LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED 8
+
+// Internal: the file path appends/validates the negotiated native RKVK trailer
+// after the local body and binds it to the Xbox snapshot. This permits staging
+// a native FULL memory body while bookkeeping-only snapshots remain guarded.
+#define LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL 16
 
     LLAMA_API bool llama_memory_state_seq_can_save_ext(
             llama_memory_t mem,
