@@ -247,6 +247,19 @@ void test_quota_admission_never_evicts() {
     if (admit_snapshot_store(StoreBudget{limit, 4}, 1, limit, 4, &error))
         existing.erase(existing.begin()); // unreachable under admission refusal
     assert(existing == before);
+
+    // Native-only eight-entry limit: four retained pairs plus a fifth fit
+    // without selecting victims; the byte budget and non-eviction rule remain.
+    constexpr uint32_t native_count_limit = 8;
+    const StoreBudget four{1266511936ull, 4};
+    assert(admit_snapshot_store(four, 512ull << 20, limit, native_count_limit, &error));
+    assert(four.bytes == 1266511936ull && four.snapshots == 4 && existing == before);
+    const StoreBudget eight{1266511936ull, 8};
+    assert(!admit_snapshot_store(eight, 1, limit, native_count_limit, &error));
+    assert(eight.bytes == 1266511936ull && eight.snapshots == 8 && existing == before);
+    const StoreBudget full_bytes{limit - 1, 4};
+    assert(!admit_snapshot_store(full_bytes, 2, limit, native_count_limit, &error));
+    assert(full_bytes.bytes == limit - 1 && full_bytes.snapshots == 4 && existing == before);
 }
 
 void test_save_gate_vs_empty_restore() {

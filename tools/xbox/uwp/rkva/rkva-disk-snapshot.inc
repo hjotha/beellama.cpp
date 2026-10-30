@@ -14,6 +14,7 @@ constexpr uint64_t chunk_bytes = 8ull << 20;
 constexpr uint64_t snapshot_limit = 4ull << 30;
 constexpr uint64_t store_limit = 8ull << 30;
 constexpr size_t retained_snapshots = 4;
+constexpr size_t native_retained_snapshots = 8;
 constexpr uint32_t max_chunks = 4096;
 #pragma pack(push, 1)
 struct Header {
@@ -181,7 +182,7 @@ inline void check_native_room(const fs::path& root, const fs::path& destination,
     }
     std::string error;
     if (!rkva_native_snapshot::admit_snapshot_store(used, requested, store_limit,
-                                                    uint32_t(retained_snapshots), &error))
+                                                    uint32_t(native_retained_snapshots), &error))
         throw std::runtime_error(error);
 }
 } // namespace rkva_snapshot
