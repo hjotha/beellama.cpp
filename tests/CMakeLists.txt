@@ -1216,3 +1216,9 @@ target_include_directories(test-cuda-graph-guard PRIVATE ${PROJECT_SOURCE_DIR}/g
 target_compile_features(test-cuda-graph-guard PRIVATE cxx_std_17)
 add_test(NAME test-cuda-graph-guard COMMAND $<TARGET_FILE:test-cuda-graph-guard>)
 set_property(TEST test-cuda-graph-guard PROPERTY LABELS main)
+
+add_executable(test-server-direct-disk-policy test-server-direct-disk-policy.cpp)
+target_include_directories(test-server-direct-disk-policy PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-direct-disk-policy PRIVATE cxx_std_17)
+add_test(NAME test-server-direct-disk-policy COMMAND $<TARGET_FILE:test-server-direct-disk-policy>)
+set_property(TEST test-server-direct-disk-policy PROPERTY LABELS main)

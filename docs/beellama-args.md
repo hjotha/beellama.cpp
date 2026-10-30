@@ -376,6 +376,16 @@ build host cannot detect it. Pre-Turing support remains runtime-unqualified
 until matching real devices pass the KVarN parity, memory, and model-smoke
 tests.
 
+## Adaptive pure-prefix disk restore
+
+`LLAMA_ADAPTIVE_DIRECT_PURE_DISK_RESTORE=1` opts into restoring an eligible
+pure KVarN disk prefix directly after selecting the XXXL mixed profile. The
+prefix must be entirely within the configured local split P. Snapshot identity,
+layout, integrity and memory admission remain checked by the existing restore
+path; a rejected snapshot remains a cache miss. With the option unset, or when
+the prefix extends beyond P, the existing staged-restore behavior is retained.
+This option does not enable native Xbox overflow snapshots.
+
 ## CUDA/HIP dequant matvec knobs
 
 | Env var | Default | Behavior |

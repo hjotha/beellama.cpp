@@ -4,6 +4,7 @@
 #include "server-common.h"
 #include "../../src/llama-state-rollback.h"
 #include "server-decision.h"
+#include "server-direct-disk-policy.h"
 #include "server-http.h"
 #include "server-loop-guard.h"
 #include "server-task.h"
@@ -6667,6 +6668,21 @@ private:
         const size_t disk_prefix = adaptive_pure_disk_prefix(req);
         const size_t resident_prefix = adaptive_resident_prefix(task.tokens);
         if (disk_prefix < MIN_STAGE_TOKENS || disk_prefix < resident_prefix + MIN_STAGE_TOKENS / 4) {
+            return true;
+        }
+        // Opt in only for a pure prefix entirely below the XXXL split.  The
+        // destination's existing auto-restore path validates the snapshot and
+        // imports pure KVarN into an empty overflow; a rejected import remains
+        // a cache miss.  This avoids creating an intermediate local context.
+        const char * direct = std::getenv("LLAMA_ADAPTIVE_DIRECT_PURE_DISK_RESTORE");
+        // The active local profile disables the effective split, so consult
+        // the configured boundary rather than the current context's boundary.
+        const uint32_t split_p = server_direct_disk_policy::configured_split(
+                params_base.kv_position_split_p, std::getenv("LLAMA_KV_POSITION_SPLIT_P"));
+        if (server_direct_disk_policy::eligible(direct, target == COMMON_CONTEXT_PROFILE_XXXLONG,
+                                               disk_prefix, split_p)) {
+            SRV_INF("adaptive direct restore: %zu-token pure KVarN prefix within split P=%u\n",
+                    disk_prefix, split_p);
             return true;
         }
         const common_context_profile stage = common_context_profile_for_budget(
