@@ -1,4 +1,6 @@
 #include "server-route-state.h"
+#include "server-legacy-slot-classifier.h"
+#include "server-slot-path-collision.h"
 #include "llama-remote-snapshot.h"
 #include "rkva-snapshot-digest.h"
 
@@ -129,15 +131,18 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         const std::function<bool(uint64_t)> & before_publish,
         const std::function<bool()> & after_publish,
         server_route_state_store_lock * store_lock,
-        server_route_state_lease * publication_lock) {
+        server_route_state_lease * publication_lock, uint32_t native_split_p) {
     std::unique_ptr<server_route_state_store_lock> owned_store;
     if (store_lock == nullptr) {
         const std::filesystem::path parent = std::filesystem::path(path).parent_path();
         owned_store = std::make_unique<server_route_state_store_lock>(parent.string());
         store_lock = owned_store.get();
     }
-    if (!store_lock->acquired()) {
+    if (!store_lock->owns_exclusive_for(path)) {
         throw std::runtime_error("router snapshot store is busy");
+    }
+    if (!server_route_state_publication_allowed(path, store_lock)) {
+        throw std::runtime_error("router cannot replace a native or unclassified snapshot");
     }
     if (publication_lock != nullptr && !publication_lock->acquired()) {
         throw std::runtime_error("router state publication is busy");
@@ -212,6 +217,10 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     callback.run = [&](const char * staged_path, size_t staged_bytes) {
         identity.verify_sources();
         const bool native_remote = llama_remote_native_kvarn_transient_active(ctx);
+        if (native_remote && (!native_split_p || tokens.size() <= native_split_p ||
+                native_split_p >= llama_n_ctx_seq(ctx))) {
+            throw std::runtime_error("router native state split geometry is unavailable");
+        }
         legacy_remote_disk = llama_remote_disk_snapshot_enabled(ctx) && !native_remote;
         XXH64_state_t hash;
         XXH64_reset(&hash, 0);
@@ -229,6 +238,8 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
             {"version", 1}, {"model", identity.fingerprint()}, {"layout", common_prompt_cache_layout(ctx)},
             {"source_ctx", llama_n_ctx_seq(ctx)}, {"position", position}, {"n_tokens", tokens.size()},
             {"state_bytes", staged_bytes}, {"state_checksum", XXH64_digest(&hash)},
+            {"native_remote", native_remote},
+            {"native_split_p", native_remote ? native_split_p : 0},
             {"logits_offset", logits_bytes ? staged_bytes : 0}, {"logits_bytes", logits_bytes},
             {"logits_checksum", logits_checksum}, {"logits_vocab", logits_vocab},
             {"logits_tokens", logits_bytes ? tokens.size() : 0},
@@ -294,13 +305,10 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
     if (std::filesystem::file_size(temporary.path) != total || total != admitted_total || total > max_bytes) {
         throw std::runtime_error("router state file size mismatch");
     }
-    // Keep the previous state and both historical auxiliaries out of the way
-    // only while the global store lock is held. If retention commit fails, the
-    // new pathname is removed and the old complete object is restored. This
-    // matters for callers that reuse a requested filename: a failed budget
-    // decision must never turn into a lost prior version or a state/.logits
-    // mixture. New auto/route names are normally unique, but the transaction
-    // remains correct for explicit legacy filenames too.
+    // Keep the previous state out of the way while the store lock is held.
+    // The earlier collision guard refuses every existing auxiliary pathname,
+    // so no .logits/.meta/.ckpt/.ckpts sibling is moved or removed here. If
+    // retention commit fails, restore the previous state.
     std::vector<publication_backup> backups;
     bool rolled_back = false;
     auto restore_backups = [&]() {
@@ -324,7 +332,7 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
 
     bool retention_committed = false;
     try {
-        for (const std::string & original : {path, path + ".logits", path + ".meta"}) {
+        for (const std::string & original : {path}) {
             std::error_code ec;
             if (std::filesystem::exists(original, ec)) {
                 if (ec) {
@@ -349,12 +357,17 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         retention_committed = true;
         for (const auto & item : backups) {
             std::error_code ec;
-            std::filesystem::remove(item.backup, ec);
+            if (std::getenv("LLAMA_TEST_ROUTE_STATE_CLEANUP_FAIL")) {
+                ec = std::make_error_code(std::errc::permission_denied);
+            } else {
+                std::filesystem::remove(item.backup, ec);
+            }
             if (ec) {
-                // The new state is already committed, but an old orphaned
-                // version must not be misreported as removed or reintroduced
-                // into the index. Surface this as an incomplete transaction.
-                throw std::runtime_error("router state publication backup cleanup failed: " + ec.message());
+                // Publication and retention already committed. Report success
+                // for that state; retain the backup and block future writers
+                // until an operator inspects the unresolved artifact.
+                std::fprintf(stderr, "warning: router state committed, backup cleanup failed for %s: %s\n",
+                             item.backup.c_str(), ec.message().c_str());
             }
         }
     } catch (...) {
@@ -379,10 +392,17 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
 }
 
 server_route_state_file server_route_state_read(const std::string & path, uint64_t max_bytes,
-        uint32_t max_tokens, bool verify_payload) {
-    server_route_state_lease reference(path, server_route_state_lock_mode::reference);
-    if (!reference.acquired()) {
-        throw std::runtime_error("router state is busy");
+        uint32_t max_tokens, bool verify_payload, server_route_state_store_lock * exclusive_store_lock) {
+    std::unique_ptr<server_route_state_lease> reference;
+    if (exclusive_store_lock) {
+        if (!exclusive_store_lock->owns_exclusive_for(path)) {
+            throw std::runtime_error("router state exclusive store lock is not held");
+        }
+    } else {
+        reference = std::make_unique<server_route_state_lease>(path, server_route_state_lock_mode::reference);
+        if (!reference->acquired()) {
+            throw std::runtime_error("router state is busy");
+        }
     }
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     const auto end = input.tellg();
@@ -420,6 +440,23 @@ server_route_state_file server_route_state_read(const std::string & path, uint64
     result.position = meta.at("position").get<llama_pos>();
     result.model = meta.at("model").get<std::string>();
     result.layout = meta.at("layout").get<std::string>();
+    if (meta.contains("native_remote")) {
+        if (!meta.at("native_remote").is_boolean()) {
+            throw std::runtime_error("invalid router native remote marker");
+        }
+        result.has_native_remote_marker = true;
+        result.native_remote = meta.at("native_remote").get<bool>();
+        if (result.native_remote) {
+            if (!meta.contains("native_split_p") || !meta.at("native_split_p").is_number_integer()) {
+                throw std::runtime_error("missing router native split geometry");
+            }
+            const int64_t native_split = meta.at("native_split_p").get<int64_t>();
+            if (native_split <= 0 || uint64_t(native_split) > UINT32_MAX) {
+                throw std::runtime_error("invalid router native split geometry");
+            }
+            result.native_split_p = uint32_t(native_split);
+        }
+    }
     const auto n_tokens = meta.at("n_tokens").get<uint64_t>();
     const uint64_t payload_bytes = result.file_bytes - footer_size - count;
     const bool logits_valid = result.logits_bytes == 0
@@ -435,6 +472,8 @@ server_route_state_file server_route_state_read(const std::string & path, uint64
             !logits_valid ||
             result.position < 0 || uint64_t(result.position) + 1 != n_tokens ||
             result.index_block > (1u << 20) ||
+            (result.native_remote && (!result.native_split_p || result.native_split_p >= n_tokens ||
+                                      result.native_split_p >= result.source_ctx)) ||
             n_tokens > (result.state_bytes - 12)/sizeof(llama_token) || result.model.empty() || result.layout.empty()) {
         throw std::runtime_error("invalid router state bounds");
     }
@@ -468,6 +507,35 @@ server_route_state_file server_route_state_read(const std::string & path, uint64
     result.tokens.resize(size_t(n_tokens));
     read_exact(input, result.tokens.data(), result.tokens.size()*sizeof(llama_token));
     return result;
+}
+
+bool server_route_state_replace_allowed(const std::string & path,
+        server_route_state_store_lock * exclusive_store_lock) {
+    if (!exclusive_store_lock || !exclusive_store_lock->owns_exclusive_for(path)) {
+        return false;
+    }
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec == std::errc::no_such_file_or_directory ||
+            (!ec && status.type() == std::filesystem::file_type::not_found)) {
+        return true;
+    }
+    if (ec || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status)) {
+        return false;
+    }
+    try {
+        const auto file = server_route_state_read(path, UINT64_MAX, 1u << 20, false, exclusive_store_lock);
+        return file.has_native_remote_marker && !file.native_remote;
+    } catch (const std::exception &) {
+        return server_legacy_slot::is_proven_local(path, UINT64_MAX);
+    }
+}
+
+bool server_route_state_publication_allowed(const std::string & path,
+        server_route_state_store_lock * exclusive_store_lock) {
+    return exclusive_store_lock && exclusive_store_lock->owns_exclusive_for(path) &&
+           server_slot_path_collision::clear(path) &&
+           server_route_state_replace_allowed(path, exclusive_store_lock);
 }
 
 bool server_route_state_read_logits(const server_route_state_file & file,
@@ -535,7 +603,7 @@ bool server_route_state_adopt_native(const std::string & native_path,
         }
         server_route_state_store_lock store(std::filesystem::path(destination).parent_path().string(),
                 server_route_state_store_lock_mode::exclusive);
-        if (!store.acquired()) {
+        if (!store.acquired() || !server_route_state_publication_allowed(destination, &store)) {
             return false;
         }
         std::ifstream input(native_path, std::ios::binary | std::ios::ate);
@@ -659,6 +727,7 @@ bool server_route_state_remove_if_unreferenced(const std::string & path,
 
 server_route_state_store_lock::server_route_state_store_lock(const std::string & directory,
         server_route_state_store_lock_mode mode) {
+    this->mode = mode;
     const std::filesystem::path dir = directory.empty() ? std::filesystem::path(".") : std::filesystem::path(directory);
     path = (dir / ".llama-kv-snapshot-store.lock").string();
 #ifndef _WIN32
@@ -693,6 +762,19 @@ server_route_state_store_lock::server_route_state_store_lock(const std::string &
     if (!acquired()) {
         path.clear();
     }
+}
+
+bool server_route_state_store_lock::owns_exclusive_for(const std::string & state_path) const {
+    if (!acquired() || mode == server_route_state_store_lock_mode::shared || path.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    const auto file_parent = std::filesystem::path(state_path).parent_path().empty()
+            ? std::filesystem::path(".") : std::filesystem::path(state_path).parent_path();
+    const auto lock_parent = std::filesystem::path(path).parent_path().empty()
+            ? std::filesystem::path(".") : std::filesystem::path(path).parent_path();
+    const bool same = std::filesystem::equivalent(file_parent, lock_parent, ec);
+    return !ec && same;
 }
 
 void server_route_state_store_lock::release() {

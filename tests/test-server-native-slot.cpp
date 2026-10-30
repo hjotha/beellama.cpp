@@ -8,11 +8,83 @@
 #include <cassert>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
+
+void test_preflight_fallback_boundary() {
+    struct candidate { std::string state_path; bool native_candidate; };
+    using outcome = server_native_slot::automatic_restore_outcome;
+    const candidate native{"/native.bin", true}, local{"/local.bin", false};
+    assert(server_native_slot::local_fallback_eligible(true,true,false,102400,102400,false));
+    assert(!server_native_slot::local_fallback_eligible(true,true,false,102401,102400,false));
+    assert(server_native_slot::local_fallback_eligible(true,false,false,102399,102400,true));
+    assert(!server_native_slot::local_fallback_eligible(true,false,false,102399,102400,false));
+    assert(!server_native_slot::local_fallback_eligible(true,false,false,102401,102400,true));
+    assert(!server_native_slot::local_fallback_eligible(true,true,true,102400,102400,true));
+    assert(!server_native_slot::local_fallback_eligible(false,true,false,102400,102400,false));
+    assert(!server_native_slot::local_fallback_eligible(true,true,false,0,102400,false));
+    int native_attempts=0, local_attempts=0, lookups=0;
+    bool empty=true;
+    outcome native_result=outcome::native_preflight_rejected;
+    std::optional<candidate> found=local;
+    auto attempt=[&](const candidate & c) {
+        if(c.native_candidate){++native_attempts;return native_result;}
+        ++local_attempts;return outcome::native_preflight_rejected; // no second retry
+    };
+    auto lookup=[&](const std::string & excluded) {
+        ++lookups;assert(excluded==native.state_path);return found;
+    };
+    auto ready=[&]() {return empty;};
+    bool called=false;
+    assert(server_native_slot::invoke_native_loader(&called,[&]() {assert(called);return 0;})==0 && called);
+    called=false;bool threw=false;
+    try { server_native_slot::invoke_native_loader(&called,[&]() -> int {assert(called);throw std::runtime_error("loader");}); }
+    catch(const std::runtime_error &) {threw=true;}
+    assert(called && threw);
+    server_native_slot::retry_local_after_preflight(native,attempt,lookup,ready);
+    assert(native_attempts==1 && local_attempts==1 && lookups==1);
+    // A loader invocation, regardless of return value, maps to no_retry.
+    native_result=outcome::no_retry;
+    server_native_slot::retry_local_after_preflight(native,attempt,lookup,ready);
+    assert(native_attempts==2 && local_attempts==1 && lookups==1);
+    native_result=outcome::native_preflight_rejected;empty=false;
+    server_native_slot::retry_local_after_preflight(native,attempt,lookup,ready);
+    assert(native_attempts==3 && local_attempts==1 && lookups==1);
+    empty=true;found=std::nullopt;
+    server_native_slot::retry_local_after_preflight(native,attempt,lookup,ready);
+    assert(native_attempts==4 && local_attempts==1 && lookups==2);
+    found=candidate{native.state_path,false};
+    server_native_slot::retry_local_after_preflight(native,attempt,lookup,ready);
+    assert(native_attempts==5 && local_attempts==1 && lookups==3);
+    found=candidate{"/other-native.bin",true};
+    server_native_slot::retry_local_after_preflight(native,attempt,lookup,ready);
+    assert(native_attempts==6 && local_attempts==1 && lookups==4);
+    server_native_slot::retry_local_after_preflight(local,attempt,lookup,ready);
+    assert(local_attempts==2 && lookups==4);
+}
+
+void test_automatic_prefix() {
+    using tokens = std::vector<int>;
+    assert(server_native_slot::automatic_prefix(tokens{1, 2, 3}, tokens{1, 2, 3, 4}));
+    assert(!server_native_slot::automatic_prefix(tokens{}, tokens{1}));
+    assert(!server_native_slot::automatic_prefix(tokens{1, 2}, tokens{1, 2}));
+    assert(!server_native_slot::automatic_prefix(tokens{1, 2, 3}, tokens{1, 2}));
+    assert(!server_native_slot::automatic_prefix(tokens{1, 9}, tokens{1, 2, 3}));
+    assert(server_native_slot::legacy_auto_importable(102399, 102400, true, false));
+    assert(server_native_slot::legacy_auto_importable(102399, 102400, false, true));
+    assert(!server_native_slot::legacy_auto_importable(102401, 102400, true, false));
+    assert(!server_native_slot::legacy_auto_importable(80000, 102400, false, false));
+    assert(!server_native_slot::legacy_auto_importable(80000, 0, true, false));
+    assert(server_native_slot::generic_route_eligible(true, false, false));
+    assert(!server_native_slot::generic_route_eligible(true, true, false));
+    assert(server_native_slot::generic_route_eligible(false, false, false));
+    assert(!server_native_slot::generic_route_eligible(false, false, true));
+}
 
 void test_failed_restore_cleanup() {
     struct slot {
@@ -188,6 +260,8 @@ void test_restore_peak_16_layers() {
 } // namespace
 
 int main() {
+    test_preflight_fallback_boundary();
+    test_automatic_prefix();
     test_eligibility();
     test_failed_restore_cleanup();
     test_restore_peak_16_layers();

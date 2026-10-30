@@ -1066,6 +1066,9 @@ bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context *
     bool make_room(size_t bytes, const server_prompt_cache_state * incoming = nullptr,
             const server_prompt_cache_state * keep = nullptr);
     bool reserve_transient(size_t bytes);
+    // Reserve only currently free cache budget. Unlike reserve_transient(),
+    // this never evicts a reusable state, including when admission fails.
+    bool reserve_transient_without_eviction(size_t bytes);
     void release_transient(size_t bytes);
     size_t evictions = 0;
 

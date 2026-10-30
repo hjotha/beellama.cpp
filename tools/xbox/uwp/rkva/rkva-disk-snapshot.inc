@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 // Included in remote-attn-engine.cpp after Session is complete. No hot-path I/O.
 #include "rkva-native-snapshot.h"
+#include "rkva-native-store.h"
 #include "rkva-snapshot-digest.h"
 #include <filesystem>
 #include <fstream>
@@ -144,46 +145,6 @@ inline void make_room(const fs::path& root, const fs::path& destination, uint64_
     }
     if (total + requested > store_limit || count >= retained_snapshots)
         throw std::runtime_error("snapshot: quota exhausted");
-}
-// Native snapshots are host/Xbox pairs. Never evict a published directory in
-// this path: a failure after victim selection would leave the older host slot
-// pointing at deleted Xbox data. Only incomplete tmp-* directories are removed;
-// a full store fails explicitly.
-inline void check_native_room(const fs::path& root, const fs::path& destination,
-                              uint64_t requested) {
-    rkva_native_snapshot::StoreBudget used{};
-    size_t scanned = 0;
-    for (const auto& entry : fs::directory_iterator(root)) {
-        if (++scanned > 64)
-            throw std::runtime_error("snapshot: directory entry limit");
-        const std::string name = entry.path().filename().string();
-        if (fs::is_symlink(entry.symlink_status()))
-            continue;
-        if (name.size() == 68 && name.compare(0, 4, "tmp-") == 0 && opaque_name(name.substr(4))) {
-            fs::remove_all(entry.path());
-            continue;
-        }
-        if (!opaque_name(name) || !entry.is_directory() || entry.path() == destination)
-            continue;
-        uint64_t size = 0;
-        size_t files = 0;
-        for (const auto& file : fs::directory_iterator(entry.path())) {
-            if (++files > max_chunks + 1 || fs::is_symlink(file.symlink_status()) ||
-                !file.is_regular_file())
-                throw std::runtime_error("snapshot: invalid store entry");
-            size += file.file_size();
-            if (size > snapshot_limit + (1ull << 20))
-                throw std::runtime_error("snapshot: oversized entry");
-        }
-        if (used.bytes > UINT64_MAX - size)
-            throw std::runtime_error("snapshot: store size overflow");
-        used.bytes += size;
-        ++used.snapshots;
-    }
-    std::string error;
-    if (!rkva_native_snapshot::admit_snapshot_store(used, requested, store_limit,
-                                                    uint32_t(native_retained_snapshots), &error))
-        throw std::runtime_error(error);
 }
 } // namespace rkva_snapshot
 
@@ -353,6 +314,7 @@ bool RemoteAttnEngine::disk_snapshot(uint32_t id, const std::string& local_folde
                 native_ack->reserved = 0;
             } else {
                 snap::fs::create_directories(root);
+                rkva_native_store::WriteGuard writer(root);
                 if (snap::fs::exists(destination)) {
                     const auto existing = snap::read_bounded(manifest_path,
                                                              rkva_native_snapshot::kMaxManifestBytes);
@@ -375,21 +337,21 @@ bool RemoteAttnEngine::disk_snapshot(uint32_t id, const std::string& local_folde
                     }
                     ack_manifest = existing;
                 } else {
-                    snap::check_native_room(root, destination,
-                                        manifest.payload_bytes + encoded.size() + (1ull << 20));
-                    snap::fs::create_directory(temporary);
+                    rkva_native_store::check_room(root,
+                        manifest.payload_bytes + encoded.size() + (1ull << 20),
+                        snap::store_limit, snap::snapshot_limit + (1ull << 20),
+                        uint32_t(snap::native_retained_snapshots), snap::max_chunks + 1);
+                    rkva_native_store::create_stage(temporary);
                     Buffer& readback = snapshot_readback_;
                     if (!readback.resource &&
                         !create_buffer(snap::chunk_bytes, D3D12_HEAP_TYPE_READBACK,
                                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
                                        &readback, error)) {
-                        snap::fs::remove_all(temporary);
                         return false;
                     }
                     for (size_t i = 0; i < manifest.chunks.size(); ++i) {
                         const auto& chunk = manifest.chunks[i];
                         if (!begin(error)) {
-                            snap::fs::remove_all(temporary);
                             return false;
                         }
                         auto& source = s->layer_kv[chunk.layer];
@@ -400,14 +362,12 @@ bool RemoteAttnEngine::disk_snapshot(uint32_t id, const std::string& local_folde
                         transition(source, previous);
                         if (!submit(error)) {
                             s->valid = false;
-                            snap::fs::remove_all(temporary);
                             return false;
                         }
                         void* mapped = nullptr;
                         D3D12_RANGE range{0, chunk.bytes};
                         const HRESULT hr = readback.resource->Map(0, &range, &mapped);
                         if (FAILED(hr)) {
-                            snap::fs::remove_all(temporary);
                             return fail(error, "snapshot: native map readback", hr);
                         }
                         manifest.chunks[i].digest = snap::digest(mapped, chunk.bytes);
@@ -423,7 +383,6 @@ bool RemoteAttnEngine::disk_snapshot(uint32_t id, const std::string& local_folde
                         readback.resource->Unmap(0, &empty);
                     }
                     if (!rkva_native_snapshot::encode(manifest, encoded, error)) {
-                        snap::fs::remove_all(temporary);
                         return false;
                     }
                     snap::write_exact(temporary / "manifest-v2.bin", encoded.data(),
@@ -451,10 +410,6 @@ bool RemoteAttnEngine::disk_snapshot(uint32_t id, const std::string& local_folde
         } catch (const std::exception& exception) {
             if (mutated)
                 s->valid = false;
-            if (!restore) {
-                std::error_code ignored;
-                snap::fs::remove_all(temporary, ignored);
-            }
             if (error)
                 *error = exception.what();
             return false;

@@ -100,15 +100,23 @@ directory:
 - `n-<index>.kv`: at most 8 MiB per chunk, each checked by SHA-256;
 - publication is `tmp-<key>` directory, flushed files, then one rename. An
   existing published directory is never overwritten. Native retention never
-  evicts a published pair during save: a full 4-snapshot/8 GiB store fails
+  evicts a published pair during save: a full 8-snapshot/8 GiB native store fails
   explicitly rather than selecting an existing Xbox snapshot as a victim.
-  Incomplete `tmp-*` directories are removed. The legacy `rkva-snapshots-v1`
-  format keeps its historical eviction policy.
+  Both published and incomplete `tmp-*` directories count toward this quota;
+  no native staging directory is removed automatically. A store-wide exclusive
+  `.native-writer-lock` directory serializes cooperating v2 writers. A failed
+  write preserves its staging directory; a crash can also leave the lock behind.
+  Recovery requires explicitly establishing that no writer is active before
+  removing a stale lock or staging directory. Never remove a published object
+  without knowing every host reference. The legacy `rkva-snapshots-v1` format
+  keeps its historical eviction policy. All writers must run this version;
+  older binaries and uncoordinated filesystem operations do not honor the lock.
+  UWP create-directory and crash behavior require platform qualification.
 
 Host deletion and retention do not currently delete or reconcile the Xbox
 directory. Consequently, even successful saves can fill the remote store after
-up to four distinct snapshots (or earlier at the byte limit), and removing a
-host slot alone does not reclaim that quota. The host runs disk-budget and
+up to eight published or incomplete staging directories (or earlier at the
+byte limit), and removing a host slot alone does not reclaim that quota. The host runs disk-budget and
 retention preflight before issuing op17, but failure or a crash after the Xbox
 save and before host publication can still leave an orphan. Existing keys can
 be shared or reused, so blindly deleting a remote directory on failure is not
@@ -220,8 +228,57 @@ The option is rejected unless all of the following hold:
 
 Without `native_stream`, saves with live native overflow are rejected; normal
 legacy/adaptive saves remain available otherwise. `ADAPTIVE_SLOT_WORKING_COPIES`
-remains five for `LLAMASLT`. Native overflow auto-save is disabled, and a native
-file discovered by automatic or router lookup is rejected by the generic reader.
+remains five for `LLAMASLT`. Native overflow auto-save is disabled. Optional
+native automatic restore requires `--slot-save-auto` and
+`LLAMA_NATIVE_SNAPSHOT_AUTO_RESTORE=1`. Only newly written unified `.bin`
+files with an explicit native-remote manifest marker and the same saved split
+point P and context capacity are candidates; old files
+without the marker are not migrated or guessed. The complete saved token
+sequence must exactly match a strict prefix of the request, and native streaming
+identity, empty-owner and RAM admission checks still apply. The generic reader
+continues to reject native files. A limited Xbox roundtrip on 2026-10-30
+restored a 111999-token code prefix at P=102400 and reproduced 1024 output
+token IDs against the same live prefill segmentation. It did not qualify all
+layouts, failure modes or automatic native save; the path remains opt-in.
+Evidence: `/home/hjotha/beellama-benchmark-results/xxxl-plan-execution-20261030/native-auto-restore-only-r1/result.json`.
+
+Native streaming saves refuse to replace an existing pathname. Explicit legacy
+slot saves may replace an existing destination only when the state is positively
+local: a marked non-native unified envelope, a checksummed LLAMASLT envelope, or
+a raw `qsgg` sequence with no literal RKVK anywhere in the file. Under the
+exclusive store lock and an eviction lease, the old state and its validated
+`.logits`/`.ckpts` sidecars are moved into a unique `.legacy-slot-stage-*`
+directory. Any failure before commit removes the new outputs and restores the
+old bytes; cleanup failure after commit is warned while the SAVE remains
+successful and the stage blocks later publication until inspected. A `.logits`
+sidecar must be structurally valid for the current vocabulary and its stored
+token count must not exceed the state token count (the saved point may be an
+aligned checkpoint smaller than the full header). `.meta` is a legacy
+auto-cache index and `.ckpt` has no current ownership-aware reader, so both
+block replacement, as do unknown, native, symlinked, unmarked or invalid
+sidecars. A destination that is itself a possible sidecar of an existing
+pathname is refused. This transaction is not crash-atomic and does not cover
+non-cooperating writers; a process death can leave the stage for explicit
+recovery. Automatic retention remains stricter and does not evict a raw `qsgg`
+sequence, even though an explicit save may replace it. Legacy checkpoint
+appendices are written and included in the quota decision before any retention
+victims are committed. Any `.tmp-rollback-*`, `.legacy-slot-stage-*` or
+`retention.tmp-*` entry blocks new publication until explicitly inspected.
+Automatic host retention evicts only a unified file explicitly marked as not containing native
+revision-3 overflow or a fully verified legacy LLAMASLT without an RKVK marker.
+Other native, unmarked, unreadable and unrecognized files remain pinned and count
+against the configured limits. Legacy verification scans the full file; a
+coincidental RKVK byte sequence conservatively prevents eviction. If pinned files fill the
+store, admission fails rather than deleting them. The marker does not describe
+legacy non-native remote companions. Do not delete either half based solely on
+absence from one local index: exported copies and offline hosts cannot be seen.
+
+The host stages eligible local-only eviction victims reversibly while holding
+the store lock. If cleanup or a process interruption leaves a `retention.tmp-*`
+directory, subsequent quota admissions fail closed until an operator inspects
+it. This staging has no crash journal and is not automatic recovery. Snapshot
+units with sidecars remain pinned until those sidecars can be verified as part
+of the same unit.
 SAVE uses the unified checksummed route-state envelope:
 its manifest records the model fingerprint and complete prompt-cache layout, and
 the host/Xbox pair is published only after the Xbox save succeeds. RESTORE uses
@@ -270,8 +327,9 @@ for the owner peak.
    (or restart/recreate the context) so the Xbox owner is cleared; emptying the
    prompt alone does not erase native owner rows.
 
-Do not claim the default adaptive slot path covers native snapshots: the
-`native_stream` marker is mandatory.
+The default adaptive slot path does not cover native snapshots: explicit
+slot requests require `native_stream`, and automatic restore requires the
+separate opt-in and marked manifest described above.
 
 ## Review corrections
 

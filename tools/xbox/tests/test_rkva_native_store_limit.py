@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Check that native admission uses its limit without changing legacy eviction."""
+"""Check native v2 uses guarded admission and leaves legacy policy alone."""
 from pathlib import Path
 import re
 
-source = (Path(__file__).resolve().parents[1] / 'uwp/rkva/rkva-disk-snapshot.inc').read_text()
+root = Path(__file__).resolve().parents[1] / 'uwp/rkva'
+source = (root / 'rkva-disk-snapshot.inc').read_text()
+store = (root / 'rkva-native-store.h').read_text()
 assert re.search(r'constexpr uint64_t store_limit\s*=\s*8ull\s*<<\s*30\s*;', source)
 assert re.search(r'constexpr size_t retained_snapshots\s*=\s*4\s*;', source)
 assert re.search(r'constexpr size_t native_retained_snapshots\s*=\s*8\s*;', source)
-legacy = source[source.index('inline void make_room('):source.index('inline void check_native_room(')]
-native = source[source.index('inline void check_native_room('):source.index('} // namespace rkva_snapshot')]
+legacy = source[source.index('inline void make_room('):source.index('} // namespace rkva_snapshot')]
 assert 'count < retained_snapshots' in legacy and 'count >= retained_snapshots' in legacy
-assert 'native_retained_snapshots' not in legacy
-assert re.search(r'admit_snapshot_store\(used,\s*requested,\s*store_limit,\s*uint32_t\(native_retained_snapshots\)', native)
-# Cleanup is restricted to generated tmp-* paths; the quota decision itself
-# has no remove operation or victim selection.
-assert native.count('fs::remove_all(') == 1
-assert native.index('name.compare(0, 4, "tmp-")') < native.index('fs::remove_all(') < native.index('if (!opaque_name(name)')
-assert native.count('admit_snapshot_store(') == 1
-print('native quota 8, legacy 4 and no published-victim eviction: PASS')
+native = source[source.index('const auto root = snap::fs::u8path(local_folder) / "rkva-snapshots-v2"'):source.index('// The legacy Q4/Q8/F16 format')]
+assert native.index('rkva_native_store::WriteGuard writer(root)') < native.index('rkva_native_store::check_room(') < native.index('rkva_native_store::create_stage(temporary)')
+assert 'remove_all(temporary' not in native
+assert 'temporary' in store and '++used.snapshots' in store
+assert 'remove_all(' not in store
+print('native guarded quota and preserved staging, legacy policy: PASS')

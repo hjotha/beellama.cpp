@@ -8,8 +8,58 @@
 
 #include <cstdint>
 #include <string>
+#include <algorithm>
 
 namespace server_native_slot {
+
+enum class automatic_restore_outcome { no_retry, native_preflight_rejected };
+
+inline bool local_fallback_eligible(bool split_active, bool has_marker, bool native,
+        size_t tokens, uint32_t split_p, bool legacy_pure) {
+    return split_active && (has_marker ? !native : legacy_pure) &&
+        split_p > 0 && tokens > 0 && tokens <= split_p;
+}
+
+// Mark entry before invoking the loader: zero, an exception, and success are
+// all potentially mutating once the function has been called.
+template <class Loader>
+auto invoke_native_loader(bool * called, Loader loader) -> decltype(loader()) {
+    if (called) *called = true;
+    return loader();
+}
+
+// The caller decides the native outcome immediately around the loader. A
+// second lookup is allowed only before that loader was ever entered, and must
+// return a different, non-native candidate into a still-empty destination.
+template <class Candidate, class Attempt, class Lookup, class StillEmpty>
+void retry_local_after_preflight(const Candidate & selected, Attempt attempt,
+        Lookup lookup_local, StillEmpty still_empty) {
+    const auto outcome = attempt(selected);
+    if (!selected.native_candidate || outcome != automatic_restore_outcome::native_preflight_rejected ||
+            !still_empty()) return;
+    const auto local = lookup_local(selected.state_path);
+    if (!local || local->native_candidate || local->state_path == selected.state_path) return;
+    (void) attempt(*local);
+}
+
+// The native owner cannot be arbitrarily rewound. Require an entire snapshot
+// and at least one unevaluated request token, even for attention-only models.
+template <class Tokens>
+bool automatic_prefix(const Tokens & saved, const Tokens & request) {
+    return !saved.empty() && saved.size() < request.size() &&
+           std::equal(saved.begin(), saved.end(), request.begin());
+}
+
+// Legacy mixed-layout envelopes have no recorded origin P. A native owner
+// from another split might fit below this P, so only disjoint pure/convertible
+// source layouts are eligible without the new checksummed metadata.
+inline bool legacy_auto_importable(size_t tokens, uint32_t split_p, bool pure, bool convertible_q4) {
+    return split_p > 0 && tokens <= split_p && (pure || convertible_q4);
+}
+
+inline bool generic_route_eligible(bool has_marker, bool native_remote, bool legacy_mixed) {
+    return has_marker ? !native_remote : !legacy_mixed;
+}
 
 // Native streaming runs only with a single target sequence. Once a restore
 // has mutated it, clear the entire memory exactly once (which invokes the

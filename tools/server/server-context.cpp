@@ -18,6 +18,9 @@
 #include "server-native-slot.h"
 #include "ggml-remote-attn-trace.h"
 #include "server-route-state.h"
+#include "server-legacy-slot-classifier.h"
+#include "server-slot-path-collision.h"
+#include "server-snapshot-retention.h"
 #if defined(LLAMA_F4_TEST_LOGIT_CAPTURE)
 #include "f4-test-logit-capture.h"
 #endif
@@ -610,6 +613,46 @@ static size_t slot_logits_write(const std::string & state_filepath,
     return 16 + logits.size() * sizeof(float);
 }
 
+static bool slot_logits_read(const std::string & state_filepath, int32_t expect_n_vocab,
+                             uint32_t expect_n_tokens, std::vector<float> & out);
+
+// Validate a logits sidecar before it is moved aside for replacement. The
+// stored token count may be an aligned checkpoint smaller than the full state
+// header, so it is bounded by the state token count rather than required to be
+// equal. The payload, vocabulary and exact file size are still checked.
+static bool slot_logits_validate(const std::string & state_filepath, int32_t n_vocab,
+                                 uint32_t max_tokens, uint32_t * token_count = nullptr) {
+    if (token_count) *token_count = 0;
+    const std::string sidecar = slot_logits_sidecar_path(state_filepath);
+    std::ifstream input(sidecar, std::ios::binary | std::ios::ate);
+    if (!input || n_vocab <= 0) {
+        return false;
+    }
+    const auto end = input.tellg();
+    if (end != std::streamoff(16) + std::streamoff(n_vocab) * std::streamoff(sizeof(float))) {
+        return false;
+    }
+    input.seekg(0);
+    auto get_u32 = [&](uint32_t & value) {
+        unsigned char b[4];
+        if (!input.read(reinterpret_cast<char *>(b), 4)) return false;
+        value = uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24;
+        return true;
+    };
+    uint32_t magic = 0, version = 0, vocab = 0, tokens = 0;
+    if (!get_u32(magic) || !get_u32(version) || !get_u32(vocab) || !get_u32(tokens) ||
+            magic != SLOT_LOGITS_MAGIC || version != SLOT_LOGITS_VERSION ||
+            vocab != uint32_t(n_vocab) || tokens == 0 || tokens > max_tokens) {
+        return false;
+    }
+    std::vector<float> ignored;
+    if (!slot_logits_read(state_filepath, n_vocab, tokens, ignored)) {
+        return false;
+    }
+    if (token_count) *token_count = tokens;
+    return true;
+}
+
 // Read a logits sidecar. Returns true and fills `out` (size n_vocab) iff a valid sidecar exists
 // whose vocab matches `expect_n_vocab` AND whose recorded token count matches `expect_n_tokens`
 // (the count of the state just restored). The token-count check is AUTHORITATIVE: it binds the
@@ -676,9 +719,19 @@ struct slot_save_unit {
     std::string state_path;
     std::string sidecar_path; // "<state>.logits", "" if none
     std::string meta_path;    // legacy "<state>.meta", "" if none
+    std::string ckpt_path;
+    std::string ckpts_path;
     uintmax_t   bytes = 0;
     std::filesystem::file_time_type mtime;
 };
+
+// Evict only a marked non-native envelope or a fully verified legacy LLAMASLT
+// without a native trailer. Unknown, corrupt and native host/Xbox pairs remain
+// pinned; deleting one half cannot release or recover the other half safely.
+// Callers hold the store publication lock while making the eviction decision.
+static bool slot_save_known_non_native(const std::string & path, server_route_state_store_lock * store_lock) {
+    return server_route_state_replace_allowed(path, store_lock);
+}
 
 // A pre-publication budget reservation for the unified store. It holds
 // exclusive eviction locks on the exact victims while the state writer holds
@@ -689,10 +742,20 @@ struct unified_snapshot_limit_plan {
     std::string just_written;
     int32_t max_count = 0;
     int64_t max_bytes = 0;
+    server_route_state_store_lock * store_lock = nullptr;
     std::vector<slot_save_unit> victims;
     std::vector<std::unique_ptr<server_route_state_lease>> locks;
 
     bool prepare(uint64_t incoming_bytes) {
+        if (!store_lock || !store_lock->owns_exclusive_for(
+                    (std::filesystem::path(dir) / ".retention-authority").string())) {
+            return false;
+        }
+        std::error_code staging_ec;
+        if (server_snapshot_retention::has_unresolved_staging(dir, staging_ec) || staging_ec) {
+            SRV_WRN("unified snapshot budget refused: unresolved staging in %s\n", dir.c_str());
+            return false;
+        }
         if (max_count <= 0 && max_bytes <= 0) {
             return true;
         }
@@ -734,6 +797,14 @@ struct unified_snapshot_limit_plan {
                     present.count(path.substr(0, path.size() - 5))) {
                 continue;
             }
+            if (path.size() >= 5 && path.compare(path.size() - 5, 5, ".ckpt") == 0 &&
+                    present.count(path.substr(0, path.size() - 5))) {
+                continue;
+            }
+            if (path.size() >= 6 && path.compare(path.size() - 6, 6, ".ckpts") == 0 &&
+                    present.count(path.substr(0, path.size() - 6))) {
+                continue;
+            }
             slot_save_unit unit;
             unit.state_path = path;
             unit.bytes = std::filesystem::file_size(path, ec);
@@ -759,6 +830,17 @@ struct unified_snapshot_limit_plan {
                 unit.meta_path = meta;
                 unit.bytes += bytes;
                 ec.clear();
+            }
+            for (const auto & suffix : {std::string(".ckpt"), std::string(".ckpts")}) {
+                const std::string sidecar = path + suffix;
+                if (present.count(sidecar)) {
+                    const auto bytes = std::filesystem::file_size(sidecar, ec);
+                    if (ec || bytes > UINTMAX_MAX - unit.bytes) {
+                        return reject("snapshot checkpoint size inspection failed");
+                    }
+                    (suffix == ".ckpt" ? unit.ckpt_path : unit.ckpts_path) = sidecar;
+                    unit.bytes += bytes;
+                }
             }
             unit.mtime = std::filesystem::last_write_time(path, ec);
             if (ec) {
@@ -805,6 +887,15 @@ struct unified_snapshot_limit_plan {
             if (unit.state_path == just_written) {
                 continue; // replacement is accounted above, never delete the old inode
             }
+            // Sidecars are preserved until their ownership is validated. A
+            // filename suffix alone is not proof that it belongs to the state.
+            if (!unit.sidecar_path.empty() || !unit.meta_path.empty() ||
+                    !unit.ckpt_path.empty() || !unit.ckpts_path.empty()) {
+                continue;
+            }
+            if (!slot_save_known_non_native(unit.state_path, store_lock)) {
+                continue; // published pair, old unmarked file, or unreadable metadata
+            }
             auto lock = std::make_unique<server_route_state_lease>(unit.state_path,
                     server_route_state_lock_mode::eviction);
             if (!lock->acquired()) {
@@ -826,200 +917,100 @@ struct unified_snapshot_limit_plan {
     }
 
     bool commit() noexcept {
-        bool ok = true;
-        for (const auto & unit : victims) {
-            std::error_code ec;
-            std::filesystem::remove(unit.state_path, ec);
-            if (ec) {
-                SRV_WRN("unified snapshot eviction failed for %s: %s\n", unit.state_path.c_str(), ec.message().c_str());
-                ok = false;
-                continue;
+        if (victims.empty()) return true;
+        try {
+            server_snapshot_retention::filesystem_ops ops;
+            std::vector<std::string> names;
+            for (const auto & unit : victims) names.push_back(std::filesystem::path(unit.state_path).filename().string());
+            const auto staged = server_snapshot_retention::run(std::filesystem::path(dir), *store_lock, names,
+                [this](const std::filesystem::path & path) {
+                    for (size_t i = 0; i < victims.size(); ++i) {
+                        if (std::filesystem::path(victims[i].state_path).lexically_normal() == path.lexically_normal())
+                            return i < locks.size() && locks[i] && locks[i]->acquired();
+                    }
+                    return false;
+                },
+                [this](const std::filesystem::path & path) {
+                    for (const auto & unit : victims) {
+                        if (std::filesystem::path(unit.state_path).lexically_normal() == path.lexically_normal() &&
+                                slot_save_known_non_native(unit.state_path, store_lock))
+                            return server_snapshot_retention::classification::local_only;
+                    }
+                    return server_snapshot_retention::classification::unknown;
+                }, []() { return true; }, ops);
+            const bool ok = staged.state == server_snapshot_retention::outcome::committed ||
+                            staged.state == server_snapshot_retention::outcome::cleanup_incomplete;
+            if (staged.state != server_snapshot_retention::outcome::committed) {
+                SRV_WRN("unified snapshot retention: %s\n", staged.reason.c_str());
             }
-            if (std::filesystem::exists(unit.state_path, ec) || ec) {
-                ok = false;
-            }
-            if (!unit.sidecar_path.empty()) {
-                std::filesystem::remove(unit.sidecar_path, ec);
-                if (ec) { ok = false; }
-            }
-            if (!unit.meta_path.empty()) {
-                std::filesystem::remove(unit.meta_path, ec);
-                if (ec) { ok = false; }
-            }
+            victims.clear();
+            locks.clear();
+            return ok;
+        } catch (const std::exception & error) {
+            SRV_WRN("unified snapshot retention failed before commit: %s\n", error.what());
+            victims.clear();
+            locks.clear();
+            return false;
+        } catch (...) {
+            SRV_WRN("%s", "unified snapshot retention failed before commit\n");
+            victims.clear();
+            locks.clear();
+            return false;
         }
-        victims.clear();
-        locks.clear();
-        return ok;
     }
 };
 
-// Enforce --slot-save-max-count / --slot-save-max-bytes over `dir` using LRU-by-mtime eviction.
-// `just_written` is the state path that was just saved: it is never evicted, but if it ALONE
-// exceeds the byte cap it is deleted (with its sidecar) and `oversized` is set so the caller can
-// reject the save rather than evict everything else. Operates strictly within `dir`; uses only
-// the error_code std::filesystem overloads so it never throws across the server loop.
-//
-    // IMPORTANT: when a cap is set, --slot-save-path is treated as a server-owned store - any regular
-    // file in it (other than recognized sidecars, temporary files and lock identities) is an eviction
-// candidate. Point --slot-save-max-count/-mb at a DEDICATED directory; do not mix unrelated files
-// into the slot-save directory. (With both caps explicitly set to zero, nothing
-// is ever deleted and the directory is left exactly as before.)
-// `just_written` is the exact filepath string the server built as `slot_save_path + filename`;
-// directory_iterator(dir) over that same `slot_save_path` yields identically-spelled path strings
-// on POSIX (the production target), so raw string equality correctly identifies the just-saved
-// unit. (Not used on Windows in practice; if ever needed there, switch to filename comparison.)
+// Apply the same protected, reversible quota plan to legacy slot writes. The
+// caller removes a newly created just_written file if admission is rejected.
 static void slot_save_enforce_limits(const std::string & dir,
                                      int32_t max_count, int64_t max_bytes,
                                      const std::string & just_written,
-                                     bool & oversized) {
+                                     bool & oversized,
+                                     server_route_state_store_lock * store_lock = nullptr) {
     oversized = false;
-    if (max_count <= 0 && max_bytes <= 0) {
-        return; // both unlimited
+    std::unique_ptr<server_route_state_store_lock> owned_store;
+    if (!store_lock) {
+        owned_store = std::make_unique<server_route_state_store_lock>(dir,
+                server_route_state_store_lock_mode::exclusive_try);
+        store_lock = owned_store.get();
     }
-
-    std::error_code ec;
-    std::vector<slot_save_unit> units;
-    uintmax_t this_unit_bytes = 0;
-
-    // First pass: enumerate every regular file once and record the full set of paths so we can
-    // tell a real sidecar (sibling of a state file we wrote) from a state file a client happened
-    // to name "foo.logits". We must NOT blindly skip every "*.logits" - fs_validate_filename
-    // allows that suffix, so a state file literally named "foo.logits" would otherwise escape both
-    // caps entirely. Only "<X>.logits" where "<X>" also exists is treated as a sidecar.
-    std::vector<std::string> all_files;
-    {
-        std::set<std::string> present;
-        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-            std::error_code fec;
-            if (!it->is_regular_file(fec) || fec) {
-                continue;
-            }
-            all_files.push_back(it->path().string());
-            present.insert(all_files.back());
-        }
-
-        for (const std::string & p : all_files) {
-            std::error_code fec;
-            // In-flight temporary and stable lock-identity files are never counted.
-            if ((p.size() >= 4 && p.compare(p.size() - 4, 4, ".tmp") == 0) ||
-                    p.find(".tmp-") != std::string::npos ||
-                    (p.size() >= 6 && p.compare(p.size() - 6, 6, ".lease") == 0) ||
-                    (p.size() >= 5 && (p.compare(p.size() - 5, 5, ".lock") == 0 ||
-                                       p.compare(p.size() - 4, 4, ".ref") == 0))) {
-                continue;
-            }
-            // a "<X>.logits" file is a sidecar ONLY when its state file "<X>" is also present;
-            // accounted together with that state file below, so skip it here.
-            if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
-                present.count(p.substr(0, p.size() - 7))) {
-                continue;
-            }
-            // a "<X>.meta" file is the auto disk cache's tokens+fingerprint sidecar; treat it
-            // exactly like ".logits" - accounted with its state file below, reaped if orphaned.
-            if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".meta") == 0 &&
-                present.count(p.substr(0, p.size() - 5))) {
-                continue;
-            }
-            slot_save_unit u;
-            u.state_path = p;
-            u.bytes = std::filesystem::file_size(p, fec);
-            if (fec) {
-                continue;
-            }
-            const std::string side = p + ".logits";
-            if (present.count(side)) {
-                const auto sb = std::filesystem::file_size(side, fec);
-                if (!fec) {
-                    u.sidecar_path = side;
-                    u.bytes += sb;
-                }
-            }
-            const std::string meta = p + ".meta";
-            if (present.count(meta)) {
-                const auto mb = std::filesystem::file_size(meta, fec);
-                if (!fec) {
-                    u.meta_path = meta;
-                    u.bytes += mb;
-                }
-            }
-            u.mtime = std::filesystem::last_write_time(p, fec);
-            if (fec) {
-                continue;
-            }
-
-            if (p == just_written) {
-                this_unit_bytes = u.bytes;
-            }
-            units.push_back(std::move(u));
-        }
-    }
-
-    // a single snapshot larger than the byte cap is rejected: delete only the just-written unit,
-    // do NOT cascade-evict every other (valid) snapshot to make room for something that can't fit.
-    // NOTE: intentionally a no-op when max_bytes == 0 (byte cap disabled); in count-only mode an
-    // individual snapshot's size is never bounded - only --slot-save-max-mb bounds per-snapshot size.
-    if (max_bytes > 0 && this_unit_bytes > (uintmax_t) max_bytes) {
-        for (const auto & u : units) {
-            if (u.state_path == just_written) {
-                server_route_state_remove_if_unreferenced(u.state_path);
-                break;
-            }
-        }
+    if (!store_lock->owns_exclusive_for(just_written)) {
         oversized = true;
         return;
     }
-
-    std::sort(units.begin(), units.end(),
-              [](const slot_save_unit & a, const slot_save_unit & b) { return a.mtime < b.mtime; }); // oldest first
-
-    size_t    count = units.size();
-    uintmax_t total = 0;
-    for (const auto & u : units) {
-        total += u.bytes;
-    }
-    size_t idx = 0;
-
-    auto evict_oldest = [&]() -> bool {
-        while (idx < units.size()) {
-            const auto & u = units[idx++];
-            if (u.state_path == just_written) {
-                continue; // the writer owns the newly published snapshot
-            }
-            // Acquire the same kernel-coordinated publication+reference lock
-            // used by readers and writers. A dead process releases its lock;
-            // a live reader makes this candidate simply ineligible for now.
-            if (!server_route_state_remove_if_unreferenced(u.state_path)) {
-                SRV_DBG("unified snapshot eviction skipped while protected: %s\n", u.state_path.c_str());
-                continue;
-            }
-            total -= std::min(total, (uintmax_t) u.bytes);
-            count = (count > 0) ? count - 1 : 0;
-            return true;
-        }
-        return false;
-    };
-
-    if (max_count > 0) {
-        while (count > (size_t) max_count) {
-            if (!evict_oldest()) {
-                break;
-            }
-        }
-    }
-    if (max_bytes > 0) {
-        while (total > (uintmax_t) max_bytes) {
-            if (!evict_oldest()) {
-                break;
-            }
-        }
-    }
-    // A live reader/reference can temporarily make the configured budget
-    // impossible. Report rejection so the publisher can remove its own new
-    // snapshot after releasing its reference, rather than growing forever.
-    if ((max_count > 0 && count > (size_t) max_count) ||
-            (max_bytes > 0 && total > (uintmax_t) max_bytes)) {
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(just_written, ec);
+    if (ec || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status)) {
         oversized = true;
+        return;
     }
+    uint64_t bytes = 0;
+    for (const auto & suffix : {std::string(), std::string(".logits"), std::string(".meta"),
+                                std::string(".ckpt"), std::string(".ckpts")}) {
+        const auto component = just_written + suffix;
+        const auto component_status = std::filesystem::symlink_status(component, ec);
+        if (ec == std::errc::no_such_file_or_directory ||
+                (!ec && component_status.type() == std::filesystem::file_type::not_found)) {
+            ec.clear();
+            if (suffix.empty()) { oversized = true; return; }
+            continue;
+        }
+        if (ec || std::filesystem::is_symlink(component_status) ||
+                !std::filesystem::is_regular_file(component_status)) {
+            oversized = true;
+            return;
+        }
+        const auto size = std::filesystem::file_size(component, ec);
+        if (ec || size > UINT64_MAX - bytes) { oversized = true; return; }
+        bytes += size;
+    }
+    unified_snapshot_limit_plan plan;
+    plan.dir = dir;
+    plan.just_written = just_written;
+    plan.store_lock = store_lock;
+    plan.max_count = max_count;
+    plan.max_bytes = max_bytes;
+    oversized = !plan.prepare(bytes) || !plan.commit();
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,6 +1153,7 @@ struct auto_cache_entry {
     uint32_t    index_block = AUTO_INDEX_DEFAULT_BLOCK;
     std::string model;
     std::string layout;
+    bool native_candidate = false; // classification at the selected lookup
 };
 
 // Keep all candidates for each boundary; select by verified token prefix.
@@ -2113,8 +2105,9 @@ struct adaptive_slot_cache_reservation {
     server_prompt_cache * cache = nullptr;
     size_t bytes = 0;
 
-    bool acquire(server_prompt_cache * value, size_t amount) {
-        if (!value || !value->reserve_transient(amount)) {
+    bool acquire(server_prompt_cache * value, size_t amount, bool no_evict = false) {
+        if (!value || !(no_evict ? value->reserve_transient_without_eviction(amount) :
+                                   value->reserve_transient(amount))) {
             return !value;
         }
         cache = value;
@@ -2136,9 +2129,10 @@ struct native_slot_cache_reservation {
     server_prompt_cache * cache = nullptr;
     size_t bytes = 0;
     uint64_t hard_limit = 0;
+    bool without_eviction = false;
 
-    native_slot_cache_reservation(server_prompt_cache * value, uint64_t limit)
-        : cache(value), hard_limit(limit) {}
+    native_slot_cache_reservation(server_prompt_cache * value, uint64_t limit, bool no_evict = false)
+        : cache(value), hard_limit(limit), without_eviction(no_evict) {}
 
     static bool reserve(void * user, size_t amount) {
         auto * self = static_cast<native_slot_cache_reservation *>(user);
@@ -2146,7 +2140,8 @@ struct native_slot_cache_reservation {
                 self->bytes > self->hard_limit ||
                 uint64_t(amount) > self->hard_limit - self->bytes ||
                 amount > std::numeric_limits<size_t>::max() - self->bytes ||
-                !self->cache->reserve_transient(amount)) {
+                !(self->without_eviction ? self->cache->reserve_transient_without_eviction(amount) :
+                                          self->cache->reserve_transient(amount))) {
             return false;
         }
         self->bytes += amount;
@@ -2926,6 +2921,286 @@ static bool slot_checkpoints_read(const std::string & state_path, size_t max_byt
         return false;
     }
 }
+
+// Reversible replacement for an explicitly requested legacy slot file. The
+// caller holds the exclusive store lock for the whole save. Only a state that
+// is positively local (a checksummed LLAMASLT envelope or a raw qsgg sequence
+// with no RKVK trailer) plus content-validated .logits/.ckpts sidecars may be
+// moved aside. .meta is a legacy auto-cache index and .ckpt has no current
+// writer, so both remain unknown and block replacement. The old bytes are
+// restored on every failure before commit; a cleanup failure after commit is
+// reported but never rolls back a successful publication.
+class legacy_publication_guard {
+public:
+    legacy_publication_guard(std::string path, server_route_state_store_lock * store)
+        : path_(std::move(path)), store_(store) {}
+
+    ~legacy_publication_guard() {
+        if (prepared_ && !committed_ && !rolled_back_) {
+            rollback();
+        }
+    }
+
+    bool prepare(int32_t n_vocab, std::string & error) {
+        namespace fs = std::filesystem;
+        if (!store_ || !store_->owns_exclusive_for(path_) || path_.empty()) {
+            error = "slot state store lock is not held";
+            return false;
+        }
+        const fs::path destination(path_);
+        const fs::path directory = destination.parent_path().empty() ? fs::path(".") : destination.parent_path();
+        if (destination.filename().empty()) {
+            error = "invalid slot destination";
+            return false;
+        }
+        if (server_slot_path_collision::has_unresolved_staging(path_)) {
+            error = "unresolved slot publication staging requires explicit recovery";
+            return false;
+        }
+        const std::string name = destination.filename().string();
+        for (const char * suffix : {".logits", ".meta", ".ckpt", ".ckpts"}) {
+            const std::string ending(suffix);
+            if (name.size() > ending.size() &&
+                    name.compare(name.size() - ending.size(), ending.size(), ending) == 0 &&
+                    path_exists(path_.substr(0, path_.size() - ending.size()))) {
+                error = "slot destination aliases an existing snapshot sidecar";
+                return false;
+            }
+        }
+
+        items_[0].path = path_;
+        items_[1].path = path_ + ".logits";
+        items_[2].path = path_ + ".ckpts";
+        bool have_state = false;
+        for (auto & item : items_) {
+            std::error_code ec;
+            const auto status = fs::symlink_status(fs::u8path(item.path), ec);
+            if (ec == std::errc::no_such_file_or_directory ||
+                    (!ec && status.type() == fs::file_type::not_found)) {
+                continue;
+            }
+            if (ec || fs::is_symlink(status) || !fs::is_regular_file(status)) {
+                error = "slot publication component is not a regular file";
+                return false;
+            }
+            item.existed = true;
+        }
+        for (const char * suffix : {".meta", ".ckpt"}) {
+            if (path_exists(path_ + suffix)) {
+                error = std::string("slot publication refuses unverified ") + suffix + " sidecar";
+                return false;
+            }
+        }
+        have_state = items_[0].existed;
+        if (!have_state) {
+            if (items_[1].existed || items_[2].existed) {
+                error = "slot sidecar exists without a state file";
+                return false;
+            }
+            prepared_ = true; // nothing to stage; rollback still removes new files
+            return true;
+        }
+        uint64_t state_tokens = 0;
+        try {
+            const auto file = server_route_state_read(path_, UINT64_MAX, 1u << 20, false, store_);
+            if (file.has_native_remote_marker && !file.native_remote &&
+                    !file.tokens.empty() && file.tokens.size() <= UINT32_MAX) {
+                state_tokens = file.tokens.size();
+            }
+        } catch (const std::exception &) {
+        }
+        if (!state_tokens &&
+                !server_legacy_slot::is_proven_local(path_, UINT64_MAX, nullptr, &state_tokens)) {
+            uint32_t sequence_tokens = 0;
+            if (!server_legacy_slot::is_local_sequence(path_, UINT64_MAX, &sequence_tokens)) {
+                error = "existing slot state is not proven local or contains a native RKVK payload";
+                return false;
+            }
+            state_tokens = sequence_tokens;
+        }
+        if (!state_tokens || state_tokens > UINT32_MAX) {
+            error = "existing slot state token count is unavailable";
+            return false;
+        }
+        // Block a live restore/publication reader for this stripe before the
+        // old pathname is moved. The store lock alone does not freeze readers.
+        lease_ = std::make_unique<server_route_state_lease>(path_, server_route_state_lock_mode::eviction);
+        if (!lease_->acquired()) {
+            error = "existing slot state has a live reader";
+            return false;
+        }
+        if (items_[1].existed) {
+            if (!slot_logits_validate(path_, n_vocab, (uint32_t) state_tokens)) {
+                error = "existing .logits sidecar does not match the local state";
+                return false;
+            }
+        }
+        if (items_[2].existed) {
+            std::vector<adaptive_slot_checkpoint_blob> blobs;
+            std::vector<uint64_t> epochs;
+            uint64_t owner_epoch = 0;
+            uint64_t owner_id = 0;
+            std::string parse_error;
+            if (!slot_checkpoints_read(items_[2].path, 4ULL * 1024 * 1024 * 1024,
+                    blobs, epochs, owner_epoch, owner_id, parse_error)) {
+                error = "existing .ckpts sidecar is invalid: " + parse_error;
+                return false;
+            }
+        }
+
+        static std::atomic<uint64_t> nonce{0};
+        for (unsigned attempt = 0; attempt < 128 && stage_.empty(); ++attempt) {
+            std::error_code ec;
+            const auto candidate = directory / (".legacy-slot-stage-" +
+                    std::to_string((uint64_t) std::chrono::steady_clock::now().time_since_epoch().count()) +
+                    "-" + std::to_string(nonce.fetch_add(1)));
+            if (fs::create_directory(candidate, ec)) {
+                stage_ = candidate.string();
+            } else if (ec && ec != std::errc::file_exists) {
+                error = "cannot create slot publication stage: " + ec.message();
+                return false;
+            }
+        }
+        if (stage_.empty()) {
+            error = "cannot create a unique slot publication stage";
+            return false;
+        }
+        prepared_ = true;
+        const std::array<const char *, 3> backups = {{"state.bak", "logits.bak", "ckpts.bak"}};
+        try {
+            for (size_t i = 0; i < items_.size(); ++i) {
+                if (!items_[i].existed) {
+                    continue;
+                }
+                items_[i].backup = (fs::path(stage_) / backups[i]).string();
+                rename_absent(items_[i].path, items_[i].backup);
+                items_[i].moved = true;
+            }
+        } catch (const std::exception & err) {
+            error = err.what();
+            rollback();
+            return false;
+        }
+        replacing_ = true;
+        return true;
+    }
+
+    bool replacing() const { return replacing_; }
+
+    void commit() {
+        namespace fs = std::filesystem;
+        if (committed_) {
+            return;
+        }
+        committed_ = true;
+        bool ok = true;
+        for (auto & item : items_) {
+            if (!item.moved) {
+                continue;
+            }
+            std::error_code ec;
+            fs::remove(fs::u8path(item.backup), ec);
+            if (ec) {
+                ok = false;
+            } else {
+                item.moved = false;
+            }
+        }
+        if (!stage_.empty()) {
+            std::error_code ec;
+            fs::remove(fs::u8path(stage_), ec);
+            if (ec) {
+                ok = false;
+            }
+        }
+        if (!ok) {
+            SRV_WRN("slot publication committed but its rollback stage needs inspection: %s\n", stage_.c_str());
+        }
+    }
+
+private:
+    static bool path_exists(const std::string & path) {
+        std::error_code ec;
+        const auto status = std::filesystem::symlink_status(std::filesystem::u8path(path), ec);
+        return !ec && status.type() != std::filesystem::file_type::not_found;
+    }
+
+    static void rename_absent(const std::string & from, const std::string & to) {
+        if (path_exists(to)) {
+            throw std::runtime_error("slot publication backup destination already exists");
+        }
+        std::error_code ec;
+        std::filesystem::rename(std::filesystem::u8path(from), std::filesystem::u8path(to), ec);
+        if (ec) {
+            throw std::runtime_error("slot publication backup failed: " + ec.message());
+        }
+    }
+
+    void rollback() noexcept {
+        namespace fs = std::filesystem;
+        if (rolled_back_) {
+            return;
+        }
+        rolled_back_ = true;
+        bool ok = true;
+        for (auto & item : items_) {
+            std::error_code ec;
+            const auto status = std::filesystem::symlink_status(std::filesystem::u8path(item.path), ec);
+            if (!ec && status.type() != std::filesystem::file_type::not_found) {
+                if (std::filesystem::is_symlink(status) || std::filesystem::is_regular_file(status)) {
+                    std::filesystem::remove(std::filesystem::u8path(item.path), ec);
+                    if (ec) {
+                        ok = false;
+                    }
+                } else {
+                    ok = false;
+                }
+            } else if (ec && ec != std::errc::no_such_file_or_directory) {
+                ok = false;
+            }
+            if (item.moved) {
+                if (path_exists(item.path)) {
+                    ok = false;
+                    continue;
+                }
+                std::error_code restore_ec;
+                std::filesystem::rename(std::filesystem::u8path(item.backup),
+                        std::filesystem::u8path(item.path), restore_ec);
+                if (restore_ec) {
+                    ok = false;
+                } else {
+                    item.moved = false;
+                }
+            }
+        }
+        if (ok && !stage_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(stage_), ec);
+            if (ec) {
+                ok = false;
+            }
+        }
+        if (!ok) {
+            SRV_WRN("slot publication rollback is incomplete; inspect %s before another save\n", stage_.c_str());
+        }
+    }
+
+    struct item {
+        std::string path;
+        std::string backup;
+        bool existed = false;
+        bool moved = false;
+    };
+    std::string path_;
+    server_route_state_store_lock * store_ = nullptr;
+    std::unique_ptr<server_route_state_lease> lease_;
+    std::array<item, 3> items_{};
+    std::string stage_;
+    bool prepared_ = false;
+    bool replacing_ = false;
+    bool committed_ = false;
+    bool rolled_back_ = false;
+};
 
 static adaptive_slot_snapshot_blob adaptive_slot_capture(
         const server_slot & slot,
@@ -3814,6 +4089,11 @@ private:
             params_base.lora_adapters.empty() && params_base.control_vectors.empty();
     }
 
+    bool native_auto_restore_enabled() const {
+        const char * value = std::getenv("LLAMA_NATIVE_SNAPSHOT_AUTO_RESTORE");
+        return auto_cache_enabled() && value && std::strcmp(value, "1") == 0;
+    }
+
     int64_t t_last_load_progress_ms = 0;
     std::string adaptive_remote_attn_host;
     uint16_t adaptive_remote_attn_port = 0;
@@ -4148,6 +4428,21 @@ private:
         return (std::filesystem::path(params_base.slot_save_path) / buf).string();
     }
 
+    static bool route_snapshot_is_generic(const server_route_state_file & file) {
+        if (file.has_native_remote_marker) {
+            return server_native_slot::generic_route_eligible(true, file.native_remote, false);
+        }
+        try {
+            const common_json layout = common_json::parse(file.layout);
+            // Old mixed-layout envelopes have no recorded origin P and may
+            // contain a native owner. Generic route readers reject RKVK.
+            return layout.is_object() && server_native_slot::generic_route_eligible(
+                    false, false, layout.value("mixed_kv", false));
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
+
     std::optional<server_route_state_file> auto_find_exact_snapshot(const llama_tokens & tokens) {
         if (!auto_cache_enabled() || !adaptive_model_identity || tokens.empty()) {
             return std::nullopt;
@@ -4162,7 +4457,7 @@ private:
             full_hash = auto_hash_mix(full_hash, tokens[i]);
         }
         const std::string expected_path = auto_state_filename(full_hash, tokens.size());
-        if (auto file = read_unified_snapshot(expected_path, false); file &&
+        if (auto file = read_unified_snapshot(expected_path, false); file && route_snapshot_is_generic(*file) &&
                 file->model == adaptive_model_identity->fingerprint() &&
                 common_prompt_cache_layout_reusable(file->layout, common_prompt_cache_layout(ctx_tgt)) &&
                 file->tokens == tokens) {
@@ -4178,7 +4473,7 @@ private:
             indexed.assign(auto_idx.indexed_files.begin(), auto_idx.indexed_files.end());
         }
         for (const auto & path : indexed) {
-            if (auto file = read_unified_snapshot(path, false); file &&
+            if (auto file = read_unified_snapshot(path, false); file && route_snapshot_is_generic(*file) &&
                     file->model == adaptive_model_identity->fingerprint() &&
                     common_prompt_cache_layout_reusable(file->layout, common_prompt_cache_layout(ctx_tgt)) &&
                     file->tokens == tokens) {
@@ -4330,9 +4625,10 @@ private:
     }
 
     std::optional<server_route_state_file> read_unified_snapshot(const std::string & path,
-            bool verify_payload = true) const {
+            bool verify_payload = true, server_route_state_store_lock * exclusive_store_lock = nullptr) const {
         try {
-            return server_route_state_read(path, auto_store_max_bytes(), auto_store_max_tokens(), verify_payload);
+            return server_route_state_read(path, auto_store_max_bytes(), auto_store_max_tokens(),
+                                           verify_payload, exclusive_store_lock);
         } catch (const std::exception & error) {
             SRV_WRN("unified snapshot ignored at %s: %s\n", path.c_str(), error.what());
             return std::nullopt;
@@ -4426,6 +4722,9 @@ private:
                 continue; // incompatible/corrupt or incomplete publication
             }
             auto_idx.indexed_files.insert(p);
+            if (file->has_native_remote_marker && file->native_remote && !native_auto_restore_enabled()) {
+                continue;
+            }
             if (file->model != current_model) {
                 SRV_WRN("unified snapshot ignored at %s: model identity mismatch\n", p.c_str());
                 continue; // identity mismatch is a safe miss, not a fallback restore
@@ -4491,7 +4790,8 @@ private:
     // Longest-prefix lookup over the request tokens. The shared index may contain
     // snapshots written with different block sizes, so search every discovered
     // block namespace and then select the deepest verified prefix.
-    std::optional<auto_cache_entry> auto_index_lookup(const llama_tokens & req) {
+    std::optional<auto_cache_entry> auto_index_lookup(const llama_tokens & req, bool allow_native = false,
+            const std::string * excluded_path = nullptr) {
         if (!auto_cache_enabled()) {
             return std::nullopt; // off by default
         }
@@ -4519,11 +4819,8 @@ private:
                     const auto range = auto_idx.by_boundary.equal_range(auto_boundary_key(block, bhs[k]));
                     for (auto it = range.first; it != range.second; ++it) {
                         ++boundary_entries;
+                        if (excluded_path && it->second.state_path == *excluded_path) continue;
                         if (!visited_paths.insert(it->second.state_path).second) {
-                            continue;
-                        }
-                        if (native_split && !server_prefix_checkpoint_policy::checkpoint_geometry_compatible(
-                                it->second.state_path, split_p, split_c)) {
                             continue;
                         }
                         auto file = read_unified_snapshot(it->second.state_path, false);
@@ -4532,6 +4829,36 @@ private:
                                  !auto_convertible_q4_layout(file->layout) &&
                                  !auto_importable_kvarn_layout(file->layout)) ||
                                 auto_index_block(file->index_block) != block) {
+                            continue;
+                        }
+                        const bool remote_native = file->has_native_remote_marker && file->native_remote;
+                        // A retry is deliberately narrower than ordinary
+                        // lookup: a marked non-native snapshot or a legacy
+                        // PURE KVarN snapshot, wholly within the local P.
+                        if (excluded_path && !server_native_slot::local_fallback_eligible(native_split,
+                                file->has_native_remote_marker, remote_native, file->tokens.size(), split_p,
+                                adaptive_layout_is_pure_kvarn(file->layout))) continue;
+                        // Pre-marker split-layout files can contain an RKVK
+                        // owner from a different origin P, even when their
+                        // token count is below the current P. Only pure
+                        // KVarN and explicitly convertible Q4 layouts are
+                        // safe legacy import candidates.
+                        if (native_split && !file->has_native_remote_marker &&
+                                !server_native_slot::legacy_auto_importable(file->tokens.size(), split_p,
+                                    adaptive_layout_is_pure_kvarn(file->layout),
+                                    auto_convertible_q4_layout(file->layout))) {
+                            continue;
+                        }
+                        if (remote_native) {
+                            if (!allow_native || !native_auto_restore_enabled() || !native_split ||
+                                    file->layout != common_prompt_cache_layout(ctx_tgt) ||
+                                    file->source_ctx != split_c ||
+                                    file->native_split_p != split_p ||
+                                    !server_native_slot::automatic_prefix(file->tokens, req)) {
+                                continue;
+                            }
+                        } else if (native_split && !server_prefix_checkpoint_policy::checkpoint_geometry_compatible(
+                                it->second.state_path, split_p, split_c)) {
                             continue;
                         }
                         // Managed MTP restore must end strictly before the
@@ -4556,6 +4883,7 @@ private:
                         if (prefix > best_prefix) {
                             best_prefix = prefix;
                             best = it->second;
+                            best->native_candidate = remote_native;
                         }
                     }
                 }
@@ -4824,14 +5152,44 @@ private:
     // actually restored, or 0 if nothing was restored (caller keeps the in-memory prefill path).
     // `req` is the full request token-ID array; `n_keep_mem` is the in-memory match to beat.
     int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
-                               const llama_tokens & req, int n_keep_mem) {
+                               const llama_tokens & req, int n_keep_mem,
+                               server_native_slot::automatic_restore_outcome * outcome = nullptr,
+                               bool strict_local_fallback = false) {
+        if (outcome) *outcome = cand.native_candidate ?
+            server_native_slot::automatic_restore_outcome::native_preflight_rejected :
+            server_native_slot::automatic_restore_outcome::no_retry;
+        // Native remote pairs use the explicit reader and its cumulative RAM
+        // admission. Never feed them to the generic rollback/restore path.
+        const auto candidate = read_unified_snapshot(cand.state_path, false);
+        if (!candidate) {
+            return 0;
+        }
+        const bool is_native = candidate->has_native_remote_marker && candidate->native_remote;
+        if (strict_local_fallback && !server_native_slot::local_fallback_eligible(
+                llama_remote_native_kvarn_enabled(ctx_tgt), candidate->has_native_remote_marker,
+                is_native, candidate->tokens.size(), server_effective_position_split_p(params_base),
+                adaptive_layout_is_pure_kvarn(candidate->layout))) return 0;
+        // A path can change between lookup and this read. Do not change the
+        // selected kind or invoke a native loader for a local-only retry.
+        if (is_native != cand.native_candidate) return 0;
+        if (is_native) {
+            if (!native_auto_restore_enabled() || !slot.task || slot.task->n_tokens_shared > 0 ||
+                    candidate->tokens.size() <= size_t(std::max(0, n_keep_mem)) ||
+                    !server_native_slot::automatic_prefix(candidate->tokens, req)) {
+                return 0;
+            }
+            bool loader_called = false;
+            const bool restored = restore_native_stream_slot(*slot.task, slot, &cand.state_path, &req, &loader_called);
+            if (outcome && loader_called) *outcome = server_native_slot::automatic_restore_outcome::no_retry;
+            return restored ? int(slot.prompt.tokens.size()) : 0;
+        }
         const int64_t restore_started = ggml_time_us();
         const uint64_t workspace = adaptive_slot_saturating_add(
             48ULL * 1024 * 1024,
             adaptive_slot_saturating_mul((uint64_t) llama_n_ctx_seq(ctx_tgt), 512));
         adaptive_slot_cache_reservation reservation;
         if (workspace > adaptive_slot_ram_budget(params_base.cache_ram_mib) ||
-                !reservation.acquire(prompt_cache.get(), (size_t) workspace)) {
+                !reservation.acquire(prompt_cache.get(), (size_t) workspace, true)) {
             SLT_WRN(slot, "auto-restore refused by transient budget: workspace=%" PRIu64 "\n", workspace);
             return 0;
         }
@@ -4843,7 +5201,20 @@ private:
         if (!reference.acquired()) {
             return 0;
         }
-        auto file = read_unified_snapshot(cand.state_path, false);
+        // A local fallback verifies the entire state checksum under this
+        // lease before any capture, clear, conversion or state load.
+        auto file = read_unified_snapshot(cand.state_path, strict_local_fallback);
+        // Re-check under the reference lease: the local fallback must never
+        // follow a path that was replaced with a native pair after lookup.
+        if (file && file->has_native_remote_marker && file->native_remote) return 0;
+        if (file && strict_local_fallback && !server_native_slot::local_fallback_eligible(
+                llama_remote_native_kvarn_enabled(ctx_tgt), file->has_native_remote_marker,
+                file->native_remote, file->tokens.size(), server_effective_position_split_p(params_base),
+                adaptive_layout_is_pure_kvarn(file->layout))) return 0;
+        if (file && llama_remote_native_kvarn_enabled(ctx_tgt) && !file->has_native_remote_marker &&
+                !server_native_slot::legacy_auto_importable(file->tokens.size(),
+                    server_effective_position_split_p(params_base),
+                    adaptive_layout_is_pure_kvarn(file->layout), auto_convertible_q4_layout(file->layout))) return 0;
         std::unique_ptr<server_route_state_lease> converted_reference;
         if (file && file->model == adaptive_model_identity->fingerprint() &&
                 !common_prompt_cache_layout_reusable(file->layout, common_prompt_cache_layout(ctx_tgt))) {
@@ -5255,7 +5626,7 @@ private:
             // Another process may have completed this exact publication while
             // we waited for the store lock. Do not write it a second time.
             if (split_prefix && std::filesystem::exists(fname, exists_ec) && !exists_ec) {
-                if (const auto existing = read_unified_snapshot(fname, true);
+                if (const auto existing = read_unified_snapshot(fname, true, &store);
                         existing && existing->model == current_model &&
                         common_prompt_cache_layout_reusable(existing->layout, current_layout) &&
                         existing->tokens == toks) {
@@ -5264,6 +5635,7 @@ private:
             }
             auto limit_plan = std::make_shared<unified_snapshot_limit_plan>();
             limit_plan->dir = params_base.slot_save_path;
+            limit_plan->store_lock = &store;
             limit_plan->just_written = fname;
             limit_plan->max_count = params_base.slot_save_max_count;
             limit_plan->max_bytes = params_base.slot_save_max_bytes;
@@ -5275,13 +5647,6 @@ private:
                         fname, auto_store_max_bytes(), block, logits,
                         [limit_plan](uint64_t incoming) { return limit_plan->prepare(incoming); },
                         [limit_plan]() { return limit_plan->commit(); }, &store, nullptr);
-                // Legacy auxiliaries cannot be combined with a new embedded
-                // payload. Remove them only after the canonical file committed,
-                // while the publication lock still excludes readers.
-                std::error_code ec;
-                std::filesystem::remove(slot_logits_sidecar_path(fname), ec);
-                std::filesystem::remove(slot_meta_sidecar_path(fname), ec);
-
                 {
                     std::lock_guard<std::mutex> lk(auto_idx.mtx);
                     auto_cache_entry e{ fname, (uint32_t) toks.size(), block, current_model, current_layout };
@@ -8350,13 +8715,13 @@ private:
     }
 
     bool native_stream_eligible(const server_task & task, const server_slot & slot, bool save,
-            std::string & error) const {
+            std::string & error, bool automatic = false) const {
         if (!ctx_tgt) {
             error = "native streaming target context is unavailable";
             return false;
         }
         server_native_slot::Eligibility e;
-        e.native_stream = task.slot_action.native_stream;
+        e.native_stream = automatic || task.slot_action.native_stream;
         e.adaptive = common_context_is_adaptive(params_base);
         e.profile_xxxl = active_context_profile == COMMON_CONTEXT_PROFILE_XXXLONG;
         e.one_sequence = llama_n_seq_max(ctx_tgt) == 1;
@@ -8435,15 +8800,28 @@ private:
             if (!store.acquired()) {
                 throw std::runtime_error("native streaming slot store is busy");
             }
+            // A replacement would orphan the former remote companion. Keep
+            // publication append-only, including dangling symlinks, while
+            // holding the same store lock used by other publishers.
+            std::error_code destination_error;
+            const auto destination = std::filesystem::symlink_status(
+                    std::filesystem::u8path(task.slot_action.filepath), destination_error);
+            if (destination_error && destination_error != std::errc::no_such_file_or_directory) {
+                throw std::runtime_error("native streaming destination cannot be inspected");
+            }
+            if (!destination_error && destination.type() != std::filesystem::file_type::not_found) {
+                throw std::runtime_error("native streaming destination already exists; choose a new filename");
+            }
             auto limit_plan = std::make_shared<unified_snapshot_limit_plan>();
             limit_plan->dir = slot_store;
+            limit_plan->store_lock = &store;
             limit_plan->just_written = task.slot_action.filepath;
             limit_plan->max_count = params_base.slot_save_max_count;
             limit_plan->max_bytes = params_base.slot_save_max_bytes;
             const size_t nwrite = server_route_state_save(ctx_tgt, slot.id, tokens,
                     *adaptive_model_identity, task.slot_action.filepath, max_bytes, 0, nullptr,
                     [limit_plan](uint64_t incoming) { return limit_plan->prepare(incoming); },
-                    [limit_plan]() { return limit_plan->commit(); }, &store, nullptr);
+                    [limit_plan]() { return limit_plan->commit(); }, &store, nullptr, slot.position_split_p);
             if (!nwrite) {
                 throw std::runtime_error("native streaming host/Xbox pair save failed");
             }
@@ -8463,15 +8841,31 @@ private:
         }
     }
 
-    void restore_native_stream_slot(const server_task & task, server_slot & slot) {
+    bool restore_native_stream_slot(const server_task & task, server_slot & slot,
+            const std::string * automatic_path = nullptr, const llama_tokens * request = nullptr,
+            bool * loader_called = nullptr) {
         const int64_t started = ggml_time_us();
+        if (loader_called) *loader_called = false;
         bool mutated = false;
+        const bool automatic = automatic_path != nullptr;
+        const std::string & state_path = automatic ? *automatic_path : task.slot_action.filepath;
         try {
             std::string error;
-            if (!native_stream_eligible(task, slot, false, error)) {
+            if (!native_stream_eligible(task, slot, false, error, automatic)) {
                 throw std::runtime_error(error);
             }
-            const auto path = std::filesystem::u8path(task.slot_action.filepath);
+            if (!prompt_cache) {
+                throw std::runtime_error("native streaming RAM budget is unavailable");
+            }
+            native_slot_cache_reservation reservation(prompt_cache.get(),
+                    adaptive_slot_ram_budget(params_base.cache_ram_mib), automatic);
+            const uint64_t workspace = 48ULL * 1024 * 1024 +
+                    uint64_t(llama_n_ctx_seq(ctx_tgt)) * 512;
+            if (workspace > SIZE_MAX ||
+                    !native_slot_cache_reservation::reserve(&reservation, size_t(workspace))) {
+                throw std::runtime_error("native streaming workspace exceeds the RAM cache budget");
+            }
+            const auto path = std::filesystem::u8path(state_path);
             std::error_code ec;
             const auto status = std::filesystem::symlink_status(path, ec);
             if (ec || std::filesystem::is_symlink(status) ||
@@ -8480,17 +8874,23 @@ private:
             }
             const uint64_t max_bytes = params_base.slot_save_max_bytes > 0
                     ? uint64_t(params_base.slot_save_max_bytes) : SIZE_MAX;
-            server_route_state_lease reference(task.slot_action.filepath,
+            server_route_state_lease reference(state_path,
                     server_route_state_lock_mode::reference);
             if (!reference.acquired()) {
                 throw std::runtime_error("native streaming slot is busy");
             }
-            auto file = server_route_state_read(task.slot_action.filepath, max_bytes, slot.n_ctx, false);
+            auto file = server_route_state_read(state_path, max_bytes, slot.n_ctx, false);
             if (!adaptive_model_identity.has_value() || file.model != adaptive_model_identity->fingerprint()) {
                 throw std::runtime_error("native streaming slot model identity differs");
             }
             if (file.layout != common_prompt_cache_layout(ctx_tgt)) {
                 throw std::runtime_error("native streaming slot layout differs");
+            }
+            if (automatic && (!request || !file.has_native_remote_marker || !file.native_remote ||
+                    file.source_ctx != llama_n_ctx_seq(ctx_tgt) ||
+                    file.native_split_p != slot.position_split_p ||
+                    !server_native_slot::automatic_prefix(file.tokens, *request))) {
+                throw std::runtime_error("native automatic snapshot no longer matches the request");
             }
             if (!file.tokens.size() || file.tokens.size() > (size_t) slot.n_ctx ||
                     file.position < 0 || uint64_t(file.position) + 1 != file.tokens.size()) {
@@ -8502,17 +8902,6 @@ private:
             }
             llama_tokens loaded(file.tokens.size());
             size_t count = 0;
-            native_slot_cache_reservation reservation(prompt_cache.get(),
-                    adaptive_slot_ram_budget(params_base.cache_ram_mib));
-            if (!prompt_cache) {
-                throw std::runtime_error("native streaming RAM budget is unavailable");
-            }
-            const uint64_t workspace = 48ULL * 1024 * 1024 +
-                    uint64_t(llama_n_ctx_seq(ctx_tgt)) * 512;
-            if (workspace > SIZE_MAX ||
-                    !native_slot_cache_reservation::reserve(&reservation, size_t(workspace))) {
-                throw std::runtime_error("native streaming workspace exceeds the RAM cache budget");
-            }
             struct reservation_guard {
                 llama_context * ctx;
                 ~reservation_guard() {
@@ -8521,9 +8910,13 @@ private:
             } guard{ctx_tgt};
             llama_state_seq_set_native_restore_reservation(ctx_tgt,
                     &native_slot_cache_reservation::reserve, &reservation);
-            const size_t read = llama_state_seq_load_file_streaming_native(ctx_tgt,
-                    task.slot_action.filepath.c_str(), slot.id, loaded.data(), loaded.size(),
-                    &count, file.state_bytes, file.state_checksum);
+            // From this point the core may send a restore/reset and poison the
+            // backend even if it returns zero. Never retry a local candidate.
+            const size_t read = server_native_slot::invoke_native_loader(loader_called, [&]() {
+                return llama_state_seq_load_file_streaming_native(ctx_tgt,
+                        state_path.c_str(), slot.id, loaded.data(), loaded.size(),
+                        &count, file.state_bytes, file.state_checksum);
+            });
             mutated = read != 0;
             if (read != file.state_bytes || count != file.tokens.size() || loaded != file.tokens ||
                     !llama_state_seq_restore_was_native(ctx_tgt) ||
@@ -8537,6 +8930,12 @@ private:
             slot.logits_last.clear();
             slot.logits_last_n_tokens = -1;
             slot.restored_logits.clear();
+            if (automatic) {
+                slot.prompt_cache_source = "disk";
+                slot.prompt_cache_reason = "native_snapshot_restore";
+                SLT_INF(slot, "auto-restore: native snapshot reused %zu tokens from %s\n", count, state_path.c_str());
+                return true;
+            }
             auto res = std::make_unique<server_task_result_slot_save_load>();
             res->id       = task.id;
             res->id_slot  = task.slot_action.id_slot;
@@ -8546,23 +8945,31 @@ private:
             res->n_bytes  = file.file_bytes;
             res->t_ms     = (ggml_time_us() - started) / 1000.0;
             queue_results.send(std::move(res));
+            return true;
         } catch (const std::bad_alloc &) {
             if (mutated) {
                 server_native_slot::clear_failed_restore(slot, [&]() {
                     llama_memory_clear(llama_get_memory(ctx_tgt), true);
                 });
             }
-            send_error(task, "Unable to restore slot: native streaming allocation failed",
-                    ERROR_TYPE_INVALID_REQUEST);
+            if (automatic) {
+                SLT_WRN(slot, "%s", "auto-restore: native streaming allocation failed\n");
+            } else {
+                send_error(task, "Unable to restore slot: native streaming allocation failed", ERROR_TYPE_INVALID_REQUEST);
+            }
         } catch (const std::exception & err) {
             if (mutated) {
                 server_native_slot::clear_failed_restore(slot, [&]() {
                     llama_memory_clear(llama_get_memory(ctx_tgt), true);
                 });
             }
-            send_error(task, std::string("Unable to restore slot: ") + err.what(),
-                    ERROR_TYPE_INVALID_REQUEST);
+            if (automatic) {
+                SLT_WRN(slot, "auto-restore: native streaming failed: %s\n", err.what());
+            } else {
+                send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+            }
         }
+        return false;
     }
 
     void route_slot_state(const server_task & task, server_slot & slot, bool save) {
@@ -8620,7 +9027,8 @@ private:
                         // involved because this path only hands the object to
                         // another child.
                         auto verified = read_unified_snapshot(existing->state_path, true);
-                        if (!verified || verified->model != adaptive_model_identity->fingerprint() ||
+                        if (!verified || !route_snapshot_is_generic(*verified) ||
+                                verified->model != adaptive_model_identity->fingerprint() ||
                                 !common_prompt_cache_layout_reusable(verified->layout, common_prompt_cache_layout(ctx_tgt)) ||
                                 verified->tokens != tokens) {
                             verified.reset();
@@ -8650,6 +9058,7 @@ private:
                 }
                 auto limit_plan = std::make_shared<unified_snapshot_limit_plan>();
                 limit_plan->dir = route_store;
+                limit_plan->store_lock = &store;
                 limit_plan->just_written = task.slot_action.filepath;
                 limit_plan->max_count = params_base.slot_save_max_count;
                 limit_plan->max_bytes = params_base.slot_save_max_bytes;
@@ -9190,6 +9599,39 @@ private:
                         break;
                     }
 
+                    // Legacy writers used to replace paths without the store
+                    // lock, possibly overwriting a published native pair.
+                    // Unknown/old files are pinned until explicitly managed.
+                    server_route_state_store_lock legacy_store(slot_store,
+                            server_route_state_store_lock_mode::exclusive_try);
+                    if (!legacy_store.acquired()) {
+                        send_error(task, "Unable to save slot: slot state store is busy", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    // Move an eligible local old version aside before any
+                    // writer touches the destination. Native pairs, unmarked
+                    // files, invalid sidecars and unverified .meta/.ckpt
+                    // sidecars fail closed before this point. The guard
+                    // restores the old bytes on every failure before commit.
+                    const int32_t state_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                    legacy_publication_guard publication(filepath, &legacy_store);
+                    std::string publication_error;
+                    if (!publication.prepare(state_vocab, publication_error)) {
+                        send_error(task, "Unable to save slot: " + publication_error, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    const bool new_destination = !publication.replacing();
+                    const auto remove_rejected_new_slot = [&]() {
+                        if (!new_destination) {
+                            return;
+                        }
+                        if (!server_route_state_remove_if_unreferenced(filepath, &legacy_store)) {
+                            SRV_WRN("failed to clean up rejected new slot %s\n", filepath.c_str());
+                        }
+                        std::error_code cleanup_ec;
+                        std::filesystem::remove(slot_checkpoints_sidecar_path(filepath), cleanup_ec);
+                    };
+
                     if (common_context_is_adaptive(params_base)) {
                         try {
                             if (!adaptive_model_identity) {
@@ -9221,8 +9663,9 @@ private:
                             }
                             bool oversized = false;
                             slot_save_enforce_limits(slot_store, params_base.slot_save_max_count,
-                                    params_base.slot_save_max_bytes, filepath, oversized);
+                                    params_base.slot_save_max_bytes, filepath, oversized, &legacy_store);
                             if (oversized) {
+                                remove_rejected_new_slot();
                                 throw std::runtime_error("slot snapshot exceeds --slot-save-max-mb; save rejected");
                             }
 
@@ -9236,6 +9679,7 @@ private:
                             res->n_tokens = snapshot.n_tokens;
                             res->n_bytes  = nwrite;
                             res->t_ms     = t_save_ms;
+                            publication.commit();
                             queue_results.send(std::move(res));
                         } catch (const std::bad_alloc &) {
                             send_error(task, "Unable to save slot: adaptive snapshot allocation failed", ERROR_TYPE_SERVER);
@@ -9296,6 +9740,7 @@ private:
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
 
                     if (nwrite == 0) {
+                        remove_rejected_new_slot();
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
                     }
@@ -9368,28 +9813,33 @@ private:
                         }
                     }
 
-                    // enforce the bounded slot-save store (LRU by mtime). If this single
-                    // snapshot exceeds the byte cap, reject the save instead of evicting everything.
+                    // Finish every required write before quota admission or
+                    // retention can remove any older snapshot. The checkpoint
+                    // appendix is part of the state file and must be counted.
+                    size_t nwrite_ckpt = 0;
+                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+                        remove_rejected_new_slot();
+                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    // Enforce the bounded store over the complete state and
+                    // sidecars, including the appended checkpoints.
                     if (nwrite > 0 &&
                         (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
                         bool oversized = false;
                         slot_save_enforce_limits(slot_store,
                                                  params_base.slot_save_max_count,
                                                  params_base.slot_save_max_bytes,
-                                                 filepath, oversized);
+                                                 filepath, oversized, &legacy_store);
                         if (oversized) {
+                            remove_rejected_new_slot();
                             send_error(task,
                                        "slot snapshot exceeds --slot-save-max-mb; save rejected",
                                        ERROR_TYPE_INVALID_REQUEST);
                             break;
                         }
                     }
-                    size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -9401,6 +9851,7 @@ private:
                     res->n_tokens = n_saved_tokens;
                     res->n_bytes  = nwrite + nwrite_ckpt;
                     res->t_ms     = t_save_ms;
+                    publication.commit();
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -10446,7 +10897,11 @@ private:
                                     // get_text_tokens() (not get_tokens()): media-safe accessor that never asserts
                                     // under has_mtmd and, for this no-media prompt, equals the full token-id prefix.
                                     const llama_tokens req = input_tokens.get_text_tokens();
-                                    if (auto cand = auto_index_lookup(req)) {
+                                    std::string native_error;
+                                    const bool allow_native = native_auto_restore_enabled() && prompt_cache &&
+                                        slot.task->n_tokens_shared == 0 &&
+                                        native_stream_eligible(*slot.task, slot, false, native_error, true);
+                                    if (auto cand = auto_index_lookup(req, allow_native)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
                                         // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
@@ -10458,7 +10913,24 @@ private:
                                         // (which would GGML_ASSERT/abort). The recompute is harmless on the
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
-                                        auto_restore_into_slot(slot, *cand, req, (int) n_past);
+                                        server_native_slot::retry_local_after_preflight(*cand,
+                                            [&](const auto_cache_entry & selected) {
+                                                auto outcome = server_native_slot::automatic_restore_outcome::no_retry;
+                                                (void) auto_restore_into_slot(slot, selected, req, (int) n_past,
+                                                    &outcome, selected.state_path != cand->state_path);
+                                                return outcome;
+                                            },
+                                            [&](const std::string & excluded) {
+                                                // The fallback is one local lookup only; never
+                                                // select another native or the same pathname.
+                                                return auto_index_lookup(req, false, &excluded);
+                                            },
+                                            [&]() {
+                                                // Recheck empty slot/owner and peer qualification;
+                                                // generic restore has its own no-eviction budget.
+                                                std::string error;
+                                                return native_stream_eligible(*slot.task, slot, false, error, true);
+                                            });
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                     }
                                 }

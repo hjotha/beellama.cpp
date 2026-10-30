@@ -2056,6 +2056,26 @@ bool server_prompt_cache::reserve_transient(size_t bytes) {
     return true;
 }
 
+bool server_prompt_cache::reserve_transient_without_eviction(size_t bytes) {
+    if (bytes > std::numeric_limits<size_t>::max() - transient_bytes) {
+        last_reason = "transient buffers exceed RAM cache budget";
+        return false;
+    }
+    const size_t used = size(); // includes outstanding transient reservations
+    if (used < transient_bytes || bytes > std::numeric_limits<size_t>::max() - used) {
+        last_reason = "transient buffers exceed RAM cache budget";
+        return false;
+    }
+    if (limit_size) {
+        if (used > limit_size || bytes > limit_size - used) {
+            last_reason = "transient buffers exceed RAM cache budget without eviction";
+            return false;
+        }
+    }
+    transient_bytes += bytes;
+    return true;
+}
+
 bool server_prompt_restore_transaction(
         llama_context * target,
         llama_context * draft,

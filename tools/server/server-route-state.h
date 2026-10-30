@@ -48,10 +48,12 @@ public:
         return handle != nullptr;
 #endif
     }
+    bool owns_exclusive_for(const std::string & state_path) const;
     void release();
 
 private:
     std::string path;
+    server_route_state_store_lock_mode mode = server_route_state_store_lock_mode::shared;
 #ifndef _WIN32
     int fd = -1;
 #else
@@ -84,6 +86,11 @@ struct server_route_state_file {
     llama_tokens tokens;
     std::string model;
     std::string layout;
+    // Old envelopes have no marker; absence is not evidence that the file
+    // has no remote companion.
+    bool has_native_remote_marker = false;
+    bool native_remote = false;
+    uint32_t native_split_p = 0;
 };
 
 size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
@@ -93,7 +100,8 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         const std::function<bool(uint64_t)> & before_publish = {},
         const std::function<bool()> & after_publish = {},
         server_route_state_store_lock * store_lock = nullptr,
-        server_route_state_lease * publication_lock = nullptr);
+        server_route_state_lease * publication_lock = nullptr,
+        uint32_t native_split_p = 0);
 
 // Bounded metadata/token read, no context mutation. With `verify_payload=true`
 // (the default) it also streams the native checksum through an 8 MiB buffer.
@@ -102,7 +110,20 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
 // before state commit while its reference lease is held.
 server_route_state_file server_route_state_read(const std::string & path,
         uint64_t max_bytes, uint32_t max_tokens,
-        bool verify_payload = true);
+        bool verify_payload = true,
+        server_route_state_store_lock * exclusive_store_lock = nullptr);
+
+// Classify the target only under its exclusive store lock. This is used by
+// retention even while this publication's own rollback backup is staged; it
+// must not infer that active staging is orphaned or classify adjacent paths.
+bool server_route_state_replace_allowed(const std::string & path,
+        server_route_state_store_lock * exclusive_store_lock);
+
+// Call before starting a publication, while holding the same store lock. In
+// addition to target classification, rejects any ambiguous sidecar, reverse
+// sidecar alias or unresolved rollback/legacy staging in the store.
+bool server_route_state_publication_allowed(const std::string & path,
+        server_route_state_store_lock * exclusive_store_lock);
 
 // Read the optional logits payload bound to the exact canonical snapshot.
 // This holds the same shared reference lock and never accepts a mismatched

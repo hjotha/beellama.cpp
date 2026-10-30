@@ -1,9 +1,12 @@
 #include "common.h"
+#include "json.h"
 #include "llama-cpp.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
 #include "server-route-state.h"
+#include "server-snapshot-retention.h"
+#include "server-slot-path-collision.h"
 #include "llama-remote-snapshot.h"
 #include "rkva-native-state.h"
 #include "../src/llama-io-file.h"
@@ -278,6 +281,213 @@ int main(int argc, char ** argv) {
         const size_t written = server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX);
         const auto file = server_route_state_read(path, SIZE_MAX, 1024);
         require(file.file_bytes == written && file.tokens == tokens, "manifest roundtrip failed");
+        require(file.has_native_remote_marker && !file.native_remote,
+                "ordinary snapshot must carry an explicit non-native marker");
+        {
+            server_route_state_store_lock held(dir, server_route_state_store_lock_mode::exclusive);
+            require(held.acquired(), "exclusive store lock failed");
+            const auto inspected = server_route_state_read(path, SIZE_MAX, 1024, false, &held);
+            require(inspected.tokens == tokens && inspected.has_native_remote_marker && !inspected.native_remote,
+                    "inspection under exclusive store lock failed");
+            require(server_route_state_replace_allowed(path, &held), "marked local file must be replaceable");
+            require(!server_route_state_replace_allowed(legacy_seq_path, &held),
+                    "unmarked legacy file must stay pinned");
+            const std::string native_marker_path = dir + "/pretend-native.bin";
+            {
+                std::ifstream in(path, std::ios::binary | std::ios::ate);
+                const size_t size = size_t(in.tellg());
+                std::vector<char> bytes(size);
+                in.seekg(0);
+                require(bool(in.read(bytes.data(), bytes.size())), "native marker fixture read failed");
+                const auto read_le = [](const char * p) {
+                    uint64_t n = 0;
+                    for (int i = 0; i < 8; ++i) n |= uint64_t(uint8_t(p[i])) << (8*i);
+                    return n;
+                };
+                const uint64_t manifest_size = read_le(bytes.data() + size - 24);
+                const size_t start = size - 24 - size_t(manifest_size);
+                auto manifest = common_json::parse(std::string(bytes.data() + start, size_t(manifest_size)));
+                manifest["native_remote"] = true;
+                manifest["native_split_p"] = 128;
+                const std::string metadata = manifest.dump();
+                std::ofstream out(native_marker_path, std::ios::binary);
+                out.write(bytes.data(), start);
+                out.write(metadata.data(), metadata.size());
+                const auto put_le = [&](uint64_t n) {
+                    for (int i = 0; i < 8; ++i) out.put(char(n >> (8*i)));
+                };
+                put_le(metadata.size());
+                put_le(XXH64(metadata.data(), metadata.size(), 0));
+                out.write("LLROUTE1", 8);
+                require(bool(out), "native marker fixture write failed");
+            }
+            require(!server_route_state_replace_allowed(native_marker_path, &held),
+                    "marked native file must stay pinned");
+            bool replacement_rejected = false;
+            try { (void) server_route_state_save(source.get(), 0, tokens, identity, native_marker_path,
+                    SIZE_MAX, 0, nullptr, {}, {}, &held); }
+            catch (const std::exception &) { replacement_rejected = true; }
+            const auto pinned = server_route_state_read(native_marker_path, SIZE_MAX, 1024, false, &held);
+            require(replacement_rejected && pinned.native_remote && pinned.native_split_p == 128,
+                    "router save replaced a pinned native file or lost its split geometry");
+            // A sibling with a conventional suffix can itself be an
+            // independent native or unknown snapshot. Reject before staging,
+            // even if the requested destination does not exist.
+            const auto file_bytes = [](const std::string & filename) {
+                std::ifstream input(filename, std::ios::binary);
+                require(bool(input), "collision fixture open failed");
+                return std::string(std::istreambuf_iterator<char>(input), {});
+            };
+            for (const std::string suffix : {".logits", ".meta", ".ckpt", ".ckpts"}) {
+                for (const bool existing : {false, true}) {
+                    for (const bool native : {false, true}) {
+                        const std::string target = dir + "/collision.bin";
+                        const std::string side = target + suffix;
+                        if (existing) std::filesystem::copy_file(path, target);
+                        if (native) std::filesystem::copy_file(native_marker_path, side);
+                        else { std::ofstream output(side, std::ios::binary); output << "unknown independent snapshot"; }
+                        const auto saved_side = file_bytes(side);
+                        const auto saved_target = existing ? file_bytes(target) : std::string();
+                        require(!server_route_state_publication_allowed(target, &held), "sidecar collision allowed");
+                        bool fail = false;
+                        try { (void) server_route_state_save(source.get(), 0, tokens, identity, target,
+                                    SIZE_MAX, 0, nullptr, {}, {}, &held); }
+                        catch (const std::exception &) { fail = true; }
+                        require(fail && file_bytes(side) == saved_side &&
+                                (existing ? file_bytes(target) == saved_target : !std::filesystem::exists(target)),
+                                "unified writer modified a sidecar collision");
+                        std::filesystem::remove(side);
+                        if (existing) std::filesystem::remove(target);
+                    }
+                }
+#ifndef _WIN32
+                const std::string symlink_target = dir + "/collision-symlink.bin";
+                const std::string side = symlink_target + suffix;
+                std::filesystem::create_symlink(dir + "/absent-file", side);
+                require(!server_route_state_publication_allowed(symlink_target, &held) &&
+                        std::filesystem::is_symlink(std::filesystem::symlink_status(side)),
+                        "dangling sidecar symlink was not protected");
+                std::filesystem::remove(side);
+#endif
+                const std::string parent = dir + "/alias-parent.bin";
+                std::filesystem::copy_file(path, parent);
+                require(!server_route_state_publication_allowed(parent + suffix, &held),
+                        "sidecar alias of an existing state was allowed");
+                bool alias_rejected = false;
+                try { (void) server_route_state_save(source.get(), 0, tokens, identity, parent + suffix,
+                            SIZE_MAX, 0, nullptr, {}, {}, &held); }
+                catch (const std::exception &) { alias_rejected = true; }
+                require(alias_rejected && !std::filesystem::exists(parent + suffix) && file_bytes(parent) == file_bytes(path),
+                        "writer changed the base of a sidecar alias");
+                std::filesystem::remove(parent);
+            }
+#ifndef _WIN32
+            for (const bool dangling : {false, true}) {
+                const std::string link = dir + "/collision-target-symlink.bin";
+                std::filesystem::create_symlink(dangling ? dir + "/missing" : path, link);
+                require(!server_route_state_publication_allowed(link, &held), "symlink destination allowed");
+                bool rejected_link = false;
+                try { (void) server_route_state_save(source.get(), 0, tokens, identity, link,
+                            SIZE_MAX, 0, nullptr, {}, {}, &held); }
+                catch (const std::exception &) { rejected_link = true; }
+                require(rejected_link && std::filesystem::is_symlink(std::filesystem::symlink_status(link)),
+                        "writer touched symlink destination");
+                std::filesystem::remove(link);
+            }
+#endif
+            const std::string sidecar_free = dir + "/collision-free.bin";
+            require(server_route_state_publication_allowed(sidecar_free, &held), "fresh sidecar-free path rejected");
+            require(server_route_state_save(source.get(), 0, tokens, identity, sidecar_free,
+                        SIZE_MAX, 0, nullptr, {}, {}, &held) > 0, "sidecar-free save failed");
+            require(server_route_state_publication_allowed(sidecar_free, &held), "sidecar-free replacement rejected");
+            std::filesystem::remove(sidecar_free);
+            std::cout << "PASS: state/sidecar collision guard preserves unknown/native siblings\n";
+            // Replacement stages its own rollback backup before invoking
+            // retention. Victim classification must not mistake that active
+            // backup for an orphan and reject a required eviction.
+            {
+                const std::string target = dir + "/evict-replace-target.bin";
+                const std::string victim = dir + "/evict-replace-victim.bin";
+                require(server_route_state_save(source.get(), 0, tokens, identity, target,
+                            SIZE_MAX, 0, nullptr, {}, {}, &held) > 0, "replacement fixture save failed");
+                require(server_route_state_save(source.get(), 0, tokens, identity, victim,
+                            SIZE_MAX, 0, nullptr, {}, {}, &held) > 0, "eviction fixture save failed");
+                server_route_state_lease eviction(victim, server_route_state_lock_mode::eviction);
+                require(eviction.acquired(), "eviction fixture lease failed");
+                bool ran_retention = false;
+                const size_t result = server_route_state_save(source.get(), 0, tokens, identity, target,
+                    SIZE_MAX, 0, nullptr, [](uint64_t) { return true; }, [&]() {
+                        ran_retention = true;
+                        require(!server_slot_path_collision::clear(target), "active rollback staging was not detected");
+                        require(server_route_state_replace_allowed(victim, &held),
+                                "active publisher backup poisoned victim classification");
+                        server_snapshot_retention::filesystem_ops ops;
+                        const auto staged = server_snapshot_retention::run(std::filesystem::path(dir), held,
+                            {std::filesystem::path(victim).filename().string()},
+                            [&](const std::filesystem::path & candidate) {
+                                return candidate == std::filesystem::path(victim) && eviction.acquired();
+                            }, [&](const std::filesystem::path & candidate) {
+                                return server_route_state_replace_allowed(candidate.string(), &held)
+                                    ? server_snapshot_retention::classification::local_only
+                                    : server_snapshot_retention::classification::unknown;
+                            }, []() { return true; }, ops);
+                        return staged.state == server_snapshot_retention::outcome::committed;
+                    }, &held);
+                require(result > 0 && ran_retention && !std::filesystem::exists(victim) &&
+                        server_route_state_read(target, SIZE_MAX, 1024, true, &held).tokens == tokens,
+                        "replacement and eviction failed while publisher backup was active");
+                std::filesystem::remove(target);
+            }
+#ifndef _WIN32
+            // A post-commit cleanup failure must not report SAVE failure. The
+            // old backup stays visible and blocks later writes under this lock.
+            const std::string cleanup_target = dir + "/cleanup-committed.bin";
+            require(server_route_state_save(source.get(), 0, tokens, identity, cleanup_target,
+                        SIZE_MAX, 0, nullptr, {}, {}, &held) > 0, "cleanup fixture save failed");
+            const auto before_cleanup = file_bytes(cleanup_target);
+            setenv("LLAMA_TEST_ROUTE_STATE_CLEANUP_FAIL", "1", 1);
+            size_t committed = 0;
+            try { committed = server_route_state_save(source.get(), 0, tokens, identity, cleanup_target,
+                        SIZE_MAX, 0, nullptr, {}, {}, &held); }
+            catch (...) { unsetenv("LLAMA_TEST_ROUTE_STATE_CLEANUP_FAIL"); throw; }
+            unsetenv("LLAMA_TEST_ROUTE_STATE_CLEANUP_FAIL");
+            require(committed > 0 && server_route_state_read(cleanup_target, SIZE_MAX, 1024, true, &held).tokens == tokens,
+                    "committed cleanup failure was reported as failed save");
+            std::vector<std::filesystem::path> artifacts;
+            for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+                if (entry.path().filename().string().find("cleanup-committed.bin.tmp-rollback-") == 0)
+                    artifacts.push_back(entry.path());
+            }
+            require(artifacts.size() == 1 && file_bytes(artifacts[0].string()) == before_cleanup,
+                    "failed post-commit cleanup did not preserve backup");
+            require(!server_route_state_publication_allowed(dir + "/another.bin", &held),
+                    "unresolved rollback backup did not block other publisher");
+            std::filesystem::remove(artifacts[0]); // isolated test fixture only
+            require(server_route_state_publication_allowed(dir + "/another.bin", &held),
+                    "resolved staging still blocks publication");
+            std::filesystem::remove(cleanup_target);
+#endif
+            const auto other_dir = std::filesystem::path(dir) / "other-store";
+            std::filesystem::create_directory(other_dir);
+            server_route_state_store_lock wrong(other_dir.string(), server_route_state_store_lock_mode::exclusive);
+            bool rejected = false;
+            try { (void) server_route_state_read(path, SIZE_MAX, 1024, false, &wrong); }
+            catch (const std::exception &) { rejected = true; }
+            require(rejected, "unrelated store lock must not authorize inspection");
+        }
+
+        // Legacy adoption also obtains the store lock itself and must refuse
+        // an unresolved backup before publishing any replacement.
+        for (const std::string name : {"external.tmp-rollback-1", ".legacy-slot-stage-1", "retention.tmp-1"}) {
+            const std::string orphan = dir + "/" + name;
+            const std::string adopted = dir + "/adoption-blocked.bin";
+            { std::ofstream output(orphan, std::ios::binary); output << "unresolved"; }
+            require(!server_route_state_adopt_native(legacy_seq_path, adopted, identity.fingerprint(),
+                        common_prompt_cache_layout(source.get()), tokens, llama_n_ctx_seq(source.get()), 256, SIZE_MAX, nullptr) &&
+                    !std::filesystem::exists(adopted) && std::filesystem::exists(orphan),
+                    "legacy adoption ignored unresolved publication backup");
+            std::filesystem::remove(orphan);
+        }
 
         // Admission runs after staging the sequence body but before replacing
         // the previous host snapshot. The accepted size must be the exact
