@@ -99,6 +99,16 @@ public:
 
     void cancel() override { operations.clear(); callbacks.clear(); staged.clear(); }
     size_t n_bytes() override { return consumed; }
+    size_t remaining() const override { return size - consumed; }
+    bool peek(void * dst, size_t count) override {
+        if (count > size - consumed) {
+            return false;
+        }
+        const size_t position = file.tell();
+        file.read_raw(dst, count);
+        file.seek(position, SEEK_SET);
+        return true;
+    }
     uint64_t checksum() const { return XXH64_digest(&hash); }
 
 private:
