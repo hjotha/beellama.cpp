@@ -24,6 +24,8 @@
 #include "rkva-bulk-fp8.h"
 #include "rkva-bulk-scratch.h"
 #include "rkva-execution-lifetime.h"
+#include "rkva-hello-telemetry.h"
+#include "rkva-lazy-int8-policy.h"
 #include <d3d12.h>
 #include <wrl/client.h>
 
@@ -59,6 +61,8 @@ class RemoteAttnEngine {
         uint32_t n_layers = 0;     // remote full-attention layer count (16)
     };
 
+    using InitTimings = rkva_hello_telemetry::InitTimings;
+
     RemoteAttnEngine();
     ~RemoteAttnEngine();
     RemoteAttnEngine(const RemoteAttnEngine&) = delete;
@@ -68,6 +72,7 @@ class RemoteAttnEngine {
     // scratch buffers. Session KV resources are allocated per create_session.
     // A failed initialize never leaves the engine half-enabled.
     bool initialize(const Geometry& geo, std::string* error);
+    const InitTimings& init_timings() const { return init_timings_; }
     bool submission_unconfirmed() const {
         return unconfirmed_submission_;
     }
@@ -190,16 +195,20 @@ class RemoteAttnEngine {
     }
     // Default-on rowlane decode; selection still requires qualified shape/PSO.
     void set_decode_rowlane(bool enabled) { decode_rowlane_ = enabled; }
+    // Experimental F32 MQ2/fine cap, selected at session initialization.
+    void set_kvarn4_mq2_cap32(bool enabled) { kvarn4_mq2_cap32_ = enabled; }
+    void set_kvarn4_mq2_cap128(bool enabled) { kvarn4_mq2_cap128_ = enabled; }
     // Opt-in INT8 QK prefill specialization (default off, NOT bit-exact): when
     // enabled and the dedicated PSO exists, nq 2..9 native KVarN4 mode-2 tiles
     // score the fast shared record tile with dot4add_i8packed instead of the
     // F32 dot. Control path only.
     // Experimental Q8_0 query-quantized INT8 dot path, default off.
-    void set_q8_mq_i8(bool enabled) { q8_mq_i8_ = enabled; }
+    // Configure before initialize. Setters called before initialize retain
+    // intent; after initialize they can create a deferred PSO once.
+    void set_lazy_int8_init(bool enabled) { if (!ready_) lazy_int8_init_ = enabled; }
+    void set_q8_mq_i8(bool enabled);
     void set_q8_paired_reduce(bool enabled);
-    void set_mq_i8(bool enabled) {
-        mq_i8_ = enabled;
-    }
+    void set_mq_i8(bool enabled);
     bool mq_i8() const {
         return mq_i8_;
     }
@@ -228,6 +237,8 @@ class RemoteAttnEngine {
     void create_q4_opt_pipelines();
     // F16/Q8_0/KVarN4 optimized pipelines; needs the Q4 opt prerequisites.
     void create_format_opt_pipelines();
+    void create_kvarn4_mq_i8_pipeline();
+    void create_q8_mq_i8_pipeline();
     void create_bulk_f16_pipelines();
     bool attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, uint32_t n_tokens,
                                    const uint8_t* data, size_t bytes, uint16_t* out_f16,
@@ -260,6 +271,7 @@ class RemoteAttnEngine {
 
     bool ready_ = false;
     Geometry geo_;
+    InitTimings init_timings_;
 
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
@@ -340,6 +352,11 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_mq_i8_pso_;
     std::string kvarn4_mq_i8_status_ = "not initialized";
     bool mq_i8_ = false;
+    bool lazy_int8_init_ = false;
+    rkva_lazy_int8::Policy kvarn4_mq_i8_policy_;
+    rkva_lazy_int8::Policy q8_mq_i8_policy_;
+    bool kvarn4_mq2_cap32_ = false;
+    bool kvarn4_mq2_cap128_ = false;
     bool q8_mq_i8_ = false;
     bool q8_paired_reduce_ = false;
     std::string q8_paired_reduce_status_ = "disabled";

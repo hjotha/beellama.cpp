@@ -85,7 +85,7 @@ def kvarn4_decode_split(active, mode):
     return max(1, k), rows
 
 
-def kvarn4_mq_split(active, mode, q_tile):
+def kvarn4_mq_split(active, mode, q_tile, mq2_cap32=False, mq2_cap128=False):
     """Multi-query tile split policy for native KVarN4 (nq 2..9, q_tile 2 or 4):
     For q_tile == 2 or 4 in mode 1 (balanced) and mode 2 (fine):
       target_rows = 256 (2 record groups of 128 tokens),
@@ -98,7 +98,8 @@ def kvarn4_mq_split(active, mode, q_tile):
     if q_tile not in (2, 4) or mode not in (1, 2):
         return kvarn4_split(active, mode)
     target_rows = 256
-    max_splits = 64 if mode == 2 else 32
+    eligible = mode == 2 and q_tile == 2
+    max_splits = 32 if eligible and mq2_cap32 else 128 if eligible and mq2_cap128 else 64 if mode == 2 else 32
     wanted = (active + target_rows - 1) // target_rows
     k0 = max(1, min(max_splits, wanted))
     rows = (active + k0 - 1) // k0
@@ -544,7 +545,8 @@ def run_reference(Kp, Vp, q, active, pos, scale, k_src, v_src, prefix=False):
 
 
 def run_optimized(
-    Kp, Vp, q, active, pos, scale, mode, wave, k_src, v_src, prefix=False, decode_split=False, mq_tile=0
+    Kp, Vp, q, active, pos, scale, mode, wave, k_src, v_src, prefix=False, decode_split=False, mq_tile=0,
+    mq2_cap32=False, mq2_cap128=False
 ):
     """prefix=True emulates RKVA_SERIAL_PREFIX=1 (see run_reference)."""
     lay = Kp.lay
@@ -552,7 +554,7 @@ def run_optimized(
     assert not (decode_split and mq_tile)
     split_k, rows = (
         kvarn4_decode_split(active, mode) if decode_split else
-        kvarn4_mq_split(active, mode, mq_tile) if mq_tile else kvarn4_split(active, mode)
+        kvarn4_mq_split(active, mode, mq_tile, mq2_cap32, mq2_cap128) if mq_tile else kvarn4_split(active, mode)
     )
     assert split_k <= 256 and rows % 8 == 0 and rows * split_k >= active
     n_waves = 128 // wave

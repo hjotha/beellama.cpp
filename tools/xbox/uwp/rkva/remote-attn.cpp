@@ -195,6 +195,8 @@ struct remote_state {
     bool fp8_gpu_enabled = true;
     // Opt-in INT8 QK prefill kernel (default off, NOT bit-exact): LocalState flag file.
     bool mq_i8_enabled = false;
+    bool kvarn4_mq2_cap32 = false;
+    bool kvarn4_mq2_cap128 = false;
     bool q8_mq_i8_enabled = false;
     bool q8_paired_reduce_enabled = false;
     bool q8_fp8_gpu_enabled = true;
@@ -330,6 +332,12 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             hello.max_ctx > uint32_t(INT32_MAX) || hello.has_sinks || hello.swa) {
             return RKVA_ERR_BAD_GEOMETRY;
         }
+        const bool mq2_cap32 = std::ifstream(g_snapshot_local_folder + "\\rkva-mq2-split-cap32.flag").good();
+        const bool mq2_cap128 = std::ifstream(g_snapshot_local_folder + "\\rkva-mq2-split-cap128.flag").good();
+        if (!rkva_rprof::kvarn4_mq2_cap_flags_valid(mq2_cap32, mq2_cap128)) {
+            event_engine_error("conflicting rkva-mq2-split-cap32.flag and rkva-mq2-split-cap128.flag");
+            return RKVA_ERR_STATE;
+        }
         state.sessions.clear();
         state.profile_enabled = state.trace_requests = false;
         for (auto& counter : state.rpc_profile)
@@ -349,6 +357,9 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         // docs/rkva-prefill-int8-dot4.md.
         state.mq_i8_enabled =
             std::ifstream(g_snapshot_local_folder + "\\rkva-mq-i8.flag").good();
+        // F32 MQ2/fine only; splitting changes floating-point reduction order.
+        state.kvarn4_mq2_cap32 = mq2_cap32;
+        state.kvarn4_mq2_cap128 = mq2_cap128;
         state.q8_mq_i8_enabled =
             std::ifstream(g_snapshot_local_folder + "\\rkva-q8-mq-i8.flag").good();
         state.q8_paired_reduce_enabled =
@@ -365,7 +376,9 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             state.native_serial_prefix_v3_client &&
             (hello.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4) != 0;
 
+        const auto evict_started = clock_type::now();
         evict_local_session();
+        const uint64_t evict_us = elapsed_us(evict_started);
 
         // cache_bits 0 or 16 -> F16 bring-up path; 2..8 -> KVarN native.
         state.engine_f16 = (hello.cache_bits_k == 0 || hello.cache_bits_k >= 16);
@@ -388,17 +401,30 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         g.n_layers = hello.n_layer_remote;
 
         state.engine = std::make_unique<RemoteAttnEngine>();
+        const bool lazy_int8 = std::ifstream(g_snapshot_local_folder + "\\rkva-lazy-int8-init.flag").good();
+        state.engine->set_lazy_int8_init(lazy_int8);
         std::string engine_error;
-        if (!state.engine->initialize(g, &engine_error)) {
+        const auto engine_started = clock_type::now();
+        const bool initialized = state.engine->initialize(g, &engine_error);
+        const uint64_t engine_us = elapsed_us(engine_started);
+        if (!initialized) {
+            event(g_log_path, rkva_hello_telemetry::event(false, req.cycle_id, evict_us,
+                    engine_us, state.engine->init_timings(), 0, elapsed_us(t0), lazy_int8));
             state.engine.reset();
             state.hello_done = false;
             event_engine_error(engine_error);
+            prepare_us = elapsed_us(t0);
             return RKVA_ERR_GPU;
         }
+        const auto options_started = clock_type::now();
         state.engine->set_mq_i8(state.mq_i8_enabled);
+        state.engine->set_kvarn4_mq2_cap32(state.kvarn4_mq2_cap32);
+        state.engine->set_kvarn4_mq2_cap128(state.kvarn4_mq2_cap128);
         state.engine->set_q8_mq_i8(state.q8_mq_i8_enabled);
         state.engine->set_q8_paired_reduce(state.q8_paired_reduce_enabled);
         state.engine->set_decode_rowlane(state.decode_rowlane_enabled);
+        const uint64_t options_us = elapsed_us(options_started);
+        const auto timings = state.engine->init_timings();
 
         rkva_hello_ack ack{};
         ack.supported_ops = supported_ops_mask();
@@ -439,6 +465,9 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         ack.mem_budget_bytes = 4ull * 1024 * 1024 * 1024;
         output.resize(sizeof(ack));
         std::memcpy(output.data(), &ack, sizeof(ack));
+        event(g_log_path, rkva_hello_telemetry::event(true, req.cycle_id, evict_us,
+                engine_us, timings, options_us, elapsed_us(t0), lazy_int8));
+        prepare_us = elapsed_us(t0);
         return RKVA_OK;
     }
     case RKVA_PING: {

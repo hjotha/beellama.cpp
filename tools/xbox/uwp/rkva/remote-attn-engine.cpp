@@ -501,6 +501,7 @@ bool RemoteAttnEngine::submit(std::string* error) {
 }
 
 bool RemoteAttnEngine::create_device(std::string* error) {
+    const auto device_started = prof_clock::now();
     auto create_device_fn = xllama::d3d12_dyn::CreateDevice();
     if (!create_device_fn) {
         return fail(error, "D3D12CreateDevice unavailable");
@@ -528,6 +529,8 @@ bool RemoteAttnEngine::create_device(std::string* error) {
     if (!device_) {
         return fail(error, "no hardware D3D12 adapter");
     }
+    init_timings_.device_us = elapsed_ns(device_started, prof_clock::now()) / 1000;
+    const auto queue_started = prof_clock::now();
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     hr = device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue_));
@@ -555,10 +558,12 @@ bool RemoteAttnEngine::create_device(std::string* error) {
     if (!fence_event_) {
         return fail(error, "CreateEventW failed");
     }
+    init_timings_.queue_us = elapsed_ns(queue_started, prof_clock::now()) / 1000;
     return true;
 }
 
 bool RemoteAttnEngine::create_pipelines(std::string* error) {
+    const auto roots_started = prof_clock::now();
     auto serialize = xllama::d3d12_dyn::SerializeRootSignature();
     if (!serialize) {
         return fail(error, "D3D12SerializeRootSignature unavailable");
@@ -633,6 +638,9 @@ bool RemoteAttnEngine::create_pipelines(std::string* error) {
         !make_root(4, 1, 1, range_reduce_root_.GetAddressOf())) {
         return false;
     }
+
+    init_timings_.roots_us = elapsed_ns(roots_started, prof_clock::now()) / 1000;
+    const auto psos_started = prof_clock::now();
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
     pso.pRootSignature = attn_root_.Get();
@@ -710,6 +718,7 @@ bool RemoteAttnEngine::create_pipelines(std::string* error) {
     if (FAILED(hr)) {
         return fail(error, "CreateComputePipelineState range reduction", hr);
     }
+    init_timings_.required_psos_us = elapsed_ns(psos_started, prof_clock::now()) / 1000;
     return true;
 }
 
@@ -832,6 +841,14 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
             fmt_mq_status_[rp::kStorageF16][i] = why;
             fmt_mq_status_[rp::kStorageQ8][i] = why;
         }
+        if (lazy_int8_init_ && kvarn4_mq_i8_policy_.requested) {
+            kvarn4_mq_i8_policy_.mark_attempted();
+            kvarn4_mq_i8_status_ = why;
+        }
+        if (lazy_int8_init_ && q8_mq_i8_policy_.requested) {
+            q8_mq_i8_policy_.mark_attempted();
+            q8_mq_i8_status_ = why;
+        }
         return;
     }
     auto serialize = xllama::d3d12_dyn::SerializeRootSignature();
@@ -879,8 +896,24 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
             fmt_mq_status_[rp::kStorageF16][i] = text;
             fmt_mq_status_[rp::kStorageQ8][i] = text;
         }
+        if (lazy_int8_init_ && kvarn4_mq_i8_policy_.requested) {
+            kvarn4_mq_i8_policy_.mark_attempted();
+            kvarn4_mq_i8_status_ = text;
+        }
+        if (lazy_int8_init_ && q8_mq_i8_policy_.requested) {
+            q8_mq_i8_policy_.mark_attempted();
+            q8_mq_i8_status_ = text;
+        }
         return;
     }
+    const auto create_format_pso = [&](const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc,
+                                       ComPtr<ID3D12PipelineState>& out,
+                                       rkva_hello_telemetry::FormatPso id) {
+        const auto started = prof_clock::now();
+        const HRESULT result = device_->CreateComputePipelineState(&desc, IID_PPV_ARGS(out.ReleaseAndGetAddressOf()));
+        init_timings_.record(id, elapsed_ns(started, prof_clock::now()) / 1000, false);
+        return result;
+    };
     struct Kernel {
         uint32_t storage;
         const void* bytecode;
@@ -896,8 +929,9 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
         pso.pRootSignature = range_attn_fmt_opt_root_.Get();
         pso.CS = {k.bytecode, k.size};
-        hr = device_->CreateComputePipelineState(&pso,
-                                                 IID_PPV_ARGS(&range_attn_fmt_opt_pso_[k.storage]));
+        const auto id = k.storage == rp::kStorageF16 ? rkva_hello_telemetry::f16_opt :
+            k.storage == rp::kStorageQ8 ? rkva_hello_telemetry::q8_opt : rkva_hello_telemetry::kvarn4_opt;
+        hr = create_format_pso(pso, range_attn_fmt_opt_pso_[k.storage], id);
         if (FAILED(hr)) {
             std::snprintf(text, sizeof(text), "%s optimized pipeline state: 0x%08X",
                           rp::storage_name(k.storage), unsigned(hr));
@@ -911,8 +945,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
     prefix.pRootSignature = range_attn_fmt_opt_root_.Get();
     prefix.CS = {g_rkva_range_attn_kvarn4_opt_prefix_dxil,
                  sizeof(g_rkva_range_attn_kvarn4_opt_prefix_dxil)};
-    hr = device_->CreateComputePipelineState(&prefix,
-                                             IID_PPV_ARGS(&range_attn_kvarn4_opt_prefix_pso_));
+    hr = create_format_pso(prefix, range_attn_kvarn4_opt_prefix_pso_, rkva_hello_telemetry::kvarn4_prefix);
     if (FAILED(hr)) {
         std::snprintf(text, sizeof(text), "kvarn4 serial-prefix optimized pipeline state: 0x%08X",
                       unsigned(hr));
@@ -933,7 +966,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         D3D12_COMPUTE_PIPELINE_STATE_DESC mq = {};
         mq.pRootSignature = range_attn_fmt_opt_root_.Get();
         mq.CS = {g_rkva_range_attn_kvarn4_mq2_dxil, sizeof(g_rkva_range_attn_kvarn4_mq2_dxil)};
-        hr = device_->CreateComputePipelineState(&mq, IID_PPV_ARGS(&range_attn_kvarn4_mq_pso_));
+        hr = create_format_pso(mq, range_attn_kvarn4_mq_pso_, rkva_hello_telemetry::kvarn4_mq2);
         if (FAILED(hr)) {
             std::snprintf(text, sizeof(text), "kvarn4 multi-query pipeline state: 0x%08X",
                           unsigned(hr));
@@ -945,7 +978,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
 #if RKVA_HAS_KVARN4_MQ4_DXIL
         mq.pRootSignature = range_attn_fmt_opt_root_.Get();
         mq.CS = {g_rkva_range_attn_kvarn4_mq4_dxil, sizeof(g_rkva_range_attn_kvarn4_mq4_dxil)};
-        hr = device_->CreateComputePipelineState(&mq, IID_PPV_ARGS(&range_attn_kvarn4_mq4_pso_));
+        hr = create_format_pso(mq, range_attn_kvarn4_mq4_pso_, rkva_hello_telemetry::kvarn4_mq4);
         if (FAILED(hr)) {
             std::snprintf(text, sizeof(text), "kvarn4 mq4 pipeline state: 0x%08X", unsigned(hr));
             range_attn_kvarn4_mq4_pso_.Reset();
@@ -956,26 +989,15 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
 #else
         kvarn4_mq4_status_ = "dxil header not generated (compile attn_kvarn4_mq4)";
 #endif
-#if RKVA_HAS_KVARN4_MQ2_I8_DXIL
-        // Same root signature and shape as attn_kvarn4_mq2; the fast shared
-        // record tile scores K with dot4add_i8packed (SM 6.4). Not bit-exact:
-        // separate opt-in PSO, never the default path.
-        mq.pRootSignature = range_attn_fmt_opt_root_.Get();
-        mq.CS = {g_rkva_range_attn_kvarn4_mq2_i8_dxil,
-                 sizeof(g_rkva_range_attn_kvarn4_mq2_i8_dxil)};
-        hr = device_->CreateComputePipelineState(&mq,
-                                                 IID_PPV_ARGS(&range_attn_kvarn4_mq_i8_pso_));
-        if (FAILED(hr)) {
-            std::snprintf(text, sizeof(text), "kvarn4 mq2 int8 pipeline state: 0x%08X",
-                          unsigned(hr));
-            range_attn_kvarn4_mq_i8_pso_.Reset();
-            kvarn4_mq_i8_status_ = text;
+        if (kvarn4_mq_i8_policy_.during_initialize(lazy_int8_init_)) {
+            create_kvarn4_mq_i8_pipeline();
         } else {
-            kvarn4_mq_i8_status_ = "ready";
-        }
+#if RKVA_HAS_KVARN4_MQ2_I8_DXIL
+            kvarn4_mq_i8_status_ = "deferred until enabled";
 #else
-        kvarn4_mq_i8_status_ = "dxil header not generated (compile attn_kvarn4_mq2_i8)";
+            kvarn4_mq_i8_status_ = "dxil header not generated (compile attn_kvarn4_mq2_i8)";
 #endif
+        }
     }
     // Native KVarN4 revision-3 wave64 decode kernel (nq == 1, 12 KiB LDS):
     // Requires wave lanes >= 64 and the generated decode DXIL.
@@ -989,8 +1011,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         dec.pRootSignature = range_attn_fmt_opt_root_.Get();
         dec.CS = {g_rkva_range_attn_kvarn4_decode_prefix_dxil,
                   sizeof(g_rkva_range_attn_kvarn4_decode_prefix_dxil)};
-        hr = device_->CreateComputePipelineState(
-            &dec, IID_PPV_ARGS(&range_attn_kvarn4_decode_prefix_pso_));
+        hr = create_format_pso(dec, range_attn_kvarn4_decode_prefix_pso_, rkva_hello_telemetry::kvarn4_decode);
         if (FAILED(hr)) {
             std::snprintf(text, sizeof(text), "kvarn4 serial-prefix decode pipeline state: 0x%08X",
                           unsigned(hr));
@@ -1013,8 +1034,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         dec.pRootSignature = range_attn_fmt_opt_root_.Get();
         dec.CS = {g_rkva_range_attn_kvarn4_decode_rowlane_dxil,
                   sizeof(g_rkva_range_attn_kvarn4_decode_rowlane_dxil)};
-        hr = device_->CreateComputePipelineState(
-            &dec, IID_PPV_ARGS(&range_attn_kvarn4_decode_rowlane_pso_));
+        hr = create_format_pso(dec, range_attn_kvarn4_decode_rowlane_pso_, rkva_hello_telemetry::kvarn4_rowlane);
         if (FAILED(hr)) {
             std::snprintf(text, sizeof(text), "kvarn4 rowlane pipeline state: 0x%08X", unsigned(hr));
             range_attn_kvarn4_decode_rowlane_pso_.Reset();
@@ -1045,7 +1065,10 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         pso.pRootSignature = range_attn_fmt_opt_root_.Get();
         pso.CS = {k.bytecode, k.size};
         ComPtr<ID3D12PipelineState>& slot = range_attn_fmt_mq_pso_[k.storage][k.index];
-        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&slot));
+        const auto id = k.storage == rp::kStorageF16
+            ? (k.index == 0 ? rkva_hello_telemetry::f16_mq2 : rkva_hello_telemetry::f16_mq4)
+            : (k.index == 0 ? rkva_hello_telemetry::q8_mq2 : rkva_hello_telemetry::q8_mq4);
+        hr = create_format_pso(pso, slot, id);
         if (FAILED(hr)) {
             std::snprintf(text, sizeof(text), "%s multi-query pipeline state: 0x%08X",
                           rp::storage_name(k.storage), unsigned(hr));
@@ -1055,23 +1078,100 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
             fmt_mq_status_[k.storage][k.index] = "ready";
         }
     }
+    if (q8_mq_i8_policy_.during_initialize(lazy_int8_init_)) {
+        create_q8_mq_i8_pipeline();
+    } else {
 #if RKVA_HAS_Q8_MQ2_I8_DXIL
-    {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
-        pso.pRootSignature = range_attn_fmt_opt_root_.Get();
-        pso.CS = {g_rkva_range_attn_q8_mq2_i8_dxil, sizeof(g_rkva_range_attn_q8_mq2_i8_dxil)};
-        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_q8_mq_i8_pso_));
-        if (FAILED(hr)) {
-            std::snprintf(text, sizeof(text), "q8 int8 multi-query pipeline state: 0x%08X", unsigned(hr));
-            range_attn_q8_mq_i8_pso_.Reset();
-            q8_mq_i8_status_ = text;
-        } else {
-            q8_mq_i8_status_ = "ready";
-        }
+        q8_mq_i8_status_ = "deferred until enabled";
+#else
+        q8_mq_i8_status_ = "header not built (compile attn_q8_mq2_i8)";
+#endif
+    }
+}
+
+void RemoteAttnEngine::create_kvarn4_mq_i8_pipeline() {
+    if (kvarn4_mq_i8_policy_.attempted) return;
+    kvarn4_mq_i8_policy_.mark_attempted();
+    if (!device_ || !range_attn_fmt_opt_root_ || !range_attn_q4_opt_pso_ || !range_reduce_opt_pso_) {
+        kvarn4_mq_i8_status_ = "requires format and q4 optimized prerequisites";
+        return;
+    }
+    if (wave_lane_min_ < rp::kKvarn4MqWaveLanes) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "requires wave lanes >= %u (reported min %u)",
+                      rp::kKvarn4MqWaveLanes, wave_lane_min_);
+        kvarn4_mq_i8_status_ = text;
+        return;
+    }
+#if RKVA_HAS_KVARN4_MQ2_I8_DXIL
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature = range_attn_fmt_opt_root_.Get();
+    pso.CS = {g_rkva_range_attn_kvarn4_mq2_i8_dxil, sizeof(g_rkva_range_attn_kvarn4_mq2_i8_dxil)};
+    const auto started = prof_clock::now();
+    const HRESULT hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_kvarn4_mq_i8_pso_));
+    init_timings_.record(rkva_hello_telemetry::kvarn4_mq2_i8,
+                         elapsed_ns(started, prof_clock::now()) / 1000, ready_);
+    if (FAILED(hr)) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "kvarn4 mq2 int8 pipeline state: 0x%08X", unsigned(hr));
+        range_attn_kvarn4_mq_i8_pso_.Reset();
+        kvarn4_mq_i8_status_ = text;
+    } else {
+        kvarn4_mq_i8_status_ = "ready";
+    }
+#else
+    kvarn4_mq_i8_status_ = "dxil header not generated (compile attn_kvarn4_mq2_i8)";
+#endif
+}
+
+void RemoteAttnEngine::create_q8_mq_i8_pipeline() {
+    if (q8_mq_i8_policy_.attempted) return;
+    q8_mq_i8_policy_.mark_attempted();
+    if (!device_ || !range_attn_fmt_opt_root_ || !range_attn_q4_opt_pso_ || !range_reduce_opt_pso_) {
+        q8_mq_i8_status_ = "requires format and q4 optimized prerequisites";
+        return;
+    }
+#if RKVA_HAS_Q8_MQ2_I8_DXIL
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature = range_attn_fmt_opt_root_.Get();
+    pso.CS = {g_rkva_range_attn_q8_mq2_i8_dxil, sizeof(g_rkva_range_attn_q8_mq2_i8_dxil)};
+    const auto started = prof_clock::now();
+    const HRESULT hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_q8_mq_i8_pso_));
+    init_timings_.record(rkva_hello_telemetry::q8_mq2_i8,
+                         elapsed_ns(started, prof_clock::now()) / 1000, ready_);
+    if (FAILED(hr)) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "q8 int8 multi-query pipeline state: 0x%08X", unsigned(hr));
+        range_attn_q8_mq_i8_pso_.Reset();
+        q8_mq_i8_status_ = text;
+    } else {
+        q8_mq_i8_status_ = "ready";
     }
 #else
     q8_mq_i8_status_ = "header not built (compile attn_q8_mq2_i8)";
 #endif
+}
+
+void RemoteAttnEngine::set_mq_i8(bool enabled) {
+    mq_i8_ = enabled;
+    if (kvarn4_mq_i8_policy_.set_requested(enabled, ready_, lazy_int8_init_)) {
+        if (unconfirmed_submission_ || terminal_failure_ || bulk_recording_) {
+            kvarn4_mq_i8_status_ = "deferred: engine is busy or failed";
+        } else {
+            create_kvarn4_mq_i8_pipeline();
+        }
+    }
+}
+
+void RemoteAttnEngine::set_q8_mq_i8(bool enabled) {
+    q8_mq_i8_ = enabled;
+    if (q8_mq_i8_policy_.set_requested(enabled, ready_, lazy_int8_init_)) {
+        if (unconfirmed_submission_ || terminal_failure_ || bulk_recording_) {
+            q8_mq_i8_status_ = "deferred: engine is busy or failed";
+        } else {
+            create_q8_mq_i8_pipeline();
+        }
+    }
 }
 
 void RemoteAttnEngine::set_q8_paired_reduce(bool enabled) {
@@ -1337,6 +1437,8 @@ std::string RemoteAttnEngine::get_range_profile_json() {
         range_attn_fmt_opt_root_ && range_attn_kvarn4_opt_prefix_pso_ && range_reduce_kvarn4_pso_;
     header.kvarn4_prefix_status[1] = kvarn4_opt_prefix_status_;
     header.kvarn4_mq_available = header.kvarn4_prefix_available[1] && range_attn_kvarn4_mq_pso_;
+    header.kvarn4_mq2_cap32 = kvarn4_mq2_cap32_;
+    header.kvarn4_mq2_cap128 = kvarn4_mq2_cap128_;
     header.kvarn4_mq_status =
         header.kvarn4_prefix_available[1]
             ? kvarn4_mq_status_
@@ -1395,6 +1497,9 @@ bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
     if (ready_) {
         return fail(error, "engine already initialized");
     }
+    // A previous failed attempt may have completed some spans. Zero fields
+    // anew; on failure, zero can mean that a stage did not complete.
+    init_timings_ = {};
     if (geo.n_head == 0 || geo.n_head_kv == 0 || geo.head_dim == 0 || geo.max_ctx == 0 ||
         geo.n_head % geo.n_head_kv != 0) {
         return fail(error, "invalid geometry");
@@ -1403,8 +1508,12 @@ bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
     if (!create_device(error) || !create_pipelines(error)) {
         return false;
     }
+    const auto q4_started = prof_clock::now();
     create_q4_opt_pipelines();
+    init_timings_.q4_psos_us = elapsed_ns(q4_started, prof_clock::now()) / 1000;
+    const auto format_started = prof_clock::now();
     create_format_opt_pipelines();
+    init_timings_.format_psos_us = elapsed_ns(format_started, prof_clock::now()) / 1000;
     // Initial scratch for a modest prefill chunk; grown on demand.
     scratch_tokens_ = 0;
     ready_ = true;
@@ -3552,7 +3661,8 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             const rp::KvarnSplit ks =
                 (n_tokens == 1 && decode_opt)
                     ? rp::kvarn4_decode_split(active_count, q4_kernel_mode_)
-                    : (q_tile ? rp::kvarn4_mq_split(active_count, q4_kernel_mode_, q_tile)
+                    : (q_tile ? rp::kvarn4_mq_split(active_count, q4_kernel_mode_, q_tile,
+                                                    kvarn4_mq2_cap32_, selected_int8_dot, kvarn4_mq2_cap128_)
                               : rp::kvarn4_split(active_count, q4_kernel_mode_));
             split_k = ks.split_k;
             rows = ks.split_rows;
