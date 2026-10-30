@@ -26,6 +26,7 @@
 #include "rkva-execution-lifetime.h"
 #include "rkva-hello-telemetry.h"
 #include "rkva-lazy-int8-policy.h"
+#include "rkva-optional-pso-policy.h"
 #include <d3d12.h>
 #include <wrl/client.h>
 
@@ -194,7 +195,7 @@ class RemoteAttnEngine {
         return profiling_;
     }
     // Default-on rowlane decode; selection still requires qualified shape/PSO.
-    void set_decode_rowlane(bool enabled) { decode_rowlane_ = enabled; }
+    void set_decode_rowlane(bool enabled);
     // Opt-in INT8 QK prefill specialization (default off, NOT bit-exact): when
     // enabled and the dedicated PSO exists, nq 2..9 native KVarN4 mode-2 tiles
     // score the fast shared record tile with dot4add_i8packed instead of the
@@ -231,8 +232,10 @@ class RemoteAttnEngine {
     // Same as create_buffer but never marks the engine failed (control-path use).
     HRESULT try_create_buffer(uint64_t bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
                               D3D12_RESOURCE_STATES state, Buffer* out);
+    void create_shared_opt_pipelines();
     void create_q4_opt_pipelines();
-    // F16/Q8_0/KVarN4 optimized pipelines; needs the Q4 opt prerequisites.
+    void create_decode_rowlane_pipeline();
+    // F16/Q8_0/KVarN4 optimized pipelines; needs shared qualification/root/reducers, not the Q4 PSO.
     void create_format_opt_pipelines();
     void create_kvarn4_mq_i8_pipeline();
     void create_q8_mq_i8_pipeline();
@@ -304,6 +307,7 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q4_opt_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_reduce_opt_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_reduce_kvarn4_pso_;
+    std::string shared_opt_status_ = "not initialized";
     std::string q4_opt_status_ = "not initialized";
     // Q4_0 multi-query tile kernels ([0] 2-query, [1] 4-query) for nq 2..9 in
     // modes 1/2; optional, a missing PSO keeps the per-query optimized kernel.
@@ -365,6 +369,7 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_decode_rowlane_pso_;
     std::string kvarn4_decode_rowlane_status_ = "not initialized";
     bool decode_rowlane_ = true;
+    rkva_optional_pso::Policy rowlane_policy_{true, false};
 
     // Profiling (default off). Timestamp slots are fixed per stage so a future
     // fused upload+attention command list cannot alias them.

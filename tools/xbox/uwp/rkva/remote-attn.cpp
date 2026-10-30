@@ -392,6 +392,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         state.engine = std::make_unique<RemoteAttnEngine>();
         const bool lazy_int8 = std::ifstream(g_snapshot_local_folder + "\\rkva-lazy-int8-init.flag").good();
         state.engine->set_lazy_int8_init(lazy_int8);
+        state.engine->set_decode_rowlane(state.decode_rowlane_enabled);
         std::string engine_error;
         const auto engine_started = clock_type::now();
         const bool initialized = state.engine->initialize(g, &engine_error);
@@ -409,7 +410,6 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         state.engine->set_mq_i8(state.mq_i8_enabled);
         state.engine->set_q8_mq_i8(state.q8_mq_i8_enabled);
         state.engine->set_q8_paired_reduce(state.q8_paired_reduce_enabled);
-        state.engine->set_decode_rowlane(state.decode_rowlane_enabled);
         const uint64_t options_us = elapsed_us(options_started);
         const auto timings = state.engine->init_timings();
 

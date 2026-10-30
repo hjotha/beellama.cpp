@@ -46,8 +46,9 @@ measure that). `check_dp4a()` runs on every invocation and proves the 4-lane
 int8 chain equals the int64 sum and that the widest score stays inside int32.
 
 Stage rows, the ORIGINAL-F16 tail, the softmax, the WHT and the partial layout
-are untouched: they keep the exact F32 path in REF and in I8, so they cannot
-mask a difference. Only the record-row score changes.
+are untouched: they keep the same F32 path in REF and in I8. Only the
+record-row score changes. Weight L1 includes records AND tail in both paths.
+Reported gate metrics are query means; true maxima are reported separately.
 
 Run: python3 tools/xbox/tests/rkva_mq_i8_quality.py [--json out.json] [--quick]
 """
@@ -281,8 +282,49 @@ def kernel_attention(s_rec, q_orig, k_tail, v_tail, v_rec):
     return o.astype(np.float64) / scale, lse
 
 
+
+def full_softmax(record_scores, tail_scores):
+    """Normalize over records AND tail. Either partition may be empty.
+
+    An entirely empty attention domain has no probability distribution and is
+    rejected rather than silently reporting zero error.
+    """
+    scores = np.concatenate((np.asarray(record_scores, dtype=np.float64),
+                             np.asarray(tail_scores, dtype=np.float64)))
+    if scores.ndim != 1 or not scores.size or not np.isfinite(scores).all():
+        raise ValueError("softmax requires a nonempty finite score vector")
+    weights = np.exp(scores - scores.max())
+    return weights / weights.sum()
+
+
+def summarize_metrics(per_query):
+    """Retain legacy means separately from true query maxima and p95.
+
+    Each metric is a list of (REF, I8) pairs. Max/p95 are observational:
+    verdict() continues to use the means, not a silently introduced new gate.
+    """
+    means, distributions = {}, {}
+    for key, pairs in per_query.items():
+        values = np.asarray(pairs, dtype=np.float64)
+        if (values.ndim != 2 or values.shape[1] != 2 or not len(values)
+                or not np.isfinite(values).all()):
+            raise ValueError("metrics require nonempty finite REF/I8 pairs")
+        means[key], distributions[key] = {}, {}
+        for index, label in enumerate(('ref', 'i8')):
+            column = values[:, index]
+            means[key][label] = float(column.mean())
+            distributions[key][label] = {
+                'max': float(column.max()),
+                'max_query_index': int(column.argmax()),
+                'p95': float(np.percentile(column, 95)),
+            }
+    return means, distributions
+
+
 def run_case(rng, live, style, dc_exact=True, n_queries=8):
     """Aggregate GOLD/REF/I8 metrics over `n_queries` independent queries."""
+    if n_queries < 1:
+        raise ValueError("n_queries must be positive")
     store = Store(rng, live, style)
     krec, vrec = store.sources()
     k_tail = f16(store.k[store.tail_begin:])
@@ -326,11 +368,17 @@ def run_case(rng, live, style, dc_exact=True, n_queries=8):
         acc['rel_o_max'].append((r[1], i[1]))
         acc['one_minus_cos'].append((r[2], i[2]))
         acc['lse_abs_max'].append((r[3], i[3]))
-        w_ref = np.exp(s_ref.astype(np.float64) - float(s_ref.max()))
-        w_i8 = np.exp(s_i8.astype(np.float64) - float(s_i8.max()))
-        w_g_rec = w_g[:store.tail_begin] / w_g.sum()
-        acc['wl1_ref'].append(float(np.abs(w_ref / w_ref.sum() - w_g_rec).sum()))
-        acc['wl1_i8'].append(float(np.abs(w_i8 / w_i8.sum() - w_g_rec).sum()))
+        # Match the ORIGINAL-F16 tail score used by kernel_attention: F64
+        # dot followed by F32 rounding. Compare probabilities on the SAME full
+        # records+tail domain as GOLD, not record-only vs a truncated GOLD.
+        s_tail = np.asarray([
+            F32(np.dot(q64, row.astype(np.float64)) * KQ_SCALE)
+            for row in k_tail], dtype=F32)
+        w_ref = full_softmax(s_ref, s_tail)
+        w_i8 = full_softmax(s_i8, s_tail)
+        w_gold = w_g / w_g.sum()
+        acc['wl1_ref'].append(float(np.abs(w_ref - w_gold).sum()))
+        acc['wl1_i8'].append(float(np.abs(w_i8 - w_gold).sum()))
         acc['gap'].append(float(np.sqrt(((s_ref - s_gold_rec) ** 2).mean())))
         acc['rms_i8'].append(float(np.sqrt(((s_i8 - s_gold_rec) ** 2).mean())))
         acc['added'].append(float(np.sqrt(((s_i8 - s_ref) ** 2).mean())))
@@ -340,18 +388,17 @@ def run_case(rng, live, style, dc_exact=True, n_queries=8):
 
     gap = mean(acc['gap'])
     added = mean(acc['added'])
+    per_query = {key: acc[key] for key in
+                 ('rel_o_rms', 'rel_o_max', 'one_minus_cos', 'lse_abs_max')}
+    per_query['weight_l1'] = list(zip(acc['wl1_ref'], acc['wl1_i8']))
+    metrics, distributions = summarize_metrics(per_query)
     out = dict(
         live=int(live), groups=int(store.groups), style=style, dc_exact=bool(dc_exact),
-        queries=int(n_queries), score_std=float(np.mean(acc['gap'])) and None,
-        metrics={}, score_rms={})
-    for key in ('rel_o_rms', 'rel_o_max', 'one_minus_cos', 'lse_abs_max'):
-        out['metrics'][key] = {'ref': mean([a for a, _ in acc[key]]),
-                               'i8': mean([b for _, b in acc[key]])}
-    out['metrics']['weight_l1'] = {'ref': mean(acc['wl1_ref']), 'i8': mean(acc['wl1_i8'])}
+        queries=int(n_queries), metrics=metrics, score_rms={},
+        per_query_metrics=per_query, metric_distribution=distributions)
     out['score_rms'] = {'ref': gap, 'i8': mean(acc['rms_i8']),
                         'ratio': mean(acc['rms_i8']) / gap if gap else 0.0,
                         'added_over_ref': added / gap if gap else 0.0}
-    out.pop('score_std', None)
     return out
 
 
@@ -390,7 +437,8 @@ def verdict(case, tol_added=0.35, tol_ratio=1.15):
     Primary criterion: the Q8 rounding error must stay a small fraction of the
     4-bit KVarN4 score error production already accepts (`added_over_ref` is the
     variant-vs-shipped gap over the shipped-vs-F16 gap). Secondary: the
-    attention output, LSE and softmax weights must not grow.
+    query-mean attention output, LSE and full-domain softmax weights must
+    stay within tol_ratio. Observational maxima do not change this gate.
     """
     reasons = []
     if case['score_rms']['added_over_ref'] > tol_added:
@@ -408,6 +456,25 @@ def verdict(case, tol_added=0.35, tol_ratio=1.15):
     return (not reasons), reasons
 
 
+
+def gated_query_maxima(results):
+    """Global maxima across gated cases, with zero-based query provenance."""
+    maxima = {}
+    for case_index, result in enumerate(results):
+        case = result['case']
+        if not case['dc_exact']:
+            continue
+        for key, distribution in case['metric_distribution'].items():
+            for label, stats in distribution.items():
+                previous = maxima.setdefault(key, {}).get(label)
+                if previous is None or stats['max'] > previous['value']:
+                    maxima[key][label] = {
+                        'value': stats['max'], 'case_index': case_index,
+                        'query_index': stats['max_query_index'],
+                        'live': case['live'], 'style': case['style']}
+    return maxima
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--json')
@@ -415,6 +482,8 @@ def main():
     ap.add_argument('--queries', type=int, default=8)
     ap.add_argument('--seed', type=int, default=11)
     args = ap.parse_args()
+    if args.queries < 1:
+        ap.error('--queries must be positive')
     dp4a = check_dp4a()
     lives = [256, 640] if args.quick else [256, 384, 640, 1920, 4096]
     results = []
@@ -427,12 +496,21 @@ def main():
                 results.append(dict(case=case, ok=ok, reasons=why))
     gated = [r for r in results if r['case']['dc_exact']]
     all_ok = all(r['ok'] for r in gated)
-    report = {'schema': 'rkva-mq-i8-quality-v1', 'kq_scale': KQ_SCALE,
+    report = {'schema': 'rkva-mq-i8-quality-v2',
+              'metric_contract': {
+                  'metrics': 'mean over independent queries (legacy keys retained)',
+                  'weight_l1_domain': 'full records+tail',
+                  'per_query_metrics_columns': ['ref', 'i8'],
+                  'metric_distribution': 'observational; not gated',
+                  'score_rms_added_over_ref': 'mean RMS(I8-REF) / mean RMS(REF-GOLD)',
+                  'tol_added': 0.35, 'tol_ratio': 1.15}, 'kq_scale': KQ_SCALE,
               'tail_tokens': TAIL, 'dp4a': dp4a, 'cases': results,
-              'gate': 'dc_exact cases only', 'ok': all_ok}
+              'gated_query_maxima': gated_query_maxima(results),
+              'gate': 'dc_exact cases only; query means, not maxima', 'ok': all_ok}
     if args.json:
         with open(args.json, 'w') as f:
             json.dump(report, f, indent=2)
+    print('Metrics below are query MEANS; weight L1 uses full records+tail (v2).')
     for r in results:
         c = r['case']
         m = c['metrics']
@@ -446,8 +524,14 @@ def main():
                  m['lse_abs_max']['ref'], m['lse_abs_max']['i8'],
                  m['weight_l1']['ref'], m['weight_l1']['i8'],
                  ('PASS' if r['ok'] else 'FAIL') if c['dc_exact'] else 'info'))
+        print('        query maxima (REF->I8; observational): ' + '  '.join(
+            '%s %.3e->%.3e' % (key, value['ref']['max'], value['i8']['max'])
+            for key, value in c['metric_distribution'].items()))
         for why in r['reasons']:
             print('        -', why)
+    print('Global gated query maxima (observational): ' + '  '.join(
+        '%s %.3e->%.3e' % (key, value['ref']['value'], value['i8']['value'])
+        for key, value in report['gated_query_maxima'].items()))
     print('rkva_mq_i8_quality: %d gated cases (dc exact, %d queries each), %s' %
           (len(gated), args.queries, 'PASS' if all_ok else 'FAIL'))
     return 0 if all_ok else 1

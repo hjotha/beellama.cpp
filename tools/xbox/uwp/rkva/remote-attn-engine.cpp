@@ -722,29 +722,28 @@ bool RemoteAttnEngine::create_pipelines(std::string* error) {
     return true;
 }
 
-// Optional optimized Q4_0 decode pipelines. Failure only disables modes 1..3;
-// the reference range pipelines and engine readiness are unaffected.
-void RemoteAttnEngine::create_q4_opt_pipelines() {
+// Shared optimized qualification/root/reducers. Failure preserves reference execution.
+void RemoteAttnEngine::create_shared_opt_pipelines() {
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 options = {};
     if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options,
                                             sizeof(options))) ||
         !options.WaveOps) {
-        q4_opt_status_ = "wave operations unsupported";
+        shared_opt_status_ = "wave operations unsupported";
         return;
     }
     wave_lane_min_ = options.WaveLaneCountMin;
     wave_lane_max_ = options.WaveLaneCountMax;
     if (wave_lane_min_ < rp::kOptMinWaveLanes || wave_lane_max_ > rp::kOptMaxWaveLanes) {
-        q4_opt_status_ = "wave lane count outside 32..128";
+        shared_opt_status_ = "wave lane count outside 32..128";
         return;
     }
     if (geo_.head_dim != rp::kOptHeadDim || geo_.n_head != rp::kOptGqa * geo_.n_head_kv) {
-        q4_opt_status_ = "geometry is not head_dim 256 with 6 Q heads per KV head";
+        shared_opt_status_ = "geometry is not head_dim 256 with 6 Q heads per KV head";
         return;
     }
     auto serialize = xllama::d3d12_dyn::SerializeRootSignature();
     if (!serialize) {
-        q4_opt_status_ = "D3D12SerializeRootSignature unavailable";
+        shared_opt_status_ = "D3D12SerializeRootSignature unavailable";
         return;
     }
     // 10 constants, SRV t0..t3, UAV u0 (partials) and u1 (direct output).
@@ -776,30 +775,43 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
     }
     if (FAILED(hr)) {
         std::snprintf(text, sizeof(text), "q4 optimized root signature: 0x%08X", unsigned(hr));
-        q4_opt_status_ = text;
+        shared_opt_status_ = text;
         range_attn_q4_opt_root_.Reset();
         return;
     }
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
-    pso.pRootSignature = range_attn_q4_opt_root_.Get();
-    pso.CS = {g_rkva_range_attn_q4_opt_dxil, sizeof(g_rkva_range_attn_q4_opt_dxil)};
-    hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_q4_opt_pso_));
+    pso.pRootSignature = range_reduce_root_.Get();
+    pso.CS = {g_rkva_range_reduce_opt_dxil, sizeof(g_rkva_range_reduce_opt_dxil)};
+    hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_reduce_opt_pso_));
     if (SUCCEEDED(hr)) {
-        pso.pRootSignature = range_reduce_root_.Get();
-        pso.CS = {g_rkva_range_reduce_opt_dxil, sizeof(g_rkva_range_reduce_opt_dxil)};
-        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_reduce_opt_pso_));
-    }
-    if (SUCCEEDED(hr)) {
-        pso.pRootSignature = range_reduce_root_.Get();
         pso.CS = {g_rkva_range_reduce_kvarn4_dxil, sizeof(g_rkva_range_reduce_kvarn4_dxil)};
         hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_reduce_kvarn4_pso_));
     }
     if (FAILED(hr)) {
+        std::snprintf(text, sizeof(text), "shared optimized reducers: 0x%08X", unsigned(hr));
+        shared_opt_status_ = text;
+        range_reduce_opt_pso_.Reset();
+        range_reduce_kvarn4_pso_.Reset();
+        return;
+    }
+    shared_opt_status_ = "ready";
+}
+
+// Q4-specific failures must not discard the shared roots or reducers.
+void RemoteAttnEngine::create_q4_opt_pipelines() {
+    if (!range_attn_q4_opt_root_ || !range_reduce_opt_pso_) {
+        q4_opt_status_ = "requires shared optimized prerequisites: " + shared_opt_status_;
+        return;
+    }
+    char text[96];
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature = range_attn_q4_opt_root_.Get();
+    pso.CS = {g_rkva_range_attn_q4_opt_dxil, sizeof(g_rkva_range_attn_q4_opt_dxil)};
+    HRESULT hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_q4_opt_pso_));
+    if (FAILED(hr)) {
         std::snprintf(text, sizeof(text), "q4 optimized pipeline state: 0x%08X", unsigned(hr));
         q4_opt_status_ = text;
         range_attn_q4_opt_pso_.Reset();
-        range_reduce_opt_pso_.Reset();
-        range_reduce_kvarn4_pso_.Reset();
         return;
     }
     q4_opt_status_ = "ready";
@@ -827,8 +839,8 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
 // 12-constant root signature; each PSO is created and reported on its own, and a
 // missing PSO keeps that storage on its reference kernel.
 void RemoteAttnEngine::create_format_opt_pipelines() {
-    if (!range_attn_q4_opt_pso_ || !range_reduce_opt_pso_) {
-        const std::string why = "requires the q4 optimized prerequisites: " + q4_opt_status_;
+    if (!range_attn_q4_opt_root_ || !range_reduce_opt_pso_) {
+        const std::string why = "requires shared optimized prerequisites: " + shared_opt_status_;
         fmt_opt_status_[rp::kStorageF16] = why;
         fmt_opt_status_[rp::kStorageQ8] = why;
         fmt_opt_status_[rp::kStorageKvarn4] = why;
@@ -1025,26 +1037,10 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
             "header not built (run compile-rkva-range-shaders.sh attn_kvarn4_decode_prefix)";
 #endif
     }
-    // Row-per-lane QK is a separate opt-in PSO, qualified only for wave64.
-    if (wave_lane_min_ != 64 || wave_lane_max_ != 64) {
-        kvarn4_decode_rowlane_status_ = "requires fixed wave64";
+    if (rowlane_policy_.requested) {
+        create_decode_rowlane_pipeline();
     } else {
-#if RKVA_HAS_KVARN4_DECODE_ROWLANE_DXIL
-        D3D12_COMPUTE_PIPELINE_STATE_DESC dec = {};
-        dec.pRootSignature = range_attn_fmt_opt_root_.Get();
-        dec.CS = {g_rkva_range_attn_kvarn4_decode_rowlane_dxil,
-                  sizeof(g_rkva_range_attn_kvarn4_decode_rowlane_dxil)};
-        hr = create_format_pso(dec, range_attn_kvarn4_decode_rowlane_pso_, rkva_hello_telemetry::kvarn4_rowlane);
-        if (FAILED(hr)) {
-            std::snprintf(text, sizeof(text), "kvarn4 rowlane pipeline state: 0x%08X", unsigned(hr));
-            range_attn_kvarn4_decode_rowlane_pso_.Reset();
-            kvarn4_decode_rowlane_status_ = text;
-        } else {
-            kvarn4_decode_rowlane_status_ = "ready";
-        }
-#else
-        kvarn4_decode_rowlane_status_ = "header not built (compile attn_kvarn4_decode_rowlane)";
-#endif
+        kvarn4_decode_rowlane_status_ = "deferred until enabled";
     }
     // F16 / Q8_0 multi-query tiles: same root signature, one PSO per (storage, tile).
     const struct {
@@ -1089,11 +1085,52 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
     }
 }
 
+// Control path only: disabled variants consume no PSO creation attempt.
+void RemoteAttnEngine::create_decode_rowlane_pipeline() {
+    if (!rowlane_policy_.begin_attempt(!unconfirmed_submission_ && !terminal_failure_ && !bulk_recording_)) return;
+    if (!device_ || !range_attn_fmt_opt_root_ || !range_reduce_opt_pso_) {
+        kvarn4_decode_rowlane_status_ = "requires format root and shared optimized reducer";
+        return;
+    }
+    if (wave_lane_min_ != 64 || wave_lane_max_ != 64) {
+        kvarn4_decode_rowlane_status_ = "requires fixed wave64";
+    } else {
+#if RKVA_HAS_KVARN4_DECODE_ROWLANE_DXIL
+        char text[96];
+        D3D12_COMPUTE_PIPELINE_STATE_DESC dec = {};
+        dec.pRootSignature = range_attn_fmt_opt_root_.Get();
+        dec.CS = {g_rkva_range_attn_kvarn4_decode_rowlane_dxil,
+                  sizeof(g_rkva_range_attn_kvarn4_decode_rowlane_dxil)};
+        const auto started = prof_clock::now();
+        const HRESULT hr = device_->CreateComputePipelineState(&dec, IID_PPV_ARGS(&range_attn_kvarn4_decode_rowlane_pso_));
+        init_timings_.record(rkva_hello_telemetry::kvarn4_rowlane,
+                            elapsed_ns(started, prof_clock::now()) / 1000, ready_);
+        if (FAILED(hr)) {
+            std::snprintf(text, sizeof(text), "kvarn4 rowlane pipeline state: 0x%08X", unsigned(hr));
+            range_attn_kvarn4_decode_rowlane_pso_.Reset();
+            kvarn4_decode_rowlane_status_ = text;
+        } else {
+            kvarn4_decode_rowlane_status_ = "ready";
+        }
+#else
+        kvarn4_decode_rowlane_status_ = "header not built (compile attn_kvarn4_decode_rowlane)";
+#endif
+    }
+}
+
+void RemoteAttnEngine::set_decode_rowlane(bool enabled) {
+    decode_rowlane_ = enabled;
+    rowlane_policy_.requested = enabled;
+    // Before initialize this only records intent. Later enablement reuses a
+    // successful PSO or makes one safe attempt; no release while GPU owns it.
+    if (ready_ && enabled) create_decode_rowlane_pipeline();
+}
+
 void RemoteAttnEngine::create_kvarn4_mq_i8_pipeline() {
     if (kvarn4_mq_i8_policy_.attempted) return;
     kvarn4_mq_i8_policy_.mark_attempted();
-    if (!device_ || !range_attn_fmt_opt_root_ || !range_attn_q4_opt_pso_ || !range_reduce_opt_pso_) {
-        kvarn4_mq_i8_status_ = "requires format and q4 optimized prerequisites";
+    if (!device_ || !range_attn_fmt_opt_root_ || !range_reduce_opt_pso_) {
+        kvarn4_mq_i8_status_ = "requires format root and shared optimized reducer";
         return;
     }
     if (wave_lane_min_ < rp::kKvarn4MqWaveLanes) {
@@ -1127,8 +1164,8 @@ void RemoteAttnEngine::create_kvarn4_mq_i8_pipeline() {
 void RemoteAttnEngine::create_q8_mq_i8_pipeline() {
     if (q8_mq_i8_policy_.attempted) return;
     q8_mq_i8_policy_.mark_attempted();
-    if (!device_ || !range_attn_fmt_opt_root_ || !range_attn_q4_opt_pso_ || !range_reduce_opt_pso_) {
-        q8_mq_i8_status_ = "requires format and q4 optimized prerequisites";
+    if (!device_ || !range_attn_fmt_opt_root_ || !range_reduce_opt_pso_) {
+        q8_mq_i8_status_ = "requires format root and shared optimized reducer";
         return;
     }
 #if RKVA_HAS_Q8_MQ2_I8_DXIL
@@ -1320,8 +1357,8 @@ bool RemoteAttnEngine::set_range_profiling(bool enabled, bool reset, uint32_t q4
         return false;
     }
     if (q4_kernel_mode != rp::kModeReference) {
-        if (!range_attn_q4_opt_pso_ || !range_reduce_opt_pso_) {
-            error = "range profiling: optimized q4 kernel unavailable: " + q4_opt_status_;
+        if (!range_attn_q4_opt_root_ || !range_reduce_opt_pso_) {
+            error = "range profiling: shared optimized prerequisites unavailable: " + shared_opt_status_;
             return false;
         }
         if (!range_opt_partials_.resource) {
@@ -1507,6 +1544,7 @@ bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
         return false;
     }
     const auto q4_started = prof_clock::now();
+    create_shared_opt_pipelines();
     create_q4_opt_pipelines();
     init_timings_.q4_psos_us = elapsed_ns(q4_started, prof_clock::now()) / 1000;
     const auto format_started = prof_clock::now();

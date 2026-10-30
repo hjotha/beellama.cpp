@@ -12,6 +12,8 @@ time in its handler. The Xbox event log also records `phase=hello_init`,
 - `required_psos_us`: mandatory pipeline creation, including the optional
   serial-prefix reference PSO currently built in the same group.
 - `q4_psos_us` and `format_psos_us`: optional groups, including their roots.
+  The historical `q4_psos_us` field includes shared optimized qualification,
+  roots and reducers as well as Q4-specific PSOs; it is not a Q4-only cost.
 - `options_us`: post-initialization option setters, including the Q8 paired
   reducer PSO when requested.
 - `hello_before_log_us`: full handler elapsed before emitting the event.
@@ -49,6 +51,36 @@ does not release its PSO; resources remain owned until engine retirement.
 The flag affects only the current engine and is read before initialization.
 Changing or removing it takes effect on the next HELLO. It does not cache
 objects across connections or change other PSOs, kernels or split policies.
+
+## Shared prerequisites and demand-created rowlane
+
+Shared optimized wave/geometry qualification, roots and reducers are created
+before Q4-specific PSOs. A Q4 shader-PSO failure no longer discards the shared
+reducers or prevents F16/Q8/KVarN factories from trying. Failure of either
+shared reducer still invalidates the shared reducer pair, as before; this is
+not full failure isolation of every optimized PSO. Non-reference profile
+configuration requires shared prerequisites; each actual dispatch still checks
+its own format PSO and falls back to reference when unavailable. Reference and
+serial-prefix capability PSOs remain eager and unchanged.
+
+The existing rowlane-off option is now passed to the engine before initialize.
+When disabled, the optional rowlane PSO is not created. Default-on behavior is
+unchanged. A later enabled control-path setter attempts creation only once,
+with fixed-wave64/header/root qualification and the usual failure fallback.
+An unsafe engine (unconfirmed submission, terminal failure or bulk recording)
+does not consume the attempt; another safe control-path enable can try later.
+Dispatch itself never creates or retries it. Disabling retains an already
+created PSO until engine retirement, so re-enabling cannot release/recreate a
+PSO that GPU work might still own. Its existing format init/late telemetry slot
+records actual creation attempts, including failed calls.
+
+This small step avoids one creation only when rowlane is genuinely disabled;
+it does not claim a startup speedup for default-on rowlane, make all storage
+variants lazy, or cache PSOs across engines. CPU policy and source-structure
+tests cover state transitions and call placement, not Windows compilation or
+Xbox runtime. Target validation must include rowlane off/on, missing DXIL,
+unsupported wave size, failed Q4/shared/rowlane factories, fallback output,
+and initialization plus first-use latency before a performance claim.
 
 ## Proposed opt-in cache: not implemented
 

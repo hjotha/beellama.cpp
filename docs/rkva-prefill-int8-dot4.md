@@ -107,7 +107,7 @@ These CPU checks do not emulate the GPU driver or qualify model/logit quality.
 over the same store: GOLD (original F16 K/V), REF (the shipped 4-bit F32 kernel
 arithmetic) and I8 (this variant). Metric of record: `added/ref`, the Q8
 rounding error as a fraction of the score error the 4-bit cache already
-introduces. Across 10 cases (prefixes 256..4096, two store distributions, 8
+introduces. Historical v1 result (the L1 domain was corrected in v2 below). Across 10 cases (prefixes 256..4096, two store distributions, 8
 queries each):
 
 ```
@@ -118,6 +118,39 @@ rkva_mq_i8_quality: 10 gated cases (dc exact, 8 queries each), PASS
 
 Without the `C_s` DC term the same harness reports `add/ref 0.12 .. 0.24`, i.e.
 the constant is worth ~2.5x.
+
+### Metric contract v2
+
+The JSON schema is now `rkva-mq-i8-quality-v2`: `weight_l1` compares
+normalized probabilities on the **full records + tail** domain in all three
+paths. V1 normalized REF/I8 over records alone but compared with GOLD record
+probabilities whose denominator included the tail. Even identical uniform
+attention then appeared to have a nonzero error equal to tail mass, potentially
+masking relative degradation. Do not compare v1/v2 L1 series as equivalent.
+
+Existing `case.metrics.*.ref/i8` keys remain **means over independent synthetic
+queries**, including the historical names `rel_o_max` and `lse_abs_max`.
+`per_query_metrics` retains each [REF, I8] pair; `metric_distribution` adds
+actual maximum, zero-based max-query index and p95 per case.
+`gated_query_maxima` reports true global maxima across DC-exact cases with
+case/query provenance. These distributions are observational, not new gates.
+
+The acceptance thresholds are unchanged: added score RMS / REF-vs-GOLD RMS
+<=0.35, total score RMS ratio <=1.15, and query-mean attention metrics <=1.15x
+REF. Only L1's domain is corrected; passing a mean gate does **not** guarantee
+each query stays within 1.15x. `added_over_ref` is mean RMS(I8−REF) divided by
+mean RMS(REF−GOLD), not percent model-quality loss. No production flag, shader,
+or hardware qualification is changed. Independent queries are not autoregressive
+generation steps.
+
+Run accounting regressions with:
+```sh
+OPENBLAS_NUM_THREADS=1 python3 tools/xbox/tests/test_rkva_mq_i8_quality_metrics.py
+```
+Readers expecting an exact v1 schema must explicitly migrate; numeric legacy
+keys remain readable, but old L1 semantics are deliberately not preserved.
+Repository search found no parser consuming this quality-report schema.
+
 
 ## Caveats
 
