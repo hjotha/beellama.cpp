@@ -195,6 +195,7 @@ struct remote_state {
     bool fp8_gpu_enabled = true;
     // Opt-in INT8 QK prefill kernel (default off, NOT bit-exact): LocalState flag file.
     bool mq_i8_enabled = false;
+    bool kvarn4_mq2_cap32 = false;
     bool q8_mq_i8_enabled = false;
     bool q8_paired_reduce_enabled = false;
     bool q8_fp8_gpu_enabled = true;
@@ -349,6 +350,9 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         // docs/rkva-prefill-int8-dot4.md.
         state.mq_i8_enabled =
             std::ifstream(g_snapshot_local_folder + "\\rkva-mq-i8.flag").good();
+        // F32 MQ2/fine only; splitting changes floating-point reduction order.
+        state.kvarn4_mq2_cap32 =
+            std::ifstream(g_snapshot_local_folder + "\\rkva-mq2-split-cap32.flag").good();
         state.q8_mq_i8_enabled =
             std::ifstream(g_snapshot_local_folder + "\\rkva-q8-mq-i8.flag").good();
         state.q8_paired_reduce_enabled =
@@ -396,6 +400,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             return RKVA_ERR_GPU;
         }
         state.engine->set_mq_i8(state.mq_i8_enabled);
+        state.engine->set_kvarn4_mq2_cap32(state.kvarn4_mq2_cap32);
         state.engine->set_q8_mq_i8(state.q8_mq_i8_enabled);
         state.engine->set_q8_paired_reduce(state.q8_paired_reduce_enabled);
         state.engine->set_decode_rowlane(state.decode_rowlane_enabled);

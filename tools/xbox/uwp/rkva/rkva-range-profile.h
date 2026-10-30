@@ -322,8 +322,11 @@ inline KvarnSplit kvarn4_decode_split(uint32_t active_count, uint32_t mode) {
 //   target_rows = 256 (2 record groups of 128 tokens),
 //   max_splits = 64 (mode fine) or 32 (mode balanced).
 // Mode 3 (coarse) or invalid q_tile keeps kvarn4_split.
+// Optional cap32 is confined to the selected MQ2/fine F32 route; changing the
+// split changes floating-point reduction order. No buffer or reducer limit grows.
 // rows is rounded up to whole kKvarnTile (8), and active_count == 0 returns {1, 0}.
-inline KvarnSplit kvarn4_mq_split(uint32_t active_count, uint32_t mode, uint32_t q_tile) {
+inline KvarnSplit kvarn4_mq_split(uint32_t active_count, uint32_t mode, uint32_t q_tile,
+                                 bool mq2_cap32 = false, bool int8_dot = false) {
     if (active_count == 0) {
         return {1, 0};
     }
@@ -331,7 +334,9 @@ inline KvarnSplit kvarn4_mq_split(uint32_t active_count, uint32_t mode, uint32_t
         return kvarn4_split(active_count, mode);
     }
     const uint32_t target_rows = 256u;
-    const uint32_t max_splits = (mode == kModeOptFine) ? 64u : 32u;
+    // Cap32 changes only a selected MQ2/fine dispatch, never MQ4 or fallback.
+    const uint32_t max_splits =
+        (mode == kModeOptFine && !(mq2_cap32 && !int8_dot && q_tile == 2)) ? 64u : 32u;
     const uint32_t wanted = (active_count + target_rows - 1) / target_rows;
     const uint32_t k0 = std::max(1u, std::min(max_splits, wanted));
     uint32_t rows = split_rows(active_count, k0);
@@ -565,6 +570,7 @@ struct Header {
     // PSO).
     bool kvarn4_mq_available = false;
     std::string kvarn4_mq_status;
+    bool kvarn4_mq2_cap32 = false;
     bool kvarn4_decode_rowlane_available = false;
     bool kvarn4_decode_rowlane_enabled = false;
     std::string kvarn4_decode_rowlane_status;
@@ -873,9 +879,11 @@ class Recorder {
                       "\"descriptor_revision\":3,\"required_wave_lanes\":%u,"
                       "\"mode_map\":\"1:kvarn4_mq4_balanced 2:kvarn4_mq2_fine "
                       "3:per-query kvarn4_gqa_coarse\","
-                      "\"mq2\":{\"available\":%s,\"status\":\"%s\",\"calls\":%llu},",
+                      "\"mq2\":{\"available\":%s,\"status\":\"%s\",\"calls\":%llu,"
+                      "\"cap32\":%s},",
                       kOptMaxQueries, kKvarn4MqWaveLanes, h.kvarn4_mq_available ? "true" : "false",
-                      json_escape(h.kvarn4_mq_status).c_str(), ull(c.kvarn4_mq_calls));
+                      json_escape(h.kvarn4_mq_status).c_str(), ull(c.kvarn4_mq_calls),
+                      h.kvarn4_mq2_cap32 ? "true" : "false");
         o += buf;
         std::snprintf(buf, sizeof(buf),
                       "\"mq4\":{\"available\":%s,\"status\":\"%s\",\"calls\":%llu},",

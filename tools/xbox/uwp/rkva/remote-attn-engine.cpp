@@ -1337,6 +1337,7 @@ std::string RemoteAttnEngine::get_range_profile_json() {
         range_attn_fmt_opt_root_ && range_attn_kvarn4_opt_prefix_pso_ && range_reduce_kvarn4_pso_;
     header.kvarn4_prefix_status[1] = kvarn4_opt_prefix_status_;
     header.kvarn4_mq_available = header.kvarn4_prefix_available[1] && range_attn_kvarn4_mq_pso_;
+    header.kvarn4_mq2_cap32 = kvarn4_mq2_cap32_;
     header.kvarn4_mq_status =
         header.kvarn4_prefix_available[1]
             ? kvarn4_mq_status_
@@ -3552,7 +3553,8 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
             const rp::KvarnSplit ks =
                 (n_tokens == 1 && decode_opt)
                     ? rp::kvarn4_decode_split(active_count, q4_kernel_mode_)
-                    : (q_tile ? rp::kvarn4_mq_split(active_count, q4_kernel_mode_, q_tile)
+                    : (q_tile ? rp::kvarn4_mq_split(active_count, q4_kernel_mode_, q_tile,
+                                                    kvarn4_mq2_cap32_, selected_int8_dot)
                               : rp::kvarn4_split(active_count, q4_kernel_mode_));
             split_k = ks.split_k;
             rows = ks.split_rows;

@@ -11,6 +11,21 @@
 
 using namespace rkva_rprof;
 
+// Original MQ split code, retained as an independent default-policy oracle.
+static KvarnSplit legacy_mq_split(uint32_t active, uint32_t mode, uint32_t tile) {
+    if (active == 0) return {1, 0};
+    if ((tile != 2 && tile != 4) || (mode != kModeOptBalanced && mode != kModeOptFine)) {
+        return kvarn4_split(active, mode);
+    }
+    const uint32_t max_splits = mode == kModeOptFine ? 64u : 32u;
+    const uint32_t wanted = (active + 255u) / 256u;
+    const uint32_t k0 = std::max(1u, std::min(max_splits, wanted));
+    uint32_t rows = split_rows(active, k0);
+    rows = (rows + kKvarnTile - 1) / kKvarnTile * kKvarnTile;
+    const uint32_t k = rows ? (active + rows - 1) / rows : 1;
+    return {std::max(1u, k), rows};
+}
+
 int main() {
     // Only genuine Q8 one-query fine decode can select the paired reducer.
     assert(q8_paired_reduce_selected(kStorageQ8, 1, kModeOptFine, 24, 4, 256, false, false, 0, true));
@@ -270,6 +285,70 @@ int main() {
     assert(kvarn4_mq_split(8193, kModeOptBalanced, 4).split_rows == 264);
     assert(kvarn4_mq_split(16385, kModeOptFine, 2).split_k == 63);
     assert(kvarn4_mq_split(16385, kModeOptFine, 2).split_rows == 264);
+
+    // The engine's original selection is unchanged: missing tile PSO resets
+    // q_tile to zero, including when the INT8 PSO alone is present.
+    for (uint32_t mode = 0; mode <= kModeCount; ++mode) {
+        for (uint32_t nq = 0; nq <= 10; ++nq) {
+            for (uint32_t tail : {0u, 64u, 128u, 256u}) {
+                for (bool mq2_pso : {false, true}) {
+                    for (bool mq4_pso : {false, true}) {
+                        for (bool int8_pso : {false, true}) {
+                            uint32_t tile = kvarn4_mq_tile(mode, nq, tail);
+                            const bool pso = tile == 2 ? mq2_pso : tile == 4 ? mq4_pso : false;
+                            if (!pso) tile = 0;
+                            const uint32_t expected = tail == 128 && nq >= 2 && nq <= 9
+                                ? (mode == kModeOptFine && mq2_pso ? 2u
+                                   : mode == kModeOptBalanced && mq4_pso ? 4u : 0u) : 0u;
+                            assert(tile == expected);
+                            const bool selected_int8 = tile == 2 && int8_pso;
+                            for (uint32_t n : {0u, 127u, 128u, 129u, 8192u, 8193u, 16384u, 34816u, 131072u}) {
+                                const KvarnSplit old = tile ? legacy_mq_split(n, mode, tile)
+                                                            : kvarn4_split(n, mode);
+                                const KvarnSplit actual = tile
+                                    ? kvarn4_mq_split(n, mode, tile, false, selected_int8)
+                                    : kvarn4_split(n, mode);
+                                assert(old.split_k == actual.split_k && old.split_rows == actual.split_rows);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (uint32_t mode = 0; mode <= kModeCount; ++mode) {
+        for (uint32_t tile = 0; tile <= 5; ++tile) {
+            for (uint32_t n = 0; n <= 131072; ++n) {
+                const KvarnSplit old = legacy_mq_split(n, mode, tile);
+                for (bool int8 : {false, true}) {
+                    const KvarnSplit actual = kvarn4_mq_split(n, mode, tile, false, int8);
+                    assert(old.split_k == actual.split_k && old.split_rows == actual.split_rows);
+                }
+            }
+        }
+    }
+    for (uint32_t n = 0; n <= 131072; ++n) {
+        const KvarnSplit original = kvarn4_mq_split(n, kModeOptFine, 2);
+        const KvarnSplit explicit_default = kvarn4_mq_split(n, kModeOptFine, 2, false);
+        const KvarnSplit cap = kvarn4_mq_split(n, kModeOptFine, 2, true);
+        const KvarnSplit int8 = kvarn4_mq_split(n, kModeOptFine, 2, true, true);
+        const KvarnSplit balanced = kvarn4_mq_split(n, kModeOptBalanced, 4);
+        const KvarnSplit fallback = kvarn4_mq_split(n, kModeOptFine, 0);
+        assert(original.split_k == explicit_default.split_k && original.split_rows == explicit_default.split_rows);
+        assert(original.split_k == int8.split_k && original.split_rows == int8.split_rows);
+        assert(cap.split_k >= 1 && cap.split_k <= 32 && cap.split_rows % 8 == 0);
+        assert(uint64_t(cap.split_k) * cap.split_rows >= n);
+        assert(!n || uint64_t(cap.split_k - 1) * cap.split_rows < n);
+        const KvarnSplit mq4_unchanged = kvarn4_mq_split(n, kModeOptBalanced, 4, true);
+        const KvarnSplit fallback_unchanged = kvarn4_mq_split(n, kModeOptFine, 0, true);
+        assert(mq4_unchanged.split_k == balanced.split_k && mq4_unchanged.split_rows == balanced.split_rows);
+        assert(fallback_unchanged.split_k == fallback.split_k && fallback_unchanged.split_rows == fallback.split_rows);
+        assert(cap.split_k == balanced.split_k && cap.split_rows == balanced.split_rows);
+    }
+    assert(kvarn4_mq_split(0, kModeOptFine, 2, true).split_rows == 0);
+    assert(kvarn4_mq_split(8192, kModeOptFine, 2, true).split_k == 32);
+    assert(kvarn4_mq_split(16384, kModeOptFine, 2, true).split_rows == 512);
+    assert(kvarn4_mq_split(34816, kModeOptFine, 2, true).split_rows == 1088);
 
     // Multi-query split policy tests (kvarn4_mq_split)
     assert(kvarn4_mq_split(0, kModeOptBalanced, 4).split_k == 1);
@@ -554,10 +633,13 @@ int main() {
                   "\"descriptor_revision\":3,\"required_wave_lanes\":64,\"mode_map\":\"1:"
                   "kvarn4_mq4_balanced 2:kvarn4_mq2_fine 3:per-query "
                   "kvarn4_gqa_coarse\",\"mq2\":{\"available\":false,\"status\":\"requires "
-                  "wave lanes >= 64 (reported min 32)\",\"calls\":13},\"mq4\":{\"available\":true,"
+                  "wave lanes >= 64 (reported min 32)\",\"calls\":13,\"cap32\":false},\"mq4\":{\"available\":true,"
                   "\"status\":\"ready\",\"calls\":5},"
                   "\"mq2_i8\":{\"available\":true,\"status\":\"ready\","
                   "\"calls\":11,\"exact\":false}}") != std::string::npos);
+    h.kvarn4_mq2_cap32 = true;
+    assert(r.json(h).find("\"calls\":13,\"cap32\":true") != std::string::npos);
+    h.kvarn4_mq2_cap32 = false;
     assert(json.find("\"kvarn4_decode_rowlane\":{\"available\":true,\"enabled\":true,"
                      "\"status\":\"ready\",\"calls\":3}") != std::string::npos);
     assert(json.find("\"kvarn4_decode\":{\"nq\":1,"

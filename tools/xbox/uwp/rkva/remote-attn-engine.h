@@ -190,6 +190,8 @@ class RemoteAttnEngine {
     }
     // Default-on rowlane decode; selection still requires qualified shape/PSO.
     void set_decode_rowlane(bool enabled) { decode_rowlane_ = enabled; }
+    // Experimental F32 MQ2/fine cap, selected at session initialization.
+    void set_kvarn4_mq2_cap32(bool enabled) { kvarn4_mq2_cap32_ = enabled; }
     // Opt-in INT8 QK prefill specialization (default off, NOT bit-exact): when
     // enabled and the dedicated PSO exists, nq 2..9 native KVarN4 mode-2 tiles
     // score the fast shared record tile with dot4add_i8packed instead of the
@@ -340,6 +342,7 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_kvarn4_mq_i8_pso_;
     std::string kvarn4_mq_i8_status_ = "not initialized";
     bool mq_i8_ = false;
+    bool kvarn4_mq2_cap32_ = false;
     bool q8_mq_i8_ = false;
     bool q8_paired_reduce_ = false;
     std::string q8_paired_reduce_status_ = "disabled";
