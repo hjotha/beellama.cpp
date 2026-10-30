@@ -1,0 +1,345 @@
+{
+  "scope": "Synthetic active KV rows; not total model context or original LLM gate",
+  "logical_wave": 128,
+  "native_subgroup": 4,
+  "adapter": "logical128-3barrier.hlsl",
+  "worker_threads": 4,
+  "cases": {
+    "102400": {
+      "geometry": {
+        "active": 102400,
+        "origin": 128,
+        "windows": [
+          102399,
+          102400,
+          102400
+        ],
+        "nq": 3,
+        "tail": 128,
+        "seed": 20261030,
+        "records_bytes": 57344000
+      },
+      "input_sha256": {
+        "b0": "27eef0113fff25f3b6ef626a12ddc1a7fd7d9fc2a4ff0b2b12cb51d874c4f733",
+        "b1": "fc00e5b8e45bacdabd56462a7af491a3a91e4becbc7ded1fb8208d3d3d30c953",
+        "b2": "f68377eede34888b376779745792ee7b1b47373c87d374d31e116c82d1fd9fbd",
+        "b3": "aa4aa3b3ae68f11559c2648f592f0dec8fbcba4ba4dab9932fe41415f0dd4b20"
+      },
+      "runs": {
+        "mq-cap32-4t": {
+          "state": "completed",
+          "elapsed_s": 90.92099536303431,
+          "peak_rss_kib": 465092,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 9.127059970000587e-09,
+            "LSE_maxabs_finite": 1.4941319754768756e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "4dcb131f29062da2e8bd6ddb6a579f14a2e7c81b06305c933df9f835d1a6b12b",
+            "reduce/out4.bin": "2007044b86ebbf4af1ad8c08f5992453e13f43d3d752f4669d9327a8aaa9a6a6",
+            "b6.bin": "ae7b0e577435a62a0771cd5092a2d6933c9c3bf0ad3a63d35201cc14e1fef5dc"
+          }
+        },
+        "mq-cap64-4t": {
+          "state": "completed",
+          "elapsed_s": 89.06872419599677,
+          "peak_rss_kib": 467324,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 7.922540606517502e-09,
+            "LSE_maxabs_finite": 1.4941319754768756e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "e0fd4cad445410975e8ddee8486852674332a8dab5c136632dc89198c51af6a7",
+            "reduce/out4.bin": "8ca5175babb4afe97ef7be753f5c3192c9d70a47c52b2c816f212caa385532ba",
+            "b6.bin": "b54ca47d45e757b61accee20e07adb163dcb93f09d8d31992e23056e1e7ab9fe"
+          }
+        },
+        "mq-cap128-4t": {
+          "state": "completed",
+          "elapsed_s": 85.09003436099738,
+          "peak_rss_kib": 475320,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 5.4736983183881205e-09,
+            "LSE_maxabs_finite": 1.3750430127856816e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "bb22cc90321816cbc0c7a87d0e310e1ebf460974633666884e70a582bf43d01a",
+            "reduce/out4.bin": "b544766190bbfa6699d6cf8c1e90aa430cde1ba92e44ed4e29aedee74362dc0f",
+            "b6.bin": "8a1f85d4b19d67a456982788f0c7699bf205c18f1fc7e9dfd0f3739742b7473e"
+          }
+        },
+        "gqa-cap64-4t": {
+          "state": "completed",
+          "elapsed_s": 54.259612681984436,
+          "peak_rss_kib": 330636,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 7.922540606517502e-09,
+            "LSE_maxabs_finite": 1.4941319754768756e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "e0fd4cad445410975e8ddee8486852674332a8dab5c136632dc89198c51af6a7",
+            "reduce/out4.bin": "8ca5175babb4afe97ef7be753f5c3192c9d70a47c52b2c816f212caa385532ba",
+            "b6.bin": "b54ca47d45e757b61accee20e07adb163dcb93f09d8d31992e23056e1e7ab9fe"
+          }
+        }
+      },
+      "comparisons": {
+        "mq-cap32-4t_vs_mq64": {
+          "O_maxabs": 9.89530235528946e-09,
+          "LSE_maxabs": 1.9073486328125e-06,
+          "O_bitdiff": 17842,
+          "LSE_bitdiff": 6
+        },
+        "mq-cap128-4t_vs_mq64": {
+          "O_maxabs": 6.752088665962219e-09,
+          "LSE_maxabs": 1.9073486328125e-06,
+          "O_bitdiff": 17570,
+          "LSE_bitdiff": 11
+        },
+        "gqa-cap64-4t_vs_mq64": {
+          "O_maxabs": 0.0,
+          "LSE_maxabs": 0.0,
+          "O_bitdiff": 0,
+          "LSE_bitdiff": 0,
+          "partial_bitdiff": 0
+        }
+      }
+    },
+    "112640": {
+      "geometry": {
+        "active": 112640,
+        "origin": 128,
+        "windows": [
+          112639,
+          112640,
+          112640
+        ],
+        "nq": 3,
+        "tail": 128,
+        "seed": 20261030,
+        "records_bytes": 63078400
+      },
+      "input_sha256": {
+        "b0": "27eef0113fff25f3b6ef626a12ddc1a7fd7d9fc2a4ff0b2b12cb51d874c4f733",
+        "b1": "40ab31275d790078e3f41e77cd5d735876a47163f6d6971b9b066376e84a6138",
+        "b2": "be5246d4db31cb21da96a7287c4350b2189031fc50d53e14998c08c34a8d0aa0",
+        "b3": "cd9125db5978686294409493ab6db8bd354af1d1c706a88d8bb0a13bd2a4d1b2"
+      },
+      "runs": {
+        "mq-cap32-4t": {
+          "state": "completed",
+          "elapsed_s": 94.33981074305484,
+          "peak_rss_kib": 476332,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 1.0156558698562988e-08,
+            "LSE_maxabs_finite": 1.438175637247241e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "dfeb98925ca5dbe99e43f3fcdb5e0a07d74f581976270dc075bac9b3fa1bbe6c",
+            "reduce/out4.bin": "748b037f3159b6138f46395c6c61958175708690ccc3988a0075023b6acb5088",
+            "b6.bin": "0f808b5aa3d816e7e57fe4c1dc3f95500c8b28509ffc3cc84fd2cf7f85536ff9"
+          }
+        },
+        "mq-cap64-4t": {
+          "state": "completed",
+          "elapsed_s": 98.78350114601199,
+          "peak_rss_kib": 478480,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 6.964989783704578e-09,
+            "LSE_maxabs_finite": 1.438175637247241e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "3fd6528f4ce89d6670307d7e6f8ef7c9c8c98081f6ce947add97f0d198a2ea09",
+            "reduce/out4.bin": "3c1081938820c069e0abf536a1b2588bc8c23c594675f61ebeca756fb5b6a027",
+            "b6.bin": "77316a6a1cfe4eed02608492fdc95ea05df19667e3482817aa10e7cb01cf84f5"
+          }
+        },
+        "mq-cap128-4t": {
+          "state": "completed",
+          "elapsed_s": 100.29907041997649,
+          "peak_rss_kib": 486640,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 5.238570816284288e-09,
+            "LSE_maxabs_finite": 1.438175637247241e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "d6a29fd0d3c9016b9b43942a0cae15fec4c9f855ebfd4f3b0d38d9e42aad83af",
+            "reduce/out4.bin": "6dd5ecf0863200faba1be23e81aadc570ab350b5118998095c7be25b5c509fde",
+            "b6.bin": "9d45302cd59d327e8f7f159a51ae84e5f90ebf28482708df0ec95174e5158bec"
+          }
+        },
+        "gqa-cap64-4t": {
+          "state": "completed",
+          "elapsed_s": 59.70052470796509,
+          "peak_rss_kib": 341516,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 6.964989783704578e-09,
+            "LSE_maxabs_finite": 1.438175637247241e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "3fd6528f4ce89d6670307d7e6f8ef7c9c8c98081f6ce947add97f0d198a2ea09",
+            "reduce/out4.bin": "3c1081938820c069e0abf536a1b2588bc8c23c594675f61ebeca756fb5b6a027",
+            "b6.bin": "77316a6a1cfe4eed02608492fdc95ea05df19667e3482817aa10e7cb01cf84f5"
+          }
+        }
+      },
+      "comparisons": {
+        "mq-cap32-4t_vs_mq64": {
+          "O_maxabs": 9.19681042432785e-09,
+          "LSE_maxabs": 1.9073486328125e-06,
+          "O_bitdiff": 17807,
+          "LSE_bitdiff": 3
+        },
+        "mq-cap128-4t_vs_mq64": {
+          "O_maxabs": 7.916241884231567e-09,
+          "LSE_maxabs": 1.9073486328125e-06,
+          "O_bitdiff": 17654,
+          "LSE_bitdiff": 10
+        },
+        "gqa-cap64-4t_vs_mq64": {
+          "O_maxabs": 0.0,
+          "LSE_maxabs": 0.0,
+          "O_bitdiff": 0,
+          "LSE_bitdiff": 0,
+          "partial_bitdiff": 0
+        }
+      }
+    },
+    "130048": {
+      "geometry": {
+        "active": 130048,
+        "origin": 128,
+        "windows": [
+          130047,
+          130048,
+          130048
+        ],
+        "nq": 3,
+        "tail": 128,
+        "seed": 20261030,
+        "records_bytes": 72826880
+      },
+      "input_sha256": {
+        "b0": "27eef0113fff25f3b6ef626a12ddc1a7fd7d9fc2a4ff0b2b12cb51d874c4f733",
+        "b1": "0f233bb45ff86697056890ee7835f81cec1bfe27c27e36d9ecc70ae5457ae813",
+        "b2": "76c4972e2fc88c47844d71d470b2b980e955e5490fc8be2e8e975713b75b3c4c",
+        "b3": "76c88fcc330d2be3fef0e31f63f845818daad88b1552eaf0f840b1d219b50eec"
+      },
+      "runs": {
+        "mq-cap32-4t": {
+          "state": "completed",
+          "elapsed_s": 102.46873165096622,
+          "peak_rss_kib": 495284,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 9.540579022550982e-09,
+            "LSE_maxabs_finite": 1.7368957845320665e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "c76cc728328aefea9ce8b61e477fdd67dff79d0d139b3baca8f97a1da79e8b74",
+            "reduce/out4.bin": "ff05b3980598b0a2181562cd8b8afa4095e93222b35df2dd83cc3b425c96c681",
+            "b6.bin": "4055f4b2207662d0e61a09198adb217875075b3aa844db4d313581a5a9183be5"
+          }
+        },
+        "mq-cap64-4t": {
+          "state": "completed",
+          "elapsed_s": 113.29666427901248,
+          "peak_rss_kib": 497280,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 7.45322847450075e-09,
+            "LSE_maxabs_finite": 1.5573491864984135e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "3dec4c8466bc92fea9f9012da70e3bf0d029e57fc6101172e817eb907c84c7ba",
+            "reduce/out4.bin": "52aa9fa8d82b2cb2c4a0379cfcbf6e5b35680d20933cbc2036c9ef1fddc1b498",
+            "b6.bin": "d2aeac1b040631e7a74aa5d3238a94bd61ef1efbc4cd54a0a54a60cabcdc7e7a"
+          }
+        },
+        "mq-cap128-4t": {
+          "state": "completed",
+          "elapsed_s": 102.00821192597505,
+          "peak_rss_kib": 505556,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 5.42594509947425e-09,
+            "LSE_maxabs_finite": 1.7368957845320665e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "eb830c6325560150c654a98c3fc307229d0bc3a4c16a56f3ca6425fa65746218",
+            "reduce/out4.bin": "5a22863e1431627883d3b1a5f2c569cfd38be1f124485724bca0530291cf341b",
+            "b6.bin": "0179c484741c57ebb5248701efc1b4952e09a3bd48ccac3e92ba337747963b64"
+          }
+        },
+        "gqa-cap64-4t": {
+          "state": "completed",
+          "elapsed_s": 61.99970612395555,
+          "peak_rss_kib": 361284,
+          "threads": 4,
+          "oracle": {
+            "finite_expected_match": true,
+            "O_maxabs": 7.45322847450075e-09,
+            "LSE_maxabs_finite": 1.5573491864984135e-06,
+            "negative_infinity_match": true
+          },
+          "hashes": {
+            "out4.bin": "3dec4c8466bc92fea9f9012da70e3bf0d029e57fc6101172e817eb907c84c7ba",
+            "reduce/out4.bin": "52aa9fa8d82b2cb2c4a0379cfcbf6e5b35680d20933cbc2036c9ef1fddc1b498",
+            "b6.bin": "d2aeac1b040631e7a74aa5d3238a94bd61ef1efbc4cd54a0a54a60cabcdc7e7a"
+          }
+        }
+      },
+      "comparisons": {
+        "mq-cap32-4t_vs_mq64": {
+          "O_maxabs": 9.589712135493755e-09,
+          "LSE_maxabs": 1.9073486328125e-06,
+          "O_bitdiff": 17857,
+          "LSE_bitdiff": 13
+        },
+        "mq-cap128-4t_vs_mq64": {
+          "O_maxabs": 7.450580596923828e-09,
+          "LSE_maxabs": 1.9073486328125e-06,
+          "O_bitdiff": 17711,
+          "LSE_bitdiff": 12
+        },
+        "gqa-cap64-4t_vs_mq64": {
+          "O_maxabs": 0.0,
+          "LSE_maxabs": 0.0,
+          "O_bitdiff": 0,
+          "LSE_bitdiff": 0,
+          "partial_bitdiff": 0
+        }
+      }
+    }
+  }
+}

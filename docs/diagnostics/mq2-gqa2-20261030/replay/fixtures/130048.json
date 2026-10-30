@@ -1,0 +1,71 @@
+{
+  "active": 130048,
+  "windows": [
+    130047,
+    130048,
+    130048
+  ],
+  "origin": 128,
+  "tail": 128,
+  "nq": 3,
+  "records_bytes": 72826880,
+  "seed": 20261030,
+  "hashes": {
+    "b0": "27eef0113fff25f3b6ef626a12ddc1a7fd7d9fc2a4ff0b2b12cb51d874c4f733",
+    "b1": "0f233bb45ff86697056890ee7835f81cec1bfe27c27e36d9ecc70ae5457ae813",
+    "b2": "76c4972e2fc88c47844d71d470b2b980e955e5490fc8be2e8e975713b75b3c4c",
+    "b3": "76c88fcc330d2be3fef0e31f63f845818daad88b1552eaf0f840b1d219b50eec"
+  },
+  "policies": [
+    {
+      "cap": 32,
+      "split_k": 32,
+      "split_rows": 4064,
+      "path": "/workspace/shared/lavapipe-replay-20261030/harness/long-130048/cap32",
+      "dispatch_mq": [
+        4,
+        2,
+        32
+      ],
+      "dispatch_gqa2": [
+        12,
+        2,
+        32
+      ]
+    },
+    {
+      "cap": 64,
+      "split_k": 64,
+      "split_rows": 2032,
+      "path": "/workspace/shared/lavapipe-replay-20261030/harness/long-130048/cap64",
+      "dispatch_mq": [
+        4,
+        2,
+        64
+      ],
+      "dispatch_gqa2": [
+        12,
+        2,
+        64
+      ]
+    },
+    {
+      "cap": 128,
+      "split_k": 128,
+      "split_rows": 1016,
+      "path": "/workspace/shared/lavapipe-replay-20261030/harness/long-130048/cap128",
+      "dispatch_mq": [
+        4,
+        2,
+        128
+      ],
+      "dispatch_gqa2": [
+        12,
+        2,
+        128
+      ]
+    }
+  ],
+  "synthetic": true,
+  "elapsed_seconds": 1.3847819730290212
+}

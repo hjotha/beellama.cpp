@@ -1,0 +1,32 @@
+{
+  "finite-mq": {
+    "bitdiff_vs_original": 0,
+    "finite": true
+  },
+  "finite-gqa": {
+    "bitdiff_vs_original": 0,
+    "finite": true
+  },
+  "direct-mq": {
+    "bitdiff_vs_original": 0,
+    "finite": true
+  },
+  "direct-gqa": {
+    "bitdiff_vs_original": 0,
+    "finite": true
+  },
+  "nan-partial": {
+    "nan_den": true,
+    "nan_numerators": true,
+    "others_finite": true
+  },
+  "nan-direct": {
+    "O_head0_all_nan": true,
+    "LSE_head0_nan": true
+  },
+  "nan-partial-reduced": {
+    "O_head0_all_nan": true,
+    "LSE_head0_nan": true,
+    "others_bit_identical": true
+  }
+}

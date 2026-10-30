@@ -1,0 +1,10 @@
+{
+  "source_path": "tools/xbox/shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl",
+  "source_sha256_all_three": "e52f25fb5fd50e1d35f05a4ca5923b7011f16ffa7aa77bc15c87af6e074540f2",
+  "verified_with_git_show": {
+    "baseline_cap64": "e8a1380e2485ae27220001337ed5982122fde803",
+    "candidate_cap32": "f3fb8a933c9bf800434f03125cea1c9abf99f157",
+    "candidate_cap128": "4a9eea29ef49ecaab3e72a476a1cd1a576a79efa"
+  },
+  "conclusion": "Same HLSL; cap comparison varies host split count and rows only."
+}

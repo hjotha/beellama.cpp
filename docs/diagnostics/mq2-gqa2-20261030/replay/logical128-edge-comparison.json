@@ -1,0 +1,14 @@
+{
+  "mq": {
+    "all_lastsplit_den0": true,
+    "emptyquery_O0": true,
+    "emptyquery_LSEminusinf": true
+  },
+  "gqa": {
+    "all_lastsplit_den0": true,
+    "emptyquery_O0": true,
+    "emptyquery_LSEminusinf": true
+  },
+  "partial_bitdiff": 0,
+  "final_bitdiff": 0
+}

@@ -1,0 +1,11 @@
+{
+  "expectation_nan_propagation_passed": false,
+  "observed_partial_head0_num0": true,
+  "observed_partial_head0_max_minus_fltmax": true,
+  "observed_partial_head0_den0": true,
+  "observed_final_head0_O0": true,
+  "observed_final_head0_LSE_minusinf": true,
+  "other_heads_partials_bit_identical": true,
+  "other_heads_final_bit_identical": true,
+  "interpretation": "Unexpected invalid-input behavior in adapted SPIR-V route; not established as Xbox defect; no fix applied."
+}

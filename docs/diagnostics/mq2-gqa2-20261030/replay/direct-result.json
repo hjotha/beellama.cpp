@@ -1,0 +1,19 @@
+{
+  "mq_cap_source": {
+    "finite": true,
+    "O_maxabs_oracle": 1.189045390759258e-07,
+    "LSE_maxabs_oracle": 6.975960573640805e-07,
+    "split_k": 1,
+    "split_rows": 256,
+    "direct_output": 1
+  },
+  "mq_gqa2": {
+    "finite": true,
+    "O_maxabs_oracle": 1.189045390759258e-07,
+    "LSE_maxabs_oracle": 6.975960573640805e-07,
+    "split_k": 1,
+    "split_rows": 256,
+    "direct_output": 1
+  },
+  "paired_bitdiff": 0
+}

@@ -1,0 +1,27 @@
+{
+  "original_query_sha256": "2d7005129e80821212456a357fefbd3ea4a31159eae0ec5b9d49ea86ffdffb34",
+  "injected_query_sha256": "553c4ef5e346d4d771ac77471ccc8ab5e0ee74ccf1c175b59abbe0d05b266a03",
+  "changed_float32_count": 512,
+  "expected_changed_ranges_bytes": [
+    [
+      0,
+      1024
+    ],
+    [
+      49152,
+      50176
+    ]
+  ],
+  "actual_first_last_changed_indices": [
+    [
+      0,
+      255
+    ],
+    [
+      12288,
+      12543
+    ]
+  ],
+  "original_all_finite": true,
+  "changed_all_qnan_7fc00000": true
+}

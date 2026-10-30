@@ -1,0 +1,46 @@
+--- original/rkva_range_attn_kvarn4_mq.hlsl
++++ isolated-candidate/rkva_range_attn_kvarn4_mq.hlsl
+@@ -304,7 +304,7 @@
+         float inv = merged_den == 0 ? 0 : 1 / merged_den;
+         output.Store((qh * RKVA_DIM + d) * 4, asuint(numerator * inv));
+         if (d == 0) {
+-            float lse = merged_den != 0 ? merged_max + log(merged_den) : asfloat(0xff800000);
++            float lse = !(merged_den == 0) ? merged_max + log(merged_den) : asfloat(0xff800000);
+             output.Store((total * RKVA_DIM + qh) * 4, asuint(lse));
+         }
+     } else {
+@@ -843,14 +843,14 @@
+                 [unroll] for (uint g = 0; g < RKVA_LH; ++g) {
+                     merged_max[g] = -3.402823466e38f;
+                     for (uint w = 0; w < n_waves; ++w) {
+-                        if (gs_den[w * RKVA_LH + g] != 0)
++                        if (!(gs_den[w * RKVA_LH + g] == 0))
+                             merged_max[g] = max(merged_max[g], gs_max[w * RKVA_LH + g]);
+                     }
+                     merged_den[g] = 0;
+                     [unroll] for (uint w = 0; w < RKVA_MAX_WAVES; ++w) {
+                         uint slot = w * RKVA_LH + g;
+                         weight[slot] = 0;
+-                        if (w < n_waves && gs_den[slot] != 0) {
++                        if (w < n_waves && !(gs_den[slot] == 0)) {
+                             weight[slot] = exp(gs_max[slot] - merged_max[g]);
+                             merged_den[g] += gs_den[slot] * weight[slot];
+                         }
+@@ -863,7 +863,7 @@
+                     merged_tail[k] = 0;
+                     [unroll] for (uint w = 0; w < RKVA_MAX_WAVES; ++w) {
+                         uint slot = w * RKVA_LH + g;
+-                        if (weight[slot] != 0)
++                        if (!(weight[slot] == 0))
+                             merged_body[k] += gs_vec[slot * RKVA_DIM + d] * weight[slot];
+                     }
+                 }
+@@ -885,7 +885,7 @@
+                         uint g = k / 2, d = tid + (k & 1) * 128;
+                         [unroll] for (uint w = 0; w < RKVA_MAX_WAVES; ++w) {
+                             uint slot = w * RKVA_LH + g;
+-                            if (weight[slot] != 0)
++                            if (!(weight[slot] == 0))
+                                 merged_tail[k] += gs_vec[slot * RKVA_DIM + d] * weight[slot];
+                         }
+                     }
