@@ -1266,9 +1266,10 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 | Metric | Type | Description |
 | ------ | ---------------------- | ----------- |
-| `llamacpp:prompt_tokens_total` | Counter | Number of prompt tokens processed. |
-| `llamacpp:prompt_seconds_total` | Counter | Prompt process time in seconds. |
-| `llamacpp:prompt_tokens_seconds` | Gauge | Average prompt throughput in tokens/s. |
+| `llamacpp:prompt_tokens_total` | Counter | Number of prompt tokens evaluated, excluding cached tokens. |
+| `llamacpp:prompt_tokens_cached_total` | Counter | Number of prompt tokens reused from cache. |
+| `llamacpp:prompt_seconds_total` | Counter | Time spent evaluating prompt batches, in seconds; cache restore time is excluded. |
+| `llamacpp:prompt_tokens_seconds` | Gauge | Evaluated prompt tokens per second, averaged over completed batches since the previous scrape. |
 | `llamacpp:tokens_predicted_total` | Counter | Number of generation tokens processed. |
 | `llamacpp:tokens_predicted_seconds_total` | Counter | Predict process time in seconds. |
 | `llamacpp:predicted_tokens_seconds` | Gauge | Average generation throughput in tokens/s. |
@@ -2641,3 +2642,36 @@ Regression (real Qwen MTP model with vocabulary):
 python3 gauntlet/test-adaptive-stream-conversion.py \
   --server build-optimized/bin/llama-server --model /path/to/qwen-mtp.gguf
 ```
+
+### Local prefix checkpoint for native position split
+
+With `--slot-save-auto` and a configured slot-save path, set
+`LLAMA_SLOT_SAVE_SPLIT_PREFIX=1` to publish a complete, local-only checkpoint
+at the split boundary P when a new text prompt crosses into native overflow
+and the preceding prefill batch naturally ends exactly at P.
+It applies to one sequence and a target-only context. The checkpoint has a
+split envelope with an empty overflow; it is not a pure-layout snapshot. A
+split destination must have matching P and C, model, RoPE and cache layout.
+Prompt caching must be enabled, context shifting and `n_cache_reuse` disabled,
+and P must be at least the configured slot-save block size. When the environment
+variable is absent, this checkpoint does not change prefill execution or publication.
+
+The server does not split a batch to reach P. If a batch crosses P, no prefix
+checkpoint is published for that pass. Saving synchronizes the context and
+performs a full state write, so budget for its extra latency,
+disk space and the existing transient RAM reservation. The normal slot-store
+quota, atomic publication and eviction policy apply. Logs report `reason=split-prefix`,
+token count, bytes, elapsed save time and reserved workspace. A failed save
+leaves inference to continue without the new checkpoint.
+
+The index filters new checkpoint filenames whose P or C differs from the active
+native split, so they cannot shadow a compatible candidate. This filename is
+only an early filter: the state reader still checks the actual saved frame.
+Existing differently named cache files keep their normal selection behavior.
+If the FULL state is unavailable, including after native overflow has been seen
+by the context, the checkpoint is skipped and the server logs the refusal.
+
+A limited native Xbox smoke test verified a same-geometry checkpoint round trip,
+including the serialized state and continuation distributions. Qualification
+for another deployment should cover its model, geometry and batch segmentation,
+as well as publication failures and quota handling in a separate test store.

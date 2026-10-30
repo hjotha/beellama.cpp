@@ -5931,6 +5931,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_remote_attn_trace_scope bookkeeping("cuda_graph_bookkeeping", cgraph->n_nodes ? cgraph->nodes[0] : nullptr);
     bookkeeping.event.graph_uid = cgraph->uid;
 #ifdef USE_CUDA_GRAPH
+    const bool first_graph_submission = !cuda_ctx->graph_policy.frozen;
+    const int graph_min_stable_calls = cuda_ctx->graph_policy.freeze_and_get_min_stable_calls(
+            ggml_cuda_graph_min_stable_calls());
+    if (first_graph_submission && ggml_cuda_graph_debug_enabled()) {
+        fprintf(stderr, "CUDA graph policy: context=%p min_stable_calls=%d override=%d\n",
+                (void *) cuda_ctx, graph_min_stable_calls,
+                cuda_ctx->graph_policy.min_stable_calls_override);
+    }
     trace_reason = GGML_CUDA_TRACE_WARMUP;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (bookkeeping.enabled) {
@@ -6025,7 +6033,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     graph->warmup_stable_calls++;
                 }
 
-                if (graph->warmup_stable_calls >= ggml_cuda_graph_min_stable_calls()) {
+                if (graph->warmup_stable_calls >= graph_min_stable_calls) {
                     graph->warmup_complete = true;
                     graph->warmup_stable_calls = 0;
                     if (ggml_cuda_graph_debug_enabled()) {
@@ -6545,6 +6553,18 @@ static ggml_guid_t ggml_backend_cuda_guid() {
 
 bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+bool ggml_backend_cuda_set_graph_min_stable_calls(ggml_backend_t backend, int value) {
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_backend_is_cuda(backend)) return false;
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    return ctx->graph_policy.set_min_stable_calls(value);
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(value);
+    return false;
+#endif
 }
 
 int ggml_backend_cuda_get_device_count() {
@@ -7866,6 +7886,9 @@ static bool ggml_backend_cuda_kv_tail_segmented_attention_supported(
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_set_graph_min_stable_calls") == 0) {
+        return (void *) ggml_backend_cuda_set_graph_min_stable_calls;
+    }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_cuda_mask_pack_stats") == 0) {
         return (void *) ggml_backend_cuda_mask_pack_stats;

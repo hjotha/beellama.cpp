@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
 #include "graph-guard.h"
+#include "graph-policy.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1577,6 +1578,7 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
+    ggml_cuda_graph_policy::config graph_policy;
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;

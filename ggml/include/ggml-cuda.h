@@ -24,6 +24,13 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// Override graph warmup for one backend instance. value must be >= 1.
+// Call before the first graph submission, without concurrent backend use.
+// Returns false for invalid/non-CUDA backends, compiled-out graphs, or after
+// the first submission. Does not alter the memory guard or evict resources.
+// Also available via the CUDA registry's proc-address interface.
+GGML_BACKEND_API bool ggml_backend_cuda_set_graph_min_stable_calls(ggml_backend_t backend, int value);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

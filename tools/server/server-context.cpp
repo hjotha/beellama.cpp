@@ -5,6 +5,7 @@
 #include "../../src/llama-state-rollback.h"
 #include "server-decision.h"
 #include "server-direct-disk-policy.h"
+#include "server-prefix-checkpoint-policy.h"
 #include "server-http.h"
 #include "server-loop-guard.h"
 #include "server-task.h"
@@ -1381,6 +1382,7 @@ struct server_slot {
     int32_t n_prompt_tokens_processed = 0;
     int32_t n_prompt_tokens_lcp       = 0;
     int32_t n_prompt_tokens_planned   = 0;
+    bool prompt_cache_metrics_pending = false;
     std::string prompt_cache_source   = "none";
     std::string prompt_cache_reason   = "none";
 
@@ -1445,6 +1447,7 @@ struct server_slot {
         n_prompt_tokens_cache = 0;
         n_prompt_tokens_lcp = 0;
         n_prompt_tokens_planned = 0;
+        prompt_cache_metrics_pending = false;
         prompt_cache_source = "none";
         prompt_cache_reason = "memory_cleared";
         spec_ckpt.clear();
@@ -1567,6 +1570,7 @@ struct server_slot {
         n_prompt_tokens_cache = 0;
         n_prompt_tokens_lcp = 0;
         n_prompt_tokens_planned = 0;
+        prompt_cache_metrics_pending = false;
         prompt_cache_source = "none";
         prompt_cache_reason = "none";
         bootstrap_pending = false;
@@ -4491,6 +4495,12 @@ private:
         if (!auto_cache_enabled()) {
             return std::nullopt; // off by default
         }
+        // The ordinary manifest layout omits P/C. Filter only names created by
+        // the split-prefix publisher in native split destinations; the state
+        // reader still authenticates the frame before committing the restore.
+        const bool native_split = llama_remote_native_kvarn_enabled(ctx_tgt);
+        const uint32_t split_p = native_split ? server_effective_position_split_p(params_base) : 0;
+        const uint32_t split_c = native_split ? llama_n_ctx_seq(ctx_tgt) : 0;
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
         // Cross-process visibility: cheaply pick up snapshots a peer process created since our last
         // scan (throttled dir-mtime check). Then search; on a MISS, force a re-scan and search again
@@ -4510,6 +4520,10 @@ private:
                     for (auto it = range.first; it != range.second; ++it) {
                         ++boundary_entries;
                         if (!visited_paths.insert(it->second.state_path).second) {
+                            continue;
+                        }
+                        if (native_split && !server_prefix_checkpoint_policy::checkpoint_geometry_compatible(
+                                it->second.state_path, split_p, split_c)) {
                             continue;
                         }
                         auto file = read_unified_snapshot(it->second.state_path, false);
@@ -5130,12 +5144,14 @@ private:
 #endif
     }
 
-    // AUTO-SAVE: persist a slot's KV before it is discarded, keyed by its token-prefix block hash.
+    // AUTO-SAVE: persist a slot's evaluated KV, keyed by its token-prefix block hash.
     // Route handoff and auto-cache use the same canonical native/footer snapshot. The optional
     // logits sidecar is an auxiliary regenerate fast-path, never an index key or a second state
-    // format. Invariant 1: first statement is the gate; invariant 5: only called on slot
-    // release/reassign, never during generation.
-    void auto_save_slot_if_useful(server_slot & slot, const char * reason = "discard") {
+    // format. Calls occur at prompt checkpoints (including the synchronized
+    // split-prefix prefill boundary), completion or slot release/reassign;
+    // never between sampled generation tokens.
+    void auto_save_slot_if_useful(server_slot & slot, const char * reason = "discard",
+            bool split_prefix = false) {
         if (llama_remote_native_kvarn_transient_active(ctx_tgt)) {
             // The automatic restore path has no native-restore RAM reservation
             // or native owner admission. Keep this explicit-only until both
@@ -5193,9 +5209,27 @@ private:
         for (size_t i = toks.size() - toks.size() % block; i < toks.size(); ++i) {
             full_hash = auto_hash_mix(full_hash, toks[i]);
         }
-        const std::string fname = auto_state_filename(full_hash, toks.size());
         const std::string current_model = adaptive_model_identity->fingerprint();
         const std::string current_layout = common_prompt_cache_layout(ctx_tgt);
+        std::string fname = auto_state_filename(full_hash, toks.size());
+        if (split_prefix) {
+            // Do not overwrite a pure snapshot of the same tokens or a split
+            // snapshot from another geometry. The index scans all .bin files.
+            char suffix[96];
+            snprintf(suffix, sizeof(suffix), "-split-%u-%u-%016" PRIx64 ".bin",
+                    slot.position_split_p, llama_n_ctx_seq(ctx_tgt),
+                    XXH64(current_layout.data(), current_layout.size(), 0));
+            fname.replace(fname.size() - 4, 4, suffix);
+            // The common layout does not encode P/C: only deduplicate a
+            // split file bearing our geometry, or a valid pure import.
+            if (const auto existing = auto_index_lookup(toks)) {
+                if (const auto verified = read_unified_snapshot(existing->state_path, true);
+                        verified && verified->tokens == toks &&
+                        (existing->state_path == fname || adaptive_layout_is_pure_kvarn(verified->layout))) {
+                    return;
+                }
+            }
+        }
         std::error_code exists_ec;
         if (std::filesystem::exists(fname, exists_ec)) {
             if (auto existing = read_unified_snapshot(fname); existing &&
@@ -5218,13 +5252,23 @@ private:
                         params_base.slot_save_path.c_str());
                 return;
             }
+            // Another process may have completed this exact publication while
+            // we waited for the store lock. Do not write it a second time.
+            if (split_prefix && std::filesystem::exists(fname, exists_ec) && !exists_ec) {
+                if (const auto existing = read_unified_snapshot(fname, true);
+                        existing && existing->model == current_model &&
+                        common_prompt_cache_layout_reusable(existing->layout, current_layout) &&
+                        existing->tokens == toks) {
+                    return;
+                }
+            }
             auto limit_plan = std::make_shared<unified_snapshot_limit_plan>();
             limit_plan->dir = params_base.slot_save_path;
             limit_plan->just_written = fname;
             limit_plan->max_count = params_base.slot_save_max_count;
             limit_plan->max_bytes = params_base.slot_save_max_bytes;
             const std::vector<float> * logits =
-                slot.logits_last_n_tokens == (int32_t) toks.size() && !slot.logits_last.empty()
+                !split_prefix && slot.logits_last_n_tokens == (int32_t) toks.size() && !slot.logits_last.empty()
                     ? &slot.logits_last : nullptr;
             try {
                 const size_t nwrite = server_route_state_save(ctx_tgt, slot.id, toks, *adaptive_model_identity,
@@ -10551,6 +10595,7 @@ private:
                                     // --- fast path: emit first token from saved logits, no decode ---
                                     slot.stats.n_prompt_cached     = n_past; // entire prompt "reused"
                                     slot.stats.n_prompt_processed  = 0;      // prompt_n = 0 => observable reuse signal
+                                    metrics.add_prompt_cached(n_past);
 
                                     // prime the sampler over the full restored prompt (penalties/grammar
                                     // history), exactly as the normal DONE_PROMPT transition (init_sampler) would.
@@ -10575,7 +10620,6 @@ private:
                                     if (slot.stats.is_set()) {
                                         slot.stats.update_prompt_last();
                                         slot.stats.update_gen_last();
-                                        metrics.add_prompt(slot.stats.n_prompt_processed, (uint64_t) (slot.stats.t_prompt_ms() * 1000));
                                     }
 
                                     if (slot.task->params.stream) {
@@ -10860,10 +10904,11 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
-                        slot.stats.n_prompt_cached    = n_past;
+                        slot.stats.n_prompt_cached    = 0;
                         slot.stats.n_prompt_processed = 0;
-
-                        metrics.add_prompt_cached(n_past);
+                        // The rollback below may reduce or discard this prefix. Defer
+                        // accounting, including if an unsplittable task waits for a batch.
+                        slot.prompt_cache_metrics_pending = true;
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -10939,6 +10984,14 @@ private:
                                 ++it;
                             }
                         }
+                    }
+                    if (slot.prompt_cache_metrics_pending) {
+                        // Count only the prefix retained after successful mutation.
+                        // FULL_REPROCESS has already cleared the prompt; failed
+                        // mutations return above without publishing a cache hit.
+                        slot.stats.n_prompt_cached = slot.prompt.tokens.size_up_to_pos(planned_p0);
+                        metrics.add_prompt_cached(slot.stats.n_prompt_cached);
+                        slot.prompt_cache_metrics_pending = false;
                     }
                     if (slot.n_prompt_tokens_cache > 0) {
                         slot.prompt_cache_reason = "committed";
@@ -11070,8 +11123,50 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    const char * split_prefix_opt = std::getenv("LLAMA_SLOT_SAVE_SPLIT_PREFIX");
+                    const bool prefix_checkpoint_eligible = split_prefix_opt &&
+                            std::strcmp(split_prefix_opt, "1") == 0 && auto_cache_enabled() &&
+                            adaptive_model_identity && !ctx_dft && slot.task->need_sampling() &&
+                            slot.task->params.cache_prompt && !input_tokens.has_media() &&
+                            !params_base.ctx_shift && slot.task->params.n_cache_reuse == 0 &&
+                            are_lora_equal(slot.lora, params_base.lora_adapters) &&
+                            llama_n_seq_max(ctx_tgt) == 1 &&
+                            llama_remote_native_kvarn_enabled(ctx_tgt);
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        // Publish a complete local-only state before the first
+                        // native overflow append. The split envelope remains
+                        // truthful; the normal same-layout restore consumes it.
+                        // Only save if the preceding batch naturally ended at P.
+                        // Never split a batch or save queued, unevaluated tokens.
+                        const auto prefix_action = server_prefix_checkpoint_policy::decide(
+                                split_prefix_opt, prefix_checkpoint_eligible,
+                                slot.position_split_p, slot.prompt.n_tokens(), batch.size() - n_tokens_prev,
+                                slot.task->n_tokens(), auto_index_block(params_base.slot_save_block));
+                        if (prefix_action == server_prefix_checkpoint_policy::action::save) {
+                            llama_synchronize(ctx_tgt);
+                            if (!llama_remote_native_kvarn_transient_active(ctx_tgt) &&
+                                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) ==
+                                        (llama_pos) slot.position_split_p - 1 &&
+                                    slot.prompt.tokens.pos_next() == (llama_pos) slot.position_split_p) {
+                                bool tokens_match = true;
+                                for (int32_t i = 0; i < slot.prompt.n_tokens(); ++i) {
+                                    if (slot.prompt.tokens[i] != input_tokens[i]) {
+                                        tokens_match = false;
+                                        break;
+                                    }
+                                }
+                                if (!tokens_match) {
+                                    SLT_WRN(slot, "%s", "split-prefix auto-save skipped: prompt tokens differ from request\n");
+                                } else if (llama_memory_state_seq_can_save_ext(llama_get_memory(ctx_tgt), slot.id,
+                                                LLAMA_STATE_SEQ_FLAGS_NONE)) {
+                                    auto_save_slot_if_useful(slot, "split-prefix", true);
+                                } else {
+                                    SLT_WRN(slot, "%s", "split-prefix auto-save skipped: FULL sequence state is unavailable\n");
+                                }
+                            }
+                        }
                         // Managed MTP's original-prompt disk hit needs a
                         // persisted state at N-1. If this slot already added
                         // prompt work to the current batch, finish that batch
@@ -11376,11 +11471,6 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             }
         }
 
-        bool has_output = false;
-        for (int i = off; i < off + batch.view.size(); ++i) {
-            has_output |= batch.tokens[i].output;
-        }
-
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -11504,7 +11594,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
             return false; // retry with the updated n_batch
         } else {
             // success, apply batch metrics
-            metrics_post_decode(off, batch.view.size(), has_output);
+            metrics_post_decode(off, batch.view.size());
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -12197,8 +12287,8 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
         n_prompt_queued = 0;
     }
 
-    // has_output is computed by the caller, which also already synchronized the context if it is set
-    void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
+    // The caller synchronizes every successful decode before reaching here.
+    void metrics_post_decode(int32_t off, int32_t n_tokens) {
         metrics.n_decode++;
         for (const auto & slot : slots) {
             if (slot.is_processing()) {
@@ -12229,10 +12319,8 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
 
         metrics_queue_prompt(n_prompt_tokens);
 
-        if (has_output) {
-            // the context is already synchronized, so the timings are correct
-            metrics_flush_prompt();
-        }
+        // Publish completed prompt-only batches too, without another synchronization.
+        metrics_flush_prompt();
 
         // advance the prompt timing of the slots that had tokens in this batch
         // note: a second pass, it must run after the sync to reflect the compute

@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-cuda-graph-policy.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1329,6 +1330,44 @@ llama_context::llama_context(
         backends.emplace_back(backend_cpu);
         if (tcp_position_split) {
             cparams.local_attn_backend = backend_cpu;
+        }
+
+        // Opt in per CUDA backend owned by this TCP position-split context.
+        // Configure before any graph submission; other contexts keep the
+        // legacy global setting (or its default).
+        const int remote_graph_stable_calls = llama_remote_cuda_graph_min_stable_calls(
+                tcp_position_split, std::getenv("GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS"));
+        if (remote_graph_stable_calls < 0) {
+            throw std::invalid_argument("GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS must be a positive integer");
+        }
+        if (remote_graph_stable_calls > 0) {
+            // Preflight the entire set before changing any direct backend. A
+            // meta backend owns nested backends that this policy cannot set.
+            const bool backends_supported = llama_remote_cuda_graph_backends_supported(backends, [](const auto & backend) {
+                auto * dev = ggml_backend_get_device(backend.get());
+                return dev && ggml_backend_dev_is_meta(dev);
+            });
+            if (!backends_supported) {
+                throw std::runtime_error("remote CUDA graph policy does not support meta backends");
+            }
+            using set_policy_fn = bool (*)(ggml_backend_t, int);
+            size_t configured = 0;
+            for (auto & backend : backends) {
+                auto * dev = ggml_backend_get_device(backend.get());
+                auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) continue;
+                auto * set_policy = (set_policy_fn) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_set_graph_min_stable_calls");
+                if (!set_policy || !set_policy(backend.get(), remote_graph_stable_calls)) {
+                    throw std::runtime_error("CUDA backend cannot configure the requested remote graph policy");
+                }
+                ++configured;
+            }
+            if (configured == 0) {
+                throw std::runtime_error("remote CUDA graph policy requested but no CUDA backend is available");
+            }
+            LLAMA_LOG_INFO("%s: remote position-split CUDA graph minimum stable calls = %d (%zu backends)\n",
+                           __func__, remote_graph_stable_calls, configured);
         }
 
         // create a list of the set_n_threads functions in the backends

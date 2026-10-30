@@ -1,6 +1,7 @@
 import pytest
 from utils import *
 import base64
+import json
 import requests
 import struct
 
@@ -593,6 +594,15 @@ def test_recurrent_slot_disk_cache(tmp_path, monkeypatch, automatic):
             response = srv.make_request("POST", "/slots/0?action=restore", {"filename": path.name})
             assert response.status_code == 200, response.body
 
+    def prompt_metrics():
+        text = requests.get(f"http://{srv.server_host}:{srv.server_port}/metrics", timeout=10).text
+        values = {}
+        for name in ("prompt_tokens_total", "prompt_tokens_cached_total", "prompt_seconds_total"):
+            match = re.search(rf"^llamacpp:{name} ([0-9.eE+-]+)$", text, re.MULTILINE)
+            assert match, text
+            values[name] = float(match.group(1))
+        return values
+
     srv.start(timeout_seconds=180)
     response = srv.make_request("POST", "/tokenize", {
         "content": "The reference code is BLUE. " * 100, "add_special": True,
@@ -601,9 +611,8 @@ def test_recurrent_slot_disk_cache(tmp_path, monkeypatch, automatic):
     assert len(tokens) > 256
     first = complete(tokens)
     if automatic:
-        deadline = time.monotonic() + 10
-        while not list(tmp_path.glob("auto-*.bin.meta")) and time.monotonic() < deadline:
-            time.sleep(0.01)
+        # The metrics task is processed after the synchronous save on the slot thread.
+        prompt_metrics()
         paths = list(tmp_path.glob("auto-*.bin"))
         assert len(paths) == 1
         path = paths[0]
@@ -612,11 +621,41 @@ def test_recurrent_slot_disk_cache(tmp_path, monkeypatch, automatic):
         response = srv.make_request("POST", "/slots/0?action=save", {"filename": path.name})
         assert response.status_code == 200, response.body
         assert response.body["n_saved"] == len(tokens)
-    sidecar = Path(str(path) + ".logits")
-    assert sidecar.is_file()
-    assert struct.unpack_from("<I", sidecar.read_bytes(), 12)[0] == len(tokens)
     original_state = path.read_bytes()
-    original_logits = sidecar.read_bytes()
+    sidecar = Path(str(path) + ".logits")
+    if automatic:
+        manifest_length, _, magic = struct.unpack("<QQ8s", original_state[-24:])
+        assert magic == b"LLROUTE1"
+        assert 0 < manifest_length <= len(original_state) - 24
+        manifest_start = len(original_state) - 24 - manifest_length
+        manifest = json.loads(original_state[manifest_start:-24])
+        assert manifest["n_tokens"] == manifest["logits_tokens"] == len(tokens)
+        assert manifest["logits_offset"] == manifest["state_bytes"]
+        assert manifest["logits_bytes"] == manifest["logits_vocab"] * 4 > 0
+        assert manifest["logits_offset"] + manifest["logits_bytes"] == manifest_start
+        original_logits = None
+    else:
+        assert sidecar.is_file()
+        original_logits = sidecar.read_bytes()
+        assert struct.unpack_from("<I", original_logits, 12)[0] == len(tokens)
+
+    def restore_fixture():
+        # Other automatic snapshots from the suffix test must not mask corruption.
+        if automatic:
+            for other in tmp_path.glob("auto-*.bin"):
+                if other != path:
+                    other.unlink()
+        path.write_bytes(original_state)
+        if original_logits is not None:
+            sidecar.write_bytes(original_logits)
+
+    def assert_prompt_metrics(response, expected_total):
+        cached = response["timings"]["cache_n"]
+        processed = response["timings"]["prompt_n"]
+        assert cached + processed == expected_total, response
+        values = prompt_metrics()
+        assert values["prompt_tokens_cached_total"] == cached
+        assert values["prompt_tokens_total"] == processed
 
     restart()
     restore(path)
@@ -626,6 +665,10 @@ def test_recurrent_slot_disk_cache(tmp_path, monkeypatch, automatic):
     metrics = requests.get(f"http://{srv.server_host}:{srv.server_port}/metrics", timeout=10).text
     predicted = re.search(r"^llamacpp:tokens_predicted_total ([0-9.]+)$", metrics, re.MULTILINE)
     assert predicted and float(predicted.group(1)) == 1, metrics
+    values = prompt_metrics()
+    assert values["prompt_tokens_cached_total"] == replay["timings"]["cache_n"] == len(tokens)
+    assert values["prompt_tokens_total"] == 0
+    assert values["prompt_seconds_total"] == 0
     print(f"disk-cache automatic={automatic}: cold prompt_n={first['timings']['prompt_n']}, replay prompt_n=0, content={replay['content']!r}")
 
     restart()
@@ -633,42 +676,75 @@ def test_recurrent_slot_disk_cache(tmp_path, monkeypatch, automatic):
     suffix = srv.make_request("POST", "/tokenize", {"content": " Continue: BLUE"}).body["tokens"]
     extended = complete(tokens + suffix)
     assert 0 < extended["timings"]["prompt_n"] <= len(suffix) + 1, extended
+    values = prompt_metrics()
+    assert values["prompt_tokens_cached_total"] == extended["timings"]["cache_n"]
+    assert values["prompt_tokens_total"] == extended["timings"]["prompt_n"]
+    assert values["prompt_tokens_cached_total"] + values["prompt_tokens_total"] == len(tokens + suffix)
     print(f"disk-cache automatic={automatic}: suffix prompt_n={extended['timings']['prompt_n']}")
 
-    # A corrupt sidecar must use a complete prefill, not stale logits.
+    # Corrupt logits must not be used; a valid checkpoint may still be reused.
     srv.stop()
-    path.write_bytes(original_state)
-    sidecar.write_bytes(original_logits[:8])
+    restore_fixture()
+    if automatic:
+        altered = bytearray(original_state)
+        altered[manifest["logits_offset"]] ^= 1
+        path.write_bytes(altered)
+    else:
+        sidecar.write_bytes(original_logits[:8])
     srv.start(timeout_seconds=180)
     restore(path)
     fallback = complete(tokens)
-    assert fallback["timings"]["prompt_n"] == len(tokens), fallback
+    assert 0 < fallback["timings"]["prompt_n"] <= len(tokens), fallback
+    assert_prompt_metrics(fallback, len(tokens))
     assert fallback["content"] == first["content"]
-    print(f"disk-cache automatic={automatic}: corrupt-sidecar fallback prompt_n={fallback['timings']['prompt_n']}")
+    print(f"disk-cache automatic={automatic}: corrupt-logits fallback prompt_n={fallback['timings']['prompt_n']}")
 
     if automatic:
-        # The native token payload must agree with metadata before claiming reuse.
+        # A mismatched first native token cannot match the requested prefix.
         srv.stop()
+        restore_fixture()
         altered = bytearray(original_state)
-        struct.pack_into("=i", altered, STATE_FILE_HEADER_SIZE, tokens[1])
+        struct.pack_into("=i", altered, STATE_FILE_HEADER_SIZE, tokens[0] ^ 1)
         path.write_bytes(altered)
-        sidecar.write_bytes(original_logits)
         srv.start(timeout_seconds=180)
         fallback = complete(tokens)
         assert fallback["timings"]["prompt_n"] == len(tokens), fallback
+        assert fallback["timings"]["cache_n"] == 0, fallback
+        assert_prompt_metrics(fallback, len(tokens))
         assert fallback["content"] == first["content"]
         print(f"disk-cache automatic=True: mismatched-state fallback prompt_n={fallback['timings']['prompt_n']}")
 
         srv.stop()
-        path.write_bytes(original_state)
-        meta = Path(str(path) + ".meta")
-        data = bytearray(meta.read_bytes())
-        struct.pack_into("<I", data, len(data) - len(tokens) * 4 - 12, 0x7fffffff)
-        meta.write_bytes(data)
+        restore_fixture()
+        altered = bytearray(original_state)
+        # The footer owns the manifest length; reject an out-of-bounds length.
+        struct.pack_into("<Q", altered, len(altered) - 24, 0x7fffffffffffffff)
+        path.write_bytes(altered)
         srv.start(timeout_seconds=180)
         fallback = complete(tokens)
         assert fallback["timings"]["prompt_n"] == len(tokens), fallback
+        assert fallback["timings"]["cache_n"] == 0, fallback
+        assert_prompt_metrics(fallback, len(tokens))
+        assert fallback["content"] == first["content"]
         print(f"disk-cache automatic=True: oversized-metadata fallback prompt_n={fallback['timings']['prompt_n']}")
+
+        srv.stop()
+        restore_fixture()
+        altered = bytearray(original_state)
+        version = b'"version":1'
+        version_pos = original_state.find(version, manifest_start, len(original_state) - 24)
+        assert version_pos >= 0
+        altered[version_pos + len(version) - 1] = ord("2")
+        assert json.loads(altered[manifest_start:-24])["version"] == 2
+        # Preserve the footer and its original checksum while corrupting the manifest.
+        path.write_bytes(altered)
+        srv.start(timeout_seconds=180)
+        fallback = complete(tokens)
+        assert fallback["timings"]["prompt_n"] == len(tokens), fallback
+        assert fallback["timings"]["cache_n"] == 0, fallback
+        assert_prompt_metrics(fallback, len(tokens))
+        assert fallback["content"] == first["content"]
+        print(f"disk-cache automatic=True: corrupt-manifest fallback prompt_n={fallback['timings']['prompt_n']}")
     srv.stop()
 
 

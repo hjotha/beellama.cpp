@@ -44,6 +44,19 @@ profile capacity, rather than individual positions. See
 [Xbox positional overflow](xbox-position-overflow.md) for storage and state
 semantics.
 
+`GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS=N` optionally sets the minimum number
+of stable calls before CUDA graph capture on each directly owned CUDA backend
+of a TCP position-split context. `N` must be a positive decimal integer. The
+setting is fixed before graph submission and applies to all phases of that
+context, not just prefill. Local contexts and non-TCP routes ignore it. If the
+option is absent, the existing `GGML_CUDA_GRAPH_MIN_STABLE_CALLS` setting and
+its default of 4 remain in effect. For an opted-in TCP split, an invalid value,
+missing CUDA backend, backend without the setter, or any composite meta
+backend fails context creation. This includes a mix of CUDA and meta backends;
+the policy does not configure nested backends. The option does not change the
+CUDA graph memory guard. Hardware qualification is required before replacing an
+existing production setting.
+
 With thresholded local Vulkan remote attention, the server applies
 `--amd-sclk-prefill`, `--amd-sclk-decode`, and `--gpu-fabric-state` only when
 the active profile's configured capacity reaches `--remote-attn-min-context`.

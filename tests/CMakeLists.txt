@@ -60,6 +60,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-cuda-graph-source-properties-static PROPERTY LABELS cuda)
 
     add_test(
+        NAME test-cuda-graph-policy-source-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-graph-policy-source-static.py)
+    set_property(TEST test-cuda-graph-policy-source-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-std-kv-tail-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-std-kv-tail-static.py)
@@ -1230,8 +1236,19 @@ target_compile_features(test-cuda-graph-guard PRIVATE cxx_std_17)
 add_test(NAME test-cuda-graph-guard COMMAND $<TARGET_FILE:test-cuda-graph-guard>)
 set_property(TEST test-cuda-graph-guard PROPERTY LABELS main)
 
+# Admission configuration is tested without a CUDA device or runtime.
+add_executable(test-cuda-graph-policy test-cuda-graph-policy.cpp)
+target_include_directories(test-cuda-graph-policy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(test-cuda-graph-policy PRIVATE cxx_std_17)
+add_test(NAME test-cuda-graph-policy COMMAND $<TARGET_FILE:test-cuda-graph-policy>)
+set_property(TEST test-cuda-graph-policy PROPERTY LABELS main)
+
 add_executable(test-server-direct-disk-policy test-server-direct-disk-policy.cpp)
 target_include_directories(test-server-direct-disk-policy PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_compile_features(test-server-direct-disk-policy PRIVATE cxx_std_17)
 add_test(NAME test-server-direct-disk-policy COMMAND $<TARGET_FILE:test-server-direct-disk-policy>)
 set_property(TEST test-server-direct-disk-policy PROPERTY LABELS main)
+add_executable(test-server-prefix-checkpoint-policy test-server-prefix-checkpoint-policy.cpp)
+target_include_directories(test-server-prefix-checkpoint-policy PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_compile_features(test-server-prefix-checkpoint-policy PRIVATE cxx_std_17)
+add_test(NAME test-server-prefix-checkpoint-policy COMMAND $<TARGET_FILE:test-server-prefix-checkpoint-policy>)

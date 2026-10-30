@@ -109,6 +109,41 @@ def test_metrics_prompt_processed_and_cached():
     assert metrics["llamacpp:prompt_tokens_cached_total"][1] == n_cached
 
 
+@pytest.mark.slow
+def test_metrics_prompt_advances_during_prefill():
+    global server
+    model = os.environ.get("METRICS_HTTP_MODEL")
+    if not model:
+        pytest.skip("METRICS_HTTP_MODEL must point to a local GGUF with a long context")
+    server = ServerProcess()
+    server.model_file = model
+    server.model_hf_repo = server.model_hf_file = None
+    server.server_metrics = True
+    server.n_slots = 1
+    server.n_ctx = 4096
+    server.n_batch = server.n_ubatch = 16
+    server.n_threads = 1
+    server.fit = "off"
+    server.start(timeout_seconds=180)
+
+    prompt = "the quick brown fox jumps over the lazy dog " * 200
+    chunks = server.make_stream_request("POST", "/completion", data={
+        "prompt": prompt, "n_predict": 1, "stream": True, "return_progress": True,
+    })
+    observed = False
+    for chunk in chunks:
+        progress = chunk.get("prompt_progress")
+        if not progress or not 0 < progress["processed"] < progress["total"] or observed:
+            continue
+        metrics = parse_metrics(fetch_metrics(server))
+        # The scrape is newer than the progress message; use only the fixed
+        # request total and the values in this single metrics snapshot.
+        observed = (metrics["llamacpp:requests_processing"][1] == 1
+                    and 0 < metrics["llamacpp:prompt_tokens_total"][1] < progress["total"]
+                    and metrics["llamacpp:prompt_tokens_seconds"][1] > 0)
+    assert observed, "did not observe completed prompt batches while the request was processing"
+
+
 def test_metrics_predicted_total_matches_requests():
     global server
     server.start()

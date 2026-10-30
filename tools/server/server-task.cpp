@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 
 #if defined(__linux__)
 #    include <sys/vfs.h>
@@ -1714,6 +1715,7 @@ std::string server_task_result_metrics::to_metrics() {
     };
 
     std::stringstream prometheus;
+    prometheus.precision(std::numeric_limits<double>::max_digits10);
 
     auto add_items = [&prometheus](const char * type, const std::vector<metric_item> & items) {
         for (const auto & item : items) {

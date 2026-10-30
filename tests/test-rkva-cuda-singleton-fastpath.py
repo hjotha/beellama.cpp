@@ -2,6 +2,7 @@
 """CPU-only guard/structure checks; not a CUDA execution qualification."""
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 
@@ -65,10 +66,69 @@ assert 'cuda_ctx->stream_context().concurrent_events.empty()' in compute
 assert 'if (!remote_singleton_fastpath) {' in compute
 assert 'if (graph && graph->is_enabled())' in compute
 assert 'if (bookkeeping.enabled && graph)' in compute
-assert compute.count('check_memory_pressure_before_graph()') == 1
-assert compute.index('check_memory_pressure_before_graph()') < compute.index('ggml_cuda_graph_evaluate_and_capture(')
-assert 'return GGML_STATUS_FAILED;' in compute
+
+# The two textual calls are mutually exclusive: the instrumented branch and
+# the uninstrumented branch must each call the guard exactly once. Compile the
+# actual dispatch block with a counting stub so both branches and both guard
+# outcomes are checked, rather than just accepting a particular call count.
+guard_start = compute.index('    bool graph_memory_pressure_ok;')
+failure_start = compute.index('    if (!graph_memory_pressure_ok) {', guard_start)
+guard_end = compute.index('\n    }', failure_start) + len('\n    }')
+guard_block = compute[guard_start:guard_end]
+# The guard must be at function scope, outside the singleton fastpath branch.
+prefix = re.sub(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '',
+                compute[:guard_start], flags=re.S)
+assert prefix.count('{') - prefix.count('}') == 1
+assert compute.count('cuda_ctx->check_memory_pressure_before_graph()') == 2
+assert guard_block.count('cuda_ctx->check_memory_pressure_before_graph()') == 2
+assert guard_end < compute.index('cudaStreamBeginCapture(')
+assert guard_end < compute.index('ggml_cuda_graph_evaluate_and_capture(')
+
+guard_fixture = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#define GGML_LOG_ERROR(...) ((void) 0)
+enum { GGML_STATUS_SUCCESS, GGML_STATUS_FAILED };
+struct event { uint64_t graph_uid = 0; unsigned flags = 0; };
+struct ggml_remote_attn_trace_scope {
+    struct event event;
+    ggml_remote_attn_trace_scope(const char *, void *) {}
+};
+struct trace { bool enabled; struct event event; };
+struct graph { void * nodes[1] = {nullptr}; uint64_t uid = 1; };
+struct context {
+    bool disable_cuda_graphs_due_to_memory_pressure = false;
+    bool result = false;
+    int calls = 0;
+    bool check_memory_pressure_before_graph() { ++calls; return result; }
+};
+bool ggml_cuda_graph_debug_enabled() { return false; }
+int guard_dispatch(context * cuda_ctx, graph * cgraph, trace & bookkeeping) {
+'''
+guard_checks = r'''
+    return GGML_STATUS_SUCCESS;
+}
+int main() {
+    for (bool enabled : {false, true}) {
+        for (bool safe : {false, true}) {
+            context ctx; ctx.result = safe;
+            graph g; trace bookkeeping{enabled, {}};
+            assert(guard_dispatch(&ctx, &g, bookkeeping) == (safe ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED));
+            assert(ctx.calls == 1);
+            assert(bool(bookkeeping.event.flags & 1u) == !safe);
+        }
+    }
+}
+'''
+with tempfile.TemporaryDirectory(prefix='rkva-singleton-guard-') as tmp:
+    cpp = Path(tmp) / 'guard.cpp'
+    cpp.write_text('#include <initializer_list>\n' + guard_fixture + guard_block + guard_checks)
+    binary = Path(tmp) / 'guard'
+    subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++11', '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
 assert 'ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,' in compute
-assert 'return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_ABORTED;' in compute
+assert 'return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;' in compute
 assert 'ggml_remote_attn_exec_cuda(' not in compute  # never bypass the evaluator
 print('RKVA singleton predicate matrix and dispatch structure checks passed (CPU-only)')

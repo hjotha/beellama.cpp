@@ -2,6 +2,7 @@
 
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
+#include "../tools/server/server-task.h"
 
 #include <cstdlib>
 #include <regex>
@@ -436,6 +437,15 @@ static void test_decision_escape(testing & t) {
     });
 }
 
+static void test_metrics_precision(testing & t) {
+    server_task_result_metrics result;
+    result.metrics.add_prompt(1100001, 1000000);
+    result.metrics.add_prompt_cached(2100003);
+    const auto text = result.to_metrics();
+    t.assert_true("processed counter retains digits", text.find("llamacpp:prompt_tokens_total 1100001\n") != std::string::npos);
+    t.assert_true("cached counter retains digits", text.find("llamacpp:prompt_tokens_cached_total 2100003\n") != std::string::npos);
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -455,6 +465,7 @@ int main(int argc, char ** argv) {
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_pipe",   test_server_pipe);
     t.test("decision_escape", test_decision_escape);
+    t.test("metrics_precision", test_metrics_precision);
 
     return t.summary();
 }
