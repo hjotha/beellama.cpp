@@ -230,6 +230,10 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
     bulk_recording_ = true;
     float dummy_f32 = 0.0f;
     for (size_t i = 0; i < segments.size(); ++i) {
+        if (capture_armed_) {
+            capture_segment_ = uint32_t(i);
+            capture_wire_ = wire;
+        }
         if (prof)
             profile_->bulk.segment_index = uint32_t(i);
         const auto& segment = segments[i];
@@ -370,6 +374,7 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
                 profile_->bulk.active = false;
             bulk_recording_ = false;
             bulk_gpu_query_ = false;
+            capture_pending_ = false;
             s->valid = false;
             terminal_failure_ = true;
             return false;

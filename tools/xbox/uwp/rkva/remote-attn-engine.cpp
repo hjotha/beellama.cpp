@@ -94,6 +94,8 @@ static const size_t kRkvaFlashAttnSplitKReduceDxilSize =
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <intrin.h>
 #include <limits>
 #include <new>
@@ -270,6 +272,56 @@ struct RemoteAttnEngine::Session {
 
 RemoteAttnEngine::RemoteAttnEngine() = default;
 
+void RemoteAttnEngine::configure_mq_capture(const std::string& folder) {
+    capture_armed_ = false;
+    std::ifstream in(folder + "\\rkva-mq-capture.cfg");
+    if (!in) return;
+    uint64_t layer, position, segment;
+    std::string extra;
+    std::error_code ec1, ec2;
+    const bool final_exists = std::filesystem::exists(folder + "\\rkva-mq-capture.bin", ec1);
+    const bool temp_exists = std::filesystem::exists(folder + "\\rkva-mq-capture.bin.tmp", ec2);
+    if (!(in >> layer >> position >> segment) || (in >> extra) || layer > UINT32_MAX ||
+        position > INT32_MAX || segment >= 32 ||
+        ec1 || ec2 || final_exists || temp_exists) {
+        std::fprintf(stderr, "RKVA MQ capture selector/output invalid; capture disabled\n");
+        return;
+    }
+    capture_selection_ = {uint32_t(layer), uint32_t(position), uint32_t(segment)};
+    capture_folder_ = folder;
+    capture_armed_ = true;
+}
+
+void RemoteAttnEngine::persist_mq_capture() {
+    if (!capture_pending_) return;
+    capture_pending_ = false;
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, static_cast<SIZE_T>(capture_extents_.total)};
+    if (FAILED(capture_readback_.resource->Map(0, &range, &mapped)) || !mapped) {
+        std::fprintf(stderr, "RKVA MQ capture readback failed\n");
+        return;
+    }
+    try {
+        const auto tmp = capture_folder_ + "\\rkva-mq-capture.bin.tmp";
+        const auto final = capture_folder_ + "\\rkva-mq-capture.bin";
+        if (std::filesystem::exists(tmp) || std::filesystem::exists(final))
+            throw std::runtime_error("capture output already exists");
+        std::ofstream out(tmp, std::ios::binary | std::ios::out);
+        if (!rkva_mq_capture::write(out, &capture_header_, sizeof(capture_header_), mapped,
+                                    size_t(capture_extents_.total)))
+            throw std::runtime_error("capture write failed");
+        out.flush();
+        if (!out) throw std::runtime_error("capture write failed");
+        out.close();
+        if (!out) throw std::runtime_error("capture close failed");
+        std::filesystem::rename(tmp, final);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "RKVA MQ capture failed: %s\n", e.what());
+    }
+    const D3D12_RANGE empty{0, 0};
+    capture_readback_.resource->Unmap(0, &empty);
+}
+
 bool RemoteAttnEngine::confirm_execution_retired() {
     if (!unconfirmed_submission_)
         return true; // normal path: no extra D3D call
@@ -394,6 +446,13 @@ bool RemoteAttnEngine::begin(std::string* error) {
 bool RemoteAttnEngine::submit(std::string* error) {
     if (bulk_recording_)
         return true;
+    // A failed submission must never publish a later buffer as this capture.
+    // Keep its resource owned by the engine until uncertain GPU work retires.
+    struct CaptureSubmitGuard {
+        bool& pending;
+        bool complete = false;
+        ~CaptureSubmitGuard() { if (!complete) pending = false; }
+    } capture_guard{capture_pending_};
     if (terminal_failure_ || unconfirmed_submission_) {
         return fail(error, "engine terminal after unconfirmed submission");
     }
@@ -457,6 +516,8 @@ bool RemoteAttnEngine::submit(std::string* error) {
         terminal_failure_ = true;
         return fail(error, "D3D12 device removed", hr);
     }
+    capture_guard.complete = true;
+    persist_mq_capture();
     return true;
 }
 
@@ -1965,6 +2026,21 @@ uint64_t RemoteAttnEngine::native_range_generation(uint32_t id) const {
     return s && s->range_configured && s->range_storage == 3 ? s->native_generation : 0;
 }
 
+bool RemoteAttnEngine::native_range_layer_state(uint32_t id, uint32_t layer,
+                                                rkva_kvarn_range_config& descriptor,
+                                                rkva_kvarn_cohort::LayerState& state) const {
+    const Session* s = find_session(id);
+    if (unconfirmed_submission_ || terminal_failure_ || bulk_recording_ || !s || !s->valid ||
+        !s->range_configured || s->range_storage != 3 || layer >= s->range_counts.size() ||
+        layer >= s->range_record_groups.size() || layer >= s->range_ready.size() ||
+        layer >= s->prefix_coverage.size())
+        return false;
+    descriptor = s->range_descriptor;
+    state = {s->range_counts[layer], s->range_record_groups[layer], s->range_ready[layer],
+             s->prefix_coverage[layer]};
+    return true;
+}
+
 // Atomic all-layer bounded rewind. Two stage ping-pong groups retain every
 // prefix row needed after <=128 removals; removed suffix rows are masked by
 // range_counts and overwritten before a group is sealed again. Only the
@@ -2566,6 +2642,10 @@ bool RemoteAttnEngine::attend_kvarn_bulk(uint32_t id, uint32_t layer, uint32_t n
 
     bulk_recording_ = true;
     for (size_t i = 0; i < segments.size(); ++i) {
+        if (capture_armed_) {
+            capture_segment_ = uint32_t(i);
+            capture_wire_ = RKVA_WIRE_F32;
+        }
         if (prof) {
             profile_->bulk.segment_index = static_cast<uint32_t>(i);
         }
@@ -2593,6 +2673,7 @@ bool RemoteAttnEngine::attend_kvarn_bulk(uint32_t id, uint32_t layer, uint32_t n
         }
         if (!ok) {
             bulk_recording_ = false;
+            capture_pending_ = false;
             if (prof) {
                 profile_->bulk.active = false;
                 ++profile_->recorder.counters.failed_calls;
@@ -3210,6 +3291,79 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                                    direct ? 1u : 0u,
                                    kvarn ? uint32_t(s->records_bytes) : 0u,
                                    kvarn ? s->precision_tail_tokens : 0u};
+        bool capture = false;
+        const uint32_t segment = bulk_recording_ ? capture_segment_ : 0;
+        if (capture_armed_ && prefix && q_tile == 2 && !int8_selected &&
+            capture_selection_.matches(layer, uint32_t(positions[0]), segment)) {
+            const uint64_t partial_bytes = direct ? 0 : uint64_t(split_k) * q_heads *
+                                                      (geo_.head_dim + 2) * sizeof(float);
+            const uint64_t query_bytes = 2 * q_bytes + uint64_t(n_tokens) * sizeof(int32_t);
+            const uint64_t kv_bytes = 2 * s->half_stride;
+            rkva_mq_capture::Extents extent{};
+            capture_armed_ = false; // exactly one attempt, including allocation failure
+            if (query_bytes <= range_query_.bytes && kv_bytes <= kv.bytes &&
+                partial_bytes <= range_opt_partials_.bytes && out_bytes <= range_output_.bytes &&
+                rkva_mq_capture::extents(query_bytes, kv_bytes, partial_bytes, out_bytes, extent) &&
+                SUCCEEDED(try_create_buffer(extent.total, D3D12_HEAP_TYPE_READBACK,
+                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
+                    &capture_readback_))) {
+                capture_extents_ = extent;
+                capture_header_ = {};
+                capture_header_.header_bytes = sizeof(capture_header_);
+                capture_header_.session = id;
+                capture_header_.layer = layer;
+                capture_header_.segment = segment;
+                capture_header_.wire = bulk_recording_ ? capture_wire_ : UINT32_MAX;
+                capture_header_.kernel = gqa2_plan.selected ? 2u : 1u;
+                capture_header_.dispatch_x = dispatch_x;
+                capture_header_.dispatch_y = query_groups;
+                capture_header_.dispatch_z = split_k;
+                capture_header_.wave_min = wave_lane_min_;
+                capture_header_.wave_max = wave_lane_max_;
+                std::memcpy(capture_header_.params, params, sizeof(params));
+                rkva_snapshot::Sha256 shader_hash;
+#if RKVA_HAS_KVARN4_MQ2_GQA2_DXIL
+                if (gqa2_plan.selected) {
+                    shader_hash.update(g_rkva_range_attn_kvarn4_mq2_gqa2_dxil,
+                                       sizeof(g_rkva_range_attn_kvarn4_mq2_gqa2_dxil));
+                } else
+#endif
+                {
+                    shader_hash.update(g_rkva_range_attn_kvarn4_mq2_dxil,
+                                       sizeof(g_rkva_range_attn_kvarn4_mq2_dxil));
+                }
+                const auto shader_digest = shader_hash.finish();
+                std::memcpy(capture_header_.shader_sha256, shader_digest.data(),
+                            shader_digest.size());
+                capture_header_.capacity = s->capacity;
+                capture_header_.record_groups = s->range_record_groups[layer];
+                capture_header_.coverage_tail = s->prefix_coverage[layer].tail_begin;
+                capture_header_.coverage_stage = s->prefix_coverage[layer].stage_begin;
+                capture_header_.generation = s->native_generation;
+                capture_header_.records_bytes = s->records_bytes;
+                capture_header_.stage_bytes = s->stage_bytes;
+                capture_header_.half_stride = s->half_stride;
+                capture_header_.query_bytes = query_bytes;
+                capture_header_.kv_bytes = kv_bytes;
+                capture_header_.partial_bytes = partial_bytes;
+                capture_header_.output_bytes = out_bytes;
+                capture_header_.geometry = geo_;
+                capture_header_.descriptor = s->range_descriptor;
+                // UPLOAD heaps remain GENERIC_READ; DEFAULT query buffers need transitions.
+                if (bulk_gpu_query_) transition(range_query_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                transition(kv, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                cmd_->CopyBufferRegion(capture_readback_.resource.Get(), 0,
+                                       range_query_.resource.Get(), 0, query_bytes);
+                cmd_->CopyBufferRegion(capture_readback_.resource.Get(), query_bytes,
+                                       kv.resource.Get(), 0, kv_bytes);
+                if (bulk_gpu_query_)
+                    transition(range_query_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(kv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                capture_pending_ = capture = true;
+            } else {
+                std::fprintf(stderr, "RKVA MQ capture exceeds limit or allocation failed\n");
+            }
+        }
         cmd_->SetComputeRootSignature(range_attn_fmt_opt_root_.Get());
         cmd_->SetPipelineState(fmt_pso);
         cmd_->SetComputeRoot32BitConstants(0, 12, params, 0);
@@ -3223,6 +3377,13 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         cmd_->Dispatch(dispatch_x, query_groups, split_k);
         if (!direct) {
             uav_barrier(range_opt_partials_);
+            if (capture) {
+                transition(range_opt_partials_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                cmd_->CopyBufferRegion(capture_readback_.resource.Get(),
+                                       capture_extents_.query + capture_extents_.kv,
+                                       range_opt_partials_.resource.Get(), 0,
+                                       capture_extents_.partial);
+            }
             transition(range_opt_partials_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             if (ts) {
                 timestamp(kTsAttnPass1);
@@ -3247,6 +3408,12 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         }
         uav_barrier(range_output_);
         transition(range_output_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (capture) {
+            cmd_->CopyBufferRegion(capture_readback_.resource.Get(),
+                                   capture_extents_.query + capture_extents_.kv +
+                                       capture_extents_.partial,
+                                   range_output_.resource.Get(), 0, capture_extents_.output);
+        }
         if (ts) {
             if (direct) {
                 timestamp(kTsAttnPass1); // pass1 includes the output barrier; reduce == 0

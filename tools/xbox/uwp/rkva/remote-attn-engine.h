@@ -24,6 +24,8 @@
 #include "rkva-bulk-fp8.h"
 #include "rkva-bulk-scratch.h"
 #include "rkva-execution-lifetime.h"
+#include "rkva-kvarn-cohort.h"
+#include "rkva-mq-capture.h"
 #include <d3d12.h>
 #include <wrl/client.h>
 
@@ -116,6 +118,9 @@ class RemoteAttnEngine {
     bool upload_range(uint32_t session_id, uint32_t layer, uint32_t start_row, uint32_t n_rows,
                       const uint16_t* k, const uint16_t* v, std::string* error);
     uint64_t native_range_generation(uint32_t id) const;
+    // Serial-owner admission snapshot only; no GPU work, synchronization or mutation.
+    bool native_range_layer_state(uint32_t id, uint32_t layer, rkva_kvarn_range_config& descriptor,
+                                  rkva_kvarn_cohort::LayerState& state) const;
     bool rewind_kvarn_range(uint32_t id, const rkva_kvarn_range_rewind& request,
                             const uint8_t* data, size_t bytes, std::string* error);
     bool configure_kvarn_range(uint32_t id, const rkva_kvarn_range_config& config,
@@ -202,6 +207,9 @@ class RemoteAttnEngine {
         return mq_gqa2_;
     }
 
+    // Optional LocalState selector: layer, first absolute position, bulk segment.
+    void configure_mq_capture(const std::string& folder);
+
     // Diagnostics / parity harness support.
     uint64_t allocated_bytes() const {
         return allocated_bytes_;
@@ -216,6 +224,31 @@ class RemoteAttnEngine {
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
         uint64_t bytes = 0;
     };
+
+#pragma pack(push, 1)
+    struct CaptureHeader {
+        uint32_t magic = 0x5043514d, version = 1, header_bytes = sizeof(CaptureHeader);
+        uint32_t session = 0, layer = 0, segment = 0, wire = 0;
+        uint32_t kernel = 0, dispatch_x = 0, dispatch_y = 0, dispatch_z = 0;
+        uint32_t wave_min = 0, wave_max = 0;
+        uint32_t params[12]{};
+        uint32_t capacity = 0, record_groups = 0, coverage_tail = 0, coverage_stage = 0;
+        uint64_t generation = 0, records_bytes = 0, stage_bytes = 0, half_stride = 0;
+        uint64_t query_bytes = 0, kv_bytes = 0, partial_bytes = 0, output_bytes = 0;
+        uint8_t shader_sha256[32]{};
+        Geometry geometry{};
+        rkva_kvarn_range_config descriptor{};
+    };
+#pragma pack(pop)
+    static_assert(sizeof(CaptureHeader) == 344, "MQ capture header layout changed");
+    void persist_mq_capture();
+    rkva_mq_capture::Selection capture_selection_{};
+    rkva_mq_capture::Extents capture_extents_{};
+    CaptureHeader capture_header_{};
+    Buffer capture_readback_;
+    std::string capture_folder_;
+    bool capture_armed_ = false, capture_pending_ = false;
+    uint32_t capture_segment_ = 0, capture_wire_ = 0;
 
     bool fail(std::string* error, const char* stage, HRESULT hr = S_OK);
     bool create_buffer(uint64_t bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
