@@ -163,6 +163,63 @@ inline bool restore_allowed(const Eligibility & e, std::string * error) {
     return true;
 }
 
+// Automatic native overflow capture is opt-in through
+// LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE=1 and reuses the explicit publication path.
+// `automatic_save_facts` holds only what the server can observe before it
+// touches the RAM cache or the snapshot store; every real guard (target-only
+// /MTP, identity, reservation, retention quota and no-overwrite) still runs
+// inside the shared publisher. `publication` is that publisher's refusal.
+struct automatic_save_facts {
+    bool opt_in = false;              // env value is exactly "1"
+    bool store_configured = false;    // --slot-save-path is set
+    bool request_completed = false;   // the slot still owns a finished request
+    bool request_persistable = false; // cacheable, text-only sampling request
+    bool slot_quiescent = false;      // the finished task was not released yet
+    bool native_overflow = false;     // native overflow is resident
+};
+
+enum class automatic_save_skip {
+    none,
+    disabled,
+    no_store,
+    request_incomplete,
+    request_not_persistable,
+    slot_busy,
+    no_native_overflow,
+    destination_exists,
+    quota_refused,
+    failed,
+};
+
+// Pre-gates are evaluated in a fixed order and always win: a request with no
+// resident overflow is skipped before any publication refusal is considered.
+inline automatic_save_skip automatic_save_decision(const automatic_save_facts & facts,
+        automatic_save_skip publication = automatic_save_skip::none) {
+    if (!facts.opt_in) return automatic_save_skip::disabled;
+    if (!facts.store_configured) return automatic_save_skip::no_store;
+    if (!facts.request_completed) return automatic_save_skip::request_incomplete;
+    if (!facts.request_persistable) return automatic_save_skip::request_not_persistable;
+    if (!facts.slot_quiescent) return automatic_save_skip::slot_busy;
+    if (!facts.native_overflow) return automatic_save_skip::no_native_overflow;
+    return publication;
+}
+
+inline const char * automatic_save_skip_name(automatic_save_skip skip) {
+    switch (skip) {
+        case automatic_save_skip::none:                   return "published";
+        case automatic_save_skip::disabled:               return "LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE is not 1";
+        case automatic_save_skip::no_store:               return "--slot-save-path is unset";
+        case automatic_save_skip::request_incomplete:     return "the request did not complete";
+        case automatic_save_skip::request_not_persistable: return "the request is not cacheable text generation";
+        case automatic_save_skip::slot_busy:              return "the slot no longer owns the finished request";
+        case automatic_save_skip::no_native_overflow:     return "no native overflow is resident";
+        case automatic_save_skip::destination_exists:     return "the generated snapshot name already exists";
+        case automatic_save_skip::quota_refused:          return "the reservation or retention quota refused publication";
+        case automatic_save_skip::failed:                 return "publication failed";
+    }
+    return "unknown";
+}
+
 inline uint64_t restore_peak_bytes(const rkva_native_state::SetHeader & header) {
     return rkva_native_state::restore_peak_bytes(header);
 }

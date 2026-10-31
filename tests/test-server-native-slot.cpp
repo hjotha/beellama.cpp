@@ -257,12 +257,63 @@ void test_restore_peak_16_layers() {
     assert(server_slot_cap_ram_budget(0, 4ull << 30, true) == 0);
 }
 
+void test_automatic_save_decision() {
+    using skip = server_native_slot::automatic_save_skip;
+    server_native_slot::automatic_save_facts facts;
+    facts.opt_in = true;
+    facts.store_configured = true;
+    facts.request_completed = true;
+    facts.request_persistable = true;
+    facts.slot_quiescent = true;
+    facts.native_overflow = true;
+    // Eligible: an opt-in completion with resident overflow is published.
+    assert(server_native_slot::automatic_save_decision(facts) == skip::none);
+
+    // Off by default and for any value other than the exact string "1".
+    auto mutate = [&](auto change) {
+        auto candidate = facts;
+        change(candidate);
+        return server_native_slot::automatic_save_decision(candidate);
+    };
+    assert(mutate([](auto & x) { x.opt_in = false; }) == skip::disabled);
+    assert(mutate([](auto & x) { x.store_configured = false; }) == skip::no_store);
+    assert(mutate([](auto & x) { x.request_completed = false; }) == skip::request_incomplete);
+    assert(mutate([](auto & x) { x.request_persistable = false; }) == skip::request_not_persistable);
+    assert(mutate([](auto & x) { x.slot_quiescent = false; }) == skip::slot_busy);
+    assert(mutate([](auto & x) { x.native_overflow = false; }) == skip::no_native_overflow);
+
+    // Pre-gates always win over a publication refusal: no attempt is made at
+    // all without resident overflow, so no quota or no-overwrite reason leaks.
+    assert(server_native_slot::automatic_save_decision(facts, skip::destination_exists) ==
+            skip::destination_exists);
+    assert(server_native_slot::automatic_save_decision(facts, skip::quota_refused) ==
+            skip::quota_refused);
+    assert(server_native_slot::automatic_save_decision(facts, skip::failed) == skip::failed);
+    auto overflowless = facts;
+    overflowless.native_overflow = false;
+    assert(server_native_slot::automatic_save_decision(overflowless, skip::quota_refused) ==
+            skip::no_native_overflow);
+    auto disabled = facts;
+    disabled.opt_in = false;
+    assert(server_native_slot::automatic_save_decision(disabled, skip::destination_exists) ==
+            skip::disabled);
+
+    // Every skip keeps a stable, non-empty log description.
+    for (auto value : { skip::none, skip::disabled, skip::no_store, skip::request_incomplete,
+                skip::request_not_persistable, skip::slot_busy, skip::no_native_overflow,
+                skip::destination_exists, skip::quota_refused, skip::failed }) {
+        const char * name = server_native_slot::automatic_save_skip_name(value);
+        assert(name != nullptr && *name != '\0');
+    }
+}
+
 } // namespace
 
 int main() {
     test_preflight_fallback_boundary();
     test_automatic_prefix();
     test_eligibility();
+    test_automatic_save_decision();
     test_failed_restore_cleanup();
     test_restore_peak_16_layers();
     std::printf("server native streaming slot CPU regression: ok\n");

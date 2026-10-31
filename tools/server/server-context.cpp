@@ -5524,9 +5524,11 @@ private:
     void auto_save_slot_if_useful(server_slot & slot, const char * reason = "discard",
             bool split_prefix = false) {
         if (llama_remote_native_kvarn_transient_active(ctx_tgt)) {
-            // The automatic restore path has no native-restore RAM reservation
-            // or native owner admission. Keep this explicit-only until both
-            // sides of the automatic path are qualified.
+            // The unified auto-cache restore path has no native-restore RAM
+            // reservation or native owner admission. Native overflow is
+            // captured only by the explicit API and, when
+            // LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE=1, by
+            // auto_save_native_stream_slot() using the same explicit publisher.
             SLT_DBG(slot, "%s", "auto-save skipped: native KVarN overflow requires explicit native streaming slots\n");
             return;
         }
@@ -5701,8 +5703,94 @@ private:
     // process can reuse the snapshot from the very first request on (not only when the slot is
     // evicted). Off by default; all correctness gates live in auto_save_slot_if_useful.
     void auto_save_on_completion(server_slot & slot) {
+        if (native_auto_save_enabled()) {
+            auto_save_native_stream_slot(slot);
+        }
         if (auto_cache_enabled()) {
             auto_save_slot_if_useful(slot);
+        }
+    }
+
+    // Opt-in automatic capture of a resident native overflow. Exactly "1" turns
+    // it on; every other value keeps the historical explicit-only behaviour.
+    // The store must be configured; both facts are part of the decision helper.
+    bool native_auto_save_enabled() const {
+        const char * value = std::getenv("LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }
+
+    // Content-addressed automatic name: model identity prefix, split geometry,
+    // target context size and the exact evaluated token prefix. Repeating a
+    // capture maps to the same name, so the no-overwrite preflight refuses
+    // instead of replacing a published host/Xbox pair.
+    std::string native_auto_state_filename(const server_slot & slot, const llama_tokens & tokens) const {
+        const uint32_t split_p = slot.position_split_p;
+        const uint32_t ctx_seq = llama_n_ctx_seq(ctx_tgt);
+        XXH64_state_t hash;
+        XXH64_reset(&hash, 0);
+        XXH64_update(&hash, &split_p, sizeof(split_p));
+        XXH64_update(&hash, &ctx_seq, sizeof(ctx_seq));
+        if (!tokens.empty()) {
+            XXH64_update(&hash, tokens.data(), tokens.size() * sizeof(llama_token));
+        }
+        const uint64_t prefix = XXH64_digest(&hash);
+        const std::string fingerprint = adaptive_model_identity->fingerprint();
+        char name[128];
+        snprintf(name, sizeof(name), "native-auto-%.16s-%08x-%016" PRIx64 "-%zu.bin",
+                fingerprint.c_str(), split_p, prefix, tokens.size());
+        return (std::filesystem::path(params_base.slot_save_path) / name).string();
+    }
+
+    // Runs only after a request completed successfully and before the slot is
+    // released. It never turns that success into an error: every refusal is a
+    // single log line and the slot state is left untouched.
+    void auto_save_native_stream_slot(server_slot & slot) {
+        server_native_slot::automatic_save_facts facts;
+        facts.opt_in              = native_auto_save_enabled();
+        facts.store_configured    = !params_base.slot_save_path.empty();
+        facts.request_completed   = slot.task != nullptr;
+        facts.request_persistable = slot.task != nullptr && slot.task->need_sampling() &&
+                slot.task->params.cache_prompt && !slot.prompt.tokens.has_media();
+        facts.slot_quiescent      = slot.is_processing() && slot.state == SLOT_STATE_GENERATING;
+        facts.native_overflow     = ctx_tgt != nullptr &&
+                llama_remote_native_kvarn_transient_active(ctx_tgt);
+        auto skip = server_native_slot::automatic_save_decision(facts);
+        if (skip != server_native_slot::automatic_save_skip::none) {
+            SLT_INF(slot, "auto-save native overflow skipped: %s\n",
+                    server_native_slot::automatic_save_skip_name(skip));
+            return;
+        }
+        const auto & task = *slot.task;
+        const auto started = ggml_time_us();
+        // Reuse the explicit path: identical target-only/MTP, identity, RAM
+        // reservation and size validation, then the same store-locked
+        // append-only publication. The staging reservation is released when it
+        // goes out of scope on every path below.
+        try {
+            const auto staging = stage_native_stream_slot(task, slot, true);
+            if (!staging.ok) {
+                SLT_INF(slot, "auto-save native overflow skipped: %s (%s)\n",
+                        server_native_slot::automatic_save_skip_name(staging.failure.refusal),
+                        staging.failure.error.c_str());
+                return;
+            }
+            const std::string destination = native_auto_state_filename(slot, staging.tokens);
+            native_stream_publication publication;
+            native_stream_failure failure;
+            if (!publish_native_stream_slot(slot, staging, destination, publication, failure)) {
+                SLT_INF(slot, "auto-save native overflow skipped: %s (%s)\n",
+                        server_native_slot::automatic_save_skip_name(failure.refusal),
+                        failure.error.c_str());
+                return;
+            }
+            SLT_INF(slot, "auto-save native overflow: published tokens=%zu bytes=%zu save_ms=%.3f path=%s\n",
+                    publication.n_tokens, publication.n_bytes,
+                    (ggml_time_us() - started) / 1000.0, destination.c_str());
+        } catch (const std::exception & err) {
+            // Never turn the completed request into an error.
+            SLT_WRN(slot, "auto-save native overflow failed safely: %s\n", err.what());
+        } catch (...) {
+            SLT_WRN(slot, "%s", "auto-save native overflow failed safely\n");
         }
     }
 
@@ -8749,29 +8837,73 @@ private:
                       server_native_slot::restore_allowed(e, &error);
     }
 
-    void save_native_stream_slot(const server_task & task, server_slot & slot) {
-        const int64_t started = ggml_time_us();
+    // Shared native streaming publication, used by the explicit SLOT_SAVE
+    // handler and the opt-in automatic capture so both apply the exact same
+    // reservation, target-only, size, quota and no-overwrite gates.
+    //
+    // `staging` performs validation and RAM admission and owns the transient
+    // reservation until it is destroyed. `publish` then holds the store lock
+    // and publishes at a complete destination pathname. A refusal never
+    // publishes anything and never sends a task result; the caller decides
+    // whether the refusal becomes an HTTP error or a logged skip.
+    struct native_stream_failure {
+        bool alloc_failed = false;
+        server_native_slot::automatic_save_skip refusal = server_native_slot::automatic_save_skip::none;
+        std::string error;
+    };
+
+    struct native_stream_staging {
+        bool ok = false;
+        native_stream_failure failure;
+        llama_tokens tokens; // complete evaluated text prefix
+        std::unique_ptr<native_slot_cache_reservation> reservation;
+    };
+
+    struct native_stream_publication {
+        size_t n_tokens = 0;
+        size_t n_bytes  = 0;
+        double t_ms     = 0.0;
+    };
+
+    // `automatic` only relaxes the request-side `native_stream` flag; every
+    // other guard, in particular the target-only/MTP and route-flag checks, is
+    // unchanged.
+    native_stream_staging stage_native_stream_slot(const server_task & task, server_slot & slot,
+            bool automatic) {
+        native_stream_staging out;
+        const auto refuse = [&out](server_native_slot::automatic_save_skip why, std::string message) {
+            out.ok              = false;
+            out.failure.refusal = why;
+            out.failure.error   = std::move(message);
+        };
         try {
             std::string error;
-            if (!native_stream_eligible(task, slot, true, error)) {
-                throw std::runtime_error(error);
+            if (!native_stream_eligible(task, slot, true, error, automatic)) {
+                refuse(server_native_slot::automatic_save_skip::failed, std::move(error));
+                return out;
             }
             if (!prompt_cache) {
-                throw std::runtime_error("native streaming save RAM budget is unavailable");
+                refuse(server_native_slot::automatic_save_skip::quota_refused,
+                        "native streaming save RAM budget is unavailable");
+                return out;
             }
-            native_slot_cache_reservation reservation(prompt_cache.get(),
+            out.reservation = std::make_unique<native_slot_cache_reservation>(prompt_cache.get(),
                     adaptive_slot_ram_budget(params_base.cache_ram_mib));
             const uint64_t save_workspace = server_native_slot::save_workspace_bytes(
                     llama_n_ctx_seq(ctx_tgt));
             if (save_workspace == UINT64_MAX || save_workspace > SIZE_MAX ||
-                    !native_slot_cache_reservation::reserve(&reservation, size_t(save_workspace))) {
-                throw std::runtime_error("native streaming save workspace exceeds the RAM cache budget");
+                    !native_slot_cache_reservation::reserve(out.reservation.get(), size_t(save_workspace))) {
+                refuse(server_native_slot::automatic_save_skip::quota_refused,
+                        "native streaming save workspace exceeds the RAM cache budget");
+                return out;
             }
             llama_synchronize(ctx_tgt);
             const auto position = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             const size_t evaluated = slot.prompt.tokens.size_up_to_pos(position + 1);
             if (position < 0 || slot.prompt.tokens.pos_next(evaluated) != position + 1) {
-                throw std::runtime_error("native streaming slot has no complete evaluated text prefix");
+                refuse(server_native_slot::automatic_save_skip::failed,
+                        "native streaming slot has no complete evaluated text prefix");
+                return out;
             }
             const size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id,
                     LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -8779,66 +8911,136 @@ private:
                     llama_remote_native_kvarn_transient_active(ctx_tgt) &&
                     llama_remote_native_kvarn_snapshot_supported(ctx_tgt);
             if (!state_size && !native_full) {
-                throw std::runtime_error("native streaming target serialization is empty");
+                refuse(server_native_slot::automatic_save_skip::failed,
+                        "native streaming target serialization is empty");
+                return out;
             }
-            auto tokens = slot.prompt.tokens.get_text_tokens();
-            tokens.resize(evaluated);
+            out.tokens = slot.prompt.tokens.get_text_tokens();
+            out.tokens.resize(evaluated);
             const uint64_t max_bytes = params_base.slot_save_max_bytes > 0
                     ? uint64_t(params_base.slot_save_max_bytes) : SIZE_MAX;
             const uint64_t token_bytes = uint64_t(evaluated) * sizeof(llama_token);
             const uint64_t overhead = 3 * sizeof(uint32_t);
             if (uint64_t(state_size) > max_bytes || token_bytes > max_bytes - uint64_t(state_size) ||
                     overhead > max_bytes - uint64_t(state_size) - token_bytes) {
-                throw std::runtime_error("native streaming slot exceeds --slot-save-max-mb");
+                refuse(server_native_slot::automatic_save_skip::quota_refused,
+                        "native streaming slot exceeds --slot-save-max-mb");
+                return out;
             }
-            const std::string slot_store = std::filesystem::path(task.slot_action.filepath).parent_path().string();
+            out.ok = true;
+            return out;
+        } catch (const std::bad_alloc &) {
+            out.failure.alloc_failed = true;
+            refuse(server_native_slot::automatic_save_skip::failed, "native streaming allocation failed");
+            return out;
+        } catch (const std::exception & err) {
+            refuse(server_native_slot::automatic_save_skip::failed, err.what());
+            return out;
+        }
+    }
+
+    // Returns false with `failure` set on any refusal. The staging reservation
+    // must stay alive: the writer allocates its staged body before publication.
+    bool publish_native_stream_slot(server_slot & slot, const native_stream_staging & staging,
+            const std::string & destination, native_stream_publication & out,
+            native_stream_failure & failure) {
+        const int64_t started = ggml_time_us();
+        const auto refuse = [&failure](server_native_slot::automatic_save_skip why, std::string message) {
+            failure.refusal = why;
+            failure.error   = std::move(message);
+            return false;
+        };
+        // Set by the retention preflight while the write is still staged. It
+        // must outlive the try block: a rejection is raised as an exception.
+        bool retention_refused = false;
+        try {
+            const std::string slot_store = std::filesystem::path(destination).parent_path().string();
             if (slot_store.empty()) {
-                throw std::runtime_error("native streaming slot state directory is unavailable");
+                return refuse(server_native_slot::automatic_save_skip::no_store,
+                        "native streaming slot state directory is unavailable");
             }
             server_route_state_store_lock store(slot_store,
                     server_route_state_store_lock_mode::exclusive);
             if (!store.acquired()) {
-                throw std::runtime_error("native streaming slot store is busy");
+                return refuse(server_native_slot::automatic_save_skip::slot_busy,
+                        "native streaming slot store is busy");
             }
             // A replacement would orphan the former remote companion. Keep
             // publication append-only, including dangling symlinks, while
             // holding the same store lock used by other publishers.
             std::error_code destination_error;
-            const auto destination = std::filesystem::symlink_status(
-                    std::filesystem::u8path(task.slot_action.filepath), destination_error);
+            const auto status = std::filesystem::symlink_status(
+                    std::filesystem::u8path(destination), destination_error);
             if (destination_error && destination_error != std::errc::no_such_file_or_directory) {
-                throw std::runtime_error("native streaming destination cannot be inspected");
+                return refuse(server_native_slot::automatic_save_skip::failed,
+                        "native streaming destination cannot be inspected");
             }
-            if (!destination_error && destination.type() != std::filesystem::file_type::not_found) {
-                throw std::runtime_error("native streaming destination already exists; choose a new filename");
+            if (!destination_error && status.type() != std::filesystem::file_type::not_found) {
+                return refuse(server_native_slot::automatic_save_skip::destination_exists,
+                        "native streaming destination already exists; choose a new filename");
             }
+            const uint64_t max_bytes = params_base.slot_save_max_bytes > 0
+                    ? uint64_t(params_base.slot_save_max_bytes) : SIZE_MAX;
             auto limit_plan = std::make_shared<unified_snapshot_limit_plan>();
             limit_plan->dir = slot_store;
             limit_plan->store_lock = &store;
-            limit_plan->just_written = task.slot_action.filepath;
+            limit_plan->just_written = destination;
             limit_plan->max_count = params_base.slot_save_max_count;
             limit_plan->max_bytes = params_base.slot_save_max_bytes;
-            const size_t nwrite = server_route_state_save(ctx_tgt, slot.id, tokens,
-                    *adaptive_model_identity, task.slot_action.filepath, max_bytes, 0, nullptr,
-                    [limit_plan](uint64_t incoming) { return limit_plan->prepare(incoming); },
+            // The retention plan is the authoritative quota admission; report a
+            // rejection as such instead of a generic write failure.
+            const size_t nwrite = server_route_state_save(ctx_tgt, slot.id, staging.tokens,
+                    *adaptive_model_identity, destination, max_bytes, 0, nullptr,
+                    [limit_plan, &retention_refused](uint64_t incoming) {
+                        const bool admitted = limit_plan->prepare(incoming);
+                        retention_refused = !admitted;
+                        return admitted;
+                    },
                     [limit_plan]() { return limit_plan->commit(); }, &store, nullptr, slot.position_split_p);
             if (!nwrite) {
-                throw std::runtime_error("native streaming host/Xbox pair save failed");
+                return refuse(retention_refused ? server_native_slot::automatic_save_skip::quota_refused
+                                                : server_native_slot::automatic_save_skip::failed,
+                        "native streaming host/Xbox pair save failed");
             }
-            auto res = std::make_unique<server_task_result_slot_save_load>();
-            res->id       = task.id;
-            res->id_slot  = task.slot_action.id_slot;
-            res->filename = task.slot_action.filename;
-            res->is_save  = true;
-            res->n_tokens = evaluated;
-            res->n_bytes  = nwrite;
-            res->t_ms     = (ggml_time_us() - started) / 1000.0;
-            queue_results.send(std::move(res));
+            out.n_tokens = staging.tokens.size();
+            out.n_bytes  = nwrite;
+            out.t_ms     = (ggml_time_us() - started) / 1000.0;
+            return true;
         } catch (const std::bad_alloc &) {
-            send_error(task, "Unable to save slot: native streaming allocation failed", ERROR_TYPE_SERVER);
+            failure.alloc_failed = true;
+            return refuse(server_native_slot::automatic_save_skip::failed,
+                    "native streaming allocation failed");
         } catch (const std::exception & err) {
-            send_error(task, std::string("Unable to save slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+            return refuse(retention_refused ? server_native_slot::automatic_save_skip::quota_refused
+                                            : server_native_slot::automatic_save_skip::failed,
+                    err.what());
         }
+    }
+
+    void save_native_stream_slot(const server_task & task, server_slot & slot) {
+        const auto staging = stage_native_stream_slot(task, slot, false);
+        if (!staging.ok) {
+            const auto type = staging.failure.alloc_failed ? ERROR_TYPE_SERVER : ERROR_TYPE_INVALID_REQUEST;
+            send_error(task, std::string("Unable to save slot: ") + staging.failure.error, type);
+            return;
+        }
+        native_stream_publication publication;
+        native_stream_failure failure;
+        if (!publish_native_stream_slot(slot, staging, task.slot_action.filepath,
+                publication, failure)) {
+            const auto type = failure.alloc_failed ? ERROR_TYPE_SERVER : ERROR_TYPE_INVALID_REQUEST;
+            send_error(task, std::string("Unable to save slot: ") + failure.error, type);
+            return;
+        }
+        auto res = std::make_unique<server_task_result_slot_save_load>();
+        res->id       = task.id;
+        res->id_slot  = task.slot_action.id_slot;
+        res->filename = task.slot_action.filename;
+        res->is_save  = true;
+        res->n_tokens = publication.n_tokens;
+        res->n_bytes  = publication.n_bytes;
+        res->t_ms     = publication.t_ms;
+        queue_results.send(std::move(res));
     }
 
     bool restore_native_stream_slot(const server_task & task, server_slot & slot,

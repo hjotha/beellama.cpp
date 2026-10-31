@@ -228,7 +228,15 @@ The option is rejected unless all of the following hold:
 
 Without `native_stream`, saves with live native overflow are rejected; normal
 legacy/adaptive saves remain available otherwise. `ADAPTIVE_SLOT_WORKING_COPIES`
-remains five for `LLAMASLT`. Native overflow auto-save is disabled. Optional
+remains five for `LLAMASLT`. Native overflow auto-save is off by default. It is
+enabled only by `LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE=1` (exact value) together with
+`--slot-save-path`: after a request completes successfully, the server stages
+the resident native overflow and publishes it at a content-addressed
+`native-auto-*.bin` name through the same explicit native save path (identical
+target-only/MTP, identity, RAM reservation, retention quota and no-overwrite
+gates). A repeated prefix maps to the same name and is skipped, never
+overwritten; any failure, busy store, unqualified peer or absent overflow is a
+log line only and cannot turn the completed request into an error. Optional
 native automatic restore requires `--slot-save-auto` and
 `LLAMA_NATIVE_SNAPSHOT_AUTO_RESTORE=1`. Only newly written unified `.bin`
 files with an explicit native-remote manifest marker and the same saved split
