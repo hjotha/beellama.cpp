@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -175,9 +177,25 @@ void check_regular(int value) {
 void sync_dir(int value) { if (::fsync(value)) throw std::runtime_error("journal directory sync failed; outcome may be uncertain"); }
 struct locked_store {
     fd dir, lock;
-    explicit locked_store(const std::string & path) {
+    std::shared_ptr<rkva_managed_store::delegation> authority;
+    std::filesystem::path delegated_parent;
+    std::unique_lock<std::recursive_mutex> section;
+    // Delegated mode: the single store authority already owns this directory
+    // and its lock file. No second lock is taken; the authority is revalidated
+    // and held for the whole operation instead.
+    locked_store(const std::string & path, const std::shared_ptr<rkva_managed_store::delegation> & authority) {
         dir.n=::open(path.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
         if(dir.n<0) throw std::runtime_error("journal directory unavailable");
+        if(authority) {
+            section=authority->enter();
+            std::error_code ec;const auto resolved=std::filesystem::canonical(path,ec);
+            if(!section.owns_lock() || ec || resolved!=authority->directory() || !authority->valid_for(resolved))
+                throw std::runtime_error("delegated store authority unavailable");
+            this->authority=authority;
+            delegated_parent=resolved;
+            sync_dir(dir.n);
+            return;
+        }
         lock.n=::openat(dir.n,"host-journal.lock",O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600);
         if(lock.n<0) throw std::runtime_error("journal lock unavailable");
         check_regular(lock.n);
@@ -228,7 +246,10 @@ void persist(locked_store & store, const std::string & content, bool initialize)
             pos+=size_t(n);
             if (pos < content.size()) hook("after_partial_write");
         }
-        hook("after_write"); hook("before_file_sync"); if(::fsync(temp.n)) throw std::runtime_error("journal staging sync failed");
+        hook("after_write"); hook("before_file_sync");
+        if (store.authority && (!store.section.owns_lock() || !store.authority->valid_for(store.delegated_parent)))
+            throw std::runtime_error("delegated store authority lost before journal publication");
+        if(::fsync(temp.n)) throw std::runtime_error("journal staging sync failed");
         hook("after_file_sync");
         hook("before_rename");
         if(initialize) {
@@ -242,7 +263,10 @@ void persist(locked_store & store, const std::string & content, bool initialize)
             if(::renameat(store.dir.n,name.c_str(),store.dir.n,"host-journal.bin")) throw std::runtime_error("journal rename failed");
             renamed=true;
         }
-        hook("after_rename"); hook("before_directory_sync"); sync_dir(store.dir.n); hook("after_directory_sync");
+        hook("after_rename");
+        if (store.authority && (!store.section.owns_lock() || !store.authority->valid_for(store.delegated_parent)))
+            throw std::runtime_error("delegated store authority lost during journal publication; outcome uncertain");
+        hook("before_directory_sync"); sync_dir(store.dir.n); hook("after_directory_sync");
     } catch (...) {
         if (!renamed) {
             ::unlinkat(store.dir.n,name.c_str(),0);
@@ -252,13 +276,15 @@ void persist(locked_store & store, const std::string & content, bool initialize)
     }
 }
 template<class Fn>
-bool run(const std::string & dir, const std::string & owner, std::string & error, Fn fn) {
-    try { if(!hex64(owner)) throw std::runtime_error("invalid journal owner"); locked_store lock(dir); fn(lock); error.clear(); return true; }
+bool run(const std::string & dir, const std::string & owner,
+         const std::shared_ptr<rkva_managed_store::delegation> & authority, std::string & error, Fn fn) {
+    try { if(!hex64(owner)) throw std::runtime_error("invalid journal owner"); locked_store lock(dir,authority); fn(lock); error.clear(); return true; }
     catch(const std::exception & e) { error=e.what(); return false; }
 }
 template<class Fn>
-bool change(const std::string & dir, const std::string & owner, std::string & error, Fn fn) {
-    return run(dir,owner,error,[&](locked_store & lock) {
+bool change(const std::string & dir, const std::string & owner,
+            const std::shared_ptr<rkva_managed_store::delegation> & authority, std::string & error, Fn fn) {
+    return run(dir,owner,authority,error,[&](locked_store & lock) {
         snapshot s=decode(read_all(lock),owner);
         if (!fn(s)) return; // idempotent replay; directory sync already performed
         if (s.revision==UINT64_MAX) throw std::runtime_error("journal revision exhausted");
@@ -275,11 +301,15 @@ template<class... T> bool unsupported(std::string & e,T&&...) { e="host journal 
 #endif
 } // namespace
 journal::journal(std::string directory, std::string owner):dir_(std::move(directory)),owner_(std::move(owner)) {}
+journal::journal(std::string directory, std::string owner,
+        std::shared_ptr<rkva_managed_store::delegation> delegated_authority)
+    :dir_(std::move(directory)),owner_(std::move(owner)),authority_(std::move(delegated_authority)) {}
+bool journal::delegated() const { return bool(authority_); }
 #ifndef _WIN32
-bool journal::initialize(std::string & e) { return run(dir_,owner_,e,[&](locked_store & l) { struct stat s{}; if(!::fstatat(l.dir.n,"host-journal.bin",&s,AT_SYMLINK_NOFOLLOW) || errno!=ENOENT) throw std::runtime_error("journal exists or cannot inspect"); persist(l,encode({},owner_),true); }); }
-bool journal::inspect(snapshot & out, std::string & e) const { return run(dir_,owner_,e,[&](locked_store & l){ out=decode(read_all(l),owner_); }); }
+bool journal::initialize(std::string & e) { return run(dir_,owner_,authority_,e,[&](locked_store & l) { struct stat s{}; if(!::fstatat(l.dir.n,"host-journal.bin",&s,AT_SYMLINK_NOFOLLOW) || errno!=ENOENT) throw std::runtime_error("journal exists or cannot inspect"); persist(l,encode({},owner_),true); }); }
+bool journal::inspect(snapshot & out, std::string & e) const { return run(dir_,owner_,authority_,e,[&](locked_store & l){ out=decode(read_all(l),owner_); }); }
 bool journal::prepare(const std::string & tx,const std::string & ref,const std::string & key,std::string & e) {
-    return change(dir_,owner_,e,[&](snapshot & s){
+    return change(dir_,owner_,authority_,e,[&](snapshot & s){
         if(!hex64(tx)||!hex64(ref)||!hex64(key)) throw std::runtime_error("invalid journal identity");
         for(const auto & r:s.transactions) {
             if(r.tx==tx) { if(r.reference!=ref||r.key!=key||r.state==phase::aborted||r.state==phase::release_ack) throw std::runtime_error("transaction reuse or terminal state"); return false; }
@@ -290,7 +320,7 @@ bool journal::prepare(const std::string & tx,const std::string & ref,const std::
     });
 }
 bool journal::host_published(const std::string & tx,const std::string & path,const std::string & sha,uint64_t bytes,std::string & e) {
-    return change(dir_,owner_,e,[&](snapshot & s){ auto & r=get(s,tx);
+    return change(dir_,owner_,authority_,e,[&](snapshot & s){ auto & r=get(s,tx);
         if(!valid_path(path)||!hex64(sha)||!bytes) throw std::runtime_error("invalid published host identity");
         if(r.state==phase::prepared) { r.state=phase::host_published; r.host_path=path; r.host_sha256=sha; r.host_bytes=bytes; return true; }
         if(r.state==phase::aborted||r.state==phase::release_ack||r.host_path!=path||r.host_sha256!=sha||r.host_bytes!=bytes)
@@ -298,18 +328,18 @@ bool journal::host_published(const std::string & tx,const std::string & path,con
         return false;
     });
 }
-bool journal::commit_ack(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){
+bool journal::commit_ack(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,authority_,e,[&](snapshot & s){
     if(s.anchor.configured)throw std::runtime_error("authenticated journal requires verified atomic commit");
     auto & r=get(s,tx); if(!ver) throw std::runtime_error("invalid commit version"); if(r.state==phase::host_published) { r.state=phase::commit_ack; r.peer_commit_version=ver; return true; } if((r.state==phase::commit_ack || r.state==phase::release_intent) && r.peer_commit_version==ver) return false; throw std::runtime_error("invalid commit transition"); }); }
 bool journal::provision_anchor(uint64_t epoch,uint64_t version,const auth_id & digest,std::string & e) {
-    return change(dir_,owner_,e,[&](snapshot & s){
+    return change(dir_,owner_,authority_,e,[&](snapshot & s){
         if(s.anchor.configured || !s.transactions.empty() || !epoch || !nonzero(digest))
             throw std::runtime_error("anchor provisioning refused");
         s.anchor.configured=true;s.anchor.key_epoch=epoch;s.anchor.version=version;s.anchor.digest=digest;return true;
     });
 }
 bool journal::issue_commit_nonce(const std::string & tx,const auth_id & nonce,const std::string & owner,uint64_t epoch,std::string & e) {
-    return change(dir_,owner_,e,[&](snapshot & s){
+    return change(dir_,owner_,authority_,e,[&](snapshot & s){
         const auto & r=get(s,tx);
         if(!s.anchor.configured || s.anchor.v3_configured || owner_!=owner || s.anchor.key_epoch!=epoch || r.state!=phase::host_published ||
                 !nonzero(nonce) || s.anchor.nonces.size()>=max_nonces)
@@ -321,7 +351,7 @@ bool journal::issue_commit_nonce(const std::string & tx,const auth_id & nonce,co
 bool journal::commit_verified(const std::string & tx,const auth_id & nonce,uint64_t peer_version,
         uint64_t anchor_version,const auth_id & digest,const std::string & reference,const std::string & key,
         const std::string & owner,uint64_t epoch,std::string & e) {
-    return change(dir_,owner_,e,[&](snapshot & s){
+    return change(dir_,owner_,authority_,e,[&](snapshot & s){
         auto & r=get(s,tx);
         if(!s.anchor.configured || s.anchor.v3_configured || owner_!=owner || s.anchor.key_epoch!=epoch ||
                 r.state!=phase::host_published || r.reference!=reference || r.key!=key ||
@@ -335,7 +365,7 @@ bool journal::commit_verified(const std::string & tx,const auth_id & nonce,uint6
     });
 }
 bool journal::configure_v3_epoch(uint64_t epoch,const auth_id & ledger,uint64_t version,const auth_id & digest,std::string & e) {
-    return change(dir_,owner_,e,[&](snapshot & s){
+    return change(dir_,owner_,authority_,e,[&](snapshot & s){
         if(!s.anchor.configured||s.anchor.v3_configured||s.anchor.key_epoch!=epoch||
            s.anchor.version!=version||s.anchor.digest!=digest||!nonzero(ledger)||
            std::any_of(s.anchor.nonces.begin(),s.anchor.nonces.end(),[](const issued_nonce & n){return !n.consumed;}))
@@ -348,7 +378,7 @@ bool journal::issue_v3_command(const rkva_managed_framing_v3::secret & secret,
         const v3_frame_builder & builder,v3_issued_request & output,std::string & e) {
     namespace v3=rkva_managed_framing_v3;
     v3_issued_request local;
-    const bool ok=change(dir_,owner_,e,[&](snapshot & s){
+    const bool ok=change(dir_,owner_,authority_,e,[&](snapshot & s){
         if(!s.anchor.configured||!s.anchor.v3_configured||!v3::valid_session(session)||
            rkva_registry_wire::to_hex(session.owner)!=owner_||session.auth_epoch!=s.anchor.key_epoch||
            session.ledger_epoch!=s.anchor.ledger_epoch||!connection||!connection->held_and_bound(session)||!builder||
@@ -377,6 +407,14 @@ bool journal::issue_v3_command(const rkva_managed_framing_v3::secret & secret,
            (h.op==RKVA_REGISTRY_COMMIT && record.state!=phase::host_published)||
            (h.op==RKVA_REGISTRY_STATUS && record.state!=phase::host_published && record.state!=phase::commit_ack))
             throw std::runtime_error("v3 transaction phase or identity differs");
+        // A lost ACK leaves an unconsumed COMMIT nonce behind. Issuing a second
+        // COMMIT would mint a fresh nonce for the same transaction and could
+        // advance the anchor twice for one peer commit. Recovery must go
+        // through the authenticated STATUS receipt instead.
+        if(h.op==RKVA_REGISTRY_COMMIT)
+            for(const auto & old:s.anchor.v3_nonces)
+                if(!old.consumed && old.op==RKVA_REGISTRY_COMMIT && old.tx==tx)
+                    throw std::runtime_error("v3 lost-ACK ambiguity: an unconsumed COMMIT nonce exists; use authenticated STATUS recovery");
         for(const auto & old:s.anchor.nonces)if(old.nonce==local.nonce)throw std::runtime_error("nonce reuse rejected");
         for(const auto & old:s.anchor.v3_nonces)
             if(old.nonce==local.nonce || old.challenge==session.peer_challenge)throw std::runtime_error("v3 nonce or session challenge reuse rejected");
@@ -396,7 +434,7 @@ bool journal::issue_v3_command(const rkva_managed_framing_v3::secret & secret,
 }
 bool journal::consume_v3_error(const auth_id & nonce,const auth_id & request_hash,const auth_id & response_hash,
         const std::string & owner,uint64_t epoch,const auth_id & ledger,std::string & e) {
-    return change(dir_,owner_,e,[&](snapshot & s){
+    return change(dir_,owner_,authority_,e,[&](snapshot & s){
         if(!s.anchor.configured||!s.anchor.v3_configured||owner_!=owner||s.anchor.key_epoch!=epoch||
            s.anchor.ledger_epoch!=ledger||!nonzero(response_hash))throw std::runtime_error("v3 error ledger identity differs");
         auto it=std::find_if(s.anchor.v3_nonces.begin(),s.anchor.v3_nonces.end(),[&](const issued_v3_nonce & x){return x.nonce==nonce;});
@@ -405,9 +443,38 @@ bool journal::consume_v3_error(const auth_id & nonce,const auth_id & request_has
         it->consumed=true;it->response_hash=response_hash;return true;
     });
 }
-bool journal::release_intent(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated release unsupported");auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::commit_ack) { r.state=phase::release_intent; return true; } if(r.state==phase::release_intent || r.state==phase::release_ack) return false; throw std::runtime_error("invalid release intent transition"); }); }
-bool journal::release_ack(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated release unsupported");auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::release_intent) { r.state=phase::release_ack; return true; } if(r.state==phase::release_ack) return false; throw std::runtime_error("invalid release ack transition"); }); }
-bool journal::abort_unpublished(const std::string & tx,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated abort unsupported");auto & r=get(s,tx); if(r.state==phase::prepared) { r.state=phase::aborted; return true; } if(r.state==phase::aborted) return false; throw std::runtime_error("published transaction cannot be aborted"); }); }
+bool journal::commit_v3_success(const auth_id & nonce,const auth_id & request_hash,const auth_id & response_hash,
+        uint64_t peer_version,uint64_t anchor_version,const auth_id & digest,const std::string & tx,
+        const std::string & reference,const std::string & key,const std::string & owner,uint64_t epoch,std::string & e) {
+    return change(dir_,owner_,authority_,e,[&](snapshot & s){
+        auto & r=get(s,tx);
+        if(!s.anchor.configured||!s.anchor.v3_configured||owner_!=owner||s.anchor.key_epoch!=epoch)
+            throw std::runtime_error("v3 success ledger identity differs");
+        if(!hex64(reference)||!hex64(key)||r.reference!=reference||r.key!=key)
+            throw std::runtime_error("v3 success transaction binding differs");
+        auto it=std::find_if(s.anchor.v3_nonces.begin(),s.anchor.v3_nonces.end(),[&](const issued_v3_nonce & x){return x.nonce==nonce;});
+        if(it==s.anchor.v3_nonces.end()||it->tx!=tx||it->request_hash!=request_hash||
+           (it->op!=RKVA_REGISTRY_COMMIT&&it->op!=RKVA_REGISTRY_STATUS))
+            throw std::runtime_error("v3 success nonce absent, request differs or operation refused");
+        if(!nonzero(response_hash)||!peer_version||!nonzero(digest)||!anchor_version||peer_version>anchor_version)
+            throw std::runtime_error("verified v3 success state mismatch");
+        if(it->consumed) {
+            // Idempotent replay of the same completed publication only.
+            if(it->response_hash!=response_hash||r.state!=phase::commit_ack||r.peer_commit_version!=peer_version||
+               s.anchor.version!=anchor_version||s.anchor.digest!=digest)
+                throw std::runtime_error("v3 success nonce already consumed with different evidence");
+            return false;
+        }
+        if(r.state!=phase::host_published||anchor_version!=s.anchor.version+1)
+            throw std::runtime_error("v3 success does not advance one host-published anchor");
+        it->consumed=true;it->response_hash=response_hash;
+        s.anchor.version=anchor_version;s.anchor.digest=digest;
+        r.state=phase::commit_ack;r.peer_commit_version=peer_version;return true;
+    });
+}
+bool journal::release_intent(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,authority_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated release unsupported");auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::commit_ack) { r.state=phase::release_intent; return true; } if(r.state==phase::release_intent || r.state==phase::release_ack) return false; throw std::runtime_error("invalid release intent transition"); }); }
+bool journal::release_ack(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,authority_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated release unsupported");auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::release_intent) { r.state=phase::release_ack; return true; } if(r.state==phase::release_ack) return false; throw std::runtime_error("invalid release ack transition"); }); }
+bool journal::abort_unpublished(const std::string & tx,std::string & e) { return change(dir_,owner_,authority_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated abort unsupported");auto & r=get(s,tx); if(r.state==phase::prepared) { r.state=phase::aborted; return true; } if(r.state==phase::aborted) return false; throw std::runtime_error("published transaction cannot be aborted"); }); }
 #else
 bool journal::initialize(std::string & e) { return unsupported(e); }
 bool journal::inspect(snapshot &,std::string & e) const { return unsupported(e); }
@@ -420,6 +487,8 @@ bool journal::commit_verified(const std::string &,const auth_id &,uint64_t,uint6
 bool journal::configure_v3_epoch(uint64_t,const auth_id &,uint64_t,const auth_id &,std::string & e) { return unsupported(e); }
 bool journal::issue_v3_command(const rkva_managed_framing_v3::secret &,const rkva_managed_framing_v3::session &,v3_connection_authority *,const v3_frame_builder &,v3_issued_request &,std::string & e) { return unsupported(e); }
 bool journal::consume_v3_error(const auth_id &,const auth_id &,const auth_id &,const std::string &,uint64_t,const auth_id &,std::string & e) { return unsupported(e); }
+bool journal::commit_v3_success(const auth_id &,const auth_id &,const auth_id &,uint64_t,uint64_t,const auth_id &,
+        const std::string &,const std::string &,const std::string &,const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::release_intent(const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::release_ack(const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::abort_unpublished(const std::string &,std::string & e) { return unsupported(e); }

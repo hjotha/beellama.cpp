@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 #ifndef _WIN32
@@ -50,12 +52,22 @@ void regular(int f, unsigned max_links=1) {
 void syncdir(int d) { need(::fsync(d)==0,"directory fsync failed; outcome uncertain"); }
 struct store {
     fd host, peer, lock; std::string root;
-    store(const std::string & h,const std::string & p) {
+    std::unique_lock<std::recursive_mutex> section;
+    store(const std::string & h,const std::string & p,const std::shared_ptr<rkva_managed_store::delegation> & authority) {
         root=trusted_dir(h); const std::string objects=trusted_dir(p);
         need(root!=objects,"host and peer object stores must be distinct");
         host.n=::open(root.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
         peer.n=::open(objects.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
         need(host.n>=0 && peer.n>=0,"managed store open failed");
+        if(authority) {
+            // Single-authority composition: the authority already holds this
+            // store's lock file. Never take a second, independent lock.
+            section=authority->enter();
+            need(section.owns_lock() && authority->valid_for(root) && authority->directory()==root,
+                 "delegated store authority unavailable");
+            syncdir(host.n); // settle a prior ambiguous rename/unlink before replay
+            return;
+        }
         lock.n=::openat(host.n,".managed-orchestrator.lock",O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600);
         need(lock.n>=0,"managed store lock unavailable"); regular(lock.n);
         need(::flock(lock.n,LOCK_EX)==0,"managed store lock failed");
@@ -178,13 +190,15 @@ void ensure_tomb(store & s,const rkva_host_journal::transaction & t,uint64_t max
 #endif
 }
 orchestrator::orchestrator(rkva_host_journal::journal & j,rkva_managed_registry::registry & p,
-        std::string host,std::string objects,uint64_t max,source_preflight check):journal_(j),peer_(p),
-        host_root_(std::move(host)),peer_objects_(std::move(objects)),max_bytes_(max),check_source_(std::move(check)) {}
+        std::string host,std::string objects,uint64_t max,source_preflight check,
+        std::shared_ptr<rkva_managed_store::delegation> authority):journal_(j),peer_(p),
+        host_root_(std::move(host)),peer_objects_(std::move(objects)),max_bytes_(max),check_source_(std::move(check)),
+        authority_(std::move(authority)) {}
 bool orchestrator::publish(const std::string & tx,const std::string & ref,const std::string & key,const std::string & source,std::string & error) {
 #ifndef _WIN32
     try {
         need(hex64(tx)&&hex64(ref)&&hex64(key)&&max_bytes_,"invalid managed identity or limit");
-        store s(host_root_,peer_objects_); std::string e;
+        store s(host_root_,peer_objects_,authority_); std::string e;
         need(!exists(s.host.n,"."+tx+".release") && !exists(s.host.n,"."+tx+".release-partial"),
              "release is in progress or terminal; publication forbidden");
         if (check_source_ && !source.empty()) {
@@ -224,7 +238,7 @@ bool orchestrator::publish(const std::string & tx,const std::string & ref,const 
 bool orchestrator::release(const std::string & tx,std::string & error) {
 #ifndef _WIN32
     try {
-        need(hex64(tx)&&max_bytes_,"invalid managed identity or limit"); store s(host_root_,peer_objects_); std::string e;
+        need(hex64(tx)&&max_bytes_,"invalid managed identity or limit"); store s(host_root_,peer_objects_,authority_); std::string e;
         auto record=lookup(journal_,tx);
         need(record.state==rkva_host_journal::phase::commit_ack || record.state==rkva_host_journal::phase::release_intent || record.state==rkva_host_journal::phase::release_ack,"journal transaction cannot release");
         need(record.host_path==s.root+"/"+tx+".managed" && record.host_sha256==record.key,"host identity mismatch");

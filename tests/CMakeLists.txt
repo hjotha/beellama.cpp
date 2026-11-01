@@ -1493,3 +1493,66 @@ if (RKVA_MANAGED_SNAPSHOT_PHASE4)
         set_property(TEST test-rkva-managed-store-authority PROPERTY LABELS main)
     endif()
 endif()
+
+# Phase 5 activation composition. Default OFF and requires Phase 4. This static
+# library is test-only scaffolding: both managed "TESTING" hooks are compiled in
+# because there is no production call site, no listener and no shipping consumer
+# in this tree. Nothing is advertised and the successful reply still fails
+# closed without an independent pin/metadata/durability proof. See
+# docs/rkva-managed-snapshot-activation.md.
+if (RKVA_MANAGED_SNAPSHOT_ACTIVATION)
+    if (NOT RKVA_MANAGED_SNAPSHOT_PHASE4)
+        message(FATAL_ERROR "RKVA_MANAGED_SNAPSHOT_ACTIVATION requires RKVA_MANAGED_SNAPSHOT_PHASE4=ON")
+    endif()
+    find_package(Threads REQUIRED)
+    if (WIN32)
+        set(RKVA_ACTIVATION_SQLITE winsqlite3)
+    else()
+        find_package(SQLite3 REQUIRED)
+        set(RKVA_ACTIVATION_SQLITE SQLite3::SQLite3)
+    endif()
+    add_library(rkva-managed-activation STATIC
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-managed-registry.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-managed-store-authority.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-anchored-sqlite.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-host-journal.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-managed-orchestrator.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-managed-authority.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-host-v3-success.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-session-authority.cpp
+        ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp)
+    target_compile_features(rkva-managed-activation PUBLIC cxx_std_17)
+    target_compile_definitions(rkva-managed-activation PUBLIC
+        RKVA_MANAGED_SNAPSHOT_ACTIVATION
+        RKVA_HOST_JOURNAL_TESTING
+        RKVA_ANCHORED_SQLITE_TESTING)
+    target_include_directories(rkva-managed-activation PUBLIC
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn
+        ${PROJECT_SOURCE_DIR}/tools/server
+        ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva)
+    target_link_libraries(rkva-managed-activation PUBLIC Threads::Threads ${RKVA_ACTIVATION_SQLITE})
+
+    add_executable(test-rkva-managed-activation-gate test-rkva-managed-activation-gate.cpp)
+    target_include_directories(test-rkva-managed-activation-gate PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-rkva-managed-activation-gate PRIVATE RKVA_MANAGED_SNAPSHOT_ACTIVATION)
+    add_test(NAME test-rkva-managed-activation-gate COMMAND $<TARGET_FILE:test-rkva-managed-activation-gate>)
+    set_property(TEST test-rkva-managed-activation-gate PROPERTY LABELS main)
+
+    add_executable(test-rkva-managed-authority test-rkva-managed-authority.cpp)
+    target_link_libraries(test-rkva-managed-authority PRIVATE rkva-managed-activation)
+    add_test(NAME test-rkva-managed-authority COMMAND $<TARGET_FILE:test-rkva-managed-authority>)
+    set_property(TEST test-rkva-managed-authority PROPERTY LABELS main)
+
+    add_executable(test-rkva-host-v3-success test-rkva-host-v3-success.cpp)
+    target_link_libraries(test-rkva-host-v3-success PRIVATE rkva-managed-activation)
+    add_test(NAME test-rkva-host-v3-success COMMAND $<TARGET_FILE:test-rkva-host-v3-success>)
+    set_property(TEST test-rkva-host-v3-success PROPERTY LABELS main)
+
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-rkva-session-authority test-rkva-session-authority.cpp)
+        target_link_libraries(test-rkva-session-authority PRIVATE rkva-managed-activation)
+        add_test(NAME test-rkva-session-authority COMMAND $<TARGET_FILE:test-rkva-session-authority>)
+        set_property(TEST test-rkva-session-authority PROPERTY LABELS main)
+    endif()
+endif()

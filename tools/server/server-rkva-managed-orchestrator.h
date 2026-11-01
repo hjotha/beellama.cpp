@@ -1,8 +1,10 @@
 #pragma once
 #include "server-rkva-host-journal.h"
 #include "../../ggml/include/rkva-managed-registry.h"
+#include "../../ggml/include/rkva-managed-store-authority.h"
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 // Standalone POSIX-only composition prototype. It is deliberately not wired to
@@ -22,7 +24,8 @@ public:
     // the SHA-256 of the complete file, NOT Xbox's native prefix digest.
     orchestrator(rkva_host_journal::journal & journal, rkva_managed_registry::registry & peer,
                  std::string host_root, std::string peer_objects, uint64_t max_bytes,
-                 source_preflight check_source = {});
+                 source_preflight check_source = {},
+                 std::shared_ptr<rkva_managed_store::delegation> authority = {});
     // Resume the same tx/ref/key; source may be empty if the host is already
     // staged or published. Never aborts or removes a peer object on failure.
     bool publish(const std::string & tx, const std::string & ref, const std::string & key,
@@ -36,5 +39,6 @@ private:
     std::string host_root_, peer_objects_;
     uint64_t max_bytes_;
     source_preflight check_source_;
+    std::shared_ptr<rkva_managed_store::delegation> authority_;
 };
 }

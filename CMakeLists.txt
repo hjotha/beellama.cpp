@@ -166,6 +166,13 @@ option(RKVA_MANAGED_SNAPSHOT_PHASE3 "rkva: build the isolated managed snapshot P
 # library and its CPU tests behind the RKVA_MANAGED_SNAPSHOT_PHASE4 run-time
 # gate; it advertises no capability and changes no HELLO/op/dispatch behaviour.
 option(RKVA_MANAGED_SNAPSHOT_PHASE4 "rkva: build the isolated managed snapshot Phase 4 framing/ATTEST/identity layer and tests" OFF)
+# Phase 5 activation composition. Default OFF and only valid with Phase 4 on:
+# one RAII store authority over journal/SQLite/object-v3/quota, the
+# authenticated successful COMMIT/STATUS reply, the listener session authority
+# test seam and receipt-based lost-ACK recovery. It has no listener call site,
+# advertises nothing and still refuses publication without the real pin/metadata
+# proof and qualified durable sync/rename.
+option(RKVA_MANAGED_SNAPSHOT_ACTIVATION "rkva: build the managed snapshot activation composition and its CPU tests" OFF)
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)

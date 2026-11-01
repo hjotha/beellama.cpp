@@ -2,8 +2,10 @@
 #include <cstdint>
 #include <array>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
+#include "../../ggml/include/rkva-managed-store-authority.h"
 #include "../../ggml/src/ggml-remote-attn/rkva-managed-framing-v3.h"
 
 // Standalone host transaction journal. Not connected to a server, RPC, host
@@ -80,6 +82,15 @@ extern void (*test_persist_hook)(const char * stage);
 class journal {
 public:
     journal(std::string directory, std::string owner);
+    // Single-authority composition: the caller holds ONE concrete managed store
+    // authority that already locks this journal's lock file, so this journal
+    // must never take a second, independent lock. Every operation enters the
+    // authority, revalidates it and refuses to proceed when it was lost,
+    // replaced or forked. `directory` must be the authority's own directory.
+    // The legacy constructor above keeps its own lock and is unchanged.
+    journal(std::string directory, std::string owner,
+            std::shared_ptr<rkva_managed_store::delegation> delegated_authority);
+    bool delegated() const;
     bool initialize(std::string & error);
     bool inspect(snapshot & result, std::string & error) const;
     bool prepare(const std::string & tx, const std::string & reference, const std::string & key, std::string & error);
@@ -104,6 +115,18 @@ public:
                           const rkva_managed_framing_v3::session & session,
                           v3_connection_authority * connection, const v3_frame_builder & builder,
                           v3_issued_request & output, std::string & error);
+    // Authenticated successful COMMIT/STATUS publication. The caller must have
+    // independently verified the receipt MAC, the object/pin proof and the
+    // successor anchor; this method only proves that the persisted ledger still
+    // agrees with that evidence and performs ONE atomic durable publication:
+    // consume the issued v3 nonce with its authenticated response hash, advance
+    // the anchor by exactly one version and record commit_ack. An identical
+    // completed publication is idempotent; every other mismatch fails closed and
+    // changes nothing. There is no automatic anchor replacement.
+    bool commit_v3_success(const auth_id & nonce, const auth_id & request_hash, const auth_id & response_hash,
+                           uint64_t peer_version, uint64_t anchor_version, const auth_id & digest,
+                           const std::string & tx, const std::string & reference, const std::string & key,
+                           const std::string & owner, uint64_t epoch, std::string & error);
     bool release_intent(const std::string & tx, uint64_t peer_version, std::string & error);
     bool release_ack(const std::string & tx, uint64_t peer_version, std::string & error);
     // Caller must have independently proved that the host file was never
@@ -132,5 +155,6 @@ private:
                          const std::string & reference, const std::string & key,
                          const std::string & owner, uint64_t epoch, std::string & error);
     std::string dir_, owner_;
+    std::shared_ptr<rkva_managed_store::delegation> authority_;
 };
 } // namespace rkva_host_journal
