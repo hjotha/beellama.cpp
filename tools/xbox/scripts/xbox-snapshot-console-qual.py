@@ -909,9 +909,10 @@ class Runner:
             text=True, timeout=self.remain(30)).strip()
 
     def is_active(self):
-        return subprocess.check_output(
-            ['systemctl', 'is-active', SERVICE], text=True,
-            timeout=self.remain(30)).strip()
+        proc = subprocess.run(
+            ['systemctl', 'is-active', SERVICE], capture_output=True,
+            text=True, timeout=self.remain(30))
+        return proc.stdout.strip()
 
     def production_child_port(self, pid):
         path = Path(f'/proc/{pid}/task/{pid}/children')
@@ -1013,7 +1014,7 @@ class Runner:
         except Exception:
             return []
 
-    def fetch(self, name, local, subdir=''):
+    def fetch(self, name, local, subdir=QUAL_DIR):
         target = self.output / local
         if target.exists():
             target.unlink()
@@ -1117,6 +1118,21 @@ class Runner:
         self.result['identity_namespace_before'] = identity
         self.save()
 
+    def check_gpu_and_sockets(self):
+        compute = subprocess.check_output(
+            ['nvidia-smi', '--query-compute-apps=pid,process_name',
+             '--format=csv,noheader,nounits'], text=True,
+            timeout=self.remain(30)).strip()
+        if compute:
+            raise RuntimeError('a GPU compute process is already running: ' + compute)
+        sockets = subprocess.check_output(
+            ['ss', '-H', '-tn', 'state', 'established'], text=True,
+            timeout=self.remain(30))
+        if any(line.split() and line.split()[-1] ==
+               f'{self.args.xbox_host}:{XBOX_RKVA_PORT}'
+               for line in sockets.splitlines()):
+            raise RuntimeError('another local process has an established Xbox RKVA socket')
+
     def pause_production(self):
         main_pid = self.result['production']['main_pid']
         current = int(self.service_property('MainPID'))
@@ -1178,6 +1194,13 @@ class Runner:
             tail = log.read_text(errors='replace')[-200000:]
             (self.output / f'xllama-{case}.tail.log').write_text(tail)
         self.stop_app()
+        for name in AUTOPILOT_FILES:
+            try:
+                self.delete_probe(name, '')
+                if ('', name) in self.result['probe_files_created']:
+                    self.result['probe_files_created'].remove(('', name))
+            except Exception:
+                pass
         return (*classify_probe_result(done_text, response is not None, document),
                 document)
 

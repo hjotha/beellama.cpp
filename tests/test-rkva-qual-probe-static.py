@@ -65,7 +65,7 @@ class GuardPlacementTests(unittest.TestCase):
 
     def test_engine_accessor_is_guarded(self):
         self.assertIsNotNone(
-            guarded_block(ENGINE.read_text(), 'RemoteAttnEngine::qual_resident_state', 0))
+            guarded_block(ENGINE.read_text(), 'RemoteAttnEngine::qual_resident_probe', 0))
 
     def test_header_is_fully_guarded(self):
         text = PROBE.read_text()
