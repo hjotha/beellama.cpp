@@ -1519,7 +1519,7 @@ bool qual_provider(void* context, uint32_t requested_session,
     out.session_id = id;
     RemoteAttnEngine::qual_resident_state raw;
     std::string why;
-    const bool ok = state->engine->qual_resident_state(id, raw, why);
+    const bool ok = state->engine->qual_resident_probe(id, raw, why);
     out.available = ok;
     out.reason = ok ? std::string() : why;
     out.has_live_rows = raw.live_rows != 0;

@@ -2133,7 +2133,7 @@ uint64_t RemoteAttnEngine::native_range_generation(uint32_t id) const {
 }
 
 #if defined(XLLAMA_QUAL_PROBE)
-bool RemoteAttnEngine::qual_resident_state(uint32_t id, qual_resident_state& out,
+bool RemoteAttnEngine::qual_resident_probe(uint32_t id, qual_resident_state& out,
                                            std::string& error) const {
     out = qual_resident_state{};
     error.clear();

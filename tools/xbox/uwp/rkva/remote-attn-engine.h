@@ -93,7 +93,7 @@ class RemoteAttnEngine {
     // Copies CPU-side session fields only: no wait, submit, signal or mutation.
     // Returns false with an exact reason when the id is not a live revision-3
     // session or no single checkpoint exists; partial fields are still filled.
-    bool qual_resident_state(uint32_t id, qual_resident_state& out, std::string& error) const;
+    bool qual_resident_probe(uint32_t id, qual_resident_state& out, std::string& error) const;
 #endif
 
     RemoteAttnEngine();
