@@ -33,7 +33,7 @@ def request(port, path, data):
 
 
 class Server:
-    def __init__(self, binary, model, root, extra_env):
+    def __init__(self, binary, model, root, extra_env, max_count="64"):
         self.root = root
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
@@ -42,7 +42,8 @@ class Server:
         env.pop("LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE", None)
         env.update(extra_env)
         command = [binary, "-m", model, "--host", "127.0.0.1", "--port", str(self.port),
-                   "-c", "512", "-np", "1", "-t", "2", "--slot-save-path", str(root)]
+                   "-c", "512", "-np", "1", "-t", "2", "--slot-save-path", str(root),
+                   "--slot-save-max-count", max_count]
         self.child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                       text=True, bufsize=1, env=env)
         self.ready = threading.Event()
@@ -133,7 +134,33 @@ def main():
         finally:
             server.stop()
 
-    print("PASS: native auto-save is silent by default and skips cleanly with no native overflow")
+        # A reference journal is store metadata, not a snapshot: retention must
+        # not count, evict or rewrite it even with a one-snapshot quota.
+        journal_dir = root / "journal"
+        journal_dir.mkdir()
+        journal = journal_dir / ".rkva-native-refs.jsonl"
+        pinned = {
+            "schema": "rkva-native-refs", "version": 1, "state": "pinned",
+            "xbox_key": "fff30e532caeac47750f17351664f3b392ffdafc0801514d09395c5326bee09a",
+            "host_file": "", "n_tokens": 0, "split_p": 0, "native": True,
+            "timestamp": "2026-11-01T00:00:00Z", "source": "migrated",
+        }
+        journal.write_text(json.dumps(pinned, separators=(",", ":")) + "\n")
+        before = journal.read_bytes()
+        server = Server(args.server, args.model, journal_dir, {}, max_count="1")
+        try:
+            assert server.ready.wait(60), "server failed to start: " + "".join(server.logs[-15:])
+            status, body = server.complete()
+            assert status == 200, (status, body)
+            status, body = request(server.port, "/slots/0?action=save", {"filename": "legacy.slot"})
+            assert status == 200, (status, body)
+            assert (journal_dir / "legacy.slot").exists(), "the snapshot was not published"
+            assert journal.read_bytes() == before, "retention modified the reference journal"
+        finally:
+            server.stop()
+
+    print("PASS: native auto-save is silent by default, skips cleanly with no native overflow, "
+          "and the reference journal survives retention")
 
 
 if __name__ == "__main__":

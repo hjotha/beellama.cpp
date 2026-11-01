@@ -16,6 +16,7 @@
 #include "server-model-identity.h"
 #include "server-slot-budget.h"
 #include "server-native-slot.h"
+#include "server-native-refs.h"
 #include "ggml-remote-attn-trace.h"
 #include "server-route-state.h"
 #include "server-legacy-slot-classifier.h"
@@ -786,7 +787,8 @@ struct unified_snapshot_limit_plan {
                     path.find(".tmp-") != std::string::npos ||
                     (path.size() >= 6 && path.compare(path.size() - 6, 6, ".lease") == 0) ||
                     (path.size() >= 5 && path.compare(path.size() - 5, 5, ".lock") == 0) ||
-                    (path.size() >= 4 && path.compare(path.size() - 4, 4, ".ref") == 0)) {
+                    (path.size() >= 4 && path.compare(path.size() - 4, 4, ".ref") == 0) ||
+                    server_native_refs::is_journal_file(std::filesystem::path(path).filename().string())) {
                 continue;
             }
             if (path.size() >= 7 && path.compare(path.size() - 7, 7, ".logits") == 0 &&
@@ -5777,7 +5779,7 @@ private:
             const std::string destination = native_auto_state_filename(slot, staging.tokens);
             native_stream_publication publication;
             native_stream_failure failure;
-            if (!publish_native_stream_slot(slot, staging, destination, publication, failure)) {
+            if (!publish_native_stream_slot(slot, staging, destination, true, publication, failure)) {
                 SLT_INF(slot, "auto-save native overflow skipped: %s (%s)\n",
                         server_native_slot::automatic_save_skip_name(failure.refusal),
                         failure.error.c_str());
@@ -8942,7 +8944,7 @@ private:
     // Returns false with `failure` set on any refusal. The staging reservation
     // must stay alive: the writer allocates its staged body before publication.
     bool publish_native_stream_slot(server_slot & slot, const native_stream_staging & staging,
-            const std::string & destination, native_stream_publication & out,
+            const std::string & destination, bool automatic, native_stream_publication & out,
             native_stream_failure & failure) {
         const int64_t started = ggml_time_us();
         const auto refuse = [&failure](server_native_slot::automatic_save_skip why, std::string message) {
@@ -8981,6 +8983,46 @@ private:
             }
             const uint64_t max_bytes = params_base.slot_save_max_bytes > 0
                     ? uint64_t(params_base.slot_save_max_bytes) : SIZE_MAX;
+            // Durable host-side reference journal. The pending record is written
+            // from the staged callback, i.e. after retention admission and
+            // before the Xbox SAVE, while this publication still holds the
+            // exclusive store lock. Any later failure leaves it pending for
+            // reconciliation; the journal is never rewritten or deleted by
+            // host-file eviction.
+            const bool native_pair = llama_remote_native_kvarn_transient_active(ctx_tgt);
+            const auto registry_lock_held = [&store](const std::string & path) {
+                return store.owns_exclusive_for(path);
+            };
+            server_native_refs::record registry_entry;
+            bool registry_pending = false;
+            server_route_state_staged_callback staged_callback;
+            if (native_pair) {
+                staged_callback = [&](const char * staged_path, size_t staged_bytes) {
+                    std::string key_error;
+                    if (!server_native_refs::hash_host_prefix(staged_path, staged_bytes,
+                                registry_entry.key, &key_error)) {
+                        SRV_WRN("native reference journal: host prefix key failed: %s\n", key_error.c_str());
+                        return false;
+                    }
+                    registry_entry.st        = server_native_refs::state::pending;
+                    registry_entry.host_file = std::filesystem::path(destination).filename().string();
+                    registry_entry.n_tokens  = staging.tokens.size();
+                    registry_entry.split_p   = slot.position_split_p;
+                    registry_entry.native    = true;
+                    registry_entry.timestamp = server_native_refs::timestamp_now();
+                    registry_entry.src       = automatic ? server_native_refs::source::auto_save
+                                                         : server_native_refs::source::explicit_save;
+                    std::string journal_error;
+                    if (!server_native_refs::append(slot_store, registry_entry,
+                                registry_lock_held, &journal_error)) {
+                        SRV_WRN("native reference journal: pending record refused: %s\n",
+                                journal_error.c_str());
+                        return false;
+                    }
+                    registry_pending = true;
+                    return true;
+                };
+            }
             auto limit_plan = std::make_shared<unified_snapshot_limit_plan>();
             limit_plan->dir = slot_store;
             limit_plan->store_lock = &store;
@@ -8996,11 +9038,26 @@ private:
                         retention_refused = !admitted;
                         return admitted;
                     },
-                    [limit_plan]() { return limit_plan->commit(); }, &store, nullptr, slot.position_split_p);
+                    [limit_plan]() { return limit_plan->commit(); }, &store, nullptr, slot.position_split_p,
+                    staged_callback);
             if (!nwrite) {
                 return refuse(retention_refused ? server_native_slot::automatic_save_skip::quota_refused
                                                 : server_native_slot::automatic_save_skip::failed,
                         "native streaming host/Xbox pair save failed");
+            }
+            // Host publication succeeded. Upgrade the pending journal record to
+            // committed while the same store lock is still held. A failure here
+            // leaves the pending record for reconciliation; it never undoes or
+            // hides the published pair.
+            if (registry_pending) {
+                server_native_refs::record committed = registry_entry;
+                committed.st        = server_native_refs::state::committed;
+                committed.timestamp = server_native_refs::timestamp_now();
+                std::string journal_error;
+                if (!server_native_refs::append(slot_store, committed, registry_lock_held, &journal_error)) {
+                    SRV_WRN("native reference journal: committed record failed (%s); pending record kept for reconciliation\n",
+                            journal_error.c_str());
+                }
             }
             out.n_tokens = staging.tokens.size();
             out.n_bytes  = nwrite;
@@ -9026,7 +9083,7 @@ private:
         }
         native_stream_publication publication;
         native_stream_failure failure;
-        if (!publish_native_stream_slot(slot, staging, task.slot_action.filepath,
+        if (!publish_native_stream_slot(slot, staging, task.slot_action.filepath, false,
                 publication, failure)) {
             const auto type = failure.alloc_failed ? ERROR_TYPE_SERVER : ERROR_TYPE_INVALID_REQUEST;
             send_error(task, std::string("Unable to save slot: ") + failure.error, type);

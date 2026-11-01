@@ -131,7 +131,8 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         const std::function<bool(uint64_t)> & before_publish,
         const std::function<bool()> & after_publish,
         server_route_state_store_lock * store_lock,
-        server_route_state_lease * publication_lock, uint32_t native_split_p) {
+        server_route_state_lease * publication_lock, uint32_t native_split_p,
+        const server_route_state_staged_callback & staged) {
     std::unique_ptr<server_route_state_store_lock> owned_store;
     if (store_lock == nullptr) {
         const std::filesystem::path parent = std::filesystem::path(path).parent_path();
@@ -255,6 +256,13 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         }
         if (before_publish && !before_publish(admitted_total)) {
             throw std::runtime_error("router snapshot store budget rejected publication");
+        }
+        // The host prefix through the RKVK frame is complete here: only the
+        // logits/manifest/footer (and possible later SCKP) are appended after
+        // this point. Callers use the closed staged file to journal the native
+        // Xbox key before the remote SAVE.
+        if (staged && !staged(staged_path, staged_bytes)) {
+            throw std::runtime_error("router snapshot staged-state admission rejected");
         }
     };
     const size_t written = llama_state_seq_save_file_preflight(ctx, temporary.path.c_str(), seq, tokens.data(), tokens.size(),

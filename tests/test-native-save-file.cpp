@@ -3,6 +3,7 @@
 // this host test exercises the shared POSIX branch and path handling.
 #include "../src/llama-native-save-file.h"
 #include "../src/llama-state-framing.h"
+#include "../tools/server/server-native-refs.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -124,6 +125,17 @@ int main() {
         assert(llama_native_save::hash_file_prefix(file, prefix_end, restored_prefix_key));
     }
     assert(std::memcmp(good_prefix_key, restored_prefix_key, sizeof(good_prefix_key)) == 0);
+    // The reference journal hashes [0, staged_bytes) with the same SHA-256
+    // implementation; at the staged callback this equals the RKVK frame end.
+    {
+        std::string registry_key;
+        assert(server_native_refs::hash_host_prefix(framed_utf8, prefix_end, registry_key, nullptr));
+        char expected[65] = {};
+        for (size_t i = 0; i < sizeof(good_prefix_key); ++i) {
+            std::snprintf(expected + i * 2, 3, "%02x", good_prefix_key[i]);
+        }
+        assert(registry_key == expected);
+    }
     auto mutated_trailer = owner;
     mutated_trailer[10] ^= 0x01;
     std::vector<uint8_t> mutated_frame = local;

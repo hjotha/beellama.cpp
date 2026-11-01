@@ -250,6 +250,45 @@ token IDs against the same live prefill segmentation. It did not qualify all
 layouts, failure modes or automatic native save; the path remains opt-in.
 Evidence: `/home/hjotha/beellama-benchmark-results/xxxl-plan-execution-20261030/native-auto-restore-only-r1/result.json`.
 
+### Host reference journal
+
+`<slot-save-path>/.rkva-native-refs.jsonl` is the durable host-side reference
+for native host/Xbox pairs. It is store metadata, not a snapshot: retention
+neither counts, evicts nor rewrites it. Every native publication appends a
+`pending` record after retention admission and before the Xbox SAVE, then a
+`committed` record after host publication, both under the exclusive store lock
+that guards the host file (explicit and automatic saves share that publisher).
+A failure or crash leaves the `pending` record for reconciliation; records are
+never deleted, and removing the host file does not remove its record, because
+the record is what keeps the Xbox key referenced. Each line is a JSON record
+(`schema`, `version`, `xbox_key`, `host_file`, `n_tokens`, `split_p`, `native`,
+`state`, `timestamp`, `source`). An unterminated final append is reported by
+the audit: a complete record without its terminator is kept and the next append
+repairs the terminator, while a partial fragment is ignored and never treated
+as a valid record.
+
+`xbox_key` is the SHA-256 of the host prefix through the end of the RKVK frame,
+the same key used by op17/op18. The save path hashes the closed staged file at
+the pre-publication callback, where nothing follows that frame yet; the audit
+hashes the manifest `state_bytes` range of a published host file. A CPU test
+asserts this equals `llama_native_save::hash_file_prefix(file, size)`.
+
+Migration is explicit and never runs at server startup:
+
+```
+llama-native-refs migrate --store <slot-save-path> [--keys <file>] [--dry-run]
+llama-native-refs audit   --store <slot-save-path> [--json]
+```
+
+`migrate` records the six original campaign keys plus the same-build key
+`fff30e532caeac47750f17351664f3b392ffdafc0801514d09395c5326bee09a` as
+`pinned`/`migrated` (or additional keys from `--keys`), idempotently. `audit` is
+read-only and lists committed/pinned references, pending-only keys, host files
+whose key is absent from the journal, and unreadable host files. The pure
+`retire_decision` yields referenced/pinned/orphan_candidate only; no command
+deletes a host or remote object. The journal is append-only and has no automatic
+compaction or remote reconciliation yet.
+
 Native streaming saves refuse to replace an existing pathname. Explicit legacy
 slot saves may replace an existing destination only when the state is positively
 local: a marked non-native unified envelope, a checksummed LLAMASLT envelope, or

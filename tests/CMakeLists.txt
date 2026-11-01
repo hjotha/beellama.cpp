@@ -120,6 +120,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-server-terminal-error-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-native-refs-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-native-refs-static.py)
+    set_property(TEST test-native-refs-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-spec-cession-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-spec-cession-static.py)
@@ -1072,6 +1078,10 @@ llama_build_and_test(test-server-native-slot.cpp)
 target_include_directories(test-server-native-slot PRIVATE
     ${PROJECT_SOURCE_DIR}/tools/server
     ${PROJECT_SOURCE_DIR}/ggml/include)
+llama_build_and_test(test-server-native-refs.cpp)
+target_include_directories(test-server-native-refs PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-server-native-refs PRIVATE server-context)
 if (UNIX)
     llama_build_and_test(test-server-snapshot-retention.cpp)
 endif()
