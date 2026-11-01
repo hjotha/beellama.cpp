@@ -159,6 +159,7 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 # are not built and no server path references them. Enabling only builds the
 # isolated core and its tests; it advertises no capability.
 option(RKVA_MANAGED_SNAPSHOT_PHASE2 "rkva: build the isolated managed snapshot Phase 2 lifecycle core and tests" OFF)
+option(RKVA_MANAGED_SNAPSHOT_PHASE3 "rkva: build the isolated managed snapshot Phase 3 PREPARE/COMMIT/receipt core and tests" OFF)
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)

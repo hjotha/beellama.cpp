@@ -1362,3 +1362,60 @@ if (RKVA_MANAGED_SNAPSHOT_PHASE2)
         endif()
     endif()
 endif()
+
+# Phase 3 PREPARE/COMMIT/receipt core. Default OFF. This static library is
+# test-only scaffolding: the test hooks (RKVA_HOST_JOURNAL_TESTING and
+# RKVA_ANCHORED_SQLITE_TESTING) are compiled in because there is no production
+# call site and no shipped consumer in this tree. The managed `apply` path
+# remains fail-closed; see docs/rkva-managed-snapshot-phase3.md.
+if (RKVA_MANAGED_SNAPSHOT_PHASE3)
+    find_package(Threads REQUIRED)
+    if (WIN32)
+        set(RKVA_PHASE3_SQLITE winsqlite3)
+    else()
+        find_package(SQLite3 REQUIRED)
+        set(RKVA_PHASE3_SQLITE SQLite3::SQLite3)
+    endif()
+    add_library(rkva-managed-phase3 STATIC
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-managed-registry.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-managed-store-authority.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-anchored-sqlite.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-host-journal.cpp)
+    target_compile_features(rkva-managed-phase3 PUBLIC cxx_std_17)
+    target_compile_definitions(rkva-managed-phase3 PUBLIC
+        RKVA_MANAGED_SNAPSHOT_PHASE3
+        RKVA_HOST_JOURNAL_TESTING
+        RKVA_ANCHORED_SQLITE_TESTING)
+    target_include_directories(rkva-managed-phase3 PUBLIC
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn
+        ${PROJECT_SOURCE_DIR}/tools/server
+        ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva)
+    target_link_libraries(rkva-managed-phase3 PUBLIC Threads::Threads ${RKVA_PHASE3_SQLITE})
+
+    add_executable(test-rkva-host-journal test-rkva-host-journal.cpp)
+    target_link_libraries(test-rkva-host-journal PRIVATE rkva-managed-phase3)
+    add_test(NAME test-rkva-host-journal COMMAND $<TARGET_FILE:test-rkva-host-journal>)
+    set_property(TEST test-rkva-host-journal PROPERTY LABELS main)
+
+    add_executable(test-rkva-managed-auth test-rkva-managed-auth.cpp)
+    target_link_libraries(test-rkva-managed-auth PRIVATE rkva-managed-phase3)
+    add_test(NAME test-rkva-managed-auth COMMAND $<TARGET_FILE:test-rkva-managed-auth>)
+    set_property(TEST test-rkva-managed-auth PROPERTY LABELS main)
+
+    add_executable(test-rkva-reconcile-gate test-rkva-reconcile-gate.cpp)
+    target_link_libraries(test-rkva-reconcile-gate PRIVATE rkva-managed-phase3)
+    add_test(NAME test-rkva-reconcile-gate COMMAND $<TARGET_FILE:test-rkva-reconcile-gate>)
+    set_property(TEST test-rkva-reconcile-gate PROPERTY LABELS main)
+
+    add_executable(test-rkva-anchored-sqlite-receipt test-rkva-anchored-sqlite-receipt.cpp)
+    target_link_libraries(test-rkva-anchored-sqlite-receipt PRIVATE rkva-managed-phase3)
+    add_test(NAME test-rkva-anchored-sqlite-receipt COMMAND $<TARGET_FILE:test-rkva-anchored-sqlite-receipt>)
+    set_property(TEST test-rkva-anchored-sqlite-receipt PROPERTY LABELS main)
+
+    add_executable(test-rkva-managed-phase3-gate test-rkva-managed-phase3-gate.cpp)
+    target_include_directories(test-rkva-managed-phase3-gate PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-rkva-managed-phase3-gate PRIVATE RKVA_MANAGED_SNAPSHOT_PHASE3)
+    add_test(NAME test-rkva-managed-phase3-gate COMMAND $<TARGET_FILE:test-rkva-managed-phase3-gate>)
+    set_property(TEST test-rkva-managed-phase3-gate PROPERTY LABELS main)
+endif()

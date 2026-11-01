@@ -20,11 +20,12 @@ namespace rkva_host_journal {
 void (*test_persist_hook)(const char *) = nullptr;
 #endif
 namespace {
-constexpr size_t max_size = 16 * 1024 * 1024, max_records = 8192, max_path = 4096;
+constexpr size_t max_size = 16 * 1024 * 1024, max_records = 8192, max_path = 4096, max_nonces = 50000;
 const std::string zero_hash(64, '0');
 bool hex64(const std::string & s) {
     return s.size() == 64 && s.find_first_not_of("0123456789abcdef") == std::string::npos && s != zero_hash;
 }
+bool nonzero(const auth_id & id) { return std::any_of(id.begin(),id.end(),[](uint8_t b){return b!=0;}); }
 bool valid_path(const std::string & s) {
     return !s.empty() && s[0] == '/' && s.size() <= max_path && s.find('\0') == std::string::npos;
 }
@@ -53,7 +54,8 @@ void validate(const transaction & r) {
 }
 std::string encode(const snapshot & snap, const std::string & owner) {
     if (!hex64(owner) || snap.transactions.size() > max_records) throw std::runtime_error("invalid journal owner or capacity");
-    std::string out = "RKHJNL01"; out += owner; u64(out,snap.revision); u32(out,uint32_t(snap.transactions.size()));
+    std::string out = snap.anchor.configured ? "RKHJNL02" : "RKHJNL01";
+    out += owner; u64(out,snap.revision); u32(out,uint32_t(snap.transactions.size()));
     std::set<std::string> txs, refs;
     for (const auto & r : snap.transactions) {
         validate(r);
@@ -63,6 +65,19 @@ std::string encode(const snapshot & snap, const std::string & owner) {
         u32(out,uint32_t(r.host_path.size())); out += r.host_path;
         if (out.size() > max_size - 32) throw std::runtime_error("journal capacity exceeded");
     }
+    if(snap.anchor.configured) {
+        if(!snap.anchor.key_epoch || !nonzero(snap.anchor.digest) || snap.anchor.nonces.size()>max_nonces)
+            throw std::runtime_error("invalid authenticated anchor");
+        u64(out,snap.anchor.key_epoch);u64(out,snap.anchor.version);
+        out.append(reinterpret_cast<const char *>(snap.anchor.digest.data()),snap.anchor.digest.size());
+        u32(out,uint32_t(snap.anchor.nonces.size()));std::set<auth_id> nonces;
+        for(const auto & n:snap.anchor.nonces) {
+            if(!hex64(n.tx) || !txs.count(n.tx) || !nonzero(n.nonce) || !nonces.insert(n.nonce).second)
+                throw std::runtime_error("invalid issued nonce");
+            out+=n.tx;out.append(reinterpret_cast<const char *>(n.nonce.data()),n.nonce.size());out.push_back(n.consumed?1:0);
+        }
+        if(out.size()>max_size-32)throw std::runtime_error("journal capacity exceeded");
+    }
     auto hash=rkva_snapshot::digest(out.data(),out.size()); out.append(reinterpret_cast<const char *>(hash.data()),hash.size());
     return out;
 }
@@ -70,7 +85,8 @@ snapshot decode(const std::string & s, const std::string & owner) {
     if (s.size() < 8+64+8+4+32 || s.size() > max_size) throw std::runtime_error("invalid journal size");
     const auto hash=rkva_snapshot::digest(s.data(),s.size()-32);
     if (std::memcmp(hash.data(),s.data()+s.size()-32,32)) throw std::runtime_error("journal checksum mismatch");
-    reader rd(s); if(rd.get(8)!="RKHJNL01" || rd.get(64)!=owner || !hex64(owner)) throw std::runtime_error("journal format or owner mismatch");
+    reader rd(s);const auto magic=rd.get(8);
+    if((magic!="RKHJNL01" && magic!="RKHJNL02") || rd.get(64)!=owner || !hex64(owner)) throw std::runtime_error("journal format or owner mismatch");
     snapshot result; result.revision=rd.get64(); auto n=rd.get32(); if(n>max_records) throw std::runtime_error("journal count exceeded");
     std::set<std::string> txs,refs;
     for(uint32_t i=0;i<n;i++) {
@@ -81,6 +97,21 @@ snapshot decode(const std::string & s, const std::string & owner) {
         validate(r);
         if(!txs.insert(r.tx).second || !refs.insert(r.reference).second) throw std::runtime_error("duplicate journal identity");
         result.transactions.push_back(std::move(r));
+    }
+    if(magic=="RKHJNL02") {
+        result.anchor.configured=true;result.anchor.key_epoch=rd.get64();result.anchor.version=rd.get64();
+        const auto digest=rd.get(32);std::copy(digest.begin(),digest.end(),result.anchor.digest.begin());
+        const auto count=rd.get32();
+        if(!result.anchor.key_epoch || !nonzero(result.anchor.digest) || count>max_nonces || count>(rd.end-rd.pos)/97)
+            throw std::runtime_error("invalid authenticated anchor");
+        std::set<auth_id> nonces;
+        for(uint32_t i=0;i<count;i++) {
+            issued_nonce item;item.tx=rd.get(64);const auto bytes=rd.get(32);
+            std::copy(bytes.begin(),bytes.end(),item.nonce.begin());const auto flag=uint8_t(rd.get(1)[0]);
+            if(!txs.count(item.tx) || !nonzero(item.nonce) || flag>1 || !nonces.insert(item.nonce).second)
+                throw std::runtime_error("invalid issued nonce");
+            item.consumed=flag!=0;result.anchor.nonces.push_back(std::move(item));
+        }
     }
     if(rd.pos != rd.end) throw std::runtime_error("journal trailing data");
     return result;
@@ -222,16 +253,54 @@ bool journal::host_published(const std::string & tx,const std::string & path,con
         return false;
     });
 }
-bool journal::commit_ack(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ auto & r=get(s,tx); if(!ver) throw std::runtime_error("invalid commit version"); if(r.state==phase::host_published) { r.state=phase::commit_ack; r.peer_commit_version=ver; return true; } if((r.state==phase::commit_ack || r.state==phase::release_intent) && r.peer_commit_version==ver) return false; throw std::runtime_error("invalid commit transition"); }); }
-bool journal::release_intent(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::commit_ack) { r.state=phase::release_intent; return true; } if(r.state==phase::release_intent || r.state==phase::release_ack) return false; throw std::runtime_error("invalid release intent transition"); }); }
-bool journal::release_ack(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::release_intent) { r.state=phase::release_ack; return true; } if(r.state==phase::release_ack) return false; throw std::runtime_error("invalid release ack transition"); }); }
-bool journal::abort_unpublished(const std::string & tx,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ auto & r=get(s,tx); if(r.state==phase::prepared) { r.state=phase::aborted; return true; } if(r.state==phase::aborted) return false; throw std::runtime_error("published transaction cannot be aborted"); }); }
+bool journal::commit_ack(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){
+    if(s.anchor.configured)throw std::runtime_error("authenticated journal requires verified atomic commit");
+    auto & r=get(s,tx); if(!ver) throw std::runtime_error("invalid commit version"); if(r.state==phase::host_published) { r.state=phase::commit_ack; r.peer_commit_version=ver; return true; } if((r.state==phase::commit_ack || r.state==phase::release_intent) && r.peer_commit_version==ver) return false; throw std::runtime_error("invalid commit transition"); }); }
+bool journal::provision_anchor(uint64_t epoch,uint64_t version,const auth_id & digest,std::string & e) {
+    return change(dir_,owner_,e,[&](snapshot & s){
+        if(s.anchor.configured || !s.transactions.empty() || !epoch || !nonzero(digest))
+            throw std::runtime_error("anchor provisioning refused");
+        s.anchor.configured=true;s.anchor.key_epoch=epoch;s.anchor.version=version;s.anchor.digest=digest;return true;
+    });
+}
+bool journal::issue_commit_nonce(const std::string & tx,const auth_id & nonce,const std::string & owner,uint64_t epoch,std::string & e) {
+    return change(dir_,owner_,e,[&](snapshot & s){
+        const auto & r=get(s,tx);
+        if(!s.anchor.configured || owner_!=owner || s.anchor.key_epoch!=epoch || r.state!=phase::host_published ||
+                !nonzero(nonce) || s.anchor.nonces.size()>=max_nonces)
+            throw std::runtime_error("commit nonce issuance refused");
+        for(const auto & prior:s.anchor.nonces)if(prior.nonce==nonce)throw std::runtime_error("nonce reuse rejected");
+        s.anchor.nonces.push_back({tx,nonce,false});return true;
+    });
+}
+bool journal::commit_verified(const std::string & tx,const auth_id & nonce,uint64_t peer_version,
+        uint64_t anchor_version,const auth_id & digest,const std::string & reference,const std::string & key,
+        const std::string & owner,uint64_t epoch,std::string & e) {
+    return change(dir_,owner_,e,[&](snapshot & s){
+        auto & r=get(s,tx);
+        if(!s.anchor.configured || owner_!=owner || s.anchor.key_epoch!=epoch ||
+                r.state!=phase::host_published || r.reference!=reference || r.key!=key ||
+                !peer_version || !nonzero(digest) || s.anchor.version==UINT64_MAX ||
+                anchor_version!=s.anchor.version+1 || peer_version>anchor_version)
+            throw std::runtime_error("verified commit state mismatch");
+        auto it=std::find_if(s.anchor.nonces.begin(),s.anchor.nonces.end(),[&](const issued_nonce & x){return x.nonce==nonce;});
+        if(it==s.anchor.nonces.end() || it->tx!=tx || it->consumed)throw std::runtime_error("nonce absent or already consumed");
+        it->consumed=true;s.anchor.version=anchor_version;s.anchor.digest=digest;
+        r.state=phase::commit_ack;r.peer_commit_version=peer_version;return true;
+    });
+}
+bool journal::release_intent(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated release unsupported");auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::commit_ack) { r.state=phase::release_intent; return true; } if(r.state==phase::release_intent || r.state==phase::release_ack) return false; throw std::runtime_error("invalid release intent transition"); }); }
+bool journal::release_ack(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated release unsupported");auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::release_intent) { r.state=phase::release_ack; return true; } if(r.state==phase::release_ack) return false; throw std::runtime_error("invalid release ack transition"); }); }
+bool journal::abort_unpublished(const std::string & tx,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated abort unsupported");auto & r=get(s,tx); if(r.state==phase::prepared) { r.state=phase::aborted; return true; } if(r.state==phase::aborted) return false; throw std::runtime_error("published transaction cannot be aborted"); }); }
 #else
 bool journal::initialize(std::string & e) { return unsupported(e); }
 bool journal::inspect(snapshot &,std::string & e) const { return unsupported(e); }
 bool journal::prepare(const std::string &,const std::string &,const std::string &,std::string & e) { return unsupported(e); }
 bool journal::host_published(const std::string &,const std::string &,const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::commit_ack(const std::string &,uint64_t,std::string & e) { return unsupported(e); }
+bool journal::provision_anchor(uint64_t,uint64_t,const auth_id &,std::string & e) { return unsupported(e); }
+bool journal::issue_commit_nonce(const std::string &,const auth_id &,const std::string &,uint64_t,std::string & e) { return unsupported(e); }
+bool journal::commit_verified(const std::string &,const auth_id &,uint64_t,uint64_t,const auth_id &,const std::string &,const std::string &,const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::release_intent(const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::release_ack(const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::abort_unpublished(const std::string &,std::string & e) { return unsupported(e); }

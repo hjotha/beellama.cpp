@@ -149,6 +149,13 @@ injection on hardware, CUDA/Vulkan, production service reload.
 
 ### Phase 3: PREPARE / COMMIT / receipt / durable pin
 
+Superseded by `docs/rkva-managed-snapshot-phase3.md` (branch
+`feat/snapshot-phase3-20261101`), which ports the host journal
+anchor/nonce/verified-commit, the anchored SQLite pending-pin/receipt store,
+the managed auth contract and the offline reconcile gate behind
+`RKVA_MANAGED_SNAPSHOT_PHASE3` (default off). The list below is kept as the
+original scoping record.
+
 - `ggml/include/rkva-anchored-sqlite.h`
 - `ggml/src/ggml-remote-attn/rkva-anchored-sqlite.cpp` (SQLite pin/quota/
   metadata schema, anchor MAC, nonce admission, `prepare_pending`)
