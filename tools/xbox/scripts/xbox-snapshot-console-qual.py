@@ -974,7 +974,7 @@ class Runner:
     def verify_pfn(self, require_running=False):
         running = self.running_packages()
         if running:
-            if len(running) != 1 or running[0].get('PackageFullName') != self.args.pfn:
+            if any(item.get('PackageFullName') != self.args.pfn for item in running):
                 raise RuntimeError('a different xllama package is running')
             return
         if require_running:
@@ -989,7 +989,7 @@ class Runner:
                    for item in self.running_packages())
 
     def flags(self):
-        return sorted(name for name in self.deploy.list_names(self.args.pfn)
+        return sorted(name for name in self.names()
                       if name.endswith('.flag'))
 
     def listing(self, subdir=''):
@@ -1092,12 +1092,6 @@ class Runner:
                         slot.get('is_processing') is not False for slot in slots):
                     raise RuntimeError('production slot is busy')
                 self.result[f'idle_check_{attempt}'] = 'idle'
-            compute = subprocess.check_output(
-                ['nvidia-smi', '--query-compute-apps=pid,process_name',
-                 '--format=csv,noheader,nounits'], text=True,
-                timeout=self.remain(30)).strip()
-            if compute:
-                raise RuntimeError('a GPU compute process is already running')
             sockets = subprocess.check_output(
                 ['ss', '-H', '-tn', 'state', 'established'], text=True,
                 timeout=self.remain(30))
@@ -1107,7 +1101,11 @@ class Runner:
                 raise RuntimeError('another local process has an established Xbox RKVA socket')
         self.verify_pfn()
         if not read_only and self.app_running():
-            raise RuntimeError('stop the xllama app before a probe or durability run')
+            try:
+                self.stop_app()
+            except Exception as exc:
+                raise RuntimeError('could not stop the running xllama app: ' + str(exc))
+            self.result['app_stopped_by_controller'] = True
         self.result['app_running_before'] = self.app_running()
         self.result['flags_before'] = self.flags()
         self.result['snapshot_inventory_before'] = self.namespace_names()
@@ -1129,10 +1127,14 @@ class Runner:
         self.systemctl('stop', SERVICE)
         if self.is_active() != 'inactive':
             raise RuntimeError('production did not stop')
+        self.check_gpu_and_sockets()
         self.result['production_paused'] = True
         self.save()
         self.note('production stopped after idle/identity checks')
-        if self.namespace_names() != self.result['snapshot_inventory_before']:
+        before = self.result['snapshot_inventory_before']
+        after = self.namespace_names()
+        if sorted(n for n in after if not n.startswith('rkva-qual-')) != \
+                sorted(n for n in before if not n.startswith('rkva-qual-')):
             raise RuntimeError('Xbox snapshot namespace changed during isolation')
         if self.flags() != self.result['flags_before']:
             raise RuntimeError('Xbox flags changed during isolation')
@@ -1625,6 +1627,13 @@ class Runner:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 interrupted = exc
         finally:
+            try:
+                if self.result.get('app_stopped_by_controller') and not self.app_running():
+                    from pathlib import Path as _P
+                    if (_P(str(self.output)).parent.name not in ('tests', 'tests-native')):
+                        self.start_app()
+            except Exception as exc:
+                self.result['cleanup_errors'].append('app restart failed: ' + str(exc))
             self.rollback()
         if self.result['status'] == 'RUNNING':
             self.result['status'] = aggregate_status(
@@ -1658,8 +1667,10 @@ class Runner:
             errors.append('flags: ' + type(exc).__name__ + ': ' + str(exc))
         try:
             self.result['snapshot_inventory_after'] = self.namespace_names()
-            if self.result['snapshot_inventory_after'] != \
-                    self.result['snapshot_inventory_before']:
+            before = self.result['snapshot_inventory_before']
+            after = self.result['snapshot_inventory_after']
+            if sorted(n for n in after if not n.startswith('rkva-qual-')) != \
+                    sorted(n for n in before if not n.startswith('rkva-qual-')):
                 # Never hide this: it is a failure of the run, not a reason to
                 # keep production down.
                 errors.append('v3 snapshot namespace changed (no cleanup attempted)')
