@@ -44,4 +44,10 @@ else()
         add_subdirectory(tuning)
     endif()
     add_subdirectory(results)
+    # Read-only RKVA snapshot forensic inspectors (Linux host only). They open
+    # inputs read-only and are not wired into the server or any runtime path.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_subdirectory(rkva-native-object-inspect)
+        add_subdirectory(rkva-native-key-inspect)
+    endif()
 endif()
