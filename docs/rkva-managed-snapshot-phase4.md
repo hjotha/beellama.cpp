@@ -320,3 +320,10 @@ stay disabled until 1–7 exist.
    from a dispatch path.
 5. MSVC/UWP compile and real console restart/power-loss qualification, plus
    independent cryptographic review of the HMAC framing and key provisioning.
+
+The console qualification matrix for blockers 2, 3 and 7, the inert controller
+skeleton and the peer-identity inventory are in
+`docs/rkva-snapshot-console-qualification-matrix.md`,
+`docs/rkva-durable-fault-injection.md` and
+`docs/rkva-peer-identity-uwp-inventory.md`. They do not close or enable any
+blocker.

@@ -35,6 +35,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-verify-windows-package.py)
     set_property(TEST test-verify-windows-package PROPERTY LABELS main)
 
+    # Hardware-free checks of the inert Xbox console qualification controller.
+    add_test(
+        NAME test-xbox-snapshot-console-qual
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-xbox-snapshot-console-qual.py)
+    set_property(TEST test-xbox-snapshot-console-qual PROPERTY LABELS main)
+
     add_test(
         NAME test-backend-ops-seed-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
@@ -1330,6 +1337,14 @@ if (RKVA_MANAGED_SNAPSHOT_PHASE2)
     target_link_libraries(test-rkva-managed-object-v3-phase2 PRIVATE rkva-managed-phase2)
     add_test(NAME test-rkva-managed-object-v3-phase2 COMMAND $<TARGET_FILE:test-rkva-managed-object-v3-phase2>)
     set_property(TEST test-rkva-managed-object-v3-phase2 PROPERTY LABELS main)
+
+    # Test-only durable sync/rename/staging fault injector. The macro is
+    # defined for this target only; no production target sees the header.
+    add_executable(test-rkva-durable-fault test-rkva-durable-fault.cpp)
+    target_compile_definitions(test-rkva-durable-fault PRIVATE RKVA_DURABLE_FAULT_TESTING)
+    target_link_libraries(test-rkva-durable-fault PRIVATE rkva-managed-phase2)
+    add_test(NAME test-rkva-durable-fault COMMAND $<TARGET_FILE:test-rkva-durable-fault>)
+    set_property(TEST test-rkva-durable-fault PROPERTY LABELS main)
 
     add_executable(test-rkva-v3-quota test-rkva-v3-quota.cpp)
     target_link_libraries(test-rkva-v3-quota PRIVATE rkva-managed-phase2)
