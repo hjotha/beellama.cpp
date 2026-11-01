@@ -9,8 +9,12 @@
 // One JSON object per line. Appends are serialized by the caller's exclusive
 // route-state store lock. `pending` is written before the Xbox SAVE and host
 // publication, `committed` after host publication (append-only, last state
-// wins on load), and `pinned` only by the explicit migration CLI. A crash or
-// failure therefore leaves a `pending` record, never a silent drop.
+// wins on load), `pinned` only by the explicit migration CLI, and `retired`
+// only after an operator has removed the Xbox object and the host file. A
+// crash or failure therefore leaves a `pending` record, never a silent drop.
+// A `retired` record is written last (host file removed first); a later
+// non-retired record for the same key is a re-save/re-pin and supersedes the
+// retirement because the append order is the authoritative operation order.
 //
 // The key is the SHA-256 of the complete host prefix through the end of the
 // RKVK frame, exactly as computed by the core native save path. The staged
@@ -49,8 +53,8 @@ inline constexpr const char * kJournalName = ".rkva-native-refs.jsonl";
 inline constexpr const char * kSchema      = "rkva-native-refs";
 inline constexpr int          kVersion     = 1;
 
-enum class state { pending, committed, pinned };
-enum class source { explicit_save, auto_save, migrated };
+enum class state { pending, committed, pinned, retired };
+enum class source { explicit_save, auto_save, migrated, retired };
 
 // The six published keys from the original campaign plus the same-build key
 // recorded on 2026-11-01. Migration is explicit (CLI/file), never automatic.
@@ -69,6 +73,7 @@ inline const char * state_name(state value) {
         case state::pending:   return "pending";
         case state::committed: return "committed";
         case state::pinned:    return "pinned";
+        case state::retired:   return "retired";
     }
     return "unknown";
 }
@@ -77,6 +82,7 @@ inline bool parse_state(const std::string & text, state & out) {
     if (text == "pending")   { out = state::pending;   return true; }
     if (text == "committed") { out = state::committed; return true; }
     if (text == "pinned")    { out = state::pinned;    return true; }
+    if (text == "retired")   { out = state::retired;   return true; }
     return false;
 }
 
@@ -85,6 +91,7 @@ inline const char * source_name(source value) {
         case source::explicit_save: return "explicit";
         case source::auto_save:     return "auto";
         case source::migrated:      return "migrated";
+        case source::retired:       return "retired";
     }
     return "unknown";
 }
@@ -93,6 +100,7 @@ inline bool parse_source(const std::string & text, source & out) {
     if (text == "explicit") { out = source::explicit_save; return true; }
     if (text == "auto")     { out = source::auto_save;     return true; }
     if (text == "migrated") { out = source::migrated;      return true; }
+    if (text == "retired")  { out = source::retired;       return true; }
     return false;
 }
 
@@ -166,8 +174,17 @@ inline bool valid_record(const record & value, std::string * error) {
     if (value.st == state::pinned) {
         if (value.src != source::migrated) return reject("pinned records must be migrated");
         if (!value.host_file.empty()) return reject("pinned records cannot name a host file");
+    } else if (value.st == state::retired) {
+        if (value.src != source::retired) return reject("retired records must use the retired source");
+        if (!value.host_file.empty() && !valid_host_file(value.host_file)) {
+            return reject("host_file must be a plain basename");
+        }
+        if (value.n_tokens != 0 || value.split_p != 0) {
+            return reject("retired records carry no token geometry");
+        }
     } else {
         if (value.src == source::migrated) return reject("only pinned records may be migrated");
+        if (value.src == source::retired) return reject("only retired records may use the retired source");
         if (!valid_host_file(value.host_file)) return reject("host_file must be a plain basename");
     }
     if (!valid_timestamp(value.timestamp)) return reject("timestamp is not RFC3339 UTC seconds");
@@ -459,10 +476,30 @@ struct load_result {
 
 // Fold append-only records: (xbox_key, host_file) identifies one reference and
 // a later state replaces the earlier one. Pins have no host file, so a pin and
-// a committed pair for the same key remain distinct records.
+// a committed pair for the same key remain distinct records. A `retired`
+// record applies to the whole key: it replaces every earlier record for that
+// key, including a pin. Because append order is operation order, a later
+// pending/committed/pinned record for the same key is a re-save or re-pin and
+// clears the retirement again. Journals written before the retired state
+// existed fold exactly as before.
 inline std::vector<record> fold_records(const std::vector<record> & raw) {
     std::vector<record> folded;
+    const auto drop_key = [&](const std::string & key) {
+        folded.erase(std::remove_if(folded.begin(), folded.end(), [&](const record & cur) {
+            return cur.key == key;
+        }), folded.end());
+    };
     for (const auto & entry : raw) {
+        if (entry.st == state::retired) {
+            drop_key(entry.key);
+            folded.push_back(entry);
+            continue;
+        }
+        if (std::any_of(folded.begin(), folded.end(), [&](const record & cur) {
+                return cur.key == entry.key && cur.st == state::retired;
+            })) {
+            drop_key(entry.key);
+        }
         const auto match = std::find_if(folded.begin(), folded.end(), [&](const record & cur) {
             return cur.key == entry.key && cur.host_file == entry.host_file;
         });
@@ -660,24 +697,28 @@ inline bool append(const std::string & store_dir, const record & value, LockHeld
     return true;
 }
 
-enum class retire_outcome { referenced, pinned, orphan_candidate };
+enum class retire_outcome { retired, pinned, referenced, orphan_candidate };
 
 // Pure decision input: only the journal and the host files currently present.
+// A retired record is terminal for the key and wins over every other record.
 // A committed or pinned record keeps the key referenced even when the host
 // file was evicted: losing the host file must never imply losing the Xbox
 // object. A pending record whose host file is still present also counts as
 // referenced (crash between publication and the committed append). Only keys
-// with no committed/pinned record and no surviving host file are candidates,
-// and even then the caller performs no remote delete.
+// with no retired/committed/pinned record and no surviving host file are
+// candidates, and even then the caller performs no remote delete.
 inline retire_outcome retire_decision(const std::string & key, const std::vector<record> & journal,
         const std::set<std::string> & host_files) {
     const std::string normalized = normalize_key(key);
+    bool has_retired  = false;
     bool has_pinned  = false;
     bool has_committed = false;
     bool pending_with_host = false;
     for (const auto & entry : journal) {
         if (entry.key != normalized) continue;
-        if (entry.st == state::pinned) {
+        if (entry.st == state::retired) {
+            has_retired = true;
+        } else if (entry.st == state::pinned) {
             has_pinned = true;
         } else if (entry.st == state::committed) {
             has_committed = true;
@@ -685,7 +726,9 @@ inline retire_outcome retire_decision(const std::string & key, const std::vector
             pending_with_host = true;
         }
     }
-    // A pin is the strongest reference and must win regardless of record order.
+    // A retirement removes the key's remote object; a pin cannot override it.
+    if (has_retired) return retire_outcome::retired;
+    // A pin is the strongest live reference and must win regardless of order.
     if (has_pinned) return retire_outcome::pinned;
     if (has_committed) return retire_outcome::referenced;
     return pending_with_host ? retire_outcome::referenced : retire_outcome::orphan_candidate;
@@ -693,11 +736,90 @@ inline retire_outcome retire_decision(const std::string & key, const std::vector
 
 inline const char * retire_name(retire_outcome decision) {
     switch (decision) {
+        case retire_outcome::retired:           return "retired";
         case retire_outcome::referenced:        return "referenced";
         case retire_outcome::pinned:            return "pinned";
         case retire_outcome::orphan_candidate:  return "orphan_candidate";
     }
     return "unknown";
+}
+
+enum class retire_refusal { none, invalid_key, unknown_key, pending, pinned, already_retired };
+
+inline const char * retire_refusal_name(retire_refusal refusal) {
+    switch (refusal) {
+        case retire_refusal::none:            return "none";
+        case retire_refusal::invalid_key:     return "invalid_key";
+        case retire_refusal::unknown_key:     return "unknown_key";
+        case retire_refusal::pending:         return "pending";
+        case retire_refusal::pinned:          return "pinned";
+        case retire_refusal::already_retired: return "already_retired";
+    }
+    return "unknown";
+}
+
+// Pure plan for `llama-native-refs retire`. It never mutates anything. A key
+// with a pending record is refused because its publication is not complete;
+// a pinned key requires the explicit --force-pinned override. `host_files`
+// lists every host file the journal still names for the key (the CLI verifies
+// and removes them before appending). A retired key is already converged;
+// the CLI may still remove a leftover host file but must not append again.
+struct retire_plan {
+    retire_refusal refusal = retire_refusal::none;
+    bool execute = false;
+    std::vector<std::string> host_files;
+    record entry;               // valid when execute; host_file is the last name
+};
+
+inline retire_plan plan_retire(const std::string & key, const std::vector<record> & journal,
+        bool force_pinned, const std::string & timestamp) {
+    retire_plan out;
+    const std::string normalized = normalize_key(key);
+    out.entry.st        = state::retired;
+    out.entry.key       = normalized;
+    out.entry.n_tokens  = 0;
+    out.entry.split_p   = 0;
+    out.entry.native    = true;
+    out.entry.timestamp = timestamp;
+    out.entry.src       = source::retired;
+    if (!is_hex_key(normalized)) {
+        out.refusal = retire_refusal::invalid_key;
+        return out;
+    }
+    bool known = false;
+    bool has_retired = false;
+    bool has_pending = false;
+    bool has_pinned = false;
+    std::set<std::string> host_files;
+    for (const auto & entry : journal) {
+        if (entry.key != normalized) continue;
+        known = true;
+        if (entry.st == state::retired) has_retired = true;
+        if (entry.st == state::pending) has_pending = true;
+        if (entry.st == state::pinned)  has_pinned = true;
+        if (!entry.host_file.empty()) host_files.insert(entry.host_file);
+    }
+    if (!known) {
+        out.refusal = retire_refusal::unknown_key;
+        return out;
+    }
+    if (has_retired) {
+        out.refusal = retire_refusal::already_retired;
+        out.host_files.assign(host_files.begin(), host_files.end());
+        return out;
+    }
+    if (has_pending) {
+        out.refusal = retire_refusal::pending;
+        return out;
+    }
+    if (has_pinned && !force_pinned) {
+        out.refusal = retire_refusal::pinned;
+        return out;
+    }
+    out.execute = true;
+    out.host_files.assign(host_files.begin(), host_files.end());
+    out.entry.host_file = out.host_files.empty() ? std::string() : out.host_files.back();
+    return out;
 }
 
 struct host_key {
@@ -708,6 +830,7 @@ struct host_key {
 struct audit_report {
     std::vector<std::string> referenced;      // committed reference (host file may be gone)
     std::vector<std::string> pinned;          // migrated pin
+    std::vector<std::string> retired;         // operator retired, remote object removed
     std::vector<std::string> pending_only;    // only pending records, no live host file
     std::vector<std::string> orphan_candidates;
     std::vector<std::string> unregistered_host_files; // host file key missing from the journal
@@ -729,6 +852,7 @@ inline audit_report audit(const std::vector<record> & journal, const std::vector
     }
     for (const auto & key : keys) {
         switch (retire_decision(key, journal, host_present)) {
+            case retire_outcome::retired:          out.retired.push_back(key); break;
             case retire_outcome::pinned:           out.pinned.push_back(key); break;
             case retire_outcome::referenced:       out.referenced.push_back(key); break;
             case retire_outcome::orphan_candidate: {
@@ -754,17 +878,22 @@ inline audit_report audit(const std::vector<record> & journal, const std::vector
 struct migration {
     std::vector<record> pins;
     std::vector<std::string> already_pinned;
+    std::vector<std::string> retired;   // terminal until a new save re-references the key
     std::vector<std::string> invalid;
 };
 
 // Build pinned/migrated records for explicit keys. Existing pins are not
-// duplicated, so re-running the migration is idempotent. Nothing here writes.
+// duplicated, and a retired key is never re-pinned: retirement removed the
+// remote object, so only a real save may establish a new reference. Nothing
+// here writes.
 inline migration plan_migration(const std::vector<std::string> & keys,
         const std::vector<record> & journal, const std::string & timestamp) {
     migration out;
     std::set<std::string> pinned;
+    std::set<std::string> retired;
     for (const auto & entry : journal) {
         if (entry.st == state::pinned) pinned.insert(entry.key);
+        if (entry.st == state::retired) retired.insert(entry.key);
     }
     std::set<std::string> seen;
     for (const auto & raw : keys) {
@@ -774,6 +903,10 @@ inline migration plan_migration(const std::vector<std::string> & keys,
             continue;
         }
         if (!seen.insert(key).second) continue;
+        if (retired.count(key)) {
+            out.retired.push_back(key);
+            continue;
+        }
         if (pinned.count(key)) {
             out.already_pinned.push_back(key);
             continue;

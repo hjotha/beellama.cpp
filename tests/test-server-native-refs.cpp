@@ -27,6 +27,7 @@ namespace {
 const char * const kKeyA = "3c1ac4014f51a0ff550c3e1346463623140e22f8c9a21bba80ff66d6b09fc582";
 const char * const kKeyB = "fff30e532caeac47750f17351664f3b392ffdafc0801514d09395c5326bee09a";
 const char * const kKeyC = "ef1c05ae42b5d79406ba3cc48b15f8107049a5c07e76339b23ad9fd96b972dd7";
+const char * const kKeyD = "1111111111111111111111111111111111111111111111111111111111111111";
 const char * const kTime = "2026-11-01T00:00:00Z";
 
 refs::record make_record(const std::string & key, const std::string & host, refs::state st,
@@ -40,6 +41,19 @@ refs::record make_record(const std::string & key, const std::string & host, refs
     entry.native    = true;
     entry.timestamp = kTime;
     entry.src       = src;
+    return entry;
+}
+
+refs::record make_retired(const std::string & key, const std::string & host) {
+    refs::record entry;
+    entry.st        = refs::state::retired;
+    entry.key       = key;
+    entry.host_file = host;
+    entry.n_tokens  = 0;
+    entry.split_p   = 0;
+    entry.native    = true;
+    entry.timestamp = kTime;
+    entry.src       = refs::source::retired;
     return entry;
 }
 
@@ -82,6 +96,15 @@ void test_serialize_roundtrip() {
     assert(refs::parse_line(refs::to_json(pinned), pinned_parsed, &error));
     assert(pinned_parsed.st == refs::state::pinned && pinned_parsed.src == refs::source::migrated);
 
+    auto retired = make_retired(kKeyC, "slot-c.bin");
+    assert(refs::valid_record(retired, &error));
+    refs::record retired_parsed;
+    assert(refs::parse_line(refs::to_json(retired), retired_parsed, &error));
+    assert(retired_parsed.st == refs::state::retired);
+    assert(retired_parsed.src == refs::source::retired);
+    assert(retired_parsed.host_file == "slot-c.bin");
+    assert(retired_parsed.n_tokens == 0 && retired_parsed.split_p == 0);
+
     // Invalid encodings are refused.
     auto bad = make_record("not-a-key", "x.bin", refs::state::pending);
     assert(!refs::valid_record(bad, &error));
@@ -90,6 +113,13 @@ void test_serialize_roundtrip() {
     bad = make_record(kKeyA, "x.bin", refs::state::pinned, refs::source::migrated);
     assert(!refs::valid_record(bad, &error));
     bad = make_record(kKeyA, "x.bin", refs::state::pending, refs::source::migrated);
+    assert(!refs::valid_record(bad, &error));
+    // The retired state has its own source and no token geometry.
+    bad = make_record(kKeyA, "x.bin", refs::state::retired, refs::source::explicit_save);
+    assert(!refs::valid_record(bad, &error));
+    bad = make_record(kKeyA, "x.bin", refs::state::retired, refs::source::retired);
+    assert(!refs::valid_record(bad, &error));
+    bad = make_record(kKeyA, "x.bin", refs::state::committed, refs::source::retired);
     assert(!refs::valid_record(bad, &error));
 }
 
@@ -276,8 +306,118 @@ void test_host_removal_and_retire(const fs::path & root) {
     assert(refs::retire_decision(kKeyA, pinned_and_committed, {}) == refs::retire_outcome::pinned);
 }
 
-void test_migration() {
-    std::vector<std::string> keys(refs::kBaselineKeys.begin(), refs::kBaselineKeys.end());
+void test_retired_fold_and_decision() {
+    const auto committed = make_record(kKeyA, "a.bin", refs::state::committed);
+    const auto pin = make_record(kKeyA, "", refs::state::pinned, refs::source::migrated);
+    const auto retired = make_retired(kKeyA, "a.bin");
+
+    // A retired record supersedes committed and pinned records for the key.
+    std::vector<refs::record> folded = refs::fold_records({committed, pin, retired});
+    assert(folded.size() == 1);
+    assert(folded.front().st == refs::state::retired);
+    assert(refs::retire_decision(kKeyA, folded, {"a.bin"}) == refs::retire_outcome::retired);
+    assert(refs::retire_decision(kKeyA, folded, {}) == refs::retire_outcome::retired);
+
+    // Append order is operation order: a later committed record is a re-save
+    // and clears the retirement again.
+    folded = refs::fold_records({committed, retired, committed});
+    assert(folded.size() == 1 && folded.front().st == refs::state::committed);
+    assert(refs::retire_decision(kKeyA, folded, {}) == refs::retire_outcome::referenced);
+
+    // A later pin is an explicit re-reference.
+    folded = refs::fold_records({retired, pin});
+    assert(folded.size() == 1 && folded.front().st == refs::state::pinned);
+    assert(refs::retire_decision(kKeyA, folded, {}) == refs::retire_outcome::pinned);
+
+    // A pending record after retirement is a save in flight: conservative
+    // referenced with its host file present, candidate otherwise.
+    const auto pending = make_record(kKeyA, "b.bin", refs::state::pending);
+    folded = refs::fold_records({retired, pending});
+    assert(folded.size() == 1 && folded.front().st == refs::state::pending);
+    assert(refs::retire_decision(kKeyA, folded, {"b.bin"}) == refs::retire_outcome::referenced);
+    assert(refs::retire_decision(kKeyA, folded, {}) == refs::retire_outcome::orphan_candidate);
+
+    // Retiring one key never affects another key's records.
+    folded = refs::fold_records({committed, make_retired(kKeyB, "b.bin")});
+    assert(folded.size() == 2);
+    assert(refs::retire_decision(kKeyA, folded, {}) == refs::retire_outcome::referenced);
+    assert(refs::retire_decision(kKeyB, folded, {}) == refs::retire_outcome::retired);
+    assert(refs::retire_decision(kKeyC, folded, {}) == refs::retire_outcome::orphan_candidate);
+}
+
+void test_plan_retire() {
+    const auto committed = make_record(kKeyA, "a.bin", refs::state::committed);
+    const auto pin = make_record(kKeyA, "", refs::state::pinned, refs::source::migrated);
+    const auto pending = make_record(kKeyA, "a.bin", refs::state::pending);
+    const auto retired = make_retired(kKeyA, "a.bin");
+
+    refs::retire_plan plan = refs::plan_retire("not-a-key", {}, false, kTime);
+    assert(plan.refusal == refs::retire_refusal::invalid_key && !plan.execute);
+
+    plan = refs::plan_retire(kKeyA, {}, false, kTime);
+    assert(plan.refusal == refs::retire_refusal::unknown_key && !plan.execute);
+
+    plan = refs::plan_retire(kKeyA, {pending}, false, kTime);
+    assert(plan.refusal == refs::retire_refusal::pending && !plan.execute);
+
+    plan = refs::plan_retire(kKeyA, {pin}, false, kTime);
+    assert(plan.refusal == refs::retire_refusal::pinned && !plan.execute);
+    plan = refs::plan_retire(kKeyA, {pin}, true, kTime);
+    assert(plan.refusal == refs::retire_refusal::none && plan.execute);
+    assert(plan.host_files.empty() && plan.entry.host_file.empty());
+    assert(plan.entry.st == refs::state::retired && plan.entry.src == refs::source::retired);
+    assert(plan.entry.key == kKeyA && plan.entry.n_tokens == 0 && plan.entry.split_p == 0);
+    assert(plan.entry.timestamp == kTime);
+
+    plan = refs::plan_retire(kKeyA, {committed, pin}, true, kTime);
+    assert(plan.execute && plan.host_files.size() == 1 && plan.host_files.front() == "a.bin");
+    assert(plan.entry.host_file == "a.bin");
+
+    plan = refs::plan_retire(kKeyA, {retired}, false, kTime);
+    assert(plan.refusal == refs::retire_refusal::already_retired && !plan.execute);
+    assert(plan.host_files.size() == 1 && plan.host_files.front() == "a.bin");
+    assert(plan.entry.key == kKeyA);
+
+    // A committed record appended after retirement reopens the key.
+    plan = refs::plan_retire(kKeyA, refs::fold_records({retired, committed}), false, kTime);
+    assert(plan.refusal == refs::retire_refusal::none && plan.execute);
+
+    // Uppercase input is normalized.
+    std::string upper(kKeyA);
+    for (char & c : upper) {
+        if (c >= 'a' && c <= 'f') c = char(c - 'a' + 'A');
+    }
+    plan = refs::plan_retire(upper, {committed}, false, kTime);
+    assert(plan.execute && plan.entry.key == kKeyA);
+}
+
+void test_retired_journal(const fs::path & root) {
+    const fs::path store = root / "retired-journal";
+    fs::create_directories(store);
+    const fs::path host = store / "a.bin";
+    write_text(host, "host-state");
+    server_route_state_store_lock lock(store.string());
+    assert(lock.acquired());
+    const auto held = [&lock](const std::string & path) { return lock.owns_exclusive_for(path); };
+    std::string error;
+    assert(refs::append(store.string(),
+            make_record(kKeyA, host.filename().string(), refs::state::committed), held, &error));
+    const auto retired = make_retired(kKeyA, host.filename().string());
+    assert(refs::valid_record(retired, &error));
+    assert(refs::append(store.string(), retired, held, &error));
+    lock.release();
+
+    fs::remove(host);
+    const refs::load_result loaded = refs::load(refs::journal_path(store.string()));
+    assert(loaded.ok && loaded.raw.size() == 2 && loaded.records.size() == 1);
+    assert(loaded.records.front().st == refs::state::retired);
+    assert(refs::retire_decision(kKeyA, loaded.records, {}) == refs::retire_outcome::retired);
+
+    const refs::retire_plan again = refs::plan_retire(kKeyA, loaded.records, false, kTime);
+    assert(again.refusal == refs::retire_refusal::already_retired && !again.execute);
+}
+
+void test_migration() {    std::vector<std::string> keys(refs::kBaselineKeys.begin(), refs::kBaselineKeys.end());
     assert(keys.size() == 7);
     for (const auto & key : keys) {
         assert(refs::is_hex_key(key));
@@ -301,6 +441,13 @@ void test_migration() {
     const refs::migration pinned_committed = refs::plan_migration({kKeyB},
             {make_record(kKeyB, "b.bin", refs::state::committed)}, kTime);
     assert(pinned_committed.pins.size() == 1);
+
+    // A retired key is never re-pinned: the remote object is gone until a real
+    // save re-references it.
+    const refs::migration retired = refs::plan_migration({kKeyA},
+            {make_retired(kKeyA, "a.bin")}, kTime);
+    assert(retired.pins.empty() && retired.already_pinned.empty());
+    assert(retired.retired.size() == 1 && retired.retired.front() == kKeyA);
 }
 
 void test_migration_writes(const fs::path & root) {
@@ -330,15 +477,18 @@ void test_audit() {
         make_record(kKeyA, "", refs::state::pinned, refs::source::migrated),
         make_record(kKeyB, "b.bin", refs::state::committed),
         make_record(kKeyC, "gone.bin", refs::state::pending, refs::source::auto_save),
+        make_retired(kKeyD, "d.bin"),
     };
     const std::vector<refs::host_key> hosts = {
         {"b.bin", kKeyB},
-        {"new.bin", "1111111111111111111111111111111111111111111111111111111111111111"},
+        {"d.bin", kKeyD},
+        {"new.bin", "2222222222222222222222222222222222222222222222222222222222222222"},
         {"unreadable.bin", ""},
     };
     const refs::audit_report report = refs::audit(journal, hosts);
     assert(report.pinned.size() == 1 && report.pinned.front() == kKeyA);
     assert(report.referenced.size() == 1 && report.referenced.front() == kKeyB);
+    assert(report.retired.size() == 1 && report.retired.front() == kKeyD);
     assert(report.pending_only.size() == 1 && report.pending_only.front() == kKeyC);
     assert(report.orphan_candidates.empty());
     assert(report.unregistered_host_files.size() == 1 &&
@@ -352,6 +502,7 @@ void test_audit() {
     const refs::audit_report present = refs::audit(journal, with_gone);
     assert(present.pending_only.empty());
     assert(present.referenced.size() == 2);
+    assert(present.retired.size() == 1);
 
     // Without the pending host file the key is explicitly only pending.
     const refs::audit_report absent = refs::audit(journal, hosts);
@@ -378,6 +529,9 @@ int main() {
     test_append_load_and_lock(root);
     test_corruption(root);
     test_host_removal_and_retire(root);
+    test_retired_fold_and_decision();
+    test_plan_retire();
+    test_retired_journal(root);
     test_migration();
     test_migration_writes(root);
     test_audit();

@@ -126,6 +126,21 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-native-refs-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-native-retire-wdp
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-native-retire-wdp.py)
+    set_tests_properties(test-native-retire-wdp PROPERTIES LABELS main TIMEOUT 30)
+
+    if (LLAMA_BUILD_TOOLS)
+        add_test(
+            NAME test-native-refs-retire-cli
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-native-refs-retire-cli.py
+                $<TARGET_FILE:llama-native-refs>)
+        set_tests_properties(test-native-refs-retire-cli PROPERTIES LABELS main TIMEOUT 120)
+    endif()
+
+    add_test(
         NAME test-spec-cession-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-spec-cession-static.py)

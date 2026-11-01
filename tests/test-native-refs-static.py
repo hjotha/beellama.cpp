@@ -83,6 +83,16 @@ def main() -> None:
     ):
         require(needle in refs, f"baseline pinned key is missing: {needle}")
 
+    # The host CLI retires the local side only. The WDP delete is a separate
+    # operator tool; the CLI must have no network path and must default to a
+    # dry run.
+    cli = (ROOT / "tools/native-refs/native-refs.cpp").read_text(encoding="utf-8")
+    require("bool execute = false;" in cli,
+            "llama-native-refs retire must default to dry-run")
+    for needle in ("http://", "https://", "XBOX_IP", "urllib", "socket"):
+        require(needle not in cli,
+                f"llama-native-refs must not contain a network/remote path: {needle}")
+
     print("PASS: native reference journal is written by the shared publisher under the store lock")
 
 

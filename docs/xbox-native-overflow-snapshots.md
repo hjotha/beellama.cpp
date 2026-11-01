@@ -124,6 +124,20 @@ safe. A reference-aware lifecycle/reconciliation mechanism remains necessary.
 The file flushes and rename are not proof of durable cross-device atomicity
 after power loss.
 
+Explicit per-key retirement is available for operator cleanup:
+`tools/xbox/scripts/native-retire.py` deletes exactly one
+`rkva-snapshots-v2/<key>` folder through WDP and then runs
+`llama-native-refs retire --store <slot-save-path> --key <key> --execute` on
+the host. The app must already be stopped; the tool does not stop it. The host
+step removes the verified host file first and appends a `retired` journal
+record second, under the exclusive store lock. The Xbox delete and the host
+append are not one transaction, so a crash between them leaves the remote object
+gone while the journal still says committed/pinned; rerunning the host CLI
+converges. This is an explicit operator action, not automatic retention, and it
+does not provide a lease against an app that starts mid-operation. `audit`
+reports retired keys separately from pinned, committed, pending and orphan
+candidates.
+
 The snapshot is bound to the SHA-256 of the complete host prefix through the
 end of the RKVK frame (server header, token IDs, local KV/recurrent state and
 the native trailer), the exact geometry/descriptor, the live row count and the
