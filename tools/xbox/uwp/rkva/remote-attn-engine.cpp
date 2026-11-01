@@ -292,6 +292,13 @@ struct RemoteAttnEngine::Session {
     std::vector<rkva_kvarn_range::prefix_coverage> prefix_coverage;
     uint64_t native_generation = 0;
     std::vector<uint32_t> range_counts; // per layer; never share a high-water mark
+#if defined(XLLAMA_QUAL_PROBE)
+    // Host prefix key observed on a successful native SAVE/RESTORE. The engine
+    // has no other source for it; without such a request the probe reports the
+    // key unavailable instead of guessing.
+    bool qual_has_host_state = false;
+    std::array<uint8_t, 32> qual_host_state{};
+#endif
 
     std::vector<Buffer> layer_kv; // 1 committed buffer per layer slot
     uint64_t kv_bytes = 0;
@@ -2124,6 +2131,64 @@ uint64_t RemoteAttnEngine::native_range_generation(uint32_t id) const {
     const Session* s = find_session(id);
     return s && s->range_configured && s->range_storage == 3 ? s->native_generation : 0;
 }
+
+#if defined(XLLAMA_QUAL_PROBE)
+bool RemoteAttnEngine::qual_resident_state(uint32_t id, qual_resident_state& out,
+                                           std::string& error) const {
+    out = qual_resident_state{};
+    error.clear();
+    const Session* s = find_session(id);
+    if (!ready_ || !s) {
+        error = "no ready engine/session for the requested id";
+        return false;
+    }
+    if (!s->valid) {
+        error = "session is invalid after a failed GPU or restore step";
+        return false;
+    }
+    if (!s->range_configured || s->range_storage != 3 ||
+        !rkva_kvarn_range::serial_prefix(s->range_descriptor)) {
+        error = "session is not a revision-3 native KVarN range session";
+        return false;
+    }
+    out.session_id = s->id;
+    out.geometry = geo_;
+    out.descriptor = s->range_descriptor;
+    out.generation = s->native_generation;
+    out.unconfirmed_submission = unconfirmed_submission_;
+    out.has_prefix_key = s->qual_has_host_state;
+    out.prefix_key = s->qual_host_state;
+    out.has_fence = bool(fence_);
+    if (fence_) {
+        out.submitted_fence = fence_value_;
+        out.completed_fence = fence_->GetCompletedValue();
+    }
+    const size_t layers = s->layer_kv.size();
+    if (!layers || s->range_counts.size() != layers || s->prefix_coverage.size() != layers) {
+        error = "per-layer coverage/count arrays are not complete";
+        return false;
+    }
+    out.layers.resize(layers);
+    uint32_t rows = 0;
+    bool same_rows = true;
+    for (size_t i = 0; i < layers; ++i) {
+        out.layers[i].tail_begin = s->prefix_coverage[i].tail_begin;
+        out.layers[i].stage_begin = s->prefix_coverage[i].stage_begin;
+        out.layers[i].live_rows = s->range_counts[i];
+        if (i == 0)
+            rows = s->range_counts[i];
+        else if (s->range_counts[i] != rows)
+            same_rows = false;
+    }
+    if (!same_rows || !rows) {
+        error = "per-layer live rows differ; there is no single evaluated checkpoint";
+        return false;
+    }
+    out.live_rows = rows;
+    return true;
+}
+#endif
+
 
 // Atomic all-layer bounded rewind. Two stage ping-pong groups retain every
 // prefix row needed after <=128 removals; removed suffix rows are masked by

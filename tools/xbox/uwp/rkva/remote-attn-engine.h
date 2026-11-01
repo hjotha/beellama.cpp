@@ -35,6 +35,10 @@
 #include <string>
 #include <vector>
 
+#if defined(XLLAMA_QUAL_PROBE)
+#include <array>
+#endif
+
 namespace rkva_rprof {
 struct Sample;
 struct BulkEnvelopeSample;
@@ -62,6 +66,35 @@ class RemoteAttnEngine {
     };
 
     using InitTimings = rkva_hello_telemetry::InitTimings;
+
+#if defined(XLLAMA_QUAL_PROBE)
+    // Test-only, read-only view of one live revision-3 session for the
+    // qualification probe. Every field comes from resident engine state; the
+    // caller must not treat this as authenticated evidence by itself.
+    struct qual_layer {
+        uint32_t tail_begin = 0;
+        uint32_t stage_begin = 0;
+        uint32_t live_rows = 0;
+    };
+    struct qual_resident_state {
+        uint32_t session_id = 0;
+        uint32_t live_rows = 0;
+        uint64_t generation = 0;
+        uint64_t submitted_fence = 0;
+        uint64_t completed_fence = 0;
+        bool has_fence = false;
+        bool has_prefix_key = false;
+        bool unconfirmed_submission = false;
+        std::array<uint8_t, 32> prefix_key{};
+        Geometry geometry{};
+        rkva_kvarn_range_config descriptor{};
+        std::vector<qual_layer> layers;
+    };
+    // Copies CPU-side session fields only: no wait, submit, signal or mutation.
+    // Returns false with an exact reason when the id is not a live revision-3
+    // session or no single checkpoint exists; partial fields are still filled.
+    bool qual_resident_state(uint32_t id, qual_resident_state& out, std::string& error) const;
+#endif
 
     RemoteAttnEngine();
     ~RemoteAttnEngine();

@@ -401,6 +401,13 @@ bool RemoteAttnEngine::disk_snapshot(uint32_t id, const std::string& local_folde
             ack->live_rows = rows;
             ack->n_layers = geo_.n_layers;
             ack->disk_bytes = ack_payload_bytes;
+#if defined(XLLAMA_QUAL_PROBE)
+            // The host prefix key is only known from this request. Retain it
+            // after the SAVE/RESTORE succeeds so the qualification probe can
+            // report the real RKVK key; never synthesize one.
+            s->qual_has_host_state = true;
+            std::memcpy(s->qual_host_state.data(), request.host_state_sha256, 32);
+#endif
             native_ack->payload_checksum =
                 uint64_t(checksum[0]) | (uint64_t(checksum[1]) << 8) |
                 (uint64_t(checksum[2]) << 16) | (uint64_t(checksum[3]) << 24) |

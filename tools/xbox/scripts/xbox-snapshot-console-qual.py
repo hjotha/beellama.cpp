@@ -377,6 +377,11 @@ def classify_probe_result(done_text, response_present, response_document):
     if text == 'ok':
         if not response_present or not isinstance(response_document, dict):
             return 'BLOCKED', 'app completed but wrote no probe response (probe not implemented)'
+        if response_document.get('status') in ('unavailable', 'refused'):
+            # The test-only probe ran and named the exact real-state gap. That
+            # is evidence, but it is BLOCKED, never PASS.
+            return 'BLOCKED', str(response_document.get('reason') or
+                                  response_document.get('status'))
         return 'READY', ''
     if any(marker in lowered for marker in (
             'unknown', 'unrecognized', 'unsupported', 'not implemented',
@@ -474,20 +479,90 @@ def load_expect(path):
     document = read_json(path)
     if not isinstance(document, dict):
         raise RuntimeError('expect file is not an object')
+    schema = document.get('schema')
+    if schema is not None and schema != 'rkva-host-expect-v1':
+        raise RuntimeError('expect.schema is not rkva-host-expect-v1')
+    unavailable = document.get('unavailable')
+    if unavailable is None:
+        unavailable = {}
+    if not isinstance(unavailable, dict):
+        raise RuntimeError('expect.unavailable is not an object')
     required = {
         'session_id': int, 'rows': int, 'generation': int,
         'host_key_sha256': str, 'prefix_sha256': str,
     }
     for key, kind in required.items():
-        if type(document.get(key)) is not kind:
+        value = document.get(key)
+        if value is None:
+            # A real host state may not carry a field (today: the console
+            # session id). It must be named in `unavailable`; it is never
+            # replaced by a zero or a plausible-looking value.
+            if key not in unavailable:
+                raise RuntimeError(f'expect.{key} is null without an exact reason')
+            continue
+        if type(value) is not kind:
             raise RuntimeError(f'expect.{key} missing or wrong type')
     for key in ('host_key_sha256', 'prefix_sha256'):
-        if not HEX64.fullmatch(document[key]):
+        value = document.get(key)
+        if value is not None and not HEX64.fullmatch(value):
             raise RuntimeError(f'expect.{key} is not a lowercase 32-byte digest')
     for key in ('session_id', 'rows', 'generation'):
-        if document[key] <= 0:
+        value = document.get(key)
+        if value is not None and value <= 0:
             raise RuntimeError(f'expect.{key} must be positive')
+    declared = document.get('expectation_available')
+    if declared is True and expectation_gaps(document):
+        raise RuntimeError('expect claims availability but a required field is unavailable')
+    if declared is False and not unavailable:
+        raise RuntimeError('expect is unavailable without an exact reason')
     return document
+
+
+def expectation_gaps(expect):
+    """Return the exact reasons a host expectation cannot authorize PASS."""
+    gaps = []
+    unavailable = expect.get('unavailable') if isinstance(expect.get('unavailable'), dict) else {}
+    for key in ('session_id', 'rows', 'generation', 'host_key_sha256', 'prefix_sha256'):
+        if expect.get(key) is None:
+            gaps.append(key + ': ' + str(unavailable.get(key, 'not supplied by the host')))
+    if expect.get('expectation_available') is False:
+        for key, reason in unavailable.items():
+            if key not in ('session_id', 'rows', 'generation',
+                           'host_key_sha256', 'prefix_sha256'):
+                gaps.append(str(key) + ': ' + str(reason))
+        if not gaps:
+            gaps.append('host expectation is explicitly unavailable')
+    return gaps
+
+
+def probe_blocking_reason(document, require_mac):
+    """Return the app's exact reason this evidence cannot be PASS, or ''."""
+    if not isinstance(document, dict):
+        return 'probe wrote no JSON evidence'
+    if document.get('status') in ('unavailable', 'refused'):
+        return str(document.get('reason') or document.get('status'))
+    build = document.get('build')
+    if not isinstance(build, dict):
+        return 'probe evidence has no build object'
+    if build.get('phase3_linked') is not True or build.get('phase4_linked') is not True:
+        return ('the Phase 3/4 libraries are not linked into the app build; compile macros '
+                'alone are not managed-capability evidence')
+    if build.get('managed_caps_negotiated') is not True:
+        return str(build.get('caps_status') or
+                   'the app advertises no managed capability, so nothing can be negotiated')
+    attestation = document.get('attestation')
+    if not isinstance(attestation, dict):
+        return 'probe evidence has no attestation object'
+    fields = attestation.get('unavailable_fields')
+    if isinstance(fields, dict):
+        required = ['session_id', 'live_rows', 'generation', 'submitted_fence',
+                    'completed_fence', 'host_key_sha256', 'prefix_sha256']
+        if require_mac:
+            required += ['coverage_mac', 'metadata_sha256']
+        present = [key for key in required if key in fields]
+        if present:
+            return '; '.join(f'{key}: {fields[key]}' for key in present)
+    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +901,9 @@ class Runner:
 
     def attestation(self):
         expect = load_expect(self.args.expect)
+        host_gaps = expectation_gaps(expect)
+        if host_gaps:
+            self.result['scenario_details']['attest-host-expect'] = '; '.join(host_gaps)
         cases = []
         positive = {
             'schema': SCHEMAS['attest'],
@@ -837,9 +915,14 @@ class Runner:
         }
         status, detail, document = self.probe('positive', positive, self.args.probe_timeout)
         if status == 'READY':
-            failures = validate_attest_evidence(document, positive)
-            status = 'PASS' if not failures else 'FAILED'
-            detail = '; '.join(failures)
+            blocking = probe_blocking_reason(document, require_mac=True)
+            if blocking or host_gaps:
+                status = 'BLOCKED'
+                detail = '; '.join([part for part in (blocking, *host_gaps) if part])
+            else:
+                failures = validate_attest_evidence(document, positive)
+                status = 'PASS' if not failures else 'FAILED'
+                detail = '; '.join(failures)
         self.result['scenario_results']['attest-positive'] = status
         self.result['scenario_details']['attest-positive'] = detail
         cases.append(status)
@@ -850,9 +933,14 @@ class Runner:
         repeat = dict(positive, probe_id=os.urandom(16).hex(), case='repeat')
         status, detail, document = self.probe('repeat', repeat, self.args.probe_timeout)
         if status == 'READY':
-            failures = validate_attest_evidence(document, repeat)
-            status = 'PASS' if not failures else 'FAILED'
-            detail = '; '.join(failures)
+            blocking = probe_blocking_reason(document, require_mac=True)
+            if blocking:
+                status = 'BLOCKED'
+                detail = blocking
+            else:
+                failures = validate_attest_evidence(document, repeat)
+                status = 'PASS' if not failures else 'FAILED'
+                detail = '; '.join(failures)
         self.result['scenario_results']['attest-repeat'] = status
         self.result['scenario_details']['attest-repeat'] = detail
         cases.append(status)
@@ -860,14 +948,42 @@ class Runner:
                         negative=True)
         status, detail, document = self.probe('negative', negative, self.args.probe_timeout)
         if status == 'READY':
-            failures = validate_attest_negative(document, negative)
-            status = 'PASS' if not failures else 'FAILED'
-            detail = '; '.join(failures)
+            blocking = probe_blocking_reason(document, require_mac=False)
+            if blocking:
+                status = 'BLOCKED'
+                detail = blocking
+            else:
+                failures = validate_attest_negative(document, negative)
+                status = 'PASS' if not failures else 'FAILED'
+                detail = '; '.join(failures)
         self.result['scenario_results']['attest-negative'] = status
         self.result['scenario_details']['attest-negative'] = detail
         cases.append(status)
         self.result['scenario_results']['attest'] = aggregate_status(
             [s for s in cases if s != 'PASS'] or ['PASS'])
+
+    def durability_fault(self):
+        """Invoke the test-only staging/fault selector and record its answer.
+
+        The current app-side selector refuses every real seam because the v3
+        writer is fail-closed. That refusal is BLOCKED evidence, never PASS.
+        """
+        request = {
+            'schema': SCHEMAS['durability'],
+            'probe_id': os.urandom(16).hex(),
+            'case': 'durability-fault-chunk-sync',
+            'fault': {'kind': 'sync_file', 'target': 'staging', 'chunk': 3},
+        }
+        status, detail, document = self.probe(
+            'durability-fault-chunk-sync', request, self.args.probe_timeout)
+        if status == 'READY':
+            # A validated staging result would still need its own evidence
+            # validator, which this controller does not have.
+            status = 'BLOCKED'
+            detail = ('probe returned staging evidence without a validator; '
+                      'D3 is not proven')
+        self.result['scenario_results']['durability-fault'] = status
+        self.result['scenario_details']['durability-fault'] = detail
 
     def durability(self):
         # D1: only a self-created 4 KiB file; never an existing snapshot.
@@ -900,6 +1016,7 @@ class Runner:
             return
         self.result['scenario_results']['durability-restart'] = 'PASS'
         if self.args.destructive and self.args.power_loss_method:
+            self.durability_fault()
             self.power_loss()
         else:
             self.result['scenario_results']['durability'] = 'PREREQ_ONLY'

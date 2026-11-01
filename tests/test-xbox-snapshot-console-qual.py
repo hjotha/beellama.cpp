@@ -211,6 +211,34 @@ class ProbeClassificationTests(unittest.TestCase):
         status, _ = console.classify_probe_result('', True, evidence())
         self.assertEqual(status, 'BLOCKED')
 
+    def test_unavailable_probe_is_blocked_with_exact_reason(self):
+        status, detail = console.classify_probe_result(
+            'ok', True, {'status': 'unavailable',
+                         'reason': 'no live RKVA engine: no accepted HELLO'})
+        self.assertEqual(status, 'BLOCKED')
+        self.assertIn('no live RKVA engine', detail)
+        status, detail = console.classify_probe_result(
+            'ok', True, {'status': 'refused',
+                         'reason': 'staging fault unavailable: writer closed'})
+        self.assertEqual(status, 'BLOCKED')
+        self.assertIn('writer closed', detail)
+
+    def test_unavailable_field_blocks_pass(self):
+        document = evidence()
+        document['build'].update({'phase3_linked': True, 'phase4_linked': True,
+                                  'managed_caps_negotiated': True})
+        document['attestation']['unavailable_fields'] = {
+            'coverage_mac': 'no authenticated managed session'}
+        reason = console.probe_blocking_reason(document, require_mac=True)
+        self.assertIn('coverage_mac', reason)
+
+    def test_unlinked_phase_libraries_block_pass(self):
+        document = evidence()
+        document['build'].update({'phase3_linked': False, 'phase4_linked': False,
+                                  'managed_caps_negotiated': False})
+        reason = console.probe_blocking_reason(document, require_mac=True)
+        self.assertIn('not linked', reason)
+
 
 class IdentityTests(unittest.TestCase):
     def test_pin_must_match_out_of_band_value(self):
@@ -349,6 +377,25 @@ class ExpectFileTests(unittest.TestCase):
                 path.write_text(json.dumps(document))
                 with self.assertRaises(RuntimeError):
                     console.load_expect(path)
+
+    def test_partial_host_expect_is_accepted_but_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'expect.json'
+            document = dict(EXPECT, schema='rkva-host-expect-v1', session_id=None,
+                            expectation_available=False,
+                            unavailable={'session_id': 'not stored by the host attempt'})
+            path.write_text(json.dumps(document))
+            loaded = console.load_expect(path)
+            gaps = console.expectation_gaps(loaded)
+            self.assertTrue(gaps)
+            self.assertIn('session_id', gaps[0])
+
+    def test_null_without_reason_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'expect.json'
+            path.write_text(json.dumps(dict(EXPECT, session_id=None)))
+            with self.assertRaises(RuntimeError):
+                console.load_expect(path)
 
 
 class StaticSafetyTests(unittest.TestCase):

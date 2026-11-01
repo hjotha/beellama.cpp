@@ -16,6 +16,9 @@
 #include "rkva-bulk-scratch.h"
 #include "rkva-kvarn-bulk.h"
 #include "rkva-range-profile.h"
+#if defined(XLLAMA_QUAL_PROBE)
+#include "rkva-qual-probe.h"
+#endif
 
 #ifndef NOMINMAX
     #define NOMINMAX
@@ -1478,6 +1481,101 @@ void client_loop(SOCKET sock, remote_state& state, const std::string& log_path) 
     }
 }
 
+#if defined(XLLAMA_QUAL_PROBE)
+// Test-only bridge from the autopilot probe to the live listener state. Runs
+// under the same mutex as every request and reads CPU-side session fields only.
+bool qual_provider(void* context, uint32_t requested_session,
+                   rkva_qual_probe::resident_state& out, std::string& error) {
+    namespace qp = rkva_qual_probe;
+    out = qp::resident_state{};
+    auto* state = static_cast<remote_state*>(context);
+    if (!state) {
+        out.reason = "qualification provider has no listener state";
+        error = out.reason;
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (!state->engine) {
+        out.reason = "no live RKVA engine: no connection/HELLO has been accepted in this "
+                     "app process";
+        error = out.reason;
+        return false;
+    }
+    uint32_t id = requested_session;
+    if (!id) {
+        if (state->sessions.size() != 1) {
+            out.reason = "expected exactly one live RKVA session, found " +
+                         std::to_string(state->sessions.size());
+            error = out.reason;
+            return false;
+        }
+        id = state->sessions.begin()->first;
+    } else if (!state->sessions.count(id)) {
+        out.reason = "requested session " + std::to_string(id) + " is not live";
+        error = out.reason;
+        return false;
+    }
+    out.has_session_id = true;
+    out.session_id = id;
+    RemoteAttnEngine::qual_resident_state raw;
+    std::string why;
+    const bool ok = state->engine->qual_resident_state(id, raw, why);
+    out.available = ok;
+    out.reason = ok ? std::string() : why;
+    out.has_live_rows = raw.live_rows != 0;
+    out.live_rows = raw.live_rows;
+    out.has_generation = raw.generation != 0;
+    out.generation = raw.generation;
+    out.has_fence = raw.has_fence;
+    out.submitted_fence = raw.submitted_fence;
+    out.completed_fence = raw.completed_fence;
+    out.unconfirmed_submission = raw.unconfirmed_submission;
+    out.has_prefix_key = raw.has_prefix_key;
+    out.prefix_key = raw.prefix_key;
+    if (!raw.layers.empty()) {
+        out.has_coverage = true;
+        out.coverage.reserve(raw.layers.size());
+        for (const auto& layer : raw.layers)
+            out.coverage.push_back({layer.tail_begin, layer.stage_begin, layer.live_rows});
+    }
+    if (raw.geometry.n_layers) {
+        out.has_geometry = true;
+        out.geometry.n_head = raw.geometry.n_head;
+        out.geometry.n_head_kv = raw.geometry.n_head_kv;
+        out.geometry.head_dim = raw.geometry.head_dim;
+        out.geometry.head_slices = raw.geometry.head_slices;
+        out.geometry.max_ctx = raw.geometry.max_ctx;
+        out.geometry.n_layers = raw.geometry.n_layers;
+    }
+    if (raw.descriptor.layout_version == 3) {
+        out.has_descriptor = true;
+        const auto& d = raw.descriptor;
+        auto& t = out.descriptor;
+        t.origin = d.origin;
+        t.capacity = d.capacity;
+        t.storage = d.storage;
+        t.layout_version = d.layout_version;
+        t.token_group = d.token_group;
+        t.record_dim = d.record_dim;
+        t.head_dim = d.head_dim;
+        t.head_slices = d.head_slices;
+        t.key_bits = d.key_bits;
+        t.value_bits = d.value_bits;
+        t.record_bytes = d.record_bytes;
+        t.stage_groups = d.stage_groups;
+        t.tail_groups = d.tail_groups;
+        t.sink_tokens = d.sink_tokens;
+        t.precision_tail_tokens = d.precision_tail_tokens;
+        t.wht_version = d.wht_version;
+        t.domain = d.domain;
+        t.record_policy = d.record_policy;
+    }
+    if (!ok)
+        error = why;
+    return ok;
+}
+#endif
+
 // A single poisoned engine remains owned by its original worker stack. This
 // predicate is deliberately never signaled: process restart releases the OS
 // context. No busy polling, global leak registry, or repeated engine creation.
@@ -1537,6 +1635,9 @@ void serve_remote_attn(const std::string& local_folder) {
           "{\"phase\":\"listen\",\"status\":\"ready\",\"port\":" + std::to_string(port) + "}");
 
     remote_state state;
+#if defined(XLLAMA_QUAL_PROBE)
+    rkva_qual_probe::set_provider(&qual_provider, &state);
+#endif
     for (;;) {
         if (state.engine && state.engine->submission_unconfirmed())
             break;
@@ -1566,6 +1667,9 @@ void serve_remote_attn(const std::string& local_folder) {
     }
     closesocket(listener);
     WSACleanup();
+#if defined(XLLAMA_QUAL_PROBE)
+    rkva_qual_probe::set_provider(nullptr, nullptr);
+#endif
     if (state.engine && !state.engine->confirm_execution_retired()) {
         event(log_path, "{\"phase\":\"gpu_retirement\",\"status\":\"unconfirmed_engine_retained\","
                         "\"restart_required\":true}");

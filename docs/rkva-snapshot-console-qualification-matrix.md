@@ -36,10 +36,12 @@ delete snapshots or change package identity.
 
 There is **no** call site, capability, HELLO change, dispatch, listener or app
 probe for any of this in the deployed app. The controller's probe action
-(`rkva_qual_probe`) does not exist yet, so today an execute run ends with
-`BLOCKED` and the app's exact `autopilot-done.txt` error, not `PASS`.
+(`rkva_qual_probe`) is not in `main`: it exists only on
+`feat/snapshot-probe-20261101` behind the default-off compile guard
+`XLLAMA_QUAL_PROBE`. An execute run against a build without that guard still
+ends with `BLOCKED` and the app's exact `autopilot-done.txt` error, not `PASS`.
 
-## 1. Required app-side probe contract (not implemented)
+## 1. Test-only app-side probe (implemented on the probe branch, default off)
 
 The matrix rows that say PROBE require a **test-only** UWP build that adds
 exactly one autopilot action and no production capability:
@@ -48,71 +50,100 @@ exactly one autopilot action and no production capability:
 - input: `LocalState\rkva-qual\request-<hex>.json`, canonical JSON;
 - output: `LocalState\rkva-qual\response-<hex>.json`;
 - completion: the existing `autopilot-done.txt` (`ok` or `error: ...`);
-- the action must be compiled only under a test-only macro and must not be
-  advertised in HELLO or `supported_ops`;
+- the action is compiled only under `XLLAMA_QUAL_PROBE`, is absent from the
+  default MSBuild property value, and is not advertised in HELLO or
+  `supported_ops`;
 - the UWP app cannot receive process environment variables from WDP, so the
-  test action itself may set `RKVA_MANAGED_SNAPSHOT_PHASE3=1` /
+  test action sets `RKVA_MANAGED_SNAPSHOT_PHASE3=1` /
   `RKVA_MANAGED_SNAPSHOT_PHASE4=1` **only** after validating the explicit
-  `phase_flags` object in the request, and must unset them before returning.
-  A production build must not compile this action or read these variables.
+  `phase_flags` object in the request, and restores/unset them before
+  returning. A production build does not compile this action or read these
+  variables for it.
 
-Attestation response (schema `rkva-console-attest-v1`):
+The response is built from the live engine, not from the request
+(`tools/xbox/uwp/rkva/rkva-qual-probe.h`):
 
-```json
-{
-  "schema": "rkva-console-attest-v1",
-  "probe_id": "<hex>",
-  "build": {
-    "commit": "4443ba6",
-    "phase3_compiled": true, "phase3_enabled": true,
-    "phase4_compiled": true, "phase4_enabled": true,
-    "caps": ["REGISTRY_V1", "AUTH_V2", "FRAMING_V3"]
-  },
-  "attestation": {
-    "session_id": 0, "live_rows": 0, "generation": 0,
-    "submitted_fence": 0, "completed_fence": 0,
-    "host_key_sha256": "<64 hex>", "prefix_sha256": "<64 hex>",
-    "metadata_sha256": "<64 hex>", "coverage_mac": "<64 hex>",
-    "state_digest": "<64 hex>"
-  },
-  "negative": {
-    "kinds": ["generation_mismatch", "key_mismatch", "session_mismatch",
-              "prefix_mismatch", "fence_regression"],
-    "all_refused": true, "accepted_any": false,
-    "coverage_mac_emitted": false
-  }
-}
-```
+- `status` is `available`, `unavailable` or `refused`, plus an exact `reason`;
+- `attestation` carries `session_id`, `live_rows`, `generation`,
+  `submitted_fence`/`completed_fence`, per-layer
+  `coverage[{tail_begin,stage_begin,live_rows}]`, `geometry`, `descriptor`,
+  `host_key_sha256`/`prefix_sha256` (the RKVK host prefix key when the engine
+  observed it on a native SAVE/RESTORE), `geometry_sha256`,
+  `descriptor_sha256`, `coverage_sha256`, `state_digest` and
+  `metadata_sha256`;
+- any field the engine cannot prove is JSON `null` and is named in
+  `unavailable_fields` with the exact reason. No zero, sentinel or
+  request-supplied value is substituted. In particular:
+  - with no accepted RKVA connection the engine has no session, so the whole
+    attestation is `unavailable`;
+  - the host prefix key exists only after a successful native SAVE/RESTORE;
+  - `coverage_mac` is always unavailable because no authenticated managed
+    session (ATTEST HMAC key) exists in this build;
+- `build` reports the exact `XLLAMA_QUAL_COMMIT` when the build passed one,
+  the Phase 3/4 compile macros, `phase3_linked`/`phase4_linked=false` and
+  `caps=[]`; the probe never claims a capability it did not advertise;
+- the negative case (`"negative": true`) compares in-memory tampered copies of
+  the real values (generation, key, session, prefix, fence) against the same
+  comparator and reports `all_refused`/`accepted_any`; it is a policy test, not
+  proof that a live HMAC accepted or refused a wire frame.
 
-The positive document must be produced by
+A malformed request still writes a `refused` response document, so the host can
+distinguish "the probe ran and refused" from "the probe is absent". The
+controller classifies both `unavailable` and `refused` as `BLOCKED`, never
+`PASS`.
+
+The host expectation (`--expect`) is produced on the host, not by this
+controller; see `tools/xbox/scripts/rkva-host-expect.py` in section 7.
+
+The positive document must still be produced over a live session by
 `rkva_resident_attestation::make()` and
-`rkva_managed_attest_v3::make_reply/accept_reply` over a live session; the
-negative document must show the same code refusing tampered requests. A
-hand-written JSON file is not acceptable evidence: the controller cannot
-distinguish it from a probe that never ran, and both must remain non-PASS.
+`rkva_managed_attest_v3::make_reply/accept_reply`, including a nonzero coverage
+MAC. This branch does **not** do that: it reports the real resident fields and
+keeps `coverage_mac` unavailable, because no authenticated managed session or
+ATTEST HMAC key is provisioned. A hand-written JSON file is not acceptable
+evidence: the controller cannot distinguish it from a probe that never ran, and
+both remain non-PASS.
 
-The host expectation file (`--expect`) is produced by the host side, not by
-this controller:
+The host expectation file (`--expect`) is produced on the host by
+`tools/xbox/scripts/rkva-host-expect.py` from a real anchored SQLite pin
+(`pins.metadata` canonical manifest), optionally cross-checked against
+`host-journal.bin` and the published object manifest:
 
 ```json
 {
-  "session_id": 1,
+  "schema": "rkva-host-expect-v1",
+  "expectation_available": false,
+  "session_id": null,
   "rows": 4096,
   "generation": 1,
   "host_key_sha256": "<64 hex>",
-  "prefix_sha256": "<64 hex>"
+  "prefix_sha256": "<64 hex>",
+  "geometry": {"n_head": 8, "n_head_kv": 2, "head_dim": 256,
+               "head_slices": 2, "max_ctx": 4096, "n_layers": 2},
+  "descriptor": {"origin": 0, "capacity": 4096, "storage": 4,
+                 "layout_version": 3, "...": "18 fields"},
+  "layers": [{"tail_begin": 385, "stage_begin": 384,
+              "record_groups": 4, "ready": 1}],
+  "geometry_sha256": "<64 hex>",
+  "descriptor_sha256": "<64 hex>",
+  "coverage_sha256": "<64 hex>",
+  "state_digest": "<64 hex>",
+  "object": {"tx": "<64 hex>", "reference": "<64 hex>",
+             "object_id": "<64 hex>", "phase": 2},
+  "unavailable": {"session_id": "not stored by the host attempt"}
 }
 ```
 
-Today no host-side producer exists either: there is no listener, session
-authority, challenge source or authenticated COMMIT/ATTEST reply (blockers 1
-and 4). Therefore blocker 2 is blocked on **both** sides of the wire.
+The host attempt does not store the console session id or the GPU fence pair,
+so the producer emits them as `null` with an exact reason and
+`expectation_available=false`. The controller accepts that file, records the
+gaps and classifies the run `BLOCKED`; it never fills the gap itself.
 
 ## 2. Blocker 2 — authenticated pin/metadata proof
 
 | ID | Action | Artifacts | PASS evidence | FAIL evidence | Hardware state |
 | --- | --- | --- | --- | --- | --- |
-| A0 | Host: run the Phase 2/3/4 CPU suites and record the exact build. | `ctest-rkva.log`, `git rev-parse HEAD` | 29/29 `rkva|console-qual` tests pass (27 prior + `test-rkva-durable-fault` + `test-xbox-snapshot-console-qual`), Phase 4 gate tests included | any failure, or Phase 3/4 options not actually ON | Linux host, CPU only |
+| A0 | Host: run the Phase 2/3/4 CPU suites and record the exact build. | `ctest-rkva.log`, `git rev-parse HEAD` | every `rkva|console-qual` test passes, including `test-rkva-qual-probe-cpu`, `test-rkva-qual-probe-guard-off`, `test-rkva-host-expect` and `test-rkva-qual-probe-static`; Phase 4 gate tests included | any failure, or Phase 3/4 options not actually ON | Linux host, CPU only |
 | A1 | Console: positive probe with the host expectation. | `probe-request-positive.json`, `probe-response-positive.json`, `autopilot-done.txt`, `xllama-*.tail.log` | session/rows/generation/key/prefix equal the host expectation; `submitted<=completed`; `completed>0`; nonzero coverage MAC distinct from metadata/key digests; build reports both phases compiled **and** enabled and all three caps | any mismatch, sentinel MAC, missing build evidence, or `done != ok` | Test-only app build with the probe; Phase 4 compiled in; `--allow-phase-flags` |
 | A2 | Console: repeat the positive probe with a fresh probe id/session. | `probe-response-repeat.json` | identical prefix digest; coverage MAC changes with the session id | identical MAC across sessions or changed prefix | Same app instance; no reboot required |
 | A3 | Console: negative probe with tampered generation, key, session, prefix and a regressed fence. | `probe-response-negative.json` | every case refused, `accepted_any=false`, no coverage MAC | any acceptance | Same app instance |
@@ -144,11 +175,23 @@ need the app-side staging probe and fault selector, which do not exist.
 | D7 | `SIGKILL`/force-stop the app while it holds the store lease, then restart. | `stale-lock.json` | stale lock is reclaimable only with owner evidence; PID reuse cannot impersonate the owner; stage remains charged | second writer enters, or the stage is adopted/deleted | Test build; app started by the controller |
 | D8 | Lost ACK: host COMMIT durable, console reply lost; restart both. | `lost-ack.json`, host journal inspect | ambiguous pair stays pinned; no automatic anchor replacement or GC | automatic recovery or nonce reuse | Host + console; requires blocker 1/4/5 code that is absent → **BLOCKED** |
 
-D3–D7 are blocked until a test-only staging/fault probe exists. The
-test-only injector in `tests/rkva-durable-fault.h` exercises the *contract
-semantics* on CPU (no-replace, sync failure, ack loss, crash-after-apply) but
-does not make the closed writer reachable; see
-`docs/rkva-durable-fault-injection.md` for the exact seam proposal.
+D3–D7 are blocked until a test-only staging/fault probe exists. The probe
+branch accepts a `fault` selector (`sync_file`, `manifest_sync`,
+`directory_sync`, `rename_noreplace`, `rename_eio`, `stale_lock`,
+`crash_point`) and returns `status=refused` with the exact closed seam:
+`rkva_managed_object_v3::write()` returns
+`"concrete authenticated pin and metadata proof unavailable"` at
+`tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:115` before any
+`durable_filesystem::sync_file`/`sync_directory`/`rename_noreplace_and_sync`
+call, and no qualified durable backend or cross-process stale-lock reclaim
+exists. It writes, renames and deletes nothing; opening that writer would be
+the forbidden v3 success path. The test-only injector in
+`tests/rkva-durable-fault.h` exercises the *contract semantics* on CPU (no
+replacement, sync failure, ack loss, crash-after-apply) but does not make the
+closed writer reachable; see `docs/rkva-durable-fault-injection.md` for the
+exact seam proposal. A destructive durability run invokes the selector once
+(`sync_file`, chunk 3) and records the refusal as `BLOCKED`; it does not
+publish, rename or delete any staging object.
 
 ## 4. Blocker 7 — peer identity / AppContainer / UWP
 
@@ -226,14 +269,14 @@ rmdir subcommand and the harness does not add one.
 Preview (safe, no console access):
 
 ```sh
-python3 /home/hjotha/worktrees/beellama-snapshot-console-qual-20261101/tools/xbox/scripts/xbox-snapshot-console-qual.py \
+python3 /home/hjotha/worktrees/beellama-snapshot-probe-20261101/tools/xbox/scripts/xbox-snapshot-console-qual.py \
   --label preview --scenario attest --scenario durability --scenario identity
 ```
 
-Host CPU evidence:
+Host CPU evidence (probe branch):
 
 ```sh
-cmake -S /home/hjotha/worktrees/beellama-snapshot-console-qual-20261101 -B /tmp/opencode/beellama-snapshot-qual \
+cmake -S /home/hjotha/worktrees/beellama-snapshot-probe-20261101 -B /tmp/opencode/beellama-snapshot-qual \
   -G Ninja -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DLLAMA_BUILD_TESTS=ON \
   -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON \
   -DRKVA_MANAGED_SNAPSHOT_PHASE2=ON -DRKVA_MANAGED_SNAPSHOT_PHASE3=ON \
@@ -242,8 +285,39 @@ cmake --build /tmp/opencode/beellama-snapshot-qual -j 6
 ctest --test-dir /tmp/opencode/beellama-snapshot-qual -R 'rkva|console-qual' --output-on-failure
 ```
 
+Test-only UWP build (Windows build host; do not deploy without an explicit
+session). The probe is default-off; `-QualProbe` is the only thing that
+compiles it:
+
+```powershell
+pwsh -File tools/xbox/scripts/build-uwp.ps1 -Configuration Release -Platform x64 `
+  -Backend llamacpp -BuildRevision <n> -QualProbe -QualCommit <branch sha>
+```
+
+A desktop/UWP compile is not console qualification. The guard-off check is the
+CPU test `test-rkva-qual-probe-guard-off`; it proves the action is unknown to
+the autopilot validator in a default build.
+
+Host expectation from the real SQLite pin (read-only; no console access):
+
+```sh
+python3 tools/xbox/scripts/rkva-host-expect.py \
+  --store /path/to/managed-store  --out /path/to/host-expect.json
+# optional cross-checks
+python3 tools/xbox/scripts/rkva-host-expect.py \
+  --store /path/to/managed-store --tx <64-hex> \
+  --journal /path/to/host-journal-dir --owner <64-hex> \
+  --object-root /path/to/rkva-snapshots-v3 --out /path/to/host-expect.json
+```
+
+The producer refuses an ambiguous store, a tampered manifest, a journal key
+that differs from the pinned key and a published object manifest that differs
+from `pins.metadata`. It emits `expectation_available=false` and a null
+`session_id`, because the host attempt does not store the console session id.
+
 Attestation run (only after the test build exists and a host expectation has
-been produced; it will be `BLOCKED` until then):
+been produced; it is expected to report `BLOCKED` until a live authenticated
+session and coverage MAC exist):
 
 ```sh
 python3 tools/xbox/scripts/xbox-snapshot-console-qual.py \
@@ -286,10 +360,12 @@ python3 tools/xbox/scripts/xbox-snapshot-console-qual.py \
 ```
 
 What the controller actually implements today: D1, D2, the D4 power-loss
-timeline and I1-I3. It does **not** implement D3, D5, D7 or I4-I6; those need
-the test-only app probe/fault selector and the Windows/UWP work described in
-`docs/rkva-peer-identity-uwp-inventory.md`. It refuses `--destructive` for the
-identity scenario rather than pretending to deploy.
+timeline and I1-I3. The app-side probe exists on the probe branch behind
+`XLLAMA_QUAL_PROBE`, but the controller still does **not** implement D3, D5,
+D7 or I4-I6; the probe's fault selector returns a precise refusal instead of
+writing a staging object, and the Windows/UWP work in
+`docs/rkva-peer-identity-uwp-inventory.md` is absent. It refuses
+`--destructive` for the identity scenario rather than pretending to deploy.
 
 ## 8. Acceptance rule
 

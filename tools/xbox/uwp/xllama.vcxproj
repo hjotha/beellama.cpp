@@ -52,6 +52,15 @@
          Default false keeps the Dev Mode package. See docs/store-readiness.md. -->
     <XllamaStoreSku Condition="'$(XllamaStoreSku)' == ''">false</XllamaStoreSku>
     <XllamaStoreSkuDefine Condition="'$(XllamaStoreSku)' == 'true'">XLLAMA_STORE_SKU=1;</XllamaStoreSkuDefine>
+    <!-- Test-only console qualification probe (default OFF). When enabled it
+         compiles exactly one extra autopilot action, "rkva_qual_probe", and
+         labels this build with the Phase 3/4 macros. It does NOT link the
+         Phase 3/4 libraries, advertise a capability, change HELLO or open the
+         managed writer. See docs/rkva-snapshot-console-qualification-matrix.md. -->
+    <XllamaQualProbe Condition="'$(XllamaQualProbe)' == ''">false</XllamaQualProbe>
+    <XllamaQualProbeDefine Condition="'$(XllamaQualProbe)' == 'true'">XLLAMA_QUAL_PROBE;</XllamaQualProbeDefine>
+    <XllamaQualPhaseDefine Condition="'$(XllamaQualProbe)' == 'true'">RKVA_MANAGED_SNAPSHOT_PHASE3;RKVA_MANAGED_SNAPSHOT_PHASE4;</XllamaQualPhaseDefine>
+    <XllamaQualCommitDefine Condition="'$(XllamaQualCommit)' != ''">XLLAMA_QUAL_COMMIT=$(XllamaQualCommit);</XllamaQualCommitDefine>
   </PropertyGroup>
 
   <Import Project="BeeLlama.props" />
@@ -120,6 +129,7 @@
         $(ProjectDir)rkva;
         $(BeeLlamaRoot)include;
         $(BeeLlamaRoot)ggml\include;
+        $(BeeLlamaRoot)vendor;
         $(ProjectDir)packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\build\native\include;
         $(ProjectDir)packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\build\native\include;
         %(AdditionalIncludeDirectories)
@@ -133,6 +143,9 @@
         $(XllamaLlamaDefine)
         $(XllamaDeviceTrainDefine)
         $(XllamaStoreSkuDefine)
+        $(XllamaQualProbeDefine)
+        $(XllamaQualPhaseDefine)
+        $(XllamaQualCommitDefine)
         %(PreprocessorDefinitions)
       </PreprocessorDefinitions>
       <LanguageStandard>stdcpp17</LanguageStandard>

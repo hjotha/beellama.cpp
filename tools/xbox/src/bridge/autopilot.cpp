@@ -40,6 +40,12 @@ std::string where(size_t i, const std::string& op) {
 } // namespace
 
 bool autopilot_op_known(const std::string& op) {
+#ifdef XLLAMA_QUAL_PROBE
+    // Test-only console qualification probe. Never present in a default build:
+    // without the macro this op is rejected as unknown before any action runs.
+    if (op == "rkva_qual_probe")
+        return true;
+#endif
     return std::find_if(kOps.begin(), kOps.end(), [&](const char* k) { return op == k; }) !=
            kOps.end();
 }
@@ -58,6 +64,28 @@ bool validate_autopilot_script(const std::vector<AutopilotAction>& actions, bool
             err = "action " + std::to_string(i) + ": unknown op '" + a.op + "'";
             return false;
         }
+
+#ifdef XLLAMA_QUAL_PROBE
+        if (a.op == "rkva_qual_probe") {
+            // The label is the 128-bit probe id; 'name' is the case. Both files
+            // under LocalState\rkva-qual are keyed by that id, so an empty or
+            // non-hex value must fail here rather than leave the host polling.
+            if (a.label.empty()) {
+                err = where(i, a.op) + "'label' (probe id) is required";
+                return false;
+            }
+            const std::string probe_id = wide_to_narrow_ascii(a.label);
+            if (probe_id.size() != 32 ||
+                probe_id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                err = where(i, a.op) + "'label' must be 128-bit lowercase hex";
+                return false;
+            }
+            if (a.arg.empty()) {
+                err = where(i, a.op) + "'name' (case) is required";
+                return false;
+            }
+        }
+#endif
 
         if (a.op == "send" || a.op == "load_chat" || a.op == "set_model" ||
             a.op == "generate_image" || a.op == "rate") {

@@ -42,6 +42,22 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-xbox-snapshot-console-qual.py)
     set_property(TEST test-xbox-snapshot-console-qual PROPERTY LABELS main)
 
+    # Host-side producer for the console qualification expectation. Reads a
+    # real SQLite/journal/object attempt; never invents session/fence values.
+    add_test(
+        NAME test-rkva-host-expect
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-rkva-host-expect.py)
+    set_property(TEST test-rkva-host-expect PROPERTY LABELS main)
+
+    # Source-level guard placement: the probe action, listener provider and
+    # engine accessor stay behind XLLAMA_QUAL_PROBE; HELLO advertises nothing.
+    add_test(
+        NAME test-rkva-qual-probe-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-rkva-qual-probe-static.py)
+    set_property(TEST test-rkva-qual-probe-static PROPERTY LABELS main)
+
     add_test(
         NAME test-backend-ops-seed-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
@@ -1571,3 +1587,35 @@ if (RKVA_MANAGED_SNAPSHOT_ACTIVATION)
         set_property(TEST test-rkva-session-authority PROPERTY LABELS main)
     endif()
 endif()
+
+# Test-only console qualification probe core. CPU only: no UWP, D3D12, engine,
+# network or console. The guard-on target compiles the action into the
+# autopilot contract; the guard-off target proves a default build cannot reach
+# it. Neither target advertises a managed capability or opens the v3 writer.
+add_executable(test-rkva-qual-probe-cpu
+    ${PROJECT_SOURCE_DIR}/tools/xbox/tests/rkva_qual_probe_cpu.cpp
+    ${PROJECT_SOURCE_DIR}/tools/xbox/src/bridge/autopilot.cpp)
+target_include_directories(test-rkva-qual-probe-cpu PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/xbox/include
+    ${PROJECT_SOURCE_DIR}/tools/xbox/uwp
+    ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn
+    ${PROJECT_SOURCE_DIR}/vendor)
+target_compile_features(test-rkva-qual-probe-cpu PRIVATE cxx_std_17)
+target_compile_definitions(test-rkva-qual-probe-cpu PRIVATE XLLAMA_QUAL_PROBE)
+add_test(NAME test-rkva-qual-probe-cpu COMMAND $<TARGET_FILE:test-rkva-qual-probe-cpu>)
+set_property(TEST test-rkva-qual-probe-cpu PROPERTY LABELS main)
+
+add_executable(test-rkva-qual-probe-guard-off
+    ${PROJECT_SOURCE_DIR}/tools/xbox/tests/rkva_qual_probe_guard_off_cpu.cpp
+    ${PROJECT_SOURCE_DIR}/tools/xbox/src/bridge/autopilot.cpp)
+target_include_directories(test-rkva-qual-probe-guard-off PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/xbox/include
+    ${PROJECT_SOURCE_DIR}/tools/xbox/uwp
+    ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn)
+target_compile_features(test-rkva-qual-probe-guard-off PRIVATE cxx_std_17)
+add_test(NAME test-rkva-qual-probe-guard-off COMMAND $<TARGET_FILE:test-rkva-qual-probe-guard-off>)
+set_property(TEST test-rkva-qual-probe-guard-off PROPERTY LABELS main)

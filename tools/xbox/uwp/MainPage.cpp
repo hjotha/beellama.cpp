@@ -33,12 +33,17 @@
     #include <algorithm>
     #include <chrono>
     #include <cstdio>
+    #include <cstdlib>
     #include <ctime>
     #include <filesystem>
     #include <limits>
     #include <string>
     #include <thread>
     #include <vector>
+
+    #ifdef XLLAMA_QUAL_PROBE
+        #include "rkva/rkva-qual-probe.h"
+    #endif
 
 using namespace winrt;
 using namespace winrt::Windows::Foundation;
@@ -97,6 +102,81 @@ static void write_local_bytes(const wchar_t* name, const std::string& bytes) {
     fwrite(bytes.data(), 1, bytes.size(), fp);
     fclose(fp);
 }
+
+#ifdef XLLAMA_QUAL_PROBE
+// Test-only qualification probe helpers. The runtime gates are process
+// environment variables; UWP cannot receive them from WDP, so the probe sets
+// them only after validating the explicit request.phase_flags object and
+// restores the previous values before returning.
+static bool qual_read_env(const char* name, std::string& value, bool& present) {
+    char* buffer = nullptr;
+    size_t size = 0;
+    if (_dupenv_s(&buffer, &size, name) != 0)
+        return false;
+    present = buffer != nullptr;
+    value = buffer ? buffer : "";
+    free(buffer);
+    return true;
+}
+
+struct qual_phase_env {
+    bool changed = false;
+    std::string prior3, prior4;
+    bool had3 = false, had4 = false;
+
+    bool enter(bool phase3, bool phase4, std::string& error) {
+        if (!qual_read_env("RKVA_MANAGED_SNAPSHOT_PHASE3", prior3, had3) ||
+            !qual_read_env("RKVA_MANAGED_SNAPSHOT_PHASE4", prior4, had4)) {
+            error = "could not read the current phase environment";
+            return false;
+        }
+        if (_putenv_s("RKVA_MANAGED_SNAPSHOT_PHASE3", phase3 ? "1" : "") != 0 ||
+            _putenv_s("RKVA_MANAGED_SNAPSHOT_PHASE4", phase4 ? "1" : "") != 0) {
+            error = "could not set the requested phase environment";
+            return false;
+        }
+        changed = true;
+        return true;
+    }
+    ~qual_phase_env() {
+        if (!changed)
+            return;
+        _putenv_s("RKVA_MANAGED_SNAPSHOT_PHASE3", had3 ? prior3.c_str() : "");
+        _putenv_s("RKVA_MANAGED_SNAPSHOT_PHASE4", had4 ? prior4.c_str() : "");
+    }
+};
+
+static bool qual_env_is_one(const char* name) {
+    std::string value;
+    bool present = false;
+    return qual_read_env(name, value, present) && present && value == "1";
+}
+
+#define XLLAMA_QUAL_STRINGIFY_(value) #value
+#define XLLAMA_QUAL_STRINGIFY(value) XLLAMA_QUAL_STRINGIFY_(value)
+
+static rkva_qual_probe::build_info qual_build_info() {
+    rkva_qual_probe::build_info info;
+#ifdef XLLAMA_QUAL_COMMIT
+    info.commit = XLLAMA_QUAL_STRINGIFY(XLLAMA_QUAL_COMMIT);
+#endif
+#ifdef RKVA_MANAGED_SNAPSHOT_PHASE3
+    info.phase3_compiled = true;
+#endif
+#ifdef RKVA_MANAGED_SNAPSHOT_PHASE4
+    info.phase4_compiled = true;
+#endif
+    // The Phase 3/4 libraries are not linked into the UWP app. These macros only
+    // label the probe translation unit; they do not activate any managed path.
+    info.phase3_enabled = info.phase3_compiled && qual_env_is_one("RKVA_MANAGED_SNAPSHOT_PHASE3");
+    info.phase4_enabled = info.phase4_compiled && qual_env_is_one("RKVA_MANAGED_SNAPSHOT_PHASE4");
+    info.managed_caps_negotiated = false;
+    info.caps_status =
+        "the RKVA HELLO supported_ops mask advertises no managed capability; the probe adds "
+        "none";
+    return info;
+}
+#endif
 
 static std::wstring format_diffuse_stage(const std::string& stage) {
     if (stage == "start")
@@ -3917,6 +3997,57 @@ void MainPageController::ApRun(std::vector<ApAction> actions, std::chrono::secon
                 throw std::runtime_error("action " + std::to_string(i) + " show_pane '" + pane +
                                          "': dialog did not close");
             log_output("[autopilot] show_pane '" + pane + "' closed\n");
+#ifdef XLLAMA_QUAL_PROBE
+        } else if (a.op == "rkva_qual_probe") {
+            // Test-only: read LocalState\rkva-qual\request-<label>.json and
+            // write response-<label>.json from the real engine state. This op
+            // is not compiled into a default build and is never advertised.
+            if (!not_running())
+                throw std::runtime_error("action " + std::to_string(i) +
+                                         " rkva_qual_probe: busy");
+            const std::string label = ::xllama::wstring_to_utf8(a.label);
+            const std::string case_name = ::xllama::wstring_to_utf8(a.arg);
+            if (label.size() != 32 ||
+                label.find_first_not_of("0123456789abcdef") != std::string::npos)
+                throw std::runtime_error("action " + std::to_string(i) +
+                                         " rkva_qual_probe: label must be 128-bit lowercase hex");
+            CreateDirectoryW(local_wpath(L"rkva-qual").c_str(), nullptr);
+            const std::wstring request_name =
+                L"rkva-qual\\request-" + ::xllama::utf8_to_wstring(label) + L".json";
+            const std::string request_text = read_local_text_file(request_name.c_str());
+            std::string response;
+            rkva_qual_probe::request request;
+            std::string parse_error;
+            if (!rkva_qual_probe::parse_request(request_text, request, parse_error)) {
+                response = rkva_qual_probe::make_invalid_response(label, parse_error);
+            } else if (request.probe_id != label) {
+                response = rkva_qual_probe::make_invalid_response(
+                    label, "autopilot label differs from request.probe_id");
+            } else if (request.case_name != case_name) {
+                response = rkva_qual_probe::make_invalid_response(
+                    label, "autopilot name differs from request.case");
+            } else {
+                qual_phase_env scoped_env;
+                std::string env_error;
+                const bool want3 = request.has_phase_flags && request.phase3;
+                const bool want4 = request.has_phase_flags && request.phase4;
+                if (!scoped_env.enter(want3, want4, env_error)) {
+                    response = rkva_qual_probe::make_invalid_response(label, env_error);
+                } else if (request.has_fault) {
+                    response = rkva_qual_probe::make_fault_response(request, qual_build_info());
+                } else {
+                    rkva_qual_probe::resident_state state;
+                    std::string query_error;
+                    rkva_qual_probe::query_resident(0, state, query_error);
+                    response = rkva_qual_probe::make_response(request, qual_build_info(), state);
+                }
+            }
+            const std::wstring response_name =
+                L"rkva-qual\\response-" + ::xllama::utf8_to_wstring(label) + L".json";
+            write_local_bytes(response_name.c_str(), response);
+            log_output("[autopilot] rkva_qual_probe " + case_name + " '" + label +
+                       "' wrote response\n");
+#endif
         } else if (a.op == "quit") {
             log_output("[autopilot] action " + std::to_string(i) + " quit\n");
             write_local_bytes(L"autopilot-done.txt", "ok");

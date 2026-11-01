@@ -51,6 +51,12 @@ param(
     # Separate persistent object/output paths preserve both build caches.
     [switch]$Iteration      = $false,
     [switch]$Clean          = $false,
+    # Test-only console qualification probe. Compiles XLLAMA_QUAL_PROBE (the
+    # rkva_qual_probe autopilot action) and labels the probe TU with the
+    # Phase 3/4 macros. It links no managed library and advertises no
+    # capability. QualCommit becomes XLLAMA_QUAL_COMMIT for build evidence.
+    [switch]$QualProbe      = $false,
+    [string]$QualCommit     = "",
     [string]$WindowsSdkVersion = ""
 )
 
@@ -290,6 +296,14 @@ if ($StoreSku) {
     $MsBuildArgs += "/p:XllamaStoreSku=true"
 }
 $MsBuildArgs += "/p:XllamaBackend=$Backend"
+if ($QualProbe) {
+    if ($StoreSku) { throw "QualProbe is not available in the Store SKU" }
+    if ($QualCommit -and $QualCommit -notmatch '^[0-9a-f]{7,40}$') {
+        throw "QualCommit must be 7-40 lowercase hex"
+    }
+    $MsBuildArgs += "/p:XllamaQualProbe=true"
+    if ($QualCommit) { $MsBuildArgs += "/p:XllamaQualCommit=$QualCommit" }
+}
 if ($Clean) {
     # Clean the whole solution before pre-building ggml. Rebuild afterwards
     # would clean the inactive ProjectReference and delete the freshly built lib.
