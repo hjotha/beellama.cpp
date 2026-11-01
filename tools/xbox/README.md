@@ -80,6 +80,17 @@ and Device Portal flows; see [device-portal.md](docs/device-portal.md) and
 - `uwp/BeeLlama.props`: one core source root for MSBuild.
 - `uwp/ggml-uwp.vcxproj`: AppContainer build of that core.
 
+## Managed snapshot console qualification
+
+`tools/xbox/scripts/xbox-snapshot-console-qual.py` is the inert console
+qualification controller for the managed snapshot blockers. It prints its plan
+without touching the console unless `--execute` and the matching explicit gates
+are supplied, and it never installs, uninstalls or deletes snapshots. The
+matrix, evidence contracts and rollback are documented in
+`docs/rkva-snapshot-console-qualification-matrix.md`; the fault-injection and
+peer-identity plans are in `docs/rkva-durable-fault-injection.md` and
+`docs/rkva-peer-identity-uwp-inventory.md`.
+
 The original worktrees remain historical references; this app does not depend
 on their paths or build caches. The earlier standalone DFlash research app is
 not a second application in this import. Current RKVA includes the newer bulk,
