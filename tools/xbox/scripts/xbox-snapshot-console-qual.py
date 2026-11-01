@@ -974,7 +974,7 @@ class Runner:
     def verify_pfn(self, require_running=False):
         running = self.running_packages()
         if running:
-            if len(running) != 1 or running[0].get('PackageFullName') != self.args.pfn:
+            if any(item.get('PackageFullName') != self.args.pfn for item in running):
                 raise RuntimeError('a different xllama package is running')
             return
         if require_running:
@@ -989,7 +989,7 @@ class Runner:
                    for item in self.running_packages())
 
     def flags(self):
-        return sorted(name for name in self.deploy.list_names(self.args.pfn)
+        return sorted(name for name in self.names()
                       if name.endswith('.flag'))
 
     def listing(self, subdir=''):
@@ -1092,12 +1092,6 @@ class Runner:
                         slot.get('is_processing') is not False for slot in slots):
                     raise RuntimeError('production slot is busy')
                 self.result[f'idle_check_{attempt}'] = 'idle'
-            compute = subprocess.check_output(
-                ['nvidia-smi', '--query-compute-apps=pid,process_name',
-                 '--format=csv,noheader,nounits'], text=True,
-                timeout=self.remain(30)).strip()
-            if compute:
-                raise RuntimeError('a GPU compute process is already running')
             sockets = subprocess.check_output(
                 ['ss', '-H', '-tn', 'state', 'established'], text=True,
                 timeout=self.remain(30))
@@ -1129,6 +1123,7 @@ class Runner:
         self.systemctl('stop', SERVICE)
         if self.is_active() != 'inactive':
             raise RuntimeError('production did not stop')
+        self.check_gpu_and_sockets()
         self.result['production_paused'] = True
         self.save()
         self.note('production stopped after idle/identity checks')
