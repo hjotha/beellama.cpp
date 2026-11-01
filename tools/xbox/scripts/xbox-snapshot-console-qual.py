@@ -66,6 +66,31 @@ SCHEMAS = {
     'identity': 'rkva-console-identity-v1',
 }
 SCENARIOS = ('attest', 'durability', 'identity')
+
+# A durability probe must use this disposable namespace under rkva-qual, never
+# the real LocalState\rkva-snapshots-v3. The root filename must still be
+# exactly rkva-snapshots-v3 because the v3 writer validates it.
+DURABILITY_ROOT = 'rkva-qual\\durable\\rkva-snapshots-v3'
+DURABILITY_FAULT_CASES = (
+    'chunk_sync',
+    'manifest_sync',
+    'dir_sync',
+    'rename_existing',
+    'rename_eio',
+    'ack_lost',
+    'crash_after_apply',
+)
+DURABILITY_EXPECTED_STATE = {
+    'chunk_sync': 'staging_preserved',
+    'manifest_sync': 'staging_preserved',
+    'dir_sync': 'staging_preserved',
+    'rename_existing': 'staging_preserved',
+    'rename_eio': 'publication_uncertain',
+    'ack_lost': 'publication_uncertain',
+    'crash_after_apply': 'publication_uncertain',
+    'stale_lock': 'staging_preserved',
+}
+DURABILITY_UNCERTAIN_CASES = {'rename_eio', 'ack_lost', 'crash_after_apply'}
 HEX64 = re.compile(r'[0-9a-f]{64}\Z')
 LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z')
 PFN_RE = re.compile(r'[A-Za-z0-9._-]+_[A-Za-z0-9.]+_[A-Za-z0-9]+__[a-z0-9]{13}\Z')
@@ -174,27 +199,53 @@ def build_plan(scenarios):
         }, {
             'id': 'D3',
             'blocker': '3',
-            'action': 'run the test-build staging protocol with the injected fault '
-                      'selected by the probe request (sync, rename, stale lock, '
-                      'crash point) and collect the app evidence file',
-            'artifacts': ['durability-fault-<case>.json', 'staging-inventory.json'],
-            'pass': 'old committed pair usable; staging/pending bytes preserved and '
-                    'charged; uncertain publication never reported durable; no v2 '
-                    'object imported or removed',
-            'fail': 'any deletion, import, unreported durable claim, or reuse of a '
-                    'consumed nonce',
-            'hardware_state': 'test-only app build with the staging probe and fault '
+            'action': 'run the test-build staging probe with chunk_sync injected '
+                      'on chunk k and collect the writer, pin, staging and '
+                      'inventory evidence',
+            'artifacts': ['durability-fault-chunk_sync.json',
+                          'staging-inventory.json'],
+            'pass': 'old committed pair byte-identical; staging/pending bytes '
+                    'preserved and charged; no object published; retry refuses to '
+                    'reuse the stale stage',
+            'fail': 'any deletion, adoption, overwrite or durable claim',
+            'hardware_state': 'test-only app build with the staging probe '
+                              '(rkva_qual_probe durability action) and fault '
                               'selector; currently ABSENT, so this step is BLOCKED',
-            'destructive': True,
+            'destructive': False,
         }, {
             'id': 'D4',
+            'blocker': '3',
+            'action': 'repeat the staging probe with manifest_sync and dir_sync '
+                      'faults',
+            'artifacts': ['durability-fault-manifest_sync.json',
+                          'durability-fault-dir_sync.json',
+                          'staging-inventory.json'],
+            'pass': 'same as D3 and no rename attempted',
+            'fail': 'object appears, stage disappears, or a durable claim is made',
+            'hardware_state': 'same test-only app build; non-destructive',
+            'destructive': False,
+        }, {
+            'id': 'D5',
+            'blocker': '3',
+            'action': 'run the staging probe with a pre-existing rename destination '
+                      'and then with rename EIO',
+            'artifacts': ['durability-fault-rename_existing.json',
+                          'durability-fault-rename_eio.json',
+                          'staging-inventory.json'],
+            'pass': 'destination unchanged; source intact or explicitly uncertain; '
+                    'never durable',
+            'fail': 'overwrite, lost stage, or a durable/committed claim on EIO',
+            'hardware_state': 'same test-only app build; non-destructive',
+            'destructive': False,
+        }, {
+            'id': 'D6',
             'blocker': '3',
             'action': 'operator cuts console power at the selected staging/rename '
                       'point, restores power, then the controller records the '
                       'timeline and re-inventories LocalState',
             'artifacts': ['power-loss-timeline.json', 'post-power-loss-inventory.json',
                           'xllama.log'],
-            'pass': 'same as D3 after a real power interruption, with the console '
+            'pass': 'same as D3-D5 after a real power interruption, with the console '
                     'reachable again and no silent cleanup',
             'fail': 'charge/pin lost, object removed, nonce replay accepted, or the '
                     'run cannot distinguish durable from uncertain',
@@ -203,15 +254,16 @@ def build_plan(scenarios):
                               '--destructive and --power-loss-method',
             'destructive': True,
         }, {
-            'id': 'D5',
+            'id': 'D7',
             'blocker': '3',
-            'action': 'kill the app while it holds the store lease, restart it and '
-                      'verify stale-lock handling and staging preservation',
+            'action': 'force-stop the app while it holds the store lease, restart '
+                      'it and verify stale-lock handling and staging preservation',
             'artifacts': ['stale-lock.json'],
             'pass': 'lock is reclaimable only with owner evidence; a reused PID '
                     'cannot impersonate the old owner; staging stays charged',
             'fail': 'a second writer enters, or the old stage is adopted/deleted',
-            'hardware_state': 'test build; app started by this controller',
+            'hardware_state': 'test build; app started by this controller; requires '
+                              '--destructive',
             'destructive': True,
         }]
     if 'identity' in chosen:
@@ -368,6 +420,224 @@ def validate_attest_negative(document, request):
     return errors
 
 
+def _durability_root_ok(value):
+    """The probe may only use the disposable rkva-qual namespace."""
+    if not isinstance(value, str):
+        return False
+    normalized = value.replace('/', '\\').strip('\\').lower()
+    return normalized == DURABILITY_ROOT.lower()
+
+
+def _digest(value):
+    return isinstance(value, str) and HEX64.fullmatch(value) is not None
+
+
+def validate_durability_evidence(document, request):
+    """Validate one D3/D4/D5 fault-injection evidence document.
+
+    Empty list means the case is proven. Any BLOCKED/absent probe is handled by
+    the caller, not here. This validator never turns a `published_pending`
+    writer result into a managed COMMIT.
+    """
+    errors = []
+    if not isinstance(document, dict):
+        return ['durability evidence is not a JSON object']
+    case = request['case']
+    if document.get('schema') != SCHEMAS['durability']:
+        _fail(errors, 'schema mismatch')
+    if document.get('probe_id') != request['probe_id']:
+        _fail(errors, 'probe_id mismatch')
+    if document.get('case') != case:
+        _fail(errors, 'case mismatch')
+
+    build = document.get('build')
+    if not isinstance(build, dict):
+        _fail(errors, 'build evidence missing')
+    else:
+        if build.get('test_only_probe') is not True:
+            _fail(errors, 'test-only probe flag missing')
+        if build.get('durable_fault_seam') is not True:
+            _fail(errors, 'durable-fault seam not compiled')
+        if build.get('production_publication_enabled') is not False:
+            _fail(errors, 'production publication must stay disabled')
+        if build.get('windows_backend_qualified') is not False:
+            _fail(errors, 'Windows backend must never claim qualification')
+        if build.get('phase3_enabled') is not False or \
+                build.get('phase4_enabled') is not False:
+            _fail(errors, 'managed phase gates must stay disabled for this probe')
+        if not isinstance(build.get('commit'), str) or \
+                not re.fullmatch(r'[0-9a-f]{7,40}', build['commit']):
+            _fail(errors, 'build commit missing')
+
+    store = document.get('store')
+    if not isinstance(store, dict):
+        _fail(errors, 'store evidence missing')
+    else:
+        if not _durability_root_ok(store.get('root')):
+            _fail(errors, 'probe used a root outside rkva-qual\\durable')
+        if store.get('namespace') != 'rkva-snapshots-v3':
+            _fail(errors, 'wrong snapshot namespace')
+        if store.get('production_namespace') is not False:
+            _fail(errors, 'probe touched the production namespace')
+
+    fault = document.get('fault')
+    if not isinstance(fault, dict):
+        _fail(errors, 'fault evidence missing')
+    else:
+        if fault.get('kind') != case:
+            _fail(errors, 'fault kind mismatch')
+        if fault.get('injected') is not True:
+            _fail(errors, 'fault was not injected')
+
+    writer = document.get('writer')
+    expected_state = DURABILITY_EXPECTED_STATE[case]
+    if not isinstance(writer, dict):
+        _fail(errors, 'writer result missing')
+    else:
+        if writer.get('state') != expected_state:
+            _fail(errors, f'writer state {writer.get("state")!r} != {expected_state!r}')
+        if writer.get('state') == 'published_pending':
+            _fail(errors, 'fault case must never publish')
+        if not isinstance(writer.get('object_present'), bool):
+            _fail(errors, 'object_present missing')
+        if not isinstance(writer.get('error'), str) or not writer['error']:
+            _fail(errors, 'writer error missing')
+
+    before = document.get('before')
+    after = document.get('after')
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        _fail(errors, 'before/after inventory missing')
+    else:
+        if not _digest(before.get('committed_sha256')) or \
+                before.get('committed_sha256') != after.get('committed_sha256'):
+            _fail(errors, 'previously committed pair changed')
+        for label, section in (('before', before), ('after', after)):
+            names = section.get('inventory')
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                _fail(errors, f'{label} inventory malformed')
+                continue
+            if any('rkva-snapshots-v1' in n or 'rkva-snapshots-v2' in n for n in names):
+                _fail(errors, f'{label} inventory lists a legacy namespace')
+
+    legacy = document.get('legacy')
+    if not isinstance(legacy, dict):
+        _fail(errors, 'legacy namespace evidence missing')
+    else:
+        if legacy.get('touched') is not False or \
+                legacy.get('v1_unchanged') is not True or \
+                legacy.get('v2_unchanged') is not True:
+            _fail(errors, 'legacy v1/v2 state changed')
+
+    staging = document.get('staging')
+    if not isinstance(staging, dict):
+        _fail(errors, 'staging evidence missing')
+    else:
+        if staging.get('charged') is not True:
+            _fail(errors, 'staged bytes are not charged')
+        if staging.get('adoptable') is not False:
+            _fail(errors, 'stale stage is adoptable')
+        if staging.get('automatic_cleanup') is not False:
+            _fail(errors, 'automatic cleanup is forbidden')
+        present = staging.get('present')
+        if not isinstance(present, bool):
+            _fail(errors, 'staging.present missing')
+        if expected_state == 'staging_preserved' and present is not True:
+            _fail(errors, 'stage was not preserved')
+        if case in DURABILITY_UNCERTAIN_CASES:
+            object_present = isinstance(writer, dict) and writer.get('object_present') is True
+            if not present and not object_present:
+                _fail(errors, 'uncertain pair left neither stage nor object bytes')
+
+    pin = document.get('pin')
+    if not isinstance(pin, dict):
+        _fail(errors, 'pin evidence missing')
+    else:
+        if pin.get('consumed') is not True:
+            _fail(errors, 'attempt/nonce was not consumed')
+        if pin.get('reusable') is not False:
+            _fail(errors, 'consumed attempt is reusable')
+
+    claims = document.get('claims')
+    if not isinstance(claims, dict):
+        _fail(errors, 'claim evidence missing')
+    else:
+        for field in ('durable', 'published', 'committed', 'gc_authorized'):
+            if claims.get(field) is not False:
+                _fail(errors, f'forbidden claim: {field}')
+
+    cleanup = document.get('cleanup')
+    if not isinstance(cleanup, dict) or cleanup.get('automatic') is not False:
+        _fail(errors, 'automatic recovery/cleanup is forbidden')
+
+    # Case-specific invariants.
+    if isinstance(writer, dict) and isinstance(staging, dict):
+        if expected_state == 'staging_preserved':
+            if writer.get('object_present') is not False:
+                _fail(errors, 'an object appeared for a pre-rename fault')
+        else:
+            if writer.get('object_present') is not True:
+                _fail(errors, 'uncertain rename lost its applied object bytes')
+            if staging.get('present') is not False:
+                _fail(errors, 'applied rename still reports a staging directory')
+    return errors
+
+
+def validate_stale_lock_evidence(document, request):
+    """Validate D7: the killed writer's lease/stage is not silently adopted."""
+    errors = validate_durability_evidence(document, request)
+    lock = document.get('lock') if isinstance(document, dict) else None
+    if not isinstance(lock, dict):
+        return errors + ['lock evidence missing']
+    if lock.get('held_by_probe') is not True and \
+            lock.get('held_by_predecessor') is not True:
+        _fail(errors, 'the probe did not prove the store lease was held')
+    if lock.get('owner_evidence_required') is not True:
+        _fail(errors, 'owner evidence is not required')
+    if lock.get('reclaimable_with_owner_evidence') is not True:
+        _fail(errors, 'lease is not reclaimable with owner evidence')
+    if lock.get('pid_reuse_accepted') is not False:
+        _fail(errors, 'PID reuse impersonated the owner')
+    if lock.get('second_writer_entered') is not False:
+        _fail(errors, 'a second writer entered while/kill-recovery')
+    staging = document.get('staging')
+    if isinstance(staging, dict):
+        if staging.get('present') is not True or staging.get('charged') is not True:
+            _fail(errors, 'stage was not preserved and charged')
+        if staging.get('adopted') is not False or staging.get('deleted') is not False:
+            _fail(errors, 'stale stage was adopted or deleted')
+    return errors
+
+
+def validate_staging_inventory(document, request):
+    """The inventory artifact must describe only the disposable qual root."""
+    errors = []
+    if not isinstance(document, dict):
+        return ['staging inventory is not a JSON object']
+    if document.get('schema') != 'rkva-console-staging-inventory-v1':
+        _fail(errors, 'staging inventory schema mismatch')
+    if document.get('probe_id') != request['probe_id']:
+        _fail(errors, 'staging inventory probe_id mismatch')
+    if not _durability_root_ok(document.get('root')):
+        _fail(errors, 'staging inventory root is outside rkva-qual\\durable')
+    entries = document.get('entries')
+    if not isinstance(entries, list):
+        return errors + ['staging inventory entries missing']
+    for entry in entries:
+        if not isinstance(entry, dict):
+            _fail(errors, 'staging inventory entry is not an object')
+            continue
+        name = entry.get('name')
+        if not isinstance(name, str) or '/' in name or '\\' in name:
+            _fail(errors, 'staging inventory name is not a leaf name')
+        if type(entry.get('bytes')) is not int or entry['bytes'] < 0:
+            _fail(errors, 'staging inventory bytes invalid')
+    if any('rkva-snapshots-v1' in (entry.get('name') or '') or
+           'rkva-snapshots-v2' in (entry.get('name') or '') for entry in entries
+           if isinstance(entry, dict)):
+        _fail(errors, 'staging inventory lists a legacy namespace')
+    return errors
+
+
 def classify_probe_result(done_text, response_present, response_document):
     """Map the app's autopilot outcome to one of PASS/FAILED/BLOCKED/INCOMPLETE."""
     text = (done_text or '').strip()
@@ -419,6 +689,16 @@ def aggregate_status(statuses):
     return 'INCOMPLETE'
 
 
+def aggregate_durability(faults, stale_lock, power_loss):
+    """Blocker 3 is PASS only when D3-D5, D7 and D6 all passed."""
+    statuses = [faults, stale_lock, power_loss]
+    if any(status == 'FAILED' for status in statuses):
+        return 'FAILED'
+    if all(status == 'PASS' for status in statuses):
+        return 'PASS'
+    return 'BLOCKED'
+
+
 def validate_gates(args):
     """Explicit opt-ins required before any console mutation."""
     if not args.execute:
@@ -447,11 +727,11 @@ def validate_gates(args):
             raise RuntimeError('--destructive is required for a power-loss run')
         if args.power_loss_method == 'smartplug' and not args.smartplug_command:
             raise RuntimeError('--smartplug-command is required for smartplug power loss')
-    if args.destructive and 'durability' in args.scenario and not args.power_loss_method:
-        raise RuntimeError('--destructive durability requires --power-loss-method')
     if args.destructive and 'identity' in args.scenario:
         raise RuntimeError('identity provisioning/deployment is not implemented; '
                            'run the inventory scenario without --destructive')
+    # --destructive alone unlocks D7 (force-stop/stale lock). D6 additionally
+    # requires an explicit --power-loss-method. Neither is ever implicit.
 
 
 def read_json(path):
@@ -783,7 +1063,7 @@ class Runner:
             raise RuntimeError('Xbox flags changed during isolation')
 
     # -- probes -----------------------------------------------------------
-    def probe(self, case, request, timeout):
+    def probe(self, case, request, timeout, action_name=None):
         """Run one autopilot probe; returns (classification, detail, doc)."""
         probe_id = request['probe_id']
         request_path = self.output / f'probe-request-{case}.json'
@@ -800,8 +1080,8 @@ class Runner:
         script = self.output / 'autopilot.json'
         write_json(script, {
             'total_timeout_s': int(timeout),
-            'actions': [{'op': PROBE_OP, 'name': case, 'label': probe_id,
-                         'timeout_s': int(timeout)}],
+            'actions': [{'op': PROBE_OP, 'name': action_name or case,
+                         'label': probe_id, 'timeout_s': int(timeout)}],
         })
         empty = self.output / 'empty.flag'
         empty.write_bytes(b'')
@@ -869,6 +1149,215 @@ class Runner:
         self.result['scenario_results']['attest'] = aggregate_status(
             [s for s in cases if s != 'PASS'] or ['PASS'])
 
+    def durability_fault_request(self, case):
+        return {
+            'schema': SCHEMAS['durability'],
+            'probe_id': os.urandom(16).hex(),
+            'case': case,
+            'fault': {'kind': case, 'injected': True,
+                      'at': 2 if case == 'chunk_sync' else 0},
+            'test_only': True,
+            'store': {'root': DURABILITY_ROOT, 'namespace': SNAPSHOT_DIR,
+                      'production_namespace': False},
+            'phase_flags': {'phase3': False, 'phase4': False},
+        }
+
+    def durability_artifact_errors(self, case, request, document):
+        """Return (failures, missing) for the two D3-D5 artifacts."""
+        failures = list(validate_durability_evidence(document, request))
+        missing = []
+        fault_path = self.fetch(f'durability-fault-{case}.json',
+                                f'durability-fault-{case}.json')
+        if fault_path is None:
+            missing.append(f'durability-fault-{case}.json')
+        else:
+            try:
+                artifact = read_json(fault_path)
+            except Exception as exc:
+                failures.append('fault artifact unreadable: ' + type(exc).__name__)
+                artifact = None
+            if isinstance(artifact, dict):
+                if artifact.get('probe_id') != request['probe_id']:
+                    failures.append('fault artifact belongs to another probe')
+                if artifact.get('schema') != SCHEMAS['durability']:
+                    failures.append('fault artifact schema mismatch')
+        inventory_path = self.fetch('staging-inventory.json', 'staging-inventory.json')
+        if inventory_path is None:
+            missing.append('staging-inventory.json')
+        else:
+            try:
+                inventory = read_json(inventory_path)
+            except Exception as exc:
+                failures.append('staging inventory unreadable: ' + type(exc).__name__)
+                inventory = None
+            if inventory is not None:
+                failures.extend(validate_staging_inventory(inventory, request))
+        return failures, missing
+
+    def durability_faults(self):
+        """D3-D5: run every selected non-destructive fault case."""
+        cases = getattr(self.args, 'fault_case', None) or list(DURABILITY_FAULT_CASES)
+        cases = [case for case in DURABILITY_FAULT_CASES if case in set(cases)]
+        statuses = []
+        for case in cases:
+            request = self.durability_fault_request(case)
+            for name in (f'durability-fault-{case}.json', 'staging-inventory.json'):
+                try:
+                    self.delete_probe(name, QUAL_DIR)
+                except Exception:
+                    pass
+            status, detail, document = self.probe(
+                f'fault-{case}', request, self.args.probe_timeout,
+                action_name=case)
+            if status == 'READY':
+                failures, missing = self.durability_artifact_errors(
+                    case, request, document)
+                if failures:
+                    status, detail = 'FAILED', '; '.join(failures)
+                elif missing:
+                    status = 'INCOMPLETE'
+                    detail = 'missing artifacts: ' + ', '.join(missing)
+                else:
+                    status, detail = 'PASS', ''
+            self.result['scenario_results'][f'durability-{case}'] = status
+            self.result['scenario_details'][f'durability-{case}'] = detail
+            statuses.append(status)
+            self.note(f'durability fault {case}: {status}'
+                      + (f' ({detail})' if detail else ''))
+        if any(status == 'FAILED' for status in statuses):
+            return 'FAILED'
+        if any(status in ('BLOCKED', 'INCOMPLETE', 'PREREQ_ONLY')
+               for status in statuses) or len(statuses) != len(cases):
+            return 'BLOCKED'
+        return 'PASS' if statuses else 'BLOCKED'
+
+    def _start_app_with_autopilot(self, request, action_name, timeout):
+        probe_id = request['probe_id']
+        request_path = self.output / f'request-{probe_id}.json'
+        write_json(request_path, request)
+        if self.app_running():
+            self.stop_app()
+        for name in AUTOPILOT_FILES:
+            if name in self.names(''):
+                raise RuntimeError(f'{name} reappeared; refusing to overwrite')
+        self.upload(request_path, f'request-{probe_id}.json')
+        script = self.output / 'autopilot.json'
+        write_json(script, {
+            'total_timeout_s': int(timeout),
+            'actions': [{'op': PROBE_OP, 'name': action_name,
+                         'label': probe_id, 'timeout_s': int(timeout)}],
+        })
+        empty = self.output / 'empty.flag'
+        empty.write_bytes(b'')
+        self.upload(script, 'autopilot.json', '')
+        self.upload(empty, 'autopilot.flag', '')
+        self.start_app()
+
+    def stale_lock(self):
+        """D7: hold the store lease, force-stop the app, restart and verify.
+
+        The app-side probe is test-only. `phase=hold` must write a response with
+        lock.held=true and stay alive; `phase=verify` runs after the controller
+        terminates the process and must write stale-lock.json.
+        """
+        if not getattr(self.args, 'destructive', False):
+            return 'BLOCKED', 'D7 requires --destructive'
+        hold_id = os.urandom(16).hex()
+        hold_request = {
+            'schema': SCHEMAS['durability'],
+            'probe_id': hold_id,
+            'case': 'stale_lock',
+            'phase': 'hold',
+            'fault': {'kind': 'stale_lock', 'injected': True, 'at': 0},
+            'test_only': True,
+            'store': {'root': DURABILITY_ROOT, 'namespace': SNAPSHOT_DIR,
+                      'production_namespace': False},
+            'phase_flags': {'phase3': False, 'phase4': False},
+        }
+        for name in ('stale-lock.json', 'staging-inventory.json',
+                     f'response-{hold_id}.json'):
+            try:
+                self.delete_probe(name, QUAL_DIR)
+            except Exception:
+                pass
+        try:
+            self._start_app_with_autopilot(hold_request, 'stale_lock', 120)
+            if not self.wait_for(
+                    lambda: f'response-{hold_id}.json' in self.names(QUAL_DIR), 120):
+                done = self.fetch('autopilot-done.txt',
+                                  f'autopilot-done-stale-hold.txt', '')
+                text = done.read_text(errors='replace') if done else ''
+                if any(marker in text.lower() for marker in (
+                        'unknown', 'unrecognized', 'unsupported', 'not implemented',
+                        'invalid action', 'invalid op', 'no such op', 'unknown op')):
+                    return 'BLOCKED', 'test-only stale-lock probe is not implemented'
+                return 'BLOCKED', 'stale-lock hold probe produced no response'
+            hold_response = self.fetch(f'response-{hold_id}.json',
+                                       'stale-lock-hold.json')
+            hold_doc = read_json(hold_response) if hold_response else None
+            if not isinstance(hold_doc, dict) or \
+                    not isinstance(hold_doc.get('lock'), dict) or \
+                    hold_doc['lock'].get('held') is not True:
+                return 'FAILED', 'hold probe did not prove the lease was held'
+            # WDP stop-app terminates the process, so the kernel lock is lost
+            # exactly as in a force-stop; no snapshot cleanup is attempted.
+            self.stop_app()
+            self.note('stale-lock hold process terminated; restarting for verify')
+        finally:
+            if self.app_running():
+                try:
+                    self.stop_app()
+                except Exception:
+                    pass
+            # The hold action intentionally stays alive, so it may leave the
+            # autopilot files behind. They were all created by this controller.
+            for name in AUTOPILOT_FILES:
+                try:
+                    self.delete_probe(name, '')
+                except Exception:
+                    pass
+
+        verify_id = os.urandom(16).hex()
+        verify_request = {
+            'schema': SCHEMAS['durability'],
+            'probe_id': verify_id,
+            'case': 'stale_lock',
+            'phase': 'verify',
+            'predecessor': hold_id,
+            'fault': {'kind': 'stale_lock', 'injected': True, 'at': 0},
+            'test_only': True,
+            'store': {'root': DURABILITY_ROOT, 'namespace': SNAPSHOT_DIR,
+                      'production_namespace': False},
+            'phase_flags': {'phase3': False, 'phase4': False},
+        }
+        for name in ('stale-lock.json', 'staging-inventory.json'):
+            try:
+                self.delete_probe(name, QUAL_DIR)
+            except Exception:
+                pass
+        status, detail, document = self.probe(
+            'stale-lock', verify_request, self.args.probe_timeout,
+            action_name='stale_lock')
+        if status != 'READY':
+            return status, detail
+        failures = validate_stale_lock_evidence(document, verify_request)
+        artifact = self.fetch('stale-lock.json', 'stale-lock.json')
+        if artifact is None:
+            failures.append('stale-lock.json artifact missing')
+        else:
+            try:
+                stored = read_json(artifact)
+            except Exception as exc:
+                failures.append('stale-lock.json unreadable: ' + type(exc).__name__)
+                stored = None
+            if isinstance(stored, dict):
+                if stored.get('probe_id') != verify_id:
+                    failures.append('stale-lock.json belongs to another probe')
+                if stored.get('schema') != SCHEMAS['durability']:
+                    failures.append('stale-lock.json schema mismatch')
+                failures.extend(validate_stale_lock_evidence(stored, verify_request))
+        return ('FAILED', '; '.join(sorted(set(failures)))) if failures else ('PASS', '')
+
     def durability(self):
         # D1: only a self-created 4 KiB file; never an existing snapshot.
         payload = os.urandom(4096)
@@ -899,13 +1388,48 @@ class Runner:
                 'v3 namespace changed across a clean restart')
             return
         self.result['scenario_results']['durability-restart'] = 'PASS'
-        if self.args.destructive and self.args.power_loss_method:
-            self.power_loss()
+
+        # D3-D5: every case needs the test-only app probe. Without it the probe
+        # returns BLOCKED and the scenario can never become PASS.
+        faults = self.durability_faults()
+        self.result['scenario_results']['durability-faults'] = faults
+
+        power_loss_status = None
+        if getattr(self.args, 'destructive', False):
+            stale_status, stale_detail = self.stale_lock()
+            self.result['scenario_results']['durability-stale-lock'] = stale_status
+            self.result['scenario_details']['durability-stale-lock'] = stale_detail
+            if stale_status == 'FAILED':
+                self.result['scenario_results']['durability'] = 'FAILED'
+                self.result['scenario_details']['durability'] = (
+                    'D7 stale-lock: ' + stale_detail)
+                return
+            if getattr(self.args, 'power_loss_method', None):
+                power_loss_status, power_detail = self.power_loss()
+                self.result['scenario_results']['durability-power-loss'] = (
+                    power_loss_status)
+                self.result['scenario_details']['durability-power-loss'] = power_detail
+            else:
+                self.result['scenario_results']['durability-power-loss'] = 'BLOCKED'
+                self.result['scenario_details']['durability-power-loss'] = (
+                    'D6 power loss not run (no --power-loss-method)')
         else:
-            self.result['scenario_results']['durability'] = 'PREREQ_ONLY'
+            self.result['scenario_results']['durability-stale-lock'] = 'BLOCKED'
+            self.result['scenario_details']['durability-stale-lock'] = (
+                'D7 not run without --destructive')
+            self.result['scenario_results']['durability-power-loss'] = 'BLOCKED'
+            self.result['scenario_details']['durability-power-loss'] = (
+                'D6 not run without --destructive --power-loss-method')
+
+        overall = aggregate_durability(
+            faults,
+            self.result['scenario_results']['durability-stale-lock'],
+            self.result['scenario_results']['durability-power-loss'])
+        self.result['scenario_results']['durability'] = overall
+        if overall != 'PASS':
             self.result['scenario_details']['durability'] = (
-                'no test-build staging probe and no power-loss run: blocker 3 '
-                'closure is not claimed')
+                'blocker 3 is not closed: D3-D7 require the test-only staging '
+                'probe, destructive stale-lock run and operator power loss')
 
     def power_loss(self):
         self.note('DESTRUCTIVE power-loss step: the operator cuts power now; '
@@ -915,10 +1439,7 @@ class Runner:
         else:
             reply = sys.stdin.readline().strip()
         if reply != 'POWER LOSS NOW':
-            self.result['scenario_results']['durability'] = 'BLOCKED'
-            self.result['scenario_details']['durability'] = (
-                'operator did not confirm the power-loss step')
-            return
+            return 'BLOCKED', 'operator did not confirm the power-loss step'
         timeline = {'method': self.args.power_loss_method}
         timeline['power_cut_requested_at'] = time.time()
         if self.args.power_loss_method == 'smartplug':
@@ -938,15 +1459,12 @@ class Runner:
         timeline['reachable_at'] = time.time()
         self.result['power_loss_timeline'] = timeline
         if not (unreachable and reachable):
-            self.result['scenario_results']['durability'] = 'FAILED'
-            self.result['scenario_details']['durability'] = (
-                'power-loss timeline incomplete')
-            return
-        # The console restart is real, but the managed staging probe is absent.
-        self.result['scenario_results']['durability'] = 'BLOCKED'
-        self.result['scenario_details']['durability'] = (
-            'power-loss timeline recorded, but the test-build staging probe is '
-            'not present: durability is not proven')
+            return 'FAILED', 'power-loss timeline incomplete'
+        # The console restart is real, but without a post-restart staging
+        # evidence run the power-loss row stays BLOCKED.
+        return 'BLOCKED', (
+            'power-loss timeline recorded, but no post-restart staging evidence '
+            'was produced: durability is not proven')
 
     def _reachable(self):
         try:
@@ -1110,6 +1628,9 @@ def parse_args(argv=None):
     parser.add_argument('--allow-app-run', action='store_true')
     parser.add_argument('--allow-phase-flags', action='store_true')
     parser.add_argument('--destructive', action='store_true')
+    parser.add_argument('--fault-case', action='append',
+                        choices=DURABILITY_FAULT_CASES,
+                        help='D3-D5 staging fault cases (default: all)')
     parser.add_argument('--power-loss-method', choices=('manual', 'smartplug'))
     parser.add_argument('--smartplug-command')
     parser.add_argument('--probe-timeout', type=int, default=600)
@@ -1140,7 +1661,8 @@ def main(argv=None):
                                   'durability' in args.scenario),
                 'allow-phase-flags': 'attest' in args.scenario,
                 'power-loss-optional': 'durability' in args.scenario,
-                'power-loss-needs': '--destructive --power-loss-method manual|smartplug',
+                'stale-lock-needs': '--destructive (D7)',
+                'power-loss-needs': '--destructive --power-loss-method manual|smartplug (D6)',
                 'identity-provisioning-implemented': False,
             },
         }, indent=2))

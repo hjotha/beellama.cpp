@@ -41,6 +41,77 @@ def request(probe_id='a' * 32, case='positive'):
     }
 
 
+def durability_request(case, probe_id='d' * 32):
+    return {
+        'schema': console.SCHEMAS['durability'],
+        'probe_id': probe_id,
+        'case': case,
+        'fault': {'kind': case, 'injected': True, 'at': 0},
+        'test_only': True,
+        'store': {'root': console.DURABILITY_ROOT,
+                  'namespace': 'rkva-snapshots-v3',
+                  'production_namespace': False},
+        'phase_flags': {'phase3': False, 'phase4': False},
+    }
+
+
+def durability_evidence(case, probe_id='d' * 32):
+    state = console.DURABILITY_EXPECTED_STATE[case]
+    uncertain = case in console.DURABILITY_UNCERTAIN_CASES
+    document = {
+        'schema': console.SCHEMAS['durability'],
+        'probe_id': probe_id,
+        'case': case,
+        'build': {
+            'commit': '3a02e90',
+            'test_only_probe': True,
+            'durable_fault_seam': True,
+            'production_publication_enabled': False,
+            'windows_backend_qualified': False,
+            'phase3_enabled': False,
+            'phase4_enabled': False,
+        },
+        'store': {'root': console.DURABILITY_ROOT,
+                  'namespace': 'rkva-snapshots-v3',
+                  'production_namespace': False},
+        'fault': {'kind': case, 'injected': True, 'at': 0},
+        'writer': {'state': state, 'object_present': uncertain,
+                   'error': 'injected fault'},
+        'before': {'committed_sha256': 'a' * 64,
+                   'inventory': ['manifest-v2.bin', 'n-0.kv']},
+        'after': {'committed_sha256': 'a' * 64,
+                  'inventory': ['manifest-v2.bin', 'n-0.kv']},
+        'legacy': {'touched': False, 'v1_unchanged': True, 'v2_unchanged': True},
+        'staging': {'present': not uncertain, 'charged': True, 'adoptable': False,
+                    'automatic_cleanup': False, 'adopted': False, 'deleted': False},
+        'pin': {'consumed': True, 'reusable': False},
+        'claims': {'durable': False, 'published': False, 'committed': False,
+                   'gc_authorized': False},
+        'cleanup': {'automatic': False},
+    }
+    if case == 'stale_lock':
+        document['lock'] = {
+            'held_by_probe': True,
+            'owner_evidence_required': True,
+            'reclaimable_with_owner_evidence': True,
+            'pid_reuse_accepted': False,
+            'second_writer_entered': False,
+        }
+    return document
+
+
+def staging_inventory(probe_id='d' * 32):
+    return {
+        'schema': 'rkva-console-staging-inventory-v1',
+        'probe_id': probe_id,
+        'root': console.DURABILITY_ROOT,
+        'entries': [
+            {'name': 'tmp-' + '1' * 64, 'bytes': 4096},
+            {'name': 'manifest-v2.bin', 'bytes': 512},
+        ],
+    }
+
+
 def evidence(probe_id='a' * 32):
     return {
         'schema': console.SCHEMAS['attest'],
@@ -90,8 +161,11 @@ class PreviewTests(unittest.TestCase):
         self.assertIn('3', blockers)
         self.assertIn('3 (prerequisite only)', blockers)
         self.assertIn('7', blockers)
-        self.assertIn('D4', plan['destructive_steps'])
+        self.assertIn('D6', plan['destructive_steps'])
+        self.assertIn('D7', plan['destructive_steps'])
         self.assertIn('I3', plan['destructive_steps'])
+        ids = {step['id'] for step in plan['steps']}
+        self.assertTrue({'D3', 'D4', 'D5', 'D6', 'D7'} <= ids)
         for step in plan['steps']:
             for key in ('id', 'action', 'artifacts', 'pass', 'fail',
                         'hardware_state', 'destructive'):
@@ -132,9 +206,9 @@ class GateTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             console.validate_gates(self.args(scenario=['durability'], allow_app_run=True,
                                              power_loss_method='manual', destructive=False))
-        with self.assertRaises(RuntimeError):
-            console.validate_gates(self.args(scenario=['durability'], allow_app_run=True,
-                                             power_loss_method=None, destructive=True))
+        # --destructive alone is D7 only; D6 additionally needs the method.
+        console.validate_gates(self.args(scenario=['durability'], allow_app_run=True,
+                                         power_loss_method=None, destructive=True))
         console.validate_gates(self.args(scenario=['durability'], allow_app_run=True,
                                          power_loss_method='manual', destructive=True))
 
@@ -186,6 +260,106 @@ class AttestationTests(unittest.TestCase):
         self.assertEqual(console.validate_attest_negative(document, request('c' * 32)), [])
         document['negative']['accepted_any'] = True
         self.assertTrue(console.validate_attest_negative(document, request('c' * 32)))
+
+
+class DurabilityEvidenceTests(unittest.TestCase):
+    def test_every_fault_case_passes_without_a_publication_claim(self):
+        for case in console.DURABILITY_FAULT_CASES:
+            self.assertEqual(
+                console.validate_durability_evidence(
+                    durability_evidence(case), durability_request(case)), [],
+                case)
+
+    def test_stale_lock_evidence(self):
+        case = 'stale_lock'
+        document = durability_evidence(case)
+        self.assertEqual(
+            console.validate_stale_lock_evidence(document, durability_request(case)), [])
+        predecessor = json.loads(json.dumps(document))
+        del predecessor['lock']['held_by_probe']
+        predecessor['lock']['held_by_predecessor'] = True
+        self.assertEqual(
+            console.validate_stale_lock_evidence(
+                predecessor, durability_request(case)), [])
+        for mutate in (
+                lambda d: d['lock'].__setitem__('held_by_probe', False),
+                lambda d: d['lock'].__setitem__('pid_reuse_accepted', True),
+                lambda d: d['lock'].__setitem__('second_writer_entered', True),
+                lambda d: d['staging'].__setitem__('adopted', True),
+                lambda d: d['staging'].__setitem__('deleted', True),
+        ):
+            broken = json.loads(json.dumps(document))
+            mutate(broken)
+            self.assertTrue(
+                console.validate_stale_lock_evidence(broken, durability_request(case)))
+
+    def test_forbidden_claims_and_scope_are_refused(self):
+        for case in ('chunk_sync', 'rename_eio'):
+            request = durability_request(case)
+            mutations = (
+                lambda d: d['writer'].__setitem__('state', 'published_pending'),
+                lambda d: d['claims'].__setitem__('durable', True),
+                lambda d: d['claims'].__setitem__('committed', True),
+                lambda d: d['store'].__setitem__(
+                    'root', 'rkva-snapshots-v3'),
+                lambda d: d['store'].__setitem__('production_namespace', True),
+                lambda d: d['after'].__setitem__('committed_sha256', 'b' * 64),
+                lambda d: d['legacy'].__setitem__('touched', True),
+                lambda d: d['staging'].__setitem__('charged', False),
+                lambda d: d['staging'].__setitem__('adoptable', True),
+                lambda d: d['pin'].__setitem__('reusable', True),
+                lambda d: d['build'].__setitem__('windows_backend_qualified', True),
+                lambda d: d['build'].__setitem__('phase4_enabled', True),
+                lambda d: d['build'].__setitem__('durable_fault_seam', False),
+                lambda d: d['fault'].__setitem__('injected', False),
+            )
+            for mutate in mutations:
+                document = durability_evidence(case)
+                mutate(document)
+                self.assertTrue(
+                    console.validate_durability_evidence(document, request),
+                    f'{case} mutation was accepted')
+
+    def test_uncertain_case_requires_object_and_no_stage(self):
+        case = 'ack_lost'
+        request = durability_request(case)
+        document = durability_evidence(case)
+        self.assertEqual(console.validate_durability_evidence(document, request), [])
+        document['writer']['object_present'] = False
+        self.assertTrue(console.validate_durability_evidence(document, request))
+        document = durability_evidence(case)
+        document['staging']['present'] = True
+        self.assertTrue(console.validate_durability_evidence(document, request))
+
+    def test_staging_failure_requires_preserved_stage(self):
+        case = 'chunk_sync'
+        request = durability_request(case)
+        document = durability_evidence(case)
+        document['staging']['present'] = False
+        self.assertTrue(console.validate_durability_evidence(document, request))
+
+    def test_staging_inventory_scope(self):
+        request = durability_request('chunk_sync')
+        self.assertEqual(
+            console.validate_staging_inventory(staging_inventory(), request), [])
+        document = staging_inventory()
+        document['root'] = 'rkva-snapshots-v3'
+        self.assertTrue(console.validate_staging_inventory(document, request))
+        document = staging_inventory()
+        document['entries'].append({'name': '../escape', 'bytes': 1})
+        self.assertTrue(console.validate_staging_inventory(document, request))
+        document = staging_inventory()
+        document['entries'].append({'name': 'rkva-snapshots-v2', 'bytes': 1})
+        self.assertTrue(console.validate_staging_inventory(document, request))
+
+    def test_durability_needs_every_row_for_pass(self):
+        self.assertEqual(console.aggregate_durability('PASS', 'PASS', 'PASS'), 'PASS')
+        self.assertEqual(console.aggregate_durability('PASS', 'PASS', 'BLOCKED'),
+                         'BLOCKED')
+        self.assertEqual(console.aggregate_durability('PASS', 'FAILED', 'PASS'),
+                         'FAILED')
+        self.assertEqual(console.aggregate_durability('BLOCKED', 'PASS', 'PASS'),
+                         'BLOCKED')
 
 
 class ProbeClassificationTests(unittest.TestCase):

@@ -89,7 +89,10 @@ are supplied, and it never installs, uninstalls or deletes snapshots. The
 matrix, evidence contracts and rollback are documented in
 `docs/rkva-snapshot-console-qualification-matrix.md`; the fault-injection and
 peer-identity plans are in `docs/rkva-durable-fault-injection.md` and
-`docs/rkva-peer-identity-uwp-inventory.md`.
+`docs/rkva-peer-identity-uwp-inventory.md`. The Windows/UWP durable backend in
+`uwp/rkva/rkva-managed-object-v3-windows.cpp` is a test-only skeleton behind
+`RKVA_MANAGED_V3_WINDOWS_EXPERIMENTAL_TEST`; it never reports `qualified()` and
+must not be treated as a power-loss qualification.
 
 The original worktrees remain historical references; this app does not depend
 on their paths or build caches. The earlier standalone DFlash research app is
