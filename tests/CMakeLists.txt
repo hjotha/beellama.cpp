@@ -58,6 +58,21 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-rkva-qual-probe-static.py)
     set_property(TEST test-rkva-qual-probe-static PROPERTY LABELS main)
 
+    # Blocker 7 static guards: default-off CMake wiring, AppContainer/ACL source
+    # invariants, no logging in the store, and the pin-before-auth WDP order.
+    add_test(
+        NAME test-rkva-peer-identity-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-rkva-peer-identity-static.py)
+    set_property(TEST test-rkva-peer-identity-static PROPERTY LABELS main)
+
+    # CPU-only checks of the pinned WDP peer-identity evidence helper.
+    add_test(
+        NAME test-rkva-peer-identity-wdp
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-rkva-peer-identity-wdp.py)
+    set_property(TEST test-rkva-peer-identity-wdp PROPERTY LABELS main)
+
     add_test(
         NAME test-backend-ops-seed-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
@@ -1550,6 +1565,52 @@ if (RKVA_MANAGED_SNAPSHOT_PHASE4)
         add_test(NAME test-rkva-managed-store-authority COMMAND $<TARGET_FILE:test-rkva-managed-store-authority>)
         set_property(TEST test-rkva-managed-store-authority PROPERTY LABELS main)
     endif()
+endif()
+
+# Blocker 7 peer identity store and certificate pin. Default OFF. The portable
+# core and the Windows/AppContainer backend are isolated: no server, UWP,
+# listener or credential path includes them, and every entry point additionally
+# requires RKVA_PEER_IDENTITY_STORE=1 at run time. The test library compiles the
+# same core with test-only backends; it is never linked into a production
+# target. See docs/rkva-peer-identity-store.md.
+if (RKVA_PEER_IDENTITY_STORE)
+    set(RKVA_PEER_IDENTITY_SOURCES
+        ${PROJECT_SOURCE_DIR}/tools/rkva-peer-identity/rkva-peer-identity-core.cpp)
+    if (WIN32)
+        list(APPEND RKVA_PEER_IDENTITY_SOURCES
+            ${PROJECT_SOURCE_DIR}/tools/rkva-peer-identity/rkva-peer-identity-win32.cpp)
+    endif()
+
+    add_library(rkva-peer-identity STATIC ${RKVA_PEER_IDENTITY_SOURCES})
+    target_compile_features(rkva-peer-identity PUBLIC cxx_std_17)
+    target_compile_definitions(rkva-peer-identity PUBLIC RKVA_PEER_IDENTITY_STORE)
+    target_include_directories(rkva-peer-identity PUBLIC
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn
+        ${PROJECT_SOURCE_DIR}/vendor)
+    if (WIN32)
+        target_link_libraries(rkva-peer-identity PUBLIC advapi32 crypt32 bcrypt)
+    endif()
+
+    add_library(rkva-peer-identity-testing STATIC
+        ${RKVA_PEER_IDENTITY_SOURCES}
+        ${PROJECT_SOURCE_DIR}/tools/rkva-peer-identity/rkva-peer-identity-test-store.cpp)
+    target_compile_features(rkva-peer-identity-testing PUBLIC cxx_std_17)
+    target_compile_definitions(rkva-peer-identity-testing PUBLIC
+        RKVA_PEER_IDENTITY_STORE
+        RKVA_PEER_IDENTITY_TESTING)
+    target_include_directories(rkva-peer-identity-testing PUBLIC
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn
+        ${PROJECT_SOURCE_DIR}/vendor)
+    if (WIN32)
+        target_link_libraries(rkva-peer-identity-testing PUBLIC advapi32 crypt32 bcrypt)
+    endif()
+
+    add_executable(test-rkva-peer-identity test-rkva-peer-identity.cpp)
+    target_link_libraries(test-rkva-peer-identity PRIVATE rkva-peer-identity-testing)
+    add_test(NAME test-rkva-peer-identity COMMAND $<TARGET_FILE:test-rkva-peer-identity>)
+    set_property(TEST test-rkva-peer-identity PROPERTY LABELS main)
 endif()
 
 # Phase 5 activation composition. Default OFF and requires Phase 4. This static

@@ -224,10 +224,17 @@ record `BLOCKED`, never PASS. See `docs/rkva-durable-fault-injection.md`.
 | I5 | Deploy the test build, provision through the authorized WDP session, restart, then power-interrupt. | `identity-provision.json`, `identity-reload.json`, `restart-timeline.json` | identity survives a clean restart; mismatched cert pin/PFN refused; rollback attempts rejected | bundle accepted without an authenticated source, TOFU used for managed trust, or rollback accepted | **DESTRUCTIVE**: test package deployment and console restart; explicit deployment session required |
 | I6 | AppContainer ACL and namespace check on the console. | `icacls-identity.txt` | only the package SID can read/write; no inherited Users/Everyone | broad ACL or reparse point | Console shell; `icacls` output pasted into the evidence dir |
 
-I4–I6 are **BLOCKED** today: `tools/rkva-peer-identity/` exists only on
-`research/rkva-peer-identity-20261030` (`e2526b34d`), is Windows-only, and is
-not built or tested by any target in this tree. The missing pieces and the
-build/test plan are in `docs/rkva-peer-identity-uwp-inventory.md`.
+I4–I6 remain **BLOCKED**. This change adds a default-off store/pin library
+(`RKVA_PEER_IDENTITY_STORE=OFF`), a Windows/AppContainer backend source, a
+pinned read-only WDP helper and CPU/static tests. The Linux tests cover schema,
+MAC, pin/TOFU/rotation/revocation, atomic-file corruption and the pin-before-auth
+order; they do **not** compile Windows code, read an ACL, run DPAPI under an
+AppContainer, deploy a package, restart the app or interrupt power. The
+namespace at rest remains exactly `identity.lock` + `identity.json`;
+`identity.pending`/`identity.new` are transient write names and a persisted one
+must be refused as ambiguous (I3). Missing work and the exact console sequence
+are in `docs/rkva-peer-identity-store.md` §7 and
+`docs/rkva-peer-identity-uwp-inventory.md`.
 
 ## 5. Destructive-test warnings
 

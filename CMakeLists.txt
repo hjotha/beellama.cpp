@@ -166,6 +166,13 @@ option(RKVA_MANAGED_SNAPSHOT_PHASE3 "rkva: build the isolated managed snapshot P
 # library and its CPU tests behind the RKVA_MANAGED_SNAPSHOT_PHASE4 run-time
 # gate; it advertises no capability and changes no HELLO/op/dispatch behaviour.
 option(RKVA_MANAGED_SNAPSHOT_PHASE4 "rkva: build the isolated managed snapshot Phase 4 framing/ATTEST/identity layer and tests" OFF)
+# Blocker 7 peer identity store and certificate pin. Default OFF: the portable
+# store core, the Windows/AppContainer backend and their CPU tests are not built
+# and no listener, HELLO, dispatch or credential path references them. Enabling
+# only builds the isolated library; every entry point still requires the
+# RKVA_PEER_IDENTITY_STORE=1 run-time gate. This does not deploy or qualify a
+# console.
+option(RKVA_PEER_IDENTITY_STORE "rkva: build the default-off Windows/UWP peer identity store and certificate pin" OFF)
 # Phase 5 activation composition. Default OFF and only valid with Phase 4 on:
 # one RAII store authority over journal/SQLite/object-v3/quota, the
 # authenticated successful COMMIT/STATUS reply, the listener session authority

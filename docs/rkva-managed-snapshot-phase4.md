@@ -244,11 +244,16 @@ transport.
 
 ### Peer identity
 
-- `tools/rkva-peer-identity/rkva-peer-identity.{h,cpp}` (Windows/AppContainer
-  only; needs an MSVC UWP build plus an exclusive LocalState/ACL contract and an
-  independently authenticated WDP certificate/package pin).
-- `tools/rkva-managed-bootstrap/tofu.py` and its local TLS test
-  (explicit-TOFU host prototype; not wired, not run here).
+- `tools/rkva-peer-identity/` now contains a portable canonical-JSON store,
+  HMAC/DPAPI integrity, pin/TOFU/rotate/revoke API, Windows/AppContainer backend
+  source and CPU/static tests behind the separate default-off option
+  `RKVA_PEER_IDENTITY_STORE`. It is **not** part of the Phase 4 library and has
+  no listener or credential call site. No MSVC/UWP build, AppContainer ACL
+  evidence, console deployment, restart or power-loss test exists, so blocker 7
+  stays open. See `docs/rkva-peer-identity-store.md`.
+- `tools/rkva-managed-bootstrap/tofu.py` and its local TLS test remain an
+  unwired host prototype; its semantics are superseded for the store by the
+  explicit TOFU boundary above.
 
 ### Real transport / backend
 
