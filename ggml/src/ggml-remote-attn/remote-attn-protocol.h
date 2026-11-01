@@ -37,6 +37,20 @@ enum rkva_op : uint16_t {
     RKVA_KVARN_RANGE_REWIND = 21,    // atomic bounded resident native rewind
     RKVA_KVARN_RANGE_BULK_ATTN = 22, // ordered native upload/query segments, one reply
     RKVA_KVARN_RANGE_COHORT_ATTN = 23, // negotiated independent-layer envelopes
+    // Reserved managed-snapshot extension. Nothing in this tree advertises,
+    // returns or dispatches these numbers from a live listener: the Phase 4
+    // codec is compiled only behind RKVA_MANAGED_SNAPSHOT_PHASE4 and gated at
+    // run time by RKVA_MANAGED_SNAPSHOT_PHASE4=1. The only negotiated managed
+    // framing is the v3 single-frame contract (see docs/rkva-managed-snapshot-
+    // phase4.md); the older E2E v2 offer/reply shape is offline-only.
+    RKVA_REGISTRY_PREPARE = 24,
+    RKVA_REGISTRY_COMMIT = 25,
+    RKVA_REGISTRY_ABORT = 26,
+    RKVA_REGISTRY_RELEASE = 27,
+    RKVA_REGISTRY_STATUS = 28,
+    RKVA_MANAGED_AUTH_HELLO = 29,
+    RKVA_MANAGED_AUTH_CHALLENGE = 30,
+    RKVA_MANAGED_ATTEST = 31,
     RKVA_RANGE_ATTN = 14,            // query-only F32, returns OUT F32 then LSE F32
 };
 
@@ -86,6 +100,12 @@ static constexpr uint64_t RKVA_CAP_KVARN_BULK_512 = 1ull << 17;
 // Additive: old servers reject revision 2 before touching state, and old hosts
 // never send it because the HELLO bit/capability are both absent.
 static constexpr uint64_t RKVA_CAP_NATIVE_KVARN_SNAPSHOT = 1ull << 18;
+// Reserved managed-snapshot capabilities. These are never set by the default
+// listener (the Phase 4 activation gate is off) and a peer that requires them
+// must fail closed instead of falling back to an unauthenticated path.
+static constexpr uint64_t RKVA_CAP_MANAGED_REGISTRY_V1 = 1ull << 19;
+static constexpr uint64_t RKVA_CAP_MANAGED_AUTH_V2 = 1ull << 20;
+static constexpr uint64_t RKVA_CAP_MANAGED_FRAMING_V3 = 1ull << 21;
 
 // v1 cohort extension; each entry immediately precedes its old op22 body.
 // Reply mirrors the envelope with OUT/LSE bodies and exact ticket/epoch echoes.
@@ -110,6 +130,11 @@ static constexpr uint32_t RKVA_KVARN_UPLOAD_OMIT_STAGE = 2u;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SNAPSHOT_V4 = 1u << 18;
+// Reserved managed-snapshot protocol flags. Advertised only by a Phase 4 build
+// that has passed the activation gate; inert otherwise.
+static constexpr uint32_t RKVA_PROTO_MANAGED_REGISTRY_V1 = 1u << 19;
+static constexpr uint32_t RKVA_PROTO_MANAGED_AUTH_V2 = 1u << 20;
+static constexpr uint32_t RKVA_PROTO_MANAGED_FRAMING_V3 = 1u << 21;
 static constexpr uint32_t RKVA_SNAPSHOT_REVISION_NATIVE = 2;
 static constexpr uint32_t RKVA_NATIVE_SNAPSHOT_FORMAT = 1;
 static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;

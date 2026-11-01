@@ -1419,3 +1419,77 @@ if (RKVA_MANAGED_SNAPSHOT_PHASE3)
     add_test(NAME test-rkva-managed-phase3-gate COMMAND $<TARGET_FILE:test-rkva-managed-phase3-gate>)
     set_property(TEST test-rkva-managed-phase3-gate PROPERTY LABELS main)
 endif()
+
+# Phase 4 framing/ATTEST/peer-identity layer. Default OFF. The single v3
+# authenticated frame is the only negotiated managed contract; the older E2E
+# v2 codec and the transactional-peer/SQLite adapter are not wired. There is
+# no listener call site and no capability advertisement, so this library is
+# test-only scaffolding behind the RKVA_MANAGED_SNAPSHOT_PHASE4 gate. See
+# docs/rkva-managed-snapshot-phase4.md.
+if (RKVA_MANAGED_SNAPSHOT_PHASE4)
+    find_package(Threads REQUIRED)
+    add_library(rkva-managed-phase4 STATIC
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-host-journal.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-host-v3-error.cpp)
+    target_compile_features(rkva-managed-phase4 PUBLIC cxx_std_17)
+    target_compile_definitions(rkva-managed-phase4 PUBLIC
+        RKVA_MANAGED_SNAPSHOT_PHASE4
+        RKVA_HOST_JOURNAL_TESTING)
+    target_include_directories(rkva-managed-phase4 PUBLIC
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn
+        ${PROJECT_SOURCE_DIR}/tools/server
+        ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva)
+    target_link_libraries(rkva-managed-phase4 PUBLIC Threads::Threads)
+
+    add_executable(test-rkva-managed-framing-v3 test-rkva-managed-framing-v3.cpp)
+    target_link_libraries(test-rkva-managed-framing-v3 PRIVATE rkva-managed-phase4)
+    add_test(NAME test-rkva-managed-framing-v3 COMMAND $<TARGET_FILE:test-rkva-managed-framing-v3>)
+    set_property(TEST test-rkva-managed-framing-v3 PROPERTY LABELS main)
+
+    add_executable(test-rkva-prepare-v3 test-rkva-prepare-v3.cpp)
+    target_link_libraries(test-rkva-prepare-v3 PRIVATE rkva-managed-phase4)
+    add_test(NAME test-rkva-prepare-v3 COMMAND $<TARGET_FILE:test-rkva-prepare-v3>)
+    set_property(TEST test-rkva-prepare-v3 PROPERTY LABELS main)
+
+    add_executable(test-rkva-resident-attestation test-rkva-resident-attestation.cpp)
+    target_link_libraries(test-rkva-resident-attestation PRIVATE rkva-managed-phase4)
+    add_test(NAME test-rkva-resident-attestation COMMAND $<TARGET_FILE:test-rkva-resident-attestation>)
+    set_property(TEST test-rkva-resident-attestation PROPERTY LABELS main)
+
+    add_executable(test-rkva-host-v3-nonce test-rkva-host-v3-nonce.cpp)
+    target_link_libraries(test-rkva-host-v3-nonce PRIVATE rkva-managed-phase4)
+    add_test(NAME test-rkva-host-v3-nonce COMMAND $<TARGET_FILE:test-rkva-host-v3-nonce>)
+    set_property(TEST test-rkva-host-v3-nonce PROPERTY LABELS main)
+
+    add_executable(test-rkva-managed-phase4-gate test-rkva-managed-phase4-gate.cpp)
+    target_include_directories(test-rkva-managed-phase4-gate PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-rkva-managed-phase4-gate PRIVATE RKVA_MANAGED_SNAPSHOT_PHASE4)
+    add_test(NAME test-rkva-managed-phase4-gate COMMAND $<TARGET_FILE:test-rkva-managed-phase4-gate>)
+    set_property(TEST test-rkva-managed-phase4-gate PROPERTY LABELS main)
+
+    add_executable(test-rkva-managed-phase4-negotiation test-rkva-managed-phase4-negotiation.cpp)
+    target_link_libraries(test-rkva-managed-phase4-negotiation PRIVATE rkva-managed-phase4)
+    add_test(NAME test-rkva-managed-phase4-negotiation COMMAND $<TARGET_FILE:test-rkva-managed-phase4-negotiation>)
+    set_property(TEST test-rkva-managed-phase4-negotiation PROPERTY LABELS main)
+
+    # Concrete store-authority composition (lease + SQLite + fail-closed v3
+    # object). Linux only and independent of the framing library: it proves the
+    # single-authority gap that keeps publication disabled. The standalone
+    # equivalent lives in tools/rkva-managed-store-authority/.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(SQLite3 REQUIRED)
+        add_executable(test-rkva-managed-store-authority test-rkva-managed-store-authority.cpp
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-managed-store-authority.cpp
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-anchored-sqlite.cpp
+            ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp)
+        target_compile_features(test-rkva-managed-store-authority PRIVATE cxx_std_17)
+        target_include_directories(test-rkva-managed-store-authority PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/include
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn
+            ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva)
+        target_link_libraries(test-rkva-managed-store-authority PRIVATE SQLite3::SQLite3 Threads::Threads)
+        add_test(NAME test-rkva-managed-store-authority COMMAND $<TARGET_FILE:test-rkva-managed-store-authority>)
+        set_property(TEST test-rkva-managed-store-authority PROPERTY LABELS main)
+    endif()
+endif()

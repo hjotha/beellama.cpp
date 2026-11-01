@@ -1,20 +1,16 @@
 #pragma once
 
-// Reserved managed-registry wire codec (Phase 3 scaffolding). Nothing in the
-// running client or server advertises, negotiates or dispatches this extension.
-// IDs and snapshot keys are 32 opaque bytes (the prototype represents the same
-// bytes as lowercase hex). These identifiers are scope/replay keys, never
-// authentication credentials.
+// Managed-registry wire codec (Phase 3 scaffolding, Phase 4 negotiation).
+// Nothing in a default build advertises, negotiates or dispatches this
+// extension. IDs and snapshot keys are 32 opaque bytes (the prototype
+// represents the same bytes as lowercase hex). These identifiers are
+// scope/replay keys, never authentication credentials.
 //
-// PHASE 3 OP ALLOCATION: the Phase 2 report deferred the reserved protocol
-// additions (op 24..29, RKVA_CAP_MANAGED_REGISTRY_V1, RKVA_CAP_MANAGED_AUTH_V2,
-// RKVA_PROTO_MANAGED_REGISTRY_V1, RKVA_PROTO_MANAGED_AUTH_V2) to the Phase 4
-// framing work. This header therefore keeps the same numeric allocation
-// locally so the offline codec and reconciliation gate stay diffable against
-// the research branches, and deliberately does NOT touch remote-attn-protocol.h
-// or define any negotiated()/capability advertisement. Phase 4 must move these
-// constants into remote-attn-protocol.h in one change together with the
-// authenticated negotiation and dispatch, and delete this local block.
+// PHASE 4 OP ALLOCATION: the reserved numbers live in
+// remote-attn-protocol.h (`RKVA_REGISTRY_*`, `RKVA_MANAGED_AUTH_*`) together
+// with the managed capability/protocol bits. `negotiated()` below is the only
+// capability gate the Phase 4 codec may consult; there is no fallback: a peer
+// missing any managed bit or op is refused before any managed payload is read.
 #include "remote-attn-protocol.h"
 
 #include <algorithm>
@@ -25,14 +21,15 @@
 
 namespace rkva_registry_wire {
 
-// Reserved operation numbers, identical to the research allocation. No server
-// returns them in `supported_ops` and no client sends them.
+// Reserved operation numbers, identical to the protocol allocation. No server
+// returns them in `supported_ops` and no client sends them while the Phase 4
+// gate is closed.
 namespace op {
-constexpr uint16_t prepare = 24;
-constexpr uint16_t commit  = 25;
-constexpr uint16_t abort   = 26;
-constexpr uint16_t release = 27;
-constexpr uint16_t status  = 28;
+constexpr uint16_t prepare = RKVA_REGISTRY_PREPARE;
+constexpr uint16_t commit  = RKVA_REGISTRY_COMMIT;
+constexpr uint16_t abort   = RKVA_REGISTRY_ABORT;
+constexpr uint16_t release = RKVA_REGISTRY_RELEASE;
+constexpr uint16_t status  = RKVA_REGISTRY_STATUS;
 } // namespace op
 
 using id = std::array<uint8_t, 32>;
@@ -43,6 +40,23 @@ using request_wire = std::array<uint8_t, request_bytes>;
 using response_wire = std::array<uint8_t, response_bytes>;
 constexpr uint32_t operations = (1u << op::prepare) | (1u << op::commit) | (1u << op::abort) |
     (1u << op::release) | (1u << op::status);
+
+// The single managed capability gate. A managed connection must offer the
+// registry, auth-v2 and framing-v3 protocol flags, the matching capabilities
+// and every reserved operation including the handshake and ATTEST ops.
+// Nothing here negotiates a weaker fallback: any missing bit returns false and
+// the caller must refuse the frame before reading it.
+constexpr uint32_t managed_protocols = RKVA_PROTO_MANAGED_REGISTRY_V1 |
+    RKVA_PROTO_MANAGED_AUTH_V2 | RKVA_PROTO_MANAGED_FRAMING_V3;
+constexpr uint64_t managed_capabilities = RKVA_CAP_MANAGED_REGISTRY_V1 |
+    RKVA_CAP_MANAGED_AUTH_V2 | RKVA_CAP_MANAGED_FRAMING_V3;
+constexpr uint32_t managed_operations = operations | (1u << RKVA_MANAGED_AUTH_HELLO) |
+    (1u << RKVA_MANAGED_AUTH_CHALLENGE) | (1u << RKVA_MANAGED_ATTEST);
+inline bool negotiated(uint32_t protocol_flags, uint64_t capabilities, uint32_t supported_ops) {
+    return (protocol_flags & managed_protocols) == managed_protocols &&
+           (capabilities & managed_capabilities) == managed_capabilities &&
+           (supported_ops & managed_operations) == managed_operations;
+}
 
 inline bool valid_op(uint16_t value) {
     return value >= op::prepare && value <= op::status;
@@ -168,7 +182,7 @@ inline bool decode_response(uint16_t operation, const request & q, const uint8_t
     out = r; return true;
 }
 
-// Deferred to Phase 4: capability/HELLO negotiation (RKVA_PROTO/CAP bits) and
-// the outer rkva_request/rkva_response envelope binding. Without a negotiated
-// capability there is no header that may carry these bodies on a live socket.
+// Phase 4 defines the authenticated negotiation above. The outer
+// rkva_request/rkva_response envelope is bound by `rkva-managed-framing-v3.h`;
+// this header deliberately has no socket, listener or dispatch call site.
 } // namespace rkva_registry_wire

@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -54,7 +55,7 @@ void validate(const transaction & r) {
 }
 std::string encode(const snapshot & snap, const std::string & owner) {
     if (!hex64(owner) || snap.transactions.size() > max_records) throw std::runtime_error("invalid journal owner or capacity");
-    std::string out = snap.anchor.configured ? "RKHJNL02" : "RKHJNL01";
+    std::string out = snap.anchor.v3_configured ? "RKHJNL03" : snap.anchor.configured ? "RKHJNL02" : "RKHJNL01";
     out += owner; u64(out,snap.revision); u32(out,uint32_t(snap.transactions.size()));
     std::set<std::string> txs, refs;
     for (const auto & r : snap.transactions) {
@@ -76,6 +77,27 @@ std::string encode(const snapshot & snap, const std::string & owner) {
                 throw std::runtime_error("invalid issued nonce");
             out+=n.tx;out.append(reinterpret_cast<const char *>(n.nonce.data()),n.nonce.size());out.push_back(n.consumed?1:0);
         }
+        if(snap.anchor.v3_configured) {
+            if(!nonzero(snap.anchor.ledger_epoch) || snap.anchor.v3_nonces.size()>max_nonces)
+                throw std::runtime_error("invalid v3 nonce ledger");
+            out.append(reinterpret_cast<const char *>(snap.anchor.ledger_epoch.data()),32);
+            u32(out,uint32_t(snap.anchor.v3_nonces.size()));
+            std::set<auth_id> v3_seen;
+            for(const auto & n:snap.anchor.v3_nonces) {
+                if(!hex64(n.tx)||!txs.count(n.tx)||!hex64(n.reference)||!hex64(n.key)||
+                   n.op>UINT16_MAX || !rkva_registry_wire::valid_op(uint16_t(n.op))||!nonzero(n.nonce)||!nonzero(n.request_hash)||
+                   !nonzero(n.transcript)||!nonzero(n.challenge)||!nonzero(n.anchor_digest)||
+                   (n.consumed != nonzero(n.response_hash)) || !v3_seen.insert(n.nonce).second)
+                    throw std::runtime_error("invalid v3 issued nonce");
+                for(const auto & old:snap.anchor.nonces)if(old.nonce==n.nonce)throw std::runtime_error("nonce reused across versions");
+                auto tx=std::find_if(snap.transactions.begin(),snap.transactions.end(),[&](const transaction & t){return t.tx==n.tx;});
+                if(tx==snap.transactions.end()||tx->reference!=n.reference||tx->key!=n.key)throw std::runtime_error("v3 transaction binding differs");
+                out+=n.tx;out+=n.reference;out+=n.key;u32(out,n.op);
+                for(const auto * id:{&n.nonce,&n.request_hash,&n.transcript,&n.challenge,&n.anchor_digest,&n.response_hash})
+                    out.append(reinterpret_cast<const char *>(id->data()),32);
+                u64(out,n.anchor_version);out.push_back(n.consumed?1:0);
+            }
+        }
         if(out.size()>max_size-32)throw std::runtime_error("journal capacity exceeded");
     }
     auto hash=rkva_snapshot::digest(out.data(),out.size()); out.append(reinterpret_cast<const char *>(hash.data()),hash.size());
@@ -86,7 +108,7 @@ snapshot decode(const std::string & s, const std::string & owner) {
     const auto hash=rkva_snapshot::digest(s.data(),s.size()-32);
     if (std::memcmp(hash.data(),s.data()+s.size()-32,32)) throw std::runtime_error("journal checksum mismatch");
     reader rd(s);const auto magic=rd.get(8);
-    if((magic!="RKHJNL01" && magic!="RKHJNL02") || rd.get(64)!=owner || !hex64(owner)) throw std::runtime_error("journal format or owner mismatch");
+    if((magic!="RKHJNL01" && magic!="RKHJNL02" && magic!="RKHJNL03") || rd.get(64)!=owner || !hex64(owner)) throw std::runtime_error("journal format or owner mismatch");
     snapshot result; result.revision=rd.get64(); auto n=rd.get32(); if(n>max_records) throw std::runtime_error("journal count exceeded");
     std::set<std::string> txs,refs;
     for(uint32_t i=0;i<n;i++) {
@@ -98,7 +120,7 @@ snapshot decode(const std::string & s, const std::string & owner) {
         if(!txs.insert(r.tx).second || !refs.insert(r.reference).second) throw std::runtime_error("duplicate journal identity");
         result.transactions.push_back(std::move(r));
     }
-    if(magic=="RKHJNL02") {
+    if(magic=="RKHJNL02" || magic=="RKHJNL03") {
         result.anchor.configured=true;result.anchor.key_epoch=rd.get64();result.anchor.version=rd.get64();
         const auto digest=rd.get(32);std::copy(digest.begin(),digest.end(),result.anchor.digest.begin());
         const auto count=rd.get32();
@@ -111,6 +133,29 @@ snapshot decode(const std::string & s, const std::string & owner) {
             if(!txs.count(item.tx) || !nonzero(item.nonce) || flag>1 || !nonces.insert(item.nonce).second)
                 throw std::runtime_error("invalid issued nonce");
             item.consumed=flag!=0;result.anchor.nonces.push_back(std::move(item));
+        }
+        if(magic=="RKHJNL03") {
+            result.anchor.v3_configured=true;
+            auto ledger=rd.get(32);std::copy(ledger.begin(),ledger.end(),result.anchor.ledger_epoch.begin());
+            const auto count_v3=rd.get32();constexpr size_t record_bytes=192+4+6*32+8+1;
+            if(!nonzero(result.anchor.ledger_epoch)||count_v3>max_nonces||count_v3>(rd.end-rd.pos)/record_bytes)
+                throw std::runtime_error("invalid v3 nonce ledger");
+            std::set<auth_id> v3_seen;
+            for(uint32_t i=0;i<count_v3;i++) {
+                issued_v3_nonce item;item.tx=rd.get(64);item.reference=rd.get(64);item.key=rd.get(64);item.op=rd.get32();
+                for(auto * value:{&item.nonce,&item.request_hash,&item.transcript,&item.challenge,&item.anchor_digest,&item.response_hash}) {
+                    const auto raw=rd.get(32);std::copy(raw.begin(),raw.end(),value->begin());
+                }
+                item.anchor_version=rd.get64();const auto flag=uint8_t(rd.get(1)[0]);item.consumed=flag!=0;
+                const auto tx=std::find_if(result.transactions.begin(),result.transactions.end(),[&](const transaction & t){return t.tx==item.tx;});
+                if(flag>1||tx==result.transactions.end()||tx->reference!=item.reference||tx->key!=item.key||
+                   item.op>UINT16_MAX || !rkva_registry_wire::valid_op(uint16_t(item.op))||!nonzero(item.nonce)||!nonzero(item.request_hash)||
+                   !nonzero(item.transcript)||!nonzero(item.challenge)||!nonzero(item.anchor_digest)||
+                   (item.consumed != nonzero(item.response_hash))||!v3_seen.insert(item.nonce).second)
+                    throw std::runtime_error("invalid v3 nonce record");
+                for(const auto & old:result.anchor.nonces)if(old.nonce==item.nonce)throw std::runtime_error("nonce reused across versions");
+                result.anchor.v3_nonces.push_back(std::move(item));
+            }
         }
     }
     if(rd.pos != rd.end) throw std::runtime_error("journal trailing data");
@@ -266,7 +311,7 @@ bool journal::provision_anchor(uint64_t epoch,uint64_t version,const auth_id & d
 bool journal::issue_commit_nonce(const std::string & tx,const auth_id & nonce,const std::string & owner,uint64_t epoch,std::string & e) {
     return change(dir_,owner_,e,[&](snapshot & s){
         const auto & r=get(s,tx);
-        if(!s.anchor.configured || owner_!=owner || s.anchor.key_epoch!=epoch || r.state!=phase::host_published ||
+        if(!s.anchor.configured || s.anchor.v3_configured || owner_!=owner || s.anchor.key_epoch!=epoch || r.state!=phase::host_published ||
                 !nonzero(nonce) || s.anchor.nonces.size()>=max_nonces)
             throw std::runtime_error("commit nonce issuance refused");
         for(const auto & prior:s.anchor.nonces)if(prior.nonce==nonce)throw std::runtime_error("nonce reuse rejected");
@@ -278,7 +323,7 @@ bool journal::commit_verified(const std::string & tx,const auth_id & nonce,uint6
         const std::string & owner,uint64_t epoch,std::string & e) {
     return change(dir_,owner_,e,[&](snapshot & s){
         auto & r=get(s,tx);
-        if(!s.anchor.configured || owner_!=owner || s.anchor.key_epoch!=epoch ||
+        if(!s.anchor.configured || s.anchor.v3_configured || owner_!=owner || s.anchor.key_epoch!=epoch ||
                 r.state!=phase::host_published || r.reference!=reference || r.key!=key ||
                 !peer_version || !nonzero(digest) || s.anchor.version==UINT64_MAX ||
                 anchor_version!=s.anchor.version+1 || peer_version>anchor_version)
@@ -287,6 +332,77 @@ bool journal::commit_verified(const std::string & tx,const auth_id & nonce,uint6
         if(it==s.anchor.nonces.end() || it->tx!=tx || it->consumed)throw std::runtime_error("nonce absent or already consumed");
         it->consumed=true;s.anchor.version=anchor_version;s.anchor.digest=digest;
         r.state=phase::commit_ack;r.peer_commit_version=peer_version;return true;
+    });
+}
+bool journal::configure_v3_epoch(uint64_t epoch,const auth_id & ledger,uint64_t version,const auth_id & digest,std::string & e) {
+    return change(dir_,owner_,e,[&](snapshot & s){
+        if(!s.anchor.configured||s.anchor.v3_configured||s.anchor.key_epoch!=epoch||
+           s.anchor.version!=version||s.anchor.digest!=digest||!nonzero(ledger)||
+           std::any_of(s.anchor.nonces.begin(),s.anchor.nonces.end(),[](const issued_nonce & n){return !n.consumed;}))
+            throw std::runtime_error("trusted v3 epoch binding refused");
+        s.anchor.v3_configured=true;s.anchor.ledger_epoch=ledger;return true;
+    });
+}
+bool journal::issue_v3_command(const rkva_managed_framing_v3::secret & secret,
+        const rkva_managed_framing_v3::session & session,v3_connection_authority * connection,
+        const v3_frame_builder & builder,v3_issued_request & output,std::string & e) {
+    namespace v3=rkva_managed_framing_v3;
+    v3_issued_request local;
+    const bool ok=change(dir_,owner_,e,[&](snapshot & s){
+        if(!s.anchor.configured||!s.anchor.v3_configured||!v3::valid_session(session)||
+           rkva_registry_wire::to_hex(session.owner)!=owner_||session.auth_epoch!=s.anchor.key_epoch||
+           session.ledger_epoch!=s.anchor.ledger_epoch||!connection||!connection->held_and_bound(session)||!builder||
+           s.anchor.v3_nonces.size()>=max_nonces)
+            throw std::runtime_error("v3 issue authority or epoch unavailable");
+        size_t used=0;
+        while(used<local.nonce.size()) {
+            const auto n=::getrandom(local.nonce.data()+used,local.nonce.size()-used,0);
+            if(n<0&&errno==EINTR)continue;
+            if(n<=0)throw std::runtime_error("v3 CSPRNG unavailable");
+            used+=size_t(n);
+        }
+        if(!nonzero(local.nonce))throw std::runtime_error("invalid random nonce");
+        if(!builder(local.nonce,local.frame)||local.frame.size()<32||local.frame.size()>32+v3::max_frame)
+            throw std::runtime_error("v3 local frame construction failed");
+        rkva_request h{};if(!v3::parse_request_header(local.frame.data(),32,h) || h.payload_bytes!=local.frame.size()-32 ||
+            (h.op!=RKVA_REGISTRY_PREPARE && h.op!=RKVA_REGISTRY_COMMIT && h.op!=RKVA_REGISTRY_STATUS))
+            throw std::runtime_error("v3 operation or exact frame length refused");
+        std::vector<uint8_t> body(local.frame.begin()+32,local.frame.end());v3::fields f;rkva_registry_wire::request q{};
+        if(!v3::command_from_wire(secret,session,h,body,f,q)||f.nonce!=local.nonce||
+           f.host_anchor.version!=s.anchor.version||f.host_anchor.digest!=s.anchor.digest||
+           !connection->held_and_bound(session))throw std::runtime_error("v3 frame authentication or anchor mismatch");
+        const std::string tx=rkva_registry_wire::to_hex(q.tx);auto & record=get(s,tx);
+        if((h.op==RKVA_REGISTRY_PREPARE && (record.state!=phase::prepared||
+            record.reference!=rkva_registry_wire::to_hex(q.reference)||record.key!=rkva_registry_wire::to_hex(q.key)))||
+           (h.op==RKVA_REGISTRY_COMMIT && record.state!=phase::host_published)||
+           (h.op==RKVA_REGISTRY_STATUS && record.state!=phase::host_published && record.state!=phase::commit_ack))
+            throw std::runtime_error("v3 transaction phase or identity differs");
+        for(const auto & old:s.anchor.nonces)if(old.nonce==local.nonce)throw std::runtime_error("nonce reuse rejected");
+        for(const auto & old:s.anchor.v3_nonces)
+            if(old.nonce==local.nonce || old.challenge==session.peer_challenge)throw std::runtime_error("v3 nonce or session challenge reuse rejected");
+        local.request_hash=rkva_snapshot::digest(local.frame.data(),local.frame.size());
+        issued_v3_nonce entry;entry.tx=tx;entry.reference=record.reference;entry.key=record.key;entry.op=h.op;
+        entry.nonce=local.nonce;entry.request_hash=local.request_hash;entry.transcript=session.transcript;
+        entry.challenge=session.peer_challenge;entry.anchor_version=s.anchor.version;entry.anchor_digest=s.anchor.digest;
+        s.anchor.v3_nonces.push_back(std::move(entry));return true;
+    });
+    if(ok) {
+        try {
+            if(!connection || !connection->held_and_bound(session)) {e="connection lost after issuance; nonce remains pending";return false;}
+            output=std::move(local);
+        } catch(...) {e="connection check failed after issuance; nonce remains pending";return false;}
+    }
+    return ok;
+}
+bool journal::consume_v3_error(const auth_id & nonce,const auth_id & request_hash,const auth_id & response_hash,
+        const std::string & owner,uint64_t epoch,const auth_id & ledger,std::string & e) {
+    return change(dir_,owner_,e,[&](snapshot & s){
+        if(!s.anchor.configured||!s.anchor.v3_configured||owner_!=owner||s.anchor.key_epoch!=epoch||
+           s.anchor.ledger_epoch!=ledger||!nonzero(response_hash))throw std::runtime_error("v3 error ledger identity differs");
+        auto it=std::find_if(s.anchor.v3_nonces.begin(),s.anchor.v3_nonces.end(),[&](const issued_v3_nonce & x){return x.nonce==nonce;});
+        if(it==s.anchor.v3_nonces.end()||it->consumed||it->request_hash!=request_hash)
+            throw std::runtime_error("v3 error nonce absent, consumed or request differs");
+        it->consumed=true;it->response_hash=response_hash;return true;
     });
 }
 bool journal::release_intent(const std::string & tx,uint64_t ver,std::string & e) { return change(dir_,owner_,e,[&](snapshot & s){ if(s.anchor.configured)throw std::runtime_error("authenticated release unsupported");auto & r=get(s,tx); if(!ver || r.peer_commit_version!=ver) throw std::runtime_error("release version mismatch"); if(r.state==phase::commit_ack) { r.state=phase::release_intent; return true; } if(r.state==phase::release_intent || r.state==phase::release_ack) return false; throw std::runtime_error("invalid release intent transition"); }); }
@@ -301,6 +417,9 @@ bool journal::commit_ack(const std::string &,uint64_t,std::string & e) { return 
 bool journal::provision_anchor(uint64_t,uint64_t,const auth_id &,std::string & e) { return unsupported(e); }
 bool journal::issue_commit_nonce(const std::string &,const auth_id &,const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::commit_verified(const std::string &,const auth_id &,uint64_t,uint64_t,const auth_id &,const std::string &,const std::string &,const std::string &,uint64_t,std::string & e) { return unsupported(e); }
+bool journal::configure_v3_epoch(uint64_t,const auth_id &,uint64_t,const auth_id &,std::string & e) { return unsupported(e); }
+bool journal::issue_v3_command(const rkva_managed_framing_v3::secret &,const rkva_managed_framing_v3::session &,v3_connection_authority *,const v3_frame_builder &,v3_issued_request &,std::string & e) { return unsupported(e); }
+bool journal::consume_v3_error(const auth_id &,const auth_id &,const auth_id &,const std::string &,uint64_t,const auth_id &,std::string & e) { return unsupported(e); }
 bool journal::release_intent(const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::release_ack(const std::string &,uint64_t,std::string & e) { return unsupported(e); }
 bool journal::abort_unpublished(const std::string &,std::string & e) { return unsupported(e); }

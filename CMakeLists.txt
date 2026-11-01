@@ -160,6 +160,12 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 # isolated core and its tests; it advertises no capability.
 option(RKVA_MANAGED_SNAPSHOT_PHASE2 "rkva: build the isolated managed snapshot Phase 2 lifecycle core and tests" OFF)
 option(RKVA_MANAGED_SNAPSHOT_PHASE3 "rkva: build the isolated managed snapshot Phase 3 PREPARE/COMMIT/receipt core and tests" OFF)
+# Phase 4 framing/ATTEST/peer-identity layer. Default OFF: the v3 single-frame
+# codec, ATTEST, resident attestation and durable v3 host nonce ledger are not
+# built and no server path references them. Enabling only builds the isolated
+# library and its CPU tests behind the RKVA_MANAGED_SNAPSHOT_PHASE4 run-time
+# gate; it advertises no capability and changes no HELLO/op/dispatch behaviour.
+option(RKVA_MANAGED_SNAPSHOT_PHASE4 "rkva: build the isolated managed snapshot Phase 4 framing/ATTEST/identity layer and tests" OFF)
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
