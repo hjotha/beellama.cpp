@@ -1296,3 +1296,69 @@ add_executable(test-server-prefix-checkpoint-policy test-server-prefix-checkpoin
 target_include_directories(test-server-prefix-checkpoint-policy PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_compile_features(test-server-prefix-checkpoint-policy PRIVATE cxx_std_17)
 add_test(NAME test-server-prefix-checkpoint-policy COMMAND $<TARGET_FILE:test-server-prefix-checkpoint-policy>)
+
+# RKVA managed snapshot lifecycle core (Phase 2), default OFF. No server, RPC,
+# capability or GC path is wired; these targets are isolated CPU-only tests.
+if (RKVA_MANAGED_SNAPSHOT_PHASE2)
+    find_package(Threads REQUIRED)
+    add_library(rkva-managed-phase2 STATIC
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-managed-registry.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn/rkva-managed-store-authority.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-host-journal.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-rkva-managed-orchestrator.cpp
+        ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp)
+    target_compile_features(rkva-managed-phase2 PUBLIC cxx_std_17)
+    target_compile_definitions(rkva-managed-phase2 PUBLIC RKVA_MANAGED_SNAPSHOT_PHASE2)
+    target_include_directories(rkva-managed-phase2 PUBLIC
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn
+        ${PROJECT_SOURCE_DIR}/tools/server
+        ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva)
+    target_link_libraries(rkva-managed-phase2 PUBLIC Threads::Threads)
+
+    add_executable(test-rkva-managed-orchestrator test-rkva-managed-orchestrator.cpp)
+    target_link_libraries(test-rkva-managed-orchestrator PRIVATE rkva-managed-phase2)
+    add_test(NAME test-rkva-managed-orchestrator COMMAND $<TARGET_FILE:test-rkva-managed-orchestrator>)
+    set_property(TEST test-rkva-managed-orchestrator PROPERTY LABELS main)
+
+    add_executable(test-rkva-managed-store-lease test-rkva-managed-store-lease.cpp)
+    target_link_libraries(test-rkva-managed-store-lease PRIVATE rkva-managed-phase2)
+    add_test(NAME test-rkva-managed-store-lease COMMAND $<TARGET_FILE:test-rkva-managed-store-lease>)
+    set_property(TEST test-rkva-managed-store-lease PROPERTY LABELS main)
+
+    add_executable(test-rkva-managed-object-v3-phase2 test-rkva-managed-object-v3-phase2.cpp)
+    target_link_libraries(test-rkva-managed-object-v3-phase2 PRIVATE rkva-managed-phase2)
+    add_test(NAME test-rkva-managed-object-v3-phase2 COMMAND $<TARGET_FILE:test-rkva-managed-object-v3-phase2>)
+    set_property(TEST test-rkva-managed-object-v3-phase2 PROPERTY LABELS main)
+
+    add_executable(test-rkva-v3-quota test-rkva-v3-quota.cpp)
+    target_link_libraries(test-rkva-v3-quota PRIVATE rkva-managed-phase2)
+    add_test(NAME test-rkva-v3-quota COMMAND $<TARGET_FILE:test-rkva-v3-quota>)
+    set_property(TEST test-rkva-v3-quota PROPERTY LABELS main)
+
+    add_executable(test-rkva-managed-phase2-gate test-rkva-managed-phase2-gate.cpp)
+    target_include_directories(test-rkva-managed-phase2-gate PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_compile_definitions(test-rkva-managed-phase2-gate PRIVATE RKVA_MANAGED_SNAPSHOT_PHASE2)
+    add_test(NAME test-rkva-managed-phase2-gate COMMAND $<TARGET_FILE:test-rkva-managed-phase2-gate>)
+    set_property(TEST test-rkva-managed-phase2-gate PROPERTY LABELS main)
+
+    # Preserved preflight from the source branch. It consumes two externally
+    # qualified snapshot files, so it is built but never registered in CTest:
+    # there is no fixture in the tree and no synthetic substitute.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(OpenSSL QUIET)
+        if (OpenSSL_FOUND)
+            add_executable(test-rkva-native-orchestrator-preflight
+                test-rkva-native-orchestrator-preflight.cpp
+                ${PROJECT_SOURCE_DIR}/tools/rkva-native-key-inspect/native-key-inspect.cpp
+                ${PROJECT_SOURCE_DIR}/src/llama-kv-mixed-state.cpp)
+            target_compile_features(test-rkva-native-orchestrator-preflight PRIVATE cxx_std_17)
+            target_include_directories(test-rkva-native-orchestrator-preflight PRIVATE
+                ${PROJECT_SOURCE_DIR}/src
+                ${PROJECT_SOURCE_DIR}/include
+                ${PROJECT_SOURCE_DIR}/ggml/include)
+            target_link_libraries(test-rkva-native-orchestrator-preflight PRIVATE
+                rkva-managed-phase2 OpenSSL::Crypto)
+        endif()
+    endif()
+endif()

@@ -154,6 +154,12 @@ option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when availab
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 
+# RKVA managed snapshot lifecycle core (Phase 2). Default OFF: the standalone
+# registry/journal/orchestrator, store lease, v3 object component and quota scan
+# are not built and no server path references them. Enabling only builds the
+# isolated core and its tests; it advertises no capability.
+option(RKVA_MANAGED_SNAPSHOT_PHASE2 "rkva: build the isolated managed snapshot Phase 2 lifecycle core and tests" OFF)
+
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
