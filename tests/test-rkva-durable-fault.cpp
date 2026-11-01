@@ -7,6 +7,7 @@
 //   * a failed file/directory sync never reports success;
 //   * a no-replace rename never overwrites an existing object and leaves the
 //     staging tree intact;
+//   * a rename EIO is explicitly uncertain, never durable;
 //   * an applied-but-unacknowledged rename (ack lost / crash model) returns
 //     "uncertain" and never "durable", while the published bytes are intact;
 //   * a parent-directory sync failure after apply is "uncertain", not durable;
@@ -161,6 +162,23 @@ int main() {
                v3::move_result::no_change);
         assert(fs::exists(staging / "n-0.kv"));
         assert(!fs::exists(object));
+    }
+
+    // 5b. Rename EIO: the applied state is unknown, so the call is uncertain,
+    // the source stays intact in this model, and no object is reported durable.
+    {
+        fi::plan schedule;
+        schedule.rename.push_back(fi::fault::rename_eio);
+        fi::injected_filesystem disk(f.token, f.root, &schedule);
+        const auto staging = make_staging(f.root, "tmp-renameeio", "renameeio");
+        const auto object = f.root / "object-renameeio";
+        std::string error;
+        assert(disk.rename_noreplace_and_sync(staging, object, error) ==
+               v3::move_result::uncertain);
+        assert(error.find("rename EIO") != std::string::npos);
+        assert(fs::exists(staging / "n-0.kv"));
+        assert(!fs::exists(object));
+        assert(schedule.rename_calls == 1);
     }
 
     // 6. Ack lost: applied bytes exist, but the call must return uncertain.

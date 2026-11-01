@@ -95,11 +95,18 @@ struct expectation {
 };
 
 struct fault_selector {
-    std::string kind;   // sync_file | manifest_sync | directory_sync |
-                        // rename_noreplace | rename_eio | stale_lock | crash_point
+    std::string kind;   // chunk_sync | manifest_sync | dir_sync |
+                        // rename_existing | rename_eio | ack_lost |
+                        // crash_after_apply | stale_lock
     std::string target; // staging | manifest | directory | lease | object
+    std::string phase;  // stale_lock: hold | verify
     bool has_chunk = false;
     uint32_t chunk = 0;
+    bool has_at = false;
+    uint32_t at = 0;
+    bool injected = false; // echoed from the request; never trusted as proof
+    bool has_store = false;
+    std::string store_root;
 };
 
 struct request {
@@ -130,6 +137,12 @@ struct build_info {
     std::vector<std::string> caps;        // actually advertised caps; empty
     std::string caps_status;
     std::string commit_status;
+    // The probe itself is test-only. The durable fault seam is a CPU test
+    // artifact (RKVA_DURABLE_FAULT_TESTING) and is not compiled into the app.
+    bool test_only_probe = true;
+    bool durable_fault_seam = false;
+    bool production_publication_enabled = false;
+    bool windows_backend_qualified = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -301,11 +314,33 @@ inline bool parse_expect(const json & value, expectation & out) {
 }
 
 inline bool fault_kind_known(const std::string & kind) {
-    static const char * const kKinds[] = {"sync_file",     "manifest_sync", "directory_sync",
-                                          "rename_noreplace", "rename_eio", "stale_lock",
-                                          "crash_point"};
+    static const char * const kKinds[] = {
+        "chunk_sync",       "manifest_sync", "dir_sync",      "rename_existing",
+        "rename_eio",       "ack_lost",      "crash_after_apply", "stale_lock",
+        // Earlier probe-branch names; accepted so an old request is refused
+        // with the same precise seam rather than "invalid selector".
+        "sync_file",        "directory_sync", "rename_noreplace", "crash_point"};
     return std::find_if(std::begin(kKinds), std::end(kKinds),
                         [&](const char * k) { return kind == k; }) != std::end(kKinds);
+}
+
+inline std::string lower_ascii(std::string value) {
+    for (char & c : value)
+        if (c >= 'A' && c <= 'Z')
+            c = char(c - 'A' + 'a');
+    return value;
+}
+
+inline bool durability_root_ok(const std::string & value) {
+    std::string normalized;
+    for (char c : value)
+        normalized.push_back(c == '/' ? '\\' : c);
+    normalized = lower_ascii(normalized);
+    while (!normalized.empty() && normalized.front() == '\\')
+        normalized.erase(normalized.begin());
+    while (!normalized.empty() && normalized.back() == '\\')
+        normalized.pop_back();
+    return normalized == "rkva-qual\\durable\\rkva-snapshots-v3";
 }
 
 inline bool fault_target_known(const std::string & target) {
@@ -332,8 +367,40 @@ inline bool parse_fault(const json & value, fault_selector & out) {
     }
     if (!get_u32(value, "chunk", out.has_chunk, out.chunk) || out.chunk > 4095)
         return false;
-    if (out.kind == "sync_file" && !out.has_chunk)
+    if (!get_u32(value, "at", out.has_at, out.at) || out.at > 4095)
         return false;
+    if (value.contains("injected")) {
+        if (!value["injected"].is_boolean())
+            return false;
+        out.injected = value["injected"].get<bool>();
+    }
+    return true;
+}
+
+inline bool parse_store(const json & value, fault_selector & out, std::string & error) {
+    if (!value.is_object()) {
+        error = "request.store is not an object";
+        return false;
+    }
+    if (!value.contains("root") || !value["root"].is_string() ||
+        !durability_root_ok(value["root"].get<std::string>())) {
+        error = "request.store.root is not rkva-qual\\durable\\rkva-snapshots-v3";
+        return false;
+    }
+    if (value.contains("namespace") &&
+        (!value["namespace"].is_string() ||
+         value["namespace"].get<std::string>() != "rkva-snapshots-v3")) {
+        error = "request.store.namespace is not rkva-snapshots-v3";
+        return false;
+    }
+    if (value.contains("production_namespace") &&
+        (!value["production_namespace"].is_boolean() ||
+         value["production_namespace"].get<bool>())) {
+        error = "request.store.production_namespace must be false";
+        return false;
+    }
+    out.has_store = true;
+    out.store_root = value["root"].get<std::string>();
     return true;
 }
 
@@ -419,6 +486,33 @@ inline bool parse_request(const std::string & text, request & out, std::string &
             error = "request.fault selector is invalid";
             return false;
         }
+    }
+    if (document.contains("test_only")) {
+        if (!document["test_only"].is_boolean() ||
+            !document["test_only"].get<bool>()) {
+            error = "request.test_only must be true for a qualification probe";
+            return false;
+        }
+    }
+    if (document.contains("store")) {
+        if (!parse_store(document["store"], out.fault, error))
+            return false;
+    }
+    if (document.contains("phase")) {
+        if (!document["phase"].is_string()) {
+            error = "request.phase is not a string";
+            return false;
+        }
+        const auto phase = document["phase"].get<std::string>();
+        if (phase != "hold" && phase != "verify") {
+            error = "request.phase must be hold or verify";
+            return false;
+        }
+        if (out.case_name != "stale_lock") {
+            error = "request.phase is only valid for the stale_lock case";
+            return false;
+        }
+        out.fault.phase = phase;
     }
     return true;
 }
@@ -572,6 +666,10 @@ inline json build_json(const build_info & b) {
     out["managed_caps_negotiated"] = b.managed_caps_negotiated;
     out["caps"] = b.caps;
     out["caps_status"] = b.caps_status;
+    out["test_only_probe"] = b.test_only_probe;
+    out["durable_fault_seam"] = b.durable_fault_seam;
+    out["production_publication_enabled"] = b.production_publication_enabled;
+    out["windows_backend_qualified"] = b.windows_backend_qualified;
     return out;
 }
 
@@ -817,26 +915,35 @@ inline std::string make_invalid_response(const std::string & probe_id,
 // ---------------------------------------------------------------------------
 
 inline std::string fault_refusal_reason(const fault_selector & f) {
-    if (f.kind == "sync_file" || f.kind == "manifest_sync" || f.kind == "directory_sync")
-        return "staging fault '" + f.kind +
-               "' unavailable: rkva_managed_object_v3::write() returns at "
-               "tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:115 ('concrete authenticated "
-               "pin and metadata proof unavailable') before durable_filesystem::sync_file/"
-               "sync_directory is ever called, so no sync seam exists to inject into";
-    if (f.kind == "rename_noreplace" || f.kind == "rename_eio")
-        return "staging fault '" + f.kind +
-               "' unavailable: the same fail-closed guard at "
-               "tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:115 precedes "
-               "durable_filesystem::rename_noreplace_and_sync, and no qualified platform "
-               "implementation of that method exists in this tree";
+    static constexpr const char * kSeam =
+        "the durable staging seam is compiled only into "
+        "tests/test-rkva-managed-object-v3-staging.cpp via "
+        "tools/xbox/uwp/rkva/rkva-managed-object-v3-write.inc under "
+        "RKVA_DURABLE_FAULT_TESTING; no UWP target includes it and the production "
+        "writer throws at tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:37 before any "
+        "durable_filesystem call";
+    if (f.kind == "chunk_sync" || f.kind == "sync_file")
+        return "staging fault '" + f.kind + "' unavailable: " + kSeam +
+               ", so there is no app-side sync_file seam to inject chunk " +
+               (f.has_chunk ? std::to_string(f.chunk)
+                            : (f.has_at ? std::to_string(f.at) : std::string("k")));
+    if (f.kind == "manifest_sync" || f.kind == "dir_sync" ||
+        f.kind == "directory_sync")
+        return "staging fault '" + f.kind + "' unavailable: " + kSeam +
+               ", so manifest/directory sync is never reached in the app";
+    if (f.kind == "rename_existing" || f.kind == "rename_noreplace" ||
+        f.kind == "rename_eio")
+        return "staging fault '" + f.kind + "' unavailable: " + kSeam +
+               ", so rename_noreplace_and_sync is never reached in the app";
+    if (f.kind == "ack_lost" || f.kind == "crash_after_apply" ||
+        f.kind == "crash_point")
+        return "staging fault '" + f.kind + "' unavailable: there is no app-side "
+               "staging writer to lose an ACK or crash after apply; " + std::string(kSeam);
     if (f.kind == "stale_lock")
-        return "staging fault 'stale_lock' unavailable: rkva_managed_store::lease is an "
-               "in-process exclusive lock only; no cross-process owner-evidence/reclaim "
-               "implementation exists, so PID reuse cannot be tested from the app";
-    if (f.kind == "crash_point")
-        return "staging fault 'crash_point' unavailable: there is no staging writer to "
-               "crash between rename and parent-directory sync; the v3 writer is closed at "
-               "tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:115";
+        return "staging fault 'stale_lock' unavailable: the app has no cross-process "
+               "lease owner-evidence/reclaim backend, and the test-only write.inc does not "
+               "implement one; the production writer still throws at "
+               "tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:37";
     return "staging fault unavailable: unknown selector";
 }
 
@@ -847,18 +954,36 @@ inline std::string make_fault_response(const request & req, const build_info & b
     document["case"] = req.case_name;
     document["status"] = "refused";
     document["selector_valid"] = true;
+    document["store"] = json{{"root", req.fault.has_store ? req.fault.store_root
+                                                           : std::string()},
+                             {"namespace", "rkva-snapshots-v3"},
+                             {"production_namespace", false}};
     document["fault"] = json{{"kind", req.fault.kind},
                              {"target", req.fault.target},
                              {"chunk", req.fault.has_chunk ? json(req.fault.chunk)
-                                                           : json(nullptr)}};
+                                                           : json(nullptr)},
+                             {"at", req.fault.has_at ? json(req.fault.at) : json(nullptr)},
+                             {"injected", false},
+                             {"requested_injected", req.fault.injected}};
+    document["phase"] = req.fault.phase.empty() ? json(nullptr) : json(req.fault.phase);
     document["reason"] = fault_refusal_reason(req.fault);
     document["wrote_anything"] = false;
     document["writer_reachable"] = false;
+    document["writer"] = nullptr;
+    document["claims"] = json{{"durable", false},
+                              {"published", false},
+                              {"committed", false},
+                              {"gc_authorized", false}};
+    if (req.fault.kind == "stale_lock")
+        document["lock"] = json{{"held", false},
+                                {"reason", "no cross-process lease backend in the app"}};
     document["writer_gate"] = json::array(
-        {"tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:115: need(false, \"concrete "
-         "authenticated pin and metadata proof unavailable\")",
-         "tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:92: verify() has the same "
+        {"tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:37: need(false, \"concrete "
+         "authenticated pin and metadata proof unavailable\") in write()",
+         "tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:14: verify() has the same "
          "fail-closed guard",
+         "tools/xbox/uwp/rkva/rkva-managed-object-v3-write.inc: test-only "
+         "write_prepared(), compiled only with RKVA_DURABLE_FAULT_TESTING",
          "ggml/src/ggml-remote-attn/rkva-anchored-sqlite.cpp: managed apply refuses every "
          "transition without the concrete pin/metadata proof"});
     document["next_action"] =

@@ -54,6 +54,7 @@ enum class fault {
     eio,                // the operation fails with EIO
     refuse_existing,    // no-replace: a competing object already exists
     os_error,           // rename fails with a benign error, nothing applied
+    rename_eio,         // rename reports EIO; the applied state is unknown
     ack_lost,           // rename applied, caller sees "uncertain"
     crash_after_apply,  // rename applied and the model process dies
 };
@@ -64,6 +65,7 @@ inline const char * name(fault value) {
         case fault::eio: return "eio";
         case fault::refuse_existing: return "refuse_existing";
         case fault::os_error: return "os_error";
+        case fault::rename_eio: return "rename_eio";
         case fault::ack_lost: return "ack_lost";
         case fault::crash_after_apply: return "crash_after_apply";
     }
@@ -233,6 +235,18 @@ public:
         if (injected == fault::os_error) {
             error = "injected rename failure";
             return v3::move_result::no_change;
+        }
+        if (injected == fault::eio) {
+            error = "unsupported rename fault: eio; use rename_eio";
+            return v3::move_result::no_change;
+        }
+        if (injected == fault::rename_eio) {
+            // A rename that reports EIO may or may not have reached the
+            // directory entry. This deterministic model leaves both entries in
+            // place but still reports the caller-visible ambiguity: never
+            // durable, and no automatic retry/cleanup.
+            error = "injected rename EIO after indeterminate outcome";
+            return v3::move_result::uncertain;
         }
         if (detail::rename_noreplace(source, destination) != 0) {
             const int saved = errno;

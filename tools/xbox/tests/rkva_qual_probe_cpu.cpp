@@ -168,15 +168,35 @@ static void test_parse_fault() {
     const std::string text = R"({
       "schema": "rkva-console-durability-v1",
       "probe_id": "0123456789abcdef0123456789abcdef",
-      "case": "durability-fault-chunk-sync",
-      "fault": {"kind": "sync_file", "target": "staging", "chunk": 3}
+      "case": "chunk_sync",
+      "test_only": true,
+      "store": {"root": "rkva-qual\\durable\\rkva-snapshots-v3",
+                "namespace": "rkva-snapshots-v3",
+                "production_namespace": false},
+      "fault": {"kind": "chunk_sync", "target": "staging", "at": 2,
+                "injected": true}
     })";
     qp::request req;
     std::string error;
     assert(qp::parse_request(text, req, error));
     assert(req.has_fault);
-    assert(req.fault.kind == "sync_file");
-    assert(req.fault.has_chunk && req.fault.chunk == 3);
+    assert(req.fault.kind == "chunk_sync");
+    assert(req.fault.has_store);
+    assert(req.fault.store_root.find("durable") != std::string::npos);
+    assert(req.fault.has_at && req.fault.at == 2);
+    assert(req.fault.injected);
+
+    qp::request hold;
+    const std::string hold_text = R"({
+      "schema": "rkva-console-durability-v1",
+      "probe_id": "0123456789abcdef0123456789abcdef",
+      "case": "stale_lock",
+      "phase": "hold",
+      "test_only": true,
+      "fault": {"kind": "stale_lock", "injected": true, "at": 0}
+    })";
+    assert(qp::parse_request(hold_text, hold, error));
+    assert(hold.fault.phase == "hold");
 }
 
 static void test_parse_rejects() {
@@ -198,8 +218,20 @@ static void test_parse_rejects() {
              "case":"positive","expect":{"session_id":0}})",
          "expect"},
         {R"({"schema":"rkva-console-durability-v1","probe_id":"0123456789abcdef0123456789abcdef",
-             "case":"durability-fault","fault":{"kind":"sync_file"}})",
-         "fault"},
+             "case":"chunk_sync","store":{"root":"rkva-snapshots-v3"},
+             "fault":{"kind":"chunk_sync","at":2}})",
+         "store.root"},
+        {R"({"schema":"rkva-console-durability-v1","probe_id":"0123456789abcdef0123456789abcdef",
+             "case":"chunk_sync","store":{"root":"rkva-qual\\durable\\rkva-snapshots-v3",
+             "namespace":"rkva-snapshots-v3","production_namespace":true},
+             "fault":{"kind":"chunk_sync"}})",
+         "production_namespace"},
+        {R"({"schema":"rkva-console-durability-v1","probe_id":"0123456789abcdef0123456789abcdef",
+             "case":"stale_lock","phase":"adopt","fault":{"kind":"stale_lock"}})",
+         "phase"},
+        {R"({"schema":"rkva-console-durability-v1","probe_id":"0123456789abcdef0123456789abcdef",
+             "case":"chunk_sync","test_only":false,"fault":{"kind":"chunk_sync"}})",
+         "test_only"},
         {R"({"schema":"rkva-console-durability-v1","probe_id":"0123456789abcdef0123456789abcdef",
              "case":"durability-fault","fault":{"kind":"format_c","chunk":1}})",
          "fault"},
@@ -328,30 +360,67 @@ static void test_negative_policy() {
     assert(partial["negative"]["results"]["key_mismatch"] == "unavailable");
 }
 
+static void test_main_controller_fault_cases_parse() {
+    // The console controller requests these exact selectors (11f37de73).
+    const char* const cases[] = {"chunk_sync",       "manifest_sync", "dir_sync",
+                                 "rename_existing",  "rename_eio",    "ack_lost",
+                                 "crash_after_apply", "stale_lock"};
+    for (const char* fault_case : cases) {
+        const std::string kind(fault_case);
+        const std::string text =
+            "{\"schema\":\"rkva-console-durability-v1\","
+            "\"probe_id\":\"0123456789abcdef0123456789abcdef\","
+            "\"case\":\"" + kind + "\","
+            "\"test_only\":true,"
+            "\"store\":{\"root\":\"rkva-qual\\\\durable\\\\rkva-snapshots-v3\","
+            "\"namespace\":\"rkva-snapshots-v3\",\"production_namespace\":false},"
+            "\"fault\":{\"kind\":\"" + kind + "\",\"injected\":true,\"at\":2}}";
+        qp::request req;
+        std::string error;
+        assert(qp::parse_request(text, req, error));
+        assert(req.has_fault);
+        assert(req.fault.kind == fault_case);
+        assert(req.fault.has_store);
+        assert(req.fault.injected);
+        const auto document = json::parse(qp::make_fault_response(req, complete_build()));
+        assert(document["status"] == "refused");
+        assert(document["writer_reachable"] == false);
+        assert(document["wrote_anything"] == false);
+        assert(document["build"]["durable_fault_seam"] == false);
+    }
+}
+
 static void test_fault_refusal_is_precise() {
     qp::request req;
     req.probe_id = kProbeId;
-    req.case_name = "durability-fault-chunk-sync";
+    req.case_name = "chunk_sync";
     req.has_fault = true;
-    req.fault.kind = "sync_file";
+    req.fault.kind = "chunk_sync";
     req.fault.target = "staging";
-    req.fault.has_chunk = true;
-    req.fault.chunk = 3;
+    req.fault.has_at = true;
+    req.fault.at = 2;
+    req.fault.has_store = true;
+    req.fault.store_root = "rkva-qual\\durable\\rkva-snapshots-v3";
     const auto document = json::parse(qp::make_fault_response(req, complete_build()));
     assert(document["schema"] == "rkva-console-durability-v1");
     assert(document["status"] == "refused");
     assert(document["wrote_anything"] == false);
     assert(document["writer_reachable"] == false);
     const auto reason = document["reason"].get<std::string>();
-    assert(reason.find("rkva-managed-object-v3.cpp:115") != std::string::npos);
-    assert(reason.find("concrete authenticated pin") != std::string::npos);
-    assert(document["writer_gate"].size() >= 2);
+    assert(reason.find("rkva-managed-object-v3.cpp:37") != std::string::npos);
+    assert(reason.find("rkva-managed-object-v3-write.inc") != std::string::npos);
+    assert(document["writer_gate"].size() >= 3);
+    assert(document["store"]["root"] == "rkva-qual\\durable\\rkva-snapshots-v3");
+    assert(document["build"]["durable_fault_seam"] == false);
+    assert(document["fault"]["injected"] == false);
+    assert(document["claims"]["published"] == false);
     // A different selector must name its own missing seam, not reuse a generic
     // "not implemented" string.
     req.fault.kind = "stale_lock";
-    req.fault.has_chunk = false;
+    req.fault.phase = "hold";
     const auto lock = json::parse(qp::make_fault_response(req, complete_build()));
     assert(lock["reason"].get<std::string>().find("cross-process") != std::string::npos);
+    assert(lock["lock"]["held"] == false);
 }
 
 static void test_build_never_invents_commit() {
@@ -372,6 +441,7 @@ int main() {
     test_unavailable_is_explicit();
     test_field_unavailability();
     test_negative_policy();
+    test_main_controller_fault_cases_parse();
     test_fault_refusal_is_precise();
     test_build_never_invents_commit();
     std::cout << "rkva-qual-probe-cpu: all checks passed\n";

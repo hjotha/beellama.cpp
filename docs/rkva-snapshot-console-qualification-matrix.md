@@ -2,8 +2,10 @@
 
 Status: **planning and harness only.** Nothing in this document has been run
 against the Xbox. No managed capability is advertised, no object is published
-and no GC exists. The Phase 2/3/4 code on main `4443ba6ee` remains default-off
-and reachable only from CPU tests. Every row below is either:
+and no GC exists. The Phase 2/3/4 code on main `3a02e90a2` remains default-off
+and reachable only from CPU tests. The test-only durable seam and the D3/D5/D7
+controller hooks exist now, but the app-side `rkva_qual_probe` durability action
+is still absent, so console rows remain BLOCKED. Every row below is either:
 
 - **READY (host)** — executable now on a Linux CPU host without a console;
 - **HARDWARE** — needs the console and the exact state named in the row;
@@ -92,9 +94,6 @@ distinguish "the probe ran and refused" from "the probe is absent". The
 controller classifies both `unavailable` and `refused` as `BLOCKED`, never
 `PASS`.
 
-The host expectation (`--expect`) is produced on the host, not by this
-controller; see `tools/xbox/scripts/rkva-host-expect.py` in section 7.
-
 The positive document must still be produced over a live session by
 `rkva_resident_attestation::make()` and
 `rkva_managed_attest_v3::make_reply/accept_reply`, including a nonzero coverage
@@ -139,6 +138,26 @@ so the producer emits them as `null` with an exact reason and
 `expectation_available=false`. The controller accepts that file, records the
 gaps and classifies the run `BLOCKED`; it never fills the gap itself.
 
+### 1.1 Durability probe contract for D3–D7
+
+The same `rkva_qual_probe` action carries `schema:
+"rkva-console-durability-v1"` with `case`/`fault.kind` set to one of
+`chunk_sync`, `manifest_sync`, `dir_sync`, `rename_existing`, `rename_eio`,
+`ack_lost`, `crash_after_apply` or `stale_lock`. The probe must use the
+disposable root `rkva-qual\durable\rkva-snapshots-v3`, not
+`LocalState\rkva-snapshots-v3`, and must not enable Phase 3/4 gates. The
+controller now validates the response, `durability-fault-<case>.json`,
+`staging-inventory.json` and `stale-lock.json`; the exact schema, required
+fields and refusal rules are in `docs/rkva-durable-fault-injection.md` §4.
+
+D7 is a two-phase flow: `phase: "hold"` writes a response proving
+`lock.held=true` and stays alive; the controller then force-stops the app
+through WDP, restarts it and runs `phase: "verify"` with `predecessor` set to
+the hold probe id. A missing action or response is `BLOCKED`, never `PASS`.
+
+The controller-side hooks and CPU validators exist. The app-side probe does
+not, so every D3–D7 row remains BLOCKED until a test-only build supplies it.
+
 ## 2. Blocker 2 — authenticated pin/metadata proof
 
 | ID | Action | Artifacts | PASS evidence | FAIL evidence | Hardware state |
@@ -162,36 +181,37 @@ real resident coverage.
 These rows are the acceptance criteria from
 `docs/rkva-v3-proof-integration-blockers.md` and
 `docs/rkva-managed-snapshot-phase4.md`. D1/D2 are prerequisites only; D3–D7
-need the app-side staging probe and fault selector, which do not exist.
+need the app-side staging probe and fault selector, which do not exist. The
+controller hooks and CPU seam exist and refuse to turn their absence into a
+PASS.
 
 | ID | Action | Artifacts | PASS evidence | FAIL evidence | Hardware state |
 | --- | --- | --- | --- | --- | --- |
 | D1 | Write/fetch/delete one self-created 4 KiB file in `LocalState\rkva-qual`. | `durability-probe.json` | fetched bytes equal the uploaded bytes; file absent afterwards | digest mismatch or silent write | App may be running; console storage writable |
 | D2 | Clean app stop/start; re-inventory `rkva-snapshots-v3`. | `app-restart.json`, `xbox-inventory-after-restart.json` | identical inventory; no new/removed staging name | namespace drift | App started by the controller |
-| D3 | Stage a v3 object and fail `sync_file` on chunk *k* (injected). | `durability-fault-chunk-sync.json`, `staging-inventory.json` | previous committed pair byte-identical; staging preserved and charged; no object published; retry refuses to reuse the stale stage | any deletion, adoption, overwrite or “durable” claim | Test build with fault selector; app stopped except the probe |
-| D4 | Fail manifest sync and staging directory sync. | `durability-fault-manifest-sync.json`, `durability-fault-dir-sync.json` | same as D3; no rename attempted | object appears | Same |
-| D5 | Rename no-replace with a pre-existing destination; then inject rename `EIO`. | `durability-fault-rename*.json` | destination unchanged; source either intact or explicitly `uncertain`; never `durable` | overwrite or `durable` on `EIO` | Same |
-| D6 | Power loss between rename and parent-directory sync. | `power-loss-timeline.json`, `post-power-loss-inventory.json` | after restart the pair is classified `uncertain`/pending, charged and pinned; old pair still usable | object reported committed, charge lost, nonce replayed, or silent cleanup | **DESTRUCTIVE**: operator cuts power; `--destructive --power-loss-method manual` |
-| D7 | `SIGKILL`/force-stop the app while it holds the store lease, then restart. | `stale-lock.json` | stale lock is reclaimable only with owner evidence; PID reuse cannot impersonate the owner; stage remains charged | second writer enters, or the stage is adopted/deleted | Test build; app started by the controller |
+| D3 | Stage a v3 object and fail `sync_file` on chunk *k* (injected). | `durability-fault-chunk_sync.json`, `staging-inventory.json` | previous committed pair byte-identical; staging preserved and charged; no object published; retry refuses to reuse the stale stage | any deletion, adoption, overwrite or “durable” claim | Controller hook ready; app probe refuses the CPU-test-only seam → **BLOCKED** |
+| D4 | Fail manifest sync and staging directory sync. | `durability-fault-manifest_sync.json`, `durability-fault-dir_sync.json`, `staging-inventory.json` | same as D3; no rename attempted | object appears | Controller hook ready; app probe refuses the CPU-test-only seam → **BLOCKED** |
+| D5 | Rename no-replace with a pre-existing destination; then inject rename `EIO`. | `durability-fault-rename_existing.json`, `durability-fault-rename_eio.json` | destination unchanged; source either intact or explicitly `uncertain`; never `durable` | overwrite or `durable` on `EIO` | Controller hook ready; app probe refuses the CPU-test-only seam → **BLOCKED** |
+| D6 | Power loss between rename and parent-directory sync. | `power-loss-timeline.json`, `post-power-loss-inventory.json` | after restart the pair is classified `uncertain`/pending, charged and pinned; old pair still usable | object reported committed, charge lost, nonce replayed, or silent cleanup | **DESTRUCTIVE**: operator cuts power; `--destructive --power-loss-method manual`; no post-restart staging evidence yet → **BLOCKED** |
+| D7 | `SIGKILL`/force-stop the app while it holds the store lease, then restart. | `stale-lock.json` | stale lock is reclaimable only with owner evidence; PID reuse cannot impersonate the owner; stage remains charged | second writer enters, or the stage is adopted/deleted | Controller two-phase hold/verify hook ready; app probe refuses the lease seam → **BLOCKED** |
 | D8 | Lost ACK: host COMMIT durable, console reply lost; restart both. | `lost-ack.json`, host journal inspect | ambiguous pair stays pinned; no automatic anchor replacement or GC | automatic recovery or nonce reuse | Host + console; requires blocker 1/4/5 code that is absent → **BLOCKED** |
 
-D3–D7 are blocked until a test-only staging/fault probe exists. The probe
-branch accepts a `fault` selector (`sync_file`, `manifest_sync`,
-`directory_sync`, `rename_noreplace`, `rename_eio`, `stale_lock`,
-`crash_point`) and returns `status=refused` with the exact closed seam:
-`rkva_managed_object_v3::write()` returns
-`"concrete authenticated pin and metadata proof unavailable"` at
-`tools/xbox/uwp/rkva/rkva-managed-object-v3.cpp:115` before any
-`durable_filesystem::sync_file`/`sync_directory`/`rename_noreplace_and_sync`
-call, and no qualified durable backend or cross-process stale-lock reclaim
-exists. It writes, renames and deletes nothing; opening that writer would be
-the forbidden v3 success path. The test-only injector in
-`tests/rkva-durable-fault.h` exercises the *contract semantics* on CPU (no
-replacement, sync failure, ack loss, crash-after-apply) but does not make the
-closed writer reachable; see `docs/rkva-durable-fault-injection.md` for the
-exact seam proposal. A destructive durability run invokes the selector once
-(`sync_file`, chunk 3) and records the refusal as `BLOCKED`; it does not
-publish, rename or delete any staging object.
+D3–D7 remain blocked: the app-side probe refuses the CPU-test-only durable
+seam. `11f37de73` adds that seam: `rkva-managed-object-v3-write.inc`
+(`write_prepared`) plus `tests/rkva-durable-fault.h` exercise the same staging
+sequence as production (no-replace, sync failure, rename EIO, ack loss,
+crash-after-apply, stale stage) without opening the production `need(false)`
+gate. The Windows/UWP backend is a guarded skeleton with no power-loss claim;
+`tests/test-rkva-managed-object-v3-staging.cpp` compiles the seam with
+`RKVA_DURABLE_FAULT_TESTING`, and no UWP target includes it. The app-side probe
+on this branch accepts the controller's fault selectors (`chunk_sync`,
+`manifest_sync`, `dir_sync`, `rename_existing`, `rename_eio`, `ack_lost`,
+`crash_after_apply`, `stale_lock`) and returns `status=refused` naming that
+missing app seam; the production writer still stops at
+`rkva-managed-object-v3.cpp:37` (`write`) and `:14` (`verify`) with
+"concrete authenticated pin and metadata proof unavailable". It writes,
+renames and deletes nothing. The controller's D3-D5 and D7 hooks therefore
+record `BLOCKED`, never PASS. See `docs/rkva-durable-fault-injection.md`.
 
 ## 4. Blocker 7 — peer identity / AppContainer / UWP
 
@@ -296,7 +316,12 @@ pwsh -File tools/xbox/scripts/build-uwp.ps1 -Configuration Release -Platform x64
 
 A desktop/UWP compile is not console qualification. The guard-off check is the
 CPU test `test-rkva-qual-probe-guard-off`; it proves the action is unknown to
-the autopilot validator in a default build.
+the autopilot validator in a default build. Expected new CPU targets in that
+build: `test-rkva-managed-object-v3-staging`,
+`test-rkva-managed-object-v3-platform`, `test-rkva-durable-fault`,
+`test-rkva-qual-probe-cpu`, `test-rkva-qual-probe-guard-off`,
+`test-rkva-host-expect` and `test-rkva-qual-probe-static`. All are CPU only;
+the Windows backend test compiles the fail-closed stub on Linux.
 
 Host expectation from the real SQLite pin (read-only; no console access):
 
@@ -328,18 +353,31 @@ python3 tools/xbox/scripts/xbox-snapshot-console-qual.py \
   --allow-app-run --allow-phase-flags
 ```
 
-Durability prerequisite run (no power loss, no destructive flag):
+Durability D3–D5 run (no power loss, no destructive flag; expected `BLOCKED`
+because the app probe accepts the request but refuses the CPU-test-only durable
+seam):
 
 ```sh
 python3 tools/xbox/scripts/xbox-snapshot-console-qual.py \
-  --execute --label durability-prereq-r1 --scenario durability \
+  --execute --label durability-fault-r1 --scenario durability \
   --xbox-host 192.168.1.200 \
   --pfn GianlucaMazza.xllama_1.6.0.436_x64__pj67f1fcj4n14 \
   --allow-app-run
 ```
 
-Power-loss run (operator present; expected `BLOCKED` for blocker 3 until the
-staging probe exists):
+D7 force-stop/stale-lock run (destructive; controller holds the lease through
+the test probe, terminates the app, restarts and verifies):
+
+```sh
+python3 tools/xbox/scripts/xbox-snapshot-console-qual.py \
+  --execute --label durability-stale-r1 --scenario durability \
+  --xbox-host 192.168.1.200 \
+  --pfn GianlucaMazza.xllama_1.6.0.436_x64__pj67f1fcj4n14 \
+  --allow-app-run --destructive
+```
+
+Power-loss D6 run (operator present; expected `BLOCKED` for blocker 3 until an
+app-side staging seam and post-restart evidence exist):
 
 ```sh
 python3 tools/xbox/scripts/xbox-snapshot-console-qual.py \
@@ -359,12 +397,14 @@ python3 tools/xbox/scripts/xbox-snapshot-console-qual.py \
   --expected-cert-sha256 <out-of-band leaf SHA-256>
 ```
 
-What the controller actually implements today: D1, D2, the D4 power-loss
-timeline and I1-I3. The app-side probe exists on the probe branch behind
-`XLLAMA_QUAL_PROBE`, but the controller still does **not** implement D3, D5,
-D7 or I4-I6; the probe's fault selector returns a precise refusal instead of
-writing a staging object, and the Windows/UWP work in
-`docs/rkva-peer-identity-uwp-inventory.md` is absent. It refuses
+What the controller actually implements today: D1, D2, the D3/D4/D5 fault
+requests and validators, the D6 power-loss timeline and the D7 two-phase
+hold/force-stop/verify flow, plus I1-I3. The app-side probe exists behind
+`XLLAMA_QUAL_PROBE`, but the durable seam is compiled only into the CPU test
+(`RKVA_DURABLE_FAULT_TESTING`); the probe therefore returns a precise refusal
+for every D3-D7 selector and the controller records `BLOCKED`, never PASS.
+I4-I6 still need the Windows/UWP work in
+`docs/rkva-peer-identity-uwp-inventory.md`. The controller refuses
 `--destructive` for the identity scenario rather than pretending to deploy.
 
 ## 8. Acceptance rule

@@ -1362,6 +1362,33 @@ if (RKVA_MANAGED_SNAPSHOT_PHASE2)
     add_test(NAME test-rkva-durable-fault COMMAND $<TARGET_FILE:test-rkva-durable-fault>)
     set_property(TEST test-rkva-durable-fault PROPERTY LABELS main)
 
+    # Test-only staging body of the v3 writer. The .inc is compiled ONLY here;
+    # the production writer keeps its unconditional fail-closed refusal.
+    add_executable(test-rkva-managed-object-v3-staging
+        test-rkva-managed-object-v3-staging.cpp)
+    target_compile_definitions(test-rkva-managed-object-v3-staging
+        PRIVATE RKVA_DURABLE_FAULT_TESTING
+                RKVA_DURABLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    target_link_libraries(test-rkva-managed-object-v3-staging
+        PRIVATE rkva-managed-phase2)
+    add_test(NAME test-rkva-managed-object-v3-staging
+        COMMAND $<TARGET_FILE:test-rkva-managed-object-v3-staging>)
+    set_property(TEST test-rkva-managed-object-v3-staging PROPERTY LABELS main)
+
+    # Windows/UWP durable backend skeleton under the experimental guard plus a
+    # POSIX reference contract test. The Windows body is not executed on Linux.
+    add_executable(test-rkva-managed-object-v3-platform
+        test-rkva-managed-object-v3-platform.cpp
+        ${PROJECT_SOURCE_DIR}/tools/xbox/uwp/rkva/rkva-managed-object-v3-windows.cpp)
+    target_compile_definitions(test-rkva-managed-object-v3-platform
+        PRIVATE RKVA_MANAGED_V3_WINDOWS_EXPERIMENTAL_TEST
+                RKVA_PLATFORM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    target_link_libraries(test-rkva-managed-object-v3-platform
+        PRIVATE rkva-managed-phase2)
+    add_test(NAME test-rkva-managed-object-v3-platform
+        COMMAND $<TARGET_FILE:test-rkva-managed-object-v3-platform>)
+    set_property(TEST test-rkva-managed-object-v3-platform PROPERTY LABELS main)
+
     add_executable(test-rkva-v3-quota test-rkva-v3-quota.cpp)
     target_link_libraries(test-rkva-v3-quota PRIVATE rkva-managed-phase2)
     add_test(NAME test-rkva-v3-quota COMMAND $<TARGET_FILE:test-rkva-v3-quota>)
