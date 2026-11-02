@@ -95,6 +95,22 @@ inline SplitPolicy split_policy(uint32_t mode) {
     }
 }
 
+// Q4 single-token decode split policy:
+// Balanced: 256 target rows, max 32 splits (30 splits at 7.6k rows, 120 threadgroups)
+// Fine:     128 target rows, max 64 splits (60 splits at 7.6k rows)
+// Coarse:   512 target rows, max 16 splits (15 splits at 7.6k rows, 60 threadgroups)
+inline SplitPolicy q4_decode_split_policy(uint32_t mode) {
+    switch (mode) {
+    case kModeOptFine:
+        return {128, 64};
+    case kModeOptCoarse:
+        return {512, 16};
+    case kModeOptBalanced:
+    default:
+        return {256, 32};
+    }
+}
+
 // Reference live259 policy: one split per 256 live rows, at most 32.
 inline uint32_t reference_split_k(uint32_t active_count) {
     return std::max(1u, std::min(kReferenceMaxSplits, (active_count + 255) / 256));

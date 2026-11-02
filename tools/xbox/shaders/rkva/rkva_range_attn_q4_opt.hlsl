@@ -44,10 +44,60 @@ groupshared float gs_max[RKVA_MAX_WAVES * RKVA_GQA];
 groupshared float gs_den[RKVA_MAX_WAVES * RKVA_GQA];
 groupshared float gs_acc[RKVA_MAX_WAVES * RKVA_GQA * RKVA_DIM];
 
+groupshared uint gs_raw_k[RKVA_MAX_WAVES][2][36];
+groupshared uint gs_raw_v[RKVA_MAX_WAVES][2][36];
+
 // Quarter unit u covers block b = u >> 3, quant bytes 4c..4c+3 (c = (u >> 1) & 3)
 // and nibble half h = u & 1: elements b*32 + h*16 + 4c + {0,1,2,3}.
 uint quarter_dim(uint u) {
     return (u >> 3) * 32 + (u & 1) * 16 + ((u >> 1) & 3) * 4;
+}
+
+// Coalesced 144-byte wave load and dequantization from LDS:
+// Lanes 0..35 store the 36 raw uints (144 bytes) of the row directly into LDS.
+// All 64 lanes then dequantize their quarter units in parallel via fast LDS reads.
+float4 unpack_q4_from_k(uint wave, uint row_slot, uint u) {
+    uint pair_idx = u >> 4;
+    uint is_odd = (u >> 3) & 1;
+    uint c = (u >> 1) & 3;
+    uint pair_base = pair_idx * 9;
+
+    uint scale_word = is_odd ? gs_raw_k[wave][row_slot][pair_base + 4] : gs_raw_k[wave][row_slot][pair_base + 0];
+    float scale = f16tof32((scale_word >> (is_odd * 16)) & 65535u);
+
+    uint word;
+    if (is_odd) {
+        word = gs_raw_k[wave][row_slot][pair_base + 5 + c];
+    } else {
+        uint p0 = gs_raw_k[wave][row_slot][pair_base + c];
+        uint p1 = gs_raw_k[wave][row_slot][pair_base + c + 1];
+        word = (p0 >> 16) | (p1 << 16);
+    }
+    word >>= (u & 1u) * 4;
+    float4 nibble = float4(word & 15u, (word >> 8) & 15u, (word >> 16) & 15u, (word >> 24) & 15u);
+    return (nibble - 8.0f) * scale;
+}
+
+float4 unpack_q4_from_v(uint wave, uint row_slot, uint u) {
+    uint pair_idx = u >> 4;
+    uint is_odd = (u >> 3) & 1;
+    uint c = (u >> 1) & 3;
+    uint pair_base = pair_idx * 9;
+
+    uint scale_word = is_odd ? gs_raw_v[wave][row_slot][pair_base + 4] : gs_raw_v[wave][row_slot][pair_base + 0];
+    float scale = f16tof32((scale_word >> (is_odd * 16)) & 65535u);
+
+    uint word;
+    if (is_odd) {
+        word = gs_raw_v[wave][row_slot][pair_base + 5 + c];
+    } else {
+        uint p0 = gs_raw_v[wave][row_slot][pair_base + c];
+        uint p1 = gs_raw_v[wave][row_slot][pair_base + c + 1];
+        word = (p0 >> 16) | (p1 << 16);
+    }
+    word >>= (u & 1u) * 4;
+    float4 nibble = float4(word & 15u, (word >> 8) & 15u, (word >> 16) & 15u, (word >> 24) & 15u);
+    return (nibble - 8.0f) * scale;
 }
 
 // Branchless aligned Q4_0 dequantization: 36-byte (2 blocks = 9 uints) alignment.
@@ -100,13 +150,26 @@ void CSRangeAttnQ4Opt(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
     }
 
     uint row_stride = n_head_kv * RKVA_ROW_HEAD;
-    uint row = begin + wave;
-    // Two independent rows per iteration so their loads are in flight together.
-    [loop] for (; row + n_waves < end; row += 2 * n_waves) {
+    uint total_rows = end - begin;
+    uint full_iters = total_rows / (2 * n_waves);
+    [loop] for (uint iter = 0; iter < full_iters; ++iter) {
+        uint row = begin + iter * (2 * n_waves) + wave;
         uint ba = (row * n_head_kv + kv_head) * RKVA_ROW_HEAD;
         uint bb = ba + n_waves * row_stride;
-        float4 ka0 = load_q4(keys, ba, u0), kb0 = load_q4(keys, bb, u0);
-        float4 va0 = load_q4(values, ba, u0), vb0 = load_q4(values, bb, u0);
+
+        if (lane < 36) {
+            gs_raw_k[wave][0][lane] = keys.Load(ba + lane * 4);
+            gs_raw_k[wave][1][lane] = keys.Load(bb + lane * 4);
+            gs_raw_v[wave][0][lane] = values.Load(ba + lane * 4);
+            gs_raw_v[wave][1][lane] = values.Load(bb + lane * 4);
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        float4 ka0 = unpack_q4_from_k(wave, 0, u0);
+        float4 kb0 = unpack_q4_from_k(wave, 1, u0);
+        float4 va0 = unpack_q4_from_v(wave, 0, u0);
+        float4 vb0 = unpack_q4_from_v(wave, 1, u0);
+
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
             float sa = WaveActiveSum(dot(q0[g], ka0)) * kq_scale;
             float sb = WaveActiveSum(dot(q0[g], kb0)) * kq_scale;
@@ -117,10 +180,30 @@ void CSRangeAttnQ4Opt(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
             denom[g] = denom[g] * old_weight + wa + wb;
             maximum[g] = next_max;
         }
+        GroupMemoryBarrierWithGroupSync();
     }
-    if (row < end) {
-        uint ba = (row * n_head_kv + kv_head) * RKVA_ROW_HEAD;
-        float4 ka0 = load_q4(keys, ba, u0), va0 = load_q4(values, ba, u0);
+
+    uint rem_base = begin + full_iters * (2 * n_waves);
+    uint rem_row = rem_base + wave;
+    if (rem_row < end) {
+        uint ba = (rem_row * n_head_kv + kv_head) * RKVA_ROW_HEAD;
+        float4 ka0 = load_q4(keys, ba, u0);
+        float4 va0 = load_q4(values, ba, u0);
+        [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+            float sa = WaveActiveSum(dot(q0[g], ka0)) * kq_scale;
+            float next_max = max(maximum[g], sa);
+            float old_weight = denom[g] == 0 ? 0 : exp(maximum[g] - next_max);
+            float wa = exp(sa - next_max);
+            acc0[g] = acc0[g] * old_weight + wa * va0;
+            denom[g] = denom[g] * old_weight + wa;
+            maximum[g] = next_max;
+        }
+    }
+    rem_row += n_waves;
+    if (rem_row < end) {
+        uint ba = (rem_row * n_head_kv + kv_head) * RKVA_ROW_HEAD;
+        float4 ka0 = load_q4(keys, ba, u0);
+        float4 va0 = load_q4(values, ba, u0);
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
             float sa = WaveActiveSum(dot(q0[g], ka0)) * kq_scale;
             float next_max = max(maximum[g], sa);

@@ -447,6 +447,20 @@ static inline bool rkva_fp8_to_f32_batch(const uint8_t * src, float * dst, size_
 #if defined(__AVX2__) && defined(__F16C__)
     size_t i = 0;
     const __m128i exp_mask = _mm_set1_epi16(0x7c00);
+    for (; i + 16 <= n; i += 16) {
+        __m128i b = _mm_loadu_si128((const __m128i*)(src + i));
+        __m128i h0 = _mm_slli_epi16(_mm_cvtepu8_epi16(b), 8);
+        __m128i h1 = _mm_slli_epi16(_mm_cvtepu8_epi16(_mm_srli_si128(b, 8)), 8);
+        __m128i exps0 = _mm_and_si128(h0, exp_mask);
+        __m128i exps1 = _mm_and_si128(h1, exp_mask);
+        __m128i is_inf_nan = _mm_or_si128(_mm_cmpeq_epi16(exps0, exp_mask),
+                                          _mm_cmpeq_epi16(exps1, exp_mask));
+        if (__builtin_expect(!_mm_testz_si128(is_inf_nan, is_inf_nan), 0)) return false;
+        __m256 f0 = _mm256_cvtph_ps(h0);
+        __m256 f1 = _mm256_cvtph_ps(h1);
+        _mm256_storeu_ps(dst + i, f0);
+        _mm256_storeu_ps(dst + i + 8, f1);
+    }
     for (; i + 8 <= n; i += 8) {
         __m128i b = _mm_loadl_epi64((const __m128i*)(src + i));
         __m128i h = _mm_slli_epi16(_mm_cvtepu8_epi16(b), 8);
