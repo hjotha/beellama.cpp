@@ -3004,7 +3004,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
     if (!ready_ || !s || !s->valid || !s->range_configured ||
         s->range_storage != storage || layer >= s->layer_kv.size() ||
         !data || (!out && !out_fp8) || !lse || bulk_recording_ || !n_tokens || n_tokens > 256 ||
-        (gpu_fp8 && (storage != RKVA_RANGE_STORAGE_Q8_0 || !ensure_q8_fp8_gpu_pipelines()))) {
+        (gpu_fp8 && ((storage != RKVA_RANGE_STORAGE_Q8_0 && storage != RKVA_RANGE_STORAGE_Q4_0) || !ensure_q8_fp8_gpu_pipelines()))) {
         return ::fail(error, "q4 bulk: invalid session/arguments");
     }
     std::vector<q4_segment> segments;
@@ -3044,7 +3044,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         std::memcpy(&attn, data + off, sizeof(attn));
         off += sizeof(attn);
         qs.wire = attn.wire;
-        if (gpu_fp8 && attn.wire != RKVA_WIRE_FP8) return ::fail(error, "Q8 GPU codec requires FP8 wire");
+        if (gpu_fp8 && attn.wire != RKVA_WIRE_FP8) return ::fail(error, "raw GPU codec requires FP8 wire");
         if (!qs.n_queries || qs.n_queries > n_tokens - sum_queries || attn.flags ||
             attn.reserved[0] || attn.reserved[1] ||
             (attn.wire != RKVA_WIRE_F32 && attn.wire != RKVA_WIRE_F16 &&
@@ -3061,7 +3061,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         if (gpu_fp8) {
             for (uint64_t e = 0; e < elements; ++e) {
                 if ((data[qs.q_off + e] & 0x7cu) == 0x7cu)
-                    return ::fail(error, "Q8 GPU codec rejects non-finite FP8 query");
+                    return ::fail(error, "raw GPU codec rejects non-finite FP8 query");
             }
         }
         off += pos_bytes + q_bytes;
@@ -3195,7 +3195,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
             const HRESULT map_hr = transfer.query_f16_upload.resource->Map(0, nullptr, &mapped);
             if (FAILED(map_hr) || !mapped) {
                 s->valid = false; terminal_failure_ = true;
-                return fail(error, "Map Q8 FP8 upload", map_hr);
+                return fail(error, "Map raw FP8 upload", map_hr);
             }
             std::memcpy(mapped, qsrc, size_t(elements));
             std::memcpy(static_cast<uint8_t*>(mapped) + elements, data + seg.pos_off, size_t(seg.n_queries) * 4);
@@ -3355,7 +3355,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
                 !rkva_kvarn_bulk::q8_fp8_lse_valid(packed + elements, data + seg.pos_off,
                     seg.n_queries, geo_.n_head, s->range_origin, seg.append_begin + seg.append_rows))) {
                 D3D12_RANGE empty{0, 0}; bulk_transfers_[i].readback.resource->Unmap(0, &empty);
-                s->valid = false; return ::fail(error, "Q8 GPU codec rejected non-finite output");
+                s->valid = false; return ::fail(error, "raw GPU codec rejected non-finite output");
             }
             std::memcpy(out_fp8 + row_out * geo_.n_head * 256, packed, elements);
             std::memcpy(lse + row_out * geo_.n_head, packed + elements, lse_bytes);
@@ -3385,6 +3385,14 @@ bool RemoteAttnEngine::attend_q4_bulk(uint32_t id, uint32_t layer, uint32_t n_to
     return attend_native_rows(id, layer, n_tokens, RKVA_RANGE_STORAGE_Q4_0,
                               rkva_kvarn_range::q4_row_bytes(geo_.head_dim, geo_.n_head_kv),
                               data, bytes, out, lse, error, cycle_id);
+}
+
+bool RemoteAttnEngine::attend_q4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens,
+                                          const uint8_t* data, size_t bytes, uint8_t* out_fp8,
+                                          float* lse, std::string* error, uint64_t cycle_id) {
+    return attend_native_rows(id, layer, n_tokens, RKVA_RANGE_STORAGE_Q4_0,
+                              rkva_kvarn_range::q4_row_bytes(geo_.head_dim, geo_.n_head_kv),
+                              data, bytes, nullptr, lse, error, cycle_id, out_fp8);
 }
 
 bool RemoteAttnEngine::attend_q8_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens,

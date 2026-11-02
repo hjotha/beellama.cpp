@@ -342,8 +342,9 @@ class EngineWiring(unittest.TestCase):
             "const bool q8_rows = it->second.native_q8;",
             "        uint32_t wire = RKVA_WIRE_F32;",
         )
-        self.assertEqual(block.count("&error, req.cycle_id)"), 3,
-                         "Q4, Q8 CPU and Q8 GPU call sites must forward req.cycle_id")
+        self.assertEqual(block.count("&error, req.cycle_id)"), 4,
+                         "Q4 CPU, Q4 GPU, Q8 CPU and Q8 GPU call sites must forward req.cycle_id")
+        self.assertIn("attend_q4_bulk_fp8", block)
         self.assertIn("attend_q8_bulk_fp8", block)
 
     def test_bulk_window_guard_armed_after_ownership(self) -> None:

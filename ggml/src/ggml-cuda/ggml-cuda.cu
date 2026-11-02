@@ -7958,6 +7958,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_q8_native_prepare_v1") == 0) {
         return (void *)ggml_cuda_q8_native_prepare;
     }
+    if (strcmp(name, "ggml_backend_cuda_q4_native_prepare_v1") == 0) {
+        return (void *)ggml_cuda_q4_native_prepare;
+    }
     if (strcmp(name, "ggml_backend_cuda_kvarn_native_append_v1") == 0) {
         return (void *)ggml_cuda_kvarn_native_append;
     }

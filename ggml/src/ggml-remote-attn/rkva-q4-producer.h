@@ -1,10 +1,13 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-q4-native-producer.h"
 #include "remote-attn-protocol.h"
 #include "rkva-native-owner.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -26,6 +29,15 @@ public:
                 uint64_t(origin_) + capacity_ > INT32_MAX) {
             throw std::invalid_argument("native Q4 range geometry");
         }
+        const char * mode = std::getenv("GGML_RKVA_Q4_PRODUCER");
+        if (!mode) mode = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
+        if (mode && std::strcmp(mode, "cpu") != 0) {
+            if (std::strcmp(mode, "cuda") != 0) throw std::invalid_argument("Q4 producer must be cpu or cuda");
+            auto reg = ggml_backend_reg_by_name("CUDA");
+            cuda_ = reg ? reinterpret_cast<ggml_backend_cuda_q4_native_prepare_v1_t>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_q4_native_prepare_v1")) : nullptr;
+            if (!cuda_) throw std::runtime_error("Q4 CUDA producer unavailable");
+        }
     }
 
     static constexpr uint32_t head_dim = 256;
@@ -35,13 +47,24 @@ public:
 
     uint32_t rows() const override { return rows_; }
 
-    // The CPU quantizer runs on the scheduler thread inside append(); there is
-    // no optional CUDA producer for layout 4.
+    // CUDA pre-packs the complete parent once; append publishes serial chunks
+    // only after verifying they still match the original finite host inputs.
     bool prepare(const float * keys, const float * values, const int32_t * positions,
                  uint32_t count, const float * device_keys = nullptr,
                  const float * device_values = nullptr) override {
-        (void) keys; (void) values; (void) positions; (void) count;
-        (void) device_keys; (void) device_values;
+        if (!cuda_) return true;
+        prepared_count_ = 0;
+        if (!keys || !values || !positions || !count || count > 512 || count > capacity_ - rows_) return false;
+        for (uint32_t i = 0; i < count; ++i) if (positions[i] != int64_t(origin_) + rows_ + i) return false;
+        const size_t elements = size_t(count) * heads_ * head_dim;
+        if (!all_finite(keys, elements) || !all_finite(values, elements)) return false;
+        prepared_keys_.assign(keys, keys + elements);
+        prepared_values_.assign(values, values + elements);
+        const size_t bytes = size_t(count) * row_bytes(heads_);
+        packed_keys_.resize(bytes); packed_values_.resize(bytes);
+        if (!cuda_(device_keys ? device_keys : keys, device_values ? device_values : values,
+                   count, heads_, packed_keys_.data(), packed_values_.data())) return false;
+        prepared_begin_ = rows_; prepared_count_ = count;
         return true;
     }
 
@@ -66,13 +89,24 @@ public:
         std::memcpy(payload.data(), &header, sizeof(header));
 
         uint8_t * dst = payload.data() + sizeof(header);
-        for (const float * source : {keys, values}) {
-            // One call packs count * heads contiguous 256-value rows and keeps
-            // the ggml block ordering (head-major) expected by the Q4_0 store.
-            const size_t written = ggml_quantize_chunk(GGML_TYPE_Q4_0, source, dst, 0,
-                    int64_t(count) * heads_, head_dim, nullptr);
-            if (written != plane) return false;
-            dst += plane;
+        if (cuda_) {
+            if (rows_ < prepared_begin_ || rows_ - prepared_begin_ > prepared_count_ ||
+                    count > prepared_count_ - (rows_ - prepared_begin_)) return false;
+            const size_t offset = size_t(rows_ - prepared_begin_);
+            const size_t source_offset = offset * heads_ * head_dim;
+            if (std::memcmp(keys, prepared_keys_.data() + source_offset, elements * sizeof(float)) ||
+                    std::memcmp(values, prepared_values_.data() + source_offset, elements * sizeof(float))) return false;
+            std::memcpy(dst, packed_keys_.data() + offset * row_bytes(heads_), plane);
+            std::memcpy(dst + plane, packed_values_.data() + offset * row_bytes(heads_), plane);
+        } else {
+            for (const float * source : {keys, values}) {
+                // One call packs count * heads contiguous 256-value rows and keeps
+                // the ggml block ordering (head-major) expected by the Q4_0 store.
+                const size_t written = ggml_quantize_chunk(GGML_TYPE_Q4_0, source, dst, 0,
+                        int64_t(count) * heads_, head_dim, nullptr);
+                if (written != plane) return false;
+                dst += plane;
+            }
         }
         rows_ = after;
         return true;
@@ -90,6 +124,7 @@ public:
     bool rewind(uint32_t keep) override {
         if (keep > rows_) return false;
         rows_ = keep;
+        prepared_count_ = 0;
         return true;
     }
 
@@ -102,6 +137,10 @@ private:
     }
 
     uint32_t origin_, capacity_, heads_, rows_ = 0;
+    uint32_t prepared_begin_ = 0, prepared_count_ = 0;
+    ggml_backend_cuda_q4_native_prepare_v1_t cuda_ = nullptr;
+    std::vector<float> prepared_keys_, prepared_values_;
+    std::vector<uint8_t> packed_keys_, packed_values_;
 };
 
 static_assert(rkva_q4_producer::record_bytes == 144, "native Q4_0 record bytes");

@@ -178,6 +178,10 @@ class RemoteAttnEngine {
                             uint64_t row_bytes, const uint8_t* data, size_t bytes, float* out,
                             float* lse, std::string* error, uint64_t cycle_id, uint8_t* out_fp8 = nullptr);
     bool ensure_q8_fp8_gpu_pipelines();
+    bool ensure_q4_fp8_gpu_pipelines() { return ensure_q8_fp8_gpu_pipelines(); }
+    bool attend_q4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
+                            size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
+                            uint64_t cycle_id);
     bool attend_q8_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                             size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
                             uint64_t cycle_id);

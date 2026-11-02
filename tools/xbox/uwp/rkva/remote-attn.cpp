@@ -201,6 +201,7 @@ struct remote_state {
     bool q8_mq_i8_enabled = false;
     bool q8_paired_reduce_enabled = false;
     bool q8_fp8_gpu_enabled = true;
+    bool q4_fp8_gpu_enabled = true;
     // FP32 row-per-lane QK decode (default on, LocalState opt-out).
     bool decode_rowlane_enabled = true;
     rpc_profile_counter rpc_profile[32]{};
@@ -358,6 +359,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             std::ifstream(g_snapshot_local_folder + "\\rkva-q8-reduce-paired.flag").good();
         state.q8_fp8_gpu_enabled =
             !std::ifstream(g_snapshot_local_folder + "\\rkva-q8-fp8-gpu-off.flag").good();
+        state.q4_fp8_gpu_enabled =
+            !std::ifstream(g_snapshot_local_folder + "\\rkva-q4-fp8-gpu-off.flag").good();
         state.geo = hello;
         state.hello_done = true;
         state.native_rewind_v2_client = (hello.proto_flags & RKVA_PROTO_NATIVE_REWIND_V2) != 0;
@@ -973,14 +976,20 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                 if (vq != req.n_tokens)
                     return q4_bad("query total", header.segment_count, vq, req.n_tokens);
             }
-            // Q8 raw-domain GPU codec is independent of the KVarN codec flag.
+            // Q8/Q4 raw-domain GPU codec is independent of the KVarN codec flag.
             // Keep the CPU path available when this device lacks the PSOs.
-            if (q8_rows && reply_wire == RKVA_WIRE_FP8 && state.q8_fp8_gpu_enabled &&
-                state.engine->ensure_q8_fp8_gpu_pipelines()) {
+            const bool raw_fp8_gpu = reply_wire == RKVA_WIRE_FP8 &&
+                (q8_rows ? (state.q8_fp8_gpu_enabled && state.engine->ensure_q8_fp8_gpu_pipelines())
+                         : (state.q4_fp8_gpu_enabled && state.engine->ensure_q4_fp8_gpu_pipelines()));
+            if (raw_fp8_gpu) {
                 output.resize(size_t(total + heads * sizeof(float)));
                 std::string error;
                 const auto start = clock_type::now();
-                const bool ok = state.engine->attend_q8_bulk_fp8(
+                const bool ok = q8_rows
+                    ? state.engine->attend_q8_bulk_fp8(
+                        req.session_id, req.layer_id, req.n_tokens, input.data(), input.size(),
+                        output.data(), reinterpret_cast<float*>(output.data() + total), &error, req.cycle_id)
+                    : state.engine->attend_q4_bulk_fp8(
                         req.session_id, req.layer_id, req.n_tokens, input.data(), input.size(),
                         output.data(), reinterpret_cast<float*>(output.data() + total), &error, req.cycle_id);
                 if (!ok) {
