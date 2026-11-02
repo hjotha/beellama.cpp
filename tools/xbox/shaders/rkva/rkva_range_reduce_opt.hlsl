@@ -110,9 +110,7 @@ void CSRangeReduceOpt(uint lane : SV_GroupIndex, uint3 group : SV_GroupID) {
     output.Store((qh * head_dim + lane) * 4, asuint(out0));
     output.Store((qh * head_dim + lane + 128) * 4, asuint(out1));
 #else
-#if RKVA_REDUCE_Q8_PAIRED
-    // Opt in only for the exact two-elements-per-lane shape. Other head
-    // dimensions keep the original loop below.
+    // Fast paired reduce: two elements per lane (lane and lane + 128) in one loop over splits.
     if (head_dim == 256) {
         float acc0 = 0;
         float acc1 = 0;
@@ -130,8 +128,7 @@ void CSRangeReduceOpt(uint lane : SV_GroupIndex, uint3 group : SV_GroupID) {
         invalid_numerator = invalid_numerator || !isfinite(acc0 * inv) || !isfinite(acc1 * inv);
         output.Store((qh * head_dim + lane) * 4, asuint(acc0 * inv));
         output.Store((qh * head_dim + lane + 128) * 4, asuint(acc1 * inv));
-    } else
-#endif
+    } else {
     for (uint d = lane; d < head_dim; d += 128) {
         float acc = 0;
         for (uint s = 0; s < splits; ++s) {
@@ -143,6 +140,7 @@ void CSRangeReduceOpt(uint lane : SV_GroupIndex, uint3 group : SV_GroupID) {
         }
         invalid_numerator = invalid_numerator || !isfinite(acc * inv);
         output.Store((qh * head_dim + d) * 4, asuint(acc * inv));
+    }
     }
 #endif
     if (invalid_numerator) InterlockedOr(gs_invalid, 1u);

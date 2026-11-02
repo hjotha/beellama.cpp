@@ -3586,16 +3586,22 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         // split_k == 1 writes OUT/LSE directly.
         uint32_t q_tile = rp::q4_mq_tile(q4_kernel_mode_, n_tokens);
         ID3D12PipelineState* attn_pso = range_attn_q4_opt_pso_.Get();
-        if (n_tokens == 1 && range_attn_q4_decode_rowlane_pso_ && wave_lane_min_ == 64 && wave_lane_max_ == 64) {
-            attn_pso = range_attn_q4_decode_rowlane_pso_.Get();
-        } else if (q_tile && range_attn_q4_mq_pso_[q_tile / 4]) {
+        if (q_tile && range_attn_q4_mq_pso_[q_tile / 4]) {
             attn_pso = range_attn_q4_mq_pso_[q_tile / 4].Get();
         } else {
             q_tile = 0;
         }
         uint32_t split_k = rp::optimized_split_k(active_count, q4_kernel_mode_);
         uint32_t rows_per_split = rp::split_rows(active_count, split_k);
-        if (q_tile) {
+        if (n_tokens == 1) {
+            // Specialized decode split policy (matches kvarn4_decode_split):
+            // Prevents pathological 238-split reducer memory bus saturation in fine mode.
+            const uint32_t target_rows = 128u;
+            const uint32_t max_splits = 64u;
+            const uint32_t wanted = (active_count + target_rows - 1) / target_rows;
+            split_k = std::max(1u, std::min(max_splits, wanted));
+            rows_per_split = rp::split_rows(active_count, split_k);
+        } else if (q_tile) {
             const rp::Q4MqSplit mq = rp::q4_mq_split(active_count, q4_kernel_mode_);
             split_k = mq.split_k;
             rows_per_split = mq.split_rows;
