@@ -9,7 +9,7 @@ DXC="${DXC:-dxc}"
 ALL_TARGETS=(attn attn_q4 attn_q8 attn_kvarn4 reduce attn_q4_opt reduce_opt reduce_kvarn4
     attn_f16_opt attn_q8_opt attn_kvarn4_opt attn_kvarn4_prefix attn_kvarn4_opt_prefix
     attn_q4_mq2 attn_q4_mq4 attn_f16_mq2 attn_f16_mq4 attn_q8_mq2 attn_q8_mq4
-    attn_kvarn4_mq2 attn_kvarn4_mq4 attn_q8_mq2_i8 reduce_q8_paired bulk_unpack_q_fp8_raw bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8)
+    attn_kvarn4_mq2 attn_kvarn4_mq4 attn_q8_mq2_i8 reduce_q8_paired bulk_unpack_q_fp8_raw bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8 attn_q4_decode_rowlane)
 if [[ $# -gt 0 ]]; then
     TARGETS=("$@")
 else
@@ -94,6 +94,11 @@ for target in "${TARGETS[@]}"; do
         entry=CSRangeAttnKvarn4Decode
         source="$ROOT/shaders/rkva/rkva_range_attn_kvarn4_opt.hlsl"
         defines=(-D RKVA_SERIAL_PREFIX=1 -D RKVA_DECODE_OPT=1 -D RKVA_DECODE_ROWLANE=1)
+    fi
+    if [[ "$target" == attn_q4_decode_rowlane ]]; then
+        entry=CSRangeAttnQ4DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_q4_opt.hlsl"
+        defines=(-D RKVA_DECODE_ROWLANE=1)
     fi
     # Q4_0 multi-query tile (nq 2..9): RKVA_MQ_QT queries share each K/V dequantization.
     if [[ "$target" == attn_q4_mq2 || "$target" == attn_q4_mq4 ]]; then

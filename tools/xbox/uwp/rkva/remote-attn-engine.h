@@ -339,9 +339,11 @@ class RemoteAttnEngine {
     // Optimized Q4_0 decode kernel (optional; reference stays available).
     Microsoft::WRL::ComPtr<ID3D12RootSignature> range_attn_q4_opt_root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q4_opt_pso_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q4_decode_rowlane_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_reduce_opt_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_reduce_kvarn4_pso_;
     std::string q4_opt_status_ = "not initialized";
+    std::string q4_decode_rowlane_status_ = "not initialized";
     // Q4_0 multi-query tile kernels ([0] 2-query, [1] 4-query) for nq 2..9 in
     // modes 1/2; optional, a missing PSO keeps the per-query optimized kernel.
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q4_mq_pso_[2];

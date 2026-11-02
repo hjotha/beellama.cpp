@@ -60,6 +60,12 @@
 #include "rkva_range_attn_q4_mq2_dxil.h"
 #include "rkva_range_attn_q4_mq4_dxil.h"
 #include "rkva_range_attn_q4_opt_dxil.h"
+#if __has_include("rkva_range_attn_q4_decode_rowlane_dxil.h")
+    #include "rkva_range_attn_q4_decode_rowlane_dxil.h"
+    #define RKVA_HAS_Q4_DECODE_ROWLANE_DXIL 1
+#else
+    #define RKVA_HAS_Q4_DECODE_ROWLANE_DXIL 0
+#endif
 #include "rkva_range_attn_q8_dxil.h"
 #include "rkva_range_attn_q8_mq2_dxil.h"
 #if __has_include("rkva_range_reduce_q8_paired_dxil.h")
@@ -827,6 +833,24 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
             q4_mq_status_[i] = "ready";
         }
     }
+#if RKVA_HAS_Q4_DECODE_ROWLANE_DXIL
+    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
+        pso.pRootSignature = range_attn_q4_opt_root_.Get();
+        pso.CS = {g_rkva_range_attn_q4_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q4_decode_rowlane_dxil)};
+        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_q4_decode_rowlane_pso_));
+        if (FAILED(hr)) {
+            std::snprintf(text, sizeof(text), "q4 decode rowlane pipeline state: 0x%08X", unsigned(hr));
+            q4_decode_rowlane_status_ = text;
+            range_attn_q4_decode_rowlane_pso_.Reset();
+        } else {
+            q4_decode_rowlane_status_ = "ready";
+        }
+    } else {
+        q4_decode_rowlane_status_ = "requires fixed wave64";
+    }
+#else
+    q4_decode_rowlane_status_ = "header not built (compile attn_q4_decode_rowlane)";
+#endif
 }
 
 // Optional optimized F16 / Q8_0 / native KVarN4 decode pipelines. They share the
@@ -3562,7 +3586,9 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         // split_k == 1 writes OUT/LSE directly.
         uint32_t q_tile = rp::q4_mq_tile(q4_kernel_mode_, n_tokens);
         ID3D12PipelineState* attn_pso = range_attn_q4_opt_pso_.Get();
-        if (q_tile && range_attn_q4_mq_pso_[q_tile / 4]) {
+        if (n_tokens == 1 && range_attn_q4_decode_rowlane_pso_ && wave_lane_min_ == 64 && wave_lane_max_ == 64) {
+            attn_pso = range_attn_q4_decode_rowlane_pso_.Get();
+        } else if (q_tile && range_attn_q4_mq_pso_[q_tile / 4]) {
             attn_pso = range_attn_q4_mq_pso_[q_tile / 4].Get();
         } else {
             q_tile = 0;
