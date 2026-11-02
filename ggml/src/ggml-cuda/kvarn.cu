@@ -1061,11 +1061,40 @@ bool ggml_cuda_q8_native_prepare(const float * keys, const float * values,
     return cudaStreamSynchronize(scratch.stream) == cudaSuccess && ok;
 }
 
-// Uses the exact GGML Q4_0 per-32 block format.
+// Uses the exact GGML Q4_0 per-32 block format with IEEE float multiply parity.
+static __device__ void q4_native_quantize_block(const float * __restrict__ x, block_q4_0 * __restrict__ y) {
+    float amax = 0.0f;
+    float vmax = 0.0f;
+
+    for (int j = 0; j < QK4_0; ++j) {
+        const float v = x[j];
+        if (amax < fabsf(v)) {
+            amax = fabsf(v);
+            vmax = v;
+        }
+    }
+
+    const float d  = vmax / -8.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    for (int j = 0; j < QK4_0/2; ++j) {
+        const float x0 = __fmul_rn(x[0       + j], id);
+        const float x1 = __fmul_rn(x[QK4_0/2 + j], id);
+
+        const uint8_t xi0 = min(15, (int8_t)(x0 + 8.5f));
+        const uint8_t xi1 = min(15, (int8_t)(x1 + 8.5f));
+
+        y->qs[j]  = xi0;
+        y->qs[j] |= xi1 << 4;
+    }
+}
+
 static __global__ void q4_native_prepare_kernel(const float * input, block_q4_0 * output, size_t blocks) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= blocks) return;
-    quantize_f32_q4_0_block(input + i * QK4_0, output + i);
+    q4_native_quantize_block(input + i * QK4_0, output + i);
 }
 
 bool ggml_cuda_q4_native_prepare(const float * keys, const float * values,
