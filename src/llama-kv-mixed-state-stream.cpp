@@ -343,8 +343,8 @@ stream_prepared stream_prepare(const stream_input & input, const stream_options 
             }
             if (d.range_id == llama_position_split::kRangeLocal) {
                 if (d.range_start != 0 || d.range_end != input.split->p ||
-                        d.kind != cache_kind::kvarn) {
-                    fail("stream: local range must be [0,P) and a kvarn cache");
+                        (d.kind != cache_kind::kvarn && d.kind != cache_kind::standard_qx)) {
+                    fail("stream: local range must be [0,P) and a kvarn or standard qx cache");
                 }
             } else if (d.range_start != input.split->p || d.range_end != input.split->c ||
                     d.kind != cache_kind::standard_qx) {

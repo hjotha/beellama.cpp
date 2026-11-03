@@ -715,6 +715,7 @@ public:
     // Additive handoff accessor: authoritative per-layer compressed tensors.
     bool handoff_layer_view(int32_t il, llama_kvarn_handoff_layer_view & out) const;
     std::vector<llama_kv_cache_standard_layer_layout> standard_layer_layout() const;
+    std::vector<llama_kv_cache_standard_layer_layout> local_standard_layer_layout() const;
     std::vector<llama_kv_cache_kvarn_layer_layout> kvarn_layer_layout() const;
     uint64_t mixed_state_owner_id() const { return state_owner_id; }
     uint64_t mixed_state_owner_epoch() const { return state_owner_epoch; }

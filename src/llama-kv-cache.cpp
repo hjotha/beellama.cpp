@@ -6326,7 +6326,7 @@ void llama_kv_cache::state_read_shared_payload(
         uint32_t count = 0;
         io.read(&count, sizeof(count));
         slot_info sinfo = sinfos[stream];
-        if (payload_row_origin != 0 && !sinfo.empty()) {
+        if ((payload_row_origin != 0 || payload_size != get_size()) && !sinfo.empty()) {
             if (sinfo.n_stream() != 1 || sinfo.idxs.size() != 1) {
                 throw std::runtime_error("compact Qx restore requires one logical metadata stream");
             }
@@ -6335,7 +6335,7 @@ void llama_kv_cache::state_read_shared_payload(
                 if (cell >= get_size()) {
                     throw std::runtime_error("compact Qx restore cell exceeds logical capacity");
                 }
-                return cell < payload_row_origin;
+                return cell < payload_row_origin || cell >= payload_row_origin + payload_size;
             }), cells.end());
         }
         if (count == 0) {

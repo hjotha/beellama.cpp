@@ -328,8 +328,8 @@ void validate_range_v2(const layer_desc & d, const position_split & split,
         if (d.range_start != 0 || d.range_end != split.p) {
             throw kv_mixed_error(std::string(where) + ": local range must be exactly [0,P)");
         }
-        if (d.kind != cache_kind::kvarn) {
-            throw kv_mixed_error(std::string(where) + ": local range must be a kvarn cache");
+        if (d.kind != cache_kind::kvarn && d.kind != cache_kind::standard_qx) {
+            throw kv_mixed_error(std::string(where) + ": local range must be a kvarn or standard qx cache");
         }
     } else {
         if (d.range_start != split.p || d.range_end != split.c) {
