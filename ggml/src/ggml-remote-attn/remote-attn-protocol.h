@@ -85,6 +85,8 @@ static constexpr uint64_t RKVA_CAP_KVARN_COMPACT_STAGE = 1ull << 13;
 static constexpr uint64_t RKVA_CAP_NATIVE_Q4_BULK = 1ull << 14;
 // layout 5: native Q8_0 overflow rows over op16/op22 (bulk + async capable server)
 static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK = 1ull << 15;
+// layout 6: native SAW-INT4 / BDR-INT4 overflow rows over op16/op22 (136 bytes per head row)
+static constexpr uint64_t RKVA_CAP_NATIVE_SAW_INT4_BULK = 1ull << 16;
 // Capability allocation in HELLO ack.reserved[0]:
 //   0..13  range/KVarN storage and bulk features
 //   14     RKVA_CAP_NATIVE_Q4_BULK (descriptor layout 4)
@@ -144,6 +146,7 @@ static constexpr uint32_t RKVA_PROFILE_REPORT_ONLY = 1u << 3;
 static constexpr uint32_t RKVA_RANGE_STORAGE_KVARN4 = 1u << 2;
 static constexpr uint32_t RKVA_RANGE_STORAGE_Q4_0 = 1u << 0; // CONFIG.reserved[0]
 static constexpr uint32_t RKVA_RANGE_STORAGE_Q8_0 = 1u << 1; // CONFIG.reserved[0]
+static constexpr uint32_t RKVA_RANGE_STORAGE_SAW_INT4 = 1u << 3;
 static constexpr uint32_t RKVA_SESSION_RANGE =
     1u << 0; // CREATE_SESSION.flags; defer allocation until CONFIG
 
