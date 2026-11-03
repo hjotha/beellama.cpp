@@ -4682,7 +4682,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
-    const bool use_kvarn = kvarn_ctx && kvarn_ctx->uses_kvarn_layer(il);
+    const bool use_kvarn = kvarn_ctx && kvarn_ctx->uses_kvarn_layer(il) &&
+        !kvarn_ctx->get_kvarn_cache()->has_local_standard_cache();
     // Backend preferences choose an implementation inside the final operation;
     // they must not veto direct KVarN attention and force full materialization.
     // validate_native_tail_operation() proves the actual attached-tail shape.
@@ -5354,21 +5355,23 @@ llm_graph_context::position_split_rpc_packet llm_graph_context::build_attn_posit
         if (!async_overlap) throw std::runtime_error("paired RKVA ranges require asynchronous transport");
         return { q_cur, range, nullptr, nullptr, nullptr, backend_cuda, wire_backend, il, true };
     }
-    const bool native_attention = kvarn_ctx->uses_native_attention(il) &&
+    const bool has_local_std = cache->has_local_standard_cache();
+    const bool native_attention = !has_local_std && kvarn_ctx->uses_native_attention(il) &&
         llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
-    const auto kvarn_plan = llama_kvarn_plan_attention(
+    const auto kvarn_plan = native_attention ? llama_kvarn_plan_attention(
         native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
         (uint32_t) q_cur->ne[2],
-        (int) q_cur->ne[0]);
+        (int) q_cur->ne[0]) : llama_kvarn_attention_plan {
+            false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
     const auto kvarn_domain = kvarn_plan.domain;
     const bool use_kvarn_rotated_domain =
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;
     const bool use_kvarn_mixed_domain =
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
     const bool use_kvarn_q_rot = use_kvarn_rotated_domain || use_kvarn_mixed_domain;
-    const bool local_tail_here = kvarn_ctx->tail_on_layer(il);
+    const bool local_tail_here = !has_local_std && kvarn_ctx->tail_on_layer(il);
     ggml_tensor * kvarn_rot = nullptr;
     if (use_kvarn_q_rot || local_tail_here) {
         kvarn_rot = llm_kvarn_rot_for_dim(
@@ -5882,14 +5885,16 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
     // unsupported shapes use the planner's explicit materialization fallback.
     // A separate query-count cap would unnecessarily densify the entire local
     // range and change the graph's memory budget near P.
-    const bool native_attention = kvarn_ctx->uses_native_attention(il) &&
+    const bool has_local_std = kvarn_cache->has_local_standard_cache();
+    const bool native_attention = !has_local_std && kvarn_ctx->uses_native_attention(il) &&
         llama_kvarn_native_attention_allowed(cparams.causal_attn, arch);
-    const auto kvarn_plan = llama_kvarn_plan_attention(
+    const auto kvarn_plan = native_attention ? llama_kvarn_plan_attention(
         native_attention,
         kvarn_ctx->native_attention_uses_original_v(il),
         kvarn_ctx->native_rotated_max_query_tokens(il),
         (uint32_t) q_cur->ne[2],
-        (int) q_cur->ne[0]);
+        (int) q_cur->ne[0]) : llama_kvarn_attention_plan {
+            false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
     const auto kvarn_domain = kvarn_plan.domain;
     if (std::getenv("F5_ROUTE_TRACE") != nullptr) {
         fprintf(stderr, "[F5ROUTE] il=%d nq=%lld native=%d nativereq=%d domain=%d nrotmax=%u minctx=%u\n",
@@ -5903,7 +5908,7 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
     const bool use_kvarn_mixed_domain =
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
     const bool use_kvarn_q_rot = use_kvarn_rotated_domain || use_kvarn_mixed_domain;
-    const bool local_tail_here = kvarn_ctx->tail_on_layer(il);
+    const bool local_tail_here = !has_local_std && kvarn_ctx->tail_on_layer(il);
     ggml_tensor * kvarn_rot = nullptr;
     if (use_kvarn_q_rot || local_tail_here) {
         kvarn_rot = llm_kvarn_rot_for_dim(

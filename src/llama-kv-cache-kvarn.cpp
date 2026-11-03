@@ -1783,6 +1783,16 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_attention(
         return sk;
     }
     const int32_t shared_il = graph_layer_for(il);
+    if (cache->has_local_standard_cache()) {
+        const uint32_t n_read = !have_range && cache->get_local_cache()->get_payload_row_origin() != 0
+                ? cache->get_local_cache()->get_payload_size() : get_n_kv();
+        ggml_tensor * sk = cache->local_standard_get_k(ctx, il, n_read, current_sinfo());
+        f4_trace_attention_source("get_k", il, false, "standard_local", range, have_range, sk);
+        const uint32_t range_id = have_range ? current_position_split_range_id() : UINT32_MAX;
+        llama_kv_cache_kvarn::capture_from_leaf("get_k", il, false, "standard_local", range, have_range,
+                range_id, sk, shared_il, cache->mapped_layer_id(shared_il), /*pos=*/0);
+        return sk;
+    }
     const auto it = stored_k.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
             current_position_split_range_id()));
     ggml_tensor * stored = it != stored_k.end() ? it->second :
@@ -1851,6 +1861,16 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
         return sv;
     }
     const int32_t shared_il = graph_layer_for(il);
+    if (cache->has_local_standard_cache()) {
+        const uint32_t n_read = !have_range && cache->get_local_cache()->get_payload_row_origin() != 0
+                ? cache->get_local_cache()->get_payload_size() : get_n_kv();
+        ggml_tensor * sv = cache->local_standard_get_v(ctx, il, n_read, current_sinfo());
+        f4_trace_attention_source("get_v", il, true, "standard_local", range, have_range, sv);
+        const uint32_t range_id = have_range ? current_position_split_range_id() : UINT32_MAX;
+        llama_kv_cache_kvarn::capture_from_leaf("get_v", il, true, "standard_local", range, have_range,
+                range_id, sv, shared_il, cache->mapped_layer_id(shared_il), /*pos=*/0);
+        return sv;
+    }
     const auto it = stored_v.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
             current_position_split_range_id()));
     ggml_tensor * stored = it != stored_v.end() ? it->second :
@@ -2007,6 +2027,10 @@ bool llama_kv_cache_kvarn_context::has_standard_cache() const {
     return shared_graph_layers.empty() && cache->has_standard_cache();
 }
 
+bool llama_kv_cache_kvarn_context::has_local_standard_cache() const {
+    return shared_graph_layers.empty() && cache->has_local_standard_cache();
+}
+
 bool llama_kv_cache_kvarn_context::position_split_enabled() const {
     return cache->position_split_enabled();
 }
@@ -2075,6 +2099,11 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_range(
         ggml_context * ctx, int32_t il, bool native_attention,
         uint32_t range_id, uint32_t n_range, ggml_tensor * range_mat_idxs) const {
     const int32_t shared_il = graph_layer_for(il);
+    if (range_id == llama_position_split::kRangeLocal && cache->has_local_standard_cache()) {
+        ggml_tensor * sk = cache->local_standard_get_k(ctx, shared_il, n_range, current_sinfo());
+        mark_split_tensor(sk, il, false, range_id);
+        return sk;
+    }
     const auto it = stored_k.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
             range_id));
     ggml_tensor * stored = it != stored_k.end() ? it->second :
@@ -2117,7 +2146,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_range(
             (cache->get_materialization_source(shared_il, false)
                 && cache->get_materialization_source(shared_il, false)->name[0])
                 ? cache->get_materialization_source(shared_il, false)->name : "<none>",
-            (const void *) cache->get_materialization_source(shared_il, false),
+            (const void *) nullptr, -1,
             uses_kv, uses_std,
             n_range, (const void *) range_mat_idxs,
             range_mat_idxs ? (long long) range_mat_idxs->ne[0] : -1LL);
@@ -2138,6 +2167,11 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_range(
         ggml_context * ctx, int32_t il, bool native_attention,
         uint32_t range_id, uint32_t n_range, ggml_tensor * range_mat_idxs) const {
     const int32_t shared_il = graph_layer_for(il);
+    if (range_id == llama_position_split::kRangeLocal && cache->has_local_standard_cache()) {
+        ggml_tensor * sv = cache->local_standard_get_v(ctx, shared_il, n_range, current_sinfo());
+        mark_split_tensor(sv, il, true, range_id);
+        return sv;
+    }
     const auto it = stored_v.find(llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
             range_id));
     ggml_tensor * stored = it != stored_v.end() ? it->second :
@@ -2197,6 +2231,13 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
                     throw std::runtime_error("position-split KV sem faixa Q4 para a camada de overflow");
                 }
                 return cache->standard_cpy_k(ctx, k_cur, k_idxs, shared_il, current_sinfo());
+            }
+            if (cache->has_local_standard_cache()) {
+                require_position_split_local_history(cache, "position-split KV store");
+                auto * position_result = cache->local_standard_cpy_k(ctx, k_cur, k_idxs, shared_il, current_sinfo());
+                stored_k[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+                        llama_position_split::kRangeLocal)] = position_result;
+                return position_result;
             }
             if (!cache->uses_kvarn_layer(shared_il)) {
                 throw std::runtime_error("position-split KV sem faixa KVarN para a camada local");
@@ -2258,6 +2299,13 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
                     throw std::runtime_error("position-split KV sem faixa Q4 para a camada de overflow");
                 }
                 return cache->standard_cpy_v(ctx, v_cur, v_idxs, shared_il, current_sinfo());
+            }
+            if (cache->has_local_standard_cache()) {
+                require_position_split_local_history(cache, "position-split KV store");
+                auto * position_result = cache->local_standard_cpy_v(ctx, v_cur, v_idxs, shared_il, current_sinfo());
+                stored_v[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
+                        llama_position_split::kRangeLocal)] = position_result;
+                return position_result;
             }
             if (!cache->uses_kvarn_layer(shared_il)) {
                 throw std::runtime_error("position-split KV sem faixa KVarN para a camada local");
@@ -2468,6 +2516,10 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const lla
         cache->get_standard_cache()->set_input_k_idxs(dst, ubatch, current_sinfo());
         return;
     }
+    if (cache->has_local_standard_cache()) {
+        cache->get_local_cache()->set_input_k_idxs(dst, ubatch, current_sinfo());
+        return;
+    }
     if (cache->is_swa()) {
         GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
         int64_t * data = (int64_t *) dst->data;
@@ -2500,6 +2552,10 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const lla
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
                 llama_position_split::range_kind::OVERFLOW_RANGE) {
         cache->get_standard_cache()->set_input_v_idxs(dst, ubatch, current_sinfo());
+        return;
+    }
+    if (cache->has_local_standard_cache()) {
+        cache->get_local_cache()->set_input_v_idxs(dst, ubatch, current_sinfo());
         return;
     }
     if (cache->is_swa()) {
@@ -2536,6 +2592,10 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, c
         cache->get_standard_cache()->set_input_k_idxs_backend(dst, ubatch, current_sinfo());
         return;
     }
+    if (cache->has_local_standard_cache()) {
+        cache->get_local_cache()->set_input_k_idxs_backend(dst, ubatch, current_sinfo());
+        return;
+    }
     if (cache->is_swa()) {
         const auto & sinfo = current_sinfo();
         GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
@@ -2568,6 +2628,10 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs_backend(ggml_tensor * dst, c
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
                 llama_position_split::range_kind::OVERFLOW_RANGE) {
         cache->get_standard_cache()->set_input_v_idxs_backend(dst, ubatch, current_sinfo());
+        return;
+    }
+    if (cache->has_local_standard_cache()) {
+        cache->get_local_cache()->set_input_v_idxs_backend(dst, ubatch, current_sinfo());
         return;
     }
     if (cache->is_swa()) {
@@ -2946,7 +3010,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         bool standard_v_trans,
         const layer_device_cb & standard_device_for_layer,
         uint32_t position_split_p,
-        bool rpc_position_split) :
+        bool rpc_position_split,
+        ggml_type local_type_k,
+        ggml_type local_type_v) :
     model(model),
     hparams(hparams),
     params(params),
@@ -3089,6 +3155,33 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             throw std::runtime_error("mixed KV override selected no remote standard-cache layers");
         }
     }
+    const bool use_local_standard = params.type == LLAMA_KVARN_TYPE_DISABLED &&
+            local_type_k != GGML_TYPE_COUNT && local_type_v != GGML_TYPE_COUNT;
+    if (use_local_standard) {
+        if (swa || n_seq_max != 1 || n_stream != 1) {
+            throw std::invalid_argument("standard local KV with position-split currently requires non-SWA and one sequence");
+        }
+        local_cache = std::make_unique<llama_kv_cache>(
+                model, hparams, local_type_k, local_type_v, standard_v_trans,
+                offload, unified, kv_size_local, n_seq_max, n_pad, n_swa, swa_type,
+                metadata.get(), filter, nullptr, nullptr, "local_",
+                n_ubatch, 0, exact_tail_type_requested, 0, false, 0, 0, false,
+                device_for_layer, false, true, /*payload_row_origin=*/0);
+        for (const uint32_t il : local_cache->get_layer_ids()) {
+            map_layer_ids[il] = layers.size();
+            layer l = {};
+            l.il = il;
+            l.n_head_kv = hparams.n_head_kv(il);
+            l.head_dim_k = hparams.n_embd_head_k(il);
+            l.head_dim_v = hparams.n_embd_head_v(il);
+            l.native_attention = false;
+            l.native_attention_owner = device_for_layer ? device_for_layer(il) : model.dev_layer(il);
+            layers.push_back(l);
+        }
+        if (local_cache->get_layer_ids().empty()) {
+            throw std::runtime_error("standard local KV selected no layers");
+        }
+    }
     if (swa) {
         const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
         // Backstop for the ring-size invariant above: the record ring must have
@@ -3145,6 +3238,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * int64_t(stage_groups) * n_stream;
     size_t raw_bytes = 0;
 
+    if (!use_local_standard) {
     for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         if (!hparams.has_kv(il) || hparams.is_recr(il)) {
             continue;
@@ -3389,6 +3483,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             map_layer_ids[il] = src->second;
         }
     }
+    }
 
     // F2b: modo por posição. P é fixo por contexto, múltiplo de 256, uma
     // sequência e sem SWA; cada camada full precisa das DUAS faixas (local
@@ -3441,6 +3536,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     }
 
     size_t total_bytes = 0;
+    if (!use_local_standard) {
     for (auto & [key, ctx] : ctx_map) {
         const auto buft = key.first;
         ggml_backend_buffer_t buf;
@@ -3710,6 +3806,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         migration_mirror_stale = false;
         LLAMA_LOG_INFO("KVarN prefill migration enabled: CUDA owner with Vulkan mirror; "
                 "ownership changes only at explicit request boundaries\n");
+    }
+    } else {
+        metadata->set_tail_routes({});
     }
 
     LLAMA_LOG_INFO("%s: type = %s, layers = %zu, groups/stream = %u, streams = %u, KVarN = %.2f MiB, equivalent F16 = %.2f MiB\n",
@@ -4157,6 +4256,7 @@ void llama_kv_cache_kvarn::clear(bool data) {
         ++state_owner_epoch;
         prefix_lineage.reset(state_owner_epoch);
     }
+    if (local_cache) local_cache->clear(data);
     if (standard_cache) standard_cache->clear(data);
     metadata->clear(false);
     if (data) {
@@ -4225,6 +4325,9 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
             return false;
         }
         if (shape != llama_position_split::rm_span_kind::OVERFLOW_ONLY) {
+            if (has_local_standard_cache()) {
+                return true;
+            }
             const llama_pos local_end = shape == llama_position_split::rm_span_kind::CROSSING
                 ? llama_pos(position_split_p_) : effective_end;
             // The metadata also includes the standard-cache overflow. Its
@@ -4352,7 +4455,9 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
         const bool metadata_removed = metadata->seq_rm(seq_id, p0, p1);
         const bool companion_removed = standard_cache ?
             standard_cache->seq_rm(seq_id, p0, p1) : true;
-        const bool removed = metadata_removed && companion_removed;
+        const bool local_removed = local_cache ?
+            local_cache->seq_rm(seq_id, p0, p1) : true;
+        const bool removed = metadata_removed && companion_removed && local_removed;
         if (removed && full_clear) {
             ++state_owner_epoch;
             prefix_lineage.reset(state_owner_epoch);
@@ -4517,6 +4622,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
         result[buft] += hparams.no_alloc
             ? ggml_backend_alloc_ctx_tensors_from_buft_size(storage.ctx.get(), buft)
             : ggml_backend_buffer_get_size(storage.buffer.get());
+    }
+    if (local_cache) {
+        for (const auto & [buft, bytes] : local_cache->memory_breakdown()) {
+            result[buft] += bytes;
+        }
     }
     if (standard_cache) {
         for (const auto & [buft, bytes] : standard_cache->memory_breakdown()) {
@@ -4739,6 +4849,7 @@ llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
             component.exact_tail_bytes + component.rollback_reserve_bytes + component.staging_bytes;
     component.padding_bytes = allocated_kvarn > accounted ? allocated_kvarn - accounted : 0;
     component.allocated_capacity_tokens = kv_size;
+    if (local_cache) result.add(local_cache->kv_memory_stats());
     if (standard_cache) result.add(standard_cache->kv_memory_stats());
     return result;
 }
@@ -7271,7 +7382,12 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
     for (const auto & [il, idx] : map_layer_ids) {
         (void) idx;
         const uint32_t layer = uint32_t(il);
-        out.push_back({layer, llama_position_split::kRangeLocal, 0, position_split_p_, 0, 0});
+        const auto * local_key = local_cache ? local_cache->get_k_storage(il) : nullptr;
+        const uint8_t local_format = local_key && local_key->type == GGML_TYPE_Q4_0 ? 1 :
+                local_key && local_key->type == GGML_TYPE_Q8_0 ? 2 :
+                local_key && local_key->type == GGML_TYPE_F16 ? 3 :
+                local_cache ? 255 : 0;
+        out.push_back({layer, llama_position_split::kRangeLocal, 0, position_split_p_, 0, local_format});
         const auto * key = standard_cache ? standard_cache->get_k_storage(il) : nullptr;
         const uint8_t format = key && key->type == GGML_TYPE_Q4_0 ? 1 :
                 key && key->type == GGML_TYPE_Q8_0 ? 2 :
@@ -7369,6 +7485,30 @@ ggml_tensor * llama_kv_cache_kvarn::standard_cpy_v(
         ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
         int32_t il, const llama_kv_cache::slot_info & sinfo) const {
     return uses_standard_layer(il) ? standard_cache->cpy_v(ctx, current, indices, il, sinfo) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::local_standard_get_k(
+        ggml_context * ctx, int32_t il, uint32_t n_kv,
+        const llama_kv_cache::slot_info & sinfo) const {
+    return local_cache ? local_cache->get_k(ctx, il, n_kv, sinfo) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::local_standard_get_v(
+        ggml_context * ctx, int32_t il, uint32_t n_kv,
+        const llama_kv_cache::slot_info & sinfo) const {
+    return local_cache ? local_cache->get_v(ctx, il, n_kv, sinfo) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::local_standard_cpy_k(
+        ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+        int32_t il, const llama_kv_cache::slot_info & sinfo) const {
+    return local_cache ? local_cache->cpy_k(ctx, current, indices, il, sinfo) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::local_standard_cpy_v(
+        ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+        int32_t il, const llama_kv_cache::slot_info & sinfo) const {
+    return local_cache ? local_cache->cpy_v(ctx, current, indices, il, sinfo) : nullptr;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::standard_build_input_k_rot(ggml_context * ctx) const {

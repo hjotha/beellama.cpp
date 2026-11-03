@@ -3599,7 +3599,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             params.kv_tail_tokens, params.kv_tail_type,
                             params.kv_tail_tokens_requested, params.kv_tail_rollback_tokens);
                     } else {
-                        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED || cparams.kv_position_split_p != 0) {
                             llama_kv_cache::layer_filter_cb filter_kvarn = filter_attn;
                             llama_kv_cache::layer_filter_cb filter_remote_standard;
                             const bool mixed_remote_selected =
@@ -3733,7 +3733,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         mixed_remote_selected ? params.remote_attn_cache_type_v : GGML_TYPE_COUNT,
                                         !cparams.flash_attn, attention_device,
                                         cparams.kv_position_split_p,
-                                        cparams.remote_attn_position_split);
+                                        cparams.remote_attn_position_split,
+                                        params.type_k,
+                                        params.type_v);
                                 // F4 v2: stamp the model/RoPE identity that the
                                 // position_split snapshot envelope must match on
                                 // restore. Derived from the loaded model geometry

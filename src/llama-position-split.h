@@ -127,8 +127,8 @@ inline std::string validate_ranges(const std::vector<range_desc> & descs,
         if (ovf->start != p || ovf->end != c) {
             return "faixa overflow deve ser [P,C)";
         }
-        if (local->backend != 0 || local->format != 0) {
-            return "faixa local deve ser CUDA/KVarN4";
+        if (local->backend != 0 || (local->format != 0 && local->format != 1 && local->format != 2 && local->format != 3)) {
+            return "faixa local deve ser CUDA (KVarN, Q4_0, Q8_0 ou F16)";
         }
         if (ovf->backend != 1 || (ovf->format != 1 && ovf->format != 2 && ovf->format != 3)) {
             return "faixa overflow deve ser um companion Q4_0, Q8_0 ou F16";

@@ -643,15 +643,18 @@ llama_context::llama_context(
                 (is_qx(cparams.remote_attn_cache_type_k) && is_qx(cparams.remote_attn_cache_type_v)) ||
                 (tcp_position_split && cparams.remote_attn_cache_type_k == GGML_TYPE_F16 &&
                  cparams.remote_attn_cache_type_v == GGML_TYPE_F16);
+        const bool local_format_supported =
+                (cparams.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) ||
+                (split_requested && (is_qx(params.type_k) || params.type_k == GGML_TYPE_F16));
         if (!local_attn_dev || !cparams.remote_attn_enabled || model.arch != LLM_ARCH_QWEN35 ||
                 cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
-                cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
+                !local_format_supported ||
                 cparams.n_seq_max != 1 || params.kv_unified || params.kv_paged ||
                 !params.offload_kqv || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
                 cparams.remote_attn_prefill != 0 || !formats_supported) {
             throw std::invalid_argument(
                     "per-layer remote KV formats require Qwen35 target context, native Vulkan or TCP position-split, "
-                    "KVarN local cache, Q4/Q5/Q6/Q8 or matching TCP position-split F16 remote K/V, "
+                    "KVarN or standard Qx/F16 local cache, Q4/Q5/Q6/Q8 or matching TCP position-split F16 remote K/V, "
                     "Flash Attention, KV offload, "
                     "one non-unified slot, and static prefill");
         }
@@ -1977,10 +1980,11 @@ std::vector<ggml_backend_t> layer_backends;
                     __func__, (int) model.arch));
             }
             if (cparams.kvarn.type == LLAMA_KVARN_TYPE_DISABLED &&
+                    !split_requested &&
                     params.type_k != GGML_TYPE_F16) {
                 throw std::runtime_error(format(
-                    "%s: --remote-attn requires a KVarN cache type (--cache-type-k/-v kvarnN) "
-                    "or the F16 bring-up path (--cache-type-k/-v f16)", __func__));
+                    "%s: --remote-attn requires a KVarN cache type (--cache-type-k/-v kvarnN), "
+                    "the F16 bring-up path (--cache-type-k/-v f16), or position-split", __func__));
             }
 
             const int n_remote = cparams.remote_attn_layers;

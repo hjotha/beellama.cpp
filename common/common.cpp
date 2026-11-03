@@ -3430,15 +3430,23 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     if (remote_cache_k != remote_cache_v) {
         throw std::invalid_argument("--remote-attn-cache-type-k and -v must be supplied together");
     }
-    if (remote_cache_k && (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED ||
+    const auto is_qx = [](ggml_type type) {
+        return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
+               type == GGML_TYPE_Q6_0 || type == GGML_TYPE_Q8_0;
+    };
+    const bool local_format_supported =
+            (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) ||
+            (params.kv_position_split_p != 0 && (is_qx(params.cache_type_k) || params.cache_type_k == GGML_TYPE_F16));
+    if (remote_cache_k && (!local_format_supported ||
             params.remote_attn_host.empty() ||
             (!common_remote_attn_is_local_vulkan(params.remote_attn_host) && params.kv_position_split_p == 0) ||
             params.remote_attn_prefill != "remote" || params.n_parallel != 1 ||
             params.kv_tail_tokens != "0" || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
             params.no_kv_offload)) {
         throw std::invalid_argument(
-                "per-layer remote KV formats require a global KVarN cache, native Vulkan or TCP position-split attention, "
-                "Flash Attention, KV offload, one slot, remote prefill, and kv-tail-tokens=0");
+                "per-layer remote KV formats require a global KVarN cache or standard Qx/F16 position-split cache, "
+                "native Vulkan or TCP position-split attention, Flash Attention, KV offload, one slot, "
+                "remote prefill, and kv-tail-tokens=0");
     }
 
     cparams.n_ctx             = params.n_ctx;

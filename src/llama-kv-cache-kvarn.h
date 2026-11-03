@@ -235,6 +235,7 @@ public:
     bool uses_kvarn_layer(int32_t il) const;
     bool uses_standard_layer(int32_t il) const;
     bool has_standard_cache() const;
+    bool has_local_standard_cache() const;
     bool has_qualified_dflash_mask() const;
     ggml_backend_dev_t native_attention_backend(int32_t il) const;
     bool position_split_enabled() const;
@@ -445,7 +446,9 @@ public:
             bool standard_v_trans = false,
             const layer_device_cb & standard_device_for_layer = nullptr,
             uint32_t position_split_p = 0,
-            bool rpc_position_split = false);
+            bool rpc_position_split = false,
+            ggml_type local_type_k = GGML_TYPE_COUNT,
+            ggml_type local_type_v = GGML_TYPE_COUNT);
     ~llama_kv_cache_kvarn() override;
 
     llama_memory_context_ptr init_batch(
@@ -707,6 +710,8 @@ public:
     // Additive handoff accessor: raw standard-cache storage for remote layers
     // (rawstorage token rows; the attention views are permuted).
     llama_kv_cache * get_standard_cache() const { return standard_cache.get(); }
+    llama_kv_cache * get_local_cache() const { return local_cache.get(); }
+    bool has_local_standard_cache() const { return bool(local_cache); }
     // Additive handoff accessor: authoritative per-layer compressed tensors.
     bool handoff_layer_view(int32_t il, llama_kvarn_handoff_layer_view & out) const;
     std::vector<llama_kv_cache_standard_layer_layout> standard_layer_layout() const;
@@ -755,6 +760,14 @@ public:
     ggml_tensor * standard_cpy_k(ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
             int32_t il, const llama_kv_cache::slot_info & sinfo) const;
     ggml_tensor * standard_cpy_v(ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+            int32_t il, const llama_kv_cache::slot_info & sinfo) const;
+    ggml_tensor * local_standard_get_k(ggml_context * ctx, int32_t il, uint32_t n_kv,
+            const llama_kv_cache::slot_info & sinfo) const;
+    ggml_tensor * local_standard_get_v(ggml_context * ctx, int32_t il, uint32_t n_kv,
+            const llama_kv_cache::slot_info & sinfo) const;
+    ggml_tensor * local_standard_cpy_k(ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
+            int32_t il, const llama_kv_cache::slot_info & sinfo) const;
+    ggml_tensor * local_standard_cpy_v(ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
             int32_t il, const llama_kv_cache::slot_info & sinfo) const;
     ggml_tensor * standard_build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * standard_build_input_v_rot(ggml_context * ctx) const;
@@ -968,6 +981,8 @@ private:
     // Optional ordinary Qx payloads for selected remote layers. This cache
     // shares only metadata/cells with `metadata`; its K/V buffers remain owned.
     std::unique_ptr<llama_kv_cache> standard_cache;
+    // Optional standard linear Qx/F16 local cache for position split.
+    std::unique_ptr<llama_kv_cache> local_cache;
 
     // Fused-span executor bundle identity (see acquire_fused_span_bundle()).
     mutable uint32_t fused_span_bundle_id = 0;

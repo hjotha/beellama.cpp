@@ -414,7 +414,7 @@ const  layer_reuse_cb & reuse,
     if (other) {
         const uint32_t size_other = other->get_size();
         if (kv_size != size_other) {
-            if (payload_row_origin == 0) {
+            if (payload_row_origin == 0 && !own_payload_with_shared_cells) {
                 LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
             }
             kv_size = size_other;
@@ -429,8 +429,15 @@ const  layer_reuse_cb & reuse,
                 requested_payload_size != kv_size - payload_row_origin) {
             throw std::invalid_argument("compact Qx payload requires a bounded owning split companion without SWA or tail");
         }
+        payload_size = kv_size - payload_row_origin;
+    } else if (own_payload_with_shared_cells && other) {
+        if (requested_payload_size >= kv_size || requested_payload_size % n_pad != 0) {
+            throw std::invalid_argument("local split companion requires a bounded capacity below the shared cache");
+        }
+        payload_size = requested_payload_size;
+    } else {
+        payload_size = kv_size;
     }
-    payload_size = kv_size - payload_row_origin;
     GGML_ASSERT(payload_size % n_pad == 0);
 
     GGML_ASSERT(kv_size % n_pad == 0);
@@ -3214,7 +3221,9 @@ uint32_t llama_kv_cache::get_payload_size() const {
 }
 
 uint32_t llama_kv_cache::payload_row_for_cell(uint32_t global_cell) const {
-    return llama_kv_mixed::qx_payload_row_for_cell(payload_row_origin, get_size(), global_cell);
+    const uint32_t bound = (payload_row_origin == 0 && own_payload_with_shared_cells && other)
+            ? payload_size : get_size();
+    return llama_kv_mixed::qx_payload_row_for_cell(payload_row_origin, bound, global_cell);
 }
 
 std::vector<uint32_t> llama_kv_cache::cells_at(llama_seq_id seq_id, llama_pos p) const {
@@ -6265,7 +6274,7 @@ void llama_kv_cache::state_write_shared_payload(
         uint32_t count = 0;
         uint32_t begin = cells.size();
         for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            bool include = cell >= payload_row_origin && !cells.is_empty(cell) &&
+            bool include = cell >= payload_row_origin && cell < payload_row_origin + payload_size && !cells.is_empty(cell) &&
                     (seq_id < 0 || cells.seq_has(cell, seq_id));
             if (include && seq_id >= 0) {
                 include = !llama_hparams::is_masked_swa(
