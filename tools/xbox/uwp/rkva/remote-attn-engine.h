@@ -397,6 +397,8 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> q8_paired_reduce_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q8_decode_rowlane_pso_;
     std::string q8_decode_rowlane_status_ = "not initialized";
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_f16_decode_rowlane_pso_;
+    std::string f16_decode_rowlane_status_ = "not initialized";
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q8_mq_i8_pso_;
     std::string q8_mq_i8_status_ = "not initialized";
     std::string kvarn4_opt_prefix_status_ = "not initialized";

@@ -569,7 +569,7 @@ int main() {
                      "\"mode_map\":\"1:<fmt>_mq4_balanced 2:<fmt>_mq2_fine 3:per-query "
                      "<fmt>_gqa_coarse\",\"f16\":{\"mq2\":{\"available\":true,\"status\":"
                      "\"ready\",\"calls\":3},\"mq4\":{\"available\":true,\"status\":\"ready\","
-                     "\"calls\":0}},\"q8_0\":{\"mq2\":{\"available\":false,\"status\":\"q8 "
+                     "\"calls\":0},\"decode_rowlane\":{\"available\":false,\"enabled\":false,\"status\":\"\",\"calls\":0}},\"q8_0\":{\"mq2\":{\"available\":false,\"status\":\"q8 "
                      "multi-query pipeline state: 0x80070057\",\"calls\":0},\"mq4\":{"
                      "\"available\":true,\"status\":\"ready\",\"calls\":11},"
                      "\"mq2_i8\":{\"available\":false,\"enabled\":false,\"status\":\"\",\"calls\":0,\"exact\":false},"

@@ -9,7 +9,8 @@ DXC="${DXC:-dxc}"
 ALL_TARGETS=(attn attn_q4 attn_q8 attn_kvarn4 reduce attn_q4_opt reduce_opt reduce_kvarn4
     attn_f16_opt attn_q8_opt attn_kvarn4_opt attn_kvarn4_prefix attn_kvarn4_opt_prefix
     attn_q4_mq2 attn_q4_mq4 attn_f16_mq2 attn_f16_mq4 attn_q8_mq2 attn_q8_mq4
-    attn_kvarn4_mq2 attn_kvarn4_mq4 attn_q8_mq2_i8 reduce_q8_paired bulk_unpack_q_fp8_raw bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8 attn_q4_decode_rowlane attn_q8_decode_rowlane)
+    attn_kvarn4_mq2 attn_kvarn4_mq4 attn_q8_mq2_i8 reduce_q8_paired bulk_unpack_q_fp8_raw bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8 attn_q4_decode_rowlane attn_q8_decode_rowlane
+    attn_f16_decode_rowlane attn_q4_1_decode_rowlane attn_q5_0_decode_rowlane attn_q5_1_decode_rowlane attn_q6_0_decode_rowlane attn_q6_1_decode_rowlane attn_iq4_nl_decode_rowlane attn_kvarn2_decode_rowlane attn_kvarn3_decode_rowlane)
 if [[ $# -gt 0 ]]; then
     TARGETS=("$@")
 else
@@ -104,6 +105,51 @@ for target in "${TARGETS[@]}"; do
         entry=CSRangeAttnQ8DecodeRowlane
         source="$ROOT/shaders/rkva/rkva_range_attn_gqa_opt.hlsl"
         defines=(-D RKVA_OPT_STORAGE=2 -D RKVA_DECODE_ROWLANE=1)
+    fi
+    if [[ "$target" == attn_f16_decode_rowlane ]]; then
+        entry=CSRangeAttnF16DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_F16=1)
+    fi
+    if [[ "$target" == attn_q4_1_decode_rowlane ]]; then
+        entry=CSRangeAttnQ4_1DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_Q4_1=1)
+    fi
+    if [[ "$target" == attn_q5_0_decode_rowlane ]]; then
+        entry=CSRangeAttnQ5_0DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_Q5_0=1)
+    fi
+    if [[ "$target" == attn_q5_1_decode_rowlane ]]; then
+        entry=CSRangeAttnQ5_1DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_Q5_1=1)
+    fi
+    if [[ "$target" == attn_q6_0_decode_rowlane ]]; then
+        entry=CSRangeAttnQ6_0DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_Q6_0=1)
+    fi
+    if [[ "$target" == attn_q6_1_decode_rowlane ]]; then
+        entry=CSRangeAttnQ6_1DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_Q6_1=1)
+    fi
+    if [[ "$target" == attn_iq4_nl_decode_rowlane ]]; then
+        entry=CSRangeAttnIQ4_NLDecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_IQ4_NL=1)
+    fi
+    if [[ "$target" == attn_kvarn2_decode_rowlane ]]; then
+        entry=CSRangeAttnKvarn2DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_KVARN2=1)
+    fi
+    if [[ "$target" == attn_kvarn3_decode_rowlane ]]; then
+        entry=CSRangeAttnKvarn3DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_KVARN3=1)
     fi
     # Q4_0 multi-query tile (nq 2..9): RKVA_MQ_QT queries share each K/V dequantization.
     if [[ "$target" == attn_q4_mq2 || "$target" == attn_q4_mq4 ]]; then
