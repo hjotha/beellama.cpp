@@ -503,18 +503,26 @@ struct server_slot_stats {
 
     // can only move one direction: start -> prompt -> gen
     void update_prompt_start() {
-        GGML_ASSERT(t_start == 0);
         t_start = ggml_time_us();
+        t_prompt_last = 0;
+        t_gen_last = 0;
     }
     void set_prompt_last(int64_t t_us) {
-        GGML_ASSERT(t_start > 0);
+        if (t_start <= 0) {
+            t_start = t_us;
+        }
         t_prompt_last = t_us;
     }
     void update_prompt_last() {
         set_prompt_last(ggml_time_us());
     }
     void update_gen_last() {
-        GGML_ASSERT(t_prompt_last > 0);
+        if (t_start <= 0) {
+            t_start = ggml_time_us();
+        }
+        if (t_prompt_last <= 0) {
+            t_prompt_last = ggml_time_us();
+        }
         t_gen_last = ggml_time_us();
     }
 

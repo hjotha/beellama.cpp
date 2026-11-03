@@ -11008,7 +11008,8 @@ private:
                 if (bootstrap_slot && &slot != bootstrap_slot) {
                     return;
                 }
-                if (!add_ok || batch.size() >= n_batch) {
+                const int32_t slot_n_batch = slot.bootstrap_pending ? std::min(n_batch, n_ubatch) : n_batch;
+                if (!add_ok || batch.size() >= slot_n_batch) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -11456,6 +11457,7 @@ private:
                                         return;
                                     }
                                     slot.prompt_reset_after_memory_clear();
+                                    slot.stats = {};
                                     slot.state = SLOT_STATE_STARTED;
                                     return;
                                 }
@@ -11697,6 +11699,7 @@ private:
                         slot.n_prompt_tokens_lcp = lexical_lcp;
                         slot.prompt_cache_reason = "suffix_removal_requires_reprocess";
                         if (!prompt_just_started) {
+                            slot.stats = {};
                             slot.state = SLOT_STATE_STARTED;
                             return;
                         }
@@ -11864,8 +11867,10 @@ private:
                             llama_n_seq_max(ctx_tgt) == 1 &&
                             llama_remote_native_kvarn_enabled(ctx_tgt);
 
+                    const int32_t eff_n_batch = slot.bootstrap_pending ? std::min(n_batch, n_ubatch) : n_batch;
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < eff_n_batch) {
                         // Publish a complete local-only state before the first
                         // native overflow append. The split envelope remains
                         // truthful; the normal same-layout restore consumes it.
@@ -12375,6 +12380,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                     slot.prompt_clear();
                     slot.bootstrap_cold_fallback = true;
                     slot.prompt_cache_reason = "mtp_bootstrap_cold_fallback";
+                    slot.stats = {};
                     slot.state = SLOT_STATE_STARTED;
                     slot.i_batch = -1;
                     retry_cold = true;
