@@ -361,6 +361,12 @@ const std::vector<ggml_type> & common_kv_cache_types() {
 }
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    if (s == "saw_int4" || s == "saw-int4" || s == "saw4" || s == "bdr_int4") {
+        return GGML_TYPE_Q4_0;
+    }
+    if (s == "oscar_int2" || s == "oscar-int2" || s == "oscar2") {
+        return GGML_TYPE_Q2_0S;
+    }
     const int32_t kvarn_bits = kvarn_bits_from_legacy_cache_type(s);
     if (kvarn_bits != 0) {
         const std::string replacement = string_format("q%d_0", kvarn_bits);
@@ -383,7 +389,7 @@ static std::string get_all_kv_cache_types(bool include_kvarn_pseudo_types = fals
         msg << kv_cache_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
     }
     if (include_kvarn_pseudo_types) {
-        msg << ", kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8";
+        msg << ", kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8, saw_int4, oscar_int2";
     }
     return msg.str();
 }
@@ -4059,12 +4065,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_STATS"));
     add_opt(common_arg(
         {"--rkva-range-storage"}, "FORMAT",
-        "remote range representation: 'auto', 'kvarn4'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'q4'/'q4_0', 'q8'/'q8_0' (default: backend auto)",
+        "remote range representation: 'auto', 'kvarn4'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'q4'/'q4_0', 'q8'/'q8_0', 'saw_int4', 'oscar_int2' (default: backend auto)",
         [](common_params & params, const std::string & value) {
             if (value != "auto" && value != "kvarn4" && value != "kvarn" &&
                 value != "f16" && value != "fp16" && value != "f32" && value != "fp32" &&
-                value != "q4" && value != "q4_0" && value != "q8" && value != "q8_0") {
-                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn4/f16/f32/q4_0/q8_0");
+                value != "q4" && value != "q4_0" && value != "q8" && value != "q8_0" &&
+                value != "saw_int4" && value != "saw-int4" && value != "saw4" && value != "bdr_int4" &&
+                value != "oscar_int2" && value != "oscar-int2" && value != "oscar2") {
+                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn4/f16/f32/q4_0/q8_0/saw_int4/oscar_int2");
             }
             params.rkva_range_storage = value;
 #if !defined(_WIN32)

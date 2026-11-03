@@ -4576,7 +4576,9 @@ bool ggml_backend_remote_attn_configure_range(
         rkva_breaker_note_configured(ctx);
         return true;
     }
-    if (format_req && (!std::strcmp(format_req, "q4") || !std::strcmp(format_req, "q4_0"))) {
+    if (format_req && (!std::strcmp(format_req, "q4") || !std::strcmp(format_req, "q4_0") ||
+                       !std::strcmp(format_req, "saw_int4") || !std::strcmp(format_req, "saw-int4") ||
+                       !std::strcmp(format_req, "saw4") || !std::strcmp(format_req, "bdr_int4"))) {
         if (rkva_configure_native_q4(ctx, origin, capacity, cache_type, async_overlap)) {
             rkva_breaker_note_configured(ctx);
             return true;
@@ -4624,7 +4626,9 @@ bool ggml_backend_remote_attn_configure_range(
             native_quant = false;
         } else if (!std::strcmp(requested, "f32") || !std::strcmp(requested, "fp32")) {
             native_quant = false;
-        } else if (!std::strcmp(requested, "q4_0") || !std::strcmp(requested, "q4")) {
+        } else if (!std::strcmp(requested, "q4_0") || !std::strcmp(requested, "q4") ||
+                   !std::strcmp(requested, "saw_int4") || !std::strcmp(requested, "saw-int4") ||
+                   !std::strcmp(requested, "saw4") || !std::strcmp(requested, "bdr_int4")) {
             if (std::strcmp(ggml_type_name(cache_type), "q4_0") != 0 || !supports_native) {
                 GGML_LOG_ERROR("%s: upload format %s requires a matching host cache and server capability\n",
                         GGML_REMOTE_ATTN_NAME, requested);
@@ -4639,7 +4643,7 @@ bool ggml_backend_remote_attn_configure_range(
             }
             native_quant = true;
         } else {
-            GGML_LOG_ERROR("%s: invalid upload format '%s' (expected auto, kvarn4/kvarn, fp16/f16, fp32/f32, q4/q4_0 or q8/q8_0)\n",
+            GGML_LOG_ERROR("%s: invalid upload format '%s' (expected auto, kvarn4/kvarn, fp16/f16, fp32/f32, q4/q4_0, q8/q8_0, saw_int4)\n",
                     GGML_REMOTE_ATTN_NAME, requested);
             return false;
         }
