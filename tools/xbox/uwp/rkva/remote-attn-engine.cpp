@@ -68,6 +68,12 @@
 #endif
 #include "rkva_range_attn_q8_dxil.h"
 #include "rkva_range_attn_q8_mq2_dxil.h"
+#if __has_include("rkva_range_attn_q8_decode_rowlane_dxil.h")
+    #include "rkva_range_attn_q8_decode_rowlane_dxil.h"
+    #define RKVA_HAS_Q8_DECODE_ROWLANE_DXIL 1
+#else
+    #define RKVA_HAS_Q8_DECODE_ROWLANE_DXIL 0
+#endif
 #if __has_include("rkva_range_reduce_q8_paired_dxil.h")
     #include "rkva_range_reduce_q8_paired_dxil.h"
     #define RKVA_HAS_Q8_PAIRED_REDUCE_DXIL 1
@@ -1109,6 +1115,25 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
             fmt_mq_status_[k.storage][k.index] = "ready";
         }
     }
+#if RKVA_HAS_Q8_DECODE_ROWLANE_DXIL
+    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = range_attn_fmt_opt_root_.Get();
+        pso.CS = {g_rkva_range_attn_q8_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q8_decode_rowlane_dxil)};
+        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_q8_decode_rowlane_pso_));
+        if (FAILED(hr)) {
+            std::snprintf(text, sizeof(text), "q8 decode rowlane pipeline state: 0x%08X", unsigned(hr));
+            range_attn_q8_decode_rowlane_pso_.Reset();
+            q8_decode_rowlane_status_ = text;
+        } else {
+            q8_decode_rowlane_status_ = "ready";
+        }
+    } else {
+        q8_decode_rowlane_status_ = "requires fixed wave64";
+    }
+#else
+    q8_decode_rowlane_status_ = "header not built (compile attn_q8_decode_rowlane)";
+#endif
     if (q8_mq_i8_policy_.during_initialize(lazy_int8_init_)) {
         create_q8_mq_i8_pipeline();
     } else {
@@ -1514,6 +1539,9 @@ std::string RemoteAttnEngine::get_range_profile_json() {
     header.q8_paired_reduce_available = q8_paired_reduce_pso_ && range_reduce_root_;
     header.q8_paired_reduce_enabled = q8_paired_reduce_;
     header.q8_paired_reduce_status = q8_paired_reduce_status_;
+    header.q8_decode_rowlane_available = header.optimized_available[rp::kStorageQ8] && range_attn_q8_decode_rowlane_pso_;
+    header.q8_decode_rowlane_enabled = decode_rowlane_;
+    header.q8_decode_rowlane_status = q8_decode_rowlane_status_;
     std::string json = profile_ ? profile_->recorder.json(header) : rp::Recorder().json(header);
     json.pop_back();
     return json + ",\"bulk_scratch\":" + bulk_scratch_.json() +
@@ -3745,15 +3773,22 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                 }
             }
         } else if (!kvarn && !prefix) {
-            q_tile = rp::format_mq_tile(q4_kernel_mode_, storage, n_tokens);
-            if (q_tile && range_attn_fmt_mq_pso_[storage][q_tile / 4]) {
-                fmt_pso = range_attn_fmt_mq_pso_[storage][q_tile / 4].Get();
-                if (storage == rp::kStorageQ8 && q_tile == 2 && q8_mq_i8_ && range_attn_q8_mq_i8_pso_) {
-                    fmt_pso = range_attn_q8_mq_i8_pso_.Get();
-                    selected_int8_dot = true;
-                }
+            if (storage == rp::kStorageQ8 && n_tokens == 1 && decode_rowlane_ &&
+                wave_lane_min_ == 64 && wave_lane_max_ == 64 && range_attn_q8_decode_rowlane_pso_) {
+                fmt_pso = range_attn_q8_decode_rowlane_pso_.Get();
+                decode_opt = true;
+                rowlane = true;
             } else {
-                q_tile = 0;
+                q_tile = rp::format_mq_tile(q4_kernel_mode_, storage, n_tokens);
+                if (q_tile && range_attn_fmt_mq_pso_[storage][q_tile / 4]) {
+                    fmt_pso = range_attn_fmt_mq_pso_[storage][q_tile / 4].Get();
+                    if (storage == rp::kStorageQ8 && q_tile == 2 && q8_mq_i8_ && range_attn_q8_mq_i8_pso_) {
+                        fmt_pso = range_attn_q8_mq_i8_pso_.Get();
+                        selected_int8_dot = true;
+                    }
+                } else {
+                    q_tile = 0;
+                }
             }
         }
         uint32_t split_k = rp::optimized_split_k(active_count, q4_kernel_mode_);

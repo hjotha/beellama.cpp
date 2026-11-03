@@ -58,6 +58,32 @@ groupshared float gs_max[RKVA_MAX_WAVES * RKVA_GQA];
 groupshared float gs_den[RKVA_MAX_WAVES * RKVA_GQA];
 groupshared float gs_acc[RKVA_MAX_WAVES * RKVA_GQA * RKVA_DIM];
 
+// Branchless aligned Q8_0 dequantization: 68-byte (2 blocks = 17 uints) pair alignment.
+// Odd block: aligned single Load for scale, aligned single Load for quants.
+// Even block: aligned Load for scale, aligned Load2 for quants.
+float4 load_q8(ByteAddressBuffer buffer, uint base, uint u) {
+    uint pair_idx = u >> 4;
+    uint pair_base = base + pair_idx * 68;
+    uint is_odd = (u >> 3) & 1;
+    uint c = u & 7;
+    float scale;
+    uint word;
+    if (is_odd) {
+        uint scale_word = buffer.Load(pair_base + 32);
+        scale = f16tof32(scale_word >> 16);
+        word = buffer.Load(pair_base + 36 + c * 4);
+    } else {
+        uint scale_word = buffer.Load(pair_base);
+        scale = f16tof32(scale_word & 65535u);
+        uint2 p = buffer.Load2(pair_base + c * 4);
+        word = (p.x >> 16) | (p.y << 16);
+    }
+    int4 quants = int4(asint(word << 24) >> 24, asint(word << 16) >> 24, asint(word << 8) >> 24,
+                       asint(word) >> 24);
+    return float4(float(quants.x) * scale, float(quants.y) * scale, float(quants.z) * scale,
+                  float(quants.w) * scale);
+}
+
 // Decode unit u (dims 4u..4u+3) of a (row, KV head) record starting at byte
 // `base` (4-byte aligned: RKVA_ROW_HEAD is a multiple of 4). Never reads outside
 // the record.
@@ -67,21 +93,7 @@ float4 load_unit(ByteAddressBuffer buffer, uint base, uint u) {
     return float4(f16tof32(packed.x & 65535u), f16tof32(packed.x >> 16),
                   f16tof32(packed.y & 65535u), f16tof32(packed.y >> 16));
 #else
-    // Block b = u >> 3 starts at 34b: its scale sits at byte 0 or 2 of a dword and
-    // its quant bytes 4c..4c+3 (c = u & 7) are dword-aligned only for odd b.
-    uint block = base + (u >> 3) * 34;
-    uint packed_scale = buffer.Load(block & ~3u);
-    float scale = f16tof32((packed_scale >> ((block & 3u) * 8)) & 65535u);
-    uint quant = block + 2 + (u & 7) * 4;
-    uint aligned = quant & ~3u;
-    uint shift = (quant & 3u) * 8;
-    uint lo = buffer.Load(aligned);
-    uint hi = buffer.Load(shift ? aligned + 4 : aligned); // never reads past the record
-    uint word = shift ? (lo >> shift) | (hi << (32 - shift)) : lo;
-    int4 quants = int4(asint(word << 24) >> 24, asint(word << 16) >> 24, asint(word << 8) >> 24,
-                       asint(word) >> 24);
-    return float4(float(quants.x) * scale, float(quants.y) * scale, float(quants.z) * scale,
-                  float(quants.w) * scale);
+    return load_q8(buffer, base, u);
 #endif
 }
 
@@ -223,3 +235,137 @@ void CSRangeAttnGqaOpt(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
         }
     }
 }
+
+#if RKVA_DECODE_ROWLANE
+[numthreads(RKVA_THREADS, 1, 1)]
+void CSRangeAttnQ8DecodeRowlane(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
+    uint kv_head = group.x, qi = group.y, split = group.z;
+    uint lane = WaveGetLaneIndex();
+    uint wave = tid >> 6; // tid / 64: 2 waves of 64 lanes
+    uint n_waves = RKVA_THREADS / 64; // 2
+    uint u = lane; // On Wave64: 64 lanes cover all 64 units (256 dims)
+    uint d0 = u * 4;
+
+    int query_pos = asint(positions.Load(qi * 4));
+    uint causal_count = query_pos < int(origin) ? 0 : uint(query_pos) - origin + 1;
+    uint limit = min(active_count, causal_count);
+    uint begin = min(limit, split * split_rows);
+    uint end = min(limit, (split + 1) * split_rows);
+
+    float4 q0[RKVA_GQA];
+    float4 acc0[RKVA_GQA];
+    float maximum[RKVA_GQA], denom[RKVA_GQA];
+    uint head0 = qi * n_head + kv_head * RKVA_GQA;
+    [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+        uint qbase = (head0 + g) * RKVA_DIM;
+        q0[g] = asfloat(queries.Load4((qbase + d0) * 4));
+        acc0[g] = float4(0, 0, 0, 0);
+        maximum[g] = -3.402823466e38f;
+        denom[g] = 0.0f;
+    }
+
+    // Row-per-lane decode loop: each wave processes 64 rows per step.
+    // Wave 0 covers begin + 0..63, begin + 128..191, ...
+    // Wave 1 covers begin + 64..127, begin + 192..255, ...
+    uint tile_row0 = begin + wave * 64;
+    [loop] for (; tile_row0 < end; tile_row0 += n_waves * 64) {
+        uint my_row = tile_row0 + lane;
+        bool row_valid = (my_row < end);
+        uint my_ba = (my_row * n_head_kv + kv_head) * RKVA_ROW_HEAD;
+
+        // QK Phase: Each lane evaluates the full 256-dim dot product for its own row.
+        float score[RKVA_GQA];
+        [unroll] for (uint g = 0; g < RKVA_GQA; ++g) score[g] = 0.0f;
+
+        if (row_valid) {
+            [loop] for (uint u_idx = 0; u_idx < RKVA_UNITS; ++u_idx) {
+                float4 k_val = load_q8(keys, my_ba, u_idx);
+                [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+                    float4 q_val = WaveReadLaneAt(q0[g], u_idx);
+                    score[g] += dot(q_val, k_val);
+                }
+            }
+        } else {
+            [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+                score[g] = -3.402823466e38f;
+            }
+        }
+
+        // Online Softmax across the 64 rows of this wave:
+        float w[RKVA_GQA];
+        [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+            score[g] *= kq_scale;
+            float tile_max = WaveActiveMax(score[g]);
+            float next_max = max(maximum[g], tile_max);
+            float old_weight = (denom[g] == 0.0f) ? 0.0f : exp(maximum[g] - next_max);
+            float weight = row_valid ? exp(score[g] - next_max) : 0.0f;
+            float tile_sum = WaveActiveSum(weight);
+            denom[g] = denom[g] * old_weight + tile_sum;
+            maximum[g] = next_max;
+            acc0[g] *= old_weight;
+            w[g] = weight;
+        }
+
+        // PV Phase: Thread lane (which owns unit lane=u) accumulates V across the valid rows of the tile.
+        uint rows_in_tile = min(64u, (end > tile_row0) ? (end - tile_row0) : 0u);
+        [loop] for (uint r = 0; r < rows_in_tile; ++r) {
+            uint v_row = tile_row0 + r;
+            uint v_ba = (v_row * n_head_kv + kv_head) * RKVA_ROW_HEAD;
+            float4 v_val = load_q8(values, v_ba, u);
+            [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+                float row_weight = WaveReadLaneAt(w[g], r);
+                acc0[g] += row_weight * v_val;
+            }
+        }
+    }
+
+    // Publish each wave's state, then merge across waves once.
+    [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+        uint slot = wave * RKVA_GQA + g;
+        if (lane == 0) {
+            gs_max[slot] = maximum[g];
+            gs_den[slot] = denom[g];
+        }
+        uint acc_base = slot * RKVA_DIM;
+        gs_acc[acc_base + d0 + 0] = acc0[g].x;
+        gs_acc[acc_base + d0 + 1] = acc0[g].y;
+        gs_acc[acc_base + d0 + 2] = acc0[g].z;
+        gs_acc[acc_base + d0 + 3] = acc0[g].w;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint total = n_query * n_head;
+    for (uint e = tid; e < RKVA_GQA * RKVA_DIM; e += RKVA_THREADS) {
+        uint g = e / RKVA_DIM, d = e % RKVA_DIM;
+        float merged_max = -3.402823466e38f;
+        for (uint w_idx = 0; w_idx < n_waves; ++w_idx) {
+            if (gs_den[w_idx * RKVA_GQA + g] > 0) merged_max = max(merged_max, gs_max[w_idx * RKVA_GQA + g]);
+        }
+        float merged_den = 0, merged_acc = 0;
+        for (uint w_idx = 0; w_idx < n_waves; ++w_idx) {
+            uint slot = w_idx * RKVA_GQA + g;
+            if (gs_den[slot] > 0) {
+                float weight = exp(gs_max[slot] - merged_max);
+                merged_den += gs_den[slot] * weight;
+                merged_acc += gs_acc[slot * RKVA_DIM + d] * weight;
+            }
+        }
+        uint qh = head0 + g;
+        if (direct_output != 0) {
+            float inv = merged_den > 0 ? 1.0f / merged_den : 0.0f;
+            output.Store((qh * RKVA_DIM + d) * 4, asuint(merged_acc * inv));
+            if (d == 0) {
+                float lse = merged_den > 0 ? merged_max + log(merged_den) : asfloat(0xff800000);
+                output.Store((total * RKVA_DIM + qh) * 4, asuint(lse));
+            }
+        } else {
+            uint dst = ((split * total + qh) * (RKVA_DIM + 2)) * 4;
+            partials.Store(dst + d * 4, asuint(merged_acc));
+            if (d == 0) {
+                partials.Store(dst + RKVA_DIM * 4, asuint(merged_max));
+                partials.Store(dst + (RKVA_DIM + 1) * 4, asuint(merged_den));
+            }
+        }
+    }
+}
+#endif

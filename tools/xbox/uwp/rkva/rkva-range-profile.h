@@ -413,6 +413,7 @@ struct Counters {
     uint64_t fmt_mq_calls[kStorageCount][2] = {};
     uint64_t q8_mq_i8_calls = 0;
     uint64_t q8_paired_reduce_calls = 0;
+    uint64_t q8_decode_rowlane_calls = 0;
     // Native KVarN4 revision-3 2-query and 4-query tile calls (subset of
     // optimized_by_storage[kvarn4]).
     uint64_t kvarn4_mq_calls = 0;
@@ -454,6 +455,7 @@ inline void count_attention_sample(Counters& c, const Sample& s) {
     if (s.optimized) {
         ++c.optimized_by_storage[s.storage];
         if (s.storage == kStorageQ8 && s.q8_paired_reduce) ++c.q8_paired_reduce_calls;
+        if (s.storage == kStorageQ8 && s.decode_rowlane) ++c.q8_decode_rowlane_calls;
         if (s.storage == kStorageQ4) {
             ++c.optimized_calls;
             if (s.q_tile == 2 || s.q_tile == 4) {
@@ -575,6 +577,8 @@ struct Header {
     std::string q8_mq_i8_status;
     bool q8_paired_reduce_available = false, q8_paired_reduce_enabled = false;
     std::string q8_paired_reduce_status;
+    bool q8_decode_rowlane_available = false, q8_decode_rowlane_enabled = false;
+    std::string q8_decode_rowlane_status;
     bool fmt_mq_available[kStorageCount][2] = {};
     std::string fmt_mq_status[kStorageCount][2];
     // Native KVarN4 revision-3 2-query and 4-query tile pipelines (require the optimized prefix
@@ -638,7 +642,8 @@ inline std::string bucket_key(const Sample& s) {
     if (s.kind == kAttention) {
         key += s.optimized ? "/optimized-" : "/reference";
         if (s.optimized) {
-            key += s.q8_paired_reduce ? "q8_gqa_fine_reduce_paired" :
+            key += (s.storage == kStorageQ8 && s.decode_rowlane) ? "q8_decode_rowlane" :
+                   s.q8_paired_reduce ? "q8_gqa_fine_reduce_paired" :
                    s.q_tile ? mq_kernel_name(s.storage, s.q_tile, s.int8_dot != 0)
                             : (s.storage == kStorageKvarn4 && s.decode_opt
                                    ? (s.decode_rowlane ? "kvarn4_decode_rowlane"
@@ -879,6 +884,12 @@ class Recorder {
                               h.q8_paired_reduce_available ? "true" : "false",
                               h.q8_paired_reduce_enabled ? "true" : "false",
                               json_escape(h.q8_paired_reduce_status).c_str(), ull(c.q8_paired_reduce_calls));
+                o += buf;
+                std::snprintf(buf, sizeof(buf),
+                              ",\"decode_rowlane\":{\"available\":%s,\"enabled\":%s,\"status\":\"%s\",\"calls\":%llu}",
+                              h.q8_decode_rowlane_available ? "true" : "false",
+                              h.q8_decode_rowlane_enabled ? "true" : "false",
+                              json_escape(h.q8_decode_rowlane_status).c_str(), ull(c.q8_decode_rowlane_calls));
                 o += buf;
             }
             o += '}';
