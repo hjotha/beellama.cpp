@@ -23,6 +23,7 @@
 #include "rkva_decode_quants_group_b.hlsli"
 #include "rkva_decode_quants_group_c.hlsli"
 #include "rkva_decode_quants_saw_int4.hlsli"
+#include "rkva_decode_quants_oscar_int2.hlsli"
 
 #ifndef RKVA_GQA
 #define RKVA_GQA 6
@@ -155,4 +156,13 @@ groupshared float gs_acc[RKVA_MAX_WAVES * RKVA_GQA * RKVA_DIM];
 #define ROWLANE_QUARTER_DIM quarter_dim_saw_int4
 #include "rkva_decode_rowlane_template.hlsli"
 #endif
+
+#if ROWLANE_OSCAR_INT2
+#define ROWLANE_ENTRY CSRangeAttnOscarInt2DecodeRowlane
+#define ROWLANE_ROW_HEAD RKVA_ROW_HEAD_OSCAR_INT2
+#define ROWLANE_LOAD load_oscar_int2
+#define ROWLANE_QUARTER_DIM quarter_dim_oscar_int2
+#include "rkva_decode_rowlane_template.hlsli"
+#endif
+
 

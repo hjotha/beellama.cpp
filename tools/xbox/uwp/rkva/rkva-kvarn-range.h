@@ -114,6 +114,35 @@ inline bool valid_saw_int4_upload(const rkva_kvarn_range_upload& u, uint32_t cap
     }
     return u.append_begin == previous_live && u.append_rows == u.live_count - previous_live;
 }
+
+// layout_version 7: native OSCAR INT2 overflow rows.
+// Every head is a 96-byte row (8 blocks of 12 bytes = 96 bytes)
+// with offline spectral covariance-aware rotation and Lloyd-Max INT2 quantization.
+inline bool valid_oscar_int2_descriptor(const rkva_kvarn_range_config& c, uint32_t dimension) {
+    return c.storage == RKVA_RANGE_STORAGE_OSCAR_INT2 && c.layout_version == 7 &&
+           c.origin % 256 == 0 && c.capacity > 0 && c.capacity <= uint32_t(INT32_MAX) &&
+           c.origin <= uint32_t(INT32_MAX) - c.capacity && dimension == 256 &&
+           c.token_group == 1 && c.record_dim == 0 && c.head_dim == 256 && c.head_slices == 2 &&
+           c.key_bits == 2 && c.value_bits == 2 && c.record_bytes == 96 &&
+           c.stage_groups == 0 && c.tail_groups == 0 && c.sink_tokens == 0 &&
+           c.precision_tail_tokens == 0 && c.wht_version == 0 && c.domain == 1 &&
+           c.record_policy == 1;
+}
+
+inline uint64_t oscar_int2_row_bytes(uint32_t head_dim, uint32_t heads) {
+    return uint64_t(heads) * uint64_t(head_dim / 32) * 12ull;
+}
+
+inline bool valid_oscar_int2_upload(const rkva_kvarn_range_upload& u, uint32_t capacity,
+                                    uint32_t previous_live) {
+    if (!u.live_count || u.live_count > capacity || (u.flags & ~RKVA_KVARN_UPLOAD_RESET) ||
+        u.record_begin || u.record_groups || u.reserved[0] || u.reserved[1])
+        return false;
+    if (u.flags & RKVA_KVARN_UPLOAD_RESET) {
+        return u.append_begin == 0 && u.append_rows == u.live_count;
+    }
+    return u.append_begin == previous_live && u.append_rows == u.live_count - previous_live;
+}
 // OMIT_STAGE is safe only when the exact tail covers every incomplete group
 // and global group 0 (whose sink uses stage) is outside this overflow range.
 inline bool compact_stage_supported(const rkva_kvarn_range_config& c) {

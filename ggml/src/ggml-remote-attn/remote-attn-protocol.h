@@ -62,6 +62,7 @@ enum rkva_wire : uint32_t {
     RKVA_WIRE_Q8_0 = 3, // RANGE_UPLOAD only: ggml block_q8_0, 34 bytes / 32 values
     RKVA_WIRE_FP8 = 4, // Option A: 1-byte FP8 E5M2 for queries and outputs
     RKVA_WIRE_SPLITZIP = 5, // Option B: lossless exponent-compressed FP16
+    RKVA_WIRE_OSCAR_INT2 = 6, // RANGE_UPLOAD only: OSCAR block_oscar_int2, 12 bytes / 32 values
 };
 
 // v2 range extensions. Native storage capabilities use ack.reserved[0].
@@ -87,6 +88,8 @@ static constexpr uint64_t RKVA_CAP_NATIVE_Q4_BULK = 1ull << 14;
 static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK = 1ull << 15;
 // layout 6: native SAW-INT4 / BDR-INT4 overflow rows over op16/op22 (136 bytes per head row)
 static constexpr uint64_t RKVA_CAP_NATIVE_SAW_INT4_BULK = 1ull << 16;
+// layout 7: native OSCAR INT2 overflow rows over op16/op22 (96 bytes per head row)
+static constexpr uint64_t RKVA_CAP_NATIVE_OSCAR_INT2_BULK = 1ull << 22;
 // Capability allocation in HELLO ack.reserved[0]:
 //   0..13  range/KVarN storage and bulk features
 //   14     RKVA_CAP_NATIVE_Q4_BULK (descriptor layout 4)
@@ -147,6 +150,7 @@ static constexpr uint32_t RKVA_RANGE_STORAGE_KVARN4 = 1u << 2;
 static constexpr uint32_t RKVA_RANGE_STORAGE_Q4_0 = 1u << 0; // CONFIG.reserved[0]
 static constexpr uint32_t RKVA_RANGE_STORAGE_Q8_0 = 1u << 1; // CONFIG.reserved[0]
 static constexpr uint32_t RKVA_RANGE_STORAGE_SAW_INT4 = 1u << 3;
+static constexpr uint32_t RKVA_RANGE_STORAGE_OSCAR_INT2 = 1u << 4;
 static constexpr uint32_t RKVA_SESSION_RANGE =
     1u << 0; // CREATE_SESSION.flags; defer allocation until CONFIG
 
