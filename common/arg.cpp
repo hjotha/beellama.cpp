@@ -3770,6 +3770,101 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVARN_WINDOW_CHUNK"));
     add_opt(common_arg(
+        {"--cuda-graph-recovery-headroom-mb"}, "N",
+        "free-VRAM headroom in MiB checked before CUDA graph capture (default: GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB or 18)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--cuda-graph-recovery-headroom-mb must be >= 0");
+            }
+            params.cuda_graph_recovery_headroom_mb = value;
+#if !defined(_WIN32)
+            setenv("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB", std::to_string(value).c_str(), 1);
+#else
+            _putenv_s("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB", std::to_string(value).c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_CUDA_GRAPH_RECOVERY_HEADROOM_MB"));
+    add_opt(common_arg(
+        {"--cuda-graph-remote-min-stable-calls"}, "N",
+        "minimum stable calls before CUDA graph capture on TCP position-split backends (default: GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS or 4)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--cuda-graph-remote-min-stable-calls must be positive");
+            }
+            params.cuda_graph_remote_min_stable_calls = value;
+#if !defined(_WIN32)
+            setenv("GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS", std::to_string(value).c_str(), 1);
+#else
+            _putenv_s("GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS", std::to_string(value).c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS"));
+    add_opt(common_arg(
+        {"--ovf-packed-view"},
+        {"--no-ovf-packed-view"},
+        "keep overflow mask at range capacity instead of cropping to occupancy (default: disabled, backend LLAMA_OVF_PACKED_VIEW)",
+        [](common_params & params, bool value) {
+            params.ovf_packed_view = value;
+#if !defined(_WIN32)
+            setenv("LLAMA_OVF_PACKED_VIEW", value ? "1" : "0", 1);
+#else
+            _putenv_s("LLAMA_OVF_PACKED_VIEW", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_OVF_PACKED_VIEW"));
+    add_opt(common_arg(
+        {"--ovf-cont-kv"},
+        {"--no-ovf-cont-kv"},
+        "materialize the Q4 overflow view with a real copy for scheduler dependency (default: disabled, backend F5_OVF_CONT_KV)",
+        [](common_params & params, bool value) {
+            params.ovf_cont_kv = value;
+#if !defined(_WIN32)
+            setenv("F5_OVF_CONT_KV", value ? "1" : "0", 1);
+#else
+            _putenv_s("F5_OVF_CONT_KV", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_OVF_CONT_KV"));
+    add_opt(common_arg(
+        {"--ovf-tail-local-cuda"},
+        {"--no-ovf-tail-local-cuda"},
+        "compute overflow tail on local CUDA with grouped decode (default: disabled, backend LLAMA_OVF_TAIL_LOCAL_CUDA=1)",
+        [](common_params & params, bool value) {
+            params.ovf_tail_local_cuda = value;
+#if !defined(_WIN32)
+            setenv("LLAMA_OVF_TAIL_LOCAL_CUDA", value ? "1" : "0", 1);
+#else
+            _putenv_s("LLAMA_OVF_TAIL_LOCAL_CUDA", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_OVF_TAIL_LOCAL_CUDA"));
+    add_opt(common_arg(
+        {"--ovf-qwht-cuda"},
+        {"--no-ovf-qwht-cuda"},
+        "pin F32 Q WHT on local CUDA instead of Vulkan overflow (default: disabled, backend LLAMA_OVF_QWHT_CUDA=1)",
+        [](common_params & params, bool value) {
+            params.ovf_qwht_cuda = value;
+#if !defined(_WIN32)
+            setenv("LLAMA_OVF_QWHT_CUDA", value ? "1" : "0", 1);
+#else
+            _putenv_s("LLAMA_OVF_QWHT_CUDA", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_OVF_QWHT_CUDA"));
+    add_opt(common_arg(
+        {"--vk-get-rows-q4-0-f16vec"},
+        {"--no-vk-get-rows-q4-0-f16vec"},
+        "enable multi-row Q4_0->F16 vector gather on Vulkan (default: enabled, backend GGML_VK_GET_ROWS_Q4_0_F16VEC, 0 disables)",
+        [](common_params & params, bool value) {
+            params.vk_get_rows_q4_0_f16vec = value;
+#if !defined(_WIN32)
+            setenv("GGML_VK_GET_ROWS_Q4_0_F16VEC", value ? "1" : "0", 1);
+#else
+            _putenv_s("GGML_VK_GET_ROWS_Q4_0_F16VEC", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_VK_GET_ROWS_Q4_0_F16VEC"));
+    add_opt(common_arg(
         {"--kv-tail-tokens"}, "SPEC",
         "exact KV-cache tail: 0, auto, N, positional list, or named group list\n"
         "KVarN always retains an intrinsic 128-token exact suffix\n"
@@ -3962,6 +4057,95 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.remote_attn_stats = true;
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_STATS"));
+    add_opt(common_arg(
+        {"--rkva-range-storage"}, "FORMAT",
+        "remote range representation: 'auto', 'kvarn4'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'q4'/'q4_0', 'q8'/'q8_0' (default: backend auto)",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && value != "kvarn4" && value != "kvarn" &&
+                value != "f16" && value != "fp16" && value != "f32" && value != "fp32" &&
+                value != "q4" && value != "q4_0" && value != "q8" && value != "q8_0") {
+                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn4/f16/f32/q4_0/q8_0");
+            }
+            params.rkva_range_storage = value;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_RANGE_STORAGE", value.c_str(), 1);
+#else
+            _putenv_s("GGML_RKVA_RANGE_STORAGE", value.c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_RKVA_RANGE_STORAGE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--rkva-range-kernel"}, "MODE",
+        "remote range kernel policy: 'reference'/'0', 'optimized'/'balanced'/'1', 'fine'/'2', 'coarse'/'3' (default: backend reference)",
+        [](common_params & params, const std::string & value) {
+            if (value != "reference" && value != "0" && value != "optimized" && value != "balanced" && value != "1" &&
+                value != "fine" && value != "2" && value != "coarse" && value != "3") {
+                throw std::invalid_argument("invalid --rkva-range-kernel, expected reference/optimized/balanced/fine/coarse or 0-3");
+            }
+            params.rkva_range_kernel = value;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_RANGE_KERNEL", value.c_str(), 1);
+#else
+            _putenv_s("GGML_RKVA_RANGE_KERNEL", value.c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_RKVA_RANGE_KERNEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--rkva-range-fuse"}, "MODE",
+        "remote range fused upload+attn: 'auto' (default), '0' separate, '1' require fusion",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && value != "0" && value != "1") {
+                throw std::invalid_argument("invalid --rkva-range-fuse, expected auto/0/1");
+            }
+            params.rkva_range_fuse = value;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_RANGE_FUSE", value.c_str(), 1);
+#else
+            _putenv_s("GGML_RKVA_RANGE_FUSE", value.c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_RKVA_RANGE_FUSE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--rkva-prefill-query-chunk"}, "N",
+        "remote prefill query chunk size, 0 disables, 8 keeps local CUDA batch intact (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 8) {
+                throw std::invalid_argument("--rkva-prefill-query-chunk must be 0 or 8");
+            }
+            params.rkva_prefill_query_chunk = value;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_PREFILL_QUERY_CHUNK", std::to_string(value).c_str(), 1);
+#else
+            _putenv_s("GGML_RKVA_PREFILL_QUERY_CHUNK", std::to_string(value).c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_RKVA_PREFILL_QUERY_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--rkva-tcp-prefetch"},
+        {"--no-rkva-tcp-prefetch"},
+        "enable experimental RKVA TCP prefetch window (default: disabled, backend GGML_RKVA_TCP_PREFETCH=1)",
+        [](common_params & params, bool value) {
+            params.rkva_tcp_prefetch = value;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_TCP_PREFETCH", value ? "1" : "0", 1);
+#else
+            _putenv_s("GGML_RKVA_TCP_PREFETCH", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_RKVA_TCP_PREFETCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--rkva-disk-snapshots"},
+        {"--no-rkva-disk-snapshots"},
+        "enable RKVA disk snapshot accelerator for native snapshots (default: disabled, backend GGML_RKVA_DISK_SNAPSHOTS=1)",
+        [](common_params & params, bool value) {
+            params.rkva_disk_snapshots = value;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_DISK_SNAPSHOTS", value ? "1" : "0", 1);
+#else
+            _putenv_s("GGML_RKVA_DISK_SNAPSHOTS", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_RKVA_DISK_SNAPSHOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-type-k-swa"}, "TYPE",
         "SWA-layer KVarN cache type override for K\n"
@@ -5337,6 +5521,58 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot_save_block = value;
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-split-prefix"},
+        {"--no-slot-save-split-prefix"},
+        "publish a complete local-only checkpoint before the first native overflow append (default: disabled, backend LLAMA_SLOT_SAVE_SPLIT_PREFIX=1)",
+        [](common_params & params, bool value) {
+            params.slot_save_split_prefix = value;
+#if !defined(_WIN32)
+            setenv("LLAMA_SLOT_SAVE_SPLIT_PREFIX", value ? "1" : "0", 1);
+#else
+            _putenv_s("LLAMA_SLOT_SAVE_SPLIT_PREFIX", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_SPLIT_PREFIX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--native-snapshot-auto-save"},
+        {"--no-native-snapshot-auto-save"},
+        "automatically capture resident native overflow snapshots (default: disabled, backend LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE=1)",
+        [](common_params & params, bool value) {
+            params.native_snapshot_auto_save = value;
+#if !defined(_WIN32)
+            setenv("LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE", value ? "1" : "0", 1);
+#else
+            _putenv_s("LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_NATIVE_SNAPSHOT_AUTO_SAVE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--native-snapshot-auto-restore"},
+        {"--no-native-snapshot-auto-restore"},
+        "automatically restore native overflow snapshots on startup (default: disabled, backend LLAMA_NATIVE_SNAPSHOT_AUTO_RESTORE=1)",
+        [](common_params & params, bool value) {
+            params.native_snapshot_auto_restore = value;
+#if !defined(_WIN32)
+            setenv("LLAMA_NATIVE_SNAPSHOT_AUTO_RESTORE", value ? "1" : "0", 1);
+#else
+            _putenv_s("LLAMA_NATIVE_SNAPSHOT_AUTO_RESTORE", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_NATIVE_SNAPSHOT_AUTO_RESTORE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--adaptive-direct-pure-disk-restore"},
+        {"--no-adaptive-direct-pure-disk-restore"},
+        "restore eligible pure KVarN disk prefix directly after XXXL mixed profile (default: disabled, backend LLAMA_ADAPTIVE_DIRECT_PURE_DISK_RESTORE=1)",
+        [](common_params & params, bool value) {
+            params.adaptive_direct_pure_disk_restore = value;
+#if !defined(_WIN32)
+            setenv("LLAMA_ADAPTIVE_DIRECT_PURE_DISK_RESTORE", value ? "1" : "0", 1);
+#else
+            _putenv_s("LLAMA_ADAPTIVE_DIRECT_PURE_DISK_RESTORE", value ? "1" : "0");
+#endif
+        }
+    ).set_env("LLAMA_ARG_ADAPTIVE_DIRECT_PURE_DISK_RESTORE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",

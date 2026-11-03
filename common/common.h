@@ -1008,6 +1008,29 @@ struct common_params {
     // When false the whole feature is inert: no startup dir scan, no index, no per-request hashing.
     bool    slot_save_auto  = false;  // master switch; requires slot_save_path to be set
     int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
+    // --- CLI bridge for backend ENVs (systemd -> --xxx / INI). -1/"" = leave env untouched ---
+    // CUDA graphs
+    int32_t cuda_graph_recovery_headroom_mb = -1;    // GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB
+    int32_t cuda_graph_remote_min_stable_calls = -1; // GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS
+    // overflow placement (llama-graph.cpp)
+    bool ovf_packed_view = false;     // LLAMA_OVF_PACKED_VIEW (truthy)
+    bool ovf_cont_kv = false;         // F5_OVF_CONT_KV (truthy)
+    bool ovf_tail_local_cuda = false; // LLAMA_OVF_TAIL_LOCAL_CUDA (exact "1")
+    bool ovf_qwht_cuda = false;       // LLAMA_OVF_QWHT_CUDA (exact "1")
+    // Vulkan
+    bool vk_get_rows_q4_0_f16vec = true; // GGML_VK_GET_ROWS_Q4_0_F16VEC (default ON, "0" disables)
+    // RKVA remote
+    std::string rkva_range_storage = ""; // GGML_RKVA_RANGE_STORAGE
+    std::string rkva_range_kernel = "";  // GGML_RKVA_RANGE_KERNEL
+    std::string rkva_range_fuse = "";    // GGML_RKVA_RANGE_FUSE ("0"/"1"/"auto")
+    int32_t rkva_prefill_query_chunk = -1; // GGML_RKVA_PREFILL_QUERY_CHUNK (0 or 8)
+    bool rkva_tcp_prefetch = false;      // GGML_RKVA_TCP_PREFETCH (exact "1")
+    bool rkva_disk_snapshots = false;    // GGML_RKVA_DISK_SNAPSHOTS (exact "1")
+    // snapshots / restore (server-context.cpp)
+    bool adaptive_direct_pure_disk_restore = false; // LLAMA_ADAPTIVE_DIRECT_PURE_DISK_RESTORE
+    bool slot_save_split_prefix = false;   // LLAMA_SLOT_SAVE_SPLIT_PREFIX
+    bool native_snapshot_auto_save = false;    // LLAMA_NATIVE_SNAPSHOT_AUTO_SAVE
+    bool native_snapshot_auto_restore = false; // LLAMA_NATIVE_SNAPSHOT_AUTO_RESTORE
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;
