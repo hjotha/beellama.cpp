@@ -170,6 +170,7 @@ struct remote_session {
     uint32_t range_origin = 0;
     bool native_q4 = false; // layout 4: native Q4_0 bulk rows
     bool native_q8 = false; // layout 5: native Q8_0 bulk rows
+    bool native_saw_int4 = false; // layout 6: native SAW-INT4 bulk rows
 };
 
 struct rpc_profile_counter {
@@ -441,12 +442,16 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             if (state.native_rewind_v2_client)
                 ack.reserved[0] |= RKVA_CAP_KVARN_REWIND;
             if (state.native_serial_prefix_v3_client &&
-                state.engine->native_serial_prefix_available())
+                state.engine->native_serial_prefix_available()) {
                 ack.reserved[0] |= RKVA_CAP_KVARN_SERIAL_PREFIX | RKVA_CAP_KVARN_BULK_ATTN |
                                    RKVA_CAP_KVARN_BULK_F16 | RKVA_CAP_KVARN_BULK_FP8 |
                                    RKVA_CAP_KVARN_BULK_FP8_RNE | RKVA_CAP_KVARN_COMPACT_STAGE |
                                    RKVA_CAP_NATIVE_Q4_BULK | RKVA_CAP_NATIVE_Q8_BULK |
                                    RKVA_CAP_KVARN_BULK_512;
+                if (state.engine->native_saw_int4_available()) {
+                    ack.reserved[0] |= RKVA_CAP_NATIVE_SAW_INT4_BULK;
+                }
+            }
             if (state.native_snapshot_client)
                 ack.reserved[0] |= RKVA_CAP_NATIVE_KVARN_SNAPSHOT;
         }
@@ -776,6 +781,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             it->second.range_storage = RKVA_RANGE_STORAGE_Q4_0;
             it->second.native_q4 = true;
             it->second.native_q8 = false;
+            it->second.native_saw_int4 = false;
             it->second.range_origin = c.origin;
             return RKVA_OK;
         }
@@ -793,6 +799,24 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             it->second.range_storage = RKVA_RANGE_STORAGE_Q8_0;
             it->second.native_q8 = true;
             it->second.native_q4 = false;
+            it->second.native_saw_int4 = false;
+            it->second.range_origin = c.origin;
+            return RKVA_OK;
+        }
+        if (c.layout_version == 6) {
+            // Native SAW-INT4 overflow rows (136 B per 256-dim head).
+            if (!rkva_kvarn_range::valid_saw_int4_descriptor(c, state.geo.head_dim))
+                return RKVA_ERR_BAD_GEOMETRY;
+            if (!state.engine->configure_range(req.session_id, c.origin, c.capacity, &error,
+                                               RKVA_RANGE_STORAGE_SAW_INT4)) {
+                event_engine_error(error);
+                return RKVA_ERR_BAD_GEOMETRY;
+            }
+            it->second.range_configured = true;
+            it->second.range_storage = RKVA_RANGE_STORAGE_SAW_INT4;
+            it->second.native_saw_int4 = true;
+            it->second.native_q4 = false;
+            it->second.native_q8 = false;
             it->second.range_origin = c.origin;
             return RKVA_OK;
         }
@@ -804,6 +828,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         it->second.range_storage = RKVA_RANGE_STORAGE_KVARN4;
         it->second.native_q4 = false;
         it->second.native_q8 = false;
+        it->second.native_saw_int4 = false;
         if (c.layout_version >= 2) {
             const uint64_t generation = state.engine->native_range_generation(req.session_id);
             output.resize(sizeof(generation));
@@ -819,19 +844,25 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             !it->second.range_configured ||
             (it->second.range_storage != RKVA_RANGE_STORAGE_KVARN4 &&
              !(it->second.native_q4 && it->second.range_storage == RKVA_RANGE_STORAGE_Q4_0) &&
-             !(it->second.native_q8 && it->second.range_storage == RKVA_RANGE_STORAGE_Q8_0)))
+             !(it->second.native_q8 && it->second.range_storage == RKVA_RANGE_STORAGE_Q8_0) &&
+             !(it->second.native_saw_int4 && it->second.range_storage == RKVA_RANGE_STORAGE_SAW_INT4)))
             return RKVA_ERR_BAD_SESSION;
         rkva_kvarn_range_upload u{};
         std::memcpy(&u, input.data(), sizeof(u));
         std::string error;
-        if (it->second.native_q4 || it->second.native_q8) {
+        if (it->second.native_q4 || it->second.native_q8 || it->second.native_saw_int4) {
             const bool q8 = it->second.native_q8;
+            const bool saw = it->second.native_saw_int4;
             const uint64_t row = q8
                 ? rkva_kvarn_range::q8_row_bytes(state.geo.head_dim, state.geo.n_head_kv)
-                : rkva_kvarn_range::q4_row_bytes(state.geo.head_dim, state.geo.n_head_kv);
+                : saw
+                    ? rkva_kvarn_range::saw_int4_row_bytes(state.geo.head_dim, state.geo.n_head_kv)
+                    : rkva_kvarn_range::q4_row_bytes(state.geo.head_dim, state.geo.n_head_kv);
             const bool valid = q8
                 ? rkva_kvarn_range::valid_q8_upload(u, it->second.capacity, u.append_begin)
-                : rkva_kvarn_range::valid_q4_upload(u, it->second.capacity, u.append_begin);
+                : saw
+                    ? rkva_kvarn_range::valid_saw_int4_upload(u, it->second.capacity, u.append_begin)
+                    : rkva_kvarn_range::valid_q4_upload(u, it->second.capacity, u.append_begin);
             if (!valid || uint64_t(u.append_begin) + u.append_rows != u.live_count)
                 return RKVA_ERR_BAD_PAYLOAD;
             const uint64_t need = uint64_t(u.append_rows) * row * 2;
@@ -871,30 +902,37 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         auto it = state.sessions.find(req.session_id);
         if (it == state.sessions.end() || !it->second.range_configured ||
             (it->second.range_storage != RKVA_RANGE_STORAGE_KVARN4 && !it->second.native_q4 &&
-             !it->second.native_q8) ||
+             !it->second.native_q8 && !it->second.native_saw_int4) ||
             !state.engine || !state.engine_f16 || !it->second.valid)
             return RKVA_ERR_BAD_SESSION;
-        if (!it->second.native_q4 && !it->second.native_q8 &&
+        if (!it->second.native_q4 && !it->second.native_q8 && !it->second.native_saw_int4 &&
             !state.native_serial_prefix_v3_client)
             return RKVA_ERR_BAD_PAYLOAD;
         if (it->second.native_q4 && it->second.range_storage != RKVA_RANGE_STORAGE_Q4_0)
             return RKVA_ERR_BAD_SESSION;
         if (it->second.native_q8 && it->second.range_storage != RKVA_RANGE_STORAGE_Q8_0)
             return RKVA_ERR_BAD_SESSION;
-        if (it->second.native_q4 || it->second.native_q8) {
+        if (it->second.native_saw_int4 && it->second.range_storage != RKVA_RANGE_STORAGE_SAW_INT4)
+            return RKVA_ERR_BAD_SESSION;
+        if (it->second.native_q4 || it->second.native_q8 || it->second.native_saw_int4) {
             if (req.n_tokens > 256) return RKVA_ERR_BAD_PAYLOAD;
-            // Layouts 4/5: ordered native row uploads plus queries in one round
+            // Layouts 4/5/6: ordered native row uploads plus queries in one round
             // trip. The host defers only the socket transaction (async overlap),
             // so the upload and the attention keep their wire order. Q/OUT may be
             // F32, F16 or FP8; LSE is always F32.
             const bool q8_rows = it->second.native_q8;
+            const bool saw_rows = it->second.native_saw_int4;
             const uint64_t row = q8_rows
                 ? rkva_kvarn_range::q8_row_bytes(state.geo.head_dim, state.geo.n_head_kv)
-                : rkva_kvarn_range::q4_row_bytes(state.geo.head_dim, state.geo.n_head_kv);
+                : saw_rows
+                    ? rkva_kvarn_range::saw_int4_row_bytes(state.geo.head_dim, state.geo.n_head_kv)
+                    : rkva_kvarn_range::q4_row_bytes(state.geo.head_dim, state.geo.n_head_kv);
             const auto valid_rows_upload = [&](const rkva_kvarn_range_upload& vu) {
                 return q8_rows
                     ? rkva_kvarn_range::valid_q8_upload(vu, it->second.capacity, vu.append_begin)
-                    : rkva_kvarn_range::valid_q4_upload(vu, it->second.capacity, vu.append_begin);
+                    : saw_rows
+                        ? rkva_kvarn_range::valid_saw_int4_upload(vu, it->second.capacity, vu.append_begin)
+                        : rkva_kvarn_range::valid_q4_upload(vu, it->second.capacity, vu.append_begin);
             };
             const uint64_t heads = uint64_t(req.n_tokens) * state.geo.n_head;
             const uint64_t total = heads * state.geo.head_dim;
@@ -989,9 +1027,13 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                     ? state.engine->attend_q8_bulk_fp8(
                         req.session_id, req.layer_id, req.n_tokens, input.data(), input.size(),
                         output.data(), reinterpret_cast<float*>(output.data() + total), &error, req.cycle_id)
-                    : state.engine->attend_q4_bulk_fp8(
-                        req.session_id, req.layer_id, req.n_tokens, input.data(), input.size(),
-                        output.data(), reinterpret_cast<float*>(output.data() + total), &error, req.cycle_id);
+                    : saw_rows
+                        ? state.engine->attend_saw_int4_bulk_fp8(
+                            req.session_id, req.layer_id, req.n_tokens, input.data(), input.size(),
+                            output.data(), reinterpret_cast<float*>(output.data() + total), &error, req.cycle_id)
+                        : state.engine->attend_q4_bulk_fp8(
+                            req.session_id, req.layer_id, req.n_tokens, input.data(), input.size(),
+                            output.data(), reinterpret_cast<float*>(output.data() + total), &error, req.cycle_id);
                 if (!ok) {
                     event_engine_error(error);
                     return state.engine->session_invalid(req.session_id) ? RKVA_ERR_GPU : RKVA_ERR_BAD_PAYLOAD;
@@ -1009,9 +1051,13 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                 ? state.engine->attend_q8_bulk(req.session_id, req.layer_id, req.n_tokens,
                                                input.data(), input.size(), out_f32.data(),
                                                lse_f32.data(), &error, req.cycle_id)
-                : state.engine->attend_q4_bulk(req.session_id, req.layer_id, req.n_tokens,
-                                               input.data(), input.size(), out_f32.data(),
-                                               lse_f32.data(), &error, req.cycle_id);
+                : saw_rows
+                    ? state.engine->attend_saw_int4_bulk(req.session_id, req.layer_id, req.n_tokens,
+                                                         input.data(), input.size(), out_f32.data(),
+                                                         lse_f32.data(), &error, req.cycle_id)
+                    : state.engine->attend_q4_bulk(req.session_id, req.layer_id, req.n_tokens,
+                                                   input.data(), input.size(), out_f32.data(),
+                                                   lse_f32.data(), &error, req.cycle_id);
             if (!bulk_ok) {
                 event_engine_error(error);
                 return state.engine->session_invalid(req.session_id) ? RKVA_ERR_GPU

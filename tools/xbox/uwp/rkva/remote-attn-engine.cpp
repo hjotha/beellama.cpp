@@ -80,6 +80,12 @@
 #else
     #define RKVA_HAS_F16_DECODE_ROWLANE_DXIL 0
 #endif
+#if __has_include("rkva_range_attn_saw_int4_decode_rowlane_dxil.h")
+    #include "rkva_range_attn_saw_int4_decode_rowlane_dxil.h"
+    #define RKVA_HAS_SAW_INT4_DECODE_ROWLANE_DXIL 1
+#else
+    #define RKVA_HAS_SAW_INT4_DECODE_ROWLANE_DXIL 0
+#endif
 #if __has_include("rkva_range_reduce_q8_paired_dxil.h")
     #include "rkva_range_reduce_q8_paired_dxil.h"
     #define RKVA_HAS_Q8_PAIRED_REDUCE_DXIL 1
@@ -862,6 +868,27 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
     }
 #else
     q4_decode_rowlane_status_ = "header not built (compile attn_q4_decode_rowlane)";
+#endif
+#if RKVA_HAS_SAW_INT4_DECODE_ROWLANE_DXIL
+    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
+        pso.pRootSignature = range_attn_q4_opt_root_.Get();
+        pso.CS = {g_rkva_range_attn_saw_int4_decode_rowlane_dxil,
+                  sizeof(g_rkva_range_attn_saw_int4_decode_rowlane_dxil)};
+        hr = device_->CreateComputePipelineState(
+            &pso, IID_PPV_ARGS(&range_attn_saw_int4_decode_rowlane_pso_));
+        if (FAILED(hr)) {
+            std::snprintf(text, sizeof(text), "saw_int4 decode rowlane pipeline state: 0x%08X",
+                          unsigned(hr));
+            saw_int4_decode_rowlane_status_ = text;
+            range_attn_saw_int4_decode_rowlane_pso_.Reset();
+        } else {
+            saw_int4_decode_rowlane_status_ = "ready";
+        }
+    } else {
+        saw_int4_decode_rowlane_status_ = "requires fixed wave64";
+    }
+#else
+    saw_int4_decode_rowlane_status_ = "header not built (compile attn_saw_int4_decode_rowlane)";
 #endif
 }
 
@@ -2096,12 +2123,15 @@ bool RemoteAttnEngine::configure_range(uint32_t id, uint32_t origin, uint32_t ca
     Session* s = find_session(id);
     if (!ready_ || !s || !s->valid || geo_.cache_bits_k != 16 || geo_.cache_bits_v != 16 ||
         geo_.domain != 0 || capacity != s->capacity || origin > uint32_t(INT32_MAX) - capacity ||
-        storage > 2) {
+        (storage > 2 && storage != RKVA_RANGE_STORAGE_SAW_INT4) ||
+        (storage == RKVA_RANGE_STORAGE_SAW_INT4 && !range_attn_saw_int4_decode_rowlane_pso_)) {
         return ::fail(error, "range config: invalid geometry/session/origin");
     }
     const uint64_t row_bytes = uint64_t(geo_.n_head_kv) *
-                               (storage ? uint64_t(geo_.head_dim / 32) * (storage == 1 ? 18 : 34)
-                                        : uint64_t(geo_.head_dim) * 2);
+                               (storage == RKVA_RANGE_STORAGE_SAW_INT4
+                                    ? 136ull
+                                    : (storage ? uint64_t(geo_.head_dim / 32) * (storage == 1 ? 18 : 34)
+                                               : uint64_t(geo_.head_dim) * 2));
     const uint64_t half_stride = uint64_t(capacity) * row_bytes;
     const uint64_t bytes = 2 * half_stride * s->layer_kv.size();
     constexpr uint64_t budget = 4ull * 1024 * 1024 * 1024;
@@ -2528,8 +2558,10 @@ bool RemoteAttnEngine::upload_range(uint32_t id, uint32_t layer, uint32_t start_
     }
     const uint64_t row_bytes =
         uint64_t(geo_.n_head_kv) *
-        (s->range_storage ? uint64_t(geo_.head_dim / 32) * (s->range_storage == 1 ? 18 : 34)
-                          : uint64_t(geo_.head_dim) * 2);
+        (s->range_storage == RKVA_RANGE_STORAGE_SAW_INT4
+             ? 136ull
+             : (s->range_storage ? uint64_t(geo_.head_dim / 32) * (s->range_storage == 1 ? 18 : 34)
+                                 : uint64_t(geo_.head_dim) * 2));
     const uint64_t bytes = uint64_t(n_rows) * row_bytes;
     timer.mark(rp::kCpuValidate);
     const bool grow = range_upload_.bytes < 2 * bytes;
@@ -3084,7 +3116,9 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
     if (!ready_ || !s || !s->valid || !s->range_configured ||
         s->range_storage != storage || layer >= s->layer_kv.size() ||
         !data || (!out && !out_fp8) || !lse || bulk_recording_ || !n_tokens || n_tokens > 256 ||
-        (gpu_fp8 && ((storage != RKVA_RANGE_STORAGE_Q8_0 && storage != RKVA_RANGE_STORAGE_Q4_0) || !ensure_q8_fp8_gpu_pipelines()))) {
+        (gpu_fp8 && ((storage != RKVA_RANGE_STORAGE_Q8_0 && storage != RKVA_RANGE_STORAGE_Q4_0 &&
+                      storage != RKVA_RANGE_STORAGE_SAW_INT4) ||
+                     !ensure_q8_fp8_gpu_pipelines()))) {
         return ::fail(error, "q4 bulk: invalid session/arguments");
     }
     std::vector<q4_segment> segments;
@@ -3110,7 +3144,9 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         std::memcpy(&u, data + off, sizeof(u));
         const bool upload_ok = storage == RKVA_RANGE_STORAGE_Q8_0
                 ? rkva_kvarn_range::valid_q8_upload(u, s->capacity, u.append_begin)
-                : rkva_kvarn_range::valid_q4_upload(u, s->capacity, u.append_begin);
+                : storage == RKVA_RANGE_STORAGE_SAW_INT4
+                    ? rkva_kvarn_range::valid_saw_int4_upload(u, s->capacity, u.append_begin)
+                    : rkva_kvarn_range::valid_q4_upload(u, s->capacity, u.append_begin);
         if (!upload_ok ||
             uint64_t(u.append_begin) + u.append_rows != u.live_count ||
             seg.upload_bytes != sizeof(u) + uint64_t(u.append_rows) * row * 2)
@@ -3491,6 +3527,23 @@ bool RemoteAttnEngine::attend_q8_bulk_fp8(uint32_t id, uint32_t layer, uint32_t 
                              data, bytes, nullptr, lse, error, cycle_id, out_fp8);
 }
 
+bool RemoteAttnEngine::attend_saw_int4_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens,
+                                            const uint8_t* data, size_t bytes, float* out,
+                                            float* lse, std::string* error, uint64_t cycle_id) {
+    return attend_native_rows(id, layer, n_tokens, RKVA_RANGE_STORAGE_SAW_INT4,
+                              rkva_kvarn_range::saw_int4_row_bytes(geo_.head_dim, geo_.n_head_kv),
+                              data, bytes, out, lse, error, cycle_id);
+}
+
+bool RemoteAttnEngine::attend_saw_int4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens,
+                                                const uint8_t* data, size_t bytes,
+                                                uint8_t* out_fp8, float* lse, std::string* error,
+                                                uint64_t cycle_id) {
+    return attend_native_rows(id, layer, n_tokens, RKVA_RANGE_STORAGE_SAW_INT4,
+                              rkva_kvarn_range::saw_int4_row_bytes(geo_.head_dim, geo_.n_head_kv),
+                              data, bytes, nullptr, lse, error, cycle_id, out_fp8);
+}
+
 bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_tokens,
                                     const int32_t* positions, const float* q, float* out,
                                     float* lse, std::string* error) {
@@ -3630,6 +3683,102 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         }
         return true;
     };
+    if (s->range_storage == RKVA_RANGE_STORAGE_SAW_INT4) {
+        if (!range_attn_saw_int4_decode_rowlane_pso_ || !range_attn_q4_opt_root_) {
+            return ::fail(error, "range attention: saw_int4 rowlane pipeline unavailable");
+        }
+        uint32_t split_k = std::max(1u, std::min(32u, (active_count + 255) / 256));
+        if (n_tokens == 1 && q4_kernel_mode_ != rp::kModeReference) {
+            const rp::SplitPolicy p = rp::q4_decode_split_policy(q4_kernel_mode_);
+            const uint32_t wanted = (active_count + p.target_rows - 1) / p.target_rows;
+            split_k = std::max(1u, std::min(std::min(32u, p.max_splits), wanted));
+        }
+        const uint32_t rows_per_split = rp::split_rows(active_count, split_k);
+        const bool direct = split_k == 1;
+        Buffer& kv = s->layer_kv[layer];
+        transition(kv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(range_partials_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(range_output_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const uint64_t q_addr = range_query_.resource->GetGPUVirtualAddress();
+        const uint64_t kv_addr = kv.resource->GetGPUVirtualAddress();
+        uint32_t scale;
+        std::memcpy(&scale, &geo_.kq_scale, sizeof(scale));
+        const uint32_t params[] = {n_tokens,       active_count,    geo_.n_head,     geo_.n_head_kv,
+                                   geo_.head_dim,  scale,           s->range_origin, split_k,
+                                   rows_per_split, direct ? 1u : 0u};
+        cmd_->SetComputeRootSignature(range_attn_q4_opt_root_.Get());
+        cmd_->SetPipelineState(range_attn_saw_int4_decode_rowlane_pso_.Get());
+        cmd_->SetComputeRoot32BitConstants(0, 10, params, 0);
+        cmd_->SetComputeRootShaderResourceView(1, q_addr);
+        cmd_->SetComputeRootShaderResourceView(2, kv_addr);
+        cmd_->SetComputeRootShaderResourceView(3, kv_addr + s->half_stride);
+        cmd_->SetComputeRootShaderResourceView(4, q_addr + positions_offset);
+        cmd_->SetComputeRootUnorderedAccessView(
+            5, range_partials_.resource->GetGPUVirtualAddress());
+        cmd_->SetComputeRootUnorderedAccessView(6, range_output_.resource->GetGPUVirtualAddress());
+        cmd_->Dispatch(geo_.n_head_kv, n_tokens, split_k);
+        if (!direct) {
+            uav_barrier(range_partials_);
+            transition(range_partials_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (ts) {
+                timestamp(kTsAttnPass1);
+            }
+            if (bulk_prof && timestamp_heap_) {
+                const uint32_t slot =
+                    1 + profile_->bulk.segment_index * kTsBulkSlotsPerSegment + kTsBulkAttnPass1;
+                timestamp(slot);
+            }
+            const uint32_t reduce_params[] = {n_tokens, geo_.n_head, geo_.head_dim, split_k};
+            cmd_->SetComputeRootSignature(range_reduce_root_.Get());
+            cmd_->SetPipelineState(range_reduce_opt_pso_ ? range_reduce_opt_pso_.Get()
+                                                         : range_reduce_pso_.Get());
+            cmd_->SetComputeRoot32BitConstants(0, 4, reduce_params, 0);
+            cmd_->SetComputeRootShaderResourceView(
+                1, range_partials_.resource->GetGPUVirtualAddress());
+            cmd_->SetComputeRootUnorderedAccessView(2,
+                                                    range_output_.resource->GetGPUVirtualAddress());
+            cmd_->Dispatch(geo_.n_head, n_tokens, 1);
+        }
+        uav_barrier(range_output_);
+        transition(range_output_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (ts) {
+            if (direct) {
+                timestamp(kTsAttnPass1);
+            }
+            timestamp(kTsAttnReduce);
+        }
+        if (bulk_prof && timestamp_heap_) {
+            const uint32_t base = 1 + profile_->bulk.segment_index * kTsBulkSlotsPerSegment;
+            if (direct) {
+                timestamp(base + kTsBulkAttnPass1);
+            }
+            timestamp(base + kTsBulkAttnReduce);
+        }
+        if (prof) {
+            sample.optimized = 1;
+            sample.decode_opt = 1;
+            sample.decode_rowlane = 1;
+            sample.direct_output = direct;
+            sample.split_k = split_k;
+            sample.groups = geo_.n_head_kv * n_tokens * split_k;
+            sample.q_tile = 0;
+        }
+        if (bulk_prof) {
+            auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
+            seg.optimized = 1;
+            seg.decode_opt = 1;
+            seg.decode_rowlane = 1;
+            seg.direct_output = direct ? 1 : 0;
+            seg.split_k = split_k;
+            seg.groups = geo_.n_head_kv * n_tokens * split_k;
+            seg.q_tile = 0;
+        }
+        if (!bulk_gpu_query_) {
+            cmd_->CopyBufferRegion(range_readback_.resource.Get(), 0, range_output_.resource.Get(),
+                                   0, out_bytes);
+        }
+        return finish(direct ? 1u : 2u);
+    }
     const bool optimized = range_attn_q4_opt_pso_ && range_reduce_opt_pso_ &&
                            range_opt_partials_.resource &&
                            rp::optimized_q4_supported(q4_kernel_mode_, s->range_storage, n_tokens,

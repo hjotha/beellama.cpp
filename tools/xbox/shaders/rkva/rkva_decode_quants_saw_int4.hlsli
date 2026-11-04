@@ -20,9 +20,8 @@
 #define RKVA_ROW_HEAD_SAW_INT4 136
 
 uint quarter_dim_saw_int4(uint u) {
-    // If u < 32: elements 4*u + {0, 1, 2, 3} (dims 0..127)
-    // If u >= 32: elements 128 + 4*(u - 32) + {0, 1, 2, 3} (dims 128..255)
-    return (u < 32u) ? (u * 4u) : (128u + (u - 32u) * 4u);
+    // 128 + 4*(u - 32) == 4*u for all u in [0, 63]: direct shift without branch.
+    return u << 2;
 }
 
 float4 load_saw_int4(ByteAddressBuffer buffer, uint base, uint u) {
@@ -36,10 +35,8 @@ float4 load_saw_int4(ByteAddressBuffer buffer, uint base, uint u) {
                     (word >> 16) & 0x0Fu,
                     (word >> 24) & 0x0Fu);
 
-    float scale = asfloat(buffer.Load(base + 128u));
-    float zero  = asfloat(buffer.Load(base + 132u));
-
-    return (float4(q) - zero) * scale;
+    float2 sz = asfloat(buffer.Load2(base + 128u));
+    return (float4(q) - sz.y) * sz.x;
 }
 
 #endif // RKVA_DECODE_QUANTS_SAW_INT4_HLSLI

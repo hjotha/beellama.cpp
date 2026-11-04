@@ -87,7 +87,7 @@ static constexpr uint64_t RKVA_CAP_NATIVE_Q4_BULK = 1ull << 14;
 // layout 5: native Q8_0 overflow rows over op16/op22 (bulk + async capable server)
 static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK = 1ull << 15;
 // layout 6: native SAW-INT4 / BDR-INT4 overflow rows over op16/op22 (136 bytes per head row)
-static constexpr uint64_t RKVA_CAP_NATIVE_SAW_INT4_BULK = 1ull << 16;
+static constexpr uint64_t RKVA_CAP_NATIVE_SAW_INT4_BULK = 1ull << 23;
 // layout 7: native OSCAR INT2 overflow rows over op16/op22 (96 bytes per head row)
 static constexpr uint64_t RKVA_CAP_NATIVE_OSCAR_INT2_BULK = 1ull << 22;
 // Capability allocation in HELLO ack.reserved[0]:
