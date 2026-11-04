@@ -172,19 +172,26 @@ class RemoteAttnEngine {
     bool attend_q8_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                         size_t bytes, float* out, float* lse, std::string* error,
                         uint64_t cycle_id);
-    // Shared layout-4/5 implementation: storage selects the row format and
-    // row_bytes is the per-token plane stride (heads * 144 or heads * 272).
+    bool attend_saw_int4_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
+                              size_t bytes, float* out, float* lse, std::string* error,
+                              uint64_t cycle_id);
+    // Shared layout-4/5/6 implementation: storage selects the row format and
+    // row_bytes is the per-token plane stride (heads * 144, heads * 272, or heads * 136).
     bool attend_native_rows(uint32_t id, uint32_t layer, uint32_t n_tokens, uint32_t storage,
                             uint64_t row_bytes, const uint8_t* data, size_t bytes, float* out,
                             float* lse, std::string* error, uint64_t cycle_id, uint8_t* out_fp8 = nullptr);
     bool ensure_q8_fp8_gpu_pipelines();
     bool ensure_q4_fp8_gpu_pipelines() { return ensure_q8_fp8_gpu_pipelines(); }
+    bool native_saw_int4_available() const { return bool(range_attn_saw_int4_decode_rowlane_pso_); }
     bool attend_q4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                             size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
                             uint64_t cycle_id);
     bool attend_q8_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                             size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
                             uint64_t cycle_id);
+    bool attend_saw_int4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
+                                  size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
+                                  uint64_t cycle_id);
     bool attend_kvarn_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                            size_t bytes, float* out, float* lse, std::string* error,
                            uint64_t cycle_id = 0);
@@ -399,6 +406,8 @@ class RemoteAttnEngine {
     std::string q8_decode_rowlane_status_ = "not initialized";
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_f16_decode_rowlane_pso_;
     std::string f16_decode_rowlane_status_ = "not initialized";
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_saw_int4_decode_rowlane_pso_;
+    std::string saw_int4_decode_rowlane_status_ = "not initialized";
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q8_mq_i8_pso_;
     std::string q8_mq_i8_status_ = "not initialized";
     std::string kvarn4_opt_prefix_status_ = "not initialized";
