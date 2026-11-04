@@ -4,7 +4,7 @@
 
 BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It adds variance-normalized KV-cache quantization (KVarN), KV cache precision tail for recent tokens, low-bit cache types, adaptive draft control for speculative decoding, reasoning-loop protection, and more.
 
-This repository combines [Anbeeld's BeeLlama](https://github.com/Anbeeld/beellama.cpp), the serving and memory-management extensions from [hjotha/llama.cpp](https://github.com/hjotha/llama.cpp), and PrismML/Bonsai weight-format support. The inventory below describes the source at `712c8f9ea` (2026-09-20); enabled features depend on the model, build backend and launch options.
+This repository combines [Anbeeld's BeeLlama](https://github.com/Anbeeld/beellama.cpp), the serving and memory-management extensions from [hjotha/llama.cpp](https://github.com/hjotha/llama.cpp), and PrismML/Bonsai weight-format support. The inventory below was checked against development branch **`main`**, source commit [`673e280d`](https://github.com/hjotha/beellama.cpp/commit/673e280d) (2026-11-04). Use `main` for this feature set; the repository's `master` branch and upstream release packages can contain older code. Enabled features depend on the model, build backend and launch options. Experimental paths and historical measurements are identified separately below.
 
 > Not quite a pegasus, but close enough.
 
@@ -18,7 +18,11 @@ This repository combines [Anbeeld's BeeLlama](https://github.com/Anbeeld/beellam
 
 ## Xbox Series S|X
 
-The Xbox app, D3D12/RKVA backend and UWP packaging are maintained in this repository and compile the same BeeLlama core. See [tools/xbox/README.md](tools/xbox/README.md) for Windows builds, host tests and the migration from xllama.
+The Xbox app, D3D12/RKVA backend and UWP packaging are maintained in this repository and compile the same BeeLlama core, rather than a separate nested fork. The app includes a dashboard, local GGUF inference and an RKVA attention server for a PC client. The unified build also has an optional ONNX Runtime/DirectML backend.
+
+The RKVA path can store a long-context overflow on Xbox while the PC retains model weights, recurrent state and the local attention prefix. This is separate from running an entire model on the console. D3D12 includes reference and optimized Wave64 row-lane kernels for several standard/KVarN formats, plus experimental SAW-INT4/OSCAR-INT2 work; a shader's presence does not establish end-to-end support for every host cache setting.
+
+See [split attention and RKVA](#split-attention-and-xbox-rkva) below and [tools/xbox/README.md](tools/xbox/README.md) for the Windows SDK/build prerequisites, host tests, packaging and migration from xllama. The build script supports iterative and full Release builds. In-place updates must preserve package identity and the existing signing certificate; uninstalling the app removes its LocalState data. A successful package build alone is not a console runtime qualification.
 
 ## Fork Features
 
@@ -26,14 +30,17 @@ The Xbox app, D3D12/RKVA backend and UWP packaging are maintained in this reposi
 - **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
 - **KVarN for speculative decoding**: compress supported owned MTP, DFlash, EAGLE3, and non-MLA DSpark caches independently of the target with `--spec-draft-type-k` and `--spec-draft-type-v`.
-- **Independent draft micro-batch sizing**: MTP, DFlash, and other drafters get their own batch size setting, `-ubd`, which defaults to 128. This saves gigabytes of memory (especially with DFlash) with little to no performance loss.
+- **Independent draft micro-batch sizing**: `--spec-draft-n-ubatch` controls the draft context separately. Omitted means automatic sizing with a floor of 128; `0` inherits the target ubatch. Smaller draft workspaces can save VRAM; measure the throughput trade-off for the selected drafter.
 - **Adaptive draft-max for DFlash**: adjusts the active DFlash draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection and realtime control**: detect repeated hidden reasoning, stop or close it, and let opted-in clients end reasoning through a live control request.
 - **INI model presets and KLD tooling**: configure reusable model profiles and compare logits, perplexity and cache quality at the actual serving batch/ubatch.
 - **PrismML/Bonsai weights**: PQ2_0/PTQ1_0, folded Hadamard/FWHT execution and compatible MTP/DFlash integration.
+- **Split attention across devices**: whole-layer local Vulkan/TCP offload, position-split CUDA prefixes with Vulkan/Xbox overflow, independent companion formats, and capability-negotiated upload/activation transport.
+- **Experimental native Xbox overflow**: KVarN4 record/stage/tail transport, native Q4/Q8 bulk routes, SAW-INT4 host/console integration, bounded rollback and opt-in paired snapshots. OSCAR-INT2 is still incomplete in the host route.
+- **DFlash multi-device experiments**: explicit target-feature exchange, optional prefetch, and an auxiliary shadow drafter alongside MTP, with observation as the default.
 - **Serving extensions from this fork**: adaptive resident contexts, unified disk snapshots, cross-tier q4_0-to-KVarN conversion, CUDA recovery, paged KV/SnapKV and AMD/NVIDIA power controls, detailed below.
 
-For the full feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
+The [Bee feature guide](docs/beellama-features.md) and [argument reference](docs/beellama-args.md) cover the inherited Bee controls. For the newer fork extensions below, consult the linked implementation guides and the current [argument parser](common/arg.cpp); older documents can describe an earlier compatibility envelope.
 
 ## About this fork
 
@@ -43,9 +50,11 @@ Standard llama.cpp tools remain available: local CLI/chat, GGUF conversion and q
 
 - [PrismML, Bonsai and calibration](#prismml-bonsai-and-calibration)
 - [Bee cache and generation controls](#bee-cache-and-generation-controls)
+- [Split attention and Xbox RKVA](#split-attention-and-xbox-rkva)
 - [Verified Qwen3.5 deployment](#verified-qwen35-deployment-2026-09-20)
 - [Adaptive context and cache reuse](#adaptive-context-with-resident-weights)
 - [Automatic disk prompt cache](#automatic-disk-prompt-cache)
+- [Native overflow snapshots](#native-overflow-snapshots-and-recovery)
 - [Router mode](#context-based-router-mode)
 - [CUDA, NVIDIA, AMDGPU and Ryzen controls](#cuda-memory-recovery-and-gpu-governors)
 - [Paged KV, SnapKV and speculation](#paged-kv-snapkv-and-other-speculation)
@@ -71,16 +80,73 @@ Sources: [quantization types](ggml/include/ggml.h), [Qwen3.5 graph](src/models/q
 
 - **KVarN:** independent K/V widths `kvarn2/3/4/5/6/8`, group transforms/normalization, exact sink/suffix and native CPU/CUDA/HIP/Vulkan attention where supported. Vulkan direct attention requires shader Int64 and buffer-device-address support; 64-dimensional K/V heads are qualified on CPU/CUDA, not Vulkan. SWA precision can be overridden with paired `--cache-type-k-swa` / `--cache-type-v-swa`.
 - **Exact precision tail:** `--kv-tail-tokens` accepts a count, `auto`, group lists or role mappings such as `full=1024,swa=1024`; `--kv-tail-type` chooses `f16` or `bf16`. Standard caches default to no tail and BF16 when enabled. KVarN retains its intrinsic exact suffix of up to 128 tokens even at `0`, defaults to F16, and rounds positive lengths to 128-token groups. Target tail settings are not inherited by draft contexts.
-- **Draft-owned KVarN:** independent `--spec-draft-type-k` / `--spec-draft-type-v` are runtime-qualified on CUDA for draft-simple, EAGLE3, allowed MTP models, DFlash1/2 and non-MLA DSpark. Non-causal DFlash keeps compressed storage but uses materialized attention. Shared Gemma 4 MTP uses the target cache; unsupported MTP/MLA layouts and n-gram modes reject independent draft KVarN. HIP/Vulkan DFlash-family draft KVarN remains unqualified.
-- **CUDA prefill workspace:** `GGML_KVARN_WINDOW_CHUNK` requests a transient materialization window (default 65,536 tokens), capped by active KV length and available VRAM. It controls temporary workspace, not persistent context capacity.
+- **Draft-owned KVarN:** independent `--spec-draft-type-k` / `--spec-draft-type-v` are runtime-qualified on CUDA for draft-simple, EAGLE3, allowed MTP models, DFlash1/2 and non-MLA DSpark. Qualified CUDA DFlash1/2 non-causal dense-K/V layers consume compressed records directly; unsupported shapes, multi-stream SWA and non-MLA DSpark use materialized attention. Shared Gemma 4 MTP uses the target cache; unsupported MTP/MLA layouts and n-gram modes reject independent draft KVarN. HIP/Vulkan DFlash-family draft KVarN remains unqualified.
+- **CUDA prefill workspace:** `--kvarn-window-chunk N` (or `GGML_KVARN_WINDOW_CHUNK`) requests a transient materialization window (default 65,536 tokens), capped by active KV length and available VRAM. The owned draft context has a separate `--spec-draft-kvarn-window-chunk` setting (default 2,048). These control temporary workspace, not persistent context capacity or cache precision. Smaller windows can change floating-point reduction order, so record both settings in KLD comparisons.
 - **Shared KV capacity:** `--kv-unified-per-slot N` sets a per-slot context limit; without an explicit `--ctx-size`, the shared pool is sized to `parallel * N`. This is separate from paged KV and is rejected by adaptive resident mode.
-- **DFlash profit controller:** `--spec-dm-controller profit|off` adjusts draft depth using observed speculative throughput against a no-spec baseline. Use `--spec-type draft-dflash` with a compatible `--spec-draft-model`; the bare `dflash` alias is not supported.
+- **DFlash profit controller:** `--spec-dm-controller profit|off` adjusts draft depth using observed speculative throughput against a no-spec baseline. Use `--spec-type draft-dflash` with a compatible `--spec-draft-model`; DFlash2 and LiliCorr keep their fixed trained block and disable this adaptive controller. The bare `dflash` alias is not supported.
 - **Reasoning loop guard:** `--reasoning-loop-guard force-close|stop|off` defaults to `force-close`; token/window/coverage/period/intervention settings tune it. Force-close needs a chat template with a usable reasoning-end sequence.
 - **Realtime reasoning control:** opt in with request JSON `"reasoning_control": true`, then send `{"id":"chatcmpl-...","action":"reasoning_end"}` to `POST /v1/chat/completions/control` while that completion is running. It is not a general edit endpoint.
 - **Presets and quality measurement:** INI model profiles support startup/loading policies and `POST /models/reload`. `llama-perplexity --save-all-logits FILE` and `--kl-divergence-base FILE --kl-divergence` compare against a saved baseline; use the same corpus, context, batch and ubatch.
-- **Observability:** cache/tail statistics distinguish prefix matches, planned/reprocessed tokens, cache source/reason and tail allocation. Server metrics and slot endpoints complement benchmark/KLD tools.
+- **Observability:** cache/tail statistics distinguish prefix matches, planned/reprocessed tokens, cache source/reason and tail allocation. Server metrics and slot endpoints complement benchmark/KLD tools. `llama-bench --kv-memory` adds synchronized KV-component/device-allocation checkpoints; use a separate run for speed comparisons because instrumentation adds synchronization. Requested/effective tails and native/fallback route counters help identify which path actually ran.
 
 See the [argument reference](docs/beellama-args.md), [feature guide](docs/beellama-features.md), [presets](docs/preset.md) and [speculation implementation](common/speculative.cpp). Some inherited feature-guide text still describes draft KVarN as MTP-only; the current route qualifications above reflect the newer implementation. Removed Bee systems such as TurboQuant/TCQ, DDTree and CopySpec are not part of this inventory.
+
+### Split attention and Xbox RKVA
+
+There are two placement modes:
+
+- **Whole layers:** selected full-attention KV caches and attention operations run on another backend. `--remote-attn vulkan:0` uses the local Vulkan scheduler; `--remote-attn HOST:PORT` uses the RKVA TCP protocol. Target weights, Q/K/V projections, RoPE, gates, FFN and Qwen35 recurrent state stay on the model device.
+- **Token positions:** `--kv-position-split-p P` keeps `[0,P)` on CUDA and puts `[P,C)` on Vulkan or RKVA, where `C` is the active context capacity. `P` must be a positive multiple of 256 and smaller than `C`. Local and overflow attention are merged using their log-sum-exp normalizers, preserving the global softmax rather than averaging outputs.
+
+| Option | Behavior |
+| --- | --- |
+| `--remote-attn HOST:PORT\|vulkan[:DEV]\|local` | Select TCP or local Vulkan attention; omitted means disabled. `local` is the local Vulkan selector, not a network relay. |
+| `--remote-attn-layers auto\|full\|N` | Automatic placement, every full-attention layer, or the first N full-attention layers. Automatic placement considers available memory and headroom. |
+| `--remote-attn-min-context N` | Enable only at adaptive profile capacities at least N; default `0`. A smaller pure-local tier need not construct an RPC context. |
+| `--remote-attn-cache-type-k TYPE`, `--remote-attn-cache-type-v TYPE` | Select remote companion storage independently of the local cache; supply K and V overrides together. Parser accepts `f16`, `q4_0`, `q5_0`, `q6_0`, `q8_0`; actual backend/path support is narrower. F16 requires TCP position splitting. |
+| `--remote-attn-upload-format FORMAT` | Alias of `--remote-attn-format`; selects K/V upload representation (`kvarn4`, `f16`, `f32`, `q4_0`, `q8_0`, with their documented aliases). This is distinct from activation wire precision. |
+| `--remote-attn-wire-format f16\|fp8\|auto` | Q upload / OUT download precision. The ordinary default is F16; native bulk routes have separate capability requirements and FP8 negotiation. FP8 can change numerical results. |
+| `--split-attn-cuda-reserve SIZE` | CUDA auto-placement headroom, also named `--remote-attn-cuda-reserve`. The audited source initializes **650 MiB**, although its help text still says 350M; set it explicitly when reproducing placement. |
+| `--remote-attn-vulkan-reserve SIZE` | Vulkan mixed-cache compute/workspace headroom; source default **512 MiB**. Reserves are placement margins, not extra usable VRAM. |
+| `--remote-attn-prefill remote\|migrate` | `remote` computes attention on the selected backend. `migrate` is **in-process Vulkan only**: it prefills on CUDA, mirrors KVarN records asynchronously and hands off decode. It requires single-slot, target-only, non-SWA KVarN, and the full prefill cache must fit CUDA; TCP rejects this mode. |
+| `--remote-attn-stats` | Log calls, bytes and RPC/kernel timing, including p50/p95 counters. |
+
+TCP position splitting is for a single contiguous, causal, unshifted Qwen35 dense text sequence. KVarN prefixes remain supported; newer code also permits standard local Q4_0/Q5_0/Q6_0/Q8_0/F16 prefixes independently of the remote companion. Mixed-format configuration requires one non-unified, non-paged target slot, FlashAttention, KV offload, `--remote-attn-prefill remote` and `--kv-tail-tokens 0`. The documented TCP standard companions are matching K/V Q4_0, Q8_0 or F16. IQ4_NL is a local general-purpose cache type but is not in the accepted standard-prefix set for this mixed override path. SWA, attention sinks, ALiBi and softcap are outside that envelope. Only one active RPC context per process is qualified. The example below is target-only; native speculative rollback has additional negotiation requirements.
+
+```sh
+# Requires a compatible running RKVA server; adjust capacities to model/hardware.
+./build/bin/llama-server -m /path/to/model.gguf \
+  --device CUDA0 --gpu-layers 99 --ctx-size 16384 \
+  --batch-size 256 --ubatch-size 256 --parallel 1 \
+  --flash-attn on --fit off --load-mode none --no-context-shift \
+  --cache-type-k kvarn4 --cache-type-v kvarn4 \
+  --spec-draft-n-max 0 --kv-position-split-p 8192 \
+  --remote-attn xbox-host:50054 --remote-attn-layers full \
+  --remote-attn-cache-type-k q4_0 --remote-attn-cache-type-v q4_0 \
+  --rkva-range-storage q4_0 --remote-attn-stats
+```
+
+The host keeps a CPU checkpoint/resynchronization companion and normally uploads only newly appended overflow rows. The prefix is not sent to the range cache. A restore or rewind invalidates remote coverage and resynchronizes before reuse. Creating a split context can connect and reserve memory before the first overflow token; no range-attention RPC is needed below `P`. Use a trusted private network for RKVA TCP; these examples do not provide an authenticated public inference service.
+
+**Formats and native paths.** Cache format, on-wire format, console layout and kernel choice are separate settings. Check the negotiated layout and runtime logs, not just accepted command-line spelling.
+
+| Path | Implemented scope / limitation |
+| --- | --- |
+| Standard Q4_0/Q8_0/F16 overflow | Packed or F16 transport, CPU companion, incremental upload and OUT/LSE merge. Expanding a Q4/Q8 companion to F16 does not recover original projection precision. An original-F16 comparison must use an F16 companion. |
+| Native KVarN4 | Opt in with `GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL=1` and `--rkva-range-storage kvarn4`. Uses original projected K/V to produce canonical records, rotated stage rows and an original-domain exact tail. Q4/Q8 bookkeeping is not its quantization source. Requires the negotiated descriptor/capabilities; see the [native KVarN guide](docs/xbox-native-kvarn4-experimental.md). |
+| Native bulk Q4_0/Q8_0 | Dedicated producers and negotiated layouts 4/5, FP8 activation transport and optional local/remote overlap. They are distinct from standard synchronous range transport and do not inherit KVarN's record/tail or snapshot guarantees. |
+| SAW-INT4 / BDR-INT4 | Experimental host AVX2 BDR-16 producer and console Wave64 kernel, 136-byte records per 256-element head, negotiated native layout 6 and FP8 activation transport. `--rkva-range-storage saw_int4` requests this path. Missing negotiation can select a Q4 route instead; verify the `native SAW-INT4 bulk descriptor=6` log before reporting SAW results. |
+| OSCAR-INT2 | Parser names and Xbox codec/shader work exist, but the audited host range configuration does not wire up an OSCAR end-to-end route. Treat this as incomplete experimental code, not a working launch recipe. |
+
+**Local cache aliases are not new codecs:** `--cache-type-k/v saw_int4` currently resolves to ordinary `q4_0`, and `oscar_int2` resolves to ordinary `q2_0` (internal `Q2_0S`). This also applies to cache arguments using the same parser, including draft types. They do not activate the corresponding Xbox algorithm or prove a local SAW/OSCAR quality result. `iq4_nl`, by contrast, is a real standard cache type listed below. This source has no restored TurboQuant-NC implementation; results from other branches or unpublished experiments are not part of this inventory.
+
+**Performance controls.** Native bulk paths default to overlapping local attention with remote work; `GGML_RKVA_ASYNC_LOCAL_REMOTE=0` serializes them for comparison. Native KVarN bulk automatically negotiates FP8 when the peer advertises the RNE codec, otherwise F16. Explicit wire selection overrides that choice. SplitZip is deactivated and rejected.
+
+`--rkva-range-kernel reference|optimized|balanced|fine|coarse` chooses a remote kernel policy (reference is the backend default). `--rkva-range-fuse auto|0|1` controls negotiated upload+attention fusion: automatic falls back to separate requests, while `1` requires support. `--rkva-prefill-query-chunk 8` groups eligible standard remote prefill queries without shrinking the CUDA batch; `0` disables it. `--rkva-tcp-prefetch` is experimental and off by default. Fewer RPCs or a faster kernel do not by themselves establish end-to-end throughput or output parity.
+
+On Xbox, eligible native KVarN4 row-lane decode kernels are enabled unless LocalState contains `rkva-decode-rowlane-off.flag`. `rkva-mq-i8.flag` opts into approximate INT8 prefix-prefill kernels; unsupported shapes retain the existing path. These files are sampled at RKVA HELLO, not continuously. See the [optimization policy](docs/rkva-final-optimizations.md) for shape gates and the distinction between implementation, operator-reported results and reproducible benchmarks.
+
+The CLI also exposes backend tuning switches for INI/preset use: `--cuda-graph-remote-min-stable-calls` (default 4), `--ovf-packed-view`, `--ovf-cont-kv`, `--ovf-tail-local-cuda`, `--ovf-qwht-cuda` (all four opt-in), and `--vk-get-rows-q4-0-f16vec` (enabled by default). These select graph/mask/layout, tail placement, Q-transform placement or Vulkan gather behavior; leave them at defaults unless measuring the matching path. Boolean switches have `--no-...` forms. See [argument definitions](common/arg.cpp), [position-split scheduling](docs/position-split-decode-scheduling.md), [RKVA critical-path analysis](docs/rkva-decode-critical-path.md), [TCP overflow protocol](docs/xbox-position-overflow.md) and [host implementation](ggml/src/ggml-remote-attn/ggml-remote-attn.cpp) for precise gates and compatibility.
 
 ### Verified Qwen3.5 deployment (2026-09-20)
 
@@ -125,7 +191,7 @@ GGML_DISABLE_VULKAN=1 GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB=18 \
 
 Create the dedicated cache directory first and use a free port. GPU governors are optional and described below.
 
-The source also supports optional fourth/fifth/sixth profiles, `xlong`, `xxlong`, and `xxxlong`, through `--ctx-size-xlong` / `--ctx-size-xxlong` / `--ctx-size-xxxlong` and `--xlong-max-tokens` / `--xxlong-max-tokens` / `--xxxlong-max-tokens`. Their context sizes and thresholds must follow the preceding tiers. Every tier independently enables MTP with a positive `--spec-draft-n-max-{s,m,l,xl,xxl,xxxl}` value or selects target-only operation with zero. The resident MTP draft KV cache can be selected per tier with `--spec-draft-type-k-s/-m/-l/-xl/-xxl/-xxxl` (and the `-v` counterparts), defaulting to the global `--spec-draft-type-k`/`--spec-draft-type-v` — e.g. a compact KVarN draft on XL while S/M/L keep q4_0. Each has independent batch/ubatch controls, such as `--batch-size-xlong` and `--ubatch-size-xlong`, to reduce workspace at larger contexts. Short aliases `--ctx-size-s`, `--ctx-size-m`, `--ctx-size-l`, `--ctx-size-xl`, `--ctx-size-xxl`, and `--ctx-size-xxxl` are available. Long/XL/XXL/XXXL also expose per-profile K/V type controls, such as `--cache-type-k-xlong` and `--cache-type-v-xlong`; representation changes remain subject to restore compatibility. These options do not establish a hardware-independent context ceiling.
+The source also supports optional fourth/fifth/sixth profiles, `xlong`, `xxlong`, and `xxxlong`, through `--ctx-size-xlong` / `--ctx-size-xxlong` / `--ctx-size-xxxlong` and `--xlong-max-tokens` / `--xxlong-max-tokens` / `--xxxlong-max-tokens`. Their context sizes and thresholds must follow the preceding tiers. Every tier independently enables MTP with a positive `--spec-draft-n-max-{s,m,l,xl,xxl,xxxl}` value or selects target-only operation with zero. The resident MTP draft KV cache can be selected per tier with `--spec-draft-type-k-s/-m/-l/-xl/-xxl/-xxxl` (and the `-v` counterparts), defaulting to the global `--spec-draft-type-k`/`--spec-draft-type-v` — e.g. a compact KVarN draft on XL while S/M/L keep q4_0. Each has independent batch/ubatch controls, such as `--batch-size-xlong` and `--ubatch-size-xlong`, to reduce workspace at larger contexts. Short aliases `--ctx-size-s`, `--ctx-size-m`, `--ctx-size-l`, `--ctx-size-xl`, `--ctx-size-xxl`, and `--ctx-size-xxxl` are available. All six tiers expose target K/V controls (`--cache-type-k-s/-m/-l/-xl/-xxl/-xxxl` and the `-v` counterparts), draft K/V controls and per-tier `--spec-draft-p-min-*` thresholds. Long-form aliases such as `--cache-type-k-xlong` remain available; representation changes remain subject to restore compatibility. These options do not establish a hardware-independent context ceiling.
 
 **Selection and lifecycle (three-profile example above)**
 
@@ -174,6 +240,32 @@ Environment equivalents are `LLAMA_ARG_SLOT_SAVE_AUTO`, `LLAMA_ARG_SLOT_SAVE_BLO
 
 The implementation and current format are documented in [unified KV snapshots](tools/server/README-router-state-streaming.md), [server context](tools/server/server-context.cpp) and [model identity](tools/server/server-model-identity.cpp). Existing [slot tests](tools/server/tests/unit/test_slot_save.py), [streaming tests](tests/test-state-file-stream.cpp) and [restart harness](tools/server/tests/router_state_auto_restart.py) exercise restore/fallback behavior. Older records using separate sidecars describe earlier formats.
 
+### Native overflow snapshots and recovery
+
+Native Xbox overflow has a separate, **experimental and opt-in** persistence path. A supported FULL snapshot pairs host producer state with the Xbox snapshot manifest; a local Q4/Q8 bookkeeping file cannot recreate the original native records. Current native KVarN4 disk support is limited to one sequence, revision-3 geometry with 256-dimensional heads and 128-token groups, compatible exact-tail settings, and a peer advertising the native snapshot capability. Explicit slot save/restore requires a target-only context without an active speculative draft/carry state.
+
+| Switch | Purpose (all disabled by default) |
+| --- | --- |
+| `--rkva-disk-snapshots` | Enable the RKVA native snapshot accelerator after capability negotiation. |
+| `--slot-save-split-prefix` | Publish a complete local-only checkpoint before the first native overflow append. |
+| `--native-snapshot-auto-save` | Automatically capture resident native overflow snapshots. |
+| `--native-snapshot-auto-restore` | Attempt automatic native overflow restore at startup. |
+| `--adaptive-direct-pure-disk-restore` | Restore an eligible pure KVarN disk prefix directly after leaving the mixed XXXL profile. |
+
+These switches also have `--no-...` forms and bridge to their backend environment gates. They do not bypass model/layout identity, memory admission, peer capability or producer-state checks. Pure local prefixes retain the ordinary snapshot format. Standard local-cache snapshot read/write is also present for position-split layouts; it does not make mixed or native formats interchangeable.
+
+MTP over a position-split target separately requires `LLAMA_MTP_POSITION_SPLIT=1`, one non-unified sequence without SWA and sufficient VRAM for the draft/reservation checks. A step crossing `P` runs non-speculatively. This gate does not replace native peer rollback negotiation.
+
+Native resident rollback is separate from durable snapshots: negotiated KVarN rewind support retains bounded original inputs, checks every layer's frontier and can repair at most 128 removed rows (draft depth capped at 127 plus the verification anchor). Uncertain transport acknowledgments invalidate the remote owner rather than continuing with unverified KV. Unsupported peers or layouts reject the operation or use the documented cache-miss/prefill fallback.
+
+The native Xbox store is bounded to **8 objects / 8 GiB**, including incomplete staging directories. It does not evict published native pairs or clean staging automatically. Deleting a host cache file alone does not reclaim Xbox quota; a failed save can leave an orphan. These limits and recovery requirements differ from ordinary host-cache retention.
+
+The repository also contains **managed snapshot lifecycle, receipt/journal, peer-identity and durable-store research**. The `RKVA_MANAGED_SNAPSHOT_PHASE2/3/4`, `RKVA_MANAGED_SNAPSHOT_ACTIVATION` and `RKVA_PEER_IDENTITY_STORE` build gates default to OFF. Activation composition is library/test code, is not wired to a production listener, and still requires independent authentication/durability/console qualification. Enabling these test gates does not create a production-safe durable store. The UWP durable-I/O skeleton and host tests are not proof of power-loss safety on an Xbox.
+
+**Inspection and reference management:** `llama-native-refs audit --store PATH --json` reports the host reference journal; migration and retirement are separate operator actions. `retire` is a dry-run unless `--execute` is supplied; execution removes matching host files and records their retirement, but never contacts Xbox. Remote object deletion is a separate step in [native-retire.py](tools/xbox/scripts/native-retire.py). The read-only [native key inspector](tools/rkva-native-key-inspect/README.md) validates one explicitly qualified fixed Qwen35 snapshot profile on Linux/OpenSSL. The [native object inspector](tools/rkva-native-object-inspect/README.md) checks a local copy against a separately trusted expected manifest. These tools do not establish peer availability, model-output equivalence, safe garbage collection or durable storage.
+
+Read [native overflow snapshots](docs/xbox-native-overflow-snapshots.md), [native rollback and descriptors](docs/xbox-native-kvarn4-experimental.md), [managed activation status](docs/rkva-managed-snapshot-activation.md), [peer identity](docs/rkva-peer-identity-store.md), and the [console qualification matrix](docs/rkva-snapshot-console-qualification-matrix.md) before relying on persistence. Keep an independent copy of any data that must survive failures.
+
 ### Context-based router mode
 
 The earlier multi-process design remains available as an alternative to resident switching:
@@ -194,7 +286,7 @@ Router swaps unload/load child processes; adaptive mode instead rebuilds context
 | Feature | Behavior and controls |
 | --- | --- |
 | CUDA Graph stability | Handles changing prompt shapes, graph capture/instantiation failure and stale graph cleanup. Recoverable pressure can fall back to ordinary kernels and re-enable graphs after memory recovers. |
-| Preventive graph margin | `GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB` controls the free-VRAM check; **source default: 18 MiB**. It does not reserve VRAM or make every OOM recoverable. |
+| Preventive graph margin | `--cuda-graph-recovery-headroom-mb` / `GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB` controls the free-VRAM check; **source default: 18 MiB**. It does not reserve VRAM or make every OOM recoverable. |
 | CUDA allocator recovery | Restores recoverable VMM-pool OOM handling and bounds retries/allocation behavior. |
 | IQ1_M workspace and kernels | Bounds full-dequantization workspace via MMVQ, adds MMQ/tensor-core support and initializes only the selected MMQ variant. |
 | KVarN prefill workspace | CUDA materialization windows are chunked according to free VRAM, avoiding an oversized temporary buffer during prompt processing. |
@@ -223,8 +315,11 @@ keeps Qwen3.5/3.8 target weights, Q/K/V projections and recurrent state on the m
 GPU and places the selected full-attention KV caches and attention operations on
 Vulkan. It uses the native GGML scheduler and ordinary KV/KVarN memory managers,
 including precision tails, speculative rollback and slot state. The attention
-core runs on Vulkan during both prefill and decode; asynchronous prefill migration
-is not implemented. The TCP Xbox RKVA path remains a separate transport.
+core normally runs on Vulkan during both prefill and decode. The opt-in
+`--remote-attn-prefill migrate` path now supports CUDA prefill, asynchronous
+KVarN mirroring and a decode handoff within the restrictions in
+[split attention](#split-attention-and-xbox-rkva). TCP Xbox RKVA remains a
+separate transport.
 
 The earlier local transport implementation returned zeros instead of computing
 attention. Its performance and quality claims are invalid; see the correction in
@@ -266,6 +361,14 @@ These optional paths remain in the fork; they are not enabled in the Qwen3.5 dep
 | Paged backends | CUDA/CPU paths plus Vulkan quantized paged attention, parallel prefill and Vulkan 1.1 Android compatibility work. Backend support does not imply equal speed or stability on every device. |
 | Traditional KV fitting | Model-specific, compute-aware context fitting accounts for hybrid/MTP state. Use `--fit off` when supplying explicitly calibrated contexts. |
 | DFlash2 | Separate draft-model speculation path with `p_min` and stochastic verification support; requires a matching drafter and model/backend validation. Adaptive resident mode supports only `draft-mtp`. |
+
+**Multi-device DFlash2:** `--spec-draft-local-split` uses explicit host feature exchange instead of sharing target tensors across devices. `--spec-draft-local-prefetch` additionally prepares a predicted next block during greedy verification and backs off when reuse is rare. Both default to disabled; prefetch implies local split. The local-split gate requires one sequence, matching target/draft embedding widths, a plain DFlash2 block of 2–64 tokens, and excludes DSpark. Choose the draft device with `--spec-draft-device` and use a compatible plain DFlash2 model.
+
+**Remote DFlash research transport:** POSIX hosts can use `DFLASH_XBOX_RPC=IPV4:PORT` with a compatible external DFL2 v2 peer (default port 50053). The selector stays local while features/hidden states cross the connection; geometry is checked during the handshake. This requires a single plain DFlash2 sequence, compatible widths and a block size of 2–64, and cannot be combined with local split. `DFLASH_XBOX_PIPELINE=1` opts into an experimental greedy pipeline. This is a different protocol from RKVA; the standalone DFlash research app was not imported as a second application in the current Xbox tree. See [the DFL2 client protocol](common/dflash-remote.h) and [Xbox migration scope](tools/xbox/README.md) before using it.
+
+**MTP plus an auxiliary drafter:** `--spec-draft-shadow-model FILE` loads a DFlash auxiliary beside `draft-mtp`. Device, offload, draft length and cutoff have `--spec-draft-shadow-device`, `--spec-draft-shadow-ngl`, `--spec-draft-shadow-n-max` and `--spec-draft-shadow-p-min` controls. Default operation is observation only. `GGML_DFLASH_SHADOW_ACTIVE=1` enables the experimental suffix-reuse pilot, restricted to text-only, one-slot Qwen3.5-family MTP with one owned head. The [recorded hybrid experiment](docs/mtp-dflash2-hybrid-plan.md) found the tested active pilot slower than MTP alone; this is an available experiment, not a recommended speedup.
+
+**Speculation measurements:** `--spec-draft-sampling greedy|probabilistic` selects proposal sampling and verification behavior; `--spec-draft-backend-sampling` controls draft sampler offload. `--spec-synth-len` and `--spec-synth-rates` are benchmarking-only synthetic acceptance controls. Their throughput must not be presented as real model acceptance or quality. Record actual target passes, accepted tokens and elapsed generation time when comparing speculative modes.
 
 SnapKV retention is lossy and experimental: reducing physical KV can change output quality. Paged KV is not automatically faster than traditional KV; older Vulkan iGPU experiments include slowdown and failure cases. Context, pool sizes and throughput need validation for the selected model, backend and workload.
 
@@ -332,7 +435,7 @@ Use this generic fallback ladder when KVarN or precision tails are unavailable. 
 ### KV Cache Type Reference
 
 <details>
-<summary><strong>All KV cache types available in BeeLlama</strong></summary>
+<summary><strong>Quantized standard and KVarN cache types</strong></summary>
 
 | Type | Origin | bpv | Size vs bf16 |
 | --- | --- | ---: | ---: |
@@ -355,11 +458,22 @@ Use this generic fallback ladder when KVarN or precision tails are unavailable. 
 | `q2_0` | fork | 2.5 | 15.6% |
 | `kvarn2` | Huawei / fork | 2.375 | 14.8% |
 
+Unquantized `f32`, `f16` and `bf16` are also accepted. Backend kernel availability still limits usable pairs. SAW/OSCAR parser aliases and experimental remote layouts are described in [split attention](#split-attention-and-xbox-rkva), not counted as additional local formats here.
+
 Standard ratios come directly from each block format. KVarN ratios describe the compressed record body, including scale and zero-point metadata; the permanent exact sink, exact suffix, staging, and alignment add overhead.
 
 </details>
 
 ## Installation
+
+### Build this fork's development branch
+
+```sh
+git clone --branch main https://github.com/hjotha/beellama.cpp.git
+cd beellama.cpp
+```
+
+Then select a build below. Local CUDA/Vulkan split attention needs both backends in the same build (`-DGGML_CUDA=ON -DGGML_VULKAN=ON`); TCP RKVA client sources are included in the core. Build/install the compatible Xbox application separately using the [Xbox guide](tools/xbox/README.md). Do not assume the upstream generic RPC server implements RKVA's attention protocol.
 
 ### Prebuilt
 
