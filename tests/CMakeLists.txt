@@ -1305,6 +1305,10 @@ if (GGML_CUDA AND TARGET ggml-cuda)
     target_link_libraries(test-remote-attn-cuda PRIVATE ggml ggml-cuda CUDA::cudart)
     add_test(NAME test-remote-attn-cuda COMMAND $<TARGET_FILE:test-remote-attn-cuda>)
     set_tests_properties(test-remote-attn-cuda PROPERTIES LABELS main SKIP_RETURN_CODE 77)
+    add_test(NAME test-remote-attn-cuda-scratch-pressure COMMAND $<TARGET_FILE:test-remote-attn-cuda>)
+    set_tests_properties(test-remote-attn-cuda-scratch-pressure PROPERTIES
+        LABELS "cuda;vram-pressure" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120
+        ENVIRONMENT "GGML_RKVA_TEST_SCRATCH_PRESSURE_ONLY=1")
 endif()
 
 # CPU prototype: N256 lookahead executor/scheduler (no model/GPU/Xbox/RPC).

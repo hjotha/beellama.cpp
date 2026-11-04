@@ -353,8 +353,16 @@ static bool rkva_scratch_ensure(rkva_cuda_remote_scratch & s, size_t needed) {
     if (!s.host_err && cudaHostAlloc(&s.host_err, sizeof(int), cudaHostAllocPortable) != cudaSuccess) return false;
     if (s.dev_capacity < needed) {
         void * replacement = nullptr;
-        const size_t alloc_sz = std::max<size_t>(needed, 4u << 20);
-        if (cudaMalloc(&replacement, alloc_sz) != cudaSuccess) return false;
+        size_t alloc_sz = std::max<size_t>(needed, 4u << 20);
+        cudaError_t status = cudaMalloc(&replacement, alloc_sz);
+        if (status == cudaErrorMemoryAllocation && alloc_sz > needed) {
+            // The minimum amortizes allocations; the exact size may fit under pressure.
+            const cudaError_t last = cudaGetLastError();
+            if (last != cudaSuccess && last != cudaErrorMemoryAllocation) return false;
+            alloc_sz = needed;
+            status = cudaMalloc(&replacement, alloc_sz);
+        }
+        if (status != cudaSuccess) return false;
         ggml_cuda_graph_guard::note_device_reservation();
         if (s.dev_data && cudaFree(s.dev_data) != cudaSuccess) {
             cudaFree(replacement);

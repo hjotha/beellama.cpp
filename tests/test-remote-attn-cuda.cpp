@@ -274,6 +274,12 @@ static void test_retirement(const ggml_remote_attn_cuda_retirement_interface_v1 
 }
 
 int main() {
+    const bool scratch_pressure = std::getenv("GGML_RKVA_TEST_SCRATCH_PRESSURE_ONLY") != nullptr;
+    const char * allow_pressure = std::getenv("GGML_TEST_ALLOW_VRAM_PRESSURE");
+    if (scratch_pressure && (!allow_pressure || std::strcmp(allow_pressure, "1") != 0)) {
+        std::puts("SKIP: set GGML_TEST_ALLOW_VRAM_PRESSURE=1 with an exclusive GPU");
+        return 77;
+    }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) {
         std::puts("SKIP: CUDA device unavailable");
@@ -303,6 +309,49 @@ int main() {
     const auto * retirement = retirement_getter();
 #endif
     REQUIRE(api && legacy && small && small->base == api && retirement && retirement->base == api);
+    if (scratch_pressure) {
+        CUDA_OK(cudaSetDevice(0));
+        constexpr size_t n = 1u << 20;
+        void * ctx = api->create_context(0);
+        REQUIRE(ctx);
+        float * input = nullptr;
+        CUDA_OK(cudaMalloc(&input, n * sizeof(float)));
+        CUDA_OK(cudaMemset(input, 0, n * sizeof(float)));
+        const float one = 1.0f;
+        CUDA_OK(cudaMemcpy(input, &one, sizeof(one), cudaMemcpyHostToDevice));
+        auto * output = static_cast<uint8_t *>(api->alloc_pinned(n));
+        REQUIRE(output);
+        std::memset(output, 0xa5, n);
+        size_t free_bytes = 0, total_bytes = 0;
+        CUDA_OK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        constexpr size_t keep_bytes = 3u << 20;
+        REQUIRE(free_bytes > keep_bytes);
+        void * pressure = nullptr;
+        CUDA_OK(cudaMalloc(&pressure, free_bytes - keep_bytes));
+        CUDA_OK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        REQUIRE(free_bytes < (4u << 20) && free_bytes > n);
+        REQUIRE(api->pack_q(ctx, input, false, n, output, nullptr));
+        REQUIRE(output[0] == oracle(one));
+        REQUIRE(std::all_of(output + 1, output + n, [](uint8_t v) { return v == 0; }));
+        api->destroy_context(ctx);
+        ctx = api->create_context(0);
+        REQUIRE(ctx);
+        CUDA_OK(cudaMemset(input, 0xff, n * sizeof(float)));
+        CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        REQUIRE(free_bytes < (4u << 20) && free_bytes > n);
+        REQUIRE(api->unpack_out(ctx, output, nullptr, 1, n, 0, input, n * sizeof(float)));
+        std::vector<float> unpacked(n);
+        CUDA_OK(cudaMemcpy(unpacked.data(), input, n * sizeof(float), cudaMemcpyDeviceToHost));
+        REQUIRE(unpacked[0] == one);
+        REQUIRE(std::all_of(unpacked.begin() + 1, unpacked.end(), [](float v) { return v == 0; }));
+        api->destroy_context(ctx);
+        CUDA_OK(cudaFree(pressure));
+        api->free_pinned(output);
+        CUDA_OK(cudaFree(input));
+        std::puts("remote-attn scratch pressure pack/unpack parity OK");
+        return 0;
+    }
     test_retirement(retirement, api, small);
     void * context = api->create_context(0);
     REQUIRE(context);
