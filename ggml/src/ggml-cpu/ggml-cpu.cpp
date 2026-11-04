@@ -133,21 +133,21 @@ struct ggml_backend_plan_cpu {
 };
 
 // A caller may invoke the backend directly without consulting supports_op.
-// Preflight NC nodes before planning or executing so unsupported CPU codecs
-// return a status instead of reaching a GGML_ABORT in a row conversion.
-static bool ggml_backend_cpu_tqnc_graph_supported(ggml_backend_t backend, const ggml_cgraph * graph) {
-    const auto is_tqnc = [](ggml_type type) {
-        return type == GGML_TYPE_TQNC_K || type == GGML_TYPE_TQNC_V;
+// Preflight custom cache nodes so unsupported CPU operations return a status
+// even when callers do not first query supports_op.
+static bool ggml_backend_cpu_custom_cache_graph_supported(ggml_backend_t backend, const ggml_cgraph * graph) {
+    const auto is_custom_cache = [](ggml_type type) {
+        return type == GGML_TYPE_SAW_INT4 || type == GGML_TYPE_TQNC_K || type == GGML_TYPE_TQNC_V;
     };
     for (int i = 0; i < graph->n_nodes; ++i) {
         const ggml_tensor * node = graph->nodes[i];
         if (node->op == GGML_OP_SET_ROWS && node->type == GGML_TYPE_SAW_INT4 &&
                 ggml_get_op_params_i32(node, GGML_SET_ROWS_OP_PARAM_SAW_CHECKED) != 0) return false;
-        bool touches_tqnc = is_tqnc(node->type);
+        bool touches_custom_cache = is_custom_cache(node->type);
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            touches_tqnc = touches_tqnc || (node->src[j] && is_tqnc(node->src[j]->type));
+            touches_custom_cache = touches_custom_cache || (node->src[j] && is_custom_cache(node->src[j]->type));
         }
-        if (touches_tqnc && !ggml_backend_dev_supports_op(ggml_backend_get_device(backend), node)) return false;
+        if (touches_custom_cache && !ggml_backend_dev_supports_op(ggml_backend_get_device(backend), node)) return false;
     }
     return true;
 }
@@ -155,7 +155,7 @@ static bool ggml_backend_cpu_tqnc_graph_supported(ggml_backend_t backend, const 
 static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    if (!ggml_backend_cpu_tqnc_graph_supported(backend, cgraph)) return nullptr;
+    if (!ggml_backend_cpu_custom_cache_graph_supported(backend, cgraph)) return nullptr;
 
     struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
 
@@ -189,7 +189,7 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
-    if (!ggml_backend_cpu_tqnc_graph_supported(backend, &cpu_plan->cgraph)) return GGML_STATUS_FAILED;
+    if (!ggml_backend_cpu_custom_cache_graph_supported(backend, &cpu_plan->cgraph)) return GGML_STATUS_FAILED;
 
     return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
 }
@@ -197,7 +197,7 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    if (!ggml_backend_cpu_tqnc_graph_supported(backend, cgraph)) return GGML_STATUS_FAILED;
+    if (!ggml_backend_cpu_custom_cache_graph_supported(backend, cgraph)) return GGML_STATUS_FAILED;
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
@@ -472,6 +472,80 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_KVARN_VIEW) {
         return true;
+    }
+
+    bool touches_saw = op->type == GGML_TYPE_SAW_INT4;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        touches_saw = touches_saw || (op->src[i] && op->src[i]->type == GGML_TYPE_SAW_INT4);
+    }
+    if (touches_saw) {
+        // CPU SAW is a restricted codec; do not advertise generic operations
+        // that can reach an unsupported dispatch or an unsafe reshape copy.
+        const auto dense_span = [](const ggml_tensor * t, size_t & span) {
+            if (!t || t->ne[0] <= 0 || t->ne[0] % ggml_blck_size(t->type) != 0 ||
+                    t->ne[0] > std::numeric_limits<int>::max() - GGML_MAX_N_THREADS ||
+                    t->nb[0] != ggml_type_size(t->type)) return false;
+            uint64_t size = uint64_t(t->ne[0] / ggml_blck_size(t->type)) * ggml_type_size(t->type);
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                if (t->ne[i] <= 0 || t->ne[i] > std::numeric_limits<int>::max() - GGML_MAX_N_THREADS ||
+                        (t->ne[i] != 1 && t->nb[i] != size) ||
+                        size > std::numeric_limits<uint32_t>::max() / uint64_t(t->ne[i])) return false;
+                size *= uint64_t(t->ne[i]);
+            }
+            if (size > std::numeric_limits<uint32_t>::max()) return false;
+            span = size_t(size);
+            return true;
+        };
+        const auto safe_dense = [&](const ggml_tensor * t, size_t & span) {
+            if (!dense_span(t, span)) return false;
+            if (!t->view_src) return true;
+            size_t base_span = 0;
+            return !t->view_src->view_src && t->view_src->type == t->type &&
+                dense_span(t->view_src, base_span) && t->view_offs % ggml_type_size(t->type) == 0 &&
+                t->view_offs <= base_span && span <= base_span - t->view_offs;
+        };
+        if (op->op == GGML_OP_CPY || op->op == GGML_OP_DUP || op->op == GGML_OP_CONT) {
+            size_t src_span = 0, dst_span = 0, target_span = 0;
+            if (!src0 || !ggml_are_same_shape(src0, op) || !safe_dense(src0, src_span) ||
+                    !safe_dense(op, dst_span) ||
+                    (op->op == GGML_OP_CPY && (!src1 || src1->type != op->type ||
+                        !ggml_are_same_shape(src1, op) || !safe_dense(src1, target_span)))) return false;
+            const bool same_saw = src0->type == GGML_TYPE_SAW_INT4 && op->type == GGML_TYPE_SAW_INT4;
+            const bool to_saw = op->type == GGML_TYPE_SAW_INT4 &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+            const bool from_saw = src0->type == GGML_TYPE_SAW_INT4 && op->type == GGML_TYPE_F32;
+            if (!same_saw && !to_saw && !from_saw) return false;
+            const auto overlaps = [](uintptr_t a, size_t na, uintptr_t b, size_t nb) {
+                return a <= b ? b - a < na : a - b < nb;
+            };
+            const ggml_tensor * src_base = src0->view_src ? src0->view_src : src0;
+            const ggml_tensor * dst_base = op->view_src ? op->view_src : op;
+            if ((src_base == dst_base && overlaps(src0->view_src ? src0->view_offs : 0, src_span,
+                                                 op->view_src ? op->view_offs : 0, dst_span)) ||
+                    (src0->data && op->data && overlaps(reinterpret_cast<uintptr_t>(src0->data), src_span,
+                                                        reinterpret_cast<uintptr_t>(op->data), dst_span))) return false;
+        } else if (op->op == GGML_OP_SET_ROWS) {
+            if (op->type != GGML_TYPE_SAW_INT4 || !src0 || !src1 || !src2 ||
+                    src2->type != GGML_TYPE_SAW_INT4 || !ggml_are_same_shape(src2, op) || op->src[3] || op->src[4] ||
+                    ggml_get_op_params_i32(op, GGML_SET_ROWS_OP_PARAM_SAW_CHECKED) != 0 ||
+                    (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
+                    (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) ||
+                    src0->ne[0] != op->ne[0] || src0->ne[0] <= 0 || src0->ne[0] % 256 != 0 ||
+                    src0->ne[0] > std::numeric_limits<int>::max() - GGML_MAX_N_THREADS ||
+                    src0->ne[2] != op->ne[2] || src0->ne[3] != op->ne[3] ||
+                    src1->ne[0] != src0->ne[1] || src1->ne[1] <= 0 || src1->ne[2] <= 0 ||
+                    src0->ne[2] % src1->ne[1] != 0 || src0->ne[3] % src1->ne[2] != 0 ||
+                    src1->ne[3] != 1 || src1->nb[0] != ggml_type_size(src1->type) ||
+                    !ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(op)) return false;
+        } else if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+            if (!src0 || !src1 || !src2 || src0->type == GGML_TYPE_SAW_INT4 ||
+                    src1->type == GGML_TYPE_SAW_INT4 || src2->type != GGML_TYPE_SAW_INT4 ||
+                    src2->ne[0] <= 0 || src2->ne[0] % 256 != 0 ||
+                    src2->nb[0] != ggml_type_size(GGML_TYPE_SAW_INT4) || op->src[5]) return false;
+            for (int i = 3; i < GGML_MAX_SRC; ++i) if (op->src[i] && op->src[i]->type == GGML_TYPE_SAW_INT4) return false;
+        } else {
+            return false;
+        }
     }
 
     // NC's CPU row codecs abort on malformed metadata and most generic CPU

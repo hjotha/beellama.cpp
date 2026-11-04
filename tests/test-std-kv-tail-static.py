@@ -24,7 +24,12 @@ def main() -> None:
     registry = arg.split("const std::vector<ggml_type> kv_cache_types = {", 1)[1].split("};", 1)[0]
     registered = set(re.findall(r"GGML_TYPE_[A-Z0-9_]+", registry))
     non_quantized = {"GGML_TYPE_F32", "GGML_TYPE_F16", "GGML_TYPE_BF16"}
-    quantized = registered - non_quantized
+    # These formats use specialized CUDA attention and reject generic CPU
+    # OUT_PROD; their admission paths are covered by dedicated backend tests.
+    specialized = {"GGML_TYPE_SAW_INT4", "GGML_TYPE_TQNC_K", "GGML_TYPE_TQNC_V"}
+    if not specialized <= registered:
+        raise AssertionError("specialized cache types missing from the registry")
+    quantized = registered - non_quantized - specialized
 
     cuda_out_prod = (ROOT / "ggml/src/ggml-cuda/out-prod.cu").read_text(encoding="utf-8")
     cpu_out_prod = (ROOT / "ggml/src/ggml-cpu/ops.cpp").read_text(encoding="utf-8")
@@ -638,7 +643,11 @@ def main() -> None:
     tail_support = cuda_fattn.split(
         "bool ggml_cuda_flash_attn_ext_tail_supported(", 1
     )[1].split("\n}\n", 1)[0]
-    if "GGML_USE_HIP" in tail_support or "return false" in tail_support:
+    # SAW/NC tails are CUDA-only; ordinary cache types still share HIP support.
+    if "if (custom_body)" not in tail_support or "#if !defined(GGML_USE_HIP)" not in tail_support:
+        raise AssertionError("custom cache tails must remain CUDA-only")
+    standard_tail_support = tail_support.split("const bool body_supported =", 1)[1]
+    if "GGML_USE_HIP" in standard_tail_support or "return false" in standard_tail_support:
         raise AssertionError("HIP must use the shared segmented-current capability path")
     direct_tail_support = kvarn_dispatch.split(
         "bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(", 2
