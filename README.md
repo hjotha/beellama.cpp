@@ -249,7 +249,7 @@ Native Xbox overflow has a separate, **experimental and opt-in** persistence pat
 
 Native Q4/Q8/SAW/NC row paths do not have a corresponding FULL snapshot codec; they refuse to reconstruct native records from the bookkeeping companion. E4/v3 native snapshots are not advertised. Use a supported KVarN4 snapshot path or recompute the prompt rather than assuming those formats are interchangeable.
 
-Bounded streaming restore rejects compact precision-tail state, including the local SAW/NC tails; callers that support it must use the legacy restore API or recompute. Explicit router transfers do not automatically fall back to the legacy reader.
+Bounded streaming restore supports a local, body-backed F16 precision-tail overlay with single-sequence source and destination, without SWA, transposed V or shared ownership. Other precision-tail layouts remain refused and may require the legacy restore API or recomputation. Explicit router transfers do not automatically fall back to the legacy reader.
 
 | Switch | Purpose (all disabled by default) |
 | --- | --- |

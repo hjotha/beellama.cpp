@@ -192,7 +192,8 @@ public:
 
     // state write/load
 
-bool requires_state_for_partial_restore() const override;
+    bool requires_state_for_partial_restore() const override;
+    bool state_streaming_restore_supported() const override;
 
     bool state_partial_retained(std::vector<const llama_memory_i *> & out) const override {
         if (other) { out.push_back(this); }

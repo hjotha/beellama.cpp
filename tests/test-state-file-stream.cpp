@@ -10,6 +10,7 @@
 #include "llama-remote-snapshot.h"
 #include "rkva-native-state.h"
 #include "../src/llama-io-file.h"
+#include "../src/llama-memory.h"
 
 #include <cmath>
 #include <cstring>
@@ -77,9 +78,179 @@ static void synthetic(const std::string & directory) {
         try { reader.commit(); } catch (const std::exception &) { failed = true; }
         require(failed && !published, "late truncation published metadata");
     }
+    // Replay must never hand tensor bytes to the inner reader before its
+    // already-consumed prefix has been replayed to the parser.
+    ggml_backend_tensor_memset(tensor, 0, 0, bytes);
+    {
+        llama_file file(path.c_str(), "rb");
+        llama_io_read_file_stream reader(file, 2*LLAMA_STATE_FILE_BUFFER_SIZE);
+        uint32_t prefix = 0;
+        reader.read(&prefix, sizeof(prefix));
+        llama_io_read_replay replay(reader, &prefix, sizeof(prefix));
+        require(replay.has_bounded_tensor_reads(), "replay lost bounded-reader capability");
+        bool rejected = false;
+        try { replay.read_tensor(tensor, 0, 1); } catch (const std::exception &) { rejected = true; }
+        require(rejected && reader.n_bytes() == sizeof(prefix), "undrained replay forwarded tensor bytes");
+        uint32_t observed = 0;
+        replay.read(&observed, sizeof(observed));
+        require(observed == prefix, "replayed prefix differed");
+        replay.read_tensor(tensor, 0, 4);
+        reader.commit();
+        uint8_t value = 0;
+        ggml_backend_tensor_get(tensor, &value, 0, 1);
+        require(value == 42, "drained replay failed to commit tensor data");
+    }
+    ggml_backend_tensor_memset(tensor, 0, 0, bytes);
+    {
+        llama_file file(path.c_str(), "rb");
+        llama_io_read_file_stream reader(file, 2*LLAMA_STATE_FILE_BUFFER_SIZE);
+        bool published_index = false, capped = false;
+        reader.on_commit([&]() { published_index = true; });
+        try {
+            // More entries than the existing cap can hold even if each entry
+            // were only one pointer. No tensor writes occur during indexing.
+            for (size_t i = 0; i <= LLAMA_STATE_FILE_BUFFER_SIZE/sizeof(void *); ++i) {
+                reader.read_tensor(tensor, 0, 1);
+            }
+        } catch (const std::exception & error) {
+            capped = std::string(error.what()).find("index budget exceeded") != std::string::npos;
+        }
+        uint8_t value = 99;
+        ggml_backend_tensor_get(tensor, &value, 0, 1);
+        require(capped && !published_index && value == 0, "fragmented index cap published or wrote data");
+        reader.cancel();
+    }
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    std::cout << "PASS: >24 MiB tensor indexed in 8 MiB chunks; parse/late-I/O publication boundary\n";
+    std::cout << "PASS: >24 MiB tensor indexed in 8 MiB chunks; replay and index cap fail closed\n";
+}
+
+static void standard_tail_model(llama_model * model, const server_model_identity & identity,
+                                const std::string & directory, const llama_tokens & tokens) {
+    auto params = llama_context_default_params();
+    params.n_ctx = 512; params.n_batch = params.n_ubatch = 64; params.n_seq_max = 1;
+    params.n_threads = params.n_threads_batch = 2;
+    params.type_k = params.type_v = GGML_TYPE_Q4_0;
+    params.kv_tail_tokens = 128; params.kv_tail_type = GGML_TYPE_F16;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; params.offload_kqv = false;
+    llama_context_ptr source(llama_init_from_model(model, params));
+    llama_context_ptr destination(llama_init_from_model(model, params));
+    require(source && destination && tokens.size() > 128, "standard tail contexts failed");
+    require(llama_get_memory(source.get())->requires_state_for_partial_restore() &&
+            llama_get_memory(source.get())->state_streaming_restore_supported() &&
+            llama_get_memory(source.get())->get_kv_tail_type() == GGML_TYPE_F16,
+            "standard tail capability or partial checkpoint contract missing");
+    decode(source.get(), tokens);
+    llama_kv_tail_coverage_info expected{};
+    require(llama_kv_tail_get_coverage(source.get(), 0, 0, &expected) &&
+            expected.requested == 128 && expected.exact == 128 && expected.degradation_flags == 0,
+            "source exact-tail coverage not complete");
+    const std::string path = directory + "/standard-tail-stream.bin";
+    const size_t written = server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX);
+    const auto file = server_route_state_read(path, SIZE_MAX, 1024);
+    require(written == file.file_bytes && file.tokens == tokens, "standard tail snapshot save failed");
+    llama_context_ptr legacy(llama_init_from_model(model, params));
+    require(bool(legacy), "standard tail legacy destination failed");
+    llama_tokens legacy_tokens(tokens.size()); size_t legacy_count = 0;
+    require(llama_state_seq_load_file(legacy.get(), path.c_str(), 0, legacy_tokens.data(), legacy_tokens.size(),
+                                     &legacy_count) == file.state_bytes &&
+            legacy_count == tokens.size() && legacy_tokens == tokens,
+            "legacy standard tail file restore regressed");
+    const auto restore = [&](llama_context * ctx, const std::string & name, uint64_t checksum) {
+        llama_tokens restored(tokens.size()); size_t count = 99;
+        const size_t n = llama_state_seq_load_file_streaming(ctx, name.c_str(), 0, restored.data(), restored.size(),
+                                                             &count, file.state_bytes, checksum);
+        require(n ? count == tokens.size() && restored == tokens : count == 0,
+                "standard tail restored token publication mismatch");
+        return n;
+    };
+    require(restore(destination.get(), path, file.state_checksum) == file.state_bytes,
+            "standard tail streaming restore failed");
+    llama_kv_tail_coverage_info actual{};
+    require(llama_kv_tail_get_coverage(destination.get(), 0, 0, &actual) &&
+            actual.state == expected.state && actual.requested == expected.requested &&
+            actual.exact == expected.exact && actual.degradation_flags == expected.degradation_flags,
+            "standard tail coverage changed after streaming restore");
+    std::vector<uint8_t> before(llama_state_seq_get_size(destination.get(), 0));
+    require(!before.empty() && llama_state_seq_get_data(destination.get(), before.data(), before.size(), 0) == before.size(),
+            "standard tail destination snapshot failed");
+    require(restore(destination.get(), path, file.state_checksum) == 0,
+            "standard tail streaming accepted occupied destination");
+    std::vector<uint8_t> after(before.size());
+    require(llama_state_seq_get_data(destination.get(), after.data(), after.size(), 0) == after.size() && before == after,
+            "occupied destination changed on rejected restore");
+
+    llama_memory_clear(llama_get_memory(destination.get()), false);
+    require(restore(destination.get(), path, file.state_checksum ^ 1) == 0 &&
+            llama_memory_seq_pos_max(llama_get_memory(destination.get()), 0) == -1,
+            "bad checksum published standard tail state");
+    const std::string damaged = directory + "/standard-tail-damaged.bin";
+    std::filesystem::copy_file(path, damaged);
+    {
+        std::fstream f(damaged, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekg(file.state_bytes - 1); char byte; f.read(&byte, 1); byte ^= 1;
+        f.seekp(file.state_bytes - 1); f.write(&byte, 1);
+        require(f.good(), "could not corrupt standard tail fixture");
+    }
+    require(restore(destination.get(), damaged, file.state_checksum) == 0 &&
+            llama_memory_seq_pos_max(llama_get_memory(destination.get()), 0) == -1,
+            "corrupt standard tail payload published state");
+    std::filesystem::resize_file(damaged, file.state_bytes/2);
+    require(restore(destination.get(), damaged, file.state_checksum) == 0 &&
+            llama_memory_seq_pos_max(llama_get_memory(destination.get()), 0) == -1,
+            "truncated standard tail payload published state");
+    // Recompute the checksum after corrupting the versioned group length, so
+    // rejection must happen in the bounded parser rather than at preflight.
+    const std::string invalid_meta = directory + "/standard-tail-bad-meta.bin";
+    std::filesystem::copy_file(path, invalid_meta);
+    {
+        const size_t frame = 3*sizeof(uint32_t) + tokens.size()*sizeof(llama_token);
+        std::fstream f(invalid_meta, std::ios::binary | std::ios::in | std::ios::out);
+        uint32_t marker = 0;
+        f.seekg(frame); f.read(reinterpret_cast<char *>(&marker), sizeof(marker));
+        require(marker == 0x4c54564bu, "standard tail frame marker missing");
+        const uint32_t huge = UINT32_MAX;
+        f.seekp(frame + 7*sizeof(uint32_t)); f.write(reinterpret_cast<const char *>(&huge), sizeof(huge));
+        require(f.good(), "could not corrupt standard tail group length");
+    }
+    std::vector<uint8_t> changed(file.state_bytes);
+    {
+        std::ifstream f(invalid_meta, std::ios::binary);
+        require(bool(f.read(reinterpret_cast<char *>(changed.data()), changed.size())),
+                "could not hash malformed standard tail frame");
+    }
+    require(restore(destination.get(), invalid_meta, XXH64(changed.data(), changed.size(), 0)) == 0 &&
+            llama_memory_seq_pos_max(llama_get_memory(destination.get()), 0) == -1,
+            "checksum-valid oversized group length was accepted");
+#ifndef _WIN32
+    setenv("LLAMA_TEST_STATE_FILE_COMMIT_FAIL_AFTER", "1", 1);
+    const size_t failed = restore(destination.get(), path, file.state_checksum);
+    unsetenv("LLAMA_TEST_STATE_FILE_COMMIT_FAIL_AFTER");
+    require(failed == 0 && llama_memory_seq_pos_max(llama_get_memory(destination.get()), 0) == -1,
+            "late standard tail commit failure published state");
+#endif
+    require(restore(destination.get(), path, file.state_checksum) == file.state_bytes,
+            "standard tail restore retry failed");
+    require(llama_kv_tail_get_coverage(destination.get(), 0, 0, &actual) &&
+            actual.exact == expected.exact && actual.degradation_flags == expected.degradation_flags,
+            "standard tail coverage changed after retry");
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const llama_tokens suffix = {3, 4, 5};
+    decode(source.get(), suffix, tokens.size());
+    decode(destination.get(), suffix, tokens.size());
+    decode(legacy.get(), suffix, tokens.size());
+    const float * a = llama_get_logits_ith(source.get(), -1);
+    const float * b = llama_get_logits_ith(destination.get(), -1);
+    const float * c = llama_get_logits_ith(legacy.get(), -1);
+    require(a && b && c, "standard tail continuation logits missing");
+    for (int i = 0; i < vocab; ++i) {
+        require(std::isfinite(a[i]) && std::isfinite(b[i]) && std::isfinite(c[i]) &&
+                std::abs(a[i] - b[i]) < 0.002f && std::abs(a[i] - c[i]) < 0.002f,
+                "standard tail streaming continuation logits differ");
+    }
+    require(greedy(source.get()) == greedy(destination.get()) && greedy(source.get()) == greedy(legacy.get()),
+            "standard tail continuation token differs");
+    std::cout << "PASS: standard F16 tail streaming, occupied/corrupt/truncated/late-failure retry, coverage and logits\n";
 }
 
 static void make_http_fixture(const char * input, const char * output) {
@@ -277,6 +448,7 @@ int main(int argc, char ** argv) {
         std::cout << "PASS: generic sequence reader rejects native trailer before reservation\n";
 
         const auto identity = server_model_identity::prepare(argv[1], {});
+        standard_tail_model(model.get(), identity, dir, tokens);
         const std::string path = dir + "/route.bin";
         const size_t written = server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX);
         const auto file = server_route_state_read(path, SIZE_MAX, 1024);

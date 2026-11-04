@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,6 +73,10 @@ public:
     virtual uint32_t native_expected_tokens() const { return native_expected_tokens_; }
     virtual void set_native_expected_tokens(uint32_t count) { native_expected_tokens_ = count; }
 
+    // True only when tensor payloads are indexed with bounded staging and
+    // installed on commit, rather than retained in RAM during parsing.
+    virtual bool has_bounded_tensor_reads() const { return false; }
+
     void read_string(std::string & str);
 
 private:
@@ -112,7 +117,15 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (m_offset != m_prefix.size()) {
+            throw std::runtime_error("cannot read a tensor before the replay prefix is consumed");
+        }
         m_inner.read_tensor(tensor, offset, size);
+    }
+    bool has_bounded_tensor_reads() const override {
+        // Preserve the underlying reader's bounded contract even while the
+        // prefix is pending; read_tensor itself fails closed until it drains.
+        return m_inner.has_bounded_tensor_reads();
     }
     void stage_tensor_set(ggml_tensor * tensor, const void * src, size_t offset, size_t size) override {
         m_inner.stage_tensor_set(tensor, src, offset, size);

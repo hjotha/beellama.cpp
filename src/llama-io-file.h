@@ -54,6 +54,8 @@ public:
         }
     }
 
+    bool has_bounded_tensor_reads() const override { return true; }
+
     void stage_tensor_set(ggml_tensor * tensor, const void * src, size_t offset, size_t count) override {
         check_span(tensor, offset, count);
         if (count > LLAMA_STATE_FILE_BUFFER_SIZE - staged.size()) {

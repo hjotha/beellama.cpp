@@ -80,8 +80,9 @@ for all models, speculative modes or production configurations.
 An optional F16 exact tail of 128 or 256 tokens is available for the local
 CUDA Qwen35 GQA24/4 target path with one non-unified sequence. This experimental
 route rejects position splitting and speculative rollback. Legacy local state
-round trips are tested; precision-tail state is not supported by the bounded
-streaming restore path.
+round trips are tested. Bounded streaming restore supports the single-sequence,
+body-backed F16 overlay subset; NC-specific streaming restore still requires
+runtime qualification.
 
 The experimental Xbox shader `CSRangeAttnTurboQuantNC` uses D=256, GQA=6 and
 Wave64. It rotates Q with a threadgroup-shared WHT. K stays in the rotated

@@ -3,6 +3,7 @@
 #include "../src/llama-kv-cache-kvarn.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-io.h"
+#include "../src/llama-io-file.h"
 #include "../src/llama-native-prefix-validation.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -11,8 +12,13 @@
 #include <cassert>
 #include <cstring>
 #include <cstdio>
+#include <fstream>
+#include <limits>
 #include <random>
 #include <stdexcept>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 struct tiny_model final : llama_model {
     tiny_model() : llama_model(llama_model_default_params()) {
@@ -44,11 +50,13 @@ struct tiny_model final : llama_model {
 
 struct writer final : llama_io_write_i {
     std::vector<uint8_t> data;
+    size_t first_tensor_offset = SIZE_MAX;
     void write(const void * src, size_t n) override {
         const auto * p = static_cast<const uint8_t *>(src);
         data.insert(data.end(), p, p + n);
     }
     void write_tensor(ggml_tensor * t, size_t offset, size_t n) override {
+        if (first_tensor_offset == SIZE_MAX) first_tensor_offset = data.size();
         const auto begin = data.size(); data.resize(begin + n);
         ggml_backend_tensor_get(t, data.data() + begin, offset, n);
     }
@@ -260,6 +268,356 @@ static void test_exact_tail_snapshot_layouts() {
         }
     }
 }
+
+#ifndef _WIN32
+struct limited_index_reader final : llama_io_read_i {
+    const std::vector<uint8_t> & data;
+    size_t pos = 0;
+    size_t indexed = 0;
+    size_t cap;
+    bool published = false;
+    std::vector<std::function<void()>> callbacks;
+    limited_index_reader(const std::vector<uint8_t> & bytes, size_t limit) : data(bytes), cap(limit) {}
+    void read(void * dst, size_t n) override {
+        if (n > data.size() - pos) throw std::runtime_error("truncated test state");
+        std::memcpy(dst, data.data() + pos, n); pos += n;
+    }
+    bool has_bounded_tensor_reads() const override { return true; }
+    void read_tensor(ggml_tensor *, size_t, size_t n) override {
+        if (indexed >= cap) throw std::runtime_error("injected index budget exceeded");
+        if (n > data.size() - pos) throw std::runtime_error("truncated test tensor");
+        ++indexed; pos += n;
+    }
+    void stage_tensor_set(ggml_tensor *, const void *, size_t, size_t) override {
+        throw std::runtime_error("unexpected materialized tensor staging");
+    }
+    void stage_tensor_clear(ggml_tensor *, size_t, size_t) override {
+        throw std::runtime_error("unexpected tensor clear");
+    }
+    void on_commit(std::function<void()> callback) override { callbacks.push_back(std::move(callback)); }
+    void commit() override { for (auto & callback : callbacks) callback(); published = true; }
+    void cancel() override { callbacks.clear(); }
+    size_t n_bytes() override { return pos; }
+};
+
+// A real standard Q4 body >8 MiB plus an F16 overlay.  This exercises the
+// cache parser against the same indexed file reader used by the public API,
+// without model inference or a GPU.
+static void test_standard_tail_bounded_state() {
+    tiny_model model;
+    model.hparams.n_layer_all = 4;
+    model.hparams.n_ctx_train = 32768;
+    model.hparams.is_recr_impl.fill(false);
+    model.layers.resize(4);
+    auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
+    const auto make_cache = [&]() {
+        return std::make_unique<llama_kv_cache>(model, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                false, false, false, 32768, 1, 256, 0, LLAMA_SWA_TYPE_NONE, nullptr,
+                llama_memory_i::layer_filter_cb{}, llama_memory_i::layer_reuse_cb{},
+                llama_memory_i::layer_share_cb{}, "bounded_test_", 64, 128, GGML_TYPE_F16,
+                128, false, 1, 0, false, cpu);
+    };
+    auto source = make_cache();
+    auto destination = make_cache();
+    assert(source->requires_state_for_partial_restore() && source->state_streaming_restore_supported());
+    {
+        llama_kv_cache multiple(model, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                false, false, false, 512, 2, 256, 0, LLAMA_SWA_TYPE_NONE, nullptr,
+                {}, {}, {}, "bounded_multi_", 64, 128, GGML_TYPE_F16, 128, false, 1, 0, false, cpu);
+        assert(multiple.requires_state_for_partial_restore() && !multiple.state_streaming_restore_supported());
+    }
+    auto & cells = const_cast<llama_kv_cells &>(source->get_cells(llama_seq_id(0)));
+    for (uint32_t i = 0; i < 32768 - 256; ++i) {
+        cells.pos_set(i, llama_pos(i));
+        cells.seq_add(i, 0);
+    }
+    for (uint32_t pos = 32768 - 256; pos < 32768; pos += 64) {
+        auto state = source->init_kv_batch({batch(llama_pos(pos), 64)});
+        assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
+        state->graph_compute_finish(GGML_STATUS_SUCCESS);
+    }
+    assert(source->seq_pos_max(0) == 32767);
+    // Distinct deterministic raw payloads expose swapped body/tail destinations.
+    ggml_context * view_ctx = ggml_init({ 32*ggml_tensor_overhead(), nullptr, true });
+    assert(view_ctx);
+    for (int layer = 0; layer < 4; ++layer) {
+        uint32_t component = 0;
+        for (ggml_tensor * tensor : { source->get_k_storage(layer), source->get_v_storage(layer),
+                                     source->get_k_tail(view_ctx, layer), source->get_v_tail(view_ctx, layer) }) {
+            assert(tensor);
+            if (tensor->view_src && !tensor->buffer) ggml_backend_view_init(tensor);
+            std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+            for (size_t i = 0; i < bytes.size(); ++i) {
+                const size_t row = i/256;
+                bytes[i] = uint8_t(i*29 + row*37 + (row >> 8)*11 + layer*17 + component*53);
+            }
+            if (component >= 2 && bytes.size() >= 512) {
+                assert(!std::equal(bytes.begin(), bytes.begin() + 256, bytes.begin() + 256));
+            }
+            ggml_backend_tensor_set(tensor, bytes.data(), 0, bytes.size());
+            ++component;
+        }
+    }
+    ggml_free(view_ctx);
+    writer full;
+    source->state_write(full, 0, 0);
+    assert(full.data.size() > LLAMA_STATE_FILE_BUFFER_SIZE && full.first_tensor_offset < full.data.size());
+    char path[] = "/tmp/beellama-kv-tail-stream-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0);
+    close(fd);
+    struct cleanup { const char * p; ~cleanup() { std::remove(p); } } unlink_file { path };
+    const auto write = [&](const std::vector<uint8_t> & bytes) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+        assert(out.good());
+    };
+    write(full.data);
+    {
+        llama_file file(path, "rb");
+        llama_io_read_file_stream input(file, full.data.size());
+        uint32_t prefix = 0;
+        input.read(&prefix, sizeof(prefix));
+        llama_io_read_replay replay(input, &prefix, sizeof(prefix));
+        assert(replay.has_bounded_tensor_reads());
+        bool rejected = false;
+        try { replay.read_tensor(destination->get_k_storage(0), 0, 1); }
+        catch (const std::runtime_error &) { rejected = true; }
+        assert(rejected && input.n_bytes() == sizeof(prefix));
+        destination->state_read(replay, 0, 0);
+        assert(input.n_bytes() == full.data.size() && input.checksum() == XXH64(full.data.data(), full.data.size(), 0));
+        assert(destination->seq_pos_max(0) == -1);
+        input.commit();
+        assert(destination->seq_pos_max(0) == source->seq_pos_max(0));
+    }
+    writer restored;
+    destination->state_write(restored, 0, 0);
+    assert(restored.data == full.data);
+    llama_kv_tail_coverage_info expected{}, actual{};
+    assert(source->get_kv_tail_coverage(0, 0, expected) && destination->get_kv_tail_coverage(0, 0, actual));
+    assert(expected.state == actual.state && expected.requested == actual.requested &&
+           expected.exact == actual.exact && expected.degradation_flags == actual.degradation_flags);
+
+    const auto reject = [&](const std::vector<uint8_t> & bytes, size_t expected_consumed) {
+        auto empty = make_cache();
+        write(bytes);
+        const uint64_t checksum = XXH64(bytes.data(), bytes.size(), 0); // checksum of the mutated frame
+        {
+            std::ifstream disk(path, std::ios::binary);
+            std::vector<char> block(1024*1024);
+            XXH64_state_t hash; XXH64_reset(&hash, 0);
+            while (disk) {
+                disk.read(block.data(), block.size());
+                XXH64_update(&hash, block.data(), size_t(disk.gcount()));
+            }
+            assert(disk.eof() && XXH64_digest(&hash) == checksum);
+        }
+        llama_file file(path, "rb");
+        llama_io_read_file_stream input(file, bytes.size());
+        bool rejected = false;
+        try { empty->state_read(input, 0, 0); } catch (const std::exception &) { rejected = true; }
+        assert(rejected && empty->seq_pos_max(0) == -1 && input.n_bytes() == expected_consumed);
+    };
+    writer body_only;
+    source->state_write(body_only, 0, LLAMA_STATE_SEQ_FLAGS_BODY_ONLY);
+    assert(body_only.data.size() > LLAMA_STATE_FILE_BUFFER_SIZE);
+    reject(body_only.data, body_only.first_tensor_offset); // before touching the payload
+
+    // Current version header: seven words, group length/string, three u64
+    // payload lengths, then stream/v_trans/n_pos/saved_n_seq_max/layer_count.
+    const auto u32 = [](const std::vector<uint8_t> & data, size_t pos) {
+        assert(pos + 4 <= data.size()); uint32_t value; std::memcpy(&value, data.data() + pos, 4); return value;
+    };
+    const auto set_u32 = [](std::vector<uint8_t> & data, size_t pos, uint32_t value) {
+        assert(pos + 4 <= data.size()); std::memcpy(data.data() + pos, &value, 4);
+    };
+    const size_t group_len_offset = 7*sizeof(uint32_t);
+    const uint32_t group_len = u32(full.data, group_len_offset);
+    assert(group_len > 0 && group_len < 64);
+    const size_t manifest_offset = group_len_offset + sizeof(uint32_t) + group_len + 3*sizeof(uint64_t);
+    {
+        auto bad = full.data;
+        set_u32(bad, group_len_offset, UINT32_MAX);
+        reject(bad, group_len_offset + sizeof(uint32_t));
+    }
+    {
+        auto bad = full.data;
+        assert(u32(bad, manifest_offset + 3*sizeof(uint32_t)) == 1);
+        set_u32(bad, manifest_offset + 3*sizeof(uint32_t), UINT32_MAX);
+        reject(bad, manifest_offset + 5*sizeof(uint32_t));
+    }
+    size_t cursor = manifest_offset;
+    assert(u32(full.data, cursor) == 1); cursor += 2*sizeof(uint32_t);
+    const uint32_t npos = u32(full.data, cursor); cursor += 2*sizeof(uint32_t);
+    const uint32_t nlayer = u32(full.data, cursor); cursor += sizeof(uint32_t);
+    cursor += nlayer*(4*sizeof(uint32_t) + 2*sizeof(uint64_t) + sizeof(uint32_t));
+    const uint32_t ncell = u32(full.data, cursor); cursor += sizeof(uint32_t);
+    const uint32_t nruns = u32(full.data, cursor); cursor += sizeof(uint32_t) + size_t(nruns)*sizeof(uint32_t);
+    for (uint32_t i = 0; i < ncell; ++i) {
+        cursor += sizeof(uint32_t) + sizeof(uint64_t) + sizeof(llama_pos);
+        if (npos > 1) cursor += sizeof(llama_kv_cell_ext);
+        const uint32_t nseq = u32(full.data, cursor); cursor += sizeof(uint32_t) + size_t(nseq)*sizeof(llama_seq_id);
+    }
+    cursor += sizeof(uint64_t); // tail_ordinal
+    {
+        auto bad = full.data;
+        assert(u32(bad, cursor) <= 129);
+        set_u32(bad, cursor, UINT32_MAX); // record_count
+        reject(bad, cursor + 4*sizeof(uint32_t));
+    }
+    {
+        auto empty = make_cache();
+        auto truncated = full.data; truncated.pop_back(); write(truncated);
+        llama_file file(path, "rb");
+        llama_io_read_file_stream input(file, truncated.size());
+        bool rejected = false;
+        try { empty->state_read(input, 0, 0); } catch (const std::exception &) { rejected = true; }
+        assert(rejected && empty->seq_pos_max(0) == -1);
+    }
+    {
+        auto empty_source = make_cache();
+        auto empty_dest = make_cache();
+        writer empty_frame; empty_source->state_write(empty_frame, 0, 0);
+        write(empty_frame.data);
+        llama_file file(path, "rb");
+        llama_io_read_file_stream input(file, empty_frame.data.size());
+        bool published = false;
+        empty_dest->state_read(input, 0, 0);
+        input.on_commit([&] { published = true; });
+        assert(!published && empty_dest->seq_pos_max(0) == -1 && input.n_bytes() == empty_frame.data.size());
+        input.commit();
+        assert(published && empty_dest->seq_pos_max(0) == -1);
+        writer after; empty_dest->state_write(after, 0, 0);
+        assert(after.data == empty_frame.data);
+    }
+    {
+        // Keep one contiguous payload run but remap its eight destination
+        // cells to even slots. This exercises splitting a single wire run into
+        // fragmented read_tensor operations rather than just multiple runs.
+        const auto make_small = [&]() {
+            return std::make_unique<llama_kv_cache>(model, model.hparams, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                    false, false, false, 512, 1, 256, 0, LLAMA_SWA_TYPE_NONE, nullptr,
+                    llama_memory_i::layer_filter_cb{}, llama_memory_i::layer_reuse_cb{},
+                    llama_memory_i::layer_share_cb{}, "bounded_small_", 64, 128, GGML_TYPE_F16,
+                    128, false, 1, 0, false, cpu);
+        };
+        auto contiguous = make_small();
+        auto & c = const_cast<llama_kv_cells &>(contiguous->get_cells(llama_seq_id(0)));
+        for (uint32_t i = 0; i < 8; ++i) { c.pos_set(i, llama_pos(i)); c.seq_add(i, 0); }
+        for (int layer = 0; layer < 4; ++layer) {
+            int kind = 0;
+            for (ggml_tensor * tensor : { contiguous->get_k_storage(layer), contiguous->get_v_storage(layer) }) {
+                const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+                std::vector<uint8_t> row(row_size);
+                for (uint32_t i = 0; i < 8; ++i) {
+                    for (size_t j = 0; j < row.size(); ++j) row[j] = uint8_t(i*37 + j*13 + layer*19 + kind*53);
+                    ggml_backend_tensor_set(tensor, row.data(), size_t(i)*row_size, row.size());
+                }
+                ++kind;
+            }
+        }
+        writer state; contiguous->state_write(state, 0, 0);
+        const size_t length_offset = 7*sizeof(uint32_t);
+        const size_t manifest = length_offset + sizeof(uint32_t) + u32(state.data, length_offset) + 3*sizeof(uint64_t);
+        const uint32_t pos_dims = u32(state.data, manifest + 2*sizeof(uint32_t));
+        const uint32_t layer_count = u32(state.data, manifest + 4*sizeof(uint32_t));
+        size_t offset = manifest + 5*sizeof(uint32_t) + layer_count*(5*sizeof(uint32_t) + 2*sizeof(uint64_t));
+        assert(u32(state.data, offset) == 8 && u32(state.data, offset + 4) == 1 &&
+               u32(state.data, offset + 8) == 8);
+        offset += 3*sizeof(uint32_t);
+        for (uint32_t i = 0; i < 8; ++i) {
+            assert(u32(state.data, offset) == i);
+            set_u32(state.data, offset, 2*i);
+            offset += sizeof(uint32_t) + sizeof(uint64_t) + sizeof(llama_pos);
+            if (pos_dims > 1) offset += sizeof(llama_kv_cell_ext);
+            const uint32_t nseq = u32(state.data, offset); offset += sizeof(uint32_t) + nseq*sizeof(llama_seq_id);
+        }
+        const uint64_t checksum = XXH64(state.data.data(), state.data.size(), 0);
+        write(state.data); // the test frame's checksum is recomputed after remapping
+        auto remapped = make_small();
+        llama_file file(path, "rb");
+        llama_io_read_file_stream input(file, state.data.size());
+        remapped->state_read(input, 0, 0);
+        assert(input.checksum() == checksum && remapped->seq_pos_max(0) == -1);
+        input.commit();
+        assert(remapped->seq_pos_max(0) == 7);
+        for (int layer = 0; layer < 4; ++layer) {
+            for (bool key : {true, false}) {
+                auto * from = key ? contiguous->get_k_storage(layer) : contiguous->get_v_storage(layer);
+                auto * to = key ? remapped->get_k_storage(layer) : remapped->get_v_storage(layer);
+                const size_t row_size = ggml_row_size(from->type, from->ne[0]);
+                std::vector<uint8_t> a(row_size), b(row_size);
+                for (uint32_t i = 0; i < 8; ++i) {
+                    ggml_backend_tensor_get(from, a.data(), size_t(i)*row_size, row_size);
+                    ggml_backend_tensor_get(to, b.data(), size_t(2*i)*row_size, row_size);
+                    assert(a == b);
+                }
+            }
+        }
+    }
+    {
+        // Each saved run maps to a separate destination row. A bounded reader
+        // rejecting its third index must fail before any logical publication.
+        auto sparse = make_cache();
+        auto & sparse_cells = const_cast<llama_kv_cells &>(sparse->get_cells(llama_seq_id(0)));
+        for (uint32_t i = 0; i < 8; ++i) {
+            sparse_cells.pos_set(2*i, llama_pos(i));
+            sparse_cells.seq_add(2*i, 0);
+        }
+        writer state;
+        // Rows are intentionally distinct so a reordered fragmented restore
+        // cannot pass by copying identical payloads into the wrong cells.
+        for (int layer = 0; layer < 4; ++layer) {
+            int kind = 0;
+            for (ggml_tensor * tensor : { sparse->get_k_storage(layer), sparse->get_v_storage(layer) }) {
+                const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+                std::vector<uint8_t> row(row_size);
+                for (uint32_t i = 0; i < 8; ++i) {
+                    for (size_t j = 0; j < row.size(); ++j) row[j] = uint8_t(i*37 + j*13 + layer*19 + kind*53);
+                    ggml_backend_tensor_set(tensor, row.data(), size_t(2*i)*row_size, row.size());
+                }
+                ++kind;
+            }
+        }
+        sparse->state_write(state, 0, 0);
+        {
+            auto sparse_dest = make_cache();
+            write(state.data);
+            llama_file file(path, "rb");
+            llama_io_read_file_stream input(file, state.data.size());
+            sparse_dest->state_read(input, 0, 0);
+            assert(sparse_dest->seq_pos_max(0) == -1 && input.n_bytes() == state.data.size());
+            input.commit();
+            assert(sparse_dest->seq_pos_max(0) == 7);
+            writer after; sparse_dest->state_write(after, 0, 0);
+            assert(after.data == state.data);
+        }
+        {
+            // A legacy reader may still restore one selected sequence from a
+            // snapshot whose source capacity was larger than one.
+            auto legacy_state = state.data;
+            const size_t length_offset = 7*sizeof(uint32_t);
+            const uint32_t length = u32(legacy_state, length_offset);
+            const size_t manifest = length_offset + sizeof(uint32_t) + length + 3*sizeof(uint64_t);
+            set_u32(legacy_state, manifest + 3*sizeof(uint32_t), 2);
+            auto legacy_dest = make_cache();
+            reader legacy(legacy_state);
+            legacy_dest->state_read(legacy, 0, 0);
+            legacy.commit();
+            assert(legacy_dest->seq_pos_max(0) == 7);
+        }
+        auto empty = make_cache();
+        limited_index_reader input(state.data, 2);
+        bool rejected = false;
+        try { empty->state_read(input, 0, 0); } catch (const std::runtime_error & error) {
+            rejected = std::string(error.what()).find("index budget exceeded") != std::string::npos;
+        }
+        assert(rejected && input.indexed == 2 && !input.published && empty->seq_pos_max(0) == -1);
+        input.cancel();
+    }
+    std::puts("PASS: standard F16 tail >8 MiB bounded restore, replay, coverage and early malformed-frame refusal");
+}
+#endif
 
 static void test_standard_overflow_full_state() {
 #ifndef _WIN32
@@ -641,6 +999,9 @@ int main() {
     test_position_range_presence();
     test_hybrid_tail_graph_reuse();
     test_exact_tail_snapshot_layouts();
+#ifndef _WIN32
+    test_standard_tail_bounded_state();
+#endif
     tiny_model model;
     auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
     auto attention = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,

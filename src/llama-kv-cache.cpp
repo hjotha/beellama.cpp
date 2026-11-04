@@ -4868,6 +4868,10 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_read_manifest(
     if (result.saved_n_seq_max == 0 || (seq_id == -1 && result.saved_n_seq_max > n_seq_max)) {
         throw std::runtime_error("KV tail state sequence capacity does not fit the context");
     }
+    const bool bounded_tail_reader = io.has_bounded_tensor_reads() && has_tail_overlay() && !tail_metadata_only;
+    if (bounded_tail_reader && (seq_id < 0 || !state_streaming_restore_supported() || result.saved_n_seq_max != 1)) {
+        throw std::runtime_error("bounded KV tail restore requires a single-sequence source and destination");
+    }
     result.body_layers.resize(layer_count);
     for (uint32_t i = 0; i < layer_count; ++i) {
         auto & saved = result.body_layers[i];
@@ -4965,6 +4969,9 @@ llama_kv_cache::state_v2_manifest llama_kv_cache::state_v2_read_manifest(
     io.read(&tail_layer_count, sizeof(tail_layer_count));
     io.read(&provenance_count, sizeof(provenance_count));
     const uint64_t max_records = uint64_t(result.tail_payload_count)*result.saved_n_seq_max;
+    if (bounded_tail_reader && tail && record_count > tail->history_capacity()) {
+        throw std::runtime_error("bounded KV tail state has too many exact records");
+    }
     if (body_only) {
         if (record_count != 0 || result.tail_payload_count != 0 ||
                 tail_layer_count != 0 || provenance_count != 0) {
@@ -5174,6 +5181,15 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
     const bool self_contained = (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0;
     const bool reference_only_partial =
             (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 && body_payload_size == 0;
+    // Only the file-stream reader has a bounded, checksummed tensor index.
+    // Leave legacy host/device readers and other state representations intact.
+    const bool bounded_reader = io.has_bounded_tensor_reads();
+    if (bounded_reader && has_tail_overlay() && !tail_metadata_only &&
+            (flags != 0 || seq_id < 0 || !state_streaming_restore_supported() ||
+             manifest.body_only || reference_only_partial)) {
+        throw std::runtime_error("bounded KV tail restore does not support this state frame");
+    }
+    const bool bounded_stream = bounded_reader && has_tail_overlay() && !tail_metadata_only;
     state_cell_remap.clear();
     std::vector<body_chunk> body_chunks;
     std::vector<tail_chunk> tail_chunks;
@@ -5185,7 +5201,7 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
     };
 
     const size_t body_begin = io.n_bytes();
-    if (!on_device && !reference_only_partial) {
+    if (!on_device && !reference_only_partial && !bounded_stream) {
         for (uint32_t s = 0; s < manifest.streams.size(); ++s) {
             const auto & stream = manifest.streams[s];
             for (uint32_t l = 0; l < manifest.body_layers.size(); ++l) {
@@ -5231,12 +5247,12 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
             }
         }
     }
-    if (io.n_bytes() - body_begin != body_payload_size) {
+    if (!bounded_stream && io.n_bytes() - body_begin != body_payload_size) {
         throw std::runtime_error("invalid KV tail state body payload size");
     }
 
-    const size_t tail_begin = io.n_bytes();
-    if (!on_device) {
+    size_t tail_begin = io.n_bytes();
+    if (!on_device && !bounded_stream) {
         for (uint32_t l = 0; l < manifest.tail_layers.size(); ++l) {
             for (uint32_t payload = 0; payload < manifest.tail_payload_count; ++payload) {
                 if (manifest.tail_layers[l].has_k) {
@@ -5254,7 +5270,7 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
             }
         }
     }
-    if (io.n_bytes() - tail_begin != tail_payload_size) {
+    if (!bounded_stream && io.n_bytes() - tail_begin != tail_payload_size) {
         throw std::runtime_error("invalid KV tail state exact payload size");
     }
 
@@ -5502,7 +5518,7 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
         return (size_t(cell) + size_t(chunk.v_element)*v_cells[dst_stream].size())*
                 manifest.body_layers[chunk.layer].v_unit;
     };
-    if (!on_device) {
+    if (!on_device && !bounded_stream) {
         for (const auto & chunk : body_chunks) {
             const size_t unit = chunk.key ? manifest.body_layers[chunk.layer].k_row :
                     manifest.body_layers[chunk.layer].v_unit;
@@ -5511,6 +5527,45 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
                         body_offset(chunk, i), unit);
             }
         }
+    } else if (bounded_stream) {
+        // The file carries each saved run contiguously, but a valid destination
+        // can be fragmented. Index each contiguous destination subrun without
+        // ever retaining the body payload; the reader enforces its 8 MiB
+        // transfer buffer and logical index-entry cap before publication.
+        for (uint32_t s = 0; s < manifest.streams.size(); ++s) {
+            const auto & stream = manifest.streams[s];
+            auto read_runs = [&](uint32_t l, bool key, uint64_t unit) {
+                uint32_t ordinal = 0;
+                for (uint32_t run : stream.payload_runs) {
+                    body_chunk chunk { s, l, ordinal, run, 0, key, {} };
+                    for (uint32_t i = 0; i < run;) {
+                        const uint32_t cell = restored_cells[s][ordinal + i];
+                        if (unit && size_t(cell) > std::numeric_limits<size_t>::max()/unit) {
+                            throw std::runtime_error("KV tail state destination offset overflows size_t");
+                        }
+                        const size_t first = size_t(cell)*size_t(unit);
+                        uint32_t count = 1;
+                        while (count < run - i &&
+                                restored_cells[s][ordinal + i + count] == uint64_t(cell) + count) {
+                            ++count;
+                        }
+                        io.read_tensor(body_tensor(chunk), first, checked_bytes(unit, count));
+                        i += count;
+                    }
+                    ordinal += run;
+                }
+            };
+            for (uint32_t l = 0; l < manifest.body_layers.size(); ++l) {
+                read_runs(l, true, manifest.body_layers[l].k_row);
+            }
+            for (uint32_t l = 0; l < manifest.body_layers.size(); ++l) {
+                if (manifest.body_layers[l].has_v) read_runs(l, false, manifest.body_layers[l].v_unit);
+            }
+        }
+        if (io.n_bytes() - body_begin != body_payload_size) {
+            throw std::runtime_error("invalid KV tail state body payload size");
+        }
+        tail_begin = io.n_bytes();
     } else if (!reference_only_partial) {
         for (uint32_t s = 0; s < manifest.streams.size(); ++s) {
             const auto & stream = manifest.streams[s];
@@ -5609,7 +5664,7 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
         }
     }
 
-    if (!on_device) {
+    if (!on_device && !bounded_stream) {
         for (const auto & chunk : tail_chunks) {
             const auto & destinations = payload_slots[chunk.payload];
             const uint64_t row = chunk.key ? manifest.tail_layers[chunk.layer].k_row :
@@ -5637,6 +5692,9 @@ std::vector<std::vector<uint32_t>> llama_kv_cache::state_v2_read_payload_and_ins
             }
         }
     }
+    if (bounded_stream && io.n_bytes() - tail_begin != tail_payload_size) {
+        throw std::runtime_error("invalid KV tail state exact payload size");
+    }
     restored_tail_payload_slots = std::move(payload_slots);
     if (seq_id == -1) {
         for (llama_seq_id current = 0; current < int32_t(n_seq_max); ++current) {
@@ -5654,6 +5712,21 @@ bool llama_kv_cache::requires_state_for_partial_restore() const {
     // by later tokens. Preserve the overlay alongside recurrent state in a
     // partial checkpoint; its immutable body remains reference-only.
     return n_swa > 0 || has_tail_overlay();
+}
+
+bool llama_kv_cache::state_streaming_restore_supported() const {
+    if (!requires_state_for_partial_restore()) {
+        return true;
+    }
+    // Only a local, body-backed single-sequence F16 overlay uses the bounded
+    // v2 tensor-index path. Other tail/SWA layouts retain the existing refusal.
+    return !other && !tail_metadata_only && n_seq_max == 1 && n_stream == 1 &&
+           n_swa == 0 && swa_type == LLAMA_SWA_TYPE_NONE && !v_trans && allocation_position_split_p == 0 &&
+           payload_row_origin == 0 && tail && !layers.empty() && has_kv_body() &&
+           tail_type == GGML_TYPE_F16 &&
+           (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ||
+            tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY) &&
+           sc_info.empty() && !tail->has_pending_seq_cp() && !tail->has_batch_transaction();
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -5859,6 +5932,9 @@ void llama_kv_cache::state_read_impl(
     uint32_t marker;
     io.read(&marker, sizeof(marker));
     if (marker != LLAMA_KV_TAIL_STATE_MAGIC) {
+        if (io.has_bounded_tensor_reads() && has_tail_overlay() && !tail_metadata_only) {
+            throw std::runtime_error("bounded KV tail restore requires a versioned exact-tail frame");
+        }
         if (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT) {
             throw std::runtime_error(
@@ -5892,6 +5968,10 @@ void llama_kv_cache::state_read_impl(
             version != LLAMA_KV_TAIL_STATE_VERSION) {
         throw std::runtime_error("unsupported KV tail state version");
     }
+    if (io.has_bounded_tensor_reads() && has_tail_overlay() && !tail_metadata_only &&
+            version < LLAMA_KV_TAIL_STATE_VERSION_V2) {
+        throw std::runtime_error("bounded KV tail restore requires a v2 or newer frame");
+    }
     io.read(&state_flags, sizeof(state_flags));
     io.read(&state_tail_tokens, sizeof(state_tail_tokens));
     io.read(&state_tail_type, sizeof(state_tail_type));
@@ -5899,13 +5979,25 @@ void llama_kv_cache::state_read_impl(
         io.read(&state_storage_kind, sizeof(state_storage_kind));
         io.read(&state_rollback_tokens, sizeof(state_rollback_tokens));
     }
-    io.read_string(state_group_id);
     uint32_t lowest_layer = UINT32_MAX;
     for (const auto & layer : layers) {
         lowest_layer = std::min(lowest_layer, uint32_t(layer.il));
     }
     const std::string group_id = std::string(n_swa > 0 ? "swa@l" : "full@l") +
             std::to_string(lowest_layer == UINT32_MAX ? 0 : lowest_layer);
+    if (io.has_bounded_tensor_reads()) {
+        // Validate the length against the known group before allocating: a
+        // checksummed but malformed frame must not request an arbitrary string.
+        uint32_t group_size = 0;
+        io.read(&group_size, sizeof(group_size));
+        if (group_size != group_id.size()) {
+            throw std::runtime_error("KV tail state cache-group ID length does not match the context");
+        }
+        state_group_id.resize(group_size);
+        if (group_size) io.read(&state_group_id[0], group_size);
+    } else {
+        io.read_string(state_group_id);
+    }
     if (state_group_id != group_id) {
         throw std::runtime_error("KV tail state cache-group ID does not match the context");
     }
