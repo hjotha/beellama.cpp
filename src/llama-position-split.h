@@ -83,7 +83,7 @@ struct range_desc {
     uint32_t start     = 0; // inclusive
     uint32_t end       = 0; // exclusive
     uint8_t  backend  = 0; // 0 = CUDA, 1 = overflow companion (Vulkan or RPC host)
-    uint8_t  format   = 0; // 0 = KVarN4, 1 = Q4_0, 2 = Q8_0, 3 = F16 (logical contract only)
+    uint8_t  format   = 0; // 0 = KVarN4, 1 = Q4_0, 2 = Q8_0, 3 = F16, 4 = SAW INT4, 5 = TurboQuant NC K/V (logical contract only)
 };
 
 // Valida exatamente as faixas [0,P) e [P,C) para um conjunto de camadas.
@@ -127,8 +127,8 @@ inline std::string validate_ranges(const std::vector<range_desc> & descs,
         if (ovf->start != p || ovf->end != c) {
             return "faixa overflow deve ser [P,C)";
         }
-        if (local->backend != 0 || (local->format != 0 && local->format != 1 && local->format != 2 && local->format != 3)) {
-            return "faixa local deve ser CUDA (KVarN, Q4_0, Q8_0 ou F16)";
+        if (local->backend != 0 || (local->format != 0 && local->format != 1 && local->format != 2 && local->format != 3 && local->format != 4 && local->format != 5)) {
+            return "faixa local deve ser CUDA (KVarN, Q4_0, Q8_0, F16 ou SAW INT4)";
         }
         if (ovf->backend != 1 || (ovf->format != 1 && ovf->format != 2 && ovf->format != 3)) {
             return "faixa overflow deve ser um companion Q4_0, Q8_0 ou F16";

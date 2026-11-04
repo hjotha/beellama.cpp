@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include "fattn.cuh"
 #include "fattn-common.cuh"
+#include "../ggml-turboquant-nc.h"
+#include "turboquant-nc-view.h"
 #include "fattn-kvarn-dispatch.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
@@ -632,8 +634,14 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_TYPE_SAW_INT4:
+        case GGML_TYPE_TQNC_K:
+        case GGML_TYPE_TQNC_V:
+#endif
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_IQ4_NL: // converted to F16; no native vector pair
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -702,6 +710,13 @@ static bool ggml_cuda_fattn_pair_compiled(ggml_type type_K, ggml_type type_V) {
         return false;
     }
 
+    // SAW is materialized to F16; no packed vector attention kernel exists yet.
+    if (type_K == GGML_TYPE_SAW_INT4 || type_V == GGML_TYPE_SAW_INT4 ||
+            type_K == GGML_TYPE_TQNC_K || type_K == GGML_TYPE_TQNC_V ||
+            type_V == GGML_TYPE_TQNC_K || type_V == GGML_TYPE_TQNC_V) {
+        return false;
+    }
+
 #if defined(GGML_CUDA_FA_ALL_QUANTS)
     return true;
 #else
@@ -719,6 +734,21 @@ bool ggml_cuda_fa_pair_compiled(ggml_type type_K, ggml_type type_V) {
 
 bool ggml_cuda_flash_attn_ext_tail_supported(
         ggml_type body_k, ggml_type body_v, ggml_type tail_k, ggml_type tail_v, int64_t d_k, int64_t d_v) {
+    // These bodies dequantize back to the original domain before attention;
+    // the separate F16 tail is already in that same domain.
+    const bool custom_body =
+        (body_k == GGML_TYPE_SAW_INT4 && body_v == GGML_TYPE_SAW_INT4) ||
+        (body_k == GGML_TYPE_TQNC_K && body_v == GGML_TYPE_TQNC_V);
+    if (!custom_body && (body_k == GGML_TYPE_SAW_INT4 || body_v == GGML_TYPE_SAW_INT4 ||
+            body_k == GGML_TYPE_TQNC_K || body_k == GGML_TYPE_TQNC_V ||
+            body_v == GGML_TYPE_TQNC_K || body_v == GGML_TYPE_TQNC_V)) return false;
+    if (custom_body) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        return d_k == 256 && d_v == 256 && tail_k == GGML_TYPE_F16 && tail_v == GGML_TYPE_F16;
+#else
+        return false;
+#endif
+    }
     const bool body_supported = ggml_cuda_fattn_pair_compiled(body_k, body_v) ||
         (body_k == GGML_TYPE_IQ4_NL && body_v == GGML_TYPE_IQ4_NL);
     return body_supported &&
@@ -764,6 +794,81 @@ enum best_fattn_kernel {
 // contract below.
 static constexpr int GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC = GGML_FLASH_ATTN_EXT_OP_PARAM_CUDA_FORCE_VEC;
 
+// Quantized attention must be able to materialize a strided cache view safely.
+// View offsets are in packed blocks relative to the owning tensor, not relative
+// to the absolute device address.
+static bool ggml_cuda_block_tensor_valid(
+        const ggml_tensor * t, ggml_type type, size_t block_bytes, size_t alignment) {
+    if (!t || t->type != type || t->nb[0] != block_bytes) return false;
+    size_t span;
+    if (!ggml_cuda_tqnc_span(t, span) ||
+            (t->data && (uintptr_t(t->data) % alignment ||
+                         span - 1 > UINTPTR_MAX - uintptr_t(t->data)))) return false;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (t->nb[i] % block_bytes) return false;
+    }
+    const ggml_tensor * base = t;
+    size_t offset = 0;
+    int depth = 0;
+    while (base->view_src) {
+        if (++depth > 128 || base->view_offs > SIZE_MAX - offset) return false;
+        offset += base->view_offs;
+        base = base->view_src;
+    }
+    size_t base_span;
+    if (base->type != type || offset % block_bytes ||
+            !ggml_cuda_tqnc_span(base, base_span) || offset > base_span || span > base_span - offset) return false;
+    if (base->data && t->data) {
+        const uintptr_t addr = uintptr_t(base->data);
+        if (offset > UINTPTR_MAX - addr || uintptr_t(t->data) != addr + offset) return false;
+    }
+    return true;
+}
+
+static bool ggml_cuda_q4_lse_tensor_valid(const ggml_tensor * t) {
+    return ggml_cuda_block_tensor_valid(t, GGML_TYPE_Q4_0, sizeof(block_q4_0), alignof(block_q4_0));
+}
+
+// Narrow initial contract: Qwen35's D256/GQA6 single-sequence split cache.
+// Larger/other geometries stay rejected until their LSE paths are qualified.
+static bool ggml_cuda_q4_lse_geometry_supported(const ggml_tensor * dst) {
+    if (!dst || dst->op != GGML_OP_FLASH_ATTN_EXT) return false;
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(dst);
+    if (!q || !k || !v || !mask || !lse || q->type != GGML_TYPE_F32 ||
+            q->ne[0] != 256 || q->ne[1] <= 0 || q->ne[1] > 256 || q->ne[2] != 24 || q->ne[3] != 1 ||
+            q->nb[0] != sizeof(float) || !ggml_cuda_tqnc_tensor_valid(q) ||
+            !ggml_cuda_q4_lse_tensor_valid(k) || !ggml_cuda_q4_lse_tensor_valid(v) ||
+            k->ne[0] != 256 || k->ne[1] <= 0 || k->ne[1] % FATTN_KQ_STRIDE != 0 ||
+            k->ne[2] != 4 || k->ne[3] != 1 || !ggml_are_same_shape(k, v) ||
+            mask->type != GGML_TYPE_F16 || mask->nb[0] != sizeof(ggml_fp16_t) ||
+            mask->ne[0] != k->ne[1] || mask->ne[1] != q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            !ggml_cuda_tqnc_tensor_valid(mask) || dst->type != GGML_TYPE_F32 ||
+            dst->ne[0] != 256 || dst->ne[1] != 24 || dst->ne[2] != q->ne[1] || dst->ne[3] != 1 ||
+            !ggml_is_contiguous(dst) || !ggml_cuda_tqnc_tensor_valid(dst) ||
+            lse->type != GGML_TYPE_F32 || lse->ne[0] != 24 || lse->ne[1] != q->ne[1] ||
+            lse->ne[2] != 1 || lse->ne[3] != 1 || !ggml_is_contiguous(lse) ||
+            !ggml_cuda_tqnc_tensor_valid(lse) ||
+            ggml_get_op_params_i32(dst, GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC) != 0) return false;
+    for (int i = 4; i < GGML_MAX_SRC; ++i) {
+        if (dst->src[i]) return false;
+    }
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (q->nb[i] > INT32_MAX || mask->nb[i] > INT32_MAX ||
+                (i < 3 && (k->nb[i] > INT32_MAX || v->nb[i] > INT32_MAX))) return false;
+    }
+    const bool same_storage = v->view_src &&
+        (v->view_src == k || (v->view_src == k->view_src && v->view_offs == k->view_offs));
+    if (same_storage) {
+        if (v->view_src == k && v->view_offs != 0) return false;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) if (k->nb[i] != v->nb[i]) return false;
+    }
+    return true;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -775,6 +880,73 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
+    const bool iq4 = K->type == GGML_TYPE_IQ4_NL || V->type == GGML_TYPE_IQ4_NL;
+    const bool saw = K->type == GGML_TYPE_SAW_INT4 || V->type == GGML_TYPE_SAW_INT4;
+    const bool tqnc = K->type == GGML_TYPE_TQNC_K || K->type == GGML_TYPE_TQNC_V ||
+                      V->type == GGML_TYPE_TQNC_K || V->type == GGML_TYPE_TQNC_V;
+    const bool q4_lse = K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
+                        ggml_flash_attn_ext_has_lse_out(dst);
+    if (q4_lse && !ggml_cuda_q4_lse_geometry_supported(dst)) return BEST_FATTN_KERNEL_NONE;
+    if ((K->type == GGML_TYPE_IQ4_NL) != (V->type == GGML_TYPE_IQ4_NL)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    if (iq4 || saw) {
+        const bool reused_view = V->view_src &&
+                (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+        if (iq4 && K->ne[0] == 576 && !reused_view) return BEST_FATTN_KERNEL_NONE;
+        if (reused_view) {
+            if (V->view_src == K && V->view_offs != 0) return BEST_FATTN_KERNEL_NONE;
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                if (K->nb[i] != V->nb[i]) return BEST_FATTN_KERNEL_NONE;
+            }
+        }
+    }
+    if (iq4) {
+        const size_t block_size = ggml_type_size(GGML_TYPE_IQ4_NL);
+        if (K->nb[0] != block_size || V->nb[0] != block_size) return BEST_FATTN_KERNEL_NONE;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (K->nb[i] % block_size || V->nb[i] % block_size) return BEST_FATTN_KERNEL_NONE;
+        }
+    }
+    if (tqnc) {
+        if (K->type != GGML_TYPE_TQNC_K || V->type != GGML_TYPE_TQNC_V ||
+                K->ne[0] != GGML_TQNC_DIM || V->ne[0] != GGML_TQNC_DIM ||
+                K->nb[0] != sizeof(ggml_tqnc_key) || V->nb[0] != sizeof(ggml_tqnc_value) ||
+                Q->type != GGML_TYPE_F32 || Q->nb[0] != sizeof(float) || !ggml_cuda_tqnc_tensor_valid(Q) ||
+                !ggml_cuda_tqnc_tensor_valid(K) || !ggml_cuda_tqnc_tensor_valid(V) ||
+                !ggml_cuda_tqnc_tensor_valid(KQV) || !ggml_is_contiguous(KQV) || KQV->src[4] ||
+                (mask && (mask->type != GGML_TYPE_F16 || !ggml_cuda_tqnc_tensor_valid(mask) ||
+                          !ggml_is_contiguous(mask) || mask->ne[0] < K->ne[1] || mask->ne[1] < Q->ne[1])) ||
+                (V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs)))) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (K->ne[i] != V->ne[i]) return BEST_FATTN_KERNEL_NONE;
+        }
+        if (Q->ne[0] != K->ne[0] || Q->ne[3] != K->ne[3] || Q->ne[2] % K->ne[2] != 0 ||
+                KQV->ne[0] != V->ne[0] || KQV->ne[1] != Q->ne[2] ||
+                KQV->ne[2] != Q->ne[1] || KQV->ne[3] != Q->ne[3] ||
+                (mask && (mask->ne[2] != 1 || Q->ne[3] % mask->ne[3] != 0))) return BEST_FATTN_KERNEL_NONE;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (K->nb[i] % sizeof(ggml_tqnc_key) || V->nb[i] % sizeof(ggml_tqnc_value) ||
+                    Q->nb[i] % sizeof(float)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+        }
+    }
+    if (saw) {
+        if (K->type != GGML_TYPE_SAW_INT4 || V->type != GGML_TYPE_SAW_INT4 ||
+                K->ne[0] != QK_SAW_INT4 || V->ne[0] != QK_SAW_INT4 ||
+                K->nb[0] != sizeof(block_saw_int4_ggml) || V->nb[0] != sizeof(block_saw_int4_ggml)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (K->nb[i] % sizeof(block_saw_int4_ggml) || V->nb[i] % sizeof(block_saw_int4_ggml)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+        }
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -866,6 +1038,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const bool force_vector_kernel =
         ggml_get_op_params_i32(KQV, GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC) != 0;
+    if (q4_lse) {
+        // Vector Q4 does not publish final softmax metadata. Force the MMA
+        // materialization path, including when the query batch is 1 or 2.
+        return turing_mma_available(cc) ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+    }
     if (force_vector_kernel && turing_mma_available(cc) &&
             can_use_vector_kernel && Q->ne[1] == 1 && Q->ne[3] == 1) {
         return BEST_FATTN_KERNEL_VEC;
@@ -962,6 +1139,39 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+static bool ggml_cuda_saw_lse_supported(int device, const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(dst);
+    const bool compatible = k && v &&
+        ((k->type == GGML_TYPE_SAW_INT4 && v->type == GGML_TYPE_SAW_INT4) ||
+         (k->type == GGML_TYPE_TQNC_K && v->type == GGML_TYPE_TQNC_V) ||
+         (k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0 &&
+          ggml_cuda_q4_lse_geometry_supported(dst)));
+    if (!q || !k || !v || !lse || !compatible ||
+            q->ne[0] != QK_SAW_INT4 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+            lse->type != GGML_TYPE_F32 || lse->ne[0] != q->ne[2] ||
+            lse->ne[1] != q->ne[1] || lse->ne[2] != q->ne[3] || lse->ne[3] != 1 ||
+            !ggml_is_contiguous(lse) || (k->type == GGML_TYPE_TQNC_K && !ggml_cuda_tqnc_tensor_valid(lse))) {
+        return false;
+    }
+    for (int i = 5; i < GGML_MAX_SRC; ++i) {
+        if (dst->src[i]) {
+            return false;
+        }
+    }
+    return ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
+}
+
+static __global__ void ggml_cuda_saw_meta_to_lse(const float2 * meta, float * lse, int64_t n) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float2 m = meta[i];
+        lse[i] = m.y == 0.0f ? -INFINITY : m.x + logf(m.y);
+    }
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -1029,7 +1239,84 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
 #include "fattn-tail.cuh"
 static int g_kdisc_seen = 0;
 
+// The first custom-body tail implementation is limited to the tested
+// single-sequence Qwen35 geometry. Validate the actual operands before the
+// wrapper constructs packed temporary views or launches any GPU work.
+static bool ggml_cuda_custom_tail_geometry_supported(const ggml_tensor * dst) {
+    if (!dst || !dst->src[0] || !dst->src[1] || !dst->src[2] || !dst->src[3] ||
+            !dst->src[5] || !dst->src[6] || !dst->src[7] || !dst->src[8] || !dst->src[9]) return false;
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * kt = dst->src[5];
+    const ggml_tensor * vt = dst->src[6];
+    const ggml_tensor * mt = dst->src[7];
+    const ggml_tensor * qo = dst->src[8];
+    const ggml_tensor * rd = dst->src[9];
+    const bool saw = k->type == GGML_TYPE_SAW_INT4 && v->type == GGML_TYPE_SAW_INT4;
+    const bool nc = k->type == GGML_TYPE_TQNC_K && v->type == GGML_TYPE_TQNC_V;
+    const auto valid_half = [](const ggml_tensor * t) {
+        if (!t || t->type != GGML_TYPE_F16 || t->nb[0] != sizeof(ggml_fp16_t) ||
+                !ggml_cuda_tqnc_tensor_valid(t)) return false;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) if (t->nb[i] % sizeof(ggml_fp16_t)) return false;
+        return true;
+    };
+    const auto valid_i32 = [](const ggml_tensor * t) {
+        return t && t->type == GGML_TYPE_I32 && ggml_is_contiguous(t) && ggml_cuda_tqnc_tensor_valid(t);
+    };
+    if ((!saw && !nc) || q->type != GGML_TYPE_F32 || q->nb[0] != sizeof(float) ||
+            q->ne[0] != 256 || q->ne[1] <= 0 || q->ne[1] > 256 || q->ne[2] != 24 || q->ne[3] != 1 ||
+            !ggml_cuda_tqnc_tensor_valid(q) || k->ne[0] != 256 || k->ne[1] <= 0 || k->ne[1] > INT32_MAX ||
+            k->ne[1] % FATTN_KQ_STRIDE != 0 || k->ne[2] != 4 || k->ne[3] != 1 ||
+            !ggml_are_same_shape(k, v) || dst->type != GGML_TYPE_F32 ||
+            dst->ne[0] != 256 || dst->ne[1] != 24 || dst->ne[2] != q->ne[1] || dst->ne[3] != 1 ||
+            !ggml_is_contiguous(dst) || !ggml_cuda_tqnc_tensor_valid(dst) || dst->src[4] ||
+            !valid_half(mask) || mask->ne[0] != k->ne[1] || mask->ne[1] != q->ne[1] ||
+            mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            !valid_half(kt) || !valid_half(vt) || !valid_half(mt) ||
+            kt->ne[0] != 256 || vt->ne[0] != 256 || kt->ne[2] != 4 || vt->ne[2] != 4 ||
+            kt->ne[3] != 1 || vt->ne[3] != 1 || kt->ne[1] != vt->ne[1] ||
+            mt->ne[0] <= 0 || mt->ne[0] > 512 || mt->ne[1] != q->ne[1] ||
+            mt->ne[2] != 1 || mt->ne[3] != 1 || !valid_i32(qo) || !valid_i32(rd) ||
+            qo->ne[0] != q->ne[1] || qo->ne[1] != 1 ||
+            rd->ne[0] < 6 + mt->ne[0] || rd->ne[0] - 6 - mt->ne[0] > 512 || rd->ne[1] != 1 ||
+            ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0) return false;
+    if (saw) {
+        if (!ggml_cuda_block_tensor_valid(k, GGML_TYPE_SAW_INT4,
+                                         sizeof(block_saw_int4_ggml), alignof(block_saw_int4_ggml)) ||
+            !ggml_cuda_block_tensor_valid(v, GGML_TYPE_SAW_INT4,
+                                         sizeof(block_saw_int4_ggml), alignof(block_saw_int4_ggml))) return false;
+    } else {
+        if (!ggml_cuda_tqnc_tensor_valid(k) || !ggml_cuda_tqnc_tensor_valid(v)) return false;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (k->nb[i] % sizeof(ggml_tqnc_key) || v->nb[i] % sizeof(ggml_tqnc_value)) return false;
+        }
+    }
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) if (q->nb[i] % sizeof(float)) return false;
+    const ggml_tensor * kc = dst->src[10];
+    const ggml_tensor * vc = dst->src[11];
+    if ((kc == nullptr) != (vc == nullptr)) return false;
+    if (kc && (!valid_half(kc) || !valid_half(vc) || kc->ne[0] != 256 || vc->ne[0] != 256 ||
+               kc->ne[1] != vc->ne[1] || kc->ne[2] != 4 || vc->ne[2] != 4 ||
+               kc->ne[1] > 256 || kc->ne[3] != 1 || vc->ne[3] != 1)) return false;
+    if (kt->ne[1] > 1024) return false;
+    if (kt->ne[1] + (kc ? kc->ne[1] : 0) < mt->ne[0]) return false;
+    const ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(dst);
+    if (lse && (lse->type != GGML_TYPE_F32 || lse->ne[0] != 24 || lse->ne[1] != q->ne[1] ||
+                lse->ne[2] != 1 || lse->ne[3] != 1 || !ggml_is_contiguous(lse) ||
+                !ggml_cuda_tqnc_tensor_valid(lse))) return false;
+    float scale = 0, max_bias = 0, softcap = 0;
+    ggml_flash_attn_ext_get_alibi_params(dst, &scale, &max_bias, &softcap);
+    if (!std::isfinite(scale) || scale <= 0 || max_bias != 0 || softcap != 0) return false;
+    return true;
+}
+
 static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_tensor * dst) {
+    if (!dst || !dst->src[0] || !dst->src[1] || !dst->src[2] || !dst->src[3] ||
+            !dst->src[5] || !dst->src[6] || !dst->src[7] || !dst->src[8] || !dst->src[9]) {
+        return false;
+    }
     const ggml_tensor * qo = dst->src[8];
     const ggml_tensor * rd = dst->src[9];
     const ggml_tensor * kt = dst->src[5];
@@ -1037,9 +1324,13 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
     const ggml_tensor * kt_current = dst->src[10];
     const ggml_tensor * vt_current = dst->src[11];
     const int64_t tail_stride = dst->src[7]->ne[0];
+    if (tail_stride <= 0) return false;
     const int64_t compute_stride = ggml_cuda_tail_compute_stride(tail_stride);
     const int64_t body_map_offset = 6 + tail_stride;
-    if (!qo || !rd || qo->ne[0] <= 0 || qo->ne[1] <= 0 ||
+    if (qo->type != GGML_TYPE_I32 || rd->type != GGML_TYPE_I32 ||
+            kt->ne[0] != dst->src[0]->ne[0] || vt->ne[0] != dst->ne[0] ||
+            kt->ne[2] != dst->src[1]->ne[2] || vt->ne[2] != dst->src[2]->ne[2] ||
+            qo->ne[0] <= 0 || qo->ne[1] <= 0 ||
             rd->ne[0] < body_map_offset || rd->ne[1] != qo->ne[1]) {
         return false;
     }
@@ -1072,6 +1363,8 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
     for (int i = 5; i < GGML_MAX_SRC; ++i) {
         pass.src[i] = nullptr;
     }
+    // The packed internal pass must not inherit the parent's output LSE.
+    ggml_flash_attn_ext_set_lse_out(&pass, nullptr);
     ggml_cuda_tail_make_contiguous(pass, pass.ne[0], pass.ne[1], qo->ne[0], qo->ne[1], sizeof(float));
     // Compact decode tails up to two native KVarN groups use the direct
     // indexed-small kernel
@@ -1108,6 +1401,7 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
         for (int i = 5; i < GGML_MAX_SRC; ++i) {
             body.src[i] = nullptr;
         }
+        ggml_flash_attn_ext_set_lse_out(&body, nullptr);
         return ggml_cuda_get_best_fattn_kernel(device, &body) != BEST_FATTN_KERNEL_NONE;
     }
     return true;
@@ -1301,6 +1595,33 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    if (ggml_cuda_saw_lse_supported(ctx.device, dst)) {
+        ggml_tensor * lse = ggml_flash_attn_ext_get_lse_out(dst);
+        GGML_ASSERT(lse->data != nullptr);
+        const int64_t n = ggml_nelements(lse);
+        ggml_cuda_pool_alloc<float2> meta(ctx.pool(), n);
+        ggml_tensor meta_tensor = {};
+        meta_tensor.data = meta.get();
+        ggml_tensor pass = *dst;
+        pass.src[8] = &meta_tensor;
+        if (dst->src[1]->type == GGML_TYPE_Q4_0) {
+            // The public Q4 geometry rejects extra operands; src[8] here is the
+            // internal metadata buffer, so invoke the already-selected MMA
+            // route directly instead of re-running that public gate on pass.
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, &pass);
+        } else {
+            ggml_cuda_flash_attn_ext_dispatch(ctx, &pass);
+        }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (dst->src[1]->type == GGML_TYPE_TQNC_K && ggml_cuda_tqnc_has_failure()) return;
+#endif
+        if (n > 0) {
+            ggml_cuda_saw_meta_to_lse<<<(n + 255)/256, 256, 0, ctx.stream()>>>(meta.get(), (float *) lse->data, n);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+
     ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
 }
 
@@ -1328,6 +1649,12 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         return ggml_cuda_flash_attn_ext_kvarn_supported(device, dst);
     }
     if (has_exact_tail) {
+        const ggml_type body_k = dst->src[1]->type;
+        const ggml_type body_v = dst->src[2]->type;
+        const bool custom_body = body_k == GGML_TYPE_SAW_INT4 || body_v == GGML_TYPE_SAW_INT4 ||
+                                 body_k == GGML_TYPE_TQNC_K || body_k == GGML_TYPE_TQNC_V ||
+                                 body_v == GGML_TYPE_TQNC_K || body_v == GGML_TYPE_TQNC_V;
+        if (custom_body && !ggml_cuda_custom_tail_geometry_supported(dst)) return false;
         if (!ggml_cuda_flash_attn_ext_tail_supported(
                     dst->src[1]->type, dst->src[2]->type, dst->src[5]->type, dst->src[6]->type,
                     dst->src[0]->ne[0], dst->ne[0]) ||
@@ -1349,7 +1676,7 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     // Position-split LSE (plan §3.4, F1b): generic FA exports no LSE yet.
     // Decline explicitly (fail-closed) instead of running silently without it.
     if (lse_requested) {
-        return false;
+        return ggml_cuda_saw_lse_supported(device, dst);
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

@@ -15,7 +15,7 @@ struct connection final:j::v3_connection_authority {
     bool held_and_bound(const v3::session & s) override {return valid && s.authenticated;}
 };
 static rkva_request request(uint16_t op,uint64_t cycle,size_t size) {
-    rkva_request h{};h.magic=RKVA_MAGIC;h.version=RKVA_VERSION;h.op=op;h.cycle_id=cycle;h.session_id=RKVA_SESSION_NONE;h.payload_bytes=uint32_t(size);return h;
+    rkva_request h{};h.magic=RKVA_MAGIC;h.version=RKVA_VERSION_V2;h.op=op;h.cycle_id=cycle;h.session_id=RKVA_SESSION_NONE;h.payload_bytes=uint32_t(size);return h;
 }
 static j::v3_frame_builder builder(const v3::secret & key,const v3::session & session,const v3::anchor & anchor,
                                    const w::request & query,uint64_t cycle,bool corrupt=false) {
@@ -34,7 +34,7 @@ static std::pair<rkva_response,std::vector<uint8_t>> error_reply(const v3::secre
                                                                  const j::v3_issued_request & issued) {
     rkva_request q{};assert(v3::parse_request_header(issued.frame.data(),32,q));
     std::vector<uint8_t> body(issued.frame.begin()+32,issued.frame.end());
-    rkva_response r{};r.magic=RKVA_MAGIC;r.version=RKVA_VERSION;r.op=q.op;r.cycle_id=q.cycle_id;
+    rkva_response r{};r.magic=RKVA_MAGIC;r.version=RKVA_VERSION_V2;r.op=q.op;r.cycle_id=q.cycle_id;
     r.status=RKVA_ERR_STATE;r.payload_bytes=v3::prefix_bytes+220+v3::tag_bytes;
     std::vector<uint8_t> out;assert(v3::make_reply(key,session,q,body,r,nullptr,out)==v3::status::accepted);return {r,out};
 }

@@ -74,7 +74,7 @@ inline bool negotiated(uint16_t protocol, uint32_t offered, const rkva_hello_ack
     const uint32_t offers=RKVA_PROTO_MANAGED_REGISTRY_V1|RKVA_PROTO_MANAGED_AUTH_V2;
     const uint64_t caps=RKVA_CAP_MANAGED_REGISTRY_V1|RKVA_CAP_MANAGED_AUTH_V2;
     const uint32_t ops=rkva_registry_wire::operations|(1u<<RKVA_MANAGED_AUTH_HELLO);
-    return protocol==RKVA_VERSION && (offered&offers)==offers && (ack.reserved[0]&caps)==caps &&
+    return protocol==RKVA_VERSION_V2 && (offered&offers)==offers && (ack.reserved[0]&caps)==caps &&
            (ack.supported_ops&ops)==ops;
 }
 struct session {
@@ -109,7 +109,7 @@ inline void resp_header_bytes(const rkva_response & h,uint8_t * p) {
     rkva_registry_wire::put64(p+48,h.xbox_response_us);
 }
 inline bool hello_request_header(const rkva_request & h) {
-    return h.magic==RKVA_MAGIC && h.version==RKVA_VERSION && h.op==RKVA_MANAGED_AUTH_HELLO &&
+    return h.magic==RKVA_MAGIC && h.version==RKVA_VERSION_V2 && h.op==RKVA_MANAGED_AUTH_HELLO &&
            h.session_id==RKVA_SESSION_NONE && !h.layer_id && !h.n_tokens && h.payload_bytes==offer_bytes;
 }
 inline bool hello_response_header(const rkva_request & q,const rkva_response & r) {
@@ -126,10 +126,10 @@ inline bool copy_wire(const uint8_t * data,size_t length,std::array<uint8_t,N> &
 // default keys, automatic random source, negotiation fallback or credentials.
 inline status make_offer(const secret & key,const id & owner,uint64_t epoch,uint32_t flags,
                          const rkva_hello_ack & ack,const rkva_request & h,const nonce & client,nonce_guard * local,offer_wire & out) {
-    if (!hello_request_header(h) || !negotiated(RKVA_VERSION,flags,ack) || !epoch || rkva_registry_wire::all_zero(owner) ||
+    if (!hello_request_header(h) || !negotiated(RKVA_VERSION_V2,flags,ack) || !epoch || rkva_registry_wire::all_zero(owner) ||
         rkva_registry_wire::all_zero(client) || rkva_registry_wire::all_zero(key)) return status::invalid;
     std::array<uint8_t,offer_body_bytes> body{};
-    rkva_registry_wire::put32(body.data(),revision); rkva_registry_wire::put32(body.data()+4,RKVA_VERSION);
+    rkva_registry_wire::put32(body.data(),revision); rkva_registry_wire::put32(body.data()+4,RKVA_VERSION_V2);
     rkva_registry_wire::put_id(body.data()+8,owner); rkva_registry_wire::put64(body.data()+40,epoch);
     rkva_registry_wire::put32(body.data()+48,flags); rkva_registry_wire::put64(body.data()+52,ack.reserved[0]);
     rkva_registry_wire::put32(body.data()+60,ack.supported_ops); rkva_registry_wire::put32(body.data()+64,ack.server_version);
@@ -145,8 +145,8 @@ inline status make_offer(const secret & key,const id & owner,uint64_t epoch,uint
 }
 inline bool offer_fields(const offer_wire & offer,const id & owner,uint64_t epoch,uint32_t flags,const rkva_hello_ack & ack) {
     const uint8_t * p=offer.data();
-    return negotiated(RKVA_VERSION,flags,ack) && rkva_registry_wire::get32(p)==revision &&
-        rkva_registry_wire::get32(p+4)==RKVA_VERSION && rkva_registry_wire::get_id(p+8)==owner &&
+    return negotiated(RKVA_VERSION_V2,flags,ack) && rkva_registry_wire::get32(p)==revision &&
+        rkva_registry_wire::get32(p+4)==RKVA_VERSION_V2 && rkva_registry_wire::get_id(p+8)==owner &&
         rkva_registry_wire::get64(p+40)==epoch && epoch && !rkva_registry_wire::all_zero(owner) &&
         rkva_registry_wire::get32(p+48)==flags && rkva_registry_wire::get64(p+52)==ack.reserved[0] &&
         rkva_registry_wire::get32(p+60)==ack.supported_ops && rkva_registry_wire::get32(p+64)==ack.server_version;
@@ -204,7 +204,7 @@ inline status finish_hello(const secret & key,const id & owner,uint64_t epoch,ui
     client=make_session(h,r,offer,reply); return status::accepted;
 }
 inline bool command_header(const rkva_request & h) {
-    return h.magic==RKVA_MAGIC && h.version==RKVA_VERSION && rkva_registry_wire::valid_op(h.op) &&
+    return h.magic==RKVA_MAGIC && h.version==RKVA_VERSION_V2 && rkva_registry_wire::valid_op(h.op) &&
            h.session_id==RKVA_SESSION_NONE && !h.layer_id && !h.n_tokens && h.payload_bytes==command_bytes;
 }
 inline bool command_mac(const secret & key,const rkva_request & h,const uint8_t * body,digest & out) {
@@ -240,7 +240,7 @@ inline status accept_command(const secret & key,const session & s,const rkva_req
     out=parsed; return status::accepted;
 }
 inline bool response_header(const rkva_request & q,const rkva_response & r) {
-    return command_header(q) && r.magic==RKVA_MAGIC && r.version==RKVA_VERSION && r.op==q.op &&
+    return command_header(q) && r.magic==RKVA_MAGIC && r.version==RKVA_VERSION_V2 && r.op==q.op &&
            r.cycle_id==q.cycle_id && r.status<=0 && r.payload_bytes==reply_bytes;
 }
 inline bool response_mac(const secret & key,const rkva_request & h,const command_wire & command,

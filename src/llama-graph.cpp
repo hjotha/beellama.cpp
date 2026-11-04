@@ -22,6 +22,7 @@
 #include "llama-memory-hybrid-paged.h"
 #include "llama-memory-recurrent.h"
 #include "llama-position-split-merge.h"
+#include "llama-recurrent-zero.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -4897,18 +4898,15 @@ ggml_tensor * llm_graph_context::build_attn(
     if (use_kvarn && k_tail) {
         GGML_ASSERT(v_tail && kvarn_rot);
         k_tail = ggml_kvarn_wht_aux(ctx0, k_tail, kvarn_rot->ne[0]);
-        // msg57 F5: the KVarN FA un-rotates the V it loads from the records and
-        // the stage, and it applies the SAME transform to the attached tail V.
-        // The stored tail is in the ORIGINAL domain, so the tail V must be
-        // rotated in EVERY domain - not only in the fully rotated one, where it
-        // happened to be rotated before. Measured in
-        // tests/test-position-split-real-pair (domain ROTATED_K_ORIGINAL_V):
-        // rotated tail V -> NRMSE 3.168e-04 / maxO 4.297e-03 (PASS);
-        // unrotated tail V -> NRMSE 2.155e-01 / maxO 1.857e+00 (catastrophic).
-        v_tail = ggml_kvarn_wht_aux(ctx0, v_tail, kvarn_rot->ne[0]);
+        // Tail V must use the same output domain as the KVarN body.
+        if (use_kvarn_rotated_domain) {
+            v_tail = ggml_kvarn_wht_aux(ctx0, v_tail, kvarn_rot->ne[0]);
+        }
         if (k_tail_current) {
             k_tail_current = ggml_kvarn_wht_aux(ctx0, k_tail_current, kvarn_rot->ne[0]);
-            v_tail_current = ggml_kvarn_wht_aux(ctx0, v_tail_current, kvarn_rot->ne[0]);
+            if (use_kvarn_rotated_domain) {
+                v_tail_current = ggml_kvarn_wht_aux(ctx0, v_tail_current, kvarn_rot->ne[0]);
+            }
         }
     }
     ggml_tensor * kq_mask_tail = tail_route == LLAMA_KV_TAIL_ROUTE_NONE ? nullptr : inp->get_kq_mask_tail();
@@ -5435,10 +5433,9 @@ llm_graph_context::position_split_rpc_packet llm_graph_context::build_attn_posit
             // purely as HISTORY (validate_native_tail_operation(..., false)).
             // Overflow keys must never enter the local tail.
             k_tail_local = ggml_kvarn_wht_aux(ctx0, k_tail_local, kvarn_rot->ne[0]);
-            // Same rule as the single-range path above: the FA un-rotates the
-            // tail V too, so the stored (original-domain) tail V must be rotated
-            // in every domain. See the measurement cited there.
-            v_tail_local = ggml_kvarn_wht_aux(ctx0, v_tail_local, kvarn_rot->ne[0]);
+            if (use_kvarn_rotated_domain) {
+                v_tail_local = ggml_kvarn_wht_aux(ctx0, v_tail_local, kvarn_rot->ne[0]);
+            }
             // Same domain rule for the current segment: K is always rotated for
             // the KVarN Q-rot path, V only in the rotated-domain case.
         }
@@ -6449,10 +6446,9 @@ ggml_tensor * llm_graph_context::build_attn_position_split(
             // purely as HISTORY (validate_native_tail_operation(..., false)).
             // Overflow keys must never enter the local tail.
             k_tail_local = ggml_kvarn_wht_aux(ctx0, k_tail_local, kvarn_rot->ne[0]);
-            // Same rule as the single-range path above: the FA un-rotates the
-            // tail V too, so the stored (original-domain) tail V must be rotated
-            // in every domain. See the measurement cited there.
-            v_tail_local = ggml_kvarn_wht_aux(ctx0, v_tail_local, kvarn_rot->ne[0]);
+            if (use_kvarn_rotated_domain) {
+                v_tail_local = ggml_kvarn_wht_aux(ctx0, v_tail_local, kvarn_rot->ne[0]);
+            }
             // Same domain rule for the current segment: K is always rotated for
             // the KVarN Q-rot path, V only in the rotated-domain case.
         }
@@ -7730,9 +7726,7 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
-    // Note that this is a no-op when the view is zero-sized.
-    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    llama_build_recurrent_zero(ctx0, gf, states, state_size, rs_zero);
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
@@ -7839,8 +7833,7 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
     // decode path, but it is a real multi-sequence hazard; the correct fix is
     // to order the relocation AFTER the GDN read (build_rs's read-before-write
     // ordering), which is a graph-dependency refactor left as follow-up.
-    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    llama_build_recurrent_zero(ctx0, gf, states, state_size, rs_zero);
 
     ggml_tensor * states_extra = ggml_get_rows(ctx0, states, inp->s_copy_extra);
     ggml_build_forward_expand(gf,

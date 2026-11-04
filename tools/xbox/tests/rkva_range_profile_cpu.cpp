@@ -545,7 +545,15 @@ int main() {
     h.memory.gpu_local_available = true;
     h.memory.gpu_local_usage_bytes = 1075838976;
     h.memory.gpu_local_budget_bytes = 3985637376;
+    h.saw_int4_optimized_available = true;
+    h.saw_int4_optimized_status = "ready";
     const std::string json = r.json(h);
+    const auto opt_begin = json.find("\"optimized_kernels\":{");
+    const auto opt_end = json.find("},\"buckets\":{", opt_begin);
+    const auto saw_entry = json.find("\"saw_int4\":{\"available\":true,\"status\":\"ready\",\"fast_nq_max\":1}", opt_begin);
+    assert(opt_begin != std::string::npos && opt_end != std::string::npos && saw_entry < opt_end);
+    const std::string unavailable = Recorder().json(Header{});
+    assert(unavailable.find("\"saw_int4\":{\"available\":false,\"status\":\"\",\"fast_nq_max\":0}") != std::string::npos);
     assert(json.find("\"app_limit_bytes\":5368709120") != std::string::npos);
     assert(json.find("\"gpu_local_usage_bytes\":1075838976") != std::string::npos);
     assert(json.find("\"kvarn4_mq_qualified_precision_tail_tokens\":[128]") != std::string::npos);

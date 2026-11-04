@@ -89,6 +89,14 @@ typedef sycl::half2 ggml_half2;
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
+#define QK_SAW_INT4 256
+typedef struct {
+    uint8_t qs[QK_SAW_INT4 / 2];
+    float scale;
+    float zero;
+} block_saw_int4_ggml;
+static_assert(sizeof(block_saw_int4_ggml) == 136, "wrong saw_int4 block size/padding");
+
 #if defined(GGML_COMMON_DECL_CUDA) || defined(GGML_COMMON_DECL_HIP) || defined(GGML_COMMON_DECL_SYCL)
 // QR = QK / number of values before dequantization
 // QI = number of 32 bit integers before dequantization

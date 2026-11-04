@@ -1,6 +1,8 @@
 #pragma once
 
 #include "rkva-kvarn-range.h"
+#include "../../../../ggml/src/ggml-remote-attn/rkva-fp8-e4m3.h"
+#include "../../../../ggml/include/ggml-remote-attn-policy.h"
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -23,6 +25,29 @@ inline bool q8_fp8_lse_valid(const uint8_t* lse, const uint8_t* positions,
             std::memcpy(&bits, lse + (size_t(q) * n_heads + h) * 4, 4);
             if ((bits & 0x7f800000u) == 0x7f800000u && !(empty && bits == 0xff800000u))
                 return false;
+        }
+    }
+    return true;
+}
+
+// E4's empty serial prefix must return an exact zero OUT and -infinity LSE.
+inline bool e4_f16_prefix_results_valid(const uint16_t* out, const float* lse,
+        const uint8_t* positions, uint32_t n_queries, uint32_t n_heads, uint32_t dimension,
+        uint32_t origin) {
+    if (!out || !lse || !positions || !n_queries || n_queries > 9 ||
+            !n_heads || n_heads > 256 || dimension != 256) return false;
+    const uint64_t width = uint64_t(n_heads) * dimension;
+    for (uint32_t q = 0; q < n_queries; ++q) {
+        int32_t position;
+        std::memcpy(&position, positions + size_t(q) * sizeof(position), sizeof(position));
+        for (uint32_t h = 0; h < n_heads; ++h) {
+            if (!ggml_remote_attn_policy::e4_lse_valid(lse[uint64_t(q) * n_heads + h], position, origin))
+                return false;
+        }
+        if (ggml_remote_attn_policy::e4_empty_prefix(position, origin)) {
+            for (uint64_t d = 0; d < width; ++d) {
+                if ((out[uint64_t(q) * width + d] & 0x7fffu) != 0) return false;
+            }
         }
     }
     return true;
@@ -105,6 +130,43 @@ inline float f16_bits_to_f32(uint16_t h) {
     float out = 0.0f;
     std::memcpy(&out, &bits, sizeof(out));
     return out;
+}
+
+// Validate both planes before touching the live GPU buffers. Metadata is
+// little-endian FP16 and keys have a mandatory two-byte zero pad.
+inline bool turboquant_nc_planes_valid(const uint8_t* k, const uint8_t* v, size_t records) {
+    if ((!k || !v) && records) return false;
+    for (size_t i = 0; i < records; ++i) {
+        const uint8_t* kb = k + i * 132;
+        const uint8_t* vb = v + i * 132;
+        const uint16_t norm_bits = uint16_t(kb[128]) | uint16_t(kb[129] << 8);
+        const uint16_t scale_bits = uint16_t(vb[128]) | uint16_t(vb[129] << 8);
+        const uint16_t min_bits = uint16_t(vb[130]) | uint16_t(vb[131] << 8);
+        if (kb[130] || kb[131] || !f16_bits_finite(norm_bits) ||
+            !f16_bits_finite(scale_bits) || !f16_bits_finite(min_bits)) return false;
+        const float norm = f16_bits_to_f32(norm_bits);
+        const float scale = f16_bits_to_f32(scale_bits);
+        const float minimum = f16_bits_to_f32(min_bits);
+        if (norm < 0.0f || scale < 0.0f ||
+            !f16_bits_finite(f32_to_f16_bits(15.0f * scale + minimum))) return false;
+    }
+    return true;
+}
+
+inline bool turboquant_nc_output_valid(const uint8_t* out, const uint8_t* lse,
+                                       const uint8_t* positions, uint32_t queries,
+                                       uint32_t heads, uint32_t origin, uint32_t live,
+                                       bool narrow_output) {
+    if (!out || !lse || !positions || !queries || !heads ||
+        !q8_fp8_lse_valid(lse, positions, queries, heads, origin, live)) return false;
+    const uint64_t elements = uint64_t(queries) * heads * 256;
+    for (uint64_t i = 0; i < elements; ++i) {
+        float value;
+        std::memcpy(&value, out + i * sizeof(float), sizeof(value));
+        if (!std::isfinite(value) || (narrow_output &&
+            !f16_bits_finite(f32_to_f16_bits(value)))) return false;
+    }
+    return true;
 }
 
 inline uint8_t f16_to_fp8_bits(uint16_t h) {
@@ -258,7 +320,7 @@ inline bool peek_wire(const uint8_t* data, size_t bytes, uint32_t* out_wire) {
     rkva_range_attn attention{};
     std::memcpy(&attention, data + upload_offset + seg.upload_bytes, sizeof(attention));
     if (attention.wire != RKVA_WIRE_F32 && attention.wire != RKVA_WIRE_F16 &&
-        attention.wire != RKVA_WIRE_FP8) {
+        attention.wire != RKVA_WIRE_FP8 && attention.wire != RKVA_WIRE_FP8_E4M3FN) {
         return false;
     }
     *out_wire = attention.wire;
@@ -273,7 +335,7 @@ inline bool validate_wire(const uint8_t* data, size_t bytes, uint32_t n_queries,
     segments.clear();
     if (!data || bytes < sizeof(rkva_kvarn_range_bulk) || bytes > (256u << 20) ||
         (expected_wire != RKVA_WIRE_F32 && expected_wire != RKVA_WIRE_F16 &&
-         expected_wire != RKVA_WIRE_FP8) ||
+         expected_wire != RKVA_WIRE_FP8 && expected_wire != RKVA_WIRE_FP8_E4M3FN) ||
         !rkva_kvarn_range::valid_descriptor(descriptor, 256) ||
         !rkva_kvarn_range::serial_prefix(descriptor) || !n_head || !n_head_kv || n_head > 256 ||
         n_head_kv > 256 || !n_queries || n_queries > 512)
@@ -285,7 +347,7 @@ inline bool validate_wire(const uint8_t* data, size_t bytes, uint32_t n_queries,
         generation > UINT64_MAX - header.segment_count)
         return false;
     const uint64_t query_elem_bytes =
-        (expected_wire == RKVA_WIRE_FP8)                                          ? sizeof(uint8_t)
+        (expected_wire == RKVA_WIRE_FP8 || expected_wire == RKVA_WIRE_FP8_E4M3FN) ? sizeof(uint8_t)
         : (expected_wire == RKVA_WIRE_F16 || expected_wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t)
                                                                                   : sizeof(float);
     size_t offset = sizeof(header);
@@ -348,7 +410,12 @@ inline bool validate_wire(const uint8_t* data, size_t bytes, uint32_t n_queries,
                                                     u.live_count, coverage,
                                                     descriptor.precision_tail_tokens))
             return false;
-        if (expected_wire == RKVA_WIRE_FP8) {
+        if (expected_wire == RKVA_WIRE_FP8_E4M3FN) {
+            for (size_t j = 0; j < query_bytes; ++j) {
+                if ((data[part.query_offset + j] & 0x7fu) == 0x7fu)
+                    return false;
+            }
+        } else if (expected_wire == RKVA_WIRE_FP8) {
             for (size_t j = 0; j < query_bytes; ++j) {
                 uint8_t value;
                 std::memcpy(&value, data + part.query_offset + j, sizeof(value));

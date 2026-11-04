@@ -161,6 +161,9 @@
     <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-quants.c">
       <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
     </ClCompile>
+    <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-turboquant-nc.c">
+      <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
+    </ClCompile>
     <ClCompile Include="$(BeeLlamaRoot)ggml\src\ggml-threading.cpp">
       <ObjectFileName>$(IntDir)ggml_%(Filename)%(Extension).obj</ObjectFileName>
     </ClCompile>

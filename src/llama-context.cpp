@@ -25,6 +25,7 @@
 #include "llama-kvarn.h"
 #include "llama-kvarn-split-fused.h"
 #include "ggml-remote-attn.h"
+#include "ggml-remote-attn-policy.h"
 #include "rkva-native-state.h"
 #include "rkva-snapshot-digest.h"
 #include "llama-remote-snapshot.h"
@@ -512,8 +513,22 @@ llama_context::llama_context(
     const bool split_requested = params.kv_position_split_p != 0 ||
             (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP && params.ctx_other == nullptr &&
              requested_split_env && requested_split_env[0] && std::strcmp(requested_split_env, "0") != 0);
+    const bool nc_cache = params.type_k == GGML_TYPE_TQNC_K && params.type_v == GGML_TYPE_TQNC_V;
+    const bool saw_cache = params.type_k == GGML_TYPE_SAW_INT4 && params.type_v == GGML_TYPE_SAW_INT4;
+    const bool custom_tail_requested = (nc_cache || saw_cache) &&
+            (params.kv_tail_tokens || params.kv_tail_config || params.kv_tail_request);
+    if (custom_tail_requested && (split_requested || (params.remote_attn_host && params.remote_attn_host[0]))) {
+        throw std::invalid_argument("SAW and TurboQuant NC F16 tails are currently local CUDA only");
+    }
     const bool tcp_position_split = split_requested &&
             params.remote_attn_host && params.remote_attn_host[0] && !local_attn_dev;
+    const bool e4_wire_requested = ggml_remote_attn_policy::e4_requested(
+            std::getenv("GGML_RKVA_WIRE_FORMAT"), std::getenv("GGML_RKVA_NATIVE_BULK_WIRE"),
+            std::getenv("GGML_RKVA_NATIVE_BULK"));
+    if (!ggml_remote_attn_policy::e4_remote_mode_allowed(
+            params.remote_attn_host && params.remote_attn_host[0], tcp_position_split, e4_wire_requested)) {
+        throw std::runtime_error("E4M3FN requires TCP position-split KVarN4; refusing local fallback");
+    }
     if (tcp_position_split) {
         local_attn_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (!local_attn_dev) {
@@ -645,7 +660,9 @@ llama_context::llama_context(
                  cparams.remote_attn_cache_type_v == GGML_TYPE_F16);
         const bool local_format_supported =
                 (cparams.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) ||
-                (split_requested && (is_qx(params.type_k) || params.type_k == GGML_TYPE_F16));
+                (split_requested && (is_qx(params.type_k) || params.type_k == GGML_TYPE_F16 ||
+                 (params.type_k == GGML_TYPE_SAW_INT4 && params.type_v == GGML_TYPE_SAW_INT4) ||
+                 (params.type_k == GGML_TYPE_TQNC_K && params.type_v == GGML_TYPE_TQNC_V)));
         if (!local_attn_dev || !cparams.remote_attn_enabled || model.arch != LLM_ARCH_QWEN35 ||
                 cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
                 !local_format_supported ||
@@ -654,7 +671,7 @@ llama_context::llama_context(
                 cparams.remote_attn_prefill != 0 || !formats_supported) {
             throw std::invalid_argument(
                     "per-layer remote KV formats require Qwen35 target context, native Vulkan or TCP position-split, "
-                    "KVarN or standard Qx/F16 local cache, Q4/Q5/Q6/Q8 or matching TCP position-split F16 remote K/V, "
+                    "KVarN or standard Qx/F16/SAW local cache, Q4/Q5/Q6/Q8 or matching TCP position-split F16 remote K/V, "
                     "Flash Attention, KV offload, "
                     "one non-unified slot, and static prefill");
         }
@@ -669,7 +686,8 @@ llama_context::llama_context(
             params.kv_tail_type != GGML_TYPE_F16 && params.kv_tail_type != GGML_TYPE_BF16) {
         throw std::invalid_argument("KV tail type must be F16, BF16, or the cache-family default");
     }
-    cparams.kv_tail_type = params.kv_tail_type;
+    cparams.kv_tail_type = custom_tail_requested && params.kv_tail_type == GGML_TYPE_COUNT ?
+            GGML_TYPE_F16 : params.kv_tail_type;
     bool tail_request_resolved = false;
     bool mixed_additional_tail_requested = params.kv_tail_tokens > 0 || params.kv_tail_config != nullptr;
     if (params.kv_tail_request && params.kv_tail_config) {
@@ -688,8 +706,12 @@ llama_context::llama_context(
                     std::min(group.effective_window, cparams.n_ctx),
                     model.arch != LLM_ARCH_DEEPSEEK4 });
         }
+        auto tail_request = *params.kv_tail_request;
+        if (custom_tail_requested && tail_request.exact_type == GGML_TYPE_COUNT) {
+            tail_request.exact_type = GGML_TYPE_F16;
+        }
         const auto resolution = llama_kv_tail_request_resolve(
-                *params.kv_tail_request, groups,
+                tail_request, groups,
                 params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED);
         if (!resolution.valid) {
             throw std::invalid_argument("invalid model-bound KV tail request: " + resolution.error);
@@ -1087,6 +1109,15 @@ llama_context::llama_context(
             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
             LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
         }
+    }
+
+    if (custom_tail_requested && (model.arch != LLM_ARCH_QWEN35 || model.hparams.n_head() != 24 ||
+            model.hparams.n_head_kv() != 4 || cparams.kv_tail_type != GGML_TYPE_F16 ||
+            (cparams.kv_tail_tokens != 128 && cparams.kv_tail_tokens != 256) ||
+            model.hparams.n_swa != 0 || cparams.kv_tail_tokens >= cparams.n_ctx_seq ||
+            params.n_seq_max != 1 || params.kv_unified || params.n_rs_seq || params.kv_tail_rollback_tokens)) {
+        throw std::invalid_argument("SAW or TurboQuant NC tail requires local Qwen35 GQA24/4, F16, "
+                                    "128/256 tokens and a larger context");
     }
 
     // Position-split boundary (plan 3.1/3.8): multiple of 256, 0 < P < effective
@@ -2067,6 +2098,9 @@ std::vector<ggml_backend_t> layer_backends;
                 if (!ggml_backend_remote_attn_connect(backend_remote)) {
                     ggml_backend_free(backend_remote);
                     backend_remote = nullptr;
+                    if (e4_wire_requested) {
+                        throw std::runtime_error("E4M3FN was not negotiated with the RKVA server; refusing local fallback");
+                    }
                     if (tcp_position_split) {
                         throw std::runtime_error("TCP position-split requires a reachable RKVA range server; refusing Vulkan fallback");
                     }
@@ -2132,6 +2166,10 @@ std::vector<ggml_backend_t> layer_backends;
                     native_cache = dynamic_cast<llama_kv_cache_kvarn *>(hybrid->get_mem_attn_base());
                 }
                 if (!native_cache) throw std::runtime_error("native RPC owner is not a KVarN memory cache");
+                // Formats 4/5 use a native append owner only if the peer
+                // actually negotiated bulk; their generic Q4/Q8 fallback
+                // continues to serialize the ordinary companion normally.
+                native_cache->set_negotiated_native_rpc_owner(remote_native_kvarn_records_enabled());
                 native_cache->set_native_kvarn_rewind_capable(remote_native_kvarn_can_rewind());
                 native_cache->set_native_kvarn_rewind_preflight([this](llama_pos p0) {
                     return backend_remote && ggml_backend_remote_attn_native_kvarn_can_restore(backend_remote, p0);
@@ -7404,7 +7442,7 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
     // overflow cells and the generic reader continues to reject RKVK trailers.
     // enabled() also requires a connected, non-poisoned backend.
     const bool can_restore_clean_native_prefix = !require_native &&
-            remote_native_kvarn_records_enabled() && !remote_native_kvarn_transient_active() && memory &&
+            remote_native_kvarn_enabled() && !remote_native_kvarn_transient_active() && memory &&
             memory->state_seq_can_restore(seq_id, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL);
     const bool can_restore_native = require_native && remote_native_kvarn_snapshot_supported() &&
             !remote_native_kvarn_transient_active() && memory &&
@@ -8387,6 +8425,48 @@ const char * context_label = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
+    }
+
+    if (params.type_k == GGML_TYPE_SAW_INT4 || params.type_v == GGML_TYPE_SAW_INT4) {
+        if (params.type_k != GGML_TYPE_SAW_INT4 || params.type_v != GGML_TYPE_SAW_INT4 ||
+                !params.offload_kqv || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
+                params.kv_paged ||
+                params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            LLAMA_LOG_ERROR("%s: SAW INT4 requires matching K/V, CUDA KV offload, Flash Attention, and no paged cache or MTP draft context\n", __func__);
+            return nullptr;
+        }
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) continue;
+            auto * dev = model->dev_layer(int32_t(il));
+            const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+            if (!name || std::strncmp(name, "CUDA", 4) != 0 ||
+                    model->hparams.n_embd_head_k(il) != 256 || model->hparams.n_embd_head_v(il) != 256) {
+                LLAMA_LOG_ERROR("%s: SAW INT4 requires CUDA KV layers with 256-dimensional heads (layer %u)\n", __func__, il);
+                return nullptr;
+            }
+        }
+    }
+
+    if (params.type_k == GGML_TYPE_TQNC_K || params.type_k == GGML_TYPE_TQNC_V ||
+            params.type_v == GGML_TYPE_TQNC_K || params.type_v == GGML_TYPE_TQNC_V) {
+        if (params.type_k != GGML_TYPE_TQNC_K || params.type_v != GGML_TYPE_TQNC_V ||
+                !params.offload_kqv || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
+                params.kv_paged ||
+                params.n_seq_max != 1 || params.kv_unified || params.n_rs_seq || params.kv_tail_rollback_tokens ||
+                params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            LLAMA_LOG_ERROR("%s: TurboQuant NC requires matching K/V, CUDA KV offload, Flash Attention, one non-unified sequence, and no paged cache or speculative rollback\n", __func__);
+            return nullptr;
+        }
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) continue;
+            auto * dev = model->dev_layer(int32_t(il));
+            const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+            if (!name || std::strncmp(name, "CUDA", 4) != 0 ||
+                    model->hparams.n_embd_head_k(il) != 256 || model->hparams.n_embd_head_v(il) != 256) {
+                LLAMA_LOG_ERROR("%s: TurboQuant NC requires CUDA KV layers with 256-dimensional heads (layer %u)\n", __func__, il);
+                return nullptr;
+            }
+        }
     }
 
     if (params.kv_paged && params.type_k != params.type_v) {

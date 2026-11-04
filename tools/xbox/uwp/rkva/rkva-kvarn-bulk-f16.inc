@@ -118,7 +118,7 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
     uint32_t wire = RKVA_WIRE_F16;
     if (!rkva_kvarn_bulk::peek_wire(data, bytes, &wire))
         return ::fail(error, "native bulk f16: invalid wire");
-    if (wire != RKVA_WIRE_F16 && wire != RKVA_WIRE_FP8)
+    if (wire != RKVA_WIRE_F16 && wire != RKVA_WIRE_FP8 && wire != RKVA_WIRE_FP8_E4M3FN)
         return ::fail(error, "native bulk f16: unsupported wire format");
     if (fp8_gpu && (wire != RKVA_WIRE_FP8 || !ensure_bulk_fp8_gpu_pipelines()))
         return ::fail(error, "native bulk fp8: GPU codec unavailable/invalid input wire");
@@ -247,11 +247,21 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
             if (SUCCEEDED(map_hr) && mapped_q) {
                 if (fp8_gpu) {
                     std::memcpy(mapped_q, data + segment.query_offset, q_elems);
-                } else if (wire == RKVA_WIRE_FP8) {
+                } else if (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) {
                     uint16_t* dst_q16 = static_cast<uint16_t*>(mapped_q);
                     const uint8_t* src_fp8 = data + segment.query_offset;
+                    bool valid_query = true;
                     for (uint64_t k = 0; k < q_elems; ++k) {
-                        dst_q16[k] = rkva_kvarn_bulk::fp8_to_f16_bits(src_fp8[k]);
+                        if (wire == RKVA_WIRE_FP8_E4M3FN) {
+                            if (!rkva_e4::decode_f16(src_fp8[k], dst_q16[k])) { valid_query = false; break; }
+                        } else {
+                            dst_q16[k] = rkva_kvarn_bulk::fp8_to_f16_bits(src_fp8[k]);
+                        }
+                    }
+                    if (!valid_query) {
+                        transfer.query_f16_upload.resource->Unmap(0, nullptr);
+                        bulk_recording_ = false; s->valid = false; terminal_failure_ = true;
+                        return ::fail(error, "native bulk E4: invalid query");
                     }
                 } else {
                     std::memcpy(mapped_q, data + segment.query_offset, q_f16_bytes);
@@ -327,11 +337,18 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
                     timestamp(1 + uint32_t(i) * kTsBulkSlotsPerSegment + kTsBulkCopyEnd);
             }
         } else {
-            if (wire == RKVA_WIRE_FP8) {
+            if (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) {
                 const uint8_t* src_fp8 = data + segment.query_offset;
                 for (size_t e = 0; e < q_elems; ++e) {
-                    fallback_q_f32[e] = rkva_kvarn_bulk::f16_bits_to_f32(
-                        rkva_kvarn_bulk::fp8_to_f16_bits(src_fp8[e]));
+                    if (wire == RKVA_WIRE_FP8_E4M3FN) {
+                        if (!rkva_e4::decode_f32(src_fp8[e], fallback_q_f32[e])) {
+                            bulk_recording_ = false; s->valid = false; terminal_failure_ = true;
+                            return ::fail(error, "native bulk E4: invalid query");
+                        }
+                    } else {
+                        fallback_q_f32[e] = rkva_kvarn_bulk::f16_bits_to_f32(
+                            rkva_kvarn_bulk::fp8_to_f16_bits(src_fp8[e]));
+                    }
                 }
             } else {
                 const auto* q_f16 = reinterpret_cast<const uint16_t*>(data + segment.query_offset);
@@ -356,7 +373,7 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
         }
         if (prof && ok) {
             auto& sample = profile_->bulk.segments[i];
-            sample.query_bytes = q_elems * (wire == RKVA_WIRE_FP8 ? 1 : 2) + pos_bytes;
+            sample.query_bytes = q_elems * (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN ? 1 : 2) + pos_bytes;
             sample.out_bytes = (fp8_gpu ? q_elems : q_f16_bytes) + lse_bytes;
             sample.dispatches += gpu_convert ? 2 : 0;
         }
@@ -468,9 +485,13 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
             }
             std::memcpy(dst_lse, static_cast<const uint8_t*>(mapped) + q_f32_bytes, lse_bytes);
         }
-        for (uint64_t h = 0; finite_ok && h < heads; ++h) {
-            if (!std::isfinite(dst_lse[h])) {
-                finite_ok = false;
+        if (finite_ok && wire == RKVA_WIRE_FP8_E4M3FN) {
+            finite_ok = rkva_kvarn_bulk::e4_f16_prefix_results_valid(dst_out, dst_lse,
+                    data + segments[i].positions_offset, segments[i].n_queries, geo_.n_head, 256,
+                    s->range_descriptor.origin);
+        } else {
+            for (uint64_t h = 0; finite_ok && h < heads; ++h) {
+                if (!std::isfinite(dst_lse[h])) finite_ok = false;
             }
         }
         D3D12_RANGE empty{0, 0};

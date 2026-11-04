@@ -64,9 +64,15 @@ enum Storage : uint32_t {
     kStorageKvarn4 = 3,
     kStorageCount = 4,
 };
+// Native row formats use protocol storage bits, outside the indexed legacy
+// arrays. Keep these separate so reporting cannot index past kStorageCount.
+constexpr uint32_t kStorageSawInt4 = 1u << 3;
+constexpr uint32_t kStorageTurboquantNC = 1u << 5;
 
 // Bucket/report kernel name. Q4_0 keeps the 261 names byte for byte.
 inline const char* kernel_name(uint32_t storage, uint32_t mode) {
+    if (storage == kStorageSawInt4) return "saw_int4_rowlane";
+    if (storage == kStorageTurboquantNC) return "turboquant_nc";
     if (mode == kModeReference || !valid_mode(mode)) {
         return mode_name(mode);
     }
@@ -495,7 +501,8 @@ inline uint32_t bulk_upload_copy_regions(uint32_t storage, bool has_upload) {
     if (!has_upload) {
         return 0;
     }
-    return storage == kStorageQ4 || storage == kStorageQ8 ? 2u : 1u;
+    return storage == kStorageQ4 || storage == kStorageQ8 || storage == kStorageSawInt4 ||
+           storage == kStorageTurboquantNC ? 2u : 1u;
 }
 
 struct BulkEnvelopeSample {
@@ -563,6 +570,10 @@ struct Header {
     std::string gpu_timestamp_status;
     bool q4_optimized_available = false;
     std::string q4_optimized_status;
+    bool saw_int4_optimized_available = false;
+    std::string saw_int4_optimized_status;
+    bool turboquant_nc_available = false;
+    std::string turboquant_nc_status;
     // Per storage (index = Storage); the Q4 entry mirrors the fields above.
     bool optimized_available[kStorageCount] = {};
     std::string optimized_status[kStorageCount];
@@ -611,6 +622,10 @@ inline const char* storage_name(uint32_t storage) {
         return "q8_0";
     case 3:
         return "kvarn4";
+    case kStorageSawInt4:
+        return "saw_int4";
+    case kStorageTurboquantNC:
+        return "turboquant_nc";
     default:
         return "unknown";
     }
@@ -838,6 +853,18 @@ class Recorder {
                 ull(c.reference_by_storage[st]), h.optimized_available[st] ? kOptMaxQueries : 0u);
             o += buf;
         }
+        std::snprintf(buf, sizeof(buf),
+                      ",\"saw_int4\":{\"available\":%s,\"status\":\"%s\",\"fast_nq_max\":%u}",
+                      h.saw_int4_optimized_available ? "true" : "false",
+                      json_escape(h.saw_int4_optimized_status).c_str(),
+                      h.saw_int4_optimized_available ? 1u : 0u);
+        o += buf;
+        std::snprintf(buf, sizeof(buf),
+                      ",\"turboquant_nc\":{\"available\":%s,\"status\":\"%s\",\"fast_nq_max\":%u}",
+                      h.turboquant_nc_available ? "true" : "false",
+                      json_escape(h.turboquant_nc_status).c_str(),
+                      h.turboquant_nc_available ? kOptMaxQueries : 0u);
+        o += buf;
         o += '}';
         std::snprintf(
             buf, sizeof(buf),

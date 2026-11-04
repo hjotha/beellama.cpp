@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "ggml-saw-int4.h"
 #include "llama-kv-cache-state.h"
 #include "llama-kv-cache-update.h"
 #include "llama-position-split.h"
@@ -625,6 +626,13 @@ const  layer_reuse_cb & reuse,
         n_swa > 0 && !has_shared_layer,
     };
     tail_plan = llama_kv_tail_storage_plan_for(storage_request);
+    const bool custom_body = (type_k == GGML_TYPE_SAW_INT4 && type_v == GGML_TYPE_SAW_INT4) ||
+                             (type_k == GGML_TYPE_TQNC_K && type_v == GGML_TYPE_TQNC_V);
+    if (custom_body && tail_tokens > 0 && !tail_metadata_only && has_owned_layer &&
+            (tail_plan.kind != LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY || tail_plan.body_promoted ||
+             tail_plan.actual_body_type_k != type_k || tail_plan.actual_body_type_v != type_v)) {
+        throw std::runtime_error("SAW/NC tail requires a compact F16 overlay with the original 4-bit body");
+    }
     if (other && has_shared_layer && !has_owned_layer && other->has_compact_tail()) {
         // A bodyless full-window tail is the target cache's authoritative K/V
         // payload. Preserve that representation for read-only auxiliary views
@@ -1371,6 +1379,7 @@ const  layer_reuse_cb & reuse,
         bool attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
+            type_k != GGML_TYPE_SAW_INT4 && type_k != GGML_TYPE_TQNC_K &&
             ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
 
@@ -1384,6 +1393,7 @@ const  layer_reuse_cb & reuse,
         const bool attn_rot_v =
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
+            type_v != GGML_TYPE_SAW_INT4 && type_v != GGML_TYPE_TQNC_V &&
             ggml_is_quantized(type_v) &&
             hparams.n_embd_head_v() % 64 == 0;
 
@@ -1405,6 +1415,12 @@ const  layer_reuse_cb & reuse,
             //}
         }
     }
+
+    // SAW performs its own BDR, including when this cache shares cell metadata.
+    if (type_k == GGML_TYPE_SAW_INT4) n_rot_k = 0;
+    if (type_v == GGML_TYPE_SAW_INT4) n_rot_v = 0;
+    if (type_k == GGML_TYPE_TQNC_K) n_rot_k = 0;
+    if (type_v == GGML_TYPE_TQNC_V) n_rot_v = 0;
 
     LLAMA_LOG_INFO("%s: n_rot_k = %u, n_embd_head_k_all = %d\n", __func__, n_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: n_rot_v = %u, n_embd_head_k_all = %d\n", __func__, n_rot_v, n_embd_head_v_all);
@@ -3448,7 +3464,11 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * written = ggml_set_rows(ctx, k, k_cur, k_idxs);
+    if (has_compact_tail() && k->type == GGML_TYPE_SAW_INT4) {
+        written->op_params[GGML_SET_ROWS_OP_PARAM_SAW_CHECKED] = 1;
+    }
+    return written;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -3488,7 +3508,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        ggml_tensor * written = ggml_set_rows(ctx, v, v_cur, v_idxs);
+        if (has_compact_tail() && v->type == GGML_TYPE_SAW_INT4) {
+            written->op_params[GGML_SET_ROWS_OP_PARAM_SAW_CHECKED] = 1;
+        }
+        return written;
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {

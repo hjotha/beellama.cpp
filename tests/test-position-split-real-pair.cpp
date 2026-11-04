@@ -1350,22 +1350,18 @@ static void run_case(const env_t & env, const cfg_t & c) {
             obs_body_lse = ggml_flash_attn_ext_lse_out(gctx, obs_body_fa);
         }
         ggml_tensor * kt_r = ggml_kvarn_wht(gctx, kt_nat, D);
-        // Match production: native tail V is rotated in every body domain.
-        // The domain-3 kernel applies its inverse WHT to the tail contribution
-        // as well as the body, so passing stored-original V transforms it twice.
-        ggml_tensor * vt_r = ggml_kvarn_wht(gctx, vt_nat, D);
-        // Same dtype/domain contract as the body operands the FA consumes: the
-        // tail stays F16 (the stored exact representation) through the WHT and
-        // the FA runs in KVARN_DOMAIN_ROTATED, exactly like fa_b.
+        const bool original_v = g_domain_original_v && !g_force_cpu_fa1;
+        ggml_tensor * vt_r = original_v ? vt_nat : ggml_kvarn_wht(gctx, vt_nat, D);
+        // Tail K is rotated; tail V follows the body's output domain.
         CHECK(kt_r->type == GGML_TYPE_F16 && kt_r->ne[0] == D &&
               kt_r->ne[1] == n_tail_rows && kt_r->ne[2] == n_kvh);
         CHECK(vt_r->type == GGML_TYPE_F16 && vt_r->ne[0] == D &&
               vt_r->ne[1] == n_tail_rows && vt_r->ne[2] == n_kvh);
-        std::printf("  [%s] rotated tail operands: K dtype=%s ne=[%lld,%lld,%lld] "
-                    "V dtype=%s | FA domain=KVARN_DOMAIN_ROTATED (body and tail)\n",
+        std::printf("  [%s] tail operands: K dtype=%s ne=[%lld,%lld,%lld] "
+                    "V dtype=%s | V domain=%s\n",
                     g_case.c_str(), ggml_type_name(kt_r->type),
                     (long long) kt_r->ne[0], (long long) kt_r->ne[1], (long long) kt_r->ne[2],
-                    ggml_type_name(vt_r->type));
+                    ggml_type_name(vt_r->type), original_v ? "original" : "rotated");
         fa1 = ggml_kv_tail_attention_merge(gctx, fa_b, kt_r, vt_r,
                 tail_mask_nat, tail_qorder, tail_rundesc);
         // Production (llama-graph.cpp build_attn) and the native-tail graph test
@@ -1414,11 +1410,9 @@ static void run_case(const env_t & env, const cfg_t & c) {
         o1_rot = fa1;
         std::printf("  [%s] local route: body-only FA (%d keys)\n", g_case.c_str(), n_body_rows);
     }
-    // ROTATED returns O in the ROTATED domain. Production restores the original
-    // V domain BEFORE the merge (src/llama-graph.cpp:4604-4609); the normalized
-    // Hadamard is its own inverse, so the same op restores it. Comparing fa1 raw
-    // against original-domain V is what made O land outside the convex hull.
-    ggml_tensor * o1 = ggml_kvarn_wht(gctx, o1_rot, D);
+    // Restore O only when the local FA returns it in the rotated domain.
+    ggml_tensor * o1 = g_domain_original_v && !g_force_cpu_fa1 ?
+            o1_rot : ggml_kvarn_wht(gctx, o1_rot, D);
     CHECK(o1->ne[0] == D && o1->ne[1] == n_qh && o1->ne[2] == n_q);
 
     ggml_tensor * fa2 = ggml_flash_attn_ext(gctx, q_t, k2_t, v2_t, mask2, scale, 0.0f, 0.0f);
@@ -2819,29 +2813,15 @@ static void run_case(const env_t & env, const cfg_t & c) {
     // values (device records/stage) plus the ACTUAL exact-F16 tail values, so
     // an effective-key or precision substitution in the graph cannot pass.
     std::vector<float> k1h_use = k1h, v1h_use = v1h;
-    // ROTATED_K_ORIGINAL_V: the store writes BOTH sides in the rotated domain
-    // and the FA un-rotates V inside the kernel, so the oracle must compare
-    // against the INVERSE-WHT (original) body V. The Hadamard is orthogonal
-    // and auto-inverse, so wht_rows() applied once more yields the original V
-    // with the same F16/4-bit rounding already baked into the stored bytes.
+    // The materializer above already returns V in the original domain.
     if (g_domain_original_v && !g_force_cpu_fa1) {
-        std::vector<float> v_body_unrot;
-        if (!wht_rows(env, v1h, D, v_body_unrot)) {
-            std::printf("  [%s] host WHT of the body V failed\n", g_case.c_str());
-            ++g_checks; ++g_failures;
-            ggml_backend_sched_free(sched); ggml_free(gctx);
-            ggml_free(dctx_c); ggml_free(dctx_v);
-            ggml_backend_buffer_free(bcuda); ggml_backend_buffer_free(bvk);
-            return;
-        }
-        v1h_use = v_body_unrot;
         // F4_RP_DOMOV3_EMULATE=1: kernel-emulating oracle. The mma original-domain
         // loader writes the un-rotated V into a half2 tile, i.e. it rounds the
         // un-rotated V to F16 before the F32 accumulation. This variant applies
         // that rounding to the oracle V as well, so the residual tells us
         // whether the measured |O| error IS that rounding (and nothing else).
         if (getenv("F4_RP_DOMOV3_EMULATE") != nullptr) {
-            // v1h_use is ALREADY the un-rotated V (wht of the stored F16 values);
+            // v1h_use is already the materialized original-domain V;
             // the kernel rounds exactly that quantity to F16 before accumulating.
             std::vector<float> v_emul = v1h_use;
             size_t rounded = 0, total = 0;

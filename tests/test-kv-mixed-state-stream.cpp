@@ -962,13 +962,25 @@ static void test_stream_parse_view_integration() {
     CHECK(std::memcmp(v.payload(1), f.p1.data(), f.p1.size()) == 0);
 }
 
-static void test_compact_split_streaming() {
+static void test_compact_split_streaming(int local_kind = 0) {
+    const bool saw_local = local_kind != 0;
+    const bool tqnc_local = local_kind == 2;
     const uint32_t p = 512, c = 1024;
     position_split split;
     split.p = p; split.c = c; split.model_id = 0x1234567890abcdefull; split.rope_id = 0xfedcba0987654321ull;
     std::vector<uint8_t> local_bytes(128), overflow_bytes(2*1152), metadata(48);
     fill_pattern(local_bytes, 101); fill_pattern(overflow_bytes, 102); fill_pattern(metadata, 103);
     auto local = make_kvarn_layer(7, kv4v4, 4, 4, uint8_t(kvarn_domain::rotated), 0, 0, local_bytes.size());
+    if (saw_local) {
+        local = make_qx_layer(7, tqnc_local ? sx_tqnc_k : sx_saw_int4,
+                               tqnc_local ? sx_tqnc_v : sx_saw_int4, 0, local_bytes.size());
+        local.owner = owner_target; local.v_trans = 0;
+        local.k_rot = local.v_rot = uint8_t(rotation::none);
+        local.k_rot_width = local.v_rot_width = 0;
+        local.head_dim_v = 256; local.token_group = 256;
+        local.k_stride = 4*(tqnc_local ? 130 : 136);
+        local.v_stride = 4*(tqnc_local ? 132 : 136);
+    }
     local.range_end = p;
     auto overflow = make_qx_layer(7, sx_q4_0, sx_q4_0, 0, 0);
     overflow.owner = owner_target; overflow.v_trans = 0; overflow.head_dim_v = 256;
@@ -991,7 +1003,8 @@ static void test_compact_split_streaming() {
         }
         auto k = local;
         k.payload_cells = table_size; k.payload_rows = occupied_overflow ? 3 : 1;
-        k.payload_mode = partial ? mode_partial_overlay : mode_full;
+        k.payload_mode = partial ? (saw_local ? mode_resident_reference : mode_partial_overlay) : mode_full;
+        if (partial && saw_local) k.payload_bytes = 0;
         auto q = overflow;
         q.payload_cells = occupied_overflow ? 2 : 0; q.payload_rows = q.payload_cells;
         q.payload_bytes = !partial && occupied_overflow ? overflow_bytes.size() : 0;
@@ -1002,7 +1015,7 @@ static void test_compact_split_streaming() {
     const auto vector_encode = [&](const stream_input & input, std::vector<uint8_t> & out) {
         std::vector<layer_blob> blobs;
         for (const auto & d : input.layers) {
-            const auto & payload = d.kind == cache_kind::standard_qx ? overflow_bytes : local_bytes;
+            const auto & payload = d.range_id == 1 ? overflow_bytes : local_bytes;
             blobs.push_back({d, d.payload_bytes ? payload.data() : nullptr, size_t(d.payload_bytes)});
         }
         serialize_options options; options.split = input.split; options.source = input.source;
@@ -1050,11 +1063,48 @@ static void test_compact_split_streaming() {
                 CHECK(state.layers()[1].payload_rows == (occupied ? 2u : 0u));
                 CHECK(state.cells().size() == table_size && state.cells().back().pos == int32_t(table_size-1));
                 CHECK(state.payload_size(1) == ((!partial && occupied) ? overflow_bytes.size() : 0));
-                CHECK(std::memcmp(state.payload(0), local_bytes.data(), local_bytes.size()) == 0);
+                if (partial && saw_local) {
+                    CHECK(state.payload_size(0) == 0 && state.layers()[0].payload_mode == mode_resident_reference);
+                } else {
+                    CHECK(state.payload_size(0) == local_bytes.size());
+                    CHECK(std::memcmp(state.payload(0), local_bytes.data(), local_bytes.size()) == 0);
+                }
                 if (!partial && occupied) {
                     CHECK(std::memcmp(state.payload(1), overflow_bytes.data(), overflow_bytes.size()) == 0);
                 }
-                if (partial) {
+                if (saw_local) {
+                    expected_snapshot expected;
+                    expected.split = split; expected.capacity_cells = c; expected.metadata_version = 1;
+                    if (partial) { expected.owner_epoch = 11; expected.owner_id = 12; }
+                    for (const auto & d : state.layers()) expected.layers.push_back(expected_layer::from_desc(d));
+                    auto wrong_type = expected;
+                    wrong_type.layers[0].k_type = sx_q4_0;
+                    CHECK_THROWS(state.validate_expected_snapshot(wrong_type));
+                    state.validate_expected_snapshot(expected);
+                    unsigned stages = 0, finishes = 0, aborts = 0;
+                    commit_handlers handlers;
+                    handlers.stage_metadata = [](uint32_t, const uint8_t *, size_t) { return true; };
+                    handlers.stage_split = [](const position_split &) { return true; };
+                    handlers.stage_layer = [&](uint32_t layer, uint32_t range, const layer_desc & d,
+                                               const uint8_t * payload, size_t bytes) {
+                        CHECK(layer == 7 && range <= 1);
+                        if (range == 0) {
+                            CHECK(d.k_type == (tqnc_local ? sx_tqnc_k : sx_saw_int4) &&
+                                  d.v_type == (tqnc_local ? sx_tqnc_v : sx_saw_int4));
+                            CHECK(partial ? (payload == nullptr && bytes == 0) :
+                                  (bytes == local_bytes.size() && std::memcmp(payload, local_bytes.data(), bytes) == 0));
+                        } else {
+                            CHECK(d.k_type == sx_q4_0 && d.v_type == sx_q4_0);
+                            CHECK((partial || !occupied) ? bytes == 0 :
+                                  (bytes == overflow_bytes.size() && std::memcmp(payload, overflow_bytes.data(), bytes) == 0));
+                        }
+                        ++stages; return true;
+                    };
+                    handlers.finish = [&] { ++finishes; };
+                    handlers.abort = [&] { ++aborts; };
+                    state.commit(handlers);
+                    CHECK(stages == 2 && finishes == 1 && aborts == 0);
+                } else if (partial) {
                     CHECK_THROWS(state.project_split_to_pure_for_import(p, split.model_id, split.rope_id, {}));
                 } else if (occupied) {
                     auto target = input.layers[0]; target.range_start = 0; target.range_end = 0;
@@ -1104,6 +1154,34 @@ static void test_compact_split_streaming() {
     bad = full; bad.cells[p].pos = int32_t(c); both_refuse_before_callbacks(bad);
     bad = full; bad.cells[p].seq_ids.clear(); both_refuse_before_callbacks(bad);
     bad = full; bad.cells.resize(c+1); both_refuse_before_callbacks(bad);
+    if (saw_local) {
+        bad = full; bad.layers[0].k_type = sx_q4_0; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].v_type = sx_q4_0; both_refuse_before_callbacks(bad);
+        if (tqnc_local) {
+            bad = full; bad.layers[0].k_type = sx_tqnc_v; bad.layers[0].v_type = sx_tqnc_k;
+            both_refuse_before_callbacks(bad);
+        }
+        bad = full; bad.layers[0].v_trans = 1; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].owner = owner_draft_mtp; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].k_rot = uint8_t(rotation::hadamard);
+        bad.layers[0].k_rot_width = 256; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].v_rot = uint8_t(rotation::hadamard);
+        bad.layers[0].v_rot_width = 64; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].k_rot_width = 256; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].v_rot_width = 64; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].token_group = 128; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].head_dim_k = 128; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[0].head_dim_v = 128; both_refuse_before_callbacks(bad);
+        bad = full; --bad.layers[0].k_stride; both_refuse_before_callbacks(bad);
+        bad = full; --bad.layers[0].v_stride; both_refuse_before_callbacks(bad);
+        bad = full; bad.layers[1].k_type = bad.layers[1].v_type = sx_saw_int4;
+        bad.layers[1].token_group = 256;
+        bad.layers[1].k_stride = bad.layers[1].v_stride = 4*136;
+        bad.layers[1].layout = layout_standard_qx_rows;
+        both_refuse_before_callbacks(bad); // SAW cannot be the overflow companion
+    } else {
+        bad = full; bad.layers[0].tail_type = sx_saw_int4; both_refuse_before_callbacks(bad);
+    }
     bad = full; bad.split.reset(); bad.layers.erase(bad.layers.begin());
     bad.layers[0].range_id = 0; bad.layers[0].range_start = 0; bad.layers[0].range_end = 0;
     both_refuse_before_callbacks(bad); // compact cannot hide inside v1/v3
@@ -1138,6 +1216,60 @@ static void test_compact_split_streaming() {
         auto owner = std::make_shared<std::vector<uint8_t>>(malformed);
         CHECK_THROWS(snapshot::parse_view(owner->data(), owner->size(), owner));
         CHECK_THROWS(stream_describe(malformed.data(), malformed.size()));
+
+        std::vector<uint8_t> intact;
+        CHECK(stream_encode(full, intact, options));
+        auto corrupt = intact;
+        corrupt[104 + metadata.size() + 113] ^= 1; // local SAW payload
+        CHECK_THROWS(snapshot::parse(corrupt.data(), corrupt.size()));
+        auto bad_owner = std::make_shared<std::vector<uint8_t>>(corrupt);
+        CHECK_THROWS(snapshot::parse_view(bad_owner->data(), bad_owner->size(), bad_owner));
+        CHECK_THROWS(stream_describe(corrupt.data(), corrupt.size()));
+        CHECK(intact != corrupt);
+    }
+    if (saw_local) {
+        // Forge a geometrically valid SAW descriptor in the overflow range and
+        // repair the frame checksum. Parsing must reject the range, not rely on
+        // corruption detection or on the companion's original Q4 descriptor.
+        auto legacy = full;
+        legacy.layers[1].layout = layout_standard_qx_rows;
+        std::vector<uint8_t> malformed;
+        CHECK(stream_encode(legacy, malformed, options));
+        auto write16 = [&](size_t offset, uint16_t value) {
+            malformed[offset] = uint8_t(value); malformed[offset + 1] = uint8_t(value >> 8);
+        };
+        auto write32 = [&](size_t offset, uint32_t value) {
+            for (int i = 0; i < 4; ++i) malformed[offset + i] = uint8_t(value >> (8*i));
+        };
+        auto write64 = [&](size_t offset, uint64_t value) {
+            for (int i = 0; i < 8; ++i) malformed[offset + i] = uint8_t(value >> (8*i));
+        };
+        write16(overflow_desc + 5, sx_saw_int4);
+        write16(overflow_desc + 7, sx_saw_int4);
+        write32(overflow_desc + 28, 256);
+        write64(overflow_desc + 56, 4*136);
+        write64(overflow_desc + 64, 4*136);
+        rehash(malformed);
+        CHECK_THROWS(snapshot::parse(malformed.data(), malformed.size()));
+        auto owner = std::make_shared<std::vector<uint8_t>>(malformed);
+        CHECK_THROWS(snapshot::parse_view(owner->data(), owner->size(), owner));
+        CHECK_THROWS(stream_describe(malformed.data(), malformed.size()));
+    }
+
+    if (saw_local) {
+        auto pure_input = make_input(false, p, false);
+        pure_input.split.reset(); pure_input.layers.resize(1);
+        pure_input.layers[0].range_end = 0;
+        std::vector<uint8_t> reference, streamed;
+        CHECK(vector_encode(pure_input, reference));
+        CHECK(stream_encode(pure_input, streamed, options));
+        CHECK(streamed == reference);
+        auto pure = snapshot::parse(streamed.data(), streamed.size());
+        CHECK(!pure.has_split() && pure.layers().size() == 1 &&
+              pure.layers()[0].k_type == (tqnc_local ? sx_tqnc_k : sx_saw_int4));
+        CHECK(pure.payload_size(0) == local_bytes.size());
+        CHECK(std::memcmp(pure.payload(0), local_bytes.data(), local_bytes.size()) == 0);
+        return;
     }
 
     // Both import directions consume the real streamed bytes through the same
@@ -1187,6 +1319,8 @@ int main() {
 #endif
     test_stream_parse_view_integration();
     test_compact_split_streaming();
+    test_compact_split_streaming(true);
+    test_compact_split_streaming(2);
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

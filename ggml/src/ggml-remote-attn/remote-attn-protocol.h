@@ -11,8 +11,14 @@
 // Bump RKVA_VERSION on any wire change.
 
 static constexpr uint32_t RKVA_MAGIC = 0x41564B52; // "RKVA"
-static constexpr uint16_t RKVA_VERSION = 2;
+static constexpr uint16_t RKVA_VERSION = 3;
+// Version 2 remains the default and the authenticated-snapshot contract.
+static constexpr uint16_t RKVA_VERSION_V2 = 2;
 static constexpr uint16_t RKVA_VERSION_LEGACY = 1;
+
+static constexpr bool rkva_range_version(uint16_t version) {
+    return version == RKVA_VERSION_V2 || version == RKVA_VERSION;
+}
 
 enum rkva_op : uint16_t {
     RKVA_HELLO = 1,
@@ -63,6 +69,7 @@ enum rkva_wire : uint32_t {
     RKVA_WIRE_FP8 = 4, // Option A: 1-byte FP8 E5M2 for queries and outputs
     RKVA_WIRE_SPLITZIP = 5, // Option B: lossless exponent-compressed FP16
     RKVA_WIRE_OSCAR_INT2 = 6, // RANGE_UPLOAD only: OSCAR block_oscar_int2, 12 bytes / 32 values
+    RKVA_WIRE_FP8_E4M3FN = 7, // v3 op22 KVarN4: 1-byte E4M3FN Q and OUT
 };
 
 // v2 range extensions. Native storage capabilities use ack.reserved[0].
@@ -90,6 +97,9 @@ static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK = 1ull << 15;
 static constexpr uint64_t RKVA_CAP_NATIVE_SAW_INT4_BULK = 1ull << 23;
 // layout 7: native OSCAR INT2 overflow rows over op16/op22 (96 bytes per head row)
 static constexpr uint64_t RKVA_CAP_NATIVE_OSCAR_INT2_BULK = 1ull << 22;
+// layout 8: TurboQuant NC, two 132-byte-per-head planes (K has two zero pad bytes)
+static constexpr uint64_t RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK = 1ull << 24;
+static constexpr uint64_t RKVA_CAP_KVARN_BULK_E4M3FN = 1ull << 25;
 // Capability allocation in HELLO ack.reserved[0]:
 //   0..13  range/KVarN storage and bulk features
 //   14     RKVA_CAP_NATIVE_Q4_BULK (descriptor layout 4)
@@ -133,6 +143,8 @@ static_assert(sizeof(rkva_kvarn_cohort_entry) == 32, "cohort entry ABI");
 static constexpr uint32_t RKVA_KVARN_UPLOAD_RESET = 1u;
 static constexpr uint32_t RKVA_KVARN_UPLOAD_OMIT_STAGE = 2u;
 static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
+// Version 3 only; separate from the legacy HELLO chosen_wire field.
+static constexpr uint32_t RKVA_PROTO_BULK_E4M3FN = 1u << RKVA_WIRE_FP8_E4M3FN;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SNAPSHOT_V4 = 1u << 18;
 // Reserved managed-snapshot protocol flags. Advertised only by a Phase 4 build
@@ -140,6 +152,13 @@ static constexpr uint32_t RKVA_PROTO_NATIVE_SNAPSHOT_V4 = 1u << 18;
 static constexpr uint32_t RKVA_PROTO_MANAGED_REGISTRY_V1 = 1u << 19;
 static constexpr uint32_t RKVA_PROTO_MANAGED_AUTH_V2 = 1u << 20;
 static constexpr uint32_t RKVA_PROTO_MANAGED_FRAMING_V3 = 1u << 21;
+// The E4 experiment is tied to one v3 HELLO; it never aliases an E5 payload.
+static constexpr bool rkva_e4_wire_allowed(uint16_t request_version, uint16_t hello_version,
+                                            bool offered, bool available, uint32_t wire) {
+    return wire == RKVA_WIRE_FP8_E4M3FN ?
+        request_version == RKVA_VERSION && hello_version == request_version && offered && available :
+        !(hello_version == RKVA_VERSION && offered);
+}
 static constexpr uint32_t RKVA_SNAPSHOT_REVISION_NATIVE = 2;
 static constexpr uint32_t RKVA_NATIVE_SNAPSHOT_FORMAT = 1;
 static constexpr uint32_t RKVA_PROFILE_ENABLE = 1u << 0;
@@ -151,6 +170,7 @@ static constexpr uint32_t RKVA_RANGE_STORAGE_Q4_0 = 1u << 0; // CONFIG.reserved[
 static constexpr uint32_t RKVA_RANGE_STORAGE_Q8_0 = 1u << 1; // CONFIG.reserved[0]
 static constexpr uint32_t RKVA_RANGE_STORAGE_SAW_INT4 = 1u << 3;
 static constexpr uint32_t RKVA_RANGE_STORAGE_OSCAR_INT2 = 1u << 4;
+static constexpr uint32_t RKVA_RANGE_STORAGE_TURBOQUANT_NC = 1u << 5;
 static constexpr uint32_t RKVA_SESSION_RANGE =
     1u << 0; // CREATE_SESSION.flags; defer allocation until CONFIG
 

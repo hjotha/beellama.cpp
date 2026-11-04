@@ -159,7 +159,28 @@ void validate_desc(layer_desc & d, bool serializing) {
             }
             break;
         case cache_kind::standard_qx:
-            if (!is_standard_type(d.k_type) || !is_standard_type(d.v_type)) {
+            if (d.k_type == sx_saw_int4 || d.v_type == sx_saw_int4) {
+                if (d.k_type != sx_saw_int4 || d.v_type != sx_saw_int4 ||
+                        d.range_id != llama_position_split::kRangeLocal ||
+                        d.layout != layout_standard_qx_rows || d.owner != owner_target || d.v_trans != 0 ||
+                        d.k_rot != uint8_t(rotation::none) || d.v_rot != uint8_t(rotation::none) ||
+                        d.k_rot_width != 0 || d.v_rot_width != 0 ||
+                        d.token_group != 256 || d.head_dim_k != 256 || d.head_dim_v != 256 ||
+                        d.k_stride != uint64_t(d.n_head_kv)*136 || d.v_stride != uint64_t(d.n_head_kv)*136) {
+                    fail(where + ": invalid local SAW INT4 cache descriptor");
+                }
+            } else if (d.k_type == sx_tqnc_k || d.k_type == sx_tqnc_v ||
+                       d.v_type == sx_tqnc_k || d.v_type == sx_tqnc_v) {
+                if (d.k_type != sx_tqnc_k || d.v_type != sx_tqnc_v ||
+                        d.range_id != llama_position_split::kRangeLocal ||
+                        d.layout != layout_standard_qx_rows || d.owner != owner_target || d.v_trans != 0 ||
+                        d.k_rot != uint8_t(rotation::none) || d.v_rot != uint8_t(rotation::none) ||
+                        d.k_rot_width != 0 || d.v_rot_width != 0 ||
+                        d.token_group != 256 || d.head_dim_k != 256 || d.head_dim_v != 256 ||
+                        d.k_stride != uint64_t(d.n_head_kv)*130 || d.v_stride != uint64_t(d.n_head_kv)*132) {
+                    fail(where + ": invalid local TurboQuant NC cache descriptor");
+                }
+            } else if (!is_standard_type(d.k_type) || !is_standard_type(d.v_type)) {
                 fail(where + ": unknown standard qx type id");
             }
             if (d.layout != layout_standard_qx_rows && d.layout != layout_standard_qx_compact_rows) {

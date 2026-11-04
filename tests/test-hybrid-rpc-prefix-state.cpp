@@ -307,6 +307,142 @@ static void test_standard_overflow_full_state() {
 #endif
 }
 
+// Native row RPC state is not the Q4 companion, even though that companion is
+// used for allocation and metadata. Test the real hybrid reader and lineage.
+static void test_native_row_snapshot_lifecycle() {
+#ifndef _WIN32
+    struct saved_env {
+        const char * name;
+        bool present;
+        std::string value;
+        explicit saved_env(const char * n) : name(n), present(std::getenv(n) != nullptr),
+            value(present ? std::getenv(n) : "") {}
+        ~saved_env() { if (present) setenv(name, value.c_str(), 1); else unsetenv(name); }
+    } save_format("GGML_RKVA_UPLOAD_FORMAT"), save_legacy("GGML_RKVA_FORMAT"),
+      save_storage("GGML_RKVA_RANGE_STORAGE"), save_enable("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    unsetenv("GGML_RKVA_FORMAT"); unsetenv("GGML_RKVA_RANGE_STORAGE");
+    unsetenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    tiny_model model;
+    auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
+    const auto make_attention = [&](ggml_type companion) {
+        auto p = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
+                llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
+                512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,
+                [](int32_t il) { return il == 0; }, nullptr, 0, GGML_TYPE_F16, 0, 1,
+                nullptr, nullptr, [](int32_t il) { return il == 0; }, companion,
+                companion, false, cpu, 256, true);
+        p->set_mixed_state_identity(123, 456);
+        return p;
+    };
+    const auto make_recurrent = [&]() {
+        return std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+                false, 1, 1, 0, [](int32_t il) { return il == 1; });
+    };
+    const auto append = [](llama_kv_cache_kvarn * a, llama_pos pos, uint32_t n) {
+        auto state = a->init_kv_batch({batch(pos, n)});
+        assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
+        state->graph_compute_finish(GGML_STATUS_SUCCESS);
+    };
+
+    // Create legitimate standard-Q4/Q8 FULL bodies with occupied overflow.
+    std::vector<uint8_t> full[2];
+    for (int i = 0; i < 2; ++i) {
+        setenv("GGML_RKVA_UPLOAD_FORMAT", i ? "q8_0" : "q4_0", 1);
+        auto source_attn = make_attention(i ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_0);
+        auto * source = source_attn.get();
+        llama_memory_hybrid generic(model, std::move(source_attn), make_recurrent(), 256);
+        append(source, 0, 256); append(source, 256, 1);
+        writer out; generic.state_write(out, 0, 0); full[i] = std::move(out.data);
+    }
+
+    struct scenario { const char * name; ggml_type companion; bool negotiated_rows; };
+    for (const scenario test : {
+            scenario{"saw_int4", GGML_TYPE_Q4_0, false}, {"saw-int4", GGML_TYPE_Q4_0, false},
+            {"saw4", GGML_TYPE_Q4_0, false}, {"bdr_int4", GGML_TYPE_Q4_0, false},
+            {"turboquant_nc", GGML_TYPE_Q4_0, false}, {"turboquant-nc", GGML_TYPE_Q4_0, false},
+            {"tqnc", GGML_TYPE_Q4_0, false}, {"turboquant_4bit_nc", GGML_TYPE_Q4_0, false},
+            {"q4_0", GGML_TYPE_Q4_0, true}, {"q8_0", GGML_TYPE_Q8_0, true}}) {
+        const char * only = std::getenv("RKVA_SNAPSHOT_TEST_CASE");
+        if (only && std::strcmp(only, test.name)) continue;
+        if (std::getenv("RKVA_SNAPSHOT_TEST_TRACE")) std::fprintf(stderr, "snapshot scenario=%s\n", test.name);
+        setenv("GGML_RKVA_UPLOAD_FORMAT", test.name, 1);
+        auto attention = make_attention(test.companion);
+        auto * attn = attention.get();
+        if (test.negotiated_rows) {
+            assert(attn->supports_resident_prefix_restore()); // ordinary generic Q4/Q8 before ACK
+            attn->set_negotiated_native_rpc_owner(false); // actual layout 4/5, no snapshot codec
+        }
+        llama_memory_hybrid hybrid(model, std::move(attention), make_recurrent(), 256);
+        assert(!attn->supports_resident_prefix_restore());
+        assert(attn->get_seq_rm_capability().suffix_rollback_tokens == 0);
+        auto restore = [&](const std::vector<uint8_t> & bytes, llama_state_seq_flags flags, bool expected,
+                           const char * expected_error = nullptr) {
+            reader in(bytes); bool accepted = false;
+            std::string error;
+            try { hybrid.state_read(in, 0, flags); in.commit(); accepted = true; }
+            catch (const std::exception & e) { error = e.what(); in.cancel(); }
+            assert(accepted == expected);
+            if (expected_error) assert(error.find(expected_error) != std::string::npos);
+        };
+        writer empty_before; hybrid.state_write(empty_before, 0, 0);
+        const auto & standard_full = full[test.companion == GGML_TYPE_Q8_0 ? 1 : 0];
+        restore(standard_full, 0, false, "cannot restore a standard-cache overflow snapshot");
+        writer empty_after; hybrid.state_write(empty_after, 0, 0);
+        assert(empty_before.data == empty_after.data && attn->seq_pos_max(0) == -1);
+        restore(standard_full, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL, false);
+        assert(attn->seq_pos_max(0) == -1);
+
+        append(attn, 0, 256);
+        writer local; hybrid.state_write(local, 0, 0);
+        append(attn, 256, 1);
+        assert(!attn->state_seq_can_save(0, 0));
+        assert(!attn->can_seq_rm(0, 256, -1));
+        bool full_saved = false;
+        try { writer full; hybrid.state_write(full, 0, 0); full_saved = true; } catch (const std::exception &) {}
+        assert(!full_saved);
+        bool native_saved = false;
+        try { writer full; hybrid.state_write(full, 0, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL); native_saved = true; }
+        catch (const std::exception &) {}
+        assert(!native_saved);
+
+        attn->set_native_kvarn_rewind_capable(true);
+        bool resident = false;
+        unsigned preflights = 0;
+        attn->set_native_kvarn_rewind_preflight([&](llama_pos) { ++preflights; return resident; });
+        const auto partial = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        auto checkpoint = [&]() { writer out; hybrid.state_write(out, 0, partial); return out.data; };
+        const auto anchor = checkpoint();
+        restore(anchor, partial, false, "native partial restore is outside the retained original prefix window");
+        assert(preflights != 0 && attn->seq_pos_max(0) == 256 && checkpoint() == anchor);
+        resident = true;
+        append(attn, 257, 2);
+        const auto stale = checkpoint();
+        assert(attn->seq_rm(0, 257, -1));
+        append(attn, 257, 2);
+        restore(stale, partial, false, "mixed partial snapshot prefix was changed or its lineage expired");
+        restore(anchor, partial, true);
+        assert(attn->seq_pos_max(0) == 256);
+        assert(hybrid.seq_rm(0, 0, -1));
+        assert(!hybrid.state_seq_can_restore(0, 0)); // historical owner latch survives clear
+        // NATIVE_FULL admission here only asks whether a clean destination can
+        // be considered; the actual row FULL body still cannot be consumed.
+        assert(hybrid.state_seq_can_restore(0, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL));
+        restore(standard_full, LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL, false);
+        restore(local.data, 0, true); // only a local prefix may be re-admitted
+        assert(attn->seq_pos_max(0) == 255);
+    }
+    // Negotiation cannot switch ownership after any live rows have been stored.
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        setenv("GGML_RKVA_UPLOAD_FORMAT", type == GGML_TYPE_Q4_0 ? "q4_0" : "q8_0", 1);
+        auto late = make_attention(type);
+        append(late.get(), 0, 1);
+        bool refused = false;
+        try { late->set_negotiated_native_rpc_owner(false); } catch (const std::logic_error &) { refused = true; }
+        assert(refused && late->seq_pos_max(0) == 0 && late->supports_resident_prefix_restore());
+    }
+#endif
+}
+
 static void test_native_resident_prefix_state() {
 #ifndef _WIN32
     // Validate identical save/restore policy, including duplicate positions.
@@ -338,6 +474,7 @@ static void test_native_resident_prefix_state() {
                 nullptr, nullptr, [](int32_t il) { return il == 0; }, GGML_TYPE_Q4_0,
                 GGML_TYPE_Q4_0, false, cpu, 256, true);
         auto * attn = attention.get();
+        attn->set_negotiated_native_rpc_owner(true); // native KVarN records retain their codec path
         assert(!attn->supports_resident_prefix_restore());
         assert(attn->get_seq_rm_capability().suffix_rollback_tokens == 0);
         bool prefix_resident = true;
@@ -499,6 +636,7 @@ static void test_native_resident_prefix_state() {
 int main() {
     ggml_backend_load_all();
     test_standard_overflow_full_state();
+    test_native_row_snapshot_lifecycle();
     test_native_resident_prefix_state();
     test_position_range_presence();
     test_hybrid_tail_graph_reuse();

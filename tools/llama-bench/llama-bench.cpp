@@ -548,6 +548,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "q4_0") {
         return GGML_TYPE_Q4_0;
     }
+    if (s == "saw_int4" || s == "saw-int4" || s == "saw4" || s == "bdr_int4") {
+        return GGML_TYPE_SAW_INT4;
+    }
     if (s == "q4_1") {
         return GGML_TYPE_Q4_1;
     }
@@ -622,7 +625,8 @@ static ggml_type kvarn_fallback_cache_type(int32_t bits) {
     }
 }
 
-static bench_cache_type bench_cache_type_from_name(const std::string & s) {
+static bench_cache_type bench_cache_type_from_name(const std::string & s, bool key) {
+    if (s == "turboquant_4bit_nc") return { key ? GGML_TYPE_TQNC_K : GGML_TYPE_TQNC_V, 0 };
     if (s == "turbo2") {
         fprintf(stderr, "cache type 'turbo2' was removed in v0.4.0; redirecting to 'kvarn2'\n");
         return { kvarn_fallback_cache_type(2), 2 };
@@ -801,7 +805,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
                 std::vector<bench_cache_type> types;
                 for (const auto & t : p) {
-                    bench_cache_type type = bench_cache_type_from_name(t);
+                    bench_cache_type type = bench_cache_type_from_name(t, true);
                     if (type.ggml == GGML_TYPE_COUNT) {
                         invalid_param = true;
                         break;
@@ -821,7 +825,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
                 std::vector<bench_cache_type> types;
                 for (const auto & t : p) {
-                    bench_cache_type type = bench_cache_type_from_name(t);
+                    bench_cache_type type = bench_cache_type_from_name(t, false);
                     if (type.ggml == GGML_TYPE_COUNT) {
                         invalid_param = true;
                         break;

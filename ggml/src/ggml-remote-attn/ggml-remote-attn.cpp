@@ -9,6 +9,7 @@
 // disabled, leaving the local baseline untouched.
 
 #include "ggml-remote-attn.h"
+#include "ggml-remote-attn-policy.h"
 #include "ggml-remote-attn-cuda.h"
 #include "ggml-remote-attn-trace.h"
 #include "ggml-local-split.h"
@@ -20,6 +21,8 @@
 #include "rkva-q4-producer.h"
 #include "rkva-q8-producer.h"
 #include "rkva-saw-int4-producer.h"
+#include "rkva-turboquant-nc-producer.h"
+#include "rkva-fp8-e4m3.h"
 
 #if defined(_WIN32)
 #include <malloc.h> // _aligned_malloc / _aligned_free
@@ -59,6 +62,22 @@
 #define GGML_REMOTE_ATTN_NAME "RemoteAttn"
 
 namespace {
+
+static bool rkva_e4_requested() {
+    return ggml_remote_attn_policy::e4_requested(std::getenv("GGML_RKVA_WIRE_FORMAT"),
+            std::getenv("GGML_RKVA_NATIVE_BULK_WIRE"), std::getenv("GGML_RKVA_NATIVE_BULK"));
+}
+
+static bool rkva_f32_to_e4_batch(const float * src, uint8_t * dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) if (!rkva_e4::encode_f32(src[i], dst[i])) return false;
+    return true;
+}
+
+static bool rkva_e4_to_f32_batch(const uint8_t * src, float * dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) if (!rkva_e4::decode_f32(src[i], dst[i])) return false;
+    return true;
+}
+
 thread_local ggml_remote_attn_trace_event rkva_trace_tls{};
 std::atomic<uint64_t> rkva_trace_graph_counter{0};
 struct rkva_trace_buffer {
@@ -919,6 +938,8 @@ struct rkva_pending_native_state {
 struct ggml_backend_remote_attn_context {
     std::string host;
     uint16_t    port = 0;
+    uint16_t    protocol_version = RKVA_VERSION_V2;
+    bool        e4_requested = false;
 
     std::mutex  mutex;                 // serializes non-async calls and ACK commits
     rkva_socket sock;
@@ -1020,6 +1041,7 @@ struct ggml_backend_remote_attn_context {
     bool native_q4 = false;            // layout 4: Q4_0 rows in the native bulk pipeline
     bool native_q8 = false;            // layout 5: Q8_0 rows in the native bulk pipeline
     bool native_saw_int4 = false;      // layout 6: SAW-INT4 rows in the native bulk pipeline
+    bool native_turboquant_nc = false; // layout 8: TurboQuant NC rows in the native bulk pipeline
     bool native_serial_prefix = false;
     bool native_bulk = false;
     uint64_t native_generation = 0;
@@ -1310,7 +1332,7 @@ static bool rkva_transact(
         return stream_failure(false);
     }
     const rkva_request req {
-        RKVA_MAGIC, RKVA_VERSION, (uint16_t) op, ++ctx->cycle_id,
+        RKVA_MAGIC, ctx->protocol_version, (uint16_t) op, ++ctx->cycle_id,
         session_id, layer_id, n_tokens, payload_bytes
     };
     if (out_cycle) *out_cycle = req.cycle_id;
@@ -1358,7 +1380,7 @@ static bool rkva_transact(
     trace_header.event.bytes = sizeof(rsp);
     trace_header.event.value = rsp.xbox_prepare_us;
     }
-    if (rsp.magic != RKVA_MAGIC || rsp.version != RKVA_VERSION ||
+    if (rsp.magic != RKVA_MAGIC || rsp.version != req.version ||
         rsp.op != (uint16_t) op || rsp.cycle_id != req.cycle_id) {
         return stream_failure();
     }
@@ -1460,7 +1482,7 @@ static bool rkva_finish_native_bulk_job(
         return false;
     }
     const rkva_wire wire = slot.wire;
-    const size_t out_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t) :
+    const size_t out_elem_bytes = (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) ? sizeof(uint8_t) :
                                   (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t) :
                                   sizeof(float);
     const size_t out_bytes = size_t(slot.nq) * slot.out_width * out_elem_bytes;
@@ -1492,6 +1514,9 @@ static bool rkva_finish_native_bulk_job(
     if (slot.epoch != ctx->range_epoch || ctx->failed) {
         return false;
     }
+    if (wire == RKVA_WIRE_FP8_E4M3FN && (slot.pos_scratch.size() != slot.nq ||
+            !ggml_remote_attn_policy::e4_reply_valid(reply.data(), reply.size(), slot.nq,
+                    slot.out_width, ctx->geo.n_head, slot.pos_scratch.data(), ctx->range_origin))) return false;
     auto response_trace = slot.trace;
     response_trace.cycle = cycle;
     if (ggml_remote_attn_trace_enabled()) ggml_remote_attn_trace_context(&response_trace);
@@ -1512,17 +1537,20 @@ static bool rkva_finish_native_bulk_job(
                 slot.nq, slot.out_width, ctx->geo.n_head, slot.output, slot.output_stride);
         slot.cuda_context_retired = unpacked;
         if (!unpacked) return false;
-    } else if (wire == RKVA_WIRE_FP8) {
+    } else if (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) {
         const auto * src_fp8 = reinterpret_cast<const uint8_t *>(reply.data());
         const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
         for (size_t row = 0; row < slot.nq; ++row) {
             auto * dst = static_cast<float *>(static_cast<void *>(slot.output + row * slot.output_stride));
-            if (!rkva_fp8_to_f32_batch(src_fp8 + row * slot.out_width, dst, slot.out_width)) {
+            const bool decoded = wire == RKVA_WIRE_FP8_E4M3FN ?
+                rkva_e4_to_f32_batch(src_fp8 + row * slot.out_width, dst, slot.out_width) :
+                rkva_fp8_to_f32_batch(src_fp8 + row * slot.out_width, dst, slot.out_width);
+            if (!decoded) {
                 return false;
             }
             for (size_t h = 0; h < ctx->geo.n_head; ++h) {
                 const float lse_val = src_lse[row * ctx->geo.n_head + h];
-                if (!std::isfinite(lse_val)) return false;
+                if (wire != RKVA_WIRE_FP8_E4M3FN && !std::isfinite(lse_val)) return false;
                 dst[slot.out_width + h] = lse_val;
             }
         }
@@ -1647,6 +1675,7 @@ static void rkva_destroy_poisoned_state_locked(ggml_backend_remote_attn_context 
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
+    ctx->native_turboquant_nc = false;
     ctx->native_serial_prefix = false;
     ctx->native_bulk = false;
     ctx->async_local_remote = false;
@@ -1790,7 +1819,7 @@ static void rkva_prefetch_two_frames(
                 slot->epoch != ctx->range_epoch || ctx->failed) return false;
         frame f;
         f.slot = slot;
-        f.request = {RKVA_MAGIC, RKVA_VERSION, RKVA_KVARN_RANGE_BULK_ATTN,
+        f.request = {RKVA_MAGIC, ctx->protocol_version, RKVA_KVARN_RANGE_BULK_ATTN,
             ++ctx->cycle_id, slot->session, slot->layer, slot->nq,
             uint32_t(slot->payload.size())};
         slot->response_cycle = f.request.cycle_id;
@@ -1879,7 +1908,7 @@ static void rkva_prefetch_two_frames(
                     const auto & req = receiving.request;
                     const size_t expected = size_t(receiving.slot->nq) *
                         (receiving.slot->out_width + size_t(ctx->geo.n_head) * sizeof(float));
-                    if (rsp.magic != RKVA_MAGIC || rsp.version != RKVA_VERSION ||
+                    if (rsp.magic != RKVA_MAGIC || rsp.version != req.version ||
                             rsp.op != req.op || rsp.cycle_id != req.cycle_id ||
                             rsp.status != RKVA_OK || rsp.payload_bytes != expected ||
                             rsp.payload_bytes > (256u << 20)) {
@@ -2261,6 +2290,10 @@ static std::unique_ptr<rkva_native_owner> rkva_new_native_owner(
         return std::unique_ptr<rkva_native_owner>(new rkva_saw_int4_producer(
                 ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv));
     }
+    if (ctx->native_turboquant_nc) {
+        return std::unique_ptr<rkva_native_owner>(new rkva_turboquant_nc_producer(
+                ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv));
+    }
     return std::unique_ptr<rkva_native_owner>(new rkva_kvarn_producer(
             ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv,
             ctx->geo.sinkhorn_iters, ctx->native_store, ctx->native_tail_tokens,
@@ -2299,7 +2332,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
             !ggml_is_contiguous(keys) || !ggml_is_contiguous(values) ||
             !ggml_are_same_shape(keys, values) || keys->ne[0] != 256 ||
             keys->ne[1] != ctx->geo.n_head_kv || keys->ne[2] != int64_t(nq) ||
-            keys->ne[3] != 1 || nq > 256 || (!ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4)) return false;
+            keys->ne[3] != 1 || nq > 256 || (!ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc)) return false;
     auto & cached = ctx->range_layers[layer];
     auto & owner = ctx->native_layers[layer];
     if ((owner && cached.epoch != ctx->range_epoch) ||
@@ -2326,7 +2359,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         // Revision 3 explicitly negotiates query-prefix semantics. Keep its
         // chunks within the qualified optimized kernel's nine-query bound;
         // prefill uses eight, verification batches keep their actual shape.
-        const size_t chunk_limit = (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4) ? (nq > 9 ? 8 : nq) :
+        const size_t chunk_limit = (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) ? (nq > 9 ? 8 : nq) :
             ctx->native_serial_prefix ? (nq > 9 ? 8 : nq) : 1;
         std::vector<uint8_t> bulk_payload;
         const uint32_t segments = uint32_t((nq + chunk_limit - 1) / chunk_limit);
@@ -2349,7 +2382,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
             if (ctx->native_bulk) {
                 const rkva_kvarn_range_bulk_segment segment {uint32_t(ctx->payload_tx.size()), uint32_t(chunk)};
                 const rkva_wire wire = ctx->range_wire;
-                const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t) :
+                const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) ? sizeof(uint8_t) :
                                             (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t) :
                                             sizeof(float);
                 const rkva_range_attn attention {wire, 0, {0, 0}};
@@ -2361,7 +2394,11 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
                 std::memcpy(dst, ctx->payload_tx.data(), ctx->payload_tx.size()); dst += ctx->payload_tx.size();
                 std::memcpy(dst, &attention, sizeof(attention)); dst += sizeof(attention);
                 std::memcpy(dst, ctx->pos_scratch.data() + first, chunk * sizeof(int32_t)); dst += chunk * sizeof(int32_t);
-                if (wire == RKVA_WIRE_FP8) {
+                if (wire == RKVA_WIRE_FP8_E4M3FN) {
+                    if (!rkva_f32_to_e4_batch(bulk_queries + first * out_width, dst, chunk * out_width)) {
+                        ctx->failed = true; return false;
+                    }
+                } else if (wire == RKVA_WIRE_FP8) {
                     uint8_t * dst_fp8 = dst;
                     if (!rkva_f32_to_fp8_batch(bulk_queries + first * out_width, dst_fp8, chunk * out_width)) {
                         ctx->failed = true; return false;
@@ -2432,7 +2469,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         if (ctx->native_bulk) {
             const rkva_wire wire = ctx->range_wire;
             std::vector<uint8_t> reply;
-            const size_t out_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t) :
+            const size_t out_elem_bytes = (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) ? sizeof(uint8_t) :
                                           (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t) :
                                           sizeof(float);
             const size_t out_bytes = nq * out_width * out_elem_bytes;
@@ -2442,17 +2479,25 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
                     bulk_payload.data(), uint32_t(bulk_payload.size()), reply, uint32_t(out_bytes + lse_bytes))) {
                 ctx->failed = true; return false;
             }
-            if (wire == RKVA_WIRE_FP8) {
+            if (wire == RKVA_WIRE_FP8_E4M3FN && (ctx->pos_scratch.size() != nq ||
+                    !ggml_remote_attn_policy::e4_reply_valid(reply.data(), reply.size(), nq,
+                            out_width, ctx->geo.n_head, ctx->pos_scratch.data(), ctx->range_origin))) {
+                ctx->failed = true; return false;
+            }
+            if (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) {
                 const auto * src_fp8 = reinterpret_cast<const uint8_t *>(reply.data());
                 const auto * src_lse = reinterpret_cast<const float *>(reply.data() + out_bytes);
                 for (size_t row = 0; row < nq; ++row) {
                     auto * dst = static_cast<float *>(static_cast<void *>(static_cast<uint8_t *>(node->data) + row * node->nb[1]));
-                    if (!rkva_fp8_to_f32_batch(src_fp8 + row * out_width, dst, out_width)) {
+                    const bool decoded = wire == RKVA_WIRE_FP8_E4M3FN ?
+                        rkva_e4_to_f32_batch(src_fp8 + row * out_width, dst, out_width) :
+                        rkva_fp8_to_f32_batch(src_fp8 + row * out_width, dst, out_width);
+                    if (!decoded) {
                         ctx->failed = true; return false;
                     }
                     for (size_t h = 0; h < ctx->geo.n_head; ++h) {
                         const float lse_val = src_lse[row * ctx->geo.n_head + h];
-                        if (!std::isfinite(lse_val)) { ctx->failed = true; return false; }
+                        if (wire != RKVA_WIRE_FP8_E4M3FN && !std::isfinite(lse_val)) { ctx->failed = true; return false; }
                         dst[out_width + h] = lse_val;
                     }
                 }
@@ -2562,7 +2607,7 @@ static bool rkva_prepare_native_bulk_job(
             keys->ne[0] != 256 || keys->ne[1] != ctx->geo.n_head_kv ||
             keys->ne[2] != int64_t(nq) || keys->ne[3] != 1 || nq == 0 || nq > 512 ||
             (nq > 256 && (!(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_512) || !ctx->native_store)) ||
-            (!ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4) ||
+            (!ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc) ||
             (size_t) layer >= ctx->range_layers.size() ||
             (size_t) layer >= ctx->native_layers.size() || live == 0) {
         return false;
@@ -2612,7 +2657,7 @@ static bool rkva_prepare_native_bulk_job(
             return false;
         }
         }
-        const size_t chunk_limit = (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4) ? (nq > 9 ? 8 : nq) :
+        const size_t chunk_limit = (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) ? (nq > 9 ? 8 : nq) :
             ctx->native_serial_prefix ? (nq > 9 ? 8 : nq) : 1;
         const uint32_t segments = uint32_t((nq + chunk_limit - 1) / chunk_limit);
         if (ctx->native_generation > UINT64_MAX - segments) {
@@ -2620,7 +2665,7 @@ static bool rkva_prepare_native_bulk_job(
             return false;
         }
         const rkva_wire wire = ctx->range_wire;
-        const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t) :
+        const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) ? sizeof(uint8_t) :
                                     (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP) ? sizeof(uint16_t) :
                                     sizeof(float);
         const rkva_kvarn_range_bulk header {1, segments, uint32_t(nq), 0};
@@ -2713,7 +2758,11 @@ static bool rkva_prepare_native_bulk_job(
             std::memcpy(dst, &attention, sizeof(attention)); dst += sizeof(attention);
             std::memcpy(dst, slot.pos_scratch.data() + first, chunk * sizeof(int32_t));
             dst += chunk * sizeof(int32_t);
-            if (wire == RKVA_WIRE_FP8) {
+            if (wire == RKVA_WIRE_FP8_E4M3FN) {
+                if (!rkva_f32_to_e4_batch(bulk_queries + first * out_width, dst, chunk * out_width)) {
+                    ctx->failed = true; return false;
+                }
+            } else if (wire == RKVA_WIRE_FP8) {
                 uint8_t * dst_fp8 = dst;
                 if (cuda_pack_q) {
                     ggml_remote_attn_trace_scope trace_copy("q_payload_copy");
@@ -3761,6 +3810,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
+    ctx->native_turboquant_nc = false;
     ctx->cohort_enabled = false;
     ctx->async_capacity = 2;
     ctx->native_serial_prefix = false;
@@ -3768,6 +3818,8 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->async_local_remote = false;
     ctx->native_layers.clear();
     ctx->native_store = nullptr;
+    ctx->e4_requested = rkva_e4_requested();
+    ctx->protocol_version = ctx->e4_requested ? RKVA_VERSION : RKVA_VERSION_V2;
     ctx->range_fused = false;
     ctx->range_profile = false;
     ctx->range_profile_controlled = false;
@@ -3810,8 +3862,9 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     // HELLO
     rkva_hello hello {};
     hello.proto_flags    = (1u << 0) | (1u << 1) | RKVA_PROTO_NATIVE_REWIND_V2 |
-                           RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 |
-                           RKVA_PROTO_NATIVE_SNAPSHOT_V4;
+                           RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3;
+    // The v3 E4 experiment does not yet qualify native snapshot/restore.
+    hello.proto_flags   |= ctx->e4_requested ? RKVA_PROTO_BULK_E4M3FN : RKVA_PROTO_NATIVE_SNAPSHOT_V4;
     hello.n_layer_remote = ctx->geo.n_layer_remote;
     hello.n_head         = ctx->geo.n_head;
     hello.n_head_kv      = ctx->geo.n_head_kv;
@@ -3839,6 +3892,18 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         return false;
     }
     std::memcpy(&ctx->ack, ack_bytes.data(), sizeof(rkva_hello_ack));
+    if (ctx->e4_requested) {
+        constexpr uint64_t caps = RKVA_CAP_RANGE_KVARN4 | RKVA_CAP_KVARN_REWIND |
+            RKVA_CAP_KVARN_SERIAL_PREFIX | RKVA_CAP_KVARN_BULK_ATTN | RKVA_CAP_KVARN_BULK_E4M3FN;
+        constexpr uint32_t ops = (1u << RKVA_KVARN_RANGE_CONFIG) | (1u << RKVA_KVARN_RANGE_UPLOAD) |
+            (1u << RKVA_KVARN_RANGE_REWIND) | (1u << RKVA_KVARN_RANGE_BULK_ATTN);
+        if ((ctx->ack.reserved[0] & caps) != caps || (ctx->ack.supported_ops & ops) != ops) {
+            GGML_LOG_ERROR("%s: requested E4M3FN needs negotiated v3 KVarN4 bulk/rewind capability\n", GGML_REMOTE_ATTN_NAME);
+            ctx->connected = false;
+            ctx->close_socket();
+            return false;
+        }
+    }
     if (!(ctx->ack.supported_ops & (1u << RKVA_ATTN_DECODE)) ||
         !(ctx->ack.supported_ops & (1u << RKVA_ATTN_PREFILL))) {
         GGML_LOG_ERROR("%s: server lacks ATTN ops (mask=0x%x)\n",
@@ -4015,7 +4080,7 @@ static bool rkva_trim_native_q4_locked(ggml_backend_remote_attn_context * ctx,
 
 static bool rkva_native_rewind_locked(ggml_backend_remote_attn_context * ctx,
         uint32_t session_id, int32_t pos0) {
-    if (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4) return rkva_trim_native_q4_locked(ctx, session_id, pos0);
+    if (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) return rkva_trim_native_q4_locked(ctx, session_id, pos0);
     if (session_id != ctx->active_session || pos0 < 0) return false;
     const uint32_t keep = uint32_t(pos0) <= ctx->range_origin ? 0 :
             std::min(uint32_t(pos0) - ctx->range_origin, ctx->range_capacity);
@@ -4225,6 +4290,10 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
         } else if (!std::strcmp(option, "fp8") || !std::strcmp(option, "fp8_e5m2")) {
             bulk = true;
             bulk_wire = RKVA_WIRE_FP8;
+        } else if (!std::strcmp(option, "fp8_e4m3fn")) {
+            bulk = true;
+            bulk_wire = RKVA_WIRE_FP8_E4M3FN;
+            bulk_wire_auto = false;
         } else if (!std::strcmp(option, "auto")) {
             bulk = true;
             bulk_wire_auto = true;
@@ -4245,6 +4314,9 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
         } else if (!std::strcmp(wire_env, "fp8") || !std::strcmp(wire_env, "fp8_e5m2")) {
             bulk_wire = RKVA_WIRE_FP8;
             bulk_wire_auto = false;
+        } else if (!std::strcmp(wire_env, "fp8_e4m3fn")) {
+            bulk_wire = RKVA_WIRE_FP8_E4M3FN;
+            bulk_wire_auto = false;
         } else if (!std::strcmp(wire_env, "auto")) {
             bulk_wire_auto = true;
         } else if (!std::strcmp(wire_env, "splitzip")) {
@@ -4254,7 +4326,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
             bulk_wire = RKVA_WIRE_F32;
             bulk_wire_auto = false;
         } else {
-            GGML_LOG_ERROR("%s: unrecognized GGML_RKVA_WIRE_FORMAT '%s' (expected f16, fp8, auto, f32)\n",
+            GGML_LOG_ERROR("%s: unrecognized GGML_RKVA_WIRE_FORMAT '%s' (expected f16, fp8, fp8_e4m3fn, auto, f32)\n",
                 GGML_REMOTE_ATTN_NAME, wire_env);
             return false;
         }
@@ -4264,6 +4336,9 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
             bulk_wire_auto = false;
         } else if (!std::strcmp(wire_env, "fp8") || !std::strcmp(wire_env, "fp8_e5m2")) {
             bulk_wire = RKVA_WIRE_FP8;
+            bulk_wire_auto = false;
+        } else if (!std::strcmp(wire_env, "fp8_e4m3fn")) {
+            bulk_wire = RKVA_WIRE_FP8_E4M3FN;
             bulk_wire_auto = false;
         } else if (!std::strcmp(wire_env, "auto")) {
             bulk_wire_auto = true;
@@ -4296,6 +4371,16 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     } else if (bulk && bulk_wire == RKVA_WIRE_FP8 &&
                (ctx->ack.reserved[0] & fp8_required) != fp8_required) {
         GGML_LOG_ERROR("%s: requested native bulk FP8 RNE RPC is not supported by the negotiated server (missing FP8/RNE capabilities)\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    if (bulk_wire == RKVA_WIRE_FP8_E4M3FN && (!ctx->e4_requested ||
+            ctx->protocol_version != RKVA_VERSION ||
+            !(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_E4M3FN))) {
+        GGML_LOG_ERROR("%s: E4M3FN was not negotiated; refusing fallback\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    if (ctx->e4_requested && (!bulk || bulk_wire != RKVA_WIRE_FP8_E4M3FN)) {
+        GGML_LOG_ERROR("%s: E4M3FN request changed after HELLO; refusing fallback\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
     if (bulk && bulk_wire == RKVA_WIRE_SPLITZIP) {
@@ -4346,6 +4431,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
+    ctx->native_turboquant_nc = false;
     ctx->native_descriptor = descriptor;
     ctx->native_serial_prefix = serial_prefix;
     ctx->native_bulk = bulk;
@@ -4367,7 +4453,8 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     ctx->range_profile = profile;
     ctx->range_kernel_mode = mode;
     if (!rkva_range_apply_control(ctx, "kvarn4", generic)) return false;
-    const char * wire_str = bulk ? (bulk_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
+    const char * wire_str = bulk ? (bulk_wire == RKVA_WIRE_FP8_E4M3FN ? "fp8_e4m3fn" :
+                                    bulk_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
                                     bulk_wire == RKVA_WIRE_F16 ? "f16" : "f32") : "f32";
     GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN4 precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d wire=%s; original F32 producer, bounded resident rewind and paired FULL snapshots require negotiated capability\n",
                   GGML_REMOTE_ATTN_NAME, precision_tail_tokens, descriptor.layout_version, int(serial_prefix), int(async_overlap), wire_str);
@@ -4438,6 +4525,7 @@ static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
     ctx->native_q4 = true;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
+    ctx->native_turboquant_nc = false;
     ctx->native_serial_prefix = false;
     ctx->native_bulk = true;
     ctx->async_local_remote = async_overlap;
@@ -4527,6 +4615,7 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
     ctx->native_q4 = false;
     ctx->native_q8 = true;
     ctx->native_saw_int4 = false;
+    ctx->native_turboquant_nc = false;
     ctx->native_serial_prefix = false;
     ctx->native_bulk = true;
     ctx->async_local_remote = async_overlap;
@@ -4556,9 +4645,10 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
 // same op16/op22 envelope and async overlap as KVarN4. Every 256-dim head is a
 // 136-byte block_saw_int4 (128B split-nibble qs + float scale + float zero) in
 // the BDR-16 rotated domain while Q/OUT stay on the FP8 activation wire.
-static bool rkva_configure_native_saw_int4(ggml_backend_remote_attn_context * ctx,
-        uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap) {
-    constexpr uint64_t caps = RKVA_CAP_NATIVE_SAW_INT4_BULK |
+static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context * ctx,
+        uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap,
+        bool turboquant_nc) {
+    const uint64_t caps = (turboquant_nc ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK : RKVA_CAP_NATIVE_SAW_INT4_BULK) |
                               RKVA_CAP_KVARN_BULK_ATTN | RKVA_CAP_KVARN_BULK_FP8 |
                               RKVA_CAP_KVARN_BULK_FP8_RNE;
     constexpr uint32_t required = (1u << RKVA_KVARN_RANGE_CONFIG) |
@@ -4568,7 +4658,8 @@ static bool rkva_configure_native_saw_int4(ggml_backend_remote_attn_context * ct
             source_type != GGML_TYPE_Q4_0 || !capacity ||
             origin % 256 || uint64_t(origin) + capacity > INT32_MAX ||
             ctx->geo.max_ctx != capacity || ctx->geo.head_dim != rkva_saw_int4_producer::head_dim ||
-            ctx->geo.n_head_kv == 0 || ctx->geo.n_layer_remote == 0 ||
+            ctx->geo.n_head_kv == 0 || uint64_t(ctx->geo.n_head) != 6u * uint64_t(ctx->geo.n_head_kv) ||
+            ctx->geo.n_layer_remote == 0 ||
             ctx->geo.domain != GGML_REMOTE_ATTN_DOMAIN_AUTO ||
             ctx->geo.has_sinks || ctx->geo.swa) {
         return false;
@@ -4596,9 +4687,12 @@ static bool rkva_configure_native_saw_int4(ggml_backend_remote_attn_context * ct
                              (ctx->ack.supported_ops & (1u << RKVA_RANGE_PROFILE));
     if ((mode || profile) && !can_profile) return false;
     const rkva_kvarn_range_config descriptor {
-        origin, capacity, RKVA_RANGE_STORAGE_SAW_INT4, 6u,
-        1, 0, rkva_saw_int4_producer::head_dim, 2, 4, 4, rkva_saw_int4_producer::record_bytes,
-        0, 0, 0, 0, 16, 1, 1};
+        origin, capacity, turboquant_nc ? RKVA_RANGE_STORAGE_TURBOQUANT_NC : RKVA_RANGE_STORAGE_SAW_INT4,
+        turboquant_nc ? 8u : 6u,
+        1, 0, rkva_saw_int4_producer::head_dim, 2, 4, 4,
+        turboquant_nc ? rkva_turboquant_nc_producer::record_bytes : rkva_saw_int4_producer::record_bytes,
+        0, 0, 0, 0, turboquant_nc ? 256u : 16u,
+        turboquant_nc ? RKVA_DOMAIN_ORIGINAL_V : RKVA_DOMAIN_ROTATED, 1};
     std::vector<uint8_t> reply;
     if (!rkva_transact(ctx, RKVA_KVARN_RANGE_CONFIG, ctx->active_session, 0, 0,
             &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
@@ -4606,7 +4700,8 @@ static bool rkva_configure_native_saw_int4(ggml_backend_remote_attn_context * ct
     ctx->range_native_kvarn = true;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
-    ctx->native_saw_int4 = true;
+    ctx->native_saw_int4 = !turboquant_nc;
+    ctx->native_turboquant_nc = turboquant_nc;
     ctx->native_serial_prefix = false;
     ctx->native_bulk = true;
     ctx->async_local_remote = async_overlap;
@@ -4624,11 +4719,13 @@ static bool rkva_configure_native_saw_int4(ggml_backend_remote_attn_context * ct
     ctx->range_fused = false;
     ctx->range_profile = profile;
     ctx->range_kernel_mode = mode;
-    if (!rkva_range_apply_control(ctx, "saw_int4", generic)) return false;
-    GGML_LOG_WARN("%s: native SAW-INT4 bulk descriptor=6 origin=%u capacity=%u async_overlap=%d "
-            "wire=fp8_e5m2; host AVX2 BDR-16 producer (136B/head), "
+    if (!rkva_range_apply_control(ctx, turboquant_nc ? "turboquant_nc" : "saw_int4", generic)) return false;
+    GGML_LOG_WARN("%s: native %s bulk descriptor=%u origin=%u capacity=%u async_overlap=%d "
+            "wire=fp8_e5m2; host producer (%uB/head), "
             "suffix rollback uses the range trim (op8)\n",
-            GGML_REMOTE_ATTN_NAME, origin, capacity, int(async_overlap));
+            GGML_REMOTE_ATTN_NAME, turboquant_nc ? "TurboQuant NC" : "SAW-INT4",
+            turboquant_nc ? 8u : 6u, origin, capacity, int(async_overlap),
+            turboquant_nc ? 132u : 136u);
     return true;
 }
 
@@ -4662,6 +4759,11 @@ bool ggml_backend_remote_attn_configure_range(
         }
     }
     const char * format_req = rkva_get_upload_format();
+    if (ctx->e4_requested && (!format_req ||
+            (std::strcmp(format_req, "kvarn4") && std::strcmp(format_req, "kvarn")))) {
+        GGML_LOG_ERROR("%s: E4M3FN requires the explicitly selected KVarN4 layout 3\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
     if (format_req && (!std::strcmp(format_req, "kvarn4") || !std::strcmp(format_req, "kvarn"))) {
         if (!rkva_configure_native_kvarn(ctx, origin, capacity, cache_type, async_overlap)) return false;
         rkva_breaker_note_configured(ctx);
@@ -4669,15 +4771,26 @@ bool ggml_backend_remote_attn_configure_range(
     }
     if (format_req && (!std::strcmp(format_req, "saw_int4") || !std::strcmp(format_req, "saw-int4") ||
                        !std::strcmp(format_req, "saw4") || !std::strcmp(format_req, "bdr_int4"))) {
-        if (rkva_configure_native_saw_int4(ctx, origin, capacity, cache_type, async_overlap)) {
+        if (rkva_configure_native_rotated_rows(ctx, origin, capacity, cache_type, async_overlap, false)) {
             rkva_breaker_note_configured(ctx);
             return true;
         }
-        if (ctx->failed) return false;
+        GGML_LOG_ERROR("%s: requested SAW-INT4 cannot be negotiated; refusing Q4 fallback\n",
+                GGML_REMOTE_ATTN_NAME);
+        return false;
     }
-    if (format_req && (!std::strcmp(format_req, "q4") || !std::strcmp(format_req, "q4_0") ||
-                       !std::strcmp(format_req, "saw_int4") || !std::strcmp(format_req, "saw-int4") ||
-                       !std::strcmp(format_req, "saw4") || !std::strcmp(format_req, "bdr_int4"))) {
+    if (format_req && (!std::strcmp(format_req, "turboquant_nc") ||
+                       !std::strcmp(format_req, "turboquant-nc") || !std::strcmp(format_req, "tqnc") ||
+                       !std::strcmp(format_req, "turboquant_4bit_nc"))) {
+        if (rkva_configure_native_rotated_rows(ctx, origin, capacity, cache_type, async_overlap, true)) {
+            rkva_breaker_note_configured(ctx);
+            return true;
+        }
+        GGML_LOG_ERROR("%s: requested TurboQuant NC cannot be negotiated; refusing Q4 fallback\n",
+                GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    if (format_req && (!std::strcmp(format_req, "q4") || !std::strcmp(format_req, "q4_0"))) {
         if (rkva_configure_native_q4(ctx, origin, capacity, cache_type, async_overlap)) {
             rkva_breaker_note_configured(ctx);
             return true;
@@ -4778,6 +4891,7 @@ bool ggml_backend_remote_attn_configure_range(
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
+    ctx->native_turboquant_nc = false;
     ctx->cohort_enabled = false;
     ctx->async_capacity = 2;
     ctx->native_serial_prefix = false;
@@ -4899,7 +5013,7 @@ bool ggml_backend_remote_attn_native_kvarn_snapshot_supported(ggml_backend_t bac
     constexpr uint32_t ops = (1u << RKVA_SNAPSHOT_SAVE) | (1u << RKVA_SNAPSHOT_RESTORE);
     return snapshots && !std::strcmp(snapshots, "1") &&
            ggml_backend_remote_attn_native_kvarn_enabled(backend) &&
-           ctx->native_serial_prefix && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 &&
+           ctx->native_serial_prefix && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
            (ctx->native_tail_tokens == 0 || ctx->native_tail_tokens == 128) &&
            ctx->native_descriptor.layout_version == 3 &&
            (ctx->ack.supported_ops & ops) == ops &&
@@ -5238,7 +5352,7 @@ bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend) {
 bool ggml_backend_remote_attn_native_kvarn_records_enabled(ggml_backend_t backend) {
     if (!ggml_backend_remote_attn_native_kvarn_enabled(backend)) return false;
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
-    return !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && ctx->native_store != nullptr;
+    return !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc && ctx->native_store != nullptr;
 }
 
 bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend) {
@@ -5251,7 +5365,7 @@ bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend) {
 bool ggml_backend_remote_attn_kvarn_bulk_512_enabled(ggml_backend_t backend) {
     if (!ggml_backend_remote_attn_async_enabled(backend)) return false;
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
-    return ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 &&
+    return ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_512);
 }
 
@@ -5315,13 +5429,13 @@ size_t ggml_backend_remote_attn_async_capacity(ggml_backend_t backend) {
 bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend) {
     if (!ggml_backend_remote_attn_native_kvarn_enabled(backend)) return false;
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
-    if (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4) {
+    if (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) {
         // Layouts 4/5/6 rows live in the standard range buffer; op8
         // trims the suffix exactly, without the KVarN resident-tail contract.
         return ctx->connected && !ctx->failed &&
                (ctx->ack.supported_ops & (1u << RKVA_REWIND));
     }
-    return ctx->connected && !ctx->failed && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 &&
+    return ctx->connected && !ctx->failed && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
            rkva_kvarn_generation_mutable(ctx->native_generation) &&
            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) &&
            (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
@@ -5478,12 +5592,13 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
         (unsigned long long) s.range_upload_calls, (unsigned long long) s.range_upload_rows,
         (unsigned long long) s.range_attn_calls, ctx->range_origin, ctx->range_capacity,
         (long long) s.range_query_min, (long long) s.range_query_max,
-        ctx->native_saw_int4 ? "saw_int4" : ctx->native_q4 ? "q4_0" : ctx->native_q8 ? "q8_0" : ctx->range_native_kvarn ? "kvarn4" : ctx->range_wire == RKVA_WIRE_Q4_0 ? "q4_0" : ctx->range_wire == RKVA_WIRE_Q8_0 ? "q8_0" : "f16",
+        ctx->native_turboquant_nc ? "turboquant_nc" : ctx->native_saw_int4 ? "saw_int4" : ctx->native_q4 ? "q4_0" : ctx->native_q8 ? "q8_0" : ctx->range_native_kvarn ? "kvarn4" : ctx->range_wire == RKVA_WIRE_Q4_0 ? "q4_0" : ctx->range_wire == RKVA_WIRE_Q8_0 ? "q8_0" : "f16",
         ctx->range_native_kvarn ? "projected_f32" : ctx->range_configured ? ggml_type_name(ctx->range_source_type) : "none",
         (unsigned long long) s.range_upload_bytes, ctx->range_native_kvarn ? ctx->native_tail_tokens : 0);
     ctx->stats_json = buf;
     ctx->stats_json.pop_back();
-    ctx->stats_json += ",\"wire_format\":\"" + std::string(ctx->range_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
+    ctx->stats_json += ",\"wire_format\":\"" + std::string(ctx->range_wire == RKVA_WIRE_FP8_E4M3FN ? "fp8_e4m3fn" :
+        ctx->range_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
         ctx->range_wire == RKVA_WIRE_F16 ? "f16" : "f32") + "\",\"remote_layers\":" + std::to_string(ctx->geo.n_layer_remote) +
         ",\"n_head\":" + std::to_string(ctx->geo.n_head) + ",\"n_head_kv\":" + std::to_string(ctx->geo.n_head_kv) +
         ",\"server_version\":" + std::to_string(ctx->ack.server_version) +
@@ -5554,6 +5669,8 @@ bool ggml_backend_remote_attn_cuda_enabled_for_node(const ggml_tensor * node) {
 }
 
 bool ggml_remote_attn_exec_cuda(struct ggml_tensor * node, void * producer_event) {
+    // E4 currently uses host buffers only; never pass a device pointer to its CPU codec.
+    if (!ggml_backend_remote_attn_cuda_enabled_for_node(node)) return false;
     struct restore_event {
         void * previous;
         ~restore_event() { rkva_cuda_producer_event = previous; }

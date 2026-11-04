@@ -23,9 +23,9 @@ int main() {
     hello.offered_flags=RKVA_PROTO_MANAGED_REGISTRY_V1|RKVA_PROTO_MANAGED_AUTH_V2;
     hello.negotiated.reserved[0]=RKVA_CAP_MANAGED_REGISTRY_V1|RKVA_CAP_MANAGED_AUTH_V2;
     hello.negotiated.supported_ops=wire::operations|(1u<<RKVA_MANAGED_AUTH_HELLO);hello.negotiated.server_version=1;
-    hello.request.magic=RKVA_MAGIC;hello.request.version=RKVA_VERSION;hello.request.op=RKVA_MANAGED_AUTH_HELLO;
+    hello.request.magic=RKVA_MAGIC;hello.request.version=RKVA_VERSION_V2;hello.request.op=RKVA_MANAGED_AUTH_HELLO;
     hello.request.cycle_id=5;hello.request.session_id=RKVA_SESSION_NONE;hello.request.payload_bytes=auth::offer_bytes;
-    hello.response.magic=RKVA_MAGIC;hello.response.version=RKVA_VERSION;hello.response.op=hello.request.op;
+    hello.response.magic=RKVA_MAGIC;hello.response.version=RKVA_VERSION_V2;hello.response.op=hello.request.op;
     hello.response.cycle_id=hello.request.cycle_id;hello.response.status=RKVA_OK;hello.response.payload_bytes=auth::hello_reply_bytes;
     assert(auth::make_offer(secret,owner,7,hello.offered_flags,hello.negotiated,hello.request,client,&host_guard,hello.offer)==auth::status::accepted);
     assert(auth::accept_offer(secret,owner,7,hello.offered_flags,hello.negotiated,hello.request,hello.response,hello.offer,peer,&peer_guard,hello.reply,hello.live)==auth::status::accepted);

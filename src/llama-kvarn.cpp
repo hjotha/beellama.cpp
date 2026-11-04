@@ -141,21 +141,9 @@ llama_kvarn_attention_plan llama_kvarn_plan_attention(
         return { true, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED };
     }
     if (native_original_v) {
-        // msg57 F5: the ROTATED_K_ORIGINAL_V route is the only production route
-        // never validated against the FP64 oracle, and it is measurably wrong:
-        //   * the exact tail: the graph feeds the STORED (original) tail V, but
-        //     the kernel applies the same inverse WHT it applies to the body V,
-        //     so the tail contribution is double-transformed
-        //     (test-position-split-real-pair: NRMSE 2.155e-01, maxO 1.857e+00);
-        //   * prefill: the mma original-domain V loader rounds the un-rotated V
-        //     to F16 before accumulating (maxO 1.03e-02 > the 1e-2 gate), while
-        //     the same geometry in the fully rotated domain passes at
-        //     NRMSE 3.977e-05 / maxO 1.363e-04 through portable-native.
-        // LLAMA_KVARN_PREFILL_ROTATED_DOMAIN=1 keeps the native route but in the
-        // fully rotated domain, so the graph un-rotates O and rotates the tail V
-        // (both already implemented) instead of relying on the kernel's
-        // original-domain V path. Default OFF preserves the historical layout
-        // for A/B; the F5 campaign measures this switch.
+        // Large-query native prefill uses original-domain V. The graph keeps
+        // its exact tail V in that same domain; the fully rotated path remains
+        // available for A/B through LLAMA_KVARN_PREFILL_ROTATED_DOMAIN.
         static const bool prefill_rotated_domain = [] {
             const char * e = getenv("LLAMA_KVARN_PREFILL_ROTATED_DOMAIN");
             return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;

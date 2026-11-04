@@ -54,7 +54,7 @@ inline bool equal_tag(const uint8_t * a, const uint8_t * b) {
 }
 inline void put16(uint8_t * p, uint16_t n) { p[0] = uint8_t(n); p[1] = uint8_t(n >> 8); }
 inline bool valid_header(const rkva_request & h) {
-    return h.magic == RKVA_MAGIC && h.version == RKVA_VERSION && rkva_registry_wire::valid_op(h.op) &&
+    return h.magic == RKVA_MAGIC && h.version == RKVA_VERSION_V2 && rkva_registry_wire::valid_op(h.op) &&
         h.session_id == RKVA_SESSION_NONE && h.layer_id == 0 && h.n_tokens == 0 && h.payload_bytes == request_bytes;
 }
 // The MAC input is explicit and endian-stable: domain (no NUL), the complete

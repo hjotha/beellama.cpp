@@ -14,6 +14,8 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-quants.h"
+#include "ggml-turboquant-nc.h"
 #include "common.h"
 #include "tiled/tiled.h"
 
@@ -249,6 +251,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot                  = ggml_vec_dot_ptq1_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
+    },
+    [GGML_TYPE_TQNC_K] = { .from_float = ggml_tqnc_quantize_key_rows },
+    [GGML_TYPE_TQNC_V] = { .from_float = ggml_tqnc_quantize_value_rows },
+    [GGML_TYPE_SAW_INT4] = {
+        .from_float               = (ggml_from_float_t) quantize_row_saw_int4_ref,
     },
     [GGML_TYPE_Q6_0] = {
         .from_float               = quantize_row_q6_0,

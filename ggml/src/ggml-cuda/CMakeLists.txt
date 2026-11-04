@@ -138,6 +138,16 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    # CUDA is enabled in this directory, so the CUDA-language test must be built here.
+    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION AND
+            EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-turboquant-nc-cuda.cu")
+        add_executable(test-turboquant-nc-cuda "${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-turboquant-nc-cuda.cu")
+        set_target_properties(test-turboquant-nc-cuda PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_include_directories(test-turboquant-nc-cuda PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+        target_link_libraries(test-turboquant-nc-cuda PRIVATE ggml ggml-cuda)
+    endif()
+
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()

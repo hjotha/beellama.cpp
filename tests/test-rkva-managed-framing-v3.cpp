@@ -84,11 +84,11 @@ struct fixture_attest_host:at::host_guard {
     }
 };
 static rkva_request req(uint16_t op,uint64_t cycle,size_t size) {
-    rkva_request h{};h.magic=RKVA_MAGIC;h.version=RKVA_VERSION;h.op=op;h.cycle_id=cycle;
+    rkva_request h{};h.magic=RKVA_MAGIC;h.version=RKVA_VERSION_V2;h.op=op;h.cycle_id=cycle;
     h.session_id=RKVA_SESSION_NONE;h.payload_bytes=uint32_t(size);return h;
 }
 static rkva_response rsp(const rkva_request & q,size_t size,int32_t status=0) {
-    rkva_response h{};h.magic=RKVA_MAGIC;h.version=RKVA_VERSION;h.op=q.op;h.cycle_id=q.cycle_id;
+    rkva_response h{};h.magic=RKVA_MAGIC;h.version=RKVA_VERSION_V2;h.op=q.op;h.cycle_id=q.cycle_id;
     h.status=status;h.payload_bytes=uint32_t(size);h.xbox_compute_us=9;return h;
 }
 static v3::hello hello() {
@@ -132,7 +132,7 @@ int main(){
     assert(!v3::negotiated(info.proposed.proto_flags,info.caps,info.ops&~(1u<<RKVA_REGISTRY_STATUS)));
     assert(!v3::negotiated(info.proposed.proto_flags,info.caps,info.ops&~(1u<<RKVA_MANAGED_ATTEST)));
     assert(!v3::negotiated(info.proposed.proto_flags,info.caps,info.ops&~(1u<<RKVA_MANAGED_AUTH_CHALLENGE)));
-    rkva_response challenge_header{};challenge_header.magic=RKVA_MAGIC;challenge_header.version=RKVA_VERSION;
+    rkva_response challenge_header{};challenge_header.magic=RKVA_MAGIC;challenge_header.version=RKVA_VERSION_V2;
     challenge_header.op=RKVA_MANAGED_AUTH_CHALLENGE;challenge_header.payload_bytes=uint32_t(v3::prefix_bytes+v3::tag_bytes);
     std::vector<uint8_t> challenge;wire::id issued{};
     assert(v3::make_prehello_challenge(key,challenge_header,owner,7,ledger,id(0x31),challenge)==v3::status::accepted);

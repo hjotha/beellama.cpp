@@ -1,7 +1,111 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "saw-int4.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
+
+// A 32-lane subgroup quantizes one 256-element head. Each lane owns eight
+// adjacent elements, so the last FWHT-16 butterfly exchanges neighboring lanes.
+template<typename idx_t>
+static __global__ void k_set_rows_saw_int4(
+        const float * __restrict__ src, const idx_t * __restrict__ indices,
+        char * __restrict__ dst, int64_t n_blocks,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne11, int64_t ne12,
+        int64_t s01, int64_t s02, int64_t s03, int64_t s10, int64_t s11, int64_t s12,
+        int64_t d1, int64_t d2, int64_t d3) {
+    const int lane = threadIdx.x % 32;
+    const int64_t block = (int64_t(blockIdx.x)*blockDim.x + threadIdx.x)/32;
+    if (block >= n_blocks) {
+        return;
+    }
+
+    const int64_t i = block*QK_SAW_INT4;
+    const int64_t i00 = i % ne00;
+    const int64_t i01 = (i/ne00) % ne01;
+    const int64_t i02 = (i/ne00/ne01) % ne02;
+    const int64_t i03 = i/ne00/ne01/ne02;
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = indices[i01*s10 + (i02 % ne11)*s11 + (i03 % ne12)*s12];
+    if (dst_row < 0) {
+        return;
+    }
+
+    const float * in = src + i01*s01 + i02*s02 + i03*s03 + i00 + 8*lane;
+    auto * out = reinterpret_cast<block_saw_int4_ggml *>(
+        dst + dst_row*d1 + i02*d2 + i03*d3) + i00/QK_SAW_INT4;
+    float values[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        values[j] = in[j];
+    }
+    saw_fwht(values);
+
+    float lo = INFINITY;
+    float hi = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float partner = __shfl_xor_sync(0xffffffffu, values[j], 1, 32);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        values[j] = __fmul_rn((lane & 1) ? __fsub_rn(partner, values[j]) : __fadd_rn(values[j], partner), 0.25f);
+#else
+        values[j] = ((lane & 1) ? partner - values[j] : values[j] + partner)*0.25f;
+#endif
+        lo = fminf(lo, values[j]);
+        hi = fmaxf(hi, values[j]);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        lo = fminf(lo, __shfl_xor_sync(0xffffffffu, lo, offset, 32));
+        hi = fmaxf(hi, __shfl_xor_sync(0xffffffffu, hi, offset, 32));
+    }
+    // The project builds CUDA with fast-math; precise division keeps the
+    // quantization boundaries aligned with the scalar reference.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const float scale = __fdiv_rn(fmaxf(hi - lo, 1e-8f), 15.0f);
+    const float zero = __fdiv_rn(-lo, scale);
+#else
+    const float scale = fmaxf(hi - lo, 1e-8f)/15.0f;
+    const float zero = -lo/scale;
+#endif
+    if (lane == 0) {
+        out->scale = scale;
+        out->zero = zero;
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const float norm = __fadd_rn(__fadd_rn(__fdiv_rn(values[j], scale), zero), 0.5f);
+#else
+        const float norm = values[j]/scale + zero + 0.5f;
+#endif
+        const int quant = min(15, max(0, int(floorf(norm))));
+        const int other = __shfl_xor_sync(0xffffffffu, quant, 16, 32);
+        if (lane < 16) {
+            out->qs[8*lane + j] = uint8_t(quant | (other << 4));
+        }
+    }
+}
+
+template<typename idx_t>
+static void set_rows_cuda_saw_int4(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src,
+        const ggml_tensor * indices, ggml_tensor * dst) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] % QK_SAW_INT4 == 0);
+    const int64_t blocks = ggml_nelements(src)/QK_SAW_INT4;
+    if (blocks == 0) {
+        return;
+    }
+    const int threads = CUDA_SET_ROWS_BLOCK_SIZE;
+    const int64_t grid = (blocks*32 + threads - 1)/threads;
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(dim3(grid), dim3(threads), 0, ctx.stream());
+    ggml_cuda_kernel_launch(k_set_rows_saw_int4<idx_t>, launch_params,
+        (const float *) src->data, (const idx_t *) indices->data, (char *) dst->data, blocks,
+        src->ne[0], src->ne[1], src->ne[2], indices->ne[1], indices->ne[2],
+        src->nb[1]/sizeof(float), src->nb[2]/sizeof(float), src->nb[3]/sizeof(float),
+        indices->nb[0]/sizeof(idx_t), indices->nb[1]/sizeof(idx_t), indices->nb[2]/sizeof(idx_t),
+        dst->nb[1], dst->nb[2], dst->nb[3]);
+}
 
 // Generic quantized set_rows kernel template
 template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
@@ -344,6 +448,8 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_SAW_INT4) {
+        set_rows_cuda_saw_int4<idx_t>(ctx, src0, src1, dst);
     } else if (dst->type == GGML_TYPE_Q4_0) {
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
             src0_d, src1_d, (block_q4_0*)dst->data,

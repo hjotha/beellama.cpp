@@ -125,6 +125,12 @@ int main() {
             0u, 0u, 0u, 0u, 16u, 1u, 1u
         };
         assert(rkva_kvarn_range::valid_saw_int4_descriptor(desc, 256));
+        assert(rkva_kvarn_range::valid_saw_int4_geometry(256, 24, 4));
+        assert(rkva_kvarn_range::valid_saw_int4_geometry(256, 12, 2));
+        assert(!rkva_kvarn_range::valid_saw_int4_geometry(128, 24, 4));
+        assert(!rkva_kvarn_range::valid_saw_int4_geometry(256, 24, 3));
+        assert(!rkva_kvarn_range::valid_saw_int4_geometry(256, 0, 0));
+        assert(!rkva_kvarn_range::valid_saw_int4_geometry(256, 0xfffffffau, 0xffffffffu));
         assert(rkva_kvarn_range::saw_int4_row_bytes(256, 2) == 272);
 
         rkva_saw_int4_producer producer(1024, 512, 2);

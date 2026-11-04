@@ -13,7 +13,7 @@
 //
 // Properties:
 //   - Self-inverse: bdr16_wave4(bdr16_wave4(v, lane), lane) == v.
-//   - Zero shared memory: uses only registers and WaveReadLaneAt.
+//   - Zero shared memory: uses registers and quad-lane reads.
 //   - Zero threadgroup barriers: entirely wavefront-local.
 
 float4 bdr16_wave4(float4 v, uint lane) {
@@ -31,13 +31,11 @@ float4 bdr16_wave4(float4 v, uint lane) {
 
     // 2. Inter-lane butterfly across the 4 lanes of this block (stages 3 & 4)
     // Stage 3 (stride 4 in elements = stride 1 in lanes)
-    uint partner1 = lane ^ 1u;
-    float4 other1 = WaveReadLaneAt(v, partner1);
+    float4 other1 = QuadReadAcrossX(v);
     v = ((lane & 1u) == 0u) ? (v + other1) : (other1 - v);
 
     // Stage 4 (stride 8 in elements = stride 2 in lanes)
-    uint partner2 = lane ^ 2u;
-    float4 other2 = WaveReadLaneAt(v, partner2);
+    float4 other2 = QuadReadAcrossY(v);
     v = ((lane & 2u) == 0u) ? (v + other2) : (other2 - v);
 
     // Scale by 1/sqrt(16) = 0.25f

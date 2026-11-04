@@ -34,7 +34,7 @@ static std::string hex(const v3::id & value) { return w::to_hex(value); }
 static rkva_request request(uint16_t op, uint64_t cycle, size_t size) {
     rkva_request h{};
     h.magic = RKVA_MAGIC;
-    h.version = RKVA_VERSION;
+    h.version = RKVA_VERSION_V2;
     h.op = op;
     h.cycle_id = cycle;
     h.session_id = RKVA_SESSION_NONE;
@@ -45,7 +45,7 @@ static rkva_request request(uint16_t op, uint64_t cycle, size_t size) {
 static rkva_response response(const rkva_request & q, size_t size) {
     rkva_response h{};
     h.magic = RKVA_MAGIC;
-    h.version = RKVA_VERSION;
+    h.version = RKVA_VERSION_V2;
     h.op = q.op;
     h.cycle_id = q.cycle_id;
     h.status = RKVA_OK;
@@ -154,7 +154,7 @@ struct scenario {
             fields.payload.assign(body.begin(), body.end());
             rkva_request header{};
             header.magic = RKVA_MAGIC;
-            header.version = RKVA_VERSION;
+            header.version = RKVA_VERSION_V2;
             header.op = op;
             header.cycle_id = cycle;
             header.session_id = RKVA_SESSION_NONE;

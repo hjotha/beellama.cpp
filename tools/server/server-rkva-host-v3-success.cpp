@@ -337,7 +337,7 @@ bool issue_status_recovery(journal & host, const v3::secret & key, const v3::ses
         fields.payload.assign(body.begin(), body.end());
         rkva_request header{};
         header.magic = RKVA_MAGIC;
-        header.version = RKVA_VERSION;
+        header.version = RKVA_VERSION_V2;
         header.op = RKVA_REGISTRY_STATUS;
         header.cycle_id = cycle_id;
         header.session_id = RKVA_SESSION_NONE;

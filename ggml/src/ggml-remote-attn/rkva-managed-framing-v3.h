@@ -177,13 +177,13 @@ inline bool decode_prepare(const std::vector<uint8_t> & p,const session & s,prep
     }catch(...){return false;}
 }
 inline bool request_header(const rkva_request & h,size_t n,kind k) {
-    return n>=prefix_bytes+tag_bytes && n<=max_frame && h.magic==RKVA_MAGIC && h.version==RKVA_VERSION &&
+    return n>=prefix_bytes+tag_bytes && n<=max_frame && h.magic==RKVA_MAGIC && h.version==RKVA_VERSION_V2 &&
         h.session_id==RKVA_SESSION_NONE && !h.layer_id && !h.n_tokens && h.payload_bytes==n &&
         ((k==kind::offer && h.op==RKVA_MANAGED_AUTH_HELLO)||(k==kind::command && wire::valid_op(h.op))||
          (k==kind::attest && h.op==RKVA_MANAGED_ATTEST));
 }
 inline bool response_header(const rkva_response & h,size_t n,kind k) {
-    return n>=prefix_bytes+tag_bytes && n<=max_frame && h.magic==RKVA_MAGIC && h.version==RKVA_VERSION &&
+    return n>=prefix_bytes+tag_bytes && n<=max_frame && h.magic==RKVA_MAGIC && h.version==RKVA_VERSION_V2 &&
         h.payload_bytes==n && h.status<=RKVA_OK && h.status>=RKVA_ERR_SNAPSHOT_IO && ((k==kind::challenge && h.op==RKVA_MANAGED_AUTH_CHALLENGE && h.cycle_id==0 && h.status==RKVA_OK)||
                                                (k==kind::hello_ack && h.op==RKVA_MANAGED_AUTH_HELLO && h.status==RKVA_OK)||
                                                (k==kind::attest_reply && h.op==RKVA_MANAGED_ATTEST && h.status==RKVA_OK)||
@@ -464,7 +464,7 @@ public:
                     wire::get32(bytes_.data()+20)!=0 || wire::get32(bytes_.data()+24)!=0);
                 const auto response_status=static_cast<int32_t>(wire::get32(bytes_.data()+16));
                 const bool invalid_response=reply_ && (response_status>RKVA_OK || response_status<RKVA_ERR_SNAPSHOT_IO);
-                if(magic!=RKVA_MAGIC||version!=RKVA_VERSION||(op!=RKVA_MANAGED_AUTH_HELLO&&op!=RKVA_MANAGED_ATTEST&&!(reply_&&op==RKVA_MANAGED_AUTH_CHALLENGE)&&!wire::valid_op(op))||
+                if(magic!=RKVA_MAGIC||version!=RKVA_VERSION_V2||(op!=RKVA_MANAGED_AUTH_HELLO&&op!=RKVA_MANAGED_ATTEST&&!(reply_&&op==RKVA_MANAGED_AUTH_CHALLENGE)&&!wire::valid_op(op))||
                    invalid_request||invalid_response||len<prefix_bytes+tag_bytes||len>max_frame) {failed_=true;return false;}
                 expected_=header_size_+len;bytes_.reserve(expected_);
             }

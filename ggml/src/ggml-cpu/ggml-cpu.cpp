@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-saw-int4.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -10,6 +11,7 @@
 #include "ggml-kvarn-cpu-store.h"
 
 #include <cctype>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -130,8 +132,30 @@ struct ggml_backend_plan_cpu {
     struct ggml_cgraph cgraph;
 };
 
+// A caller may invoke the backend directly without consulting supports_op.
+// Preflight NC nodes before planning or executing so unsupported CPU codecs
+// return a status instead of reaching a GGML_ABORT in a row conversion.
+static bool ggml_backend_cpu_tqnc_graph_supported(ggml_backend_t backend, const ggml_cgraph * graph) {
+    const auto is_tqnc = [](ggml_type type) {
+        return type == GGML_TYPE_TQNC_K || type == GGML_TYPE_TQNC_V;
+    };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_SET_ROWS && node->type == GGML_TYPE_SAW_INT4 &&
+                ggml_get_op_params_i32(node, GGML_SET_ROWS_OP_PARAM_SAW_CHECKED) != 0) return false;
+        bool touches_tqnc = is_tqnc(node->type);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            touches_tqnc = touches_tqnc || (node->src[j] && is_tqnc(node->src[j]->type));
+        }
+        if (touches_tqnc && !ggml_backend_dev_supports_op(ggml_backend_get_device(backend), node)) return false;
+    }
+    return true;
+}
+
 static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+
+    if (!ggml_backend_cpu_tqnc_graph_supported(backend, cgraph)) return nullptr;
 
     struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
 
@@ -165,13 +189,15 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
-    return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
+    if (!ggml_backend_cpu_tqnc_graph_supported(backend, &cpu_plan->cgraph)) return GGML_STATUS_FAILED;
 
-    GGML_UNUSED(backend);
+    return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+
+    if (!ggml_backend_cpu_tqnc_graph_supported(backend, cgraph)) return GGML_STATUS_FAILED;
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
@@ -448,6 +474,68 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // NC's CPU row codecs abort on malformed metadata and most generic CPU
+    // operations do not implement the format. Admit only a raw, contiguous
+    // same-type copy; it never interprets the metadata or invokes a codec.
+    const auto is_tqnc = [](ggml_type type) {
+        return type == GGML_TYPE_TQNC_K || type == GGML_TYPE_TQNC_V;
+    };
+    bool touches_tqnc = is_tqnc(op->type);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        touches_tqnc = touches_tqnc || (op->src[i] && is_tqnc(op->src[i]->type));
+    }
+    bool tqnc_raw_copy = false;
+    if (touches_tqnc) {
+        const auto contiguous_span = [&](const ggml_tensor * t, size_t & span) {
+            if (!t || !is_tqnc(t->type) || t->ne[0] <= 0 || t->ne[0] % 256 != 0) return false;
+            const size_t bytes_per_block = ggml_type_size(t->type);
+            if (t->nb[0] != bytes_per_block ||
+                uint64_t(t->ne[0]) > std::numeric_limits<size_t>::max() / (sizeof(float) * GGML_MAX_N_THREADS)) return false;
+            uint64_t blocks = uint64_t(t->ne[0] / 256);
+            // The raw CPU copy implementation uses int block/worker indices.
+            constexpr uint64_t max_blocks = uint64_t(std::numeric_limits<int>::max()) - GGML_MAX_N_THREADS;
+            if (blocks > max_blocks || blocks > std::numeric_limits<size_t>::max() / bytes_per_block) return false;
+            span = size_t(blocks) * bytes_per_block;
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                if (t->ne[i] <= 0 || (t->ne[i] != 1 && t->nb[i] != span)) return false;
+                const uint64_t dim = uint64_t(t->ne[i]);
+                if (dim > max_blocks / blocks || dim > std::numeric_limits<size_t>::max() / span) return false;
+                blocks *= dim;
+                span *= size_t(dim);
+            }
+            return true;
+        };
+        const auto safe_contiguous = [&](const ggml_tensor * t, size_t & span) {
+            if (!contiguous_span(t, span)) return false;
+            if (!t->view_src) return true;
+            // GGML normally flattens nested views to an absolute base/offset.
+            // Refuse manually constructed chains rather than guessing bounds.
+            const ggml_tensor * base = t->view_src;
+            size_t base_span = 0;
+            if (base->view_src || base->type != t->type || !contiguous_span(base, base_span)) return false;
+            return t->view_offs % ggml_type_size(t->type) == 0 && t->view_offs <= base_span &&
+                   span <= base_span - t->view_offs;
+        };
+        size_t src_span = 0, dst_span = 0, target_span = 0;
+        tqnc_raw_copy = (op->op == GGML_OP_CPY || op->op == GGML_OP_DUP || op->op == GGML_OP_CONT) &&
+            src0 && is_tqnc(op->type) && src0->type == op->type && ggml_are_same_shape(src0, op) &&
+            safe_contiguous(src0, src_span) && safe_contiguous(op, dst_span) &&
+            (op->op != GGML_OP_CPY || (src1 && src1->type == op->type && ggml_are_same_shape(src1, op) &&
+                                       safe_contiguous(src1, target_span)));
+        if (tqnc_raw_copy) {
+            const auto overlaps = [](size_t a, size_t b, size_t n) { return (a <= b ? b - a : a - b) < n; };
+            const ggml_tensor * src_base = src0->view_src ? src0->view_src : src0;
+            const ggml_tensor * dst_base = op->view_src ? op->view_src : op;
+            if ((src_base == dst_base && overlaps(src0->view_src ? src0->view_offs : 0,
+                                                 op->view_src ? op->view_offs : 0, src_span)) ||
+                (src0->data && op->data && overlaps(reinterpret_cast<uintptr_t>(src0->data),
+                                                     reinterpret_cast<uintptr_t>(op->data), src_span))) {
+                tqnc_raw_copy = false;
+            }
+        }
+        if (!tqnc_raw_copy) return false;
+    }
+
     // Remote attention is computed on the CPU backend (pinned like offload_kqv):
     // the RPC to the remote KV+attention server runs inside compute_forward.
     if (op->op == GGML_OP_REMOTE_ATTN) {
@@ -464,9 +552,15 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
     }
 
+    if (tqnc_raw_copy) return true;
+
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
+            // The NC row trait has no recoverable error channel on CPU.
+            if (op->type == GGML_TYPE_TQNC_K || op->type == GGML_TYPE_TQNC_V) return false;
+            if (op->op == GGML_OP_SET_ROWS && op->type == GGML_TYPE_SAW_INT4 &&
+                    ggml_get_op_params_i32(op, GGML_SET_ROWS_OP_PARAM_SAW_CHECKED) != 0) return false;
             return
                 op->type != GGML_TYPE_IQ3_XXS &&
                 op->type != GGML_TYPE_IQ3_S   &&
@@ -479,6 +573,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_KVARN_MATERIALIZE:
             return true;
         case GGML_OP_MUL_MAT:
+            if (src0->type == GGML_TYPE_SAW_INT4 || src0->type == GGML_TYPE_TQNC_K ||
+                    src0->type == GGML_TYPE_TQNC_V) {
+                return false;
+            }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;

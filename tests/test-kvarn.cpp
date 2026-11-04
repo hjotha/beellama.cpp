@@ -169,6 +169,27 @@ static void test_attention_domain_policy() {
     require(cuda_d128_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
             "native D128 large-query prefill must use original-domain V");
 
+    // Decode remains fully rotated; native prefill uses original-domain V.
+    for (uint32_t n_q : { 1u, 16u, 17u, 32u, 256u, 512u }) {
+        const auto d256 = llama_kvarn_plan_attention(true, true, 16, n_q, 256);
+        const auto expected = n_q <= 16 ? GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED :
+                GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
+        require(d256.native_attention && d256.domain == expected,
+                "D256 native attention chose the wrong domain");
+    }
+    const auto d256_no_native = llama_kvarn_plan_attention(false, true, 16, 32, 256);
+    require(!d256_no_native.native_attention &&
+            d256_no_native.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "D256 without native attention must retain the materialized rotated fallback");
+    const auto d256_no_original_v = llama_kvarn_plan_attention(true, false, 16, 32, 256);
+    require(!d256_no_original_v.native_attention &&
+            d256_no_original_v.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
+            "D256 must not claim native large-query support without a capable backend");
+    const auto cuda_d512_prefill = llama_kvarn_plan_attention(true, true, 16, 32, 512);
+    require(cuda_d512_prefill.native_attention &&
+            cuda_d512_prefill.domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V,
+            "D512 prefill domain must remain unchanged");
+
     require(llama_kvarn_attention_domain(false, false, 0, 64) ==
                 GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED,
             "materialized KVarN attention must remain in the rotated domain");
@@ -2264,6 +2285,9 @@ struct test_native_attention_options {
     bool all_masked = false;
     bool omit_mask = false;
     bool separate_value_indices = false;
+    // Test-only: reproduce a graph that rotates V despite requesting original V.
+    // Bit 0 applies to history, bit 1 to the current segment.
+    unsigned force_rotate_tail_v = 0;
     std::vector<double> * attention_times_us = nullptr;
 };
 
@@ -2636,7 +2660,7 @@ static std::vector<float> test_native_flash_attention_output(
                 ctx, exact_tail_type, head_dim, n_kv_heads, arena_stride, n_stream);
         ggml_tensor * k_tail_source = use_q_rot ?
             apply_kvarn_wht_head(ctx, k_tail_storage, head_dim) : k_tail_storage;
-        ggml_tensor * v_tail_source = use_output_rot ?
+        ggml_tensor * v_tail_source = (use_output_rot || (options.force_rotate_tail_v & 1u)) ?
             apply_kvarn_wht_head(ctx, v_tail_storage, head_dim) : v_tail_storage;
         ggml_tensor * k_tail = ggml_permute(ctx, k_tail_source, 0, 2, 1, 3);
         ggml_tensor * v_tail = ggml_permute(ctx, v_tail_source, 0, 2, 1, 3);
@@ -2649,7 +2673,7 @@ static std::vector<float> test_native_flash_attention_output(
                     ctx, exact_tail_type, head_dim, n_kv_heads, exact_tail_current_tokens, 1);
             ggml_tensor * k_current_source = use_q_rot ?
                 apply_kvarn_wht_head(ctx, k_tail_current_storage, head_dim) : k_tail_current_storage;
-            ggml_tensor * v_current_source = use_output_rot ?
+            ggml_tensor * v_current_source = (use_output_rot || (options.force_rotate_tail_v & 2u)) ?
                 apply_kvarn_wht_head(ctx, v_tail_current_storage, head_dim) : v_tail_current_storage;
             k_tail_current = ggml_permute(ctx, k_current_source, 0, 2, 1, 3);
             v_tail_current = ggml_permute(ctx, v_current_source, 0, 2, 1, 3);
@@ -3044,8 +3068,6 @@ static std::vector<float> test_native_flash_attention_output(
         std::vector<float> k_tail_ref;
         std::vector<float> v_tail_ref;
         if (exact_tail_tokens > 0) {
-            require(!exact_tail_bodyless,
-                    "FP64 reference: tail-without-body is not modelled yet");
             // With no current arena, every row comes from history.
             // Tokens [0, history) live in the history arena, tokens
             // [history, exact_tail_tokens) in the current arena. Reading every
@@ -3751,6 +3773,105 @@ get_kvarn_store_route_stats_fns(ggml_backend_t backend) {
     auto get = reg ? reinterpret_cast<test_kvarn_store_route_stats_get_fn>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_kvarn_store_route_stats_get")) : nullptr;
     return { reset, get };
+}
+
+// Isolate the graph/backend contract for exact-tail V. This is opt-in because
+// it runs real CUDA kernels and includes deliberately mismatched controls.
+static bool test_d256_tail_domain_causality() {
+    ggml_backend_t gpu = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    ggml_backend_dev_t dev = gpu ? ggml_backend_get_device(gpu) : nullptr;
+    const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+    if (!gpu || !name || std::strncmp(name, "CUDA", 4) != 0) {
+        if (gpu) ggml_backend_free(gpu);
+        std::fprintf(stderr, "test-kvarn: D256 tail-domain test requires CUDA; no result\n");
+        return false;
+    }
+    const auto [route_reset, route_get] = get_kvarn_route_stats_fns(gpu);
+    if (!route_reset || !route_get || !backend_supports_kvarn_flash_attention_shape(gpu, 256)) {
+        std::fprintf(stderr, "test-kvarn: D256 tail-domain route telemetry or capability unavailable\n");
+        ggml_backend_free(gpu);
+        return false;
+    }
+
+    // Compare the same portable implementation in each domain. A current V
+    // segment makes direct-tail support decline and exercises the compact
+    // wrapper; without it, the portable native-tail route is eligible.
+    scoped_test_env portable("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN", "1");
+    const auto run = [&](const char * label, bool original_v, int tail, int current,
+                         bool bodyless, unsigned force_v, int expected_route, bool should_match) {
+        test_native_attention_options options;
+        options.force_rotate_tail_v = force_v;
+        std::vector<float> lse;
+        lse_fp64_reference reference;
+        route_reset();
+        const std::vector<float> actual = test_native_flash_attention_output(
+                gpu, true, true, 256, 4, 4, 32, 24, 4, 512, 3,
+                false, nullptr, false, tail, original_v, GGML_TYPE_F16,
+                current, bodyless, false, -1, true, false, false, 0, false,
+                options, &lse, &reference);
+        test_kvarn_route_stats stats = make_test_kvarn_route_stats();
+        route_get(&stats);
+        require(actual.size() == reference.o.size() && lse.size() == reference.lse.size(),
+                "D256 tail-domain FP64 reference shape mismatch");
+        if (expected_route == 1) {
+            require(stats.direct_entry > 0 && stats.compact_tail_entry == 0 && stats.portable_native > 0,
+                    "D256 tail-domain control did not use the direct portable route");
+        } else if (expected_route == 2) {
+            require(stats.compact_tail_entry > 0 && stats.direct_entry == 0 && stats.portable_native > 0,
+                    "D256 tail-domain case did not use the compact wrapper");
+        }
+        double squared = 0.0, reference_squared = 0.0, max_o = 0.0, max_lse = 0.0;
+        size_t visible = 0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            require(std::isfinite(actual[i]) && std::isfinite(reference.o[i]),
+                    "D256 tail-domain output is non-finite");
+            const double delta = double(actual[i]) - reference.o[i];
+            squared += delta*delta;
+            reference_squared += reference.o[i]*reference.o[i];
+            max_o = std::max(max_o, std::fabs(delta));
+        }
+        for (size_t i = 0; i < lse.size(); ++i) {
+            if (!reference.row_has_keys[i]) {
+                require(std::isinf(lse[i]) && lse[i] < 0, "D256 all-masked row did not return -inf LSE");
+                continue;
+            }
+            require(std::isfinite(lse[i]) && std::isfinite(reference.lse[i]),
+                    "D256 visible row has non-finite LSE");
+            max_lse = std::max(max_lse, std::fabs(double(lse[i]) - reference.lse[i]));
+            ++visible;
+        }
+        require(visible > 0 && reference_squared > 0.0, "D256 tail-domain test has no meaningful visible output");
+        const double nrmse = std::sqrt(squared/reference_squared);
+        std::printf("D256-tail-domain %-25s nrmse=%g maxO=%g maxLSE=%g direct=%llu compact=%llu portable=%llu\n",
+                label, nrmse, max_o, max_lse, (unsigned long long) stats.direct_entry,
+                (unsigned long long) stats.compact_tail_entry, (unsigned long long) stats.portable_native);
+        std::fflush(stdout);
+        require(max_lse <= 1e-2, "D256 tail-domain LSE differs from FP64");
+        if (should_match) {
+            require(nrmse <= 3e-3 && max_o <= 1e-2,
+                    "D256 tail-domain valid control differs from FP64");
+        } else {
+            // Deliberately inconsistent graph input: this is a sensitivity
+            // control, not an acceptance of a faulty production result.
+            require(nrmse >= 1e-2,
+                    "D256 mismatched tail-V control failed to expose the domain error");
+        }
+    };
+
+    run("body-only mixed",          true,    0,  0, false, 0, 1, true);
+    run("direct mixed V original",  true,  128,  0, false, 0, 1, true);
+    run("direct mixed V rotated",   true,  128,  0, false, 1, 1, false);
+    run("compact mixed V original", true,  128, 32, false, 0, 2, true);
+    run("compact mixed V rotated",  true,  128, 32, false, 3, 2, false);
+    run("compact fully rotated",    false, 128, 32, false, 0, 2, true);
+    // Bodyless segmented KVarN tails are not supported by this backend.
+    std::puts("D256-tail-domain bodyless segmented: unsupported, skipped");
+    // A 257-row tail takes the separate padded-tail FA, not indexed-small.
+    run("large mixed V original",   true,  257, 32, false, 0, 2, true);
+    run("large mixed V rotated",    true,  257, 32, false, 3, 2, false);
+    ggml_backend_free(gpu);
+    std::printf("test-kvarn: D256 tail-domain causality controls OK\n");
+    return true;
 }
 
 static void test_native_flash_attention_support_gates() {
@@ -7458,6 +7579,10 @@ static void test_headwide_multistream_store() {
 
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_D256_TAIL_DOMAIN_ONLY") != nullptr) {
+        return test_d256_tail_domain_causality() ? 0 : 1;
+    }
 
     if (std::getenv("GGML_KVARN_TEST_BUFFER_REALLOCATE_ONLY") != nullptr) {
         test_backend_buffer_detach_and_reallocate_views();

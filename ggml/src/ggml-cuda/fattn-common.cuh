@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "turboquant-nc-kernels.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -1634,6 +1635,9 @@ void launch_fattn(
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
         }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (K->type == GGML_TYPE_TQNC_K && ggml_cuda_tqnc_has_failure()) return;
+#endif
         K_data = (char *) K_f16;
     }
 
@@ -1669,6 +1673,9 @@ void launch_fattn(
                 nb22 = V->ne[1] * nb21;
                 nb23 = V->ne[2] * nb22;
             }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (V->type == GGML_TYPE_TQNC_V && ggml_cuda_tqnc_has_failure()) return;
+#endif
             V_data = (char *) V_f16;
         }
     }

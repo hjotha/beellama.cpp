@@ -89,6 +89,10 @@ inline bool valid_q8_upload(const rkva_kvarn_range_upload& u, uint32_t capacity,
 // layout_version 6: native SAW-INT4 / BDR-INT4 overflow rows.
 // Every head is a 136-byte block (128 bytes qs + float scale + float zero)
 // with block-diagonal Walsh-Hadamard transform (order 16).
+inline bool valid_saw_int4_geometry(uint32_t dimension, uint32_t heads, uint32_t kv_heads) {
+    return dimension == 256 && kv_heads > 0 && uint64_t(heads) == 6ull * kv_heads;
+}
+
 inline bool valid_saw_int4_descriptor(const rkva_kvarn_range_config& c, uint32_t dimension) {
     return c.storage == RKVA_RANGE_STORAGE_SAW_INT4 && c.layout_version == 6 &&
            c.origin % 256 == 0 && c.capacity > 0 && c.capacity <= uint32_t(INT32_MAX) &&
@@ -100,7 +104,7 @@ inline bool valid_saw_int4_descriptor(const rkva_kvarn_range_config& c, uint32_t
            c.record_policy == 1;
 }
 
-inline uint64_t saw_int4_row_bytes(uint32_t head_dim, uint32_t heads) {
+inline uint64_t saw_int4_row_bytes(uint32_t /*head_dim*/, uint32_t heads) {
     return uint64_t(heads) * 136ull;
 }
 
@@ -113,6 +117,27 @@ inline bool valid_saw_int4_upload(const rkva_kvarn_range_upload& u, uint32_t cap
         return u.append_begin == 0 && u.append_rows == u.live_count;
     }
     return u.append_begin == previous_live && u.append_rows == u.live_count - previous_live;
+}
+
+// Layout 8: WHT256 keys with original-domain values; both wire records are
+// 132 bytes, with two zero padding bytes after each key's FP16 norm.
+inline bool valid_turboquant_nc_descriptor(const rkva_kvarn_range_config& c, uint32_t dimension) {
+    return c.storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC && c.layout_version == 8 &&
+           c.origin % 256 == 0 && c.capacity > 0 && c.capacity <= uint32_t(INT32_MAX) &&
+           c.origin <= uint32_t(INT32_MAX) - c.capacity && dimension == 256 &&
+           c.token_group == 1 && c.record_dim == 0 && c.head_dim == 256 && c.head_slices == 2 &&
+           c.key_bits == 4 && c.value_bits == 4 && c.record_bytes == 132 &&
+           c.stage_groups == 0 && c.tail_groups == 0 && c.sink_tokens == 0 &&
+           c.precision_tail_tokens == 0 && c.wht_version == 256 &&
+           c.domain == RKVA_DOMAIN_ORIGINAL_V && c.record_policy == 1;
+}
+
+inline uint64_t turboquant_nc_row_bytes(uint32_t heads) { return uint64_t(heads) * 132ull; }
+
+inline bool valid_turboquant_nc_upload(const rkva_kvarn_range_upload& u, uint32_t capacity,
+                                       uint32_t previous_live) {
+    return (u.append_begin != 0 || (u.flags & RKVA_KVARN_UPLOAD_RESET)) &&
+           valid_saw_int4_upload(u, capacity, previous_live);
 }
 
 // layout_version 7: native OSCAR INT2 overflow rows.

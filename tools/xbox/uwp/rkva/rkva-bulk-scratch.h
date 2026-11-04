@@ -16,16 +16,17 @@ struct Scratch {
     struct Shape {
         uint64_t calls = 0, growth_calls = 0, reallocations = 0, grown_bytes = 0;
     };
-    std::array<std::array<Shape, 513>, 3> shapes{}; // F16, F32, FP8; bounded nq
+    std::array<std::array<Shape, 513>, 4> shapes{}; // F16, F32, E5, E4; bounded nq
     std::array<size_t, 4> capacities() const {
         return {segments.capacity() * sizeof(Segment), queries.capacity() * sizeof(float),
                 lse.capacity() * sizeof(float), output_f16.capacity() * sizeof(uint16_t)};
     }
     void record(uint32_t nq, uint32_t wire, const std::array<size_t, 4>& before) {
         if (!nq || nq > 512 ||
-            (wire != RKVA_WIRE_F16 && wire != RKVA_WIRE_F32 && wire != RKVA_WIRE_FP8))
+            (wire != RKVA_WIRE_F16 && wire != RKVA_WIRE_F32 && wire != RKVA_WIRE_FP8 &&
+             wire != RKVA_WIRE_FP8_E4M3FN))
             return;
-        auto& shape = shapes[wire == RKVA_WIRE_FP8 ? 2 : wire == RKVA_WIRE_F32 ? 1 : 0][nq];
+        auto& shape = shapes[wire == RKVA_WIRE_FP8_E4M3FN ? 3 : wire == RKVA_WIRE_FP8 ? 2 : wire == RKVA_WIRE_F32 ? 1 : 0][nq];
         ++shape.calls;
         bool grew = false;
         const auto after = capacities();
@@ -53,7 +54,8 @@ struct Scratch {
                     out += ',';
                 first = false;
                 out += "{\"wire\":" +
-                       std::to_string(w == 2   ? RKVA_WIRE_FP8
+                       std::to_string(w == 3   ? RKVA_WIRE_FP8_E4M3FN
+                                      : w == 2 ? RKVA_WIRE_FP8
                                       : w == 1 ? RKVA_WIRE_F32
                                                : RKVA_WIRE_F16) +
                        ",\"nq\":" + std::to_string(nq) + ",\"calls\":" + std::to_string(s.calls) +

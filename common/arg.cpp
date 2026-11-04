@@ -344,6 +344,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_BF16,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q4_0,
+    GGML_TYPE_SAW_INT4,
+    GGML_TYPE_TQNC_K,
+    GGML_TYPE_TQNC_V,
     GGML_TYPE_Q4_1,
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
@@ -362,7 +365,7 @@ const std::vector<ggml_type> & common_kv_cache_types() {
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
     if (s == "saw_int4" || s == "saw-int4" || s == "saw4" || s == "bdr_int4") {
-        return GGML_TYPE_Q4_0;
+        return GGML_TYPE_SAW_INT4;
     }
     if (s == "oscar_int2" || s == "oscar-int2" || s == "oscar2") {
         return GGML_TYPE_Q2_0S;
@@ -389,7 +392,7 @@ static std::string get_all_kv_cache_types(bool include_kvarn_pseudo_types = fals
         msg << kv_cache_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
     }
     if (include_kvarn_pseudo_types) {
-        msg << ", kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8, saw_int4, oscar_int2";
+        msg << ", kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8, oscar_int2, turboquant_4bit_nc";
     }
     return msg.str();
 }
@@ -412,7 +415,12 @@ static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bit
 static void parse_kvarn_cache_type(
         ggml_type & backing_type,
         int32_t & kvarn_bits_out,
-        const std::string & value) {
+        const std::string & value, bool key) {
+    if (value == "turboquant_4bit_nc") {
+        kvarn_bits_out = 0;
+        backing_type = key ? GGML_TYPE_TQNC_K : GGML_TYPE_TQNC_V;
+        return;
+    }
     const int32_t redirected_kvarn_bits = kvarn_bits_from_legacy_cache_type(value);
     const std::string cache_type = redirected_kvarn_bits != 0
         ? string_format("kvarn%d", redirected_kvarn_bits)
@@ -436,9 +444,9 @@ static void parse_kvarn_cache_type(
 
 static void parse_target_cache_type(common_params & params, bool key, const std::string & value) {
     if (key) {
-        parse_kvarn_cache_type(params.cache_type_k, params.cache_kvarn_bits_k, value);
+        parse_kvarn_cache_type(params.cache_type_k, params.cache_kvarn_bits_k, value, true);
     } else {
-        parse_kvarn_cache_type(params.cache_type_v, params.cache_kvarn_bits_v, value);
+        parse_kvarn_cache_type(params.cache_type_v, params.cache_kvarn_bits_v, value, false);
     }
 }
 
@@ -455,9 +463,9 @@ static ggml_type parse_remote_attn_standard_cache_type(const std::string & value
 static void parse_draft_cache_type(common_params & params, bool key, const std::string & value) {
     auto & draft = params.speculative.draft;
     if (key) {
-        parse_kvarn_cache_type(draft.cache_type_k, draft.cache_kvarn_bits_k, value);
+        parse_kvarn_cache_type(draft.cache_type_k, draft.cache_kvarn_bits_k, value, true);
     } else {
-        parse_kvarn_cache_type(draft.cache_type_v, draft.cache_kvarn_bits_v, value);
+        parse_kvarn_cache_type(draft.cache_type_v, draft.cache_kvarn_bits_v, value, false);
     }
 }
 
@@ -2334,14 +2342,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--cache-type-k-m", "--cache-type-k-medium"}, "TYPE",
         "KV cache type for K for medium profile (default: the shared --cache-type-k)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_k_medium, params.cache_kvarn_bits_k_medium, value);
+            parse_kvarn_cache_type(params.cache_type_k_medium, params.cache_kvarn_bits_k_medium, value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_MEDIUM").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-v-m", "--cache-type-v-medium"}, "TYPE",
         "KV cache type for V for medium profile (default: the shared --cache-type-v)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_v_medium, params.cache_kvarn_bits_v_medium, value);
+            parse_kvarn_cache_type(params.cache_type_v_medium, params.cache_kvarn_bits_v_medium, value, false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_MEDIUM").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2388,14 +2396,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--cache-type-k-s", "--cache-type-k-short"}, "TYPE",
         "KV cache type for K for short profile (default: the shared --cache-type-k)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_k_short, params.cache_kvarn_bits_k_short, value);
+            parse_kvarn_cache_type(params.cache_type_k_short, params.cache_kvarn_bits_k_short, value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-v-s", "--cache-type-v-short"}, "TYPE",
         "KV cache type for V for short profile (default: the shared --cache-type-v)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_v_short, params.cache_kvarn_bits_v_short, value);
+            parse_kvarn_cache_type(params.cache_type_v_short, params.cache_kvarn_bits_v_short, value, false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2492,14 +2500,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--cache-type-k-xl", "--cache-type-k-xlong"}, "TYPE",
         "KV cache type for K for xlong profile (default: the shared --cache-type-k)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_k_xlong, params.cache_kvarn_bits_k_xlong, value);
+            parse_kvarn_cache_type(params.cache_type_k_xlong, params.cache_kvarn_bits_k_xlong, value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-v-xl", "--cache-type-v-xlong"}, "TYPE",
         "KV cache type for V for xlong profile (default: the shared --cache-type-v)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_v_xlong, params.cache_kvarn_bits_v_xlong, value);
+            parse_kvarn_cache_type(params.cache_type_v_xlong, params.cache_kvarn_bits_v_xlong, value, false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2610,7 +2618,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-k)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_k_short, params.spec_draft_kvarn_bits_k_short, value);
+            parse_kvarn_cache_type(params.spec_draft_type_k_short, params.spec_draft_kvarn_bits_k_short, value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2621,7 +2629,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-v)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_v_short, params.spec_draft_kvarn_bits_v_short, value);
+            parse_kvarn_cache_type(params.spec_draft_type_v_short, params.spec_draft_kvarn_bits_v_short, value, false);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_SHORT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2632,7 +2640,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-k)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_k_medium, params.spec_draft_kvarn_bits_k_medium, value);
+            parse_kvarn_cache_type(params.spec_draft_type_k_medium, params.spec_draft_kvarn_bits_k_medium, value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_MEDIUM").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2643,7 +2651,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-v)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_v_medium, params.spec_draft_kvarn_bits_v_medium, value);
+            parse_kvarn_cache_type(params.spec_draft_type_v_medium, params.spec_draft_kvarn_bits_v_medium, value, false);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_MEDIUM").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2654,7 +2662,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-k)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_k_long, params.spec_draft_kvarn_bits_k_long, value);
+            parse_kvarn_cache_type(params.spec_draft_type_k_long, params.spec_draft_kvarn_bits_k_long, value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_LONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2665,7 +2673,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-v)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_v_long, params.spec_draft_kvarn_bits_v_long, value);
+            parse_kvarn_cache_type(params.spec_draft_type_v_long, params.spec_draft_kvarn_bits_v_long, value, false);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_LONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2676,7 +2684,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-k)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_k_xlong, params.spec_draft_kvarn_bits_k_xlong, value);
+            parse_kvarn_cache_type(params.spec_draft_type_k_xlong, params.spec_draft_kvarn_bits_k_xlong, value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2687,7 +2695,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-v)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_v_xlong, params.spec_draft_kvarn_bits_v_xlong, value);
+            parse_kvarn_cache_type(params.spec_draft_type_v_xlong, params.spec_draft_kvarn_bits_v_xlong, value, false);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_XLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2698,7 +2706,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-k)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_k_xxlong, params.spec_draft_kvarn_bits_k_xxlong, value);
+            parse_kvarn_cache_type(params.spec_draft_type_k_xxlong, params.spec_draft_kvarn_bits_k_xxlong, value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2709,7 +2717,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-k)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_k_xxxlong, params.spec_draft_kvarn_bits_k_xxxlong, value);
+            parse_kvarn_cache_type(params.spec_draft_type_k_xxxlong, params.spec_draft_kvarn_bits_k_xxxlong, value, true);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_K_XXXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2720,7 +2728,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-v)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_v_xxlong, params.spec_draft_kvarn_bits_v_xxlong, value);
+            parse_kvarn_cache_type(params.spec_draft_type_v_xxlong, params.spec_draft_kvarn_bits_v_xxlong, value, false);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -2731,49 +2739,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: the global --spec-draft-type-v)",
             get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str()),
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.spec_draft_type_v_xxxlong, params.spec_draft_kvarn_bits_v_xxxlong, value);
+            parse_kvarn_cache_type(params.spec_draft_type_v_xxxlong, params.spec_draft_kvarn_bits_v_xxxlong, value, false);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_TYPE_V_XXXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-k-xxl", "--cache-type-k-xxlong"}, "TYPE",
         "KV cache type for K for xxlong profile (default: kvarn4)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_k_xxlong, params.cache_kvarn_bits_k_xxlong, value);
+            parse_kvarn_cache_type(params.cache_type_k_xxlong, params.cache_kvarn_bits_k_xxlong, value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-k-xxxl", "--cache-type-k-xxxlong"}, "TYPE",
         "KV cache type for K for xxxlong profile (default: kvarn4)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_k_xxxlong, params.cache_kvarn_bits_k_xxxlong, value);
+            parse_kvarn_cache_type(params.cache_type_k_xxxlong, params.cache_kvarn_bits_k_xxxlong, value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_XXXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-v-xxl", "--cache-type-v-xxlong"}, "TYPE",
         "KV cache type for V for xxlong profile (default: kvarn4)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_v_xxlong, params.cache_kvarn_bits_v_xxlong, value);
+            parse_kvarn_cache_type(params.cache_type_v_xxlong, params.cache_kvarn_bits_v_xxlong, value, false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_XXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-v-xxxl", "--cache-type-v-xxxlong"}, "TYPE",
         "KV cache type for V for xxxlong profile (default: kvarn4)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_v_xxxlong, params.cache_kvarn_bits_v_xxxlong, value);
+            parse_kvarn_cache_type(params.cache_type_v_xxxlong, params.cache_kvarn_bits_v_xxxlong, value, false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_XXXLONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-k-l", "--cache-type-k-long"}, "TYPE",
         "KV cache type for K for long profile (default: q4_0)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_k_long, params.cache_kvarn_bits_k_long, value);
+            parse_kvarn_cache_type(params.cache_type_k_long, params.cache_kvarn_bits_k_long, value, true);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K_LONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--cache-type-v-l", "--cache-type-v-long"}, "TYPE",
         "KV cache type for V for long profile (default: q4_0)",
         [](common_params & params, const std::string & value) {
-            parse_kvarn_cache_type(params.cache_type_v_long, params.cache_kvarn_bits_v_long, value);
+            parse_kvarn_cache_type(params.cache_type_v_long, params.cache_kvarn_bits_v_long, value, false);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_LONG").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
@@ -3927,7 +3935,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.kv_position_split_p = uint32_t(value);
         }
-    ).set_env("LLAMA_ARG_KV_POSITION_SPLIT_P").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_KV_POSITION_SPLIT_P").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-min-context"}, "N",
         "minimum adaptive profile context size before enabling remote attention (default: 0, always enabled)",
@@ -3964,7 +3972,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.remote_attn_cache_type_k = parse_remote_attn_standard_cache_type(value);
         }
-    ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_K").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_K").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-cache-type-v"}, "TYPE",
         "optional standard V cache type for locally remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0); "
@@ -3972,10 +3980,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.remote_attn_cache_type_v = parse_remote_attn_standard_cache_type(value);
         }
-    ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_V").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_V").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-format", "--remote-attn-upload-format"}, "FORMAT",
-        "RPC upload format for remote attention: 'kvarn4'/'kvarn', 'fp16'/'f16', 'fp32'/'f32', 'q4'/'q4_0', 'q8'/'q8_0' (default: kvarn4)",
+        "RPC upload format for remote attention: 'kvarn4'/'kvarn', 'fp16'/'f16', 'fp32'/'f32', 'q4'/'q4_0', 'q8'/'q8_0', 'saw_int4', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: kvarn4)",
         [](common_params & params, const std::string & value) {
             params.remote_attn_format = value;
 #if !defined(_WIN32)
@@ -3984,21 +3992,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             _putenv_s("GGML_RKVA_UPLOAD_FORMAT", value.c_str());
 #endif
         }
-    ).set_env("LLAMA_ARG_REMOTE_ATTN_FORMAT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_REMOTE_ATTN_FORMAT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-wire-format", "--remote-attn-activation-format"}, "FORMAT",
-        "RPC activation wire format for Q upload and OUT download: 'f16'/'fp16' (default), 'fp8'/'fp8_e5m2', 'auto'",
+        "RPC activation wire format for Q upload and OUT download: 'f16'/'fp16', 'fp8'/'fp8_e5m2', "
+        "'fp8_e4m3fn' (experimental KVarN4 TCP position split), or 'auto'",
         [](common_params & params, const std::string & value) {
             std::string canonical;
             if (value == "f16" || value == "fp16") {
                 canonical = "f16";
             } else if (value == "fp8" || value == "fp8_e5m2") {
                 canonical = "fp8";
+            } else if (value == "fp8_e4m3fn") {
+                canonical = "fp8_e4m3fn";
             } else if (value == "auto") {
                 canonical = "auto";
             } else {
                 throw std::invalid_argument(
-                    "invalid --remote-attn-wire-format: expected 'f16', 'fp8', or 'auto'");
+                    "invalid --remote-attn-wire-format: expected 'f16', 'fp8', 'fp8_e4m3fn', or 'auto'");
             }
             params.remote_attn_wire_format = canonical;
 #if !defined(_WIN32)
@@ -4065,14 +4076,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_STATS"));
     add_opt(common_arg(
         {"--rkva-range-storage"}, "FORMAT",
-        "remote range representation: 'auto', 'kvarn4'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'q4'/'q4_0', 'q8'/'q8_0', 'saw_int4', 'oscar_int2' (default: backend auto)",
+        "remote range representation: 'auto', 'kvarn4'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'q4'/'q4_0', 'q8'/'q8_0', 'saw_int4', 'oscar_int2', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: backend auto)",
         [](common_params & params, const std::string & value) {
             if (value != "auto" && value != "kvarn4" && value != "kvarn" &&
                 value != "f16" && value != "fp16" && value != "f32" && value != "fp32" &&
                 value != "q4" && value != "q4_0" && value != "q8" && value != "q8_0" &&
                 value != "saw_int4" && value != "saw-int4" && value != "saw4" && value != "bdr_int4" &&
-                value != "oscar_int2" && value != "oscar-int2" && value != "oscar2") {
-                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn4/f16/f32/q4_0/q8_0/saw_int4/oscar_int2");
+                value != "oscar_int2" && value != "oscar-int2" && value != "oscar2" &&
+                value != "turboquant_nc" && value != "turboquant-nc" && value != "tqnc" &&
+                value != "turboquant_4bit_nc") {
+                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn4/f16/f32/q4_0/q8_0/saw_int4/oscar_int2/turboquant_nc");
             }
             params.rkva_range_storage = value;
 #if !defined(_WIN32)
@@ -4097,7 +4110,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             _putenv_s("GGML_RKVA_RANGE_KERNEL", value.c_str());
 #endif
         }
-    ).set_env("LLAMA_ARG_RKVA_RANGE_KERNEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_RKVA_RANGE_KERNEL").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--rkva-range-fuse"}, "MODE",
         "remote range fused upload+attn: 'auto' (default), '0' separate, '1' require fusion",

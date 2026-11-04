@@ -56,7 +56,7 @@ inline bool valid_hello(const rkva_hello & h,const snap::Manifest & m,uint32_t f
         !h.has_sinks && !h.swa && !h.reserved[0] && !h.reserved[1] && std::isfinite(h.kq_scale) && h.kq_scale>0;
 }
 inline bool header(const rkva_request & h,size_t n) {
-    return n<=UINT32_MAX && h.magic==RKVA_MAGIC && h.version==RKVA_VERSION && h.op==RKVA_REGISTRY_PREPARE &&
+    return n<=UINT32_MAX && h.magic==RKVA_MAGIC && h.version==RKVA_VERSION_V2 && h.op==RKVA_REGISTRY_PREPARE &&
         h.session_id==RKVA_SESSION_NONE && !h.layer_id && !h.n_tokens && h.payload_bytes==n;
 }
 inline bool nonzero(const id & v){return !rkva_registry_wire::all_zero(v);}

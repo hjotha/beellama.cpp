@@ -938,11 +938,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     // by the flag in route selection). Both plain and LSE parent runs attach
     // it, so attachment isolation compares identical routes.
     //
-    // R5 evidence: support/execute agreement is proven per run by route
-    // telemetry (same_route + printed route family); the best-kernel support
-    // probe (ggml_cuda_get_best_fattn_kernel) reads only src[0..3]/ne/nb/type,
-    // so it is unaffected by src[8]/LSE by inspection. Lifetime matches every
-    // other tail transient (stream-ordered pool, scoped to this function).
+    // This temporary LSE is a KVarN route-selection hint only. Standard Q4
+    // bodies export their (max, denom) through body_meta directly: attaching
+    // an LSE to them would make the public Q4-LSE gate reject src[8], which is
+    // this internal metadata buffer rather than an extra public operand.
     // Windowed original-V prompt bodies already publish precise metadata.
     // D256/Q1 original-V bodies need the precise route too: long-context
     // coverage disproved the former assumption that every small-Q MMA body
@@ -959,7 +958,8 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const bool body_precise_d256_decode =
         body_pass.src[0]->ne[0] == 256 && body_pass.src[0]->ne[1] == 1 &&
         body_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V;
-    if (!tail_bodyless && !parent_body_sinks && !body_windowed_applies &&
+    const bool body_is_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(&body_pass);
+    if (body_is_kvarn && !tail_bodyless && !parent_body_sinks && !body_windowed_applies &&
             (n_query > 16 || body_precise_d256_decode)) {
         body_lse_alloc.alloc(n_body_rows);
         body_lse.data = body_lse_alloc.get();
@@ -1041,6 +1041,11 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             }
         } else {
             ggml_cuda_flash_attn_ext_dispatch(ctx, &body_pass);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            // NC materialization validates encoded metadata synchronously. A
+            // failure must stop before the tail merge reads incomplete O/meta.
+            if (kb->type == GGML_TYPE_TQNC_K && ggml_cuda_tqnc_has_failure()) return;
+#endif
         }
     }
 

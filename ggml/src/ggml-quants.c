@@ -2,6 +2,7 @@
 #include "ggml-common.h"
 
 #include "ggml-quants.h"
+#include "ggml-turboquant-nc.h"
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
@@ -24,6 +25,75 @@
 #define GROUP_MAX_EPS_IQ1_S 1e-12f
 
 #define UNUSED GGML_UNUSED
+
+static void saw_int4_bdr16(const float * src, float * dst) {
+    for (int block = 0; block < QK_SAW_INT4; block += 16) {
+        float v[16];
+        memcpy(v, src + block, sizeof(v));
+        for (int stride = 1; stride < 16; stride *= 2) {
+            for (int i = 0; i < 16; i += 2*stride) {
+                for (int j = 0; j < stride; ++j) {
+                    const float u = v[i + j];
+                    const float w = v[i + j + stride];
+                    v[i + j] = u + w;
+                    v[i + j + stride] = u - w;
+                }
+            }
+        }
+        for (int i = 0; i < 16; ++i) dst[block + i] = v[i] * 0.25f;
+    }
+}
+
+void quantize_row_saw_int4_ref(const float * GGML_RESTRICT x, block_saw_int4_ggml * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k >= 0 && k % QK_SAW_INT4 == 0);
+    for (int64_t i = 0; i < k / QK_SAW_INT4; ++i) {
+        float rotated[QK_SAW_INT4];
+        saw_int4_bdr16(x + i*QK_SAW_INT4, rotated);
+        float vmin = rotated[0];
+        float vmax = rotated[0];
+        for (int j = 0; j < QK_SAW_INT4; ++j) {
+            GGML_ASSERT(isfinite(rotated[j]));
+            if (rotated[j] < vmin) vmin = rotated[j];
+            if (rotated[j] > vmax) vmax = rotated[j];
+        }
+        float range = vmax - vmin;
+        if (range < 1e-8f) range = 1e-8f;
+        const float scale = range / 15.0f;
+        const float zero = -vmin / scale;
+        GGML_ASSERT(isfinite(scale) && scale > 0.0f && isfinite(zero));
+        y[i].scale = scale;
+        y[i].zero = zero;
+        for (int j = 0; j < QK_SAW_INT4 / 2; ++j) {
+            const float a = floorf(rotated[j] / scale + zero + 0.5f);
+            const float b = floorf(rotated[j + QK_SAW_INT4 / 2] / scale + zero + 0.5f);
+            GGML_ASSERT(isfinite(a) && isfinite(b));
+            const int q0 = a < 0 ? 0 : a > 15 ? 15 : (int) a;
+            const int q1 = b < 0 ? 0 : b > 15 ? 15 : (int) b;
+            y[i].qs[j] = (uint8_t) (q0 | (q1 << 4));
+        }
+    }
+}
+
+void dequantize_row_saw_int4(const block_saw_int4_ggml * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k >= 0 && k % QK_SAW_INT4 == 0);
+    for (int64_t i = 0; i < k / QK_SAW_INT4; ++i) {
+        float rotated[QK_SAW_INT4];
+        for (int j = 0; j < QK_SAW_INT4 / 2; ++j) {
+            const uint8_t q = x[i].qs[j];
+            rotated[j] = ((float) (q & 0x0f) - x[i].zero) * x[i].scale;
+            rotated[j + QK_SAW_INT4 / 2] = ((float) (q >> 4) - x[i].zero) * x[i].scale;
+        }
+        saw_int4_bdr16(rotated, y + i*QK_SAW_INT4);
+    }
+}
+
+size_t quantize_saw_int4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                          int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    GGML_ASSERT(nrows >= 0 && n_per_row > 0 && n_per_row % QK_SAW_INT4 == 0);
+    quantize_row_saw_int4_ref(src, (block_saw_int4_ggml *) dst, nrows*n_per_row);
+    return nrows * ggml_row_size(GGML_TYPE_SAW_INT4, n_per_row);
+}
 
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
@@ -6112,6 +6182,26 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_PTQ1_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_ptq1_0, data, nb);
+            } break;
+        case GGML_TYPE_TQNC_K:
+        case GGML_TYPE_TQNC_V:
+            {
+                float decoded[GGML_TQNC_DIM];
+                for (size_t i = 0; i < nb; ++i) {
+                    const bool ok = type == GGML_TYPE_TQNC_K ?
+                        ggml_tqnc_dequantize_key((const ggml_tqnc_key *) data + i, decoded) :
+                        ggml_tqnc_dequantize_value((const ggml_tqnc_value *) data + i, decoded);
+                    if (!ok) return false;
+                }
+            } break;
+        case GGML_TYPE_SAW_INT4:
+            {
+                const block_saw_int4_ggml * q = (const block_saw_int4_ggml *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_float(q[i].scale, i) || !validate_float(q[i].zero, i) || q[i].scale < 0.0f) {
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {

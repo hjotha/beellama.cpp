@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "ggml-saw-int4.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-remote-attn.h"
@@ -23,6 +24,8 @@
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/conv3d.cuh"
 #include "ggml-cuda/convert.cuh"
+#include "ggml-cuda/turboquant-nc-kernels.cuh"
+#include "ggml-cuda/turboquant-nc-view.h"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
@@ -2752,6 +2755,44 @@ struct ggml_cuda_trace_local_span {
 };
 #endif
 
+static bool ggml_cuda_is_tqnc_type(ggml_type type) {
+    return type == GGML_TYPE_TQNC_K || type == GGML_TYPE_TQNC_V;
+}
+
+static bool ggml_cuda_is_tqnc_flash_attn(const ggml_tensor * node) {
+    return node->op == GGML_OP_FLASH_ATTN_EXT &&
+           ((node->src[1] && ggml_cuda_is_tqnc_type(node->src[1]->type)) ||
+            (node->src[2] && ggml_cuda_is_tqnc_type(node->src[2]->type)));
+}
+
+static bool ggml_cuda_is_saw_checked_store(const ggml_tensor * node) {
+    return node && node->op == GGML_OP_SET_ROWS && node->type == GGML_TYPE_SAW_INT4 &&
+           ggml_get_op_params_i32(node, GGML_SET_ROWS_OP_PARAM_SAW_CHECKED) != 0;
+}
+
+static bool ggml_cuda_is_saw_tail(const ggml_tensor * node) {
+    return node && node->op == GGML_OP_FLASH_ATTN_EXT && node->src[5] &&
+           ((node->src[1] && node->src[1]->type == GGML_TYPE_SAW_INT4) ||
+            (node->src[2] && node->src[2]->type == GGML_TYPE_SAW_INT4));
+}
+
+// These composite attention nodes cannot safely skip the capability check,
+// even when a caller pins them to CUDA explicitly.
+static bool ggml_cuda_flash_attn_needs_validation(const ggml_tensor * node) {
+    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT) return false;
+    if (ggml_flash_attn_ext_has_lse_out(node)) return true;
+    for (int i = 5; i < GGML_MAX_SRC; ++i) if (node->src[i]) return true;
+    return false;
+}
+
+static bool ggml_cuda_flash_attn_validation_ok(int device, const ggml_tensor * node) {
+    if (!node->src[0] || !node->src[1] || !node->src[2]) return false;
+    bool has_tail_operand = false;
+    for (int i = 5; i < GGML_MAX_SRC; ++i) has_tail_operand |= node->src[i] != nullptr;
+    const bool complete_tail = node->src[5] && node->src[6] && node->src[7] && node->src[8] && node->src[9];
+    return (!has_tail_operand || complete_tail) && ggml_cuda_flash_attn_ext_supported(device, node);
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_REMOTE_ATTN:
@@ -2816,7 +2857,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_get_rows_back(ctx, dst);
             break;
         case GGML_OP_SET_ROWS:
-            ggml_cuda_op_set_rows(ctx, dst);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (dst->type == GGML_TYPE_TQNC_K || dst->type == GGML_TYPE_TQNC_V) {
+                if (!ggml_cuda_tqnc_set_rows(ctx, dst->src[0], dst->src[1], dst,
+                                              dst->type == GGML_TYPE_TQNC_K)) return false;
+            } else if (ggml_cuda_is_saw_checked_store(dst)) {
+                if (!ggml_cuda_saw_set_rows_checked(ctx, dst->src[0], dst->src[1], dst)) return false;
+            } else
+#endif
+            {
+                ggml_cuda_op_set_rows(ctx, dst);
+            }
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -3099,7 +3150,31 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_cuda_flash_attn_ext(ctx, dst);
+            // Explicit scheduler placement can bypass supports_op. Never run
+            // an FA route that cannot produce the requested LSE side output.
+            if (ggml_cuda_flash_attn_needs_validation(dst) &&
+                    !ggml_cuda_flash_attn_validation_ok(ctx.device, dst)) {
+                GGML_LOG_ERROR("%s: unsupported CUDA FlashAttention LSE or tail geometry\n", __func__);
+                return false;
+            }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (ggml_cuda_is_tqnc_flash_attn(dst)) {
+                if (!dst->src[0] || !dst->src[1] || !dst->src[2] ||
+                        dst->src[1]->type != GGML_TYPE_TQNC_K || dst->src[2]->type != GGML_TYPE_TQNC_V ||
+                        !ggml_cuda_flash_attn_ext_supported(ctx.device, dst)) return false;
+                ggml_cuda_tqnc_clear_failure();
+                if (dst->src[5] && !ggml_cuda_tqnc_validate_tail(ctx, dst)) return false;
+                ggml_cuda_flash_attn_ext(ctx, dst);
+                if (ggml_cuda_tqnc_has_failure()) return false;
+            } else if (ggml_cuda_is_saw_tail(dst)) {
+                ggml_cuda_tqnc_clear_failure();
+                if (!ggml_cuda_tqnc_validate_tail(ctx, dst)) return false;
+                ggml_cuda_flash_attn_ext(ctx, dst);
+            } else
+#endif
+            {
+                ggml_cuda_flash_attn_ext(ctx, dst);
+            }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -3342,7 +3417,7 @@ enum ggml_cuda_trace_direct_reason : uint64_t {
     GGML_CUDA_TRACE_UID_ZERO = 5, GGML_CUDA_TRACE_REMOTE = 6, GGML_CUDA_TRACE_FUSED = 7,
     GGML_CUDA_TRACE_PAGED = 8, GGML_CUDA_TRACE_MUL_MAT_ID = 9,
     GGML_CUDA_TRACE_WARMUP = 10, GGML_CUDA_TRACE_CHANGED = 11, GGML_CUDA_TRACE_HIP_PREFILL = 12,
-    GGML_CUDA_TRACE_CAPTURE_FALLBACK = 13,
+    GGML_CUDA_TRACE_CAPTURE_FALLBACK = 13, GGML_CUDA_TRACE_TQNC_SYNC = 14,
 };
 
 #ifdef USE_CUDA_GRAPH
@@ -3365,6 +3440,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, uint64_t * t
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        // NC validates a complete staging batch before publishing and needs a host sync.
+        if ((node->op == GGML_OP_SET_ROWS &&
+                (node->type == GGML_TYPE_TQNC_K || node->type == GGML_TYPE_TQNC_V)) ||
+            ggml_cuda_is_tqnc_flash_attn(node) || ggml_cuda_is_saw_checked_store(node) ||
+            ggml_cuda_is_saw_tail(node)) {
+            if (trace_reason) *trace_reason = GGML_CUDA_TRACE_TQNC_SYNC;
+            if (ggml_cuda_graph_debug_enabled()) {
+                GGML_LOG_INFO("%s: TurboQuant NC requires synchronous validation; CUDA Graph disabled for this graph\n", __func__);
+            }
+            return false;
         }
 
         // Paged prefill updates active_context in op_params for every ubatch.
@@ -5723,7 +5810,12 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
-                if (!ok && node->op == GGML_OP_REMOTE_ATTN) {
+                const bool tqnc_failed = ggml_cuda_is_saw_checked_store(node) ||
+                    (node->op == GGML_OP_SET_ROWS &&
+                     (node->type == GGML_TYPE_TQNC_K || node->type == GGML_TYPE_TQNC_V)) ||
+                    ggml_cuda_is_tqnc_flash_attn(node);
+                const bool attn_failed = ggml_cuda_flash_attn_needs_validation(node);
+                if (!ok && (node->op == GGML_OP_REMOTE_ATTN || tqnc_failed || attn_failed)) {
                     // Remote failure poisons its backend; retire concurrent
                     // CUDA branches before the scheduler may recycle buffers.
                     // Consumers of invalid remote output must never execute.
@@ -5922,6 +6014,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     host_timing.event.flags |= 0x40000001u; // inclusive host interval; clear failure on success
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // Check before starting or replaying a CUDA Graph. A caller may explicitly
+    // pin an unsupported FA node, bypassing scheduler supports_op selection;
+    // returning here avoids consuming an unwritten LSE or aborting capture.
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_cuda_flash_attn_needs_validation(node) &&
+                !ggml_cuda_flash_attn_validation_ok(cuda_ctx->device, node)) {
+            GGML_LOG_ERROR("%s: unsupported CUDA FlashAttention LSE or tail geometry\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+        if ((ggml_cuda_is_saw_checked_store(node) ||
+                (node->op == GGML_OP_SET_ROWS && ggml_cuda_is_tqnc_type(node->type))) &&
+                !ggml_backend_dev_supports_op(ggml_backend_get_device(backend), node)) {
+            GGML_LOG_ERROR("%s: unsupported checked SAW/NC SET_ROWS geometry\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -7110,6 +7220,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    const auto is_tqnc = [](ggml_type type) {
+        return type == GGML_TYPE_TQNC_K || type == GGML_TYPE_TQNC_V;
+    };
+    bool touches_tqnc = is_tqnc(op->type);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        touches_tqnc = touches_tqnc || (op->src[i] && is_tqnc(op->src[i]->type));
+    }
+    if (touches_tqnc && op->op != GGML_OP_SET_ROWS && op->op != GGML_OP_FLASH_ATTN_EXT &&
+            op->op != GGML_OP_NONE && op->op != GGML_OP_VIEW && op->op != GGML_OP_RESHAPE &&
+            op->op != GGML_OP_PERMUTE && op->op != GGML_OP_TRANSPOSE) {
+        const bool raw_copy = op->op == GGML_OP_CPY && op->src[0] && op->src[1] &&
+            is_tqnc(op->type) && op->type == op->src[0]->type && op->type == op->src[1]->type &&
+            ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+            ggml_cuda_tqnc_tensor_valid(op) && ggml_cuda_tqnc_tensor_valid(op->src[0]) &&
+            ggml_cuda_tqnc_tensor_valid(op->src[1]);
+        if (!raw_copy) return false;
+    }
+
     switch (op->op) {
         case GGML_OP_REMOTE_ATTN:
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -7303,6 +7431,56 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
         case GGML_OP_SET_ROWS:
             {
+                if (op->type == GGML_TYPE_SAW_INT4 || op->type == GGML_TYPE_TQNC_K ||
+                        op->type == GGML_TYPE_TQNC_V) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+                    return false;
+#else
+                    if (op->src[3] || !op->src[0] || !op->src[1] || !op->src[2] ||
+                            op->src[0]->type != GGML_TYPE_F32 || op->src[0]->ne[0] % QK_SAW_INT4 != 0 ||
+                            (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64)) {
+                        return false;
+                    }
+                    const size_t idx_size = ggml_type_size(op->src[1]->type);
+                    const size_t block_bytes = ggml_type_size(op->type);
+                    const bool checked = op->type != GGML_TYPE_SAW_INT4 || ggml_cuda_is_saw_checked_store(op);
+                    if (ggml_cuda_is_saw_checked_store(op) &&
+                            ggml_get_op_params_i32(op, GGML_SET_ROWS_OP_PARAM_SAW_CHECKED) != 1) return false;
+                    if (checked &&
+                            (!ggml_cuda_tqnc_tensor_valid(op) || !ggml_cuda_tqnc_tensor_valid(op->src[2]) ||
+                             !ggml_cuda_tqnc_tensor_valid(op->src[0]) || !ggml_cuda_tqnc_tensor_valid(op->src[1]))) {
+                        return false;
+                    }
+                    if (checked &&
+                            (op->src[2]->type != op->type || op->src[0]->ne[0] != op->ne[0] ||
+                             op->src[0]->ne[2] != op->ne[2] || op->src[0]->ne[3] != op->ne[3] ||
+                             op->src[0]->ne[1] != op->src[1]->ne[0] ||
+                             op->src[0]->ne[2] % op->src[1]->ne[1] != 0 ||
+                             op->src[0]->ne[3] % op->src[1]->ne[2] != 0 || op->src[1]->ne[3] != 1)) {
+                        return false;
+                    }
+                    if (checked) {
+                        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                            if (op->ne[i] != op->src[2]->ne[i] || op->nb[i] != op->src[2]->nb[i]) return false;
+                        }
+                        if (op->data && op->src[2]->data && op->data != op->src[2]->data) return false;
+                    }
+                    if (op->src[0]->nb[0] != sizeof(float) || op->nb[0] != block_bytes) {
+                        return false;
+                    }
+                    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                        if (op->src[0]->nb[i] % sizeof(float) || op->nb[i] % block_bytes) {
+                            return false;
+                        }
+                    }
+                    for (int i = 0; i < 3; ++i) {
+                        if (op->src[1]->nb[i] % idx_size) {
+                            return false;
+                        }
+                    }
+                    return true;
+#endif
+                }
                 if (op->src[3] != nullptr) {
                     bool body_supported = false;
                     switch (op->src[2]->type) {

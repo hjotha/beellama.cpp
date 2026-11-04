@@ -11,6 +11,7 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-turboquant-nc.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -717,6 +718,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_ptq1_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_ptq1_0_ref,
+    },
+    [GGML_TYPE_TQNC_K] = {
+        .type_name                = "turboquant_4bit_nc_k",
+        .blck_size                = GGML_TQNC_DIM,
+        .type_size                = sizeof(ggml_tqnc_key),
+        .is_quantized             = true,
+        .to_float                 = ggml_tqnc_dequantize_key_rows,
+        .from_float_ref           = ggml_tqnc_quantize_key_rows,
+    },
+    [GGML_TYPE_TQNC_V] = {
+        .type_name                = "turboquant_4bit_nc_v",
+        .blck_size                = GGML_TQNC_DIM,
+        .type_size                = sizeof(ggml_tqnc_value),
+        .is_quantized             = true,
+        .to_float                 = ggml_tqnc_dequantize_value_rows,
+        .from_float_ref           = ggml_tqnc_quantize_value_rows,
+    },
+    [GGML_TYPE_SAW_INT4] = {
+        .type_name                = "saw_int4",
+        .blck_size                = QK_SAW_INT4,
+        .type_size                = sizeof(block_saw_int4_ggml),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_saw_int4,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_saw_int4_ref,
     },
     [GGML_TYPE_Q6_0] = {
         .type_name                = "q6_0",
@@ -8962,6 +8987,15 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_PQ2_0:   result = quantize_pq2_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_PTQ1_0:  result = quantize_ptq1_0 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_SAW_INT4: result = quantize_saw_int4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TQNC_K:
+            ggml_tqnc_quantize_key_rows(src + start, (char *) dst + start_row * row_size, n);
+            result = nrows*row_size;
+            break;
+        case GGML_TYPE_TQNC_V:
+            ggml_tqnc_quantize_value_rows(src + start, (char *) dst + start_row * row_size, n);
+            result = nrows*row_size;
+            break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

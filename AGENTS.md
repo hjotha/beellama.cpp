@@ -18,6 +18,10 @@ small:
   `q6_0`, and `q6_1`. Bee's cache-facing `q2_0` uses the internal enum
   `GGML_TYPE_Q2_0S` so it cannot collide with upstream's serialized Q2_0 weight
   format.
+- Experimental local CUDA SAW-INT4 and TurboQuant 4-bit NC KV caches, plus
+  their negotiated Xbox paths. NC uses different K/V formats and is not the
+  historical TurboQuant format; see `docs/turboquant-nc-experiment.md` for
+  hardware, tail, snapshot, and speculative-decoding restrictions.
 - A profit-only adaptive draft-max controller for DFlash.
 - Reasoning-loop detection and the opted-in realtime
   `/v1/chat/completions/control` endpoint.
@@ -26,10 +30,12 @@ small:
 DFlash GGUFs must use upstream's `dflash` architecture, metadata, and tensor
 names.
 
-TurboQuant/TCQ, TQ3_1S/TQ4_1S, DDTree, CopySpec, the fork DFlash ring/tape and
-reduced-verifier paths, the fringe controller, and their arguments and
-environment variables were removed in v0.4.0. Do not reintroduce those systems
-as compatibility code. The old cache names redirect to same-width KVarN presets.
+The legacy TurboQuant/TCQ formats, TQ3_1S/TQ4_1S, DDTree, CopySpec, the fork
+DFlash ring/tape and reduced-verifier paths, the fringe controller, and their
+arguments and environment variables were removed in v0.4.0. Do not reintroduce
+those legacy systems as compatibility code. The separate experimental
+`turboquant_4bit_nc` implementation is not a legacy alias. Other old cache names
+redirect to same-width KVarN presets.
 Use upstream's `draft-dflash` name for the DFlash speculative type; the bare
 `dflash` alias was removed in v0.4.0 and now errors.
 

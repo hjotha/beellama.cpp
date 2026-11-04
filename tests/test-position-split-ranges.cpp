@@ -331,6 +331,19 @@ int main() {
         }
         CHECK(validate_ranges(descs, P, C, full_layers).empty());
         {
+            auto saw = descs;
+            for (auto & desc : saw) {
+                if (desc.range_id == kRangeLocal) desc.format = 4;
+            }
+            CHECK(validate_ranges(saw, P, C, full_layers).empty());
+            for (auto & desc : saw) {
+                if (desc.range_id == kRangeLocal) desc.format = 5;
+            }
+            CHECK(validate_ranges(saw, P, C, full_layers).empty());
+            saw[1].format = 5;
+            CHECK(!validate_ranges(saw, P, C, full_layers).empty());
+        }
+        {
             auto q8 = descs;
             for (auto & desc : q8) {
                 if (desc.range_id == kRangeOverflow) desc.format = 2;

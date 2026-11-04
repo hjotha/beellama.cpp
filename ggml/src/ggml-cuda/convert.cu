@@ -1,9 +1,73 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "saw-int4.cuh"
+#include "turboquant-nc-kernels.cuh"
 
 #include <cstdint>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
+
+template<typename dst_t>
+static __global__ void dequantize_saw_int4(
+        const block_saw_int4_ggml * __restrict__ src, dst_t * __restrict__ dst,
+        int64_t n_groups, int64_t ne00, int64_t ne01, int64_t ne02,
+        int64_t s01, int64_t s02, int64_t s03) {
+    const int64_t group = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (group >= n_groups) {
+        return;
+    }
+    const int64_t groups_per_row = ne00/16;
+    const int64_t i0 = group % groups_per_row;
+    const int64_t i1 = (group/groups_per_row) % ne01;
+    const int64_t i2 = (group/groups_per_row/ne01) % ne02;
+    const int64_t i3 = group/groups_per_row/ne01/ne02;
+    const auto & block = src[i3*s03 + i2*s02 + i1*s01 + i0/16];
+    const int dim = int(i0 % 16)*16;
+
+    float values[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int element = dim + j;
+        const uint8_t packed = block.qs[element % 128];
+        const int quant = element < 128 ? packed & 15 : packed >> 4;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        values[j] = __fmul_rn(__fsub_rn(float(quant), block.zero), block.scale);
+#else
+        values[j] = (float(quant) - block.zero)*block.scale;
+#endif
+    }
+    saw_fwht(values);
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        dst[group*16 + j] = ggml_cuda_cast<dst_t>(__fmul_rn(values[j], 0.25f));
+#else
+        dst[group*16 + j] = ggml_cuda_cast<dst_t>(values[j]*0.25f);
+#endif
+    }
+}
+
+template<typename dst_t>
+static void dequantize_saw_int4_nc_cuda(
+        const void * src, dst_t * dst, int64_t ne00, int64_t ne01,
+        int64_t ne02, int64_t ne03, int64_t s01, int64_t s02, int64_t s03,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_SAW_INT4 == 0);
+    const int64_t groups = (ne00/16)*ne01*ne02*ne03;
+    if (groups == 0) {
+        return;
+    }
+    const int64_t grid = (groups + CUDA_DEQUANTIZE_BLOCK_SIZE - 1)/CUDA_DEQUANTIZE_BLOCK_SIZE;
+    dequantize_saw_int4<dst_t><<<grid, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+        (const block_saw_int4_ggml *) src, dst, groups, ne00, ne01, ne02, s01, s02, s03);
+}
+
+template<typename dst_t>
+static void dequantize_saw_int4_cont_cuda(const void * src, dst_t * dst, int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_SAW_INT4 == 0);
+    const int64_t blocks = k/QK_SAW_INT4;
+    dequantize_saw_int4_nc_cuda(src, dst, QK_SAW_INT4, blocks, 1, 1, 1, blocks, blocks, stream);
+}
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
@@ -690,6 +754,12 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_TYPE_TQNC_K: return ggml_cuda_tqnc_key_f16_cont;
+        case GGML_TYPE_TQNC_V: return ggml_cuda_tqnc_value_f16_cont;
+#endif
+        case GGML_TYPE_SAW_INT4:
+            return dequantize_saw_int4_cont_cuda<half>;
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -770,6 +840,12 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_TYPE_TQNC_K: return ggml_cuda_tqnc_key_f32_cont;
+        case GGML_TYPE_TQNC_V: return ggml_cuda_tqnc_value_f32_cont;
+#endif
+        case GGML_TYPE_SAW_INT4:
+            return dequantize_saw_int4_cont_cuda<float>;
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -847,6 +923,12 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
 
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
     switch (type) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_TYPE_TQNC_K: return ggml_cuda_tqnc_key_f16_nc;
+        case GGML_TYPE_TQNC_V: return ggml_cuda_tqnc_value_f16_nc;
+#endif
+        case GGML_TYPE_SAW_INT4:
+            return dequantize_saw_int4_nc_cuda<half>;
         case GGML_TYPE_F32:
             return convert_unary_cuda<float>;
         case GGML_TYPE_Q1_0:
@@ -931,6 +1013,12 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
 
 to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
     switch (type) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_TYPE_TQNC_K: return ggml_cuda_tqnc_key_f32_nc;
+        case GGML_TYPE_TQNC_V: return ggml_cuda_tqnc_value_f32_nc;
+#endif
+        case GGML_TYPE_SAW_INT4:
+            return dequantize_saw_int4_nc_cuda<float>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, float>;
         case GGML_TYPE_Q1_0:

@@ -10419,6 +10419,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_SAW_INT4, idx_type,
+                {256, 8, 1, 1}, {1, 1}, 4, false, true));
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_SAW_INT4, idx_type,
+                {1024, 11, 1, 2}, {2, 3}, 8, true, true));
+    }
     // wide f32 rows (recurrent-state snapshot shape) -- exercises the wide-row fast paths
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 4096, 3, 1, 1 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 4096, 3, 1, 1 }, { 1, 1 }, 2, false));

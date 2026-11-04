@@ -39,7 +39,7 @@ int main() {
     owner.fill(0x12); tx.fill(0x34); ref.fill(0x56); object.fill(0x78);
     request q{owner, tx, ref, object, 0}, decoded{};
     nonce n{}; n.fill(0xab);
-    rkva_request h{}; h.magic = RKVA_MAGIC; h.version = RKVA_VERSION; h.op = rkva_registry_wire::op::prepare;
+    rkva_request h{}; h.magic = RKVA_MAGIC; h.version = RKVA_VERSION_V2; h.op = rkva_registry_wire::op::prepare;
     h.cycle_id = 0x123456789abcdef0ull; h.session_id = RKVA_SESSION_NONE; h.payload_bytes = rkva_managed_auth::request_bytes;
     wire signed_request{}; assert(encode(key, h, q, n, signed_request));
     // Cross-checked with Python hmac/hashlib and struct little-endian packing.

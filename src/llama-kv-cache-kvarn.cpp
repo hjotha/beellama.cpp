@@ -62,6 +62,27 @@ GGML_API void dequantize_row_q4_0(const block_q4_0 * x, float * y, int64_t k);
 
 namespace {
 
+static const char * selected_remote_upload_format() {
+    if (const char * s = std::getenv("GGML_RKVA_UPLOAD_FORMAT")) return s;
+    if (const char * s = std::getenv("GGML_RKVA_FORMAT")) return s;
+    return std::getenv("GGML_RKVA_RANGE_STORAGE");
+}
+
+static bool native_row_rpc_selected() {
+    const char * s = selected_remote_upload_format();
+    return s && (!std::strcmp(s, "saw_int4") || !std::strcmp(s, "saw-int4") ||
+                 !std::strcmp(s, "saw4") || !std::strcmp(s, "bdr_int4") ||
+                 !std::strcmp(s, "turboquant_nc") || !std::strcmp(s, "turboquant-nc") ||
+                 !std::strcmp(s, "tqnc") || !std::strcmp(s, "turboquant_4bit_nc"));
+}
+
+static bool native_kvarn_records_rpc_selected() {
+    const char * s = selected_remote_upload_format();
+    const char * enabled = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    return s && (!std::strcmp(s, "kvarn4") || !std::strcmp(s, "kvarn")) &&
+           enabled && !std::strcmp(enabled, "1");
+}
+
 constexpr uint32_t MIXED_KV_STATE_ENVELOPE_MAGIC = 0x4D4B5351u; // "QSKM"
 constexpr uint32_t MIXED_KV_STATE_ENVELOPE_VERSION = 1;
 constexpr uint32_t MIXED_KV_STATE_METADATA_VERSION = 1;
@@ -3064,14 +3085,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     kv_size_overflow(position_split_p != 0 ? kv_size - position_split_p : kv_size),
     position_split_p_(position_split_p),
     native_kvarn_rpc_experimental_(rpc_position_split &&
-        ([]() {
-            const char * s = std::getenv("GGML_RKVA_UPLOAD_FORMAT");
-            if (!s) s = std::getenv("GGML_RKVA_FORMAT");
-            if (!s) s = std::getenv("GGML_RKVA_RANGE_STORAGE");
-            return s && (std::strcmp(s, "kvarn4") == 0 || std::strcmp(s, "kvarn") == 0);
-        })() &&
-        std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL") &&
-        std::strcmp(std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL"), "1") == 0),
+        (native_kvarn_records_rpc_selected() || native_row_rpc_selected())),
+    native_row_rpc_experimental_(rpc_position_split && native_row_rpc_selected()),
     // Dynamic staging: size the lossless F16 ring from position semantics.
     // Non-SWA keeps a permanent sink slot plus the scheduler-span tail. SWA has
     // no sink, so every stage slot is part of the local tail.
@@ -3146,7 +3161,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 model, hparams, standard_type_k, standard_type_v, standard_v_trans,
                 offload, unified, kv_size_overflow, n_seq_max, n_pad, n_swa, swa_type,
                 metadata.get(), standard_layer_filter, nullptr, nullptr, "remote_",
-                n_ubatch, 0, exact_tail_type_requested, 0, false, 0, 0, false,
+                n_ubatch, 0, exact_tail_type_requested, 0, false, 0, 0,
+                position_split_p_ != 0 &&
+                    ((local_type_k == GGML_TYPE_SAW_INT4 && local_type_v == GGML_TYPE_SAW_INT4) ||
+                     (local_type_k == GGML_TYPE_TQNC_K && local_type_v == GGML_TYPE_TQNC_V)),
                 standard_device_for_layer, false, true, position_split_p);
     if (standard_cache) {
             for (const uint32_t il : standard_cache->get_layer_ids()) {
@@ -4691,6 +4709,19 @@ bool llama_kv_cache_kvarn::stream_is_exclusive_for(llama_seq_id seq_id) const {
             [&](llama_seq_id other) { return metadata->seq_pos_max(other); });
 }
 
+void llama_kv_cache_kvarn::set_negotiated_native_rpc_owner(bool has_record_snapshot_codec) {
+    if (!position_split_enabled() || !standard_cache || !metadata || native_kvarn_overflow_seen_) {
+        throw std::logic_error("native RPC owner must be selected on a fresh split cache");
+    }
+    for (uint32_t seq = 0; seq < n_seq_max; ++seq) {
+        if (metadata->seq_pos_max(llama_seq_id(seq)) >= 0) {
+            throw std::logic_error("native RPC owner must be selected before cache writes");
+        }
+    }
+    native_kvarn_rpc_experimental_ = true;
+    native_row_rpc_experimental_ = !has_record_snapshot_codec;
+}
+
 bool llama_kv_cache_kvarn::native_kvarn_checkpoint_unavailable() const {
     if (!native_kvarn_rpc_experimental_) {
         return false;
@@ -5202,6 +5233,9 @@ void llama_kv_cache_kvarn::state_write_kvarn_body(
 
 void llama_kv_cache_kvarn::state_write_mixed(
         llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (native_row_rpc_experimental_ && (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL)) {
+        throw std::runtime_error("native row RPC has no FULL snapshot codec");
+    }
     if (native_kvarn_rpc_experimental_ &&
             !(flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL))) {
         const auto & cells = metadata->get_cells(uint32_t(0));
@@ -5452,7 +5486,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
     }
     const bool requested_partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
     const bool native_full = (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) != 0;
-    if (native_full && (!native_kvarn_rpc_experimental_ || !position_split_enabled() ||
+    if (native_full && (native_row_rpc_experimental_ || !native_kvarn_rpc_experimental_ || !position_split_enabled() ||
             requested_partial || (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) || seq_id != 0)) {
         throw std::invalid_argument("native FULL memory restore requires a single native split sequence");
     }
@@ -7459,6 +7493,8 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
         const uint8_t local_format = local_key && local_key->type == GGML_TYPE_Q4_0 ? 1 :
                 local_key && local_key->type == GGML_TYPE_Q8_0 ? 2 :
                 local_key && local_key->type == GGML_TYPE_F16 ? 3 :
+                local_key && local_key->type == GGML_TYPE_SAW_INT4 ? 4 :
+                local_key && local_key->type == GGML_TYPE_TQNC_K ? 5 :
                 local_cache ? 255 : 0;
         out.push_back({layer, llama_position_split::kRangeLocal, 0, position_split_p_, 0, local_format});
         const auto * key = standard_cache ? standard_cache->get_k_storage(il) : nullptr;

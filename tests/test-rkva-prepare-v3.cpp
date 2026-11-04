@@ -111,9 +111,9 @@ int main() {
     session.offered_flags=1u|RKVA_PROTO_MANAGED_REGISTRY_V1|RKVA_PROTO_MANAGED_AUTH_V2;
     session.negotiated.reserved[0]=RKVA_CAP_MANAGED_REGISTRY_V1|RKVA_CAP_MANAGED_AUTH_V2;
     session.negotiated.supported_ops=wire::operations|(1u<<RKVA_MANAGED_AUTH_HELLO);session.negotiated.server_version=1;
-    session.request.magic=RKVA_MAGIC;session.request.version=RKVA_VERSION;session.request.op=RKVA_MANAGED_AUTH_HELLO;
+    session.request.magic=RKVA_MAGIC;session.request.version=RKVA_VERSION_V2;session.request.op=RKVA_MANAGED_AUTH_HELLO;
     session.request.cycle_id=9;session.request.session_id=RKVA_SESSION_NONE;session.request.payload_bytes=auth::offer_bytes;
-    session.response.magic=RKVA_MAGIC;session.response.version=RKVA_VERSION;session.response.op=session.request.op;
+    session.response.magic=RKVA_MAGIC;session.response.version=RKVA_VERSION_V2;session.response.op=session.request.op;
     session.response.cycle_id=9;session.response.status=RKVA_OK;session.response.payload_bytes=auth::hello_reply_bytes;
     auth::nonce client_nonce{},peer_nonce{};client_nonce.fill(6);peer_nonce.fill(7);
     assert(auth::make_offer(secret,owner,3,session.offered_flags,session.negotiated,session.request,client_nonce,&client,session.offer)==auth::status::accepted);
@@ -125,7 +125,7 @@ int main() {
     in.geometry={8,2,256,2,4096,1};in.descriptor={1024,1024,RKVA_RANGE_STORAGE_KVARN4,3,128,128,256,2,4,4,8960,3,2,128,128,1,1,1};
     in.counts={513};in.record_groups={4};in.ready={true};in.layers={{385,384,4,1}};
     a::evidence proof;std::string error;assert(a::make(in,session,secret,proof,error));
-    rkva_request header{};header.magic=RKVA_MAGIC;header.version=RKVA_VERSION;header.op=RKVA_REGISTRY_PREPARE;
+    rkva_request header{};header.magic=RKVA_MAGIC;header.version=RKVA_VERSION_V2;header.op=RKVA_REGISTRY_PREPARE;
     header.session_id=RKVA_SESSION_NONE;header.cycle_id=42;
     header.payload_bytes=uint32_t(v3::prefix_bytes+proof.canonical_metadata.size()+v3::tag_bytes);
     std::vector<uint8_t> frame;assert(v3::make(secret,session,header,tx,ref,object,hello,in.session_id,proof,nonce,frame));
@@ -139,7 +139,7 @@ int main() {
         db::backend store(dir,owner,ledger,anchor_key);assert(store.provision(token,error));db::state state{};assert(store.inspect(token,state,error));
         const db::state before_hello=state;
         db::anchor old;old.owner=owner;old.epoch=ledger;old.accepted=state;assert(store.challenge(token,old.challenge,error));
-        rkva_response challenge_header{};challenge_header.magic=RKVA_MAGIC;challenge_header.version=RKVA_VERSION;
+        rkva_response challenge_header{};challenge_header.magic=RKVA_MAGIC;challenge_header.version=RKVA_VERSION_V2;
         challenge_header.op=RKVA_MANAGED_AUTH_CHALLENGE;challenge_header.payload_bytes=uint32_t(f::prefix_bytes+f::tag_bytes);
         std::vector<uint8_t> challenge;assert(f::make_prehello_challenge(secret,challenge_header,owner,3,ledger,old.challenge,challenge)==f::status::accepted);
         wire::id received{};assert(f::accept_prehello_challenge(secret,challenge_header,challenge.data(),challenge.size(),owner,3,ledger,received)==f::status::accepted);
@@ -148,7 +148,7 @@ int main() {
         f::hello info;info.proposed=hello;info.proposed.proto_flags|=RKVA_PROTO_MANAGED_FRAMING_V3;
         info.caps=RKVA_CAP_MANAGED_REGISTRY_V1|RKVA_CAP_MANAGED_AUTH_V2|RKVA_CAP_MANAGED_FRAMING_V3;
         info.ops=wire::operations|(1u<<RKVA_MANAGED_AUTH_HELLO)|(1u<<RKVA_MANAGED_AUTH_CHALLENGE)|(1u<<RKVA_MANAGED_ATTEST);info.server_version=1;
-        rkva_request q{};q.magic=RKVA_MAGIC;q.version=RKVA_VERSION;q.op=RKVA_MANAGED_AUTH_HELLO;q.session_id=RKVA_SESSION_NONE;
+        rkva_request q{};q.magic=RKVA_MAGIC;q.version=RKVA_VERSION_V2;q.op=RKVA_MANAGED_AUTH_HELLO;q.session_id=RKVA_SESSION_NONE;
         q.payload_bytes=uint32_t(f::prefix_bytes+f::hello_bytes+f::tag_bytes);q.cycle_id=1;
         handshake_guard host_nonce;hello_ack_fixture ack_guard(host_nonce);std::vector<uint8_t> offer;wire::id hello_nonce{};hello_nonce.fill(0x63);
         assert(f::make_offer(secret,q,info,owner,3,ledger,host_anchor,hello_nonce,&host_nonce,offer)==f::status::accepted);
@@ -156,7 +156,7 @@ int main() {
         assert(f::accept_offer(secret,q,offer.data(),offer.size(),info,owner,3,ledger,received,&peer,accepted)==f::status::accepted);
         assert(peer.state.version==state.version+1 && store.inspect(token,state,error) && state.digest==peer.state.digest);
         wire::id next{};assert(store.challenge(token,next,error));
-        rkva_response rh{};rh.magic=RKVA_MAGIC;rh.version=RKVA_VERSION;rh.op=q.op;rh.cycle_id=q.cycle_id;
+        rkva_response rh{};rh.magic=RKVA_MAGIC;rh.version=RKVA_VERSION_V2;rh.op=q.op;rh.cycle_id=q.cycle_id;
         rh.payload_bytes=uint32_t(f::prefix_bytes+f::hello_ack_bytes+f::tag_bytes);
         f::session peer_session{},host_session{};std::vector<uint8_t> ack;f::hello_state committed{state.version,state.digest},host_state{};
         assert(f::make_hello_ack(secret,q,offer,rh,accepted,next,committed,ack,peer_session)==f::status::accepted);

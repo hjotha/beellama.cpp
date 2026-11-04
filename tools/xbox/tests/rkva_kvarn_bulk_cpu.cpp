@@ -24,7 +24,7 @@ std::vector<uint8_t> payload(uint32_t begin, uint32_t count, uint32_t tail,
                              uint32_t wire = RKVA_WIRE_F32, bool compact_stage = false) {
     std::vector<uint8_t> data;
     const uint32_t segments = (count + 7) / 8;
-    const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8) ? sizeof(uint8_t)
+    const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) ? sizeof(uint8_t)
                                 : (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP)
                                     ? sizeof(uint16_t)
                                     : sizeof(float);
@@ -348,7 +348,8 @@ int main() {
     // FP16 and FP8 wire formats. SplitZip remains archived, never admitted.
     for (uint32_t tail : {0u, 128u}) {
         for (uint32_t wire :
-             {uint32_t(RKVA_WIRE_F32), uint32_t(RKVA_WIRE_F16), uint32_t(RKVA_WIRE_FP8)}) {
+             {uint32_t(RKVA_WIRE_F32), uint32_t(RKVA_WIRE_F16), uint32_t(RKVA_WIRE_FP8),
+              uint32_t(RKVA_WIRE_FP8_E4M3FN)}) {
             for (uint32_t begin : {0u, 1u, 120u, 127u, 128u, 255u, 8191u}) {
                 for (uint32_t count : {1u, 8u, 9u, 64u, 256u}) {
                     auto data = payload(begin, count, tail, wire);
@@ -366,6 +367,34 @@ int main() {
                     assert(!valid(data, begin, count, tail, 1, wire));
                 }
             }
+        }
+        if (tail == 128) {
+            static_assert(!rkva_range_version(RKVA_VERSION_LEGACY) && rkva_range_version(RKVA_VERSION_V2) &&
+                          rkva_range_version(RKVA_VERSION), "v1/v2/v3 range versions");
+            assert(!rkva_e4_wire_allowed(RKVA_VERSION_LEGACY, RKVA_VERSION_LEGACY, false, false, RKVA_WIRE_FP8_E4M3FN));
+            assert(!rkva_e4_wire_allowed(RKVA_VERSION_V2, RKVA_VERSION_V2, true, true, RKVA_WIRE_FP8_E4M3FN));
+            assert(!rkva_e4_wire_allowed(RKVA_VERSION, RKVA_VERSION, false, true, RKVA_WIRE_FP8_E4M3FN));
+            assert(!rkva_e4_wire_allowed(RKVA_VERSION, RKVA_VERSION, true, false, RKVA_WIRE_FP8_E4M3FN));
+            assert(!rkva_e4_wire_allowed(RKVA_VERSION_V2, RKVA_VERSION, true, true, RKVA_WIRE_FP8_E4M3FN));
+            assert(!rkva_e4_wire_allowed(RKVA_VERSION, RKVA_VERSION, true, true, RKVA_WIRE_FP8));
+            assert(rkva_e4_wire_allowed(RKVA_VERSION, RKVA_VERSION, true, true, RKVA_WIRE_FP8_E4M3FN));
+            assert(rkva_e4_wire_allowed(RKVA_VERSION_V2, RKVA_VERSION_V2, false, false, RKVA_WIRE_FP8));
+            auto e4 = payload(0, 16, tail, RKVA_WIRE_FP8_E4M3FN, true);
+            std::vector<Segment> e4_segments;
+            assert(validate_wire(e4.data(), e4.size(), 16, descriptor(tail), 24, 4, 0, 0, false,
+                    rkva_kvarn_range::coverage_after_reset(0, tail), 1, RKVA_WIRE_FP8_E4M3FN, e4_segments));
+            assert(e4_segments.size() == 2);
+            e4[e4_segments[0].query_offset] = 0x7e; // valid maximum 448
+            assert(valid(e4, 0, 16, tail, 1, RKVA_WIRE_FP8_E4M3FN));
+            for (uint8_t bad : {uint8_t(0x7f), uint8_t(0xff)}) {
+                auto invalid = e4;
+                invalid[e4_segments.back().query_offset] = bad;
+                assert(!valid(invalid, 0, 16, tail, 1, RKVA_WIRE_FP8_E4M3FN));
+            }
+            auto mixed = e4;
+            const uint32_t e5 = RKVA_WIRE_FP8;
+            std::memcpy(mixed.data() + e4_segments.back().positions_offset - sizeof(rkva_range_attn), &e5, sizeof(e5));
+            assert(!valid(mixed, 0, 16, tail, 1, RKVA_WIRE_FP8_E4M3FN));
         }
         auto data = payload(120, 256, tail, RKVA_WIRE_F32);
         std::vector<Segment> segments;

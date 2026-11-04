@@ -442,7 +442,10 @@ extern "C" {
         // Bonsai 2 files load unchanged. type_traits is sized to COUNT, 49..141 stay unused.
         GGML_TYPE_PQ2_0   = 142, // ternary, group 128 (upstream Q2_0 is group 64)
         GGML_TYPE_PTQ1_0  = 143, // ternary, group 128, trits packed base-3, five per byte
-        GGML_TYPE_COUNT   = 144,
+        GGML_TYPE_SAW_INT4 = 144, // BeeLlama KV cache, 256 values per block
+        GGML_TYPE_TQNC_K   = 145, // TurboQuant NC 4-bit MSE key, 256 values
+        GGML_TYPE_TQNC_V   = 146, // TurboQuant NC 4-bit uniform value, 256 values
+        GGML_TYPE_COUNT    = 147,
     };
 
     // [TAG_GGML_PREC]

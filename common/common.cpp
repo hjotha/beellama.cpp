@@ -3436,7 +3436,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     };
     const bool local_format_supported =
             (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) ||
-            (params.kv_position_split_p != 0 && (is_qx(params.cache_type_k) || params.cache_type_k == GGML_TYPE_F16));
+            (params.kv_position_split_p != 0 &&
+             (is_qx(params.cache_type_k) || params.cache_type_k == GGML_TYPE_F16 ||
+              (params.cache_type_k == GGML_TYPE_SAW_INT4 && params.cache_type_v == GGML_TYPE_SAW_INT4) ||
+              (params.cache_type_k == GGML_TYPE_TQNC_K && params.cache_type_v == GGML_TYPE_TQNC_V)));
     if (remote_cache_k && (!local_format_supported ||
             params.remote_attn_host.empty() ||
             (!common_remote_attn_is_local_vulkan(params.remote_attn_host) && params.kv_position_split_p == 0) ||
@@ -3444,7 +3447,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
             params.kv_tail_tokens != "0" || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
             params.no_kv_offload)) {
         throw std::invalid_argument(
-                "per-layer remote KV formats require a global KVarN cache or standard Qx/F16 position-split cache, "
+                "per-layer remote KV formats require a global KVarN cache or standard Qx/F16/SAW/TurboQuant NC position-split cache, "
                 "native Vulkan or TCP position-split attention, Flash Attention, KV offload, one slot, "
                 "remote prefill, and kv-tail-tokens=0");
     }

@@ -19,6 +19,10 @@
 
 namespace llama_kv_mixed {
 
+static_assert(uint16_t(sx_saw_int4) == uint16_t(GGML_TYPE_SAW_INT4), "SAW snapshot type must match ggml");
+static_assert(uint16_t(sx_tqnc_k) == uint16_t(GGML_TYPE_TQNC_K), "TQNC key snapshot type must match ggml");
+static_assert(uint16_t(sx_tqnc_v) == uint16_t(GGML_TYPE_TQNC_V), "TQNC value snapshot type must match ggml");
+
 uint32_t qx_payload_row_for_cell(uint32_t origin, uint32_t capacity, uint32_t global_cell) {
     if (origin >= capacity || global_cell < origin || global_cell >= capacity) {
         throw kv_mixed_error("Qx payload cell is outside its owned logical interval");
@@ -236,7 +240,28 @@ void validate_desc(layer_desc & d, bool serializing) {
             }
             break;
         case cache_kind::standard_qx:
-            if (!is_standard_type(d.k_type) || !is_standard_type(d.v_type)) {
+            if (d.k_type == sx_saw_int4 || d.v_type == sx_saw_int4) {
+                if (d.k_type != sx_saw_int4 || d.v_type != sx_saw_int4 ||
+                        d.range_id != llama_position_split::kRangeLocal ||
+                        d.layout != layout_standard_qx_rows || d.owner != owner_target || d.v_trans != 0 ||
+                        d.k_rot != uint8_t(rotation::none) || d.v_rot != uint8_t(rotation::none) ||
+                        d.k_rot_width != 0 || d.v_rot_width != 0 ||
+                        d.token_group != 256 || d.head_dim_k != 256 || d.head_dim_v != 256 ||
+                        d.k_stride != uint64_t(d.n_head_kv)*136 || d.v_stride != uint64_t(d.n_head_kv)*136) {
+                    throw kv_mixed_error(where + ": invalid local SAW INT4 cache descriptor");
+                }
+            } else if (d.k_type == sx_tqnc_k || d.k_type == sx_tqnc_v ||
+                       d.v_type == sx_tqnc_k || d.v_type == sx_tqnc_v) {
+                if (d.k_type != sx_tqnc_k || d.v_type != sx_tqnc_v ||
+                        d.range_id != llama_position_split::kRangeLocal ||
+                        d.layout != layout_standard_qx_rows || d.owner != owner_target || d.v_trans != 0 ||
+                        d.k_rot != uint8_t(rotation::none) || d.v_rot != uint8_t(rotation::none) ||
+                        d.k_rot_width != 0 || d.v_rot_width != 0 ||
+                        d.token_group != 256 || d.head_dim_k != 256 || d.head_dim_v != 256 ||
+                        d.k_stride != uint64_t(d.n_head_kv)*130 || d.v_stride != uint64_t(d.n_head_kv)*132) {
+                    throw kv_mixed_error(where + ": invalid local TurboQuant NC cache descriptor");
+                }
+            } else if (!is_standard_type(d.k_type) || !is_standard_type(d.v_type)) {
                 throw kv_mixed_error(where + ": unknown standard qx type id");
             }
             if (d.layout != layout_standard_qx_rows && d.layout != layout_standard_qx_compact_rows) {

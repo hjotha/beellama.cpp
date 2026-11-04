@@ -409,7 +409,7 @@ This option does not enable native Xbox overflow snapshots.
 
 ## Experimental TCP FP8 codec placement
 
-For negotiated native KVarN4 bulk attention with FP8 on the wire,
+For negotiated native KVarN4 bulk attention with E5M2 FP8 on the wire,
 `GGML_RKVA_CUDA_FP8` selects the host codec placement:
 
 | Value | Placement |
@@ -434,6 +434,15 @@ slot buffers. Actual device-loss/destructor fault handling remains a separate
 qualification gate. Keep the setting fixed for
 the process lifetime and restart serving to change it. Explicit `prefill`
 does not change the existing `0`/`1` defaults or select a policy from timings.
+
+`--remote-attn-wire-format fp8_e4m3fn` opts into the separate E4M3FN wire
+for Q and OUT. It requires `--remote-attn-format kvarn4`, a TCP
+`--remote-attn HOST:PORT` position split, and an RKVA v3 peer advertising E4;
+an unavailable or incompatible peer fails instead of falling back to Vulkan,
+F32 or E5. The default remains unchanged. E4 conversion currently runs on
+CPU on both host and Xbox, so `GGML_RKVA_CUDA_FP8` does not accelerate it.
+Q rounds directly to E4M3FN; OUT rounds through F16 first; LSE remains F32.
+Native snapshot support for E4/v3 is not advertised until qualified.
 
 `GGML_RKVA_CUDA_SINGLETON_FASTPATH=1` is a separate, default-off host
 bookkeeping experiment. Keep it fixed for the process lifetime. It only skips

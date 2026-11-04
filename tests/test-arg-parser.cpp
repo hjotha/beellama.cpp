@@ -7,6 +7,8 @@
 #include "speculative.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <cmath>
 #include <filesystem>
@@ -2219,8 +2221,90 @@ static void test_position_split_option_and_adaptive_scope() {
     assert(common_base_params_to_speculative(adaptive).kv_position_split_p == 0);
 }
 
+static void test_e4_wire_argument() {
+    auto parse = [](common_params & params, std::vector<std::string> args) {
+        std::vector<char *> argv;
+        for (auto & arg : args) argv.push_back(arg.data());
+        return common_params_parse(int(argv.size()), argv.data(), params, LLAMA_EXAMPLE_SERVER);
+    };
+    const char * old_wire = std::getenv("GGML_RKVA_WIRE_FORMAT");
+    const bool had_wire = old_wire != nullptr;
+    const std::string saved_wire = old_wire ? old_wire : "";
+    const char * old_option = std::getenv("LLAMA_ARG_REMOTE_ATTN_WIRE_FORMAT");
+    const bool had_option = old_option != nullptr;
+    const std::string saved_option = old_option ? old_option : "";
+    unset_test_env("LLAMA_ARG_REMOTE_ATTN_WIRE_FORMAT");
+    for (const char * flag : {"--remote-attn-wire-format", "--remote-attn-activation-format"}) {
+        common_params params;
+        assert(parse(params, {"binary", flag, "fp8_e4m3fn"}));
+        assert(params.remote_attn_wire_format == "fp8_e4m3fn");
+        const char * selected = std::getenv("GGML_RKVA_WIRE_FORMAT");
+        assert(selected && std::strcmp(selected, "fp8_e4m3fn") == 0);
+    }
+    set_test_env("GGML_RKVA_WIRE_FORMAT", "fp8");
+    for (const char * invalid : {"fp8_e4m3", "fp8_e4m3fnuz", "FP8_E4M3FN"}) {
+        common_params params;
+        const std::string error = capture_stderr([&] {
+            assert(!parse(params, {"binary", "--remote-attn-wire-format", invalid}));
+        });
+        assert(error.find("invalid --remote-attn-wire-format") != std::string::npos);
+        const char * selected = std::getenv("GGML_RKVA_WIRE_FORMAT");
+        assert(selected && std::strcmp(selected, "fp8") == 0);
+    }
+    if (had_wire) set_test_env("GGML_RKVA_WIRE_FORMAT", saved_wire.c_str());
+    else unset_test_env("GGML_RKVA_WIRE_FORMAT");
+    if (had_option) set_test_env("LLAMA_ARG_REMOTE_ATTN_WIRE_FORMAT", saved_option.c_str());
+    else unset_test_env("LLAMA_ARG_REMOTE_ATTN_WIRE_FORMAT");
+}
+
+static void test_turboquant_nc_aliases() {
+    auto parse = [](common_params & params, std::vector<std::string> args) {
+        std::vector<char *> argv;
+        for (auto & arg : args) argv.push_back(arg.data());
+        return common_params_parse(int(argv.size()), argv.data(), params, LLAMA_EXAMPLE_SERVER);
+    };
+    for (const char * value : {"turboquant_nc", "turboquant-nc", "tqnc", "turboquant_4bit_nc",
+                               "q4_0", "saw4", "oscar2"}) {
+        common_params storage;
+        assert(parse(storage, {"binary", "--rkva-range-storage", value}));
+        assert(storage.rkva_range_storage == value);
+        unset_test_env("GGML_RKVA_RANGE_STORAGE");
+    }
+    for (const char * value : {"turboquant_nc", "turboquant-nc", "tqnc", "turboquant_4bit_nc"}) {
+        common_params upload;
+        assert(parse(upload, {"binary", "--remote-attn-format", value}));
+        assert(upload.remote_attn_format == value);
+        unset_test_env("GGML_RKVA_UPLOAD_FORMAT");
+    }
+    common_params kv;
+    assert(parse(kv, {"binary", "--cache-type-k", "turboquant_4bit_nc", "--cache-type-v", "turboquant_4bit_nc"}));
+    assert(kv.cache_type_k == GGML_TYPE_TQNC_K && kv.cache_type_v == GGML_TYPE_TQNC_V);
+
+    common_params split;
+    assert(parse(split, {"binary", "-c", "2048", "-fa", "on",
+                         "--cache-type-k", "turboquant_4bit_nc", "--cache-type-v", "turboquant_4bit_nc",
+                         "--remote-attn", "127.0.0.1:50054", "--kv-position-split-p", "256",
+                         "--remote-attn-cache-type-k", "q4_0", "--remote-attn-cache-type-v", "q4_0"}));
+    split.n_parallel = 1;
+    const auto context = common_context_params_to_llama(split);
+    assert(context.type_k == GGML_TYPE_TQNC_K && context.type_v == GGML_TYPE_TQNC_V);
+    assert(context.kv_position_split_p == 256);
+    const auto rejected = [](const common_params & value) {
+        try { (void) common_context_params_to_llama(value); }
+        catch (const std::invalid_argument &) { return true; }
+        return false;
+    };
+    split.cache_type_v = GGML_TYPE_F16;
+    assert(rejected(split));
+    split.cache_type_v = GGML_TYPE_TQNC_V;
+    split.kv_position_split_p = 0;
+    assert(rejected(split));
+}
+
 int main(void) {
     try {
+        test_e4_wire_argument();
+        test_turboquant_nc_aliases();
         test();
         test_position_split_option_and_adaptive_scope();
         test_draft_ubatch_configuration_is_independent();

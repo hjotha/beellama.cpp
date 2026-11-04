@@ -468,6 +468,9 @@ public:
         return position_split_enabled() && standard_cache &&
                 (!native_kvarn_rpc_experimental_ || native_kvarn_rewind_capable_);
     }
+    // Called after HELLO/CONFIG succeeds and before any sequence is populated.
+    // The generic Q4/Q8 fallback does not call this and remains snapshotable.
+    void set_negotiated_native_rpc_owner(bool has_record_snapshot_codec);
     void set_native_kvarn_rewind_capable(bool capable) { native_kvarn_rewind_capable_ = capable; }
     void set_native_kvarn_rewind_preflight(std::function<bool(llama_pos)> preflight) {
         native_kvarn_rewind_preflight_ = std::move(preflight);
@@ -949,7 +952,9 @@ private:
     const uint32_t kv_size_local;
     const uint32_t kv_size_overflow;
     const uint32_t position_split_p_;
-    const bool native_kvarn_rpc_experimental_;
+    bool native_kvarn_rpc_experimental_;
+    // SAW/TurboQuant native rows own remote state but have no native FULL codec.
+    bool native_row_rpc_experimental_;
     bool native_kvarn_rewind_capable_ = false;
     std::function<bool(llama_pos)> native_kvarn_rewind_preflight_;
     bool native_kvarn_checkpoint_unavailable() const;

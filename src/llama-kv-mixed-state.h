@@ -225,6 +225,9 @@ enum standard_qx_type : uint16_t {
     sx_q3_1  = 46, // GGML_TYPE_Q3_1
     sx_q2_0s = 47, // GGML_TYPE_Q2_0S (Bee cache-facing Q2_0)
     sx_q2_1  = 48, // GGML_TYPE_Q2_1
+    sx_saw_int4 = 144, // GGML_TYPE_SAW_INT4 (local target cache)
+    sx_tqnc_k   = 145, // GGML_TYPE_TQNC_K
+    sx_tqnc_v   = 146, // GGML_TYPE_TQNC_V
 };
 
 // KVarN joint type ids (wire). Numeric values are identical to the
