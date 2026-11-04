@@ -44,6 +44,14 @@ three adjacent 20,480-token chunks. They are not the integrated BDR16 codec;
 their reused experimental type ID is not interoperable. These chunks are not
 independent samples from a representative corpus.
 
+The pinned upstream SAW tests and an extended 256-dimensional set passed on
+the RTX 4070, but those tests exercise the upstream code, not Bee's codec.
+The integrated Bee path rotates both K and V with BDR16; the inspected
+upstream configuration uses BDR128 for K and leaves V unrotated. A separate
+CPU emulation of the upstream BF16 rounding differed from Bee's scalar codec
+on 137 packed bytes out of 8,192 in one fixture. This is evidence of a
+rounding difference in that emulation, not a direct Triton/Bee GPU parity test.
+
 Cold local `llama-server` requests used the same model, context capacity
 22,016, 20,480 prompt tokens, 64 generated tokens, batch 128, ubatch 32, one
 sequence, no MTP and no prompt cache hit. These are medians of two requests;
@@ -95,6 +103,29 @@ app 1.6.0.926; it is not a comparison to another format or a qualification of
 the full 162,816-token capacity. Free GPU memory was sampled as low as 21 MiB
 during the run. Snapshot auto-save/restore was disabled for this isolated
 measurement.
+
+On 2026-11-05 the production router was configured for KVarN4 target KV on
+all six tiers, Q4_0 MTP draft KV, and native KVarN4 on Xbox with E5M2 transfer.
+Each tier was selected and generated a first token in the live service; this
+is an allocation and routing check, not a full-capacity test of each tier. A
+109,490-token cache-miss request on the already initialized production XXXL
+tier completed at 501.21 prefill tokens/s and 18.27 decode tokens/s for 16
+generated tokens, with 219.33 seconds client wall time. Xbox app 1.6.0.927
+was running and the host/Xbox native snapshot was published at 109,505 tokens.
+The published host file was 2,249,892,456 bytes and the logged save took
+21.33 seconds. After a service restart, a continuation restored 109,505 tokens
+from disk, reprocessed one prompt token and generated eight tokens in 38.92
+seconds client wall time including the tier transition and restore. The log
+identified a native snapshot restore. A second cold restore generated the same
+eight token IDs and its logged counters showed 128 remote KVarN4 attention
+calls in 16 layers, using E5M2 for positions 109,505 through 109,512.
+Repeating that same prompt immediately in the live context instead fell back
+to full prefill because no usable recurrent checkpoint was available; this
+repeat was cancelled rather than run to completion.
+GPU memory was sampled as low as 19 MiB free during that prefill; the samples
+are not a continuous peak measurement. Production's default log verbosity did
+not expose the remote call counters for that request; the call count above is
+from the isolated 926 run.
 
 For a local KLD reproduction, first save BF16 logits with the same model,
 corpus and batching, then compare a selected cache type and tail, for example:
