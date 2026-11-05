@@ -105,6 +105,20 @@ struct ggml_remote_attn_cuda_fp8_interface_v3 {
 typedef const struct ggml_remote_attn_cuda_fp8_interface_v3 *
     (*ggml_backend_cuda_remote_attn_fp8_interface_v3_t)(void);
 
+// E4M3FN uses the existing v2 context and allocator, with separate codec calls.
+// Before unpacking, the caller validates LSE against each query's prefix;
+// negative infinity is permitted for an empty range.
+struct ggml_remote_attn_cuda_e4_interface_v1 {
+    const struct ggml_remote_attn_cuda_fp8_interface_v2 * base;
+    bool (*pack_q)(void * context, const void * src_q, bool is_f16,
+                   size_t n_elements, uint8_t * dst_fp8, void * producer_event);
+    bool (*unpack_out)(void * context, const uint8_t * src_fp8, const float * src_lse,
+                       size_t nq, size_t out_width, size_t n_head,
+                       void * dst_out, size_t dst_stride_bytes);
+};
+typedef const struct ggml_remote_attn_cuda_e4_interface_v1 *
+    (*ggml_backend_cuda_remote_attn_e4_interface_v1_t)(void);
+
 // CUDA proc "ggml_backend_cuda_remote_attn_retirement_interface_v1".
 // Separate extension: all FP8 v1/v2/v3 table layouts remain unchanged. Applies
 // only to contexts created through base and their private serving stream.

@@ -60,15 +60,46 @@ static __device__ __forceinline__ bool fp8_e5m2_to_f32(uint8_t byte, float & out
     return true;
 }
 
+static __device__ __forceinline__ bool f32_to_fp8_e4m3_rne(float value, uint8_t & out) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t magnitude = bits & 0x7fffffffu;
+    const uint8_t sign = uint8_t((bits >> 24) & 0x80u);
+    if (magnitude >= 0x7f800000u) return false;
+    if (magnitude >= 0x43e00000u) { out = sign | 0x7eu; return true; }
+    if (magnitude <= 0x3a800000u) { out = sign; return true; }
+    const uint32_t exponent = magnitude >> 23;
+    const uint32_t mantissa = magnitude & 0x7fffffu;
+    const uint32_t encoded = magnitude < 0x3c800000u ?
+        rkva_cuda_round_shift_even(mantissa | 0x800000u, 141u - exponent) :
+        ((exponent - 120u) << 3) + rkva_cuda_round_shift_even(mantissa, 20);
+    out = sign | uint8_t(encoded);
+    return true;
+}
+
+static __device__ __forceinline__ bool fp8_e4m3_to_f32(uint8_t byte, float & out) {
+    const uint8_t magnitude = byte & 0x7fu;
+    if (magnitude == 0x7fu) return false;
+    const uint32_t sign = uint32_t(byte & 0x80u) << 24;
+    const unsigned exponent = magnitude >> 3, mantissa = magnitude & 7u;
+    uint32_t bits = sign;
+    if (exponent) bits |= ((exponent + 120u) << 23) | (mantissa << 20);
+    else if (mantissa) {
+        const unsigned power = mantissa >= 4 ? 2u : mantissa >= 2 ? 1u : 0u;
+        bits |= ((power + 118u) << 23) | ((mantissa << (23u - power)) & 0x7fffffu);
+    }
+    out = __uint_as_float(bits);
+    return true;
+}
+
 static __global__ void rkva_cuda_fp8_pack_q_f32_kernel(
         const float * __restrict__ src,
         uint8_t     * __restrict__ dst,
         size_t n,
-        int         * __restrict__ err_flag) {
+        int         * __restrict__ err_flag, bool e4) {
     size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     uint8_t packed = 0;
-    if (!f32_to_fp8_e5m2_rne(src[idx], packed)) {
+    if (!(e4 ? f32_to_fp8_e4m3_rne(src[idx], packed) : f32_to_fp8_e5m2_rne(src[idx], packed))) {
         atomicExch(err_flag, 1);
         return;
     }
@@ -79,11 +110,11 @@ static __global__ void rkva_cuda_fp8_pack_q_f16_kernel(
         const half  * __restrict__ src,
         uint8_t     * __restrict__ dst,
         size_t n,
-        int         * __restrict__ err_flag) {
+        int         * __restrict__ err_flag, bool e4) {
     size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     uint8_t packed = 0;
-    if (!f16_to_fp8_e5m2_rne(src[idx], packed)) {
+    if (!(e4 ? f32_to_fp8_e4m3_rne(__half2float(src[idx]), packed) : f16_to_fp8_e5m2_rne(src[idx], packed))) {
         atomicExch(err_flag, 1);
         return;
     }
@@ -98,7 +129,7 @@ static __global__ void rkva_cuda_fp8_unpack_out_kernel(
         size_t out_width,
         size_t n_head,
         size_t dst_stride_floats,
-        int           * __restrict__ err_flag) {
+        int           * __restrict__ err_flag, bool e4) {
     size_t col_total = out_width + n_head;
     size_t total = nq * col_total;
     size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -109,7 +140,7 @@ static __global__ void rkva_cuda_fp8_unpack_out_kernel(
     if (col < out_width) {
         uint8_t byte = src_fp8[row * out_width + col];
         float val = 0.0f;
-        if (!fp8_e5m2_to_f32(byte, val)) {
+        if (!(e4 ? fp8_e4m3_to_f32(byte, val) : fp8_e5m2_to_f32(byte, val))) {
             atomicExch(err_flag, 1);
             return;
         }
@@ -118,7 +149,7 @@ static __global__ void rkva_cuda_fp8_unpack_out_kernel(
         size_t h = col - out_width;
         if (src_lse) {
             float lse = src_lse[row * n_head + h];
-            if (!isfinite(lse)) {
+            if (!isfinite(lse) && !(e4 && isinf(lse) && lse < 0)) {
                 atomicExch(err_flag, 1);
                 return;
             }
@@ -680,7 +711,7 @@ static bool rkva_unpack_small_impl(rkva_cuda_remote_scratch & s, const uint8_t *
 static bool rkva_pack_impl(rkva_cuda_remote_scratch & s, const void * src_q, bool is_f16,
                           size_t n_elements, uint8_t * dst_pinned_fp8,
                           cudaStream_t user_stream, cudaEvent_t producer_event,
-                          cudaEvent_t event_done) {
+                          cudaEvent_t event_done, bool e4 = false) {
     ggml_remote_attn_trace_scope call_timing("cuda_pack_host");
     call_timing.event.flags |= 0x40000001u;
     if (!src_q || !dst_pinned_fp8 || !n_elements) return false;
@@ -728,10 +759,10 @@ static bool rkva_pack_impl(rkva_cuda_remote_scratch & s, const void * src_q, boo
         gpu_timing.mark(3, stream);
         if (is_f16) {
             rkva_cuda_fp8_pack_q_f16_kernel<<<grid, 256, 0, stream>>>(
-                static_cast<const half *>(dev_src), dev_dst, n_elements, s.dev_err);
+                static_cast<const half *>(dev_src), dev_dst, n_elements, s.dev_err, e4);
         } else {
             rkva_cuda_fp8_pack_q_f32_kernel<<<grid, 256, 0, stream>>>(
-                static_cast<const float *>(dev_src), dev_dst, n_elements, s.dev_err);
+                static_cast<const float *>(dev_src), dev_dst, n_elements, s.dev_err, e4);
         }
         if (cudaGetLastError() != cudaSuccess) return false;
         gpu_timing.mark(4, stream);
@@ -760,7 +791,7 @@ static bool rkva_pack_impl(rkva_cuda_remote_scratch & s, const void * src_q, boo
 static bool rkva_unpack_impl(rkva_cuda_remote_scratch & s, const uint8_t * src_pinned_fp8,
                             const float * src_lse, size_t nq, size_t out_width, size_t n_head,
                             void * dst_out, size_t dst_stride_bytes, cudaStream_t user_stream,
-                            cudaEvent_t event_done) {
+                            cudaEvent_t event_done, bool e4 = false) {
     ggml_remote_attn_trace_scope call_timing("cuda_unpack_host");
     call_timing.event.flags |= 0x40000001u;
     if (!src_pinned_fp8 || !dst_out || !nq || !out_width || (n_head && !src_lse) ||
@@ -806,7 +837,7 @@ static bool rkva_unpack_impl(rkva_cuda_remote_scratch & s, const uint8_t * src_p
         gpu_timing.mark(3, stream);
         rkva_cuda_fp8_unpack_out_kernel<<<grid, 256, 0, stream>>>(
             dev_fp8, lse_bytes ? dev_lse : nullptr, dev_out, nq, out_width, n_head,
-            is_dev ? dst_stride_bytes / sizeof(float) : col_total, s.dev_err);
+            is_dev ? dst_stride_bytes / sizeof(float) : col_total, s.dev_err, e4);
         if (cudaGetLastError() != cudaSuccess) return false;
         gpu_timing.mark(4, stream);
         if (!is_dev && cudaMemcpy2DAsync(dst_out, dst_stride_bytes, dev_out, row_bytes,
@@ -916,6 +947,25 @@ static bool rkva_unpack_context(void * context, const uint8_t * src_pinned_fp8, 
     rkva_device_guard guard(s->device);
     return guard.ok && rkva_unpack_impl(*s, src_pinned_fp8, src_lse, nq, out_width, n_head,
                                         dst_out, stride, nullptr, nullptr);
+}
+
+static bool rkva_pack_e4_context(void * context, const void * src, bool is_f16, size_t count,
+                                 uint8_t * dst, void * producer_event) {
+    auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
+    if (!s) return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    rkva_device_guard guard(s->device);
+    return guard.ok && rkva_pack_impl(*s, src, is_f16, count, dst,
+                                     nullptr, static_cast<cudaEvent_t>(producer_event), nullptr, true);
+}
+
+static bool rkva_unpack_e4_context(void * context, const uint8_t * src, const float * lse,
+                                   size_t nq, size_t width, size_t heads, void * dst, size_t stride) {
+    auto * s = static_cast<rkva_cuda_remote_scratch *>(context);
+    if (!s) return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    rkva_device_guard guard(s->device);
+    return guard.ok && rkva_unpack_impl(*s, src, lse, nq, width, heads, dst, stride, nullptr, nullptr, true);
 }
 
 static bool rkva_pack_small_context(void * context, const void * src, bool is_f16,
@@ -1060,6 +1110,14 @@ static const ggml_remote_attn_cuda_fp8_interface_v2 s_cuda_remote_attn_fp8_inter
 
 const struct ggml_remote_attn_cuda_fp8_interface_v2 * ggml_backend_cuda_remote_attn_fp8_interface_v2(void) {
     return &s_cuda_remote_attn_fp8_interface_v2;
+}
+
+static const ggml_remote_attn_cuda_e4_interface_v1 s_cuda_remote_attn_e4_interface_v1 = {
+    &s_cuda_remote_attn_fp8_interface_v2, rkva_pack_e4_context, rkva_unpack_e4_context,
+};
+
+const struct ggml_remote_attn_cuda_e4_interface_v1 * ggml_backend_cuda_remote_attn_e4_interface_v1(void) {
+    return &s_cuda_remote_attn_e4_interface_v1;
 }
 
 static const ggml_remote_attn_cuda_fp8_interface_v3 s_cuda_remote_attn_fp8_interface_v3 = {

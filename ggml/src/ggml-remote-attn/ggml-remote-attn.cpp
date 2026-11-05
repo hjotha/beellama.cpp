@@ -224,6 +224,21 @@ static const ggml_remote_attn_cuda_fp8_interface_v3 * rkva_cuda_fp8_small_api() 
     return api;
 }
 
+static const ggml_remote_attn_cuda_e4_interface_v1 * rkva_cuda_e4_api() {
+    const char * option = std::getenv("GGML_RKVA_CUDA_FP8");
+    if (option && !std::strcmp(option, "0")) return nullptr;
+    static std::mutex mutex;
+    static const ggml_remote_attn_cuda_e4_interface_v1 * api = nullptr;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!api) {
+        auto * reg = ggml_backend_reg_by_name("CUDA");
+        auto getter = reg && ggml_backend_reg_dev_count(reg) ? reinterpret_cast<ggml_backend_cuda_remote_attn_e4_interface_v1_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_e4_interface_v1")) : nullptr;
+        if (getter) api = getter();
+    }
+    return api;
+}
+
 static bool rkva_cuda_fp8_mapped_requested() {
     const char * option = std::getenv("GGML_RKVA_CUDA_FP8");
     return option && !std::strcmp(option, "mapped");
@@ -1521,7 +1536,8 @@ static bool rkva_finish_native_bulk_job(
     response_trace.cycle = cycle;
     if (ggml_remote_attn_trace_enabled()) ggml_remote_attn_trace_context(&response_trace);
     trace_finish.event.cycle = cycle;
-    const bool cuda_output = wire == RKVA_WIRE_FP8 && slot.cuda_api &&
+    const auto * e4_api = wire == RKVA_WIRE_FP8_E4M3FN ? rkva_cuda_e4_api() : nullptr;
+    const bool cuda_output = (wire == RKVA_WIRE_FP8 || (e4_api && e4_api->base == slot.cuda_api)) && slot.cuda_api &&
         slot.cuda_api->device_for_pointer(slot.output) >= 0;
     {
     ggml_remote_attn_trace_scope trace_unpack("out_decode");
@@ -1529,7 +1545,10 @@ static bool rkva_finish_native_bulk_job(
     if (cuda_output) {
         if (!slot.cuda_context_retired || !slot.cuda_context) return false;
         slot.cuda_context_retired = false;
-        const bool unpacked = slot.cuda_small ? slot.cuda_small_api->unpack_small(slot.cuda_context, reply.data(),
+        const bool unpacked = e4_api ? e4_api->unpack_out(slot.cuda_context, reply.data(),
+                reinterpret_cast<const float *>(reply.data() + out_bytes),
+                slot.nq, slot.out_width, ctx->geo.n_head, slot.output, slot.output_stride) :
+            slot.cuda_small ? slot.cuda_small_api->unpack_small(slot.cuda_context, reply.data(),
                 reinterpret_cast<const float *>(reply.data() + out_bytes),
                 slot.nq, slot.out_width, ctx->geo.n_head, slot.output, slot.output_stride) :
             slot.cuda_api->unpack_out(slot.cuda_context, reply.data(),
@@ -2304,7 +2323,8 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
                                   uint32_t layer, uint32_t live, size_t nq, size_t out_width) {
     // Includes the QCPU/outputCPU fallback, which does not prepare a slot.
     if (!ctx->synchronous_slot.cuda_context_retired) return false;
-    auto * cuda_api = ctx->range_wire == RKVA_WIRE_FP8 && ctx->native_bulk ? rkva_cuda_fp8_api() : nullptr;
+    auto * cuda_api = (ctx->range_wire == RKVA_WIRE_FP8 ||
+            (ctx->range_wire == RKVA_WIRE_FP8_E4M3FN && rkva_cuda_e4_api())) && ctx->native_bulk ? rkva_cuda_fp8_api() : nullptr;
     if (cuda_api && !rkva_cuda_fp8_bucket_permitted(int64_t(nq)) &&
             cuda_api->device_for_pointer(node->data) >= 0) {
         // Placement must agree with the CPU codec policy. Never let CPU decode
@@ -2671,7 +2691,9 @@ static bool rkva_prepare_native_bulk_job(
         const rkva_kvarn_range_bulk header {1, segments, uint32_t(nq), 0};
         slot.payload.resize(sizeof(header));
         std::memcpy(slot.payload.data(), &header, sizeof(header));
-        const auto * api = wire == RKVA_WIRE_FP8 ? rkva_cuda_fp8_api() : nullptr;
+        const auto * e4_api = wire == RKVA_WIRE_FP8_E4M3FN ? rkva_cuda_e4_api() : nullptr;
+        const auto * api = (wire == RKVA_WIRE_FP8 || e4_api) ? rkva_cuda_fp8_api() : nullptr;
+        if (e4_api && e4_api->base != api) return cuda_failure("e4_interface_mismatch");
         const int q_device = api ? api->device_for_pointer(node->src[0]->data) : -1;
         const int out_device = api ? api->device_for_pointer(node->data) : -1;
         // Managed pointers and CUDA attribute failures have no supported host
@@ -2681,7 +2703,7 @@ static bool rkva_prepare_native_bulk_job(
         if (!cuda_allowed && out_device >= 0) return cuda_failure("bucket_device_output");
         if (!cuda_allowed && !rkva_release_cuda_cpu_phase(ctx, slot, node)) return cuda_failure("cpu_phase_release");
         const bool cuda_pack_q = cuda_allowed && q_device >= 0;
-        slot.cuda_small = rkva_cuda_fp8_mapped_requested() && nq <= 9 &&
+        slot.cuda_small = !e4_api && rkva_cuda_fp8_mapped_requested() && nq <= 9 &&
                           (cuda_pack_q || out_device >= 0);
         slot.cuda_small_api = slot.cuda_small ? rkva_cuda_fp8_small_api() : nullptr;
         // An explicit experimental selection is not a request to silently use
@@ -2710,7 +2732,9 @@ static bool rkva_prepare_native_bulk_job(
             trace_q.event.bytes = nq * out_width;
             slot.query_fp8.resize(nq * out_width);
             slot.cuda_context_retired = false;
-            const bool packed = slot.cuda_small ? slot.cuda_small_api->pack_small(slot.cuda_context,
+            const bool packed = e4_api ? e4_api->pack_q(slot.cuda_context, node->src[0]->data, false,
+                    nq * out_width, slot.query_fp8.data(), rkva_cuda_producer_event) :
+                slot.cuda_small ? slot.cuda_small_api->pack_small(slot.cuda_context,
                     node->src[0]->data, false, nq, out_width, slot.query_fp8.data(), rkva_cuda_producer_event) :
                 api->pack_q(slot.cuda_context, node->src[0]->data, false, nq * out_width,
                     slot.query_fp8.data(), rkva_cuda_producer_event);
@@ -2759,7 +2783,9 @@ static bool rkva_prepare_native_bulk_job(
             std::memcpy(dst, slot.pos_scratch.data() + first, chunk * sizeof(int32_t));
             dst += chunk * sizeof(int32_t);
             if (wire == RKVA_WIRE_FP8_E4M3FN) {
-                if (!rkva_f32_to_e4_batch(bulk_queries + first * out_width, dst, chunk * out_width)) {
+                if (cuda_pack_q) {
+                    std::memcpy(dst, slot.query_fp8.data() + first * out_width, chunk * out_width);
+                } else if (!rkva_f32_to_e4_batch(bulk_queries + first * out_width, dst, chunk * out_width)) {
                     ctx->failed = true; return false;
                 }
             } else if (wire == RKVA_WIRE_FP8) {
@@ -3863,8 +3889,10 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     rkva_hello hello {};
     hello.proto_flags    = (1u << 0) | (1u << 1) | RKVA_PROTO_NATIVE_REWIND_V2 |
                            RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3;
-    // The v3 E4 experiment does not yet qualify native snapshot/restore.
-    hello.proto_flags   |= ctx->e4_requested ? RKVA_PROTO_BULK_E4M3FN : RKVA_PROTO_NATIVE_SNAPSHOT_V4;
+    hello.proto_flags   |= RKVA_PROTO_NATIVE_SNAPSHOT_V4;
+    if (ctx->e4_requested) {
+        hello.proto_flags |= RKVA_PROTO_BULK_E4M3FN;
+    }
     hello.n_layer_remote = ctx->geo.n_layer_remote;
     hello.n_head         = ctx->geo.n_head;
     hello.n_head_kv      = ctx->geo.n_head_kv;
@@ -5652,8 +5680,14 @@ bool ggml_backend_remote_attn_cuda_enabled(void) {
     const char * option = std::getenv("GGML_RKVA_CUDA_FP8");
     if (option && !std::strcmp(option, "0")) return false;
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    // E4's generic CUDA path has higher overhead on small remote workloads;
+    // require an explicit selection until that path is qualified for the workload.
+    if (ctx->range_wire == RKVA_WIRE_FP8_E4M3FN && !option) return false;
     return ctx->connected && !ctx->failed && ctx->range_configured &&
-        ctx->range_native_kvarn && ctx->native_bulk && ctx->range_wire == RKVA_WIRE_FP8 && rkva_cuda_fp8_api();
+        ctx->range_native_kvarn && ctx->native_bulk && rkva_cuda_fp8_api() &&
+        (ctx->range_wire == RKVA_WIRE_FP8 ||
+         (ctx->range_wire == RKVA_WIRE_FP8_E4M3FN && rkva_cuda_e4_api() &&
+          rkva_cuda_e4_api()->base == rkva_cuda_fp8_api()));
 }
 
 bool ggml_backend_remote_attn_cuda_enabled_for_node(const ggml_tensor * node) {
@@ -5669,7 +5703,6 @@ bool ggml_backend_remote_attn_cuda_enabled_for_node(const ggml_tensor * node) {
 }
 
 bool ggml_remote_attn_exec_cuda(struct ggml_tensor * node, void * producer_event) {
-    // E4 currently uses host buffers only; never pass a device pointer to its CPU codec.
     if (!ggml_backend_remote_attn_cuda_enabled_for_node(node)) return false;
     struct restore_event {
         void * previous;

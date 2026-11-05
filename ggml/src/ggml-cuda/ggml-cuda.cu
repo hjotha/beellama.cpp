@@ -8162,6 +8162,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_interface_v3") == 0) {
         return (void *)ggml_backend_cuda_remote_attn_fp8_interface_v3;
     }
+    if (strcmp(name, "ggml_backend_cuda_remote_attn_e4_interface_v1") == 0) {
+        return (void *)ggml_backend_cuda_remote_attn_e4_interface_v1;
+    }
     if (strcmp(name, "ggml_backend_cuda_remote_attn_fp8_interface_v2") == 0) {
         return (void *)ggml_backend_cuda_remote_attn_fp8_interface_v2;
     }

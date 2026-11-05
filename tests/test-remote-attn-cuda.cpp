@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-remote-attn-cuda.h"
 #include "ggml-remote-attn-trace.h"
+#include "../ggml/src/ggml-remote-attn/rkva-fp8-e4m3.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #if __has_include(<cuda_fp8.h>)
@@ -20,6 +21,7 @@
 #ifdef RKVA_CUDA_STANDALONE_TEST
 extern "C" const ggml_remote_attn_cuda_fp8_interface_v2 * ggml_backend_cuda_remote_attn_fp8_interface_v2(void);
 extern "C" const ggml_remote_attn_cuda_fp8_interface_v3 * ggml_backend_cuda_remote_attn_fp8_interface_v3(void);
+extern "C" const ggml_remote_attn_cuda_e4_interface_v1 * ggml_backend_cuda_remote_attn_e4_interface_v1(void);
 extern "C" const ggml_remote_attn_cuda_retirement_interface_v1 * ggml_backend_cuda_remote_attn_retirement_interface_v1(void);
 extern "C" const ggml_remote_attn_cuda_fp8_interface * ggml_backend_cuda_remote_attn_fp8_interface(void);
 #endif
@@ -30,6 +32,76 @@ extern "C" const ggml_remote_attn_cuda_fp8_interface * ggml_backend_cuda_remote_
 static float from_bits(uint32_t bits) { float value; std::memcpy(&value, &bits, 4); return value; }
 static uint32_t bits_of(float value) { uint32_t bits; std::memcpy(&bits, &value, 4); return bits; }
 static float half_float(uint16_t bits) { half h; std::memcpy(&h, &bits, 2); return __half2float(h); }
+
+static void test_e4(const ggml_remote_attn_cuda_e4_interface_v1 * e4,
+                    const ggml_remote_attn_cuda_fp8_interface_v2 * base) {
+    REQUIRE(e4 && e4->base == base && e4->pack_q && e4->unpack_out);
+    void * context = base->create_context(0);
+    REQUIRE(context);
+    std::vector<float> values;
+    std::vector<uint16_t> halves;
+    for (unsigned h = 0; h < 65536; ++h) {
+        const float value = half_float(uint16_t(h));
+        if (std::isfinite(value)) { values.push_back(value); halves.push_back(uint16_t(h)); }
+    }
+    for (unsigned i = 1; i < 0x7f; ++i) {
+        float x = 0, y = 0;
+        REQUIRE(rkva_e4::decode_f32(uint8_t(i - 1), x) && rkva_e4::decode_f32(uint8_t(i), y));
+        const float midpoint = (x + y) * 0.5f;
+        values.push_back(midpoint);
+        values.push_back(std::nextafter(midpoint, -INFINITY));
+        values.push_back(std::nextafter(midpoint, INFINITY));
+    }
+    auto * packed = static_cast<uint8_t *>(base->alloc_pinned(values.size()));
+    REQUIRE(packed && e4->pack_q(context, values.data(), false, values.size(), packed, nullptr));
+    for (size_t i = 0; i < values.size(); ++i) {
+        uint8_t expected = 0;
+        REQUIRE(rkva_e4::encode_f32(values[i], expected) && packed[i] == expected);
+    }
+    float * device_values = nullptr;
+    CUDA_OK(cudaMalloc(&device_values, values.size() * sizeof(float)));
+    CUDA_OK(cudaMemcpy(device_values, values.data(), values.size() * sizeof(float), cudaMemcpyHostToDevice));
+    REQUIRE(e4->pack_q(context, device_values, false, values.size(), packed, nullptr));
+    for (size_t i = 0; i < values.size(); ++i) {
+        uint8_t expected = 0;
+        REQUIRE(rkva_e4::encode_f32(values[i], expected) && packed[i] == expected);
+    }
+    CUDA_OK(cudaFree(device_values));
+    half * device_halves = nullptr;
+    CUDA_OK(cudaMalloc(&device_halves, halves.size() * sizeof(uint16_t)));
+    CUDA_OK(cudaMemcpy(device_halves, halves.data(), halves.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    REQUIRE(e4->pack_q(context, device_halves, true, halves.size(), packed, nullptr));
+    for (size_t i = 0; i < halves.size(); ++i) {
+        uint8_t expected = 0;
+        REQUIRE(rkva_e4::encode_f16(halves[i], expected) && packed[i] == expected);
+    }
+    CUDA_OK(cudaFree(device_halves));
+    for (float invalid : {INFINITY, -INFINITY, std::numeric_limits<float>::quiet_NaN()})
+        REQUIRE(!e4->pack_q(context, &invalid, false, 1, packed, nullptr));
+    std::vector<uint8_t> codes;
+    for (unsigned i = 0; i < 256; ++i) if ((i & 0x7f) != 0x7f) codes.push_back(uint8_t(i));
+    std::memcpy(packed, codes.data(), codes.size());
+    std::vector<float> decoded(codes.size() + 1);
+    const float lse = -INFINITY;
+    REQUIRE(e4->unpack_out(context, packed, &lse, 1, codes.size(), 1, decoded.data(), decoded.size() * sizeof(float)));
+    for (size_t i = 0; i < codes.size(); ++i) {
+        float expected = 0;
+        REQUIRE(rkva_e4::decode_f32(codes[i], expected) && bits_of(decoded[i]) == bits_of(expected));
+    }
+    REQUIRE(std::isinf(decoded.back()) && decoded.back() < 0);
+    float * device_out = nullptr;
+    CUDA_OK(cudaMalloc(&device_out, decoded.size() * sizeof(float)));
+    REQUIRE(e4->unpack_out(context, packed, &lse, 1, codes.size(), 1, device_out, decoded.size() * sizeof(float)));
+    std::vector<float> gpu_decoded(decoded.size());
+    CUDA_OK(cudaMemcpy(gpu_decoded.data(), device_out, decoded.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < decoded.size(); ++i) REQUIRE(bits_of(decoded[i]) == bits_of(gpu_decoded[i]));
+    CUDA_OK(cudaFree(device_out));
+    packed[0] = 0x7f;
+    REQUIRE(!e4->unpack_out(context, packed, nullptr, 1, 1, 0, decoded.data(), sizeof(float)));
+    base->free_pinned(packed);
+    base->destroy_context(context);
+    std::puts("E4M3 CUDA: all finite F16, F32 boundaries, GPU pointers and invalid values passed");
+}
 static uint8_t oracle(float value) {
 #ifdef RKVA_HAVE_CUDA_FP8_ORACLE
     return uint8_t(__nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E5M2));
@@ -287,6 +359,7 @@ int main() {
     }
 #ifdef RKVA_CUDA_STANDALONE_TEST
     const auto * api = ggml_backend_cuda_remote_attn_fp8_interface_v2();
+    const auto * e4 = ggml_backend_cuda_remote_attn_e4_interface_v1();
     const auto * legacy = ggml_backend_cuda_remote_attn_fp8_interface();
     const auto * small = ggml_backend_cuda_remote_attn_fp8_interface_v3();
     const auto * retirement = ggml_backend_cuda_remote_attn_retirement_interface_v1();
@@ -296,14 +369,17 @@ int main() {
     REQUIRE(reg);
     const auto getter = reinterpret_cast<ggml_backend_cuda_remote_attn_fp8_interface_v2_t>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_fp8_interface_v2"));
+    const auto e4_getter = reinterpret_cast<ggml_backend_cuda_remote_attn_e4_interface_v1_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_e4_interface_v1"));
     const auto legacy_getter = reinterpret_cast<ggml_backend_cuda_remote_attn_fp8_interface_v1_t>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_fp8_interface_v1"));
     const auto small_getter = reinterpret_cast<ggml_backend_cuda_remote_attn_fp8_interface_v3_t>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_fp8_interface_v3"));
     const auto retirement_getter = reinterpret_cast<ggml_backend_cuda_remote_attn_retirement_interface_v1_t>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_remote_attn_retirement_interface_v1"));
-    REQUIRE(getter && legacy_getter && small_getter && retirement_getter);
+    REQUIRE(getter && e4_getter && legacy_getter && small_getter && retirement_getter);
     const auto * api = getter();
+    const auto * e4 = e4_getter();
     const auto * legacy = legacy_getter();
     const auto * small = small_getter();
     const auto * retirement = retirement_getter();
@@ -352,6 +428,7 @@ int main() {
         std::puts("remote-attn scratch pressure pack/unpack parity OK");
         return 0;
     }
+    test_e4(e4, api);
     test_retirement(retirement, api, small);
     void * context = api->create_context(0);
     REQUIRE(context);

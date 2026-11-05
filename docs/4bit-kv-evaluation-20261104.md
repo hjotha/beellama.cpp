@@ -91,8 +91,24 @@ With the same KVarN4 format on both devices and an artificial split at token
 placement and producer/attention implementation as well as transfer precision;
 they do not isolate the device. The split deliberately sends nearly the entire
 context to Xbox, unlike the production split at 108,032. E4M3FN was more
-accurate in that experiment, while E5M2 was faster and supports the native
-snapshot capability on this path.
+accurate in that experiment, while E5M2 was faster. E4M3FN and the native
+snapshot capability can be negotiated together by a qualified peer.
+
+On Xbox app 1.6.0.928, an E4M3FN session restored an existing 109,505-token
+native snapshot, published a new 109,513-token pair and restored that pair in
+a fresh process. The test-created pair was then retired; the five previously
+observed Xbox native objects remained. The existing 128-token tail is included
+in this native state; this does not qualify a global 256-token split tail.
+
+An E4 CPU-versus-CUDA comparison on the same model and 2,048-token prompt
+used the artificial split P=256 and three cold requests per arm. CPU medians
+were 72.04 prefill tokens/s, 21.42 decode tokens/s and 31.36 seconds wall;
+CUDA medians were 57.23, 21.47 and 38.76 respectively. All generated outputs
+matched, and CUDA counters recorded 5,712 pack and 5,712 unpack calls. Both
+arms measured KLD 0.000984 against the same BF16 KV reference in a separate
+2,048-token run. The generic CUDA E4 path is therefore opt-in through
+`GGML_RKVA_CUDA_FP8=1`; these measurements do not establish its performance
+at the production split.
 
 An isolated request using the actual production split, E5M2, KVarN4 on both
 sides and 109,490 prompt tokens completed with a cache miss: prefill 499.34

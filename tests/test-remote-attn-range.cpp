@@ -1377,16 +1377,20 @@ static void test_native_rewind() {
 // trailer, restore, continue, and rewind. This exercises the real request/ACK
 // parser and the staged owner commit over TCP; the Xbox disk codec remains in
 // the MSVC/D3D12 build.
-static void test_native_snapshot_transport() {
+static void test_native_snapshot_transport(bool e4 = false) {
     storage_env native("kvarn4");
     storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
-    storage_env legacy_bulk("0", "GGML_RKVA_NATIVE_BULK");
+    storage_env legacy_bulk(e4 ? "1" : "0", "GGML_RKVA_NATIVE_BULK");
+    storage_env wire(e4 ? "fp8_e4m3fn" : nullptr, "GGML_RKVA_WIRE_FORMAT");
+    storage_env upload("kvarn4", "GGML_RKVA_UPLOAD_FORMAT");
+    storage_env acceleration("0", "GGML_RKVA_CUDA_FP8");
     storage_env legacy_async("0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
     storage_env precision("128", "GGML_RKVA_NATIVE_TAIL_TOKENS");
     storage_env snapshots("1", "GGML_RKVA_DISK_SNAPSHOTS");
     ggml_backend_load_all();
-    loopback server(false, true, false, false, false, false, 0, 0, true, 3u | 4u | 512u);
+    loopback server(false, true, false, false, false, false, 0, 0, true,
+                    3u | 4u | 512u | (e4 ? 8u | 16u | 32u | 2048u : 0u));
     auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
     ggml_remote_attn_geometry geometry {};
     geometry.n_layer_remote = 2; geometry.n_head = 2; geometry.n_head_kv = 1;
@@ -1394,6 +1398,8 @@ static void test_native_snapshot_transport() {
     geometry.group_tokens = 128; geometry.sinkhorn_iters = 3;
     assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
     assert(ggml_backend_remote_attn_connect(backend));
+    assert(server.geometry.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4);
+    if (e4) assert(server.geometry.proto_flags & RKVA_PROTO_BULK_E4M3FN);
     assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
     ggml_backend_remote_attn_set_active_session(backend, 0);
     assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
@@ -1732,6 +1738,7 @@ static void test_native_bulk_e4m3fn() {
         assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
         ggml_backend_remote_attn_set_active_session(backend, 0);
         assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
+        assert(!ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend));
         assert(std::string(ggml_backend_remote_attn_stats_json(backend)).find("\"wire_format\":\"fp8_e4m3fn\"") != std::string::npos);
         ggml_remote_attn_set_active(backend);
         auto * ctx = ggml_init({1u << 20, nullptr, true});
@@ -4246,6 +4253,8 @@ static void test_prefetch_public_controls() {
 int main() {
     if (std::getenv("GGML_RKVA_E4_TEST_ONLY")) {
         test_native_bulk_e4m3fn();
+        test_native_snapshot_transport();
+        test_native_snapshot_transport(true);
         std::puts("PASS: E4M3FN v3 negotiation, CPU sync/async wire and fail-closed checks");
         return 0;
     }

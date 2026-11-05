@@ -160,7 +160,8 @@ revision 2 before touching state.
 
 The host adds `RKVA_PROTO_NATIVE_SNAPSHOT_V4` (`1 << 18`) to HELLO
 `proto_flags`. The server advertises `RKVA_CAP_NATIVE_KVARN_SNAPSHOT`
-(`1 << 18`) for the native-snapshot client in the supported F16/domain HELLO.
+(`1 << 18`) for the native-snapshot client in the supported F16/domain HELLO,
+including a version-3 E4M3FN session when both capabilities are negotiated.
 Actual host admission also requires native serial-prefix capability, the
 revision-3 descriptor, the snapshot capability and ops 17/18. Unnegotiated
 peers keep the old fail-closed guards.

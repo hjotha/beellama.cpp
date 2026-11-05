@@ -388,7 +388,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             state.native_rewind_v2_client &&
             (hello.proto_flags & RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3) != 0;
         state.native_snapshot_client =
-            req.version == RKVA_VERSION_V2 && state.native_serial_prefix_v3_client &&
+            rkva_range_version(req.version) && state.native_serial_prefix_v3_client &&
             (hello.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4) != 0;
 
         const auto evict_started = clock_type::now();
