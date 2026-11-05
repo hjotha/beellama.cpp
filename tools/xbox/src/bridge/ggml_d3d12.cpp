@@ -35,6 +35,10 @@ namespace xllama {
 
 // --- Pure rules (host-tested) ---
 
+bool d3d12_empty_fill_supported(const ggml_tensor* op) {
+    return op && op->op == GGML_OP_FILL && ggml_is_empty(op);
+}
+
 bool d3d12_weight_type_supported(ggml_type t) {
     return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
            t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q8_0;
@@ -2346,6 +2350,10 @@ ggml_backend_buffer_type_t dev_buffer_type(ggml_backend_dev_t) {
 
 bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
     switch (op->op) {
+    case GGML_OP_FILL:
+        // The graph collector skips empty tensors before dispatch. A real
+        // FILL still belongs to CPU, which implements the operation.
+        return d3d12_empty_fill_supported(op);
     case GGML_OP_ADD:
         return g_island_enabled && d3d12_add_supported(op);
     case GGML_OP_RMS_NORM:

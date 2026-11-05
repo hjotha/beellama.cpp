@@ -81,6 +81,8 @@ add_library(${TARGET}
     fit.h
     fit-kvarn-tail.cpp
     fit-kvarn-tail.h
+    file-lock.cpp
+    file-lock.h
     hf-cache.cpp
     hf-cache.h
     http.h
@@ -236,3 +238,8 @@ if (LLAMA_DSPARK_MARKOV_METAL)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
+
+if (CMAKE_SYSTEM_NAME MATCHES "AIX")
+    # AIX's flock() function comes from libbsd.a
+    target_link_libraries(${TARGET} PRIVATE -lbsd)
+endif()

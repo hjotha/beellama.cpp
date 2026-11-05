@@ -661,8 +661,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
 json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     std::vector<json> server_sent_events;
     std::vector<json> output;
+    size_t output_index = 0;
 
     if (oaicompat_msg.reasoning_content != "") {
+        const size_t item_output_index = output_index++;
         const json output_item = json {
             {"id",      oai_resp_reasoning_id},
             {"summary", json::array()},
@@ -678,6 +680,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"event", "response.output_item.done"},
             {"data", json {
                 {"type", "response.output_item.done"},
+                {"output_index", item_output_index},
                 {"item", output_item}
             }}
         });
@@ -685,11 +688,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     if (oaicompat_msg.content != "") {
+        const size_t item_output_index = output_index++;
         server_sent_events.push_back(json {
             {"event", "response.output_text.done"},
             {"data", json {
                 {"type",    "response.output_text.done"},
                 {"item_id", oai_resp_message_id},
+                {"output_index", item_output_index},
+                {"content_index", 0},
                 {"text",    oaicompat_msg.content}
             }}
         });
@@ -706,6 +712,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"data", json {
                 {"type",    "response.content_part.done"},
                 {"item_id", oai_resp_message_id},
+                {"output_index", item_output_index},
+                {"content_index", 0},
                 {"part",    content_part}
             }}
         });
@@ -721,6 +729,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"event", "response.output_item.done"},
             {"data", json {
                 {"type", "response.output_item.done"},
+                {"output_index", item_output_index},
                 {"item", output_item}
             }}
         });
@@ -728,6 +737,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
+        const size_t item_output_index = output_index++;
         const json output_item = {
             {"id",        "fc_" + tool_call.id},
             {"type",      "function_call"},
@@ -740,6 +750,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"event", "response.output_item.done"},
             {"data", json {
                 {"type", "response.output_item.done"},
+                {"output_index", item_output_index},
                 {"item", output_item}
             }}
         });
@@ -1272,6 +1283,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"event", "response.output_item.added"},
                     {"data", json {
                         {"type", "response.output_item.added"},
+                        {"output_index", 0},
                         {"item", json {
                             {"id",                oai_resp_reasoning_id},
                             {"summary",           json::array()},
@@ -1288,6 +1300,8 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 {"event", "response.reasoning_text.delta"},
                 {"data", json {
                     {"type",    "response.reasoning_text.delta"},
+                    {"output_index", 0},
+                    {"content_index", 0},
                     {"delta",   diff.reasoning_content_delta},
                     {"item_id", oai_resp_reasoning_id},
                 }},
@@ -1300,6 +1314,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"event", "response.output_item.added"},
                     {"data", json {
                         {"type", "response.output_item.added"},
+                        {"output_index", anthropic_has_reasoning ? 1 : 0},
                         {"item", json {
                             {"content", json::array()},
                             {"id",      oai_resp_message_id},
@@ -1314,6 +1329,8 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"data", json {
                         {"type",    "response.content_part.added"},
                         {"item_id", oai_resp_message_id},
+                        {"output_index", anthropic_has_reasoning ? 1 : 0},
+                        {"content_index", 0},
                         {"part", json {
                             {"type", "output_text"},
                             {"text", ""},
@@ -1327,6 +1344,8 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 {"data", json {
                     {"type",    "response.output_text.delta"},
                     {"item_id", oai_resp_message_id},
+                    {"output_index", anthropic_has_reasoning ? 1 : 0},
+                    {"content_index", 0},
                     {"delta",   diff.content_delta},
                 }},
             });
@@ -1337,6 +1356,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 {"event", "response.output_item.added"},
                 {"data", json {
                     {"type",  "response.output_item.added"},
+                    {"output_index", (anthropic_has_reasoning ? 1 : 0) + (text_block_started ? 1 : 0) + diff.tool_call_index},
                     {"item", json {
                         {"id",        "fc_" + diff.tool_call_delta.id},
                         {"arguments", ""},
@@ -1357,6 +1377,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"type",    "response.function_call_arguments.delta"},
                     {"delta",   diff.tool_call_delta.arguments},
                     {"item_id", "fc_" + oai_resp_fc_id},
+                    {"output_index", (anthropic_has_reasoning ? 1 : 0) + (text_block_started ? 1 : 0) + diff.tool_call_index},
                 }},
             });
         }
@@ -1554,6 +1575,17 @@ json server_task_result_rerank::to_json() {
         {"index",            index},
         {"score",            score},
         {"tokens_evaluated", n_tokens},
+    };
+}
+
+//
+// server_task_result_tts
+//
+json server_task_result_tts::to_json() {
+    return json {
+        {"sample_rate", sample_rate},
+        {"n_bytes",     audio.size()},
+        {"final",       final},
     };
 }
 
@@ -2613,12 +2645,26 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
 
 server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new,
         llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot,
-        const server_prompt_cache_state * excluded, server_prompt_restore_timings * timings) {
+        const server_prompt_cache_state * excluded, server_prompt_restore_timings * timings,
+        int32_t reuse_alignment, uint32_t native_rollback_limit) {
     last_reason = "no better matching snapshot";
     if (tokens_new.empty() || std::none_of(states.begin(), states.end(),
             [&](const auto & state) { return &state != excluded; })) {
         return server_prompt_cache_result::unchanged;
     }
+    const auto recurrent_rollback = [](llama_context * ctx) -> uint32_t {
+        const auto * model = llama_get_model(ctx);
+        return llama_model_is_recurrent(model) || llama_model_is_hybrid(model) ?
+                common_context_seq_rm_max_rollback(ctx) : UINT32_MAX;
+    };
+    uint32_t rollback = recurrent_rollback(ctx_tgt);
+    if (ctx_dft) {
+        rollback = std::min(rollback, recurrent_rollback(ctx_dft));
+    }
+    if (rollback != UINT32_MAX) {
+        ++rollback; // The last sampled token may not have been decoded yet.
+    }
+    native_rollback_limit = std::min(native_rollback_limit, rollback);
     const auto info = llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt));
     auto best = states.end();
     int best_lcp = prompt.tokens.get_common_prefix(tokens_new);
@@ -2632,6 +2678,9 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
         if (&*it == excluded) { continue; }
         const int lcp = it->prompt.tokens.get_common_prefix(tokens_new);
         if (!lcp) { continue; }
+        if (!server_prompt_candidate_rollback_safe(it->prompt, tokens_new, reuse_alignment, native_rollback_limit)) {
+            continue;
+        }
         auto reject = [&](const char * reason) {
             if (lcp > rejected_lcp) { rejected_lcp = lcp; rejected_reason = reason; }
         };

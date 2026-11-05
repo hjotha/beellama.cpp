@@ -229,6 +229,10 @@ struct llama_context {
             std::vector<uint8_t> & out,
             llama_token * tokens_out, size_t capacity, size_t * count_out);
 
+    llama_state_seq_restore_plan * state_seq_prepare_file(
+            llama_seq_id seq_id, const char * filepath, llama_token * tokens_out,
+            size_t n_token_capacity, size_t * n_token_count_out, size_t * n_bytes_out);
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,

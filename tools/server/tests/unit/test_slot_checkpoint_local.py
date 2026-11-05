@@ -206,8 +206,69 @@ def _appendix(data: bytes) -> tuple[int, list[tuple[int, list[tuple[int, int, in
             blobs.append((length_offset, cursor, size))
             cursor += size
         entries.append((metadata, blobs))
+    # The live draft/speculative appendix follows the checkpoints when present.
+    if cursor < len(data):
+        magic, version = struct.unpack_from("=II", data, cursor)
+        assert magic == 0x54464453 and version == 1
+        cursor += 8
+        for _ in range(2):
+            size, = struct.unpack_from("=Q", data, cursor)
+            cursor += 8 + size
     assert cursor == len(data)
     return offset, entries
+
+
+@pytest.mark.parametrize("model", ["mtp"], indirect=True)
+def test_mtp_slot_save_preserves_live_unaligned_prefix(model: Path, tmp_path: Path):
+    directory = tmp_path / "mtp-unaligned"
+    server = _server(model, "kvarn4", directory, "save", "mtp")
+    server.n_batch = 128
+    server.n_slots = 1  # KVarN mixed-state snapshots require one stream.
+    server.start(timeout_seconds=600)
+    try:
+        tokens = _tokenize(server, "Historical checkpoint exercise. " +
+                           "alpha beta gamma delta epsilon zeta eta theta. " * 80, special=True)
+        prompt = tokens[:270]
+        assert len(prompt) == 270
+        _complete(server, prompt[:128], 0)
+        seeded = _complete(server, prompt, 0)
+        saved = _slot(server, 0, "save", "state.bin")
+        data = (directory / "state.bin").read_bytes()
+        _, entries = _appendix(data)
+        boundaries = [struct.unpack_from("=q", data, offset)[0] for offset, _ in entries]
+        assert any(0 < boundary <= 256 for boundary in boundaries), boundaries
+        assert saved["n_saved"] >= len(prompt), (saved, boundaries)
+
+        suffix = _tokenize(server, " Continue the discussion:", special=False)
+        continuation = prompt + seeded["tokens"] + suffix
+        live = _complete(server, continuation, 0)
+        restored = _slot(server, 0, "restore", "state.bin")
+        assert restored["n_restored"] == saved["n_saved"]
+        replay = _complete(server, continuation, 0)
+        assert replay["tokens"] == live["tokens"]
+        assert replay["timings"]["cache_n"] == live["timings"]["cache_n"]
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("model", ["mtp"], indirect=True)
+def test_failed_checkpoint_capture_is_not_admitted(model: Path, tmp_path: Path):
+    directory = tmp_path / "unsupported-mixed-checkpoint"
+    server = _server(model, "kvarn4", directory, "capture", "mtp")
+    # Two non-unified streams cannot serialize mixed KVarN state. This is a
+    # real target-capture failure, rather than a synthetic empty checkpoint.
+    server.n_batch = 128
+    server.start(timeout_seconds=600)
+    try:
+        tokens = _tokenize(server, "Checkpoint failure. " + "alpha beta gamma delta. " * 80,
+                           special=True)
+        assert len(tokens) >= 270
+        _complete(server, tokens[:270], 0)
+    finally:
+        server.stop()
+    log = (directory / "capture.log").read_text()
+    assert "rejected context checkpoint" in log
+    assert "created context checkpoint" not in log
 
 
 @pytest.mark.parametrize("model,spec", [("none", "none"), ("mtp", "mtp")], indirect=["model"], ids=["target", "mtp"])

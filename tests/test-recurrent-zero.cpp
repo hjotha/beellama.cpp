@@ -13,8 +13,9 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <vector>
 
-static bool run_case(ggml_backend_t backend, int row, int count) {
+static bool run_case(ggml_backend_t backend, int row, int count, std::vector<ggml_op> & ops) {
     ggml_init_params params = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(params);
     if (!ctx) return false;
@@ -25,7 +26,10 @@ static bool run_case(ggml_backend_t backend, int row, int count) {
     llama_build_recurrent_zero(ctx, graph, states, count, row);
     const int added = ggml_graph_n_nodes(graph) - before;
     const bool has_clear = row >= 0 && count > 0;
-    if ((added > 0) != has_clear) {
+    for (int i = before; i < before + added; ++i) {
+        ops.push_back(ggml_graph_node(graph, i)->op);
+    }
+    if (added <= 0) {
         std::fprintf(stderr, "row=%d count=%d: unexpected clear-node count %d\n", row, count, added);
         ggml_free(ctx);
         return false;
@@ -77,8 +81,12 @@ int main() {
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) { std::fprintf(stderr, "CPU backend unavailable\n"); return 1; }
 #endif
-    const bool ok = run_case(backend, 0, 4) && run_case(backend, 1, 4) &&
-                    run_case(backend, -1, 4) && run_case(backend, 0, 0);
+    std::vector<ggml_op> ops_zero, ops_one, ops_absent, ops_empty;
+    const bool ok = run_case(backend, 0, 4, ops_zero) && run_case(backend, 1, 4, ops_one) &&
+                    run_case(backend, -1, 4, ops_absent) && run_case(backend, 0, 0, ops_empty) &&
+                    ops_zero == ops_one && ops_zero == ops_absent && ops_zero == ops_empty;
+    std::printf("recurrent zero graph nodes: row0=%zu row1=%zu absent=%zu empty=%zu\n",
+                ops_zero.size(), ops_one.size(), ops_absent.size(), ops_empty.size());
     std::printf("%s recurrent zero: %s\n", ggml_backend_name(backend), ok ? "PASS" : "FAIL");
     ggml_backend_free(backend);
     return ok ? 0 : 1;

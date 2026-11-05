@@ -1376,15 +1376,13 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
-        if (instance != nullptr) {
-            CUDA_CHECK(cudaGraphExecDestroy(instance));
-        }
-        if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
+        for (cudaGraphExec_t instance : instances) {
+            if (instance != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(instance));
+            }
         }
     }
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t instance = nullptr;
+    std::vector<cudaGraphExec_t> instances;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1690,30 +1688,21 @@ struct ggml_backend_cuda_context {
                 continue;
             }
 
-            if (graph->instance != nullptr) {
-                const cudaError_t status = cudaGraphExecDestroy(graph->instance);
-                if (status != cudaSuccess) {
-                    GGML_LOG_ERROR("%s: CUDA graph executable release failed: %s\n",
-                                  __func__, cudaGetErrorString(status));
-                    cuda_graphs_memory_cleanup_failed = true;
-                    disable_cuda_graphs_due_to_memory_pressure = true;
-                    return false;
+            for (auto & instance : graph->instances) {
+                if (instance != nullptr) {
+                    const cudaError_t status = cudaGraphExecDestroy(instance);
+                    if (status != cudaSuccess) {
+                        GGML_LOG_ERROR("%s: CUDA graph executable release failed: %s\n",
+                                      __func__, cudaGetErrorString(status));
+                        cuda_graphs_memory_cleanup_failed = true;
+                        disable_cuda_graphs_due_to_memory_pressure = true;
+                        return false;
+                    }
+                    instance = nullptr;
+                    destroyed_instances++;
                 }
-                graph->instance = nullptr;
-                destroyed_instances++;
             }
-            if (graph->graph != nullptr) {
-                const cudaError_t status = cudaGraphDestroy(graph->graph);
-                if (status != cudaSuccess) {
-                    GGML_LOG_ERROR("%s: CUDA graph capture release failed: %s\n",
-                                  __func__, cudaGetErrorString(status));
-                    cuda_graphs_memory_cleanup_failed = true;
-                    disable_cuda_graphs_due_to_memory_pressure = true;
-                    return false;
-                }
-                graph->graph = nullptr;
-                destroyed_graphs++;
-            }
+            graph->instances.clear();
 
             graph->disable_due_to_memory_pressure = true;
             graph->warmup_complete = false;
@@ -1791,13 +1780,16 @@ struct ggml_backend_cuda_context {
         // sweep every 5s, evicting cuda graphs unused for >=10s
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
+            // BEGIN ggml_cuda_graph_eviction_sweep
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                // The caller may still hold this graph across a long capture.
+                if (it->first != first_node_ptr && time_now - it->second->last_used_time >= 10'000'000) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
                 }
             }
+            // END ggml_cuda_graph_eviction_sweep
         }
 
         check_memory_pressure_recovery();
@@ -1829,7 +1821,7 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph has an instance for this context
     bool any_cuda_graph_has_instance() const {
         for (const auto & [key, graph] : cuda_graphs) {
-            if (graph && graph->instance != nullptr) {
+            if (graph && !graph->instances.empty()) {
                 return true;
             }
         }

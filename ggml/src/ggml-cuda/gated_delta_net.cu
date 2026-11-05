@@ -2,6 +2,11 @@
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 
+#include <atomic>
+#include <cstdlib>
+#include <limits>
+#include <cstring>
+
 static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n;
          i += (int64_t) blockDim.x*gridDim.x) {
@@ -12,7 +17,7 @@ static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_
 // RAW: beta and g arrive pre-activation (ggml_gated_delta_net_set_raw_gates); the kernel applies
 // sigmoid(beta) and raw_a[h] * softplus(g + raw_dt_bias[h]) with the unary kernels' formulas.
 // G_PRECOMPUTED: g already holds exp(g) (GB10 long-prompt path); only used with RAW == false.
-template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED>
+template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool SEGMENTED = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -45,14 +50,23 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       state_row_size) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
-    // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
-    const int      lane     = threadIdx.x;
+    // Segmented mode assigns one column to each quarter warp. The existing
+    // DGX path instead uses the entire warp sequentially for four columns.
+    const int lane = threadIdx.x;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
-    constexpr int cols_per_warp = S_v == 128 && !KDA ? 4 : 1;
+    constexpr int cols_per_warp = SEGMENTED ? 4 : (S_v == 128 && !KDA ? 4 : 1);
 #else
-    constexpr int cols_per_warp = 1;
+    constexpr int cols_per_warp = SEGMENTED ? 4 : 1;
 #endif
-    const int      col      = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp;
+    static_assert(!SEGMENTED || (S_v == 128 && !KDA), "segmented mode requires scalar gates and S_v=128");
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    constexpr int lanes_per_col = SEGMENTED ? warp_size / 4 : warp_size;
+    constexpr int cols_per_lane = SEGMENTED ? 1 : cols_per_warp;
+    constexpr int rows_per_lane = S_v / lanes_per_col;
+    const int lane_in_col = lane % lanes_per_col;
+    const int col_in_warp = SEGMENTED ? lane / lanes_per_col : 0;
+    const int col = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp + col_in_warp;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
@@ -73,18 +87,15 @@ gated_delta_net_cuda(const float * q,
     curr_state += state_in_offset;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
-    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
-    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
-    float         s_shard[cols_per_warp][rows_per_lane];
+    float         s_shard[cols_per_lane][rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
 #pragma unroll
-    for (int c = 0; c < cols_per_warp; ++c) {
+    for (int c = 0; c < cols_per_lane; ++c) {
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
+            const int i = r * lanes_per_col + lane_in_col;
             s_shard[c][r] = curr_state[(col + c) * S_v + i];
         }
     }
@@ -108,7 +119,7 @@ gated_delta_net_cuda(const float * q,
         float q_reg[rows_per_lane];
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
+            const int i = r * lanes_per_col + lane_in_col;
             k_reg[r] = k_t[i];
             q_reg[r] = q_t[i];
         }
@@ -124,13 +135,13 @@ gated_delta_net_cuda(const float * q,
 
             // Each warp owns one or more columns and reuses the common q/k registers.
 #pragma unroll
-            for (int c = 0; c < cols_per_warp; ++c) {
+            for (int c = 0; c < cols_per_lane; ++c) {
                 float kv_shard = 0.0f;
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
                     kv_shard += s_shard[c][r] * k_reg[r];
                 }
-                float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+                float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
 
                 float delta_col = (v_t[col + c] - g_val * kv_col) * beta_val;
 
@@ -141,9 +152,9 @@ gated_delta_net_cuda(const float * q,
                     attn_partial += s_shard[c][r] * q_reg[r];
                 }
 
-                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                float attn_col = warp_reduce_sum<lanes_per_col>(attn_partial);
 
-                if (lane == 0) {
+                if (lane_in_col == 0) {
                     attn_data[col + c] = attn_col * scale;
                 }
             }
@@ -152,11 +163,11 @@ gated_delta_net_cuda(const float * q,
             float kv_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = r * lanes_per_col + lane_in_col;
                 kv_shard += expf(g_t[i]) * s_shard[0][r] * k_reg[r];
             }
 
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
 
             // delta[col] = (v[col] - kv[col]) * beta
             float delta_col = (v_t[col] - kv_col) * beta_val;
@@ -166,14 +177,14 @@ gated_delta_net_cuda(const float * q,
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = r * lanes_per_col + lane_in_col;
                 s_shard[0][r]  = expf(g_t[i]) * s_shard[0][r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[0][r] * q_reg[r];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            float attn_col = warp_reduce_sum<lanes_per_col>(attn_partial);
 
-            if (lane == 0) {
+            if (lane_in_col == 0) {
                 attn_data[col] = attn_col * scale;
             }
         }
@@ -187,10 +198,10 @@ gated_delta_net_cuda(const float * q,
             if (target_slot >= 0 && target_slot < K) {
                 float * curr_state = state + target_slot * state_slot_stride;
 #pragma unroll
-                for (int c = 0; c < cols_per_warp; ++c) {
+                for (int c = 0; c < cols_per_lane; ++c) {
 #pragma unroll
                     for (int r = 0; r < rows_per_lane; r++) {
-                        const int i = r * warp_size + lane;
+                        const int i = r * lanes_per_col + lane_in_col;
                         curr_state[(col + c) * S_v + i] = s_shard[c][r];
                     }
                 }
@@ -201,10 +212,10 @@ gated_delta_net_cuda(const float * q,
 
     if constexpr (!keep_rs_t) {
 #pragma unroll
-        for (int c = 0; c < cols_per_warp; ++c) {
+        for (int c = 0; c < cols_per_lane; ++c) {
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
+                const int i = r * lanes_per_col + lane_in_col;
                 state[(col + c) * S_v + i] = s_shard[c][r];
             }
         }
@@ -226,6 +237,35 @@ static void launch_gated_delta_net(
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Opt-in only: leave all existing routes and default production behavior intact.
+    static const int segmented = [] {
+        const char * value = std::getenv("GGML_CUDA_GDN_SEGMENTED");
+        if (value == nullptr) return 0;
+        if (std::strcmp(value, "1") == 0) return 1;
+        if (std::strcmp(value, "2") == 0) return 2;
+        return 0;
+    }();
+    if constexpr (!KDA && !G_PRECOMPUTED) {
+        if (segmented && (segmented == 1 || n_tokens >= 32) &&
+                cc == GGML_CUDA_CC_ADA_LOVELACE && warp_size == 32 && S_v == 128) {
+            int segmented_warps = 4;
+            const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+            while (segmented_warps > 1 && H*n_seqs*(S_v / (4*segmented_warps)) < nsm) {
+                segmented_warps /= 2;
+            }
+            const dim3 grid(H, n_seqs, (S_v + 4*segmented_warps - 1) / (4*segmented_warps));
+            const dim3 block(warp_size, segmented_warps, 1);
+            const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, keep_rs_t, RAW, false, true>, params,
+                q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, init_fastdiv_values(neqk1), init_fastdiv_values(rq3),
+                scale, state_slot_stride, K, rows, state_row_size);
+            return;
+        }
+    }
+#endif
     const int num_warps = 4;
     const int cols_per_warp = cc == GGML_CUDA_CC_DGX_SPARK && S_v == 128 && !KDA ? 4 : 1;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp - 1) / (num_warps * cols_per_warp));
@@ -305,6 +345,35 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
         g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
     };
 }
+
+// BEGIN ggml_cuda_gdn_prefix_slot_guard
+// Address-only guard; false means use the unchanged whole-graph scalar path.
+struct ggml_cuda_gdn_byte_span {
+    uintptr_t begin;
+    size_t size;
+};
+
+static bool ggml_cuda_gdn_prefix_slot_guard(
+        uintptr_t base, size_t stride, size_t state_bytes, size_t slots,
+        const ggml_cuda_gdn_byte_span * forbidden, size_t n_forbidden, uintptr_t & out) {
+    const uintptr_t max = std::numeric_limits<uintptr_t>::max();
+    if (base == 0 || slots < 2 || state_bytes == 0 || stride < state_bytes ||
+        slots - 1 > max / stride) return false;
+    const uintptr_t offset = (slots - 1) * stride;
+    if (offset > max - base) return false;
+    const uintptr_t slot = base + offset;
+    if (state_bytes > max - slot) return false;
+    const uintptr_t end = slot + state_bytes;
+    for (size_t i = 0; i < n_forbidden; ++i) {
+        const auto & range = forbidden[i];
+        if (range.begin == 0 || range.size > max - range.begin) return false;
+        const uintptr_t range_end = range.begin + range.size;
+        if (range.size != 0 && slot < range_end && range.begin < end) return false;
+    }
+    out = slot;
+    return true;
+}
+// END ggml_cuda_gdn_prefix_slot_guard
 
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
@@ -393,6 +462,91 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float * rb_d = raw ? (const float *) dst->src[7]->data : nullptr;
     const float * ra_d = raw ? (const float *) dst->src[8]->data : nullptr;
     GGML_ASSERT(!(raw && kda)); // raw gates are defined for the scalar gate only
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Experimental transaction: MMA writes the boundary snapshot (slot K-1),
+    // then the existing scalar kernel writes the suffix and remaining slots.
+    static const int prefix_mma_mode = [] {
+        const char * value = std::getenv("GGML_CUDA_GDN_PREFIX_MMA");
+        if (value == nullptr) return 0;
+        if (std::strcmp(value, "1") == 0) return 1;
+        if (std::strcmp(value, "2") == 0) return 2;
+        return 0;
+    }();
+    const int64_t max_prefix = n_tokens - (K - 1);
+    const int64_t prefix = prefix_mma_mode == 2 ? (max_prefix / 16) * 16 : max_prefix;
+    if (prefix_mma_mode && !raw && !kda && src_rows == nullptr && n_seqs == 1 &&
+        S_v == 128 && H > 0 && K > 1 && n_tokens >= K && prefix >= 64 &&
+        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_ADA_LOVELACE &&
+        state_slot_stride > 0) {
+        const size_t max = std::numeric_limits<size_t>::max();
+        const size_t head_size = size_t(128)*128*sizeof(float);
+        const bool dimensions_ok = size_t(H) <= max / head_size &&
+            size_t(n_tokens) <= max / (size_t(128)*sizeof(float)) / size_t(H) &&
+            uint64_t(state_slot_stride) <= max / sizeof(float);
+        if (dimensions_ok) {
+            const size_t state_bytes = size_t(H) * head_size;
+            const size_t scores_bytes = size_t(n_tokens) * size_t(H) * 128 * sizeof(float);
+            const size_t stride_bytes = size_t(state_slot_stride) * sizeof(float);
+            const ggml_cuda_gdn_byte_span forbidden[] = {
+                { uintptr_t(q_d), ggml_nbytes(src_q) },
+                { uintptr_t(k_d), ggml_nbytes(src_k) },
+                { uintptr_t(v_d), ggml_nbytes(src_v) },
+                { uintptr_t(g_d), ggml_nbytes(src_g) },
+                { uintptr_t(b_d), ggml_nbytes(src_beta) },
+                { uintptr_t(s_d), ggml_nbytes(src_state) },
+                { uintptr_t(dst_d), scores_bytes },
+            };
+            uintptr_t boundary = 0;
+            if (ggml_cuda_gdn_prefix_slot_guard(uintptr_t(state_d), stride_bytes, state_bytes,
+                    size_t(K), forbidden, sizeof(forbidden)/sizeof(forbidden[0]), boundary)) {
+                const int64_t suffix = n_tokens - prefix;
+                ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                args.n_tokens = prefix;
+                args.state_out = reinterpret_cast<float *>(boundary);
+                if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+                    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+                    if (!logged.test_and_set(std::memory_order_relaxed)) {
+                        GGML_LOG_INFO("%s: opt-in GDN prefix MMA selected (prefix=%lld suffix=%lld K=%d); "
+                                      "capture may record this launch for replay\n",
+                                      __func__, (long long) prefix, (long long) suffix, K);
+                    }
+                    launch_gated_delta_net<false, true, false, false>(
+                        q_d + size_t(prefix)*size_t(sq2), k_d + size_t(prefix)*size_t(sq2),
+                        v_d + size_t(prefix)*size_t(sv2), g_d + size_t(prefix)*size_t(sb2),
+                        b_d + size_t(prefix)*size_t(sb2), nullptr, nullptr,
+                        reinterpret_cast<const float *>(boundary),
+                        dst_d + size_t(prefix)*size_t(H)*128, state_d,
+                        S_v, H, suffix, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
+                        nullptr, 0, stream);
+                    return;
+                }
+                static std::atomic_flag declined_logged = ATOMIC_FLAG_INIT;
+                if (!declined_logged.test_and_set(std::memory_order_relaxed)) {
+                    GGML_LOG_WARN("%s: opt-in GDN prefix MMA declined by launcher; using scalar fallback\n", __func__);
+                }
+            } else {
+                static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+                if (!logged.test_and_set(std::memory_order_relaxed)) {
+                    GGML_LOG_WARN("%s: opt-in GDN prefix MMA overlap guard rejected a graph; "
+                                  "using scalar fallback\n", __func__);
+                }
+            }
+        } else {
+            static std::atomic_flag dimensions_logged = ATOMIC_FLAG_INIT;
+            if (!dimensions_logged.test_and_set(std::memory_order_relaxed)) {
+                GGML_LOG_WARN("%s: opt-in GDN prefix MMA dimensions overflow; using scalar fallback\n", __func__);
+            }
+        }
+    } else if (prefix_mma_mode) {
+        static std::atomic_flag ineligible_logged = ATOMIC_FLAG_INIT;
+        if (!ineligible_logged.test_and_set(std::memory_order_relaxed)) {
+            GGML_LOG_INFO("%s: opt-in GDN prefix MMA shape ineligible (T=%lld K=%d raw=%d rows=%d); "
+                          "using existing path\n", __func__, (long long) n_tokens, K, int(raw), int(src_rows != nullptr));
+        }
+    }
+#endif
 
     // MMA publishes only the final state; retain scalar snapshots for rollback.
     if (!raw && src_rows == nullptr && !keep_rs) {

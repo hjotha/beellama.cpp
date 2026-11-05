@@ -10,11 +10,14 @@
 
 #include "../src/llama-io.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid.h"
+#include "../src/llama-memory-recurrent.h"
 
 #include <algorithm>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -119,6 +122,205 @@ static double nmse(const float * a, const float * b, int n) {
         mse_a0 += (double) a[i]*a[i];
     }
     return mse_a0 == 0.0 ? (mse_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : mse_ab/mse_a0;
+}
+
+// Long Qwen prefill must retain every advertised rollback state, including
+// after short decodes carry the prefill history into older snapshot planes.
+struct recurrent_state_capture : llama_io_write_i {
+    struct row { std::string name; std::vector<float> values; };
+    std::vector<row> rows;
+    size_t bytes = 0;
+    bool valid = true;
+
+    void write(const void *, size_t n) override { bytes += n; }
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t n) override {
+        bytes += n;
+        if (tensor->type != GGML_TYPE_F32 || n % sizeof(float) != 0) {
+            valid = false;
+            return;
+        }
+        row item { tensor->name, std::vector<float>(n / sizeof(float)) };
+        ggml_backend_tensor_get(tensor, item.values.data(), offset, n);
+        rows.push_back(std::move(item));
+    }
+    size_t n_bytes() override { return bytes; }
+};
+
+static bool gdn_prefill_capture(llama_context * ctx, recurrent_state_capture & capture) {
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
+    auto * recurrent = hybrid ? hybrid->get_mem_recr() : nullptr;
+    if (!recurrent) {
+        LOG_ERR("%s: expected a hybrid recurrent memory\n", __func__);
+        return false;
+    }
+    llama_synchronize(ctx);
+    recurrent->state_write(capture, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    return capture.valid && !capture.rows.empty();
+}
+
+// Read a rollback plane directly without changing rs_idx or the live sequence.
+// state_write selects `cell.src` (or the physical tail cell) in the same way.
+static bool gdn_capture_physical_age(llama_context * ctx, uint32_t age, recurrent_state_capture & out) {
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
+    auto * mem = hybrid ? hybrid->get_mem_recr() : nullptr;
+    if (!mem || age > mem->n_rs_seq || mem->cells.empty()) return false;
+    const int32_t tail = mem->cells[0].tail;
+    if (tail < 0 || size_t(tail) >= mem->cells.size()) return false;
+    const auto & cell = mem->cells[tail];
+    const int32_t source = cell.src >= 0 ? cell.src : tail;
+    if (source < 0 || uint32_t(source) >= mem->size) return false;
+    const size_t physical_row = size_t(age)*mem->size + size_t(source);
+    llama_synchronize(ctx);
+    const auto read_row = [&](ggml_tensor * t) {
+        if (!t) return true;
+        if (t->type != GGML_TYPE_F32 || physical_row >= size_t(t->ne[1])) return false;
+        const size_t n = ggml_row_size(t->type, t->ne[0]);
+        if (n % sizeof(float)) return false;
+        recurrent_state_capture::row row { t->name, std::vector<float>(n / sizeof(float)) };
+        ggml_backend_tensor_get(t, row.values.data(), physical_row*t->nb[1], n);
+        out.rows.push_back(std::move(row));
+        return true;
+    };
+    // Match llama_memory_recurrent::state_write_data: R and PLE per layer,
+    // followed by all S layers. Metadata bytes are deliberately excluded.
+    for (size_t i = 0; i < mem->r_l.size(); ++i) {
+        if (!mem->r_l[i]) continue;
+        if (!read_row(mem->r_l[i]) || !read_row(mem->p_l[i])) return false;
+    }
+    for (auto * t : mem->s_l) {
+        if (!read_row(t)) return false;
+    }
+    return !out.rows.empty();
+}
+
+static bool gdn_states_exact(const recurrent_state_capture & a, const recurrent_state_capture & b,
+                             const char * stage, int short_count, int rollback, bool quiet = false) {
+    if (!a.valid || !b.valid || a.rows.size() != b.rows.size()) return false;
+    for (size_t i = 0; i < a.rows.size(); ++i) {
+        const auto & x = a.rows[i];
+        const auto & y = b.rows[i];
+        if (x.name != y.name || x.values.size() != y.values.size() ||
+                memcmp(x.values.data(), y.values.data(), x.values.size()*sizeof(float)) != 0) {
+            if (!quiet) LOG_ERR("%s: %s row=%s short=%d rollback=%d differs bytewise\n", __func__, stage,
+                                x.name.c_str(), short_count, rollback);
+            return false;
+        }
+    }
+    return true;
+}
+
+static test_status test_gdn_long_prefill_rollback(const common_params & params, llama_model * model, uint8_t fill) {
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    if (strcmp(arch, "qwen35") != 0) {
+        LOG_INF("%s: only qwen35 GDN is covered\n", __func__);
+        return test_status::SKIP;
+    }
+    const char * prefill_env = std::getenv("LLAMA_TEST_GDN_PREFILL_T");
+    const int prefill = prefill_env ? std::atoi(prefill_env) : 128;
+    if (prefill < 70 || prefill > 200) {
+        LOG_ERR("%s: prefill length must be between 70 and 200\n", __func__);
+        return test_status::FAIL;
+    }
+    constexpr int rs = 6;
+    auto cp = common_context_params_to_llama(params);
+    cp.n_seq_max = 1;
+    cp.n_rs_seq = rs;
+    cp.n_ctx = 256;
+    cp.n_batch = std::max(128, prefill);
+    cp.n_ubatch = cp.n_batch;
+    cp.kv_unified = false;
+    llama_context_ptr ctx = init_ctx(model, cp, fill);
+    if (!ctx || llama_n_rs_seq(ctx.get()) != rs) {
+        LOG_ERR("%s: could not create context with n_rs_seq=6\n", __func__);
+        return test_status::FAIL;
+    }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto token = [n_vocab](llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 1) % (uint32_t) n_vocab);
+    };
+    const auto decode = [&](llama_pos begin, llama_pos end, bool outputs) {
+        common_batch batch(ctx.get());
+        for (llama_pos pos = begin; pos < end; ++pos) {
+            batch.add(token(pos), pos, 0, outputs || pos + 1 == end);
+        }
+        return llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+    };
+    bool negative_checked = false;
+    for (const int n_short : {0, 2}) {
+        for (int rollback = 1; rollback <= rs; ++rollback) {
+            const llama_pos end = prefill + n_short;
+            const llama_pos cut = end - rollback;
+            recurrent_state_capture first_selected, first_replayed;
+            std::vector<std::vector<float>> first_logits;
+            // Same context, initial clear, tokens, prefill, short decodes,
+            // rollback, and replay. No T versus T-r numerical comparison.
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                llama_memory_clear(llama_get_memory(ctx.get()), true);
+                if (!decode(0, prefill, false)) return test_status::FAIL;
+                for (llama_pos pos = prefill; pos < end; ++pos) {
+                    if (!decode(pos, pos + 1, false)) return test_status::FAIL;
+                }
+                if (llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) != end - 1) {
+                    LOG_ERR("%s: wrong position before rollback\n", __func__);
+                    return test_status::FAIL;
+                }
+                recurrent_state_capture physical;
+                if (!gdn_capture_physical_age(ctx.get(), rollback, physical)) return test_status::FAIL;
+                if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, cut, -1) ||
+                        llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) != cut - 1) {
+                    LOG_ERR("%s: rollback refused or wrong position (short=%d rollback=%d)\n",
+                            __func__, n_short, rollback);
+                    return test_status::FAIL;
+                }
+                recurrent_state_capture selected;
+                if (!gdn_prefill_capture(ctx.get(), selected) ||
+                        !gdn_states_exact(selected, physical, "physical-vs-logical", n_short, rollback)) {
+                    return test_status::FAIL;
+                }
+                if (!negative_checked) {
+                    if (physical.rows[0].values.empty()) return test_status::FAIL;
+                    auto * byte = reinterpret_cast<unsigned char *>(physical.rows[0].values.data());
+                    *byte ^= 1u; // mutate only the host-side oracle copy
+                    const bool caught = !gdn_states_exact(selected, physical, "negative", n_short, rollback, true);
+                    *byte ^= 1u;
+                    if (!caught) {
+                        LOG_ERR("%s: negative control failed to detect corruption\n", __func__);
+                        return test_status::FAIL;
+                    }
+                    negative_checked = true;
+                }
+                if (repeat == 0) first_selected = std::move(selected);
+                else if (!gdn_states_exact(selected, first_selected, "repeated-selection", n_short, rollback)) {
+                    return test_status::FAIL;
+                }
+                // Release copied state before replay, limiting host memory use.
+                physical.rows.clear();
+                if (!decode(cut, end, true)) return test_status::FAIL;
+                for (int i = 0; i < rollback; ++i) {
+                    const float * p = llama_get_logits_ith(ctx.get(), i);
+                    if (!p) return test_status::FAIL;
+                    if (repeat == 0) first_logits.emplace_back(p, p + n_vocab);
+                    else if (memcmp(p, first_logits[i].data(), size_t(n_vocab)*sizeof(float)) != 0) {
+                        const double diff = nmse(p, first_logits[i].data(), n_vocab);
+                        LOG_ERR("%s: repeated logits differ (short=%d rollback=%d token=%d nmse=%g); "
+                                "check backend reproducibility and graph mode\n", __func__, n_short, rollback, i, diff);
+                        return test_status::FAIL;
+                    }
+                }
+                recurrent_state_capture replayed;
+                if (!gdn_prefill_capture(ctx.get(), replayed)) return test_status::FAIL;
+                if (repeat == 0) first_replayed = std::move(replayed);
+                else if (!gdn_states_exact(replayed, first_replayed, "repeated-replay", n_short, rollback)) {
+                    return test_status::FAIL;
+                }
+            }
+        }
+    }
+    if (!negative_checked) return test_status::FAIL;
+    LOG_INF("%s: T=%d, n_rs_seq=6, exact physical/logical and repeated replay passed; negative control caught\n",
+            __func__, prefill);
+    return test_status::PASS;
 }
 
 // A short first decode must work when the rollback reserve exceeds the batch.
@@ -592,6 +794,15 @@ struct test_results {
 // Run every test for an initialized model over both cache fills.
 static test_results run_tests(const common_params & params, llama_model * model) {
     test_results res;
+    // Opt-in for the GDN prefill path; avoids multiplying runtime in the broad
+    // model matrix while allowing a focused CUDA/CPU regression gate.
+    if (std::getenv("LLAMA_TEST_GDN_PREFILL_ROLLBACK_ONLY")) {
+        res.rollback = test_gdn_long_prefill_rollback(params, model, 0);
+        if (res.rollback == test_status::PASS) {
+            res.rollback = test_gdn_long_prefill_rollback(params, model, 0x3e);
+        }
+        return res;
+    }
     for (uint8_t fill : { 0, 0x3e }) {
         LOG_INF("%s: testing with cache fill 0x%02x\n", __func__, fill);
         const test_status rb = test_rollback(params, model, fill);

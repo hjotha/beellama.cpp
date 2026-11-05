@@ -17,6 +17,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <cstdio>
 #include <cstring>
@@ -323,6 +324,112 @@ static void test_read_payload_slices() {
     std::vector<uint8_t> xdst(50);
     CHECK(w.read_payload(0, 0, 300, xdst.data(), 50) == 50);
     CHECK(std::memcmp(xdst.data(), ref0.data() + 300, 50) == 0);
+}
+
+static int g_payload_2d_calls = 0;
+static layer_desc make_qx_desc(uint32_t id, uint64_t bytes);
+static void payload_test_get_2d(ggml_backend_buffer_t, const ggml_tensor * tensor, void * data,
+        size_t offset, size_t size, size_t copies, size_t src_stride, size_t dst_stride) {
+    ++g_payload_2d_calls;
+    for (size_t i = 0; i < copies; ++i) {
+        std::memcpy(static_cast<uint8_t *>(data) + i*dst_stride,
+                    static_cast<const uint8_t *>(tensor->data) + offset + i*src_stride, size);
+    }
+}
+
+static void test_read_payload_interleaved_batching() {
+    tensors ts = make_tensors();
+    CHECK(ts.t0->buffer == ts.t1->buffer);
+    auto * buffer = ts.t0->buffer;
+    const auto old_get_2d = buffer->iface.get_tensor_2d;
+    buffer->iface.get_tensor_2d = payload_test_get_2d;
+    g_payload_2d_calls = 0;
+
+    split_writer w([](const ggml_tensor *) { return mixed_range_key(2, 0); });
+    std::vector<uint8_t> reference;
+    const auto append = [&](ggml_tensor * tensor, const std::vector<uint8_t> & bytes, size_t off, size_t size) {
+        w.write_tensor(tensor, off, size);
+        reference.insert(reference.end(), bytes.begin() + off, bytes.begin() + off + size);
+    };
+    for (size_t i = 0; i < 8; ++i) {
+        append(ts.t0, ts.d0, 64 + i*64, 32);
+        append(ts.t1, ts.d1, 32 + i*64, 32);
+    }
+    // Out-of-order, duplicate, and overlapping sources must retain payload order.
+    append(ts.t0, ts.d0, 320, 32);
+    append(ts.t1, ts.d1, 64, 17);
+    append(ts.t0, ts.d0, 64, 32);
+    append(ts.t0, ts.d0, 64, 32);
+    append(ts.t1, ts.d1, 81, 31);
+    CHECK(g_wrap_get == 0 && g_payload_2d_calls == 0);
+
+    std::vector<uint8_t> actual(reference.size());
+    CHECK(w.read_payload(2, 0, 0, actual.data(), actual.size()) == actual.size());
+    CHECK(actual == reference);
+    CHECK(g_payload_2d_calls >= 2); // both interleaved tensors were batched
+    for (size_t start : {size_t(1), size_t(17), size_t(31), size_t(32), size_t(63), size_t(127), size_t(511)}) {
+        for (size_t count : {size_t(1), size_t(17), size_t(63), size_t(129), size_t(512)}) {
+            std::vector<uint8_t> chunk(count, 0x9d);
+            const size_t expected = std::min(count, reference.size() - start);
+            CHECK(w.read_payload(2, 0, start, chunk.data(), count) == expected);
+            CHECK(std::memcmp(chunk.data(), reference.data() + start, expected) == 0);
+            for (size_t j = expected; j < count; ++j) CHECK(chunk[j] == 0x9d);
+        }
+    }
+
+    // The same producer is read in both checksum and emission passes. Mutation
+    // between them must still be detected, even for an interleaved run.
+    const auto manifest = mixed_manifest_serialize(w.manifest());
+    stream_input in;
+    in.layers.push_back(make_qx_desc(2, reference.size()));
+    in.metadata_version = 1;
+    in.metadata = manifest.data();
+    in.metadata_size = manifest.size();
+    in.flags = snapshot_flags::full;
+    int reads_count = 0;
+    stream_read_callbacks reads;
+    reads.read_payload = [&](uint32_t layer, uint32_t range, uint64_t off, uint8_t * dst, size_t count) {
+        if (++reads_count == 2) {
+            const uint8_t changed = uint8_t(ts.d0[64] ^ 0xff);
+            ggml_backend_tensor_set(ts.t0, &changed, 64, 1);
+        }
+        return w.read_payload(layer, range, off, dst, count);
+    };
+    stream_write_callbacks writes;
+    writes.write_bytes = [](const uint8_t *, size_t) { return true; };
+    CHECK_THROWS(stream_serialize(in, reads, writes));
+    CHECK(reads_count == 2);
+    ggml_backend_tensor_set(ts.t0, ts.d0.data(), 0, ts.d0.size());
+
+    // Distinct range IDs must never be combined, even for one layer.
+    split_writer ranges([&](const ggml_tensor * tensor) {
+        return mixed_range_key(3, tensor == ts.t0 ? 0 : 1);
+    });
+    for (size_t i = 0; i < 4; ++i) {
+        ranges.write_tensor(ts.t0, i*64, 16);
+        ranges.write_tensor(ts.t1, i*64, 16);
+    }
+    for (uint32_t range = 0; range < 2; ++range) {
+        std::vector<uint8_t> expected;
+        const auto & source = range == 0 ? ts.d0 : ts.d1;
+        for (size_t i = 0; i < 4; ++i) expected.insert(expected.end(), source.begin() + i*64, source.begin() + i*64 + 16);
+        std::vector<uint8_t> result(expected.size());
+        CHECK(ranges.read_payload(3, range, 0, result.data(), result.size()) == result.size());
+        CHECK(result == expected);
+    }
+
+    // Exercise the bounded descriptor batches using tiny, repeated events.
+    split_writer many([](const ggml_tensor *) { return mixed_range_key(4, 0); });
+    std::vector<uint8_t> expected_many;
+    for (size_t i = 0; i < 4101; ++i) {
+        const size_t off = (i*7) % ts.d0.size();
+        many.write_tensor(ts.t0, off, 1);
+        expected_many.push_back(ts.d0[off]);
+    }
+    std::vector<uint8_t> result_many(expected_many.size());
+    CHECK(many.read_payload(4, 0, 0, result_many.data(), result_many.size()) == result_many.size());
+    CHECK(result_many == expected_many);
+    buffer->iface.get_tensor_2d = old_get_2d;
 }
 
 static void test_split_reader_reverse_and_outer_commit() {
@@ -1287,6 +1394,7 @@ int main() {
     test_split_writer_bounds();
     test_manifest_wire_roundtrip();
     test_read_payload_slices();
+    test_read_payload_interleaved_batching();
     test_split_reader_reverse_and_outer_commit();
     test_read_across_events_and_tensor_splits();
     test_fixup_caps_and_big_borrowed();

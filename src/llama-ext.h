@@ -285,6 +285,9 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
+LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
@@ -478,3 +481,10 @@ LLAMA_API std::string llama_recurrent_state_diff(llama_context * ctx_a, llama_co
 // tag resets the evaluation counter, which is what prevents a sample captured
 // during one prefill from ever being attributed to another.
 LLAMA_API void llama_f4_set_dump_tag(const char * tag);
+
+// same as above, but only the rows of the given tokens, in order (n_tokens * n_embd elements)
+// returns the number of elements written or 0 on error
+LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const llama_token * tokens, uint32_t n_tokens, float * out);
+
+// realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
+LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);

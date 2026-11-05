@@ -2,9 +2,12 @@
 // Deliberately includes the implementation to exercise its private pool/cache.
 #include "../ggml/src/ggml-cuda/ggml-cuda.cu"
 
-static __global__ void fixture_write(float * scratch, float * output, int value) {
+static __global__ void fixture_write(float * scratch, int value) {
     const int i = threadIdx.x;
     scratch[i] = float(value + i);
+}
+static __global__ void fixture_copy(const float * scratch, float * output) {
+    const int i = threadIdx.x;
     output[i] = scratch[i];
 }
 static void check_output(float * output, int value) {
@@ -12,7 +15,7 @@ static void check_output(float * output, int value) {
     CUDA_CHECK(cudaMemcpy(host, output, sizeof(host), cudaMemcpyDeviceToHost));
     for (int i=0; i<256; ++i) GGML_ASSERT(host[i] == float(value+i));
 }
-static void capture_fixture(ggml_backend_cuda_context & ctx, ggml_cgraph & gf,
+static float * capture_fixture(ggml_backend_cuda_context & ctx, ggml_cgraph & gf,
                             float * output, int value, bool overflow) {
     auto & pool = static_cast<ggml_cuda_pool_leg &>(ctx.pool());
     auto * graph = ctx.cuda_graph(gf.nodes[0]);
@@ -21,22 +24,32 @@ static void capture_fixture(ggml_backend_cuda_context & ctx, ggml_cgraph & gf,
     float * scratch = (float *)pool.alloc(1024*1024, &actual);
     const auto before = ctx.pool_epoch;
     ctx.pool_capture_active = true;
+    std::vector<cudaGraph_t> chunks(2, nullptr);
     CUDA_CHECK(cudaStreamBeginCapture(ctx.stream(),cudaStreamCaptureModeRelaxed));
-    fixture_write<<<1,256,0,ctx.stream()>>>(scratch,output,value);
+    fixture_write<<<1,256,0,ctx.stream()>>>(scratch,value);
+    CUDA_CHECK(cudaStreamEndCapture(ctx.stream(),&chunks[0]));
+    CUDA_CHECK(cudaStreamBeginCapture(ctx.stream(),cudaStreamCaptureModeRelaxed));
+    fixture_copy<<<1,256,0,ctx.stream()>>>(scratch,output);
     pool.free(scratch,actual);
     if (overflow) {
         GGML_ASSERT(pool.has_deferred_frees());
         GGML_ASSERT(ctx.pool_deferred_frees);
         GGML_ASSERT(ctx.pool_epoch == before);
     }
-    CUDA_CHECK(cudaStreamEndCapture(ctx.stream(),&graph->graph));
+    CUDA_CHECK(cudaStreamEndCapture(ctx.stream(),&chunks[1]));
     ctx.pool_capture_active = false;
     graph->pool_epoch = ctx.pool_epoch;
-    GGML_ASSERT(ggml_cuda_graph_instantiate(&ctx,gf.nodes[0]));
+    GGML_ASSERT(ggml_cuda_graph_chunk_transaction(chunks.size(),
+        [&](size_t i) { return ggml_cuda_graph_prepare_chunk(&ctx,gf.nodes[0],graph,i,chunks[i]); },
+        [&]() { for (auto chunk : chunks) CUDA_CHECK(cudaGraphDestroy(chunk)); },
+        [&]() { return true; },
+        [&]() { return false; }));
+    GGML_ASSERT(graph->instances.size() == 2);
     graph->warmup_complete = true;
-    CUDA_CHECK(cudaGraphLaunch(graph->instance,ctx.stream()));
+    for (auto instance : graph->instances) CUDA_CHECK(cudaGraphLaunch(instance,ctx.stream()));
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
     check_output(output,value);
+    return scratch;
 }
 int main() {
     ggml_cuda_set_device(0);
@@ -58,9 +71,11 @@ int main() {
         pool.clear_pool(); // Same release path used by a real allocation-OOM retry.
         GGML_ASSERT(ctx.pool_epoch != captured);
         ggml_cuda_graph_update_required(&ctx,&gf);
-        GGML_ASSERT(!graph->instance && !graph->graph && !graph->warmup_complete);
-        capture_fixture(ctx,gf,output,13,false);
-        CUDA_CHECK(cudaGraphLaunch(graph->instance,ctx.stream()));
+        GGML_ASSERT(graph->instances.empty() && !graph->warmup_complete);
+        float * replay_scratch = capture_fixture(ctx,gf,output,13,false);
+        CUDA_CHECK(cudaMemsetAsync(replay_scratch,0,256*sizeof(float),ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(output,0,256*sizeof(float),ctx.stream()));
+        for (auto instance : graph->instances) CUDA_CHECK(cudaGraphLaunch(instance,ctx.stream()));
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));check_output(output,13);
         puts("PASS: post-capture pool flush invalidates stale replay; recapture numeric output exact");
         pool.clear_pool();ggml_cuda_graph_update_required(&ctx,&gf);
@@ -77,13 +92,15 @@ int main() {
         GGML_ASSERT(!ctx.pool_deferred_frees && !pool.has_deferred_frees());
         GGML_ASSERT(ctx.pool_epoch != spill_capture);
         ggml_cuda_graph_update_required(&ctx,&gf);
-        GGML_ASSERT(!graph->instance && !graph->graph && !graph->warmup_complete);
+        GGML_ASSERT(graph->instances.empty() && !graph->warmup_complete);
         pool.clear_pool();
-        capture_fixture(ctx,gf,output,41,false);
-        CUDA_CHECK(cudaGraphLaunch(graph->instance,ctx.stream()));
+        replay_scratch = capture_fixture(ctx,gf,output,41,false);
+        CUDA_CHECK(cudaMemsetAsync(replay_scratch,0,256*sizeof(float),ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(output,0,256*sizeof(float),ctx.stream()));
+        for (auto instance : graph->instances) CUDA_CHECK(cudaGraphLaunch(instance,ctx.stream()));
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));check_output(output,41);
         puts("PASS: cache-full free deferred during capture; first launch exact; release invalidates replay; recapture exact");
     }
     CUDA_CHECK(cudaFree(output));
-    puts("PASS: legacy CUDA graph pool regression");
+    puts("PASS: legacy CUDA graph pool regression, two ordered dependent chunks");
 }

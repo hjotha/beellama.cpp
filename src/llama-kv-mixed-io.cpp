@@ -576,6 +576,60 @@ size_t split_writer::read_payload(uint32_t layer_id, uint32_t range_id, uint64_t
             }
         }
     }
+    struct payload_read {
+        const ggml_tensor * tensor;
+        size_t source_offset;
+        size_t size;
+        size_t output_offset;
+    };
+    std::vector<payload_read> reads;
+    const auto flush_reads = [&]() {
+        // K/V rows are frequently interleaved in the payload. Sort descriptors,
+        // never bytes: their original output offsets preserve the exact wire order.
+        std::sort(reads.begin(), reads.end(), [](const payload_read & a, const payload_read & b) {
+            if (a.tensor != b.tensor) return std::less<const ggml_tensor *>{}(a.tensor, b.tensor);
+            if (a.size != b.size) return a.size < b.size;
+            if (a.source_offset != b.source_offset) return a.source_offset < b.source_offset;
+            return a.output_offset < b.output_offset;
+        });
+        for (size_t i = 0; i < reads.size();) {
+            const auto & first = reads[i];
+            size_t run = 1, source_stride = 0, output_stride = 0;
+            if (i + 1 < reads.size()) {
+                const auto & next = reads[i + 1];
+                if (next.tensor == first.tensor && next.size == first.size &&
+                        next.source_offset > first.source_offset && next.output_offset > first.output_offset) {
+                    source_stride = next.source_offset - first.source_offset;
+                    output_stride = next.output_offset - first.output_offset;
+                    // Keep 2D pitches within the conservative CUDA limit.
+                    const size_t max_pitch = size_t(std::numeric_limits<int>::max());
+                    if (source_stride >= first.size && output_stride >= first.size &&
+                            source_stride <= max_pitch && output_stride <= max_pitch) {
+                        run = 2;
+                        while (i + run < reads.size()) {
+                            const auto & item = reads[i + run];
+                            const auto & previous = reads[i + run - 1];
+                            if (item.tensor != first.tensor || item.size != first.size ||
+                                    item.source_offset < previous.source_offset || item.output_offset < previous.output_offset ||
+                                    item.source_offset - previous.source_offset != source_stride ||
+                                    item.output_offset - previous.output_offset != output_stride) break;
+                            ++run;
+                        }
+                    }
+                }
+            }
+            if (run > 1 && source_stride == first.size && output_stride == first.size) {
+                ggml_backend_tensor_get(first.tensor, dst + first.output_offset, first.source_offset, run * first.size);
+            } else if (run > 1) {
+                ggml_backend_tensor_get_2d(first.tensor, dst + first.output_offset, first.source_offset,
+                                           first.size, run, source_stride, output_stride);
+            } else {
+                ggml_backend_tensor_get(first.tensor, dst + first.output_offset, first.source_offset, first.size);
+            }
+            i += run;
+        }
+        reads.clear();
+    };
     size_t done = 0;
     uint64_t pos = offset;
     for (const mixed_manifest_event * e : evs) {
@@ -598,10 +652,13 @@ size_t split_writer::read_payload(uint32_t layer_id, uint32_t range_id, uint64_t
         if (abs_off > nbytes || take > nbytes - abs_off) {
             io_fail("split_writer: captured tensor range is out of bounds");
         }
-        ggml_backend_tensor_get(tr.tensor, dst + done, size_t(abs_off), size_t(take));
+        reads.push_back({tr.tensor, size_t(abs_off), size_t(take), done});
+        if (reads.size() == 4096) flush_reads();
         done += size_t(take);
         pos += take;
     }
+
+    flush_reads();
     return done;
 }
 

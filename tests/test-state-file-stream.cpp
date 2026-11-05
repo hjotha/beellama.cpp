@@ -445,6 +445,83 @@ int main(int argc, char ** argv) {
                 generic_count == 0 && reservation_calls == 0 &&
                 llama_memory_seq_pos_max(llama_get_memory(generic_native.get()), 0) == -1,
                 "generic streaming reader accepted or reserved a native trailer");
+
+        // The base file without the native trailer must prepare successfully in
+        // an occupied context, so the negative case below reaches the trailer.
+        {
+            llama_context_ptr probe(llama_init_from_model(model.get(), params));
+            require(bool(probe), "occupied generic prepare control context failed");
+            decode(probe.get(), tokens);
+            llama_tokens probe_tokens(tokens.size());
+            size_t probe_count = 0, probe_bytes = 0;
+            std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> accepted_plan(
+                    llama_state_seq_prepare_file(probe.get(), legacy_seq_path.c_str(), 0,
+                        probe_tokens.data(), probe_tokens.size(), &probe_count, &probe_bytes),
+                    llama_state_seq_restore_plan_free);
+            require(bool(accepted_plan) && probe_count == tokens.size() && probe_bytes == legacy_seq_size &&
+                    probe_tokens == tokens, "occupied generic prepare rejected the valid base file");
+        }
+
+        // A generic restore must also leave an occupied destination intact.
+        llama_context_ptr occupied(llama_init_from_model(model.get(), params));
+        llama_context_ptr occupied_control(llama_init_from_model(model.get(), params));
+        require(bool(occupied) && bool(occupied_control), "occupied native guard contexts failed");
+        decode(occupied.get(), tokens);
+        decode(occupied_control.get(), tokens);
+        require(llama_get_memory(occupied.get())->state_seq_can_restore(0, LLAMA_STATE_SEQ_FLAGS_NONE),
+                "occupied native guard did not reach generic restore admission");
+        const llama_pos occupied_pos = llama_memory_seq_pos_max(llama_get_memory(occupied.get()), 0);
+        const float * initial_logits = llama_get_logits_ith(occupied.get(), -1);
+        require(initial_logits != nullptr, "occupied native guard logits missing");
+        const std::vector<float> logits_before(initial_logits, initial_logits + n_vocab);
+        auto sequence_bytes = [](llama_context * ctx) {
+            const size_t size = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+            require(size > 0, "occupied native guard could not size sequence");
+            std::vector<uint8_t> bytes(size);
+            require(llama_state_seq_get_data_ext(ctx, bytes.data(), bytes.size(), 0,
+                        LLAMA_STATE_SEQ_FLAGS_NONE) == size, "occupied native guard could not read sequence");
+            return bytes;
+        };
+        const auto state_before = sequence_bytes(occupied.get());
+        int occupied_reservations = 0;
+        llama_state_seq_set_native_restore_reservation(occupied.get(),
+                [](void * user, size_t) { ++*static_cast<int *>(user); return true; }, &occupied_reservations);
+        size_t occupied_count = 0, occupied_bytes = 0;
+        std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> rejected_plan(
+                llama_state_seq_prepare_file(occupied.get(), generic_native_path.c_str(), 0,
+                    generic_tokens.data(), generic_tokens.size(), &occupied_count, &occupied_bytes),
+                llama_state_seq_restore_plan_free);
+        require(!rejected_plan && occupied_count == 0 && occupied_bytes == 0 && occupied_reservations == 0,
+                "generic prepare accepted or reserved a native trailer in an occupied context");
+        require(llama_memory_seq_pos_max(llama_get_memory(occupied.get()), 0) == occupied_pos &&
+                sequence_bytes(occupied.get()) == state_before,
+                "rejected generic prepare changed the occupied sequence");
+        const float * after_prepare = llama_get_logits_ith(occupied.get(), -1);
+        require(after_prepare && std::equal(logits_before.begin(), logits_before.end(), after_prepare),
+                "rejected generic prepare changed the occupied logits");
+        occupied_count = 99;
+        require(llama_state_seq_load_file(occupied.get(), generic_native_path.c_str(), 0,
+                    generic_tokens.data(), generic_tokens.size(), &occupied_count) == 0 &&
+                occupied_count == 0 && occupied_reservations == 0,
+                "generic reader accepted or reserved a native trailer in an occupied context");
+        require(llama_memory_seq_pos_max(llama_get_memory(occupied.get()), 0) == occupied_pos &&
+                sequence_bytes(occupied.get()) == state_before,
+                "rejected generic read changed the occupied sequence");
+        const float * after_read = llama_get_logits_ith(occupied.get(), -1);
+        require(after_read && std::equal(logits_before.begin(), logits_before.end(), after_read),
+                "rejected generic read changed the occupied logits");
+        const llama_token continuation = greedy(occupied_control.get());
+        decode(occupied.get(), {continuation}, tokens.size());
+        decode(occupied_control.get(), {continuation}, tokens.size());
+        const float * live = llama_get_logits_ith(occupied.get(), -1);
+        const float * reference = llama_get_logits_ith(occupied_control.get(), -1);
+        require(live && reference, "occupied native guard continuation logits missing");
+        for (int i = 0; i < n_vocab; ++i) {
+            require(std::isfinite(live[i]) && std::isfinite(reference[i]) && std::abs(live[i] - reference[i]) < 0.002f,
+                    "rejected generic native restore changed continuation logits");
+        }
+        llama_state_seq_set_native_restore_reservation(occupied.get(), nullptr, nullptr);
+        std::cout << "PASS: generic native trailer rejects in occupied contexts without state or logits mutation\n";
         std::cout << "PASS: generic sequence reader rejects native trailer before reservation\n";
 
         const auto identity = server_model_identity::prepare(argv[1], {});

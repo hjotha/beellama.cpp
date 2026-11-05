@@ -561,10 +561,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
+                return 2;
             case 2:
             case 3:
+                return type == GGML_TYPE_Q3_K ? 1 : 2;
             case 4:
-                return 2;
+                return type == GGML_TYPE_Q6_K? 1 : 2;
             case 5:
             case 6:
             case 7:
@@ -693,6 +695,20 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
+// Low bit types load few weight bytes per thread, a second row per block shares the q8_1 loads and adds memory parallelism.
+static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (ptq1_0_pt_enabled() && type == GGML_TYPE_PTQ1_0 &&
         (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
@@ -701,7 +717,13 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                if (small_k) {
+                    return nwarps;
+                }
+                if (table_id == MMVQ_PARAMETERS_GB10) {
+                    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
+                }
+                return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
             case 3:
             case 4:
@@ -886,6 +908,23 @@ static __global__ void mul_mat_vec_q(
 
             // x block quant index when casting the quants to int
             const int kqs = vdr * (tid % (qi/vdr));
+
+#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+            if constexpr (mmvq_should_prefetch(type)) {
+                constexpr int pf_dist = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 1 : 2;
+                const int kbx_pf = kbx + pf_dist * blocks_per_iter;
+                if (kbx_pf < blocks_per_row_x) {
+                    #pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        const size_t off = (size_t) (kbx_offset + i * stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                        mmvq_prefetch_l2((const char *) vx + off);
+                        if constexpr (has_fusion && has_gate) {
+                            mmvq_prefetch_l2((const char *) vgate + off);
+                        }
+                    }
+                }
+            }
+#endif
 
 #if !defined(GGML_USE_HIP)
         if constexpr (type == GGML_TYPE_PTQ1_0) {

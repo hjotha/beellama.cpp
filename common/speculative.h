@@ -109,7 +109,7 @@ struct common_speculative_draft_params {
     std::vector<common_speculative_token_dist> * dists = nullptr;
 
     float temperature = 0.0f;
-    // candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash (DFlash2 only) sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
     // the target's temp and seed, read only when the drafter samples probabilistically
@@ -119,6 +119,13 @@ struct common_speculative_draft_params {
     // per-draft p_min override (< 0 = inherit implementation default)
     float    p_min = -1.0f;
 };
+
+inline void common_speculative_truncate_draft(common_speculative_draft_params & params) {
+    if (!params.result || params.n_max <= 0 || params.result->size() <= (size_t) params.n_max) return;
+    params.result->resize(params.n_max);
+    if (params.dists && params.dists->size() >= (size_t) params.n_max) params.dists->resize(params.n_max);
+    if (params.result_q && params.result_q->size() >= (size_t) params.n_max) params.result_q->resize(params.n_max);
+}
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 

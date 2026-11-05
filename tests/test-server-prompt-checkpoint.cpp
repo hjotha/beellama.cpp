@@ -22,6 +22,14 @@ static void speculative_rollback_checkpoint_boundary() {
     assert( server_prompt_reuse_requires_checkpoint_search(false, 512, 512));
     assert( server_prompt_reuse_requires_checkpoint_search(true, 0, 528));
 
+    // A checkpoint may still match the request but extend beyond the restored
+    // MTP continuation state. Ordinary checkpoints only need the shared prefix.
+    assert(!server_prompt_checkpoint_must_prune(false, 100, 101, 100, 120, 100));
+    assert( server_prompt_checkpoint_must_prune(true,  100, 101, 100, 120, 100));
+    assert(!server_prompt_checkpoint_must_prune(true,   99, 100, 100, 120, 100));
+    assert( server_prompt_checkpoint_must_prune(false,  99, 100, 100,  99, 100));
+    assert( server_prompt_checkpoint_must_prune(false, 101, 102, 100, 120, 100));
+
     assert(server_prompt_reuse_alignment(0) == 1);
     assert(server_prompt_reuse_alignment(128) == 128);
     assert(server_prompt_reuse_alignment(192) == 192);
@@ -278,6 +286,24 @@ static void slot_save_prefers_only_the_last_aligned_checkpoint() {
     std::list<std::shared_ptr<const common_prompt_checkpoint>> too_new;
     too_new.push_back(make_checkpoint(6784, 6784, 16));
     assert(!server_prompt_save_aligned_checkpoint(too_new, 6734, 128));
+}
+
+static void prompt_cache_respects_native_rollback_limit() {
+    for (const uint32_t limit : {0u, 1u, UINT32_MAX}) {
+        for (const bool checkpoint : {false, true}) {
+            server_prompt saved = make_prompt({1, 2, 3, 4, 5});
+            if (checkpoint) {
+                saved.checkpoints.push_back(make_checkpoint(1, 0, 16));
+            }
+            server_tokens requested(llama_tokens {1, 2, 9}, false);
+            const bool useful = checkpoint || limit == UINT32_MAX;
+            assert(server_prompt_candidate_rollback_safe(saved, requested, 1, limit) == useful);
+        }
+    }
+    const server_prompt saved = make_prompt({1, 2, 3, 4, 5});
+    const server_tokens requested(llama_tokens {1, 2, 9}, false);
+    assert(!server_prompt_candidate_rollback_safe(saved, requested, 1, 2));
+    assert(server_prompt_candidate_rollback_safe(saved, requested, 1, 3));
 }
 
 static void prompt_cache_does_not_restore_just_admitted_live_state() {
@@ -567,6 +593,7 @@ static void prompt_cache_make_room_fails_when_single_state_exceeds_budget() {
 int main() {
     kvarn_checkpoint_cadence_preserves_production_compute_shapes();
     prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp();
+    prompt_cache_respects_native_rollback_limit();
     prompt_cache_does_not_restore_just_admitted_live_state();
     prompt_cache_self_contained_wins_over_native();
     prompt_cache_checkpoint_must_respect_alignment_and_position();

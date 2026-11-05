@@ -15,6 +15,9 @@
 
 using namespace xllama;
 
+// Internal placement rule shared with the Windows device implementation.
+namespace xllama { bool d3d12_empty_fill_supported(const ggml_tensor* op); }
+
 namespace {
 
 D3d12MatmulDesc decode_desc(ggml_type t, std::int64_t n, std::int64_t k) {
@@ -71,6 +74,24 @@ double emulate_rel_err(ggml_type t, int n, int k, int ncols, std::size_t x_pad, 
 }
 
 } // namespace
+
+TEST_CASE("ggml_d3d12: only empty FILL is supported") {
+    ggml_init_params params = {};
+    params.mem_size = 8 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context* ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    ggml_tensor* states = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor* empty = ggml_view_1d(ctx, states, 0, 0);
+    ggml_tensor* empty_fill = ggml_fill_inplace(ctx, empty, 0.0f);
+    ggml_tensor* nonempty_fill = ggml_fill_inplace(ctx, states, 0.0f);
+    ggml_tensor* other_empty = ggml_scale_inplace(ctx, empty, 0.0f);
+    CHECK(d3d12_empty_fill_supported(empty_fill));
+    CHECK_FALSE(d3d12_empty_fill_supported(nonempty_fill));
+    CHECK_FALSE(d3d12_empty_fill_supported(other_empty));
+    CHECK_FALSE(d3d12_empty_fill_supported(nullptr));
+    ggml_free(ctx);
+}
 
 TEST_CASE("ggml_d3d12: weight types") {
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q4_0));
