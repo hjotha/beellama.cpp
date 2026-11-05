@@ -435,7 +435,7 @@ public:
             ggml_tensor * body, ggml_tensor * exact,
             ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
             const llama_ubatch * ubatch, bool causal_attn,
-            const std::vector<int64_t> & read_cells) const;
+            const std::vector<int64_t> & read_cells, uint32_t global_tail_tokens = 0) const;
     bool can_pack_tail_body(const llama_ubatch & ubatch) const;
     void set_input_tail_body_plan(
             ggml_tensor * query_order, ggml_tensor * run_desc,

@@ -53,6 +53,10 @@ llama_kv_tail_request llama_kv_tail_request_parse(
         result.mode = LLAMA_KV_TAIL_REQUEST_DISABLED;
         return result;
     }
+    if (specification == "none") {
+        result.mode = LLAMA_KV_TAIL_REQUEST_EXPLICIT_ZERO;
+        return result;
+    }
     if (specification == "auto") {
         result.mode = LLAMA_KV_TAIL_REQUEST_AUTOMATIC;
         return result;
@@ -105,6 +109,7 @@ llama_kv_tail_request_resolution llama_kv_tail_request_resolve(
     std::vector<uint32_t> raw(groups.size(), 0);
     switch (request.mode) {
         case LLAMA_KV_TAIL_REQUEST_DISABLED:
+        case LLAMA_KV_TAIL_REQUEST_EXPLICIT_ZERO:
             break;
         case LLAMA_KV_TAIL_REQUEST_NUMERIC:
             if (request.entries.size() != 1) {
@@ -166,7 +171,8 @@ llama_kv_tail_request_resolution llama_kv_tail_request_resolve(
                 std::min(raw[i], group.effective_window) : 0;
         bool native_exact = false;
         if (kvarn) {
-            const auto policy = llama_kvarn_tail_policy_for(raw[i], group.effective_window);
+            const auto policy = llama_kvarn_tail_policy_for(raw[i], group.effective_window,
+                    request.mode != LLAMA_KV_TAIL_REQUEST_EXPLICIT_ZERO);
             requested = policy.requested_tokens;
             effective = policy.effective_tokens;
             native_exact = policy.native_exact;

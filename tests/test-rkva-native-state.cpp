@@ -112,8 +112,9 @@ void test_roundtrip(uint32_t tail) {
     assert(layout.compact_stage == 0);
     assert(layers[0].stage_k.size() == size_t(384) * kHeads * 256);
     assert(layers[0].tail_k.size() == size_t(tail) * kHeads * 256);
-    assert(layers[0].original_k.size() == size_t(256) * kHeads * 256);
-    assert(layers[0].original_pos.size() == 256);
+    const uint32_t history_rows = rkva_native_history_rows(tail);
+    assert(layers[0].original_k.size() == size_t(history_rows) * kHeads * 256);
+    assert(layers[0].original_pos.size() == history_rows);
     // CPU/global records are normalized to the origin group.
     assert(layers[0].records_k.size() == size_t(513 / 128) * kHeads * 2 * 8960);
 
@@ -217,6 +218,25 @@ void test_rewind_and_reappend() {
     assert(restored.producer->can_rewind(385));
     assert(export_one(*source.producer, 0x300000003ull) ==
            export_one(*restored.producer, 0x300000003ull));
+}
+
+void test_flexible_rewind(uint32_t tail) {
+    Fixture source(tail);
+    source.append(0, 713);
+    const uint32_t keep = 585;
+    assert(source.producer->can_rewind(keep));
+    std::vector<uint8_t> tail_rows;
+    assert(source.producer->rewind_tail(keep, tail_rows));
+    const auto span = rkva_kvarn_rewind_tail(713, keep, tail);
+    assert(tail_rows.size() == size_t(span.rows) * 2 * kHeads * 256 * sizeof(uint16_t));
+    assert(source.producer->rewind(keep));
+    const auto saved = export_one(*source.producer, 0x300000005ull);
+    Fixture restored(tail);
+    import_one(*restored.producer, saved);
+    source.append(keep, 128);
+    restored.append(keep, 128);
+    assert(export_one(*source.producer, 0x300000006ull) ==
+           export_one(*restored.producer, 0x300000006ull));
 }
 
 void test_corruption_and_short_io() {
@@ -376,6 +396,16 @@ void test_reset_coverage_and_seals() {
     assert(c.stage_begin == 384);
     assert(rkva_kvarn_range::coverage_after_rewind(c, 600, 472, 128).tail_begin == 385);
     assert(rkva_kvarn_range::coverage_after_reset(300, 0).tail_begin == 300);
+    for (uint32_t tail : {1u, 17u, 127u, 129u, 257u, 513u}) {
+        auto coverage = rkva_kvarn_range::coverage_after_reset(600, tail);
+        coverage = rkva_kvarn_range::coverage_after_append(coverage, 728, tail);
+        assert(coverage.tail_begin <= 600 - std::min(600u, tail));
+        const int32_t positions[] = {int32_t(kOrigin + 727)};
+        assert(rkva_kvarn_range::valid_prefix_queries(positions, 1, kOrigin, 728, coverage, tail));
+    }
+    const int32_t stage_position[] = {int32_t(kOrigin + 149)};
+    rkva_kvarn_range::prefix_coverage missing_stage{149, 256};
+    assert(!rkva_kvarn_range::valid_prefix_queries(stage_position, 1, kOrigin, 150, missing_stage, 1));
 }
 
 } // namespace
@@ -383,9 +413,11 @@ void test_reset_coverage_and_seals() {
 int main() {
     test_roundtrip(128);
     test_roundtrip(0);
+    for (uint32_t tail : {1u, 127u, 129u, 255u, 256u, 257u, 513u}) test_roundtrip(tail);
     test_compact_layout_normalization();
     test_multilayer();
     test_rewind_and_reappend();
+    for (uint32_t tail : {1u, 127u, 129u, 257u, 513u}) test_flexible_rewind(tail);
     test_corruption_and_short_io();
     test_import_is_atomic();
     test_generation_validation();

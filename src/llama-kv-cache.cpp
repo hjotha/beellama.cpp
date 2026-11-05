@@ -8028,7 +8028,8 @@ static void set_input_kq_mask_tail_impl(
         uint32_t n_kv,
         uint32_t attention_stride,
         bool causal_attn,
-        const std::vector<int32_t> * physical_to_read) {
+        const std::vector<int32_t> * physical_to_read,
+        uint32_t global_tail_tokens) {
     const T drop = llama_cast<T>(-INFINITY);
     std::fill(exact_data, exact_data + uint64_t(attention_stride)*ubatch->n_tokens, drop);
     if (read_data) {
@@ -8117,6 +8118,12 @@ static void set_input_kq_mask_tail_impl(
         }
         llama_kv_tail_select_masked_entries(
                 plan.mask_entries, finite, ubatch->pos[i], tail.retention(), causal_attn, selected);
+        if (global_tail_tokens) {
+            selected.erase(std::remove_if(selected.begin(), selected.end(), [&](uint32_t index) {
+                return !llama_position_split::global_tail_contains(
+                        plan.entries[index].mask.position, ubatch->pos[i], global_tail_tokens);
+            }), selected.end());
+        }
         GGML_ASSERT(selected.size() <= tail.retention());
 
         selected_runs.clear();
@@ -8175,7 +8182,7 @@ void llama_kv_cache::set_input_kq_mask_tail_mapped(
         ggml_tensor * body, ggml_tensor * exact,
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
         const llama_ubatch * ubatch, bool causal_attn,
-        const std::vector<int64_t> & read_cells) const {
+        const std::vector<int64_t> & read_cells, uint32_t global_tail_tokens) const {
     const uint32_t n_kv = uint32_t(body ? body->ne[0] : read_cells.size());
     if (!tail || !exact || !exact->buffer) {
         return;
@@ -8224,7 +8231,7 @@ void llama_kv_cache::set_input_kq_mask_tail_mapped(
                 body_read_idxs && body_read_idxs->buffer ? static_cast<int32_t *>(body_read_idxs->data) : nullptr,
                 bias_read_idxs && bias_read_idxs->buffer ? static_cast<int32_t *>(bias_read_idxs->data) : nullptr,
                 ubatch, n_kv, attention_stride, causal_attn,
-                physical_to_read.empty() ? nullptr : &physical_to_read);
+                physical_to_read.empty() ? nullptr : &physical_to_read, global_tail_tokens);
     } else {
         GGML_ASSERT(body->type == GGML_TYPE_F32);
         set_input_kq_mask_tail_impl(*tail, tail_generations, seq_to_stream,
@@ -8233,7 +8240,7 @@ void llama_kv_cache::set_input_kq_mask_tail_mapped(
                 body_read_idxs && body_read_idxs->buffer ? static_cast<int32_t *>(body_read_idxs->data) : nullptr,
                 bias_read_idxs && bias_read_idxs->buffer ? static_cast<int32_t *>(bias_read_idxs->data) : nullptr,
                 ubatch, n_kv, attention_stride, causal_attn,
-                physical_to_read.empty() ? nullptr : &physical_to_read);
+                physical_to_read.empty() ? nullptr : &physical_to_read, global_tail_tokens);
     }
 }
 

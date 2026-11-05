@@ -45,7 +45,7 @@ inline bool rkva_kvarn_plan_rewind(const rkva_kvarn_range_rewind& request, uint3
     if (!rkva_kvarn_generation_mutable(generation) || request.expected_generation != generation ||
         !data || !heads || request.reserved || request.pos0 > uint32_t(INT32_MAX) ||
         request.n_layers != counts.size() || ready.size() != counts.size() ||
-        request.tail_tokens != tail_tokens || (tail_tokens != 0 && tail_tokens != 128))
+        request.tail_tokens != tail_tokens)
         return false;
     const uint32_t keep = request.pos0 <= origin ? 0 : std::min(request.pos0 - origin, capacity);
     rkva_kvarn_rewind_plan candidate;

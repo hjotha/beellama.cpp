@@ -18,6 +18,7 @@
 #include "ggml.h"
 #include "remote-attn-protocol.h"
 #include "rkva-kvarn-producer.h"
+#include "rkva-bulk-segments.h"
 #include "rkva-q4-producer.h"
 #include "rkva-q8-producer.h"
 #include "rkva-saw-int4-producer.h"
@@ -1062,6 +1063,7 @@ struct ggml_backend_remote_attn_context {
     uint64_t native_generation = 0;
     rkva_kvarn_range_config native_descriptor {};
     uint32_t native_tail_tokens = 128;
+    uint32_t native_tail_override = UINT32_MAX;
     ggml_backend_cpu_kvarn_store_direct_v1_t native_store = nullptr;
     std::vector<std::unique_ptr<rkva_native_owner>> native_layers;
     std::unique_ptr<rkva_pending_native_state> pending_native_state;
@@ -2379,10 +2381,11 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         // Revision 3 explicitly negotiates query-prefix semantics. Keep its
         // chunks within the qualified optimized kernel's nine-query bound;
         // prefill uses eight, verification batches keep their actual shape.
-        const size_t chunk_limit = (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) ? (nq > 9 ? 8 : nq) :
-            ctx->native_serial_prefix ? (nq > 9 ? 8 : nq) : 1;
+        const bool native_rows = ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc;
+        const auto chunks = rkva_bulk_segments(nq, native_rows || ctx->native_serial_prefix,
+                !native_rows && ctx->native_serial_prefix && cached.rows == 0, ctx->native_tail_tokens);
         std::vector<uint8_t> bulk_payload;
-        const uint32_t segments = uint32_t((nq + chunk_limit - 1) / chunk_limit);
+        const uint32_t segments = uint32_t(chunks.size());
         if (ctx->native_bulk) {
             if (ctx->native_generation > UINT64_MAX - segments) { ctx->failed = true; return false; }
             const rkva_kvarn_range_bulk header {1, segments, uint32_t(nq), 0};
@@ -2393,8 +2396,8 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         }
         const auto * bulk_queries = ctx->f32_scratch.data();
         uint64_t bulk_upload_bytes = 0;
-        for (size_t first = 0; first < nq; first += chunk_limit) {
-            const size_t chunk = std::min(chunk_limit, nq - first);
+        for (size_t first = 0, i = 0; first < nq; first += chunks[i++]) {
+            const size_t chunk = chunks[i];
             if (!owner->append(original_k.data() + first * width, original_v.data() + first * width,
                     ctx->pos_scratch.data() + first, uint32_t(chunk), first == 0 && cached.rows == 0, ctx->payload_tx)) {
                 ctx->failed = true; return false;
@@ -2677,9 +2680,10 @@ static bool rkva_prepare_native_bulk_job(
             return false;
         }
         }
-        const size_t chunk_limit = (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) ? (nq > 9 ? 8 : nq) :
-            ctx->native_serial_prefix ? (nq > 9 ? 8 : nq) : 1;
-        const uint32_t segments = uint32_t((nq + chunk_limit - 1) / chunk_limit);
+        const bool native_rows = ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc;
+        const auto chunks = rkva_bulk_segments(nq, native_rows || ctx->native_serial_prefix,
+                !native_rows && ctx->native_serial_prefix && slot.start_rows == 0, ctx->native_tail_tokens);
+        const uint32_t segments = uint32_t(chunks.size());
         if (ctx->native_generation > UINT64_MAX - segments) {
             ctx->failed = true;
             return false;
@@ -2755,8 +2759,8 @@ static bool rkva_prepare_native_bulk_job(
         ggml_remote_attn_trace_scope trace_envelope("envelope");
         trace_envelope.event.flags = 0x40000000u;
         const uint64_t zeros_before = slot.payload.zeroed_bytes();
-        for (size_t first = 0; first < nq; first += chunk_limit) {
-            const size_t chunk = std::min(chunk_limit, nq - first);
+        for (size_t first = 0, i = 0; first < nq; first += chunks[i++]) {
+            const size_t chunk = chunks[i];
             const bool is_bootstrap = (first == 0) && (slot.start_rows == 0);
             {
             ggml_remote_attn_trace_scope trace_append("kv_append");
@@ -3807,6 +3811,15 @@ bool ggml_backend_remote_attn_set_geometry(
     return true;
 }
 
+bool ggml_backend_remote_attn_set_native_tail(ggml_backend_t backend, uint32_t tokens) {
+    if (!backend || ggml_backend_is_local_split(backend) || tokens == UINT32_MAX) return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    auto lock = rkva_lock_ctx_drained(ctx);
+    if (ctx->connected) return false;
+    ctx->native_tail_override = tokens;
+    return true;
+}
+
 bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
 #ifdef _WIN32
     (void) backend;
@@ -3890,6 +3903,8 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     hello.proto_flags    = (1u << 0) | (1u << 1) | RKVA_PROTO_NATIVE_REWIND_V2 |
                            RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3;
     hello.proto_flags   |= RKVA_PROTO_NATIVE_SNAPSHOT_V4;
+    if (ctx->native_tail_override != UINT32_MAX && ctx->native_tail_override != 0 &&
+        ctx->native_tail_override != 128) hello.proto_flags |= RKVA_PROTO_KVARN_FLEX_TAIL;
     if (ctx->e4_requested) {
         hello.proto_flags |= RKVA_PROTO_BULK_E4M3FN;
     }
@@ -3920,6 +3935,13 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         return false;
     }
     std::memcpy(&ctx->ack, ack_bytes.data(), sizeof(rkva_hello_ack));
+    if ((hello.proto_flags & RKVA_PROTO_KVARN_FLEX_TAIL) &&
+        !(ctx->ack.reserved[0] & RKVA_CAP_KVARN_FLEX_TAIL)) {
+        GGML_LOG_ERROR("%s: requested native tail size was not negotiated\n", GGML_REMOTE_ATTN_NAME);
+        ctx->connected = false;
+        ctx->close_socket();
+        return false;
+    }
     if (ctx->e4_requested) {
         constexpr uint64_t caps = RKVA_CAP_RANGE_KVARN4 | RKVA_CAP_KVARN_REWIND |
             RKVA_CAP_KVARN_SERIAL_PREFIX | RKVA_CAP_KVARN_BULK_ATTN | RKVA_CAP_KVARN_BULK_E4M3FN;
@@ -4291,7 +4313,9 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
         ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu), "ggml_backend_cpu_kvarn_store_direct_v1"));
     if (!store) return false;
     uint32_t precision_tail_tokens = 128;
-    if (const char * tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS")) {
+    if (ctx->native_tail_override != UINT32_MAX) {
+        precision_tail_tokens = std::min(ctx->native_tail_override, capacity);
+    } else if (const char * tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS")) {
         if (!std::strcmp(tail, "0")) precision_tail_tokens = 0;
         else if (std::strcmp(tail, "128")) {
             GGML_LOG_ERROR("%s: GGML_RKVA_NATIVE_TAIL_TOKENS must be 0 or 128\n", GGML_REMOTE_ATTN_NAME);
@@ -5042,7 +5066,8 @@ bool ggml_backend_remote_attn_native_kvarn_snapshot_supported(ggml_backend_t bac
     return snapshots && !std::strcmp(snapshots, "1") &&
            ggml_backend_remote_attn_native_kvarn_enabled(backend) &&
            ctx->native_serial_prefix && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
-           (ctx->native_tail_tokens == 0 || ctx->native_tail_tokens == 128) &&
+           (ctx->native_tail_tokens == 0 || ctx->native_tail_tokens == 128 ||
+            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_FLEX_TAIL)) &&
            ctx->native_descriptor.layout_version == 3 &&
            (ctx->ack.supported_ops & ops) == ops &&
            (ctx->ack.reserved[0] & RKVA_CAP_NATIVE_KVARN_SNAPSHOT);
@@ -5129,7 +5154,7 @@ bool ggml_backend_remote_attn_native_kvarn_state_read(
     const uint64_t generation = pending->layers.front().layout.saved_generation;
     const bool compact = (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) &&
                          ctx->native_serial_prefix && ctx->range_origin >= 128 &&
-                         ctx->native_tail_tokens == 128;
+                         ctx->native_tail_tokens >= 128;
     for (const auto & state : pending->layers) {
         const auto & layout = state.layout;
         if (!state.valid || layout.origin != ctx->range_origin ||
@@ -5632,7 +5657,7 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
         ",\"server_version\":" + std::to_string(ctx->ack.server_version) +
         ",\"compact_stage\":" + std::string(ctx->range_native_kvarn && ctx->native_serial_prefix &&
             (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) && ctx->range_origin >= 128 &&
-            ctx->native_tail_tokens == 128 ? "true" : "false") +
+            ctx->native_tail_tokens >= 128 ? "true" : "false") +
         ",\"cuda_pack_calls\":" + std::to_string(s.cuda_pack_calls) +
         ",\"cuda_unpack_calls\":" + std::to_string(s.cuda_unpack_calls) +
         ",\"cuda_small_pack_calls\":" + std::to_string(s.cuda_small_pack_calls) +

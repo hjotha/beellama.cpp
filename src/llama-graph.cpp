@@ -1052,7 +1052,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
                 metadata->set_input_kq_mask_tail_mapped(
                         self_kq_mask_local, self_kq_mask_tail,
                         self_tail_read_idxs, self_tail_body_read_idxs, self_tail_bias_read_idxs,
-                        ubatch, cparams.causal_attn, local_read_cells);
+                        ubatch, cparams.causal_attn, local_read_cells, kvarn_cache->native_global_tail_tokens());
                 metadata->set_input_tail_body_plan(
                         self_tail_query_order, self_tail_run_desc, self_kq_mask_local,
                         ubatch, cparams.causal_attn);

@@ -3880,8 +3880,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VK_GET_ROWS_Q4_0_F16VEC"));
     add_opt(common_arg(
         {"--kv-tail-tokens"}, "SPEC",
-        "exact KV-cache tail: 0, auto, N, positional list, or named group list\n"
-        "KVarN always retains an intrinsic 128-token exact suffix\n"
+        "exact KV-cache tail: 0, none, auto, N, positional list, or named group list\n"
+        "KVarN defaults to a 128-token exact suffix; an explicit N is exact\n"
         "(default: 0)",
         [](common_params & params, const std::string & value) {
             parse_kv_tail_tokens(params, value);

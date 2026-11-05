@@ -151,7 +151,7 @@ standard cache types.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, ambiguous, or wrong-length specifications fail context creation. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
+| `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix; `none` explicitly disables the overlay. A positive number applies exactly to every canonical group, without rounding. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, ambiguous, or wrong-length specifications fail context creation. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
 | `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16` or `bf16` exact storage for compact history and compact-native SWA. An explicit value overrides the cache-family default in either direction. Other types are rejected. |
 
 An omitted tail type remains automatic until context placement. If the standard
@@ -160,7 +160,7 @@ selection warns and resolves once to F16. Explicit `--kv-tail-type bf16` fails
 instead of changing the requested representation.
 
 Explicit values are capped by the group's effective attention window and context
-capacity. KVarN values are also rounded upward to 128-token groups. Startup logs
+capacity. KVarN allocates whole physical groups without rounding the requested logical tail. Startup logs
 show raw, requested, effective, and window lengths, the structural group ID,
 participating layers, selected compact-overlay or compact-native-exact
 representation, actual body and exact types, logical history rows, rollback

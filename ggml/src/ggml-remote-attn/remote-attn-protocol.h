@@ -100,6 +100,7 @@ static constexpr uint64_t RKVA_CAP_NATIVE_OSCAR_INT2_BULK = 1ull << 22;
 // layout 8: TurboQuant NC, two 132-byte-per-head planes (K has two zero pad bytes)
 static constexpr uint64_t RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK = 1ull << 24;
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_E4M3FN = 1ull << 25;
+static constexpr uint64_t RKVA_CAP_KVARN_FLEX_TAIL = 1ull << 26;
 // Capability allocation in HELLO ack.reserved[0]:
 //   0..13  range/KVarN storage and bulk features
 //   14     RKVA_CAP_NATIVE_Q4_BULK (descriptor layout 4)
@@ -147,6 +148,7 @@ static constexpr uint32_t RKVA_PROTO_NATIVE_REWIND_V2 = 1u << 16;
 static constexpr uint32_t RKVA_PROTO_BULK_E4M3FN = 1u << RKVA_WIRE_FP8_E4M3FN;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SNAPSHOT_V4 = 1u << 18;
+static constexpr uint32_t RKVA_PROTO_KVARN_FLEX_TAIL = 1u << 26;
 // Reserved managed-snapshot protocol flags. Advertised only by a Phase 4 build
 // that has passed the activation gate; inert otherwise.
 static constexpr uint32_t RKVA_PROTO_MANAGED_REGISTRY_V1 = 1u << 19;
@@ -349,7 +351,7 @@ struct rkva_kvarn_range_config {
     uint32_t token_group, record_dim, head_dim, head_slices;
     uint32_t key_bits, value_bits, record_bytes;
     uint32_t stage_groups, tail_groups, sink_tokens;
-    uint32_t precision_tail_tokens; // 0 or 128
+    uint32_t precision_tail_tokens; // 0, 128, or negotiated flexible length
     uint32_t wht_version;           // 1: H128 normalized, then normalized cross-slice mix
     uint32_t domain;                // 1: K and V records/stage rotated; Q/OUT wire original
     uint32_t record_policy;         // 1: eager committed records; delayed/SWA unsupported
@@ -360,7 +362,7 @@ struct rkva_kvarn_range_config {
 // RESET snapshots contain all 3*128 physical stage rows and
 // min(live_count,precision_tail_tokens) chronological original-domain tail rows.
 // When COMPACT_STAGE was negotiated, OMIT_STAGE may omit both stage planes only
-// with descriptor revision 3, origin >= 128 and precision_tail_tokens == 128.
+// with descriptor revision 3, origin >= 128 and precision_tail_tokens >= 128.
 // Every incomplete group is then entirely covered by the exact tail, and no
 // global group-0 sink can read stage. Records and all per-prefix tail rows stay.
 // Append payloads otherwise contain append_rows stage and tail rows at positions

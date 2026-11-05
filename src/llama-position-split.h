@@ -543,6 +543,11 @@ inline removal_disposition plan_removal(
 //   - empty ubatch          -> q_max (nothing to classify)
 //   - any token >= P        -> 1 (configured persistent-tail extent only)
 //   - all tokens < P        -> number of local tokens
+inline bool global_tail_contains(llama_pos key, llama_pos query, uint32_t tail_tokens) {
+    return tail_tokens && key >= 0 && query >= key &&
+           int64_t(key) >= int64_t(query) + 1 - int64_t(tail_tokens);
+}
+
 inline int64_t tail_extent_queries(
         bool        position_split_enabled,
         uint32_t    p,

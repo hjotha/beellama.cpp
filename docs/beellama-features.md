@@ -476,7 +476,8 @@ KVarN-specific workspace, attention, and state decisions are in
 ### State and compatibility
 
 For standard caches, the default length is zero and preserves the ordinary
-topology. KVarN always resolves at least its intrinsic 128-token suffix.
+topology. KVarN defaults to its intrinsic 128-token suffix, while explicit
+positive lengths are exact and `none` disables the overlay.
 Sequence state writes validated KV-tail manifest version 5 and can
 transfer tail tensors through host buffers or the on-device tensor protocol.
 Version 5 records exact source cells and generations, local tail slots,
@@ -738,5 +739,12 @@ for redirects and replacements.
 Native Xbox KVarN4 resident rollback is an experimental negotiated extension: both capability bit 6 and RKVA operation 21 are required, with at most 128 removed tokens and retained original-F32 inputs. Draft depth is limited to 127 so checkpoint replay can include its verification anchor. Active MTP stays disabled on older servers. PARTIAL checkpoints require the hybrid owner/dirty-prefix proof and live native-prefix coverage. FULL native overflow snapshots use the paired host-trailer + revision-3 Xbox disk codec only when both peers negotiate `RKVA_CAP_NATIVE_KVARN_SNAPSHOT`; unnegotiated peers and other native layouts keep the fail-closed guards. Windows, GPU rollback and full-model MTP qualification are separate gates.
 
 `GGML_RKVA_NATIVE_TAIL_TOKENS=0|128` independently selects the experimental Xbox native precision tail (default 128); it does not change the CUDA cache tail. The selected value appears in remote stats as `native_precision_tail_tokens`. Tail 0 omits original-domain tail planes from native upload/rewind packets; canonical native records and original-F32 rollback retention remain unchanged.
+
+With native KVarN4 position split, an explicit `--kv-tail-tokens N` selects one
+global F16 suffix across CUDA and Xbox. Positive lengths are exact; `none`
+selects zero. A peer must negotiate flexible tails before accepting lengths
+other than zero or 128. Sizes above the context are equivalent to the context
+size, and available memory still applies. Existing native snapshot size and
+store quotas also apply; they are independent of tail admission.
 
 Dense Ada Q2_K matmuls keep the serial per-32 activation scaling through query batches 5–8 by choosing MMVQ. `GGML_CUDA_Q2_K_MMVQ=0` restores the previous performance routing for profiling; other query sizes, weight formats and architectures keep their existing policy. The experimental zero-tail target also limits local MTP verification at KVarN group seals, while frozen local history after P needs no such limit.

@@ -10,6 +10,7 @@
 #include "../ggml/src/ggml-remote-attn/rkva-kvarn-rewind.h"
 #include "../ggml/src/ggml-remote-attn/rkva-kvarn-producer.h"
 #include "../ggml/src/ggml-turboquant-nc.h"
+#include "../tools/xbox/uwp/rkva/rkva-kvarn-bulk.h"
 #undef NDEBUG
 #include <cassert>
 #include <algorithm>
@@ -276,6 +277,8 @@ struct loopback {
                                 ack.supported_ops |= (1u << RKVA_SNAPSHOT_SAVE) |
                                                      (1u << RKVA_SNAPSHOT_RESTORE);
                             }
+                            if ((geometry.proto_flags & RKVA_PROTO_KVARN_FLEX_TAIL) &&
+                                (native_rewind_support & 4096)) ack.reserved[0] |= RKVA_CAP_KVARN_FLEX_TAIL;
                             if (profile_support & 1) ack.reserved[0] |= RKVA_CAP_RANGE_PROFILE;
                             response.resize(sizeof(ack)); std::memcpy(response.data(), &ack, sizeof(ack));
                         } break;
@@ -625,6 +628,16 @@ struct loopback {
                             std::memcpy(&header, payload.data(), sizeof(header));
                             assert(header.version == 1 && header.total_queries == req.n_tokens);
                             assert(header.segment_count > 0);
+                            if (native_descriptor.layout_version == 3 &&
+                                native_descriptor.precision_tail_tokens > 0 &&
+                                native_descriptor.precision_tail_tokens < 8 && !native_ready[req.layer_id]) {
+                                uint32_t wire = 0;
+                                std::vector<rkva_kvarn_bulk::Segment> segments;
+                                assert(rkva_kvarn_bulk::peek_wire(payload.data(), payload.size(), &wire));
+                                assert(rkva_kvarn_bulk::validate_wire(payload.data(), payload.size(), req.n_tokens,
+                                    native_descriptor, geometry.n_head, geometry.n_head_kv, 0, 0, false,
+                                    {}, native_generation, wire, segments));
+                            }
                             native_generation += header.segment_count;
 
                             size_t seg_offset = sizeof(header);
@@ -1377,7 +1390,7 @@ static void test_native_rewind() {
 // trailer, restore, continue, and rewind. This exercises the real request/ACK
 // parser and the staged owner commit over TCP; the Xbox disk codec remains in
 // the MSVC/D3D12 build.
-static void test_native_snapshot_transport(bool e4 = false) {
+static void test_native_snapshot_transport(bool e4 = false, uint32_t tail = 128) {
     storage_env native("kvarn4");
     storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
@@ -1390,19 +1403,22 @@ static void test_native_snapshot_transport(bool e4 = false) {
     storage_env snapshots("1", "GGML_RKVA_DISK_SNAPSHOTS");
     ggml_backend_load_all();
     loopback server(false, true, false, false, false, false, 0, 0, true,
-                    3u | 4u | 512u | (e4 ? 8u | 16u | 32u | 2048u : 0u));
+                    3u | 4u | 512u | 4096u | (e4 ? 8u | 16u | 32u | 2048u : 0u));
     auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
     ggml_remote_attn_geometry geometry {};
     geometry.n_layer_remote = 2; geometry.n_head = 2; geometry.n_head_kv = 1;
     geometry.head_dim = 256; geometry.max_ctx = 512; geometry.kq_scale = 0.0625f;
     geometry.group_tokens = 128; geometry.sinkhorn_iters = 3;
     assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+    if (tail != 128) assert(ggml_backend_remote_attn_set_native_tail(backend, tail));
     assert(ggml_backend_remote_attn_connect(backend));
     assert(server.geometry.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4);
     if (e4) assert(server.geometry.proto_flags & RKVA_PROTO_BULK_E4M3FN);
     assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
     ggml_backend_remote_attn_set_active_session(backend, 0);
     assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
+    assert(std::string(ggml_backend_remote_attn_stats_json(backend)).find(
+            "\"native_precision_tail_tokens\":" + std::to_string(tail)) != std::string::npos);
     assert(ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend));
     ggml_remote_attn_set_active(backend);
 
@@ -4256,6 +4272,23 @@ int main() {
         test_native_snapshot_transport();
         test_native_snapshot_transport(true);
         std::puts("PASS: E4M3FN v3 negotiation, CPU sync/async wire and fail-closed checks");
+        return 0;
+    }
+    if (std::getenv("GGML_RKVA_FLEX_TAIL_TEST_ONLY")) {
+        {
+            loopback old_server(false, true, false, false, false, false, 0, 0, true, 3u | 4u | 512u);
+            auto * backend = ggml_backend_remote_attn_init("127.0.0.1", old_server.port);
+            ggml_remote_attn_geometry geometry{};
+            geometry.n_layer_remote = 2; geometry.n_head = 2; geometry.n_head_kv = 1;
+            geometry.head_dim = 256; geometry.max_ctx = 512; geometry.kq_scale = 0.0625f;
+            geometry.group_tokens = 128; geometry.sinkhorn_iters = 3;
+            assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+            assert(ggml_backend_remote_attn_set_native_tail(backend, 129));
+            assert(!ggml_backend_remote_attn_connect(backend));
+            ggml_backend_free(backend);
+        }
+        for (uint32_t tail : {1u, 127u, 129u, 257u, 511u}) test_native_snapshot_transport(true, tail);
+        std::puts("PASS: flexible native tail negotiation and snapshot transport");
         return 0;
     }
     if (std::getenv("GGML_RKVA_TQNC_TEST_ONLY")) {

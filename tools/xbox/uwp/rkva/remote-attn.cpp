@@ -194,6 +194,7 @@ struct remote_state {
     bool native_rewind_v2_client = false;
     bool native_serial_prefix_v3_client = false;
     bool native_snapshot_client = false;
+    bool native_flex_tail_client = false;
     rkva_hello geo{};
     std::map<uint32_t, remote_session> sessions;
     std::unique_ptr<RemoteAttnEngine> engine;
@@ -390,6 +391,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         state.native_snapshot_client =
             rkva_range_version(req.version) && state.native_serial_prefix_v3_client &&
             (hello.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4) != 0;
+        state.native_flex_tail_client = state.native_serial_prefix_v3_client &&
+            (hello.proto_flags & RKVA_PROTO_KVARN_FLEX_TAIL) != 0;
 
         const auto evict_started = clock_type::now();
         evict_local_session();
@@ -477,6 +480,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             }
             if (state.native_snapshot_client)
                 ack.reserved[0] |= RKVA_CAP_NATIVE_KVARN_SNAPSHOT;
+            if (state.native_flex_tail_client)
+                ack.reserved[0] |= RKVA_CAP_KVARN_FLEX_TAIL;
         }
         state.e4_available = (ack.reserved[0] & RKVA_CAP_KVARN_BULK_E4M3FN) != 0;
         if (!state.native_rewind_v2_client)
@@ -794,6 +799,9 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         std::memcpy(&c, input.data(), sizeof(c));
         if (state.e4_client && (c.storage != RKVA_RANGE_STORAGE_KVARN4 || c.layout_version != 3))
             return RKVA_ERR_BAD_PAYLOAD;
+        if (c.storage == RKVA_RANGE_STORAGE_KVARN4 && c.precision_tail_tokens != 0 &&
+            c.precision_tail_tokens != 128 && !state.native_flex_tail_client)
+            return RKVA_ERR_UNSUPPORTED_OP;
         if ((c.layout_version >= 2 && c.layout_version <= 3 && !state.native_rewind_v2_client) ||
             (c.layout_version == 3 && !state.native_serial_prefix_v3_client))
             return RKVA_ERR_BAD_PAYLOAD;

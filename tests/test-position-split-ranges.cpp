@@ -407,6 +407,20 @@ int main() {
         }
     }
 
+    // The exact window is global, including when it straddles the split.
+    for (uint32_t tail : {1u, 17u, 127u, 128u, 129u, 255u, 256u, 257u, 513u, 2049u}) {
+        for (int32_t q : {0, 126, 127, 128, 255, 256, 257, 383, 384, 511, 512, 767, 1023}) {
+            uint32_t local = 0, remote = 0;
+            for (int32_t k = 0; k <= q; ++k) {
+                const bool selected = llama_position_split::global_tail_contains(k, q, tail);
+                CHECK(selected == (uint64_t(q - k) < tail));
+                if (selected) (k < 256 ? local : remote)++;
+            }
+            CHECK(local + remote == std::min<uint32_t>(tail, uint32_t(q) + 1));
+            CHECK(!llama_position_split::global_tail_contains(-1, q, tail));
+            CHECK(!llama_position_split::global_tail_contains(q + 1, q, tail));
+        }
+    }
     std::printf("position-split-ranges: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

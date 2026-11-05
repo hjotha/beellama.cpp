@@ -707,6 +707,8 @@ llama_context::llama_context(
                     model.arch != LLM_ARCH_DEEPSEEK4 });
         }
         auto tail_request = *params.kv_tail_request;
+        if (tail_request.mode == LLAMA_KV_TAIL_REQUEST_EXPLICIT_ZERO)
+            mixed_additional_tail_requested = true;
         if (custom_tail_requested && tail_request.exact_type == GGML_TYPE_COUNT) {
             tail_request.exact_type = GGML_TYPE_F16;
         }
@@ -902,8 +904,9 @@ llama_context::llama_context(
         // the active ubatch as accidental rollback storage.
         cparams.kv_tail_rollback_tokens = 1;
     }
-    if (remote_type_k && (mixed_additional_tail_requested || hparams.n_swa > 0)) {
-        throw std::invalid_argument("mixed remote KV currently requires no additional tail and no SWA layers");
+    if (remote_type_k && (hparams.n_swa > 0 || (mixed_additional_tail_requested &&
+            !(tcp_position_split && params.kvarn.type == LLAMA_KVARN_K4V4_G128)))) {
+        throw std::invalid_argument("mixed remote KV requires no SWA and supports explicit split tails only with KVarN4");
     }
 
     cparams.ctx_other = nullptr;
@@ -2038,13 +2041,19 @@ std::vector<ggml_backend_t> layer_backends;
             geo.swa            = 0;
             geo.kq_scale       = model.hparams.f_attention_scale == 0.0f ?
                                  1.0f / sqrtf((float) geo.head_dim) : model.hparams.f_attention_scale;
+            bool explicit_native_tail = false;
             if (tcp_position_split) {
                 const char * storage = std::getenv("GGML_RKVA_UPLOAD_FORMAT");
                 if (!storage) storage = std::getenv("GGML_RKVA_FORMAT");
                 if (!storage) storage = std::getenv("GGML_RKVA_RANGE_STORAGE");
-                if (storage && (std::strcmp(storage, "kvarn4") == 0 || std::strcmp(storage, "kvarn") == 0) &&
-                        (cparams.kv_tail_tokens > 128 || cparams.kv_tail_type != GGML_TYPE_F16)) {
-                    throw std::runtime_error("experimental native Xbox KVarN4 requires an F16 precision tail of at most 128 tokens");
+                const bool native_kvarn = storage &&
+                    (!std::strcmp(storage, "kvarn4") || !std::strcmp(storage, "kvarn"));
+                if (native_kvarn && cparams.kv_tail_type != GGML_TYPE_F16)
+                    throw std::runtime_error("native Xbox KVarN4 requires an F16 precision tail");
+                if (mixed_additional_tail_requested) {
+                    if (!native_kvarn || cparams.kvarn.type != LLAMA_KVARN_K4V4_G128)
+                        throw std::runtime_error("an explicit split tail requires native Xbox KVarN4");
+                    explicit_native_tail = true;
                 }
                 geo.max_ctx = cparams.n_ctx_seq - cparams.kv_position_split_p;
                 // The CPU companion encodes Q4_0, Q8_0 or F16 once. The Xbox
@@ -2095,6 +2104,10 @@ std::vector<ggml_backend_t> layer_backends;
                         __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
                 }
                 ggml_backend_remote_attn_set_geometry(backend_remote, &geo);
+                if (explicit_native_tail && !ggml_backend_remote_attn_set_native_tail(
+                        backend_remote, std::min(cparams.kv_tail_tokens, geo.max_ctx))) {
+                    throw std::runtime_error("failed to configure native Xbox tail size");
+                }
                 if (!ggml_backend_remote_attn_connect(backend_remote)) {
                     ggml_backend_free(backend_remote);
                     backend_remote = nullptr;
@@ -2169,7 +2182,8 @@ std::vector<ggml_backend_t> layer_backends;
                 // Formats 4/5 use a native append owner only if the peer
                 // actually negotiated bulk; their generic Q4/Q8 fallback
                 // continues to serialize the ordinary companion normally.
-                native_cache->set_negotiated_native_rpc_owner(remote_native_kvarn_records_enabled());
+                native_cache->set_negotiated_native_rpc_owner(remote_native_kvarn_records_enabled(),
+                        mixed_additional_tail_requested ? cparams.kv_tail_tokens : 0);
                 native_cache->set_native_kvarn_rewind_capable(remote_native_kvarn_can_rewind());
                 native_cache->set_native_kvarn_rewind_preflight([this](llama_pos p0) {
                     return backend_remote && ggml_backend_remote_attn_native_kvarn_can_restore(backend_remote, p0);

@@ -10,6 +10,7 @@
 // extent instead of trusting the directory listing.
 
 #include "remote-attn-protocol.h"
+#include "rkva-native-tail.h"
 #include "rkva-snapshot-digest.h"
 
 #include <algorithm>
@@ -138,7 +139,8 @@ inline bool valid_descriptor(const Descriptor& d, const Geometry& g) {
            d.head_slices == 2 && d.key_bits == 4 && d.value_bits == 4 &&
            d.record_bytes == kRecordBytes && d.stage_groups == 3 && d.tail_groups == 2 &&
            d.sink_tokens == 128 &&
-           (d.precision_tail_tokens == 0 || d.precision_tail_tokens == 128) &&
+           (!d.precision_tail_tokens || rkva_native_history_rows(d.precision_tail_tokens)) &&
+           (d.precision_tail_tokens <= d.capacity || d.precision_tail_tokens == 128) &&
            d.wht_version == 1 && d.domain == 1 && d.record_policy == 1;
 }
 
@@ -205,7 +207,7 @@ inline uint64_t stage_bytes(const Geometry& g) {
     return uint64_t(kStageRows) * uint64_t(g.n_head_kv) * 256ull * sizeof(uint16_t);
 }
 inline uint32_t physical_tail_rows(const Descriptor& d) {
-    return d.precision_tail_tokens ? kTailRingRows : 0;
+    return d.precision_tail_tokens ? rkva_native_history_rows(d.precision_tail_tokens) : 0;
 }
 inline uint64_t tail_bytes(const Descriptor& d, const Geometry& g) {
     return uint64_t(physical_tail_rows(d)) * uint64_t(g.n_head_kv) * 256ull * sizeof(uint16_t);

@@ -113,6 +113,8 @@ GGML_API ggml_backend_t ggml_backend_remote_attn_init(const char * host, uint16_
 // be set before connecting.
 GGML_API bool ggml_backend_remote_attn_set_geometry(
         ggml_backend_t backend, const struct ggml_remote_attn_geometry * geo);
+// Must be called before HELLO; selects the native KVarN overflow tail size.
+GGML_API bool ggml_backend_remote_attn_set_native_tail(ggml_backend_t backend, uint32_t tokens);
 GGML_API bool ggml_backend_remote_attn_connect(ggml_backend_t backend);
 GGML_API bool ggml_backend_remote_attn_connected(ggml_backend_t backend);
 

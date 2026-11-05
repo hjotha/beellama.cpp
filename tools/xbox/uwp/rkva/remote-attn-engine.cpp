@@ -2400,7 +2400,7 @@ bool RemoteAttnEngine::rewind_kvarn_range(uint32_t id, const rkva_kvarn_range_re
             };
             if (prefix)
                 rkva_kvarn_range::tail_ring_chunks(span.begin, tail_rows,
-                                                   rkva_kvarn_range::kPrefixTailRing, copy);
+                                                   rkva_kvarn_range::physical_tail_rows(s->range_descriptor), copy);
             else
                 rkva_kvarn_range::tail_chunks(span.begin, tail_rows, copy);
         }
@@ -2527,7 +2527,7 @@ bool RemoteAttnEngine::upload_kvarn_range(uint32_t id, uint32_t layer,
         // 256, the physical ring) stay in the overlay.
         if (prefix)
             rkva_kvarn_range::tail_ring_chunks(tail_begin, tail_rows,
-                                               rkva_kvarn_range::kPrefixTailRing, copy_tail);
+                                               rkva_kvarn_range::physical_tail_rows(s->range_descriptor), copy_tail);
         else
             rkva_kvarn_range::tail_chunks(tail_begin, tail_rows, copy_tail);
     }

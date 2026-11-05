@@ -1,5 +1,6 @@
 #pragma once
 #include "remote-attn-protocol.h"
+#include "../../../../ggml/include/rkva-native-tail.h"
 #include <algorithm>
 #include <cstdint>
 
@@ -20,7 +21,9 @@ inline bool valid_descriptor(const rkva_kvarn_range_config& c, uint32_t dimensio
            c.token_group == 128 && c.record_dim == 128 && c.head_dim == 256 && c.head_slices == 2 &&
            c.key_bits == 4 && c.value_bits == 4 && c.record_bytes == 8960 && c.stage_groups == 3 &&
            c.tail_groups == 2 && c.sink_tokens == 128 &&
-           (c.precision_tail_tokens == 0 || c.precision_tail_tokens == 128) && c.wht_version == 1 &&
+           (c.layout_version == 3 || c.precision_tail_tokens == 0 || c.precision_tail_tokens == 128) &&
+           (!c.precision_tail_tokens || rkva_native_history_rows(c.precision_tail_tokens)) && c.wht_version == 1 &&
+           (c.precision_tail_tokens <= c.capacity || c.precision_tail_tokens == 128) &&
            c.domain == 1 && c.record_policy == 1;
 }
 inline uint32_t required_record_groups(uint32_t live) {
@@ -171,7 +174,7 @@ inline bool valid_oscar_int2_upload(const rkva_kvarn_range_upload& u, uint32_t c
 // OMIT_STAGE is safe only when the exact tail covers every incomplete group
 // and global group 0 (whose sink uses stage) is outside this overflow range.
 inline bool compact_stage_supported(const rkva_kvarn_range_config& c) {
-    return c.layout_version == 3 && c.origin >= 128 && c.precision_tail_tokens == 128;
+    return c.layout_version == 3 && c.origin >= 128 && c.precision_tail_tokens >= 128;
 }
 inline uint32_t upload_stage_rows(const rkva_kvarn_range_upload& u) {
     return (u.flags & RKVA_KVARN_UPLOAD_OMIT_STAGE)
@@ -228,9 +231,9 @@ inline bool serial_prefix(const rkva_kvarn_range_config& c) {
 constexpr uint32_t kPrefixTailRing = 256;
 constexpr uint32_t kPrefixMaxQueries = 128;
 // Physical ORIGINAL-F16 tail rows per kind; the logical window stays
-// precision_tail_tokens (0 or 128).
+// precision_tail_tokens; revision 3 retains additional rows for serial queries.
 inline uint32_t physical_tail_rows(const rkva_kvarn_range_config& c) {
-    return serial_prefix(c) && c.precision_tail_tokens ? kPrefixTailRing : c.precision_tail_tokens;
+    return serial_prefix(c) && c.precision_tail_tokens ? rkva_native_history_rows(c.precision_tail_tokens) : c.precision_tail_tokens;
 }
 // Newest min(rows, ring) rows of [begin, begin + rows) at ring slot token % ring.
 template <typename Copy>
@@ -258,13 +261,15 @@ inline prefix_coverage coverage_after_reset(uint32_t live, uint32_t tail_tokens)
     const uint32_t live_group = live ? (live - 1) / 128 : 0;
     return {live - std::min(live, tail_tokens), live_group ? (live_group - 1) * 128 : 0};
 }
-// Append [previous, live): the ring keeps the newest 256 rows; a new stage group
+// Append [previous, live): the ring keeps its newest rows; a new stage group
 // overwrites the slot of the group two before it.
 inline prefix_coverage coverage_after_append(prefix_coverage c, uint32_t live,
                                              uint32_t tail_tokens) {
     const uint32_t live_group = live ? (live - 1) / 128 : 0;
-    if (tail_tokens)
-        c.tail_begin = std::max(c.tail_begin, live > kPrefixTailRing ? live - kPrefixTailRing : 0);
+    if (tail_tokens) {
+        const uint32_t ring = rkva_native_history_rows(tail_tokens);
+        c.tail_begin = std::max(c.tail_begin, live > ring ? live - ring : 0);
+    }
     c.stage_begin = std::max(c.stage_begin, live_group ? (live_group - 1) * 128 : 0);
     return c;
 }
@@ -282,8 +287,8 @@ inline prefix_coverage coverage_after_rewind(prefix_coverage c, uint32_t keep,
 }
 // Revision-3 query batch: 1..128 contiguous positions ending at origin + live -
 // 1 (leading positions below origin give empty results), every non-empty
-// prefix covered by the stage slots (tail 0) or by the ORIGINAL-F16 ring
-// (tail 128). False rejects the call before any mutation.
+// prefix covered by the stage slots and, when enabled, the ORIGINAL-F16 ring.
+// False rejects the call before any mutation.
 inline bool valid_prefix_queries(const int32_t* positions, uint32_t n, uint32_t origin,
                                  uint32_t live, prefix_coverage c, uint32_t tail_tokens) {
     if (!positions || !n || n > kPrefixMaxQueries || !live)
@@ -299,11 +304,11 @@ inline bool valid_prefix_queries(const int32_t* positions, uint32_t n, uint32_t 
         if (q_count <= 0)
             continue;
         const uint32_t count = uint32_t(q_count);
-        if (tail_tokens) {
-            // Rows [count - tail_tokens, live) for the first and therefore every query.
-            return c.tail_begin <= (count > tail_tokens ? count - tail_tokens : 0);
-        }
-        if (count % 128 && c.stage_begin > count / 128 * 128)
+        if (tail_tokens && c.tail_begin > (count > tail_tokens ? count - tail_tokens : 0))
+            return false;
+        // A tail shorter than one group does not cover the entire unsealed
+        // group, so the older rows still require the rotated stage.
+        if (count % 128 > tail_tokens && c.stage_begin > count / 128 * 128)
             return false;
     }
     return true;

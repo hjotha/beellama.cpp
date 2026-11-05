@@ -84,6 +84,41 @@ void test_layout() {
         assert(chunk.region != kTailK && chunk.region != kTailV);
 }
 
+void test_flexible_tail_layouts() {
+    const uint32_t live = 513;
+    const auto sha = host_sha();
+    for (uint32_t tail : {1u, 127u, 128u, 129u, 255u, 256u, 257u, 513u}) {
+        auto d = descriptor(); d.precision_tail_tokens = tail;
+        auto cov = coverage(2, live);
+        for (auto & layer : cov) layer.tail_begin = live - std::min(live, tail);
+        Manifest manifest; std::string error;
+        assert(build(geometry(), d, live, 0x700000001ull, sha.data(), cov, manifest, &error));
+        assert(physical_tail_rows(d) == rkva_native_history_rows(tail));
+        std::vector<uint8_t> encoded;
+        assert(encode(manifest, encoded, &error));
+        Manifest decoded;
+        assert(decode(encoded, decoded, &error));
+        assert(validate(decoded, geometry(), d, live, 0x700000001ull, sha.data(), &error));
+    }
+    // Exercise a tail larger than typical kernel tiles without allocating its payload.
+    auto d = descriptor();
+    d.capacity = 32768;
+    d.precision_tail_tokens = 16385;
+    auto g = geometry();
+    g.max_ctx = d.capacity;
+    auto cov = coverage(2, live);
+    for (auto & layer : cov) layer.tail_begin = 0;
+    Manifest manifest;
+    std::string error;
+    assert(build(g, d, live, 0x700000001ull, sha.data(), cov, manifest, &error));
+    assert(physical_tail_rows(d) == 32768);
+    std::vector<uint8_t> encoded;
+    assert(encode(manifest, encoded, &error));
+    Manifest decoded;
+    assert(decode(encoded, decoded, &error));
+    assert(validate(decoded, g, d, live, 0x700000001ull, sha.data(), &error));
+}
+
 void test_roundtrip_and_validate() {
     auto manifest = build_ok();
     for (size_t i = 0; i < manifest.chunks.size(); ++i) {
@@ -312,6 +347,7 @@ void test_chunk_splitting() {
 
 int main() {
     test_layout();
+    test_flexible_tail_layouts();
     test_roundtrip_and_validate();
     test_encoded_corruption();
     test_build_rejections();

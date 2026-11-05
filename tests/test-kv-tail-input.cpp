@@ -190,6 +190,22 @@ static void mapped_local_tail_plan(ggml_backend_t backend) {
             check(mask[i] == -INFINITY, "tail row remained visible in local body (duplicate attention)");
         }
     }
+    // With a global two-token tail, query 256 retains only local row 255;
+    // at query 257 both local rows belong to the quantized body.
+    std::fill(mask.begin(), mask.end(), -INFINITY);
+    mask[0] = mask[1] = mask[256] = mask[257] = 0;
+    ggml_backend_tensor_set(local, mask.data(), 0, mask.size()*sizeof(float));
+    cache.set_input_kq_mask_tail_mapped(local, exact, read, body_read, bias_read, &batch, true, map, 2);
+    ggml_backend_tensor_get(exact, tails.data(), 0, tails.size()*sizeof(float));
+    ggml_backend_tensor_get(local, mask.data(), 0, mask.size()*sizeof(float));
+    size_t first = 0, second = 0;
+    for (size_t i = 0; i < stride; ++i) {
+        first += std::isfinite(tails[i]);
+        second += std::isfinite(tails[stride + i]);
+    }
+    check(first == 1 && second == 0, "global tail did not shrink across the split");
+    check(mask[0] == 0 && mask[1] == -INFINITY && mask[256] == 0 && mask[257] == 0,
+            "global tail did not leave older local rows in the quantized body");
     cache.finish_tail_batch(true, false);
     ggml_free(pruned_ctx);
     ggml_backend_buffer_free(buffer);

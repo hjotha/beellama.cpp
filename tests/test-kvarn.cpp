@@ -722,7 +722,7 @@ static void test_exact_tail_policy() {
     require(no_intrinsic.raw_requested_tokens == 0 && no_intrinsic.requested_tokens == 0 &&
             no_intrinsic.effective_tokens == 0 && no_intrinsic.exact_groups == 0 && !no_intrinsic.native_exact,
             "experimental zero tail must keep compressed body without an exact overlay");
-    require(llama_kvarn_tail_policy_for(129, 4096, false).effective_tokens == 256,
+    require(llama_kvarn_tail_policy_for(129, 4096, false).effective_tokens == 129,
             "disabling the intrinsic floor must not discard an explicit exact-tail request");
     require(llama_kvarn_tail_policy_for(0, 64, false).effective_tokens == 0 &&
             !llama_kvarn_tail_policy_for(0, 64, false).native_exact,
@@ -731,14 +731,19 @@ static void test_exact_tail_policy() {
     for (uint32_t requested : { 1u, 127u, 128u }) {
         const auto policy = llama_kvarn_tail_policy_for(requested, 4096);
         require(policy.raw_requested_tokens == requested, "explicit KVarN tail request provenance changed");
-        require(policy.requested_tokens == 128, "explicit sub-group KVarN tail coverage target was not rounded");
-        require(policy.effective_tokens == 128, "sub-group KVarN tail request did not round to one group");
+        require(policy.requested_tokens == requested, "explicit KVarN tail coverage target changed");
+        require(policy.effective_tokens == requested, "explicit KVarN tail request was not preserved");
         require(policy.exact_groups == 1, "sub-group KVarN tail request resolved to the wrong group count");
     }
 
     const auto rounded = llama_kvarn_tail_policy_for(129, 4096);
-    require(rounded.effective_tokens == 256 && rounded.exact_groups == 2,
-            "KVarN tail request did not round upward to complete groups");
+    require(rounded.effective_tokens == 129 && rounded.exact_groups == 2,
+            "KVarN tail request lost its exact size or storage group count");
+    for (uint32_t requested : { 17u, 255u, 257u, 513u, 4095u }) {
+        const auto policy = llama_kvarn_tail_policy_for(requested, 4096);
+        require(policy.effective_tokens == requested && policy.exact_groups == (requested + 127u) / 128u,
+                "KVarN tail size or physical group count changed");
+    }
 
     const auto capped = llama_kvarn_tail_policy_for(4096, 1000);
     require(capped.effective_tokens == 1000 && capped.exact_groups == 8 && capped.native_exact,
@@ -4843,9 +4848,12 @@ static void test_native_flash_attention_gpu() {
             "intrinsic-128 exact-tail merge differs from generic KVarN reference");
     require_exact_tail_case(256, 1, 6, 1, false, 1024, 1, 0, false,
             "requested-1024 exact-tail merge differs from generic KVarN reference");
-    // A request of 129 is rounded by policy to this 256-token effective tail.
     require_exact_tail_case(256, 1, 6, 1, false, 256, 1, 0, false,
-            "rounded-256 exact-tail merge differs from generic KVarN reference");
+            "256-token exact-tail merge differs from generic KVarN reference");
+    for (int tail : {1, 17, 127, 129, 255, 257, 513}) {
+        require_exact_tail_case(256, 1, 6, 1, false, tail, 1, 0, false,
+                "arbitrary-size exact-tail merge differs from generic KVarN reference");
+    }
     require_exact_tail_case(512, 1, 16, 1, false, 128, 1, 0, false,
             "D512 exact-tail merge differs from generic KVarN reference");
     require_exact_tail_case(256, 1, 2, 1, true, 128, 0, 1, false,
@@ -7577,8 +7585,29 @@ static void test_headwide_multistream_store() {
     ggml_backend_free(backend);
 }
 
+static void test_flexible_tail_gpu() {
+    auto * gpu = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, true);
+    for (int tail : {1, 17, 127, 128, 129, 255, 256, 257, 513, 1023}) {
+        for (int nq : {1, 4}) {
+            const auto reference = test_native_flash_attention_output(
+                    gpu, true, true, 256, 4, 4, nq, 6, 1, 1024, 5, false, nullptr, true, tail);
+            const auto actual = test_native_flash_attention_output(
+                    gpu, true, true, 256, 4, 4, nq, 6, 1, 1024, 5, false, nullptr, false, tail);
+            require_close_f32_rmse(actual, reference, 1e-4f,
+                    "arbitrary KVarN tail differs between native and generic CUDA attention");
+        }
+    }
+    ggml_backend_free(gpu);
+}
+
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_FLEX_TAIL_GPU_ONLY") != nullptr) {
+        test_flexible_tail_gpu();
+        std::puts("test-kvarn: arbitrary CUDA tail attention parity OK");
+        return 0;
+    }
 
     if (std::getenv("GGML_KVARN_TEST_D256_TAIL_DOMAIN_ONLY") != nullptr) {
         return test_d256_tail_domain_causality() ? 0 : 1;

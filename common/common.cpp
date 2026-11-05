@@ -3444,12 +3444,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
             params.remote_attn_host.empty() ||
             (!common_remote_attn_is_local_vulkan(params.remote_attn_host) && params.kv_position_split_p == 0) ||
             params.remote_attn_prefill != "remote" || params.n_parallel != 1 ||
-            params.kv_tail_tokens != "0" || params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
+            (params.kv_tail_tokens != "0" && params.kvarn.type != LLAMA_KVARN_K4V4_G128) ||
+            params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ||
             params.no_kv_offload)) {
         throw std::invalid_argument(
                 "per-layer remote KV formats require a global KVarN cache or standard Qx/F16/SAW/TurboQuant NC position-split cache, "
                 "native Vulkan or TCP position-split attention, Flash Attention, KV offload, one slot, "
-                "remote prefill, and kv-tail-tokens=0");
+                "remote prefill, and an explicit tail only for native KVarN4");
     }
 
     cparams.n_ctx             = params.n_ctx;
@@ -3520,7 +3521,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
     cparams.kvarn  = params.kvarn;
     cparams.kv_tail_tokens = params.kv_tail_tokens.find_first_of(",=") == std::string::npos &&
-            params.kv_tail_tokens != "auto" ? std::stoul(params.kv_tail_tokens) : 0;
+            params.kv_tail_tokens != "auto" && params.kv_tail_tokens != "none" ? std::stoul(params.kv_tail_tokens) : 0;
     cparams.kv_tail_type = params.kv_tail_type;
 
     // note: params (and therefore params.kv_mean_center_path) is kept alive by the caller for
@@ -4263,6 +4264,8 @@ std::string common_prompt_cache_layout(llama_context * ctx) {
     if (mixed_kv) {
         const auto & kvarn_params = ctx->get_cparams().kvarn;
         layout["mixed_kv"] = true;
+        if (kvarn->native_global_tail_tokens())
+            layout["native_global_tail_tokens"] = kvarn->native_global_tail_tokens();
         layout["mixed_kvarn_type"] = static_cast<int32_t>(kvarn_params.type);
         layout["mixed_kvarn_bits_k"] = kvarn_params.key_bits;
         layout["mixed_kvarn_bits_v"] = kvarn_params.value_bits;

@@ -85,19 +85,27 @@ int main() {
         }
     }
     {
+        const auto result = resolve("none", GGML_TYPE_COUNT, true);
+        for (const auto & group : result.groups) {
+            require(group.raw_requested_tokens == 0 && group.requested_tokens == 0 &&
+                    group.effective_tokens == 0 && group.exact_type == GGML_TYPE_F16,
+                    "explicit zero KVarN tail was not preserved");
+        }
+    }
+    {
         const auto result = resolve("64", GGML_TYPE_COUNT, true);
         require(result.groups[0].raw_requested_tokens == 64 &&
-                result.groups[0].requested_tokens == 128 &&
-                result.groups[0].effective_tokens == 128,
-                "KVarN request below the intrinsic minimum was not raised to 128");
+                result.groups[0].requested_tokens == 64 &&
+                result.groups[0].effective_tokens == 64,
+                "explicit sub-group KVarN tail size changed");
     }
     {
         const auto result = resolve("129", GGML_TYPE_BF16, true);
         require(result.groups[0].raw_requested_tokens == 129 &&
-                result.groups[0].requested_tokens == 256 &&
-                result.groups[0].effective_tokens == 256 &&
+                result.groups[0].requested_tokens == 129 &&
+                result.groups[0].effective_tokens == 129 &&
                 result.groups[0].exact_type == GGML_TYPE_BF16,
-                "KVarN explicit request did not retain provenance, rounding, or type");
+                "KVarN explicit request did not retain provenance, exact size, or type");
     }
     {
         const auto result = resolve("auto", GGML_TYPE_COUNT, true);

@@ -6,7 +6,7 @@
 // the image of its own causal prefix q_count = limit instead of the resident
 // image of active_count. The live staged group, the record/stage split and the
 // exact-tail window [q_count - precision_tail_tokens, q_count) follow q_count,
-// and the ORIGINAL-F16 tail is a 256-row physical ring (row & 255). Without
+// and the ORIGINAL-F16 tail uses a power-of-two history ring. Without
 // the define the legacy revision 1/2 source is unchanged token for token.
 #ifndef RKVA_SERIAL_PREFIX
 #define RKVA_SERIAL_PREFIX 0
@@ -14,7 +14,7 @@
 #if RKVA_SERIAL_PREFIX
 static uint rkva_window; // per-thread q_count, set once in the entry point
 #define RKVA_WINDOW rkva_window
-#define RKVA_TAIL_MASK 255u
+#define RKVA_TAIL_MASK ((1u << (firstbithigh(max(256u, precision_tail_tokens + 128u) - 1u) + 1u)) - 1u)
 #else
 #define RKVA_WINDOW active_count
 #define RKVA_TAIL_MASK 127u

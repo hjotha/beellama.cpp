@@ -2752,7 +2752,11 @@ void llama_kv_cache_kvarn_context::set_input_kq_mask_tail(
     if (uses_compact_read_indices()) {
         cache->get_metadata_cache()->set_input_kq_mask_tail_mapped(
                 body, exact, read_idxs, body_read_idxs, bias_read_idxs,
-                ubatch, causal_attn, compact_read_plan());
+                ubatch, causal_attn, compact_read_plan(), cache->native_global_tail_tokens());
+    } else if (cache->native_global_tail_tokens()) {
+        cache->get_metadata_cache()->set_input_kq_mask_tail_mapped(
+                body, exact, read_idxs, body_read_idxs, bias_read_idxs,
+                ubatch, causal_attn, {}, cache->native_global_tail_tokens());
     } else {
         base()->set_input_kq_mask_tail(
                 body, exact, read_idxs, body_read_idxs, bias_read_idxs, ubatch, causal_attn);
@@ -4709,7 +4713,7 @@ bool llama_kv_cache_kvarn::stream_is_exclusive_for(llama_seq_id seq_id) const {
             [&](llama_seq_id other) { return metadata->seq_pos_max(other); });
 }
 
-void llama_kv_cache_kvarn::set_negotiated_native_rpc_owner(bool has_record_snapshot_codec) {
+void llama_kv_cache_kvarn::set_negotiated_native_rpc_owner(bool has_record_snapshot_codec, uint32_t global_tail_tokens) {
     if (!position_split_enabled() || !standard_cache || !metadata || native_kvarn_overflow_seen_) {
         throw std::logic_error("native RPC owner must be selected on a fresh split cache");
     }
@@ -4720,6 +4724,7 @@ void llama_kv_cache_kvarn::set_negotiated_native_rpc_owner(bool has_record_snaps
     }
     native_kvarn_rpc_experimental_ = true;
     native_row_rpc_experimental_ = !has_record_snapshot_codec;
+    native_global_tail_tokens_ = has_record_snapshot_codec ? global_tail_tokens : 0;
 }
 
 bool llama_kv_cache_kvarn::native_kvarn_checkpoint_unavailable() const {

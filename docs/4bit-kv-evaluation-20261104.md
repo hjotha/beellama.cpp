@@ -147,6 +147,15 @@ are not a continuous peak measurement. Production's default log verbosity did
 not expose the remote call counters for that request; the call count above is
 from the isolated 926 run.
 
+On Xbox 1.6.0.929 and the RTX 4070, flexible global KVarN4 tails were tested
+with a 256-token split. The Xbox shader matched an independent FP64 oracle for
+tail lengths 0, 1, 17, 127, 128, 129, 257, 513 and 1,023, including rewind.
+Cold 1,024-token model requests plus 16 generated tokens completed with tails
+0, 1, 17, 128, 129, 257 and 513 using E4M3FN transfer. A tail-257 native
+snapshot saved 1,031 evaluated tokens and restored them after a server restart,
+reprocessing one token. These are correctness checks, not a matched TPS or KLD
+comparison. Snapshot storage still enforces its separate quotas.
+
 For a local KLD reproduction, first save BF16 logits with the same model,
 corpus and batching, then compare a selected cache type and tail, for example:
 

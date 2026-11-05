@@ -1,5 +1,6 @@
 #include "../uwp/rkva/rkva-kvarn-bulk.h"
 #include "../uwp/rkva/rkva-range-profile.h"
+#include "../../../ggml/src/ggml-remote-attn/rkva-bulk-segments.h"
 #undef NDEBUG
 #include <cassert>
 #include <cmath>
@@ -21,16 +22,24 @@ rkva_kvarn_range_config descriptor(uint32_t tail) {
             1,     1,     1};
 }
 std::vector<uint8_t> payload(uint32_t begin, uint32_t count, uint32_t tail,
-                             uint32_t wire = RKVA_WIRE_F32, bool compact_stage = false) {
+                             uint32_t wire = RKVA_WIRE_F32, bool compact_stage = false,
+                             bool safe_bootstrap = false) {
     std::vector<uint8_t> data;
-    const uint32_t segments = (count + 7) / 8;
+    std::vector<size_t> chunks;
+    if (safe_bootstrap) chunks = rkva_bulk_segments(count, true, begin == 0, tail);
+    else for (uint32_t remaining = count; remaining; ) {
+        const uint32_t chunk = std::min(8u, remaining);
+        chunks.push_back(chunk);
+        remaining -= chunk;
+    }
+    const uint32_t segments = uint32_t(chunks.size());
     const size_t q_elem_bytes = (wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN) ? sizeof(uint8_t)
                                 : (wire == RKVA_WIRE_F16 || wire == RKVA_WIRE_SPLITZIP)
                                     ? sizeof(uint16_t)
                                     : sizeof(float);
     append(data, rkva_kvarn_range_bulk{1, segments, count, 0});
-    for (uint32_t first = 0; first < count; first += 8) {
-        const uint32_t n = std::min(8u, count - first);
+    for (uint32_t first = 0, i = 0; first < count; first += chunks[i++]) {
+        const uint32_t n = uint32_t(chunks[i]);
         const uint32_t previous = begin + first, live = previous + n;
         const bool reset = previous == 0;
         const uint32_t groups = live / 128 - previous / 128;
@@ -337,6 +346,16 @@ int main() {
     test_splitzip();
     test_kvarn4_mq_split();
     test_compact_stage();
+    // A RESET with fewer tail rows than queries loses early-prefix coverage.
+    assert(!valid(payload(0, 8, 1), 0, 8, 1));
+    for (uint32_t tail : {1u, 2u, 7u}) {
+        for (uint32_t count : {8u, 32u, 256u, 512u}) {
+            const auto chunks = rkva_bulk_segments(count, true, true, tail);
+            assert(chunks.front() <= tail && chunks.size() <= 64);
+            const auto data = payload(0, count, tail, RKVA_WIRE_FP8_E4M3FN, false, true);
+            assert(valid(data, 0, count, tail, 1, RKVA_WIRE_FP8_E4M3FN));
+        }
+    }
     for (uint32_t count : {1u, 8u, 256u}) {
         auto data = payload(0, count, 128, RKVA_WIRE_SPLITZIP);
         uint32_t wire = 99;

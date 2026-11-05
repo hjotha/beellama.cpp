@@ -27,8 +27,9 @@ public:
                         uint32_t precision_tail_tokens = 128, bool compact_stage = false)
         : origin_(origin), capacity_(capacity), heads_(heads), iterations_(iterations),
           precision_tail_tokens_(precision_tail_tokens),
-          compact_stage_(compact_stage && origin >= 128 && precision_tail_tokens == 128), store_(store) {
-        if (!store || !heads || !iterations || (precision_tail_tokens != 0 && precision_tail_tokens != 128) ||
+          compact_stage_(compact_stage && origin >= 128 && precision_tail_tokens >= 128), store_(store) {
+        if (!store || !heads || !iterations ||
+                (precision_tail_tokens > capacity && precision_tail_tokens != 128) ||
                 origin % 128 || !capacity ||
                 uint64_t(origin) + capacity > INT32_MAX) throw std::invalid_argument("native KVarN geometry");
         const char * producer = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
@@ -52,9 +53,13 @@ public:
         stage_v_.resize(stage_k_.size());
         tail_k_.resize(size_t(precision_tail_tokens_) * width());
         tail_v_.resize(tail_k_.size());
-        original_k_.resize(size_t(256) * width());
+        rkva_native_state::Layout layout{};
+        layout.precision_tail_tokens = precision_tail_tokens_;
+        const uint32_t ring_rows = rkva_native_state::original_rows(layout);
+        if (!ring_rows) throw std::overflow_error("native KVarN original ring size overflow");
+        original_k_.resize(size_t(ring_rows) * width());
         original_v_.resize(original_k_.size());
-        original_pos_.assign(256, UINT32_MAX);
+        original_pos_.assign(ring_rows, UINT32_MAX);
     }
 
     static constexpr uint32_t max_rewind = 128;
@@ -149,9 +154,10 @@ public:
     }
     bool can_rewind(uint32_t keep) const override {
         if (keep > rows_ || rows_ - keep > max_rewind) return false;
-        const uint32_t begin = std::min(keep / 128 * 128, keep > 128 ? keep - 128 : 0);
+        const uint32_t needed = std::max(128u, precision_tail_tokens_);
+        const uint32_t begin = std::min(keep / 128 * 128, keep > needed ? keep - needed : 0);
         for (uint32_t row = begin; row < keep; ++row) {
-            if (original_pos_[row % 256] != row) return false;
+            if (original_pos_[row % original_pos_.size()] != row) return false;
         }
         return true;
     }
@@ -164,7 +170,7 @@ public:
         for (const auto * source : {&original_k_, &original_v_}) {
             for (uint32_t row = span.begin; row < span.begin + span.rows; ++row) {
                 for (size_t d = 0; d < width(); ++d) {
-                    const ggml_fp16_t half = ggml_fp32_to_fp16((*source)[size_t(row % 256) * width() + d]);
+                    const ggml_fp16_t half = ggml_fp32_to_fp16((*source)[size_t(row % original_pos_.size()) * width() + d]);
                     const auto * bytes = reinterpret_cast<const uint8_t *>(&half);
                     output.insert(output.end(), bytes, bytes + sizeof(half));
                 }
@@ -181,8 +187,8 @@ public:
         std::vector<float> k(size_t(keep - group_begin) * width()), v(k.size());
         std::vector<int32_t> positions(keep - group_begin);
         for (uint32_t row = group_begin; row < keep; ++row) {
-            std::copy_n(original_k_.data() + size_t(row % 256) * width(), width(), k.data() + size_t(row - group_begin) * width());
-            std::copy_n(original_v_.data() + size_t(row % 256) * width(), width(), v.data() + size_t(row - group_begin) * width());
+            std::copy_n(original_k_.data() + size_t(row % original_pos_.size()) * width(), width(), k.data() + size_t(row - group_begin) * width());
+            std::copy_n(original_v_.data() + size_t(row % original_pos_.size()) * width(), width(), v.data() + size_t(row - group_begin) * width());
             positions[row - group_begin] = int32_t(origin_ + row);
         }
         prepared_count_ = 0;
@@ -192,8 +198,8 @@ public:
         rows_ = keep;
         for (uint32_t row = keep - std::min(keep, precision_tail_tokens_); row < keep; ++row) {
             for (size_t d = 0; d < width(); ++d) {
-                tail_k_[size_t(row % 128) * width() + d] = ggml_fp32_to_fp16(original_k_[size_t(row % 256) * width() + d]);
-                tail_v_[size_t(row % 128) * width() + d] = ggml_fp32_to_fp16(original_v_[size_t(row % 256) * width() + d]);
+                tail_k_[size_t(row % precision_tail_tokens_) * width() + d] = ggml_fp32_to_fp16(original_k_[size_t(row % original_pos_.size()) * width() + d]);
+                tail_v_[size_t(row % precision_tail_tokens_) * width() + d] = ggml_fp32_to_fp16(original_v_[size_t(row % original_pos_.size()) * width() + d]);
             }
         }
         return true;
@@ -292,9 +298,9 @@ public:
             }
             for (uint32_t i = 0; i < count; ++i) {
                 const uint32_t row = before + i;
-                std::copy_n(keys + size_t(i) * width(), width(), original_k_.data() + size_t(row % 256) * width());
-                std::copy_n(values + size_t(i) * width(), width(), original_v_.data() + size_t(row % 256) * width());
-                original_pos_[row % 256] = row;
+                std::copy_n(keys + size_t(i) * width(), width(), original_k_.data() + size_t(row % original_pos_.size()) * width());
+                std::copy_n(values + size_t(i) * width(), width(), original_v_.data() + size_t(row % original_pos_.size()) * width());
+                original_pos_[row % original_pos_.size()] = row;
                 int64_t global = positions[i];
                 index->data = &global;
                 current->data = const_cast<float *>(keys + size_t(i) * width());
@@ -306,7 +312,7 @@ public:
                 const size_t stage_offset = (size_t(slot) * 128 + uint32_t(global) % 128) * width();
                 std::memcpy(append_k_.data() + size_t(i) * width(), stage_k_.data() + stage_offset, width() * 2);
                 std::memcpy(append_v_.data() + size_t(i) * width(), stage_v_.data() + stage_offset, width() * 2);
-                const size_t tail_offset = size_t(before + i) % 128 * width();
+                const size_t tail_offset = (precision_tail_tokens_ ? size_t(before + i) % precision_tail_tokens_ : 0) * width();
                 for (size_t d = 0; precision_tail_tokens_ && d < width(); ++d) {
                     tail_k_[tail_offset + d] = ggml_fp32_to_fp16(keys[size_t(i) * width() + d]);
                     tail_v_[tail_offset + d] = ggml_fp32_to_fp16(values[size_t(i) * width() + d]);
@@ -337,12 +343,12 @@ public:
                 const size_t stage_offset = (size_t(slot) * 128 + (origin_ + row) % 128) * width();
                 std::copy_n(append_k_.data() + size_t(i) * width(), width(), stage_k_.data() + stage_offset);
                 std::copy_n(append_v_.data() + size_t(i) * width(), width(), stage_v_.data() + stage_offset);
-                std::copy_n(keys + size_t(i) * width(), width(), original_k_.data() + size_t(row % 256) * width());
-                std::copy_n(values + size_t(i) * width(), width(), original_v_.data() + size_t(row % 256) * width());
-                original_pos_[row % 256] = row;
+                std::copy_n(keys + size_t(i) * width(), width(), original_k_.data() + size_t(row % original_pos_.size()) * width());
+                std::copy_n(values + size_t(i) * width(), width(), original_v_.data() + size_t(row % original_pos_.size()) * width());
+                original_pos_[row % original_pos_.size()] = row;
                 for (size_t d = 0; precision_tail_tokens_ && d < width(); ++d) {
-                    tail_k_[size_t(row % 128) * width() + d] = ggml_fp32_to_fp16(keys[size_t(i) * width() + d]);
-                    tail_v_[size_t(row % 128) * width() + d] = ggml_fp32_to_fp16(values[size_t(i) * width() + d]);
+                    tail_k_[size_t(row % precision_tail_tokens_) * width() + d] = ggml_fp32_to_fp16(keys[size_t(i) * width() + d]);
+                    tail_v_[size_t(row % precision_tail_tokens_) * width() + d] = ggml_fp32_to_fp16(values[size_t(i) * width() + d]);
                 }
             }
         }
@@ -366,7 +372,7 @@ public:
             }
             for (const auto * tail : {&tail_k_, &tail_v_}) {
                 for (uint32_t row = after - std::min(after, precision_tail_tokens_); row < after; ++row) {
-                    emit(tail->data() + size_t(row % 128) * width(), width() * 2);
+                    emit(tail->data() + size_t(row % precision_tail_tokens_) * width(), width() * 2);
                 }
             }
         } else {

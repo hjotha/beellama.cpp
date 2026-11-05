@@ -106,15 +106,13 @@ inline llama_kvarn_tail_policy llama_kvarn_tail_policy_for(
     }
 
     const uint32_t intrinsic = retain_intrinsic_tail ? std::min(group_size, effective_window) : 0;
-    const uint64_t rounded = raw_requested_tokens == 0 ? 0 :
-        ((uint64_t(raw_requested_tokens) + group_size - 1u) / group_size) * group_size;
-    const uint32_t explicit_tokens = uint32_t(std::min<uint64_t>(rounded, effective_window));
-    const uint32_t effective_tokens = std::max(intrinsic, explicit_tokens);
+    const uint32_t effective_tokens = raw_requested_tokens == 0 ? intrinsic :
+        std::min(raw_requested_tokens, effective_window);
     return {
         raw_requested_tokens,
         effective_tokens,
         effective_tokens,
-        (effective_tokens + group_size - 1u) / group_size,
+        uint32_t((uint64_t(effective_tokens) + group_size - 1u) / group_size),
         effective_tokens == effective_window,
     };
 }
@@ -470,7 +468,8 @@ public:
     }
     // Called after HELLO/CONFIG succeeds and before any sequence is populated.
     // The generic Q4/Q8 fallback does not call this and remains snapshotable.
-    void set_negotiated_native_rpc_owner(bool has_record_snapshot_codec);
+    void set_negotiated_native_rpc_owner(bool has_record_snapshot_codec, uint32_t global_tail_tokens = 0);
+    uint32_t native_global_tail_tokens() const { return native_global_tail_tokens_; }
     void set_native_kvarn_rewind_capable(bool capable) { native_kvarn_rewind_capable_ = capable; }
     void set_native_kvarn_rewind_preflight(std::function<bool(llama_pos)> preflight) {
         native_kvarn_rewind_preflight_ = std::move(preflight);
@@ -955,6 +954,7 @@ private:
     bool native_kvarn_rpc_experimental_;
     // SAW/TurboQuant native rows own remote state but have no native FULL codec.
     bool native_row_rpc_experimental_;
+    uint32_t native_global_tail_tokens_ = 0;
     bool native_kvarn_rewind_capable_ = false;
     std::function<bool(llama_pos)> native_kvarn_rewind_preflight_;
     bool native_kvarn_checkpoint_unavailable() const;

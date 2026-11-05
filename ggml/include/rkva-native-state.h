@@ -14,7 +14,9 @@
 // SHA-256 footer) before a caller may install it into a producer.
 
 #include "rkva-snapshot-digest.h"
+#include "rkva-native-tail.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -172,16 +174,19 @@ inline uint64_t stage_bytes(const Layout& layout) {
 inline uint64_t tail_bytes(const Layout& layout) {
     return uint64_t(layout.precision_tail_tokens) * width(layout) * sizeof(uint16_t);
 }
-inline uint64_t original_bytes(const Layout& layout) {
-    return uint64_t(kOriginalRows) * width(layout) * sizeof(float);
+inline uint32_t original_rows(const Layout& layout) {
+    return rkva_native_history_rows(layout.precision_tail_tokens);
 }
-inline uint64_t positions_bytes() {
-    return uint64_t(kOriginalRows) * sizeof(uint32_t);
+inline uint64_t original_bytes(const Layout& layout) {
+    return uint64_t(original_rows(layout)) * width(layout) * sizeof(float);
+}
+inline uint64_t positions_bytes(const Layout& layout) {
+    return uint64_t(original_rows(layout)) * sizeof(uint32_t);
 }
 inline uint64_t layer_bytes(const Layout& layout) {
     return 2 * (records_bytes(layout) + stage_bytes(layout) + tail_bytes(layout) +
                 original_bytes(layout)) +
-           positions_bytes();
+           positions_bytes(layout);
 }
 inline bool generation_supported(uint64_t generation) {
     return generation != 0 && uint32_t(generation) != UINT32_MAX;
@@ -202,7 +207,9 @@ inline bool valid_layout(const Layout& layout, std::string* error) {
         !layout.iterations || layout.origin % 128 ||
         uint64_t(layout.origin) + layout.capacity > uint32_t(INT32_MAX) ||
         layout.heads > kMaxHeads ||
-        (layout.precision_tail_tokens != 0 && layout.precision_tail_tokens != kMaxTailTokens) ||
+        !original_rows(layout) ||
+        (layout.precision_tail_tokens > layout.capacity && layout.precision_tail_tokens != 128) ||
+        (layout.compact_stage && layout.precision_tail_tokens < 128) ||
         layout.compact_stage > 1 || layout.rows > layout.capacity ||
         (layout.record_base_group != 0 && layout.record_base_group != layout.origin / 128) ||
         !generation_supported(layout.saved_generation))
@@ -229,21 +236,22 @@ inline bool valid_ring(const Storage& storage, std::string* error) {
         return false;
     };
     const Layout& layout = storage.layout;
-    if (storage.original_pos.size() != kOriginalRows ||
+    const uint32_t ring_rows = original_rows(layout);
+    if (!ring_rows || storage.original_pos.size() != ring_rows ||
         storage.original_k.size() * sizeof(float) != original_bytes(layout) ||
         storage.original_v.size() * sizeof(float) != original_bytes(layout))
         return reject("native state: original rollback ring size mismatch");
     // Every non-sentinel slot must still obey the ring's slot invariant. A
     // post-rewind ring may retain older/future stale values; only the contiguous
     // newest window is authoritative.
-    for (uint32_t slot = 0; slot < kOriginalRows; ++slot) {
+    for (uint32_t slot = 0; slot < ring_rows; ++slot) {
         const uint32_t position = storage.original_pos[slot];
         if (position == UINT32_MAX) {
-            if (layout.rows >= kOriginalRows)
+            if (layout.rows >= ring_rows)
                 return reject("native state: missing original rollback row");
             continue;
         }
-        if (position % kOriginalRows != slot)
+        if (position % ring_rows != slot)
             return reject("native state: original rollback position mismatch");
     }
     // Walk backwards from the newest row. A rewind can only consume this
@@ -252,11 +260,12 @@ inline bool valid_ring(const Storage& storage, std::string* error) {
     uint32_t available = layout.rows;
     while (available > 0) {
         const uint32_t position = available - 1;
-        if (storage.original_pos[position % kOriginalRows] != position)
+        if (storage.original_pos[position % ring_rows] != position)
             break;
         --available;
     }
-    const uint32_t needed = layout.rows > kMaxTailTokens ? layout.rows - kMaxTailTokens : 0;
+    const uint32_t required_rows = std::max(kMaxTailTokens, layout.precision_tail_tokens);
+    const uint32_t needed = layout.rows > required_rows ? layout.rows - required_rows : 0;
     if (available > needed)
         return reject("native state: original rollback ring is incomplete");
     return true;
@@ -288,7 +297,7 @@ inline uint64_t owner_storage_bytes(const Layout& layout) {
     const uint64_t planes = saturating_add(
         saturating_add(records, stage_bytes(layout)),
         saturating_add(tail_bytes(layout), original_bytes(layout)));
-    return saturating_add(saturating_mul(2, planes), positions_bytes());
+    return saturating_add(saturating_mul(2, planes), positions_bytes(layout));
 }
 
 // Peak simultaneous RAM during a native FULL restore: the staged RKVK set
@@ -446,7 +455,7 @@ inline bool write_set(const std::vector<View>& views, Sink& sink, std::string* e
             !write_section(sink, hash, view.original_k, size_t(original), error) ||
             !write_section(sink, hash, view.original_v, size_t(original), error) ||
             !write_section(sink, hash, reinterpret_cast<const uint8_t*>(view.original_pos),
-                           size_t(positions_bytes()), error))
+                           size_t(positions_bytes(header.layout)), error))
             return false;
     }
     const auto digest = hash.finish();
@@ -485,7 +494,7 @@ inline bool read_set(Source& source, std::vector<Storage>& out, std::string* err
         storage.tail_v.resize(size_t(tail_bytes(header.layout) / sizeof(uint16_t)));
         storage.original_k.resize(size_t(original_bytes(header.layout) / sizeof(float)));
         storage.original_v.resize(size_t(original_bytes(header.layout) / sizeof(float)));
-        storage.original_pos.resize(kOriginalRows);
+        storage.original_pos.resize(original_rows(header.layout));
         if (!read_section(source, hash, storage.records_k.data(), storage.records_k.size(), error) ||
             !read_section(source, hash, storage.records_v.data(), storage.records_v.size(), error) ||
             !read_section(source, hash, reinterpret_cast<uint8_t*>(storage.stage_k.data()),
@@ -501,7 +510,7 @@ inline bool read_set(Source& source, std::vector<Storage>& out, std::string* err
             !read_section(source, hash, reinterpret_cast<uint8_t*>(storage.original_v.data()),
                           storage.original_v.size() * sizeof(float), error) ||
             !read_section(source, hash, reinterpret_cast<uint8_t*>(storage.original_pos.data()),
-                          size_t(positions_bytes()), error))
+                          size_t(positions_bytes(header.layout)), error))
             return false;
         if (!valid_ring(storage, error))
             return false;
