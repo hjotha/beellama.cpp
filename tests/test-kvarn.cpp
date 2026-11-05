@@ -7587,12 +7587,13 @@ static void test_headwide_multistream_store() {
 
 static void test_flexible_tail_gpu() {
     auto * gpu = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, true);
-    for (int tail : {1, 17, 127, 128, 129, 255, 256, 257, 513, 1023}) {
+    for (int tail : {1, 17, 127, 128, 129, 255, 256, 257, 513, 1023, 4097, 16385}) {
         for (int nq : {1, 4}) {
+            const int n_kv = std::max(1024, tail + 128);
             const auto reference = test_native_flash_attention_output(
-                    gpu, true, true, 256, 4, 4, nq, 6, 1, 1024, 5, false, nullptr, true, tail);
+                    gpu, true, true, 256, 4, 4, nq, 6, 1, n_kv, 5, false, nullptr, true, tail);
             const auto actual = test_native_flash_attention_output(
-                    gpu, true, true, 256, 4, 4, nq, 6, 1, 1024, 5, false, nullptr, false, tail);
+                    gpu, true, true, 256, 4, 4, nq, 6, 1, n_kv, 5, false, nullptr, false, tail);
             require_close_f32_rmse(actual, reference, 1e-4f,
                     "arbitrary KVarN tail differs between native and generic CUDA attention");
         }
