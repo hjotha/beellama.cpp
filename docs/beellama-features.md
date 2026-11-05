@@ -738,7 +738,7 @@ for redirects and replacements.
 
 Native Xbox KVarN4 resident rollback is an experimental negotiated extension: both capability bit 6 and RKVA operation 21 are required, with at most 128 removed tokens and retained original-F32 inputs. Draft depth is limited to 127 so checkpoint replay can include its verification anchor. Active MTP stays disabled on older servers. PARTIAL checkpoints require the hybrid owner/dirty-prefix proof and live native-prefix coverage. FULL native overflow snapshots use the paired host-trailer + revision-3 Xbox disk codec only when both peers negotiate `RKVA_CAP_NATIVE_KVARN_SNAPSHOT`; unnegotiated peers and other native layouts keep the fail-closed guards. Windows, GPU rollback and full-model MTP qualification are separate gates.
 
-`GGML_RKVA_NATIVE_TAIL_TOKENS=0|128` independently selects the experimental Xbox native precision tail (default 128); it does not change the CUDA cache tail. The selected value appears in remote stats as `native_precision_tail_tokens`. Tail 0 omits original-domain tail planes from native upload/rewind packets; canonical native records and original-F32 rollback retention remain unchanged.
+`GGML_RKVA_NATIVE_TAIL_TOKENS=N` independently selects the experimental Xbox native precision tail (default 128); it does not change the CUDA cache tail. The selected value appears in remote stats as `native_precision_tail_tokens`. Tail 0 omits original-domain tail planes from native upload/rewind packets; canonical native records and original-F32 rollback retention remain unchanged.
 
 With native KVarN4 position split, an explicit `--kv-tail-tokens N` selects one
 global F16 suffix across CUDA and Xbox. Positive lengths are exact; `none`

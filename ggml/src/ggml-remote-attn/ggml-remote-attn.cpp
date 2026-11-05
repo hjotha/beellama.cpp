@@ -3840,6 +3840,24 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         GGML_LOG_ERROR("%s: geometry not set before connect\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
+    if (ctx->native_tail_override == UINT32_MAX) {
+        if (const char * tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS")) {
+            if (!*tail || !std::all_of(tail, tail + std::strlen(tail), [](unsigned char c) {
+                    return c >= '0' && c <= '9';
+                })) {
+                GGML_LOG_ERROR("%s: invalid GGML_RKVA_NATIVE_TAIL_TOKENS\n", GGML_REMOTE_ATTN_NAME);
+                return false;
+            }
+            errno = 0;
+            const unsigned long long requested = std::strtoull(tail, nullptr, 10);
+            if (errno == ERANGE) {
+                GGML_LOG_ERROR("%s: GGML_RKVA_NATIVE_TAIL_TOKENS is not representable\n", GGML_REMOTE_ATTN_NAME);
+                return false;
+            }
+            ctx->native_tail_override = requested == 128 ? 128u :
+                    uint32_t(std::min<unsigned long long>(requested, ctx->geo.max_ctx));
+        }
+    }
     ctx->close_socket();
     ctx->connected = false;
     ctx->failed = false;
@@ -4313,15 +4331,9 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
         ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu), "ggml_backend_cpu_kvarn_store_direct_v1"));
     if (!store) return false;
     uint32_t precision_tail_tokens = 128;
-    if (ctx->native_tail_override != UINT32_MAX) {
-        precision_tail_tokens = std::min(ctx->native_tail_override, capacity);
-    } else if (const char * tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS")) {
-        if (!std::strcmp(tail, "0")) precision_tail_tokens = 0;
-        else if (std::strcmp(tail, "128")) {
-            GGML_LOG_ERROR("%s: GGML_RKVA_NATIVE_TAIL_TOKENS must be 0 or 128\n", GGML_REMOTE_ATTN_NAME);
-            return false;
-        }
-    }
+    if (ctx->native_tail_override != UINT32_MAX)
+        precision_tail_tokens = ctx->native_tail_override == 128 ? 128 :
+                std::min(ctx->native_tail_override, capacity);
     const bool rewind_v2 = (ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) &&
                            (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
     const bool serial_prefix = rewind_v2 && (ctx->ack.reserved[0] & RKVA_CAP_KVARN_SERIAL_PREFIX);
