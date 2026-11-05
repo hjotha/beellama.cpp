@@ -54,6 +54,13 @@ The Xbox owns the GPU-resident revision-3 representation:
 - per-layer prefix coverage (`tail_begin`, `stage_begin`), record-group
   coverage, live rows and the resident mutation generation.
 
+New native FULL saves omit the non-authoritative Q4/Q8 companion payload: the
+local KVarN data and the paired native producer/Xbox records remain the saved
+cache. The current reader accepts earlier native files that included the
+companion payload as well as new files that omit it; older readers can reject
+the new files and require an older snapshot or a cold prefill. Native row
+formats without a FULL snapshot codec remain rejected.
+
 Neither side serializes pointers, C++ objects, D3D12 handles or transient
 preparation caches. All integers are canonical little-endian; F16/F32 values
 are raw IEEE bit patterns in little-endian order.

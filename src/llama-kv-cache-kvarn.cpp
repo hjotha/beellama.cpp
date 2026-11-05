@@ -5344,10 +5344,13 @@ void llama_kv_cache_kvarn::state_write_mixed(
             }
             empty_split_overflow = overflow_cells.empty();
         }
-        if (empty_split_overflow) {
+        const bool native_companion_omitted = native_kvarn_rpc_experimental_ &&
+                !native_row_rpc_experimental_ && (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL);
+        if (empty_split_overflow || native_companion_omitted) {
             // The companion shares the logical table, whose LOCAL cells are
-            // occupied even though overflow is empty. Do not serialize unused
-            // Qx rows for them. Keep an explicit, validated native trailer.
+            // occupied even though overflow is empty. Native FULL snapshots
+            // carry authoritative overflow records in the paired RKVK state;
+            // their Qx companion is only bookkeeping and has no payload.
             const uint32_t empty_overflow[] = {1u, 1u, 0u}; // full, one stream, zero overflow cells
             split.write(empty_overflow, sizeof(empty_overflow));
         } else {
@@ -5985,8 +5988,10 @@ void llama_kv_cache_kvarn::state_read_mixed(
     bool empty_split_overflow = split_to_pure_import;
     if (!partial && position_split_enabled() && original_split_frame) {
         empty_split_overflow = true;
-        for (const auto & cell : parsed.cells()) {
-            if (cell.pos >= llama_pos(position_split_p())) { empty_split_overflow = false; }
+        if (!native_full) {
+            for (const auto & cell : parsed.cells()) {
+                if (cell.pos >= llama_pos(position_split_p())) { empty_split_overflow = false; }
+            }
         }
         for (const auto & desc : parsed.layers()) {
             if (desc.range_id == llama_position_split::kRangeOverflow && desc.payload_bytes != 0) {

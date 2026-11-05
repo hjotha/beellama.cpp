@@ -1,6 +1,7 @@
 // CPU memory integration: no GGUF weights, model forward pass or remote host.
 #include "../src/llama-model.h"
 #include "../src/llama-kv-cache-kvarn.h"
+#include "../src/llama-kv-mixed-state.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-io.h"
 #include "../src/llama-io-file.h"
@@ -914,6 +915,19 @@ static void test_native_resident_prefix_state() {
         catch (const std::exception &) {}
         assert(saved == !sparse); // a gap must never be published as a valid snapshot
         if (!sparse) {
+            assert(native_body.data.size() >= 16);
+            uint64_t frame_bytes = 0;
+            std::memcpy(&frame_bytes, native_body.data.data() + 8, sizeof(frame_bytes));
+            assert(frame_bytes <= native_body.data.size() - 16);
+            const auto frame = llama_kv_mixed::snapshot::parse(native_body.data.data() + 16, size_t(frame_bytes));
+            size_t overflow_layers = 0;
+            for (const auto & layer : frame.layers()) {
+                if (layer.range_id == llama_position_split::kRangeOverflow) {
+                    ++overflow_layers;
+                    assert(layer.payload_bytes == 0); // native RKVK owns the real records
+                }
+            }
+            assert(overflow_layers != 0);
             auto dest_attn = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
                     llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
                     512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,

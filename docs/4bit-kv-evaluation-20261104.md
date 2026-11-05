@@ -99,6 +99,10 @@ native snapshot, published a new 109,513-token pair and restored that pair in
 a fresh process. The test-created pair was then retired; the five previously
 observed Xbox native objects remained. The existing 128-token tail is included
 in this native state; this does not qualify a global 256-token split tail.
+An updated host subsequently restored an older native file, saved without its
+Q4 companion payload, and restored the new pair in a fresh process. At 109,513
+tokens the host file fell from 2,250,587,800 to 2,223,286,770 bytes for these
+fixtures; old readers can reject the new layout.
 
 An E4 CPU-versus-CUDA comparison on the same model and 2,048-token prompt
 used the artificial split P=256 and three cold requests per arm. CPU medians
