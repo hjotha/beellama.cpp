@@ -78,9 +78,10 @@ and owned draft contexts independently. The draft context defaults to `2048`,
 which keeps its transient F16 workspace bounded for shallow speculative models;
 the target context falls back to `GGML_KVARN_WINDOW_CHUNK`. The value does not
 change the context size, retained cache, KVarN bit width, or precision-tail
-length. Smaller windows remain mathematically online-softmax equivalent but
-change floating-point reduction order, so KLD comparisons must record both
-context settings.
+length. Adaptive profiles inherit their respective target or draft window even
+when their cache types are explicitly overridden. Smaller windows remain
+mathematically online-softmax equivalent but change floating-point reduction
+order, so KLD comparisons must record both context settings.
 
 The CUDA specialized split, SWA-vector, and tiled descriptor-native MMA routes
 publish the same optional FP32 `(maximum, denominator)` metadata as upstream

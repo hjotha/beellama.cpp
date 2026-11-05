@@ -85,6 +85,17 @@ available as the same storage format on the Xbox. Explicit global KVarN4 tail
 sizes were subsequently added to the split path. SAW/NC F16 tails remain
 local-only. Low KLD alone does not establish freedom from generation loops.
 
+On the RTX 4070 production preset, explicitly selecting KVarN4 per adaptive
+profile previously lost the configured 4,096-token prefill window. With the
+same model, KVarN4 MTP draft, prompt, batch 2,048 and ubatch 512, one cold
+request per arm measured 691.51 versus 797.18 prefill tokens/s at 8,192 tokens
+and 398.33 versus 818.37 at 16,384 tokens, before versus after preserving the
+configured window. Greedy output text differed at 8,192 tokens and matched at
+16,384; window size changes reduction order. A separate local target-only
+20,480-token KLD comparison at batch 128 and ubatch 32 measured 0.001238 for
+the former default window and 0.001216 for 4,096, against the same BF16 KV
+reference. These single runs do not establish a statistical confidence interval.
+
 With the same KVarN4 format on both devices and an artificial split at token
 256, F32, FP8 E5M2 and FP8 E4M3FN transfer gave KLD 0.001242, 0.002352 and
 0.001540 respectively on the 20,480-token evaluation. These runs change the

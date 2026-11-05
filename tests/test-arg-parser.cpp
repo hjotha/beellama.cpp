@@ -566,7 +566,8 @@ params = common_params();
                 extra_tail_argv.size(), list_str_to_char(extra_tail_argv).data(), extra_tail,
                 LLAMA_EXAMPLE_SERVER));
         extra_tail.n_parallel = 1;
-        assert(invalid_mixed_context(extra_tail));
+        assert(!invalid_mixed_context(extra_tail));
+        assert(common_context_params_to_llama(extra_tail).kv_tail_tokens == 1);
 
         common_params flash_off;
         std::vector<std::string> flash_off_argv = {
@@ -1202,6 +1203,45 @@ unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
                ista_draft_tiers.speculative.draft.cache_type_k);
         assert(ista_draft_tiers.spec_draft_type_v_medium ==
                ista_draft_tiers.speculative.draft.cache_type_v);
+
+        // Explicit per-tier cache widths must preserve the global target and
+        // draft window settings, just like tiers that inherit their KV types.
+        common_params tier_windows;
+        argv = {
+            "binary_name", "--ctx-size-s", "32768", "--s-max-tokens", "32768",
+            "--ctx-size-m", "45056", "--m-max-tokens", "45056",
+            "--ctx-size-l", "58368", "--ctx-size-xl", "102400", "--xl-max-tokens", "102400",
+            "--ctx-size-xxl", "108032", "--xxl-max-tokens", "108032",
+            "--ctx-size-xxxl", "162816", "--xxxlong-max-tokens", "162816",
+            "--cache-type-k", "kvarn4", "--cache-type-v", "kvarn4",
+            "--kvarn-window-chunk", "4096",
+            "--cache-type-k-s", "kvarn4", "--cache-type-v-s", "kvarn4",
+            "--cache-type-k-m", "kvarn4", "--cache-type-v-m", "kvarn4",
+            "--cache-type-k-l", "kvarn4", "--cache-type-v-l", "kvarn4",
+            "--cache-type-k-xl", "kvarn4", "--cache-type-v-xl", "kvarn4",
+            "--cache-type-k-xxl", "kvarn4", "--cache-type-v-xxl", "kvarn4",
+            "--cache-type-k-xxxl", "kvarn4", "--cache-type-v-xxxl", "kvarn4",
+            "--spec-draft-type-k", "kvarn4", "--spec-draft-type-v", "kvarn4",
+            "--spec-draft-kvarn-window-chunk", "1024",
+            "--spec-draft-type-k-s", "kvarn4", "--spec-draft-type-v-s", "kvarn4",
+            "--spec-draft-type-k-m", "kvarn4", "--spec-draft-type-v-m", "kvarn4",
+            "--spec-draft-type-k-l", "kvarn4", "--spec-draft-type-v-l", "kvarn4",
+            "--spec-draft-type-k-xl", "kvarn4", "--spec-draft-type-v-xl", "kvarn4",
+            "--spec-draft-type-k-xxl", "kvarn4", "--spec-draft-type-v-xxl", "kvarn4",
+            "--spec-draft-type-k-xxxl", "kvarn4", "--spec-draft-type-v-xxxl", "kvarn4",
+            "--fit", "off", "--parallel", "1", "--spec-type", "draft-mtp",
+        };
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), tier_windows, LLAMA_EXAMPLE_SERVER));
+        for (const auto * tier : {&tier_windows.kvarn_short, &tier_windows.kvarn_medium,
+                                  &tier_windows.kvarn_long, &tier_windows.kvarn_xlong,
+                                  &tier_windows.kvarn_xxlong, &tier_windows.kvarn_xxxlong}) {
+            assert(tier->type == LLAMA_KVARN_K4V4_G128 && tier->window_chunk == 4096);
+        }
+        for (const auto * tier : {&tier_windows.spec_draft_kvarn_short, &tier_windows.spec_draft_kvarn_medium,
+                                  &tier_windows.spec_draft_kvarn_long, &tier_windows.spec_draft_kvarn_xlong,
+                                  &tier_windows.spec_draft_kvarn_xxlong, &tier_windows.spec_draft_kvarn_xxxlong}) {
+            assert(tier->type == LLAMA_KVARN_K4V4_G128 && tier->window_chunk == 1024);
+        }
 
         common_params five_profile_shorthand = adaptive;
         argv = {

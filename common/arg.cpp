@@ -1620,6 +1620,7 @@ static void common_params_target_tier_kvarn_normalize(
         kvarn = llama_kvarn_default_params();
         return;
     }
+    kvarn.window_chunk = params.kvarn.window_chunk;
     common_kvarn_pair_normalize(type_k, type_v, bits_k, bits_v, kvarn, arg_k, arg_v);
 }
 
@@ -1686,6 +1687,7 @@ static void common_params_spec_draft_tier_kvarn_normalize(
         return;
     }
 
+    kvarn.window_chunk = draft.kvarn.window_chunk;
     common_kvarn_pair_normalize(type_k, type_v, bits_k, bits_v, kvarn, arg_k, arg_v);
 }
 
@@ -1790,6 +1792,7 @@ static void common_params_long_kvarn_normalize(common_params & params) {
         return;
     }
 
+    params.kvarn_long.window_chunk = params.kvarn.window_chunk;
     common_kvarn_pair_normalize(
             params.cache_type_k_long,
             params.cache_type_v_long,
@@ -1832,6 +1835,7 @@ static void common_params_xlong_kvarn_normalize(common_params & params) {
         return;
     }
 
+    params.kvarn_xlong.window_chunk = params.kvarn.window_chunk;
     common_kvarn_pair_normalize(
             params.cache_type_k_xlong,
             params.cache_type_v_xlong,
@@ -1856,6 +1860,7 @@ static void common_params_xxlong_kvarn_normalize(common_params & params) {
         params.cache_type_k_xxlong = GGML_TYPE_Q4_0;
         params.cache_type_v_xxlong = GGML_TYPE_Q4_0;
     }
+    params.kvarn_xxlong.window_chunk = params.kvarn.window_chunk;
     common_kvarn_pair_normalize(
             params.cache_type_k_xxlong,
             params.cache_type_v_xxlong,
@@ -1880,6 +1885,7 @@ static void common_params_xxxlong_kvarn_normalize(common_params & params) {
         params.cache_type_k_xxxlong = GGML_TYPE_Q4_0;
         params.cache_type_v_xxxlong = GGML_TYPE_Q4_0;
     }
+    params.kvarn_xxxlong.window_chunk = params.kvarn.window_chunk;
     common_kvarn_pair_normalize(
             params.cache_type_k_xxxlong,
             params.cache_type_v_xxxlong,
