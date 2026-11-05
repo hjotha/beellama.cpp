@@ -988,7 +988,7 @@ struct ggml_backend_remote_attn_context {
                     fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC) < 0) return false;
         }
         prefetch_enabled = true;
-        GGML_LOG_INFO("RKVA TCP prefetch experimental: max_frames=2 nq_min=10 wire=fp8 single_io_owner=1\n");
+        GGML_LOG_INFO("RKVA TCP prefetch experimental: max_frames=2 nq_min=10 wire=fp8_e5m2/e4m3fn single_io_owner=1\n");
 #endif
         return true;
     }
@@ -1501,6 +1501,13 @@ static void rkva_test_handshake_barrier() {
     });
 }
 
+static bool rkva_prefetch_wire_allowed(const ggml_backend_remote_attn_context * ctx, rkva_wire wire) {
+    if (wire != ctx->range_wire) return false;
+    if (wire == RKVA_WIRE_FP8) return true;
+    return wire == RKVA_WIRE_FP8_E4M3FN && ctx->protocol_version == RKVA_VERSION &&
+        ctx->e4_requested && (ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_E4M3FN);
+}
+
 // The worker thread has sole ownership of ctx->sock. Network transmit/receive
 // and reply decoding run without ctx->mutex to prevent host CPU stall.
 // ctx->mutex is only acquired briefly to commit generation and ACK coverage.
@@ -1510,7 +1517,9 @@ static bool rkva_finish_native_bulk_job(
     ggml_remote_attn_trace_context_scope trace_owner(slot.trace);
     ggml_remote_attn_trace_scope trace_finish("job_finish");
     trace_finish.event.flags = 0x40000000u;
-    if (slot.layer >= ctx->range_layers.size() ||
+    if (slot.wire != ctx->range_wire ||
+            (slot.wire == RKVA_WIRE_FP8_E4M3FN && !rkva_prefetch_wire_allowed(ctx, slot.wire)) ||
+            slot.layer >= ctx->range_layers.size() ||
             slot.layer >= ctx->native_layers.size() || !slot.output) {
         return false;
     }
@@ -1857,7 +1866,7 @@ static void rkva_prefetch_two_frames(
     };
     auto admit = [&](rkva_async_slot * slot) {
         if (ctx->cycle_id == UINT64_MAX || slot->payload.size() > (256u << 20) ||
-                !slot->nq || !slot->out_width || slot->cohort_count || slot->wire != RKVA_WIRE_FP8 ||
+                !slot->nq || !slot->out_width || slot->cohort_count || !rkva_prefetch_wire_allowed(ctx, slot->wire) ||
                 slot->epoch != ctx->range_epoch || ctx->failed) return false;
         frame f;
         f.slot = slot;
@@ -1888,7 +1897,7 @@ static void rkva_prefetch_two_frames(
                 std::lock_guard<std::mutex> alock(ctx->async_mutex);
                 rkva_async_slot * group[4]{};
                 const size_t count = rkva_ready_group(ctx, group);
-                if (count == 1 && !group[0]->cohort_count && group[0]->nq > 9 && group[0]->wire == RKVA_WIRE_FP8) {
+                if (count == 1 && !group[0]->cohort_count && group[0]->nq > 9 && rkva_prefetch_wire_allowed(ctx, group[0]->wire)) {
                     group[0]->state = rkva_slot_state::RUNNING;
                     ok = admit(group[0]);
                     if (!ok) break;
@@ -2083,7 +2092,7 @@ static void rkva_async_worker_main(ggml_backend_remote_attn_context * ctx) {
         auto * slot = group[0];
         for (size_t i = 0; i < count; ++i) group[i]->state = rkva_slot_state::RUNNING;
         const bool use_prefetch = ctx->prefetch_enabled && ctx->async_capacity == 2 && count == 1 &&
-            !slot->cohort_count && slot->wire == RKVA_WIRE_FP8 && slot->nq > 9;
+            !slot->cohort_count && rkva_prefetch_wire_allowed(ctx, slot->wire) && slot->nq > 9;
         if (!use_prefetch && ggml_remote_attn_trace_enabled()) for (size_t i = 0; i < count; ++i) {
             auto e = group[i]->trace;
             std::snprintf(e.phase, sizeof(e.phase), "rpc_queue");

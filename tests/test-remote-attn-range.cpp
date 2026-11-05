@@ -4174,22 +4174,28 @@ static void test_cuda_wavefront_marker_only_two_slots() {
 }
 
 
-static void test_prefetch_public_controls() {
+static void test_prefetch_public_controls(bool e4) {
     storage_env native("kvarn4"), experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL"),
         fusion("0", "GGML_RKVA_RANGE_FUSE"), precision("128", "GGML_RKVA_NATIVE_TAIL_TOKENS"),
-        bulk("1", "GGML_RKVA_NATIVE_BULK"), wire("fp8", "GGML_RKVA_WIRE_FORMAT"),
+        bulk("1", "GGML_RKVA_NATIVE_BULK"), wire(e4 ? "fp8_e4m3fn" : "fp8", "GGML_RKVA_WIRE_FORMAT"),
         overlap("1", "GGML_RKVA_ASYNC_LOCAL_REMOTE"), profiling("1", "GGML_RKVA_PROFILE");
     const char *names[] = {"destroy session",      "reset",         "free/close",
                            "profile idle barrier", "drain/profile", "epoch invalidation",
                            "wrong cycle",          "wrong version", "oversized reply",
                            "truncated body",       "server error",  "truncated header",
-                           "EOF before header"};
-    for (int mode = 0; mode < 13; ++mode) {
-        loopback server(false, true, false, false, false, false, 3, 0, true, 7 | 8 | 16 | 32);
+                           "EOF before header",   "E4 NaN positive", "E4 max positive", "E4 max negative", "E4 NaN negative"};
+    for (int mode = 0; mode < (e4 ? 17 : 13); ++mode) {
+        loopback server(false, true, false, false, false, false, 3, 0, true, 7 | 8 | 16 | 32 | (e4 ? 2048 : 0));
+        if (e4) server.fp8_output_byte = mode == 13 ? 0x7f : mode == 14 ? 0x7e :
+                                         mode == 15 ? 0xfe : mode == 16 ? 0xff : 0x38;
         auto *backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
         ggml_remote_attn_geometry geo{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
         assert(ggml_backend_remote_attn_set_geometry(backend, &geo));
         assert(ggml_backend_remote_attn_connect(backend));
+        if (mode == 3 || mode == 14 || mode == 15) {
+            const int recv_buffer = 4 << 20;
+            assert(setsockopt(server.client, SOL_SOCKET, SO_RCVBUF, &recv_buffer, sizeof(recv_buffer)) == 0);
+        }
         assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
         ggml_backend_remote_attn_set_active_session(backend, 0);
         assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
@@ -4227,13 +4233,13 @@ static void test_prefetch_public_controls() {
             j.node->op_params[GGML_REMOTE_ATTN_PARAM_N_LIVE] = live;
             assert(ggml_remote_attn_exec(j.node));
         };
-        if (mode >= 6) {
+        if (mode >= 6 && mode != 14 && mode != 15) {
             const loopback::profile_failure faults[] = {
                 loopback::profile_failure::cycle,        loopback::profile_failure::version,
                 loopback::profile_failure::oversized,    loopback::profile_failure::truncated,
                 loopback::profile_failure::server_error, loopback::profile_failure::short_header,
                 loopback::profile_failure::none};
-            server.fail_bulk_reply = faults[mode - 6];
+            if (mode < 13) server.fail_bulk_reply = faults[mode - 6];
             server.drop_attention = mode == 12;
             std::vector<float> sentinel(128 * 514, 42.0f);
             ggml_backend_tensor_set(a.wait, sentinel.data(), 0, sentinel.size() * sizeof(float));
@@ -4244,7 +4250,7 @@ static void test_prefetch_public_controls() {
         submit(b, 256);
         assert(server.wait_until_reply_paused());
         assert(ggml_backend_remote_attn_async_in_flight(backend) == 2);
-        if (mode >= 6) {
+        if (mode >= 6 && mode != 14 && mode != 15) {
             server.unpause();
             assert(!ggml_remote_attn_exec(a.wait));
             assert(!ggml_remote_attn_exec(b.wait));
@@ -4255,7 +4261,13 @@ static void test_prefetch_public_controls() {
                 for (size_t i = 0; i < 128 * 514; ++i)
                     assert(values[i] == 42.0f);
             }
-        } else if (mode == 3) {
+        } else if (mode == 3 || mode == 14 || mode == 15) {
+            // The first reply is paused; peek the complete second request before releasing it.
+            rkva_request next{};
+            assert(recv(server.client, &next, sizeof(next), MSG_PEEK | MSG_WAITALL) == sizeof(next));
+            assert(next.magic == RKVA_MAGIC && next.op == RKVA_KVARN_RANGE_BULK_ATTN && next.payload_bytes < (4u << 20));
+            std::vector<uint8_t> next_frame(sizeof(next) + next.payload_bytes);
+            assert(recv(server.client, next_frame.data(), next_frame.size(), MSG_PEEK | MSG_WAITALL) == ssize_t(next_frame.size()));
             auto report = std::async(std::launch::async,
                                      [&] { return std::string(ggml_backend_remote_attn_stats_json(backend)); });
             assert(report.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready);
@@ -4268,7 +4280,20 @@ static void test_prefetch_public_controls() {
                 assert(server.profile_controls.size() == 1);
             }
             const std::string stats = ggml_backend_remote_attn_stats_json(backend);
+            assert(stats.find("\"tcp_prefetch_admitted\":2") != std::string::npos);
+            assert(stats.find("\"tcp_prefetch_sent\":2") != std::string::npos);
             assert(stats.find("\"tcp_prefetch_completed\":2") != std::string::npos);
+            assert(stats.find("\"tcp_prefetch_ahead_sent\":1") != std::string::npos);
+            assert(stats.find("\"tcp_prefetch_max_frames\":2") != std::string::npos);
+            if (e4) {
+                assert(stats.find("\"wire_format\":\"fp8_e4m3fn\"") != std::string::npos);
+                for (auto *output : {a.wait, b.wait}) {
+                    const auto *values = static_cast<const float *>(output->data);
+                    for (size_t t = 0; t < 128; ++t)
+                        for (size_t d = 0; d < 512; ++d)
+                            assert(values[t * 514 + d] == (mode == 14 ? 448.0f : mode == 15 ? -448.0f : 1.0f));
+                }
+            }
             {
                 std::lock_guard<std::mutex> lock(server.mutex);
                 assert(server.profile_controls.size() == 2);
@@ -4395,7 +4420,8 @@ int main() {
         storage_env codec("0", "GGML_RKVA_CUDA_FP8");
         test_phase6_double_buffer_async(128);
         test_async_failure_two_slots(128);
-        test_prefetch_public_controls();
+        test_prefetch_public_controls(false);
+        test_prefetch_public_controls(true);
         std::puts("TCP prefetch: N128 public controls, FIFO/reuse, poison/publication passed");
         return 0;
     }
