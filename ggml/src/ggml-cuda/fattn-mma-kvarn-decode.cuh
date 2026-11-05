@@ -283,6 +283,12 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     constexpr int WARPS_PER_CHUNK = SLICES;
     constexpr int CHUNKS_PER_PASS = NWARPS / WARPS_PER_CHUNK;
     constexpr int Q_STRIDE2 = D / 2 + 4;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890 && !defined(__HIPCC__) && !defined(GGML_USE_MUSA)
+    constexpr bool PARALLEL_Q_PRIME = D == 256 && MAX_GQA == 6 && SPLIT_TOKENS == 64 &&
+        NWARPS == 8 && K_BITS == 4 && V_BITS == 4 && Q_TILE == 1;
+#else
+    constexpr bool PARALLEL_Q_PRIME = false;
+#endif
     // load_ldmatrix ниже читает из q_sh фиксированные 8 строк, поэтому при
     // MAX_GQA == 6 массив на шесть строк давал чтение за его границей (попадало
     // в score_partial_sh). Результат лишних строк отбрасывается по h < MAX_GQA,
@@ -448,6 +454,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         for (int i = tid; i < Q_ROWS * D; i += NWARPS * PHYSICAL_WAVE_SIZE) {
             const int h = i / D;
             const int dim = i % D;
+            if constexpr (PARALLEL_Q_PRIME) {
+                if (k_split_in_group && h < gqa_head_count) {
+                    continue;
+                }
+            }
             float value = 0.0f;
             if (qt < q_count && h < gqa_head_count && q_head0 + h < n_q_heads) {
                 const float * q = (const float *)
@@ -476,6 +487,23 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     __syncthreads();
 
     if (k_split_in_group) {
+        if constexpr (PARALLEL_Q_PRIME) {
+            // Q conversion is independent across dimensions; keep zq's sum serial below.
+            for (int i = tid; i < gqa_head_count * D; i += NWARPS * PHYSICAL_WAVE_SIZE) {
+                const int h = i / D;
+                const int dim = i % D;
+                const int slice = dim / RECORD_DIM;
+                const int slice_dim = dim % RECORD_DIM;
+                float q_val = 0.0f;
+                if (q_count > 0 && q_head0 + h < n_q_heads) {
+                    const float * q = (const float *)
+                        (Q + nb03 * stream + nb02 * (q_head0 + h) + nb01 * q_base);
+                    q_val = q[dim] * scale;
+                }
+                const float q_prime = KVARN_K_AXIS_SCALE(slice, slice_dim) * q_val;
+                ((half *) q_sh[0])[h * (2 * Q_STRIDE2) + dim] = __float2half(q_prime);
+            }
+        }
         // Замер на 3090 (парный прогон, один слот, глубина 65000): распараллеливание
         // этого цикла по варпам с древовидной свёрткой zq дало 27.70 против 27.71
         // tok/s, то есть ровно ничего, при том что меняло порядок суммирования zq
@@ -496,9 +524,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                 // adds avoidable error; the zero-point term also needs F32 Q.
                 const float q_val = q_original ? q_original[slice * RECORD_DIM + dim] * scale : 0.0f;
                 zq += KVARN_K_AXIS_ZP(slice, dim) * q_val;
-                const float q_prime = KVARN_K_AXIS_SCALE(slice, dim) * q_val;
-                ((half *) q_sh[qt])[h * (2 * Q_STRIDE2) + slice * RECORD_DIM + dim] =
-                    __float2half(q_prime);
+                if constexpr (!PARALLEL_Q_PRIME) {
+                    const float q_prime = KVARN_K_AXIS_SCALE(slice, dim) * q_val;
+                    ((half *) q_sh[qt])[h * (2 * Q_STRIDE2) + slice * RECORD_DIM + dim] =
+                        __float2half(q_prime);
+                }
             }
             zq_sh[qt][slice][h] = zq;
         }

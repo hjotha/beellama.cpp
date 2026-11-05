@@ -97,8 +97,8 @@ static inline int32_t server_prompt_reuse_alignment(int32_t kvarn_group) {
     return kvarn_group > 0 ? kvarn_group : 1;
 }
 
-// KVarN numerical cadence follows the physical compute size, independently
-// of the logical parent batch. Alignment1 keeps the existing server policy.
+// A reduced physical ubatch preserves its seam even with a larger parent batch.
+// Otherwise checkpoint cuts use the logical batch; alignment1 stays unchanged.
 struct server_prompt_checkpoint_cadence {
     int ubatch;
     int batch_cap;
@@ -106,7 +106,8 @@ struct server_prompt_checkpoint_cadence {
 
     server_prompt_checkpoint_cadence(int batch, int requested_ubatch, int physical_ubatch, int alignment)
         : ubatch(alignment > 1 ? physical_ubatch : requested_ubatch),
-          batch_cap(alignment > 1 ? std::min(batch, ubatch) : batch),
+          batch_cap(alignment > 1 && physical_ubatch < requested_ubatch ?
+                  std::min(batch, physical_ubatch) : batch),
           offsets{4 + ubatch, 4, 1} {
         GGML_ASSERT(batch > 0 && requested_ubatch > 0 && physical_ubatch > 0 &&
                     physical_ubatch <= requested_ubatch && alignment > 0);

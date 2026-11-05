@@ -4297,6 +4297,80 @@ static void test_odd_offset_record_decode_gpu() {
     ggml_backend_free(gpu_backend);
 }
 
+static void test_d256_k4_split_decode_gpu() {
+    scoped_test_env clear_max("GGML_CUDA_KVARN_SPLIT_MAX_Q", nullptr);
+    scoped_test_env clear_budget("GGML_CUDA_KVARN_SPLIT_PARTIAL_MB", nullptr);
+    scoped_test_env clear_portable("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN", nullptr);
+    scoped_test_env clear_materialize("GGML_KVARN_TEST_FORCE_MATERIALIZE_FATTN", nullptr);
+    scoped_test_env route_debug("GGML_CUDA_FA_ROUTE_DEBUG", "1");
+
+    ggml_backend_t gpu = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, true);
+    ggml_backend_t cpu = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    ggml_backend_dev_t dev = ggml_backend_get_device(gpu);
+    const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+    require(name != nullptr && std::strncmp(name, "CUDA", 4) == 0,
+            "D256 K4 split test requires CUDA");
+    require(backend_supports_kvarn_flash_attention_shape(gpu, 256),
+            "D256 K4 split test requires native KVarN attention");
+    const auto routes = get_kvarn_route_stats_fns(gpu);
+    require(routes.first != nullptr && routes.second != nullptr,
+            "D256 K4 split test requires route telemetry");
+
+    const auto check = [&](int nq, int nkv, int nqh, int nkh, bool production_layout,
+                           const test_native_attention_options & options) {
+        const auto run = [&](ggml_backend_t backend, bool native, bool rotate) {
+            return test_native_flash_attention_output(
+                    backend, native, rotate, 256, 4, 4, nq, nqh, nkh, nkv, 5,
+                    false, nullptr, false, 0, false, GGML_TYPE_F16, 0, false,
+                    production_layout, -1, true, false, false, 0, false, options);
+        };
+        const auto expected = run(cpu, false, false);
+        routes.first();
+        const auto actual = run(gpu, true, true);
+        auto stats = make_test_kvarn_route_stats();
+        routes.second(&stats);
+        require_close_f32_rmse(actual, expected, 1e-2f,
+                "D256 K4 split decode differs from CPU materialized reference");
+        require(stats.decode_split > 0 && stats.split_reduce > 0 &&
+                stats.geometry_split_64 > 0 && stats.materialize_fallback == 0,
+                "D256 K4 test did not execute 64-token split decode");
+        if (!options.all_masked) {
+            require(std::any_of(expected.begin(), expected.end(), [](float x) { return std::fabs(x) > 1e-5f; }),
+                    "D256 K4 reference output is unexpectedly all zero");
+        }
+        uint64_t hash = UINT64_C(1469598103934665603);
+        for (float x : actual) {
+            uint32_t bits;
+            std::memcpy(&bits, &x, sizeof(bits));
+            for (unsigned i = 0; i < sizeof(bits); ++i) {
+                hash = (hash ^ ((bits >> (8*i)) & 0xffu)) * UINT64_C(1099511628211);
+            }
+        }
+        std::printf("kvarn-d256-k4-split nq=%d nkv=%d heads=%d/%d layout=%d masked=%d bias=%.3f "
+                    "split=%llu split64=%llu output_hash=%016llx\n",
+                nq, nkv, nqh, nkh, int(production_layout), int(options.all_masked), options.mask_bias,
+                (unsigned long long) stats.decode_split, (unsigned long long) stats.geometry_split_64,
+                (unsigned long long) hash);
+        std::fflush(stdout);
+    };
+
+    for (int nq : { 1, 2, 3, 7 }) {
+        for (int nkv : { 127, 128, 129, 255, 256, 257, 1024 }) {
+            check(nq, nkv, 6, 1, false, {});
+        }
+    }
+    test_native_attention_options biased;
+    biased.mask_bias = -0.003f;
+    check(7, 257, 24, 4, true, biased);
+    test_native_attention_options masked;
+    masked.all_masked = true;
+    check(1, 128, 24, 4, true, masked);
+    check(7, 257, 24, 4, true, masked);
+
+    ggml_backend_free(cpu);
+    ggml_backend_free(gpu);
+}
+
 // Opt-in GPU regression: exercise the production environment policy and route
 // counters, then compare both attention outputs and LSE across native kernels.
 static void test_native_split_budget_gpu() {
@@ -7603,6 +7677,12 @@ static void test_flexible_tail_gpu() {
 
 int main() {
     ggml_backend_load_all();
+
+    if (std::getenv("GGML_KVARN_TEST_D256_K4_SPLIT_ONLY") != nullptr) {
+        test_d256_k4_split_decode_gpu();
+        std::puts("test-kvarn: D256 K4 split decode parity OK");
+        return 0;
+    }
 
     if (std::getenv("GGML_KVARN_TEST_FLEX_TAIL_GPU_ONLY") != nullptr) {
         test_flexible_tail_gpu();

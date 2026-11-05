@@ -2,10 +2,12 @@
 #include "ggml-backend.h"
 #include "llama-kv-cache-tail.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <unordered_set>
 #include <vector>
 
@@ -498,6 +500,8 @@ static void set_matrix_data(
     fail("unsupported mixed-side test type");
 }
 
+enum class tail_mask_case { visible, interleaved, tail_hidden, fully_hidden };
+
 static std::vector<float> run_attached_tail_attention(
         ggml_backend_t backend,
         int64_t n_query,
@@ -506,7 +510,9 @@ static std::vector<float> run_attached_tail_attention(
         bool segmented = false,
         bool model_shape = false,
         bool export_lse = false,
-        bool packed_body = false) {
+        bool packed_body = false,
+        tail_mask_case mask_case = tail_mask_case::visible,
+        bool poison_underflow = false) {
     const int64_t d = model_shape ? 256 : 128;
     const int64_t n_q_head = model_shape ? 24 : 2;
     const int64_t n_kv_head = model_shape ? 4 : 1;
@@ -572,6 +578,22 @@ static std::vector<float> run_attached_tail_attention(
     for (size_t i = 0; i < vt_data.size(); ++i) vt_data[i] = 0.006f*float(int(i%11) - 5);
     for (size_t i = 0; i < kt_current_data.size(); ++i) kt_current_data[i] = 0.007f*float(int(i%17) - 8);
     for (size_t i = 0; i < vt_current_data.size(); ++i) vt_current_data[i] = 0.008f*float(int(i%19) - 9);
+    // Poison only slots with zero weight for every query.
+    if (mask_case != tail_mask_case::visible) {
+        for (int64_t slot = 0; slot < n_tail; ++slot) {
+            const bool masked = slot % 3 == 0;
+            const bool underflow = poison_underflow && mask_case == tail_mask_case::interleaved && slot % 7 == 0;
+            if (!masked && !underflow) continue;
+            auto & data = slot < n_history ? vt_data : vt_current_data;
+            const int64_t row = slot < n_history ? slot : slot - n_history;
+            for (int64_t h = 0; h < n_kv_head; ++h) {
+                for (int64_t dim = 0; dim < d; ++dim) {
+                    data[size_t(dim + d*(h + n_kv_head*row))] =
+                            std::numeric_limits<float>::quiet_NaN();
+                }
+            }
+        }
+    }
     set_matrix_data(q, q_data, n_query*n_q_head, d);
     set_matrix_data(k, k_data, n_kv*n_kv_head, d);
     set_matrix_data(v, v_data, n_kv*n_kv_head, d);
@@ -587,7 +609,27 @@ static std::vector<float> run_attached_tail_attention(
     for (int32_t i = 0; i < n_query; ++i) query_order_data[size_t(i)] = i;
     std::vector<int32_t> run_data(6 + n_tail + (packed_body ? n_kv : 0), -1);
     run_data[4] = int32_t(n_tail);
-    for (int32_t i = 0; i < n_tail; ++i) run_data[size_t(6 + i)] = i;
+    for (int32_t i = 0; i < n_tail; ++i) {
+        const int32_t slot = mask_case == tail_mask_case::visible ? i : (5*i + 3) % n_tail;
+        run_data[size_t(6 + i)] = slot;
+        for (int64_t iq = 0; iq < n_query; ++iq) {
+            const bool hidden = mask_case == tail_mask_case::tail_hidden ||
+                    mask_case == tail_mask_case::fully_hidden ||
+                    (mask_case == tail_mask_case::interleaved &&
+                     (slot % 3 == 0 || (iq % 2 != 0 && slot % 3 == 1)));
+            if (hidden) {
+                tail_mask_data[size_t(i + n_tail*iq)] = ggml_fp32_to_fp16(-INFINITY);
+            } else if (mask_case == tail_mask_case::interleaved && slot % 7 == 0) {
+                // A finite bias can also produce an exactly zero softmax weight.
+                tail_mask_data[size_t(i + n_tail*iq)] = ggml_fp32_to_fp16(-128.0f);
+            } else if (mask_case == tail_mask_case::interleaved && slot % 5 == 0) {
+                tail_mask_data[size_t(i + n_tail*iq)] = ggml_fp32_to_fp16(-0.5f);
+            }
+        }
+    }
+    if (mask_case == tail_mask_case::fully_hidden) {
+        std::fill(mask_data.begin(), mask_data.end(), ggml_fp32_to_fp16(-INFINITY));
+    }
     if (packed_body) {
         run_data[5] = int32_t(n_kv);
         for (int32_t i = 0; i < n_kv; ++i) run_data[size_t(6 + n_tail + i)] = i;
@@ -596,6 +638,10 @@ static std::vector<float> run_attached_tail_attention(
     ggml_backend_tensor_set(tail_mask, tail_mask_data.data(), 0, tail_mask_data.size()*sizeof(tail_mask_data[0]));
     ggml_backend_tensor_set(query_order, query_order_data.data(), 0, query_order_data.size()*sizeof(int32_t));
     ggml_backend_tensor_set(run_desc, run_data.data(), 0, run_data.size()*sizeof(int32_t));
+    if (lse) {
+        const std::vector<float> sentinel(ggml_nelements(lse), -7777.0f);
+        ggml_backend_tensor_set(lse, sentinel.data(), 0, ggml_nbytes(lse));
+    }
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
         fail("attached-tail graph compute failed");
     }
@@ -667,6 +713,37 @@ static void test_bounded_attached_tail_attention(ggml_backend_t gpu, ggml_backen
                 std::printf("Q4 tail D256 GQA24/4 nq=%lld segmented=%d lse=%d packed=%d maxO=%g maxLSE=%g\n",
                             (long long) c.nq, int(c.segmented), int(c.lse), int(c.packed), max_o, max_lse);
                 if (max_o > 0.01 || max_lse > 0.01) fail("Qwen35 Q4 tail differs from CPU oracle");
+    }
+
+    for (ggml_type tail_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (bool segmented : { false, true }) {
+            for (tail_mask_case mask_case : { tail_mask_case::interleaved,
+                                            tail_mask_case::tail_hidden,
+                                            tail_mask_case::fully_hidden }) {
+                // The CPU online oracle may multiply 0*NaN for a finite underflow;
+                // only the GPU receives NaNs in those otherwise identical rows.
+                const auto expected = run_attached_tail_attention(
+                        cpu, 3, GGML_TYPE_Q4_0, tail_type, segmented, true, true, true, mask_case);
+                const auto actual = run_attached_tail_attention(
+                        gpu, 3, GGML_TYPE_Q4_0, tail_type, segmented, true, true, true,
+                        mask_case, mask_case == tail_mask_case::interleaved);
+                if (actual.size() != expected.size()) fail("masked tail result size mismatch");
+                const size_t output_count = size_t(256*24*3);
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    if (mask_case == tail_mask_case::fully_hidden) {
+                        const float wanted = i < output_count ? 0.0f : -INFINITY;
+                        if (expected[i] != wanted || actual[i] != wanted) {
+                            fail("fully masked body and tail must produce zero O and negative-infinite LSE");
+                        }
+                    } else if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) ||
+                               std::abs(double(actual[i]) - expected[i]) > 0.01) {
+                        fail("masked tail O/LSE differs from CPU oracle or contains NaN");
+                    }
+                }
+                std::printf("masked tail type=%s segmented=%d case=%d O/LSE passed\n",
+                        ggml_type_name(tail_type), int(segmented), int(mask_case));
+            }
+        }
     }
 }
 

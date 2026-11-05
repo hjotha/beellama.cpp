@@ -262,10 +262,15 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
     __shared__ float reduction[256];
     __shared__ float tail_max_shared;
     __shared__ float tail_sum_shared;
+    __shared__ int active_tail_slots[max_tail];
+    __shared__ int active_tail_count;
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
+    for (int token = tid; token < n_tail; token += blockDim.x) {
+        active_tail_slots[token] = desc[6 + token];
+    }
     const int ih_k = ih/(n_head/n_head_k);
     const int ih_v = ih/(n_head/n_head_v);
     const float * qrow = reinterpret_cast<const float *>(
@@ -375,6 +380,16 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
     }
     if (tid == 0) {
         tail_sum_shared = reduction[0];
+        int count = 0;
+        for (int token = 0; token < n_tail; ++token) {
+            const float token_weight = scores[token];
+            if (token_weight != 0.0f) {
+                scores[count] = token_weight;
+                active_tail_slots[count] = active_tail_slots[token];
+                ++count;
+            }
+        }
+        active_tail_count = count;
     }
     __syncthreads();
 
@@ -395,19 +410,26 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
             size_t(iq)*dst_nb2 + size_t(is)*dst_nb3;
     for (int d = tid; d < d_v; d += blockDim.x) {
         float tail_acc = 0.0f;
-        for (int token = 0; token < n_tail; ++token) {
-            const float weight = scores[token];
-            if (weight == 0.0f) { continue; }
-            const int slot = desc[6 + token];
-            const bool from_current = vt_current && slot >= history_slots;
-            const int row = from_current ? slot - history_slots : slot;
-            const char * v_source = from_current ? vt_current : vt;
-            const TV vval = *reinterpret_cast<const TV *>(
-                    v_source +
-                    size_t(d)*(from_current ? vtc_nb0 : vt_nb0) +
-                    size_t(row)*(from_current ? vtc_nb1 : vt_nb1) +
-                    size_t(ih_v)*(from_current ? vtc_nb2 : vt_nb2));
-            tail_acc += tail_value_to_float(vval)*weight;
+        if (vt_current == nullptr) {
+            const char * v_base = vt + size_t(d)*vt_nb0 + size_t(ih_v)*vt_nb2;
+            for (int index = 0; index < active_tail_count; ++index) {
+                const TV vval = *reinterpret_cast<const TV *>(
+                        v_base + size_t(active_tail_slots[index])*vt_nb1);
+                tail_acc += tail_value_to_float(vval)*scores[index];
+            }
+        } else {
+            for (int index = 0; index < active_tail_count; ++index) {
+                const int slot = active_tail_slots[index];
+                const bool from_current = slot >= history_slots;
+                const int row = from_current ? slot - history_slots : slot;
+                const char * v_source = from_current ? vt_current : vt;
+                const TV vval = *reinterpret_cast<const TV *>(
+                        v_source +
+                        size_t(d)*(from_current ? vtc_nb0 : vt_nb0) +
+                        size_t(row)*(from_current ? vtc_nb1 : vt_nb1) +
+                        size_t(ih_v)*(from_current ? vtc_nb2 : vt_nb2));
+                tail_acc += tail_value_to_float(vval)*scores[index];
+            }
         }
         const float body_value = bv ? *reinterpret_cast<const float *>(brow + size_t(d)*sizeof(float)) : 0.0f;
         *reinterpret_cast<float *>(drow + size_t(d)*sizeof(float)) =

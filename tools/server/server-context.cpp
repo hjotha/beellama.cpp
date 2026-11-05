@@ -12539,9 +12539,8 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                         //    repeated scoring replays the same final batch shape.
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            // KVarN cuts follow physical compute, retaining the production
-                            // B256/UB256 seam (256/128/128) for logical parent512 too.
-                            // Ordinary alignment1 checkpoint cadence stays unchanged.
+                            // Reduced physical ubatches retain their KVarN seam;
+                            // otherwise use the ordinary logical-batch cadence.
                             bool should_break = false;
                             for (int offset : checkpoint_cadence.offsets) {
                                 if ((offset == 1 && !uses_mtp()) || (offset == 4 && uses_mtp())) {

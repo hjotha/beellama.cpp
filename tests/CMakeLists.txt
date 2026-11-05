@@ -241,6 +241,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-cuda-graph-chunk-transaction PROPERTY LABELS main)
 
     add_test(
+        NAME test-cuda-fa-metadata-policy
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cuda-fa-metadata-policy.py)
+    set_property(TEST test-cuda-fa-metadata-policy PROPERTY LABELS main)
+
+    add_test(
         NAME test-kvarn-port-safety-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-port-safety-static.py)

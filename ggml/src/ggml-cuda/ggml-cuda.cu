@@ -2800,8 +2800,22 @@ static bool ggml_cuda_flash_attn_validation_ok(int device, const ggml_tensor * n
     if (!node->src[0] || !node->src[1] || !node->src[2]) return false;
     bool has_tail_operand = false;
     for (int i = 5; i < GGML_MAX_SRC; ++i) has_tail_operand |= node->src[i] != nullptr;
-    const bool complete_tail = node->src[5] && node->src[6] && node->src[7] && node->src[8] && node->src[9];
-    return (!has_tail_operand || complete_tail) && ggml_cuda_flash_attn_ext_supported(device, node);
+    const bool complete_tail = node->src[5] && node->src[6] && node->src[7] && node->src[8] && node->src[9] &&
+        ((node->src[10] == nullptr) == (node->src[11] == nullptr));
+    bool has_non_metadata_operand = false;
+    for (int i = 5; i < GGML_MAX_SRC; ++i) {
+        if (i != 8 && node->src[i]) has_non_metadata_operand = true;
+    }
+    const ggml_tensor * meta = node->src[8];
+    const ggml_tensor * q = node->src[0];
+    // Standalone KVarN bodies may publish (max, denominator) in src[8].
+    const bool metadata_only = meta && !has_non_metadata_operand && meta->data &&
+        meta->type == GGML_TYPE_F32 && meta->ne[0] == 2 && meta->ne[1] == q->ne[2] &&
+        meta->ne[2] == q->ne[1] && meta->ne[3] == q->ne[3] && ggml_is_contiguous(meta) &&
+        ggml_cuda_flash_attn_ext_kvarn_uses_views(node);
+    // The support predicate also verifies that both K and V are valid KVarN views.
+    return (!has_tail_operand || complete_tail || metadata_only) &&
+        ggml_cuda_flash_attn_ext_supported(device, node);
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
