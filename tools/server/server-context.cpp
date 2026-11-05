@@ -11599,12 +11599,33 @@ private:
                                             if (slot_was_restored) {
                                                 SLT_WRN(slot, "%s", "target-only snapshot restore discarded; no valid MTP/checkpoint suffix was available, falling back to cold prefill\n");
                                             }
+                                            bool retry_native_snapshot = false;
+                                            if (!slot_was_restored && native_auto_restore_enabled() && prompt_cache &&
+                                                    !slot.bootstrap_cold_fallback && slot.task->need_sampling() &&
+                                                    slot.task->params.cache_prompt && !slot.task->is_stateless() &&
+                                                    slot.task->n_tokens_shared == 0 && !input_tokens.has_media() &&
+                                                    slot.alora_invocation_start <= 0 &&
+                                                    are_lora_equal(slot.lora, params_base.lora_adapters)) {
+                                                const auto candidate = auto_index_lookup(input_tokens.get_text_tokens(), true);
+                                                retry_native_snapshot = candidate && candidate->native_candidate;
+                                            }
                                             if (!slot.mem.seq_rm(slot.id, -1, -1)) {
                                                 SLT_ERR(slot, "%s", "failed to clear memory before cold prefill; aborting request\n");
                                                 fail_slot(slot, "failed to clear memory before cold prefill");
                                                 return;
                                             }
                                             common_speculative_set_state(spec.get(), slot.id, {});
+                                            if (retry_native_snapshot) {
+                                                slot.prompt_reset_after_memory_clear();
+                                                std::string native_error;
+                                                if (native_stream_eligible(*slot.task, slot, false, native_error, true)) {
+                                                    SLT_INF(slot, "%s", "retrying prompt from a compatible native snapshot after clearing the live context\n");
+                                                    slot.stats = {};
+                                                    slot.state = SLOT_STATE_STARTED;
+                                                    slot.i_batch = -1;
+                                                    return;
+                                                }
+                                            }
                                             SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                     "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                             pos_next = 0;
