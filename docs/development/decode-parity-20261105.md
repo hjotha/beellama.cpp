@@ -1,5 +1,17 @@
 # Investigação da diferença de decode entre fork e BeeLlama oficial — 2026-11-05
 
+## MTP e limites de contexto promovidos após a investigação
+
+Em 2026-11-05, foi promovido o preset `/home/hjotha/router-production-kvarn4-e4-draft-kvarn4-20261105.ini`: S passou de 32.768 para 36.864 tokens e `p-min` de 0,65 para 0,80; M passou de 45.056 para 56.320 e `p-min` de 0,60 para 0,70; L passou de 58.368 para 75.776 e manteve `p-min` 0,65. `profit` permaneceu desligado. O processo de produção confirmou os argumentos, inferência e S → M → L → S; `/health` e `/metrics` responderam. O backup anterior ao deploy está em `/home/hjotha/.codex/artifacts/mtp-parity-tuning-20261105/promotion/preset-before.ini`, e a validação em `promotion/result.json` sob o mesmo diretório.
+
+O controlador `profit` suporta MTP nesta árvore e ajusta a profundidade máxima de draft; ele não ajusta `p-min`. Em uma rodada com três prompts e 256 tokens, seus resultados não mostraram vantagem consistente. Para os primeiros 128 tokens de três prompts, os IDs do fork e do oficial foram idênticos; os aceites foram 48/48, 87/86 e 85/84, respectivamente. Em 512 tokens, as trajetórias divergiram e as contagens variaram nos dois sentidos. Dados em `/home/hjotha/.codex/artifacts/mtp-parity-tuning-20261105/parity-results.json` e `common-prefix/parity-results.json`.
+
+Em três prompts com 512 tokens, os logs preservados mostram no S 24,96/25,92/25,40 tokens/s com 0,65 e 27,60/26,32/26,12 com 0,80; controles e candidato foram repetidos. No M, 0,70 foi superior ao controle nos três prompts dessa rodada, com resultados repetidos de 26,83/30,47/27,12 tokens/s. Esses ganhos dependem da carga. Os logs sobreviventes estão em `tuning-preserved/` sob o diretório de artefatos. Um erro no script reutilizou o diretório de saída e sobrescreveu parte dos logs e JSONs das rodadas anteriores, inclusive o controle consolidado do M; os valores apresentados ao usuário para esses ensaios vieram das saídas dos comandos, mas o arquivo original já não está disponível. A pedido do usuário, a promoção foi feita sem repetir a matriz inteira.
+
+Com a configuração candidata, requisições isoladas de contexto máximo menos 1.024 tokens e 1.024 de saída passaram com amostragem de VRAM a cada 100 ms. S em 36.864 teve mínimo de 69 MiB em duas rodadas; M em 56.320 teve 59 MiB; L em 75.776 terminou com 61 MiB, com mínimo de 59 MiB durante a transição desde M. As sequências S → M → L → S foram verificadas em duas combinações de limites; os limites finais de M e L passaram juntos, com volta ao S final. Não houve aviso de desativação de CUDA graphs nessas rodadas. Evidências em `vram-expanded-2/` e `vram-expanded-4/` no diretório de artefatos acima. Os ensaios isolados desativaram o auto-restore de snapshots; a verificação posterior de produção usou requisições curtas.
+
+O ensaio S em 40.960 chegou a 9 MiB livres e desabilitou CUDA graphs; foi interrompido e descartado. L em 81.920, após M cheio, chegou a 3 MiB, desabilitou CUDA graphs e falhou com OOM; foi descartado. Evidências em `vram-expanded-final/` e `vram-expanded-1-preserved/`.
+
 ## Objetivo e estado das conclusões
 
 Investigar por que o decode com MTP do fork é mais lento que o BeeLlama oficial na RTX 4070, sem sacrificar qualidade, rollback, transições de tier ou o funcionamento do Xbox. O `main` usado como base é `4bad0205c`, após o merge do upstream `4260165a9`. Os experimentos foram feitos em builds isoladas; o estado das mudanças promovidas está registrado abaixo.
