@@ -4278,6 +4278,7 @@ int main() {
     if (std::getenv("GGML_RKVA_FLEX_TAIL_TEST_ONLY")) {
         for (bool tail_from_env : {false, true}) {
             storage_env tail_env(tail_from_env ? "129" : nullptr, "GGML_RKVA_NATIVE_TAIL_TOKENS");
+            storage_env format("kvarn4", "GGML_RKVA_UPLOAD_FORMAT");
             loopback old_server(false, true, false, false, false, false, 0, 0, true, 3u | 4u | 512u);
             auto * backend = ggml_backend_remote_attn_init("127.0.0.1", old_server.port);
             ggml_remote_attn_geometry geometry{};
@@ -4291,11 +4292,25 @@ int main() {
         }
         {
             storage_env bad_tail("-1", "GGML_RKVA_NATIVE_TAIL_TOKENS");
+            storage_env format("kvarn4", "GGML_RKVA_UPLOAD_FORMAT");
             auto * backend = ggml_backend_remote_attn_init("127.0.0.1", 9);
             ggml_remote_attn_geometry geometry{};
             geometry.max_ctx = 512;
             assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
             assert(!ggml_backend_remote_attn_connect(backend));
+            ggml_backend_free(backend);
+        }
+        {
+            storage_env tail_env("129", "GGML_RKVA_NATIVE_TAIL_TOKENS");
+            storage_env format("q4_0", "GGML_RKVA_UPLOAD_FORMAT");
+            loopback old_server(false, true, false, false, false, false, 0, 0, true, 3u | 4u | 512u);
+            auto * backend = ggml_backend_remote_attn_init("127.0.0.1", old_server.port);
+            ggml_remote_attn_geometry geometry{};
+            geometry.n_layer_remote = 2; geometry.n_head = 2; geometry.n_head_kv = 1;
+            geometry.head_dim = 256; geometry.max_ctx = 512; geometry.kq_scale = 0.0625f;
+            geometry.group_tokens = 128; geometry.sinkhorn_iters = 3;
+            assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+            assert(ggml_backend_remote_attn_connect(backend));
             ggml_backend_free(backend);
         }
         for (uint32_t tail : {1u, 127u, 129u, 257u, 511u}) test_native_snapshot_transport(true, tail);

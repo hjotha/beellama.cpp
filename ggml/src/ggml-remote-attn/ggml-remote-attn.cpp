@@ -3840,7 +3840,12 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         GGML_LOG_ERROR("%s: geometry not set before connect\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
-    if (ctx->native_tail_override == UINT32_MAX) {
+    const char * requested_storage = std::getenv("GGML_RKVA_UPLOAD_FORMAT");
+    if (!requested_storage) requested_storage = std::getenv("GGML_RKVA_FORMAT");
+    if (!requested_storage) requested_storage = std::getenv("GGML_RKVA_RANGE_STORAGE");
+    const bool env_native_kvarn = requested_storage &&
+            (!std::strcmp(requested_storage, "kvarn4") || !std::strcmp(requested_storage, "kvarn"));
+    if (ctx->native_tail_override == UINT32_MAX && env_native_kvarn) {
         if (const char * tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS")) {
             if (!*tail || !std::all_of(tail, tail + std::strlen(tail), [](unsigned char c) {
                     return c >= '0' && c <= '9';
