@@ -746,5 +746,9 @@ selects zero. A peer must negotiate flexible tails before accepting lengths
 other than zero or 128. Sizes above the context are equivalent to the context
 size, and available memory still applies. Existing native snapshot size and
 store quotas also apply; they are independent of tail admission.
+Native paired snapshots can rotate registered, unpinned old pairs when
+`GGML_RKVA_NATIVE_ROTATE_SINGLE_OWNER=1` is set and the Xbox peer negotiates
+store management. This opt-in assumes no other store or host refers to the
+same remote keys; unknown entries and pending entries with host files remain protected.
 
 Dense Ada Q2_K matmuls keep the serial per-32 activation scaling through query batches 5–8 by choosing MMVQ. `GGML_CUDA_Q2_K_MMVQ=0` restores the previous performance routing for profiling; other query sizes, weight formats and architectures keep their existing policy. The experimental zero-tail target also limits local MTP verification at KVarN group seals, while frozen local history after P needs no such limit.

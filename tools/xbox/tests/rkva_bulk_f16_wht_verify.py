@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline DXIL regression for the F16 wire's exact CPU-WHT query contract.
+"""Offline DXIL regression for exact CPU-WHT query arithmetic.
 
 No GPU or socket is opened. DXC only disassembles the shipping header/blob.
 The GPU serial/bulk probe remains the numerical OUT/LSE oracle.
@@ -13,9 +13,9 @@ import subprocess
 import tempfile
 
 
-def verify(assembly):
-    if not re.search(r"define void @CSBulkUnpackQF16\(", assembly):
-        raise ValueError("not the CSBulkUnpackQF16 entry point")
+def verify(assembly, entry="CSBulkUnpackQF16"):
+    if not re.search(r"define void @" + re.escape(entry) + r"\(", assembly):
+        raise ValueError("not the " + entry + " entry point")
     arithmetic = [line.strip() for line in assembly.splitlines()
                   if re.search(r"= (?:fadd|fsub|fmul|fdiv)\b", line)]
     if any(re.search(r"\b(?:fast|reassoc|contract|afn)\b", line) for line in arithmetic):
@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--shader", type=Path, default=Path(__file__).resolve().parents[1] /
                         "shaders/generated/rkva_range_bulk_unpack_q_f16_dxil.h",
                         help="shipping generated header or compiled .dxil blob")
+    parser.add_argument("--entry", default="CSBulkUnpackQF16", help="DXIL entry point")
     args = parser.parse_args()
     data = args.shader.read_bytes()
     if args.shader.suffix == ".h":
@@ -51,7 +52,7 @@ def main():
             blob.write_bytes(data)
             dumped = subprocess.run([args.dxc, "-dumpbin", str(blob)], check=True,
                                     capture_output=True, text=True)
-        checks = verify(dumped.stdout)
+        checks = verify(dumped.stdout, args.entry)
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
         parser.exit(1, "FAIL: " + str(error) + "\n")
     print(json.dumps(dict(ok=True, shader=str(args.shader), sha256=hashlib.sha256(data).hexdigest(),

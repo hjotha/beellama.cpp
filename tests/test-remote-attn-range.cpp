@@ -14,6 +14,7 @@
 #undef NDEBUG
 #include <cassert>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -65,6 +66,8 @@ struct loopback {
     rkva_snapshot::Digest native_snapshot_hash{};
     uint64_t native_snapshot_generation = 0;
     uint32_t native_snapshot_rows = 0;
+    std::vector<std::array<uint8_t, 32>> native_store_keys;
+    bool native_store_bad_status = false;
     std::vector<rkva_range_profile> profile_controls;
     bool profile_enabled = false;
     uint32_t kernel_mode = 0;
@@ -133,6 +136,10 @@ struct loopback {
     }
     // profile_support bits: 1 = capability, 2 = operation. Both are required.
     explicit loopback(bool old_version = false, bool range_ops = true, bool native_q4 = false, bool force_f16 = false, bool native_q8 = false, bool fused_range = false, uint32_t profile_support = 0, uint32_t format_kernels = 0, bool native_kvarn = false, uint32_t native_rewind_support = 0) {
+        if (native_rewind_support & 8192) {
+            std::array<uint8_t, 32> a{}, b{}; a.fill(0x11); b.fill(0x22);
+            native_store_keys = {a, b};
+        }
         listener = socket(AF_INET, SOCK_STREAM, 0);
         assert(listener >= 0);
         sockaddr_in address {}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -279,6 +286,8 @@ struct loopback {
                             }
                             if ((geometry.proto_flags & RKVA_PROTO_KVARN_FLEX_TAIL) &&
                                 (native_rewind_support & 4096)) ack.reserved[0] |= RKVA_CAP_KVARN_FLEX_TAIL;
+                            if ((geometry.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_STORE) &&
+                                (native_rewind_support & 8192)) ack.reserved[0] |= RKVA_CAP_NATIVE_SNAPSHOT_STORE;
                             if (profile_support & 1) ack.reserved[0] |= RKVA_CAP_RANGE_PROFILE;
                             response.resize(sizeof(ack)); std::memcpy(response.data(), &ack, sizeof(ack));
                         } break;
@@ -340,6 +349,36 @@ struct loopback {
                                     native_counts[il] = plan.layers[il].new_live;
                                     native_ready[il] = native_counts[il] != 0;
                                 }
+                            }
+                        } break;
+                        case RKVA_NATIVE_SNAPSHOT_STORE: {
+                            assert((native_rewind_support & 8192) && req.session_id == RKVA_SESSION_NONE);
+                            rkva_native_store_request request{};
+                            assert(payload.size() >= sizeof(request));
+                            std::memcpy(&request, payload.data(), sizeof(request));
+                            assert(request.keys <= 64 && payload.size() == sizeof(request) + size_t(request.keys) * 32);
+                            const uint8_t * keys = payload.data() + sizeof(request);
+                            if (request.action == 1) {
+                                assert(request.keys == 1);
+                                native_store_keys.erase(std::remove_if(native_store_keys.begin(), native_store_keys.end(),
+                                    [&](const auto & key) { return !std::memcmp(key.data(), keys, 32); }), native_store_keys.end());
+                            } else if (request.action == 2 || request.action == 3) {
+                                assert(request.keys == 1);
+                            } else {
+                                assert(request.action == 0);
+                                std::vector<rkva_native_store_match> matches;
+                                for (const auto & stored : native_store_keys)
+                                    for (uint32_t i = 0; i < request.keys; ++i)
+                                        if (!std::memcmp(stored.data(), keys + size_t(i) * 32, 32))
+                                            matches.push_back({i, 0, 100});
+                                if (native_store_bad_status && matches.size() > 1)
+                                    matches[1].key_index = matches[0].key_index;
+                                const rkva_native_store_status status{100 * (native_store_keys.size() + 1),
+                                    1000, uint32_t(native_store_keys.size() + 1), 8, uint32_t(matches.size()), 0};
+                                response.resize(sizeof(status) + matches.size() * sizeof(rkva_native_store_match));
+                                std::memcpy(response.data(), &status, sizeof(status));
+                                if (!matches.empty()) std::memcpy(response.data() + sizeof(status), matches.data(),
+                                                                  matches.size() * sizeof(rkva_native_store_match));
                             }
                         } break;
                         case RKVA_SNAPSHOT_SAVE:
@@ -1390,7 +1429,8 @@ static void test_native_rewind() {
 // trailer, restore, continue, and rewind. This exercises the real request/ACK
 // parser and the staged owner commit over TCP; the Xbox disk codec remains in
 // the MSVC/D3D12 build.
-static void test_native_snapshot_transport(bool e4 = false, uint32_t tail = 128, bool tail_from_env = false) {
+static void test_native_snapshot_transport(bool e4 = false, uint32_t tail = 128,
+                                           bool tail_from_env = false, bool store_test = false) {
     storage_env native("kvarn4");
     storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
@@ -1404,7 +1444,8 @@ static void test_native_snapshot_transport(bool e4 = false, uint32_t tail = 128,
     storage_env snapshots("1", "GGML_RKVA_DISK_SNAPSHOTS");
     ggml_backend_load_all();
     loopback server(false, true, false, false, false, false, 0, 0, true,
-                    3u | 4u | 512u | 4096u | (e4 ? 8u | 16u | 32u | 2048u : 0u));
+                    3u | 4u | 512u | 4096u | (e4 ? 8u | 16u | 32u | 2048u : 0u) |
+                    (store_test ? 8192u : 0u));
     auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
     ggml_remote_attn_geometry geometry {};
     geometry.n_layer_remote = 2; geometry.n_head = 2; geometry.n_head_kv = 1;
@@ -1448,6 +1489,30 @@ static void test_native_snapshot_transport(bool e4 = false, uint32_t tail = 128,
     };
     for (uint32_t live = 2; live <= 130; live += 2) { run(live, 0); run(live, 1); }
     assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
+
+    {
+        std::array<uint8_t, 96> keys{};
+        std::fill_n(keys.data(), 32, 0x22); std::fill_n(keys.data() + 32, 32, 0x11);
+        std::fill_n(keys.data() + 64, 32, 0x33);
+        ggml_remote_native_store_info info{};
+        if (!store_test) {
+            assert(!ggml_backend_remote_attn_native_store_status(backend, keys.data(), 3, &info));
+        } else {
+            assert(ggml_backend_remote_attn_native_store_status(backend, keys.data(), 3, &info));
+            assert(info.objects == 3 && info.used_bytes == 300 && info.matches == 2);
+            assert(info.match[0].key_index == 1 && info.match[1].key_index == 0);
+            assert(info.incoming_bytes > (1u << 20));
+            { std::lock_guard<std::mutex> lock(server.mutex); server.native_store_bad_status = true; }
+            assert(!ggml_backend_remote_attn_native_store_status(backend, keys.data(), 3, &info));
+            { std::lock_guard<std::mutex> lock(server.mutex); server.native_store_bad_status = false; }
+            assert(ggml_backend_remote_attn_native_store_verify(backend, keys.data(), false));
+            assert(ggml_backend_remote_attn_native_store_verify(backend, keys.data(), true));
+            assert(ggml_backend_remote_attn_native_store_retire(backend, keys.data()));
+            assert(ggml_backend_remote_attn_native_store_retire(backend, keys.data()));
+            assert(ggml_backend_remote_attn_native_store_status(backend, keys.data(), 3, &info));
+            assert(info.objects == 2 && info.matches == 1 && info.match[0].key_index == 1);
+        }
+    }
 
     std::vector<uint8_t> owner_state;
     uint8_t owner_key[32] = {};
@@ -4315,6 +4380,7 @@ int main() {
         }
         for (uint32_t tail : {1u, 127u, 129u, 257u, 511u}) test_native_snapshot_transport(true, tail);
         test_native_snapshot_transport(true, 129, true);
+        test_native_snapshot_transport(true, 257, false, true);
         std::puts("PASS: flexible native tail negotiation and snapshot transport");
         return 0;
     }

@@ -25,6 +25,28 @@ static bool rejected(const Fn & fn) {
 static void write(const fs::path & p, const std::string & s) {
     std::ofstream f(p, std::ios::binary); f << s; assert(f.good());
 }
+static void write_native_object(const fs::path & object, uint8_t key_byte) {
+    using namespace rkva_native_snapshot;
+    const Geometry geometry{1, 1, 256, 2, 128, 1};
+    const Descriptor descriptor{1024, 128, RKVA_RANGE_STORAGE_KVARN4, 3, 128, 128, 256, 2,
+                                4, 4, 8960, 3, 2, 128, 0, 1, 1, 1};
+    const std::vector<LayerCoverage> coverage{{0, 0, 0, 1}};
+    std::array<uint8_t, 32> key{}; key.fill(key_byte);
+    Manifest manifest; std::string error;
+    assert(build(geometry, descriptor, 1, 0x100000001ull, key.data(), coverage, manifest, &error));
+    for (size_t i = 0; i < manifest.chunks.size(); ++i) {
+        std::vector<uint8_t> data(manifest.chunks[i].bytes, uint8_t(i + 1));
+        manifest.chunks[i].digest = rkva_snapshot::digest(data.data(), data.size());
+        std::ofstream file(object / ("n-" + std::to_string(i) + ".kv"), std::ios::binary);
+        file.write(reinterpret_cast<const char *>(data.data()), std::streamsize(data.size()));
+        assert(file.good());
+    }
+    std::vector<uint8_t> encoded;
+    assert(encode(manifest, encoded, &error));
+    std::ofstream file(object / "manifest-v2.bin", std::ios::binary);
+    file.write(reinterpret_cast<const char *>(encoded.data()), std::streamsize(encoded.size()));
+    assert(file.good());
+}
 #ifdef _WIN32
 static DWORD run_child(const fs::path & root, const char * operation) {
     char exe[32768];
@@ -148,6 +170,45 @@ int main(int argc, char ** argv) {
         fs::create_directory(stage / "unexpected");
         assert(rejected([&] { store::check_room(root, 1, 100, 100, 8, 10); }));
         fs::remove(stage / "unexpected");
+        fs::remove(published / "n-0.kv");
+        write_native_object(published, 0xaa);
+        const auto now = fs::file_time_type::clock::now();
+        fs::last_write_time(published, now - std::chrono::seconds(10));
+        fs::last_write_time(stage, now);
+        const auto entries = store::inspect(root, 1u << 20, 8);
+        assert(entries.size() == 2 && entries[0].name == key1 && entries[0].published);
+        assert(entries[1].name == "tmp-" + key2 && !entries[1].published);
+        const auto verified = store::plan_retirement(root, key1, 1u << 20, 8, false);
+        assert(verified.present && verified.files.size() == 3 && fs::exists(published / "n-0.kv"));
+        assert(rejected([&] { store::erase_published(root, "tmp-" + key2, 1u << 20, 8); }));
+        assert(rejected([&] { (void) store::plan_retirement(root, std::string(64, 'd'), 1u << 20, 8, false); }));
+        store::erase_published(root, std::string(64, 'd'), 1u << 20, 8);
+        write(published / "unrelated", "preserve");
+        assert(rejected([&] { store::erase_published(root, key1, 1u << 20, 8); }));
+        assert(fs::exists(published / "n-0.kv") && fs::exists(published / "unrelated"));
+        fs::remove(published / "unrelated");
+        {
+            std::fstream file(published / "n-0.kv", std::ios::binary | std::ios::in | std::ios::out);
+            file.put(char(99)); assert(file.good());
+        }
+        assert(rejected([&] { store::erase_published(root, key1, 1u << 20, 8); }));
+        assert(fs::exists(published / "manifest-v2.bin"));
+        {
+            std::fstream file(published / "n-0.kv", std::ios::binary | std::ios::in | std::ios::out);
+            file.put(char(1)); assert(file.good());
+        }
+#ifndef _WIN32
+        fs::create_symlink(stage / "n-0.kv", published / "link");
+        assert(rejected([&] { store::erase_published(root, key1, 1u << 20, 8); }));
+        assert(fs::exists(published / "n-0.kv"));
+        fs::remove(published / "link");
+#endif
+        fs::remove(published / "n-0.kv"); // a previous interrupted retirement
+        assert(rejected([&] { (void) store::plan_retirement(root, key1, 1u << 20, 8, false); }));
+        assert(store::plan_retirement(root, key1, 1u << 20, 8, true).present);
+        store::erase_published(root, key1, 1u << 20, 8);
+        assert(!fs::exists(published) && fs::file_size(stage / "n-0.kv") == 5);
+        store::erase_published(root, key1, 1u << 20, 8);
     }
     fs::remove_all(root);
     std::cout << "native filesystem quota, preserved staging and writer exclusion: PASS\n";

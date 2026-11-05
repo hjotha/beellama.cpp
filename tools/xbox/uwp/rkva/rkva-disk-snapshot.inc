@@ -13,9 +13,9 @@ namespace rkva_snapshot {
 namespace fs = std::filesystem;
 constexpr uint64_t chunk_bytes = 8ull << 20;
 constexpr uint64_t snapshot_limit = 4ull << 30;
-constexpr uint64_t store_limit = 8ull << 30;
+constexpr uint64_t store_limit = rkva_native_store::byte_limit;
 constexpr size_t retained_snapshots = 4;
-constexpr size_t native_retained_snapshots = 8;
+constexpr size_t native_retained_snapshots = rkva_native_store::object_count_limit;
 constexpr uint32_t max_chunks = 4096;
 #pragma pack(push, 1)
 struct Header {

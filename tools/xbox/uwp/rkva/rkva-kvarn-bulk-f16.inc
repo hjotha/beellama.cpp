@@ -21,6 +21,15 @@
     #define RKVA_HAS_BULK_FP8_DXIL 0
 #endif
 
+#if __has_include("rkva_range_bulk_unpack_q_e4m3fn_dxil.h") && \
+                  __has_include("rkva_range_bulk_pack_out_e4m3fn_dxil.h")
+    #include "rkva_range_bulk_pack_out_e4m3fn_dxil.h"
+    #include "rkva_range_bulk_unpack_q_e4m3fn_dxil.h"
+    #define RKVA_HAS_BULK_E4_DXIL 1
+#else
+    #define RKVA_HAS_BULK_E4_DXIL 0
+#endif
+
 bool RemoteAttnEngine::ensure_bulk_fp8_gpu_pipelines() {
     if (!ready_ || unconfirmed_submission_ || terminal_failure_ || bulk_recording_)
         return false;
@@ -51,6 +60,39 @@ bool RemoteAttnEngine::ensure_bulk_fp8_gpu_pipelines() {
     return true;
 #else
     bulk_fp8_status_ = "DXIL unavailable; CPU fallback";
+    return false;
+#endif
+}
+
+bool RemoteAttnEngine::ensure_bulk_e4_gpu_pipelines() {
+    if (!ready_ || unconfirmed_submission_ || terminal_failure_ || bulk_recording_)
+        return false;
+    if (bulk_e4_status_ != "not initialized")
+        return bool(bulk_unpack_q_e4_pso_) && bool(bulk_pack_out_e4_pso_);
+#if RKVA_HAS_BULK_E4_DXIL
+    if (!device_ || !range_reduce_root_) {
+        bulk_e4_status_ = "range root/device unavailable; CPU fallback";
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = range_reduce_root_.Get();
+    pso.CS = {g_rkva_range_bulk_unpack_q_e4m3fn_dxil, sizeof(g_rkva_range_bulk_unpack_q_e4m3fn_dxil)};
+    HRESULT hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&bulk_unpack_q_e4_pso_));
+    if (SUCCEEDED(hr)) {
+        pso.CS = {g_rkva_range_bulk_pack_out_e4m3fn_dxil, sizeof(g_rkva_range_bulk_pack_out_e4m3fn_dxil)};
+        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&bulk_pack_out_e4_pso_));
+    }
+    if (FAILED(hr)) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "E4 PSO 0x%08X; CPU fallback", unsigned(hr));
+        bulk_e4_status_ = text;
+        bulk_unpack_q_e4_pso_.Reset(); bulk_pack_out_e4_pso_.Reset();
+        return false;
+    }
+    bulk_e4_status_ = "ready: E4M3FN Q unpack and F32->F16->E4M3FN OUT pack";
+    return true;
+#else
+    bulk_e4_status_ = "DXIL unavailable; CPU fallback";
     return false;
 #endif
 }
@@ -120,7 +162,8 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
         return ::fail(error, "native bulk f16: invalid wire");
     if (wire != RKVA_WIRE_F16 && wire != RKVA_WIRE_FP8 && wire != RKVA_WIRE_FP8_E4M3FN)
         return ::fail(error, "native bulk f16: unsupported wire format");
-    if (fp8_gpu && (wire != RKVA_WIRE_FP8 || !ensure_bulk_fp8_gpu_pipelines()))
+    if (fp8_gpu && (wire == RKVA_WIRE_FP8_E4M3FN ? !ensure_bulk_e4_gpu_pipelines() :
+                    wire != RKVA_WIRE_FP8 || !ensure_bulk_fp8_gpu_pipelines()))
         return ::fail(error, "native bulk fp8: GPU codec unavailable/invalid input wire");
     envelope.wire = wire;
     envelope.fp8_gpu = fp8_gpu;
@@ -284,7 +327,8 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
                 const uint32_t unpack_params[4] = {q_pairs, segment.n_queries, 0u, 0u};
                 transition(transfer.query_f32_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 cmd_->SetComputeRootSignature(range_reduce_root_.Get());
-                cmd_->SetPipelineState(fp8_gpu ? bulk_unpack_q_fp8_pso_.Get()
+                cmd_->SetPipelineState(fp8_gpu ? (wire == RKVA_WIRE_FP8_E4M3FN ? bulk_unpack_q_e4_pso_.Get()
+                                                                                 : bulk_unpack_q_fp8_pso_.Get())
                                                : bulk_unpack_q_f16_pso_.Get());
                 cmd_->SetComputeRoot32BitConstants(0, 4, unpack_params, 0);
                 cmd_->SetComputeRootShaderResourceView(
@@ -314,7 +358,8 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
                 transition(range_output_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 transition(transfer.packed_out_f16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 cmd_->SetComputeRootSignature(range_reduce_root_.Get());
-                cmd_->SetPipelineState(fp8_gpu ? bulk_pack_out_fp8_pso_.Get()
+                cmd_->SetPipelineState(fp8_gpu ? (wire == RKVA_WIRE_FP8_E4M3FN ? bulk_pack_out_e4_pso_.Get()
+                                                                                 : bulk_pack_out_fp8_pso_.Get())
                                                : bulk_pack_out_f16_pso_.Get());
                 cmd_->SetComputeRoot32BitConstants(0, 4, pack_params, 0);
                 cmd_->SetComputeRootShaderResourceView(
@@ -451,7 +496,7 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
             for (uint32_t g = 0; g < groups; ++g) {
                 uint32_t status;
                 std::memcpy(&status, packed + q_elems + lse_bytes + uint64_t(g) * 4, 4);
-                if (status) {
+                if (!rkva_kvarn_bulk::fp8_gpu_status_valid(status, wire == RKVA_WIRE_FP8_E4M3FN)) {
                     finite_ok = false;
                     break;
                 }
@@ -486,7 +531,11 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
             std::memcpy(dst_lse, static_cast<const uint8_t*>(mapped) + q_f32_bytes, lse_bytes);
         }
         if (finite_ok && wire == RKVA_WIRE_FP8_E4M3FN) {
-            finite_ok = rkva_kvarn_bulk::e4_f16_prefix_results_valid(dst_out, dst_lse,
+            finite_ok = fp8_gpu
+                ? rkva_kvarn_bulk::e4_fp8_prefix_results_valid(out_fp8 + row * geo_.n_head * 256, dst_lse,
+                    data + segments[i].positions_offset, segments[i].n_queries, geo_.n_head, 256,
+                    s->range_descriptor.origin)
+                : rkva_kvarn_bulk::e4_f16_prefix_results_valid(dst_out, dst_lse,
                     data + segments[i].positions_offset, segments[i].n_queries, geo_.n_head, 256,
                     s->range_descriptor.origin);
         } else {
@@ -525,7 +574,10 @@ bool RemoteAttnEngine::probe_bulk_fp8_pack(const uint8_t* data, size_t bytes,
     rkva_bulk_fp8::ProbeLayout layout;
     if (!rkva_bulk_fp8::validate_probe(data, bytes, layout))
         return ::fail(error, "bulk fp8 pack probe: invalid bounded payload");
-    if (!ensure_bulk_fp8_gpu_pipelines() || bulk_recording_)
+    rkva_probe_req request{};
+    std::memcpy(&request, data, sizeof(request));
+    const bool e4 = request.probe_id == 6;
+    if (!(e4 ? ensure_bulk_e4_gpu_pipelines() : ensure_bulk_fp8_gpu_pipelines()) || bulk_recording_)
         return ::fail(error, "bulk fp8 pack probe: unavailable or busy");
     if ((bulk_probe_upload_.bytes < layout.source_bytes &&
          !create_buffer(layout.source_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
@@ -550,7 +602,7 @@ bool RemoteAttnEngine::probe_bulk_fp8_pack(const uint8_t* data, size_t bytes,
     transition(bulk_probe_packed_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const uint32_t params[4] = {layout.elements / 2, layout.heads, 0, 0};
     cmd_->SetComputeRootSignature(range_reduce_root_.Get());
-    cmd_->SetPipelineState(bulk_pack_out_fp8_pso_.Get());
+    cmd_->SetPipelineState(e4 ? bulk_pack_out_e4_pso_.Get() : bulk_pack_out_fp8_pso_.Get());
     cmd_->SetComputeRoot32BitConstants(0, 4, params, 0);
     cmd_->SetComputeRootShaderResourceView(1, bulk_probe_upload_.resource->GetGPUVirtualAddress());
     cmd_->SetComputeRootUnorderedAccessView(2, bulk_probe_packed_.resource->GetGPUVirtualAddress());

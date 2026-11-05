@@ -10,6 +10,9 @@
 // Pure, bounded admission. No live metadata or GPU resource is changed until
 // every segment has passed descriptor, coverage, size and finite-query checks.
 namespace rkva_kvarn_bulk {
+inline bool fp8_gpu_status_valid(uint32_t status, bool e4) {
+    return status == 0 || (e4 && status == 2);
+}
 // The FP8 pack shader reports every non-finite LSE. Negative infinity is
 // nevertheless the defined result for a query with no visible remote rows.
 // Validate against the original positions before accepting that status.
@@ -49,6 +52,27 @@ inline bool e4_f16_prefix_results_valid(const uint16_t* out, const float* lse,
                 if ((out[uint64_t(q) * width + d] & 0x7fffu) != 0) return false;
             }
         }
+    }
+    return true;
+}
+
+// The pack shader validates finite OUT; empty prefixes additionally require
+// zero packed OUT and negative-infinity LSE.
+inline bool e4_fp8_prefix_results_valid(const uint8_t* out, const float* lse,
+        const uint8_t* positions, uint32_t n_queries, uint32_t n_heads, uint32_t dimension,
+        uint32_t origin) {
+    if (!out || !lse || !positions || !n_queries || n_queries > 9 ||
+            !n_heads || n_heads > 256 || dimension != 256) return false;
+    const uint64_t width = uint64_t(n_heads) * dimension;
+    for (uint32_t q = 0; q < n_queries; ++q) {
+        int32_t position;
+        std::memcpy(&position, positions + size_t(q) * sizeof(position), sizeof(position));
+        for (uint32_t h = 0; h < n_heads; ++h)
+            if (!ggml_remote_attn_policy::e4_lse_valid(lse[uint64_t(q) * n_heads + h], position, origin))
+                return false;
+        if (ggml_remote_attn_policy::e4_empty_prefix(position, origin))
+            for (uint64_t d = 0; d < width; ++d)
+                if ((out[uint64_t(q) * width + d] & 0x7fu) != 0) return false;
     }
     return true;
 }

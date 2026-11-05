@@ -75,6 +75,10 @@ int main() {
         assert(!rkva_bulk_fp8::validate_probe(bytes.data(), bytes.size(), layout));
     }
     auto good = probe(1);
+    auto e4 = good;
+    e4[0] = 6;
+    rkva_bulk_fp8::ProbeLayout e4_layout;
+    assert(rkva_bulk_fp8::validate_probe(e4.data(), e4.size(), e4_layout));
     for (size_t field : {0u, 4u, 8u, 12u, 20u}) {
         auto bad = good;
         bad[field] ^= 0x80;

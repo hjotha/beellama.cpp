@@ -57,6 +57,7 @@ enum rkva_op : uint16_t {
     RKVA_MANAGED_AUTH_HELLO = 29,
     RKVA_MANAGED_AUTH_CHALLENGE = 30,
     RKVA_MANAGED_ATTEST = 31,
+    RKVA_NATIVE_SNAPSHOT_STORE = 32, // negotiated quota status / keyed retirement
     RKVA_RANGE_ATTN = 14,            // query-only F32, returns OUT F32 then LSE F32
 };
 
@@ -101,6 +102,7 @@ static constexpr uint64_t RKVA_CAP_NATIVE_OSCAR_INT2_BULK = 1ull << 22;
 static constexpr uint64_t RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK = 1ull << 24;
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_E4M3FN = 1ull << 25;
 static constexpr uint64_t RKVA_CAP_KVARN_FLEX_TAIL = 1ull << 26;
+static constexpr uint64_t RKVA_CAP_NATIVE_SNAPSHOT_STORE = 1ull << 27;
 // Capability allocation in HELLO ack.reserved[0]:
 //   0..13  range/KVarN storage and bulk features
 //   14     RKVA_CAP_NATIVE_Q4_BULK (descriptor layout 4)
@@ -149,6 +151,7 @@ static constexpr uint32_t RKVA_PROTO_BULK_E4M3FN = 1u << RKVA_WIRE_FP8_E4M3FN;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SERIAL_PREFIX_V3 = 1u << 17;
 static constexpr uint32_t RKVA_PROTO_NATIVE_SNAPSHOT_V4 = 1u << 18;
 static constexpr uint32_t RKVA_PROTO_KVARN_FLEX_TAIL = 1u << 26;
+static constexpr uint32_t RKVA_PROTO_NATIVE_SNAPSHOT_STORE = 1u << 27;
 // Reserved managed-snapshot protocol flags. Advertised only by a Phase 4 build
 // that has passed the activation gate; inert otherwise.
 static constexpr uint32_t RKVA_PROTO_MANAGED_REGISTRY_V1 = 1u << 19;
@@ -448,6 +451,26 @@ struct rkva_native_snapshot_ack {
     uint32_t reserved;
 };
 
+// Status matches only keys already supplied by the host; it does not expose
+// unrelated snapshot keys. Retire accepts one such 256-bit key.
+struct rkva_native_store_request {
+    uint32_t action; // 0=status, 1=retire, 2=verify complete, 3=verify recovery
+    uint32_t keys;
+};
+struct rkva_native_store_status {
+    uint64_t used_bytes;
+    uint64_t limit_bytes;
+    uint32_t objects;
+    uint32_t max_objects;
+    uint32_t matches;
+    uint32_t reserved;
+};
+struct rkva_native_store_match {
+    uint32_t key_index;
+    uint32_t reserved;
+    uint64_t bytes;
+};
+
 // TRIM / REWIND request payload: remove every stored position >= pos0.
 struct rkva_trim_req {
     int32_t pos0;
@@ -476,6 +499,9 @@ enum rkva_probe : uint32_t {
 
 static_assert(sizeof(rkva_request) == 32, "RKVA request wire size");
 static_assert(sizeof(rkva_response) == 56, "RKVA response wire size");
+static_assert(sizeof(rkva_native_store_request) == 8, "native store request wire size");
+static_assert(sizeof(rkva_native_store_status) == 32, "native store status wire size");
+static_assert(sizeof(rkva_native_store_match) == 16, "native store match wire size");
 static_assert(sizeof(rkva_hello) == 84, "RKVA hello wire size");
 static_assert(sizeof(rkva_hello_ack) == 40, "RKVA hello ack wire size");
 static_assert(sizeof(rkva_session_req) == 16, "RKVA session wire size");

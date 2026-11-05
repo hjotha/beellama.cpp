@@ -12,8 +12,8 @@ production configuration:
 - one sequence (`n_seq_max == 1`, `n_rs_seq == 0`, `seq_id == 0`);
 - native KVarN4 overflow, descriptor revision 3 (`layout_version == 3`),
   128-token groups, 256-dimensional heads, two physical slices, 384 stage rows,
-  exact-tail 0 or 128, and the 256-row original-F16 physical tail ring when the
-  exact tail is enabled;
+  an exact F16 tail selected by the global tail request, and a power-of-two
+  physical history ring sized for that tail and bounded rewind;
 - native KVarN4 explicitly enabled, KVarN4 selected as the remote upload
   format, and `GGML_RKVA_DISK_SNAPSHOTS=1`;
 - a server that advertises `RKVA_CAP_NATIVE_KVARN_SNAPSHOT` and supports
@@ -42,15 +42,15 @@ The host owns the original projected inputs and the native producer state:
 - normalized complete KVarN4 records relative to the remote origin group
   (`origin / 128`);
 - the 384-row rotated F16 stage planes;
-- the logical 128-row original-F16 precision tail (or no tail);
-- the 256-row original-F32 rollback ring and its monotonic positions;
+- the logical original-F16 precision tail (or no tail);
+- the original-F32 history ring and its monotonic positions;
 - rows/counts, geometry, descriptor parameters and the mutation generation.
 
 The Xbox owns the GPU-resident revision-3 representation:
 
 - the same complete records (stored relative to the range origin);
 - both 384-row stage planes;
-- the 256-row physical original-F16 tail ring;
+- the physical original-F16 tail history ring;
 - per-layer prefix coverage (`tail_begin`, `stage_begin`), record-group
   coverage, live rows and the resident mutation generation.
 
@@ -92,6 +92,12 @@ validates the complete header, exact derived sizes, position-ring invariants
 and footer before any producer is mutated. Import builds shadow producers and
 swaps them only after the complete set validates.
 
+The bounded streaming reader accepts host payloads larger than 4 GiB when the
+file extent, negotiated geometry and configured restore-memory reservation
+permit them. A payload above 4 GiB requires an explicit reservation callback.
+The legacy callback-only backend entry point keeps its former bounded behavior;
+native sequence-file restores use the bounded entry point.
+
 The trailer exists only for a non-empty native overflow. A pure local prefix
 (`evaluated_tokens <= P`) keeps the legacy state format byte-for-byte.
 
@@ -106,9 +112,8 @@ directory:
   a SHA-256 footer);
 - `n-<index>.kv`: at most 8 MiB per chunk, each checked by SHA-256;
 - publication is `tmp-<key>` directory, flushed files, then one rename. An
-  existing published directory is never overwritten. Native retention never
-  evicts a published pair during save: a full 8-snapshot/8 GiB native store fails
-  explicitly rather than selecting an existing Xbox snapshot as a victim.
+  existing published directory is never overwritten. The native store is
+  bounded to eight objects, 8 GiB total and 4 GiB payload per Xbox object.
   Both published and incomplete `tmp-*` directories count toward this quota;
   no native staging directory is removed automatically. A store-wide exclusive
   `.native-writer-lock` directory serializes cooperating v2 writers. A failed
@@ -120,16 +125,30 @@ directory:
   older binaries and uncoordinated filesystem operations do not honor the lock.
   UWP create-directory and crash behavior require platform qualification.
 
-Host deletion and retention do not currently delete or reconcile the Xbox
-directory. Consequently, even successful saves can fill the remote store after
-up to eight published or incomplete staging directories (or earlier at the
-byte limit), and removing a host slot alone does not reclaim that quota. The host runs disk-budget and
-retention preflight before issuing op17, but failure or a crash after the Xbox
-save and before host publication can still leave an orphan. Existing keys can
-be shared or reused, so blindly deleting a remote directory on failure is not
-safe. A reference-aware lifecycle/reconciliation mechanism remains necessary.
-The file flushes and rename are not proof of durable cross-device atomicity
-after power loss.
+With `GGML_RKVA_NATIVE_ROTATE_SINGLE_OWNER=1` and a peer that negotiates
+`RKVA_CAP_NATIVE_SNAPSHOT_STORE`, native publication can retire the oldest
+eligible pair when either host or Xbox quota would block the new save. Enable
+this only when the configured host journal is the sole owner of its remote
+keys: the protocol cannot discover references in other stores or hosts.
+Pinned, unknown, in-use, hard-linked and unverifiable files are not retired.
+A key with pending journal entries is eligible only when all pending host paths
+are absent under the store lock; pending entries with host files stay protected.
+If no eligible pair can make enough room, publication fails closed.
+
+While the host store lock and victim leases are held, the host verifies every
+recorded host file and its key and asks the Xbox to verify the complete remote
+manifest and chunk checksums. It then unlinks the host files, syncs the host
+directory, requests an idempotent Xbox deletion and appends a retired journal
+record. A retry with no surviving host file can finish a partially deleted
+Xbox object, but it still verifies the manifest and every remaining chunk.
+If the delete or acknowledgement fails, the committed journal entry remains
+and the next rotation can retry. Host-first ordering avoids leaving a surviving
+host file pointing at an already deleted Xbox object after a process failure.
+A failure after the new Xbox SAVE but before host publication can leave a
+pending orphan; a later rotation can reclaim it after verifying that its host
+paths are absent. Retired keys are also retried if an Xbox object reappears.
+Stale Xbox staging directories and writer locks are not removed automatically.
+File flushes and rename do not prove cross-device atomicity after power loss.
 
 Explicit per-key retirement is available for operator cleanup:
 `tools/xbox/scripts/native-retire.py` deletes exactly one
@@ -140,8 +159,8 @@ step removes the verified host file first and appends a `retired` journal
 record second, under the exclusive store lock. The Xbox delete and the host
 append are not one transaction, so a crash between them leaves the remote object
 gone while the journal still says committed/pinned; rerunning the host CLI
-converges. This is an explicit operator action, not automatic retention, and it
-does not provide a lease against an app that starts mid-operation. `audit`
+converges. This manual alternative does not provide a lease against an app that
+starts mid-operation. `audit`
 reports retired keys separately from pinned, committed, pending and orphan
 candidates.
 
@@ -280,9 +299,9 @@ neither counts, evicts nor rewrites it. Every native publication appends a
 `pending` record after retention admission and before the Xbox SAVE, then a
 `committed` record after host publication, both under the exclusive store lock
 that guards the host file (explicit and automatic saves share that publisher).
-A failure or crash leaves the `pending` record for reconciliation; records are
-never deleted, and removing the host file does not remove its record, because
-the record is what keeps the Xbox key referenced. Each line is a JSON record
+Retirement appends a `retired` record after host and Xbox removal. A failure or
+crash can leave a `pending` or `committed` record for later reconciliation;
+records are never deleted. Each line is a JSON record
 (`schema`, `version`, `xbox_key`, `host_file`, `n_tokens`, `split_p`, `native`,
 `state`, `timestamp`, `source`). An unterminated final append is reported by
 the audit: a complete record without its terminator is kept and the next append
@@ -307,9 +326,9 @@ llama-native-refs audit   --store <slot-save-path> [--json]
 `pinned`/`migrated` (or additional keys from `--keys`), idempotently. `audit` is
 read-only and lists committed/pinned references, pending-only keys, host files
 whose key is absent from the journal, and unreadable host files. The pure
-`retire_decision` yields referenced/pinned/orphan_candidate only; no command
-deletes a host or remote object. The journal is append-only and has no automatic
-compaction or remote reconciliation yet.
+`retire_decision` yields referenced/pinned/orphan_candidate only; the separate
+manual retirement command and negotiated single-owner rotation perform the
+actual removal. The journal is append-only and has no automatic compaction.
 
 Native streaming saves refuse to replace an existing pathname. Explicit legacy
 slot saves may replace an existing destination only when the state is positively
@@ -333,10 +352,11 @@ sequence, even though an explicit save may replace it. Legacy checkpoint
 appendices are written and included in the quota decision before any retention
 victims are committed. Any `.tmp-rollback-*`, `.legacy-slot-stage-*` or
 `retention.tmp-*` entry blocks new publication until explicitly inspected.
-Automatic host retention evicts only a unified file explicitly marked as not containing native
-revision-3 overflow or a fully verified legacy LLAMASLT without an RKVK marker.
-Other native, unmarked, unreadable and unrecognized files remain pinned and count
-against the configured limits. Legacy verification scans the full file; a
+The ordinary host retention plan evicts only a unified file explicitly marked
+as not containing native revision-3 overflow or a fully verified legacy
+LLAMASLT without an RKVK marker. The separate opt-in single-owner rotation above
+can retire journal-verified native pairs. Unmarked, unreadable and unrecognized
+files remain pinned and count against configured limits. Legacy verification scans the full file; a
 coincidental RKVK byte sequence conservatively prevents eviction. If pinned files fill the
 store, admission fails rather than deleting them. The marker does not describe
 legacy non-native remote companions. Do not delete either half based solely on
@@ -416,8 +436,9 @@ The preliminary review found and this branch fixes:
    same-size bit flip cannot be acknowledged as a valid snapshot.
 5. The host staging file is closed before rename/publication, and Windows
    publication uses `MoveFileExW` with a UTF-8 to UTF-16 conversion.
-6. Native quota admission never selects or deletes a victim before the new pair
-   commits; a full store fails explicitly.
+6. The original native quota admission fails closed when full. The separate
+   opt-in single-owner rotation can retire eligible old pairs before the new
+   pair is committed, as described above.
 7. Direct native save/load binds the Xbox snapshot to the complete host prefix
    through the RKVK frame, not only the trailer. A same-size mutation in the
    local state changes the key; the Xbox restore is refused before the local
@@ -530,12 +551,12 @@ actual peak RAM, exercise Xbox quota exhaustion or corrupt a console chunk.
 
 ## Pending qualification and lifecycle work
 
-- Add reference-aware remote cleanup/reconciliation and recovery for the
-  post-op17 failure window; host retention alone cannot reclaim Xbox quota.
+- Qualify shared-key ownership across multiple host stores or machines and
+  recovery of stale staging directories or writer locks.
 - Verify rewind 128 and re-append, and rejection of rewind 129, after a real
   Xbox disk restore.
 - Compare full-vocabulary logits against the pre-save continuation.
-- Exercise console quota exhaustion, missing/corrupt console chunks, failure
-  after peer mutation, disk-full/interrupted writes and power-loss recovery.
+- Exercise missing/corrupt console chunks, failure after peer mutation,
+  disk-full/interrupted writes and power-loss recovery on hardware.
 - Qualify any draft/MTP-enabled XXXL configuration separately; the current
   implementation supports only a target-only snapshot.

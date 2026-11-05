@@ -461,6 +461,33 @@ int main(int argc, char ** argv) {
             const auto inspected = server_route_state_read(path, SIZE_MAX, 1024, false, &held);
             require(inspected.tokens == tokens && inspected.has_native_remote_marker && !inspected.native_remote,
                     "inspection under exclusive store lock failed");
+            {
+                const std::string target = dir + "/rotation-preflight.bin";
+                bool rotated = false, admitted = false, staged = false;
+                const size_t saved = server_route_state_save(source.get(), 0, tokens, identity, target,
+                    SIZE_MAX, 0, nullptr,
+                    [&](uint64_t) { require(rotated, "admission ran before rotation"); admitted = true; return true; },
+                    {}, &held, nullptr, 0,
+                    [&](const char *, size_t) { require(admitted, "staged callback ran before admission"); staged = true; return true; },
+                    [&](const char * staged_path, size_t bytes, uint64_t total) {
+                        require(bytes > 0 && total >= bytes && std::filesystem::is_regular_file(staged_path),
+                                "rotation preflight did not receive the closed staged file");
+                        rotated = true; return true;
+                    });
+                require(saved && rotated && admitted && staged, "rotation preflight callback was not completed");
+                std::filesystem::remove(target);
+                admitted = staged = false;
+                bool refused = false;
+                try {
+                    (void) server_route_state_save(source.get(), 0, tokens, identity, target,
+                        SIZE_MAX, 0, nullptr,
+                        [&](uint64_t) { admitted = true; return true; }, {}, &held, nullptr, 0,
+                        [&](const char *, size_t) { staged = true; return true; },
+                        [&](const char *, size_t, uint64_t) { return false; });
+                } catch (const std::exception &) { refused = true; }
+                require(refused && !admitted && !staged && !std::filesystem::exists(target),
+                        "rejected rotation advanced snapshot publication");
+            }
             require(server_route_state_replace_allowed(path, &held), "marked local file must be replaceable");
             require(!server_route_state_replace_allowed(legacy_seq_path, &held),
                     "unmarked legacy file must stay pinned");

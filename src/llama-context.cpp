@@ -7392,6 +7392,23 @@ bool llama_context::remote_native_kvarn_snapshot_supported() const {
            ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend_remote);
 }
 
+bool llama_context::remote_native_store_supported() const {
+    return backend_remote && ggml_backend_remote_attn_native_store_supported(backend_remote);
+}
+
+bool llama_context::remote_native_store_status(const uint8_t * keys, uint32_t count,
+                                                ggml_remote_native_store_info * info) {
+    return backend_remote && ggml_backend_remote_attn_native_store_status(backend_remote, keys, count, info);
+}
+
+bool llama_context::remote_native_store_retire(const uint8_t key[32]) {
+    return backend_remote && ggml_backend_remote_attn_native_store_retire(backend_remote, key);
+}
+
+bool llama_context::remote_native_store_verify(const uint8_t key[32], bool allow_partial) {
+    return backend_remote && ggml_backend_remote_attn_native_store_verify(backend_remote, key, allow_partial);
+}
+
 bool llama_context::remote_disk_snapshot(llama_seq_id seq_id, const uint8_t key[32],
                                          size_t evaluated_tokens, bool restore) {
     // Native revision-3 state uses the paired owner trailer and native opcode
@@ -7426,6 +7443,23 @@ bool llama_remote_native_kvarn_transient_active(const llama_context * ctx) {
 
 bool llama_remote_native_kvarn_snapshot_supported(const llama_context * ctx) {
     return ctx && ctx->remote_native_kvarn_snapshot_supported();
+}
+
+bool llama_remote_native_store_supported(const llama_context * ctx) {
+    return ctx && ctx->remote_native_store_supported();
+}
+
+bool llama_remote_native_store_status(llama_context * ctx, const uint8_t * keys, uint32_t count,
+                                      ggml_remote_native_store_info * info) {
+    return ctx && ctx->remote_native_store_status(keys, count, info);
+}
+
+bool llama_remote_native_store_retire(llama_context * ctx, const uint8_t key[32]) {
+    return ctx && ctx->remote_native_store_retire(key);
+}
+
+bool llama_remote_native_store_verify(llama_context * ctx, const uint8_t key[32], bool allow_partial) {
+    return ctx && ctx->remote_native_store_verify(key, allow_partial);
 }
 
 void llama_state_seq_set_native_restore_reservation(llama_context * ctx,
@@ -7769,13 +7803,15 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                         uint8_t native_header[rkva_native_state::kHeaderBytes];
                         rkva_native_state::SetHeader header;
                         std::string header_error;
-                        if (remaining < sizeof(native_header) ||
+                        if (remaining < sizeof(native_header) + 32 ||
                                 !io.peek(native_header, sizeof(native_header)) ||
-                                !rkva_native_state::decode_header(native_header, header, &header_error)) {
+                                !rkva_native_state::decode_header(native_header, header, &header_error) ||
+                                header.payload_bytes > remaining - sizeof(native_header) - 32) {
                             throw std::runtime_error("native KVarN4 overflow trailer header is invalid");
                         }
                         const uint64_t peak = rkva_native_state::restore_peak_bytes(header);
                         if (peak == UINT64_MAX || peak > SIZE_MAX ||
+                                (header.payload_bytes > (4ull << 30) && !native_restore_reserve) ||
                                 (native_restore_reserve &&
                                  !native_restore_reserve(native_restore_reserve_user, size_t(peak)))) {
                             throw std::runtime_error("native KVarN4 overflow restore RAM reservation rejected");
@@ -7790,7 +7826,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                         uint32_t live_rows = 0;
                         uint64_t saved_generation = 0;
                         uint8_t state_key[32] = {};
-                        if (!ggml_backend_remote_attn_native_kvarn_state_read(backend_remote,
+                        if (!ggml_backend_remote_attn_native_kvarn_state_read_bounded(backend_remote,
                                     [](void * user, void * data, size_t bytes) {
                                         try {
                                             static_cast<llama_io_read_replay *>(user)->read(data, bytes);
@@ -7798,7 +7834,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                                         } catch (...) {
                                             return false;
                                         }
-                                    }, &replay, &live_rows, &saved_generation, state_key)) {
+                                    }, &replay, remaining, &live_rows, &saved_generation, state_key)) {
                             throw std::runtime_error("native KVarN4 overflow owner-state trailer is invalid");
                         }
                         if (!evaluated_tokens || evaluated_tokens > cparams.n_ctx_seq ||

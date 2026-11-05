@@ -81,8 +81,8 @@ wall time is measured at the client and excludes server startup.
 Two repetitions do not establish statistical significance. Q4_1 with tail 256
 had the lowest local KLD on this chunk, closely followed by IQ4_NL with tail
 256. KVarN4 with its native 128-token tail is the leading tested option also
-available as the same storage format on the Xbox; explicit positive global
-tail sizes are not supported on the current split path. SAW/NC F16 tails are
+available as the same storage format on the Xbox. Explicit global KVarN4 tail
+sizes were subsequently added to the split path. SAW/NC F16 tails remain
 local-only. Low KLD alone does not establish freedom from generation loops.
 
 With the same KVarN4 format on both devices and an artificial split at token
@@ -113,6 +113,43 @@ arms measured KLD 0.000984 against the same BF16 KV reference in a separate
 2,048-token run. The generic CUDA E4 path is therefore opt-in through
 `GGML_RKVA_CUDA_FP8=1`; these measurements do not establish its performance
 at the production split.
+
+On Xbox app 1.6.0.937, the E4M3FN Q unpack and OUT pack run on the Xbox GPU
+when its pipelines are available. A matched KVarN4 test used a 2,048-token
+prompt, split 256, a global F16 tail of 128, batch 128 and ubatch 32. With
+profiling enabled and three cold requests per arm, the E4 CPU codec median was
+73.47 prefill tokens/s, 21.64 decode tokens/s and 30.78 seconds wall; the GPU
+codec median was 85.16, 22.49 and 26.85 respectively. All generated text
+hashes matched. This isolates the Xbox codec on the same package and host
+libraries; it does not measure the production split. Each request used the
+same 2,048 WikiText-2 reference tokens, generated 64 tokens with temperature 0
+and seed 1234, and disabled prompt caching. The test was based on `e32265fa0`
+plus this change; the signed 937 MSIX SHA-256 was
+`2822dea5e3384ec956b3cf8d29e0da2b9349998a48e5f883e4f5f565eee3263a`.
+An on-console diagnostic
+also checked all 65,536 F16 bit patterns and the finite output bytes against an
+independent E4M3FN reference.
+
+The first GPU E4 unpack shader allowed floating-point reassociation in its
+WHT; on the 20,480-token global-tail-128 KLD run it gave 0.001540 instead of
+the CPU codec's 0.001478. The E4 unpack shader is now compiled with the same
+strict, separately rounded WHT arithmetic as the F16 unpack. On Xbox app
+1.6.0.939, GPU and CPU E4 both reported KLD 0.001478 with the same host
+libraries, model, reference, split 256, batch 128 and ubatch 32. This is
+equality at the six decimal places reported by the tool, not a comparison of
+every logit. With profiling enabled on 939 and the same 2,048-token request,
+three cold runs gave CPU and strict GPU medians of 73.37 and 85.23 prefill
+tokens/s, 21.63 and 22.46 decode tokens/s, and 30.82 and 26.84 seconds wall;
+generated text hashes matched. The signed 939 package SHA-256 was
+`b7e67a6fada13c089242f22b50c1be1bc7c2a5b0d90597f399b07242aa5479c6`.
+
+With the prior relaxed E4 shader in Xbox app 1.6.0.937, the matched 20,480-token
+run reported E4 KLD 0.001540 and E5 KLD 0.002268, with two cold requests per
+arm. E4 and E5 medians were 64.31 and 62.91 prefill tokens/s, 20.69 and 20.67
+decode tokens/s, and 321.52 and 328.67 seconds wall. The strict shader's
+20,480-token request speeds were not repeated; the 939 KLD was measured, and
+its 2,048-token request speeds above are close to the relaxed shader's. All
+these split-256 measurements differ from the production split of 108,032.
 
 An isolated request using the actual production split, E5M2, KVarN4 on both
 sides and 109,490 prompt tokens completed with a cache miss: prefill 499.34

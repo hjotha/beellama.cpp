@@ -15,7 +15,7 @@ struct ProbeLayout {
     uint32_t heads = 0, elements = 0, groups = 0;
     size_t source_offset = 0, source_bytes = 0, readback_bytes = 0;
 };
-// Diagnostic op11/id5: rkva_probe_req then {heads,reserved} then OUT F32 + LSE F32.
+// Diagnostic op11/id5 (E5) or id6 (E4): {heads,reserved} then OUT F32 + LSE F32.
 // No session/KV reference; bounded at 1024 independent 256-element vectors.
 inline bool validate_probe(const uint8_t* data, size_t bytes, ProbeLayout& out) {
     out = {};
@@ -25,7 +25,7 @@ inline bool validate_probe(const uint8_t* data, size_t bytes, ProbeLayout& out) 
     uint32_t header[2]{};
     std::memcpy(&request, data, sizeof(request));
     std::memcpy(header, data + sizeof(request), sizeof(header));
-    if (request.probe_id != 5 || request.mode || request.reserved || header[1] || !header[0] ||
+    if ((request.probe_id != 5 && request.probe_id != 6) || request.mode || request.reserved || header[1] || !header[0] ||
         header[0] > 1024)
         return false;
     const uint64_t source = uint64_t(header[0]) * (256 + 1) * 4;

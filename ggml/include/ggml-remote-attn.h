@@ -210,12 +210,38 @@ GGML_API bool ggml_backend_remote_attn_disk_snapshot(
 typedef bool (*ggml_remote_attn_native_write_fn)(void * user, const void * data, size_t size);
 typedef bool (*ggml_remote_attn_native_read_fn)(void * user, void * data, size_t size);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_snapshot_supported(ggml_backend_t backend);
+struct ggml_remote_native_store_match {
+    uint32_t key_index;
+    uint64_t bytes;
+};
+struct ggml_remote_native_store_info {
+    uint64_t used_bytes;
+    uint64_t limit_bytes;
+    uint64_t incoming_bytes;
+    uint32_t objects;
+    uint32_t max_objects;
+    uint32_t matches;
+    struct ggml_remote_native_store_match match[64];
+};
+// Status returns matches in Xbox publication order; retire is idempotent.
+GGML_API bool ggml_backend_remote_attn_native_store_supported(ggml_backend_t backend);
+GGML_API bool ggml_backend_remote_attn_native_store_status(
+        ggml_backend_t backend, const uint8_t * keys, uint32_t count,
+        struct ggml_remote_native_store_info * info);
+GGML_API bool ggml_backend_remote_attn_native_store_retire(
+        ggml_backend_t backend, const uint8_t key[32]);
+GGML_API bool ggml_backend_remote_attn_native_store_verify(
+        ggml_backend_t backend, const uint8_t key[32], bool allow_partial);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_state_write(
         ggml_backend_t backend, ggml_remote_attn_native_write_fn write, void * user,
         uint8_t out_sha256[32]);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_state_read(
         ggml_backend_t backend, ggml_remote_attn_native_read_fn read, void * user,
         uint32_t * live_rows, uint64_t * saved_generation, uint8_t out_sha256[32]);
+GGML_API bool ggml_backend_remote_attn_native_kvarn_state_read_bounded(
+        ggml_backend_t backend, ggml_remote_attn_native_read_fn read, void * user,
+        uint64_t available_bytes, uint32_t * live_rows, uint64_t * saved_generation,
+        uint8_t out_sha256[32]);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_remote_save(
         ggml_backend_t backend, const uint8_t owner_set_sha256[32], uint32_t live_rows);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_remote_restore(

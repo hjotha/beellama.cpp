@@ -1,5 +1,6 @@
 #pragma once
 #include "llama.h"
+#include "ggml-remote-attn.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,6 +19,11 @@ LLAMA_API bool llama_remote_native_kvarn_transient_active(const struct llama_con
 // opt-in disk snapshots, negotiated native snapshot capability). Other native
 // combinations retain the fail-closed FULL save/restore guards.
 LLAMA_API bool llama_remote_native_kvarn_snapshot_supported(const struct llama_context * ctx);
+LLAMA_API bool llama_remote_native_store_supported(const struct llama_context * ctx);
+LLAMA_API bool llama_remote_native_store_status(struct llama_context * ctx, const uint8_t * keys,
+        uint32_t count, struct ggml_remote_native_store_info * info);
+LLAMA_API bool llama_remote_native_store_retire(struct llama_context * ctx, const uint8_t key[32]);
+LLAMA_API bool llama_remote_native_store_verify(struct llama_context * ctx, const uint8_t key[32], bool allow_partial);
 LLAMA_API bool llama_state_seq_remote_disk_snapshot_save(
         struct llama_context * ctx, llama_seq_id seq_id,
         const uint8_t host_native_sha256[32], size_t evaluated_tokens);

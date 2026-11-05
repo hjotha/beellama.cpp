@@ -17,6 +17,7 @@
 #include "server-slot-budget.h"
 #include "server-native-slot.h"
 #include "server-native-refs.h"
+#include "server-native-rotation.h"
 #include "ggml-remote-attn-trace.h"
 #include "server-route-state.h"
 #include "server-legacy-slot-classifier.h"
@@ -746,8 +747,12 @@ struct unified_snapshot_limit_plan {
     server_route_state_store_lock * store_lock = nullptr;
     std::vector<slot_save_unit> victims;
     std::vector<std::unique_ptr<server_route_state_lease>> locks;
+    bool quota_blocked = false;
 
     bool prepare(uint64_t incoming_bytes) {
+        victims.clear();
+        locks.clear();
+        quota_blocked = false;
         if (!store_lock || !store_lock->owns_exclusive_for(
                     (std::filesystem::path(dir) / ".retention-authority").string())) {
             return false;
@@ -913,6 +918,7 @@ struct unified_snapshot_limit_plan {
         if (!fits) {
             victims.clear();
             locks.clear();
+            quota_blocked = true;
             return reject("all remaining candidates are protected or limits cannot fit");
         }
         return true;
@@ -8999,7 +9005,7 @@ private:
             if (native_pair) {
                 staged_callback = [&](const char * staged_path, size_t staged_bytes) {
                     std::string key_error;
-                    if (!server_native_refs::hash_host_prefix(staged_path, staged_bytes,
+                    if (registry_entry.key.empty() && !server_native_refs::hash_host_prefix(staged_path, staged_bytes,
                                 registry_entry.key, &key_error)) {
                         SRV_WRN("native reference journal: host prefix key failed: %s\n", key_error.c_str());
                         return false;
@@ -9029,6 +9035,81 @@ private:
             limit_plan->just_written = destination;
             limit_plan->max_count = params_base.slot_save_max_count;
             limit_plan->max_bytes = params_base.slot_save_max_bytes;
+            server_route_state_rotation_callback rotate_callback;
+            const char * single_owner = std::getenv("GGML_RKVA_NATIVE_ROTATE_SINGLE_OWNER");
+            if (native_pair && server_native_rotation::enabled(single_owner,
+                    llama_remote_native_store_supported(ctx_tgt))) {
+                rotate_callback = [&](const char * staged_path, size_t staged_bytes, uint64_t incoming_bytes) {
+                    std::string error;
+                    if (!server_native_refs::hash_host_prefix(staged_path, staged_bytes, registry_entry.key, &error)) {
+                        SRV_WRN("native rotation: cannot hash staged state: %s\n", error.c_str());
+                        return false;
+                    }
+                    const auto incoming_key = server_native_rotation::decode_key(registry_entry.key);
+                    std::set<std::string> skipped;
+                    for (;;) {
+                        const bool host_fits = limit_plan->prepare(incoming_bytes);
+                        if (!host_fits && !limit_plan->quota_blocked) return false;
+                        const auto journal = server_native_refs::load(server_native_refs::journal_path(slot_store));
+                        if (!journal.ok || journal.truncated_tail) {
+                            SRV_WRN("native rotation: reference journal requires recovery: %s\n", journal.error.c_str());
+                            return false;
+                        }
+                        auto candidates = server_native_rotation::candidates(journal.records, registry_entry.key);
+                        candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const auto & item) {
+                            return skipped.count(item.key) != 0;
+                        }), candidates.end());
+                        bool retired = false;
+                        for (size_t offset = 0; offset < candidates.size() || offset == 0; offset += 63) {
+                            const size_t count = std::min<size_t>(63, candidates.size() - offset);
+                            std::vector<uint8_t> keys((count + 1) * 32);
+                            std::memcpy(keys.data(), incoming_key.data(), 32);
+                            for (size_t i = 0; i < count; ++i)
+                                std::memcpy(keys.data() + (i + 1) * 32, candidates[offset + i].bytes.data(), 32);
+                            ggml_remote_native_store_info info{};
+                            if (!llama_remote_native_store_status(ctx_tgt, keys.data(), uint32_t(count + 1), &info)) {
+                                SRV_WRN("%s", "native rotation: Xbox quota query failed\n");
+                                return false;
+                            }
+                            const int selected = server_native_rotation::select(info, count, host_fits);
+                            if (selected == -1) return true;
+                            if (selected < 0) continue;
+                            const auto & victim = candidates[offset + size_t(selected)];
+                            size_t removed = 0;
+                            const auto result = server_native_rotation::retire(victim, slot_store, store,
+                                [&](const std::filesystem::path & path, const std::string & expected) {
+                                    try {
+                                        const auto file = server_route_state_read(path.string(), UINT64_MAX,
+                                                                                  UINT32_MAX, false, &store);
+                                        std::string key;
+                                        return file.has_native_remote_marker && file.native_remote && file.state_bytes &&
+                                            server_native_refs::hash_host_prefix(path.string(), file.state_bytes, key, &error) &&
+                                            key == expected;
+                                    } catch (const std::exception &) { return false; }
+                                }, [&](const uint8_t * key, bool partial) { return llama_remote_native_store_verify(ctx_tgt, key, partial); },
+                                [&](const uint8_t * key) { return llama_remote_native_store_retire(ctx_tgt, key); },
+                                server_native_rotation::sync_directory,
+                                removed, error);
+                            if (result == server_native_rotation::retirement_result::skipped) {
+                                skipped.insert(victim.key); retired = true; break;
+                            }
+                            if (result == server_native_rotation::retirement_result::failed) {
+                                SRV_WRN("native rotation: %s\n", error.c_str());
+                                return false;
+                            }
+                            SRV_INF("native rotation: retired snapshot key %s and %zu host file(s)\n",
+                                    victim.key.c_str(), removed);
+                            if (!victim.retirement.execute) skipped.insert(victim.key);
+                            retired = true;
+                            break;
+                        }
+                        if (!retired) {
+                            SRV_WRN("%s", "native rotation: no safe unpinned candidate satisfies the quota\n");
+                            return false;
+                        }
+                    }
+                };
+            }
             // The retention plan is the authoritative quota admission; report a
             // rejection as such instead of a generic write failure.
             const size_t nwrite = server_route_state_save(ctx_tgt, slot.id, staging.tokens,
@@ -9039,7 +9120,7 @@ private:
                         return admitted;
                     },
                     [limit_plan]() { return limit_plan->commit(); }, &store, nullptr, slot.position_split_p,
-                    staged_callback);
+                    staged_callback, rotate_callback);
             if (!nwrite) {
                 return refuse(retention_refused ? server_native_slot::automatic_save_skip::quota_refused
                                                 : server_native_slot::automatic_save_skip::failed,

@@ -1646,7 +1646,9 @@ std::string RemoteAttnEngine::get_range_profile_json() {
     return json + ",\"bulk_scratch\":" + bulk_scratch_.json() +
            ",\"bulk_fp8_gpu\":{\"available\":" +
            (bulk_unpack_q_fp8_pso_ && bulk_pack_out_fp8_pso_ ? "true" : "false") +
-           ",\"status\":\"" + rp::json_escape(bulk_fp8_status_) + "\"}}";
+           ",\"status\":\"" + rp::json_escape(bulk_fp8_status_) + "\"},\"bulk_e4_gpu\":{\"available\":" +
+           (bulk_unpack_q_e4_pso_ && bulk_pack_out_e4_pso_ ? "true" : "false") +
+           ",\"status\":\"" + rp::json_escape(bulk_e4_status_) + "\"}}";
 }
 
 bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
@@ -2754,7 +2756,7 @@ void RemoteAttnEngine::finish_bulk_profile(rp::BulkEnvelopeSample& envelope, boo
     // Q4_0/Q8_0 native-row envelope is not a KVarN GPU codec call.
     const bool kvarn_route = envelope.storage == rp::kStorageKvarn4;
     if (kvarn_route) {
-        if (envelope.wire == RKVA_WIRE_FP8) {
+        if (envelope.wire == RKVA_WIRE_FP8 || envelope.wire == RKVA_WIRE_FP8_E4M3FN) {
             if (envelope.fp8_gpu)
                 ++c.fp8_gpu_calls;
             else

@@ -29,6 +29,10 @@ cbuffer Params : register(b0) {
 
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer dst : register(u0);
+#include "rkva_e4m3_codec.hlsli"
+#ifndef RKVA_E4_CODEC
+#define RKVA_E4_CODEC 0
+#endif
 
 // GGML F32->F16 round-to-nearest-even (bit-exact with ggml_fp32_to_fp16).
 uint ggml_half_bits(float value) {
@@ -83,8 +87,13 @@ void unpack_query(uint lane, uint3 group, bool fp8) {
         uint h0, h1;
         if (fp8) {
             const uint packed = src.Load((idx / 2) * 4) >> ((idx & 1u) * 16);
+#if RKVA_E4_CODEC
+            h0 = e4m3fn_to_half(packed & 0xffu);
+            h1 = e4m3fn_to_half((packed >> 8) & 0xffu);
+#else
             h0 = (packed & 0xffu) << 8;
             h1 = ((packed >> 8) & 0xffu) << 8;
+#endif
         } else {
             const uint packed = src.Load(idx * 4);
             h0 = packed & 0xffffu;
@@ -133,8 +142,8 @@ void CSBulkUnpackQF16(uint lane : SV_GroupIndex, uint3 group : SV_GroupID) {
 
 [numthreads(256, 1, 1)]
 void CSBulkUnpackQFP8(uint lane : SV_GroupIndex, uint3 group : SV_GroupID) {
-    // Admission rejects every exponent-31 byte before native mutation.
-    // Expand through the identical F16 bit pattern, then reuse the same WHT.
+    // Admission rejects invalid FP8 bytes before native mutation.
+    // Expand through F16, then reuse the same WHT.
     unpack_query(lane, group, true);
 }
 
@@ -184,7 +193,11 @@ void CSBulkPackOutFP8(uint lane : SV_GroupIndex, uint3 group : SV_GroupID) {
             // different result near midpoints and would accept F16 overflow.
             const uint h = ggml_half_bits(asfloat(source[j]));
             if ((h & 0x7c00u) == 0x7c00u) bad |= 1u;
+#if RKVA_E4_CODEC
+            packed |= e4m3fn_from_half(h) << (j * 8);
+#else
             packed |= fp8_from_half(h) << (j * 8);
+#endif
         }
         dst.Store(idx * 4, packed);
     }

@@ -11,6 +11,7 @@
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
+#include "ggml-remote-attn.h"
 
 #include <array>
 #include <map>
@@ -261,6 +262,10 @@ struct llama_context {
     bool remote_native_kvarn_can_rewind() const;
     bool remote_native_kvarn_transient_active() const;
     bool remote_native_kvarn_snapshot_supported() const;
+    bool remote_native_store_supported() const;
+    bool remote_native_store_status(const uint8_t * keys, uint32_t count, ggml_remote_native_store_info * info);
+    bool remote_native_store_retire(const uint8_t key[32]);
+    bool remote_native_store_verify(const uint8_t key[32], bool allow_partial);
     bool remote_disk_snapshot(llama_seq_id seq_id, const uint8_t key[32],
                               size_t evaluated_tokens, bool restore);
 

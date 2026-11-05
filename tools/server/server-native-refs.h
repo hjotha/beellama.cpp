@@ -10,7 +10,7 @@
 // route-state store lock. `pending` is written before the Xbox SAVE and host
 // publication, `committed` after host publication (append-only, last state
 // wins on load), `pinned` only by the explicit migration CLI, and `retired`
-// only after an operator has removed the Xbox object and the host file. A
+// only after the Xbox object and host files have been removed. A
 // crash or failure therefore leaves a `pending` record, never a silent drop.
 // A `retired` record is written last (host file removed first); a later
 // non-retired record for the same key is a re-save/re-pin and supersedes the

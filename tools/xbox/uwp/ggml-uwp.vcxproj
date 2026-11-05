@@ -65,6 +65,7 @@
         $(BeeLlamaRoot)src;
         $(BeeLlamaRoot)ggml\include;
         $(BeeLlamaRoot)ggml\src;
+        $(BeeLlamaRoot)ggml\src\ggml-remote-attn;
         $(BeeLlamaRoot)ggml\src\ggml-cpu;
         %(AdditionalIncludeDirectories)
       </AdditionalIncludeDirectories>

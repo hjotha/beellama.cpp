@@ -36,8 +36,6 @@ constexpr uint32_t kTailRingRows = 256;
 constexpr uint32_t kOriginalRows = 256;
 constexpr uint32_t kMaxTailTokens = 128;
 constexpr uint32_t kMaxHeads = 4096;
-constexpr uint64_t kMaxPayloadBytes = 4ull << 30;
-constexpr uint64_t kMaxLayerBytes = 1ull << 30;
 
 inline bool little_endian() {
     const uint16_t probe = 1;
@@ -82,6 +80,7 @@ class Source {
   public:
     virtual ~Source() = default;
     virtual bool read(void* data, size_t bytes) = 0;
+    virtual uint64_t remaining() const = 0;
 };
 
 class VectorSink final : public Sink {
@@ -108,7 +107,7 @@ class VectorSource final : public Source {
         offset_ += size;
         return true;
     }
-    size_t remaining() const { return data_.size() - offset_; }
+    uint64_t remaining() const override { return data_.size() - offset_; }
 
   private:
     const std::vector<uint8_t>& data_;
@@ -215,8 +214,8 @@ inline bool valid_layout(const Layout& layout, std::string* error) {
         !generation_supported(layout.saved_generation))
         return reject("native state: invalid layout");
     const uint64_t layer = layer_bytes(layout);
-    if (!layer || layer > kMaxLayerBytes || layer > kMaxPayloadBytes)
-        return reject("native state: payload exceeds bounded store");
+    if (!layer || layer > SIZE_MAX)
+        return reject("native state: layer size is not representable");
     return true;
 }
 
@@ -226,7 +225,7 @@ inline bool valid_payload_size(const Layout& layout, uint32_t layers) {
     if (!layers || layers > kMaxLayers)
         return false;
     const uint64_t layer = layer_bytes(layout);
-    return layer != 0 && layer <= kMaxLayerBytes && layer <= kMaxPayloadBytes / layers;
+    return layer != 0 && layer <= SIZE_MAX / layers;
 }
 
 inline bool valid_ring(const Storage& storage, std::string* error) {
@@ -469,8 +468,11 @@ inline bool write_set(const std::vector<View>& views, Sink& sink, std::string* e
     return true;
 }
 
+using header_check = bool (*)(void*, const SetHeader&);
+
 inline bool read_set(Source& source, std::vector<Storage>& out, std::string* error,
-                     rkva_snapshot::Digest* out_digest = nullptr) {
+                     rkva_snapshot::Digest* out_digest = nullptr,
+                     header_check check = nullptr, void* check_user = nullptr) {
     out.clear();
     uint8_t encoded[kHeaderBytes];
     if (!source.read(encoded, sizeof(encoded))) {
@@ -481,6 +483,11 @@ inline bool read_set(Source& source, std::vector<Storage>& out, std::string* err
     SetHeader header;
     if (!decode_header(encoded, header, error))
         return false;
+    if (source.remaining() < 32 || header.payload_bytes > source.remaining() - 32 ||
+        (check && !check(check_user, header))) {
+        if (error) *error = "native state: source extent or negotiated geometry mismatch";
+        return false;
+    }
     rkva_snapshot::Sha256 hash;
     hash.update(encoded, sizeof(encoded));
     std::vector<Storage> candidate(header.layers);

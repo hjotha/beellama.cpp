@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--host', default='192.168.1.26')
     parser.add_argument('--port', type=int, default=50054)
     parser.add_argument('--output')
+    parser.add_argument('--e4', action='store_true', help='test E4M3FN instead of E5M2')
     args = parser.parse_args()
     if not args.execute:
         print(json.dumps(dict(execute=False, plan='Explicit --execute tests all F16 patterns, F32 midpoints and neighbors, finite F16 overflow, NaN/Inf, LSE bits and malformed probe framing.')))
@@ -45,7 +46,7 @@ def main():
             lse = np.zeros(heads, dtype='<u4') if lse_bits is None else np.asarray(lse_bits, dtype='<u4')
             assert lse.size == heads
             blob = struct.pack('<2I', heads, 0) + padded.tobytes() + lse.tobytes()
-            return struct.pack('<4I', 5, 0, len(blob), 0) + blob, padded, lse
+            return struct.pack('<4I', 6 if args.e4 else 5, 0, len(blob), 0) + blob, padded, lse
 
         def case(name, values, lse_bits=None):
             payload, values, lse = request(values, lse_bits)
@@ -56,8 +57,20 @@ def main():
             with np.errstate(over='ignore', invalid='ignore'):
                 half = values.astype('<f2').view('<u2').astype(np.uint32)
             invalid = (half & 0x7c00) == 0x7c00
-            mag = np.minimum(half & 0x7fff, 0x7b00)
-            want = (((half >> 8) & 0x80) | ((mag + 0x7f + ((mag >> 8) & 1)) >> 8)).astype(np.uint8)
+            if args.e4:
+                codes = np.arange(127, dtype=np.uint16)
+                exponents, mantissas = codes >> 3, codes & 7
+                table = np.where(exponents == 0, mantissas * 2.0**-9,
+                                 (1 + mantissas / 8) * np.exp2(exponents.astype(np.int32) - 7))
+                magnitude = np.abs(values.astype('<f2').astype(np.float64))
+                index = np.minimum(np.searchsorted(table, magnitude, side='left'), 126)
+                lower = np.maximum(index - 1, 0)
+                dl, dh = magnitude - table[lower], table[index] - magnitude
+                index = np.where((dl < dh) | ((dl == dh) & ((lower & 1) == 0)), lower, index)
+                want = (index | ((half >> 8) & 0x80)).astype(np.uint8)
+            else:
+                mag = np.minimum(half & 0x7fff, 0x7b00)
+                want = (((half >> 8) & 0x80) | ((mag + 0x7f + ((mag >> 8) & 1)) >> 8)).astype(np.uint8)
             got = np.frombuffer(response, dtype=np.uint8, count=n)
             # Invalid lanes have no serving value. They must poison their group;
             # every finite lane still must match the old two-rounding contract.
@@ -100,7 +113,7 @@ def main():
         for payload in malformed:
             client.call(11, payload, success=False)
             assert client.timings[-1]['status'] == -8, client.timings[-1]
-        for probe_id in (1, 2, 3, 4, 6):
+        for probe_id in (1, 2, 3, 4, 7):
             payload = bytearray(good)
             struct.pack_into('<I', payload, 0, probe_id)
             client.call(11, payload, success=False)

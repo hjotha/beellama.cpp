@@ -206,6 +206,7 @@ class RemoteAttnEngine {
                                size_t bytes, uint16_t* out_f16, float* lse, std::string* error,
                                uint64_t cycle_id = 0);
     bool ensure_bulk_fp8_gpu_pipelines();
+    bool ensure_bulk_e4_gpu_pipelines();
     bool attend_kvarn_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                                size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
                                uint64_t cycle_id = 0);
@@ -457,9 +458,11 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_pack_out_f16_pso_;
     std::string bulk_f16_status_ = "not initialized";
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_fp8_pso_, bulk_pack_out_fp8_pso_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_e4_pso_, bulk_pack_out_e4_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_fp8_raw_pso_;
     std::string q8_fp8_gpu_status_ = "not initialized";
     std::string bulk_fp8_status_ = "not initialized";
+    std::string bulk_e4_status_ = "not initialized";
     Buffer bulk_probe_upload_, bulk_probe_packed_, bulk_probe_readback_;
     Buffer range_upload_;
     Buffer range_query_;

@@ -132,7 +132,8 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         const std::function<bool()> & after_publish,
         server_route_state_store_lock * store_lock,
         server_route_state_lease * publication_lock, uint32_t native_split_p,
-        const server_route_state_staged_callback & staged) {
+        const server_route_state_staged_callback & staged,
+        const server_route_state_rotation_callback & rotate) {
     std::unique_ptr<server_route_state_store_lock> owned_store;
     if (store_lock == nullptr) {
         const std::filesystem::path parent = std::filesystem::path(path).parent_path();
@@ -253,6 +254,9 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
                 !checked_add(admitted_total, footer_size, admitted_total) ||
                 admitted_total > max_bytes || admitted_total > SIZE_MAX) {
             throw std::runtime_error("router state exceeds disk size budget");
+        }
+        if (rotate && !rotate(staged_path, staged_bytes, admitted_total)) {
+            throw std::runtime_error("router native snapshot rotation rejected publication");
         }
         if (before_publish && !before_publish(admitted_total)) {
             throw std::runtime_error("router snapshot store budget rejected publication");

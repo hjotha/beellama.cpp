@@ -278,12 +278,29 @@ void test_corruption_and_short_io() {
             offset += size;
             return true;
         }
+        uint64_t remaining() const override { return limit - offset; }
       private:
         const std::vector<uint8_t> & data;
         size_t limit = 0;
         size_t offset = 0;
     } source_short(bytes, bytes.size() - 17);
     assert(!rkva_native_state::read_set(source_short, layers, &error));
+
+    class counting_source final : public rkva_native_state::Source {
+      public:
+        explicit counting_source(const std::vector<uint8_t> & data) : data(data) {}
+        bool read(void * dst, size_t size) override {
+            if (size > remaining()) return false;
+            std::memcpy(dst, data.data() + offset, size); offset += size; ++reads; return true;
+        }
+        uint64_t remaining() const override { return data.size() - offset; }
+        const std::vector<uint8_t> & data;
+        size_t offset = 0;
+        unsigned reads = 0;
+    } mismatch(bytes);
+    assert(!rkva_native_state::read_set(mismatch, layers, &error, nullptr,
+            [](void *, const rkva_native_state::SetHeader &) { return false; }, nullptr));
+    assert(mismatch.reads == 1); // reject geometry before allocating or reading the body
 
     class short_sink final : public rkva_native_state::Sink {
       public:
@@ -359,7 +376,7 @@ void test_aggregate_layer_budget() {
     assert(rkva_native_state::valid_layout(production, &production_error));
     assert(rkva_native_state::layer_bytes(production) == 34014208ull);
     assert(rkva_native_state::valid_payload_size(production, 16));
-    assert(!rkva_native_state::valid_payload_size(production, 256));
+    assert(rkva_native_state::valid_payload_size(production, 256) == (SIZE_MAX > UINT32_MAX));
 
     rkva_native_state::Layout layout;
     layout.origin = 1024;
@@ -373,7 +390,7 @@ void test_aggregate_layer_budget() {
     std::string error;
     assert(rkva_native_state::valid_layout(layout, &error));
     assert(rkva_native_state::valid_payload_size(layout, 16));
-    assert(!rkva_native_state::valid_payload_size(layout, 64));
+    assert(rkva_native_state::valid_payload_size(layout, 64) == (SIZE_MAX > UINT32_MAX));
     rkva_native_state::SetHeader header;
     header.layers = 16;
     header.layout = layout;
@@ -383,7 +400,20 @@ void test_aggregate_layer_budget() {
     assert(rkva_native_state::encode_header(header, encoded, &error));
     header.layers = 64;
     header.payload_bytes = rkva_native_state::payload_bytes(layout, header.layers);
-    assert(!rkva_native_state::encode_header(header, encoded, &error));
+    if (SIZE_MAX > UINT32_MAX) {
+        assert(header.payload_bytes > (4ull << 30));
+        assert(rkva_native_state::encode_header(header, encoded, &error));
+        rkva_native_state::SetHeader decoded;
+        assert(rkva_native_state::decode_header(encoded, decoded, &error));
+        std::vector<uint8_t> truncated(encoded, encoded + sizeof(encoded));
+        truncated.resize(truncated.size() + 32);
+        std::vector<rkva_native_state::Storage> output;
+        assert(!rkva_native_state::read_set(truncated, output, &error));
+        rkva_native_state::put_u64(encoded + 56, UINT64_MAX);
+        assert(!rkva_native_state::decode_header(encoded, decoded, &error));
+    } else {
+        assert(!rkva_native_state::encode_header(header, encoded, &error));
+    }
 }
 
 void test_reset_coverage_and_seals() {

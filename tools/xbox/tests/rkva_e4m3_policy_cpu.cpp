@@ -68,6 +68,20 @@ int main() {
     assert(!server_valid(bad_lse));
     bad_lse[0] = 0.0f; bad_lse[2] = 0.0f; assert(!server_valid(bad_lse));
 
+    std::vector<uint8_t> packed(nq * width, 0);
+    packed[0] = 0x80; packed[width] = 0x38;
+    const auto gpu_valid = [&](const float * lse) {
+        return rkva_kvarn_bulk::e4_fp8_prefix_results_valid(packed.data(), lse,
+                reinterpret_cast<const uint8_t *>(positions), nq, heads, dim, origin);
+    };
+    assert(gpu_valid(good_lse));
+    packed[0] = 1; assert(!gpu_valid(good_lse)); packed[0] = 0;
+    assert(!gpu_valid(bad_lse));
+    assert(rkva_kvarn_bulk::fp8_gpu_status_valid(0, false));
+    assert(!rkva_kvarn_bulk::fp8_gpu_status_valid(2, false));
+    assert(rkva_kvarn_bulk::fp8_gpu_status_valid(2, true));
+    for (uint32_t invalid : {1u, 3u, 4u}) assert(!rkva_kvarn_bulk::fp8_gpu_status_valid(invalid, true));
+
     // Real descriptor and op22 framing: two queries, one visible row.
     const rkva_kvarn_range_config desc {origin, 512, RKVA_RANGE_STORAGE_KVARN4, 3,
         128, 128, 256, 2, 4, 4, 8960, 3, 2, 128, 128, 1, 1, 1};

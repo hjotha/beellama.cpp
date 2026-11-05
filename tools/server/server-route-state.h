@@ -97,6 +97,8 @@ struct server_route_state_file {
 // before the Xbox SAVE / host publication. Returning false aborts publication
 // while the host file is still staged, so nothing is exposed or paired.
 using server_route_state_staged_callback = std::function<bool(const char * staged_path, size_t staged_bytes)>;
+using server_route_state_rotation_callback = std::function<bool(const char * staged_path,
+        size_t staged_bytes, uint64_t incoming_bytes)>;
 
 size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         const llama_tokens & tokens, const server_model_identity & identity,
@@ -107,7 +109,8 @@ size_t server_route_state_save(llama_context * ctx, llama_seq_id seq,
         server_route_state_store_lock * store_lock = nullptr,
         server_route_state_lease * publication_lock = nullptr,
         uint32_t native_split_p = 0,
-        const server_route_state_staged_callback & staged = {});
+        const server_route_state_staged_callback & staged = {},
+        const server_route_state_rotation_callback & rotate = {});
 
 // Bounded metadata/token read, no context mutation. With `verify_payload=true`
 // (the default) it also streams the native checksum through an 8 MiB buffer.

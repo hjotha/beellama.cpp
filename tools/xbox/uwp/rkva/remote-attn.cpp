@@ -15,6 +15,7 @@
 #include "remote-attn-protocol.h"
 #include "rkva-bulk-scratch.h"
 #include "rkva-kvarn-bulk.h"
+#include "rkva-native-store.h"
 #include "rkva-range-profile.h"
 #if defined(XLLAMA_QUAL_PROBE)
 #include "rkva-qual-probe.h"
@@ -195,6 +196,7 @@ struct remote_state {
     bool native_serial_prefix_v3_client = false;
     bool native_snapshot_client = false;
     bool native_flex_tail_client = false;
+    bool native_store_client = false;
     rkva_hello geo{};
     std::map<uint32_t, remote_session> sessions;
     std::unique_ptr<RemoteAttnEngine> engine;
@@ -393,6 +395,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             (hello.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_V4) != 0;
         state.native_flex_tail_client = state.native_serial_prefix_v3_client &&
             (hello.proto_flags & RKVA_PROTO_KVARN_FLEX_TAIL) != 0;
+        state.native_store_client = state.native_snapshot_client &&
+            (hello.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_STORE) != 0;
 
         const auto evict_started = clock_type::now();
         evict_local_session();
@@ -482,6 +486,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                 ack.reserved[0] |= RKVA_CAP_NATIVE_KVARN_SNAPSHOT;
             if (state.native_flex_tail_client)
                 ack.reserved[0] |= RKVA_CAP_KVARN_FLEX_TAIL;
+            if (state.native_store_client)
+                ack.reserved[0] |= RKVA_CAP_NATIVE_SNAPSHOT_STORE;
         }
         state.e4_available = (ack.reserved[0] & RKVA_CAP_KVARN_BULK_E4M3FN) != 0;
         if (!state.native_rewind_v2_client)
@@ -1201,12 +1207,13 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                                                                           : 4ull);
         // Include cold optional PSO setup in preparation, not an unreported gap.
         const auto t_scratch = state.profile_enabled ? clock_type::now() : clock_type::time_point{};
-        const bool gpu_fp8 =
-            wire_fp8 && state.fp8_gpu_enabled && state.engine->ensure_bulk_fp8_gpu_pipelines();
+        const bool gpu_fp8 = state.fp8_gpu_enabled &&
+            ((wire_fp8 && state.engine->ensure_bulk_fp8_gpu_pipelines()) ||
+             (wire_e4 && state.engine->ensure_bulk_e4_gpu_pipelines()));
         rkva_kvarn_bulk::ScratchCall scratch_call(state.bulk_scratch, req.n_tokens, wire);
         auto& temp_out_f16 = state.bulk_scratch.output_f16;
         auto& temp_lse = state.bulk_scratch.lse;
-        if ((wire_fp8 && !gpu_fp8) || wire_e4 || wire_sz) {
+        if (((wire_fp8 || wire_e4) && !gpu_fp8) || wire_sz) {
             temp_out_f16.resize(total_elems);
             temp_lse.resize(heads);
         } else {
@@ -1253,7 +1260,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             return state.engine->session_invalid(req.session_id) ? RKVA_ERR_GPU
                                                                  : RKVA_ERR_BAD_PAYLOAD;
         }
-        if ((wire_fp8 && !gpu_fp8) || wire_e4) {
+        if ((wire_fp8 || wire_e4) && !gpu_fp8) {
             output.resize(total_elems + heads * sizeof(float));
             uint8_t* dst_fp8 = output.data();
             for (size_t e = 0; e < total_elems; ++e) {
@@ -1474,6 +1481,68 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         prepare_us = elapsed_us(t0);
         return RKVA_OK;
     }
+    case RKVA_NATIVE_SNAPSHOT_STORE: {
+        if (!state.native_store_client || g_snapshot_local_folder.empty() ||
+            req.session_id != RKVA_SESSION_NONE || req.layer_id ||
+            req.n_tokens || input.size() < sizeof(rkva_native_store_request))
+            return RKVA_ERR_BAD_PAYLOAD;
+        rkva_native_store_request request{};
+        std::memcpy(&request, input.data(), sizeof(request));
+        if (request.action > 3 || request.keys > 64 || (request.action && request.keys != 1) ||
+            input.size() != sizeof(request) + size_t(request.keys) * 32)
+            return RKVA_ERR_BAD_PAYLOAD;
+        std::vector<std::string> keys;
+        static constexpr char hex[] = "0123456789abcdef";
+        for (uint32_t i = 0; i < request.keys; ++i) {
+            std::string key(64, '0');
+            for (size_t j = 0; j < 32; ++j) {
+                const uint8_t byte = input[sizeof(request) + size_t(i) * 32 + j];
+                key[2*j] = hex[byte >> 4]; key[2*j + 1] = hex[byte & 15];
+            }
+            if (std::find(keys.begin(), keys.end(), key) != keys.end()) return RKVA_ERR_BAD_PAYLOAD;
+            keys.push_back(std::move(key));
+        }
+        try {
+            namespace store = rkva_native_store;
+            const auto root = store::fs::u8path(g_snapshot_local_folder) / "rkva-snapshots-v2";
+            store::fs::create_directories(root);
+            if (store::fs::is_symlink(store::fs::symlink_status(root)))
+                throw std::runtime_error("snapshot: invalid native root");
+            store::WriteGuard guard(root);
+            if (request.action == 1) {
+                store::erase_published(root, keys[0], store::object_limit, store::file_count_limit);
+                return RKVA_OK;
+            }
+            if (request.action == 2 || request.action == 3) {
+                (void) store::plan_retirement(root, keys[0], store::object_limit,
+                                             store::file_count_limit, request.action == 3);
+                return RKVA_OK;
+            }
+            const auto entries = store::inspect(root, store::object_limit, store::file_count_limit);
+            rkva_native_store_status status{0, store::byte_limit, uint32_t(entries.size()),
+                                             store::object_count_limit, 0, 0};
+            std::vector<rkva_native_store_match> matches;
+            for (const auto& entry : entries) {
+                if (entry.bytes > UINT64_MAX - status.used_bytes)
+                    throw std::runtime_error("snapshot: native store size overflow");
+                status.used_bytes += entry.bytes;
+                if (!entry.published) continue;
+                const auto found = std::find(keys.begin(), keys.end(), entry.name);
+                if (found != keys.end())
+                    matches.push_back({uint32_t(found - keys.begin()), 0, entry.bytes});
+            }
+            status.matches = uint32_t(matches.size());
+            output.resize(sizeof(status) + matches.size() * sizeof(rkva_native_store_match));
+            std::memcpy(output.data(), &status, sizeof(status));
+            if (!matches.empty()) std::memcpy(output.data() + sizeof(status), matches.data(),
+                                               matches.size() * sizeof(rkva_native_store_match));
+            return RKVA_OK;
+        } catch (const std::exception& error) {
+            event_engine_error(error.what());
+            output.clear();
+            return RKVA_ERR_SNAPSHOT_IO;
+        }
+    }
     case RKVA_SNAPSHOT_SAVE:
     case RKVA_SNAPSHOT_RESTORE: {
         if (req.n_tokens || req.layer_id)
@@ -1540,7 +1609,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         if (input.size() < sizeof(probe))
             return RKVA_ERR_BAD_PAYLOAD;
         std::memcpy(&probe, input.data(), sizeof(probe));
-        if (probe.probe_id != 5)
+        if (probe.probe_id != 5 && probe.probe_id != 6)
             return RKVA_ERR_UNSUPPORTED_OP;
         rkva_bulk_fp8::ProbeLayout layout;
         if (req.session_id != RKVA_SESSION_NONE || req.layer_id || req.n_tokens ||
@@ -1548,7 +1617,8 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             return RKVA_ERR_BAD_PAYLOAD;
         if (!state.hello_done || !state.engine)
             return RKVA_ERR_STATE;
-        if (!state.engine->ensure_bulk_fp8_gpu_pipelines())
+        if (!(probe.probe_id == 6 ? state.engine->ensure_bulk_e4_gpu_pipelines() :
+                                   state.engine->ensure_bulk_fp8_gpu_pipelines()))
             return RKVA_ERR_UNSUPPORTED_OP;
         std::string error;
         const auto start = clock_type::now();

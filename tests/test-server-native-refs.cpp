@@ -5,6 +5,7 @@
 // which is the same critical section used by the explicit and automatic native
 // save paths.
 #include "../tools/server/server-native-refs.h"
+#include "../tools/server/server-native-rotation.h"
 #include "../tools/server/server-route-state.h"
 
 #undef NDEBUG
@@ -23,6 +24,8 @@ namespace fs = std::filesystem;
 namespace refs = server_native_refs;
 
 namespace {
+
+bool accept_remote(const uint8_t *, bool) { return true; }
 
 const char * const kKeyA = "3c1ac4014f51a0ff550c3e1346463623140e22f8c9a21bba80ff66d6b09fc582";
 const char * const kKeyB = "fff30e532caeac47750f17351664f3b392ffdafc0801514d09395c5326bee09a";
@@ -515,6 +518,219 @@ void test_naming() {
     assert(refs::journal_path("/tmp/store") == "/tmp/store/.rkva-native-refs.jsonl");
 }
 
+void test_rotation_plan() {
+    assert(!server_native_rotation::enabled(nullptr, true));
+    assert(!server_native_rotation::enabled("0", true));
+    assert(!server_native_rotation::enabled("1", false));
+    assert(server_native_rotation::enabled("1", true));
+    auto pinned = make_record(kKeyC, "", refs::state::pinned, refs::source::migrated);
+    auto pending = make_record(kKeyB, "pending.bin", refs::state::pending);
+    std::vector<refs::record> journal{
+        make_record(kKeyA, "a.bin", refs::state::committed), pending, pinned,
+        make_record(kKeyD, "d.bin", refs::state::committed)};
+    const auto candidates = server_native_rotation::candidates(journal, "2222222222222222222222222222222222222222222222222222222222222222");
+    assert(candidates.size() == 3);
+    assert(candidates[0].key == kKeyD && candidates[1].key == kKeyA);
+    assert(candidates[2].key == kKeyB && candidates[2].pending_files.size() == 1);
+    ggml_remote_native_store_info info{};
+    info.used_bytes = 600; info.limit_bytes = 1000; info.incoming_bytes = 200;
+    info.objects = 8; info.max_objects = 8; info.matches = 2;
+    info.match[0] = {2, 100}; info.match[1] = {1, 100};
+    assert(server_native_rotation::select(info, candidates.size(), true) == 1); // remote oldest
+    info.objects = 7;
+    assert(server_native_rotation::select(info, candidates.size(), true) == -1);
+    info.matches = 1; info.match[0] = {2, 100};
+    assert(server_native_rotation::select(info, candidates.size(), false) == 0); // missing on Xbox
+    info.incoming_bytes = 1001;
+    assert(server_native_rotation::select(info, candidates.size(), true) == -2);
+    info.matches = 1; info.match[0] = {0, 100}; // already published, no remote extra space
+    assert(server_native_rotation::select(info, candidates.size(), true) == -1);
+    assert(server_native_rotation::candidates(journal, kKeyA).size() == 2);
+}
+
+void test_rotation_pending_orphan(const fs::path & root) {
+    const fs::path dir = root / "rotation-pending";
+    fs::create_directory(dir);
+    server_route_state_store_lock store(dir.string());
+    const auto held = [&store](const std::string & p) { return store.owns_exclusive_for(p); };
+    std::string error;
+    assert(refs::append(dir.string(), make_record(kKeyD, "pending.bin", refs::state::pending), held, &error));
+    auto journal = refs::load(refs::journal_path(dir.string()));
+    auto options = server_native_rotation::candidates(journal.records, kKeyA);
+    assert(options.size() == 1 && options[0].pending_files.size() == 1);
+    const auto path = dir / "pending.bin";
+    { std::ofstream file(path); file << "possibly published"; }
+    unsigned remote_calls = 0; size_t removed = 0;
+    auto verify = [](const fs::path &, const std::string &) { return false; };
+    auto remote = [&](const uint8_t *) { ++remote_calls; return true; };
+    auto sync = [](const std::string & p) { return server_native_rotation::sync_directory(p); };
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::skipped);
+    assert(fs::exists(path) && remote_calls == 0);
+    fs::remove(path);
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::retired);
+    assert(remote_calls == 1 && removed == 0);
+    journal = refs::load(refs::journal_path(dir.string()));
+    assert(journal.ok && journal.records.size() == 1 && journal.records[0].st == refs::state::retired);
+}
+
+void test_rotation_mixed_pending(const fs::path & root) {
+    const fs::path dir = root / "rotation-mixed-pending";
+    fs::create_directory(dir);
+    const auto pending_path = dir / "pending.bin", committed_path = dir / "committed.bin";
+    { std::ofstream file(pending_path); file << "pending"; }
+    { std::ofstream file(committed_path); file << "valid"; }
+    server_route_state_store_lock store(dir.string());
+    const auto held = [&store](const std::string & p) { return store.owns_exclusive_for(p); };
+    std::string error;
+    assert(refs::append(dir.string(), make_record(kKeyD, "pending.bin", refs::state::pending), held, &error));
+    assert(refs::append(dir.string(), make_record(kKeyD, "committed.bin", refs::state::committed), held, &error));
+    auto journal = refs::load(refs::journal_path(dir.string()));
+    auto options = server_native_rotation::candidates(journal.records, kKeyA);
+    assert(options.size() == 1 && options[0].pending_files.size() == 1 &&
+           options[0].retirement.host_files.size() == 1);
+    unsigned remote_calls = 0; size_t removed = 0;
+    auto verify = [](const fs::path & p, const std::string & key) {
+        std::ifstream file(p); std::string value; file >> value; return key == kKeyD && value == "valid";
+    };
+    auto remote = [&](const uint8_t *) { ++remote_calls; assert(!fs::exists(committed_path)); return true; };
+    auto sync = [](const std::string & p) { return server_native_rotation::sync_directory(p); };
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::skipped);
+    assert(fs::exists(pending_path) && fs::exists(committed_path) && remote_calls == 0);
+    fs::remove(pending_path);
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::retired);
+    assert(removed == 1 && remote_calls == 1 && !fs::exists(committed_path));
+    journal = refs::load(refs::journal_path(dir.string()));
+    assert(journal.ok && journal.records.size() == 1 && journal.records[0].st == refs::state::retired);
+}
+
+void test_rotation_multiple_references(const fs::path & root) {
+    const fs::path dir = root / "rotation-multiple";
+    fs::create_directory(dir);
+    server_route_state_store_lock store(dir.string());
+    const auto first = dir / "first.bin";
+    { std::ofstream file(first); file << "valid"; }
+    fs::path second;
+    {
+        server_route_state_lease first_lock(first.string(), server_route_state_lock_mode::eviction);
+        assert(first_lock.acquired());
+        for (int i = 0; i < 128 && second.empty(); ++i) {
+            const auto candidate = dir / ("second-" + std::to_string(i) + ".bin");
+            server_route_state_lease candidate_lock(candidate.string(), server_route_state_lock_mode::eviction);
+            if (candidate_lock.acquired()) second = candidate;
+        }
+    }
+    assert(!second.empty());
+    { std::ofstream file(second); file << "invalid"; }
+    const auto held = [&store](const std::string & p) { return store.owns_exclusive_for(p); };
+    std::string error;
+    assert(refs::append(dir.string(), make_record(kKeyD, first.filename().string(), refs::state::committed), held, &error));
+    assert(refs::append(dir.string(), make_record(kKeyD, second.filename().string(), refs::state::committed), held, &error));
+    auto journal = refs::load(refs::journal_path(dir.string()));
+    auto options = server_native_rotation::candidates(journal.records, kKeyA);
+    assert(options.size() == 1 && options[0].retirement.host_files.size() == 2);
+    unsigned remote_calls = 0; size_t removed = 0;
+    auto verify = [](const fs::path & p, const std::string & key) {
+        std::ifstream file(p); std::string value; file >> value; return key == kKeyD && value == "valid";
+    };
+    auto remote = [&](const uint8_t *) { ++remote_calls; assert(!fs::exists(first) && !fs::exists(second)); return true; };
+    auto sync = [](const std::string & p) { return server_native_rotation::sync_directory(p); };
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::skipped);
+    assert(fs::exists(first) && fs::exists(second) && remote_calls == 0);
+    { std::ofstream file(second, std::ios::trunc); file << "valid"; }
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::retired);
+    assert(removed == 2 && remote_calls == 1);
+    journal = refs::load(refs::journal_path(dir.string()));
+    assert(journal.ok && journal.records.size() == 1 && journal.records[0].st == refs::state::retired);
+}
+
+void test_rotation_retirement(const fs::path & root) {
+    for (int failure : {0, 1, 2}) {
+    const fs::path dir = root / (failure == 2 ? "rotation-sync-failed" :
+                                 failure == 1 ? "rotation-lost-ack" : "rotation-failed-delete");
+    fs::create_directory(dir);
+    const auto path = dir / "old.bin";
+    { std::ofstream file(path); file << "validated"; }
+    server_route_state_store_lock store(dir.string());
+    assert(store.acquired());
+    const auto held = [&store](const std::string & p) { return store.owns_exclusive_for(p); };
+    std::string error;
+    assert(refs::append(dir.string(), make_record(kKeyD, "old.bin", refs::state::committed), held, &error));
+    auto loaded = refs::load(refs::journal_path(dir.string()));
+    auto options = server_native_rotation::candidates(loaded.records, kKeyA);
+    assert(options.size() == 1);
+    auto verify = [](const fs::path & p, const std::string & key) {
+        std::ifstream file(p); std::string value; file >> value;
+        return key == kKeyD && value == "validated";
+    };
+    size_t removed = 0;
+    unsigned remote_calls = 0;
+    bool remote_exists = true;
+    bool synced = false;
+    auto fail_remote = [&](const uint8_t *) { assert(synced); ++remote_calls; if (failure == 1) remote_exists = false; return false; };
+    auto ok_remote = [&](const uint8_t *) { assert(synced); ++remote_calls; assert(!fs::exists(path)); remote_exists = false; return true; };
+    auto bad_verify = [](const fs::path &, const std::string &) { return false; };
+    auto preflight = [&](const uint8_t *, bool partial) { assert(partial == !fs::exists(path)); return true; };
+    auto sync = [&](const std::string & directory) { synced = server_native_rotation::sync_directory(directory); return synced; };
+    auto fail_sync = [](const std::string &) { return false; };
+    assert(server_native_rotation::retire(options[0], dir.string(), store, bad_verify, accept_remote, ok_remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::skipped);
+    assert(fs::exists(path) && remote_calls == 0);
+    auto reject_remote = [](const uint8_t *, bool) { return false; };
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, reject_remote, ok_remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::skipped);
+    assert(fs::exists(path) && remote_calls == 0);
+    { std::ofstream sidecar(path.string() + ".meta"); sidecar << "protected"; }
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, ok_remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::skipped);
+    fs::remove(path.string() + ".meta");
+    {
+        server_route_state_lease live(path.string(), server_route_state_lock_mode::reservation);
+        assert(live.acquired());
+        assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, ok_remote, sync, removed, error) ==
+               server_native_rotation::retirement_result::skipped);
+    }
+    const auto alias = dir / "alias.bin";
+    std::error_code hardlink_error;
+    fs::create_hard_link(path, alias, hardlink_error);
+    if (!hardlink_error) {
+        assert(server_native_rotation::retire(options[0], dir.string(), store, verify, accept_remote, ok_remote, sync, removed, error) ==
+               server_native_rotation::retirement_result::skipped);
+        fs::remove(alias);
+    }
+    assert(fs::exists(path) && remote_calls == 0);
+    const auto failed = failure == 2
+        ? server_native_rotation::retire(options[0], dir.string(), store, verify, preflight, ok_remote, fail_sync, removed, error)
+        : server_native_rotation::retire(options[0], dir.string(), store, verify, preflight, fail_remote, sync, removed, error);
+    assert(failed == server_native_rotation::retirement_result::failed);
+    assert(removed == 1 && !fs::exists(path) && remote_calls == (failure == 2 ? 0u : 1u));
+    assert(remote_exists == (failure != 1));
+    loaded = refs::load(refs::journal_path(dir.string()));
+    assert(loaded.ok && loaded.records.size() == 1 && loaded.records[0].st == refs::state::committed);
+    options = server_native_rotation::candidates(loaded.records, kKeyA);
+    assert(options.size() == 1);
+    synced = false;
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, preflight, ok_remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::retired);
+    assert(removed == 0 && remote_calls == (failure == 2 ? 1u : 2u) && !remote_exists);
+    loaded = refs::load(refs::journal_path(dir.string()));
+    assert(loaded.ok && loaded.records.size() == 1 && loaded.records[0].st == refs::state::retired);
+    options = server_native_rotation::candidates(loaded.records, kKeyA);
+    assert(options.size() == 1 && options[0].retirement.refusal == refs::retire_refusal::already_retired);
+    remote_exists = true; // a retired Xbox object reappeared after an interrupted cleanup
+    synced = false;
+    assert(server_native_rotation::retire(options[0], dir.string(), store, verify, preflight, ok_remote, sync, removed, error) ==
+           server_native_rotation::retirement_result::retired);
+    assert(!remote_exists && removed == 0);
+    assert(refs::load(refs::journal_path(dir.string())).records.size() == 1);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -536,6 +752,11 @@ int main() {
     test_migration_writes(root);
     test_audit();
     test_naming();
+    test_rotation_plan();
+    test_rotation_pending_orphan(root);
+    test_rotation_mixed_pending(root);
+    test_rotation_multiple_references(root);
+    test_rotation_retirement(root);
 
     fs::remove_all(root, ec);
     assert(!ec);

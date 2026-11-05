@@ -6,9 +6,11 @@ import re
 root = Path(__file__).resolve().parents[1] / 'uwp/rkva'
 source = (root / 'rkva-disk-snapshot.inc').read_text()
 store = (root / 'rkva-native-store.h').read_text()
-assert re.search(r'constexpr uint64_t store_limit\s*=\s*8ull\s*<<\s*30\s*;', source)
+assert re.search(r'constexpr uint64_t byte_limit\s*=\s*8ull\s*<<\s*30\s*;', store)
+assert 'store_limit = rkva_native_store::byte_limit' in source
 assert re.search(r'constexpr size_t retained_snapshots\s*=\s*4\s*;', source)
-assert re.search(r'constexpr size_t native_retained_snapshots\s*=\s*8\s*;', source)
+assert re.search(r'constexpr uint32_t object_count_limit\s*=\s*8\s*;', store)
+assert 'native_retained_snapshots = rkva_native_store::object_count_limit' in source
 legacy = source[source.index('inline void make_room('):source.index('} // namespace rkva_snapshot')]
 assert 'count < retained_snapshots' in legacy and 'count >= retained_snapshots' in legacy
 native = source[source.index('const auto root = snap::fs::u8path(local_folder) / "rkva-snapshots-v2"'):source.index('// The legacy Q4/Q8/F16 format')]

@@ -10,6 +10,9 @@
 #include <limits>
 #include <random>
 
+using uint = uint32_t;
+#include "../shaders/rkva/rkva_e4m3_codec.hlsli"
+
 static std::array<double, 127> reference_levels() {
     std::array<double, 127> result{};
     for (unsigned i = 0; i < result.size(); ++i) {
@@ -62,6 +65,7 @@ int main() {
         const double expected = (code & 0x80u) ? -levels[code & 0x7fu] : levels[code];
         const float from_half = reference_half(half);
         assert(valid_f32 && valid_f16 && double(value) == expected);
+        assert(e4m3fn_to_half(code) == half);
         assert(value == from_half && std::signbit(value) == std::signbit(from_half));
         uint8_t encoded = 0xff;
         assert(rkva_e4::encode_f32(value, encoded) && encoded == code);
@@ -80,6 +84,7 @@ int main() {
         } else {
             const float value = reference_half(uint16_t(half));
             assert(ok && got == reference_encode(value, levels));
+            assert(e4m3fn_from_half(half) == got);
             check_f32(value, levels);
             ++finite_half;
         }

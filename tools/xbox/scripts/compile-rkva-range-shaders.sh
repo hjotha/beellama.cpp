@@ -9,7 +9,7 @@ DXC="${DXC:-dxc}"
 ALL_TARGETS=(attn attn_q4 attn_q8 attn_kvarn4 reduce attn_q4_opt reduce_opt reduce_kvarn4
     attn_f16_opt attn_q8_opt attn_kvarn4_opt attn_kvarn4_prefix attn_kvarn4_opt_prefix
     attn_q4_mq2 attn_q4_mq4 attn_f16_mq2 attn_f16_mq4 attn_q8_mq2 attn_q8_mq4
-    attn_kvarn4_mq2 attn_kvarn4_mq4 attn_q8_mq2_i8 reduce_q8_paired bulk_unpack_q_fp8_raw bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8 attn_q4_decode_rowlane attn_q8_decode_rowlane
+    attn_kvarn4_mq2 attn_kvarn4_mq4 attn_q8_mq2_i8 reduce_q8_paired bulk_unpack_q_fp8_raw bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 bulk_unpack_q_e4m3fn bulk_pack_out_e4m3fn attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8 attn_q4_decode_rowlane attn_q8_decode_rowlane
     attn_f16_decode_rowlane attn_q4_1_decode_rowlane attn_q5_0_decode_rowlane attn_q5_1_decode_rowlane attn_q6_0_decode_rowlane attn_q6_1_decode_rowlane attn_iq4_nl_decode_rowlane attn_kvarn2_decode_rowlane attn_kvarn3_decode_rowlane attn_saw_int4_decode_rowlane attn_oscar_int2_decode_rowlane attn_turboquant_nc)
 if [[ $# -gt 0 ]]; then
     TARGETS=("$@")
@@ -215,7 +215,7 @@ for target in "${TARGETS[@]}"; do
         # F32 wire uses CPU butterfly_wht256. Preserve its separately rounded
         # H128 and H2 normalizations: fast DXIL folds them into one multiply
         # and changes Q_rot/LSE even when both wires carry identical F16 Q.
-        # Scope strict arithmetic to this entry; qualified FP8 stays unchanged.
+        # Preserve the qualified E5 entry; E4 also uses strict arithmetic below.
         compile_flags=(-Gis)
     fi
     if [[ "$target" == bulk_pack_out_f16 ]]; then
@@ -233,15 +233,27 @@ for target in "${TARGETS[@]}"; do
         source="$ROOT/shaders/rkva/rkva_range_bulk_f16.hlsl"
         defines=()
     fi
+    if [[ "$target" == bulk_unpack_q_e4m3fn ]]; then
+        entry=CSBulkUnpackQFP8
+        source="$ROOT/shaders/rkva/rkva_range_bulk_f16.hlsl"
+        defines=(-D RKVA_E4_CODEC=1)
+        # Match the F16 unpack's separately rounded WHT normalizations.
+        compile_flags=(-Gis)
+    fi
+    if [[ "$target" == bulk_pack_out_e4m3fn ]]; then
+        entry=CSBulkPackOutFP8
+        source="$ROOT/shaders/rkva/rkva_range_bulk_f16.hlsl"
+        defines=(-D RKVA_E4_CODEC=1)
+    fi
     out="$ROOT/shaders/generated/rkva_range_${target}_dxil.h"
     tmp="$(mktemp)"
     trap 'rm -f "$tmp"' EXIT
     "$DXC" -T "$profile" -E "$entry" "${compile_flags[@]}" "${defines[@]}" "$source" -Fo "$tmp"
-    python3 - "$tmp" "$out" "$source" "$target" "${compile_flags[*]}" "$profile" <<'PY'
+    python3 - "$tmp" "$out" "$source" "$target" "${compile_flags[*]}" "$profile" "${defines[*]}" <<'PY'
 import hashlib
 import pathlib
 import sys
-binary, output, source, target, compile_flags, profile = sys.argv[1:]
+binary, output, source, target, compile_flags, profile, defines = sys.argv[1:]
 data = pathlib.Path(binary).read_bytes()
 src_path = pathlib.Path(source)
 entry_text = src_path.read_text()
@@ -251,7 +263,7 @@ entry_text = src_path.read_text()
 included = []
 for line in entry_text.splitlines():
     text = line.strip()
-    if text.startswith('#include "') and text.endswith('.hlsl"'):
+    if text.startswith('#include "') and (text.endswith('.hlsl"') or text.endswith('.hlsli"')):
         name = text.split('"')[1]
         sibling = src_path.parent / name
         if sibling.exists():
@@ -266,6 +278,7 @@ lines = [
         src_path.with_name('rkva_decode_rowlane.hlsli').read_bytes()).hexdigest()]
       if target == 'attn_kvarn4_decode_rowlane' else []),
     *(['// Additional compiler options: ' + compile_flags] if compile_flags else []),
+    *(['// Defines: ' + defines] if defines else []),
     *(['// Shader model: ' + profile] if profile != 'cs_6_0' else []),
     '#pragma once', '#include <cstdint>', '// clang-format off',
     'static const uint8_t g_rkva_range_' + target + '_dxil[] = {',
