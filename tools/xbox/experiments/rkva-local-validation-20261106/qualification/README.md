@@ -96,66 +96,33 @@ Mesmo `eligible_for_human_review_only` exige conferir logs originais, cobertura,
 independência, ruído, identidade do PSO, efeitos de sistema e decisão humana.
 Nenhuma mudança em produção está incluída neste pacote.
 
-## Evidência recente, somente relato de transcript
+## Resultado final externo, não entrada do analisador
 
-Fonte: transcript técnico da máquina .57, consultado em 2026-11-06 às 16:32 UTC. Não contém série bruta
-neste pacote, portanto NÃO foi convertido em fixtures ou reanalisado.
+Leia [FINAL-XBOX-RESULTS-20261106.md](../FINAL-XBOX-RESULTS-20261106.md).
+Fonte: `NOTAS.md` e transcript técnico consultados em 2026-11-06 às 16:52:32 UTC;
+resposta final às 16:44:46 UTC. Esse resultado substitui os relatos preliminares.
+Não houve novos testes remotos nesta atualização documental.
 
-- 16:17:27: WHT passou probes seriais e 696 registros bulk byte a byte.
-- 16:22:58: ABBA terminou com +0,08% médio remoto relatado, sem ganho decode/total.
-  Baseline mantido; WHT descartado por falta de ganho. Não reinterpretamos o
-  sinal ou denominador desse percentual como a métrica de latência desta ferramenta.
-- Q_rot compilava separadamente; WHT original havia sido restaurado.
-- GQA2 histórico em 129k: cerca de 2% prefill, mas KLD 1,11 e top1 divergente.
-  Pequenas diferenças parciais não justificam promoção.
+- WHT: 498 checagens seriais e 696 bulk com requests e OUT/LSE idênticos;
+  1024 tokens iguais nos quatro braços. +0,08% de throughput remoto médio
+  relatado, no ruído; sem ganho justificável. Não promover.
+- Q_rot: build Final/MSVC/MSIX 1004 e DXIL esperado relatados; serial passou,
+  mas 8/696 respostas bulk F32 divergem em bytes, todas nq1, com requests iguais.
+  B1/B2 geram tokens iguais entre si, mas divergem do baseline a partir do token
+  23. Falha do gate exato e ausência de ganho: não promover.
+- Decode Q_rot médio relatado: 21,40 t/s baseline e 21,35 t/s candidato,
+  delta relatado -0,25%. Não é demonstração estatística de regressão.
+- Baseline restaurado segundo o relatório final, sem integração ao main.
+- GQA2 histórico não qualificado por qualidade; não repetido nesta campanha.
+  MQ2 permanece modelo CPU. LDS wave64 continua sem validação GPU.
 
-Esses relatos não são logs brutos, nem novos testes desta máquina. A conclusão
-WHT continua 'não promover'; não é evidência de falha de corretude dos probes.
-Esse era o estado Q_rot às 16:32 UTC; a atualização abaixo registra a falha
-posterior do gate bulk e substitui esse estado preliminar.
+As tabelas do relatório têm somente **um bloco ABBA por candidato**, valores
+arredondados e nenhum manifesto bruto completo por corrida. Q_rot reutiliza
+como A1 o A2 final de WHT; a geração diferente a partir do token 23 confunde a
+comparabilidade do workload end-to-end. Tokens diferentes, isoladamente, não
+provam perda de qualidade. Não invente hashes, réplicas, intervalos ou p-valores.
 
-### Retrospectiva adicional: NOTAS.md consultado às ~16:35 UTC
-
-Observações do transcript técnico na .57, consultado em 2026-11-06, **não**
-validações novas no dot: WHT compilado em MSIX 1001 Final/MSVC com DXIL candidato
-confirmado; 498 checagens seriais (tails 0/128); 696 requests e bytes OUT/LSE
-iguais no bulk; 1024 tokens idênticos nos quatro braços. DXIL: 20→13 barreiras
-relatadas. Caso: 8k, P4096, output1024, KVarN4/E4M3FN/CUDA/prefetch, base
-`7310f5d7e`. Gates restantes de cobertura/qualidade não são presumidos completos.
-
-Valores arredondados transcritos, preservados sem conversão ou recomputação:
-
-| Braço | Prefill total t/s | Trecho remoto t/s | Decode t/s | Wall s |
-| --- | ---: | ---: | ---: | ---: |
-| A1 | 465.13 | 318.97 | 21.38 | 65.48 |
-| B1 | 464.90 | 317.44 | 21.38 | 65.47 |
-| B2 | 465.73 | 318.71 | 21.38 | 65.44 |
-| A2 | 462.30 | 316.68 | 21.39 | 65.56 |
-
-Unidades confirmadas no cabeçalho de NOTAS.md: throughput em tokens/s e wall
-em segundos. Não copiar throughput para campos `*_ms` de latência. Baseline
-939/restaurado 1002 usavam o mesmo executável; candidato WHT era 1001.
-Há apenas um bloco ABBA nessa transcrição. Não é série bruta completa, não contém
-hashes verificáveis por corrida e não satisfaz o contrato do analisador. O ganho
-remoto médio relatado de +0,08% está no ruído; baseline mantido e WHT não promovido.
-Os 1024 tokens iguais nesse caso não provam cobertura geral de qualidade.
-
-GQA2 histórico: divergência top1 em 1 de 16 passos forçados e KLD 1,11; duas
-tentativas de correção falharam segundo o mesmo repasse. Não é candidato
-qualificado. Qualquer gate de qualidade incompleto também impede promoção.
-
-### Atualização Q_rot: transcript consultado às 16:38:27 UTC
-
-Fonte: transcript técnico da máquina .57, consultado em 2026-11-06. Estes são
-resultados relatados da execução remota, não novos testes no dot nem logs brutos:
-
-- 16:33:13: build Q_rot completo.
-- 16:34:22: pacote com DXIL esperado e reducer original no Xbox.
-- 16:37:29: probes seriais passaram nas tolerâncias, mas **8 das 696 respostas
-  bulk diferiram em bytes**. O gate de igualdade bulk falhou e bloqueia promoção.
-
-A causa das diferenças e o resultado final de desempenho ainda não foram
-determinados neste relato. Medição isolada poderia continuar para diagnóstico,
-sem promover o candidato. Tolerância serial não substitui igualdade byte a byte;
-nenhuma alteração de gate foi feita para aceitar essas diferenças. Não foram
-criadas amostras, hashes ou resultados do analisador a partir desse resumo.
+Não passe essas tabelas por `qualify_abba.py` como evidência completa e não
+copie throughput t/s para campos de latência `*_ms`. O percentual remoto WHT
+é throughput relatado, não redução de latência deste analisador. Os gates e a
+exigência de novas campanhas independentes continuam inalterados.

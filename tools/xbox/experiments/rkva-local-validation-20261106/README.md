@@ -18,7 +18,7 @@ benchmark do console e não demonstra aceleração.
 
 | Candidato | O que existe | Resultado CPU histórico | O que falta |
 | --- | --- | --- | --- |
-| Q_rot reuse | Patch HLSL opt-in, flag OFF; modelos e fixtures | 44 casos completos, OUT/LSE bitwise A/B | Relato externo: compilou/executou; bloqueado por 8/696 bulk divergentes |
+| Q_rot reuse | Patch HLSL opt-in, flag OFF; modelos e fixtures | 44 casos completos, OUT/LSE bitwise A/B | Resultado final externo: 8/696 bulk divergentes, tokens divergem após 23; sem ganho, não promover |
 | WHT ping-pong | Patch HLSL do reducer; modelo de sincronização | 2.469 vetores, 94 casos; ASan/UBSan | Relato externo: corretude passou; ABBA +0,08%, sem ganho real |
 | GQA2 | Patch parcial de shader, teste de layout e política | 6 testes; 5.598.720 combinações | Falha histórica de qualidade em 129k; não promover por tolerância CPU |
 | LDS wave64 rowlane | Patch opt-in Q4/Q8/F16/SAW, sem integração | 6 testes host nesta atualização | DXIL/LDS compilada, PSO, corretude GPU e desempenho |
@@ -212,11 +212,21 @@ experimentais, sem alterar Xbox ou produção.
 O relato novo de WHT passou corretude serial/bulk, mas não mostrou ganho em
 decode/total; baseline mantido e candidato descartado por desempenho. Esse
 relato atualiza o estado histórico da tabela acima, sem substituir logs brutos.
-Atualização do transcript consultado às 16:38:27 UTC: Q_rot compilou e executou
-no Xbox, mas 8/696 respostas bulk diferiram em bytes. Apesar de passar as
-tolerâncias seriais, falhou o gate de igualdade bulk e não pode ser promovido.
-Causa e ganho final ainda não determinados. Não promover GQA2 por tolerância
-CPU: o relato histórico em 129k inclui KLD 1,11 e top1 divergente.
+Resultado final consultado em `NOTAS.md` e no transcript em 2026-11-06 às
+16:52:32 UTC (resposta final às 16:44:46 UTC): Q_rot passou tolerâncias seriais,
+mas falhou igualdade bulk (8/696 respostas) e os tokens divergem do baseline a
+partir do token 23. Sem ganho mensurável; não promover nem repetir o mesmo
+candidato sem nova hipótese verificável. WHT também não deve ser repetido como
+suposta otimização validada: +0,08% remoto relatado, sem ganho justificável.
+O baseline foi restaurado segundo o relatório final; nada integrado ao main.
+
+Leia [FINAL-XBOX-RESULTS-20261106.md](FINAL-XBOX-RESULTS-20261106.md) antes de
+retomar trabalho. O relatório reúne tabelas, limites da comparação e estado
+final, substituindo o estado preliminar Q_rot. Dados transcritos/arredondados,
+não testes novos no dot nem entradas completas para o analisador. GQA2 continua
+não qualificado por qualidade histórica; MQ2 permanece modelo CPU e LDS ainda
+não tem evidência GPU. Nenhum resultado de WHT/Q_rot valida LDS.
+
 
 
 ## Nova prioridade experimental: LDS rowlane wave64
