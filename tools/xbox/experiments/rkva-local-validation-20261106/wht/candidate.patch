@@ -1,0 +1,46 @@
+--- a/tools/xbox/shaders/rkva/rkva_range_reduce_opt.hlsl
++++ b/tools/xbox/shaders/rkva/rkva_range_reduce_opt.hlsl
+@@ -19,7 +19,7 @@
+ groupshared uint gs_invalid;
+ 
+ #if RKVA_REDUCE_WHT
+-groupshared float gs_wht[256];
++groupshared float gs_wht[512];
+ #endif
+ 
+ [numthreads(128, 1, 1)]
+@@ -91,18 +91,25 @@
+     gs_wht[lane + 128] = acc1 * inv;
+     GroupMemoryBarrierWithGroupSync();
+ 
++    // Isolated prototype: ping-pong LDS avoids lane-dependent wave shuffles.
++    // Each stage reads one complete bank and writes a disjoint bank. The
++    // trailing group barrier protects both the next stage's reads and reuse
++    // of the old bank. Keep all 128 lanes participating, including both waves.
++    uint wht_read = 0;
++    uint wht_write = 256;
+     [unroll] for (uint stride_wht = 1; stride_wht < 128; stride_wht *= 2) {
+-        float own0 = gs_wht[lane];
+-        float other0 = gs_wht[lane ^ stride_wht];
+-        float own1 = gs_wht[lane + 128];
+-        float other1 = gs_wht[(lane ^ stride_wht) + 128];
++        float own0 = gs_wht[wht_read + lane];
++        float other0 = gs_wht[wht_read + (lane ^ stride_wht)];
++        float own1 = gs_wht[wht_read + lane + 128];
++        float other1 = gs_wht[wht_read + (lane ^ stride_wht) + 128];
++        gs_wht[wht_write + lane] = (lane & stride_wht) ? other0 - own0 : own0 + other0;
++        gs_wht[wht_write + lane + 128] = (lane & stride_wht) ? other1 - own1 : own1 + other1;
+         GroupMemoryBarrierWithGroupSync();
+-        gs_wht[lane] = (lane & stride_wht) ? other0 - own0 : own0 + other0;
+-        gs_wht[lane + 128] = (lane & stride_wht) ? other1 - own1 : own1 + other1;
+-        GroupMemoryBarrierWithGroupSync();
++        wht_read ^= 256;
++        wht_write ^= 256;
+     }
+-    float x = gs_wht[lane] * 0.08838834764831845f;
+-    float y = gs_wht[lane + 128] * 0.08838834764831845f;
++    float x = gs_wht[wht_read + lane] * 0.08838834764831845f;
++    float y = gs_wht[wht_read + lane + 128] * 0.08838834764831845f;
+     float out0 = (x + y) * 0.7071067811865475f;
+     float out1 = (x - y) * 0.7071067811865475f;
+ 

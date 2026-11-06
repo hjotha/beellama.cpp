@@ -1,0 +1,11 @@
+{
+  "claimed_source_revision": "4bad0205c1658ac1aa67b358b89884c2e9cddf4c (supplied revision; baseline bytes verified by SHA256)",
+  "source_sha256": "3513aa4a0dc38597cc0f690e768ad2837873543d1cbfc64a645baa1ec6a586fe",
+  "prototype_sha256": "d31a509a8bc1966d5b47158c9a31145ef116c5246c22f3fd9078cbc8a546fd82",
+  "patch_sha256": "0d5bed237343fa451cb9192cba6b399c0eae4b5f30f0b423afe6bd6df5082d85",
+  "source": "tools/xbox/shaders/rkva/rkva_range_reduce_opt.hlsl",
+  "baseline_fixture": "baseline.hlsl",
+  "compile_script_source": "tools/xbox/scripts/compile-rkva-range-shaders.sh",
+  "compile_script_sha256": "5f1119df975a5e01a0d154a49d036203945b0e78e63359e0b63cd740823862c0",
+  "compile_script_observation": "Snapshot reduce_kvarn4 target does not pass -Gis; script not bundled or executed."
+}

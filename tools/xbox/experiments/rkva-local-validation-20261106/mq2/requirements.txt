@@ -1,0 +1,2 @@
+# Historical and portable validation both used NumPy 2.3.5.
+numpy==2.3.5

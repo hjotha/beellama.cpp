@@ -1,0 +1,127 @@
+{
+  "date_utc": "2026-11-06",
+  "scope": "CPU validation package; not a production shader change",
+  "saved_gqa2_branch": {
+    "name": "perf/rkva-gqa2-prefill-20261027",
+    "head": "582cc8d8e70216e0ba697e735fbe3c6817704f9a",
+    "comparison_base": "e3fedf8d17a8224fc4b4669533fee45aff7427d6",
+    "original_test_pinned_base": "8bad8e84e67e9fcd43d12f637962b87685e0fecc",
+    "saved_full_patch_sha256": "8b7e59354ea1fa9f2e7e6c7266ae604ba53f3d1a6c225beada2239c93b5a787e",
+    "included_subset": "patches/gqa2-fixture-only.patch",
+    "subset_sha256": "74d47b367ab8a5b4ce4a13dcb5b6d84243e98ebfe94381ec47a98fc5b0f94519",
+    "limitation": "Full historical engine/profile integration patch does not apply cleanly to inspected main; not bundled or applied."
+  },
+  "baseline_shader": {
+    "repository_path": "tools/xbox/shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl",
+    "saved_source_sha256": "f661e955dc0516a51dde7bb4df1692b7512b818390476742132422a664b82979",
+    "bundled_path": "fixtures/main_mq.hlsl",
+    "snapshot": "saved main snapshot inspected 2026-11-05; not a current Git lookup",
+    "snapshot_commit": "4bad0205c1658ac1aa67b358b89884c2e9cddf4c"
+  },
+  "dependency_sources": [
+    {
+      "repository_path": "tools/xbox/tests/rkva_decode_rowlane_model.py",
+      "saved_source_sha256": "7a560b34f2c74ae6000b881efb6e2c835b9b79cbb3c343e9d8b0f66ad7113a7b",
+      "checkout_head": "ff008e07eea8e471ebe247ad3ef5dfce35b828bf",
+      "matches_checkout_head": true,
+      "bundled_path": "rkva_decode_rowlane_model.py",
+      "adaptation": "unchanged"
+    },
+    {
+      "repository_path": "tools/xbox/tests/rkva_kvarn_serial_prefix_model.py",
+      "saved_source_sha256": "cc524cceb7d474a48536686d41bddfedbeb5afe6b9e8f39ce8750e34073b3795",
+      "checkout_head": "ff008e07eea8e471ebe247ad3ef5dfce35b828bf",
+      "matches_checkout_head": true,
+      "bundled_path": "rkva_kvarn_serial_prefix_model.py",
+      "adaptation": "unchanged"
+    },
+    {
+      "repository_path": "tools/xbox/tests/rkva_kvarn_serial_prefix_probe.py",
+      "saved_source_sha256": "f84ba5f3d0e21adb8d01341198eb0d0915c5378c68ff0951f1a1eaf0eedd00b3",
+      "checkout_head": "ff008e07eea8e471ebe247ad3ef5dfce35b828bf",
+      "matches_checkout_head": true,
+      "bundled_path": "rkva_kvarn_serial_prefix_probe.py",
+      "adaptation": "exact compare() excerpt only; no network client"
+    },
+    {
+      "repository_path": "tools/xbox/tests/rkva_range_kvarn4_opt_model.py",
+      "saved_source_sha256": "0ed4b40665bb196a47e275dc309fce299bff8f89a5b4a714f11c05af73ccf81a",
+      "checkout_head": "ff008e07eea8e471ebe247ad3ef5dfce35b828bf",
+      "matches_checkout_head": true,
+      "bundled_path": "rkva_range_kvarn4_opt_model.py",
+      "adaptation": "default optional Bee fixture path made package-relative"
+    },
+    {
+      "repository_path": "tools/xbox/tests/rkva_range_q4_opt_model.py",
+      "saved_source_sha256": "f76d9f6f631f4e1e64e5ea71cb4016d6aa1524ee15af9d45eb7e44219ffcc849",
+      "checkout_head": "ff008e07eea8e471ebe247ad3ef5dfce35b828bf",
+      "matches_checkout_head": true,
+      "bundled_path": "rkva_range_q4_opt_model.py",
+      "adaptation": "unchanged"
+    }
+  ],
+  "compare_excerpt_sha256": "6e704d7816dbd5f36d0efa951239c6046519965d81fe1c71c6f296391af3de8e",
+  "extracted_fixtures": [
+    {
+      "path": "fixtures/gqa2_policy_extract.h",
+      "sha256": "f61ec0a7fe3195d7bb451d3e55b2843a6e2e22b50e490e615412520c47d16c12",
+      "origin": "GQA2 branch policy first added block with host constants"
+    },
+    {
+      "path": "fixtures/row_kind_extract.inc",
+      "sha256": "454175a691e23e9ddf9a5436f1b82de6a2a69fccc373bd340e6ec7c0649e4916",
+      "origin": "reconstructed GQA2 shader; selector only removes [unroll] attribute"
+    },
+    {
+      "path": "fixtures/selector_extract.inc",
+      "sha256": "290d106c38ea2bbbaefc33d519fa2cb9da8071fd87761549099f9180f8d6bb74",
+      "origin": "reconstructed GQA2 shader; selector only removes [unroll] attribute"
+    }
+  ],
+  "reconstructed_fixture_files": [
+    {
+      "path": "tools/xbox/shaders/rkva/rkva_range_attn_kvarn4_mq.hlsl",
+      "sha256": "6c2847b69894720f5822ab3c9c4494b38e46c0ed7928c83650cea1c87402fff0"
+    },
+    {
+      "path": "tools/xbox/shaders/rkva/rkva_range_attn_kvarn4_mq_gqa2.hlsl",
+      "sha256": "045bc33453cacf9782dcc0c306122cd58fb56dd00989481be9a8effb8a7d640a"
+    },
+    {
+      "path": "tools/xbox/tests/test_rkva_mq_gqa2_layout.py",
+      "sha256": "092d5aaf90013a06558aec1e867dfc2cb24cccb9da3b56f558613e1524a4bd9d"
+    }
+  ],
+  "original_experiment_sources": [
+    {
+      "path": "mq2_rowlane_prototype.py",
+      "sha256": "d27b3e16f33c87d3238d7ba40c2aff9d46ec9327097192f43db645c20d6c88ba"
+    },
+    {
+      "path": "check_negative_controls.py",
+      "sha256": "0d276a7563ca2b22a5b7a50625cbf9ed87ef615c72bf3aad520aa42feeb5b493"
+    },
+    {
+      "path": "audit_error_budget.py",
+      "sha256": "0a5709a6618552bb5d3266e7556caf174da915dfcd6c16194ed9f1042e3e7170"
+    },
+    {
+      "path": "run_gqa2_layout.py",
+      "sha256": "d46854841ea357239165bc257a44ee1da3c84364d434b7621e6c0853f8c427d3"
+    },
+    {
+      "path": "test_gqa2_policy.cpp",
+      "sha256": "95cc2bb0b738cc5bf13525767d4c901372b1e9448f7753f27b5adb1ccbfb7401"
+    },
+    {
+      "path": "test_mq2_masks.cpp",
+      "sha256": "ff316d78e929d722efec33d3ff41e14a26bcbe79bb137b424120fb97f3d5042c"
+    }
+  ],
+  "historical_environment": {
+    "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+    "numpy": "2.3.5",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "compiler": "g++ (Debian 14.2.0-19) 14.2.0"
+  }
+}

@@ -1,0 +1,2 @@
+# Preserve the byte-exact fixture and patch hashes, including Windows checkouts.
+* text eol=lf

@@ -1,0 +1,13 @@
+{
+  "tests_run": 6,
+  "failures": 0,
+  "errors": 0,
+  "success": true,
+  "base": "preserved main snapshot, not pinned historical Git revision",
+  "not_tested": [
+    "GeneratedDxilTest",
+    "DXC compilation",
+    "engine integration",
+    "GPU"
+  ]
+}

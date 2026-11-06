@@ -1,0 +1,140 @@
+{
+  "success": true,
+  "record_kind": "fresh portable-package CPU validation",
+  "completed_utc": "2026-11-06T06:11:08.209968+00:00",
+  "full_attention_cpu_proposal": {
+    "success": true,
+    "seed": 20261106,
+    "contract": false,
+    "cpu_seconds_not_gpu_performance": 274.38158066498,
+    "numeric_runs": 104,
+    "numeric_cases": 40,
+    "worst_out_max_abs": 0.00018272082498071995,
+    "worst_lse_max_abs": 1.4576248370090639e-05,
+    "geometry": {
+      "cases": 4560,
+      "query_split_checks": 179064,
+      "sealed_group_checks": 210679,
+      "phantom_tiles": 19896,
+      "split_geometry_28672_nq2": {
+        "448": {
+          "splits": 64,
+          "shared_full_group_rows": 24320,
+          "first_query_residual_rows": 4351,
+          "second_query_residual_rows": 4352
+        },
+        "512": {
+          "splits": 56,
+          "shared_full_group_rows": 28416,
+          "first_query_residual_rows": 255,
+          "second_query_residual_rows": 256
+        }
+      }
+    },
+    "negative_controls": [
+      {
+        "mutation": "use first-slice other for both K slices",
+        "detected": true,
+        "ok": false,
+        "out_max_abs": 14.430114681716098,
+        "lse_max_abs": 2.748578297664599
+      }
+    ],
+    "limits": [
+      "CPU FP32 proposal only; no new MQ2 rowlane HLSL exists",
+      "Not DXIL interpretation, compilation, Windows/UWP or GPU execution",
+      "GQA2 shader structural checks separately; numerical model uses proposed rowlane algorithm",
+      "Synthetic Bee-like records, not model-vocabulary/KLD or recurrent-state parity"
+    ]
+  },
+  "two_local_head_bitwise_comparisons": 36,
+  "error_budget_replay": {
+    "case": {
+      "origin": 72704,
+      "tail": 0,
+      "live": 255,
+      "nq": 9,
+      "split_k": 1,
+      "split_rows": 448
+    },
+    "official_gate_unchanged": {
+      "ok": true,
+      "out_max_abs": 0.00018272082498071995,
+      "lse_max_abs": 1.0060868433470205e-05
+    },
+    "out_max_fraction_of_allowed_error": 0.030092438581308834,
+    "lse_max_fraction_of_allowed_error": 0.017768776517415142,
+    "out_relative_l2": 1.3431342408829247e-06,
+    "lse_relative_l2": 1.7827158260097143e-07,
+    "out_atol": 0.0003,
+    "out_rtol": 0.0003,
+    "lse_atol": 0.0003,
+    "lse_rtol": 3e-05,
+    "gate_statement": "Every component must satisfy abs(error) <= atol + rtol*abs(reference); finite LSE mask must match, and all OUT components must be finite."
+  },
+  "gqa2_layout": {
+    "tests_run": 6,
+    "failures": 0,
+    "errors": 0,
+    "success": true,
+    "base": "preserved main snapshot, not pinned historical Git revision",
+    "not_tested": [
+      "GeneratedDxilTest",
+      "DXC compilation",
+      "engine integration",
+      "GPU"
+    ]
+  },
+  "gqa2_policy": {
+    "success": true,
+    "combinations": 5598720,
+    "selected": 10,
+    "arm_checks": 4,
+    "scope": "exact standalone branch policy extract, not D3D12 engine"
+  },
+  "hlsl_arithmetic_masks": {
+    "success": true,
+    "selector_calls": 895320,
+    "row_classifications": 329855172,
+    "phantom_query_checks": 179064,
+    "inactive_query_split_checks": 693792,
+    "scope": "exact HLSL arithmetic extracts executed as C++, only [unroll] attribute removed; not shader compilation"
+  },
+  "negative_controls_masks": {
+    "success": true,
+    "active_count_instead_of_prefix": [
+      {
+        "tail": 0,
+        "row": 128,
+        "query_window": 255,
+        "active_count": 256,
+        "correct": "stage",
+        "broken": "record",
+        "detected": true
+      },
+      {
+        "tail": 128,
+        "row": 127,
+        "query_window": 255,
+        "active_count": 256,
+        "correct": "tail",
+        "broken": "record",
+        "detected": true
+      },
+      {
+        "tail": 128,
+        "row": 128,
+        "query_window": 256,
+        "active_count": 257,
+        "correct": "tail",
+        "broken": "record",
+        "detected": true
+      }
+    ],
+    "unsealed_group_read": {
+      "detected": true,
+      "reason": "record group not covered by the image"
+    }
+  },
+  "scope": "Historical bundled fixtures and CPU proposal, not current-main integration, HLSL compilation or GPU performance."
+}

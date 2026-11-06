@@ -1,0 +1,15 @@
+{
+  ".gitattributes": "cb3a12a43c7b5ad0ac159ab9570fdc2939fa6790737b13584faae297f269039c",
+  ".gitignore": "ddfbd60768302fc4c181b5480a08c718c3b4a780ae687a760e8f8b5cd69fb568",
+  "README.md": "e0c6f36d12e90f814b98b4606c44b63fcafe3af09cb28345981465f7032690fe",
+  "baseline.hlsl": "3513aa4a0dc38597cc0f690e768ad2837873543d1cbfc64a645baa1ec6a586fe",
+  "build_prototype.py": "49496b2c58f43c911f8d93e3775e2647b8b566c02d7c9fb171546ba1f735abf5",
+  "candidate.patch": "0d5bed237343fa451cb9192cba6b399c0eae4b5f30f0b423afe6bd6df5082d85",
+  "generate_cpu_kernel.py": "05efdf6495d258a9d5a50e255879f3a937fd4065aa831140c9389247c1d825b7",
+  "rkva_range_reduce_opt_pingpong.hlsl": "d31a509a8bc1966d5b47158c9a31145ef116c5246c22f3fd9078cbc8a546fd82",
+  "run_all.sh": "ef7643f5cd1c961b79e6975a1a036cbac3429faab89305134e7ddb09127456b8",
+  "source_manifest.json": "386d42bbb5ba6e33598e65eb8f36964be66f161bfaaa0d618c3c72d09079e01a",
+  "summarize_results.py": "3a8f32443d1e927493ec504aed0a80af5669a1482aa79990557baab4a9866ebe",
+  "validate.cpp": "5dd46728362896af890116a9a627d4ee761a668345a65b01b25d2b0d838fbb50",
+  "validate_structure.py": "0f6d9e1b5a0df99cbcfc32e9d35b40c91fefd6aee6bbbb2137a0136c8d5a382f"
+}

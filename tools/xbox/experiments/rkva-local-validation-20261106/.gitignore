@@ -1,0 +1,6 @@
+.build/
+__pycache__/
+*.pyc
+# These are Python reference models, not model weights excluded by repo rules.
+!qrot/models/
+!qrot/models/*.py

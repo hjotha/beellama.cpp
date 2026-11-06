@@ -1,0 +1,49 @@
+--- a/tools/xbox/shaders/rkva/rkva_range_attn_kvarn4_opt.hlsl
++++ b/tools/xbox/shaders/rkva/rkva_range_attn_kvarn4_opt.hlsl
+@@ -59,6 +59,14 @@
+ #ifndef RKVA_DECODE_OPT
+ #define RKVA_DECODE_OPT 0
+ #endif
++// Isolated experiment only. Host compilation/PSO selection is intentionally NOT wired.
++// Q_rot must have been populated by attend_range CPU WHT or bulk GPU unpack.
++#ifndef RKVA_DECODE_QROT_REUSE
++#define RKVA_DECODE_QROT_REUSE 0
++#endif
++#if RKVA_DECODE_QROT_REUSE && (!RKVA_DECODE_OPT || !RKVA_SERIAL_PREFIX)
++#error RKVA_DECODE_QROT_REUSE requires the existing serial-prefix decode specialization
++#endif
+ #if RKVA_SERIAL_PREFIX
+ static uint rkva_window; // per-thread q_count, set once in the entry point
+ #define RKVA_WINDOW rkva_window
+@@ -602,6 +610,10 @@
+     uint u = lane;        // wave64: 64 lanes cover all 64 4-dim units (256 dims)
+     uint head0 = qi * n_head + kv_head * RKVA_GQA;
+ 
++    // 1. Reuse the already staged rotation only in the opt-in candidate.
++#if RKVA_DECODE_QROT_REUSE
++    uint q_stride = n_query * n_head * RKVA_DIM * 4;
++#else
+     // 1. Rotate the GQA Q heads into WHT domain
+     float v[RKVA_ELEMS];
+     [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+@@ -609,13 +621,20 @@
+         v[2 * g + 1] = asfloat(queries.Load(((head0 + g) * RKVA_DIM + tid + 128) * 4));
+     }
+     wht256x6_decode(v, tid);
++
++#endif
+ 
+     float4 q[RKVA_GQA];
+     float4 body[RKVA_GQA], tail[RKVA_GQA];
+     float maximum[RKVA_GQA], denom[RKVA_GQA];
+     [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
++#if RKVA_DECODE_QROT_REUSE
++        uint q_rot_base = q_stride + ((head0 + g) * RKVA_DIM + u * 4) * 4;
++        q[g] = asfloat(queries.Load4(q_rot_base));
++#else
+         uint b0 = g * RKVA_DIM + u * 4;
+         q[g] = float4(gs_vec[b0], gs_vec[b0 + 1], gs_vec[b0 + 2], gs_vec[b0 + 3]);
++#endif
+         body[g] = float4(0, 0, 0, 0);
+         tail[g] = float4(0, 0, 0, 0);
+         maximum[g] = -3.402823466e38f;

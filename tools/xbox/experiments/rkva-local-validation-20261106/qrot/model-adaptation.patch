@@ -1,0 +1,110 @@
+--- original/rkva_decode_rowlane_model.py
++++ models/rkva_decode_rowlane_model.py
+@@ -6,13 +6,11 @@
+ zero folding, sequential fused QK and optionally contracted PV, tree wave sums, online
+ softmax, separate body/tail merge, and both output contracts. The independent
+ canonical serial-prefix FP64 oracle and tolerances are those of the GPU probe.
+-Run with OPENBLAS_NUM_THREADS=1; --long adds the measured 28672-row shape.
++Use the bundled run.sh for the supported local CPU test entry point.
+ """
+-import argparse
+-import json
+ import numpy as np
+ import rkva_kvarn_serial_prefix_model as sp
+-import rkva_kvarn_serial_prefix_probe as probe
++
+ 
+ km = sp.km
+ F = np.float32
+@@ -67,7 +65,7 @@
+     return (score * F(sp.SCALE)).astype(F)
+ 
+ 
+-def run(K, V, q, active, pos, mode=2, forced=None):
++def run(K, V, q, active, pos, mode=2, forced=None, qrot=None, bad_tail=False):
+     limit = km.causal_limit(K.lay, active, pos)
+     K.window = V.window = limit
+     split_k, rows = forced or km.kvarn4_decode_split(active, mode)
+@@ -83,7 +81,9 @@
+         for kv in range(4):
+             hs = slice(kv*6, (kv+1)*6)
+             qo = q[hs]
+-            qr = km.butterfly_wht(qo)
++            qr = km.butterfly_wht(qo) if qrot is None else qrot[hs]
++            if bad_tail:
++                qo = qr
+             states, covered = [], []
+             for wave in range(2):
+                 mx = np.full(6, -km.FLT_MAX, F)
+@@ -134,71 +134,3 @@
+                       bm+km.butterfly_wht(tm))
+         partials.append((pm, pd, pa))
+     return km.reduce_partials(partials, rotated=split_k != 1)
+-
+-
+-def check(canon, res, rng, label, forced=None, pos=None):
+-    pos = res.lay.origin + res.live - 1 if pos is None else pos
+-    count = km.causal_limit(res.lay, res.live, pos)
+-    ks, exact = sp.serial_sources(canon, res.lay, count, False)
+-    vs, _ = sp.serial_sources(canon, res.lay, count, True)
+-    q = rng.normal(size=(24, 256)).astype(F)
+-    want = km.oracle_attention(q, ks, vs, exact, count, sp.SCALE)
+-    worst = [0., 0.]
+-    for mode in (1, 2):
+-        got = run(*sp.planes(res), q, res.live, pos, mode, forced)
+-        result = probe.compare(np, *got, *want)
+-        assert result['ok'], (label, mode, result)
+-        worst = [max(worst[0], result['out_max_abs']), max(worst[1], result['lse_max_abs'])]
+-    print(json.dumps(dict(case=label, live=res.live, origin=res.lay.origin,
+-                          tail=res.lay.ptt, out_max_abs=worst[0], lse_max_abs=worst[1])), flush=True)
+-    return worst
+-
+-
+-def main():
+-    ap = argparse.ArgumentParser(description=__doc__)
+-    ap.add_argument('--contract', action='store_true', help='contract DXIL fast fmul/fadd')
+-    ap.add_argument('--long', action='store_true')
+-    ap.add_argument('--seed', type=int, default=20261026)
+-    args = ap.parse_args()
+-    global CONTRACT
+-    CONTRACT = args.contract
+-    rng = np.random.default_rng(args.seed)
+-    worst = np.zeros(2)
+-    cases = 0
+-    lives = (1, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1025)
+-    for origin in (0, 72704):
+-        for ptt in (0, 128):
+-            cap = 2048
+-            canon = sp.Canon(rng, cap)
+-            canon.append(1025)
+-            lay = km.Layout(origin, cap, ptt, ring=256)
+-            for live in lives:
+-                res = sp.Resident(canon, lay)
+-                res.reset(live)
+-                worst = np.maximum(worst, check(canon, res, rng, 'boundary'))
+-                cases += 1
+-            # Deliberately nonaligned splits and empty trailing split.
+-            for forced in ((5, 211), (1, 1025), (10, 128)):
+-                worst = np.maximum(worst, check(canon, res, rng, 'split override', forced))
+-                cases += 1
+-            worst = np.maximum(worst, check(canon, res, rng, 'masked', pos=origin-1))
+-            cases += 1
+-            # Repaired tail after rewind, then NEW contents crossing a seal.
+-            canon.rewind(1018)
+-            res.rewind(1018)
+-            canon.append(9)
+-            res.append(1027)
+-            worst = np.maximum(worst, check(canon, res, rng, 'rewind/reappend'))
+-            cases += 1
+-    if args.long:
+-        canon = sp.Canon(rng, 28672)
+-        canon.append(28672)
+-        res = sp.Resident(canon, km.Layout(72704, 28672, 128, ring=256))
+-        res.reset(28672)
+-        worst = np.maximum(worst, check(canon, res, rng, 'long records'))
+-        cases += 1
+-    print(f'PASS cases={cases} mode_runs={cases*2} worst_out={worst[0]:.9g} worst_lse={worst[1]:.9g}')
+-
+-
+-if __name__ == '__main__':
+-    main()

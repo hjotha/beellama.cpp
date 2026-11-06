@@ -1,0 +1,4 @@
+# Generated code, binaries, binary vectors, logs and local test results.
+.build/
+__pycache__/
+*.pyc

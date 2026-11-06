@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "comparison": {
+    "full_attention_cpu_proposal": "exactly equal, excluding CPU elapsed time",
+    "error_budget_replay": "exactly equal, excluding CPU elapsed time",
+    "gqa2_layout": "exactly equal, excluding CPU elapsed time",
+    "gqa2_policy": "exactly equal, excluding CPU elapsed time",
+    "hlsl_arithmetic_masks": "exactly equal, excluding CPU elapsed time"
+  },
+  "note": "Same floating results in this environment do not guarantee bitwise equality across all CPUs/NumPy builds."
+}

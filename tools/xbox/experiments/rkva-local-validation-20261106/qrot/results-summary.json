@@ -1,0 +1,167 @@
+{
+  "schema": 1,
+  "seed": 20261106,
+  "status": "PASS",
+  "environment": {
+    "python": "3.12.14",
+    "numpy": "2.3.5",
+    "compiler": "g++ (Debian 14.2.0-19) 14.2.0",
+    "flags": "-std=c++17 -O2 -fno-fast-math -ffp-contract=off -shared -fPIC"
+  },
+  "qualification": "CPU-only source/layout/numerical validation; no HLSL compilation, DXIL, GPU/console execution, timing or performance claim",
+  "summary": {
+    "attention_cases": 44,
+    "transform_cases": 7,
+    "layout_cases": 30,
+    "long_layout_only_cases": 16,
+    "negative_controls": 5,
+    "out_lse_ab_bit_differences": 0,
+    "oracle_out_max_abs": 6.185070402509041e-05,
+    "oracle_lse_max_abs": 9.597882320022677e-06
+  },
+  "transforms": [
+    {
+      "case": "F16-all-finite",
+      "encodings": 63488,
+      "heads": 248,
+      "bitwise_equal": true
+    },
+    {
+      "case": "E5M2-all-finite",
+      "encodings": 248,
+      "heads": 1,
+      "bitwise_equal": true
+    },
+    {
+      "case": "E4M3FN-all-finite",
+      "encodings": 254,
+      "heads": 1,
+      "bitwise_equal": true
+    },
+    {
+      "case": "random-F32",
+      "heads": 2049,
+      "bitwise_equal": true
+    },
+    {
+      "case": "basis",
+      "heads": 256,
+      "bitwise_equal": true
+    },
+    {
+      "case": "cancellation-and-signed-zero",
+      "heads": 17,
+      "bitwise_equal": true
+    },
+    {
+      "case": "nonfinite-and-overflow-diagnostic",
+      "heads": 6,
+      "classification_equal": true,
+      "nan_payload_not_compared": true
+    }
+  ],
+  "negative_controls": [
+    {
+      "case": "collapse_two_normalizations_to_1_over_16",
+      "detected": true,
+      "changed_f32_elements": 3281
+    },
+    {
+      "case": "reverse_lane_mapping",
+      "detected": true
+    },
+    {
+      "case": "read_original_plane_as_rotated",
+      "detected": true
+    },
+    {
+      "case": "original_plane_as_qrot",
+      "detected": true,
+      "attention_out_max_difference": 8.82346248626709
+    },
+    {
+      "case": "rotated_Q_used_for_original_tail",
+      "detected": true,
+      "attention_out_max_difference": 17.33854866027832
+    }
+  ],
+  "static_load_tradeoff": {
+    "baseline_q_input_floats_per_group": 1536,
+    "candidate_qrot_input_floats_per_group": 3072,
+    "baseline_bytes": 6144,
+    "candidate_bytes": 12288,
+    "excludes_tail": true,
+    "not_measured_dram_traffic": true,
+    "cache_effect_unknown": true,
+    "net_performance_unknown": true
+  },
+  "structural_checks": {
+    "status": "PASS",
+    "cpp_preprocessing_only_not_hlsl_compilation": true,
+    "variants": [
+      {
+        "rowlane": 0,
+        "reuse_default_off_exact_preprocessor_identity": true,
+        "reuse_off_exact_preprocessor_identity": true,
+        "candidate_direct_Load4_from_qrot": true,
+        "initial_conservative_group_barrier_retained": true
+      },
+      {
+        "rowlane": 1,
+        "reuse_default_off_exact_preprocessor_identity": true,
+        "reuse_off_exact_preprocessor_identity": true,
+        "candidate_direct_Load4_from_qrot": true,
+        "initial_conservative_group_barrier_retained": true
+      }
+    ],
+    "all_code_after_q_setup_byte_identical": true,
+    "no_host_PSO_flag_or_dispatch_change": true,
+    "unsupported_define_combinations_rejected": 2
+  },
+  "rerun": {
+    "date_utc": "2026-11-06",
+    "portable_package": true,
+    "numeric_and_layout_results_equal_to_original_run": true,
+    "source_hashes_verified_before_and_after": true
+  },
+  "coverage": {
+    "attention_rows": [
+      1,
+      127,
+      128,
+      129,
+      255,
+      256,
+      257,
+      513,
+      1025
+    ],
+    "origins": [
+      0,
+      102400
+    ],
+    "tails": [
+      0,
+      128
+    ],
+    "codecs": [
+      "CPU-F32",
+      "F16",
+      "E5M2",
+      "E4M3FN"
+    ],
+    "not_full_cartesian_product": true,
+    "additional_attention": [
+      "causally-empty",
+      "rewind-reappend-ring-wrap"
+    ],
+    "long_layout_only_rows": [
+      4096,
+      8192,
+      16384,
+      28672
+    ],
+    "long_numeric_attention_not_run": true,
+    "gpu_validation_not_run": true
+  }
+}

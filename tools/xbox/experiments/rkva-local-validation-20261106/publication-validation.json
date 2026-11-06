@@ -1,0 +1,27 @@
+{
+  "date_utc": "2026-11-06",
+  "scope": "Portable research package; production code remains unchanged",
+  "publication_base_commit": "e64ad7c43ee6f2ae6ced1d1a47ba462d7751594e",
+  "qrot_portable_rerun": "PASS: 44 attention cases; numerical results match the original CPU experiment",
+  "wht_portable_rerun": "PASS: 2469 vectors, 94 reducer cases, ASan/UBSan; rerun failure clears stale aggregate",
+  "mq2_portable_rerun": "PASS: 40 cases / 104 executions; numerical results match the original CPU experiment",
+  "patch_apply_check_on_publication_base": {
+    "qrot": "PASS",
+    "wht": "PASS"
+  },
+  "review": "Read-only review checked public-data minimization, matching DXC/probe commands, limitations, fixture hashes and LF portability; stale WHT evidence issue corrected and regression tested",
+  "static_validation": {
+    "python_syntax": "PASS",
+    "json_parse": "PASS",
+    "bash_syntax": "PASS",
+    "missing_dxc_exit_2": "PASS"
+  },
+  "not_executed": [
+    "DXC/HLSL/DXIL compilation",
+    "MSVC/UWP package build",
+    "PSO creation and runtime selection",
+    "Xbox shader execution",
+    "GPU performance benchmark",
+    "Deployment"
+  ]
+}

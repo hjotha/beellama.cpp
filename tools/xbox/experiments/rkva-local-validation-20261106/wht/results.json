@@ -1,0 +1,68 @@
+{
+  "status": "PASS_CPU_MODEL_ONLY",
+  "date": "2026-11-06",
+  "scope": "Bundled fixture and CPU model only; no production edit, HLSL compilation, GPU execution or performance measurement",
+  "environment": {
+    "compiler": "g++ (Debian 14.2.0-19) 14.2.0",
+    "python": "3.12.14",
+    "numpy": "2.3.5"
+  },
+  "source_sha256": "3513aa4a0dc38597cc0f690e768ad2837873543d1cbfc64a645baa1ec6a586fe",
+  "prototype_sha256": "d31a509a8bc1966d5b47158c9a31145ef116c5246c22f3fd9078cbc8a546fd82",
+  "patch_sha256": "0d5bed237343fa451cb9192cba6b399c0eae4b5f30f0b423afe6bd6df5082d85",
+  "cpu": {
+    "status": "PASS",
+    "wht_vectors": 2469,
+    "wht_elements_checked": 632064,
+    "finite_bitwise_comparisons": 429856,
+    "infinity_bitwise_comparisons": 57315,
+    "nan_classification_comparisons": 144893,
+    "oracle": "independent scalar pair/block float32 butterfly",
+    "scheduler": "128 source-derived C++20 coroutines, randomized lane order between group barriers",
+    "barrier_rounds_executed": 95491,
+    "negative_controls": {
+      "unsafe_inplace_vectors_detected": 1536,
+      "fused_normalization_vectors_detected": 1536,
+      "stale_bank_vectors_detected": 1536
+    },
+    "reducer_cases": 94,
+    "poison_cases": 60,
+    "empty_cases": 12,
+    "dense_check_vectors": 64
+  },
+  "structure": {
+    "status": "PASS",
+    "safe_two_wave64_schedules": 2048,
+    "negative_missing_barrier_schedules_detected": 1479,
+    "layout_shapes": 260,
+    "odd_head_layout_shapes": 130,
+    "dense_float64_vectors": 64,
+    "dense_float64_max_abs_error": 1.0339426808059216e-06,
+    "dynamic_wht_barriers_baseline": 15,
+    "dynamic_wht_barriers_candidate": 8,
+    "butterfly_loop_barriers_baseline": 14,
+    "butterfly_loop_barriers_candidate": 7,
+    "wht_shared_bytes_baseline": 1024,
+    "wht_shared_bytes_candidate": 2048,
+    "declared_total_shared_bytes_baseline": 4104,
+    "declared_total_shared_bytes_candidate": 5128,
+    "patch_dry_run": "PASS",
+    "limits": [
+      "No DXC or D3D12/GPU execution",
+      "No ISA/resource-allocation inspection",
+      "CPU strict float32, gradual underflow; Xbox denormal policy unverified",
+      "No Xbox correctness or performance qualification",
+      "Reducer build target currently lacks -Gis; compiler reassociation/two-rounding behavior must be inspected before integration"
+    ]
+  },
+  "sanitizers": {
+    "address_sanitizer": "PASS",
+    "undefined_behavior_sanitizer": "PASS",
+    "optimized_and_sanitized_results_identical": true,
+    "leak_sanitizer": "NOT RUN: disabled by default; opt in with WHT_DETECT_LEAKS=1 on a supported runner"
+  },
+  "shader_compilation": "NOT RUN",
+  "console_runtime": "NOT RUN",
+  "performance": "NOT MEASURED",
+  "next_gate": "Compile baseline and candidate with the actual DXC/profile; inspect separate H128/H2 normalization and group barriers in DXIL; verify resources and poison/quality on the console before any performance conclusion."
+}

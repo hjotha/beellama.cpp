@@ -1,0 +1,36 @@
+{
+  "success": true,
+  "active_count_instead_of_prefix": [
+    {
+      "tail": 0,
+      "row": 128,
+      "query_window": 255,
+      "active_count": 256,
+      "correct": "stage",
+      "broken": "record",
+      "detected": true
+    },
+    {
+      "tail": 128,
+      "row": 127,
+      "query_window": 255,
+      "active_count": 256,
+      "correct": "tail",
+      "broken": "record",
+      "detected": true
+    },
+    {
+      "tail": 128,
+      "row": 128,
+      "query_window": 256,
+      "active_count": 257,
+      "correct": "tail",
+      "broken": "record",
+      "detected": true
+    }
+  ],
+  "unsealed_group_read": {
+    "detected": true,
+    "reason": "record group not covered by the image"
+  }
+}

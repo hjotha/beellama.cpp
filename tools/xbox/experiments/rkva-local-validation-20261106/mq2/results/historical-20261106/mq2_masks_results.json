@@ -1,0 +1,1 @@
+{"success":true,"selector_calls":895320,"row_classifications":329855172,"phantom_query_checks":179064,"inactive_query_split_checks":693792,"scope":"exact HLSL arithmetic extracts executed as C++, only [unroll] attribute removed; not shader compilation"}
