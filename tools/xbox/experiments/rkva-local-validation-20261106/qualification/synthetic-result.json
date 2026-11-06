@@ -1,0 +1,297 @@
+{
+  "schema": 1,
+  "data_kind": "synthetic",
+  "complete_blocks": 8,
+  "decision": "not_qualified",
+  "reasons": [
+    "synthetic_data_not_hardware_evidence"
+  ],
+  "metrics": {
+    "kernel_ms": {
+      "A_ms": {
+        "median": 100.0,
+        "mad": 0.0,
+        "min": 100,
+        "max": 100,
+        "n": 16
+      },
+      "B_ms": {
+        "median": 90.0,
+        "mad": 0.0,
+        "min": 90,
+        "max": 90,
+        "n": 16
+      },
+      "block_latency_reduction_pct": {
+        "median": 10.0,
+        "mad": 0.0,
+        "min": 10.0,
+        "max": 10.0,
+        "n": 8
+      },
+      "block_gains_pct": [
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "within_block_spread_pct": {
+        "median": 0.0,
+        "mad": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 8
+      },
+      "noise_threshold_pct": 0.5,
+      "sign_test_p_diagnostic": 0.00390625,
+      "screen": "improvement_signal"
+    },
+    "remote_ms": {
+      "A_ms": {
+        "median": 100.0,
+        "mad": 0.0,
+        "min": 100,
+        "max": 100,
+        "n": 16
+      },
+      "B_ms": {
+        "median": 90.0,
+        "mad": 0.0,
+        "min": 90,
+        "max": 90,
+        "n": 16
+      },
+      "block_latency_reduction_pct": {
+        "median": 10.0,
+        "mad": 0.0,
+        "min": 10.0,
+        "max": 10.0,
+        "n": 8
+      },
+      "block_gains_pct": [
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "within_block_spread_pct": {
+        "median": 0.0,
+        "mad": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 8
+      },
+      "noise_threshold_pct": 0.5,
+      "sign_test_p_diagnostic": 0.00390625,
+      "screen": "improvement_signal"
+    },
+    "prefill_ms": {
+      "A_ms": {
+        "median": 100.0,
+        "mad": 0.0,
+        "min": 100,
+        "max": 100,
+        "n": 16
+      },
+      "B_ms": {
+        "median": 90.0,
+        "mad": 0.0,
+        "min": 90,
+        "max": 90,
+        "n": 16
+      },
+      "block_latency_reduction_pct": {
+        "median": 10.0,
+        "mad": 0.0,
+        "min": 10.0,
+        "max": 10.0,
+        "n": 8
+      },
+      "block_gains_pct": [
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "within_block_spread_pct": {
+        "median": 0.0,
+        "mad": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 8
+      },
+      "noise_threshold_pct": 0.5,
+      "sign_test_p_diagnostic": 0.00390625,
+      "screen": "improvement_signal"
+    },
+    "decode_ms": {
+      "A_ms": {
+        "median": 100.0,
+        "mad": 0.0,
+        "min": 100,
+        "max": 100,
+        "n": 16
+      },
+      "B_ms": {
+        "median": 90.0,
+        "mad": 0.0,
+        "min": 90,
+        "max": 90,
+        "n": 16
+      },
+      "block_latency_reduction_pct": {
+        "median": 10.0,
+        "mad": 0.0,
+        "min": 10.0,
+        "max": 10.0,
+        "n": 8
+      },
+      "block_gains_pct": [
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "within_block_spread_pct": {
+        "median": 0.0,
+        "mad": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 8
+      },
+      "noise_threshold_pct": 0.5,
+      "sign_test_p_diagnostic": 0.00390625,
+      "screen": "improvement_signal"
+    },
+    "total_ms": {
+      "A_ms": {
+        "median": 100.0,
+        "mad": 0.0,
+        "min": 100,
+        "max": 100,
+        "n": 16
+      },
+      "B_ms": {
+        "median": 90.0,
+        "mad": 0.0,
+        "min": 90,
+        "max": 90,
+        "n": 16
+      },
+      "block_latency_reduction_pct": {
+        "median": 10.0,
+        "mad": 0.0,
+        "min": 10.0,
+        "max": 10.0,
+        "n": 8
+      },
+      "block_gains_pct": [
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "within_block_spread_pct": {
+        "median": 0.0,
+        "mad": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 8
+      },
+      "noise_threshold_pct": 0.5,
+      "sign_test_p_diagnostic": 0.00390625,
+      "screen": "improvement_signal"
+    }
+  },
+  "workload": {
+    "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "hardware": "SYNTHETIC hardware, not Xbox measurements",
+    "configuration": {
+      "batch": 512,
+      "ubatch": 256,
+      "context": 129024,
+      "codec": "F16"
+    },
+    "command": [
+      "synthetic-fixture"
+    ],
+    "sampling": {
+      "seed": 42
+    },
+    "thermal_clock_policy": "synthetic constant"
+  },
+  "variants": {
+    "A": {
+      "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "commit": "synthetic-A",
+      "compiler": "synthetic",
+      "compiler_flags": [
+        "-O3"
+      ],
+      "feature_flags": {
+        "candidate": false
+      }
+    },
+    "B": {
+      "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "commit": "synthetic-B",
+      "compiler": "synthetic",
+      "compiler_flags": [
+        "-O3"
+      ],
+      "feature_flags": {
+        "candidate": true
+      }
+    }
+  },
+  "correctness": {
+    "serial": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "bulk_bitwise": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "matrix": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "long_context_quality": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "serving_mtp": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "caution": "Offline screening only. Hashes are declared, not attested. No automatic promotion.",
+  "input_sha256": "24ddbdf38fdcc2693dd0c19742307a45ed0ccb1bc059da26a31dde356d90d60b"
+}

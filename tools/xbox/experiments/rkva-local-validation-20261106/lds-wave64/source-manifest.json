@@ -1,0 +1,17 @@
+{
+  "source_head": "e64ad7c43ee6f2ae6ced1d1a47ba462d7751594e",
+  "files": {
+    "tools/xbox/shaders/rkva/ggml_float.hlsli": "1530bf7873876595cf2e4eac83a142104ee7298095f470ee37460b5790cd2fb3",
+    "tools/xbox/shaders/rkva/rkva_bdr.hlsli": "acbce0f20033da7f3009a49bab834312641ccae559b8dd095309a49e2c22e861",
+    "tools/xbox/shaders/rkva/rkva_decode_quants_group_a.hlsli": "a7aa29686d6d0b2e6791e30d997109ff5ebe4e68b8c52e7c24ee3609ecea0644",
+    "tools/xbox/shaders/rkva/rkva_decode_quants_group_b.hlsli": "f0eef24bb5488982aaa46956a532363e4dc080a6256fa26ee7fe28ec86a1a5a7",
+    "tools/xbox/shaders/rkva/rkva_decode_quants_group_c.hlsli": "c22f9571cb77deed0afd43026644e5e0a7bbc5e24f44173a02fa7700023e98a5",
+    "tools/xbox/shaders/rkva/rkva_decode_quants_oscar_int2.hlsli": "9072a66db87340e3403ac2bfe054d96e1b5f44dfba276cdfcb968b3be7c9224c",
+    "tools/xbox/shaders/rkva/rkva_decode_quants_saw_int4.hlsli": "b987addcce661cb98abd3338aaf6ea908cec8174a67afbdce89b2426bf89ddd3",
+    "tools/xbox/shaders/rkva/rkva_decode_rowlane_template.hlsli": "a6f27b83b1346e22e601cdad4caf108c2944f9bd73d3b68197c29aeb1204810e",
+    "tools/xbox/shaders/rkva/rkva_range_attn_gqa_opt.hlsl": "f437e953fb0214eb283646c2ef04a290cb1f3e5723655ded5e1040a77ea40757",
+    "tools/xbox/shaders/rkva/rkva_range_attn_q4_opt.hlsl": "990639b942b9d23828859c61434f243ff75fcb72631ca44c9edf1289142c3d40",
+    "tools/xbox/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl": "8d9649107523e0326f3626173808abb91f1ece5c76de926790f6f0afc0a43f6a"
+  },
+  "host_gate_sha256": "558a6d9bd56209b75376a0081c711d09174abd2a1ada4dde0ecab97a39589697"
+}

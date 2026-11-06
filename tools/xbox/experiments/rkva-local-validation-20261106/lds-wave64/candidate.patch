@@ -1,0 +1,125 @@
+--- a/tools/xbox/shaders/rkva/rkva_range_attn_q4_opt.hlsl
++++ b/tools/xbox/shaders/rkva/rkva_range_attn_q4_opt.hlsl
+@@ -17,9 +17,24 @@
+ #define RKVA_GQA 6
+ #define RKVA_DIM 256
+ #define RKVA_THREADS 128
++#if RKVA_EXPERIMENT_ROWLANE_WAVE64_LDS
++#define RKVA_MAX_WAVES (RKVA_THREADS / 64)
++#else
+ #define RKVA_MAX_WAVES 4    // RKVA_THREADS / minimum supported wave size (32)
++#endif
+ #define RKVA_ROW_HEAD 144   // 8 Q4_0 blocks x 18 bytes per (row, KV head)
+ #define RKVA_QUARTERS 64    // 4-element units per 256-wide row
++
++// Experimental source-only specialization. Host must retain fixed-wave64 gating.
++// No default build target enables this flag.
++#if RKVA_EXPERIMENT_ROWLANE_WAVE64_LDS
++#if RKVA_THREADS != 128 || RKVA_DIM != 256 || RKVA_GQA != 6 || RKVA_MAX_WAVES != 2
++#error Experimental LDS requires the audited 128-thread, D256, GQA6, two-wave shape.
++#endif
++#if RKVA_DECODE_ROWLANE != 1
++#error Experimental LDS requires a rowlane-only compilation.
++#endif
++#endif
+ 
+ cbuffer Params : register(b0) {
+     uint n_query;
+@@ -123,6 +138,7 @@
+ 
+ #define RKVA_WAVE64 1
+ 
++#if !RKVA_EXPERIMENT_ROWLANE_WAVE64_LDS
+ [numthreads(RKVA_THREADS, 1, 1)]
+ void CSRangeAttnQ4Opt(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
+     uint kv_head = group.x, qi = group.y, split = group.z;
+@@ -265,6 +281,8 @@
+     }
+ }
+ 
++#endif // generic entry retained only in baseline compilation
++
+ #if RKVA_DECODE_ROWLANE
+ [numthreads(RKVA_THREADS, 1, 1)]
+ void CSRangeAttnQ4DecodeRowlane(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
+--- a/tools/xbox/shaders/rkva/rkva_range_attn_gqa_opt.hlsl
++++ b/tools/xbox/shaders/rkva/rkva_range_attn_gqa_opt.hlsl
+@@ -19,7 +19,11 @@
+ #define RKVA_GQA 6
+ #define RKVA_DIM 256
+ #define RKVA_THREADS 128
++#if RKVA_EXPERIMENT_ROWLANE_WAVE64_LDS
++#define RKVA_MAX_WAVES (RKVA_THREADS / 64)
++#else
+ #define RKVA_MAX_WAVES 4 // RKVA_THREADS / minimum supported wave size (32)
++#endif
+ #define RKVA_UNITS 64    // 4-element units per 256-wide row; unit u is dims 4u..4u+3
+ 
+ #ifndef RKVA_OPT_STORAGE
+@@ -31,6 +35,20 @@
+ #define RKVA_ROW_HEAD 272 // 8 Q8_0 blocks x 34 bytes per (row, KV head)
+ #else
+ #error RKVA_OPT_STORAGE must be 0 (F16) or 2 (Q8_0).
++#endif
++
++// Experimental source-only specialization. Host must retain fixed-wave64 gating.
++// No default build target enables this flag.
++#if RKVA_EXPERIMENT_ROWLANE_WAVE64_LDS
++#if RKVA_THREADS != 128 || RKVA_DIM != 256 || RKVA_GQA != 6 || RKVA_MAX_WAVES != 2
++#error Experimental LDS requires the audited 128-thread, D256, GQA6, two-wave shape.
++#endif
++#if RKVA_DECODE_ROWLANE != 1
++#error Experimental LDS requires a rowlane-only compilation.
++#endif
++#if RKVA_OPT_STORAGE != 2
++#error Experimental GQA LDS is restricted to Q8 rowlane.
++#endif
+ #endif
+ 
+ cbuffer Params : register(b0) {
+@@ -97,6 +115,7 @@
+ #endif
+ }
+ 
++#if !RKVA_EXPERIMENT_ROWLANE_WAVE64_LDS
+ [numthreads(RKVA_THREADS, 1, 1)]
+ void CSRangeAttnGqaOpt(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
+     uint kv_head = group.x, qi = group.y, split = group.z;
+@@ -236,6 +255,8 @@
+     }
+ }
+ 
++#endif // generic entry retained only in baseline compilation
++
+ #if RKVA_DECODE_ROWLANE
+ [numthreads(RKVA_THREADS, 1, 1)]
+ void CSRangeAttnQ8DecodeRowlane(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
+--- a/tools/xbox/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl
++++ b/tools/xbox/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl
+@@ -39,11 +39,26 @@
+ #endif
+ 
+ #ifndef RKVA_MAX_WAVES
++#if RKVA_EXPERIMENT_ROWLANE_WAVE64_LDS
++#define RKVA_MAX_WAVES (RKVA_THREADS / 64)
++#else
+ #define RKVA_MAX_WAVES 4
++#endif
+ #endif
+ 
+ #ifndef RKVA_QUARTERS
+ #define RKVA_QUARTERS 64
++#endif
++
++// Experimental source-only specialization. Host must retain fixed-wave64 gating.
++// No default build target enables this flag.
++#if RKVA_EXPERIMENT_ROWLANE_WAVE64_LDS
++#if RKVA_THREADS != 128 || RKVA_DIM != 256 || RKVA_GQA != 6 || RKVA_MAX_WAVES != 2
++#error Experimental LDS requires the audited 128-thread, D256, GQA6, two-wave shape.
++#endif
++#if (ROWLANE_F16 + ROWLANE_SAW_INT4) != 1 || ROWLANE_Q4_1 || ROWLANE_Q5_0 || ROWLANE_KVARN5 || ROWLANE_Q5_1 || ROWLANE_Q6_0 || ROWLANE_KVARN6 || ROWLANE_Q6_1 || ROWLANE_IQ4_NL || ROWLANE_KVARN2 || ROWLANE_KVARN3 || ROWLANE_KVARN8 || ROWLANE_OSCAR_INT2 || ROWLANE_Q2_0S || ROWLANE_Q3_0 || ROWLANE_Q8_0 || ROWLANE_BDR_INT4
++#error Experimental LDS is restricted to one of F16 or SAW_INT4.
++#endif
+ #endif
+ 
+ cbuffer Params : register(b0) {

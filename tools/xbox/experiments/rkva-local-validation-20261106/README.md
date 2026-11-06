@@ -18,9 +18,10 @@ benchmark do console e não demonstra aceleração.
 
 | Candidato | O que existe | Resultado CPU histórico | O que falta |
 | --- | --- | --- | --- |
-| Q_rot reuse | Patch HLSL opt-in, flag OFF; modelos e fixtures | 44 casos completos, OUT/LSE bitwise A/B | DXC, integração PSO, Xbox e desempenho |
-| WHT ping-pong | Patch HLSL do reducer; modelo de sincronização | 2.469 vetores, 94 casos; ASan/UBSan | DXIL e qualificação GPU |
-| GQA2 | Patch parcial de shader, teste de layout e política | 6 testes; 5.598.720 combinações | Reaplicar integração de engine/profile, DXIL e GPU |
+| Q_rot reuse | Patch HLSL opt-in, flag OFF; modelos e fixtures | 44 casos completos, OUT/LSE bitwise A/B | Relato externo: compilou/executou; bloqueado por 8/696 bulk divergentes |
+| WHT ping-pong | Patch HLSL do reducer; modelo de sincronização | 2.469 vetores, 94 casos; ASan/UBSan | Relato externo: corretude passou; ABBA +0,08%, sem ganho real |
+| GQA2 | Patch parcial de shader, teste de layout e política | 6 testes; 5.598.720 combinações | Falha histórica de qualidade em 129k; não promover por tolerância CPU |
+| LDS wave64 rowlane | Patch opt-in Q4/Q8/F16/SAW, sem integração | 6 testes host nesta atualização | DXIL/LDS compilada, PSO, corretude GPU e desempenho |
 | MQ2 rowlane | Modelo executável de atenção, **não um shader** | 40 cenários / 104 execuções contra FP64 | Implementação HLSL, registradores, PSO e GPU |
 
 Gates originais mantidos: OUT `abs(delta) <= 3e-4 + 3e-4 * abs(ref)`;
@@ -53,8 +54,9 @@ Qualificação ao vivo exige uma janela/lease de console já autorizada.
 ### 2. Reproduzir as validações CPU
 
 Ambiente de referência: Linux x86_64, Python 3.12, NumPy 2.3.5, g++ 14.2, `cpp`,
-`patch` e Bash. Use dependências de confiança já disponíveis; se necessário,
-prepare um ambiente virtual isolado com NumPy. Não altere o Python global.
+`patch` e Bash. Use dependências de confiança já disponíveis; se faltarem,
+registre o bloqueio e peça a preparação do ambiente. Não instale dependências
+automaticamente nem altere o Python global.
 
 ```sh
 P=tools/xbox/experiments/rkva-local-validation-20261106
@@ -91,7 +93,9 @@ declare uma experiência separada.
 
 ### 4. Integrar um candidato por vez, somente no clone de teste
 
-Comece por Q_rot. Antes de aplicar, confirme que não há outra alteração local:
+Q_rot está bloqueado pela divergência bulk descrita na atualização abaixo.
+O procedimento seguinte é referência para investigação, não recomendação de
+promoção. Antes de aplicar qualquer patch, confirme que não há alteração local:
 
 ```sh
 git apply --check "$P/qrot/qrot-reuse-opt-in.patch"
@@ -198,3 +202,66 @@ Entregue commit testado, source/DXIL hashes, versão e flags do DXC, build MSVC,
 hardware e configuração, gates numéricos, requests exatos, ABBA e counters,
 falhas/reverts e decisão por candidato. Separe claramente: passou em CPU,
 compilou DXIL, compilou pacote, executou no Xbox, melhorou desempenho.
+
+## Atualização local de qualificação (2026-11-06)
+
+Veja [qualification/README.md](qualification/README.md) para o analisador ABBA
+conservador, testes e fixtures explicitamente sintéticas. Esta extensão foi
+preparada e testada em cópia isolada; a publicação contém apenas artefatos
+experimentais, sem alterar Xbox ou produção.
+O relato novo de WHT passou corretude serial/bulk, mas não mostrou ganho em
+decode/total; baseline mantido e candidato descartado por desempenho. Esse
+relato atualiza o estado histórico da tabela acima, sem substituir logs brutos.
+Atualização do transcript consultado às 16:38:27 UTC: Q_rot compilou e executou
+no Xbox, mas 8/696 respostas bulk diferiram em bytes. Apesar de passar as
+tolerâncias seriais, falhou o gate de igualdade bulk e não pode ser promovido.
+Causa e ganho final ainda não determinados. Não promover GQA2 por tolerância
+CPU: o relato histórico em 129k inclui KLD 1,11 e top1 divergente.
+
+
+## Nova prioridade experimental: LDS rowlane wave64
+
+Veja [lds-wave64/README.md](lds-wave64/README.md) e o
+[patch inerte](lds-wave64/candidate.patch). O experimento é independente de
+WHT e Q_rot e não altera shaders de produção. Não é KVarN4.
+
+1. No clone limpo, valide o manifesto e os testes novos:
+
+   ```sh
+   cd tools/xbox/experiments/rkva-local-validation-20261106
+   sha256sum -c SHA256SUMS-PACKAGE
+   python3 -m unittest discover -s qualification -v
+   python3 lds-wave64/test_lds.py
+   python3 qualification/qualify_abba.py qualification/synthetic-example.json
+   ```
+
+   Esperado: 10 testes ABBA + 6 LDS passam; dados sintéticos resultam sempre
+   `not_qualified`. GNU cpp/CPU não qualificam DXC, DXIL ou GPU.
+2. Compile baseline e candidato isolados com o DXC exato já usado no build
+   local (registre versão e hash do executável), perfil `cs_6_0`, entradas e
+   defines da tabela LDS. Reconfira o script de produção no commit testado.
+   Não acrescente `-Gis` ou outros flags apenas a um lado. Guarde DXIL e
+   disassembly em `.build/`, sem substituir headers gerados de produção.
+   O script `compile-fixtures-dxil.sh` antigo não cobre LDS; use o roteiro LDS.
+3. Compare LDS declarada por entry no DXIL e recursos, não apenas os tamanhos
+   declarados em HLSL. Alocação física, registradores e ocupação exigem o
+   compilador/profiler do alvo quando disponível; DXIL não os mede. Se não houver redução real de
+   LDS, pare esta hipótese e registre o resultado. Não alegue ganho de ocupação
+   sem medição. Q4 rowlane pode eliminar arrays de staging já no baseline.
+4. Somente após esse gate, prepare PSO/payload experimental separado no clone
+   de teste e confirme o gate host `wave_lane_min_ == 64 && wave_lane_max_ == 64`.
+   Restrinja a Q4/Q8/F16/SAW rowlane, D256/GQA6/128 threads. Não aplique define
+   global, não altere generic/wave32, fallback, KVarN4 ou outros formatos.
+   Registre hash do PSO efetivamente selecionado; o define não força wave64.
+5. Uma execução real requer janela de console autorizada. Use probes e oráculos
+   adequados a cada formato; os probes KVarN4 acima não qualificam Q4/Q8/F16/SAW.
+   Confirme OUT/LSE, finitude, igualdade bulk onde exigida, tails, splits,
+   origens, rewind/reappend, ring wrap e qualidade/serving/MTP. Pare em qualquer
+   falha e mantenha baseline. Não afrouxe tolerâncias para passar.
+6. Só depois, execute ABBA repetido e isolado por formato/workload seguindo
+   `qualification/README.md`. Não combine LDS com WHT/Q_rot. O analisador é um
+   filtro conservador de decode e total, não prova estatística confirmatória
+   nem gate genérico de prefill. Não faça install/deploy/merge automático.
+
+Resultado desta publicação: somente testes CPU/estrutura e integridade. DXC,
+DXIL LDS, Windows/MSVC, PSO e GPU desse candidato ainda não foram executados.

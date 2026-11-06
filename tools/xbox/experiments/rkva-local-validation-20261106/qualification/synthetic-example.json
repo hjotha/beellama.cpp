@@ -1,0 +1,1547 @@
+{
+  "schema": 1,
+  "data_kind": "synthetic",
+  "workload": {
+    "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "hardware": "SYNTHETIC hardware, not Xbox measurements",
+    "configuration": {
+      "batch": 512,
+      "ubatch": 256,
+      "context": 129024,
+      "codec": "F16"
+    },
+    "command": [
+      "synthetic-fixture"
+    ],
+    "sampling": {
+      "seed": 42
+    },
+    "thermal_clock_policy": "synthetic constant"
+  },
+  "variants": {
+    "A": {
+      "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "commit": "synthetic-A",
+      "compiler": "synthetic",
+      "compiler_flags": [
+        "-O3"
+      ],
+      "feature_flags": {
+        "candidate": false
+      }
+    },
+    "B": {
+      "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "commit": "synthetic-B",
+      "compiler": "synthetic",
+      "compiler_flags": [
+        "-O3"
+      ],
+      "feature_flags": {
+        "candidate": true
+      }
+    }
+  },
+  "correctness": {
+    "serial": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "bulk_bitwise": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "matrix": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "long_context_quality": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "serving_mtp": {
+      "status": "pass",
+      "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "runs": [
+    {
+      "run_id": "synthetic-1",
+      "sequence": 1,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-2",
+      "sequence": 2,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-3",
+      "sequence": 3,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-4",
+      "sequence": 4,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-5",
+      "sequence": 5,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-6",
+      "sequence": 6,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-7",
+      "sequence": 7,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-8",
+      "sequence": 8,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-9",
+      "sequence": 9,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-10",
+      "sequence": 10,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-11",
+      "sequence": 11,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-12",
+      "sequence": 12,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-13",
+      "sequence": 13,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-14",
+      "sequence": 14,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-15",
+      "sequence": 15,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-16",
+      "sequence": 16,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-17",
+      "sequence": 17,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-18",
+      "sequence": 18,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-19",
+      "sequence": 19,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-20",
+      "sequence": 20,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-21",
+      "sequence": 21,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-22",
+      "sequence": 22,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-23",
+      "sequence": 23,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-24",
+      "sequence": 24,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-25",
+      "sequence": 25,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-26",
+      "sequence": 26,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-27",
+      "sequence": 27,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-28",
+      "sequence": 28,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-29",
+      "sequence": 29,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    },
+    {
+      "run_id": "synthetic-30",
+      "sequence": 30,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-31",
+      "sequence": 31,
+      "variant": "B",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pso_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit": "synthetic-B",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": true
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 90,
+        "remote_ms": 90,
+        "prefill_ms": 90,
+        "decode_ms": 90,
+        "total_ms": 90
+      }
+    },
+    {
+      "run_id": "synthetic-32",
+      "sequence": 32,
+      "variant": "A",
+      "warmup": false,
+      "workload": {
+        "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requests_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tokens_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hardware": "SYNTHETIC hardware, not Xbox measurements",
+        "configuration": {
+          "batch": 512,
+          "ubatch": 256,
+          "context": 129024,
+          "codec": "F16"
+        },
+        "command": [
+          "synthetic-fixture"
+        ],
+        "sampling": {
+          "seed": 42
+        },
+        "thermal_clock_policy": "synthetic constant"
+      },
+      "artifact": {
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pso_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "commit": "synthetic-A",
+        "compiler": "synthetic",
+        "compiler_flags": [
+          "-O3"
+        ],
+        "feature_flags": {
+          "candidate": false
+        }
+      },
+      "raw_log_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timings": {
+        "kernel_ms": 100,
+        "remote_ms": 100,
+        "prefill_ms": 100,
+        "decode_ms": 100,
+        "total_ms": 100
+      }
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+test_all_indices_and_wave32_negative (__main__.LDS.test_all_indices_and_wave32_negative) ... ok
+test_cpu_merge_storage_equivalence (__main__.LDS.test_cpu_merge_storage_equivalence) ... ok
+test_default_preprocessor_identical (__main__.LDS.test_default_preprocessor_identical) ... ok
+test_invalid_flags_fail_closed (__main__.LDS.test_invalid_flags_fail_closed) ... ok
+test_selected_bodies_and_sizes (__main__.LDS.test_selected_bodies_and_sizes) ... ok
+test_source_hashes (__main__.LDS.test_source_hashes) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 1.072s
+
+OK
