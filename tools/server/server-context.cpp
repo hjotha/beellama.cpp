@@ -4913,6 +4913,10 @@ private:
                             continue;
                         }
                         const bool remote_native = file->has_native_remote_marker && file->native_remote;
+                        if (!server_native_slot::auto_candidate_fits_position_split(
+                                native_split, remote_native, file->tokens.size(), split_p)) {
+                            continue;
+                        }
                         // A retry is deliberately narrower than ordinary
                         // lookup: a marked non-native snapshot or a legacy
                         // PURE KVarN snapshot, wholly within the local P.

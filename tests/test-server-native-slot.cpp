@@ -70,6 +70,11 @@ void test_preflight_fallback_boundary() {
 
 void test_automatic_prefix() {
     using tokens = std::vector<int>;
+    assert(server_native_slot::auto_candidate_fits_position_split(true, false, 102400, 102400));
+    assert(!server_native_slot::auto_candidate_fits_position_split(true, false, 102401, 102400));
+    assert(server_native_slot::auto_candidate_fits_position_split(true, true, 102401, 102400));
+    assert(server_native_slot::auto_candidate_fits_position_split(false, false, 102401, 102400));
+    assert(server_native_slot::auto_candidate_fits_position_split(true, false, 102401, 0));
     assert(server_native_slot::automatic_prefix(tokens{1, 2, 3}, tokens{1, 2, 3, 4}));
     assert(!server_native_slot::automatic_prefix(tokens{}, tokens{1}));
     assert(!server_native_slot::automatic_prefix(tokens{1, 2}, tokens{1, 2}));

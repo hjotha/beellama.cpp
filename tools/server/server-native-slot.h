@@ -14,6 +14,11 @@ namespace server_native_slot {
 
 enum class automatic_restore_outcome { no_retry, native_preflight_rejected };
 
+inline bool auto_candidate_fits_position_split(bool native_split, bool native_remote,
+        size_t tokens, uint32_t split_p) {
+    return !native_split || split_p == 0 || native_remote || tokens <= split_p;
+}
+
 inline bool local_fallback_eligible(bool split_active, bool has_marker, bool native,
         size_t tokens, uint32_t split_p, bool legacy_pure) {
     return split_active && (has_marker ? !native : legacy_pure) &&
