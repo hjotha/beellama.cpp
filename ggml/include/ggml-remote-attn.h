@@ -157,6 +157,29 @@ GGML_API bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backe
 // Distinguishes descriptor-native KVarN records from the Q4/Q8 row layouts,
 // which also use the native bulk transport and report enabled above.
 GGML_API bool ggml_backend_remote_attn_native_kvarn_records_enabled(ggml_backend_t backend);
+// Upload a contiguous original-domain K/V span without issuing attention.
+// This call is synchronous; callers own the input until it returns and may
+// run it on a background worker. A failed upload invalidates the session.
+GGML_API bool ggml_backend_remote_attn_native_kvarn_stage_append(
+        ggml_backend_t backend, uint32_t layer, uint32_t first_pos, uint32_t count,
+        const float * keys, const float * values);
+// The stage owns copied inputs; its control calls must be serialized by the
+// caller, and it must be freed before its backend. Until finish succeeds, the
+// backend is a private shadow and cannot serve attention.
+struct ggml_remote_attn_kvarn_stage;
+GGML_API struct ggml_remote_attn_kvarn_stage * ggml_backend_remote_attn_kvarn_stage_create(ggml_backend_t backend);
+GGML_API bool ggml_backend_remote_attn_kvarn_stage_submit(struct ggml_remote_attn_kvarn_stage * stage,
+        uint32_t layer, uint32_t first_pos, uint32_t count, const float * keys, const float * values);
+GGML_API bool ggml_backend_remote_attn_kvarn_stage_finish(struct ggml_remote_attn_kvarn_stage * stage, uint32_t expected_rows);
+// Claim the sealed backend once, only when the receiving context has the same
+// endpoint and native geometry. The caller owns the returned backend.
+GGML_API ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take(struct ggml_remote_attn_kvarn_stage * stage,
+        const char * host, uint16_t port, const struct ggml_remote_attn_geometry * geometry,
+        uint32_t origin, uint32_t capacity, enum ggml_type cache_type, uint32_t native_tail_tokens);
+GGML_API bool ggml_backend_remote_attn_kvarn_stage_taken(const struct ggml_remote_attn_kvarn_stage * stage);
+GGML_API bool ggml_backend_remote_attn_kvarn_stage_matches(const struct ggml_remote_attn_kvarn_stage * stage,
+        ggml_backend_t backend, uint32_t expected_rows);
+GGML_API void ggml_backend_remote_attn_kvarn_stage_free(struct ggml_remote_attn_kvarn_stage * stage);
 // True when the opt-in GGML_RKVA_ASYNC_LOCAL_REMOTE=1 overlap was accepted by a
 // native KVarN4 bulk-capable server. Always false for synchronous/local modes.
 GGML_API bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend);

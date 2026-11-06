@@ -14,6 +14,19 @@
 #include <map>
 #include <vector>
 
+struct ggml_remote_attn_kvarn_stage;
+struct llama_ubatch;
+// One-shot, thread-local offer for the next context constructor. The caller
+// retains the stage handle and must clear an unconsumed offer on failure.
+LLAMA_API bool llama_remote_attn_offer_kvarn_stage(ggml_remote_attn_kvarn_stage * stage);
+LLAMA_API void llama_remote_attn_clear_kvarn_stage_offer();
+
+using llama_kvarn_ahead_capture_cb = bool (*)(void * user, ggml_backend_sched_t sched,
+        ggml_cgraph * graph, const llama_ubatch * ubatch);
+// Change only between decode calls; the callback must not retain graph tensors.
+LLAMA_API void llama_kvarn_ahead_capture_set(llama_context * ctx, uint32_t origin,
+        llama_kvarn_ahead_capture_cb callback, void * user);
+
 // Convert a q4_0 sequence state held in RAM straight into a caller-owned
 // buffer (no temporary file on the critical path). Returns the converted byte
 // count and fills `out`; tokens are copied to `tokens_out`.

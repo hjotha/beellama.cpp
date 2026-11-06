@@ -11,6 +11,7 @@
 #include "../ggml/src/ggml-remote-attn/rkva-kvarn-producer.h"
 #include "../ggml/src/ggml-turboquant-nc.h"
 #include "../tools/xbox/uwp/rkva/rkva-kvarn-bulk.h"
+#include "../tools/server/server-rkva-ahead.h"
 #undef NDEBUG
 #include <cassert>
 #include <algorithm>
@@ -1310,6 +1311,165 @@ static void test_old_native_client_ack_compatibility() {
         transact(RKVA_KVARN_RANGE_UPLOAD, payload.data(), uint32_t(payload.size()), 0);
     }
     shutdown(fd, SHUT_RDWR); close(fd);
+}
+
+static void test_native_stage_append() {
+    storage_env native("kvarn4");
+    storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
+    storage_env legacy_bulk("0", "GGML_RKVA_NATIVE_BULK");
+    storage_env legacy_async("0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+    storage_env producer("cpu", "GGML_RKVA_NATIVE_PRODUCER");
+    ggml_backend_load_all();
+    loopback server(false, true, false, false, false, false, 0, 0, true, 3);
+    auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+    ggml_remote_attn_geometry geometry {};
+    geometry.n_layer_remote = 2; geometry.n_head = 2; geometry.n_head_kv = 1;
+    geometry.head_dim = 256; geometry.max_ctx = 512; geometry.kq_scale = 0.0625f;
+    geometry.group_tokens = 128; geometry.sinkhorn_iters = 3;
+    assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+    assert(ggml_backend_remote_attn_connect(backend));
+    assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+    ggml_backend_remote_attn_set_active_session(backend, 0);
+    assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
+    std::vector<float> keys(130 * 256, 0.0f), values(130 * 256, 0.0f);
+    assert(!ggml_backend_remote_attn_native_kvarn_stage_append(backend, 0, 1025, 1, keys.data(), values.data()));
+    assert(!ggml_backend_remote_attn_native_kvarn_stage_append(backend, 2, 1024, 1, keys.data(), values.data()));
+    {
+        auto * stage = ggml_backend_remote_attn_kvarn_stage_create(backend);
+        assert(stage);
+        assert(ggml_backend_remote_attn_kvarn_stage_submit(stage, 0, 1024, 130, keys.data(), values.data()));
+        assert(ggml_backend_remote_attn_kvarn_stage_submit(stage, 1, 1024, 130, keys.data(), values.data()));
+        assert(ggml_backend_remote_attn_kvarn_stage_finish(stage, 130));
+        assert(!ggml_backend_remote_attn_kvarn_stage_taken(stage));
+        assert(!ggml_backend_remote_attn_kvarn_stage_matches(stage, backend, 130));
+        auto wrong = geometry;
+        wrong.n_head = 4;
+        assert(!ggml_backend_remote_attn_kvarn_stage_take(stage, "127.0.0.1", server.port, &wrong, 1024, 512, GGML_TYPE_Q4_0, 128));
+        assert(!ggml_backend_remote_attn_kvarn_stage_take(stage, "127.0.0.1", server.port, &geometry, 1152, 512, GGML_TYPE_Q4_0, 128));
+        assert(ggml_backend_remote_attn_kvarn_stage_take(stage, "127.0.0.1", server.port, &geometry, 1024, 512, GGML_TYPE_Q4_0, 128) == backend);
+        assert(ggml_backend_remote_attn_kvarn_stage_taken(stage));
+        assert(ggml_backend_remote_attn_kvarn_stage_matches(stage, backend, 130));
+        assert(!ggml_backend_remote_attn_kvarn_stage_matches(stage, backend, 129));
+        assert(!ggml_backend_remote_attn_kvarn_stage_matches(stage, nullptr, 130));
+        assert(!ggml_backend_remote_attn_kvarn_stage_take(stage, "127.0.0.1", server.port, &geometry, 1024, 512, GGML_TYPE_Q4_0, 128));
+        ggml_backend_remote_attn_kvarn_stage_free(stage);
+    }
+    assert(ggml_backend_remote_attn_native_kvarn_has_state(backend));
+    assert(!ggml_backend_remote_attn_native_kvarn_stage_append(backend, 0, 1024, 1, keys.data(), values.data()));
+    assert(!ggml_backend_remote_attn_failed(backend));
+    assert(ggml_backend_remote_attn_trim(backend, 0, 1024 + 129));
+    assert(ggml_backend_remote_attn_native_kvarn_stage_append(backend, 0, 1024 + 129, 1, keys.data(), values.data()));
+    assert(ggml_backend_remote_attn_native_kvarn_stage_append(backend, 1, 1024 + 129, 1, keys.data(), values.data()));
+    ggml_remote_attn_set_active(backend);
+    auto * ctx = ggml_init({1u << 20, nullptr, true});
+    auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 2, 1);
+    auto * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 512);
+    auto * v = ggml_dup_tensor(ctx, k);
+    auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+    auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    auto * original_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 1);
+    auto * original_v = ggml_dup_tensor(ctx, original_k);
+    auto * node = ggml_remote_attn_range(ctx, q, k, v, ids, pos, 0, 1024, 131, geometry.kq_scale);
+    ggml_remote_attn_range_set_native_sources(node, original_k, original_v);
+    auto * cpu = ggml_backend_cpu_init();
+    auto * buffers = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    assert(buffers); ggml_backend_buffer_clear(buffers, 0);
+    std::vector<int32_t> cells(512, -1);
+    for (int32_t i = 0; i < 131; ++i) cells[i] = 1024 + i;
+    const int32_t position = 1024 + 130;
+    ggml_backend_tensor_set(ids, cells.data(), 0, cells.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(pos, &position, 0, sizeof(position));
+    assert(ggml_remote_attn_exec(node));
+    const float * output = static_cast<const float *>(node->data);
+    for (size_t i = 0; i < 512; ++i) assert(output[i] == 0.0f);
+    for (size_t i = 512; i < 514; ++i) assert(std::abs(double(output[i]) - std::log(131.0)) < 1e-6);
+    {
+        std::lock_guard<std::mutex> lock(server.mutex);
+        assert(server.native_counts == std::vector<uint32_t>({131, 130}));
+    }
+    ggml_remote_attn_set_active(nullptr);
+    ggml_backend_buffer_free(buffers); ggml_free(ctx); ggml_backend_free(cpu);
+    ggml_backend_free(backend);
+
+    loopback incomplete(false, true, false, false, false, false, 0, 0, true, 3);
+    backend = ggml_backend_remote_attn_init("127.0.0.1", incomplete.port);
+    assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+    assert(ggml_backend_remote_attn_connect(backend));
+    assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+    ggml_backend_remote_attn_set_active_session(backend, 0);
+    assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_Q4_0));
+    auto * incomplete_stage = ggml_backend_remote_attn_kvarn_stage_create(backend);
+    assert(incomplete_stage);
+    assert(ggml_backend_remote_attn_kvarn_stage_submit(incomplete_stage, 0, 1024, 1, keys.data(), values.data()));
+    assert(!ggml_backend_remote_attn_kvarn_stage_finish(incomplete_stage, 1));
+    assert(ggml_backend_remote_attn_failed(backend));
+    ggml_backend_remote_attn_kvarn_stage_free(incomplete_stage);
+    ggml_backend_free(backend);
+}
+
+static void test_server_ahead_lineage() {
+    storage_env native("kvarn4");
+    storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
+    storage_env bulk("0", "GGML_RKVA_NATIVE_BULK");
+    storage_env async("0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+    storage_env producer("cpu", "GGML_RKVA_NATIVE_PRODUCER");
+    ggml_backend_load_all();
+    ggml_remote_attn_geometry geo{};
+    geo.n_layer_remote=2; geo.n_head=2; geo.n_head_kv=1; geo.head_dim=256;
+    geo.max_ctx=512; geo.group_tokens=128; geo.sinkhorn_iters=3; geo.kq_scale=0.0625f;
+    auto * cpu=ggml_backend_cpu_init(); assert(cpu);
+    auto * scheduler=ggml_backend_sched_new(&cpu,nullptr,1,64,false,false); assert(scheduler);
+    auto * ctx=ggml_init({1u<<20,nullptr,true});
+    auto * graph=ggml_new_graph_custom(ctx,64,false);
+    std::vector<ggml_tensor *> copies;
+    for (int layer : {3,7}) for (const char * kind : {"k","v"}) {
+        auto * input=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,256,1,1);
+        auto * copy=ggml_dup(ctx,input);
+        ggml_format_name(copy,"rkva_ahead_%s-%d",kind,layer);
+        ggml_set_output(copy); ggml_build_forward_expand(graph,copy); copies.push_back(copy);
+    }
+    auto * buffer=ggml_backend_alloc_ctx_tensors(ctx,cpu); assert(buffer); ggml_backend_buffer_clear(buffer,0);
+    auto capture = [&](server_rkva_ahead & ahead, llama_pos pos, llama_token token) {
+        int32_t count=1; llama_seq_id id=0; llama_seq_id * ids=&id;
+        llama_ubatch batch{}; batch.n_tokens=1; batch.n_seqs_unq=1; batch.token=&token;
+        batch.pos=&pos; batch.n_seq_id=&count; batch.seq_id=&ids;
+        return server_rkva_ahead::capture(&ahead,scheduler,graph,&batch);
+    };
+    std::vector<llama_token> tokens(1026,7);
+    tokens[1024]=10; tokens[1025]=11;
+    ggml_backend_t adopted=nullptr;
+    {
+        loopback server(false,true,false,false,false,false,0,0,true,3);
+        {
+        server_rkva_ahead ahead("127.0.0.1",server.port,geo,1024,GGML_TYPE_Q4_0,
+                {3,7},std::vector<llama_token>(tokens.begin(),tokens.begin()+1025));
+        assert(ahead.valid() && capture(ahead,1024,10));
+        assert(ahead.extend(tokens,1026));
+        assert(capture(ahead,1025,11));
+        assert(ahead.ready());
+        adopted=ggml_backend_remote_attn_kvarn_stage_take(ahead.stage(),"127.0.0.1",server.port,
+                &geo,1024,512,GGML_TYPE_Q4_0,128);
+        assert(adopted && ggml_backend_remote_attn_kvarn_stage_matches(ahead.stage(),adopted,2));
+        }
+        ggml_backend_free(adopted);
+    }
+    {
+        loopback server(false,true,false,false,false,false,0,0,true,3);
+        server_rkva_ahead ahead("127.0.0.1",server.port,geo,1024,GGML_TYPE_Q4_0,
+                {3,7},std::vector<llama_token>(tokens.begin(),tokens.begin()+1025));
+        auto changed=tokens; changed[0]++;
+        assert(!ahead.extend(changed,1026) && !ahead.valid());
+    }
+    {
+        loopback server(false,true,false,false,false,false,0,0,true,3);
+        server_rkva_ahead ahead("127.0.0.1",server.port,geo,1024,GGML_TYPE_Q4_0,
+                {3,7},std::vector<llama_token>(tokens.begin(),tokens.begin()+1025));
+        assert(capture(ahead,1024,10));
+        assert(!capture(ahead,1024,10) && !ahead.valid());
+    }
+    ggml_backend_buffer_free(buffer); ggml_free(ctx); ggml_backend_sched_free(scheduler); ggml_backend_free(cpu);
 }
 
 static void test_native_rewind() {
@@ -4358,6 +4518,12 @@ static void test_prefetch_public_controls(bool e4) {
 }
 
 int main() {
+    if (std::getenv("GGML_RKVA_STAGE_TEST_ONLY")) {
+        test_native_stage_append();
+        test_server_ahead_lineage();
+        std::puts("PASS: native stage append and rewind");
+        return 0;
+    }
     if (std::getenv("GGML_RKVA_E4_TEST_ONLY")) {
         test_native_bulk_e4m3fn();
         test_native_snapshot_transport();
@@ -4448,6 +4614,8 @@ int main() {
     test_turboquant_nc_loopback();
     test_native_physical_peer();
     test_old_native_client_ack_compatibility();
+    test_native_stage_append();
+    test_server_ahead_lineage();
     test_native_rewind();
     test_native_snapshot_transport();
     test_failure_retirement();

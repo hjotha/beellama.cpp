@@ -30,8 +30,11 @@
 #include "f4-test-logit-capture.h"
 #endif
 #include "server-mixed-kv-handoff.h"
+#include "server-rkva-ahead.h"
 #include "src/llama-kv-mixed-handoff.h"
 #include "src/llama-position-split.h"
+#include "src/llama-context.h"
+#include "src/llama-model.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -53,6 +56,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -4184,8 +4188,124 @@ private:
     // One-way PURE KVarN -> MIXED handoff: source descriptor captured before
     // the old context is destroyed (same resident model, no weight reload).
     server_mixed_kv_handoff::source_capture mixed_handoff_source_;
+    std::unique_ptr<server_rkva_ahead> rkva_ahead_;
+    std::shared_ptr<const common_prompt_checkpoint> rkva_ahead_checkpoint_;
+    bool rkva_ahead_adopted_ = false;
+    int rkva_ahead_attempt_task_ = -1;
+    uint64_t rkva_ahead_owner_id_ = 0;
+    uint64_t rkva_ahead_owner_epoch_ = 0;
     void mixed_handoff_capture() {
         mixed_handoff_source_ = server_mixed_kv_handoff::capture_source(ctx_tgt);
+    }
+
+    static bool rkva_ahead_same_kvarn(const llama_kvarn_params & a, const llama_kvarn_params & b) {
+        return a.type == LLAMA_KVARN_K4V4_G128 && b.type == LLAMA_KVARN_K4V4_G128 &&
+                a.key_bits == b.key_bits && a.value_bits == b.value_bits && a.group == b.group &&
+                a.sinkhorn_iters == b.sinkhorn_iters && a.sink_tokens == b.sink_tokens;
+    }
+
+    bool rkva_ahead_has_cuda_headroom() const {
+        auto * cuda = ggml_backend_dev_by_name("CUDA0");
+        size_t free_bytes = 0, total_bytes = 0;
+        if (cuda) ggml_backend_dev_memory(cuda, &free_bytes, &total_bytes);
+        uint64_t layers = 0;
+        for (uint32_t il = 0; il < model_tgt->hparams.n_layer(); ++il)
+            if (model_tgt->hparams.has_kv(il) && !model_tgt->hparams.is_recr(il)) ++layers;
+        const uint64_t capture_bytes = layers * llama_n_ubatch(ctx_tgt) * model_tgt->hparams.n_head_kv() *
+                model_tgt->hparams.n_embd_head_k() * 2 * sizeof(float);
+        if (cuda && free_bytes >= capture_bytes + (32ull << 20)) return true;
+        SRV_WRN("RKVA ahead skipped: insufficient CUDA headroom (free=%zu, capture=%" PRIu64 ")\n",
+                free_bytes, capture_bytes);
+        return false;
+    }
+
+    void maybe_start_rkva_ahead() {
+        if (rkva_ahead_) {
+            if (slots.size() == 1 && slots.front().task &&
+                    slots.front().task->id != rkva_ahead_attempt_task_) {
+                auto & slot = slots.front();
+                rkva_ahead_attempt_task_ = slot.task->id;
+                if (slot.mctx || !slot.lora.empty() || !slot.task->params.lora.empty() ||
+                        !params_base.lora_adapters.empty() || !params_base.control_vectors.empty() ||
+                        slot.task->is_stateless() || !slot.task->params.cache_prompt ||
+                        rkva_ahead_owner_id_ != llama_kvarn_state_owner_id(ctx_tgt) ||
+                        rkva_ahead_owner_epoch_ != llama_kvarn_state_owner_epoch(ctx_tgt) ||
+                        slot.task->tokens.has_media()) {
+                    rkva_ahead_->invalidate();
+                } else {
+                    const auto & tokens = slot.task->tokens.get_tokens();
+                    const int64_t boundary = server_prompt_checkpoint_boundary(tokens.size(),
+                            std::min<int32_t>(4, llama_n_batch(ctx_tgt)), prompt_reuse_alignment());
+                    const uint32_t old_target = rkva_ahead_->target();
+                    const uint32_t target = uint32_t(std::max<int64_t>(old_target, boundary));
+                    if (rkva_ahead_->extend(tokens, target) && target > old_target) {
+                        SRV_INF("RKVA ahead: extending staged prefix from %u to %u tokens\n", old_target, target);
+                    }
+                }
+            }
+            return;
+        }
+        if (!ctx_tgt || !model_tgt || slots.size() != 1 || !prompt_cache ||
+                params_base.n_ctx_checkpoints <= 0 || params_base.n_parallel != 1 || params_base.ctx_shift ||
+                model_tgt->arch != LLM_ARCH_QWEN35 || ctx_dft ||
+                adaptive_profile_is_mixed(active_context_profile) ||
+                !adaptive_profile_is_mixed(COMMON_CONTEXT_PROFILE_XXXLONG) ||
+                adaptive_draft_n_for_profile(COMMON_CONTEXT_PROFILE_XXXLONG) != 0 ||
+                adaptive_remote_attn_host.empty() || params_base.kv_tail_tokens != "0" ||
+                !params_base.lora_adapters.empty() || !params_base.control_vectors.empty()) return;
+        const uint32_t origin = params_base.kv_position_split_p;
+        const auto & local_kvarn = ctx_tgt->get_cparams().kvarn;
+        if (!origin || origin % 128 || params_base.n_ctx <= int32_t(origin) ||
+                params_base.ctx_size_xxxlong <= int32_t(origin) ||
+                adaptive_remote_attn_cache_type_k != GGML_TYPE_Q4_0 ||
+                adaptive_remote_attn_cache_type_v != GGML_TYPE_Q4_0 ||
+                !rkva_ahead_same_kvarn(local_kvarn, adaptive_kvarn_xxxlong)) return;
+        const char * native_tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS");
+        if (native_tail && std::strcmp(native_tail, "128") != 0) return;
+        auto & slot = slots.front();
+        if (!slot.task || slot.id != 0 || slot.mctx || !slot.lora.empty() ||
+                !slot.task->params.lora.empty() || slot.task->is_stateless() ||
+                !slot.task->params.cache_prompt || slot.task->tokens.has_media() ||
+                (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) ||
+                rkva_ahead_attempt_task_ == slot.task->id) return;
+        const auto & all = slot.task->tokens.get_tokens();
+        const int32_t alignment = prompt_reuse_alignment();
+        if (alignment != 128) return;
+        const int64_t target = server_prompt_checkpoint_boundary(all.size(),
+                std::min<int32_t>(4, llama_n_batch(ctx_tgt)), alignment);
+        if (target <= int64_t(origin) + 128 || target > params_base.n_ctx) return;
+        ggml_remote_attn_geometry geo{};
+        geo.n_head = model_tgt->hparams.n_head();
+        geo.n_head_kv = model_tgt->hparams.n_head_kv();
+        geo.head_dim = model_tgt->hparams.n_embd_head_k();
+        if (geo.head_dim != 256 || !geo.n_head_kv) return;
+        std::vector<int> layers;
+        for (uint32_t il = 0; il < model_tgt->hparams.n_layer(); ++il)
+            if (model_tgt->hparams.has_kv(il) && !model_tgt->hparams.is_recr(il)) layers.push_back(int(il));
+        geo.n_layer_remote = uint32_t(layers.size());
+        geo.max_ctx = uint32_t(params_base.ctx_size_xxxlong) - origin;
+        geo.group_tokens = 128;
+        geo.sinkhorn_iters = uint32_t(adaptive_kvarn_xxxlong.sinkhorn_iters);
+        geo.kq_scale = model_tgt->hparams.f_attention_scale == 0.0f ?
+                1.0f / std::sqrt(float(geo.head_dim)) : model_tgt->hparams.f_attention_scale;
+        rkva_ahead_attempt_task_ = slot.task->id;
+        if (!rkva_ahead_has_cuda_headroom()) return;
+        const uint64_t owner_id = llama_kvarn_state_owner_id(ctx_tgt);
+        const uint64_t owner_epoch = llama_kvarn_state_owner_epoch(ctx_tgt);
+        if (!owner_id || !owner_epoch) return;
+        try {
+            auto ahead = std::make_unique<server_rkva_ahead>(adaptive_remote_attn_host.c_str(),
+                    adaptive_remote_attn_port, geo, origin, adaptive_remote_attn_cache_type_k,
+                    std::move(layers), std::vector<llama_token>(all.begin(), all.begin() + target));
+            if (!ahead->valid()) return;
+            rkva_ahead_ = std::move(ahead);
+            rkva_ahead_owner_id_ = owner_id;
+            rkva_ahead_owner_epoch_ = owner_epoch;
+            llama_kvarn_ahead_capture_set(ctx_tgt, origin, server_rkva_ahead::capture, rkva_ahead_.get());
+            SRV_INF("RKVA ahead: staging [%u, %" PRId64 ") in background\n", origin, target);
+        } catch (const std::exception & error) {
+            SRV_WRN("RKVA ahead disabled: %s\n", error.what());
+        }
     }
 
     int32_t adaptive_draft_n_for_profile(common_context_profile profile) const {
@@ -7349,7 +7469,7 @@ private:
         return true;
     }
 
-    bool switch_adaptive_context(common_context_profile requested) {
+    bool switch_adaptive_context(common_context_profile requested, const server_task * incoming = nullptr) {
         if (!common_context_is_adaptive(params_base)) {
             return true;
         }
@@ -7380,6 +7500,39 @@ private:
         old_params.speculative.draft.ctx_dft = nullptr;
         old_params.speculative.shadow.ctx_tgt = nullptr;
         old_params.speculative.shadow.ctx_dft = nullptr;
+
+        bool adopt_ahead = false;
+        bool carry_ahead = false;
+        if (rkva_ahead_ && rkva_ahead_->valid() && rkva_ahead_checkpoint_ && incoming &&
+                !incoming->is_stateless() &&
+                slots.size() == 1 && incoming->params.lora.empty() && params_base.lora_adapters.empty() &&
+                params_base.control_vectors.empty() && slots.front().lora.empty() &&
+                incoming->params.cache_prompt && !incoming->tokens.has_media() &&
+                !slots.front().prompt.tokens.has_media() &&
+                incoming->tokens.size() >= rkva_ahead_->target() &&
+                slots.front().prompt.tokens.size() >= rkva_ahead_->target() &&
+                rkva_ahead_checkpoint_->n_tokens == rkva_ahead_->target() &&
+                rkva_ahead_owner_id_ == llama_kvarn_state_owner_id(ctx_tgt) &&
+                rkva_ahead_owner_epoch_ == llama_kvarn_state_owner_epoch(ctx_tgt) &&
+                rkva_ahead_checkpoint_->owner_id == llama_kvarn_state_owner_id(ctx_tgt) &&
+                rkva_ahead_checkpoint_->owner_epoch == llama_kvarn_state_owner_epoch(ctx_tgt) &&
+                rkva_ahead_checkpoint_->compatible_tgt(ctx_tgt) &&
+                std::equal(rkva_ahead_->tokens().begin(), rkva_ahead_->tokens().end(), incoming->tokens.get_tokens().begin()) &&
+                std::equal(rkva_ahead_->tokens().begin(), rkva_ahead_->tokens().end(), slots.front().prompt.tokens.get_tokens().begin())) {
+            if (requested == COMMON_CONTEXT_PROFILE_XXXLONG) {
+                adopt_ahead = rkva_ahead_->ready();
+            } else if (!adaptive_profile_is_mixed(requested) && adaptive_draft_n_for_profile(requested) == 0 &&
+                    adaptive_profile_ctx_size(requested) > params_base.kv_position_split_p &&
+                    adaptive_profile_ctx_size(requested) >= rkva_ahead_->target()) {
+                carry_ahead = true;
+            }
+            if (adopt_ahead || carry_ahead) slots.front().prompt.checkpoints.push_back(rkva_ahead_checkpoint_);
+        }
+        if (rkva_ahead_) llama_kvarn_ahead_capture_set(ctx_tgt, 0, nullptr, nullptr);
+        if (!adopt_ahead && !carry_ahead) {
+            rkva_ahead_.reset();
+            rkva_ahead_checkpoint_.reset();
+        }
 
         // Publish every reusable idle state before destroying either context.
         if (prompt_cache) {
@@ -7462,6 +7615,8 @@ private:
         const auto req_name = adaptive_status_profile_name((int) requested);
         if (!llama_model_mtp_weights_set_resident(model_tgt, resident,
                 adaptive_test_mtp_fault("candidate", requested, resident))) {
+            rkva_ahead_.reset();
+            rkva_ahead_checkpoint_.reset();
             SRV_WRN("adaptive test fault: candidate %s MTP residency/upload\n",
                     req_name.c_str());
             SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
@@ -7472,6 +7627,8 @@ private:
             return false;
         }
         if (adaptive_test_fault("candidate-after-residency", requested)) {
+            rkva_ahead_.reset();
+            rkva_ahead_checkpoint_.reset();
             SRV_WRN("adaptive test fault: candidate %s after MTP residency\n",
                     req_name.c_str());
             SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
@@ -7481,7 +7638,19 @@ private:
             }
             return false;
         }
-        if (!llama_init->recreate_context(params_base)) {
+        if (adopt_ahead && !llama_remote_attn_offer_kvarn_stage(rkva_ahead_->stage())) {
+            adopt_ahead = false;
+            rkva_ahead_.reset();
+            rkva_ahead_checkpoint_.reset();
+        }
+        const bool saved_warmup = params_base.warmup;
+        if (adopt_ahead) params_base.warmup = false; // warmup clears the already-populated peer
+        const bool created = llama_init->recreate_context(params_base);
+        params_base.warmup = saved_warmup;
+        llama_remote_attn_clear_kvarn_stage_offer();
+        if (!created) {
+            rkva_ahead_.reset();
+            rkva_ahead_checkpoint_.reset();
             SRV_ERR("adaptive context transition to %s failed; attempting rollback\n",
                     req_name.c_str());
             if (!restore_old()) {
@@ -7493,12 +7662,28 @@ private:
         if (ctx_tgt == nullptr || !rebuild_active_speculation(requested)) {
             SRV_ERR("%s", "adaptive context transition built an unusable speculative profile; attempting rollback\n");
             discard_context();
+            rkva_ahead_.reset();
+            rkva_ahead_checkpoint_.reset();
             if (!restore_old()) {
                 enter_adaptive_unavailable();
             }
             return false;
         }
+        if (carry_ahead) {
+            if (rkva_ahead_same_kvarn(ctx_tgt->get_cparams().kvarn, adaptive_kvarn_xxxlong) &&
+                    rkva_ahead_has_cuda_headroom()) {
+                llama_kvarn_ahead_capture_set(ctx_tgt, params_base.kv_position_split_p,
+                        server_rkva_ahead::capture, rkva_ahead_.get());
+                SRV_INF("RKVA ahead: preserving staged prefix across local tier transition (%u tokens)\n",
+                        rkva_ahead_->target());
+            } else {
+                rkva_ahead_.reset();
+                rkva_ahead_checkpoint_.reset();
+            }
+        }
         active_context_profile = requested;
+        rkva_ahead_adopted_ = adopt_ahead &&
+                ggml_backend_remote_attn_kvarn_stage_taken(rkva_ahead_->stage());
         adaptive_context_unavailable = false;
         n_ctx = llama_n_ctx(ctx_tgt);
         const bool source_is_q4 = old_params.cache_kvarn_bits_k == 0 &&
@@ -7631,6 +7816,46 @@ private:
         }
 
         if (ret) {
+            if (rkva_ahead_adopted_) {
+                bool committed = false;
+                for (const auto & state : prompt_cache->states) {
+                    const bool checkpoint_present = std::any_of(state.prompt.checkpoints.begin(), state.prompt.checkpoints.end(),
+                            [&](const auto & checkpoint) { return checkpoint == rkva_ahead_checkpoint_; });
+                    if (!checkpoint_present || state.layout_tgt != mixed_handoff_source_.source_layout ||
+                            state.prompt.tokens.has_media() || state.prompt.tokens.size() < rkva_ahead_->target() ||
+                            task.tokens.has_media() || task.tokens.size() < rkva_ahead_->target() ||
+                            !std::equal(rkva_ahead_->tokens().begin(), rkva_ahead_->tokens().end(), state.prompt.tokens.get_tokens().begin()) ||
+                            !std::equal(rkva_ahead_->tokens().begin(), rkva_ahead_->tokens().end(), task.tokens.get_tokens().begin())) continue;
+                    server_mixed_kv_handoff::input hi;
+                    hi.ctx_tgt = ret->ctx_tgt; hi.ctx_dft = ret->ctx_dft; hi.spec = ret->spec;
+                    hi.model = model_tgt; hi.seq_id = ret->id; hi.has_mtmd = ret->mctx != nullptr;
+                    hi.source = &mixed_handoff_source_; hi.state = &state; hi.tokens_new = &task.tokens;
+                    hi.staged_remote = rkva_ahead_->stage(); hi.staged_tokens = &rkva_ahead_->tokens();
+                    const auto result = server_mixed_kv_handoff::try_handoff(hi);
+                    if (result.committed) {
+                        ret->prompt.tokens = server_tokens(result.prefix_tokens, false);
+                        ret->prompt.checkpoints.clear();
+                        ret->just_restored = true;
+                        ret->prompt_cache_source = "mixed_handoff";
+                        ret->prompt_cache_reason = "ahead_prefix";
+                        SRV_INF("%s\n", result.marker.c_str());
+                        committed = true;
+                    } else {
+                        SRV_WRN("RKVA ahead handoff rejected: %s\n", result.reason.c_str());
+                    }
+                    break;
+                }
+                if (committed) {
+                    update_cache = false;
+                } else {
+                    // Reset the peer before any cold replay into this context.
+                    ret->prompt_clear();
+                    SRV_WRN("%s", "RKVA ahead unavailable; reset peer and use normal prompt restore\n");
+                }
+                rkva_ahead_adopted_ = false;
+                rkva_ahead_.reset();
+                rkva_ahead_checkpoint_.reset();
+            }
             // Second auto-save site for when cache_idle_slots is OFF (the idle-flush path in
             // process_single_task -> auto_save never runs). Here get_available_slot just picked `ret`
             // for a new task and `update_cache` signals its prior KV is about to be discarded, so we
@@ -7669,9 +7894,41 @@ private:
 
                 t_phase = ggml_time_us();
                 if (task.params.cache_prompt) {
-                    const auto cache_result = ret->prompt_load_result(
+                    auto cache_result = ret->prompt_load_result(
                             *prompt_cache, task.tokens, admitted, prompt_reuse_alignment(),
                             uses_mtp() ? 0 : UINT32_MAX);
+                    if (cache_result == server_prompt_cache_result::hit && rkva_ahead_ &&
+                            rkva_ahead_->valid() && rkva_ahead_checkpoint_ &&
+                            rkva_ahead_checkpoint_->owner_id == rkva_ahead_owner_id_ &&
+                            rkva_ahead_checkpoint_->owner_epoch == rkva_ahead_owner_epoch_ &&
+                            !ret->prompt.tokens.has_media() && !task.tokens.has_media() &&
+                            ret->prompt.tokens.size() >= rkva_ahead_->target() &&
+                            task.tokens.size() >= rkva_ahead_->target() &&
+                            llama_memory_seq_pos_max(llama_get_memory(ret->ctx_tgt), ret->id) >=
+                                    (llama_pos) rkva_ahead_->target() - 1 &&
+                            std::find(ret->prompt.checkpoints.begin(), ret->prompt.checkpoints.end(),
+                                    rkva_ahead_checkpoint_) != ret->prompt.checkpoints.end() &&
+                            std::equal(rkva_ahead_->tokens().begin(), rkva_ahead_->tokens().end(),
+                                    ret->prompt.tokens.get_tokens().begin()) &&
+                            std::equal(rkva_ahead_->tokens().begin(), rkva_ahead_->tokens().end(),
+                                    task.tokens.get_tokens().begin())) {
+                        adopt_checkpoint_owner(ret->ctx_tgt, *rkva_ahead_checkpoint_, "ahead restored prefix");
+                        const llama_pos target = llama_pos(rkva_ahead_->target());
+                        if (llama_kvarn_state_owner_id(ret->ctx_tgt) != rkva_ahead_owner_id_ ||
+                                llama_kvarn_state_owner_epoch(ret->ctx_tgt) != rkva_ahead_owner_epoch_ ||
+                                !restore_checkpoint_transaction(*ret, *rkva_ahead_checkpoint_, ret->ctx_tgt,
+                                        nullptr, true, false, false) ||
+                                !ret->mem.seq_rm(ret->id, target, -1)) {
+                            rkva_ahead_->invalidate();
+                            ret->prompt_clear();
+                            cache_result = server_prompt_cache_result::unchanged;
+                            SRV_WRN("%s", "RKVA ahead checkpoint restore failed; clearing the local prefix\n");
+                        } else {
+                            ret->prompt.tokens.keep_first(size_t(target));
+                            ret->just_restored = true;
+                            SRV_INF("RKVA ahead: restored local checkpoint at %d tokens\n", target);
+                        }
+                    }
                     if (mixed_handoff_source_.valid &&
                             (cache_result == server_prompt_cache_result::miss ||
                              (cache_result == server_prompt_cache_result::unchanged && ret->prompt.tokens.empty()))) {
@@ -8895,6 +9152,14 @@ private:
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
+        if (rkva_ahead_ && rkva_ahead_->valid() && slot.id == 0 &&
+                n_tokens_checkpoint == rkva_ahead_->target() &&
+                pos_max == n_tokens_checkpoint - 1 && !slot.prompt.tokens.has_media() &&
+                slot.prompt.tokens.size() >= rkva_ahead_->target() &&
+                std::equal(rkva_ahead_->tokens().begin(), rkva_ahead_->tokens().end(),
+                        slot.prompt.tokens.get_tokens().begin())) {
+            rkva_ahead_checkpoint_ = checkpoint;
+        }
         slot.prompt.checkpoints.push_back(std::move(checkpoint));
         const auto & admitted = *slot.prompt.checkpoints.back();
 
@@ -9907,7 +10172,7 @@ private:
                             break;
                         }
                         if (!adaptive_stage_pure_disk_prefix(task) ||
-                                !switch_adaptive_context(task.context_profile)) {
+                                !switch_adaptive_context(task.context_profile, &task)) {
                             send_error(task, "adaptive context profile transition failed", ERROR_TYPE_SERVER);
                             break;
                         }
@@ -12755,6 +13020,7 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
         const bool    prof_mtp = getenv("GGML_MTP_PROF") != nullptr;
         const int64_t prof_t0  = prof_mtp ? ggml_time_us() : 0;
         const int64_t trace_decode_start = dflash_trace_tick_us();
+        maybe_start_rkva_ahead();
         queue_tasks.yield_to_queue([&]() {
             if (ggml_remote_attn_trace_enabled()) {
                 uint64_t request_id = 0;

@@ -22,11 +22,35 @@ GGML_RKVA_RANGE_STORAGE=auto build-optimized/bin/llama-server \
 
 P must be a positive multiple of 256 and smaller than C. In an adaptive
 server, retain the pure CUDA tier at C=102400 and enable remote attention only
-in the larger tier using `--remote-attn-min-context 131072`. Requests whose
-budget selects the pure tier do not construct an RPC context. Within a split
+in the larger tier using `--remote-attn-min-context 131072`. Within a split
 context, only queries at positions P or later execute range attention RPCs.
 Creating a split context can negotiate a connection and reserve remote KV
 before those positions are reached.
+
+### Preparing overflow while inference stays local
+
+When an adaptive local profile extends past P, the server can copy projected
+K/V rows at and above P to a private Xbox session while continuing to compute
+local attention. A later split profile can adopt that session and its matching
+local KVarN and recurrent checkpoint. The server checks the model owner,
+checkpoint, exact token prefix, geometry and remote row counts; a changed or
+rewritten prefix, failed upload or insufficient resources falls back to the
+ordinary prompt restore and prefill.
+
+This preparation currently applies to one text-only Qwen35 sequence, KVarN4
+on both profiles, native Xbox KVarN4 with a Q4_0 companion, the CPU producer,
+the default 128-token native tail, and a split profile without MTP. Other
+configurations keep their existing serving path. The normal split path still
+supports its independently configured tail sizes.
+
+The upload worker buffers up to 256 MiB of projected rows in RAM and can spill
+up to 8 GiB into an automatically removed, disk-backed temporary file while
+leaving at least 1 GiB free on that filesystem. If it cannot keep the data,
+the shadow session is discarded. The server also checks available host memory
+and CUDA headroom before enabling capture. A transition may wait for queued
+uploads if the Xbox has not caught up. Local and split attention can have small
+numerical differences, so this optimization does not promise bit-identical
+generation to a prompt processed remotely from the start.
 
 The initial range path supports one contiguous, unshifted, causal text
 sequence with Qwen35 dense full-attention layers, a CUDA KVarN prefix and a

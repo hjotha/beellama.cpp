@@ -807,6 +807,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     auto * Qcur = terms.q;
     auto * Kcur = terms.k;
     auto * Vcur = terms.v;
+    if ((Kcur->flags & GGML_TENSOR_FLAG_OUTPUT) && (Vcur->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        Kcur->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+        Vcur->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+        auto * capture_k = ggml_dup(ctx0, Kcur);
+        auto * capture_v = ggml_dup(ctx0, Vcur);
+        cb(capture_k, "rkva_ahead_k", il);
+        cb(capture_v, "rkva_ahead_v", il);
+        ggml_set_output(capture_k);
+        ggml_set_output(capture_v);
+        ggml_build_forward_expand(gf, capture_k);
+        ggml_build_forward_expand(gf, capture_v);
+    }
     const int64_t n_embd_head = hparams.n_embd_head_v();
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;

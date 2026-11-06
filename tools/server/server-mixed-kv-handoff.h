@@ -24,6 +24,7 @@
 struct server_prompt_cache_state;
 struct server_tokens;
 struct common_speculative;
+struct ggml_remote_attn_kvarn_stage;
 
 namespace server_mixed_kv_handoff {
 
@@ -67,6 +68,9 @@ struct input {
     const source_capture * source = nullptr;
     const server_prompt_cache_state * state = nullptr; // selected pure snapshot
     const server_tokens * tokens_new = nullptr;
+    // A sealed stage is eligible only for the exact evaluated token lineage.
+    const ggml_remote_attn_kvarn_stage * staged_remote = nullptr;
+    const std::vector<llama_token> * staged_tokens = nullptr;
 };
 
 // Runs the handoff. Returns committed=true only when the candidate was fully

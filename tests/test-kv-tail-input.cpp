@@ -212,6 +212,24 @@ static void mapped_local_tail_plan(ggml_backend_t backend) {
     ggml_free(ctx);
 }
 
+static void split_prefix_import() {
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+    llama_kv_cache cache(*model, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
+            false, false, true, 512, 1, 1, 0, LLAMA_SWA_TYPE_NONE,
+            nullptr, {}, {}, {}, "", 4, 2, GGML_TYPE_F16, 2, true, 2);
+    cache.set_position_split_p(256);
+    for (const uint32_t size : {200u, 256u, 300u}) {
+        const auto imported = cache.import_sequence_prefix(0, size, {});
+        check(imported.size() == size, "split prefix import has the wrong size");
+        const auto & cells = cache.get_cells(0);
+        for (uint32_t pos = 0; pos < size; ++pos) {
+            check(imported[pos] == pos && cells.pos_get(pos) == llama_pos(pos) && cells.seq_has(pos, 0),
+                    "split prefix import lost the logical position or owner");
+        }
+        check(cache.seq_pos_max(0) == llama_pos(size - 1), "split prefix import retained a stale suffix");
+    }
+}
+
 int main() {
     ggml_backend_load_all();
     auto backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -220,6 +238,7 @@ int main() {
     persistent_stage_descriptor(backend, 256);
     persistent_stage_descriptor(backend, 512);
     mapped_local_tail_plan(backend);
+    split_prefix_import();
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
     // No model tensors: exercise the same metadata cache used by structured caches.
     llama_kv_cache cache(*model, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,

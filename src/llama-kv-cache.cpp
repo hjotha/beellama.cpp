@@ -6555,37 +6555,41 @@ std::vector<uint32_t> llama_kv_cache::import_sequence_prefix(
     seq_rm(seq_id, -1, -1);
 
     llama_batch_allocr balloc(hparams.n_pos_per_embd());
-    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens, 1);
     llama_seq_id owner = seq_id;
-    ubatch.seq_id_unq[0] = seq_id;
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        ubatch.pos[i]      = llama_pos(i);
-        ubatch.n_seq_id[i] = 1;
-        ubatch.seq_id[i]   = &owner;
-    }
-
-    const slot_info sinfo = find_slot(ubatch, false);
-    if (sinfo.empty() || sinfo.n_stream() != 1 || sinfo.idxs[0].size() != n_tokens) {
-        throw std::runtime_error("KV import could not allocate the prefix cells");
-    }
-
-    {
-        struct tail_preparing_guard {
-            bool & value;
-            bool old;
-            ~tail_preparing_guard() { value = old; }
-        } guard { tail_preparing, tail_preparing };
-        tail_preparing = true;
-        apply_ubatch(sinfo, ubatch);
-    }
-
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        if (!exts.empty()) {
-            v_cells[sinfo.strm[0]].ext_set(sinfo.idxs[0][i], exts[i]);
+    std::vector<uint32_t> imported;
+    imported.reserve(n_tokens);
+    for (uint32_t begin = 0; begin < n_tokens;) {
+        const uint32_t end = allocation_position_split_p > begin && allocation_position_split_p < n_tokens
+                ? allocation_position_split_p : n_tokens;
+        const uint32_t count = end - begin;
+        llama_ubatch ubatch = balloc.ubatch_reserve(count, 1);
+        ubatch.seq_id_unq[0] = seq_id;
+        for (uint32_t i = 0; i < count; ++i) {
+            ubatch.pos[i]      = llama_pos(begin + i);
+            ubatch.n_seq_id[i] = 1;
+            ubatch.seq_id[i]   = &owner;
         }
+        const slot_info sinfo = find_slot(ubatch, false);
+        if (sinfo.empty() || sinfo.n_stream() != 1 || sinfo.idxs[0].size() != count) {
+            throw std::runtime_error("KV import could not allocate the prefix cells");
+        }
+        {
+            struct tail_preparing_guard {
+                bool & value;
+                bool old;
+                ~tail_preparing_guard() { value = old; }
+            } guard { tail_preparing, tail_preparing };
+            tail_preparing = true;
+            apply_ubatch(sinfo, ubatch);
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!exts.empty()) v_cells[sinfo.strm[0]].ext_set(sinfo.idxs[0][i], exts[begin + i]);
+            imported.push_back(sinfo.idxs[0][i]);
+        }
+        begin = end;
     }
     rebuild_allocation_head(seq_id);
-    return sinfo.idxs[0];
+    return imported;
 }
 
 void llama_kv_cache::import_sequence_tail(llama_seq_id seq_id, uint32_t pos_begin, uint32_t pos_end) {

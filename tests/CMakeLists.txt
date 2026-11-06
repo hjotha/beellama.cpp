@@ -1206,6 +1206,7 @@ llama_build_and_test(test-native-save-file.cpp)
 target_include_directories(test-native-save-file PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-server-native-slot.cpp)
+llama_build_and_test(test-rkva-stage-queue.cpp)
 target_include_directories(test-server-native-slot PRIVATE
     ${PROJECT_SOURCE_DIR}/tools/server
     ${PROJECT_SOURCE_DIR}/ggml/include)

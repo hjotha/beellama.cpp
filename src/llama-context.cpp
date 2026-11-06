@@ -42,13 +42,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -496,6 +499,18 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static thread_local ggml_remote_attn_kvarn_stage * next_remote_kvarn_stage = nullptr;
+
+bool llama_remote_attn_offer_kvarn_stage(ggml_remote_attn_kvarn_stage * stage) {
+    if (!stage || next_remote_kvarn_stage) return false;
+    next_remote_kvarn_stage = stage;
+    return true;
+}
+
+void llama_remote_attn_clear_kvarn_stage_offer() {
+    next_remote_kvarn_stage = nullptr;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -528,6 +543,20 @@ llama_context::llama_context(
     }
     const bool tcp_position_split = split_requested &&
             params.remote_attn_host && params.remote_attn_host[0] && !local_attn_dev;
+    auto * offered_stage = next_remote_kvarn_stage;
+    next_remote_kvarn_stage = nullptr;
+    if (offered_stage && !tcp_position_split) {
+        throw std::invalid_argument("a staged remote KV requires a TCP position-split context");
+    }
+    int adopted_sentinel = 0;
+    auto cleanup_adopted = [this](int *) {
+        if (backend_remote) {
+            ggml_remote_attn_set_active(nullptr);
+            ggml_backend_free(backend_remote);
+            backend_remote = nullptr;
+        }
+    };
+    std::unique_ptr<int, decltype(cleanup_adopted)> adopted_guard(nullptr, cleanup_adopted);
     const bool e4_wire_requested = ggml_remote_attn_policy::e4_requested(
             std::getenv("GGML_RKVA_WIRE_FORMAT"), std::getenv("GGML_RKVA_NATIVE_BULK_WIRE"),
             std::getenv("GGML_RKVA_NATIVE_BULK"));
@@ -2106,6 +2135,27 @@ std::vector<ggml_backend_t> layer_backends;
                 ggml_backend_local_split_set_active_session(backend_remote, remote_attn_session);
                 LLAMA_LOG_INFO("%s: local-split attention enabled — %d full-attn layers offloaded to %s\n",
                         __func__, n_remote, params.remote_attn_host);
+            } else if (offered_stage) {
+                uint32_t expected_tail = explicit_native_tail ? std::min(cparams.kv_tail_tokens, geo.max_ctx) : 128;
+                if (!explicit_native_tail) {
+                    if (const char * value = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS")) {
+                        if (!*value || !std::all_of(value, value + std::strlen(value), [](unsigned char c) {
+                                return c >= '0' && c <= '9';
+                            })) throw std::invalid_argument("invalid native tail for staged remote KV");
+                        errno = 0;
+                        const unsigned long long requested = std::strtoull(value, nullptr, 10);
+                        if (errno == ERANGE) throw std::invalid_argument("native tail is not representable");
+                        expected_tail = requested == 128 ? 128u : uint32_t(std::min<unsigned long long>(requested, geo.max_ctx));
+                    }
+                }
+                backend_remote = ggml_backend_remote_attn_kvarn_stage_take(offered_stage,
+                        params.remote_attn_host, params.remote_attn_port, &geo, cparams.kv_position_split_p,
+                        geo.max_ctx, cparams.remote_attn_cache_type_k, expected_tail);
+                if (!backend_remote) throw std::runtime_error("staged remote KV does not match the destination context");
+                adopted_guard.reset(&adopted_sentinel);
+                remote_attn_session = 0;
+                offered_stage = nullptr;
+                LLAMA_LOG_INFO("%s: adopted validated staged Xbox KVarN session\n", __func__);
             } else {
                 backend_remote = ggml_backend_remote_attn_init(params.remote_attn_host, params.remote_attn_port);
                 if (backend_remote == nullptr) {
@@ -2302,6 +2352,8 @@ std::vector<ggml_backend_t> layer_backends;
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+    if (offered_stage) throw std::runtime_error("staged remote KV was not consumed by the destination context");
+    adopted_guard.release();
 }
 
 llama_context::~llama_context() {
@@ -4306,6 +4358,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         mctx->capture_after_compute(sched.get(), status);
         mctx->graph_compute_complete(sched.get(), status);
     }
+    if (status == GGML_STATUS_SUCCESS && kvarn_ahead_callback && ubatch.pos &&
+            std::any_of(ubatch.pos, ubatch.pos + ubatch.n_tokens,
+                [this](llama_pos p) { return p >= int64_t(kvarn_ahead_origin); })) {
+        bool ok = false;
+        try { ok = kvarn_ahead_callback(kvarn_ahead_user, sched.get(), res->get_gf(), &ubatch); }
+        catch (...) { ok = false; }
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: KVarN ahead capture failed; continuing locally\n", __func__);
+            kvarn_ahead_callback = nullptr;
+            kvarn_ahead_user = nullptr;
+            gf_res_prev_active = nullptr;
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -5854,6 +5919,14 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        if (kvarn_ahead_callback && model.arch == LLM_ARCH_QWEN35 && il >= 0 &&
+                cur->type == GGML_TYPE_F32 && cur->ne[0] == model.hparams.n_embd_head_k() &&
+                cur->ne[1] == model.hparams.n_head_kv() &&
+                ((!std::strcmp(name, "Kcur") && cur->op == GGML_OP_ROPE) ||
+                 (!std::strcmp(name, "Vcur") && cur->op == GGML_OP_RESHAPE))) {
+            ggml_set_output(cur);
+        }
+
         // DFlash2 requires a global vocabulary top-k. Tensor-parallel output
         // logits are vocabulary-axis split, so gather them through the CPU
         // scheduler boundary before selecting candidates.
@@ -5878,6 +5951,19 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
     };
+}
+
+void llama_context::set_kvarn_ahead_capture(uint32_t origin, llama_kvarn_ahead_capture_cb callback, void * user) {
+    synchronize();
+    kvarn_ahead_origin = origin;
+    kvarn_ahead_callback = callback;
+    kvarn_ahead_user = user;
+    gf_res_prev_active = nullptr;
+}
+
+void llama_kvarn_ahead_capture_set(llama_context * ctx, uint32_t origin,
+        llama_kvarn_ahead_capture_cb callback, void * user) {
+    if (ctx) ctx->set_kvarn_ahead_capture(origin, callback, user);
 }
 
 void llama_context::set_snapkv_prefill_end(llama_seq_id seq_id, llama_pos prefill_end) {

@@ -68,6 +68,11 @@ struct llama_context {
 
     void synchronize();
 
+    void set_kvarn_ahead_capture(uint32_t origin, llama_kvarn_ahead_capture_cb callback, void * user);
+    bool kvarn_ahead_stage_matches(const ggml_remote_attn_kvarn_stage * stage, uint32_t rows) const {
+        return ggml_backend_remote_attn_kvarn_stage_matches(stage, backend_remote, rows);
+    }
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
     uint64_t get_context_instance() const { return context_instance; }
@@ -546,6 +551,9 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+    uint32_t kvarn_ahead_origin = 0;
+    llama_kvarn_ahead_capture_cb kvarn_ahead_callback = nullptr;
+    void * kvarn_ahead_user = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

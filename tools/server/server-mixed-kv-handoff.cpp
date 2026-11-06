@@ -428,8 +428,14 @@ result try_handoff_impl(const input & in, result & out,
         candidates.push_back({ uint32_t(std::max<int64_t>(0, c->n_tokens)), c->pos_max,
                 c->host_only() });
     }
-    const uint32_t selected = handoff_select_prefix(candidates.data(), candidates.size(),
+    uint32_t selected = handoff_select_prefix(candidates.data(), candidates.size(),
             uint32_t(std::min<size_t>(lcp, UINT32_MAX)));
+    if (in.staged_remote && in.staged_tokens && in.staged_tokens->size() <= lcp &&
+            in.staged_tokens->size() <= UINT32_MAX) {
+        const uint32_t staged_size = uint32_t(in.staged_tokens->size());
+        const uint32_t eligible = handoff_select_prefix(candidates.data(), candidates.size(), staged_size);
+        if (eligible == staged_size) selected = staged_size;
+    }
     const common_prompt_checkpoint * checkpoint = nullptr;
     if (selected > 0) {
         for (const auto & c : in.state->prompt.checkpoints) {
@@ -448,14 +454,23 @@ result try_handoff_impl(const input & in, result & out,
         return out;
     }
 
-    // A positional split owns BOTH ranges in every full-attention layer.
-    // A pure checkpoint can be reused without conversion only while its
-    // selected, evaluated prefix lies entirely in the local range [0,P).
-    // Do not trim a checkpoint past P or convert prefix rows into overflow.
+    // Past P the peer must already own precisely this evaluated lineage.
     const uint32_t split_p = kvarn->position_split_p();
+    bool staged_overflow = false;
     if (split_p != 0) {
         if (selected > split_p) {
-            return fail("positional handoff prefix exceeds the local boundary P");
+            const auto & source_tokens = in.state->prompt.tokens.get_tokens();
+            const auto & next_tokens = in.tokens_new->get_tokens();
+            staged_overflow = in.staged_remote && in.staged_tokens &&
+                    split_p % 128 == 0 && selected - split_p >= in.source->exact_tail_tokens &&
+                    in.staged_tokens->size() == selected && source_tokens.size() >= selected &&
+                    next_tokens.size() >= selected &&
+                    std::equal(in.staged_tokens->begin(), in.staged_tokens->end(), source_tokens.begin()) &&
+                    std::equal(in.staged_tokens->begin(), in.staged_tokens->end(), next_tokens.begin()) &&
+                    in.ctx_tgt->kvarn_ahead_stage_matches(in.staged_remote, selected - split_p);
+            if (!staged_overflow) {
+                return fail("positional handoff lacks an exact staged overflow lineage");
+            }
         }
         if (llama_memory_seq_pos_max(llama_get_memory(in.ctx_tgt), in.seq_id) >= 0) {
             return fail("positional handoff requires an empty candidate");
@@ -703,6 +718,9 @@ result try_handoff_impl(const input & in, result & out,
     } catch (const std::exception & error) {
         return fail(("candidate metadata import failed: " + std::string(error.what())).c_str());
     }
+    if (staged_overflow && !in.ctx_tgt->kvarn_ahead_stage_matches(in.staged_remote, selected - split_p)) {
+        return fail("staged overflow changed during metadata import");
+    }
 
     // Whole-layer placement converts the selected prefix into each remote
     // standard layer. Positional placement instead keeps this entire prefix
@@ -730,7 +748,8 @@ result try_handoff_impl(const input & in, result & out,
     }
 
     handoff_source_desc source_desc;
-    source_desc.n_tokens = selected;
+    const uint32_t local_tokens = staged_overflow ? split_p : selected;
+    source_desc.n_tokens = local_tokens;
     source_desc.n_ctx_seq = in.source->n_ctx_seq;
     source_desc.n_seq_max = in.source->cparams.n_seq_max;
     source_desc.kv_unified = in.source->cparams.kv_unified;
@@ -801,6 +820,13 @@ result try_handoff_impl(const input & in, result & out,
 
     handoff_transaction txn;
     const auto dst_meta = kvarn->get_metadata_cache();
+    if (staged_overflow) {
+        for (uint32_t pos = 0; pos < local_tokens; ++pos) {
+            if (src_meta->allocation_cell_uses_stage(pos) != dst_meta->allocation_cell_uses_stage(pos)) {
+                return fail(("local stage ownership differs at position " + std::to_string(pos)).c_str());
+            }
+        }
+    }
     // Destination tail slots: authoritative position->slot map from the
     // candidate snapshot (state_tail_payload_slots is an ORDERED slot vector,
     // NOT indexed by token position).
@@ -816,7 +842,7 @@ result try_handoff_impl(const input & in, result & out,
     }
 
     size_t expected_ops = 0;
-    const uint32_t n_groups = (selected + 127) / 128;
+    const uint32_t n_groups = (local_tokens + 127) / 128;
 
     // Local layers: compressed records groups + stage cells + exact tail.
     for (const uint32_t il : plan.local_layers) {
@@ -852,7 +878,7 @@ result try_handoff_impl(const input & in, result & out,
         }
         // Stage cells: ONLY cells whose source metadata allocates an F16
         // stage row (canonical ownership; sealed groups stay in records).
-        for (uint32_t c = 0; c < selected; ++c) {
+        for (uint32_t c = 0; c < local_tokens; ++c) {
             const uint32_t pos = uint32_t(sinfos[0].idxs[0][c]);
             if (!src_meta->allocation_cell_uses_stage(pos)) {
                 continue; // sealed record cell; no F16 stage row
@@ -884,7 +910,7 @@ result try_handoff_impl(const input & in, result & out,
         }
         // Exact tail rows (K and V) mapped by POSITION through each side's
         // authoritative snapshot maps.
-        for (uint32_t pos = 0; pos < selected; ++pos) {
+        for (uint32_t pos = 0; pos < local_tokens; ++pos) {
             const auto it = tail_slot_of_token.find(pos);
             if (it == tail_slot_of_token.end() || it->second < 0) {
                 continue;
@@ -1056,7 +1082,7 @@ result try_handoff_impl(const input & in, result & out,
     out.marker += " rs_bytes=" + std::to_string(rs_bytes_);
     if (split_p != 0) {
         out.marker += " placement=position_split split_p=" + std::to_string(split_p) +
-                " overflow_tokens=0";
+                " overflow_tokens=" + std::to_string(selected - local_tokens);
     }
     out.prefix_tokens = in.state->prompt.tokens.get_tokens();
     if (out.prefix_tokens.size() > selected) {

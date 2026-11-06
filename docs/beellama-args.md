@@ -42,7 +42,8 @@ runs below P; initialization may negotiate a connection for an active split
 profile. `--remote-attn-min-context` still gates the configured adaptive
 profile capacity, rather than individual positions. See
 [Xbox positional overflow](xbox-position-overflow.md) for storage and state
-semantics.
+semantics, including background preparation of overflow K/V while an eligible
+local profile remains active.
 
 `GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS=N` optionally sets the minimum number
 of stable calls before CUDA graph capture on each directly owned CUDA backend
