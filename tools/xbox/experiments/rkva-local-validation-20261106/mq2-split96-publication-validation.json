@@ -1,0 +1,26 @@
+{
+  "status": "PASS_CPU_ONLY",
+  "run_tests_exit_status": 0,
+  "policy_comparisons_per_mode": 37748916,
+  "window_checks": 103680,
+  "numeric_cases": 36,
+  "negative_controls": 6,
+  "non_bit_exact_cases": 20,
+  "branch_base": "e5b969ed9935abde9be9593e429ab47b48003cf7",
+  "main_reference": "7310f5d7e56b4ed5565f7f941c91a386633f31b9",
+  "header_sha256": "df6af91eb37ccce2cbdd558021e8f277d3335e5d8d1bd400dbd423bea825a058",
+  "patch_applies_to_both_headers": true,
+  "baseline_fixture_only_difference": "namespace rkva_rprof renamed baseline for side-by-side tests",
+  "not_qualified": [
+    "codec",
+    "QK",
+    "engine",
+    "DXIL",
+    "Windows build",
+    "GPU",
+    "byte-exact replay",
+    "performance"
+  ],
+  "publication_scope": "Experimental package only; no production headers changed.",
+  "manifest_verification": "Root and candidate manifests verified after final integration."
+}

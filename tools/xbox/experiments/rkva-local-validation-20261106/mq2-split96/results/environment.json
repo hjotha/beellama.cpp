@@ -1,0 +1,6 @@
+{
+  "python": "3.12.14",
+  "numpy": "2.3.5",
+  "compiler": "c++ (Debian 14.2.0-19) 14.2.0",
+  "hardware_stages": "NOT_RUN"
+}

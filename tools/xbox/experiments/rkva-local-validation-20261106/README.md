@@ -4,6 +4,22 @@ Pacote de pesquisa, **sem ativar otimizações em produção**. Preparado em 202
 para o agente local continuar a qualificação de DXIL, Windows e Xbox. Não é um
 benchmark do console e não demonstra aceleração.
 
+## Prioridade atual: MQ2 fine cap64 → cap96 (opt-in)
+
+Comece pelo [pacote MQ2 split96](mq2-split96/README.md) e pelo
+[roteiro RTX 4070/Xbox](GPU-QUALIFICATION-HANDOFF.md). Esta prioridade substitui
+as sugestões históricas abaixo de começar por LDS, Q_rot ou WHT. Não combina
+candidatos nem altera o perfil atual sem MTP.
+
+O patch é inerte, default **OFF**, e muda somente o limite MQ2 fine quando
+explicitamente compilado ON. Nenhum header de produção foi substituído.
+A reexecução CPU final passou, mas **20/36 casos não são bit-exact** entre braços,
+embora dentro das tolerâncias. Não qualifica codec, QK, engine ou GPU e não
+assegura que o replay byte-exact passará. Não afrouxe esse gate.
+Veja [validação da publicação](mq2-split96-publication-validation.json) para
+hashes, reconciliação dos headers e limites reais. O pacote final supersede a
+análise preliminar de geometria; benchmark e promoção hardware seguem pendentes.
+
 ## Estado e proveniência
 
 - Base do branch de publicação: `e64ad7c43ee6f2ae6ced1d1a47ba462d7751594e` (`main`).

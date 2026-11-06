@@ -1,0 +1,30 @@
+{
+  "source_commit": "e64ad7c43ee6f2ae6ced1d1a47ba462d7751594e",
+  "source_header_sha256": "df6af91eb37ccce2cbdd558021e8f277d3335e5d8d1bd400dbd423bea825a058",
+  "source_path": "tools/xbox/uwp/rkva/rkva-range-profile.h",
+  "policy_reconciliation": {
+    "branch_commit": "e5b969ed9935abde9be9593e429ab47b48003cf7",
+    "main_reference_commit": "7310f5d7e56b4ed5565f7f941c91a386633f31b9",
+    "verification": "Headers fetched independently through GitHub; git apply --check passed on both. No production header replaced.",
+    "results": {
+      "branch": {
+        "sha256": "df6af91eb37ccce2cbdd558021e8f277d3335e5d8d1bd400dbd423bea825a058",
+        "git_apply_check_exit": 0,
+        "matches_archived_baseline": false,
+        "matches_baseline_after_namespace_rename": true
+      },
+      "main": {
+        "sha256": "df6af91eb37ccce2cbdd558021e8f277d3335e5d8d1bd400dbd423bea825a058",
+        "git_apply_check_exit": 0,
+        "matches_archived_baseline": false,
+        "matches_baseline_after_namespace_rename": true
+      }
+    }
+  },
+  "models_source": "tools/xbox/experiments/rkva-local-validation-20261106/mq2 (preserved local qualification snapshot)",
+  "model_sha256": {
+    "rkva_range_q4_opt_model.py": "f76d9f6f631f4e1e64e5ea71cb4016d6aa1524ee15af9d45eb7e44219ffcc849",
+    "rkva_range_kvarn4_opt_model.py": "e83b4f359f167f58876751b3471e200bba89950fb998c9d7c76979af6c53cb1a",
+    "rkva_kvarn_serial_prefix_probe.py": "aef871a54d4c0fba63602f3a0d90b33290eb064aac18e2fb1d40b929d6ac890d"
+  }
+}

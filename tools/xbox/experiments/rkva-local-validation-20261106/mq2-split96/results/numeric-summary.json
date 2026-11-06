@@ -1,0 +1,1 @@
+{"status": "PASS_CPU_SYNTHETIC_REDUCTION_ONLY", "cases": 36, "negative_controls": 6, "worst_out": 1.9073486328125e-06, "worst_lse": 6.975323803004585e-07, "worst_ab_out": 8.940696716308594e-08, "worst_ab_lse": 9.5367431640625e-07, "non_bit_exact_cases": 20}

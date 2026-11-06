@@ -1,0 +1,29 @@
+--- a/tools/xbox/uwp/rkva/rkva-range-profile.h
++++ b/tools/xbox/uwp/rkva/rkva-range-profile.h
+@@ -10,6 +10,15 @@
+ #include <map>
+ #include <string>
+ #include <vector>
++
++// Experimental host-policy switch. OFF preserves the qualified cap64 policy.
++// Set consistently in every translation unit of an isolated candidate build.
++#ifndef RKVA_EXPERIMENTAL_MQ2_FINE_SPLIT96
++#define RKVA_EXPERIMENTAL_MQ2_FINE_SPLIT96 0
++#endif
++#if RKVA_EXPERIMENTAL_MQ2_FINE_SPLIT96 != 0 && RKVA_EXPERIMENTAL_MQ2_FINE_SPLIT96 != 1
++#error "RKVA_EXPERIMENTAL_MQ2_FINE_SPLIT96 must be 0 or 1"
++#endif
+ 
+ namespace rkva_rprof {
+ 
+@@ -353,7 +362,9 @@
+         return kvarn4_split(active_count, mode);
+     }
+     const uint32_t target_rows = 256u;
+-    const uint32_t max_splits = (mode == kModeOptFine) ? 64u : 32u;
++    const uint32_t fine_max_splits =
++        (RKVA_EXPERIMENTAL_MQ2_FINE_SPLIT96 && q_tile == 2) ? 96u : 64u;
++    const uint32_t max_splits = (mode == kModeOptFine) ? fine_max_splits : 32u;
+     const uint32_t wanted = (active_count + target_rows - 1) / target_rows;
+     const uint32_t k0 = std::max(1u, std::min(max_splits, wanted));
+     uint32_t rows = split_rows(active_count, k0);

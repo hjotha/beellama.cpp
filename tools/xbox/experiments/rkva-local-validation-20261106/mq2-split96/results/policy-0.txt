@@ -1,0 +1,1 @@
+PASS macro=0 comparisons=37748916 changed=0; inherited UINT32_MAX overflow reproduced (not valid coverage)

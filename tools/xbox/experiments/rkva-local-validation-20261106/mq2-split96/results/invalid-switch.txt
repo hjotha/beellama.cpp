@@ -1,0 +1,4 @@
+In file included from tests/policy.cpp:2:
+tests/../include/rkva-range-profile.h:20:2: error: #error "RKVA_EXPERIMENTAL_MQ2_FINE_SPLIT96 must be 0 or 1"
+   20 | #error "RKVA_EXPERIMENTAL_MQ2_FINE_SPLIT96 must be 0 or 1"
+      |  ^~~~~
