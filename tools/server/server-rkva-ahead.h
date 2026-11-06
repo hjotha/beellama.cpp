@@ -27,8 +27,7 @@ public:
         : origin_(origin), layer_ids_(std::move(layer_ids)), tokens_(std::move(tokens)), rows_(layer_ids_.size()) {
         if (tokens_.size() <= origin_ || geometry.n_layer_remote != layer_ids_.size()) return;
         const char * producer = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
-        // shortcut: the CUDA producer needs a separate shared-VRAM qualification.
-        if (producer && std::strcmp(producer, "cpu") != 0) return;
+        if (producer && std::strcmp(producer, "cpu") != 0 && std::strcmp(producer, "cuda") != 0) return;
         const uint64_t groups = (uint64_t(origin_) + geometry.max_ctx + 127) / 128;
         const uint64_t owner_bytes = groups * geometry.n_head_kv * 2 * 8960 * 2 + (16ull << 20);
         if (available_memory() < owner_bytes * geometry.n_layer_remote + (1024ull << 20)) {

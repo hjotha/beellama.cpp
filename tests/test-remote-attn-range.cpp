@@ -1408,13 +1408,13 @@ static void test_native_stage_append() {
     ggml_backend_free(backend);
 }
 
-static void test_server_ahead_lineage() {
+static void test_server_ahead_lineage(bool cuda_after_stage = false) {
     storage_env native("kvarn4");
     storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
     storage_env bulk("0", "GGML_RKVA_NATIVE_BULK");
     storage_env async("0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
-    storage_env producer("cpu", "GGML_RKVA_NATIVE_PRODUCER");
+    storage_env producer(cuda_after_stage ? "cuda" : "cpu", "GGML_RKVA_NATIVE_PRODUCER");
     ggml_backend_load_all();
     ggml_remote_attn_geometry geo{};
     geo.n_layer_remote=2; geo.n_head=2; geo.n_head_kv=1; geo.head_dim=256;
@@ -1452,6 +1452,11 @@ static void test_server_ahead_lineage() {
         adopted=ggml_backend_remote_attn_kvarn_stage_take(ahead.stage(),"127.0.0.1",server.port,
                 &geo,1024,512,GGML_TYPE_Q4_0,128);
         assert(adopted && ggml_backend_remote_attn_kvarn_stage_matches(ahead.stage(),adopted,2));
+        if (cuda_after_stage) {
+            std::vector<float> zero(256, 0.0f);
+            for (uint32_t layer : {0u, 1u})
+                assert(ggml_backend_remote_attn_native_kvarn_stage_append(adopted, layer, 1026, 1, zero.data(), zero.data()));
+        }
         }
         ggml_backend_free(adopted);
     }
@@ -4521,6 +4526,7 @@ int main() {
     if (std::getenv("GGML_RKVA_STAGE_TEST_ONLY")) {
         test_native_stage_append();
         test_server_ahead_lineage();
+        if (std::getenv("GGML_RKVA_GPU_TEST")) test_server_ahead_lineage(true);
         std::puts("PASS: native stage append and rewind");
         return 0;
     }

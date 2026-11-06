@@ -29,14 +29,14 @@ static float record_value(const uint8_t * p, uint32_t row, uint32_t col) {
     return (q * half_at(p + 8192 + row * 2) + half_at(p + 8448 + row * 2)) * half_at(p + 8704 + col * 2);
 }
 
-static void test(uint32_t tail, bool extended) {
+static void test(uint32_t tail, bool extended, bool staged = false) {
     constexpr uint32_t origin = 1024, capacity = 768, heads = 4, total = 640;
     constexpr size_t width = heads * 256, record = 8960, physical = heads * 2;
     const auto store = reinterpret_cast<ggml_backend_cpu_kvarn_store_direct_v1_t>(
         ggml_backend_reg_get_proc_address(ggml_backend_cpu_reg(), "ggml_backend_cpu_kvarn_store_direct_v1"));
     assert(store);
     mode("cpu"); rkva_kvarn_producer cpu(origin, capacity, heads, 16, store, tail);
-    mode("cuda"); rkva_kvarn_producer gpu(origin, capacity, heads, 16, store, tail);
+    mode("cuda"); rkva_kvarn_producer gpu(origin, capacity, heads, 16, store, tail, false, staged);
     std::vector<float> k(total * width), v(k.size()); std::vector<int32_t> pos(total);
     uint32_t rng = 12345;
     for (uint32_t t = 0; t < total; ++t) {
@@ -72,6 +72,11 @@ static void test(uint32_t tail, bool extended) {
     // stage rows and newly rotated rows, and cross both ping-pong slots.
     for (uint32_t batch : (extended ? std::vector<uint32_t>{120u, 512u, 8u} :
                                       std::vector<uint32_t>{120u, 256u, 256u, 8u})) {
+        if (staged && at == 120) {
+            auto api = rkva_kvarn_producer::cuda_api();
+            assert(api);
+            gpu.enable_cuda(api);
+        }
         const auto start = std::chrono::steady_clock::now();
         assert(gpu.prepare(k.data() + at * width, v.data() + at * width, pos.data() + at, batch));
         gpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -174,6 +179,25 @@ static void benchmark_decode(bool read_only_contract) {
         ordinary[ordinary.size() * 95 / 100], seals.size(), seal_sum / seals.size(), unsigned(read_only_contract));
 }
 
+static void test_prefill_scratch_release() {
+    auto api = rkva_kvarn_producer::cuda_api(); assert(api);
+    auto dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU); assert(dev);
+    constexpr uint32_t heads = 4, count = 512;
+    constexpr size_t width = heads * 256;
+    std::vector<float> k(count * width, 0.1f), v(k.size(), -0.2f);
+    std::vector<ggml_fp16_t> stage(384 * width), ak(count * width), av(ak.size());
+    std::vector<uint8_t> rk(4 * heads * 2 * 8960), rv(rk.size());
+    assert(api(k.data(), v.data(), 1024, count, heads, 16, stage.data(), stage.data(),
+               ak.data(), av.data(), rk.data(), rv.data()));
+    size_t bulk_free = 0, total = 0, decode_free = 0;
+    ggml_backend_dev_memory(dev, &bulk_free, &total);
+    assert(api(k.data(), v.data(), 1024, 1, heads, 16, stage.data(), stage.data(),
+               ak.data(), av.data(), rk.data(), rv.data()));
+    ggml_backend_dev_memory(dev, &decode_free, &total);
+    std::printf("prefill scratch release: %zu bytes\n", decode_free - bulk_free);
+    assert(decode_free >= bulk_free + (2u << 20));
+}
+
 int main() {
     if (!std::getenv("GGML_RKVA_GPU_TEST")) { std::puts("SKIP: set GGML_RKVA_GPU_TEST=1 for CUDA qualification"); return 0; }
     ggml_backend_load_all();
@@ -181,6 +205,8 @@ int main() {
     if (std::getenv("GGML_RKVA_GPU_MICRO_ONLY")) { benchmark_decode(false); return 0; }
     test(0, false); test(128, false);
     test(0, true); test(128, true);
+    test(0, true, true); test(128, true, true);
+    test_prefill_scratch_release();
     benchmark_decode(true);
     mode("cpu");
 }

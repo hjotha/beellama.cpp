@@ -927,6 +927,12 @@ bool ggml_cuda_kvarn_native_append(
     const size_t append_bytes = size_t(count) * width * sizeof(half);
     const size_t record_bytes = size_t(groups) * heads * 2 * 8960;
     const size_t bytes = 2 * (input_bytes + stage_bytes + append_bytes + record_bytes);
+    // Release the bulk-prefill reservation when singleton decode begins.
+    if (count == 1 && scratch.data && scratch.bytes > bytes * 4) {
+        if (cudaFree(scratch.data) != cudaSuccess) return false;
+        scratch.data = nullptr;
+        scratch.bytes = 0;
+    }
     if (!kvarn_convert_scratch_grow(&scratch.data, scratch.bytes, bytes)) return false;
     auto * input = static_cast<float *>(scratch.data);
     auto * stage = reinterpret_cast<half *>(reinterpret_cast<uint8_t *>(input) + 2 * input_bytes);

@@ -24,7 +24,8 @@ class rkva_kvarn_producer : public rkva_native_owner {
 public:
     rkva_kvarn_producer(uint32_t origin, uint32_t capacity, uint32_t heads,
                         uint32_t iterations, ggml_backend_cpu_kvarn_store_direct_v1_t store,
-                        uint32_t precision_tail_tokens = 128, bool compact_stage = false)
+                        uint32_t precision_tail_tokens = 128, bool compact_stage = false,
+                        bool force_cpu = false)
         : origin_(origin), capacity_(capacity), heads_(heads), iterations_(iterations),
           precision_tail_tokens_(precision_tail_tokens),
           compact_stage_(compact_stage && origin >= 128 && precision_tail_tokens >= 128), store_(store) {
@@ -33,11 +34,9 @@ public:
                 origin % 128 || !capacity ||
                 uint64_t(origin) + capacity > INT32_MAX) throw std::invalid_argument("native KVarN geometry");
         const char * producer = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
-        if (producer && std::strcmp(producer, "cpu") != 0) {
+        if (!force_cpu && producer && std::strcmp(producer, "cpu") != 0) {
             if (std::strcmp(producer, "cuda") != 0) throw std::invalid_argument("native KVarN producer must be cpu or cuda");
-            auto reg = ggml_backend_reg_by_name("CUDA");
-            cuda_ = reg ? reinterpret_cast<ggml_backend_cuda_kvarn_native_append_v1_t>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kvarn_native_append_v1")) : nullptr;
+            cuda_ = cuda_api();
             if (!cuda_) throw std::runtime_error("native KVarN CUDA producer unavailable");
         }
         const size_t groups = (uint64_t(origin) + capacity + 127) / 128;
@@ -63,6 +62,12 @@ public:
     }
 
     static constexpr uint32_t max_rewind = 128;
+    static ggml_backend_cuda_kvarn_native_append_v1_t cuda_api() {
+        auto reg = ggml_backend_reg_by_name("CUDA");
+        return reg ? reinterpret_cast<ggml_backend_cuda_kvarn_native_append_v1_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kvarn_native_append_v1")) : nullptr;
+    }
+    void enable_cuda(ggml_backend_cuda_kvarn_native_append_v1_t api) { cuda_ = api; }
     uint32_t rows() const override { return rows_; }
 
     // Exports only authoritative, non-transient state. The record view starts

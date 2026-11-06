@@ -2329,7 +2329,7 @@ static bool rkva_prepare_native_bulk_job(
 // One authoritative host owner per layer. Layouts 4/5 pack ordinary Q4_0/Q8_0
 // rows; layouts 1..3 keep the KVarN record/stage/tail producer untouched.
 static std::unique_ptr<rkva_native_owner> rkva_new_native_owner(
-        ggml_backend_remote_attn_context * ctx) {
+        ggml_backend_remote_attn_context * ctx, bool force_cpu = false) {
     if (ctx->native_q4) {
         return std::unique_ptr<rkva_native_owner>(new rkva_q4_producer(
                 ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv));
@@ -2349,7 +2349,7 @@ static std::unique_ptr<rkva_native_owner> rkva_new_native_owner(
     return std::unique_ptr<rkva_native_owner>(new rkva_kvarn_producer(
             ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv,
             ctx->geo.sinkhorn_iters, ctx->native_store, ctx->native_tail_tokens,
-            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) && ctx->native_serial_prefix));
+            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) && ctx->native_serial_prefix, force_cpu));
 }
 
 static bool rkva_native_kvarn_stage_append(
@@ -2376,7 +2376,8 @@ static bool rkva_native_kvarn_stage_append(
         return false;
     }
     try {
-        if (!owner) owner = rkva_new_native_owner(ctx);
+        // Staging runs beside the local tier, so it must not consume its CUDA headroom.
+        if (!owner) owner = rkva_new_native_owner(ctx, true);
         std::vector<int32_t> positions(count);
         for (uint32_t i = 0; i < count; ++i) positions[i] = int32_t(first_pos + i);
         std::vector<uint8_t> payload, reply;
@@ -5696,6 +5697,14 @@ ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take(ggml_remote_attn_kvarn_
         const auto & owner = ctx->native_layers[i];
         if (!owner || owner->rows() != stage->sealed_rows || ctx->range_layers[i].rows != stage->sealed_rows ||
                 ctx->range_layers[i].epoch != ctx->range_epoch) return nullptr;
+    }
+    const char * producer = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
+    if (producer && std::strcmp(producer, "cpu") != 0) {
+        if (std::strcmp(producer, "cuda") != 0) return nullptr;
+        auto api = rkva_kvarn_producer::cuda_api();
+        if (!api) return nullptr;
+        // Retain the staged records and their CPU allocation layout during adoption.
+        for (auto & owner : ctx->native_layers) static_cast<rkva_kvarn_producer *>(owner.get())->enable_cuda(api);
     }
     stage->taken = true;
     return stage->backend;
