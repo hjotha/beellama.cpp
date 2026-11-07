@@ -132,6 +132,7 @@ bool is_standard_type(uint16_t id) {
         case sx_f16:
         case sx_q4_0:
         case sx_q4_1:
+        case sx_iq4_nl:
         case sx_q5_0:
         case sx_q5_1:
         case sx_q8_0:

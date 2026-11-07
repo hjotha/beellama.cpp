@@ -3270,8 +3270,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 if (position_split_p_ != 0) {
                     if (key->type != value->type ||
                             (key->type != GGML_TYPE_Q4_0 && key->type != GGML_TYPE_Q8_0 &&
-                             !(rpc_position_split && key->type == GGML_TYPE_F16))) {
-                        throw std::invalid_argument("position-split overflow requires matching Q4_0, Q8_0 or RPC F16 K/V");
+                             !(rpc_position_split && (key->type == GGML_TYPE_F16 || key->type == GGML_TYPE_Q4_1 || key->type == GGML_TYPE_IQ4_NL)))) {
+                        throw std::invalid_argument("position-split overflow requires matching Q4_0, Q8_0 or RPC F16/Q4_1/IQ4_NL K/V");
                     }
                     const char * dev_name = key_dev ? ggml_backend_dev_name(key_dev) : nullptr;
                     const bool host_mirror = rpc_position_split &&
@@ -7673,13 +7673,17 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
                 local_key && local_key->type == GGML_TYPE_F16 ? 3 :
                 local_key && local_key->type == GGML_TYPE_SAW_INT4 ? 4 :
                 local_key && local_key->type == GGML_TYPE_TQNC_K ? 5 :
+                local_key && local_key->type == GGML_TYPE_Q4_1 ? llama_position_split::kFormatQ4_1 :
+                local_key && local_key->type == GGML_TYPE_IQ4_NL ? llama_position_split::kFormatIQ4_NL :
                 local_cache ? 255 : 0;
         out.push_back({layer, llama_position_split::kRangeLocal, 0, position_split_p_, 0, local_format});
         const auto * key = standard_cache ? standard_cache->get_k_storage(il) : nullptr;
         const uint8_t format = native_companion_enabled() ? uint8_t(native_companion_format_) :
                 key && key->type == GGML_TYPE_Q4_0 ? 1 :
                 key && key->type == GGML_TYPE_Q8_0 ? 2 :
-                key && key->type == GGML_TYPE_F16 ? 3 : 255;
+                key && key->type == GGML_TYPE_F16 ? 3 :
+                key && key->type == GGML_TYPE_Q4_1 ? llama_position_split::kFormatQ4_1 :
+                key && key->type == GGML_TYPE_IQ4_NL ? llama_position_split::kFormatIQ4_NL : 255;
         out.push_back({layer, llama_position_split::kRangeOverflow, position_split_p_, kv_size, 1, format});
     }
     return out;

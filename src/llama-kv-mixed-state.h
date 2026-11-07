@@ -219,6 +219,7 @@ enum standard_qx_type : uint16_t {
     sx_q5_0  = 6,  // GGML_TYPE_Q5_0
     sx_q5_1  = 7,  // GGML_TYPE_Q5_1
     sx_q8_0  = 8,  // GGML_TYPE_Q8_0
+    sx_iq4_nl = 20, // GGML_TYPE_IQ4_NL (distinct from Q4_0 despite equal row size)
     sx_bf16  = 30, // GGML_TYPE_BF16
     sx_q6_0  = 43, // GGML_TYPE_Q6_0
     sx_q6_1  = 44, // GGML_TYPE_Q6_1

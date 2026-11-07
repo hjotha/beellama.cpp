@@ -34,7 +34,9 @@ program = r'''
 #include <cstring>
 #include <stdexcept>
 #include <string>
-enum ggml_type { GGML_TYPE_COUNT, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32 };
+#include <utility>
+enum ggml_type { GGML_TYPE_COUNT, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL,
+    GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32 };
 enum llama_remote_native_companion { LLAMA_REMOTE_COMPANION_AUTO, LLAMA_REMOTE_COMPANION_NONE,
     LLAMA_REMOTE_COMPANION_KVARN4, LLAMA_REMOTE_COMPANION_SAW_INT4, LLAMA_REMOTE_COMPANION_TURBOQUANT_NC };
 struct common_params {
@@ -73,6 +75,28 @@ int main() {
         assert(ggml_remote_attn_companion_format_matches("f32", type)); // explicit diagnostic transport
     assert(!ggml_remote_attn_companion_format_matches("f32", GGML_TYPE_F32));
     assert(!ggml_remote_attn_companion_format_matches("oscar_int2", GGML_TYPE_F32));
+    for (const auto &entry : {std::pair<const char *, ggml_type>{"q4_1", GGML_TYPE_Q4_1},
+                              {"iq4_nl", GGML_TYPE_IQ4_NL}}) {
+        assert(ggml_remote_attn_companion_format_matches(entry.first, entry.second));
+        for (auto other : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32})
+            assert(!ggml_remote_attn_companion_format_matches(entry.first, other));
+        assert(!ggml_remote_attn_companion_format_matches("auto", entry.second));
+        assert(!ggml_remote_attn_companion_format_matches("f32", entry.second));
+    }
+    assert(!ggml_remote_attn_companion_format_matches("q4_1", GGML_TYPE_IQ4_NL));
+    assert(!ggml_remote_attn_companion_format_matches("iq4_nl", GGML_TYPE_Q4_1));
+    for (const auto &entry : {std::pair<const char *, ggml_type>{"q4_1", GGML_TYPE_Q4_1},
+                              {"iq4_nl", GGML_TYPE_IQ4_NL}}) {
+        common_params low4;
+        low4.remote_attn_host = "127.0.0.1";
+        low4.remote_attn_format = entry.first;
+        low4.remote_attn_cache_type_k = low4.remote_attn_cache_type_v = entry.second;
+        assert(common_resolve_remote_native_companion(low4) == LLAMA_REMOTE_COMPANION_NONE);
+        low4.remote_attn_cache_type_v = GGML_TYPE_Q4_0;
+        bool mismatch = false;
+        try { (void) common_resolve_remote_native_companion(low4); } catch (const std::invalid_argument &) { mismatch = true; }
+        assert(mismatch);
+    }
     common_params original;
     original.remote_attn_format = "kvarn4";
     original.remote_attn_cache_type_k = GGML_TYPE_Q4_0;

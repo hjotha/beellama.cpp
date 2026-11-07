@@ -7403,6 +7403,7 @@ struct ggml_tensor * ggml_remote_attn_range(
     GGML_ASSERT(q && k_written && v_written && overflow_cells && query_pos);
     GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q) && q->ne[3] == 1);
     GGML_ASSERT((k_written->type == GGML_TYPE_Q4_0 || k_written->type == GGML_TYPE_Q8_0 ||
+                 k_written->type == GGML_TYPE_Q4_1 || k_written->type == GGML_TYPE_IQ4_NL ||
                  k_written->type == GGML_TYPE_F16) &&
             v_written->type == k_written->type);
     GGML_ASSERT(ggml_are_same_shape(k_written, v_written));

@@ -192,17 +192,22 @@ void CSRangeAttnSawInt4DecodeRowlane(uint tid : SV_GroupIndex, uint3 group : SV_
         float score[RKVA_GQA];
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) score[g] = 0.0f;
 
-        if (row_valid) {
-            [loop] for (uint k = 0; k < 32u; ++k) {
-                uint word = keys.Load(my_ba + k * 4u);
-                float4 k_lo = float4(word & 0x0Fu, (word >> 8) & 0x0Fu, (word >> 16) & 0x0Fu, (word >> 24) & 0x0Fu);
-                float4 k_hi = float4((word >> 4) & 0x0Fu, (word >> 12) & 0x0Fu, (word >> 20) & 0x0Fu, (word >> 28) & 0x0Fu);
-                [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-                    float4 q_lo = WaveReadLaneAt(q0[g], k);
-                    float4 q_hi = WaveReadLaneAt(q0[g], k + 32u);
-                    score[g] += dot(q_lo, k_lo) + dot(q_hi, k_hi);
-                }
+        // All lanes must participate in Q broadcasts; invalid rows still own Q.
+        // Only the K loads are conditional, so partial tiles never read past end.
+        [loop] for (uint k = 0; k < 32u; ++k) {
+            uint word = 0;
+            [branch] if (row_valid) {
+                word = keys.Load(my_ba + k * 4u);
             }
+            float4 k_lo = float4(word & 0x0Fu, (word >> 8) & 0x0Fu, (word >> 16) & 0x0Fu, (word >> 24) & 0x0Fu);
+            float4 k_hi = float4((word >> 4) & 0x0Fu, (word >> 12) & 0x0Fu, (word >> 20) & 0x0Fu, (word >> 28) & 0x0Fu);
+            [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+                float4 q_lo = WaveReadLaneAt(q0[g], k);
+                float4 q_hi = WaveReadLaneAt(q0[g], k + 32u);
+                score[g] += dot(q_lo, k_lo) + dot(q_hi, k_hi);
+            }
+        }
+        [branch] if (row_valid) {
             float2 k_sz = asfloat(keys.Load2(my_ba + 128u));
             [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
                 score[g] = (score[g] - k_sz.y * q_sum[g]) * k_sz.x;
@@ -229,7 +234,10 @@ void CSRangeAttnSawInt4DecodeRowlane(uint tid : SV_GroupIndex, uint3 group : SV_
         }
 
         // PV Phase: Factor v_scale into row weights and v_zero into tile_v_bias once per 64-row tile
-        float2 v_sz = row_valid ? asfloat(values.Load2(my_ba + 128u)) : float2(0.0f, 0.0f);
+        float2 v_sz = float2(0.0f, 0.0f);
+        [branch] if (row_valid) {
+            v_sz = asfloat(values.Load2(my_ba + 128u));
+        }
         float w_scaled[RKVA_GQA];
         float tile_v_bias[RKVA_GQA];
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {

@@ -22,6 +22,7 @@
 #include "rkva-native-snapshot.h"
 #include "rkva-bulk-segments.h"
 #include "rkva-q4-producer.h"
+#include "rkva-low4-producer.h"
 #include "rkva-q8-producer.h"
 #include "rkva-saw-int4-producer.h"
 #include "rkva-turboquant-nc-producer.h"
@@ -65,7 +66,62 @@
 
 #define GGML_REMOTE_ATTN_NAME "RemoteAttn"
 
-static bool rkva_legacy_dispatch_retired();
+// Global dispatch retains a lease while using a remote backend. Retirement and
+// lease admission share this mutex; no network operation holds it.
+struct rkva_backend_lifetime { size_t users = 0; bool retiring = false; };
+static std::atomic<ggml_backend_t> g_remote_attn_active {nullptr};
+static std::atomic<bool> g_remote_attn_legacy_conflict {false};
+static ggml_backend_t g_remote_attn_stage = nullptr;
+static ggml_backend_t g_remote_attn_legacy_owner = nullptr;
+static std::mutex g_remote_attn_owner_mutex;
+static std::condition_variable g_remote_attn_owner_cv;
+static std::unordered_map<ggml_backend_t, std::shared_ptr<rkva_backend_lifetime>> g_remote_attn_lifetimes;
+static size_t g_remote_attn_retiring_owners = 0;
+
+#ifdef GGML_RKVA_LIFETIME_TEST_HOOKS
+static std::atomic<void (*)(int)> g_rkva_test_lifetime_hook {nullptr};
+extern "C" {
+GGML_API void ggml_rkva_test_lifetime_hook(void (*hook)(int));
+void ggml_rkva_test_lifetime_hook(void (*hook)(int)) { g_rkva_test_lifetime_hook.store(hook); }
+}
+static void rkva_lifetime_test_point(int event) { if (auto hook = g_rkva_test_lifetime_hook.load()) hook(event); }
+#else
+static void rkva_lifetime_test_point(int) {}
+#endif
+
+class rkva_backend_lease {
+    ggml_backend_t backend_ = nullptr;
+    std::shared_ptr<rkva_backend_lifetime> lifetime_;
+public:
+    // When expected is provided, it must match the original instance even if
+    // an allocator has subsequently reused the backend pointer's address.
+    explicit rkva_backend_lease(ggml_backend_t backend, bool active = false,
+            const std::shared_ptr<rkva_backend_lifetime> & expected = {}) {
+        std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+        if (g_remote_attn_legacy_conflict.load()) return;
+        if (active) backend = g_remote_attn_active.load();
+        if (!backend) return;
+        auto it = g_remote_attn_lifetimes.find(backend);
+        if (it == g_remote_attn_lifetimes.end()) {
+            // local-split has a separate backend lifetime contract.
+            if (!expected && active && ggml_backend_is_local_split(backend)) backend_ = backend;
+            return;
+        }
+        if (it->second->retiring || (expected && it->second != expected)) return;
+        backend_ = backend;
+        lifetime_ = it->second;
+        ++lifetime_->users;
+    }
+    ~rkva_backend_lease() {
+        if (!lifetime_) return;
+        std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+        if (--lifetime_->users == 0) g_remote_attn_owner_cv.notify_all();
+    }
+    rkva_backend_lease(const rkva_backend_lease &) = delete;
+    rkva_backend_lease & operator=(const rkva_backend_lease &) = delete;
+    ggml_backend_t get() const { return backend_; }
+    const std::shared_ptr<rkva_backend_lifetime> & lifetime() const { return lifetime_; }
+};
 
 namespace {
 
@@ -1060,6 +1116,7 @@ struct ggml_backend_remote_attn_context {
     };
     std::vector<range_layer> range_layers;
     bool range_native_kvarn = false;
+    uint32_t native_low4 = 0;            // layout 9/10: Q4_1 / IQ4_NL storage
     bool native_q4 = false;            // layout 4: Q4_0 rows in the native bulk pipeline
     bool native_q8 = false;            // layout 5: Q8_0 rows in the native bulk pipeline
     bool native_saw_int4 = false;      // layout 6: SAW-INT4 rows in the native bulk pipeline
@@ -1506,11 +1563,37 @@ static void rkva_test_handshake_barrier() {
     });
 }
 
+static const char * rkva_get_upload_format(const ggml_backend_remote_attn_context * ctx = nullptr) {
+    if (ctx && ctx->upload_format_fixed) return ctx->upload_format.empty() ? nullptr : ctx->upload_format.c_str();
+    if (const char * fmt = std::getenv("GGML_RKVA_UPLOAD_FORMAT")) return fmt;
+    if (const char * fmt = std::getenv("GGML_RKVA_FORMAT")) return fmt;
+    return std::getenv("GGML_RKVA_RANGE_STORAGE");
+}
+
+static uint64_t rkva_requested_e4_capability(const char * fmt) {
+    if (!fmt) return 0;
+    if (!std::strcmp(fmt, "kvarn4") || !std::strcmp(fmt, "kvarn")) return RKVA_CAP_KVARN_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q4_0") || !std::strcmp(fmt, "q4")) return RKVA_CAP_NATIVE_Q4_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q4_1")) return RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "iq4_nl")) return RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "saw_int4") || !std::strcmp(fmt, "saw-int4") ||
+        !std::strcmp(fmt, "saw4") || !std::strcmp(fmt, "bdr_int4")) return RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "turboquant_nc") || !std::strcmp(fmt, "turboquant-nc") ||
+        !std::strcmp(fmt, "tqnc") || !std::strcmp(fmt, "turboquant_4bit_nc")) return RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN;
+    return 0;
+}
+
 static bool rkva_prefetch_wire_allowed(const ggml_backend_remote_attn_context * ctx, rkva_wire wire) {
     if (wire != ctx->range_wire) return false;
     if (wire == RKVA_WIRE_FP8) return true;
     return wire == RKVA_WIRE_FP8_E4M3FN && ctx->protocol_version == RKVA_VERSION &&
-        ctx->e4_requested && (ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_E4M3FN);
+        ctx->e4_requested && (ctx->ack.reserved[0] &
+            (ctx->native_low4 == RKVA_RANGE_STORAGE_Q4_1 ? RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN :
+             ctx->native_low4 == RKVA_RANGE_STORAGE_IQ4_NL ? RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN :
+             ctx->native_q4 ? RKVA_CAP_NATIVE_Q4_BULK_E4M3FN :
+             ctx->native_saw_int4 ? RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN :
+             ctx->native_turboquant_nc ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN :
+             ctx->native_q8 ? 0 : RKVA_CAP_KVARN_BULK_E4M3FN));
 }
 
 // The worker thread has sole ownership of ctx->sock. Network transmit/receive
@@ -1728,6 +1811,7 @@ static void rkva_destroy_poisoned_state_locked(ggml_backend_remote_attn_context 
     ctx->native_layers.clear();
     ctx->range_layers.clear();
     ctx->native_store = nullptr;
+    ctx->native_low4 = 0;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
@@ -2334,6 +2418,10 @@ static bool rkva_prepare_native_bulk_job(
 // rows; layouts 1..3 keep the KVarN record/stage/tail producer untouched.
 static std::unique_ptr<rkva_native_owner> rkva_new_native_owner(
         ggml_backend_remote_attn_context * ctx, bool force_cpu = false) {
+    if (ctx->native_low4) {
+        return std::unique_ptr<rkva_native_owner>(new rkva_low4_producer(
+                ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv, ctx->range_source_type));
+    }
     if (ctx->native_q4) {
         return std::unique_ptr<rkva_native_owner>(new rkva_q4_producer(
                 ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv));
@@ -2365,7 +2453,7 @@ static bool rkva_native_kvarn_stage_append(
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
     auto lock = rkva_lock_ctx_drained(ctx);
     if (!ctx->connected || ctx->failed || !ctx->range_configured || !ctx->range_native_kvarn ||
-            ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc ||
+            ctx->native_low4 || ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc ||
             !ctx->native_store || ctx->active_session == RKVA_SESSION_NONE ||
             layer >= ctx->native_layers.size() || layer >= ctx->range_layers.size() ||
             ctx->native_descriptor.layout_version < 2 || !rkva_kvarn_generation_mutable(ctx->native_generation)) {
@@ -2438,7 +2526,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
             !ggml_is_contiguous(keys) || !ggml_is_contiguous(values) ||
             !ggml_are_same_shape(keys, values) || keys->ne[0] != 256 ||
             keys->ne[1] != ctx->geo.n_head_kv || keys->ne[2] != int64_t(nq) ||
-            keys->ne[3] != 1 || nq > 256 || (!ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc)) return false;
+            keys->ne[3] != 1 || nq > 256 || (!ctx->native_store && !ctx->native_low4 && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc)) return false;
     auto & cached = ctx->range_layers[layer];
     auto & owner = ctx->native_layers[layer];
     if ((owner && cached.epoch != ctx->range_epoch) ||
@@ -2465,7 +2553,7 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         // Revision 3 explicitly negotiates query-prefix semantics. Keep its
         // chunks within the qualified optimized kernel's nine-query bound;
         // prefill uses eight, verification batches keep their actual shape.
-        const bool native_rows = ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc;
+        const bool native_rows = ctx->native_low4 || ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc;
         const auto chunks = rkva_bulk_segments(nq, native_rows || ctx->native_serial_prefix,
                 !native_rows && ctx->native_serial_prefix && cached.rows == 0, ctx->native_tail_tokens);
         std::vector<uint8_t> bulk_payload;
@@ -2714,7 +2802,7 @@ static bool rkva_prepare_native_bulk_job(
             keys->ne[0] != 256 || keys->ne[1] != ctx->geo.n_head_kv ||
             keys->ne[2] != int64_t(nq) || keys->ne[3] != 1 || nq == 0 || nq > 512 ||
             (nq > 256 && (!(ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_512) || !ctx->native_store)) ||
-            (!ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc) ||
+            (!ctx->native_store && !ctx->native_low4 && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc) ||
             (size_t) layer >= ctx->range_layers.size() ||
             (size_t) layer >= ctx->native_layers.size() || live == 0) {
         return false;
@@ -2764,7 +2852,7 @@ static bool rkva_prepare_native_bulk_job(
             return false;
         }
         }
-        const bool native_rows = ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc;
+        const bool native_rows = ctx->native_low4 || ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc;
         const auto chunks = rkva_bulk_segments(nq, native_rows || ctx->native_serial_prefix,
                 !native_rows && ctx->native_serial_prefix && slot.start_rows == 0, ctx->native_tail_tokens);
         const uint32_t segments = uint32_t(chunks.size());
@@ -3601,6 +3689,22 @@ static const char * ggml_backend_remote_attn_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_remote_attn_free(ggml_backend_t backend) {
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    {
+        std::unique_lock<std::mutex> lock(g_remote_attn_owner_mutex);
+        auto it = g_remote_attn_lifetimes.find(backend);
+        GGML_ASSERT(it != g_remote_attn_lifetimes.end());
+        auto lifetime = it->second;
+        lifetime->retiring = true;
+        ++g_remote_attn_retiring_owners;
+        if (g_remote_attn_active.load() == backend) g_remote_attn_active.store(nullptr);
+        if (g_remote_attn_legacy_owner == backend) g_remote_attn_legacy_owner = nullptr;
+        if (g_remote_attn_stage == backend) g_remote_attn_stage = nullptr;
+        lock.unlock();
+        rkva_lifetime_test_point(4);
+        lock.lock();
+        g_remote_attn_owner_cv.wait(lock, [&] { return lifetime->users == 0; });
+        g_remote_attn_lifetimes.erase(backend);
+    }
     rkva_async_drain(ctx);
     {
         std::lock_guard<std::mutex> alock(ctx->async_mutex);
@@ -3618,6 +3722,10 @@ static void ggml_backend_remote_attn_free(ggml_backend_t backend) {
     delete ctx;
     ggml_remote_attn_trace_flush();
     delete backend;
+    {
+        std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+        --g_remote_attn_retiring_owners;
+    }
 }
 
 static void ggml_backend_remote_attn_set_tensor_async(
@@ -3887,6 +3995,15 @@ ggml_backend_t ggml_backend_remote_attn_init(const char * host, uint16_t port) {
         /* .device = */ &ggml_backend_remote_attn_dev_global,
         /* .context= */ ctx,
     };
+    try {
+        auto lifetime = std::make_shared<rkva_backend_lifetime>();
+        std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+        g_remote_attn_lifetimes.emplace(backend, std::move(lifetime));
+    } catch (...) {
+        delete backend;
+        delete ctx;
+        return nullptr;
+    }
     return backend;
 #endif
 }
@@ -4012,6 +4129,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->range_configured = false;
     ctx->range_layers.clear();
     ctx->range_native_kvarn = false;
+    ctx->native_low4 = 0;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
@@ -4111,12 +4229,19 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         return false;
     }
     if (ctx->e4_requested) {
-        constexpr uint64_t caps = RKVA_CAP_RANGE_KVARN4 | RKVA_CAP_KVARN_REWIND |
-            RKVA_CAP_KVARN_SERIAL_PREFIX | RKVA_CAP_KVARN_BULK_ATTN | RKVA_CAP_KVARN_BULK_E4M3FN;
-        constexpr uint32_t ops = (1u << RKVA_KVARN_RANGE_CONFIG) | (1u << RKVA_KVARN_RANGE_UPLOAD) |
-            (1u << RKVA_KVARN_RANGE_REWIND) | (1u << RKVA_KVARN_RANGE_BULK_ATTN);
-        if ((ctx->ack.reserved[0] & caps) != caps || (ctx->ack.supported_ops & ops) != ops) {
-            GGML_LOG_ERROR("%s: requested E4M3FN needs negotiated v3 KVarN4 bulk/rewind capability\n", GGML_REMOTE_ATTN_NAME);
+        const uint64_t e4_cap = rkva_requested_e4_capability(rkva_get_upload_format(ctx));
+        const bool kvarn = e4_cap == RKVA_CAP_KVARN_BULK_E4M3FN;
+        const uint64_t storage_caps = kvarn ? RKVA_CAP_RANGE_KVARN4 | RKVA_CAP_KVARN_REWIND | RKVA_CAP_KVARN_SERIAL_PREFIX :
+            e4_cap == RKVA_CAP_NATIVE_Q4_BULK_E4M3FN ? RKVA_CAP_RANGE_Q4_0 | RKVA_CAP_NATIVE_Q4_BULK :
+            e4_cap == RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN ? RKVA_CAP_NATIVE_SAW_INT4_BULK :
+            e4_cap == RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK :
+            e4_cap == RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN ? RKVA_CAP_NATIVE_Q4_1_BULK :
+            e4_cap == RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN ? RKVA_CAP_NATIVE_IQ4_NL_BULK : 0;
+        const uint64_t caps = e4_cap | storage_caps | RKVA_CAP_KVARN_BULK_ATTN;
+        const uint32_t ops = (1u << RKVA_KVARN_RANGE_CONFIG) | (1u << RKVA_KVARN_RANGE_UPLOAD) |
+            (1u << (kvarn ? RKVA_KVARN_RANGE_REWIND : RKVA_REWIND)) | (1u << RKVA_KVARN_RANGE_BULK_ATTN);
+        if (!e4_cap || (ctx->ack.reserved[0] & caps) != caps || (ctx->ack.supported_ops & ops) != ops) {
+            GGML_LOG_ERROR("%s: requested E4M3FN needs the selected layout's v3 bulk capability\n", GGML_REMOTE_ATTN_NAME);
             ctx->connected = false;
             ctx->close_socket();
             return false;
@@ -4298,7 +4423,7 @@ static bool rkva_trim_native_q4_locked(ggml_backend_remote_attn_context * ctx,
 
 static bool rkva_native_rewind_locked(ggml_backend_remote_attn_context * ctx,
         uint32_t session_id, int32_t pos0) {
-    if (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) return rkva_trim_native_q4_locked(ctx, session_id, pos0);
+    if (ctx->native_low4 || ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) return rkva_trim_native_q4_locked(ctx, session_id, pos0);
     if (session_id != ctx->active_session || pos0 < 0) return false;
     const uint32_t keep = uint32_t(pos0) <= ctx->range_origin ? 0 :
             std::min(uint32_t(pos0) - ctx->range_origin, ctx->range_capacity);
@@ -4643,6 +4768,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     }
     ctx->range_configured = true;
     ctx->range_native_kvarn = true;
+    ctx->native_low4 = 0;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
@@ -4684,9 +4810,9 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
 // the synchronous Q4 range path.
 static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
         uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap) {
-    constexpr uint64_t caps = RKVA_CAP_RANGE_Q4_0 | RKVA_CAP_NATIVE_Q4_BULK |
-                              RKVA_CAP_KVARN_BULK_ATTN | RKVA_CAP_KVARN_BULK_FP8 |
-                              RKVA_CAP_KVARN_BULK_FP8_RNE;
+    const uint64_t caps = RKVA_CAP_RANGE_Q4_0 | RKVA_CAP_NATIVE_Q4_BULK |
+                              RKVA_CAP_KVARN_BULK_ATTN | (ctx->e4_requested ? RKVA_CAP_NATIVE_Q4_BULK_E4M3FN :
+                              RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE);
     constexpr uint32_t required = (1u << RKVA_KVARN_RANGE_CONFIG) |
                                   (1u << RKVA_KVARN_RANGE_UPLOAD) |
                                   (1u << RKVA_KVARN_RANGE_BULK_ATTN);
@@ -4700,8 +4826,8 @@ static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
         return false;
     }
     if ((ctx->ack.reserved[0] & caps) != caps || (ctx->ack.supported_ops & required) != required) {
-        GGML_LOG_INFO("%s: native Q4_0 bulk is not advertised by the negotiated server; "
-                "using the synchronous range path\n", GGML_REMOTE_ATTN_NAME);
+        GGML_LOG_INFO("%s: native Q4_0 bulk is not advertised by the negotiated server; %s\n",
+                GGML_REMOTE_ATTN_NAME, ctx->e4_requested ? "refusing E4 fallback" : "using the synchronous range path");
         return false;
     }
     // Layout 4 mandates the FP8 Q/OUT activation wire. Follow the same option
@@ -4713,7 +4839,9 @@ static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
     const char * selected_wire = wire_option ? wire_option :
             bulk_wire_option ? bulk_wire_option : bulk_option;
     const bool selected_is_bulk = !wire_option && !bulk_wire_option;
-    const bool fp8_selected = !selected_wire ||
+    const bool e4_selected = selected_wire && !std::strcmp(selected_wire, "fp8_e4m3fn");
+    if (e4_selected != ctx->e4_requested || (e4_selected && ctx->protocol_version != RKVA_VERSION)) return false;
+    const bool fp8_selected = e4_selected || !selected_wire ||
             !std::strcmp(selected_wire, "fp8") || !std::strcmp(selected_wire, "fp8_e5m2") ||
             !std::strcmp(selected_wire, "auto") ||
             (selected_is_bulk && !std::strcmp(selected_wire, "1"));
@@ -4737,6 +4865,7 @@ static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
             &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
     ctx->range_configured = true;
     ctx->range_native_kvarn = true;
+    ctx->native_low4 = 0;
     ctx->native_q4 = true;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
@@ -4750,7 +4879,7 @@ static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
     ctx->native_layers.clear();
     ctx->native_layers.resize(ctx->geo.n_layer_remote);
     ctx->range_source_type = source_type;
-    ctx->range_wire = RKVA_WIRE_FP8; // Q/OUT only; op16 carries Q4_0 rows
+    ctx->range_wire = e4_selected ? RKVA_WIRE_FP8_E4M3FN : RKVA_WIRE_FP8; // Q/OUT only; op16 carries Q4_0 rows
     ctx->range_origin = origin;
     ctx->range_capacity = capacity;
     ++ctx->range_epoch;
@@ -4760,9 +4889,113 @@ static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
     ctx->range_kernel_mode = mode;
     if (!rkva_range_apply_control(ctx, "q4_0", generic)) return false;
     GGML_LOG_WARN("%s: native Q4_0 bulk descriptor=4 origin=%u capacity=%u async_overlap=%d "
-            "wire=fp8_e5m2; host CPU q4_0 producer, no KVarN records/stage/tail, "
+            "wire=%s; host CPU q4_0 producer, no KVarN records/stage/tail, "
             "suffix rollback uses the range trim (op8)\n",
-            GGML_REMOTE_ATTN_NAME, origin, capacity, int(async_overlap));
+            GGML_REMOTE_ATTN_NAME, origin, capacity, int(async_overlap),
+            e4_selected ? "fp8_e4m3fn" : "fp8_e5m2");
+    return true;
+}
+
+static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
+        uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap) {
+    const char * experimental = std::getenv("GGML_RKVA_EXPERIMENTAL_LOW4");
+    if (!experimental || std::strcmp(experimental, "1")) {
+        GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL requires GGML_RKVA_EXPERIMENTAL_LOW4=1; no fallback\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    const char * producer = std::getenv("GGML_RKVA_LOW4_PRODUCER");
+    if (!producer) producer = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
+    if (producer && std::strcmp(producer, "cpu")) {
+        GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL requires a CPU producer\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    const bool q41 = source_type == GGML_TYPE_Q4_1;
+    const uint32_t storage = q41 ? RKVA_RANGE_STORAGE_Q4_1 : RKVA_RANGE_STORAGE_IQ4_NL;
+    const uint32_t layout = q41 ? RKVA_LAYOUT_Q4_1 : RKVA_LAYOUT_IQ4_NL;
+    const uint64_t caps = (q41 ? RKVA_CAP_NATIVE_Q4_1_BULK : RKVA_CAP_NATIVE_IQ4_NL_BULK) |
+                              RKVA_CAP_KVARN_BULK_ATTN | (ctx->e4_requested ?
+                              (q41 ? RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN : RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN) :
+                              RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE);
+    constexpr uint32_t required = (1u << RKVA_KVARN_RANGE_CONFIG) |
+                                  (1u << RKVA_KVARN_RANGE_UPLOAD) |
+                                  (1u << RKVA_KVARN_RANGE_BULK_ATTN);
+    if (!ctx->connected || ctx->failed || ctx->active_session == RKVA_SESSION_NONE ||
+            (source_type != GGML_TYPE_Q4_1 && source_type != GGML_TYPE_IQ4_NL) || !capacity ||
+            origin % 256 || uint64_t(origin) + capacity > INT32_MAX ||
+            ctx->geo.max_ctx != capacity || ctx->geo.head_dim != rkva_low4_producer::head_dim ||
+            ctx->geo.n_head_kv == 0 || uint64_t(ctx->geo.n_head) != 6ull * ctx->geo.n_head_kv || ctx->geo.n_layer_remote == 0 ||
+            ctx->geo.domain != GGML_REMOTE_ATTN_DOMAIN_AUTO ||
+            ctx->geo.has_sinks || ctx->geo.swa) {
+        return false;
+    }
+    if ((ctx->ack.reserved[0] & caps) != caps || (ctx->ack.supported_ops & required) != required) {
+        GGML_LOG_INFO("%s: native Q4_1/IQ4_NL bulk is not advertised by the negotiated server; "
+                "refusing fallback\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    // New layouts require the explicitly negotiated FP8 bulk path. A missing
+    // capability or incompatible option fails closed, never Q4_0/F16 fallback.
+    const char * wire_option = rkva_optional_cstr(ctx->wire_format);
+    const char * bulk_wire_option = rkva_optional_cstr(ctx->bulk_wire_option);
+    const char * bulk_option = rkva_optional_cstr(ctx->bulk_option);
+    const char * selected_wire = wire_option ? wire_option :
+            bulk_wire_option ? bulk_wire_option : bulk_option;
+    const bool selected_is_bulk = !wire_option && !bulk_wire_option;
+    const bool e4_selected = selected_wire && !std::strcmp(selected_wire, "fp8_e4m3fn");
+    if (e4_selected != ctx->e4_requested || (e4_selected && ctx->protocol_version != RKVA_VERSION)) return false;
+    const bool fp8_selected = e4_selected || !selected_wire ||
+            !std::strcmp(selected_wire, "fp8") || !std::strcmp(selected_wire, "fp8_e5m2") ||
+            !std::strcmp(selected_wire, "auto") ||
+            (selected_is_bulk && !std::strcmp(selected_wire, "1"));
+    if (!fp8_selected) {
+        GGML_LOG_INFO("%s: native Q4_1/IQ4_NL bulk requires the FP8 activation wire; "
+                "refusing fallback\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
+    uint32_t mode = 0;
+    bool profile = false, generic = false;
+    if (!rkva_range_kernel_options(mode, profile, generic)) return false;
+    const bool can_profile = (ctx->ack.reserved[0] & RKVA_CAP_RANGE_PROFILE) &&
+                             (ctx->ack.supported_ops & (1u << RKVA_RANGE_PROFILE));
+    if ((mode || profile) && !can_profile) return false;
+    const rkva_kvarn_range_config descriptor {
+        origin, capacity, storage, layout,
+        1, 0, rkva_low4_producer::head_dim, 2, 4, 4, rkva_low4_producer::record_bytes(source_type),
+        0, 0, 0, 0, 0, 0, 1};
+    std::vector<uint8_t> reply;
+    if (!rkva_transact(ctx, RKVA_KVARN_RANGE_CONFIG, ctx->active_session, 0, 0,
+            &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
+    ctx->range_configured = true;
+    ctx->range_native_kvarn = true;
+    ctx->native_low4 = storage;
+    ctx->native_descriptor = descriptor;
+    ctx->native_q4 = false;
+    ctx->native_q8 = false;
+    ctx->native_saw_int4 = false;
+    ctx->native_turboquant_nc = false;
+    ctx->native_serial_prefix = false;
+    ctx->native_bulk = true;
+    ctx->async_local_remote = async_overlap;
+    ctx->native_generation = 0;
+    ctx->native_tail_tokens = 0;
+    ctx->native_store = nullptr;
+    ctx->native_layers.clear();
+    ctx->native_layers.resize(ctx->geo.n_layer_remote);
+    ctx->range_source_type = source_type;
+    ctx->range_wire = e4_selected ? RKVA_WIRE_FP8_E4M3FN : RKVA_WIRE_FP8; // Q/OUT only; op16 carries native low4 rows
+    ctx->range_origin = origin;
+    ctx->range_capacity = capacity;
+    ++ctx->range_epoch;
+    ctx->range_layers.assign(ctx->geo.n_layer_remote, {});
+    ctx->range_fused = false;
+    ctx->range_profile = profile;
+    ctx->range_kernel_mode = mode;
+    if (!rkva_range_apply_control(ctx, ggml_type_name(source_type), generic)) return false;
+    GGML_LOG_WARN("%s: experimental native %s descriptor=%u origin=%u capacity=%u async_overlap=%d "
+            "wire=%s; CPU GGML producer, native packed Xbox rowlane, no stage/tail; "
+            "suffix rollback uses op8; GPU/model qualification still required\n",
+            GGML_REMOTE_ATTN_NAME, ggml_type_name(source_type), layout, origin, capacity, int(async_overlap),
+            e4_selected ? "fp8_e4m3fn" : "fp8_e5m2");
     return true;
 }
 
@@ -4827,6 +5060,7 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
             &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
     ctx->range_configured = true;
     ctx->range_native_kvarn = true;
+    ctx->native_low4 = 0;
     ctx->native_q4 = false;
     ctx->native_q8 = true;
     ctx->native_saw_int4 = false;
@@ -4864,8 +5098,8 @@ static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context 
         uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap,
         bool turboquant_nc) {
     const uint64_t caps = (turboquant_nc ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK : RKVA_CAP_NATIVE_SAW_INT4_BULK) |
-                              RKVA_CAP_KVARN_BULK_ATTN | RKVA_CAP_KVARN_BULK_FP8 |
-                              RKVA_CAP_KVARN_BULK_FP8_RNE;
+                              RKVA_CAP_KVARN_BULK_ATTN | (ctx->e4_requested ? (turboquant_nc ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN : RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN) :
+                              RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE);
     constexpr uint32_t required = (1u << RKVA_KVARN_RANGE_CONFIG) |
                                   (1u << RKVA_KVARN_RANGE_UPLOAD) |
                                   (1u << RKVA_KVARN_RANGE_BULK_ATTN);
@@ -4888,7 +5122,9 @@ static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context 
     const char * selected_wire = wire_option ? wire_option :
             bulk_wire_option ? bulk_wire_option : bulk_option;
     const bool selected_is_bulk = !wire_option && !bulk_wire_option;
-    const bool fp8_selected = !selected_wire ||
+    const bool e4_selected = selected_wire && !std::strcmp(selected_wire, "fp8_e4m3fn");
+    if (e4_selected != ctx->e4_requested || (e4_selected && ctx->protocol_version != RKVA_VERSION)) return false;
+    const bool fp8_selected = e4_selected || !selected_wire ||
             !std::strcmp(selected_wire, "fp8") || !std::strcmp(selected_wire, "fp8_e5m2") ||
             !std::strcmp(selected_wire, "auto") ||
             (selected_is_bulk && !std::strcmp(selected_wire, "1"));
@@ -4913,6 +5149,7 @@ static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context 
             &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
     ctx->range_configured = true;
     ctx->range_native_kvarn = true;
+    ctx->native_low4 = 0;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = !turboquant_nc;
@@ -4926,7 +5163,7 @@ static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context 
     ctx->native_layers.clear();
     ctx->native_layers.resize(ctx->geo.n_layer_remote);
     ctx->range_source_type = source_type;
-    ctx->range_wire = RKVA_WIRE_FP8;
+    ctx->range_wire = e4_selected ? RKVA_WIRE_FP8_E4M3FN : RKVA_WIRE_FP8;
     ctx->range_origin = origin;
     ctx->range_capacity = capacity;
     ++ctx->range_epoch;
@@ -4936,17 +5173,12 @@ static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context 
     ctx->range_kernel_mode = mode;
     if (!rkva_range_apply_control(ctx, turboquant_nc ? "turboquant_nc" : "saw_int4", generic)) return false;
     GGML_LOG_WARN("%s: native %s bulk descriptor=%u origin=%u capacity=%u async_overlap=%d "
-            "wire=fp8_e5m2; host producer (%uB/head), "
+            "wire=%s; host producer (%uB/head), "
             "suffix rollback uses the range trim (op8)\n",
             GGML_REMOTE_ATTN_NAME, turboquant_nc ? "TurboQuant NC" : "SAW-INT4",
             turboquant_nc ? 8u : 6u, origin, capacity, int(async_overlap),
-            turboquant_nc ? 132u : 136u);
+            e4_selected ? "fp8_e4m3fn" : "fp8_e5m2", turboquant_nc ? 132u : 136u);
     return true;
-}
-
-static const char * rkva_get_upload_format(const ggml_backend_remote_attn_context * ctx = nullptr) {
-    if (ctx && ctx->upload_format_fixed) return ctx->upload_format.empty() ? nullptr : ctx->upload_format.c_str();
-    return rkva_legacy_upload_format();
 }
 
 bool ggml_remote_attn_companion_format_matches(const char * format, ggml_type source_type) {
@@ -4954,6 +5186,8 @@ bool ggml_remote_attn_companion_format_matches(const char * format, ggml_type so
         return source_type == GGML_TYPE_Q4_0 || source_type == GGML_TYPE_Q8_0 || source_type == GGML_TYPE_F16;
     }
     if (!std::strcmp(format, "q4") || !std::strcmp(format, "q4_0")) return source_type == GGML_TYPE_Q4_0;
+    if (!std::strcmp(format, "q4_1")) return source_type == GGML_TYPE_Q4_1;
+    if (!std::strcmp(format, "iq4_nl")) return source_type == GGML_TYPE_IQ4_NL;
     if (!std::strcmp(format, "q8") || !std::strcmp(format, "q8_0")) return source_type == GGML_TYPE_Q8_0;
     if (!std::strcmp(format, "f16") || !std::strcmp(format, "fp16")) return source_type == GGML_TYPE_F16;
     // Explicit F32 upload is a diagnostic wire conversion, not a KV cache type.
@@ -5011,9 +5245,8 @@ bool ggml_backend_remote_attn_configure_range(
         GGML_LOG_ERROR("%s: companion cache does not match the requested RKVA format\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
-    if (ctx->e4_requested && (!format_req ||
-            (std::strcmp(format_req, "kvarn4") && std::strcmp(format_req, "kvarn")))) {
-        GGML_LOG_ERROR("%s: E4M3FN requires the explicitly selected KVarN4 layout 3\n", GGML_REMOTE_ATTN_NAME);
+    if (ctx->e4_requested && !rkva_requested_e4_capability(format_req)) {
+        GGML_LOG_ERROR("%s: E4M3FN requires an explicitly supported native layout\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
     if (format_req && (!std::strcmp(format_req, "kvarn4") || !std::strcmp(format_req, "kvarn"))) {
@@ -5042,12 +5275,22 @@ bool ggml_backend_remote_attn_configure_range(
                 GGML_REMOTE_ATTN_NAME);
         return false;
     }
+    if (format_req && (!std::strcmp(format_req, "q4_1") || !std::strcmp(format_req, "iq4_nl"))) {
+        const ggml_type expected = !std::strcmp(format_req, "q4_1") ? GGML_TYPE_Q4_1 : GGML_TYPE_IQ4_NL;
+        if (cache_type != expected || !rkva_configure_native_low4(ctx, origin, capacity, cache_type, async_overlap)) {
+            GGML_LOG_ERROR("%s: requested %s cannot be negotiated with matching remote K/V; refusing fallback\n",
+                    GGML_REMOTE_ATTN_NAME, format_req);
+            return false;
+        }
+        rkva_breaker_note_configured(ctx);
+        return true;
+    }
     if (format_req && (!std::strcmp(format_req, "q4") || !std::strcmp(format_req, "q4_0"))) {
         if (rkva_configure_native_q4(ctx, origin, capacity, cache_type, async_overlap)) {
             rkva_breaker_note_configured(ctx);
             return true;
         }
-        if (ctx->failed) return false;
+        if (ctx->failed || ctx->e4_requested) return false;
         // Not negotiated (old server or missing bulk caps): keep the current
         // synchronous range upload path below, unchanged.
     }
@@ -5145,6 +5388,7 @@ bool ggml_backend_remote_attn_configure_range(
     }
     ctx->range_configured = true;
     ctx->range_native_kvarn = false;
+    ctx->native_low4 = 0;
     ctx->native_q4 = false;
     ctx->native_q8 = false;
     ctx->native_saw_int4 = false;
@@ -5257,7 +5501,7 @@ bool ggml_backend_remote_attn_native_kvarn_snapshot_supported(ggml_backend_t bac
     constexpr uint32_t ops = (1u << RKVA_SNAPSHOT_SAVE) | (1u << RKVA_SNAPSHOT_RESTORE);
     return snapshots && !std::strcmp(snapshots, "1") &&
            ggml_backend_remote_attn_native_kvarn_enabled(backend) &&
-           ctx->native_serial_prefix && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
+           ctx->native_serial_prefix && !ctx->native_low4 && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
            (ctx->native_tail_tokens == 0 || ctx->native_tail_tokens == 128 ||
             (ctx->ack.reserved[0] & RKVA_CAP_KVARN_FLEX_TAIL)) &&
            ctx->native_descriptor.layout_version == 3 &&
@@ -5718,37 +5962,44 @@ bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend) {
 bool ggml_backend_remote_attn_native_kvarn_records_enabled(ggml_backend_t backend) {
     if (!ggml_backend_remote_attn_native_kvarn_enabled(backend)) return false;
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
-    return !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc && ctx->native_store != nullptr;
+    return !ctx->native_low4 && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc && ctx->native_store != nullptr;
 }
 
 bool ggml_backend_remote_attn_native_kvarn_stage_append(
         ggml_backend_t backend, uint32_t layer, uint32_t first_pos, uint32_t count,
         const float * keys, const float * values) {
-    if (rkva_legacy_dispatch_retired()) return false;
+    rkva_backend_lease lease(backend);
+    if (!lease.get()) return false;
+    rkva_lifetime_test_point(3);
     return rkva_native_kvarn_stage_append(backend, layer, first_pos, count, keys, values);
 }
 
 struct ggml_remote_attn_kvarn_stage {
     ggml_backend_t backend;
+    std::shared_ptr<rkva_backend_lifetime> lifetime;
     rkva_stage_queue queue;
     bool sealed = false;
     bool taken = false;
     uint32_t sealed_rows = 0;
 
-    ggml_remote_attn_kvarn_stage(ggml_backend_t b, size_t width)
-        : backend(b), queue(width, 256u << 20, [b](const rkva_stage_queue::frame & f) {
-            return ggml_backend_remote_attn_native_kvarn_stage_append(
+    ggml_remote_attn_kvarn_stage(ggml_backend_t b, size_t width, std::shared_ptr<rkva_backend_lifetime> life)
+        : backend(b), lifetime(std::move(life)), queue(width, 256u << 20, [b, life = lifetime](const rkva_stage_queue::frame & f) {
+            rkva_backend_lease lease(b, false, life);
+            if (!lease.get()) return false;
+            rkva_lifetime_test_point(3);
+            return rkva_native_kvarn_stage_append(
                     b, f.layer, f.first_pos, f.count, f.keys.data(), f.values.data());
         }) {}
 };
 
 struct ggml_remote_attn_kvarn_stage * ggml_backend_remote_attn_kvarn_stage_create(ggml_backend_t backend) {
-    if (!backend || ggml_backend_is_local_split(backend)) return nullptr;
+    rkva_backend_lease lease(backend);
+    if (!lease.get()) return nullptr;
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
     auto lock = rkva_lock_ctx_drained(ctx);
     if (!ggml_backend_remote_attn_native_kvarn_records_enabled(backend) || !ctx->geo.n_head_kv ||
             ctx->native_descriptor.layout_version < 2 || !rkva_kvarn_generation_mutable(ctx->native_generation)) return nullptr;
-    try { return new ggml_remote_attn_kvarn_stage(backend, size_t(ctx->geo.n_head_kv) * 256); }
+    try { return new ggml_remote_attn_kvarn_stage(backend, size_t(ctx->geo.n_head_kv) * 256, lease.lifetime()); }
     catch (...) { return nullptr; }
 }
 
@@ -5760,6 +6011,8 @@ bool ggml_backend_remote_attn_kvarn_stage_submit(ggml_remote_attn_kvarn_stage * 
 bool ggml_backend_remote_attn_kvarn_stage_finish(ggml_remote_attn_kvarn_stage * stage, uint32_t expected_rows) {
     if (!stage || stage->sealed) return false;
     bool ok = stage->queue.drain();
+    rkva_backend_lease lease(stage->backend, false, stage->lifetime);
+    if (!lease.get()) return false;
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(stage->backend->context);
     auto lock = rkva_lock_ctx_drained(ctx);
     ok = ok && ctx->connected && !ctx->failed && ctx->range_configured &&
@@ -5783,6 +6036,8 @@ ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take_for_format(ggml_remote_
         uint32_t origin, uint32_t capacity, ggml_type cache_type, uint32_t native_tail_tokens,
         const char * upload_format, const char * wire_format) {
     if (!stage || !stage->sealed || stage->taken || !host || !geometry) return nullptr;
+    rkva_backend_lease lease(stage->backend, false, stage->lifetime);
+    if (!lease.get()) return nullptr;
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(stage->backend->context);
     auto lock = rkva_lock_ctx_drained(ctx);
     const auto & g = ctx->geo;
@@ -5851,6 +6106,8 @@ bool ggml_backend_remote_attn_kvarn_stage_matches(const ggml_remote_attn_kvarn_s
         ggml_backend_t backend, uint32_t expected_rows) {
     if (!stage || !stage->taken || !stage->sealed || stage->backend != backend ||
             stage->sealed_rows != expected_rows) return false;
+    rkva_backend_lease lease(backend, false, stage->lifetime);
+    if (!lease.get()) return false;
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
     auto lock = rkva_lock_ctx_drained(ctx);
     if (!ctx->connected || ctx->failed || !ctx->range_configured ||
@@ -5868,9 +6125,12 @@ void ggml_backend_remote_attn_kvarn_stage_free(ggml_remote_attn_kvarn_stage * st
     if (!stage) return;
     if (!stage->sealed) {
         stage->queue.drain();
-        auto * ctx = static_cast<ggml_backend_remote_attn_context *>(stage->backend->context);
-        auto lock = rkva_lock_ctx_drained(ctx);
-        if (!ctx->failed) rkva_poison_remote_state_locked(ctx);
+        rkva_backend_lease lease(stage->backend, false, stage->lifetime);
+        if (lease.get()) {
+            auto * ctx = static_cast<ggml_backend_remote_attn_context *>(stage->backend->context);
+            auto lock = rkva_lock_ctx_drained(ctx);
+            if (!ctx->failed) rkva_poison_remote_state_locked(ctx);
+        }
     }
     delete stage;
 }
@@ -5885,7 +6145,7 @@ bool ggml_backend_remote_attn_async_enabled(ggml_backend_t backend) {
 bool ggml_backend_remote_attn_kvarn_bulk_512_enabled(ggml_backend_t backend) {
     if (!ggml_backend_remote_attn_async_enabled(backend)) return false;
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
-    return ctx->native_store && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
+    return ctx->native_store && !ctx->native_low4 && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_BULK_512);
 }
 
@@ -5949,13 +6209,13 @@ size_t ggml_backend_remote_attn_async_capacity(ggml_backend_t backend) {
 bool ggml_backend_remote_attn_native_kvarn_can_rewind(ggml_backend_t backend) {
     if (!ggml_backend_remote_attn_native_kvarn_enabled(backend)) return false;
     const auto * ctx = static_cast<const ggml_backend_remote_attn_context *>(backend->context);
-    if (ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) {
+    if (ctx->native_low4 || ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc) {
         // Layouts 4/5/6 rows live in the standard range buffer; op8
         // trims the suffix exactly, without the KVarN resident-tail contract.
         return ctx->connected && !ctx->failed &&
                (ctx->ack.supported_ops & (1u << RKVA_REWIND));
     }
-    return ctx->connected && !ctx->failed && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
+    return ctx->connected && !ctx->failed && !ctx->native_low4 && !ctx->native_q4 && !ctx->native_q8 && !ctx->native_saw_int4 && !ctx->native_turboquant_nc &&
            rkva_kvarn_generation_mutable(ctx->native_generation) &&
            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) &&
            (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
@@ -6112,7 +6372,7 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
         (unsigned long long) s.range_upload_calls, (unsigned long long) s.range_upload_rows,
         (unsigned long long) s.range_attn_calls, ctx->range_origin, ctx->range_capacity,
         (long long) s.range_query_min, (long long) s.range_query_max,
-        ctx->native_turboquant_nc ? "turboquant_nc" : ctx->native_saw_int4 ? "saw_int4" : ctx->native_q4 ? "q4_0" : ctx->native_q8 ? "q8_0" : ctx->range_native_kvarn ? "kvarn4" : ctx->range_wire == RKVA_WIRE_Q4_0 ? "q4_0" : ctx->range_wire == RKVA_WIRE_Q8_0 ? "q8_0" : "f16",
+        ctx->native_low4 ? ggml_type_name(ctx->range_source_type) : ctx->native_turboquant_nc ? "turboquant_nc" : ctx->native_saw_int4 ? "saw_int4" : ctx->native_q4 ? "q4_0" : ctx->native_q8 ? "q8_0" : ctx->range_native_kvarn ? "kvarn4" : ctx->range_wire == RKVA_WIRE_Q4_0 ? "q4_0" : ctx->range_wire == RKVA_WIRE_Q8_0 ? "q8_0" : "f16",
         ctx->range_native_kvarn ? "projected_f32" : ctx->range_configured ? ggml_type_name(ctx->range_source_type) : "none",
         (unsigned long long) s.range_upload_bytes, ctx->range_native_kvarn ? ctx->native_tail_tokens : 0);
     ctx->stats_json = buf;
@@ -6164,18 +6424,7 @@ void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend) {
 // calls into the active connection here. One active connection per process (MVP).
 // ---------------------------------------------------------------------------
 
-static std::atomic<ggml_backend_t> g_remote_attn_active {nullptr};
-// Legacy activation has no result or caller identity, so a refused caller can
-// otherwise dispatch through the previous owner's peer. Retire until restart.
-static std::atomic<bool> g_remote_attn_legacy_conflict {false};
-static bool rkva_legacy_dispatch_retired() { return g_remote_attn_legacy_conflict.load(); }
-static ggml_backend_t g_remote_attn_stage = nullptr;
-static ggml_backend_t g_remote_attn_legacy_owner = nullptr;
-static std::mutex g_remote_attn_owner_mutex;
-
-bool ggml_backend_remote_attn_cuda_enabled(void) {
-    if (g_remote_attn_legacy_conflict.load()) return false;
-    auto * backend = g_remote_attn_active.load();
+static bool rkva_cuda_enabled_backend(ggml_backend_t backend) {
     if (!backend || ggml_backend_is_local_split(backend)) return false;
     const char * option = std::getenv("GGML_RKVA_CUDA_FP8");
     if (option && !std::strcmp(option, "0")) return false;
@@ -6190,7 +6439,14 @@ bool ggml_backend_remote_attn_cuda_enabled(void) {
           rkva_cuda_e4_api()->base == rkva_cuda_fp8_api()));
 }
 
-bool ggml_backend_remote_attn_cuda_enabled_for_node(const ggml_tensor * node) {
+bool ggml_backend_remote_attn_cuda_enabled(void) {
+    rkva_backend_lease lease(nullptr, true);
+    if (!lease.get()) return false;
+    rkva_lifetime_test_point(2);
+    return rkva_cuda_enabled_backend(lease.get());
+}
+
+static bool rkva_cuda_node_permitted(const ggml_tensor * node) {
     if (!node || node->op != GGML_OP_REMOTE_ATTN) return false;
     const auto * range = ggml_get_op_params_i32(node, GGML_REMOTE_ATTN_PARAM_WAIT) ? node->src[0] : node;
     if (!range || range->op != GGML_OP_REMOTE_ATTN ||
@@ -6198,18 +6454,27 @@ bool ggml_backend_remote_attn_cuda_enabled_for_node(const ggml_tensor * node) {
     // This is the native serial-prefix protocol bucket, not a measured or
     // adaptive threshold. A prefill segment of eight queries still belongs to
     // its original whole range, e.g.256, for this decision.
-    if (!rkva_cuda_fp8_bucket_permitted(range->ne[1])) return false;
-    return ggml_backend_remote_attn_cuda_enabled();
+    return rkva_cuda_fp8_bucket_permitted(range->ne[1]);
 }
 
+bool ggml_backend_remote_attn_cuda_enabled_for_node(const ggml_tensor * node) {
+    return rkva_cuda_node_permitted(node) && ggml_backend_remote_attn_cuda_enabled();
+}
+
+static bool rkva_exec_with_backend(struct ggml_tensor * node, ggml_backend_t backend);
+
 bool ggml_remote_attn_exec_cuda(struct ggml_tensor * node, void * producer_event) {
-    if (!ggml_backend_remote_attn_cuda_enabled_for_node(node)) return false;
+    if (!rkva_cuda_node_permitted(node)) return false;
+    rkva_backend_lease lease(nullptr, true);
+    if (!lease.get()) return false;
+    rkva_lifetime_test_point(2);
+    if (!rkva_cuda_enabled_backend(lease.get())) return false;
     struct restore_event {
         void * previous;
         ~restore_event() { rkva_cuda_producer_event = previous; }
     } restore {rkva_cuda_producer_event};
     rkva_cuda_producer_event = producer_event;
-    return ggml_remote_attn_exec(node);
+    return rkva_exec_with_backend(node, lease.get());
 }
 
 void ggml_remote_attn_set_active(ggml_backend_t backend) {
@@ -6224,7 +6489,10 @@ void ggml_remote_attn_set_active(ggml_backend_t backend) {
         return;
     }
     if (g_remote_attn_legacy_conflict.load()) return;
+    const auto life = g_remote_attn_lifetimes.find(backend);
+    if (life != g_remote_attn_lifetimes.end() && life->second->retiring) return;
     const auto active = g_remote_attn_active.load();
+    if (g_remote_attn_retiring_owners) return;
     if (g_remote_attn_stage || (active && (active != backend || g_remote_attn_legacy_owner != backend))) {
         g_remote_attn_legacy_conflict.store(true);
         GGML_LOG_WARN("%s: legacy activation refused: another owner or stage is active\n", GGML_REMOTE_ATTN_NAME);
@@ -6238,7 +6506,9 @@ void ggml_remote_attn_set_active(ggml_backend_t backend) {
 bool ggml_remote_attn_try_activate(ggml_backend_t backend) {
     if (!backend) return false;
     std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
-    if (g_remote_attn_legacy_conflict.load()) return false;
+    if (g_remote_attn_legacy_conflict.load() || g_remote_attn_retiring_owners) return false;
+    auto life = g_remote_attn_lifetimes.find(backend);
+    if (life != g_remote_attn_lifetimes.end() && life->second->retiring) return false;
     if (g_remote_attn_stage && g_remote_attn_stage != backend) return false;
     ggml_backend_t expected = nullptr;
     if (!g_remote_attn_active.compare_exchange_strong(expected, backend))
@@ -6259,9 +6529,11 @@ void ggml_remote_attn_deactivate(ggml_backend_t backend) {
 }
 
 bool ggml_remote_attn_reserve_stage(ggml_backend_t backend) {
-    if (!backend || ggml_backend_is_local_split(backend)) return false;
+    if (!backend) return false;
     std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
-    if (g_remote_attn_legacy_conflict.load()) return false;
+    const auto life = g_remote_attn_lifetimes.find(backend);
+    if (life == g_remote_attn_lifetimes.end() || life->second->retiring) return false;
+    if (g_remote_attn_legacy_conflict.load() || g_remote_attn_retiring_owners) return false;
     if (g_remote_attn_active.load() || g_remote_attn_stage) return false;
     g_remote_attn_stage = backend;
     return true;
@@ -6274,21 +6546,17 @@ void ggml_remote_attn_release_stage(ggml_backend_t backend) {
 }
 
 bool ggml_remote_attn_exec(struct ggml_tensor * node) {
-    ggml_backend_t backend;
-    {
-        // Operations admitted before a conflicting registration may finish;
-        // no later operation can acquire the prior owner's backend.
-        std::lock_guard<std::mutex> admission(g_remote_attn_owner_mutex);
-        if (g_remote_attn_legacy_conflict.load()) {
-            GGML_LOG_ERROR("%s: legacy owner conflict; remote dispatch disabled until process restart\n", GGML_REMOTE_ATTN_NAME);
-            return false;
-        }
-        backend = g_remote_attn_active.load();
-    }
-    if (backend == nullptr) {
+    // Calls admitted before retirement may finish; free waits for the lease.
+    rkva_backend_lease lease(nullptr, true);
+    if (!lease.get()) {
         GGML_LOG_ERROR("%s: exec with no active remote connection\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
+    return rkva_exec_with_backend(node, lease.get());
+}
+
+static bool rkva_exec_with_backend(struct ggml_tensor * node, ggml_backend_t backend) {
+    rkva_lifetime_test_point(1);
     if (ggml_backend_is_local_split(backend)) {
         return ggml_local_split_exec(node);
     }

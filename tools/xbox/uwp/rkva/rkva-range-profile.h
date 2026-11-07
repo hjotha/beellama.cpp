@@ -66,11 +66,15 @@ enum Storage : uint32_t {
 };
 // Native row formats use protocol storage bits, outside the indexed legacy
 // arrays. Keep these separate so reporting cannot index past kStorageCount.
+constexpr uint32_t kStorageQ4_1 = 1u << 6;
+constexpr uint32_t kStorageIQ4_NL = 1u << 7;
 constexpr uint32_t kStorageSawInt4 = 1u << 3;
 constexpr uint32_t kStorageTurboquantNC = 1u << 5;
 
 // Bucket/report kernel name. Q4_0 keeps the 261 names byte for byte.
 inline const char* kernel_name(uint32_t storage, uint32_t mode) {
+    if (storage == kStorageQ4_1) return "q4_1_rowlane";
+    if (storage == kStorageIQ4_NL) return "iq4_nl_rowlane";
     if (storage == kStorageSawInt4) return "saw_int4_rowlane";
     if (storage == kStorageTurboquantNC) return "turboquant_nc";
     if (mode == kModeReference || !valid_mode(mode)) {
@@ -622,6 +626,10 @@ inline const char* storage_name(uint32_t storage) {
         return "q8_0";
     case 3:
         return "kvarn4";
+    case kStorageQ4_1:
+        return "q4_1";
+    case kStorageIQ4_NL:
+        return "iq4_nl";
     case kStorageSawInt4:
         return "saw_int4";
     case kStorageTurboquantNC:

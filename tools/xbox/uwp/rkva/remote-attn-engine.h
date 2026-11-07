@@ -185,6 +185,12 @@ class RemoteAttnEngine {
                             float* lse, std::string* error, uint64_t cycle_id, uint8_t* out_fp8 = nullptr);
     bool ensure_q8_fp8_gpu_pipelines();
     bool ensure_q4_fp8_gpu_pipelines() { return ensure_q8_fp8_gpu_pipelines(); }
+    bool native_low4_available(uint32_t storage) const;
+    bool upload_low4_range(uint32_t id, uint32_t layer, const rkva_kvarn_range_upload& upload,
+                           const uint8_t* k, const uint8_t* v, std::string* error);
+    bool attend_low4_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens, uint32_t storage,
+                         const uint8_t* data, size_t bytes, float* out, float* lse,
+                         std::string* error, uint64_t cycle_id);
     bool native_saw_int4_available() const;
     bool native_turboquant_nc_available() const;
     bool attend_q4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
@@ -350,6 +356,7 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> range_attn_root_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> range_reduce_root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_pso_[4];
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q4_1_pso_, range_attn_iq4_nl_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_reduce_pso_;
     // Optimized Q4_0 decode kernel (optional; reference stays available).
     Microsoft::WRL::ComPtr<ID3D12RootSignature> range_attn_q4_opt_root_;

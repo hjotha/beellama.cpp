@@ -59,7 +59,7 @@ int main() {
     std::vector<uint16_t> f16(nq * width, 0);
     f16[0] = 0x8000; f16[width] = 0x3c00;
     const auto server_valid = [&](const float * lse) {
-        return rkva_kvarn_bulk::e4_f16_prefix_results_valid(f16.data(), lse,
+        return rkva_kvarn_bulk::compact_f16_prefix_results_valid(f16.data(), lse,
                 reinterpret_cast<const uint8_t *>(positions), nq, heads, dim, origin);
     };
     assert(server_valid(good_lse));
@@ -71,16 +71,39 @@ int main() {
     std::vector<uint8_t> packed(nq * width, 0);
     packed[0] = 0x80; packed[width] = 0x38;
     const auto gpu_valid = [&](const float * lse) {
-        return rkva_kvarn_bulk::e4_fp8_prefix_results_valid(packed.data(), lse,
+        return rkva_kvarn_bulk::compact_fp8_prefix_results_valid(packed.data(), lse,
                 reinterpret_cast<const uint8_t *>(positions), nq, heads, dim, origin);
     };
     assert(gpu_valid(good_lse));
     packed[0] = 1; assert(!gpu_valid(good_lse)); packed[0] = 0;
     assert(!gpu_valid(bad_lse));
     assert(rkva_kvarn_bulk::fp8_gpu_status_valid(0, false));
-    assert(!rkva_kvarn_bulk::fp8_gpu_status_valid(2, false));
-    assert(rkva_kvarn_bulk::fp8_gpu_status_valid(2, true));
-    for (uint32_t invalid : {1u, 3u, 4u}) assert(!rkva_kvarn_bulk::fp8_gpu_status_valid(invalid, true));
+    assert(!rkva_kvarn_bulk::fp8_gpu_status_valid(2, false)); // no follow-up validation
+    // Both E5 and E4 use provisional status 2 only with complete per-query
+    // verification; a lone status 2 cannot identify a valid empty prefix.
+    for (uint32_t wire : {uint32_t(RKVA_WIRE_FP8), uint32_t(RKVA_WIRE_FP8_E4M3FN)}) {
+        const bool prefix_validation = wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN;
+        const auto accepted = [&](uint32_t status, const float * lse) {
+            return rkva_kvarn_bulk::fp8_gpu_status_valid(status, prefix_validation) && gpu_valid(lse);
+        };
+        assert(accepted(2, good_lse));
+        assert(server_valid(good_lse)); // CPU conversion fallback uses the same contract
+        assert(!accepted(2, bad_lse));
+        assert(!server_valid(bad_lse));
+        packed[0] = 1; assert(!accepted(2, good_lse)); packed[0] = 0;
+        f16[0] = 1; assert(!server_valid(good_lse)); f16[0] = 0;
+        for (float invalid : {neg_inf, pos_inf, nan}) {
+            float invalid_lse[] = {neg_inf, neg_inf, invalid, 1.0f};
+            assert(!accepted(2, invalid_lse));
+            assert(!server_valid(invalid_lse));
+        }
+        for (float invalid : {0.0f, pos_inf, nan}) {
+            float invalid_lse[] = {invalid, neg_inf, 0.0f, 1.0f};
+            assert(!accepted(2, invalid_lse));
+            assert(!server_valid(invalid_lse));
+        }
+        for (uint32_t invalid : {1u, 3u, 4u, 6u}) assert(!accepted(invalid, good_lse));
+    }
 
     // Real descriptor and op22 framing: two queries, one visible row.
     const rkva_kvarn_range_config desc {origin, 512, RKVA_RANGE_STORAGE_KVARN4, 3,
@@ -101,5 +124,5 @@ int main() {
             0, 0, false, rkva_kvarn_range::coverage_after_reset(0, 128), 1,
             RKVA_WIRE_FP8_E4M3FN, segments));
     assert(segments.size() == 1 && segments[0].upload.live_count == 1);
-    std::puts("E4 policy: explicit fallback, empty-prefix OUT/LSE, invalid responses and real op22 framing passed");
+    std::puts("E4/E5 policy: empty-prefix OUT/LSE, invalid responses and real op22 framing passed");
 }

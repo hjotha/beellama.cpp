@@ -490,13 +490,15 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
         uint16_t* dst_out = out_f16 ? out_f16 + row * geo_.n_head * 256 : nullptr;
         float* dst_lse = lse + row * geo_.n_head;
         bool finite_ok = true;
+        // Both FP8 wires use the same serial-prefix OUT/LSE contract.
+        const bool validate_prefix = wire == RKVA_WIRE_FP8 || wire == RKVA_WIRE_FP8_E4M3FN;
         if (fp8_gpu) {
             const uint8_t* packed = static_cast<const uint8_t*>(mapped);
             const uint32_t groups = rkva_bulk_fp8::pack_groups(uint32_t(q_elems), uint32_t(heads));
             for (uint32_t g = 0; g < groups; ++g) {
                 uint32_t status;
                 std::memcpy(&status, packed + q_elems + lse_bytes + uint64_t(g) * 4, 4);
-                if (!rkva_kvarn_bulk::fp8_gpu_status_valid(status, wire == RKVA_WIRE_FP8_E4M3FN)) {
+                if (!rkva_kvarn_bulk::fp8_gpu_status_valid(status, validate_prefix)) {
                     finite_ok = false;
                     break;
                 }
@@ -530,12 +532,12 @@ bool RemoteAttnEngine::attend_kvarn_bulk_compact(uint32_t id, uint32_t layer, ui
             }
             std::memcpy(dst_lse, static_cast<const uint8_t*>(mapped) + q_f32_bytes, lse_bytes);
         }
-        if (finite_ok && wire == RKVA_WIRE_FP8_E4M3FN) {
+        if (finite_ok && validate_prefix) {
             finite_ok = fp8_gpu
-                ? rkva_kvarn_bulk::e4_fp8_prefix_results_valid(out_fp8 + row * geo_.n_head * 256, dst_lse,
+                ? rkva_kvarn_bulk::compact_fp8_prefix_results_valid(out_fp8 + row * geo_.n_head * 256, dst_lse,
                     data + segments[i].positions_offset, segments[i].n_queries, geo_.n_head, 256,
                     s->range_descriptor.origin)
-                : rkva_kvarn_bulk::e4_f16_prefix_results_valid(dst_out, dst_lse,
+                : rkva_kvarn_bulk::compact_f16_prefix_results_valid(dst_out, dst_lse,
                     data + segments[i].positions_offset, segments[i].n_queries, geo_.n_head, 256,
                     s->range_descriptor.origin);
         } else {

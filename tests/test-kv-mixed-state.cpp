@@ -12,6 +12,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <random>
+#include <stdexcept>
 
 using namespace llama_kv_mixed;
 
@@ -2503,13 +2505,38 @@ static void test_spool_preflight() {
     };
     std::string err;
 
+    // A unique fixture under the test's working directory keeps disk-backed
+    // semantics (/tmp may be tmpfs) and avoids a developer-specific home path.
+    // Never reuse or delete an existing directory owned by another test run.
+    struct scoped_fixture {
+        std::filesystem::path path;
+        scoped_fixture() {
+            std::random_device random;
+            for (unsigned attempt = 0; attempt < 16; ++attempt) {
+                auto candidate = std::filesystem::current_path() /
+                    ("test-mixed-state-spool-" + std::to_string(random()) + "-" + std::to_string(random()));
+                std::error_code ec;
+                if (std::filesystem::create_directory(candidate, ec)) { path = candidate; return; }
+                if (ec) throw std::filesystem::filesystem_error("create spool fixture", candidate, ec);
+            }
+            throw std::runtime_error("cannot allocate unique spool fixture");
+        }
+        ~scoped_fixture() {
+            std::error_code ec;
+            const auto locked = path / "f4-locked";
+            if (std::filesystem::is_directory(locked, ec))
+                std::filesystem::permissions(locked, std::filesystem::perms::owner_all, ec);
+            std::filesystem::remove_all(path, ec);
+        }
+    } fixture;
+
     // (1) empty
     err.clear();
     imp(!llama_state_rollback::spool_usable("", &err) && !err.empty(),
         "empty spool is refused with a reason");
 
     // (2) not a directory (a regular file)
-    const std::string file_path = "/home/hjotha/f4-spool/f4-not-a-dir.bin";
+    const std::string file_path = (fixture.path / "f4-not-a-dir.bin").string();
     { FILE * f = fopen(file_path.c_str(), "wb"); if (f) { fputc('x', f); fclose(f); } }
     err.clear();
     imp(!llama_state_rollback::spool_usable(file_path, &err),
@@ -2517,7 +2544,7 @@ static void test_spool_preflight() {
     std::remove(file_path.c_str());
 
     // (3) unwritable directory
-    const std::string locked = "/home/hjotha/f4-spool/f4-locked";
+    const std::string locked = (fixture.path / "f4-locked").string();
     std::filesystem::create_directories(locked);
     std::filesystem::permissions(locked, std::filesystem::perms::owner_read |
                                           std::filesystem::perms::owner_exec);
@@ -2542,7 +2569,7 @@ static void test_spool_preflight() {
 #endif
 
     // (5) a real disk-backed directory is accepted and prepares its subdir
-    const std::string good = "/home/hjotha/f4-spool/tmp-preflight";
+    const std::string good = (fixture.path / "tmp-preflight").string();
     std::filesystem::create_directories(good);
     err.clear();
     imp(llama_state_rollback::spool_usable(good, &err),
@@ -2872,7 +2899,7 @@ static void test_compact_qx_rows(uint16_t type = sx_q4_0) {
     cells[SPLIT_P-1].pos = SPLIT_P-1; cells[SPLIT_P-1].seq_ids = {0};
     cells[SPLIT_P].pos = SPLIT_P; cells[SPLIT_P].seq_ids = {0};
     cells[SPLIT_P+2].pos = SPLIT_P+2; cells[SPLIT_P+2].seq_ids = {0};
-    const uint64_t row_stride = type == sx_f16 ? 2048 : 576;
+    const uint64_t row_stride = type == sx_f16 ? 2048 : type == sx_q4_1 ? 640 : 576;
     std::vector<uint8_t> local_bytes(128), overflow_bytes(4*row_stride), metadata;
     fill_pattern(local_bytes, 91); fill_pattern(overflow_bytes, 92);
     make_metadata(metadata, 93);
@@ -2935,7 +2962,7 @@ static void test_compact_qx_rows(uint16_t type = sx_q4_0) {
         CHECK(*backing == original);
     }
 
-    if (type == sx_f16) {
+    if (type == sx_f16 || type == sx_q4_1 || type == sx_iq4_nl) {
         // Format identity is authoritative even with equal padded row sizes:
         // a Q4 destination must never consume a native F16 snapshot.
         auto mismatch = expected;
@@ -3137,6 +3164,12 @@ static void test_native_external_legacy_companion_validation() {
 }
 
 int main() {
+    if (std::getenv("GGML_LOW4_STATE_TEST_ONLY")) {
+        test_compact_qx_rows(sx_q4_1);
+        test_compact_qx_rows(sx_iq4_nl);
+        std::printf("%s: low4 compact state %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);
+        return g_failures == 0 ? 0 : 1;
+    }
     test_native_external_legacy_companion_validation();
     test_native_external_kvarn4_layout_v1();
     test_roundtrip_mixed();
@@ -3151,6 +3184,8 @@ int main() {
     test_split_to_pure_import_adapter();
     test_compact_qx_rows();
     test_compact_qx_rows(sx_f16);
+    test_compact_qx_rows(sx_q4_1);
+    test_compact_qx_rows(sx_iq4_nl);
     test_fingerprint_controls();
     test_spool_preflight();
     test_kms3_move_identity();

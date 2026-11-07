@@ -10,8 +10,55 @@
 // Pure, bounded admission. No live metadata or GPU resource is changed until
 // every segment has passed descriptor, coverage, size and finite-query checks.
 namespace rkva_kvarn_bulk {
-inline bool fp8_gpu_status_valid(uint32_t status, bool e4) {
-    return status == 0 || (e4 && status == 2);
+// Native-row CPU E4 admission/packing. Shared with host tests; unlike the
+// KVarN kernel helpers, this accepts the complete bounded 256-query envelope.
+inline bool native_e4_queries_valid(const uint8_t* positions, const uint8_t* query,
+                                    uint32_t nq, uint32_t heads, uint32_t dim) {
+    if (!positions || !query || !nq || nq > 256 || !heads || heads > 256 || dim != 256) return false;
+    for (uint32_t q = 0; q < nq; ++q) {
+        int32_t pos;
+        std::memcpy(&pos, positions + size_t(q) * sizeof(pos), sizeof(pos));
+        if (pos < 0) return false;
+    }
+    for (size_t e = 0; e < size_t(nq) * heads * dim; ++e)
+        if ((query[e] & 0x7fu) == 0x7fu) return false;
+    return true;
+}
+inline bool native_e4_results_valid(const float* out, const float* lse, const uint8_t* positions,
+                                    uint32_t nq, uint32_t heads, uint32_t dim, uint32_t origin) {
+    if (!out || !lse || !positions || !nq || nq > 256 || !heads || heads > 256 || dim != 256) return false;
+    const size_t width = size_t(heads) * dim;
+    for (uint32_t q = 0; q < nq; ++q) {
+        int32_t position;
+        std::memcpy(&position, positions + size_t(q) * sizeof(position), sizeof(position));
+        if (position < 0) return false;
+        const bool empty = ggml_remote_attn_policy::e4_empty_prefix(position, origin);
+        for (size_t e = 0; e < width; ++e)
+            if (!std::isfinite(out[size_t(q) * width + e]) ||
+                (empty && out[size_t(q) * width + e] != 0.0f)) return false;
+        for (uint32_t h = 0; h < heads; ++h)
+            if (!ggml_remote_attn_policy::e4_lse_valid(lse[size_t(q) * heads + h], position, origin)) return false;
+    }
+    return true;
+}
+inline bool native_e4_pack_reply(const float* out, const float* lse, const int32_t* positions,
+                                 uint32_t nq, uint32_t heads, uint32_t dim, uint32_t origin,
+                                 std::vector<uint8_t>& reply) {
+    // Validate before publishing any bytes, including empty-prefix semantics.
+    if (!native_e4_results_valid(out, lse, reinterpret_cast<const uint8_t*>(positions), nq, heads, dim, origin)) return false;
+    const size_t elements = size_t(nq) * heads * dim;
+    reply.resize(elements + size_t(nq) * heads * sizeof(float));
+    for (size_t e = 0; e < elements; ++e) {
+        // Direct F32 RNE: no intermediate F16 double rounding or overflow.
+        if (!rkva_e4::encode_f32(out[e], reply[e])) return false;
+    }
+    std::memcpy(reply.data() + elements, lse, size_t(nq) * heads * sizeof(float));
+    return true;
+}
+// Status 2 may only be provisionally accepted when a per-query prefix
+// validation follows, since the status also covers NaN/+inf LSE.
+inline bool fp8_gpu_status_valid(uint32_t status, bool validate_prefix) {
+    return status == 0 || (validate_prefix && status == 2);
 }
 // The FP8 pack shader reports every non-finite LSE. Negative infinity is
 // nevertheless the defined result for a query with no visible remote rows.
@@ -33,8 +80,8 @@ inline bool q8_fp8_lse_valid(const uint8_t* lse, const uint8_t* positions,
     return true;
 }
 
-// E4's empty serial prefix must return an exact zero OUT and -infinity LSE.
-inline bool e4_f16_prefix_results_valid(const uint16_t* out, const float* lse,
+// Empty serial prefixes must return an exact zero OUT and -infinity LSE.
+inline bool compact_f16_prefix_results_valid(const uint16_t* out, const float* lse,
         const uint8_t* positions, uint32_t n_queries, uint32_t n_heads, uint32_t dimension,
         uint32_t origin) {
     if (!out || !lse || !positions || !n_queries || n_queries > 9 ||
@@ -58,7 +105,7 @@ inline bool e4_f16_prefix_results_valid(const uint16_t* out, const float* lse,
 
 // The pack shader validates finite OUT; empty prefixes additionally require
 // zero packed OUT and negative-infinity LSE.
-inline bool e4_fp8_prefix_results_valid(const uint8_t* out, const float* lse,
+inline bool compact_fp8_prefix_results_valid(const uint8_t* out, const float* lse,
         const uint8_t* positions, uint32_t n_queries, uint32_t n_heads, uint32_t dimension,
         uint32_t origin) {
     if (!out || !lse || !positions || !n_queries || n_queries > 9 ||
@@ -175,6 +222,80 @@ inline bool turboquant_nc_planes_valid(const uint8_t* k, const uint8_t* v, size_
             !f16_bits_finite(f32_to_f16_bits(15.0f * scale + minimum))) return false;
     }
     return true;
+}
+
+// The CPU E4 native-row path admits complete envelopes before any upload.
+// Current coverage is authoritative in the engine; the handler can validate
+// framing/metadata without inventing a per-layer resident count.
+inline bool native_e4_planes_valid(uint32_t storage, const uint8_t* k, const uint8_t* v, size_t heads) {
+    if (rkva_kvarn_range::low4_storage(storage)) return rkva_kvarn_range::valid_low4_planes(storage, k, v, heads);
+    if (storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC) return turboquant_nc_planes_valid(k, v, heads);
+    if (storage != RKVA_RANGE_STORAGE_Q4_0 && storage != RKVA_RANGE_STORAGE_SAW_INT4) return false;
+    if (heads && (!k || !v)) return false;
+    for (const auto* plane : {k, v}) {
+        for (size_t h = 0; h < heads; ++h) {
+            if (storage == RKVA_RANGE_STORAGE_Q4_0) {
+                for (size_t block = 0; block < 8; ++block) {
+                    uint16_t scale;
+                    std::memcpy(&scale, plane + h * 144 + block * 18, sizeof(scale));
+                    if (!f16_bits_finite(scale)) return false;
+                }
+            } else {
+                float scale, zero;
+                std::memcpy(&scale, plane + h * 136 + 128, sizeof(scale));
+                std::memcpy(&zero, plane + h * 136 + 132, sizeof(zero));
+                if (!std::isfinite(scale) || !std::isfinite(zero) || scale < 0.0f ||
+                    !std::isfinite(scale * (0.0f - zero)) || !std::isfinite(scale * (15.0f - zero))) return false;
+            }
+        }
+    }
+    return true;
+}
+inline bool validate_native_e4(const uint8_t* data, size_t bytes, uint32_t nq, uint32_t storage,
+                               uint32_t heads, uint32_t kv_heads, uint32_t capacity,
+                               uint32_t live, bool check_live) {
+    const size_t row = storage == RKVA_RANGE_STORAGE_Q4_0 ? 144 :
+                       storage == RKVA_RANGE_STORAGE_SAW_INT4 ? 136 :
+                       storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC ? 132 : rkva_kvarn_range::low4_head_bytes(storage);
+    if (!data || bytes < sizeof(rkva_kvarn_range_bulk) || !row || !nq || nq > 256 ||
+        !heads || heads > 256 || !kv_heads || kv_heads > 256 || !capacity || live > capacity) return false;
+    rkva_kvarn_range_bulk header;
+    std::memcpy(&header, data, sizeof(header));
+    if (header.version != 1 || header.reserved || !header.segment_count || header.segment_count > 32 ||
+        header.total_queries != nq) return false;
+    size_t off = sizeof(header);
+    uint32_t queries = 0;
+    for (uint32_t i = 0; i < header.segment_count; ++i) {
+        rkva_kvarn_range_bulk_segment segment;
+        if (bytes - off < sizeof(segment)) return false;
+        std::memcpy(&segment, data + off, sizeof(segment)); off += sizeof(segment);
+        if (segment.upload_bytes < sizeof(rkva_kvarn_range_upload) || segment.upload_bytes > bytes - off ||
+            !segment.n_queries || segment.n_queries > nq - queries) return false;
+        rkva_kvarn_range_upload upload;
+        std::memcpy(&upload, data + off, sizeof(upload));
+        const bool valid = rkva_kvarn_range::low4_storage(storage) ? rkva_kvarn_range::valid_low4_upload(upload, capacity, upload.append_begin) :
+            storage == RKVA_RANGE_STORAGE_Q4_0 ? rkva_kvarn_range::valid_q4_upload(upload, capacity, upload.append_begin) :
+            storage == RKVA_RANGE_STORAGE_SAW_INT4 ? rkva_kvarn_range::valid_saw_int4_upload(upload, capacity, upload.append_begin) :
+                rkva_kvarn_range::valid_turboquant_nc_upload(upload, capacity, upload.append_begin);
+        const bool reset = (upload.flags & RKVA_KVARN_UPLOAD_RESET) != 0;
+        const uint64_t plane = uint64_t(upload.append_rows) * kv_heads * row;
+        if (!valid || uint64_t(upload.append_begin) + upload.append_rows != upload.live_count ||
+            (reset ? (i != 0 || upload.append_begin != 0) : ((i || check_live) && upload.append_begin != live)) ||
+            uint64_t(segment.upload_bytes) != sizeof(upload) + 2 * plane) return false;
+        const uint8_t* k = data + off + sizeof(upload);
+        if (!native_e4_planes_valid(storage, k, k + size_t(plane), size_t(upload.append_rows) * kv_heads)) return false;
+        live = upload.live_count; off += segment.upload_bytes;
+        rkva_range_attn attn;
+        if (bytes - off < sizeof(attn)) return false;
+        std::memcpy(&attn, data + off, sizeof(attn)); off += sizeof(attn);
+        const size_t pos_bytes = size_t(segment.n_queries) * sizeof(int32_t);
+        const size_t query_bytes = size_t(segment.n_queries) * heads * 256;
+        if (attn.wire != RKVA_WIRE_FP8_E4M3FN || attn.flags || attn.reserved[0] || attn.reserved[1] ||
+            bytes - off < pos_bytes + query_bytes ||
+            !native_e4_queries_valid(data + off, data + off + pos_bytes, segment.n_queries, heads, 256)) return false;
+        off += pos_bytes + query_bytes; queries += segment.n_queries;
+    }
+    return off == bytes && queries == nq;
 }
 
 inline bool turboquant_nc_output_valid(const uint8_t* out, const uint8_t* lse,

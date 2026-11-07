@@ -135,8 +135,11 @@ static void test_position_range_presence() {
     add(511, 600, 1); check(); // unrelated owner must not invalidate sequence 0
     add(9, 512, 0); check(); // invalid later position invalidates BOTH ranges
     cells.seq_rm(9, 0); check();
-    add(10, -2, 0); check(); // invalid lower bound, including negative positions
-    cells.seq_rm(10, 0); check();
+    // Negative positions are invalid in the range contract, but cannot be
+    // placed in llama_kv_cells: its empty sentinel is -1 and live positions
+    // must be nonnegative.
+    assert(llama_position_split::range_for_pos(-2, 256, 512).kind == llama_position_split::range_kind::INVALID);
+    assert(llama_position_split::range_for_pos(-1, 256, 512).kind == llama_position_split::range_kind::INVALID);
     cells.seq_rm(7, 0); check();
     cells.seq_rm(2, 0); check(); // only a foreign sequence remains
 
@@ -145,8 +148,7 @@ static void test_position_range_presence() {
         cells.reset();
         const uint32_t count = rng() % 32;
         for (uint32_t i = 0; i < count; ++i) {
-            llama_pos pos = llama_pos(rng() % 520) - 2;
-            if (pos == -1) { pos = -2; }
+            llama_pos pos = llama_pos(rng() % 518);
             add(i, pos, llama_seq_id(rng() % 3) - 1);
         }
         check();

@@ -81,15 +81,19 @@ void ROWLANE_ENTRY(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
         float score[RKVA_GQA];
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) score[g] = 0.0f;
 
-        if (row_valid) {
-            [loop] for (uint u_idx = 0; u_idx < RKVA_QUARTERS; ++u_idx) {
-                float4 k_val = ROWLANE_LOAD(keys, my_ba, u_idx);
-                [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
-                    float4 q_val = WaveReadLaneAt(q0[g], u_idx);
-                    score[g] += dot(q_val, k_val);
-                }
+        // Keep query broadcasts wave-uniform, including partial/causal tiles.
+        // Every source lane owns four Q dimensions even when it has no KV row.
+        [loop] for (uint u_idx = 0; u_idx < RKVA_QUARTERS; ++u_idx) {
+            float4 k_val = float4(0, 0, 0, 0);
+            [branch] if (row_valid) {
+                k_val = ROWLANE_LOAD(keys, my_ba, u_idx);
             }
-        } else {
+            [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
+                float4 q_val = WaveReadLaneAt(q0[g], u_idx);
+                score[g] += dot(q_val, k_val);
+            }
+        }
+        if (!row_valid) {
             [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
                 score[g] = -3.402823466e38f;
             }

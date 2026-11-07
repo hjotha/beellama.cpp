@@ -444,13 +444,29 @@ the process lifetime and restart serving to change it. Explicit `prefill`
 does not change the existing `0`/`1` defaults or select a policy from timings.
 
 `--remote-attn-wire-format fp8_e4m3fn` opts into the separate E4M3FN wire
-for Q and OUT. It requires `--remote-attn-format kvarn4`, a TCP
-`--remote-attn HOST:PORT` position split, and an RKVA v3 peer advertising E4;
-an unavailable or incompatible peer fails instead of falling back to Vulkan,
-F32 or E5. The default remains unchanged. E4 conversion currently runs on
-CPU on both host and Xbox, so `GGML_RKVA_CUDA_FP8` does not accelerate it.
-Q rounds directly to E4M3FN; OUT rounds through F16 first; LSE remains F32.
-Native snapshot support for E4/v3 is not advertised until qualified.
+for Q and OUT. It requires an explicit native `--remote-attn-format` (`kvarn4`,
+`q4_0`, `saw_int4`, `turboquant_nc`, `q4_1`, or `iq4_nl`), a TCP `--remote-attn HOST:PORT`
+position split, and an RKVA v3 peer advertising E4 for that exact storage
+layout. An unavailable or incompatible peer fails instead of falling back to
+Vulkan, F32, E5 or another KV quantizer. The default remains unchanged.
+
+KVarN4 keeps its existing E4 CPU/GPU codec routes: Q rounds directly from
+F32 and OUT rounds through F16. Native-row Q4_0/SAW/NC/Q4_1/IQ4_NL use the Xbox CPU
+codec for E4, with direct F32-to-E4 round-to-nearest-even for Q and OUT;
+the existing E5 GPU codec is not used to reinterpret E4. Finite overflow
+saturates at 448, NaNs/infinities are rejected, and LSE remains F32 with
+zero OUT / negative-infinite LSE required for an empty remote prefix.
+KV row sizes, quantizers, SAW BDR16 and NC WHT256 are unchanged.
+
+These native-row layouts support bulk, async local/remote overlap, and the
+opt-in `GGML_RKVA_TCP_PREFETCH=1` two-frame pipeline with E4 as well as E5.
+CPU loopback tests exercise negotiation, actual host producers/codecs, framing,
+queue controls and failure handling. They do not qualify Windows/UWP compilation,
+D3D12 attention correctness, Xbox runtime, model quality or performance.
+Native-row snapshots remain unsupported; KVarN snapshots retain their own
+negotiated capabilities and validation. Q4_1/IQ4_NL additionally require the
+host/server experimental gates described in [the 4-bit wire matrix](rkva-4bit-wire-matrix.md);
+E4 does not bypass these gates.
 
 `GGML_RKVA_CUDA_SINGLETON_FASTPATH=1` is a separate, default-off host
 bookkeeping experiment. Keep it fixed for the process lifetime. It only skips

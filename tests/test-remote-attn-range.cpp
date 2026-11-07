@@ -79,6 +79,8 @@ struct loopback {
     std::vector<int32_t> fp8_query_positions;
     std::vector<uint32_t> bulk_query_segments;
     std::vector<uint32_t> bulk_live_counts;
+    std::vector<rkva_kvarn_range_upload> low4_upload_headers;
+    std::vector<std::vector<uint8_t>> low4_upload_planes;
     std::vector<rkva_kvarn_range_upload> tqnc_upload_headers;
     std::vector<std::vector<uint8_t>> tqnc_upload_planes;
     uint8_t fp8_output_byte = 0;
@@ -92,6 +94,7 @@ struct loopback {
     std::vector<uint32_t> cohort_counts, cohort_queries, cohort_layers;
     std::vector<uint64_t> cohort_tickets, cohort_epochs;
     std::atomic<bool> pause_mode{false};
+    std::atomic<bool> pause_native_upload{false};
     int reply_tokens = 0;
     unsigned paused_replies = 0; // protected by pause_mutex
     std::mutex pause_mutex;
@@ -138,7 +141,7 @@ struct loopback {
         return true;
     }
     // profile_support bits: 1 = capability, 2 = operation. Both are required.
-    explicit loopback(bool old_version = false, bool range_ops = true, bool native_q4 = false, bool force_f16 = false, bool native_q8 = false, bool fused_range = false, uint32_t profile_support = 0, uint32_t format_kernels = 0, bool native_kvarn = false, uint32_t native_rewind_support = 0) {
+    explicit loopback(bool old_version = false, bool range_ops = true, bool native_q4 = false, bool force_f16 = false, bool native_q8 = false, bool fused_range = false, uint32_t profile_support = 0, uint32_t format_kernels = 0, bool native_kvarn = false, uint32_t native_rewind_support = 0, uint32_t low4_support = 0) {
         if (native_rewind_support & 8192) {
             std::array<uint8_t, 32> a{}, b{}; a.fill(0x11); b.fill(0x22);
             native_store_keys = {a, b};
@@ -151,7 +154,7 @@ struct loopback {
         assert(getsockname(listener, (sockaddr *) &address, &length) == 0);
         port = ntohs(address.sin_port);
         assert(listen(listener, 1) == 0);
-        worker = std::thread([this, old_version, range_ops, native_q4, force_f16, native_q8, fused_range, profile_support, format_kernels, native_kvarn, native_rewind_support] {
+        worker = std::thread([this, old_version, range_ops, native_q4, force_f16, native_q8, fused_range, profile_support, format_kernels, native_kvarn, native_rewind_support, low4_support] {
             const int fd = accept(listener, nullptr, nullptr);
             client = fd;
             if (fd < 0) return;
@@ -251,9 +254,20 @@ struct loopback {
                             ack.chosen_wire = RKVA_WIRE_F16;
                             ack.reserved[0] = (native_q4 ? RKVA_CAP_RANGE_Q4_0 : 0) | (native_q8 ? RKVA_CAP_RANGE_Q8_0 : 0) |
                                               (fused_range ? RKVA_CAP_RANGE_UPLOAD_ATTN : 0);
+                            if (low4_support == RKVA_RANGE_STORAGE_Q4_1) ack.reserved[0] |= RKVA_CAP_NATIVE_Q4_1_BULK;
+                            if (low4_support == RKVA_RANGE_STORAGE_IQ4_NL) ack.reserved[0] |= RKVA_CAP_NATIVE_IQ4_NL_BULK;
                             if (native_q4) ack.reserved[0] |= RKVA_CAP_NATIVE_Q4_BULK;
                             if (native_q8) ack.reserved[0] |= RKVA_CAP_NATIVE_Q8_BULK;
                             if (native_rewind_support & 1024) ack.reserved[0] |= RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK;
+                            if (native_rewind_support & 32768) ack.reserved[0] |= RKVA_CAP_NATIVE_SAW_INT4_BULK;
+                            if (req.version == RKVA_VERSION && (geometry.proto_flags & RKVA_PROTO_BULK_E4M3FN) &&
+                                (native_rewind_support & 16384)) {
+                                if (native_q4) ack.reserved[0] |= RKVA_CAP_NATIVE_Q4_BULK_E4M3FN;
+                                if (low4_support == RKVA_RANGE_STORAGE_Q4_1) ack.reserved[0] |= RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN;
+                                if (low4_support == RKVA_RANGE_STORAGE_IQ4_NL) ack.reserved[0] |= RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN;
+                                if (native_rewind_support & 32768) ack.reserved[0] |= RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN;
+                                if (native_rewind_support & 1024) ack.reserved[0] |= RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN;
+                            }
                             if (native_kvarn) ack.reserved[0] |= RKVA_CAP_RANGE_KVARN4;
                             if (req.version == RKVA_VERSION && (geometry.proto_flags & RKVA_PROTO_BULK_E4M3FN) &&
                                     (native_rewind_support & 2048)) ack.reserved[0] |= RKVA_CAP_KVARN_BULK_E4M3FN;
@@ -305,6 +319,10 @@ struct loopback {
                         case RKVA_KVARN_RANGE_CONFIG:
                             assert(payload.size() == sizeof(native_descriptor));
                             std::memcpy(&native_descriptor, payload.data(), sizeof(native_descriptor));
+                            if (rkva_kvarn_range::low4_storage(native_descriptor.storage)) {
+                                assert(low4_support == native_descriptor.storage);
+                                assert(rkva_kvarn_range::valid_low4_descriptor(native_descriptor, geometry.head_dim));
+                            }
                             if (native_descriptor.layout_version == 8) {
                                 assert(native_rewind_support & 1024);
                                 assert(native_descriptor.storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC &&
@@ -468,7 +486,7 @@ struct loopback {
                                 response_failure = profile_failure::server_error;
                                 break;
                             }
-                            if (native_descriptor.layout_version == 8) {
+                            if (native_descriptor.layout_version == 8 || rkva_kvarn_range::low4_storage(native_descriptor.storage)) {
                                 const uint32_t keep = uint32_t(trim.pos0) <= native_descriptor.origin ? 0 :
                                     std::min(uint32_t(trim.pos0) - native_descriptor.origin, native_descriptor.capacity);
                                 for (size_t il = 0; il < native_counts.size(); ++il) {
@@ -680,6 +698,15 @@ struct loopback {
                                     native_descriptor, geometry.n_head, geometry.n_head_kv, 0, 0, false,
                                     {}, native_generation, wire, segments));
                             }
+                            if (native_descriptor.layout_version == 4 || native_descriptor.layout_version == 6 || native_descriptor.layout_version == 8 ||
+                                rkva_kvarn_range::low4_storage(native_descriptor.storage)) {
+                                uint32_t wire;
+                                assert(rkva_kvarn_bulk::peek_wire(payload.data(), payload.size(), &wire));
+                                if (wire == RKVA_WIRE_FP8_E4M3FN)
+                                    assert(rkva_kvarn_bulk::validate_native_e4(payload.data(), payload.size(), req.n_tokens,
+                                        native_descriptor.storage, geometry.n_head, geometry.n_head_kv, native_descriptor.capacity,
+                                        native_counts[req.layer_id], true));
+                            }
                             native_generation += header.segment_count;
 
                             size_t seg_offset = sizeof(header);
@@ -701,6 +728,16 @@ struct loopback {
                                 rkva_kvarn_range_upload u{};
                                 assert(seg.upload_bytes >= sizeof(u));
                                 std::memcpy(&u, payload.data() + seg_offset, sizeof(u));
+                                if (rkva_kvarn_range::low4_storage(native_descriptor.storage)) {
+                                    const size_t plane = size_t(u.append_rows) * rkva_kvarn_range::low4_row_bytes(native_descriptor.storage, geometry.n_head_kv);
+                                    assert(seg.upload_bytes == sizeof(u) + 2 * plane);
+                                    assert(rkva_kvarn_range::valid_low4_upload(u, native_descriptor.capacity, native_counts[req.layer_id]));
+                                    const uint8_t * data = payload.data() + seg_offset + sizeof(u);
+                                    assert(rkva_kvarn_range::valid_low4_planes(native_descriptor.storage, data, data + plane,
+                                           size_t(u.append_rows) * geometry.n_head_kv));
+                                    low4_upload_headers.push_back(u);
+                                    low4_upload_planes.emplace_back(data, data + 2 * plane);
+                                }
                                 if (native_descriptor.layout_version == 8) {
                                     const size_t plane = size_t(u.append_rows) * geometry.n_head_kv * 132;
                                     assert(seg.upload_bytes == sizeof(u) + 2 * plane);
@@ -731,7 +768,9 @@ struct loopback {
                                 const bool wire_f16_seg = (attn.wire == RKVA_WIRE_F16);
                                 const bool wire_fp8_seg = (attn.wire == RKVA_WIRE_FP8 || attn.wire == RKVA_WIRE_FP8_E4M3FN);
                                 if (attn.wire == RKVA_WIRE_FP8_E4M3FN)
-                                    assert(req.version == RKVA_VERSION && (native_rewind_support & 2048) && native_descriptor.layout_version == 3);
+                                    assert(req.version == RKVA_VERSION &&
+                                        (native_descriptor.layout_version == 3 ? (native_rewind_support & 2048) :
+                                         ((native_rewind_support & 16384) && rkva_e4_layout_capability(native_descriptor.storage, native_descriptor.layout_version))));
                                 const bool wire_sz_seg  = (attn.wire == RKVA_WIRE_SPLITZIP);
                                 const size_t elem_bytes = wire_fp8_seg ? sizeof(uint8_t) :
                                                           (wire_f16_seg || wire_sz_seg) ? sizeof(uint16_t) :
@@ -801,7 +840,8 @@ struct loopback {
                         } break;
                         default: assert(false);
                     }
-                    if (pause_mode.load() && (req.op == RKVA_KVARN_RANGE_BULK_ATTN || req.op == RKVA_KVARN_RANGE_COHORT_ATTN || req.op == RKVA_RANGE_ATTN || req.op == RKVA_RANGE_UPLOAD_ATTN)) {
+                    if (pause_mode.load() && (req.op == RKVA_KVARN_RANGE_BULK_ATTN || req.op == RKVA_KVARN_RANGE_COHORT_ATTN || req.op == RKVA_RANGE_ATTN || req.op == RKVA_RANGE_UPLOAD_ATTN ||
+                                              (pause_native_upload.load() && req.op == RKVA_KVARN_RANGE_UPLOAD))) {
                         std::unique_lock<std::mutex> lk(pause_mutex);
                         ++paused_replies;
                         pause_cv.notify_all();
@@ -2171,67 +2211,102 @@ static void test_native_bulk_f16(bool direct = false) {
     }
 }
 
-static void test_native_bulk_e4m3fn() {
-    storage_env native("kvarn4");
-    storage_env upload("kvarn4", "GGML_RKVA_UPLOAD_FORMAT");
+static void test_native_bulk_e4m3fn(uint32_t layout = 3) {
+    const char * format = layout == 4 ? "q4_0" : layout == 6 ? "saw_int4" : layout == 8 ? "turboquant_nc" :
+        layout == 9 ? "q4_1" : layout == 10 ? "iq4_nl" : "kvarn4";
+    const bool native_projection = layout == 3 || layout == 6 || layout == 8;
+    const ggml_type source_type = native_projection ? GGML_TYPE_F32 : layout == 9 ? GGML_TYPE_Q4_1 : layout == 10 ? GGML_TYPE_IQ4_NL : GGML_TYPE_Q4_0;
+    const uint32_t low4_storage = layout == 9 ? RKVA_RANGE_STORAGE_Q4_1 : layout == 10 ? RKVA_RANGE_STORAGE_IQ4_NL : 0;
+    storage_env low4_gate(layout >= 9 ? "1" : nullptr, "GGML_RKVA_EXPERIMENTAL_LOW4");
+    const uint32_t extra = layout == 3 ? 0 : 16384 | (layout == 6 ? 32768 : layout == 8 ? 1024 : 0);
+    const uint32_t heads = layout == 3 ? 2 : 6, width = heads * 256, stride = width + heads;
+    storage_env native(format);
+    storage_env upload(format, "GGML_RKVA_UPLOAD_FORMAT");
     storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
     storage_env precision("128", "GGML_RKVA_NATIVE_TAIL_TOKENS");
     storage_env bulk("1", "GGML_RKVA_NATIVE_BULK");
     storage_env wire("fp8_e4m3fn", "GGML_RKVA_WIRE_FORMAT");
     storage_env acceleration("0", "GGML_RKVA_CUDA_FP8");
-    const ggml_remote_attn_geometry geometry{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
+    const ggml_remote_attn_geometry geometry{1, heads, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
 
     // Explicit E4 never silently falls back to an old or unqualified peer.
-    for (uint32_t support : {uint32_t(7 | 8 | 16 | 32), uint32_t(2048)}) {
-        loopback server(false, true, false, false, false, false, 0, 0, true, support);
+    for (uint32_t support : {uint32_t(7 | 8 | 16 | 32), uint32_t(2048),
+            uint32_t(layout == 3 ? 2048 : 7 | 8 | 16 | 32 | 2048 | (extra & ~16384u))}) {
+        loopback server(false, true, layout == 4, false, false, false, 0, 0, true, support, low4_storage);
         auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
         assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
         assert(!ggml_backend_remote_attn_connect(backend));
         ggml_backend_free(backend);
     }
     {
-        loopback server(true, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 2048);
+        loopback server(true, true, layout == 4, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 2048 | extra, low4_storage);
         auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
         assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
         assert(!ggml_backend_remote_attn_connect(backend));
         ggml_backend_free(backend);
     }
-    {
+    if (layout == 3) {
         storage_env wrong("q4_0", "GGML_RKVA_UPLOAD_FORMAT");
         loopback server(false, true, true, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 2048);
+        auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+        assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+        assert(!ggml_backend_remote_attn_connect(backend));
+        ggml_backend_free(backend);
+    }
+
+    // An explicit E4 selection must remain bound to HELLO in both directions.
+    // In particular an E5 HELLO followed by E4 must not enter Q4's legacy fallback.
+    for (bool initial_e4 : {false, true}) {
+        storage_env initial_wire(initial_e4 ? "fp8_e4m3fn" : "fp8", "GGML_RKVA_WIRE_FORMAT");
+        loopback server(false, true, layout == 4, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 2048 | extra, low4_storage);
         auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
         assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
         assert(ggml_backend_remote_attn_connect(backend));
         assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
         ggml_backend_remote_attn_set_active_session(backend, 0);
-        assert(!ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_F32));
+        // A session keeps the wire negotiated at HELLO even if process environment changes.
+        storage_env changed_wire(initial_e4 ? "fp8" : "fp8_e4m3fn", "GGML_RKVA_WIRE_FORMAT");
+        assert(!ggml_backend_remote_attn_set_wire_format(backend, initial_e4 ? "fp8" : "fp8_e4m3fn"));
+        assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, source_type));
+        const std::string captured_stats = ggml_backend_remote_attn_stats_json(backend);
+        assert(captured_stats.find(initial_e4 ? "\"wire_format\":\"fp8_e4m3fn\"" :
+                                               "\"wire_format\":\"fp8_e5m2\"") != std::string::npos);
+        {
+            std::lock_guard<std::mutex> lock(server.mutex);
+            assert(server.native_descriptor.layout_version == layout);
+        }
         ggml_backend_free(backend);
     }
 
     for (const char * overlap : {"0", "1"}) {
         storage_env async(overlap, "GGML_RKVA_ASYNC_LOCAL_REMOTE");
         const uint32_t nq = 5;
-        loopback server(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 2048);
+        loopback server(false, true, layout == 4, false, false, false, 0, 0, true, 7 | 8 | 16 | 32 | 2048 | extra, low4_storage);
         server.fp8_output_byte = 0x38; // E4 = 1; E5 would decode this as 0.5.
         auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
         assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
         assert(ggml_backend_remote_attn_connect(backend));
         assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
         ggml_backend_remote_attn_set_active_session(backend, 0);
-        assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_F32));
+        assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, source_type));
         assert(!ggml_backend_remote_attn_native_kvarn_snapshot_supported(backend));
+        assert(server.native_descriptor.layout_version == layout);
+        assert(ggml_backend_remote_attn_native_kvarn_records_enabled(backend) == (layout == 3));
         assert(std::string(ggml_backend_remote_attn_stats_json(backend)).find("\"wire_format\":\"fp8_e4m3fn\"") != std::string::npos);
         ggml_remote_attn_set_active(backend);
         auto * ctx = ggml_init({1u << 20, nullptr, true});
-        auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 2, nq);
-        auto * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 512);
-        auto * v = ggml_dup_tensor(ctx, k);
+        auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, heads, nq);
+        auto * k = native_projection ? nullptr : ggml_new_tensor_2d(ctx, source_type, 256, 512);
+        auto * v = k ? ggml_dup_tensor(ctx, k) : nullptr;
         auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
         auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nq);
         auto * original_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, nq);
         auto * original_v = ggml_dup_tensor(ctx, original_k);
-        auto * node = ggml_remote_attn_range_native(ctx, q, original_k, original_v, ids, pos, 0, 1024, nq, geometry.kq_scale);
+        auto * node = native_projection ?
+                ggml_remote_attn_range_native(ctx, q, original_k, original_v, ids, pos, 0, 1024, nq, geometry.kq_scale) :
+                ggml_remote_attn_range(ctx, q, k, v, ids, pos, 0, 1024, nq, geometry.kq_scale);
+        if (!native_projection) ggml_remote_attn_range_set_native_sources(node, original_k, original_v);
         ggml_tensor * result = node;
         if (!std::strcmp(overlap, "1")) {
             ggml_remote_attn_range_set_async(node);
@@ -2241,7 +2316,7 @@ static void test_native_bulk_e4m3fn() {
         auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
         assert(buffer);
         ggml_backend_buffer_clear(buffer, 0);
-        std::vector<float> values(size_t(nq) * 512, 0.0f);
+        std::vector<float> values(size_t(nq) * width, 0.0f);
         values[0] = 600.0f; values[1] = -600.0f; values[2] = 448.0f; values[3] = -448.0f;
         values[4] = 1.0625f; values[5] = std::nextafter(values[4], 2.0f);
         values[6] = std::ldexp(1.0f, -10); values[7] = std::nextafter(values[6], 1.0f);
@@ -2251,14 +2326,20 @@ static void test_native_bulk_e4m3fn() {
         ggml_backend_tensor_set(ids, cells.data(), 0, cells.size() * sizeof(int32_t));
         ggml_backend_tensor_set(pos, positions.data(), 0, positions.size() * sizeof(int32_t));
         node->op_params[GGML_REMOTE_ATTN_PARAM_N_LIVE] = int32_t(nq);
+        if (layout != 3) {
+            std::vector<float> keys(size_t(nq) * 256), vals(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) { keys[i] = std::sin(float(i) * 0.031f); vals[i] = std::cos(float(i) * 0.047f); }
+            ggml_backend_tensor_set(original_k, keys.data(), 0, keys.size() * sizeof(float));
+            ggml_backend_tensor_set(original_v, vals.data(), 0, vals.size() * sizeof(float));
+        }
         assert(!ggml_remote_attn_exec_cuda(node, nullptr));
         assert(ggml_remote_attn_exec(node));
         if (result != node) assert(ggml_remote_attn_exec(result));
         const auto * out = static_cast<const float *>(result->data);
         for (uint32_t t = 0; t < nq; ++t) {
-            for (size_t d = 0; d < 512; ++d) assert(out[t * 514 + d] == 1.0f);
-            for (uint32_t h = 0; h < 2; ++h)
-                assert(std::abs(double(out[t * 514 + 512 + h]) - std::log(double(t + 1))) < 1e-6);
+            for (size_t d = 0; d < width; ++d) assert(out[t * stride + d] == 1.0f);
+            for (uint32_t h = 0; h < heads; ++h)
+                assert(std::abs(double(out[t * stride + width + h]) - std::log(double(t + 1))) < 1e-6);
         }
         {
             std::lock_guard<std::mutex> lock(server.mutex);
@@ -2266,7 +2347,7 @@ static void test_native_bulk_e4m3fn() {
             assert(server.geometry.proto_flags & RKVA_PROTO_BULK_E4M3FN);
             server.fp8_output_byte = 0x7f; // E4 NaN in the next reply
         }
-        std::vector<float> sentinel(size_t(nq) * 514, 42.0f);
+        std::vector<float> sentinel(size_t(nq) * stride, 42.0f);
         ggml_backend_tensor_set(result, sentinel.data(), 0, sentinel.size() * sizeof(float));
         for (uint32_t i = 0; i < 2 * nq; ++i) cells[i] = 1024 + i;
         for (uint32_t i = 0; i < nq; ++i) positions[i] = 1024 + nq + i;
@@ -2286,6 +2367,47 @@ static void test_native_bulk_e4m3fn() {
         ggml_free(ctx);
         ggml_backend_free(cpu);
         ggml_backend_free(backend);
+    }
+}
+
+static void test_native_rejects_pre_origin_query() {
+    storage_env native("kvarn4"), experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL"),
+        bulk("1", "GGML_RKVA_NATIVE_BULK"), wire("fp8", "GGML_RKVA_WIRE_FORMAT"),
+        acceleration("0", "GGML_RKVA_CUDA_FP8"), upload("kvarn4", "GGML_RKVA_UPLOAD_FORMAT");
+    for (bool async : {false, true}) {
+        storage_env overlap(async ? "1" : "0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+        loopback server(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16 | 32);
+        auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+        ggml_remote_attn_geometry geometry{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
+        assert(ggml_backend_remote_attn_set_geometry(backend, &geometry));
+        assert(ggml_backend_remote_attn_connect(backend));
+        assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+        ggml_backend_remote_attn_set_active_session(backend, 0);
+        assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_F32));
+        ggml_remote_attn_set_active(backend);
+        auto * ctx = ggml_init({1u << 20, nullptr, true});
+        auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 2, 2);
+        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+        auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+        auto * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 2);
+        auto * v = ggml_dup_tensor(ctx, k);
+        auto * node = ggml_remote_attn_range_native(ctx, q, k, v, ids, pos, 0, 1024, 2, geometry.kq_scale);
+        if (async) ggml_remote_attn_range_set_async(node);
+        auto * cpu = ggml_backend_cpu_init(); auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+        assert(buffer); ggml_backend_buffer_clear(buffer, 0);
+        std::vector<int32_t> cells(512, -1); cells[0] = 1024;
+        const int32_t positions[] = {1023, 1024};
+        ggml_backend_tensor_set(ids, cells.data(), 0, cells.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(pos, positions, 0, sizeof(positions));
+        node->op_params[GGML_REMOTE_ATTN_PARAM_N_LIVE] = 1;
+        std::vector<float> sentinel(2 * 514, 42.0f);
+        ggml_backend_tensor_set(node, sentinel.data(), 0, sentinel.size() * sizeof(float));
+        assert(!ggml_remote_attn_exec(node));
+        for (size_t i = 0; i < sentinel.size(); ++i) assert(static_cast<float *>(node->data)[i] == 42.0f);
+        { std::lock_guard<std::mutex> lock(server.mutex);
+          assert(std::count(server.packet_ops.begin(), server.packet_ops.end(), RKVA_KVARN_RANGE_BULK_ATTN) == 0); }
+        ggml_remote_attn_set_active(nullptr); ggml_backend_buffer_free(buffer); ggml_free(ctx);
+        ggml_backend_free(cpu); ggml_backend_free(backend);
     }
 }
 
@@ -3233,8 +3355,6 @@ static void test_cuda_fp8_serving_graph() {
 
         auto * ctx = ggml_init({4u << 20, nullptr, true});
         auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, nq);
-        auto * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, kv_width, capacity);
-        auto * v = ggml_dup_tensor(ctx, k);
         auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, capacity);
         auto * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nq);
         auto * original_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head_kv, nq);
@@ -3265,7 +3385,7 @@ static void test_cuda_fp8_serving_graph() {
         for (auto * tensor : {original_k, original_v, node, complete, local_input, local_branch, consumer})
             ggml_backend_sched_set_tensor_backend(sched, tensor, gpu);
         ggml_backend_sched_set_tensor_backend(sched, q, q_on_gpu ? gpu : cpu);
-        for (auto * tensor : {k, v, ids, positions})
+        for (auto * tensor : {ids, positions})
             ggml_backend_sched_set_tensor_backend(sched, tensor, cpu);
         assert(ggml_backend_sched_alloc_graph(sched, graph));
         assert(ggml_backend_sched_get_n_splits(sched) >= (async ? 3 : 2));
@@ -3282,7 +3402,9 @@ static void test_cuda_fp8_serving_graph() {
         assert(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
         ggml_backend_sched_synchronize(sched);
         assert(node->src[0] == q); // scheduler must not introduce an F32 D2H copy
-        assert(node->src[1] == k && node->src[3] == ids); // metadata stays on CPU
+        assert(node->src[1] == original_k && node->src[2] == original_v);
+        assert(node->src[5] == original_k && node->src[6] == original_v);
+        assert(node->src[3] == ids && node->src[4] == positions); // metadata stays on CPU
         std::vector<float> output(row_width * nq), raw_output(output.size());
         ggml_backend_tensor_get(consumer, output.data(), 0, output.size() * sizeof(float));
         ggml_backend_tensor_get(complete, raw_output.data(), 0, raw_output.size() * sizeof(float));
@@ -4568,8 +4690,17 @@ static void test_cuda_wavefront_marker_only_two_slots() {
 }
 
 
-static void test_prefetch_public_controls(bool e4) {
-    storage_env native("kvarn4"), experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL"),
+static void test_prefetch_public_controls(bool e4, uint32_t layout = 3) {
+    const char * format = layout == 4 ? "q4_0" : layout == 6 ? "saw_int4" : layout == 8 ? "turboquant_nc" :
+        layout == 9 ? "q4_1" : layout == 10 ? "iq4_nl" : "kvarn4";
+    const bool native_projection = layout == 3 || layout == 6 || layout == 8;
+    const ggml_type source_type = native_projection ? GGML_TYPE_F32 : layout == 9 ? GGML_TYPE_Q4_1 : layout == 10 ? GGML_TYPE_IQ4_NL : GGML_TYPE_Q4_0;
+    const uint32_t low4_storage = layout == 9 ? RKVA_RANGE_STORAGE_Q4_1 : layout == 10 ? RKVA_RANGE_STORAGE_IQ4_NL : 0;
+    storage_env low4_gate(layout >= 9 ? "1" : nullptr, "GGML_RKVA_EXPERIMENTAL_LOW4");
+    const uint32_t extra = layout == 3 ? 0 : 16384 | (layout == 6 ? 32768 : layout == 8 ? 1024 : 0);
+    const uint32_t heads = layout == 3 ? 2 : 6, width = heads * 256, stride = width + heads;
+    storage_env upload(nullptr, "GGML_RKVA_UPLOAD_FORMAT"), legacy(nullptr, "GGML_RKVA_FORMAT");
+    storage_env native(format), experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL"),
         fusion("0", "GGML_RKVA_RANGE_FUSE"), precision("128", "GGML_RKVA_NATIVE_TAIL_TOKENS"),
         bulk("1", "GGML_RKVA_NATIVE_BULK"), wire(e4 ? "fp8_e4m3fn" : "fp8", "GGML_RKVA_WIRE_FORMAT"),
         overlap("1", "GGML_RKVA_ASYNC_LOCAL_REMOTE"), profiling("1", "GGML_RKVA_PROFILE");
@@ -4579,11 +4710,11 @@ static void test_prefetch_public_controls(bool e4) {
                            "truncated body",       "server error",  "truncated header",
                            "EOF before header",   "E4 NaN positive", "E4 max positive", "E4 max negative", "E4 NaN negative"};
     for (int mode = 0; mode < (e4 ? 17 : 13); ++mode) {
-        loopback server(false, true, false, false, false, false, 3, 0, true, 7 | 8 | 16 | 32 | (e4 ? 2048 : 0));
+        loopback server(false, true, layout == 4, false, false, false, 3, 0, true, 7 | 8 | 16 | 32 | (e4 ? 2048 : 0) | extra, low4_storage);
         if (e4) server.fp8_output_byte = mode == 13 ? 0x7f : mode == 14 ? 0x7e :
                                          mode == 15 ? 0xfe : mode == 16 ? 0xff : 0x38;
         auto *backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
-        ggml_remote_attn_geometry geo{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
+        ggml_remote_attn_geometry geo{1, heads, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.0f / 16};
         assert(ggml_backend_remote_attn_set_geometry(backend, &geo));
         assert(ggml_backend_remote_attn_connect(backend));
         if (mode == 3 || mode == 14 || mode == 15) {
@@ -4592,21 +4723,24 @@ static void test_prefetch_public_controls(bool e4) {
         }
         assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
         ggml_backend_remote_attn_set_active_session(backend, 0);
-        assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, GGML_TYPE_F32));
+        assert(ggml_backend_remote_attn_configure_range(backend, 1024, 512, source_type));
         ggml_remote_attn_set_active(backend);
         auto *tensors = ggml_init({4u << 20, nullptr, true});
         struct job {
             ggml_tensor *node, *wait, *ids, *pos;
         };
         auto make = [&] {
-            auto *q = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 256, 2, 128);
-            auto *k = ggml_new_tensor_2d(tensors, GGML_TYPE_Q4_0, 256, 512);
-            auto *v = ggml_dup_tensor(tensors, k);
+            auto *q = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 256, heads, 128);
+            auto *k = native_projection ? nullptr : ggml_new_tensor_2d(tensors, source_type, 256, 512);
+            auto *v = k ? ggml_dup_tensor(tensors, k) : nullptr;
             auto *ids = ggml_new_tensor_1d(tensors, GGML_TYPE_I32, 512);
             auto *pos = ggml_new_tensor_1d(tensors, GGML_TYPE_I32, 128);
             auto *ok = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 256, 1, 128);
             auto *ov = ggml_dup_tensor(tensors, ok);
-            auto *node = ggml_remote_attn_range_native(tensors, q, ok, ov, ids, pos, 0, 1024, 128, geo.kq_scale);
+            auto *node = native_projection ?
+                ggml_remote_attn_range_native(tensors, q, ok, ov, ids, pos, 0, 1024, 128, geo.kq_scale) :
+                ggml_remote_attn_range(tensors, q, k, v, ids, pos, 0, 1024, 128, geo.kq_scale);
+            if (!native_projection) ggml_remote_attn_range_set_native_sources(node, ok, ov);
             ggml_remote_attn_range_set_async(node);
             return job{node, ggml_remote_attn_range_wait(tensors, node), ids, pos};
         };
@@ -4634,7 +4768,7 @@ static void test_prefetch_public_controls(bool e4) {
                 loopback::profile_failure::none};
             if (mode < 13) server.fail_bulk_reply = faults[mode - 6];
             server.drop_attention = mode == 12;
-            std::vector<float> sentinel(128 * 514, 42.0f);
+            std::vector<float> sentinel(128 * stride, 42.0f);
             ggml_backend_tensor_set(a.wait, sentinel.data(), 0, sentinel.size() * sizeof(float));
             ggml_backend_tensor_set(b.wait, sentinel.data(), 0, sentinel.size() * sizeof(float));
         }
@@ -4651,7 +4785,7 @@ static void test_prefetch_public_controls(bool e4) {
             assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));
             for (auto *output : {a.wait, b.wait}) {
                 const auto *values = static_cast<const float *>(output->data);
-                for (size_t i = 0; i < 128 * 514; ++i)
+                for (size_t i = 0; i < 128 * stride; ++i)
                     assert(values[i] == 42.0f);
             }
         } else if (mode == 3 || mode == 14 || mode == 15) {
@@ -4683,8 +4817,8 @@ static void test_prefetch_public_controls(bool e4) {
                 for (auto *output : {a.wait, b.wait}) {
                     const auto *values = static_cast<const float *>(output->data);
                     for (size_t t = 0; t < 128; ++t)
-                        for (size_t d = 0; d < 512; ++d)
-                            assert(values[t * 514 + d] == (mode == 14 ? 448.0f : mode == 15 ? -448.0f : 1.0f));
+                        for (size_t d = 0; d < width; ++d)
+                            assert(values[t * stride + d] == (mode == 14 ? 448.0f : mode == 15 ? -448.0f : 1.0f));
                 }
             }
             {
@@ -4746,7 +4880,7 @@ static void test_prefetch_public_controls(bool e4) {
         ggml_backend_buffer_free(buf);
         ggml_free(tensors);
         ggml_backend_free(cpu);
-        printf("PASS public control case %d: %s (two N128 frames)\n", mode, names[mode]);
+        printf("PASS layout %u wire %s public control case %d: %s (two N128 frames)\n", layout, e4 ? "E4" : "E5", mode, names[mode]);
     }
 }
 
@@ -4870,7 +5004,279 @@ static void test_refused_legacy_never_dispatches(bool legacy_owner) {
     ggml_backend_free(owner); ggml_backend_free(other);
 }
 
+#include "test-rkva-low4-loopback.inc"
+
+#ifdef GGML_RKVA_LIFETIME_TEST_HOOKS
+extern "C" void ggml_rkva_test_lifetime_hook(void (*hook)(int));
+
+struct lifetime_test_gate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    int event = 0;
+    bool admitted = false;
+    bool retiring = false;
+    bool release = false;
+};
+
+static lifetime_test_gate * active_lifetime_test_gate = nullptr;
+
+static void lifetime_test_hook(int event) {
+    auto & gate = *active_lifetime_test_gate;
+    std::unique_lock<std::mutex> lock(gate.mutex);
+    if (event == gate.event) {
+        gate.admitted = true;
+        gate.cv.notify_all();
+        gate.cv.wait(lock, [&] { return gate.release; });
+    } else if (event == 4) {
+        gate.retiring = true;
+        gate.cv.notify_all();
+    }
+}
+
+static void test_backend_lifetime_admission() {
+    enum class operation { sync, async, wait, cuda_query, stage };
+    for (const auto op : {operation::sync, operation::async, operation::wait,
+                          operation::cuda_query, operation::stage}) {
+        auto * owner = ggml_backend_remote_attn_init("127.0.0.1", 1);
+        auto * replacement = ggml_backend_remote_attn_init("127.0.0.1", 2);
+        assert(owner && replacement && owner != replacement);
+        const bool stage = op == operation::stage;
+        assert(stage ? ggml_remote_attn_reserve_stage(owner) : ggml_remote_attn_try_activate(owner));
+
+        lifetime_test_gate gate;
+        gate.event = stage ? 3 : op == operation::cuda_query ? 2 : 1;
+        active_lifetime_test_gate = &gate;
+        ggml_rkva_test_lifetime_hook(lifetime_test_hook);
+        ggml_tensor node{};
+        node.op = GGML_OP_REMOTE_ATTN;
+        if (op == operation::async) node.op_params[GGML_REMOTE_ATTN_PARAM_ASYNC] = 1;
+        if (op == operation::wait) node.op_params[GGML_REMOTE_ATTN_PARAM_WAIT] = 1;
+        std::array<float, 256> keys{}, values{};
+        auto dispatched = std::async(std::launch::async, [&] {
+            if (stage) return ggml_backend_remote_attn_native_kvarn_stage_append(
+                    owner, 0, 256, 1, keys.data(), values.data());
+            if (op == operation::cuda_query) return ggml_backend_remote_attn_cuda_enabled();
+            return ggml_remote_attn_exec(&node);
+        });
+        {
+            std::unique_lock<std::mutex> lock(gate.mutex);
+            assert(gate.cv.wait_for(lock, std::chrono::seconds(5), [&] { return gate.admitted; }));
+        }
+        auto freed = std::async(std::launch::async, [&] { ggml_backend_free(owner); });
+        {
+            std::unique_lock<std::mutex> lock(gate.mutex);
+            assert(gate.cv.wait_for(lock, std::chrono::seconds(5), [&] { return gate.retiring; }));
+        }
+        assert(freed.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+        assert(!ggml_remote_attn_try_activate(replacement));
+        assert(!ggml_remote_attn_reserve_stage(replacement));
+        {
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            gate.release = true;
+            gate.cv.notify_all();
+        }
+        assert(dispatched.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        assert(!dispatched.get()); // disconnected fixture: no network operations are expected
+        assert(freed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        freed.get();
+        ggml_rkva_test_lifetime_hook(nullptr);
+        active_lifetime_test_gate = nullptr;
+        assert(ggml_remote_attn_try_activate(replacement));
+        ggml_remote_attn_deactivate(replacement);
+        ggml_backend_free(replacement);
+    }
+}
+
+static void test_backend_lifetime_network_inflight() {
+    storage_env upload("kvarn4", "GGML_RKVA_UPLOAD_FORMAT");
+    storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+    storage_env bulk("1", "GGML_RKVA_NATIVE_BULK");
+    storage_env async("1", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+    storage_env wire("f16", "GGML_RKVA_WIRE_FORMAT");
+    storage_env producer("cpu", "GGML_RKVA_NATIVE_PRODUCER");
+    storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
+    ggml_backend_load_all();
+    for (bool stage : {false, true}) {
+        loopback peer(false, true, false, false, false, false, 0, 0, true, 7 | 8 | 16);
+        auto * owner = ggml_backend_remote_attn_init("127.0.0.1", peer.port);
+        auto * replacement = ggml_backend_remote_attn_init("127.0.0.1", 2);
+        assert(owner && replacement);
+        assert(stage ? ggml_remote_attn_reserve_stage(owner) : ggml_remote_attn_try_activate(owner));
+        const ggml_remote_attn_geometry geometry{1, 2, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.f / 16};
+        assert(ggml_backend_remote_attn_set_geometry(owner, &geometry));
+        assert(ggml_backend_remote_attn_connect(owner));
+        assert(ggml_backend_remote_attn_create_range_session(owner, 0, 0, 512));
+        ggml_backend_remote_attn_set_active_session(owner, 0);
+        assert(ggml_backend_remote_attn_configure_range(owner, 1024, 512, GGML_TYPE_F32));
+
+        ggml_context * tensors = nullptr;
+        ggml_backend_t cpu = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_tensor * wait_node = nullptr;
+        std::array<float, 256> keys{}, values{};
+        if (!stage) {
+            tensors = ggml_init({1u << 20, nullptr, true});
+            auto * q = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 256, 2, 1);
+            auto * k = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 256, 1, 1);
+            auto * v = ggml_dup_tensor(tensors, k);
+            auto * ids = ggml_new_tensor_1d(tensors, GGML_TYPE_I32, 512);
+            auto * pos = ggml_new_tensor_1d(tensors, GGML_TYPE_I32, 1);
+            auto * node = ggml_remote_attn_range_native(tensors, q, k, v, ids, pos, 0, 1024, 1, geometry.kq_scale);
+            ggml_remote_attn_range_set_async(node);
+            wait_node = ggml_remote_attn_range_wait(tensors, node);
+            cpu = ggml_backend_cpu_init();
+            buffer = ggml_backend_alloc_ctx_tensors(tensors, cpu);
+            assert(buffer);
+            ggml_backend_buffer_clear(buffer, 0);
+            std::vector<int32_t> cells(512, -1);
+            cells[0] = 1024;
+            const int32_t position = 1024;
+            ggml_backend_tensor_set(ids, cells.data(), 0, cells.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(pos, &position, 0, sizeof(position));
+            peer.set_pause(true);
+            assert(ggml_remote_attn_exec(node));
+            assert(peer.wait_until_reply_paused());
+        } else {
+            peer.pause_native_upload.store(true);
+            peer.set_pause(true);
+        }
+
+        lifetime_test_gate gate;
+        gate.event = stage ? 3 : 1;
+        active_lifetime_test_gate = &gate;
+        ggml_rkva_test_lifetime_hook(lifetime_test_hook);
+        auto dispatched = std::async(std::launch::async, [&] {
+            return stage ? ggml_backend_remote_attn_native_kvarn_stage_append(
+                                   owner, 0, 1024, 1, keys.data(), values.data()) :
+                           ggml_remote_attn_exec(wait_node);
+        });
+        {
+            std::unique_lock<std::mutex> lock(gate.mutex);
+            assert(gate.cv.wait_for(lock, std::chrono::seconds(5), [&] { return gate.admitted; }));
+        }
+        auto freed = std::async(std::launch::async, [&] { ggml_backend_free(owner); });
+        {
+            std::unique_lock<std::mutex> lock(gate.mutex);
+            assert(gate.cv.wait_for(lock, std::chrono::seconds(5), [&] { return gate.retiring; }));
+        }
+        assert(freed.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+        assert(!ggml_remote_attn_try_activate(replacement));
+        {
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            gate.release = true;
+            gate.cv.notify_all();
+        }
+        if (stage) assert(peer.wait_until_reply_paused());
+        assert(dispatched.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+        assert(freed.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+        peer.unpause();
+        assert(dispatched.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        assert(dispatched.get());
+        assert(freed.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        freed.get();
+        ggml_rkva_test_lifetime_hook(nullptr);
+        active_lifetime_test_gate = nullptr;
+        assert(ggml_remote_attn_try_activate(replacement));
+        ggml_remote_attn_deactivate(replacement);
+        ggml_backend_free(replacement);
+        if (buffer) ggml_backend_buffer_free(buffer);
+        if (tensors) ggml_free(tensors);
+        if (cpu) ggml_backend_free(cpu);
+    }
+}
+#endif
+
+static void test_free_unregisters_remote_owner() {
+    auto * legacy = ggml_backend_remote_attn_init("127.0.0.1", 1);
+    auto * replacement = ggml_backend_remote_attn_init("127.0.0.1", 2);
+    assert(legacy && replacement && legacy != replacement);
+    ggml_remote_attn_set_active(legacy);
+    ggml_backend_free(legacy);
+    assert(ggml_remote_attn_try_activate(replacement));
+    ggml_remote_attn_set_active(nullptr); // stale legacy cleanup cannot release a new owner
+    assert(ggml_remote_attn_try_activate(replacement));
+    ggml_remote_attn_deactivate(replacement);
+    ggml_backend_free(replacement);
+
+    auto * stage = ggml_backend_remote_attn_init("127.0.0.1", 3);
+    auto * next = ggml_backend_remote_attn_init("127.0.0.1", 4);
+    assert(stage && next && stage != next);
+    assert(ggml_remote_attn_reserve_stage(stage));
+    ggml_backend_free(stage);
+    assert(ggml_remote_attn_reserve_stage(next));
+    ggml_remote_attn_release_stage(next);
+    ggml_backend_free(next);
+}
+
+static void test_low4_explicit_wire_and_producer_guards() {
+    storage_env upload(nullptr, "GGML_RKVA_UPLOAD_FORMAT"), legacy(nullptr, "GGML_RKVA_FORMAT");
+    storage_env companion(nullptr, "GGML_RKVA_NATIVE_COMPANION");
+    storage_env native_gate("1", "GGML_RKVA_EXPERIMENTAL_LOW4");
+    storage_env initial_wire("fp8", "GGML_RKVA_WIRE_FORMAT");
+    storage_env bulk("1", "GGML_RKVA_NATIVE_BULK");
+    storage_env overlap("0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
+    storage_env kernel("reference", "GGML_RKVA_Q4_KERNEL");
+    for (const auto type : {GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL}) {
+        const uint32_t storage = type == GGML_TYPE_Q4_1 ? RKVA_RANGE_STORAGE_Q4_1 : RKVA_RANGE_STORAGE_IQ4_NL;
+        const uint32_t layout = type == GGML_TYPE_Q4_1 ? 9u : 10u;
+        const ggml_remote_attn_geometry geo{1, 6, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.f/16};
+        {
+            storage_env producer("cpu", "GGML_RKVA_NATIVE_PRODUCER");
+            loopback server(false, true, false, false, false, false, 0, 0, true, 8 | 32 | 16384, storage);
+            auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+            assert(backend && ggml_backend_remote_attn_set_upload_format(backend, ggml_type_name(type)));
+            assert(ggml_backend_remote_attn_set_wire_format(backend, "fp8_e4m3fn"));
+            assert(ggml_backend_remote_attn_set_geometry(backend, &geo));
+            assert(ggml_backend_remote_attn_connect(backend));
+            assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+            ggml_backend_remote_attn_set_active_session(backend, 0);
+            storage_env changed_wire("f16", "GGML_RKVA_WIRE_FORMAT");
+            assert(!ggml_backend_remote_attn_set_wire_format(backend, "f16"));
+            assert(ggml_backend_remote_attn_configure_range(backend, 256, 512, type));
+            const std::string stats = ggml_backend_remote_attn_stats_json(backend);
+            assert(stats.find("\"wire_format\":\"fp8_e4m3fn\"") != std::string::npos);
+            {
+                std::lock_guard<std::mutex> lock(server.mutex);
+                assert(server.native_descriptor.layout_version == layout);
+            }
+            ggml_backend_free(backend);
+        }
+        for (const char * wire : {"fp8", "fp8_e4m3fn"}) {
+            storage_env producer("cuda", "GGML_RKVA_NATIVE_PRODUCER");
+            loopback server(false, true, false, false, false, false, 0, 0, true, 8 | 32 | 16384, storage);
+            auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
+            assert(backend && ggml_backend_remote_attn_set_upload_format(backend, ggml_type_name(type)));
+            assert(ggml_backend_remote_attn_set_wire_format(backend, wire));
+            assert(ggml_backend_remote_attn_set_geometry(backend, &geo));
+            assert(ggml_backend_remote_attn_connect(backend));
+            assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
+            ggml_backend_remote_attn_set_active_session(backend, 0);
+            assert(!ggml_backend_remote_attn_configure_range(backend, 256, 512, type));
+            {
+                std::lock_guard<std::mutex> lock(server.mutex);
+                assert(std::find(server.packet_ops.begin(), server.packet_ops.end(), RKVA_KVARN_RANGE_CONFIG) == server.packet_ops.end());
+                assert(std::find(server.packet_ops.begin(), server.packet_ops.end(), RKVA_RANGE_CONFIG) == server.packet_ops.end());
+                assert(server.native_descriptor.layout_version == 0);
+            }
+            ggml_backend_free(backend);
+        }
+    }
+}
+
 int main() {
+#ifdef GGML_RKVA_LIFETIME_TEST_HOOKS
+    if (std::getenv("GGML_RKVA_LIFETIME_TEST_ONLY")) {
+        test_backend_lifetime_admission();
+        test_backend_lifetime_network_inflight();
+        std::puts("PASS: sync, async, WAIT, CUDA query and stage leases block concurrent free, including in-flight RPCs");
+        return 0;
+    }
+#endif
+    if (std::getenv("GGML_RKVA_OWNER_FREE_TEST_ONLY")) {
+        test_free_unregisters_remote_owner();
+        std::puts("PASS: freeing a legacy owner or reserved stage releases only its registration");
+        return 0;
+    }
     if (std::getenv("GGML_RKVA_WIRE_TEST_ONLY")) {
         test_context_wire_isolation();
         return 0;
@@ -4894,6 +5300,16 @@ int main() {
         std::puts("PASS: native range with matching companions and mismatch rejection");
         return 0;
     }
+    if (std::getenv("GGML_RKVA_LOW4_TEST_ONLY")) {
+        test_low4_negotiation();
+        test_low4_explicit_wire_and_producer_guards();
+        for (auto type : {GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL})
+            for (bool async : {false, true})
+                for (uint32_t nq : {1u, 9u, 128u, 256u})
+                    for (bool e4 : {false, true}) test_low4_loopback(type, async, nq, e4);
+        std::puts("PASS: native Q4_1/IQ4_NL real host TCP E5M2/E4M3FN bulk/async/prefetch/trim, mock server (no GPU)");
+        return 0;
+    }
     if (std::getenv("GGML_RKVA_STAGE_TEST_ONLY")) {
         test_native_companion_policy();
         test_native_stage_append(false);
@@ -4902,6 +5318,15 @@ int main() {
         test_server_ahead_lineage(false, true);
         if (std::getenv("GGML_RKVA_GPU_TEST")) test_server_ahead_lineage(true, true);
         std::puts("PASS: native stage append and rewind");
+        return 0;
+    }
+    if (std::getenv("GGML_RKVA_NATIVE_ROWS_E4_TEST_ONLY")) {
+        for (uint32_t layout : {4u, 6u, 8u, 9u, 10u}) test_native_bulk_e4m3fn(layout);
+        storage_env prefetch("1", "GGML_RKVA_TCP_PREFETCH"), producer("cpu", "GGML_RKVA_NATIVE_PRODUCER"),
+            codec("0", "GGML_RKVA_CUDA_FP8");
+        for (uint32_t layout : {4u, 6u, 8u, 9u, 10u})
+            for (bool e4 : {false, true}) test_prefetch_public_controls(e4, layout);
+        std::puts("PASS: native Q4_0/SAW/NC/Q4_1/IQ4_NL E4 sync/async and E5/E4 two-frame TCP prefetch matrix");
         return 0;
     }
     if (std::getenv("GGML_RKVA_E4_TEST_ONLY")) {
@@ -5007,6 +5432,7 @@ int main() {
     test_native_bulk_f16(false);
     test_native_bulk_f16(true);
     test_native_bulk_e4m3fn();
+    test_native_rejects_pre_origin_query();
     test_native_bulk_fp8_splitzip();
     test_phase6_double_buffer_async();
     test_done_epoch_invalidation_race();
