@@ -3,6 +3,10 @@ llama_add_compile_flags()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
+    add_test(NAME test-rkva-rowlane-uniform
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-rkva-rowlane-uniform.py)
+    set_tests_properties(test-rkva-rowlane-uniform PROPERTIES LABELS main TIMEOUT 30)
+
     # Hardware-free timing/provenance qualification for the RKVA benchmark.
     add_test(
         NAME test-rkva-range-benchmark-harness
@@ -1146,10 +1150,18 @@ if (UNIX)
     add_test(NAME test-rkva-turboquant-nc-loopback COMMAND ${CMAKE_COMMAND} -E env
         GGML_RKVA_TQNC_TEST_ONLY=1 $<TARGET_FILE:test-remote-attn-range>)
     set_tests_properties(test-rkva-turboquant-nc-loopback PROPERTIES LABELS main TIMEOUT 30)
+    add_test(NAME test-rkva-native-rows-e4-loopback COMMAND ${CMAKE_COMMAND} -E env
+        GGML_RKVA_NATIVE_ROWS_E4_TEST_ONLY=1 $<TARGET_FILE:test-remote-attn-range>)
+    set_tests_properties(test-rkva-native-rows-e4-loopback PROPERTIES LABELS main TIMEOUT 120)
     add_test(NAME test-rkva-e4m3-loopback COMMAND ${CMAKE_COMMAND} -E env
         GGML_RKVA_E4_TEST_ONLY=1 $<TARGET_FILE:test-remote-attn-range>)
     set_tests_properties(test-rkva-e4m3-loopback PROPERTIES LABELS main TIMEOUT 30)
 endif()
+add_executable(test-rkva-native-e4-cpu ${PROJECT_SOURCE_DIR}/tools/xbox/tests/rkva_native_e4_cpu.cpp)
+target_compile_features(test-rkva-native-e4-cpu PRIVATE cxx_std_17)
+target_include_directories(test-rkva-native-e4-cpu PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn)
+add_test(NAME test-rkva-native-e4-cpu COMMAND test-rkva-native-e4-cpu)
+set_tests_properties(test-rkva-native-e4-cpu PROPERTIES LABELS main TIMEOUT 30)
 add_executable(test-rkva-e4m3-cpu ${PROJECT_SOURCE_DIR}/tools/xbox/tests/rkva_e4m3_cpu.cpp)
 target_compile_features(test-rkva-e4m3-cpu PRIVATE cxx_std_17)
 add_test(NAME test-rkva-e4m3-cpu COMMAND test-rkva-e4m3-cpu)
@@ -1825,3 +1837,14 @@ target_include_directories(test-rkva-qual-probe-guard-off PRIVATE
 target_compile_features(test-rkva-qual-probe-guard-off PRIVATE cxx_std_17)
 add_test(NAME test-rkva-qual-probe-guard-off COMMAND $<TARGET_FILE:test-rkva-qual-probe-guard-off>)
 set_property(TEST test-rkva-qual-probe-guard-off PROPERTY LABELS main)
+
+# Native Q4_1/IQ4_NL CPU format contracts (no GPU qualification).
+llama_build_and_test(test-rkva-low4.cpp)
+
+if (NOT WIN32)
+    add_test(NAME test-rkva-low4-loopback COMMAND ${CMAKE_COMMAND} -E env
+        GGML_RKVA_LOW4_TEST_ONLY=1 $<TARGET_FILE:test-remote-attn-range>)
+endif()
+
+add_test(NAME test-rkva-low4-state COMMAND ${CMAKE_COMMAND} -E env
+    GGML_LOW4_STATE_TEST_ONLY=1 $<TARGET_FILE:test-kv-mixed-state>)

@@ -3444,10 +3444,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
                type == GGML_TYPE_Q6_0 || type == GGML_TYPE_Q8_0;
     };
+    const bool tcp_position_split = params.kv_position_split_p != 0 && !params.remote_attn_host.empty() &&
+            !common_remote_attn_is_local_vulkan(params.remote_attn_host);
+    const auto is_low4 = [](ggml_type type) { return type == GGML_TYPE_Q4_1 || type == GGML_TYPE_IQ4_NL; };
+    if ((is_low4(params.remote_attn_cache_type_k) || is_low4(params.remote_attn_cache_type_v)) &&
+        (!tcp_position_split || params.remote_attn_cache_type_k != params.remote_attn_cache_type_v))
+        throw std::invalid_argument("remote Q4_1/IQ4_NL requires matching TCP position-split K/V");
     const bool local_format_supported =
             (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) ||
             (params.kv_position_split_p != 0 &&
              (is_qx(params.cache_type_k) || params.cache_type_k == GGML_TYPE_F16 ||
+              (tcp_position_split && is_low4(params.cache_type_k) && params.cache_type_k == params.cache_type_v) ||
               (params.cache_type_k == GGML_TYPE_SAW_INT4 && params.cache_type_v == GGML_TYPE_SAW_INT4) ||
               (params.cache_type_k == GGML_TYPE_TQNC_K && params.cache_type_v == GGML_TYPE_TQNC_V)));
     if (remote_cache_k && (!local_format_supported ||

@@ -452,10 +452,11 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
 
 static ggml_type parse_remote_attn_standard_cache_type(const std::string & value) {
     const ggml_type type = kv_cache_type_from_str(value);
-    if (type != GGML_TYPE_F16 && type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q5_0 &&
+    if (type != GGML_TYPE_F16 && type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 &&
+            type != GGML_TYPE_IQ4_NL && type != GGML_TYPE_Q5_0 &&
             type != GGML_TYPE_Q6_0 && type != GGML_TYPE_Q8_0) {
         throw std::invalid_argument(
-                "remote attention cache overrides currently support f16, q4_0, q5_0, q6_0, or q8_0");
+                "remote attention cache overrides currently support f16, q4_0, q4_1, iq4_nl, q5_0, q6_0, or q8_0");
     }
     return type;
 }
@@ -3981,7 +3982,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_LAYERS"));
     add_opt(common_arg(
         {"--remote-attn-cache-type-k"}, "TYPE",
-        "optional standard K cache type for locally remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0); "
+        "optional standard K cache type for locally remote-attended layers (f16, q4_0, q4_1, iq4_nl, q5_0, q6_0, q8_0); "
         "requires Vulkan or TCP position-split --remote-attn and a global KVarN cache; f16 requires TCP position split; unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
             params.remote_attn_cache_type_k = parse_remote_attn_standard_cache_type(value);
@@ -3989,7 +3990,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_K").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-cache-type-v"}, "TYPE",
-        "optional standard V cache type for locally remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0); "
+        "optional standard V cache type for locally remote-attended layers (f16, q4_0, q4_1, iq4_nl, q5_0, q6_0, q8_0); "
         "unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
             params.remote_attn_cache_type_v = parse_remote_attn_standard_cache_type(value);
@@ -3997,7 +3998,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_V").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-format", "--remote-attn-upload-format"}, "FORMAT",
-        "RPC upload format for remote attention: 'kvarn4'/'kvarn', 'fp16'/'f16', 'fp32'/'f32', 'q4'/'q4_0', 'q8'/'q8_0', 'saw_int4', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: kvarn4)",
+        "RPC upload format for remote attention: 'kvarn4'/'kvarn', 'fp16'/'f16', 'fp32'/'f32', 'q4'/'q4_0', 'q4_1'/'iq4_nl' (experimental TCP), 'q8'/'q8_0', 'saw_int4', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: kvarn4)",
         [](common_params & params, const std::string & value) {
             params.remote_attn_format = value;
 #if !defined(_WIN32)
@@ -4010,7 +4011,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--remote-attn-wire-format", "--remote-attn-activation-format"}, "FORMAT",
         "RPC activation wire format for Q upload and OUT download: 'f16'/'fp16', 'fp8'/'fp8_e5m2', "
-        "'fp8_e4m3fn' (experimental KVarN4 TCP position split), or 'auto'",
+        "'fp8_e4m3fn' (experimental negotiated native TCP position split), or 'auto'",
         [](common_params & params, const std::string & value) {
             std::string canonical;
             if (value == "f16" || value == "fp16") {
@@ -4090,16 +4091,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_STATS"));
     add_opt(common_arg(
         {"--rkva-range-storage"}, "FORMAT",
-        "remote range representation: 'auto', 'kvarn4'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'q4'/'q4_0', 'q8'/'q8_0', 'saw_int4', 'oscar_int2', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: backend auto)",
+        "remote range representation: 'auto', 'kvarn4'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'q4'/'q4_0', 'q4_1'/'iq4_nl' (experimental TCP), 'q8'/'q8_0', 'saw_int4', 'oscar_int2', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: backend auto)",
         [](common_params & params, const std::string & value) {
             if (value != "auto" && value != "kvarn4" && value != "kvarn" &&
                 value != "f16" && value != "fp16" && value != "f32" && value != "fp32" &&
-                value != "q4" && value != "q4_0" && value != "q8" && value != "q8_0" &&
+                value != "q4" && value != "q4_0" && value != "q4_1" && value != "iq4_nl" && value != "q8" && value != "q8_0" &&
                 value != "saw_int4" && value != "saw-int4" && value != "saw4" && value != "bdr_int4" &&
                 value != "oscar_int2" && value != "oscar-int2" && value != "oscar2" &&
                 value != "turboquant_nc" && value != "turboquant-nc" && value != "tqnc" &&
                 value != "turboquant_4bit_nc") {
-                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn4/f16/f32/q4_0/q8_0/saw_int4/oscar_int2/turboquant_nc");
+                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn4/f16/f32/q4_0/q4_1/iq4_nl/q8_0/saw_int4/oscar_int2/turboquant_nc");
             }
             params.rkva_range_storage = value;
 #if !defined(_WIN32)

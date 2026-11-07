@@ -70,7 +70,7 @@ enum rkva_wire : uint32_t {
     RKVA_WIRE_FP8 = 4, // Option A: 1-byte FP8 E5M2 for queries and outputs
     RKVA_WIRE_SPLITZIP = 5, // Option B: lossless exponent-compressed FP16
     RKVA_WIRE_OSCAR_INT2 = 6, // RANGE_UPLOAD only: OSCAR block_oscar_int2, 12 bytes / 32 values
-    RKVA_WIRE_FP8_E4M3FN = 7, // v3 op22 KVarN4: 1-byte E4M3FN Q and OUT
+    RKVA_WIRE_FP8_E4M3FN = 7, // v3 op22: layout-specific negotiated E4M3FN Q and OUT
 };
 
 // v2 range extensions. Native storage capabilities use ack.reserved[0].
@@ -103,12 +103,25 @@ static constexpr uint64_t RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK = 1ull << 24;
 static constexpr uint64_t RKVA_CAP_KVARN_BULK_E4M3FN = 1ull << 25;
 static constexpr uint64_t RKVA_CAP_KVARN_FLEX_TAIL = 1ull << 26;
 static constexpr uint64_t RKVA_CAP_NATIVE_SNAPSHOT_STORE = 1ull << 27;
+// E4 is not implied by the E5 native-row caps or the KVarN-only bit 25.
+// An old server must never receive E4 for layouts it only decodes as E5.
+static constexpr uint64_t RKVA_CAP_NATIVE_Q4_BULK_E4M3FN = 1ull << 28;
+static constexpr uint64_t RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN = 1ull << 29;
+static constexpr uint64_t RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN = 1ull << 30;
+// Experimental native standard 4-bit rows; never reinterpret as layout 4.
+// Additive descriptors carried by existing op15/op16/op22 framing (no ABI change).
+static constexpr uint64_t RKVA_CAP_NATIVE_Q4_1_BULK = 1ull << 31;
+static constexpr uint64_t RKVA_CAP_NATIVE_IQ4_NL_BULK = 1ull << 32;
+static constexpr uint64_t RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN = 1ull << 33;
+static constexpr uint64_t RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN = 1ull << 34;
 // Capability allocation in HELLO ack.reserved[0]:
 //   0..13  range/KVarN storage and bulk features
 //   14     RKVA_CAP_NATIVE_Q4_BULK (descriptor layout 4)
 //   15     RKVA_CAP_NATIVE_Q8_BULK (descriptor layout 5)
-//   16+    reserved; experimental branches (e.g. the cohort worktree) must not
-//          reuse 14/15, otherwise a host would probe a layout the server lacks.
+//   16..27 existing cohort, snapshot and native-storage extensions
+//   28..30 native Q4_0/SAW/NC E4M3FN
+//   31..34 experimental Q4_1/IQ4_NL bulk and their separate E4M3FN capabilities
+//   35+    reserved; do not reuse allocated bits for a different descriptor.
 // Reserved experimental identity only. This client refuses RPC_BATCH=4 until
 // a matching server implementation has been qualified; bits14/15 stay native.
 static constexpr uint64_t RKVA_CAP_KVARN_COHORT_ATTN = 1ull << 16;
@@ -176,6 +189,23 @@ static constexpr uint32_t RKVA_RANGE_STORAGE_Q8_0 = 1u << 1; // CONFIG.reserved[
 static constexpr uint32_t RKVA_RANGE_STORAGE_SAW_INT4 = 1u << 3;
 static constexpr uint32_t RKVA_RANGE_STORAGE_OSCAR_INT2 = 1u << 4;
 static constexpr uint32_t RKVA_RANGE_STORAGE_TURBOQUANT_NC = 1u << 5;
+static constexpr uint32_t RKVA_RANGE_STORAGE_Q4_1 = 1u << 6;
+static constexpr uint32_t RKVA_RANGE_STORAGE_IQ4_NL = 1u << 7;
+static constexpr uint32_t RKVA_LAYOUT_Q4_1 = 9;
+static constexpr uint32_t RKVA_LAYOUT_IQ4_NL = 10;
+// Exact descriptor identity, not a bitwise storage test. Unknown layouts fail closed.
+static constexpr uint64_t rkva_e4_layout_capability(uint32_t storage, uint32_t layout) {
+    return storage == RKVA_RANGE_STORAGE_KVARN4 && layout == 3 ? RKVA_CAP_KVARN_BULK_E4M3FN :
+           storage == RKVA_RANGE_STORAGE_Q4_0 && layout == 4 ? RKVA_CAP_NATIVE_Q4_BULK_E4M3FN :
+           storage == RKVA_RANGE_STORAGE_SAW_INT4 && layout == 6 ? RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN :
+           storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC && layout == 8 ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN :
+           storage == RKVA_RANGE_STORAGE_Q4_1 && layout == RKVA_LAYOUT_Q4_1 ? RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN :
+           storage == RKVA_RANGE_STORAGE_IQ4_NL && layout == RKVA_LAYOUT_IQ4_NL ? RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN : 0;
+}
+static constexpr bool rkva_e4_layout_allowed(uint64_t caps, uint32_t storage, uint32_t layout) {
+    const uint64_t required = rkva_e4_layout_capability(storage, layout);
+    return required != 0 && (caps & required) == required;
+}
 static constexpr uint32_t RKVA_SESSION_RANGE =
     1u << 0; // CREATE_SESSION.flags; defer allocation until CONFIG
 

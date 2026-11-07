@@ -354,6 +354,13 @@ int main() {
             q8[1].format = 4;
             CHECK(!validate_ranges(q8, P, C, full_layers).empty());
         }
+        for (uint8_t format : {kFormatQ4_1, kFormatIQ4_NL}) {
+            auto low4 = descs;
+            for (auto & desc : low4) desc.format = format;
+            CHECK(validate_ranges(low4, P, C, full_layers).empty());
+            low4[1].format = 255;
+            CHECK(!validate_ranges(low4, P, C, full_layers).empty());
+        }
         // Missing overflow range.
         {
             std::vector<range_desc> bad = descs;

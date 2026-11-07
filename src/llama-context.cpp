@@ -562,7 +562,7 @@ llama_context::llama_context(
             std::getenv("GGML_RKVA_NATIVE_BULK"));
     if (!ggml_remote_attn_policy::e4_remote_mode_allowed(
             params.remote_attn_host && params.remote_attn_host[0], tcp_position_split, e4_wire_requested)) {
-        throw std::runtime_error("E4M3FN requires TCP position-split KVarN4; refusing local fallback");
+        throw std::runtime_error("E4M3FN requires TCP position-split with a negotiated native layout; refusing local fallback");
     }
     if (tcp_position_split) {
         local_attn_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -691,11 +691,15 @@ llama_context::llama_context(
         };
         const bool formats_supported =
                 (is_qx(cparams.remote_attn_cache_type_k) && is_qx(cparams.remote_attn_cache_type_v)) ||
-                (tcp_position_split && cparams.remote_attn_cache_type_k == GGML_TYPE_F16 &&
-                 cparams.remote_attn_cache_type_v == GGML_TYPE_F16);
+                (tcp_position_split && cparams.remote_attn_cache_type_k == cparams.remote_attn_cache_type_v &&
+                 (cparams.remote_attn_cache_type_k == GGML_TYPE_F16 ||
+                  cparams.remote_attn_cache_type_k == GGML_TYPE_Q4_1 ||
+                  cparams.remote_attn_cache_type_k == GGML_TYPE_IQ4_NL));
         const bool local_format_supported =
                 (cparams.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) ||
                 (split_requested && (is_qx(params.type_k) || params.type_k == GGML_TYPE_F16 ||
+                 (tcp_position_split && params.type_k == params.type_v &&
+                  (params.type_k == GGML_TYPE_Q4_1 || params.type_k == GGML_TYPE_IQ4_NL)) ||
                  (params.type_k == GGML_TYPE_SAW_INT4 && params.type_v == GGML_TYPE_SAW_INT4) ||
                  (params.type_k == GGML_TYPE_TQNC_K && params.type_v == GGML_TYPE_TQNC_V)));
         if (!local_attn_dev || !cparams.remote_attn_enabled || model.arch != LLM_ARCH_QWEN35 ||
@@ -706,7 +710,7 @@ llama_context::llama_context(
                 cparams.remote_attn_prefill != 0 || !formats_supported) {
             throw std::invalid_argument(
                     "per-layer remote KV formats require Qwen35 target context, native Vulkan or TCP position-split, "
-                    "KVarN or standard Qx/F16/SAW local cache, Q4/Q5/Q6/Q8 or matching TCP position-split F16 remote K/V, "
+                    "KVarN or standard Qx/F16/SAW local cache, Q4/Q5/Q6/Q8 or matching TCP position-split F16/Q4_1/IQ4_NL remote K/V, "
                     "Flash Attention, KV offload, "
                     "one non-unified slot, and static prefill");
         }

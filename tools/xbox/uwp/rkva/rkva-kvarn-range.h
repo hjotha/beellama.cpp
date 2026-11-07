@@ -3,6 +3,8 @@
 #include "../../../../ggml/include/rkva-native-tail.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <cmath>
 
 // Native Bee KVarN4 descriptor helpers. Revision 1/2 keep the resident-image
 // semantics (every query reads the image of active_count; 128-row ORIGINAL-F16
@@ -58,6 +60,75 @@ inline bool valid_q4_upload(const rkva_kvarn_range_upload& u, uint32_t capacity,
         return u.append_begin == 0 && u.append_rows == u.live_count;
     }
     return u.append_begin == previous_live && u.append_rows == u.live_count - previous_live;
+}
+
+// Layouts 9/10 are native GGML Q4_1 / IQ4_NL. A distinct descriptor is
+// mandatory even though IQ4_NL and Q4_0 have the same byte count.
+inline bool low4_storage(uint32_t storage) {
+    return storage == RKVA_RANGE_STORAGE_Q4_1 || storage == RKVA_RANGE_STORAGE_IQ4_NL;
+}
+inline uint32_t low4_head_bytes(uint32_t storage) {
+    return storage == RKVA_RANGE_STORAGE_Q4_1 ? 160u :
+           storage == RKVA_RANGE_STORAGE_IQ4_NL ? 144u : 0u;
+}
+inline uint64_t low4_row_bytes(uint32_t storage, uint32_t heads) {
+    return uint64_t(heads) * low4_head_bytes(storage);
+}
+inline bool valid_low4_descriptor(const rkva_kvarn_range_config& c, uint32_t dimension) {
+    return low4_storage(c.storage) &&
+           c.layout_version == (c.storage == RKVA_RANGE_STORAGE_Q4_1 ? RKVA_LAYOUT_Q4_1 : RKVA_LAYOUT_IQ4_NL) &&
+           c.origin % 256 == 0 && c.capacity > 0 && c.capacity <= uint32_t(INT32_MAX) &&
+           c.origin <= uint32_t(INT32_MAX) - c.capacity && dimension == 256 &&
+           c.token_group == 1 && c.record_dim == 0 && c.head_dim == 256 && c.head_slices == 2 &&
+           c.key_bits == 4 && c.value_bits == 4 && c.record_bytes == low4_head_bytes(c.storage) &&
+           c.stage_groups == 0 && c.tail_groups == 0 && c.sink_tokens == 0 &&
+           c.precision_tail_tokens == 0 && c.wht_version == 0 && c.domain == 0 && c.record_policy == 1;
+}
+inline bool valid_low4_upload(const rkva_kvarn_range_upload& u, uint32_t capacity,
+                             uint32_t previous_live) {
+    return u.append_rows > 0 && previous_live <= capacity &&
+           u.append_begin <= u.live_count && u.append_rows <= u.live_count - u.append_begin &&
+           uint64_t(u.append_begin) + u.append_rows == u.live_count &&
+           valid_q4_upload(u, capacity, previous_live);
+}
+
+inline bool valid_low4_planes(uint32_t storage, const uint8_t * k, const uint8_t * v, size_t head_rows) {
+    if (!low4_storage(storage) || !k || !v || !head_rows || head_rows > SIZE_MAX / low4_head_bytes(storage)) return false;
+    const size_t block_bytes = storage == RKVA_RANGE_STORAGE_Q4_1 ? 20u : 18u;
+    for (const uint8_t * plane : {k, v}) {
+        for (size_t off = 0; off < head_rows * low4_head_bytes(storage); off += block_bytes) {
+            uint16_t d; std::memcpy(&d, plane + off, sizeof(d));
+            if ((d & 0x7c00u) == 0x7c00u) return false;
+            if (storage == RKVA_RANGE_STORAGE_Q4_1) {
+                uint16_t m; std::memcpy(&m, plane + off + 2, sizeof(m));
+                if ((m & 0x7c00u) == 0x7c00u) return false;
+            }
+        }
+    }
+    return true;
+}
+
+inline bool valid_low4_queries(uint32_t wire, const uint8_t * data, size_t bytes,
+                               const uint8_t * positions, uint32_t queries, uint32_t heads) {
+    if (!data || !positions || !queries || queries > 256 || !heads) return false;
+    const uint64_t count = uint64_t(queries) * heads * 256;
+    const uint32_t width = wire == RKVA_WIRE_FP8 ? 1 : wire == RKVA_WIRE_F16 ? 2 : wire == RKVA_WIRE_F32 ? 4 : 0;
+    if (!width || count > SIZE_MAX / width || bytes != count * width) return false;
+    for (uint32_t q = 0; q < queries; ++q) {
+        int32_t p; std::memcpy(&p, positions + size_t(q) * 4, 4);
+        if (p < 0) return false;
+    }
+    for (uint64_t i = 0; i < count; ++i) {
+        if (width == 1) { if ((data[i] & 0x7cu) == 0x7cu) return false; }
+        else if (width == 2) {
+            uint16_t h; std::memcpy(&h, data + i * 2, 2);
+            if ((h & 0x7c00u) == 0x7c00u) return false;
+        } else {
+            float f; std::memcpy(&f, data + i * 4, 4);
+            if (!std::isfinite(f)) return false;
+        }
+    }
+    return true;
 }
 
 // layout_version 5: native Q8_0 overflow rows. Identical op16/op22 envelope and

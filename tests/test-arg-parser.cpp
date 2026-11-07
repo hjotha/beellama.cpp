@@ -553,6 +553,30 @@ params = common_params();
             assert(context.remote_attn_cache_type_v == context.remote_attn_cache_type_k);
         }
 
+        for (const auto & name : {"q4_1", "iq4_nl"}) {
+            const auto type = std::string(name) == "q4_1" ? GGML_TYPE_Q4_1 : GGML_TYPE_IQ4_NL;
+            for (bool local_same : {false, true}) {
+                common_params positional;
+                std::vector<std::string> argv = {
+                    "binary_name", "-m", "model_file.gguf",
+                    "--cache-type-k", local_same ? name : "kvarn4", "--cache-type-v", local_same ? name : "kvarn4",
+                    "--remote-attn", "127.0.0.1:18090", "--kv-position-split-p", "512",
+                    "--remote-attn-cache-type-k", name, "--remote-attn-cache-type-v", name,
+                    "--remote-attn-format", name, "--kv-tail-tokens", "0",
+                };
+                assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), positional, LLAMA_EXAMPLE_SERVER));
+                positional.n_parallel = 1;
+                const auto context = common_context_params_to_llama(positional);
+                assert(context.remote_attn_cache_type_k == type && context.remote_attn_cache_type_v == type);
+                if (local_same) assert(context.type_k == type && context.type_v == type);
+                positional.remote_attn_host = "vulkan:0";
+                assert(invalid_mixed_context(positional));
+                positional.remote_attn_host = "127.0.0.1";
+                positional.remote_attn_cache_type_v = GGML_TYPE_Q4_0;
+                assert(invalid_mixed_context(positional));
+            }
+        }
+
         common_params extra_tail;
         std::vector<std::string> extra_tail_argv = {
             "binary_name", "-m", "model_file.gguf",

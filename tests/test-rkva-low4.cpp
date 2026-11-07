@@ -1,0 +1,143 @@
+// CPU contracts only. This does not qualify D3D12, DXIL or model quality.
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "../ggml/src/ggml-remote-attn/rkva-low4-producer.h"
+#include "../tools/xbox/uwp/rkva/rkva-kvarn-range.h"
+#include "../tools/xbox/uwp/rkva/rkva-kvarn-bulk.h"
+#undef NDEBUG
+#include <cassert>
+#include <cstdio>
+#include <limits>
+#include <random>
+
+static void test_format(ggml_type type) {
+    const uint32_t storage = type == GGML_TYPE_Q4_1 ? RKVA_RANGE_STORAGE_Q4_1 : RKVA_RANGE_STORAGE_IQ4_NL;
+    const uint32_t layout = type == GGML_TYPE_Q4_1 ? RKVA_LAYOUT_Q4_1 : RKVA_LAYOUT_IQ4_NL;
+    const uint32_t head_bytes = rkva_low4_producer::record_bytes(type);
+    rkva_kvarn_range_config d{256, 512, storage, layout, 1, 0, 256, 2, 4, 4, head_bytes, 0, 0, 0, 0, 0, 0, 1};
+    assert(rkva_kvarn_range::valid_low4_descriptor(d, 256));
+    for (size_t field = 0; field < sizeof(d) / 4; ++field) {
+        auto bad = d; uint32_t word;
+        std::memcpy(&word, reinterpret_cast<uint8_t*>(&bad) + field * 4, 4);
+        word = UINT32_MAX; std::memcpy(reinterpret_cast<uint8_t*>(&bad) + field * 4, &word, 4);
+        assert(!rkva_kvarn_range::valid_low4_descriptor(bad, 256));
+    }
+    auto alias = d; alias.storage = RKVA_RANGE_STORAGE_Q4_0; alias.layout_version = 4;
+    assert(!rkva_kvarn_range::valid_low4_descriptor(alias, 256));
+    assert(!rkva_kvarn_range::valid_q4_descriptor(d, 256));
+    assert(!rkva_kvarn_range::valid_low4_descriptor(d, 128));
+    std::mt19937 rng(0x1a41);
+    std::uniform_real_distribution<float> dist(-17.0f, 9.0f);
+    for (uint32_t heads : {1u, 4u}) for (uint32_t count : {1u, 2u, 9u, 128u, 256u}) {
+        rkva_low4_producer producer(256, 512, heads, type);
+        const size_t n = size_t(count) * heads * 256;
+        std::vector<float> k(n), v(n);
+        for (size_t i = 0; i < n; ++i) { k[i] = dist(rng); v[i] = std::sin(float(i) * .017f) + 3.0f; }
+        // Exercise nonzero Q4_1 minima and IQ4_NL codebook, not just zero blocks.
+        if (count > 1) for (size_t i = 0; i < 256; ++i) k[i] = -2.75f;
+        std::vector<int32_t> positions(count); for (uint32_t i = 0; i < count; ++i) positions[i] = 256 + i;
+        std::vector<uint8_t> payload;
+        assert(producer.prepare(k.data(), v.data(), positions.data(), count));
+        assert(producer.append(k.data(), v.data(), positions.data(), count, true, payload));
+        assert(producer.rows() == count);
+        rkva_kvarn_range_upload u; std::memcpy(&u, payload.data(), sizeof(u));
+        assert(rkva_kvarn_range::valid_low4_upload(u, 512, 0));
+        const size_t plane = size_t(count) * heads * head_bytes;
+        assert(payload.size() == sizeof(u) + 2 * plane);
+        std::vector<uint8_t> expected(plane);
+        const uint8_t* data = payload.data() + sizeof(u);
+        assert(rkva_kvarn_range::valid_low4_planes(storage, data, data + plane, size_t(count) * heads));
+        for (const float* input : {k.data(), v.data()}) {
+            assert(ggml_quantize_chunk(type, input, expected.data(), 0, int64_t(count) * heads, 256, nullptr) == plane);
+            assert(std::memcmp(expected.data(), data, plane) == 0);
+#ifdef RKVA_LOW4_SHADER_HOST
+            // Compile and execute the actual scalar HLSL loaders through a tiny
+            // ByteAddressBuffer shim. This checks offsets/table/packing only.
+            std::vector<float> decoded(n);
+            ggml_get_type_traits(type)->to_float(data, decoded.data(), n);
+            ByteAddressBuffer buffer{data, plane};
+            for (size_t row = 0; row < size_t(count) * heads; ++row) for (uint32_t q = 0; q < 64; ++q) {
+                const auto out = type == GGML_TYPE_Q4_1 ? load_q4_1(buffer, row * head_bytes, q) : load_iq4_nl(buffer, row * head_bytes, q);
+                const auto base = type == GGML_TYPE_Q4_1 ? quarter_dim_q4_1(q) : quarter_dim_iq4_nl(q);
+                for (size_t j = 0; j < 4; ++j) assert(out[j] == decoded[row * 256 + base + j]);
+            }
+#endif
+            data += plane;
+        }
+        auto corrupted = payload;
+        corrupted[sizeof(u)] = 0; corrupted[sizeof(u) + 1] = 0x7c;
+        assert(!rkva_kvarn_range::valid_low4_planes(storage, corrupted.data() + sizeof(u),
+                corrupted.data() + sizeof(u) + plane, size_t(count) * heads));
+        if (type == GGML_TYPE_Q4_1) {
+            corrupted = payload; corrupted[sizeof(u) + 2] = 1; corrupted[sizeof(u) + 3] = 0x7c;
+            assert(!rkva_kvarn_range::valid_low4_planes(storage, corrupted.data() + sizeof(u),
+                    corrupted.data() + sizeof(u) + plane, size_t(count) * heads));
+        }
+        auto bad = u; bad.append_rows = UINT32_MAX;
+        assert(!rkva_kvarn_range::valid_low4_upload(bad, 512, 0));
+        bad = u; bad.reserved[1] = 1; assert(!rkva_kvarn_range::valid_low4_upload(bad, 512, 0));
+        assert(!producer.rewind(count + 1));
+        assert(producer.rewind(0));
+        const auto saved = payload;
+        k[0] = std::numeric_limits<float>::infinity();
+        assert(!producer.append(k.data(), v.data(), positions.data(), count, true, payload));
+        assert(payload == saved && producer.rows() == 0);
+        k[0] = std::numeric_limits<float>::quiet_NaN();
+        assert(!producer.append(k.data(), v.data(), positions.data(), count, true, payload));
+        k[0] = 1e30f;
+        assert(!producer.append(k.data(), v.data(), positions.data(), count, true, payload));
+        k[0] = 0;
+        positions[0]++;
+        assert(!producer.append(k.data(), v.data(), positions.data(), count, true, payload));
+        positions[0]--;
+        assert(producer.append(k.data(), v.data(), positions.data(), count, true, payload));
+        assert(producer.rewind(count - 1));
+        const int32_t last = int32_t(256 + count - 1);
+        assert(producer.append(k.data(), v.data(), &last, 1, false, payload));
+        std::memcpy(&u, payload.data(), sizeof(u));
+        assert(rkva_kvarn_range::valid_low4_upload(u, 512, count - 1));
+        assert(u.live_count == count && u.append_rows == 1 && u.append_begin == count - 1);
+        assert(!producer.append(k.data(), v.data(), &last, 1, true, payload));
+    }
+    std::printf("PASS: %s native producer, descriptors, metadata, rollback%s\n", ggml_type_name(type),
+#ifdef RKVA_LOW4_SHADER_HOST
+        ", actual HLSL scalar loader parity"
+#else
+        ""
+#endif
+    );
+}
+static void test_wire_validation() {
+    int32_t pos = 256;
+    for (uint32_t wire : {uint32_t(RKVA_WIRE_FP8), uint32_t(RKVA_WIRE_F16), uint32_t(RKVA_WIRE_F32)}) {
+        const size_t width = wire == RKVA_WIRE_FP8 ? 1 : wire == RKVA_WIRE_F16 ? 2 : 4;
+        std::vector<uint8_t> q(256 * width);
+        const auto valid = [&] { return rkva_kvarn_range::valid_low4_queries(wire, q.data(), q.size(),
+                    reinterpret_cast<const uint8_t*>(&pos), 1, 1); };
+        assert(valid());
+        assert(!rkva_kvarn_range::valid_low4_queries(wire, q.data(), q.size()-1,
+                    reinterpret_cast<const uint8_t*>(&pos), 1, 1));
+        pos = -1; assert(!valid()); pos = 256;
+        if (width == 1) q[0] = 0x7c;
+        else if (width == 2) { q[0] = 0; q[1] = 0x7c; }
+        else { float f = std::numeric_limits<float>::quiet_NaN(); std::memcpy(q.data(), &f, 4); }
+        assert(!valid());
+    }
+    std::vector<float> out(256, 1.f); float lse = 0;
+    const auto valid_out = [&] { return rkva_kvarn_bulk::turboquant_nc_output_valid(
+        reinterpret_cast<const uint8_t*>(out.data()), reinterpret_cast<const uint8_t*>(&lse),
+        reinterpret_cast<const uint8_t*>(&pos), 1, 1, 256, 1, true); };
+    assert(valid_out());
+    out.back() = std::numeric_limits<float>::quiet_NaN(); assert(!valid_out()); out.back() = 1;
+    lse = std::numeric_limits<float>::infinity(); assert(!valid_out());
+    lse = -std::numeric_limits<float>::infinity(); assert(!valid_out());
+    pos = 255; assert(valid_out()); // empty causal range may have LSE -inf
+    std::puts("PASS: native low4 query/position/truncation and CPU output finite guards");
+}
+int main() {
+    ggml_backend_load_all();
+    ggml_context * init = ggml_init({1u << 16, nullptr, true}); assert(init);
+    test_wire_validation();
+    test_format(GGML_TYPE_Q4_1); test_format(GGML_TYPE_IQ4_NL);
+    ggml_free(init);
+}
