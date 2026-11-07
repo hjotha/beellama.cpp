@@ -16,11 +16,11 @@ GGML_RKVA_RANGE_KERNEL=balanced
 GGML_RKVA_RANGE_FUSE=0
 ```
 
-The ordinary remote companion flags remain Q4_0 or Q8_0 for metadata/bookkeeping.
-Its quantized values are not the native producer's input. Two additional graph
-operands carry original projected F32 K/V. The CPU backend's canonical KVarN store
-performs WHT, F16 staging, eager record quantization and rounding; the RPC layer
-does not duplicate those algorithms. Native records, canonical rotated stage rows
+Select `--remote-attn-format kvarn4` with either matching
+`--remote-attn-cache-type-k kvarn4 --remote-attn-cache-type-v kvarn4` or no
+remote cache overrides. The native owner replaces the standard Q4/Q8 companion;
+it consumes the original projected F32 K/V directly. The native CPU or CUDA
+producer performs WHT, F16 staging and eager record quantization. Native records, canonical rotated stage rows
 and original-domain F16 precision-tail rows are sent through RKVA operations 15/16.
 Operation 14 returns original-domain OUT and natural-log LSE for the existing CUDA
 merge. There are no attention or upload RPCs below P.
@@ -30,8 +30,8 @@ three canonical stage slots, eager K4/V4 records and an F16 precision tail of at
 most 128 requested tokens (the native descriptor uses a 128-token tail). Query
 batches are limited to 256. The CPU producer retains full global record addressing
 to match the canonical store. With C=131072 and four KV heads this adds about
-2.35 GB of host record storage across 16 attention layers, in addition to the
-existing bookkeeping companion. Only actual overflow groups cross the network.
+2.35 GB of host record storage across 16 attention layers. Only actual overflow
+groups cross the network.
 
 Each layer must begin with an original-data append exactly at P. Bootstrap from
 occupied standard-cache overflow fails closed. Without the negotiated snapshot
@@ -96,6 +96,11 @@ so a PARTIAL checkpoint cannot validate merely through matching token/position
 IDs after the prefix bytes changed. These rules use existing memory/restore
 transactions and the existing standard RKVA REWIND operation; native overflow
 continues to require a fresh context for unsupported rollback/state operations.
+
+The native companion currently admits full sequence reset and negotiated FULL
+KVarN4 snapshots. Partial checkpoint restore and suffix rewind remain disabled
+for this layout; an edited prefix can require a cold reprocess. Native SAW and
+TurboQuant NC row owners do not yet provide the KVarN4 FULL snapshot codec.
 
 Resident prefix tickets also record dirty suffix generations. Removing positions
 at or beyond r invalidates any saved prefix that included those positions, even

@@ -472,6 +472,14 @@ extern "C" {
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
+    enum llama_remote_native_companion {
+        LLAMA_REMOTE_COMPANION_AUTO = 0,
+        LLAMA_REMOTE_COMPANION_NONE = 1,
+        LLAMA_REMOTE_COMPANION_KVARN4 = 2,
+        LLAMA_REMOTE_COMPANION_SAW_INT4 = 3,
+        LLAMA_REMOTE_COMPANION_TURBOQUANT_NC = 4,
+    };
+
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
@@ -532,6 +540,9 @@ extern "C" {
         // layers. GGML_TYPE_COUNT keeps the existing global cache behavior.
         enum ggml_type remote_attn_cache_type_k;
         enum ggml_type remote_attn_cache_type_v;
+        enum llama_remote_native_companion remote_attn_native_companion;
+        const char * remote_attn_upload_format; // copied during context construction
+        const char * remote_attn_wire_format; // copied during context construction; null uses legacy environment
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback

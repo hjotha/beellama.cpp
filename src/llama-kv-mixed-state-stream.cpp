@@ -142,7 +142,14 @@ void validate_desc(layer_desc & d, bool serializing) {
                     fail(where + ": kvarn bit fields disagree with the type id");
                 }
             }
-            if (d.layout != layout_kvarn_records_stage_tail) {
+            if (d.layout == layout_kvarn_native_external_v1 &&
+                    (d.range_id != llama_position_split::kRangeOverflow || d.k_bits != 4 || d.v_bits != 4 ||
+                     d.token_group != 128 || d.head_dim_k != 256 || d.head_dim_v != 256 ||
+                     d.payload_mode != mode_full || d.payload_bytes != 0 || d.payload_checksum != 0 ||
+                     d.payload_cells != d.payload_rows || d.owner != owner_target)) {
+                fail(where + ": invalid native external KVarN4 descriptor");
+            }
+            if (d.layout != layout_kvarn_records_stage_tail && d.layout != layout_kvarn_native_external_v1) {
                 fail(where + ": unknown kvarn layout id");
             }
             if (d.v_trans != 0) {
@@ -368,10 +375,11 @@ stream_prepared stream_prepare(const stream_input & input, const stream_options 
                     fail("stream: local range must be [0,P) and a kvarn or standard qx cache");
                 }
             } else if (d.range_start != input.split->p || d.range_end != input.split->c ||
-                    d.kind != cache_kind::standard_qx) {
-                fail("stream: overflow range must be [P,C) and a standard qx cache");
+                    (d.kind != cache_kind::standard_qx &&
+                     !(d.kind == cache_kind::kvarn && d.layout == layout_kvarn_native_external_v1))) {
+                fail("stream: overflow range must be [P,C) and a standard or native external cache");
             }
-            if (d.layout == layout_standard_qx_compact_rows &&
+            if ((d.layout == layout_standard_qx_compact_rows || d.layout == layout_kvarn_native_external_v1) &&
                     (d.payload_cells != d.payload_rows ||
                      d.payload_rows > uint64_t(input.split->c - input.split->p))) {
                 fail("stream: compact Qx payload rows exceed C-P or disagree with cell count");

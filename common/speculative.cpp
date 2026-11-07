@@ -5661,7 +5661,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // BEFORE the overrides are cleared below; the pre-existing non-mixed
     // Vulkan MTP behavior is preserved.
     const bool mixed_target = params.remote_attn_cache_type_k != GGML_TYPE_COUNT ||
-            params.remote_attn_cache_type_v != GGML_TYPE_COUNT;
+            params.remote_attn_cache_type_v != GGML_TYPE_COUNT ||
+            !params.remote_attn_native_cache_type_k.empty() ||
+            !params.remote_attn_native_cache_type_v.empty();
 
     common_validate_draft_kvarn_mode(params.speculative);
 
@@ -5685,6 +5687,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // representation; the draft context retains its existing cache contract.
     result.remote_attn_cache_type_k = GGML_TYPE_COUNT;
     result.remote_attn_cache_type_v = GGML_TYPE_COUNT;
+    result.remote_attn_native_cache_type_k.clear();
+    result.remote_attn_native_cache_type_v.clear();
     // A local Vulkan MTP cache is independent of the target cache and can live
     // on the same device. This keeps its full-context K/V allocation off CUDA;
     // prefill migration itself remains target-only. Under the mixed-target

@@ -22,6 +22,7 @@
 #include "server-native-refs.h"
 #include "server-native-rotation.h"
 #include "ggml-remote-attn-trace.h"
+#include "ggml-remote-attn.h"
 #include "server-route-state.h"
 #include "server-legacy-slot-classifier.h"
 #include "server-slot-path-collision.h"
@@ -1532,14 +1533,28 @@ struct server_slot {
         bootstrap_pending = false;
     }
 
-    void prompt_clear() {
+    // A refused clear can leave local and remote ownership out of sync.
+    bool prompt_cleanup_failed = false;
+
+    bool prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        if (!mem.seq_rm(id, -1, -1)) {
+        if (prompt_cleanup_failed) return false;
+        bool cleared = false;
+        try {
+            cleared = mem.seq_rm(id, -1, -1);
+        } catch (const std::exception & error) {
+            SRV_ERR("prompt_clear: exception while clearing slot %d: %s\n", id, error.what());
+        } catch (...) {
+            SRV_ERR("prompt_clear: unknown exception while clearing slot %d\n", id);
+        }
+        if (!cleared) {
             SRV_ERR("prompt_clear: failed to clear memory for slot %d; keeping prompt bookkeeping\n", id);
-            return;
+            prompt_cleanup_failed = true;
+            return false;
         }
         prompt_forget_memory();
+        return true;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1953,12 +1968,9 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (clear_context_on_release || task->is_child() || task->is_stateless() || audio_stream) {
-                prompt_clear();
-            }
-            // mtmd_helper always re-evaluates the whole prompt.
-            if (task->type == SERVER_TASK_TYPE_TTS) {
-                prompt_clear();
+            if (clear_context_on_release || task->is_child() || task->is_stateless() || audio_stream ||
+                    task->type == SERVER_TASK_TYPE_TTS) {
+                (void) prompt_clear(); // failure quarantines this slot before its next assignment
             }
 
             callback_on_reset(*this);
@@ -3607,7 +3619,10 @@ static bool adaptive_slot_restore(
     // Only now clear the live sequence. Any malformed file or incompatible
     // metadata has already returned, so a failed set operation leaves no
     // published prompt and no partial cache hit.
-    slot.prompt_clear();
+    if (!slot.prompt_clear()) {
+        error = "adaptive slot memory cleanup failed";
+        return false;
+    }
     const bool target_ok = llama_state_seq_set_data_ext(ctx_tgt, snapshot.data_tgt.data(), snapshot.data_tgt.size(),
             slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == snapshot.data_tgt.size() &&
         llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) == snapshot.pos_tgt;
@@ -4185,6 +4200,7 @@ private:
     std::string adaptive_remote_attn_prefill = "remote";
     ggml_type adaptive_remote_attn_cache_type_k = GGML_TYPE_COUNT;
     ggml_type adaptive_remote_attn_cache_type_v = GGML_TYPE_COUNT;
+    llama_remote_native_companion adaptive_remote_native_companion = LLAMA_REMOTE_COMPANION_NONE;
     // One-way PURE KVarN -> MIXED handoff: source descriptor captured before
     // the old context is destroyed (same resident model, no weight reload).
     server_mixed_kv_handoff::source_capture mixed_handoff_source_;
@@ -4255,10 +4271,16 @@ private:
                 !params_base.lora_adapters.empty() || !params_base.control_vectors.empty()) return;
         const uint32_t origin = params_base.kv_position_split_p;
         const auto & local_kvarn = ctx_tgt->get_cparams().kvarn;
+        const auto native_selection = adaptive_remote_native_companion;
+        const bool native_companion = native_selection != LLAMA_REMOTE_COMPANION_NONE;
+        const bool native_kvarn = native_selection == LLAMA_REMOTE_COMPANION_KVARN4;
+        const bool matching_companion = native_kvarn ?
+                adaptive_remote_attn_cache_type_k == GGML_TYPE_COUNT && adaptive_remote_attn_cache_type_v == GGML_TYPE_COUNT :
+                !native_companion && adaptive_remote_attn_cache_type_k == GGML_TYPE_Q4_0 &&
+                        adaptive_remote_attn_cache_type_v == GGML_TYPE_Q4_0;
         if (!origin || origin % 128 || params_base.n_ctx <= int32_t(origin) ||
                 params_base.ctx_size_xxxlong <= int32_t(origin) ||
-                adaptive_remote_attn_cache_type_k != GGML_TYPE_Q4_0 ||
-                adaptive_remote_attn_cache_type_v != GGML_TYPE_Q4_0 ||
+                !matching_companion ||
                 !rkva_ahead_same_kvarn(local_kvarn, adaptive_kvarn_xxxlong)) return;
         const char * native_tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS");
         if (native_tail && std::strcmp(native_tail, "128") != 0) return;
@@ -4295,8 +4317,11 @@ private:
         if (!owner_id || !owner_epoch) return;
         try {
             auto ahead = std::make_unique<server_rkva_ahead>(adaptive_remote_attn_host.c_str(),
-                    adaptive_remote_attn_port, geo, origin, adaptive_remote_attn_cache_type_k,
-                    std::move(layers), std::vector<llama_token>(all.begin(), all.begin() + target));
+                    adaptive_remote_attn_port, geo, origin,
+                    native_kvarn ? GGML_TYPE_F32 : adaptive_remote_attn_cache_type_k,
+                    params_base.remote_attn_format.empty() ? nullptr : params_base.remote_attn_format.c_str(),
+                    std::move(layers), std::vector<llama_token>(all.begin(), all.begin() + target),
+                    params_base.remote_attn_wire_format.empty() ? nullptr : params_base.remote_attn_wire_format.c_str());
             if (!ahead->valid()) return;
             rkva_ahead_ = std::move(ahead);
             rkva_ahead_owner_id_ = owner_id;
@@ -5566,7 +5591,7 @@ private:
             // unconditionally so a PARTIAL write from a refused restore is always
             // removed, including when the destination started empty.
             rollback_result rollback() {
-                slot.prompt_clear();
+                if (!slot.prompt_clear()) return rollback_result::lost;
                 if (state == capture_state::resident_empty) {
                     return rollback_result::not_attempted; // nothing was resident
                 }
@@ -5593,7 +5618,10 @@ private:
 
         // Clear the slot's resident KV before loading the snapshot (mirror the restore-continue safe
         // fallback): seq removal + token/checkpoint clear so the restore writes into an empty seq.
-        slot.prompt_clear();
+        if (!slot.prompt_clear()) {
+            if (outcome) *outcome = server_native_slot::automatic_restore_outcome::no_retry;
+            return 0;
+        }
 
         if (!do_slot_restore(slot, *file, disk_toks)) {
             // The import was refused. Roll the destination back to its previous
@@ -6119,6 +6147,7 @@ private:
             adaptive_remote_attn_prefill = params.remote_attn_prefill;
             adaptive_remote_attn_cache_type_k = params.remote_attn_cache_type_k;
             adaptive_remote_attn_cache_type_v = params.remote_attn_cache_type_v;
+            adaptive_remote_native_companion = common_resolve_remote_native_companion(params);
             adaptive_p_min_base = params.speculative.draft.p_min;
         }
         if (!common_speculative_resolve_dflash_draft_n_max(
@@ -7136,6 +7165,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.draft_owns_state = draft_owns_state;
             slot.mem.init(ctx_tgt, slot.draft_owns_state ? ctx_dft : nullptr);
+            slot.prompt_cleanup_failed = false;
             slot.spec = spec.get();
             slot.n_ctx = slot_ctx;
             slot.position_split_p = slot_position_split_p;
@@ -7285,7 +7315,7 @@ private:
                     &count, written, XXH64_digest(&hash));
                 if (loaded != written || count != tokens.size() || restored != tokens ||
                         llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != state.pos_tgt) {
-                    slot.prompt_clear();
+                    if (!slot.prompt_clear()) return false;
                     SRV_WRN("%s", "adaptive streaming conversion: restore rejected\n");
                     continue;
                 }
@@ -7300,7 +7330,7 @@ private:
                         (ggml_time_us() - convert_start) / 1000.0 - convert_ms);
                 return true;
             } catch (const std::exception & error) {
-                slots.front().prompt_clear();
+                if (!slots.front().prompt_clear()) return false;
                 SRV_WRN("adaptive streaming conversion: %s\n", error.what());
             }
         }
@@ -7325,8 +7355,9 @@ private:
         const int32_t ctx = (int32_t) adaptive_profile_ctx_size(profile);
         return params_base.remote_attn_min_ctx_size > 0 && ctx > 0 &&
             !adaptive_remote_attn_host.empty() &&
-            adaptive_remote_attn_cache_type_k != GGML_TYPE_COUNT &&
-            adaptive_remote_attn_cache_type_v != GGML_TYPE_COUNT &&
+            ((adaptive_remote_attn_cache_type_k != GGML_TYPE_COUNT &&
+              adaptive_remote_attn_cache_type_v != GGML_TYPE_COUNT) ||
+             adaptive_remote_native_companion != LLAMA_REMOTE_COMPANION_NONE) &&
             common_context_remote_attn_enabled(params_base, ctx);
     }
 
@@ -7446,7 +7477,7 @@ private:
         }
         server_slot * slot = nullptr;
         for (auto & candidate : slots) {
-            if (!candidate.is_processing()) {
+            if (!candidate.is_processing() && !candidate.prompt_cleanup_failed) {
                 slot = &candidate;
                 break;
             }
@@ -7464,6 +7495,7 @@ private:
             return true;
         }
         const int restored = auto_restore_into_slot(*slot, *cand, req, 0);
+        if (slot->prompt_cleanup_failed) return false;
         SRV_INF("adaptive staged restore: restored %d tokens into profile %s\n",
                 restored, adaptive_status_profile_name((int) stage).c_str());
         return true;
@@ -7544,7 +7576,10 @@ private:
             prompt_cache->update();
         }
         for (auto & slot : slots) {
-            slot.prompt_clear();
+            if (!slot.prompt_clear()) {
+                SRV_ERR("adaptive transition: slot %d cleanup failed\n", slot.id);
+                return false;
+            }
             slot.reset();
         }
 
@@ -7726,6 +7761,7 @@ private:
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
+                if (ret->prompt_cleanup_failed) return ret;
                 // a busy slot is returned untouched, the caller defers the task
                 if (ret->is_processing()) {
                     return ret;
@@ -7751,7 +7787,7 @@ private:
                 }
 
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (slot.is_processing() || slot.prompt_cleanup_failed) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
                     continue;
                 }
@@ -7849,7 +7885,7 @@ private:
                     update_cache = false;
                 } else {
                     // Reset the peer before any cold replay into this context.
-                    ret->prompt_clear();
+                    if (!ret->prompt_clear()) return ret;
                     SRV_WRN("%s", "RKVA ahead unavailable; reset peer and use normal prompt restore\n");
                 }
                 rkva_ahead_adopted_ = false;
@@ -7920,7 +7956,7 @@ private:
                                         nullptr, true, false, false) ||
                                 !ret->mem.seq_rm(ret->id, target, -1)) {
                             rkva_ahead_->invalidate();
-                            ret->prompt_clear();
+                            if (!ret->prompt_clear()) return ret;
                             cache_result = server_prompt_cache_result::unchanged;
                             SRV_WRN("%s", "RKVA ahead checkpoint restore failed; clearing the local prefix\n");
                         } else {
@@ -7934,7 +7970,7 @@ private:
                              (cache_result == server_prompt_cache_result::unchanged && ret->prompt.tokens.empty()))) {
                         // A rejected cache entry leaves no reusable slot state.
                         // Handoff installs only into an empty private candidate.
-                        ret->prompt_clear();
+                        if (!ret->prompt_clear()) return ret;
                         // One-way PURE KVarN -> MIXED handoff: the prompt-cache
                         // load rejected the pure snapshot for the mixed target;
                         // attempt bounded prefix reuse before the cold path.
@@ -8005,7 +8041,7 @@ private:
                     } else if (cache_result == server_prompt_cache_result::hit) {
                         ret->just_restored = true;
                     } else if (cache_result != server_prompt_cache_result::unchanged) {
-                        ret->prompt_clear();
+                        if (!ret->prompt_clear()) return ret;
                     }
                 }
                 ret->stats.cache_ram_load_ms = (ggml_time_us() - t_phase) / 1000.0;
@@ -8043,9 +8079,7 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                slot.prompt_clear();
-
-                res = true;
+                res = slot.prompt_clear();
 
                 // clear slots one by one
                 break;
@@ -8164,7 +8198,10 @@ private:
                 slot.tts.ctx.init(ctx_tgt, slot.mctx);
             }
             // mtmd_helper always re-eval the whole prompt
-            slot.prompt_clear();
+            if (!slot.prompt_clear()) {
+                send_error(task, "failed to clear slot memory", ERROR_TYPE_SERVER);
+                return false;
+            }
             task.tts_inp.data.seq_id = slot.id;
             if (slot.tts.ctx.set_input(task.tts_inp.get()) != 0) {
                 send_error(task, "failed to process TTS prompt", ERROR_TYPE_SERVER);
@@ -8326,7 +8363,11 @@ private:
                 slot.release();
                 return false;
             }
-            slot.prompt_clear();
+            if (!slot.prompt_clear()) {
+                send_error(slot, "failed to clear slot memory", ERROR_TYPE_SERVER);
+                slot.release();
+                return false;
+            }
             slot.init_sampler();
             slot.sampled = LLAMA_TOKEN_NULL;
             slot.i_batch = -1;
@@ -8978,7 +9019,7 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && !slot.prompt_cleanup_failed && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
         }
@@ -9573,6 +9614,57 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // Admission only: the native reader still verifies RKVK and the Xbox pair.
+    static bool legacy_native_stream_layout_compatible(const std::string & source_layout,
+            const std::string & target_layout, const std::string & source_model,
+            const std::string & target_model, bool native_marker, uint32_t source_ctx,
+            uint32_t target_ctx, uint32_t source_p, uint32_t target_p) {
+        if (!native_marker || source_model.empty() || source_model != target_model ||
+                source_ctx != target_ctx || source_p == 0 || source_p != target_p || source_p >= source_ctx) {
+            return false;
+        }
+        try {
+            auto source = common_json::parse(source_layout);
+            auto target = common_json::parse(target_layout);
+            if (!source.is_object() || !target.is_object() || !source.value("mixed_kv", false) ||
+                    source.contains("native_companion_format") || target.contains("mixed_kv") ||
+                    target.at("native_companion_format").get<int32_t>() != 0 ||
+                    target.at("native_companion_split_p").get<uint32_t>() != target_p ||
+                    source.at("mixed_kvarn_type").get<int32_t>() != LLAMA_KVARN_K4V4_G128 ||
+                    target.at("native_companion_kvarn_type").get<int32_t>() != LLAMA_KVARN_K4V4_G128 ||
+                    source.at("mixed_kvarn_bits_k").get<int32_t>() != 4 ||
+                    source.at("mixed_kvarn_bits_v").get<int32_t>() != 4 ||
+                    target.at("native_companion_kvarn_bits_k").get<int32_t>() != 4 ||
+                    target.at("native_companion_kvarn_bits_v").get<int32_t>() != 4 ||
+                    source.value("native_global_tail_tokens", 0u) != target.value("native_global_tail_tokens", 0u)) {
+                return false;
+            }
+            const auto & layers = source.at("mixed_remote_layers");
+            const int32_t layer_count = source.at("mixed_layer_count").get<int32_t>();
+            if (!layers.is_array() || layers.empty() || layer_count <= 0 || layers.size() > size_t(layer_count)) return false;
+            std::unordered_set<int32_t> seen;
+            int32_t quant = -1;
+            for (const auto & layer : layers) {
+                const int32_t id = layer.at("layer").get<int32_t>();
+                const int32_t k = layer.at("type_k").get<int32_t>();
+                const int32_t v = layer.at("type_v").get<int32_t>();
+                if (id < 0 || id >= layer_count || !seen.insert(id).second || k != v ||
+                        (k != int32_t(GGML_TYPE_Q4_0) && k != int32_t(GGML_TYPE_Q8_0)) ||
+                        (quant != -1 && quant != k)) return false;
+                quant = k;
+            }
+            for (const char * key : {"mixed_kv", "mixed_kvarn_type", "mixed_kvarn_bits_k",
+                    "mixed_kvarn_bits_v", "mixed_layer_count", "mixed_remote_layers",
+                    "native_global_tail_tokens", "type_k_aux", "type_v_aux"}) source.erase(key);
+            for (const char * key : {"native_companion_format", "native_companion_split_p",
+                    "native_companion_kvarn_type", "native_companion_kvarn_bits_k",
+                    "native_companion_kvarn_bits_v", "native_global_tail_tokens", "type_k_aux", "type_v_aux"}) target.erase(key);
+            return source == target;
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
+
     bool restore_native_stream_slot(const server_task & task, server_slot & slot,
             const std::string * automatic_path = nullptr, const llama_tokens * request = nullptr,
             bool * loader_called = nullptr) {
@@ -9615,7 +9707,11 @@ private:
             if (!adaptive_model_identity.has_value() || file.model != adaptive_model_identity->fingerprint()) {
                 throw std::runtime_error("native streaming slot model identity differs");
             }
-            if (file.layout != common_prompt_cache_layout(ctx_tgt)) {
+            const std::string target_layout = common_prompt_cache_layout(ctx_tgt);
+            if (file.layout != target_layout && !legacy_native_stream_layout_compatible(
+                    file.layout, target_layout, file.model, adaptive_model_identity->fingerprint(),
+                    file.has_native_remote_marker && file.native_remote, file.source_ctx,
+                    llama_n_ctx_seq(ctx_tgt), file.native_split_p, slot.position_split_p)) {
                 throw std::runtime_error("native streaming slot layout differs");
             }
             if (automatic && (!request || !file.has_native_remote_marker || !file.native_remote ||
@@ -10194,9 +10290,22 @@ private:
                     //
 
                     if (slot == nullptr) {
+                        const bool all_unusable = !slots.empty() &&
+                                std::all_of(slots.begin(), slots.end(), [](const server_slot & candidate) {
+                                    return candidate.prompt_cleanup_failed;
+                                });
+                        if (all_unusable) {
+                            send_error(task, "slot memory cleanup failed; context must be recreated", ERROR_TYPE_SERVER);
+                            break;
+                        }
                         // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    if (slot->prompt_cleanup_failed) {
+                        send_error(task, "slot memory cleanup failed; context must be recreated", ERROR_TYPE_SERVER);
                         break;
                     }
 
@@ -10212,6 +10321,14 @@ private:
                         size_t n_child_tasks = task.child_tasks.size();
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
+                            const size_t usable_children = std::count_if(slots.begin(), slots.end(),
+                                    [&](const server_slot & candidate) {
+                                        return candidate.id != slot->id && !candidate.prompt_cleanup_failed;
+                                    });
+                            if (usable_children < n_child_tasks) {
+                                send_error(task, "slot memory cleanup failed; not enough usable slots", ERROR_TYPE_SERVER);
+                                break;
+                            }
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
                             break;
@@ -10389,6 +10506,10 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->prompt_cleanup_failed) {
+                        send_error(task, "slot memory cleanup failed; context must be recreated", ERROR_TYPE_SERVER);
                         break;
                     }
                     if (slot->is_processing()) {
@@ -10710,6 +10831,10 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    if (slot->prompt_cleanup_failed) {
+                        send_error(task, "slot memory cleanup failed; context must be recreated", ERROR_TYPE_SERVER);
+                        break;
+                    }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
@@ -10753,8 +10878,7 @@ private:
                                 return false;
                             }
                             if (!previous_snapshot) {
-                                slot->prompt_clear();
-                                return true;
+                                return slot->prompt_clear();
                             }
                             std::string rollback_error;
                             if (!adaptive_slot_restore(*previous_snapshot, *slot, ctx_tgt, ctx_dft,
@@ -10938,7 +11062,9 @@ private:
                         if (slot->draft_owns_state && !restore_draft) {
                             // Old target-only files cannot supply a common draft epoch.
                             // Keep compatibility through an explicit full reevaluation.
-                            slot->prompt_clear();
+                            if (!slot->prompt_clear()) {
+                                throw std::runtime_error("failed to clear restored slot memory");
+                            }
                             SLT_WRN(*slot, "%s", "legacy target-only slot state requires prompt reevaluation\n");
                         }
                     } catch (const std::exception & err) {
@@ -11027,7 +11153,10 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
-                    slot->prompt_clear();
+                    if (!slot->prompt_clear()) {
+                        send_error(task, "failed to clear slot memory", ERROR_TYPE_SERVER);
+                        break;
+                    }
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -11974,6 +12103,11 @@ private:
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                     }
                                 }
+                                if (slot.prompt_cleanup_failed) {
+                                    send_error(slot, "failed to clear slot memory", ERROR_TYPE_SERVER);
+                                    slot.release();
+                                    return;
+                                }
                                 // ===== end AUTO-RESTORE =====================================================
                                 // the children start from the shared prefix, do not go past it
                                 if (slot.task->n_tokens_shared > 0) {
@@ -12214,7 +12348,11 @@ private:
                                     // into the already-occupied restored state (which is the crash being fixed).
                                     slot.just_restored = false;
                                     SLT_WRN(slot, "%s", "restore-continue: saved logits unavailable or incompatible and context cannot rollback; clearing restored state and re-prefilling\n");
-                                    slot.prompt_clear();
+                                    if (!slot.prompt_clear()) {
+                                        send_error(slot, "failed to clear slot memory", ERROR_TYPE_SERVER);
+                                        slot.release();
+                                        return;
+                                    }
                                     n_past   = 0;
                                     pos_next = 0; // mirror the do_reset path; keep the stale full-length value from leaking into the checkpoint-erase loop below
                                     // fall through to the normal guard below with an empty sequence (safe)
@@ -13184,7 +13322,11 @@ if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_t
                             "target-only MTP bootstrap rejected (decode_id=%llu, decoded_suffix=%d, pos_last=%d, pos_max=%d, ubatch=%u); retrying with cold prefill\n",
                             (unsigned long long) decode_id, batch.view.size(), pos_last, pos_max,
                             llama_n_ubatch(ctx_tgt));
-                    slot.prompt_clear();
+                    if (!slot.prompt_clear()) {
+                        send_error(slot, "failed to clear slot memory", ERROR_TYPE_SERVER);
+                        slot.release();
+                        continue;
+                    }
                     slot.bootstrap_cold_fallback = true;
                     slot.prompt_cache_reason = "mtp_bootstrap_cold_fallback";
                     slot.stats = {};

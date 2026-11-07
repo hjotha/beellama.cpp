@@ -1299,7 +1299,48 @@ static void test_compact_split_streaming(int local_kind = 0) {
     CHECK(pure_streamed == pure_reference);
 }
 
+
+static void test_native_external_kvarn4_stream() {
+    std::vector<uint8_t> payload(128, 42), metadata(1, 7), encoded, reference;
+    layer_desc local = make_kvarn_layer(7, kv4v4, 4, 4,
+            uint8_t(kvarn_domain::rotated), 0, 0, payload.size());
+    local.range_id = 0; local.range_start = 0; local.range_end = 512;
+    layer_desc remote = local;
+    remote.range_id = 1; remote.range_start = 512; remote.range_end = 1024;
+    remote.layout = layout_kvarn_native_external_v1;
+    remote.payload_cells = 0; remote.payload_rows = 0; remote.payload_bytes = 0;
+    position_split split; split.p = 512; split.c = 1024; split.model_id = 123; split.rope_id = 456;
+    stream_input input; input.layers = {local, remote}; input.split = split;
+    input.metadata_version = 2; input.metadata = metadata.data(); input.metadata_size = metadata.size();
+    size_t remote_reads = 0;
+    stream_read_callbacks reads;
+    reads.read_payload = [&](uint32_t layer, uint32_t range, uint64_t offset, uint8_t *dst, size_t count) {
+        if (range == 1) { ++remote_reads; return size_t(0); }
+        if (layer != 7 || offset > payload.size() || count > payload.size() - size_t(offset)) return size_t(0);
+        std::memcpy(dst, payload.data() + offset, count); return count;
+    };
+    stream_write_callbacks writes;
+    writes.write_bytes = [&](const uint8_t *data, size_t size) {
+        encoded.insert(encoded.end(), data, data + size); return true;
+    };
+    CHECK(stream_serialize(input, reads, writes));
+    CHECK(remote_reads == 0);
+    serialize_options options; options.split = split;
+    CHECK(snapshot::serialize({{local, payload.data(), payload.size()}, {remote, nullptr, 0}},
+            {}, 2, metadata.data(), metadata.size(), snapshot_flags::full, 0, 0, reference, {}, options));
+    CHECK(encoded == reference);
+    auto parsed = snapshot::parse(encoded.data(), encoded.size());
+    CHECK(parsed.layers().size() == 2 && parsed.layers()[1].layout == layout_kvarn_native_external_v1);
+    stream_input bad = input; bad.layers[1].payload_bytes = 1;
+    CHECK_THROWS(stream_serialize(bad, reads, writes));
+    bad = input; bad.layers[1].range_start = 768;
+    CHECK_THROWS(stream_serialize(bad, reads, writes));
+    bad = input; bad.layers[1].v_bits = 5; bad.layers[1].k_type = kv4v5; bad.layers[1].v_type = kv4v5;
+    CHECK_THROWS(stream_serialize(bad, reads, writes));
+}
+
 int main() {
+    test_native_external_kvarn4_stream();
     test_stream_equals_serialize_all_fixtures();
     test_chunk_boundaries();
     test_stream_roundtrip_parse();

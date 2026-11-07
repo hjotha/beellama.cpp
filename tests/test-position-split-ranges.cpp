@@ -356,6 +356,20 @@ int main() {
         }
         // Missing overflow range.
         {
+            for (uint8_t format : {uint8_t(0), uint8_t(4), uint8_t(5)}) {
+                auto native = descs;
+                for (auto & desc : native) {
+                    if (desc.range_id == kRangeOverflow) desc.format = format;
+                }
+                CHECK(!validate_ranges(native, P, C, full_layers).empty());
+                CHECK(validate_ranges(native, P, C, full_layers, format).empty());
+                CHECK(!validate_ranges(native, P, C, full_layers, (format + 1) % 6).empty());
+                native[1].format = 1;
+                CHECK(!validate_ranges(native, P, C, full_layers, format).empty());
+            }
+            CHECK(!validate_ranges(descs, P, C, full_layers, 2).empty());
+        }
+        {
             std::vector<range_desc> bad = descs;
             bad.pop_back();
             CHECK(!validate_ranges(bad, P, C, full_layers).empty());

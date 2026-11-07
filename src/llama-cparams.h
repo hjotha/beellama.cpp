@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
@@ -118,6 +119,10 @@ bool kv_unified;
     bool        remote_attn_stats   = false;
     ggml_type   remote_attn_cache_type_k = GGML_TYPE_COUNT;
     ggml_type   remote_attn_cache_type_v = GGML_TYPE_COUNT;
+    llama_remote_native_companion remote_attn_native_companion = LLAMA_REMOTE_COMPANION_AUTO;
+    std::string remote_attn_upload_format;
+    std::string remote_attn_wire_format;
+    bool remote_attn_wire_format_set = false;
 
     // Prism: per-channel K-cache mean-centering bias file (requires type_k == Q4_0).
     const char * path_kv_mean_center = nullptr;

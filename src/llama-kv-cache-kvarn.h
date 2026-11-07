@@ -446,7 +446,9 @@ public:
             uint32_t position_split_p = 0,
             bool rpc_position_split = false,
             ggml_type local_type_k = GGML_TYPE_COUNT,
-            ggml_type local_type_v = GGML_TYPE_COUNT);
+            ggml_type local_type_v = GGML_TYPE_COUNT,
+            llama_remote_native_companion native_companion = LLAMA_REMOTE_COMPANION_AUTO,
+            const char * upload_format = nullptr);
     ~llama_kv_cache_kvarn() override;
 
     llama_memory_context_ptr init_batch(
@@ -473,6 +475,9 @@ public:
     void set_native_kvarn_rewind_capable(bool capable) { native_kvarn_rewind_capable_ = capable; }
     void set_native_kvarn_rewind_preflight(std::function<bool(llama_pos)> preflight) {
         native_kvarn_rewind_preflight_ = std::move(preflight);
+    }
+    void set_native_companion_reset(std::function<bool()> reset) {
+        native_companion_reset_ = std::move(reset);
     }
     seq_rm_capability get_seq_rm_capability() const override;
 
@@ -693,6 +698,8 @@ public:
     uint32_t position_split_p() const { return position_split_p_; }
     uint32_t position_split_local_capacity() const { return kv_size_local; }
     uint32_t position_split_overflow_capacity() const { return kv_size_overflow; }
+    bool native_companion_enabled() const { return native_companion_format_ >= 0; }
+    int native_companion_format() const { return native_companion_format_; }
     // Tabela lógica única de faixas por camada full (Fase 2b): dois
     // descritores por camada, [0,P) CUDA/KVarN4 e [P,C) Vulkan0/Q4, sem
     // lacunas nem sobreposições. Vazio quando o modo está desligado.
@@ -951,12 +958,16 @@ private:
     const uint32_t kv_size_local;
     const uint32_t kv_size_overflow;
     const uint32_t position_split_p_;
+    // Native producer owns the overflow; -1 keeps the standard companion path.
+    const int native_companion_format_;
+    bool native_companion_negotiated_ = false;
     bool native_kvarn_rpc_experimental_;
     // SAW/TurboQuant native rows own remote state but have no native FULL codec.
     bool native_row_rpc_experimental_;
     uint32_t native_global_tail_tokens_ = 0;
     bool native_kvarn_rewind_capable_ = false;
     std::function<bool(llama_pos)> native_kvarn_rewind_preflight_;
+    std::function<bool()> native_companion_reset_;
     bool native_kvarn_checkpoint_unavailable() const;
     mutable bool native_kvarn_overflow_seen_ = false;
     // Declaration order matters: stage_groups depends on tail_groups, so

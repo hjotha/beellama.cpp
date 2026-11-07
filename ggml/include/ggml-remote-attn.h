@@ -57,6 +57,31 @@ GGML_API struct ggml_tensor * ggml_remote_attn_range(
         struct ggml_tensor * query_pos,
         int layer_id, uint32_t origin, uint32_t n_live, float kq_scale);
 
+// Native producer: projected K/V are contiguous F32 [head_dim, n_head_kv, nq].
+// Configure the range with GGML_TYPE_F32 and negotiate the requested native
+// format before execution; no standard quantized companion is read or stored.
+GGML_API struct ggml_tensor * ggml_remote_attn_range_native(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q,
+        struct ggml_tensor * projected_k,
+        struct ggml_tensor * projected_v,
+        struct ggml_tensor * overflow_cells,
+        struct ggml_tensor * query_pos,
+        int layer_id, uint32_t origin, uint32_t n_live, float kq_scale);
+
+// True only for an explicitly requested native companion and native format.
+// This is an intent check; peer capabilities must still be negotiated.
+GGML_API bool ggml_remote_attn_native_companion_requested(void);
+
+// Whether the host companion and selected positional RKVA KV format agree.
+// F32 denotes original projections supplied to a structured native producer.
+GGML_API bool ggml_remote_attn_companion_format_matches(const char * format, enum ggml_type source_type);
+
+// Capture the upload selection before HELLO; NULL resolves the legacy env once.
+GGML_API bool ggml_backend_remote_attn_set_upload_format(ggml_backend_t backend, const char * format);
+// Capture Q/OUT wire and its legacy fallback options before HELLO.
+GGML_API bool ggml_backend_remote_attn_set_wire_format(ggml_backend_t backend, const char * format);
+
 // Opt-in overlap plumbing. Marking a range node async is only valid when
 // ggml_backend_remote_attn_async_enabled() is true (native KVarN4 bulk RPC).
 // The completion node must be scheduled after the local attention work and
@@ -176,6 +201,10 @@ GGML_API bool ggml_backend_remote_attn_kvarn_stage_finish(struct ggml_remote_att
 GGML_API ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take(struct ggml_remote_attn_kvarn_stage * stage,
         const char * host, uint16_t port, const struct ggml_remote_attn_geometry * geometry,
         uint32_t origin, uint32_t capacity, enum ggml_type cache_type, uint32_t native_tail_tokens);
+GGML_API ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take_for_format(struct ggml_remote_attn_kvarn_stage * stage,
+        const char * host, uint16_t port, const struct ggml_remote_attn_geometry * geometry,
+        uint32_t origin, uint32_t capacity, enum ggml_type cache_type, uint32_t native_tail_tokens,
+        const char * upload_format, const char * wire_format);
 GGML_API bool ggml_backend_remote_attn_kvarn_stage_taken(const struct ggml_remote_attn_kvarn_stage * stage);
 GGML_API bool ggml_backend_remote_attn_kvarn_stage_matches(const struct ggml_remote_attn_kvarn_stage * stage,
         ggml_backend_t backend, uint32_t expected_rows);
@@ -296,7 +325,13 @@ GGML_API void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend);
 //
 // Registers the backend whose connection ggml_remote_attn_exec() should use
 // (MVP: one active remote connection per process). Pass NULL to clear.
+// A refused legacy activation retires remote dispatch until process restart:
+// this void API cannot identify the caller of a later operation.
 GGML_API void ggml_remote_attn_set_active(ggml_backend_t backend);
+GGML_API bool ggml_remote_attn_try_activate(ggml_backend_t backend);
+GGML_API void ggml_remote_attn_deactivate(ggml_backend_t backend);
+GGML_API bool ggml_remote_attn_reserve_stage(ggml_backend_t backend);
+GGML_API void ggml_remote_attn_release_stage(ggml_backend_t backend);
 
 // Executes one GGML_OP_REMOTE_ATTN node over the active connection. Called from
 // the CPU backend's compute_forward. The node's sources are host tensors (CPU

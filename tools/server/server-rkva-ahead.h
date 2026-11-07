@@ -22,8 +22,8 @@
 class server_rkva_ahead {
 public:
     server_rkva_ahead(const char * host, uint16_t port, const ggml_remote_attn_geometry & geometry,
-            uint32_t origin, ggml_type type, std::vector<int> layer_ids,
-            std::vector<llama_token> tokens)
+            uint32_t origin, ggml_type type, const char * upload_format, std::vector<int> layer_ids,
+            std::vector<llama_token> tokens, const char * wire_format = nullptr)
         : origin_(origin), layer_ids_(std::move(layer_ids)), tokens_(std::move(tokens)), rows_(layer_ids_.size()) {
         if (tokens_.size() <= origin_ || geometry.n_layer_remote != layer_ids_.size()) return;
         const char * producer = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
@@ -35,7 +35,14 @@ public:
             return;
         }
         backend_ = ggml_backend_remote_attn_init(host, port);
-        if (!backend_ || !ggml_backend_remote_attn_set_geometry(backend_, &geometry)) return;
+        if (backend_ && !ggml_remote_attn_reserve_stage(backend_)) {
+            ggml_backend_free(backend_);
+            backend_ = nullptr;
+            return;
+        }
+        if (!backend_ || !ggml_backend_remote_attn_set_upload_format(backend_, upload_format) ||
+                !ggml_backend_remote_attn_set_wire_format(backend_, wire_format) ||
+                !ggml_backend_remote_attn_set_geometry(backend_, &geometry)) return;
         try {
             queue_ = std::make_unique<rkva_stage_queue>(size_t(geometry.n_head_kv) * geometry.head_dim, 256u << 20,
                 [this, geometry, type, owner_bytes](const rkva_stage_queue::frame & frame) {
@@ -52,6 +59,7 @@ public:
                     frame.first_pos, frame.count, frame.keys.data(), frame.values.data());
             }, 8ull << 30);
         } catch (...) {
+            ggml_remote_attn_release_stage(backend_);
             ggml_backend_free(backend_);
             backend_ = nullptr;
             throw;
@@ -62,6 +70,7 @@ public:
         queue_.reset();
         const bool taken = stage_ && ggml_backend_remote_attn_kvarn_stage_taken(stage_);
         ggml_backend_remote_attn_kvarn_stage_free(stage_);
+        ggml_remote_attn_release_stage(backend_);
         if (backend_ && !taken) ggml_backend_free(backend_);
     }
     server_rkva_ahead(const server_rkva_ahead &) = delete;

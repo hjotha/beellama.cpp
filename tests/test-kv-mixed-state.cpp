@@ -3053,7 +3053,92 @@ static void test_compact_qx_rows(uint16_t type = sx_q4_0) {
     CHECK(compact == original);
 }
 
+
+static void test_native_external_kvarn4_layout_v1() {
+    std::vector<uint8_t> payload(64, 42), out;
+    layer_desc local = make_kvarn_layer(0, kv4v4, 4, 4,
+            uint8_t(kvarn_domain::rotated), 0, 0, payload.size());
+    local.range_id = 0; local.range_start = 0; local.range_end = SPLIT_P;
+    layer_desc remote = local;
+    remote.range_id = 1; remote.range_start = SPLIT_P; remote.range_end = SPLIT_C;
+    remote.layout = layout_kvarn_native_external_v1;
+    remote.payload_cells = 0; remote.payload_rows = 0; remote.payload_bytes = 0;
+    serialize_options options; options.split = make_split();
+    const std::vector<cell_entry> cells;
+    const uint8_t metadata[] = {1};
+    CHECK(snapshot::serialize({{local, payload.data(), payload.size()}, {remote, nullptr, 0}},
+            cells, 2, metadata, sizeof(metadata), snapshot_flags::full, 0, 0, out, {}, options));
+    auto parsed = snapshot::parse(out.data(), out.size());
+    CHECK(parsed.has_split());
+    CHECK(parsed.layers().size() == 2);
+    CHECK(parsed.layers()[1].layout == layout_kvarn_native_external_v1);
+    CHECK(parsed.layers()[1].payload_bytes == 0);
+    expected_snapshot expected;
+    expected.capacity_cells = SPLIT_C; expected.metadata_version = 2; expected.split = make_split();
+    for (const auto & d : parsed.layers()) expected.layers.push_back(expected_layer::from_desc(d));
+    parsed.validate_expected_snapshot(expected);
+    auto wrong_identity = snapshot::parse(out.data(), out.size());
+    expected.split->model_id ^= 1;
+    CHECK_THROWS(wrong_identity.validate_expected_snapshot(expected));
+    expected.split = make_split();
+    expected.layers[1].kind = cache_kind::standard_qx;
+    expected.layers[1].layout = layout_standard_qx_compact_rows;
+    auto wrong_format = snapshot::parse(out.data(), out.size());
+    CHECK_THROWS(wrong_format.validate_expected_snapshot(expected));
+    layer_desc bad = remote;
+    bad.k_type = kv4v5; bad.v_type = kv4v5; bad.v_bits = 5;
+    CHECK_THROWS(snapshot::serialize({{local, payload.data(), payload.size()}, {bad, nullptr, 0}},
+            cells, 2, metadata, sizeof(metadata), snapshot_flags::full, 0, 0, out, {}, options));
+    bad = remote; bad.payload_bytes = 1;
+    CHECK_THROWS(snapshot::serialize({{local, payload.data(), payload.size()}, {bad, payload.data(), 1}},
+            cells, 2, metadata, sizeof(metadata), snapshot_flags::full, 0, 0, out, {}, options));
+    bad = remote; bad.range_start += 256;
+    CHECK_THROWS(snapshot::serialize({{local, payload.data(), payload.size()}, {bad, nullptr, 0}},
+            cells, 2, metadata, sizeof(metadata), snapshot_flags::full, 0, 0, out, {}, options));
+    bad = remote; bad.layout = layout_kvarn_records_stage_tail;
+    CHECK_THROWS(snapshot::serialize({{local, payload.data(), payload.size()}, {bad, nullptr, 0}},
+            cells, 2, metadata, sizeof(metadata), snapshot_flags::full, 0, 0, out, {}, options));
+}
+
+
+static void test_native_external_legacy_companion_validation() {
+    layer_desc native = make_kvarn_layer(0, kv4v4, 4, 4,
+            uint8_t(kvarn_domain::rotated), 3, 3, 0);
+    native.range_id = 1; native.range_start = SPLIT_P; native.range_end = SPLIT_C;
+    native.layout = layout_kvarn_native_external_v1;
+    native.payload_cells = 3; native.payload_rows = 3; native.payload_bytes = 0;
+    for (const uint16_t type : {uint16_t(sx_q4_0), uint16_t(sx_q8_0)}) {
+        auto old = make_qx_layer(0, type, type, 3, 0);
+        old.owner = owner_target; old.v_trans = 0; old.token_group = 32;
+        old.head_dim_v = native.head_dim_v;
+        old.range_id = 1; old.range_start = SPLIT_P; old.range_end = SPLIT_C;
+        old.layout = layout_standard_qx_compact_rows;
+        old.k_stride = old.v_stride = uint64_t(native.n_head_kv) * 8 * (type == sx_q4_0 ? 18 : 34);
+        CHECK(native_external_legacy_layer_compatible(old, native));
+        auto bad = old; bad.payload_bytes = 1;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+        bad = old; bad.payload_checksum = 1;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+        bad = old; bad.payload_mode = mode_resident_reference;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+        bad = old; bad.v_type = sx_f16;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+        bad = old; ++bad.k_stride;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+        bad = old; ++bad.range_start;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+        bad = old; ++bad.n_head_kv;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+        bad = old; bad.payload_rows = 2;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+        bad = old; bad.layout = layout_standard_qx_rows;
+        CHECK(!native_external_legacy_layer_compatible(bad, native));
+    }
+}
+
 int main() {
+    test_native_external_legacy_companion_validation();
+    test_native_external_kvarn4_layout_v1();
     test_roundtrip_mixed();
     test_empty_prefix();
     test_validate_strict();

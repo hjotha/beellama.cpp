@@ -47,6 +47,45 @@ int main() {
         require(!common_prompt_cache_layout_reusable(pure_zero.dump(), pure.dump()) &&
                 !common_prompt_cache_layout_convertible(pure_zero.dump(), pure.dump()),
                 "zero-tail cache must not select or convert an ordinary-tail snapshot");
+
+        // Native overflow has no standard mixed-cache payload. Its format and
+        // geometry must remain part of the identity across contexts.
+        json native = pure;
+        native.erase("source_context"); native.erase("source_capacity");
+        native["kv_layout_known"] = true;
+        native["native_companion_format"] = 0;
+        native["native_companion_split_p"] = 1024;
+        native["native_companion_kvarn_type"] = 1;
+        native["native_companion_kvarn_bits_k"] = 4;
+        native["native_companion_kvarn_bits_v"] = 4;
+        native["native_global_tail_tokens"] = 128;
+        require(common_prompt_cache_layout_reusable(native.dump(), native.dump()),
+                "identical native companion rejected");
+        require(common_prompt_cache_layout_convertible(native.dump(), native.dump()),
+                "identical native companion conversion rejected");
+        for (const char * key : {"native_companion_format", "native_companion_split_p",
+                                 "native_companion_kvarn_type", "native_companion_kvarn_bits_k",
+                                 "native_companion_kvarn_bits_v", "native_global_tail_tokens"}) {
+            json changed = native;
+            changed[key] = native[key].get<int>() + 1;
+            require(!common_prompt_cache_layout_reusable(native.dump(), changed.dump()) &&
+                    !common_prompt_cache_layout_reusable(changed.dump(), native.dump()),
+                    "different native companion identities reused");
+            require(!common_prompt_cache_layout_convertible(native.dump(), changed.dump()) &&
+                    !common_prompt_cache_layout_convertible(changed.dump(), native.dump()),
+                    "different native companion identities converted");
+        }
+        for (const json * other : {&pure, static_cast<const json *>(&split)}) {
+            require(!common_prompt_cache_layout_reusable(native.dump(), other->dump()) &&
+                    !common_prompt_cache_layout_reusable(other->dump(), native.dump()),
+                    "native companion reused as pure or standard mixed cache");
+            require(!common_prompt_cache_layout_convertible(native.dump(), other->dump()) &&
+                    !common_prompt_cache_layout_convertible(other->dump(), native.dump()),
+                    "native companion converted as pure or standard mixed cache");
+            require(!common_prompt_cache_layout_pure_to_split(other->dump(), native.dump()) &&
+                    !common_prompt_cache_layout_split_to_pure(native.dump(), other->dump()),
+                    "native companion accepted by standard mixed handoff");
+        }
         for (const char * key : {"rope_type", "rope_base", "rope_scale", "state_version", "session_version",
                                 "ctx_type", "nextn_layer", "cache_layout_version"}) {
             json mismatch = pure;

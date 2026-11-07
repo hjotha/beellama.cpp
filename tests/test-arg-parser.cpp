@@ -499,6 +499,64 @@ params = common_params();
             }
         };
 
+        {
+            const char * names[] = { "GGML_RKVA_NATIVE_COMPANION", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL", "GGML_RKVA_UPLOAD_FORMAT" };
+            std::vector<std::string> old;
+            std::vector<bool> present;
+            for (const char * name : names) {
+                const char * value = std::getenv(name);
+                present.push_back(value != nullptr);
+                old.emplace_back(value ? value : "");
+            }
+            set_test_env("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL", "1");
+            for (const char * format : { "kvarn4", "saw_int4", "turboquant_nc" }) {
+                common_params native;
+                std::vector<std::string> argv = {
+                    "binary_name", "-m", "model_file.gguf", "--cache-type-k", "kvarn4",
+                    "--cache-type-v", "kvarn4", "--remote-attn", "127.0.0.1:50054",
+                    "--kv-position-split-p", "256", "--remote-attn-format", format,
+                    "--remote-attn-cache-type-k", format, "--remote-attn-cache-type-v", format,
+                };
+                assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), native, LLAMA_EXAMPLE_SERVER));
+                assert(native.remote_attn_native_cache_type_k == format);
+                assert(native.remote_attn_native_cache_type_v == format);
+                assert(!invalid_mixed_context(native));
+                assert(common_resolve_remote_native_companion(native) != LLAMA_REMOTE_COMPANION_NONE);
+                auto draft = common_base_params_to_speculative(native);
+                assert(draft.remote_attn_native_cache_type_k.empty() && draft.remote_attn_native_cache_type_v.empty());
+                assert(!invalid_mixed_context(draft));
+                native.remote_attn_native_cache_type_v.clear();
+                assert(invalid_mixed_context(native));
+                native.remote_attn_native_cache_type_v = format;
+                native.remote_attn_format = "q4_0";
+                assert(invalid_mixed_context(native));
+            }
+            {
+                set_test_env("GGML_RKVA_NATIVE_COMPANION", "0");
+                set_test_env("GGML_RKVA_UPLOAD_FORMAT", "q8_0");
+                common_params native;
+                std::vector<std::string> args = { "binary_name", "-m", "model_file.gguf",
+                    "--remote-attn", "127.0.0.1:50054", "--kv-position-split-p", "256",
+                    "--remote-attn-format", "kvarn4", "--remote-attn-cache-type-k", "kvarn4",
+                    "--remote-attn-cache-type-v", "kvarn4" };
+                assert(common_params_parse(args.size(), list_str_to_char(args).data(), native, LLAMA_EXAMPLE_SERVER));
+                assert(std::string(std::getenv("GGML_RKVA_NATIVE_COMPANION")) == "0");
+                assert(std::string(std::getenv("GGML_RKVA_UPLOAD_FORMAT")) == "q8_0");
+                assert(common_resolve_remote_native_companion(native) == LLAMA_REMOTE_COMPANION_KVARN4);
+                common_params standard;
+                args.insert(args.end(), { "--remote-attn-cache-type-k", "q4_0", "--remote-attn-cache-type-v", "q4_0" });
+                assert(common_params_parse(args.size(), list_str_to_char(args).data(), standard, LLAMA_EXAMPLE_SERVER));
+                assert(invalid_mixed_context(standard)); // KVarN upload cannot use a Q4 companion
+                assert(standard.remote_attn_cache_type_k == GGML_TYPE_Q4_0 && standard.remote_attn_cache_type_v == GGML_TYPE_Q4_0);
+                standard.remote_attn_format = "q4_0";
+                assert(common_resolve_remote_native_companion(standard) == LLAMA_REMOTE_COMPANION_NONE);
+            }
+            for (size_t i = 0; i < old.size(); ++i) {
+                if (present[i]) set_test_env(names[i], old[i].c_str());
+                else unset_test_env(names[i]);
+            }
+        }
+
         common_params missing_v;
         std::vector<std::string> missing_v_argv = {
             "binary_name", "-m", "model_file.gguf",
@@ -2274,12 +2332,25 @@ static void test_e4_wire_argument() {
     const bool had_option = old_option != nullptr;
     const std::string saved_option = old_option ? old_option : "";
     unset_test_env("LLAMA_ARG_REMOTE_ATTN_WIRE_FORMAT");
+    set_test_env("GGML_RKVA_WIRE_FORMAT", "f16");
     for (const char * flag : {"--remote-attn-wire-format", "--remote-attn-activation-format"}) {
         common_params params;
         assert(parse(params, {"binary", flag, "fp8_e4m3fn"}));
         assert(params.remote_attn_wire_format == "fp8_e4m3fn");
         const char * selected = std::getenv("GGML_RKVA_WIRE_FORMAT");
-        assert(selected && std::strcmp(selected, "fp8_e4m3fn") == 0);
+        assert(selected && std::strcmp(selected, "f16") == 0);
+    }
+    {
+        common_params e4, f16, legacy;
+        assert(parse(e4, {"binary", "--remote-attn-wire-format", "fp8_e4m3fn"}));
+        assert(parse(f16, {"binary", "--remote-attn-wire-format", "f16"}));
+        const auto e4_ctx = common_context_params_to_llama(e4);
+        const auto f16_ctx = common_context_params_to_llama(f16);
+        const auto legacy_ctx = common_context_params_to_llama(legacy);
+        assert(e4_ctx.remote_attn_wire_format && std::strcmp(e4_ctx.remote_attn_wire_format, "fp8_e4m3fn") == 0);
+        assert(f16_ctx.remote_attn_wire_format && std::strcmp(f16_ctx.remote_attn_wire_format, "f16") == 0);
+        assert(legacy_ctx.remote_attn_wire_format == nullptr);
+        assert(std::strcmp(std::getenv("GGML_RKVA_WIRE_FORMAT"), "f16") == 0);
     }
     set_test_env("GGML_RKVA_WIRE_FORMAT", "fp8");
     for (const char * invalid : {"fp8_e4m3", "fp8_e4m3fnuz", "FP8_E4M3FN"}) {

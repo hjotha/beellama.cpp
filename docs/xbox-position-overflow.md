@@ -9,14 +9,15 @@ that delegates complete layers.
 ## Configuration
 
 ```sh
-GGML_RKVA_RANGE_STORAGE=auto build-optimized/bin/llama-server \
+GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL=1 build-optimized/bin/llama-server \
   -m model.gguf --device CUDA0 -ngl 99 -c 131072 -b 256 -ub 256 \
   --parallel 1 --flash-attn on --fit off --load-mode none \
   --cache-type-k kvarn4 --cache-type-v kvarn4 \
   --spec-draft-n-max 0 --no-context-shift \
   --kv-position-split-p 102400 \
   --remote-attn 192.168.1.26:50054 --remote-attn-layers full \
-  --remote-attn-cache-type-k q4_0 --remote-attn-cache-type-v q4_0 \
+  --remote-attn-format kvarn4 \
+  --remote-attn-cache-type-k kvarn4 --remote-attn-cache-type-v kvarn4 \
   --remote-attn-stats
 ```
 
@@ -38,7 +39,7 @@ rewritten prefix, failed upload or insufficient resources falls back to the
 ordinary prompt restore and prefill.
 
 This preparation currently applies to one text-only Qwen35 sequence, KVarN4
-on both profiles, native Xbox KVarN4 with a Q4_0 companion, the CPU producer,
+on both profiles, native Xbox KVarN4 without a standard companion,
 the default 128-token native tail, and a split profile without MTP. Other
 configurations keep their existing serving path. The normal split path still
 supports its independently configured tail sizes.
@@ -53,8 +54,9 @@ numerical differences, so this optimization does not promise bit-identical
 generation to a prompt processed remotely from the start.
 
 The initial range path supports one contiguous, unshifted, causal text
-sequence with Qwen35 dense full-attention layers, a CUDA KVarN prefix and a
-Q4_0, Q8_0 or F16 companion (matching K and V types). It rejects holes or changed
+sequence with Qwen35 dense full-attention layers and a CUDA KVarN prefix. The
+remote companion matches the selected KV format: native KVarN4, SAW-INT4 or
+TurboQuant NC, or matching Q4_0, Q8_0 or F16 rows. It rejects holes or changed
 absolute positions rather than silently reading a different history. SWA, attention sinks, ALiBi and softcap
 are outside this path. The initial serving and comparison workload disables
 MTP in the split profile. Only one active RPC context per server process is
@@ -62,8 +64,9 @@ qualified; the existing remote-backend selector is process-global.
 
 ## Storage and transport
 
-The host retains a compact CPU companion for checkpointing and
-resynchronization. It sends only newly appended overflow rows during ordinary
+For standard row formats the host retains a matching compact CPU companion for
+checkpointing and resynchronization. Native formats use their own producer and
+remote owner without a standard Q4/Q8 mirror. The host sends only newly appended overflow rows during ordinary
 inference; it does not transmit the full history for every token. The prefix
 never enters the RPC cache. A restored or rewound range is uploaded again
 before it is read remotely. New overflow K/V is quantized directly from the
@@ -73,8 +76,8 @@ than Q4_0, but remains lossy and cannot guarantee identical logits.
 
 `GGML_RKVA_RANGE_STORAGE` selects the remote representation:
 
-- `auto` negotiates native storage matching the host companion, otherwise F16.
-  An F16 companion always sends its half-precision bytes directly.
+- `auto` requires a negotiated storage format matching the host companion;
+  it does not silently fall back to F16 for Q4/Q8 caches.
 - `q4_0` or `q8_0` requires the matching host cache and server capability and
   transmits the packed records directly. To use Q8_0, set both
   `--remote-attn-cache-type-k q8_0` and `--remote-attn-cache-type-v q8_0`.
@@ -83,9 +86,9 @@ than Q4_0, but remains lossy and cannot guarantee identical logits.
   those exact bytes to Xbox. The CUDA prefix remains KVarN4. There is no Q4/Q8
   intermediate. CPU F16 snapshots retain format identity and cannot be restored
   as a Q4/Q8 overflow.
-- For explicit transport diagnostics, `f16` with a Q4/Q8 companion still expands
-  that quantized source. This older route does not recover its lost precision;
-  it must not be labeled an original-F16 quality baseline.
+- The host accepts explicit F32 diagnostic transport, but the current Xbox
+  standard-range receiver does not accept F32 uploads. Do not treat it as a
+  supported end-to-end path or an F32 companion.
 
 Unknown values and missing required capabilities fail closed. With 16 layers,
 4 KV heads and head width 256, the 28672-position overflow requires
@@ -109,9 +112,9 @@ The Xbox implementation retains legacy v1 whole-layer commands. A client
 requiring ranges rejects a server without the range capabilities; it does not
 silently substitute Vulkan. Snapshot layout validation remains authoritative:
 native snapshots from different device layouts must not be force-restored.
-Full restore invalidates the remote upload epoch, and the CPU companion is
-the source for resynchronization. Session clear and rewind cannot leave stale
-future keys visible.
+Full restore invalidates the remote upload epoch. Standard formats resynchronize
+from their CPU companion; native KVarN4 restores its authenticated producer and
+Xbox snapshot pair. Session clear cannot leave stale future keys visible.
 
 `test-remote-attn-range` exercises the host against a loopback oracle without
 a model or GPU. It covers protocol rejection, Q4/Q8/F16 transport, OUT/LSE

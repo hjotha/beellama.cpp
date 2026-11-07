@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -64,12 +65,9 @@
 
 #define GGML_REMOTE_ATTN_NAME "RemoteAttn"
 
-namespace {
+static bool rkva_legacy_dispatch_retired();
 
-static bool rkva_e4_requested() {
-    return ggml_remote_attn_policy::e4_requested(std::getenv("GGML_RKVA_WIRE_FORMAT"),
-            std::getenv("GGML_RKVA_NATIVE_BULK_WIRE"), std::getenv("GGML_RKVA_NATIVE_BULK"));
-}
+namespace {
 
 static bool rkva_f32_to_e4_batch(const float * src, uint8_t * dst, size_t n) {
     for (size_t i = 0; i < n; ++i) if (!rkva_e4::encode_f32(src[i], dst[i])) return false;
@@ -1034,6 +1032,12 @@ struct ggml_backend_remote_attn_context {
 
     ggml_remote_attn_geometry geo {};
     bool        geo_set = false;
+    std::string upload_format;
+    bool        upload_format_fixed = false;
+    std::optional<std::string> wire_format;
+    std::optional<std::string> bulk_wire_option;
+    std::optional<std::string> bulk_option;
+    bool        wire_options_fixed = false;
     rkva_hello_ack ack {};
 
     uint32_t    active_session = RKVA_SESSION_NONE;
@@ -3089,15 +3093,22 @@ static bool rkva_run_range(
                 GGML_REMOTE_ATTN_NAME, stage, layer, nq, n_live, origin);
         return false;
     };
+    const bool native_projection = ctx->range_source_type == GGML_TYPE_F32;
+    const bool source_geometry_ok = k && v && k->type == ctx->range_source_type &&
+            v->type == ctx->range_source_type && ggml_are_same_shape(k, v) &&
+            (native_projection ?
+                ctx->range_native_kvarn && ggml_is_contiguous(k) && ggml_is_contiguous(v) &&
+                k->ne[0] == ctx->geo.head_dim && k->ne[1] == ctx->geo.n_head_kv &&
+                k->ne[2] == int64_t(nq) && k->ne[3] == 1 &&
+                node->src[5] == k && node->src[6] == v :
+                k->ne[0] == int64_t(width) && k->ne[2] == 1 && k->ne[3] == 1);
     if (!ctx->range_configured || ctx->active_session == RKVA_SESSION_NONE ||
             layer < 0 || (size_t) layer >= ctx->range_layers.size() ||
             origin < 0 || (uint32_t) origin != ctx->range_origin || n_live <= 0 ||
             (uint32_t) n_live > ctx->range_capacity || !q || !k || !v || !cells || !pos ||
             q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || q->ne[3] != 1 || nq == 0 ||
             q->ne[0] != ctx->geo.head_dim || q->ne[1] != ctx->geo.n_head ||
-            k->type != ctx->range_source_type || v->type != ctx->range_source_type ||
-            !ggml_are_same_shape(k, v) || k->ne[0] != (int64_t) width ||
-            k->ne[2] != 1 || k->ne[3] != 1 ||
+            !source_geometry_ok ||
             cells->type != GGML_TYPE_I32 || pos->type != GGML_TYPE_I32 ||
             !ggml_is_contiguous(cells) || !ggml_is_contiguous(pos) ||
             ggml_nelements(cells) < n_live || ggml_nelements(pos) < (int64_t) nq ||
@@ -3129,7 +3140,8 @@ static bool rkva_run_range(
             ++count;
         }
     }
-    if (count == 0 || count > (uint64_t) k->ne[1] || count > (uint64_t) v->ne[1]) {
+    if (count == 0 || (!native_projection &&
+            (count > (uint64_t) k->ne[1] || count > (uint64_t) v->ne[1]))) {
         return invalid_range("coverage");
     }
     ctx->pos_scratch.resize(nq);
@@ -3879,6 +3891,53 @@ ggml_backend_t ggml_backend_remote_attn_init(const char * host, uint16_t port) {
 #endif
 }
 
+static const char * rkva_legacy_upload_format() {
+    if (const char * fmt = std::getenv("GGML_RKVA_UPLOAD_FORMAT")) return fmt;
+    if (const char * fmt = std::getenv("GGML_RKVA_FORMAT")) return fmt;
+    return std::getenv("GGML_RKVA_RANGE_STORAGE");
+}
+
+bool ggml_backend_remote_attn_set_upload_format(ggml_backend_t backend, const char * format) {
+    if (!backend || ggml_backend_is_local_split(backend)) return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->connected || ctx->range_configured) return false;
+    const char * selected = format ? format : rkva_legacy_upload_format();
+    try { ctx->upload_format = selected ? selected : ""; }
+    catch (...) { return false; }
+    ctx->upload_format_fixed = true;
+    return true;
+}
+
+static const char * rkva_optional_cstr(const std::optional<std::string> & value) {
+    return value ? value->c_str() : nullptr;
+}
+
+static bool rkva_capture_wire_options(ggml_backend_remote_attn_context * ctx, const char * format) {
+    const char * wire = format ? format : std::getenv("GGML_RKVA_WIRE_FORMAT");
+    const char * bulk_wire = std::getenv("GGML_RKVA_NATIVE_BULK_WIRE");
+    const char * bulk = std::getenv("GGML_RKVA_NATIVE_BULK");
+    try {
+        ctx->wire_format = wire ? std::optional<std::string>(wire) : std::nullopt;
+        ctx->bulk_wire_option = bulk_wire ? std::optional<std::string>(bulk_wire) : std::nullopt;
+        ctx->bulk_option = bulk ? std::optional<std::string>(bulk) : std::nullopt;
+        ctx->wire_options_fixed = true;
+        return true;
+    } catch (...) { return false; }
+}
+
+bool ggml_backend_remote_attn_set_wire_format(ggml_backend_t backend, const char * format) {
+    if (!backend || ggml_backend_is_local_split(backend)) return false;
+    if (format && std::strcmp(format, "f16") && std::strcmp(format, "fp16") &&
+            std::strcmp(format, "fp8") && std::strcmp(format, "fp8_e5m2") &&
+            std::strcmp(format, "fp8_e4m3fn") && std::strcmp(format, "auto") &&
+            std::strcmp(format, "f32") && std::strcmp(format, "fp32")) return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->connected || ctx->range_configured) return false;
+    return rkva_capture_wire_options(ctx, format);
+}
+
 bool ggml_backend_remote_attn_set_geometry(
         ggml_backend_t backend, const struct ggml_remote_attn_geometry * geo) {
     if (!backend || !geo) {
@@ -3920,9 +3979,13 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
         GGML_LOG_ERROR("%s: geometry not set before connect\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
-    const char * requested_storage = std::getenv("GGML_RKVA_UPLOAD_FORMAT");
-    if (!requested_storage) requested_storage = std::getenv("GGML_RKVA_FORMAT");
-    if (!requested_storage) requested_storage = std::getenv("GGML_RKVA_RANGE_STORAGE");
+    if (!ctx->upload_format_fixed) {
+        const char * legacy = rkva_legacy_upload_format();
+        ctx->upload_format = legacy ? legacy : "";
+        ctx->upload_format_fixed = true;
+    }
+    if (!ctx->wire_options_fixed && !rkva_capture_wire_options(ctx, nullptr)) return false;
+    const char * requested_storage = ctx->upload_format.empty() ? nullptr : ctx->upload_format.c_str();
     const bool env_native_kvarn = requested_storage &&
             (!std::strcmp(requested_storage, "kvarn4") || !std::strcmp(requested_storage, "kvarn"));
     if (ctx->native_tail_override == UINT32_MAX && env_native_kvarn) {
@@ -3960,7 +4023,8 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->async_local_remote = false;
     ctx->native_layers.clear();
     ctx->native_store = nullptr;
-    ctx->e4_requested = rkva_e4_requested();
+    ctx->e4_requested = ggml_remote_attn_policy::e4_requested(rkva_optional_cstr(ctx->wire_format),
+            rkva_optional_cstr(ctx->bulk_wire_option), rkva_optional_cstr(ctx->bulk_option));
     ctx->protocol_version = ctx->e4_requested ? RKVA_VERSION : RKVA_VERSION_V2;
     ctx->range_fused = false;
     ctx->range_profile = false;
@@ -4401,7 +4465,8 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
             ctx->geo.head_dim != 256 || ctx->geo.n_head_kv == 0 ||
             ctx->geo.group_tokens != 128 || ctx->geo.sinkhorn_iters == 0 ||
             ctx->geo.tail_type != 0 || ctx->geo.has_sinks || ctx->geo.swa ||
-            (source_type != GGML_TYPE_Q4_0 && source_type != GGML_TYPE_Q8_0)) return false;
+            (source_type != GGML_TYPE_Q4_0 && source_type != GGML_TYPE_Q8_0 &&
+             source_type != GGML_TYPE_F32)) return false;
     if (const char * fuse = std::getenv("GGML_RKVA_RANGE_FUSE")) {
         if (std::strcmp(fuse, "auto") && std::strcmp(fuse, "0")) return false;
     }
@@ -4430,7 +4495,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     bool bulk = true;
     rkva_wire bulk_wire = RKVA_WIRE_F16;
     bool bulk_wire_auto = true;
-    if (const char * option = std::getenv("GGML_RKVA_NATIVE_BULK")) {
+    if (const char * option = rkva_optional_cstr(ctx->bulk_option)) {
         if (!std::strcmp(option, "1")) {
             bulk = true;
             bulk_wire = RKVA_WIRE_F16;
@@ -4456,7 +4521,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
             bulk = false;
         }
     }
-    if (const char * wire_env = std::getenv("GGML_RKVA_WIRE_FORMAT")) {
+    if (const char * wire_env = rkva_optional_cstr(ctx->wire_format)) {
         bulk = true;
         if (!std::strcmp(wire_env, "f16") || !std::strcmp(wire_env, "fp16")) {
             bulk_wire = RKVA_WIRE_F16;
@@ -4480,7 +4545,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
                 GGML_REMOTE_ATTN_NAME, wire_env);
             return false;
         }
-    } else if (const char * wire_env = std::getenv("GGML_RKVA_NATIVE_BULK_WIRE")) {
+    } else if (const char * wire_env = rkva_optional_cstr(ctx->bulk_wire_option)) {
         if (!std::strcmp(wire_env, "f16") || !std::strcmp(wire_env, "fp16")) {
             bulk_wire = RKVA_WIRE_F16;
             bulk_wire_auto = false;
@@ -4642,9 +4707,9 @@ static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
     // Layout 4 mandates the FP8 Q/OUT activation wire. Follow the same option
     // precedence as the KVarN4 bulk path; an explicit non-FP8 request keeps
     // the previous synchronous path instead of downgrading.
-    const char * wire_option = std::getenv("GGML_RKVA_WIRE_FORMAT");
-    const char * bulk_wire_option = std::getenv("GGML_RKVA_NATIVE_BULK_WIRE");
-    const char * bulk_option = std::getenv("GGML_RKVA_NATIVE_BULK");
+    const char * wire_option = rkva_optional_cstr(ctx->wire_format);
+    const char * bulk_wire_option = rkva_optional_cstr(ctx->bulk_wire_option);
+    const char * bulk_option = rkva_optional_cstr(ctx->bulk_option);
     const char * selected_wire = wire_option ? wire_option :
             bulk_wire_option ? bulk_wire_option : bulk_option;
     const bool selected_is_bulk = !wire_option && !bulk_wire_option;
@@ -4732,9 +4797,9 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
     // Layout 5 mandates the FP8 Q/OUT activation wire. Follow the same option
     // precedence as the KVarN4 bulk path; an explicit non-FP8 request keeps
     // the previous synchronous path instead of downgrading.
-    const char * wire_option = std::getenv("GGML_RKVA_WIRE_FORMAT");
-    const char * bulk_wire_option = std::getenv("GGML_RKVA_NATIVE_BULK_WIRE");
-    const char * bulk_option = std::getenv("GGML_RKVA_NATIVE_BULK");
+    const char * wire_option = rkva_optional_cstr(ctx->wire_format);
+    const char * bulk_wire_option = rkva_optional_cstr(ctx->bulk_wire_option);
+    const char * bulk_option = rkva_optional_cstr(ctx->bulk_option);
     const char * selected_wire = wire_option ? wire_option :
             bulk_wire_option ? bulk_wire_option : bulk_option;
     const bool selected_is_bulk = !wire_option && !bulk_wire_option;
@@ -4805,7 +4870,7 @@ static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context 
                                   (1u << RKVA_KVARN_RANGE_UPLOAD) |
                                   (1u << RKVA_KVARN_RANGE_BULK_ATTN);
     if (!ctx->connected || ctx->failed || ctx->active_session == RKVA_SESSION_NONE ||
-            source_type != GGML_TYPE_Q4_0 || !capacity ||
+            (source_type != GGML_TYPE_Q4_0 && source_type != GGML_TYPE_F32) || !capacity ||
             origin % 256 || uint64_t(origin) + capacity > INT32_MAX ||
             ctx->geo.max_ctx != capacity || ctx->geo.head_dim != rkva_saw_int4_producer::head_dim ||
             ctx->geo.n_head_kv == 0 || uint64_t(ctx->geo.n_head) != 6u * uint64_t(ctx->geo.n_head_kv) ||
@@ -4817,9 +4882,9 @@ static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context 
     if ((ctx->ack.reserved[0] & caps) != caps || (ctx->ack.supported_ops & required) != required) {
         return false;
     }
-    const char * wire_option = std::getenv("GGML_RKVA_WIRE_FORMAT");
-    const char * bulk_wire_option = std::getenv("GGML_RKVA_NATIVE_BULK_WIRE");
-    const char * bulk_option = std::getenv("GGML_RKVA_NATIVE_BULK");
+    const char * wire_option = rkva_optional_cstr(ctx->wire_format);
+    const char * bulk_wire_option = rkva_optional_cstr(ctx->bulk_wire_option);
+    const char * bulk_option = rkva_optional_cstr(ctx->bulk_option);
     const char * selected_wire = wire_option ? wire_option :
             bulk_wire_option ? bulk_wire_option : bulk_option;
     const bool selected_is_bulk = !wire_option && !bulk_wire_option;
@@ -4879,11 +4944,44 @@ static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context 
     return true;
 }
 
-static const char * rkva_get_upload_format() {
-    if (const char * fmt = std::getenv("GGML_RKVA_UPLOAD_FORMAT")) return fmt;
-    if (const char * fmt = std::getenv("GGML_RKVA_FORMAT")) return fmt;
-    if (const char * fmt = std::getenv("GGML_RKVA_RANGE_STORAGE")) return fmt;
-    return nullptr;
+static const char * rkva_get_upload_format(const ggml_backend_remote_attn_context * ctx = nullptr) {
+    if (ctx && ctx->upload_format_fixed) return ctx->upload_format.empty() ? nullptr : ctx->upload_format.c_str();
+    return rkva_legacy_upload_format();
+}
+
+bool ggml_remote_attn_companion_format_matches(const char * format, ggml_type source_type) {
+    if (!format || !*format || !std::strcmp(format, "auto")) {
+        return source_type == GGML_TYPE_Q4_0 || source_type == GGML_TYPE_Q8_0 || source_type == GGML_TYPE_F16;
+    }
+    if (!std::strcmp(format, "q4") || !std::strcmp(format, "q4_0")) return source_type == GGML_TYPE_Q4_0;
+    if (!std::strcmp(format, "q8") || !std::strcmp(format, "q8_0")) return source_type == GGML_TYPE_Q8_0;
+    if (!std::strcmp(format, "f16") || !std::strcmp(format, "fp16")) return source_type == GGML_TYPE_F16;
+    // Explicit F32 upload is a diagnostic wire conversion, not a KV cache type.
+    if (!std::strcmp(format, "f32") || !std::strcmp(format, "fp32")) {
+        return source_type == GGML_TYPE_Q4_0 || source_type == GGML_TYPE_Q8_0 || source_type == GGML_TYPE_F16;
+    }
+    if (!std::strcmp(format, "kvarn4") || !std::strcmp(format, "kvarn") ||
+            !std::strcmp(format, "saw_int4") || !std::strcmp(format, "saw-int4") ||
+            !std::strcmp(format, "saw4") || !std::strcmp(format, "bdr_int4") ||
+            !std::strcmp(format, "turboquant_nc") || !std::strcmp(format, "turboquant-nc") ||
+            !std::strcmp(format, "tqnc") || !std::strcmp(format, "turboquant_4bit_nc")) {
+        return source_type == GGML_TYPE_F32;
+    }
+    return false;
+}
+
+bool ggml_remote_attn_native_companion_requested(void) {
+    const char * option = std::getenv("GGML_RKVA_NATIVE_COMPANION");
+    const char * format = rkva_get_upload_format();
+    if (!option || std::strcmp(option, "1") || !format) return false;
+    if (!std::strcmp(format, "kvarn4") || !std::strcmp(format, "kvarn")) {
+        const char * enabled = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
+        return enabled && !std::strcmp(enabled, "1");
+    }
+    return !std::strcmp(format, "saw_int4") || !std::strcmp(format, "saw-int4") ||
+           !std::strcmp(format, "saw4") || !std::strcmp(format, "bdr_int4") ||
+           !std::strcmp(format, "turboquant_nc") || !std::strcmp(format, "turboquant-nc") ||
+           !std::strcmp(format, "tqnc") || !std::strcmp(format, "turboquant_4bit_nc");
 }
 
 bool ggml_backend_remote_attn_configure_range(
@@ -4903,12 +5001,16 @@ bool ggml_backend_remote_attn_configure_range(
     if (!async_explicit) {
         // No bulk path => no overlap. This also covers the KVarN4 branch, which
         // returns before the generic non-bulk adjustment below.
-        const char * bulk_opt = std::getenv("GGML_RKVA_NATIVE_BULK");
+        const char * bulk_opt = rkva_optional_cstr(ctx->bulk_option);
         if (bulk_opt && !std::strcmp(bulk_opt, "0")) {
             async_overlap = false;
         }
     }
-    const char * format_req = rkva_get_upload_format();
+    const char * format_req = rkva_get_upload_format(ctx);
+    if (!ggml_remote_attn_companion_format_matches(format_req, cache_type)) {
+        GGML_LOG_ERROR("%s: companion cache does not match the requested RKVA format\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
     if (ctx->e4_requested && (!format_req ||
             (std::strcmp(format_req, "kvarn4") && std::strcmp(format_req, "kvarn")))) {
         GGML_LOG_ERROR("%s: E4M3FN requires the explicitly selected KVarN4 layout 3\n", GGML_REMOTE_ATTN_NAME);
@@ -4981,6 +5083,11 @@ bool ggml_backend_remote_attn_configure_range(
     const bool source_q4 = cache_type == GGML_TYPE_Q4_0;
     const uint64_t capability = source_q4 ? RKVA_CAP_RANGE_Q4_0 : RKVA_CAP_RANGE_Q8_0;
     const bool supports_native = cache_type != GGML_TYPE_F16 && (ctx->ack.reserved[0] & capability) != 0;
+    if ((!format_req || !*format_req || !std::strcmp(format_req, "auto")) &&
+            cache_type != GGML_TYPE_F16 && !supports_native) {
+        GGML_LOG_ERROR("%s: peer lacks the matching companion format; refusing F16 fallback\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
     const char * requested = format_req;
     bool native_quant = supports_native;
     if (requested && std::strcmp(requested, "auto") != 0) {
@@ -5617,6 +5724,7 @@ bool ggml_backend_remote_attn_native_kvarn_records_enabled(ggml_backend_t backen
 bool ggml_backend_remote_attn_native_kvarn_stage_append(
         ggml_backend_t backend, uint32_t layer, uint32_t first_pos, uint32_t count,
         const float * keys, const float * values) {
+    if (rkva_legacy_dispatch_retired()) return false;
     return rkva_native_kvarn_stage_append(backend, layer, first_pos, count, keys, values);
 }
 
@@ -5670,19 +5778,37 @@ bool ggml_backend_remote_attn_kvarn_stage_finish(ggml_remote_attn_kvarn_stage * 
     return ok;
 }
 
-ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take(ggml_remote_attn_kvarn_stage * stage,
+ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take_for_format(ggml_remote_attn_kvarn_stage * stage,
         const char * host, uint16_t port, const ggml_remote_attn_geometry * geometry,
-        uint32_t origin, uint32_t capacity, ggml_type cache_type, uint32_t native_tail_tokens) {
+        uint32_t origin, uint32_t capacity, ggml_type cache_type, uint32_t native_tail_tokens,
+        const char * upload_format, const char * wire_format) {
     if (!stage || !stage->sealed || stage->taken || !host || !geometry) return nullptr;
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(stage->backend->context);
     auto lock = rkva_lock_ctx_drained(ctx);
     const auto & g = ctx->geo;
-    const char * format = rkva_get_upload_format();
+    const char * format = rkva_get_upload_format(ctx);
+    if (!upload_format) upload_format = rkva_legacy_upload_format();
+    if (!wire_format) wire_format = std::getenv("GGML_RKVA_WIRE_FORMAT");
+    const auto canonical_wire = [](const char * wire) -> std::string {
+        if (!wire) return "";
+        if (!std::strcmp(wire, "fp16")) return "f16";
+        if (!std::strcmp(wire, "fp8_e5m2")) return "fp8";
+        if (!std::strcmp(wire, "fp32")) return "f32";
+        return wire;
+    };
+    const auto env_matches = [](const std::optional<std::string> & captured, const char * current) {
+        return captured ? current && *captured == current : current == nullptr;
+    };
+    if ((wire_format == nullptr) != !ctx->wire_format ||
+            canonical_wire(wire_format) != canonical_wire(rkva_optional_cstr(ctx->wire_format)) ||
+            !env_matches(ctx->bulk_wire_option, std::getenv("GGML_RKVA_NATIVE_BULK_WIRE")) ||
+            !env_matches(ctx->bulk_option, std::getenv("GGML_RKVA_NATIVE_BULK"))) return nullptr;
+    if (!upload_format || (std::strcmp(upload_format, "kvarn4") && std::strcmp(upload_format, "kvarn"))) return nullptr;
     if (!ctx->connected || ctx->failed || !ctx->range_configured || !ctx->range_native_kvarn ||
             ctx->active_session != 0 || !format || (std::strcmp(format, "kvarn4") && std::strcmp(format, "kvarn")) ||
             ctx->host != host || ctx->port != port || ctx->range_origin != origin ||
             ctx->range_capacity != capacity || ctx->range_source_type != cache_type ||
-            ctx->native_tail_tokens != native_tail_tokens || ctx->e4_requested != rkva_e4_requested() ||
+            ctx->native_tail_tokens != native_tail_tokens ||
             g.n_layer_remote != geometry->n_layer_remote || g.n_head != geometry->n_head ||
             g.n_head_kv != geometry->n_head_kv || g.head_dim != geometry->head_dim ||
             g.max_ctx != geometry->max_ctx || g.cache_bits_k != geometry->cache_bits_k ||
@@ -5708,6 +5834,13 @@ ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take(ggml_remote_attn_kvarn_
     }
     stage->taken = true;
     return stage->backend;
+}
+
+ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take(ggml_remote_attn_kvarn_stage * stage,
+        const char * host, uint16_t port, const ggml_remote_attn_geometry * geometry,
+        uint32_t origin, uint32_t capacity, ggml_type cache_type, uint32_t native_tail_tokens) {
+    return ggml_backend_remote_attn_kvarn_stage_take_for_format(stage, host, port, geometry,
+            origin, capacity, cache_type, native_tail_tokens, nullptr, nullptr);
 }
 
 bool ggml_backend_remote_attn_kvarn_stage_taken(const ggml_remote_attn_kvarn_stage * stage) {
@@ -6031,10 +6164,18 @@ void ggml_backend_remote_attn_reset_stats(ggml_backend_t backend) {
 // calls into the active connection here. One active connection per process (MVP).
 // ---------------------------------------------------------------------------
 
-static ggml_backend_t g_remote_attn_active = nullptr;
+static std::atomic<ggml_backend_t> g_remote_attn_active {nullptr};
+// Legacy activation has no result or caller identity, so a refused caller can
+// otherwise dispatch through the previous owner's peer. Retire until restart.
+static std::atomic<bool> g_remote_attn_legacy_conflict {false};
+static bool rkva_legacy_dispatch_retired() { return g_remote_attn_legacy_conflict.load(); }
+static ggml_backend_t g_remote_attn_stage = nullptr;
+static ggml_backend_t g_remote_attn_legacy_owner = nullptr;
+static std::mutex g_remote_attn_owner_mutex;
 
 bool ggml_backend_remote_attn_cuda_enabled(void) {
-    auto * backend = g_remote_attn_active;
+    if (g_remote_attn_legacy_conflict.load()) return false;
+    auto * backend = g_remote_attn_active.load();
     if (!backend || ggml_backend_is_local_split(backend)) return false;
     const char * option = std::getenv("GGML_RKVA_CUDA_FP8");
     if (option && !std::strcmp(option, "0")) return false;
@@ -6072,14 +6213,78 @@ bool ggml_remote_attn_exec_cuda(struct ggml_tensor * node, void * producer_event
 }
 
 void ggml_remote_attn_set_active(ggml_backend_t backend) {
-    g_remote_attn_active = backend;
-    if (ggml_backend_is_local_split(backend)) {
-        ggml_backend_local_split_set_active(backend);
+    std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+    if (!backend) {
+        if (g_remote_attn_legacy_owner && g_remote_attn_active.load() == g_remote_attn_legacy_owner) {
+            auto * released = g_remote_attn_legacy_owner;
+            g_remote_attn_active.store(nullptr);
+            g_remote_attn_legacy_owner = nullptr;
+            if (ggml_backend_is_local_split(released)) ggml_backend_local_split_set_active(nullptr);
+        }
+        return;
+    }
+    if (g_remote_attn_legacy_conflict.load()) return;
+    const auto active = g_remote_attn_active.load();
+    if (g_remote_attn_stage || (active && (active != backend || g_remote_attn_legacy_owner != backend))) {
+        g_remote_attn_legacy_conflict.store(true);
+        GGML_LOG_WARN("%s: legacy activation refused: another owner or stage is active\n", GGML_REMOTE_ATTN_NAME);
+        return;
+    }
+    g_remote_attn_active.store(backend);
+    g_remote_attn_legacy_owner = backend;
+    if (ggml_backend_is_local_split(backend)) ggml_backend_local_split_set_active(backend);
+}
+
+bool ggml_remote_attn_try_activate(ggml_backend_t backend) {
+    if (!backend) return false;
+    std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+    if (g_remote_attn_legacy_conflict.load()) return false;
+    if (g_remote_attn_stage && g_remote_attn_stage != backend) return false;
+    ggml_backend_t expected = nullptr;
+    if (!g_remote_attn_active.compare_exchange_strong(expected, backend))
+        return expected == backend && g_remote_attn_legacy_owner != backend;
+    if (g_remote_attn_stage == backend) g_remote_attn_stage = nullptr;
+    if (ggml_backend_is_local_split(backend)) ggml_backend_local_split_set_active(backend);
+    return true;
+}
+
+void ggml_remote_attn_deactivate(ggml_backend_t backend) {
+    if (!backend) return;
+    std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+    ggml_backend_t expected = backend;
+    if (g_remote_attn_active.compare_exchange_strong(expected, nullptr)) {
+        if (g_remote_attn_legacy_owner == backend) g_remote_attn_legacy_owner = nullptr;
+        if (ggml_backend_is_local_split(backend)) ggml_backend_local_split_set_active(nullptr);
     }
 }
 
+bool ggml_remote_attn_reserve_stage(ggml_backend_t backend) {
+    if (!backend || ggml_backend_is_local_split(backend)) return false;
+    std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+    if (g_remote_attn_legacy_conflict.load()) return false;
+    if (g_remote_attn_active.load() || g_remote_attn_stage) return false;
+    g_remote_attn_stage = backend;
+    return true;
+}
+
+void ggml_remote_attn_release_stage(ggml_backend_t backend) {
+    if (!backend) return;
+    std::lock_guard<std::mutex> lock(g_remote_attn_owner_mutex);
+    if (g_remote_attn_stage == backend) g_remote_attn_stage = nullptr;
+}
+
 bool ggml_remote_attn_exec(struct ggml_tensor * node) {
-    ggml_backend_t backend = g_remote_attn_active;
+    ggml_backend_t backend;
+    {
+        // Operations admitted before a conflicting registration may finish;
+        // no later operation can acquire the prior owner's backend.
+        std::lock_guard<std::mutex> admission(g_remote_attn_owner_mutex);
+        if (g_remote_attn_legacy_conflict.load()) {
+            GGML_LOG_ERROR("%s: legacy owner conflict; remote dispatch disabled until process restart\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
+        backend = g_remote_attn_active.load();
+    }
     if (backend == nullptr) {
         GGML_LOG_ERROR("%s: exec with no active remote connection\n", GGML_REMOTE_ATTN_NAME);
         return false;

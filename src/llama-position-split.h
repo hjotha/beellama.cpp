@@ -90,7 +90,12 @@ struct range_desc {
 // Retorna "" se válido, ou motivo explícito (fail-closed).
 inline std::string validate_ranges(const std::vector<range_desc> & descs,
                                    uint32_t p, uint32_t c,
-                                   const std::vector<uint32_t> & full_layers) {
+                                   const std::vector<uint32_t> & full_layers,
+                                   int native_overflow_format = -1) {
+    if (native_overflow_format != -1 && native_overflow_format != 0 &&
+            native_overflow_format != 4 && native_overflow_format != 5) {
+        return "formato nativo de overflow inválido";
+    }
     if (!is_valid_p(p, c)) {
         return "P inválido (exige múltiplo de 256, 0 < P < C)";
     }
@@ -130,8 +135,11 @@ inline std::string validate_ranges(const std::vector<range_desc> & descs,
         if (local->backend != 0 || (local->format != 0 && local->format != 1 && local->format != 2 && local->format != 3 && local->format != 4 && local->format != 5)) {
             return "faixa local deve ser CUDA (KVarN, Q4_0, Q8_0, F16 ou SAW INT4)";
         }
-        if (ovf->backend != 1 || (ovf->format != 1 && ovf->format != 2 && ovf->format != 3)) {
-            return "faixa overflow deve ser um companion Q4_0, Q8_0 ou F16";
+        const bool valid_overflow_format = native_overflow_format >= 0 ?
+                ovf->format == native_overflow_format :
+                (ovf->format == 1 || ovf->format == 2 || ovf->format == 3);
+        if (ovf->backend != 1 || !valid_overflow_format) {
+            return "formato ou backend da faixa overflow incompatível";
         }
         if (local->end != ovf->start) {
             return "lacuna/sobreposição na fronteira P";

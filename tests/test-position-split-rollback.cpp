@@ -87,6 +87,8 @@ int main() {
     // C: cleanup policy (no abort on empty/full-clear refusals; partial fails).
     check( common_seq_rm_cleanup_tolerated(true,  false), "C removed");
     check( common_seq_rm_cleanup_tolerated(false, true), "C empty full tolerated");
+    check(!common_seq_rm_cleanup_tolerated(false, true, true), "C empty full remote failure propagates");
+    check(!common_seq_rm_cleanup_tolerated(true, true, true), "C remote failure cannot be hidden by local removal");
     check(!common_seq_rm_cleanup_tolerated(false, false), "C total refusal propagates");
     check(!common_seq_rm_cleanup_tolerated(false, false), "C partial refusal propagates");
 

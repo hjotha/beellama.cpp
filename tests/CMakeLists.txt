@@ -3,6 +3,21 @@ llama_add_compile_flags()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
+    if (UNIX)
+        add_test(NAME test-server-prompt-cleanup
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-server-prompt-cleanup.py)
+        add_test(NAME test-adaptive-native-companion
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-adaptive-native-companion.py)
+        add_test(NAME test-legacy-native-stream-layout
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-legacy-native-stream-layout.py)
+        add_test(NAME test-rkva-companion-context
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-rkva-companion-context.py)
+        add_test(NAME test-native-companion-acceptance
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/xbox/tests/native_companion_acceptance_test.py)
+        add_test(NAME test-native-companion-hardware-self-test
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/xbox/tests/native_companion_hardware.py --self-test)
+        set_tests_properties(test-server-prompt-cleanup test-adaptive-native-companion test-legacy-native-stream-layout test-rkva-companion-context test-native-companion-acceptance test-native-companion-hardware-self-test PROPERTIES LABELS main TIMEOUT 60)
+    endif()
     # Hardware-free timing/provenance qualification for the RKVA benchmark.
     add_test(
         NAME test-rkva-range-benchmark-harness
@@ -1139,7 +1154,15 @@ llama_build_and_test(test-server-gpu-power.cpp ${PROJECT_SOURCE_DIR}/tools/serve
 target_include_directories(test-server-gpu-power PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 target_link_libraries(test-server-gpu-power PRIVATE ${CMAKE_DL_LIBS})
 llama_build_and_test(test-remote-attn-range.cpp)
+llama_build_and_test(test-native-companion-isolation.cpp)
 if (UNIX)
+    add_test(NAME test-rkva-legacy-conflict-modern COMMAND ${CMAKE_COMMAND} -E env
+        CUDA_VISIBLE_DEVICES=-1 GGML_RKVA_LEGACY_CONFLICT_TEST_ONLY=modern $<TARGET_FILE:test-remote-attn-range>)
+    add_test(NAME test-rkva-legacy-conflict-legacy COMMAND ${CMAKE_COMMAND} -E env
+        CUDA_VISIBLE_DEVICES=-1 GGML_RKVA_LEGACY_CONFLICT_TEST_ONLY=legacy $<TARGET_FILE:test-remote-attn-range>)
+    add_test(NAME test-rkva-legacy-conflict-stage COMMAND ${CMAKE_COMMAND} -E env
+        CUDA_VISIBLE_DEVICES=-1 GGML_RKVA_LEGACY_CONFLICT_TEST_ONLY=stage $<TARGET_FILE:test-remote-attn-range>)
+    set_tests_properties(test-rkva-legacy-conflict-modern test-rkva-legacy-conflict-legacy test-rkva-legacy-conflict-stage PROPERTIES LABELS main TIMEOUT 30)
     add_test(NAME test-rkva-tcp-prefetch COMMAND ${CMAKE_COMMAND} -E env
         GGML_RKVA_TCP_PREFETCH_TEST_ONLY=1 $<TARGET_FILE:test-remote-attn-range>)
     set_tests_properties(test-rkva-tcp-prefetch PROPERTIES LABELS main TIMEOUT 120)
@@ -1183,6 +1206,11 @@ if (Python3_Interpreter_FOUND AND BUILD_SHARED_LIBS)
 endif()
 llama_build_and_test(test-kv-prefix-lineage.cpp)
 llama_build_and_test(test-hybrid-rpc-prefix-state.cpp)
+if (UNIX)
+    llama_build_and_test(test-native-companion-rewind-integration.cpp)
+    set_tests_properties(test-native-companion-rewind-integration PROPERTIES
+        ENVIRONMENT "CUDA_VISIBLE_DEVICES=;GGML_VK_VISIBLE_DEVICES=")
+endif()
 llama_build_and_test(test-rkva-kvarn-producer.cpp)
 llama_build_and_test(test-rkva-native-state.cpp)
 target_include_directories(test-rkva-native-state PRIVATE

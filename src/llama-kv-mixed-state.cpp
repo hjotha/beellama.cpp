@@ -19,6 +19,27 @@
 
 namespace llama_kv_mixed {
 
+bool native_external_legacy_layer_compatible(const layer_desc & legacy, const layer_desc & native) {
+    if (native.kind != cache_kind::kvarn || native.layout != layout_kvarn_native_external_v1 ||
+            native.range_id != llama_position_split::kRangeOverflow ||
+            legacy.kind != cache_kind::standard_qx || legacy.layout != layout_standard_qx_compact_rows ||
+            (legacy.k_type != sx_q4_0 && legacy.k_type != sx_q8_0) || legacy.k_type != legacy.v_type ||
+            legacy.owner != owner_target || legacy.v_trans != 0 || legacy.tail_type != 0 ||
+            legacy.token_group != 32 || legacy.payload_mode != mode_full ||
+            legacy.payload_bytes != 0 || legacy.payload_checksum != 0 ||
+            legacy.layer_id != native.layer_id || legacy.range_id != native.range_id ||
+            legacy.range_start != native.range_start || legacy.range_end != native.range_end ||
+            legacy.head_dim_k != native.head_dim_k || legacy.head_dim_v != native.head_dim_v ||
+            legacy.n_head_kv != native.n_head_kv || legacy.n_stream != native.n_stream ||
+            legacy.payload_cells != native.payload_cells || legacy.payload_rows != native.payload_rows ||
+            legacy.head_dim_k % 32 != 0 || legacy.head_dim_v % 32 != 0) {
+        return false;
+    }
+    const uint64_t block_bytes = legacy.k_type == sx_q4_0 ? 18 : 34;
+    return legacy.k_stride == uint64_t(legacy.head_dim_k / 32) * legacy.n_head_kv * block_bytes &&
+            legacy.v_stride == uint64_t(legacy.head_dim_v / 32) * legacy.n_head_kv * block_bytes;
+}
+
 static_assert(uint16_t(sx_saw_int4) == uint16_t(GGML_TYPE_SAW_INT4), "SAW snapshot type must match ggml");
 static_assert(uint16_t(sx_tqnc_k) == uint16_t(GGML_TYPE_TQNC_K), "TQNC key snapshot type must match ggml");
 static_assert(uint16_t(sx_tqnc_v) == uint16_t(GGML_TYPE_TQNC_V), "TQNC value snapshot type must match ggml");
@@ -223,7 +244,14 @@ void validate_desc(layer_desc & d, bool serializing) {
                     throw kv_mixed_error(where + ": kvarn bit fields disagree with the type id");
                 }
             }
-            if (d.layout != layout_kvarn_records_stage_tail) {
+            if (d.layout == layout_kvarn_native_external_v1 &&
+                    (d.range_id != llama_position_split::kRangeOverflow || d.k_bits != 4 || d.v_bits != 4 ||
+                     d.token_group != 128 || d.head_dim_k != 256 || d.head_dim_v != 256 ||
+                     d.payload_mode != mode_full || d.payload_bytes != 0 || d.payload_checksum != 0 ||
+                     d.payload_cells != d.payload_rows || d.owner != owner_target)) {
+                throw kv_mixed_error(where + ": invalid native external KVarN4 descriptor");
+            }
+            if (d.layout != layout_kvarn_records_stage_tail && d.layout != layout_kvarn_native_external_v1) {
                 throw kv_mixed_error(where + ": unknown kvarn layout id");
             }
             if (d.v_trans != 0) {
@@ -360,10 +388,11 @@ void validate_range_v2(const layer_desc & d, const position_split & split,
         if (d.range_start != split.p || d.range_end != split.c) {
             throw kv_mixed_error(std::string(where) + ": overflow range must be exactly [P,C)");
         }
-        if (d.kind != cache_kind::standard_qx) {
-            throw kv_mixed_error(std::string(where) + ": overflow range must be a standard qx cache");
+        if (d.kind != cache_kind::standard_qx &&
+                !(d.kind == cache_kind::kvarn && d.layout == layout_kvarn_native_external_v1)) {
+            throw kv_mixed_error(std::string(where) + ": overflow range must be a standard or native external cache");
         }
-        if (d.layout == layout_standard_qx_compact_rows &&
+        if ((d.layout == layout_standard_qx_compact_rows || d.layout == layout_kvarn_native_external_v1) &&
                 (d.payload_cells != d.payload_rows || d.payload_rows > uint64_t(split.c - split.p))) {
             throw kv_mixed_error(std::string(where) + ": compact Qx payload rows exceed C-P or disagree with cell count");
         }
@@ -765,6 +794,9 @@ bool snapshot::serialize(const std::vector<layer_blob> & layers,
             if (!seen.insert(d.layer_id).second) {
                 fault(opts, "serialize: duplicate layer id");
             }
+        }
+        if (d.layout == layout_kvarn_native_external_v1 && blob.size != 0) {
+            fault(opts, "serialize: native external KVarN4 cannot carry an inline payload");
         }
         if (blob.data == nullptr && blob.size > 0) {
             fault(opts, "serialize: null payload with nonzero size");

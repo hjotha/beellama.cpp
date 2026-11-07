@@ -841,6 +841,8 @@ struct common_params {
     bool        remote_attn_stats        = false;
     ggml_type   remote_attn_cache_type_k = GGML_TYPE_COUNT; // opt-in Qx override on local Vulkan layers
     ggml_type   remote_attn_cache_type_v = GGML_TYPE_COUNT;
+    std::string remote_attn_native_cache_type_k;
+    std::string remote_attn_native_cache_type_v;
     int32_t     remote_attn_min_ctx_size = 0; // minimum adaptive profile context size before enabling remote attention
     uint32_t kv_position_split_p = 0; // fixed local KV position boundary; 0 disables
     size_t      remote_attn_cuda_reserve = 650 * 1024 * 1024; // 650 MiB default safety reserve (covers compute graph & allocator headroom)
@@ -1391,6 +1393,7 @@ std::string common_context_prepare_devices(common_params & params);
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
+enum llama_remote_native_companion common_resolve_remote_native_companion(const common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters

@@ -460,6 +460,16 @@ static ggml_type parse_remote_attn_standard_cache_type(const std::string & value
     return type;
 }
 
+static bool parse_remote_native_companion(const std::string & value, std::string & native, ggml_type & standard) {
+    if (value != "kvarn4" && value != "saw_int4" && value != "turboquant_nc") {
+        native.clear();
+        return false;
+    }
+    native = value;
+    standard = GGML_TYPE_COUNT;
+    return true;
+}
+
 static void parse_draft_cache_type(common_params & params, bool key, const std::string & value) {
     auto & draft = params.speculative.draft;
     if (key) {
@@ -3981,18 +3991,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_LAYERS"));
     add_opt(common_arg(
         {"--remote-attn-cache-type-k"}, "TYPE",
-        "optional standard K cache type for locally remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0); "
+        "optional K cache type for remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0; experimental native kvarn4, saw_int4, turboquant_nc); "
         "requires Vulkan or TCP position-split --remote-attn and a global KVarN cache; f16 requires TCP position split; unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
-            params.remote_attn_cache_type_k = parse_remote_attn_standard_cache_type(value);
+            if (!parse_remote_native_companion(value, params.remote_attn_native_cache_type_k, params.remote_attn_cache_type_k)) {
+                params.remote_attn_cache_type_k = parse_remote_attn_standard_cache_type(value);
+            }
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_K").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-cache-type-v"}, "TYPE",
-        "optional standard V cache type for locally remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0); "
+        "optional V cache type for remote-attended layers (f16, q4_0, q5_0, q6_0, q8_0; experimental native kvarn4, saw_int4, turboquant_nc); "
         "unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
-            params.remote_attn_cache_type_v = parse_remote_attn_standard_cache_type(value);
+            if (!parse_remote_native_companion(value, params.remote_attn_native_cache_type_v, params.remote_attn_cache_type_v)) {
+                params.remote_attn_cache_type_v = parse_remote_attn_standard_cache_type(value);
+            }
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_V").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
@@ -4000,11 +4014,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "RPC upload format for remote attention: 'kvarn4'/'kvarn', 'fp16'/'f16', 'fp32'/'f32', 'q4'/'q4_0', 'q8'/'q8_0', 'saw_int4', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: kvarn4)",
         [](common_params & params, const std::string & value) {
             params.remote_attn_format = value;
-#if !defined(_WIN32)
-            setenv("GGML_RKVA_UPLOAD_FORMAT", value.c_str(), 1);
-#else
-            _putenv_s("GGML_RKVA_UPLOAD_FORMAT", value.c_str());
-#endif
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_FORMAT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
@@ -4026,11 +4035,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     "invalid --remote-attn-wire-format: expected 'f16', 'fp8', 'fp8_e4m3fn', or 'auto'");
             }
             params.remote_attn_wire_format = canonical;
-#if !defined(_WIN32)
-            setenv("GGML_RKVA_WIRE_FORMAT", canonical.c_str(), 1);
-#else
-            _putenv_s("GGML_RKVA_WIRE_FORMAT", canonical.c_str());
-#endif
         }
     ).set_env("LLAMA_ARG_REMOTE_ATTN_WIRE_FORMAT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(

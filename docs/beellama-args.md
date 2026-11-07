@@ -36,14 +36,21 @@ its availability alone does not mean production qualification has passed.
 
 With `--kv-position-split-p P` and a TCP `--remote-attn HOST:PORT`, the RKVA
 range protocol keeps positions `[0,P)` on CUDA and computes only `[P,C)` on
-the remote server. It requires an RKVA v2 range server, matching Q4_0 or Q8_0 remote
-cache types, and one causal Qwen35 sequence. No attention or KV upload RPC
+the remote server. It requires an RKVA v2 range server and one causal Qwen35
+sequence. The remote companion must match its storage format: native KVarN4,
+SAW-INT4 or TurboQuant NC, or matching Q4_0, Q8_0 or F16 rows. F32 transport
+is accepted by the host for diagnostics, but the current Xbox standard-range
+receiver does not accept it. No attention or KV upload RPC
 runs below P; initialization may negotiate a connection for an active split
 profile. `--remote-attn-min-context` still gates the configured adaptive
 profile capacity, rather than individual positions. See
 [Xbox positional overflow](xbox-position-overflow.md) for storage and state
 semantics, including background preparation of overflow K/V while an eligible
 local profile remains active.
+
+The native-companion context adds fields to `llama_context_params`. Rebuild
+applications and shared libraries together; a client built against the previous
+by-value structure cannot safely load the new shared library.
 
 `GGML_CUDA_GRAPH_REMOTE_MIN_STABLE_CALLS=N` optionally sets the minimum number
 of stable calls before CUDA graph capture on each directly owned CUDA backend

@@ -267,6 +267,7 @@ struct llama_context {
 
     bool remote_disk_snapshot_enabled() const;
     bool remote_native_kvarn_enabled() const;
+    bool remote_native_companion_failed() const;
     bool remote_native_kvarn_records_enabled() const;
     bool remote_native_kvarn_can_rewind() const;
     bool remote_native_kvarn_transient_active() const;

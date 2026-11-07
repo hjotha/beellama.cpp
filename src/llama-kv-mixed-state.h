@@ -175,6 +175,7 @@ enum layout_id : uint16_t {
     layout_kvarn_records_stage_tail = 1, // KVarN: record groups + stage rows + optional exact tail
     layout_standard_qx_rows         = 2, // standard: contiguous Qx rows per stream
     layout_standard_qx_compact_rows = 3, // split v2 overflow: physical row = global cell - P
+    layout_kvarn_native_external_v1 = 4, // split KVarN4 overflow owned by paired native snapshot
 };
 
 // Shared by native compact Qx storage and its codec tests. The logical cell
@@ -287,6 +288,9 @@ struct layer_desc {
     uint32_t range_start = 0; // inclusive logical cell index (v2 only)
     uint32_t range_end = 0;   // exclusive logical cell index (v2 only)
 };
+
+// The old split companion can be ignored only when it contains no inline KV.
+bool native_external_legacy_layer_compatible(const layer_desc & legacy, const layer_desc & native);
 
 // F4 v2 envelope: position_split identity + occupancy of the two ranges.
 // All fields are REQUIRED in a v2 snapshot (no defaults are inferred) and must

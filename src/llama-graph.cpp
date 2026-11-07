@@ -999,11 +999,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         const auto * kvarn_cache = kvarn->get_kvarn_cache();
         GGML_ASSERT(kvarn_cache != nullptr);
         const auto * standard_cache = kvarn_cache->get_standard_cache();
-        if (!standard_cache) {
+        if (!standard_cache && !kvarn_cache->native_companion_enabled()) {
             throw std::runtime_error("position-split overflow indices require the standard Qx cache");
         }
-        const uint32_t payload_origin = standard_cache->get_payload_row_origin();
-        const uint32_t payload_size = standard_cache->get_payload_size();
+        const uint32_t payload_origin = standard_cache ? standard_cache->get_payload_row_origin() : kvarn_cache->position_split_p();
+        const uint32_t payload_size = standard_cache ? standard_cache->get_payload_size() : kvarn_cache->get_kv_size() - payload_origin;
         std::vector<uint32_t> local_cells, overflow_cells;
         GGML_ASSERT(kvarn_cache->position_split_live_cells(
                     llama_position_split::range_kind::LOCAL, local_cells));
@@ -1096,7 +1096,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
                 // GET_ROWS consumes the companion's physical payload row instead.
                 // The cache owns this mapping because compact v2 payloads start at P
                 // while legacy standard rows still start at zero.
-                const uint32_t physical_row = standard_cache->payload_row_for_cell(global_cell);
+                const uint32_t physical_row = standard_cache ? standard_cache->payload_row_for_cell(global_cell) : global_cell - payload_origin;
                 if (physical_row >= payload_size || physical_row > uint32_t(INT32_MAX)) {
                     throw std::runtime_error(format(
                             "position-split overflow cell %u maps outside Qx payload origin=%u size=%u (row=%u)",
@@ -5390,7 +5390,8 @@ llm_graph_context::position_split_rpc_packet llm_graph_context::build_attn_posit
     }
     const auto * cache = kvarn_ctx->get_kvarn_cache();
     const auto * standard = cache->get_standard_cache();
-    if (!standard || standard->get_payload_row_origin() != cache->position_split_p()) {
+    if ((!standard && !cache->native_companion_enabled()) ||
+            (standard && standard->get_payload_row_origin() != cache->position_split_p())) {
         throw std::runtime_error("RKVA range requires a compact quantized checkpoint mirror beginning at P");
     }
     ggml_backend_t backend_cuda = nullptr;
@@ -5417,27 +5418,40 @@ llm_graph_context::position_split_rpc_packet llm_graph_context::build_attn_posit
         ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_cpu);
     } else {
         // Preserve the Q4_0/Q8_0/F16 checkpoint representation; upload only appended rows.
-        auto * k_written = kvarn_ctx->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il);
-        auto * v_written = kvarn_ctx->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il);
-        if (!k_written || !v_written) throw std::runtime_error("missing RKVA companion stores");
-        ggml_backend_sched_set_tensor_backend(sched, k_written, backend_cpu);
-        ggml_backend_sched_set_tensor_backend(sched, v_written, backend_cpu);
+        ggml_tensor * k_written = nullptr;
+        ggml_tensor * v_written = nullptr;
+        if (!cache->native_companion_enabled()) {
+            k_written = kvarn_ctx->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il);
+            v_written = kvarn_ctx->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il);
+            if (!k_written || !v_written) throw std::runtime_error("missing RKVA companion stores");
+            ggml_backend_sched_set_tensor_backend(sched, k_written, backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, v_written, backend_cpu);
+            ggml_build_forward_expand(gf, k_written);
+            ggml_build_forward_expand(gf, v_written);
+        }
         ggml_backend_sched_set_tensor_backend(sched, inp->self_overflow_cell_idxs, backend_cpu);
         ggml_backend_sched_set_tensor_backend(sched, inp->self_kvarn_mat_idxs_local, backend_cpu);
         ggml_backend_sched_set_tensor_backend(sched, inp->self_kq_mask_local, backend_cpu);
-        ggml_build_forward_expand(gf, k_written);
-        ggml_build_forward_expand(gf, v_written);
         int remote_layer = 0;
         for (int l = 0; l < il; ++l) {
             if (hparams.has_kv(l) && !hparams.is_recr(l)) ++remote_layer;
         }
         async_overlap = ggml_backend_remote_attn_async_enabled(backend_remote);
-        range = ggml_remote_attn_range(ctx0, q_cur, k_written, v_written,
-                inp->self_overflow_cell_idxs, positions, remote_layer,
-                cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
+        if (cache->native_companion_enabled()) {
+            if (!ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
+                throw std::runtime_error("native companion requires negotiated native RPC");
+            }
+            range = ggml_remote_attn_range_native(ctx0, q_cur, ggml_cont(ctx0, k_cur), ggml_cont(ctx0, v_cur),
+                    inp->self_overflow_cell_idxs, positions, remote_layer,
+                    cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
+        } else {
+            range = ggml_remote_attn_range(ctx0, q_cur, k_written, v_written,
+                    inp->self_overflow_cell_idxs, positions, remote_layer,
+                    cache->position_split_p(), uint32_t(inp->self_overflow_cell_idxs->ne[0]), kq_scale);
+        }
         const bool cuda_wire = ggml_backend_remote_attn_cuda_enabled_for_node(range);
         wire_backend = cuda_wire ? backend_cuda : backend_cpu;
-        if (ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
+        if (!cache->native_companion_enabled() && ggml_backend_remote_attn_native_kvarn_enabled(backend_remote)) {
             // Preserve original projected values as independent graph operands.
             // The Q4/Q8 companion above remains metadata/bookkeeping only for this
             // experimental native owner; none of its quantized bytes are decoded.

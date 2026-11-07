@@ -62,25 +62,49 @@ GGML_API void dequantize_row_q4_0(const block_q4_0 * x, float * y, int64_t k);
 
 namespace {
 
-static const char * selected_remote_upload_format() {
+static const char * selected_remote_upload_format(const char * explicit_format) {
+    if (explicit_format) return explicit_format;
     if (const char * s = std::getenv("GGML_RKVA_UPLOAD_FORMAT")) return s;
     if (const char * s = std::getenv("GGML_RKVA_FORMAT")) return s;
     return std::getenv("GGML_RKVA_RANGE_STORAGE");
 }
 
-static bool native_row_rpc_selected() {
-    const char * s = selected_remote_upload_format();
+static bool native_row_rpc_selected(const char * format) {
+    const char * s = selected_remote_upload_format(format);
     return s && (!std::strcmp(s, "saw_int4") || !std::strcmp(s, "saw-int4") ||
                  !std::strcmp(s, "saw4") || !std::strcmp(s, "bdr_int4") ||
                  !std::strcmp(s, "turboquant_nc") || !std::strcmp(s, "turboquant-nc") ||
                  !std::strcmp(s, "tqnc") || !std::strcmp(s, "turboquant_4bit_nc"));
 }
 
-static bool native_kvarn_records_rpc_selected() {
-    const char * s = selected_remote_upload_format();
+static bool native_kvarn_records_rpc_selected(const char * format) {
+    const char * s = selected_remote_upload_format(format);
     const char * enabled = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     return s && (!std::strcmp(s, "kvarn4") || !std::strcmp(s, "kvarn")) &&
            enabled && !std::strcmp(enabled, "1");
+}
+
+static int selected_native_companion_format(bool rpc_position_split, uint32_t position_split_p,
+        ggml_type standard_type_k, ggml_type standard_type_v,
+        llama_remote_native_companion selection, const char * upload_format) {
+    if (selection != LLAMA_REMOTE_COMPANION_AUTO) {
+        if (!rpc_position_split || !position_split_p || standard_type_k != GGML_TYPE_COUNT || standard_type_v != GGML_TYPE_COUNT)
+            return -1;
+        if (selection == LLAMA_REMOTE_COMPANION_KVARN4) return 0;
+        if (selection == LLAMA_REMOTE_COMPANION_SAW_INT4) return 4;
+        if (selection == LLAMA_REMOTE_COMPANION_TURBOQUANT_NC) return 5;
+        return -1;
+    }
+    const char * enabled = std::getenv("GGML_RKVA_NATIVE_COMPANION");
+    if (!enabled || std::strcmp(enabled, "1") || !rpc_position_split || !position_split_p ||
+            standard_type_k != GGML_TYPE_COUNT || standard_type_v != GGML_TYPE_COUNT) {
+        return -1;
+    }
+    if (native_kvarn_records_rpc_selected(upload_format)) return 0;
+    if (!native_row_rpc_selected(upload_format)) return -1;
+    const char * format = selected_remote_upload_format(upload_format);
+    return (!std::strcmp(format, "saw_int4") || !std::strcmp(format, "saw-int4") ||
+            !std::strcmp(format, "saw4") || !std::strcmp(format, "bdr_int4")) ? 4 : 5;
 }
 
 constexpr uint32_t MIXED_KV_STATE_ENVELOPE_MAGIC = 0x4D4B5351u; // "QSKM"
@@ -359,6 +383,25 @@ std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
                 desc.payload_mode = mode_resident_reference;
             }
             result.push_back(desc);
+            if (cache.native_companion_enabled() && cache.native_companion_format() == 0) {
+                if (partial || desc.k_bits != 4 || desc.v_bits != 4 ||
+                        layer.head_dim_k != 256 || layer.head_dim_v != 256) {
+                    throw kv_mixed_error("native external KVarN4 snapshot requires a full compatible local KVarN4 layout");
+                }
+                desc.layout = layout_kvarn_native_external_v1;
+                desc.range_id = overflow_range;
+                desc.range_start = cache.position_split_p();
+                desc.range_end = cache.get_kv_size();
+                desc.payload_mode = mode_full;
+                desc.payload_cells = compact_overflow_rows;
+                desc.payload_rows = compact_overflow_rows;
+                desc.payload_bytes = 0;
+                desc.payload_checksum = 0;
+                if (payload_size(layer.layer_id, overflow_range) != 0) {
+                    throw kv_mixed_error("native external KVarN4 must not contain inline overflow bytes");
+                }
+                result.push_back(desc);
+            }
         }
     }
 
@@ -2568,10 +2611,31 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs_local_impl(
     ggml_backend_tensor_set(dst, host.data(), 0, host.size()*sizeof(int64_t));
 }
 
+static void set_native_split_indices(ggml_tensor * dst, const llama_ubatch * ubatch,
+        const llama_kv_cache::slot_info & sinfo, uint32_t origin, uint32_t capacity) {
+    if (sinfo.n_stream() != 1 || sinfo.size() != ubatch->n_tokens ||
+            dst->type != GGML_TYPE_I64 || dst->ne[0] < ubatch->n_tokens) {
+        throw std::runtime_error("native split requires one stream and one index per token");
+    }
+    std::vector<int64_t> indices(ubatch->n_tokens);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const uint32_t cell = sinfo.idxs[0][i];
+        if (cell < origin || cell - origin >= capacity) {
+            throw std::runtime_error("native split index outside overflow range");
+        }
+        indices[i] = cell - origin;
+    }
+    ggml_backend_tensor_set(dst, indices.data(), 0, indices.size() * sizeof(int64_t));
+}
+
 void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
                 llama_position_split::range_kind::OVERFLOW_RANGE) {
+        if (cache->native_companion_enabled()) {
+            set_native_split_indices(dst, ubatch, current_sinfo(), cache->position_split_p(), cache->position_split_overflow_capacity());
+            return;
+        }
         cache->get_standard_cache()->set_input_k_idxs(dst, ubatch, current_sinfo());
         return;
     }
@@ -2610,6 +2674,10 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const lla
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
                 llama_position_split::range_kind::OVERFLOW_RANGE) {
+        if (cache->native_companion_enabled()) {
+            set_native_split_indices(dst, ubatch, current_sinfo(), cache->position_split_p(), cache->position_split_overflow_capacity());
+            return;
+        }
         cache->get_standard_cache()->set_input_v_idxs(dst, ubatch, current_sinfo());
         return;
     }
@@ -2648,6 +2716,10 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, c
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
                 llama_position_split::range_kind::OVERFLOW_RANGE) {
+        if (cache->native_companion_enabled()) {
+            set_native_split_indices(dst, ubatch, current_sinfo(), cache->position_split_p(), cache->position_split_overflow_capacity());
+            return;
+        }
         cache->get_standard_cache()->set_input_k_idxs_backend(dst, ubatch, current_sinfo());
         return;
     }
@@ -2686,6 +2758,10 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs_backend(ggml_tensor * dst, c
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
                 llama_position_split::range_kind::OVERFLOW_RANGE) {
+        if (cache->native_companion_enabled()) {
+            set_native_split_indices(dst, ubatch, current_sinfo(), cache->position_split_p(), cache->position_split_overflow_capacity());
+            return;
+        }
         cache->get_standard_cache()->set_input_v_idxs_backend(dst, ubatch, current_sinfo());
         return;
     }
@@ -3075,7 +3151,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         uint32_t position_split_p,
         bool rpc_position_split,
         ggml_type local_type_k,
-        ggml_type local_type_v) :
+        ggml_type local_type_v,
+        llama_remote_native_companion native_companion, const char * upload_format) :
     model(model),
     hparams(hparams),
     params(params),
@@ -3088,9 +3165,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     kv_size_local(position_split_p != 0 ? position_split_p : kv_size),
     kv_size_overflow(position_split_p != 0 ? kv_size - position_split_p : kv_size),
     position_split_p_(position_split_p),
+    native_companion_format_(selected_native_companion_format(rpc_position_split, position_split_p,
+            standard_type_k, standard_type_v, native_companion, upload_format)),
     native_kvarn_rpc_experimental_(rpc_position_split &&
-        (native_kvarn_records_rpc_selected() || native_row_rpc_selected())),
-    native_row_rpc_experimental_(rpc_position_split && native_row_rpc_selected()),
+        (native_kvarn_records_rpc_selected(upload_format) || native_row_rpc_selected(upload_format))),
+    native_row_rpc_experimental_(rpc_position_split && native_row_rpc_selected(upload_format)),
     // Dynamic staging: size the lossless F16 ring from position semantics.
     // Non-SWA keeps a permanent sink slot plus the scheduler-span tail. SWA has
     // no sink, so every stage slot is part of the local tail.
@@ -3572,17 +3651,17 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                        standard_layers.begin(), standard_layers.end(),
                        std::back_inserter(full_layers));
         position_split_error_ = llama_position_split::validate_ranges(
-                position_split_ranges(), position_split_p, kv_size, full_layers);
+                position_split_ranges(), position_split_p, kv_size, full_layers, native_companion_format_);
         if (position_split_error_.empty() && swa) {
             position_split_error_ = "position-split exige cache não-SWA";
         }
         if (position_split_error_.empty() && (n_seq_max != 1 || n_stream != 1)) {
             position_split_error_ = "position-split exige uma única sequência";
         }
-        if (position_split_error_.empty() && !standard_cache) {
+        if (position_split_error_.empty() && !standard_cache && !native_companion_enabled()) {
             position_split_error_ = "position-split exige a faixa overflow Q4 por camada full";
         }
-        if (position_split_error_.empty() && standard_layers != kvarn_layers) {
+        if (position_split_error_.empty() && standard_cache && standard_layers != kvarn_layers) {
             position_split_error_ =
                 "position-split exige as mesmas camadas full nas faixas local e overflow";
         }
@@ -4271,7 +4350,7 @@ void llama_kv_cache_kvarn::dirty_state_prefix(llama_pos pos) {
 }
 
 bool llama_kv_cache_kvarn::invalidate_prefix_on_write(const llama_ubatch & ubatch) {
-    if (!position_split_enabled() || !standard_cache) {
+    if (!position_split_enabled() || (!standard_cache && !native_companion_enabled())) {
         return false;
     }
     const auto prior_max = metadata->seq_pos_max(0);
@@ -4291,6 +4370,7 @@ bool llama_kv_cache_kvarn::get_can_shift() const {
 }
 
 llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() const {
+    if (native_companion_enabled()) return { true, false, 0 };
     if (native_kvarn_rpc_experimental_ && !native_kvarn_rewind_capable_) {
         // Capability must hold for future appends too, including the first
         // append at P. Without negotiation there is no native rollback contract.
@@ -4304,6 +4384,11 @@ llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() 
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {
+    if (native_companion_enabled() && native_companion_negotiated_) {
+        if (!native_companion_reset_ || !native_companion_reset_()) {
+            throw std::runtime_error("native-only overflow clear requires a successful remote-owner reset");
+        }
+    }
     // Logical clear cannot manufacture a native checkpoint codec or prove the
     // remote owner empty. Retain fail-closed eligibility for this context.
     (void) native_kvarn_checkpoint_unavailable();
@@ -4319,6 +4404,7 @@ void llama_kv_cache_kvarn::clear(bool data) {
     if (local_cache) local_cache->clear(data);
     if (standard_cache) standard_cache->clear(data);
     metadata->clear(false);
+    if (native_companion_enabled()) native_kvarn_overflow_seen_ = false;
     if (data) {
         for (auto & storage : ctxs_bufs) {
             if (storage.buffer) {
@@ -4331,6 +4417,10 @@ void llama_kv_cache_kvarn::clear(bool data) {
 }
 
 bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (native_companion_enabled() && metadata->seq_pos_max(0) >= llama_pos(position_split_p_)) {
+        return (seq_id <= 0 && p0 <= 0 && p1 < 0) ||
+                (seq_id == 0 && p0 > metadata->seq_pos_max(0) && (p1 < 0 || p1 >= p0));
+    }
     // Remember live native ownership before an allowed full logical clear.
     (void) native_kvarn_checkpoint_unavailable();
     if (seq_id < 0) {
@@ -4548,6 +4638,9 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
+    if (native_companion_enabled() && metadata->seq_pos_max(0) >= llama_pos(position_split_p_)) {
+        return false;
+    }
     if (position_split_enabled()) {
         // F2b: remoção funcional por célula. Resolve a posição absoluta da
         // célula antes de drenar/mutar; a tabela é compartilhada com o
@@ -4714,8 +4807,12 @@ bool llama_kv_cache_kvarn::stream_is_exclusive_for(llama_seq_id seq_id) const {
 }
 
 void llama_kv_cache_kvarn::set_negotiated_native_rpc_owner(bool has_record_snapshot_codec, uint32_t global_tail_tokens) {
-    if (!position_split_enabled() || !standard_cache || !metadata || native_kvarn_overflow_seen_) {
+    if (!position_split_enabled() || (!standard_cache && !native_companion_enabled()) ||
+            !metadata || native_kvarn_overflow_seen_) {
         throw std::logic_error("native RPC owner must be selected on a fresh split cache");
+    }
+    if (native_companion_enabled() && ((native_companion_format_ == 0) != has_record_snapshot_codec)) {
+        throw std::logic_error("negotiated native RPC owner differs from the selected overflow format");
     }
     for (uint32_t seq = 0; seq < n_seq_max; ++seq) {
         if (metadata->seq_pos_max(llama_seq_id(seq)) >= 0) {
@@ -4725,6 +4822,7 @@ void llama_kv_cache_kvarn::set_negotiated_native_rpc_owner(bool has_record_snaps
     native_kvarn_rpc_experimental_ = true;
     native_row_rpc_experimental_ = !has_record_snapshot_codec;
     native_global_tail_tokens_ = has_record_snapshot_codec ? global_tail_tokens : 0;
+    native_companion_negotiated_ = native_companion_enabled();
 }
 
 bool llama_kv_cache_kvarn::native_kvarn_checkpoint_unavailable() const {
@@ -4740,15 +4838,21 @@ bool llama_kv_cache_kvarn::native_kvarn_checkpoint_unavailable() const {
 }
 
 bool llama_kv_cache_kvarn::state_seq_can_save(llama_seq_id seq_id) const {
-    return !native_kvarn_checkpoint_unavailable() && stream_is_exclusive_for(seq_id);
+    return !native_companion_enabled() && !native_kvarn_checkpoint_unavailable() && stream_is_exclusive_for(seq_id);
 }
 
 bool llama_kv_cache_kvarn::state_seq_can_restore(llama_seq_id seq_id) const {
-    return !native_kvarn_checkpoint_unavailable() && stream_is_exclusive_for(seq_id);
+    return !native_companion_enabled() && !native_kvarn_checkpoint_unavailable() && stream_is_exclusive_for(seq_id);
 }
 
 bool llama_kv_cache_kvarn::state_seq_can_save(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (native_companion_enabled()) {
+        return native_companion_format_ == 0 && native_companion_negotiated_ &&
+                flags == LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL && seq_id == 0 &&
+                metadata->seq_pos_max(0) >= llama_pos(position_split_p_) &&
+                !has_pending_stream_copies() && stream_is_exclusive_for(seq_id);
+    }
     if (seq_id < 0 ||
             (native_kvarn_checkpoint_unavailable() && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))) {
         return false;
@@ -4770,6 +4874,11 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
 
 bool llama_kv_cache_kvarn::state_seq_can_restore(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (native_companion_enabled()) {
+        return native_companion_format_ == 0 && native_companion_negotiated_ &&
+                flags == LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL && seq_id == 0 &&
+                !has_pending_stream_copies() && stream_is_exclusive_for(seq_id);
+    }
     if (flags == LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) {
         // This only admits the outer, authenticated native file path. A
         // logical clear does not clear the historical native-owner latch, but
@@ -4942,6 +5051,13 @@ uint64_t llama_kv_cache_kvarn::get_kv_tail_planner_timing_ns() const {
 }
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (native_companion_enabled()) {
+        if (!state_seq_can_save(seq_id, flags)) {
+            throw std::runtime_error("native-only overflow requires a negotiated full KVarN4 snapshot");
+        }
+        state_write_mixed(io, seq_id, flags);
+        return;
+    }
     if (standard_cache) {
         state_write_mixed(io, seq_id, flags);
         return;
@@ -5253,7 +5369,7 @@ void llama_kv_cache_kvarn::state_write_mixed(
     // A split destination MUST own the Q4 overflow companion; a PURE source or
     // a PURE destination has no standard_cache by definition and must never be
     // forced to invent remote ownership (plan 3.6: pure stays no-remote).
-    if ((standard_cache == nullptr && position_split_enabled()) ||
+    if ((standard_cache == nullptr && position_split_enabled() && !native_companion_enabled()) ||
             migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
         throw std::runtime_error(
                 "mixed state requires static non-SWA one-stream KV ownership"
@@ -5361,6 +5477,9 @@ void llama_kv_cache_kvarn::state_write_mixed(
         } else {
             standard_cache->state_write_shared_payload(split, seq_id, partial);
         }
+    } else if (native_companion_enabled()) {
+        const uint32_t empty_overflow[] = {1u, 1u, 0u};
+        split.write(empty_overflow, sizeof(empty_overflow));
     }
 
     uint32_t payload_rows = 0;
@@ -5479,7 +5598,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
     // A split destination MUST own the Q4 overflow companion; a PURE source or
     // a PURE destination has no standard_cache by definition and must never be
     // forced to invent remote ownership (plan 3.6: pure stays no-remote).
-    if ((standard_cache == nullptr && position_split_enabled()) ||
+    if ((standard_cache == nullptr && position_split_enabled() && !native_companion_enabled()) ||
             migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
         throw std::runtime_error(
                 "mixed state requires static non-SWA one-stream KV ownership"
@@ -5698,6 +5817,43 @@ void llama_kv_cache_kvarn::state_read_mixed(
     auto expected_descs = mixed_state_layer_descs(
             *this, payload_sizes, partial, uint32_t(parsed.cells().size()), payload_rows,
             split_overflow_payload_rows(parsed.cells(), position_split_p()));
+    if (native_companion_enabled() && native_companion_format_ == 0 && native_full && parsed.has_split()) {
+        bool legacy_seen = false;
+        bool native_seen = false;
+        uint16_t legacy_type = 0;
+        for (auto & wanted : expected_descs) {
+            if (wanted.layout != layout_kvarn_native_external_v1) continue;
+            const auto found = std::find_if(parsed.layers().begin(), parsed.layers().end(),
+                    [&](const layer_desc & source) {
+                        return source.layer_id == wanted.layer_id && source.range_id == wanted.range_id;
+                    });
+            if (found == parsed.layers().end()) {
+                throw kv_mixed_error("native FULL snapshot lacks an overflow descriptor");
+            }
+            if (found->kind == cache_kind::standard_qx) {
+                if (!native_external_legacy_layer_compatible(*found, wanted) ||
+                        (legacy_type && legacy_type != found->k_type)) {
+                    throw kv_mixed_error("legacy native FULL companion is not an empty compatible Q4/Q8 layout");
+                }
+                legacy_type = found->k_type;
+                legacy_seen = true;
+                // Keep the authenticated legacy descriptor and original frame bytes.
+                wanted = *found;
+            } else {
+                native_seen = true;
+            }
+        }
+        if (legacy_seen && native_seen) {
+            throw kv_mixed_error("native FULL snapshot mixes legacy and external overflow layouts");
+        }
+        if (legacy_seen) {
+            for (const auto & event : manifest.events) {
+                if (event.kind == 1 && event.range_id == llama_position_split::kRangeOverflow) {
+                    throw kv_mixed_error("legacy native FULL companion declares an overflow tensor event");
+                }
+            }
+        }
+    }
     if (split_to_pure_import) {
         parsed.project_split_to_pure_for_import(metadata->get_size(), state_model_id, state_rope_id, expected_descs);
         // These entries were independently checked against the original
@@ -6075,6 +6231,18 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
         llama_kv_cache::slot_info_vec_t * sinfos_out,
         const llama_kv_cache::slot_info_vec_t * sinfos_in) {
+    if (native_companion_enabled()) {
+        if (!state_seq_can_restore(seq_id, flags)) {
+            throw std::runtime_error("native-only overflow requires a negotiated full KVarN4 restore");
+        }
+        uint32_t magic = 0;
+        io.read(&magic, sizeof(magic));
+        if (magic != MIXED_KV_STATE_ENVELOPE_MAGIC) {
+            throw std::runtime_error("native-only overflow requires a versioned mixed state envelope");
+        }
+        state_read_mixed(io, seq_id, flags, sinfos_out, sinfos_in, magic);
+        return;
+    }
     if (standard_cache) {
         // F4 §3.6. llama_io_read_i is sequential and offers no peek/seek, so the
         // leading word is read once here to classify the frame.
@@ -7508,7 +7676,8 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
                 local_cache ? 255 : 0;
         out.push_back({layer, llama_position_split::kRangeLocal, 0, position_split_p_, 0, local_format});
         const auto * key = standard_cache ? standard_cache->get_k_storage(il) : nullptr;
-        const uint8_t format = key && key->type == GGML_TYPE_Q4_0 ? 1 :
+        const uint8_t format = native_companion_enabled() ? uint8_t(native_companion_format_) :
+                key && key->type == GGML_TYPE_Q4_0 ? 1 :
                 key && key->type == GGML_TYPE_Q8_0 ? 2 :
                 key && key->type == GGML_TYPE_F16 ? 3 : 255;
         out.push_back({layer, llama_position_split::kRangeOverflow, position_split_p_, kv_size, 1, format});

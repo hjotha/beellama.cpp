@@ -29,6 +29,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-remote-attn.h"
 
 #include <algorithm>
 #include <atomic>
@@ -3645,6 +3646,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.local_attn_backend != nullptr &&
                                     cparams.remote_attn_layers > 0 &&
                                     params.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+                            const bool native_companion_selected = cparams.remote_attn_position_split &&
+                                    cparams.kv_position_split_p != 0 &&
+                                    cparams.remote_attn_native_companion != LLAMA_REMOTE_COMPANION_NONE &&
+                                    cparams.remote_attn_native_companion != LLAMA_REMOTE_COMPANION_AUTO;
+                            if (native_companion_selected &&
+                                    (params.remote_attn_cache_type_k != GGML_TYPE_COUNT ||
+                                     params.remote_attn_cache_type_v != GGML_TYPE_COUNT)) {
+                                throw std::invalid_argument("native companion cannot be combined with standard cache overrides");
+                            }
                             if (mixed_remote_selected &&
                                     (params.remote_attn_cache_type_k == GGML_TYPE_F16 ||
                                      params.remote_attn_cache_type_v == GGML_TYPE_F16) &&
@@ -3658,14 +3668,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             // precisa do dispositivo da camada, não do remoto.
                             llama_memory_i::layer_device_cb position_split_local_device;
                             if (cparams.kv_position_split_p != 0) {
-                                if (!mixed_remote_selected) {
+                                if (!mixed_remote_selected && !native_companion_selected) {
                                     throw std::invalid_argument(
                                             "position-split KV exige cache remoto Q4_0, Q8_0 ou F16 (tipos K/V + backend)");
                                 }
-                                if ((params.remote_attn_cache_type_k != GGML_TYPE_Q4_0 &&
+                                if (!native_companion_selected && ((params.remote_attn_cache_type_k != GGML_TYPE_Q4_0 &&
                                      params.remote_attn_cache_type_k != GGML_TYPE_Q8_0 &&
                                      params.remote_attn_cache_type_k != GGML_TYPE_F16) ||
-                                        params.remote_attn_cache_type_v != params.remote_attn_cache_type_k) {
+                                        params.remote_attn_cache_type_v != params.remote_attn_cache_type_k)) {
                                     throw std::invalid_argument(
                                             "position-split KV exige K/V remotos do mesmo tipo: Q4_0, Q8_0 ou F16");
                                 }
@@ -3772,7 +3782,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         cparams.kv_position_split_p,
                                         cparams.remote_attn_position_split,
                                         params.type_k,
-                                        params.type_v);
+                                        params.type_v, cparams.remote_attn_native_companion,
+                                        cparams.remote_attn_upload_format.c_str());
                                 // F4 v2: stamp the model/RoPE identity that the
                                 // position_split snapshot envelope must match on
                                 // restore. Derived from the loaded model geometry

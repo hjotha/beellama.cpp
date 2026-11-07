@@ -1005,11 +1005,145 @@ static void test_native_resident_prefix_state() {
 #endif
 }
 
+static void test_native_companion_full_body_and_reset() {
+#ifndef _WIN32
+    const char * names[] = {"GGML_RKVA_UPLOAD_FORMAT", "GGML_RKVA_NATIVE_COMPANION", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL"};
+    std::vector<std::string> old;
+    std::vector<bool> present;
+    for (const char * name : names) {
+        const char * value = std::getenv(name);
+        present.push_back(value != nullptr);
+        old.emplace_back(value ? value : "");
+    }
+    setenv(names[0], "kvarn4", 1);
+    setenv(names[1], "1", 1);
+    setenv(names[2], "1", 1);
+    tiny_model model;
+    model.hparams.n_embd = 256;
+    model.hparams.n_embd_head_k_full = model.hparams.n_embd_head_v_full = 256;
+    model.hparams.n_rot_full = 256;
+    auto make_cache = [&]() {
+        auto result = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
+                llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
+                512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,
+                [](int32_t il) { return il == 0; }, nullptr, 0, GGML_TYPE_F16, 0, 1,
+                nullptr, nullptr, nullptr, GGML_TYPE_COUNT, GGML_TYPE_COUNT, false, nullptr, 256, true);
+        result->set_mixed_state_identity(123, 456);
+        result->set_negotiated_native_rpc_owner(true);
+        return result;
+    };
+    auto source = make_cache();
+    assert(source->native_companion_enabled() && !source->has_standard_cache());
+    for (const auto & span : {std::pair<llama_pos, uint32_t>{0, 256}, {256, 1}}) {
+        auto state = source->init_kv_batch({batch(span.first, span.second)});
+        assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
+        state->graph_compute_finish(GGML_STATUS_SUCCESS);
+    }
+    const auto full = LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL;
+    assert(source->state_seq_can_save(0, full));
+    assert(!source->state_seq_can_save(0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    source->set_native_kvarn_rewind_capable(true);
+    source->set_native_kvarn_rewind_preflight([](llama_pos) { return true; });
+    assert(!source->can_seq_rm(0, 256, -1));
+    writer saved;
+    saved.set_native_expected_tokens(257);
+    source->state_write(saved, 0, full);
+    // Legacy native FULL bodies carried an empty Q4/Q8 companion descriptor;
+    // the outer file reader still has to validate the paired RKVK trailer.
+    auto cpu = [](int32_t) { return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); };
+    for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        auto legacy = std::make_unique<llama_kv_cache_kvarn>(model, model.hparams,
+                llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128), false, false,
+                512, 1, 256, 256, 1, 0, LLAMA_SWA_TYPE_NONE,
+                [](int32_t il) { return il == 0; }, nullptr, 0, GGML_TYPE_F16, 0, 1,
+                nullptr, nullptr, [](int32_t il) { return il == 0; }, type, type, false, cpu, 256, true);
+        legacy->set_mixed_state_identity(123, 456);
+        legacy->set_negotiated_native_rpc_owner(true);
+        for (const auto & span : {std::pair<llama_pos, uint32_t>{0, 256}, {256, 1}}) {
+            auto state = legacy->init_kv_batch({batch(span.first, span.second)});
+            assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
+            state->graph_compute_finish(GGML_STATUS_SUCCESS);
+        }
+        writer legacy_body;
+        legacy_body.set_native_expected_tokens(257);
+        legacy->state_write(legacy_body, 0, full);
+        const auto original_bytes = legacy_body.data;
+        auto adapted = make_cache();
+        reader legacy_input(legacy_body.data);
+        legacy_input.set_native_expected_tokens(257);
+        adapted->state_read(legacy_input, 0, full);
+        assert(adapted->seq_pos_max(0) < 0);
+        legacy_input.commit();
+        assert(adapted->seq_pos_max(0) == 256 && legacy_body.data == original_bytes);
+        auto wrong_identity = make_cache();
+        wrong_identity->set_mixed_state_identity(123, 999);
+        reader rejected(legacy_body.data);
+        rejected.set_native_expected_tokens(257);
+        bool failed = false;
+        try { wrong_identity->state_read(rejected, 0, full); } catch (const std::exception &) { failed = true; }
+        assert(failed && wrong_identity->seq_pos_max(0) < 0 && legacy_body.data == original_bytes);
+        auto wrong_prefix = make_cache();
+        reader wrong_count(legacy_body.data);
+        wrong_count.set_native_expected_tokens(258);
+        failed = false;
+        try { wrong_prefix->state_read(wrong_count, 0, full); } catch (const std::exception &) { failed = true; }
+        assert(failed && wrong_prefix->seq_pos_max(0) < 0 && legacy_body.data == original_bytes);
+        auto corrupt = legacy_body.data;
+        corrupt.pop_back();
+        auto truncated = make_cache();
+        reader short_input(corrupt);
+        short_input.set_native_expected_tokens(257);
+        failed = false;
+        try { truncated->state_read(short_input, 0, full); } catch (const std::exception &) { failed = true; }
+        assert(failed && truncated->seq_pos_max(0) < 0 && legacy_body.data == original_bytes);
+    }
+    auto destination = make_cache();
+    reader input(saved.data);
+    input.set_native_expected_tokens(257);
+    destination->state_read(input, 0, full);
+    assert(destination->seq_pos_max(0) < 0);
+    input.commit();
+    assert(destination->seq_pos_max(0) == 256);
+    destination->set_native_companion_reset([]() { return false; });
+    bool refused = false;
+    try { destination->clear(false); } catch (const std::runtime_error &) { refused = true; }
+    assert(refused && destination->seq_pos_max(0) == 256);
+    int resets = 0;
+    destination->set_native_companion_reset([&]() { ++resets; return true; });
+    destination->clear(false);
+    assert(resets == 1 && destination->seq_pos_max(0) < 0);
+    destination->clear(false);
+    assert(resets == 2 && destination->seq_pos_max(0) < 0);
+    auto hybrid_attention = make_cache();
+    auto * hybrid_cache = hybrid_attention.get();
+    auto state = hybrid_cache->init_kv_batch({batch(0, 1)});
+    assert(state && state->get_status() == LLAMA_MEMORY_STATUS_SUCCESS && state->apply());
+    state->graph_compute_finish(GGML_STATUS_SUCCESS);
+    auto recurrent = std::make_unique<llama_memory_recurrent>(model, GGML_TYPE_F32, GGML_TYPE_F32,
+            false, 1, 1, 0, [](int32_t il) { return il == 1; });
+    llama_memory_hybrid hybrid(model, std::move(hybrid_attention), std::move(recurrent), 256);
+    hybrid_cache->set_native_companion_reset([]() { return false; });
+    llama_memory_clear(&hybrid, false);
+    assert(hybrid_cache->seq_pos_max(0) == 0);
+    refused = false;
+    try { hybrid.clear(false); } catch (const std::runtime_error &) { refused = true; }
+    assert(refused && hybrid_cache->seq_pos_max(0) == 0);
+    int hybrid_resets = 0;
+    hybrid_cache->set_native_companion_reset([&]() { ++hybrid_resets; return true; });
+    hybrid.clear(false);
+    assert(hybrid_resets == 1 && hybrid_cache->seq_pos_max(0) < 0);
+    for (size_t i = 0; i < old.size(); ++i) {
+        if (present[i]) setenv(names[i], old[i].c_str(), 1); else unsetenv(names[i]);
+    }
+#endif
+}
+
 int main() {
     ggml_backend_load_all();
     test_standard_overflow_full_state();
     test_native_row_snapshot_lifecycle();
     test_native_resident_prefix_state();
+    test_native_companion_full_body_and_reset();
     test_position_range_presence();
     test_hybrid_tail_graph_reuse();
     test_exact_tail_snapshot_layouts();

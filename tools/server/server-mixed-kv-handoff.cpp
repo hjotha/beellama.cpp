@@ -207,7 +207,8 @@ source_capture capture_source(llama_context * ctx) {
     auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory);
     auto * kvarn = hybrid
             ? dynamic_cast<llama_kv_cache_kvarn *>(hybrid->get_mem_attn_base()) : nullptr;
-    if (kvarn == nullptr || kvarn->has_standard_cache()) {
+    if (kvarn == nullptr || kvarn->has_standard_cache() || kvarn->native_companion_enabled() ||
+            kvarn->position_split_enabled()) {
         return out; // only a PURE KVarN source is handoff-eligible
     }
     const auto allocation_bytes = [](const llama_memory_i * mem) {
@@ -386,8 +387,14 @@ result try_handoff_impl(const input & in, result & out,
     auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(in.ctx_tgt));
     auto * kvarn = hybrid
             ? dynamic_cast<llama_kv_cache_kvarn *>(hybrid->get_mem_attn_base()) : nullptr;
-    if (kvarn == nullptr || !kvarn->has_standard_cache()) {
+    const bool native_split = kvarn && kvarn->native_companion_enabled() &&
+            kvarn->native_companion_format() == 0 && kvarn->position_split_enabled() &&
+            !kvarn->has_standard_cache();
+    if (kvarn == nullptr || (!kvarn->has_standard_cache() && !native_split)) {
         return fail("destination is not a mixed KVarN+Qx cache");
+    }
+    if (native_split && (!in.staged_remote || !in.staged_tokens)) {
+        return fail("native split handoff requires an adopted staged overflow");
     }
     if (in.state->prompt.tokens.empty() || in.tokens_new->empty()) {
         return out; // no source (cold path, no marker)
@@ -453,11 +460,19 @@ result try_handoff_impl(const input & in, result & out,
         out.marker = handoff_marker_no_source();
         return out;
     }
+    if (native_split && (in.source->source_owner_id == 0 || in.source->source_owner_epoch == 0 ||
+            checkpoint->owner_id != in.source->source_owner_id ||
+            checkpoint->owner_epoch != in.source->source_owner_epoch)) {
+        return fail("native split checkpoint does not match captured source owner and epoch");
+    }
 
     // Past P the peer must already own precisely this evaluated lineage.
     const uint32_t split_p = kvarn->position_split_p();
     bool staged_overflow = false;
     if (split_p != 0) {
+        if (native_split && selected <= split_p) {
+            return fail("native split handoff requires an occupied staged overflow");
+        }
         if (selected > split_p) {
             const auto & source_tokens = in.state->prompt.tokens.get_tokens();
             const auto & next_tokens = in.tokens_new->get_tokens();

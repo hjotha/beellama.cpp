@@ -7435,6 +7435,42 @@ struct ggml_tensor * ggml_remote_attn_range(
     return result;
 }
 
+struct ggml_tensor * ggml_remote_attn_range_native(
+        struct ggml_context * ctx, struct ggml_tensor * q,
+        struct ggml_tensor * k, struct ggml_tensor * v,
+        struct ggml_tensor * overflow_cells, struct ggml_tensor * query_pos,
+        int layer_id, uint32_t origin, uint32_t n_live, float kq_scale) {
+    GGML_ASSERT(q && k && v && overflow_cells && query_pos);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q) && q->ne[3] == 1);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(k) && ggml_is_contiguous(v) && ggml_are_same_shape(k, v));
+    GGML_ASSERT(k->ne[0] == q->ne[0] && k->ne[1] > 0 &&
+            q->ne[1] % k->ne[1] == 0 && k->ne[2] == q->ne[2] && k->ne[3] == 1);
+    GGML_ASSERT(overflow_cells->type == GGML_TYPE_I32 && query_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(overflow_cells) && ggml_is_contiguous(query_pos));
+    GGML_ASSERT(ggml_nelements(overflow_cells) >= n_live && query_pos->ne[0] >= q->ne[2]);
+    GGML_ASSERT(origin <= INT32_MAX && n_live <= INT32_MAX && layer_id >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            q->ne[0] * q->ne[1] + q->ne[1], q->ne[2]);
+    result->op = GGML_OP_REMOTE_ATTN;
+    result->src[0] = q;
+    result->src[1] = result->src[5] = k;
+    result->src[2] = result->src[6] = v;
+    result->src[3] = overflow_cells;
+    result->src[4] = query_pos;
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_LAYER_ID, layer_id);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_DOMAIN, 0);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_HEAD, (int) q->ne[1]);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_HEAD_KV, (int) k->ne[1]);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_EMBD_HEAD, (int) q->ne[0]);
+    ggml_set_op_params_f32(result, GGML_REMOTE_ATTN_PARAM_KQ_SCALE, kq_scale);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_RANGE, 1);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_ORIGIN, (int) origin);
+    ggml_set_op_params_i32(result, GGML_REMOTE_ATTN_PARAM_N_LIVE, (int) n_live);
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 // ggml_kvarn_split_fused

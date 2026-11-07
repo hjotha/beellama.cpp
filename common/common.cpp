@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-remote-attn.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -2835,7 +2836,7 @@ static bool common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llam
                                 llama_memory_seq_pos_min(mem, seq_id) == -1 &&
                                 llama_memory_seq_pos_max(mem, seq_id) == -1;
     const bool removed = llama_memory_seq_rm(mem, seq_id, p0, p1);
-    if (common_seq_rm_cleanup_tolerated(removed, was_empty_full)) {
+    if (common_seq_rm_cleanup_tolerated(removed, was_empty_full, ctx->remote_native_companion_failed())) {
         if (!removed) {
             LOG_WRN("%s: refused cleanup of already empty sequence %d; backend failure remains unchanged\n",
                     __func__, seq_id);
@@ -3432,11 +3433,50 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
-struct llama_context_params common_context_params_to_llama(const common_params & params) {
-    auto cparams = llama_context_default_params();
-
+enum llama_remote_native_companion common_resolve_remote_native_companion(const common_params & params) {
     const bool remote_cache_k = params.remote_attn_cache_type_k != GGML_TYPE_COUNT;
     const bool remote_cache_v = params.remote_attn_cache_type_v != GGML_TYPE_COUNT;
+    const auto & native_k = params.remote_attn_native_cache_type_k;
+    const auto & native_v = params.remote_attn_native_cache_type_v;
+    const char * format_env = std::getenv("GGML_RKVA_UPLOAD_FORMAT");
+    if (!format_env) format_env = std::getenv("GGML_RKVA_FORMAT");
+    if (!format_env) format_env = std::getenv("GGML_RKVA_RANGE_STORAGE");
+    const std::string selected = !params.remote_attn_format.empty() ? params.remote_attn_format :
+            (format_env ? format_env : "");
+    if (params.kv_position_split_p != 0 && !common_remote_attn_is_local_vulkan(params.remote_attn_host) &&
+            (remote_cache_k || remote_cache_v) &&
+            (!remote_cache_k || !remote_cache_v || params.remote_attn_cache_type_k != params.remote_attn_cache_type_v ||
+             !ggml_remote_attn_companion_format_matches(selected.c_str(), params.remote_attn_cache_type_k))) {
+        throw std::invalid_argument("positional RPC companion K/V must match the selected remote KV format");
+    }
+    const auto format_id = [](const std::string & value) {
+        if (value == "kvarn4" || value == "kvarn") return LLAMA_REMOTE_COMPANION_KVARN4;
+        if (value == "saw_int4" || value == "saw-int4" || value == "saw4" || value == "bdr_int4") return LLAMA_REMOTE_COMPANION_SAW_INT4;
+        if (value == "turboquant_nc" || value == "turboquant-nc" || value == "tqnc" || value == "turboquant_4bit_nc") return LLAMA_REMOTE_COMPANION_TURBOQUANT_NC;
+        return LLAMA_REMOTE_COMPANION_NONE;
+    };
+    auto native_selection = LLAMA_REMOTE_COMPANION_NONE;
+    if (!native_k.empty() || !native_v.empty()) {
+        if (native_k.empty() || native_k != native_v || remote_cache_k || remote_cache_v ||
+                params.kv_position_split_p == 0) {
+            throw std::invalid_argument("native remote companion requires matching K/V and an explicitly enabled native upload format");
+        }
+        native_selection = format_id(native_k);
+        if (native_selection == LLAMA_REMOTE_COMPANION_NONE || native_selection != format_id(selected))
+            throw std::invalid_argument("native remote companion must match the selected upload format");
+    } else if (!remote_cache_k && !remote_cache_v && params.kv_position_split_p != 0) {
+        const char * legacy = std::getenv("GGML_RKVA_NATIVE_COMPANION");
+        if (!params.remote_attn_format.empty() || (legacy && !std::strcmp(legacy, "1")))
+            native_selection = format_id(selected);
+    }
+    return native_selection;
+}
+
+struct llama_context_params common_context_params_to_llama(const common_params & params) {
+    auto cparams = llama_context_default_params();
+    const bool remote_cache_k = params.remote_attn_cache_type_k != GGML_TYPE_COUNT;
+    const bool remote_cache_v = params.remote_attn_cache_type_v != GGML_TYPE_COUNT;
+    const auto native_selection = common_resolve_remote_native_companion(params);
     if (remote_cache_k != remote_cache_v) {
         throw std::invalid_argument("--remote-attn-cache-type-k and -v must be supplied together");
     }
@@ -3562,6 +3602,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.remote_attn_vulkan_reserve = params.remote_attn_vulkan_reserve;
     cparams.remote_attn_cache_type_k = params.remote_attn_cache_type_k;
     cparams.remote_attn_cache_type_v = params.remote_attn_cache_type_v;
+    cparams.remote_attn_native_companion = native_selection;
+    cparams.remote_attn_upload_format = params.remote_attn_format.empty() ? nullptr : params.remote_attn_format.c_str();
+    cparams.remote_attn_wire_format = params.remote_attn_wire_format.empty() ? nullptr : params.remote_attn_wire_format.c_str();
 
     // Planned draft-MTP KV reservation (internal contract, no user CLI flags):
     // active only when a real draft-MTP context with n_max > 0 is present in
@@ -4240,7 +4283,8 @@ std::string common_prompt_cache_layout(llama_context * ctx) {
     }
     const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn *>(memory);
     const bool mixed_kv = kvarn && kvarn->has_standard_cache();
-    const bool layout_known = p.kv_layout_known || mixed_kv;
+    const bool native_companion = kvarn && kvarn->native_companion_enabled();
+    const bool layout_known = p.kv_layout_known || mixed_kv || native_companion;
     common_json layout = {
         {"cache_layout_version", 2},
         // nlohmann/json treats the uncast ggml/llama enums as boolean-like
@@ -4264,6 +4308,15 @@ std::string common_prompt_cache_layout(llama_context * ctx) {
     layout["type_k_aux"] = static_cast<int32_t>(p.type_k_aux);
     layout["type_v_aux"] = static_cast<int32_t>(p.type_v_aux);
     layout["kv_layout_known"] = layout_known;
+    if (native_companion) {
+        const auto & native_params = ctx->get_cparams().kvarn;
+        layout["native_companion_format"] = kvarn->native_companion_format();
+        layout["native_companion_split_p"] = kvarn->position_split_p();
+        layout["native_companion_kvarn_type"] = static_cast<int32_t>(native_params.type);
+        layout["native_companion_kvarn_bits_k"] = native_params.key_bits;
+        layout["native_companion_kvarn_bits_v"] = native_params.value_bits;
+        layout["native_global_tail_tokens"] = kvarn->native_global_tail_tokens();
+    }
     if (kvarn && ctx->get_cparams().kv_tail_tokens == 0 &&
             ctx->get_cparams().kv_tail_tokens_swa == 0) {
         // Distinguish the experimental zero-overlay representation before
