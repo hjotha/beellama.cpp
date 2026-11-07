@@ -5211,6 +5211,7 @@ static void test_free_unregisters_remote_owner() {
 static void test_low4_explicit_wire_and_producer_guards() {
     storage_env upload(nullptr, "GGML_RKVA_UPLOAD_FORMAT"), legacy(nullptr, "GGML_RKVA_FORMAT");
     storage_env companion(nullptr, "GGML_RKVA_NATIVE_COMPANION");
+    storage_env specific_unset(nullptr, "GGML_RKVA_LOW4_PRODUCER");
     storage_env native_gate("1", "GGML_RKVA_EXPERIMENTAL_LOW4");
     storage_env initial_wire("fp8", "GGML_RKVA_WIRE_FORMAT");
     storage_env bulk("1", "GGML_RKVA_NATIVE_BULK");
@@ -5242,7 +5243,14 @@ static void test_low4_explicit_wire_and_producer_guards() {
             ggml_backend_free(backend);
         }
         for (const char * wire : {"fp8", "fp8_e4m3fn"}) {
-            storage_env producer("cuda", "GGML_RKVA_NATIVE_PRODUCER");
+          for (const bool explicit_cuda : {false, true}) {
+            // The explicit path exercises actual configure-time availability,
+            // not merely the legacy generic opt-in rejection or constructors.
+            auto cuda_reg = ggml_backend_reg_by_name("CUDA");
+            if (explicit_cuda && cuda_reg && ggml_backend_reg_get_proc_address(
+                    cuda_reg, "ggml_backend_cuda_low4_native_prepare_v1")) continue;
+            storage_env producer(explicit_cuda ? "cpu" : "cuda", "GGML_RKVA_NATIVE_PRODUCER");
+            storage_env specific(explicit_cuda ? "cuda" : nullptr, "GGML_RKVA_LOW4_PRODUCER");
             loopback server(false, true, false, false, false, false, 0, 0, true, 8 | 32 | 16384, storage);
             auto * backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
             assert(backend && ggml_backend_remote_attn_set_upload_format(backend, ggml_type_name(type)));
@@ -5251,14 +5259,23 @@ static void test_low4_explicit_wire_and_producer_guards() {
             assert(ggml_backend_remote_attn_connect(backend));
             assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
             ggml_backend_remote_attn_set_active_session(backend, 0);
+            const std::string before = ggml_backend_remote_attn_stats_json(backend);
+            std::vector<uint32_t> packet_ops_before;
+            {
+                std::lock_guard<std::mutex> lock(server.mutex);
+                packet_ops_before.assign(server.packet_ops.begin(), server.packet_ops.end());
+            }
             assert(!ggml_backend_remote_attn_configure_range(backend, 256, 512, type));
+            assert(before == ggml_backend_remote_attn_stats_json(backend));
             {
                 std::lock_guard<std::mutex> lock(server.mutex);
                 assert(std::find(server.packet_ops.begin(), server.packet_ops.end(), RKVA_KVARN_RANGE_CONFIG) == server.packet_ops.end());
                 assert(std::find(server.packet_ops.begin(), server.packet_ops.end(), RKVA_RANGE_CONFIG) == server.packet_ops.end());
                 assert(server.native_descriptor.layout_version == 0);
+                assert(std::vector<uint32_t>(server.packet_ops.begin(), server.packet_ops.end()) == packet_ops_before);
             }
             ggml_backend_free(backend);
+          }
         }
     }
 }

@@ -8349,6 +8349,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_q8_native_prepare_v1") == 0) {
         return (void *)ggml_cuda_q8_native_prepare;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_low4_native_prepare_v1") == 0) {
+        return (void *)ggml_cuda_low4_native_prepare;
+    }
+#endif
     if (strcmp(name, "ggml_backend_cuda_q4_native_prepare_v1") == 0) {
         return (void *)ggml_cuda_q4_native_prepare;
     }

@@ -17,3 +17,7 @@ bool ggml_cuda_q8_native_prepare(const float * keys, const float * values,
 // Q4_0 raw-domain counterpart, independent of KVarN record format.
 bool ggml_cuda_q4_native_prepare(const float * keys, const float * values,
         uint32_t count, uint32_t heads, void * packed_keys, void * packed_values);
+
+// Experimental native Q4_1/IQ4_NL/SAW/NC rows, format-specific wire ABI.
+bool ggml_cuda_low4_native_prepare(int format, uint32_t flags, const float * keys, const float * values,
+        uint32_t count, uint32_t heads, void * packed_keys, void * packed_values);

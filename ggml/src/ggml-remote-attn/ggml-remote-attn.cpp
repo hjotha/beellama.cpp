@@ -4904,10 +4904,25 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
         return false;
     }
     const char * producer = std::getenv("GGML_RKVA_LOW4_PRODUCER");
-    if (!producer) producer = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
-    if (producer && std::strcmp(producer, "cpu")) {
-        GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL requires a CPU producer\n", GGML_REMOTE_ATTN_NAME);
+    if (!producer) {
+        producer = std::getenv("GGML_RKVA_NATIVE_PRODUCER");
+        if (producer && !std::strcmp(producer, "cuda")) {
+            GGML_LOG_ERROR("%s: native low4 CUDA requires GGML_RKVA_LOW4_PRODUCER=cuda explicitly\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
+    }
+    if (producer && std::strcmp(producer, "cpu") && std::strcmp(producer, "cuda")) {
+        GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL producer must be cpu or cuda\n", GGML_REMOTE_ATTN_NAME);
         return false;
+    }
+    const bool cuda_producer = producer && !std::strcmp(producer, "cuda");
+    if (cuda_producer) {
+        auto reg = ggml_backend_reg_by_name("CUDA");
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_low4_native_prepare_v1") ||
+                ctx->geo.n_head_kv == 0 || ctx->geo.n_head_kv > 32) {
+            GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL CUDA producer unavailable or unsupported geometry\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
     }
     const bool q41 = source_type == GGML_TYPE_Q4_1;
     const uint32_t storage = q41 ? RKVA_RANGE_STORAGE_Q4_1 : RKVA_RANGE_STORAGE_IQ4_NL;
@@ -4992,10 +5007,10 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
     ctx->range_kernel_mode = mode;
     if (!rkva_range_apply_control(ctx, ggml_type_name(source_type), generic)) return false;
     GGML_LOG_WARN("%s: experimental native %s descriptor=%u origin=%u capacity=%u async_overlap=%d "
-            "wire=%s; CPU GGML producer, native packed Xbox rowlane, no stage/tail; "
+            "wire=%s; %s producer, native packed Xbox rowlane, no stage/tail; "
             "suffix rollback uses op8; GPU/model qualification still required\n",
             GGML_REMOTE_ATTN_NAME, ggml_type_name(source_type), layout, origin, capacity, int(async_overlap),
-            e4_selected ? "fp8_e4m3fn" : "fp8_e5m2");
+            e4_selected ? "fp8_e4m3fn" : "fp8_e5m2", cuda_producer ? "experimental CUDA" : "CPU GGML");
     return true;
 }
 
@@ -5097,6 +5112,16 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
 static bool rkva_configure_native_rotated_rows(ggml_backend_remote_attn_context * ctx,
         uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap,
         bool turboquant_nc) {
+    // Validate explicit producer selection before mutating the remote session.
+    try {
+        rkva_low4_cuda_prepared probe;
+        probe.configure(turboquant_nc ? "GGML_RKVA_TQNC_PRODUCER" : "GGML_RKVA_SAW_PRODUCER",
+            turboquant_nc ? GGML_TYPE_TQNC_K : GGML_TYPE_SAW_INT4, ctx->geo.n_head_kv,
+            turboquant_nc ? 132 : 136);
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: native SAW/NC producer rejected: %s\n", GGML_REMOTE_ATTN_NAME, e.what());
+        return false;
+    }
     const uint64_t caps = (turboquant_nc ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK : RKVA_CAP_NATIVE_SAW_INT4_BULK) |
                               RKVA_CAP_KVARN_BULK_ATTN | (ctx->e4_requested ? (turboquant_nc ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN : RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN) :
                               RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE);
