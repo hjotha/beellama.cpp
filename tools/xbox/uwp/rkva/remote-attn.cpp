@@ -1190,7 +1190,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             }
             // Q8/Q4 raw-domain GPU codec is independent of the KVarN codec flag.
             // Keep the CPU path available when this device lacks the PSOs.
-            const bool new_native_codec = it->second.native_low4 || reply_wire == RKVA_WIRE_FP8_E4M3FN;
+            const bool new_native_codec = it->second.native_low4 || it->second.native_extended || reply_wire == RKVA_WIRE_FP8_E4M3FN;
             const bool raw_fp8_gpu =
                 (!new_native_codec || RKVA_EXPERIMENTAL_NATIVE_FP8_GPU) &&
                 (reply_wire == RKVA_WIRE_FP8 || (!q8_rows && reply_wire == RKVA_WIRE_FP8_E4M3FN)) &&
@@ -1200,9 +1200,9 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                 output.resize(size_t(total + heads * sizeof(float)));
                 std::string error;
                 const auto start = clock_type::now();
-                const bool ok = it->second.native_low4
+                const bool ok = (it->second.native_low4 || it->second.native_extended)
                     ? state.engine->attend_low4_bulk_fp8(
-                        req.session_id, req.layer_id, req.n_tokens, it->second.native_low4,
+                        req.session_id, req.layer_id, req.n_tokens, it->second.range_storage,
                         input.data(), input.size(), output.data(),
                         reinterpret_cast<float*>(output.data() + total), &error, req.cycle_id)
                     : q8_rows ? state.engine->attend_q8_bulk_fp8(

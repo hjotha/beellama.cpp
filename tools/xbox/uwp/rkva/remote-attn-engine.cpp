@@ -3318,13 +3318,16 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         !data || (!out && !out_fp8) || !lse || bulk_recording_ || !n_tokens || n_tokens > 256 ||
         (gpu_fp8 && storage != RKVA_RANGE_STORAGE_Q8_0 && storage != RKVA_RANGE_STORAGE_Q4_0 &&
          storage != RKVA_RANGE_STORAGE_SAW_INT4 && storage != RKVA_RANGE_STORAGE_TURBOQUANT_NC &&
-         !rkva_kvarn_range::low4_storage(storage))) {
+         storage != RKVA_RANGE_STORAGE_OSCAR_INT2 &&
+         !rkva_kvarn_range::low4_storage(storage) &&
+         !rkva_kvarn_range::is_extended_native_storage(storage))) {
         return ::fail(error, "q4 bulk: invalid session/arguments");
     }
     uint32_t wire = RKVA_WIRE_F32;
     if (!rkva_kvarn_bulk::peek_wire(data, bytes, &wire)) return ::fail(error, "native rows: invalid envelope wire");
     if (gpu_fp8 && !RKVA_EXPERIMENTAL_NATIVE_FP8_GPU &&
-        (wire == RKVA_WIRE_FP8_E4M3FN || rkva_kvarn_range::low4_storage(storage)))
+        (wire == RKVA_WIRE_FP8_E4M3FN || rkva_kvarn_range::low4_storage(storage) ||
+         storage == RKVA_RANGE_STORAGE_OSCAR_INT2 || rkva_kvarn_range::is_extended_native_storage(storage)))
         return ::fail(error, "experimental native FP8 GPU gate disabled");
     if (gpu_fp8 && !ensure_native_fp8_gpu_pipelines(wire))
         return ::fail(error, "native GPU codec pipeline unavailable");
