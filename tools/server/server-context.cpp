@@ -3968,6 +3968,16 @@ public:
     server_metrics get_metrics() const {
         server_metrics result = metrics;
         for (const server_slot & slot : slots) {
+            // The completion hook only folds a generation into the metrics on
+            // slot reset, so while a request was decoding the
+            // predicted_tokens_seconds gauge stayed at 0 and telemetry
+            // consumers (the Xbox UWP dashboard) could not show decode tok/s.
+            // Fold the in-flight slot into this copy; the reset hook still
+            // accounts it once in the cumulative metrics.
+            if (slot.stats.n_gen > 0 && slot.stats.t_gen_us() > 0) {
+                result.predict_bucket.add(slot.stats.n_gen, slot.stats.n_gen_steps(),
+                                          (uint64_t) slot.stats.t_gen_us());
+            }
             llama_kv_tail_coverage_aggregate tail_coverage;
             if (!llama_kv_tail_get_coverage_aggregate(ctx_tgt, slot.id, &tail_coverage)) {
                 continue;
