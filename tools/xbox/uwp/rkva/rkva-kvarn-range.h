@@ -132,14 +132,16 @@ inline bool valid_low4_descriptor(const rkva_kvarn_range_config& c, uint32_t dim
 }
 inline bool valid_low4_upload(const rkva_kvarn_range_upload& u, uint32_t capacity,
                              uint32_t previous_live) {
-    return u.append_rows > 0 && previous_live <= capacity &&
+    return previous_live <= capacity &&
            u.append_begin <= u.live_count && u.append_rows <= u.live_count - u.append_begin &&
            uint64_t(u.append_begin) + u.append_rows == u.live_count &&
            valid_q4_upload(u, capacity, previous_live);
 }
 
 inline bool valid_low4_planes(uint32_t storage, const uint8_t * k, const uint8_t * v, size_t head_rows) {
-    if (!low4_storage(storage) || !k || !v || !head_rows || head_rows > SIZE_MAX / low4_head_bytes(storage)) return false;
+    if (!low4_storage(storage)) return false;
+    if (!head_rows) return true;
+    if (!k || !v || head_rows > SIZE_MAX / low4_head_bytes(storage)) return false;
     const size_t block_bytes = storage == RKVA_RANGE_STORAGE_Q4_1 ? 20u : 18u;
     for (const uint8_t * plane : {k, v}) {
         for (size_t off = 0; off < head_rows * low4_head_bytes(storage); off += block_bytes) {

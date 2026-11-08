@@ -3381,7 +3381,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
                 !rkva_kvarn_bulk::turboquant_nc_planes_valid(k, v, size_t(u.append_rows) * geo_.n_head_kv))
                 return ::fail(error, "turboquant_nc bulk: invalid metadata");
         }
-        if (rkva_kvarn_range::low4_storage(storage)) {
+        if (rkva_kvarn_range::low4_storage(storage) && u.append_rows > 0) {
             const uint8_t* k = data + off + sizeof(u);
             const uint8_t* v = k + uint64_t(u.append_rows) * row;
             if (!rkva_kvarn_range::valid_low4_planes(storage, k, v,
