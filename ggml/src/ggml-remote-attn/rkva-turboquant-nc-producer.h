@@ -3,6 +3,7 @@
 #include "../ggml-turboquant-nc.h"
 #include "remote-attn-protocol.h"
 #include "rkva-native-owner.h"
+#include "rkva-low4-cuda-prepared.h"
 
 #include <cstdint>
 #include <cstring>
@@ -23,13 +24,17 @@ public:
                 *reinterpret_cast<const uint8_t *>(&endian) != 1) {
             throw std::invalid_argument("native TurboQuant NC range geometry or byte order");
         }
+        cuda_.configure("GGML_RKVA_TQNC_PRODUCER", GGML_TYPE_TQNC_K, heads_, record_bytes);
     }
 
     static size_t row_bytes(uint32_t heads) { return size_t(heads)*record_bytes; }
     uint32_t rows() const override { return rows_; }
 
-    bool prepare(const float *, const float *, const int32_t *, uint32_t,
-                 const float * = nullptr, const float * = nullptr) override { return true; }
+    bool prepare(const float * keys, const float * values, const int32_t * positions,
+                 uint32_t count, const float * device_keys = nullptr,
+                 const float * device_values = nullptr) override {
+        return cuda_.prepare(keys, values, positions, count, origin_, rows_, capacity_, device_keys, device_values);
+    }
 
     bool append(const float * keys, const float * values, const int32_t * positions,
                 uint32_t count, bool reset_snapshot, std::vector<uint8_t> & payload) override {
@@ -50,14 +55,18 @@ public:
         std::memcpy(next.data(), &header, sizeof(header));
         uint8_t * kdst = next.data() + sizeof(header);
         uint8_t * vdst = kdst + plane;
-        const size_t n_heads = size_t(count)*heads_;
-        for (size_t i = 0; i < n_heads; ++i) {
-            ggml_tqnc_key key;
-            ggml_tqnc_value value;
-            if (!ggml_tqnc_quantize_key(keys + i*head_dim, &key) ||
-                    !ggml_tqnc_quantize_value(values + i*head_dim, &value)) return false;
-            std::memcpy(kdst + i*record_bytes, &key, sizeof(key));
-            std::memcpy(vdst + i*record_bytes, &value, sizeof(value));
+        if (cuda_) {
+            if (!cuda_.copy(keys, values, rows_, count, kdst)) return false;
+        } else {
+            const size_t n_heads = size_t(count)*heads_;
+            for (size_t i = 0; i < n_heads; ++i) {
+                ggml_tqnc_key key;
+                ggml_tqnc_value value;
+                if (!ggml_tqnc_quantize_key(keys + i*head_dim, &key) ||
+                        !ggml_tqnc_quantize_value(values + i*head_dim, &value)) return false;
+                std::memcpy(kdst + i*record_bytes, &key, sizeof(key));
+                std::memcpy(vdst + i*record_bytes, &value, sizeof(value));
+            }
         }
         payload.swap(next);
         rows_ = after;
@@ -68,11 +77,13 @@ public:
     bool rewind_tail(uint32_t, std::vector<uint8_t> &) const override { return false; }
     bool rewind(uint32_t keep) override {
         if (keep > rows_) return false;
+        cuda_.invalidate();
         rows_ = keep;
         return true;
     }
 
 private:
+    rkva_low4_cuda_prepared cuda_;
     uint32_t origin_, capacity_, heads_, rows_ = 0;
 };
 

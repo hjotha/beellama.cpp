@@ -1876,6 +1876,13 @@ set_property(TEST test-rkva-qual-probe-guard-off PROPERTY LABELS main)
 
 # Native Q4_1/IQ4_NL CPU format contracts (no GPU qualification).
 llama_build_and_test(test-rkva-low4.cpp)
+# Host oracle and mocked transaction tests; not CUDA execution.
+llama_build_and_test(test-rkva-low4-native-reference.cpp)
+llama_build_and_test(test-rkva-low4-gpu-producer.cpp)
+set_tests_properties(test-rkva-low4-gpu-producer PROPERTIES SKIP_RETURN_CODE 77)
+if (NOT MSVC)
+    target_compile_options(test-rkva-low4-native-reference PRIVATE -ffp-contract=off)
+endif()
 
 if (NOT WIN32)
     add_test(NAME test-rkva-low4-loopback COMMAND ${CMAKE_COMMAND} -E env

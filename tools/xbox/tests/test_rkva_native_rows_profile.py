@@ -65,6 +65,20 @@ def function_body(text: str, signature: str) -> str:
     raise AssertionError(f"unbalanced braces after {signature}")
 
 
+def call_arguments(text: str, call: str) -> str:
+    """Extract one call's arguments, including nested function calls."""
+    start = text.index(call) + len(call)
+    depth = 1
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:index]
+    raise AssertionError(f"unbalanced parentheses after {call}")
+
+
 FIXTURE = r"""
 #include "rkva-range-profile.h"
 
@@ -321,31 +335,40 @@ class EngineWiring(unittest.TestCase):
 
     def test_cycle_id_signatures_and_forwarding(self) -> None:
         header = read(os.path.join(RKVA, "remote-attn-engine.h"))
-        for signature in ("attend_q4_bulk", "attend_q8_bulk"):
+        signatures = tuple(
+            f"attend_{fmt}_bulk{suffix}"
+            for fmt in ("q4", "q8", "low4", "saw_int4", "turboquant_nc")
+            for suffix in ("", "_fp8")
+        )
+        for signature in signatures:
             decl = slice_between(header, f"bool {signature}(", ");")
             self.assertIn("uint64_t cycle_id", decl, f"{signature} lost the cycle_id parameter")
             self.assertNotIn("cycle_id = 0", decl, f"{signature} still defaults cycle_id")
+            body = function_body(self.engine, f"bool RemoteAttnEngine::{signature}(")
+            args = call_arguments(body, "attend_native_rows(")
+            expected = "error, cycle_id"
+            if signature.endswith("_fp8"):
+                expected += ", out" if signature == "attend_turboquant_nc_bulk_fp8" else ", out_fp8"
+            self.assertTrue(args.rstrip().endswith(expected), f"{signature} drops cycle_id")
         native = slice_between(header, "bool attend_native_rows(", ");")
         self.assertIn("uint64_t cycle_id", native)
         self.assertNotIn("cycle_id = 0", native)
 
         native_body = function_body(self.engine, "bool RemoteAttnEngine::attend_native_rows")
         self.assertIn("envelope.cycle_id = cycle_id;", native_body)
-        q4 = function_body(self.engine, "bool RemoteAttnEngine::attend_q4_bulk")
-        q8 = function_body(self.engine, "bool RemoteAttnEngine::attend_q8_bulk")
-        self.assertIn("error, cycle_id);", q4)
-        self.assertIn("error, cycle_id);", q8, "Q8 wrapper drops cycle_id")
-
         transport = read(REMOTE_ATTN_CPP)
         block = slice_between(
             transport,
             "const bool q8_rows = it->second.native_q8;",
             "        uint32_t wire = RKVA_WIRE_F32;",
         )
-        self.assertEqual(block.count("&error, req.cycle_id)"), 4,
-                         "Q4 CPU, Q4 GPU, Q8 CPU and Q8 GPU call sites must forward req.cycle_id")
-        self.assertIn("attend_q4_bulk_fp8", block)
-        self.assertIn("attend_q8_bulk_fp8", block)
+        for signature in signatures:
+            with self.subTest(signature=signature):
+                call = f"state.engine->{signature}("
+                self.assertEqual(block.count(call), 1, f"expected one {signature} call")
+                args = call_arguments(block, call)
+                self.assertTrue(args.rstrip().endswith("&error, req.cycle_id"),
+                                f"{signature} transport call drops req.cycle_id")
 
     def test_bulk_window_guard_armed_after_ownership(self) -> None:
         body = function_body(self.engine, "bool RemoteAttnEngine::attend_native_rows")

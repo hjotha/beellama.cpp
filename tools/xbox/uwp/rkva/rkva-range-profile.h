@@ -70,6 +70,17 @@ constexpr uint32_t kStorageQ4_1 = 1u << 6;
 constexpr uint32_t kStorageIQ4_NL = 1u << 7;
 constexpr uint32_t kStorageSawInt4 = 1u << 3;
 constexpr uint32_t kStorageTurboquantNC = 1u << 5;
+constexpr uint32_t kNativeStorageCount = 4;
+
+inline uint32_t native_storage_index(uint32_t storage) {
+    switch (storage) {
+    case kStorageQ4_1: return 0;
+    case kStorageIQ4_NL: return 1;
+    case kStorageSawInt4: return 2;
+    case kStorageTurboquantNC: return 3;
+    default: return kNativeStorageCount;
+    }
+}
 
 // Bucket/report kernel name. Q4_0 keeps the 261 names byte for byte.
 inline const char* kernel_name(uint32_t storage, uint32_t mode) {
@@ -259,6 +270,15 @@ inline const char* kvarn4_mq_kernel_name(uint32_t q_tile, bool int8_dot = false)
 
 // Storage-qualified multi-query kernel name (Q4_0 keeps its 266 names).
 inline const char* mq_kernel_name(uint32_t storage, uint32_t q_tile, bool int8_dot = false) {
+    if (q_tile == 2) {
+        switch (storage) {
+        case kStorageQ4_1: return "q4_1_mq2";
+        case kStorageIQ4_NL: return "iq4_nl_mq2";
+        case kStorageSawInt4: return "saw_int4_mq2";
+        case kStorageTurboquantNC: return "turboquant_nc_mq2";
+        default: break;
+        }
+    }
     if (storage == kStorageKvarn4) {
         return kvarn4_mq_kernel_name(q_tile, int8_dot);
     }
@@ -434,6 +454,9 @@ struct Counters {
     uint64_t kvarn4_mq4_calls = 0;
     uint64_t optimized_by_storage[kStorageCount] = {};
     uint64_t reference_by_storage[kStorageCount] = {};
+    uint64_t native_optimized[kNativeStorageCount] = {};
+    uint64_t native_reference[kNativeStorageCount] = {};
+    uint64_t native_mq2[kNativeStorageCount] = {};
     uint64_t failed_calls = 0;
     uint64_t submits = 0;
     uint64_t fence_blocking_waits = 0;
@@ -460,7 +483,20 @@ struct Counters {
 // for the kernel specializations, its serial-prefix descriptor), so native
 // Q4_0/Q8_0 rows never increment them.
 inline void count_attention_sample(Counters& c, const Sample& s) {
-    if (s.kind != kAttention || s.storage >= kStorageCount) {
+    if (s.kind != kAttention) {
+        return;
+    }
+    const uint32_t native = native_storage_index(s.storage);
+    if (native < kNativeStorageCount) {
+        if (s.optimized) {
+            ++c.native_optimized[native];
+            if (s.q_tile == 2) ++c.native_mq2[native];
+        } else {
+            ++c.native_reference[native];
+        }
+        return;
+    }
+    if (s.storage >= kStorageCount) {
         return;
     }
     if (s.optimized) {
@@ -505,8 +541,8 @@ inline uint32_t bulk_upload_copy_regions(uint32_t storage, bool has_upload) {
     if (!has_upload) {
         return 0;
     }
-    return storage == kStorageQ4 || storage == kStorageQ8 || storage == kStorageSawInt4 ||
-           storage == kStorageTurboquantNC ? 2u : 1u;
+    return storage == kStorageQ4 || storage == kStorageQ8 ||
+           native_storage_index(storage) < kNativeStorageCount ? 2u : 1u;
 }
 
 struct BulkEnvelopeSample {
@@ -578,6 +614,7 @@ struct Header {
     std::string saw_int4_optimized_status;
     bool turboquant_nc_available = false;
     std::string turboquant_nc_status;
+    bool low4_mq_available[2] = {};
     // Per storage (index = Storage); the Q4 entry mirrors the fields above.
     bool optimized_available[kStorageCount] = {};
     std::string optimized_status[kStorageCount];
@@ -873,6 +910,25 @@ class Recorder {
                       json_escape(h.turboquant_nc_status).c_str(),
                       h.turboquant_nc_available ? kOptMaxQueries : 0u);
         o += buf;
+        for (uint32_t i = 0; i < 2; ++i) {
+            std::snprintf(buf, sizeof(buf),
+                          ",\"%s\":{\"available\":%s,\"status\":\"%s\",\"fast_nq_max\":%u}",
+                          i == 0 ? "q4_1" : "iq4_nl",
+                          h.low4_mq_available[i] ? "true" : "false",
+                          h.low4_mq_available[i] ? "ready" : "requires native LOW4 and MQ2 pipelines",
+                          h.low4_mq_available[i] ? 256u : 0u);
+            o += buf;
+        }
+        o += '}';
+        o += ",\"native_row_attention\":{";
+        const uint32_t native_storages[] = {kStorageQ4_1, kStorageIQ4_NL, kStorageSawInt4, kStorageTurboquantNC};
+        for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
+            std::snprintf(buf, sizeof(buf),
+                          "%s\"%s\":{\"optimized_calls\":%llu,\"reference_calls\":%llu,\"mq2_calls\":%llu}",
+                          i ? "," : "", storage_name(native_storages[i]),
+                          ull(c.native_optimized[i]), ull(c.native_reference[i]), ull(c.native_mq2[i]));
+            o += buf;
+        }
         o += '}';
         std::snprintf(
             buf, sizeof(buf),

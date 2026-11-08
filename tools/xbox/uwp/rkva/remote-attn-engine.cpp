@@ -19,6 +19,13 @@
 #else
     #define RKVA_HAS_Q8_RAW_FP8_DXIL 0
 #endif
+#if __has_include("rkva_range_bulk_unpack_q_e4m3fn_raw_dxil.h") && __has_include("rkva_range_bulk_pack_out_e4m3fn_raw_dxil.h")
+    #include "rkva_range_bulk_unpack_q_e4m3fn_raw_dxil.h"
+    #include "rkva_range_bulk_pack_out_e4m3fn_raw_dxil.h"
+    #define RKVA_HAS_NATIVE_E4_DXIL 1
+#else
+    #define RKVA_HAS_NATIVE_E4_DXIL 0
+#endif
 #include "rkva-range-profile.h"
 #include "rkva_flash_attn_dxil.h"
 #include "rkva_flash_attn_kvarn4_dxil.h"
@@ -66,6 +73,34 @@
 #define RKVA_HAS_LOW4_DXIL 1
 #else
 #define RKVA_HAS_LOW4_DXIL 0
+#endif
+// Experimental MQ2 stays off until native Windows/GPU and quality qualification.
+#ifndef RKVA_EXPERIMENTAL_NATIVE_MQ
+#define RKVA_EXPERIMENTAL_NATIVE_MQ 0
+#endif
+#if RKVA_EXPERIMENTAL_NATIVE_MQ && __has_include("rkva_range_attn_q4_1_mq2_dxil.h")
+#include "rkva_range_attn_q4_1_mq2_dxil.h"
+#define RKVA_HAS_Q4_1_MQ2_DXIL 1
+#else
+#define RKVA_HAS_Q4_1_MQ2_DXIL 0
+#endif
+#if RKVA_EXPERIMENTAL_NATIVE_MQ && __has_include("rkva_range_attn_iq4_nl_mq2_dxil.h")
+#include "rkva_range_attn_iq4_nl_mq2_dxil.h"
+#define RKVA_HAS_IQ4_NL_MQ2_DXIL 1
+#else
+#define RKVA_HAS_IQ4_NL_MQ2_DXIL 0
+#endif
+#if RKVA_EXPERIMENTAL_NATIVE_MQ && __has_include("rkva_range_attn_saw_int4_mq2_dxil.h")
+#include "rkva_range_attn_saw_int4_mq2_dxil.h"
+#define RKVA_HAS_SAW_INT4_MQ2_DXIL 1
+#else
+#define RKVA_HAS_SAW_INT4_MQ2_DXIL 0
+#endif
+#if RKVA_EXPERIMENTAL_NATIVE_MQ && __has_include("rkva_range_attn_turboquant_nc_mq2_dxil.h")
+#include "rkva_range_attn_turboquant_nc_mq2_dxil.h"
+#define RKVA_HAS_TURBOQUANT_NC_MQ2_DXIL 1
+#else
+#define RKVA_HAS_TURBOQUANT_NC_MQ2_DXIL 0
 #endif
 #include "rkva_range_attn_q4_dxil.h"
 #include "rkva_range_attn_q4_mq2_dxil.h"
@@ -899,6 +934,38 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
             range_attn_iq4_nl_pso_.Reset();
     }
 #endif
+#if RKVA_HAS_Q4_1_MQ2_DXIL
+    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
+        pso.pRootSignature = range_attn_q4_opt_root_.Get();
+        pso.CS = {g_rkva_range_attn_q4_1_mq2_dxil, sizeof(g_rkva_range_attn_q4_1_mq2_dxil)};
+        if (FAILED(device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_native_mq2_pso_[0]))))
+            range_attn_native_mq2_pso_[0].Reset();
+    }
+#endif
+#if RKVA_HAS_IQ4_NL_MQ2_DXIL
+    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
+        pso.pRootSignature = range_attn_q4_opt_root_.Get();
+        pso.CS = {g_rkva_range_attn_iq4_nl_mq2_dxil, sizeof(g_rkva_range_attn_iq4_nl_mq2_dxil)};
+        if (FAILED(device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_native_mq2_pso_[1]))))
+            range_attn_native_mq2_pso_[1].Reset();
+    }
+#endif
+#if RKVA_HAS_SAW_INT4_MQ2_DXIL
+    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
+        pso.pRootSignature = range_attn_q4_opt_root_.Get();
+        pso.CS = {g_rkva_range_attn_saw_int4_mq2_dxil, sizeof(g_rkva_range_attn_saw_int4_mq2_dxil)};
+        if (FAILED(device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_native_mq2_pso_[2]))))
+            range_attn_native_mq2_pso_[2].Reset();
+    }
+#endif
+#if RKVA_HAS_TURBOQUANT_NC_MQ2_DXIL
+    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
+        pso.pRootSignature = range_attn_q4_opt_root_.Get();
+        pso.CS = {g_rkva_range_attn_turboquant_nc_mq2_dxil, sizeof(g_rkva_range_attn_turboquant_nc_mq2_dxil)};
+        if (FAILED(device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_native_mq2_pso_[3]))))
+            range_attn_native_mq2_pso_[3].Reset();
+    }
+#endif
 #if RKVA_HAS_SAW_INT4_DECODE_ROWLANE_DXIL
     if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
         pso.pRootSignature = range_attn_q4_opt_root_.Get();
@@ -1606,6 +1673,8 @@ std::string RemoteAttnEngine::get_range_profile_json() {
     header.turboquant_nc_available = native_turboquant_nc_available();
     header.turboquant_nc_status = header.turboquant_nc_available ? "ready" :
         turboquant_nc_status_ == "ready" ? "requires D=256, GQA=6 and reduction prerequisites" : turboquant_nc_status_;
+    header.low4_mq_available[0] = native_low4_available(RKVA_RANGE_STORAGE_Q4_1) && range_attn_native_mq2_pso_[0];
+    header.low4_mq_available[1] = native_low4_available(RKVA_RANGE_STORAGE_IQ4_NL) && range_attn_native_mq2_pso_[1];
     for (uint32_t st = 0; st < rp::kStorageCount; ++st) {
         header.optimized_available[st] =
             st == rp::kStorageQ4
@@ -1680,7 +1749,9 @@ std::string RemoteAttnEngine::get_range_profile_json() {
            (bulk_unpack_q_fp8_pso_ && bulk_pack_out_fp8_pso_ ? "true" : "false") +
            ",\"status\":\"" + rp::json_escape(bulk_fp8_status_) + "\"},\"bulk_e4_gpu\":{\"available\":" +
            (bulk_unpack_q_e4_pso_ && bulk_pack_out_e4_pso_ ? "true" : "false") +
-           ",\"status\":\"" + rp::json_escape(bulk_e4_status_) + "\"}}";
+           ",\"status\":\"" + rp::json_escape(bulk_e4_status_) + "\"},\"native_e4_gpu\":{\"available\":" +
+           (bulk_unpack_q_e4_raw_pso_ && bulk_pack_out_e4_raw_pso_ ? "true" : "false") +
+           ",\"status\":\"" + rp::json_escape(native_e4_gpu_status_) + "\"}}";
 }
 
 bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
@@ -3193,6 +3264,38 @@ bool RemoteAttnEngine::ensure_q8_fp8_gpu_pipelines() {
 #endif
 }
 
+bool RemoteAttnEngine::ensure_native_fp8_gpu_pipelines(uint32_t wire) {
+    if (wire == RKVA_WIRE_FP8) return ensure_q8_fp8_gpu_pipelines();
+    if (wire != RKVA_WIRE_FP8_E4M3FN) return false;
+    if (!RKVA_EXPERIMENTAL_NATIVE_FP8_GPU) {
+        native_e4_gpu_status_ = "experimental native FP8 GPU gate disabled";
+        return false;
+    }
+    if (bulk_unpack_q_e4_raw_pso_ && bulk_pack_out_e4_raw_pso_) return true;
+#if RKVA_HAS_NATIVE_E4_DXIL
+    if (!device_ || !range_reduce_root_) return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = range_reduce_root_.Get();
+    pso.CS = {g_rkva_range_bulk_unpack_q_e4m3fn_raw_dxil, sizeof(g_rkva_range_bulk_unpack_q_e4m3fn_raw_dxil)};
+    HRESULT hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&bulk_unpack_q_e4_raw_pso_));
+    if (SUCCEEDED(hr)) {
+        pso.CS = {g_rkva_range_bulk_pack_out_e4m3fn_raw_dxil, sizeof(g_rkva_range_bulk_pack_out_e4m3fn_raw_dxil)};
+        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&bulk_pack_out_e4_raw_pso_));
+    }
+    if (FAILED(hr)) {
+        char text[96]; std::snprintf(text, sizeof(text), "native E4 PSO 0x%08X", unsigned(hr));
+        native_e4_gpu_status_ = text;
+        bulk_unpack_q_e4_raw_pso_.Reset(); bulk_pack_out_e4_raw_pso_.Reset();
+        return false;
+    }
+    native_e4_gpu_status_ = "ready (direct F32 RNE)";
+    return true;
+#else
+    native_e4_gpu_status_ = "native E4 headers not generated";
+    return false;
+#endif
+}
+
 bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t n_tokens,
                                           uint32_t storage, uint64_t row_bytes,
                                           const uint8_t* data, size_t bytes, float* out,
@@ -3220,13 +3323,18 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
     if (!ready_ || !s || !s->valid || !s->range_configured ||
         s->range_storage != storage || layer >= s->layer_kv.size() ||
         !data || (!out && !out_fp8) || !lse || bulk_recording_ || !n_tokens || n_tokens > 256 ||
-        (gpu_fp8 && ((storage != RKVA_RANGE_STORAGE_Q8_0 && storage != RKVA_RANGE_STORAGE_Q4_0 &&
-                      storage != RKVA_RANGE_STORAGE_SAW_INT4 && storage != RKVA_RANGE_STORAGE_TURBOQUANT_NC) ||
-                     !ensure_q8_fp8_gpu_pipelines()))) {
+        (gpu_fp8 && storage != RKVA_RANGE_STORAGE_Q8_0 && storage != RKVA_RANGE_STORAGE_Q4_0 &&
+         storage != RKVA_RANGE_STORAGE_SAW_INT4 && storage != RKVA_RANGE_STORAGE_TURBOQUANT_NC &&
+         !rkva_kvarn_range::low4_storage(storage))) {
         return ::fail(error, "q4 bulk: invalid session/arguments");
     }
     uint32_t wire = RKVA_WIRE_F32;
     if (!rkva_kvarn_bulk::peek_wire(data, bytes, &wire)) return ::fail(error, "native rows: invalid envelope wire");
+    if (gpu_fp8 && !RKVA_EXPERIMENTAL_NATIVE_FP8_GPU &&
+        (wire == RKVA_WIRE_FP8_E4M3FN || rkva_kvarn_range::low4_storage(storage)))
+        return ::fail(error, "experimental native FP8 GPU gate disabled");
+    if (gpu_fp8 && !ensure_native_fp8_gpu_pipelines(wire))
+        return ::fail(error, "native GPU codec pipeline unavailable");
     if (wire == RKVA_WIRE_FP8_E4M3FN && !rkva_kvarn_bulk::validate_native_e4(data, bytes, n_tokens,
             storage, geo_.n_head, geo_.n_head_kv, s->capacity, s->range_counts[layer], true))
         return ::fail(error, "native E4: invalid envelope/coverage/metadata/query");
@@ -3292,7 +3400,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         std::memcpy(&attn, data + off, sizeof(attn));
         off += sizeof(attn);
         qs.wire = attn.wire;
-        if (gpu_fp8 && attn.wire != RKVA_WIRE_FP8) return ::fail(error, "raw GPU codec requires FP8 wire");
+        if (gpu_fp8 && attn.wire != wire) return ::fail(error, "raw GPU codec requires FP8 wire");
         if (!qs.n_queries || qs.n_queries > n_tokens - sum_queries || attn.flags ||
             attn.reserved[0] || attn.reserved[1] ||
             (attn.wire != RKVA_WIRE_F32 && attn.wire != RKVA_WIRE_F16 &&
@@ -3348,7 +3456,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
                 }
             }
         }
-        if (gpu_fp8) {
+        if (gpu_fp8 && !e4) {
             for (uint64_t e = 0; e < elements; ++e) {
                 if ((data[qs.q_off + e] & 0x7cu) == 0x7cu)
                     return ::fail(error, "raw GPU codec rejects non-finite FP8 query");
@@ -3501,7 +3609,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
                 const uint32_t unpack_params[4] = {q_pairs, seg.n_queries, 0u, 0u};
                 transition(transfer.query_f32_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 cmd_->SetComputeRootSignature(range_reduce_root_.Get());
-                cmd_->SetPipelineState(bulk_unpack_q_fp8_raw_pso_.Get());
+                cmd_->SetPipelineState(wire == RKVA_WIRE_FP8_E4M3FN ? bulk_unpack_q_e4_raw_pso_.Get() : bulk_unpack_q_fp8_raw_pso_.Get());
                 cmd_->SetComputeRoot32BitConstants(0, 4, unpack_params, 0);
                 cmd_->SetComputeRootShaderResourceView(1, transfer.query_f16_upload.resource->GetGPUVirtualAddress());
                 cmd_->SetComputeRootUnorderedAccessView(2, transfer.query_f32_default.resource->GetGPUVirtualAddress());
@@ -3534,7 +3642,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
                 transition(range_output_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 transition(transfer.packed_out_f16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 cmd_->SetComputeRootSignature(range_reduce_root_.Get());
-                cmd_->SetPipelineState(bulk_pack_out_fp8_pso_.Get());
+                cmd_->SetPipelineState(wire == RKVA_WIRE_FP8_E4M3FN ? bulk_pack_out_e4_raw_pso_.Get() : bulk_pack_out_fp8_pso_.Get());
                 cmd_->SetComputeRoot32BitConstants(0, 4, pack_params, 0);
                 cmd_->SetComputeRootShaderResourceView(1, range_output_.resource->GetGPUVirtualAddress());
                 cmd_->SetComputeRootUnorderedAccessView(2, transfer.packed_out_f16.resource->GetGPUVirtualAddress());
@@ -3650,6 +3758,22 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
                 D3D12_RANGE empty{0, 0}; bulk_transfers_[i].readback.resource->Unmap(0, &empty);
                 s->valid = false; return ::fail(error, "raw GPU codec rejected non-finite output");
             }
+            // E4 additionally requires -inf iff the prefix is empty, even when
+            // all LSEs are finite. The shader checked exact OUT zero before packing.
+            if (wire == RKVA_WIRE_FP8_E4M3FN) {
+                bool valid = true;
+                for (uint32_t q = 0; q < seg.n_queries; ++q) {
+                    int32_t pos; std::memcpy(&pos, data + seg.pos_off + size_t(q) * 4, 4);
+                    for (uint32_t h = 0; h < geo_.n_head; ++h) {
+                        float value; std::memcpy(&value, packed + elements + (size_t(q) * geo_.n_head + h) * 4, 4);
+                        valid = valid && ggml_remote_attn_policy::e4_lse_valid(value, pos, s->range_origin);
+                    }
+                }
+                if (!valid) {
+                    D3D12_RANGE empty{0, 0}; bulk_transfers_[i].readback.resource->Unmap(0, &empty);
+                    s->valid = false; return ::fail(error, "native E4 GPU: invalid LSE/prefix");
+                }
+            }
             std::memcpy(out_fp8 + row_out * geo_.n_head * 256, packed, elements);
             std::memcpy(lse + row_out * geo_.n_head, packed + elements, lse_bytes);
         } else {
@@ -3697,10 +3821,19 @@ bool RemoteAttnEngine::attend_low4_bulk(uint32_t id, uint32_t layer, uint32_t n_
                                         uint32_t storage, const uint8_t* data, size_t bytes,
                                         float* out, float* lse, std::string* error, uint64_t cycle_id) {
     if (!native_low4_available(storage)) return ::fail(error, "Q4_1/IQ4_NL pipeline unavailable");
-    // Q/O codecs run on CPU; KV remains native packed all the way to the GPU.
+    // CPU codec entry; the separately admitted FP8 entry retains native KV too.
     return attend_native_rows(id, layer, n_tokens, storage,
                               rkva_kvarn_range::low4_row_bytes(storage, geo_.n_head_kv),
                               data, bytes, out, lse, error, cycle_id);
+}
+
+bool RemoteAttnEngine::attend_low4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens,
+        uint32_t storage, const uint8_t* data, size_t bytes, uint8_t* out_fp8,
+        float* lse, std::string* error, uint64_t cycle_id) {
+    if (!native_low4_available(storage)) return ::fail(error, "Q4_1/IQ4_NL pipeline unavailable");
+    return attend_native_rows(id, layer, n_tokens, storage,
+        rkva_kvarn_range::low4_row_bytes(storage, geo_.n_head_kv), data, bytes,
+        nullptr, lse, error, cycle_id, out_fp8);
 }
 
 bool RemoteAttnEngine::attend_q4_bulk(uint32_t id, uint32_t layer, uint32_t n_tokens,
@@ -3909,9 +4042,19 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
     };
     if (rkva_kvarn_range::low4_storage(s->range_storage) ||
         s->range_storage == RKVA_RANGE_STORAGE_SAW_INT4 || s->range_storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC) {
-        ID3D12PipelineState* const pso = s->range_storage == RKVA_RANGE_STORAGE_Q4_1 ? range_attn_q4_1_pso_.Get() :
+        ID3D12PipelineState* pso = s->range_storage == RKVA_RANGE_STORAGE_Q4_1 ? range_attn_q4_1_pso_.Get() :
             s->range_storage == RKVA_RANGE_STORAGE_IQ4_NL ? range_attn_iq4_nl_pso_.Get() : s->range_storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC
             ? range_attn_turboquant_nc_pso_.Get() : range_attn_saw_int4_decode_rowlane_pso_.Get();
+        // Missing optional MQ PSO keeps the qualified per-query path. LOW4's
+        // own availability gate remains mandatory and is not bypassed by MQ.
+        const uint32_t mq_index = s->range_storage == RKVA_RANGE_STORAGE_Q4_1 ? 0u :
+            s->range_storage == RKVA_RANGE_STORAGE_IQ4_NL ? 1u :
+            s->range_storage == RKVA_RANGE_STORAGE_SAW_INT4 ? 2u : 3u;
+        const bool mq2 = pso && n_tokens >= 2 && q4_kernel_mode_ != rp::kModeReference &&
+            geo_.head_dim == 256 && geo_.n_head == 6 * geo_.n_head_kv &&
+            range_attn_native_mq2_pso_[mq_index];
+        if (mq2) pso = range_attn_native_mq2_pso_[mq_index].Get();
+        const uint32_t query_groups = mq2 ? (n_tokens + 1u) / 2u : n_tokens;
         if (!pso || !range_attn_q4_opt_root_) {
             return ::fail(error, "range attention: native row pipeline unavailable");
         }
@@ -3944,7 +4087,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         cmd_->SetComputeRootUnorderedAccessView(
             5, range_partials_.resource->GetGPUVirtualAddress());
         cmd_->SetComputeRootUnorderedAccessView(6, range_output_.resource->GetGPUVirtualAddress());
-        cmd_->Dispatch(geo_.n_head_kv, n_tokens, split_k);
+        cmd_->Dispatch(geo_.n_head_kv, query_groups, split_k);
         if (!direct) {
             uav_barrier(range_partials_);
             transition(range_partials_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -3984,22 +4127,22 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         }
         if (prof) {
             sample.optimized = 1;
-            sample.decode_opt = 1;
-            sample.decode_rowlane = 1;
+            sample.decode_opt = mq2 ? 0 : 1;
+            sample.decode_rowlane = mq2 ? 0 : 1;
             sample.direct_output = direct;
             sample.split_k = split_k;
-            sample.groups = geo_.n_head_kv * n_tokens * split_k;
-            sample.q_tile = 0;
+            sample.groups = geo_.n_head_kv * query_groups * split_k;
+            sample.q_tile = mq2 ? 2 : 0;
         }
         if (bulk_prof) {
             auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
             seg.optimized = 1;
-            seg.decode_opt = 1;
-            seg.decode_rowlane = 1;
+            seg.decode_opt = mq2 ? 0 : 1;
+            seg.decode_rowlane = mq2 ? 0 : 1;
             seg.direct_output = direct ? 1 : 0;
             seg.split_k = split_k;
-            seg.groups = geo_.n_head_kv * n_tokens * split_k;
-            seg.q_tile = 0;
+            seg.groups = geo_.n_head_kv * query_groups * split_k;
+            seg.q_tile = mq2 ? 2 : 0;
         }
         if (!bulk_gpu_query_) {
             cmd_->CopyBufferRegion(range_readback_.resource.Get(), 0, range_output_.resource.Get(),

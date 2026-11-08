@@ -409,6 +409,59 @@ int main() {
     s.q_tile = 0;
     assert(bucket_key(s) == "attention/f16/optimized-f16_gqa_coarse/nq2-16/r16k-32k/warm");
 
+    // Native MQ2 formats have distinct buckets and counters, separate from
+    // both each other and the legacy storage-indexed counters.
+    {
+        const uint32_t storages[] = {kStorageQ4_1, kStorageIQ4_NL, kStorageSawInt4, kStorageTurboquantNC};
+        const char* names[] = {"q4_1", "iq4_nl", "saw_int4", "turboquant_nc"};
+        const char* kernels[] = {"q4_1_mq2", "iq4_nl_mq2", "saw_int4_mq2", "turboquant_nc_mq2"};
+        Recorder native;
+        native.configure(32);
+        for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
+            Sample sample;
+            sample.kind = kAttention;
+            sample.storage = uint8_t(storages[i]);
+            sample.optimized = 1;
+            sample.q_tile = 2;
+            sample.n_tokens = 3;
+            sample.rows = 257;
+            assert(std::strcmp(mq_kernel_name(storages[i], 2), kernels[i]) == 0);
+            assert(std::strcmp(mq_kernel_name(storages[i], 4), "invalid") == 0);
+            assert(bucket_key(sample) == std::string("attention/") + names[i] + "/optimized-" +
+                                             kernels[i] + "/nq2-16/r257-1k/warm");
+            for (uint32_t n = 0; n <= i; ++n) {
+                count_attention_sample(native.counters, sample);
+                native.record(sample);
+            }
+            sample.q_tile = 0;
+            count_attention_sample(native.counters, sample);
+            sample.optimized = 0;
+            count_attention_sample(native.counters, sample);
+            assert(native.counters.native_mq2[i] == i + 1);
+            assert(native.counters.native_optimized[i] == i + 2);
+            assert(native.counters.native_reference[i] == 1);
+            assert(bulk_upload_copy_regions(storages[i], true) == 2);
+            assert(bulk_upload_copy_regions(storages[i], false) == 0);
+        }
+        Sample unknown;
+        unknown.kind = kAttention;
+        unknown.storage = 0xff;
+        count_attention_sample(native.counters, unknown);
+        assert(native.counters.optimized_calls == 0 && native.counters.reference_q4_calls == 0);
+        for (uint32_t i = 0; i < kStorageCount; ++i) {
+            assert(native.counters.optimized_by_storage[i] == 0);
+            assert(native.counters.reference_by_storage[i] == 0);
+        }
+        const std::string report = native.json(Header{});
+        for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
+            const std::string counts = std::string("\"") + names[i] + "\":{\"optimized_calls\":" +
+                std::to_string(i + 2) + ",\"reference_calls\":1,\"mq2_calls\":" + std::to_string(i + 1) + "}";
+            assert(report.find(counts) != std::string::npos);
+            assert(report.find(std::string("optimized-") + kernels[i]) != std::string::npos);
+        }
+        assert(report.find("optimized-invalid") == std::string::npos);
+    }
+
     // Ring: fixed capacity, overwrites oldest, counts everything.
     Recorder r;
     assert(r.capacity() == 0);
@@ -547,12 +600,23 @@ int main() {
     h.memory.gpu_local_budget_bytes = 3985637376;
     h.saw_int4_optimized_available = true;
     h.saw_int4_optimized_status = "ready";
+    h.low4_mq_available[0] = true;
     const std::string json = r.json(h);
     const auto opt_begin = json.find("\"optimized_kernels\":{");
     const auto opt_end = json.find("},\"buckets\":{", opt_begin);
     const auto saw_entry = json.find("\"saw_int4\":{\"available\":true,\"status\":\"ready\",\"fast_nq_max\":1}", opt_begin);
     assert(opt_begin != std::string::npos && opt_end != std::string::npos && saw_entry < opt_end);
+    const auto q4_1_entry = json.find("\"q4_1\":{\"available\":true,\"status\":\"ready\",\"fast_nq_max\":256}", opt_begin);
+    const auto iq4_nl_entry = json.find("\"iq4_nl\":{\"available\":false,\"status\":\"requires native LOW4 and MQ2 pipelines\",\"fast_nq_max\":0}", opt_begin);
+    assert(q4_1_entry < opt_end && iq4_nl_entry < opt_end);
     const std::string unavailable = Recorder().json(Header{});
+    assert(unavailable.find("\"q4_1\":{\"available\":false") != std::string::npos);
+    assert(unavailable.find("\"iq4_nl\":{\"available\":false") != std::string::npos);
+    Header iq4_only;
+    iq4_only.low4_mq_available[1] = true;
+    const std::string iq4_json = Recorder().json(iq4_only);
+    assert(iq4_json.find("\"q4_1\":{\"available\":false") != std::string::npos);
+    assert(iq4_json.find("\"iq4_nl\":{\"available\":true,\"status\":\"ready\",\"fast_nq_max\":256}") != std::string::npos);
     assert(unavailable.find("\"saw_int4\":{\"available\":false,\"status\":\"\",\"fast_nq_max\":0}") != std::string::npos);
     assert(json.find("\"app_limit_bytes\":5368709120") != std::string::npos);
     assert(json.find("\"gpu_local_usage_bytes\":1075838976") != std::string::npos);

@@ -296,6 +296,13 @@ if (CUDAToolkit_FOUND)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+    # Per-source options follow target options: preserve native wire bytes even
+    # for subnormal inputs/intermediates without changing other CUDA kernels.
+    if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+        set_source_files_properties(native-low4-producer.cu PROPERTIES
+            COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=false")
+    endif()
+
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()

@@ -1,5 +1,11 @@
 #pragma once
 
+// New native E4 / LOW4 E5 codecs remain opt-in until D3D12 qualification.
+// Existing raw E5 Q4/Q8/SAW/NC routing does not depend on this gate.
+#ifndef RKVA_EXPERIMENTAL_NATIVE_FP8_GPU
+#define RKVA_EXPERIMENTAL_NATIVE_FP8_GPU 0
+#endif
+
 // RemoteAttnEngine — D3D12 executor for the RKVA remote KVarN attention
 // service on Xbox Series X. Owns the compressed KV (KVarN records + F16 stage
 // + exact precision tail) per (session, layer) and runs the KVarN WHT / store /
@@ -185,6 +191,10 @@ class RemoteAttnEngine {
                             float* lse, std::string* error, uint64_t cycle_id, uint8_t* out_fp8 = nullptr);
     bool ensure_q8_fp8_gpu_pipelines();
     bool ensure_q4_fp8_gpu_pipelines() { return ensure_q8_fp8_gpu_pipelines(); }
+    bool ensure_native_fp8_gpu_pipelines(uint32_t wire);
+    bool attend_low4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, uint32_t storage,
+                              const uint8_t* data, size_t bytes, uint8_t* out_fp8, float* lse,
+                              std::string* error, uint64_t cycle_id);
     bool native_low4_available(uint32_t storage) const;
     bool upload_low4_range(uint32_t id, uint32_t layer, const rkva_kvarn_range_upload& upload,
                            const uint8_t* k, const uint8_t* v, std::string* error);
@@ -357,6 +367,8 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> range_reduce_root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_pso_[4];
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q4_1_pso_, range_attn_iq4_nl_pso_;
+    // Q4_1, IQ4_NL, SAW-INT4, TurboQuant NC, respectively; experimental opt-in.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_native_mq2_pso_[4];
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_reduce_pso_;
     // Optimized Q4_0 decode kernel (optional; reference stays available).
     Microsoft::WRL::ComPtr<ID3D12RootSignature> range_attn_q4_opt_root_;
@@ -467,6 +479,8 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_fp8_pso_, bulk_pack_out_fp8_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_e4_pso_, bulk_pack_out_e4_pso_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_fp8_raw_pso_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> bulk_unpack_q_e4_raw_pso_, bulk_pack_out_e4_raw_pso_;
+    std::string native_e4_gpu_status_ = "not initialized";
     std::string q8_fp8_gpu_status_ = "not initialized";
     std::string bulk_fp8_status_ = "not initialized";
     std::string bulk_e4_status_ = "not initialized";
