@@ -367,8 +367,20 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     if (s == "saw_int4" || s == "saw-int4" || s == "saw4" || s == "bdr_int4") {
         return GGML_TYPE_SAW_INT4;
     }
-    if (s == "oscar_int2" || s == "oscar-int2" || s == "oscar2") {
+    if (s == "oscar_int2" || s == "oscar-int2" || s == "oscar2" || s == "q2_0s" || s == "kvarn2") {
         return GGML_TYPE_Q2_0S;
+    }
+    if (s == "kvarn3") {
+        return GGML_TYPE_Q3_0;
+    }
+    if (s == "kvarn5") {
+        return GGML_TYPE_Q5_0;
+    }
+    if (s == "kvarn6") {
+        return GGML_TYPE_Q6_0;
+    }
+    if (s == "kvarn8") {
+        return GGML_TYPE_Q8_0;
     }
     const int32_t kvarn_bits = kvarn_bits_from_legacy_cache_type(s);
     if (kvarn_bits != 0) {
@@ -452,11 +464,15 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
 
 static ggml_type parse_remote_attn_standard_cache_type(const std::string & value) {
     const ggml_type type = kv_cache_type_from_str(value);
-    if (type != GGML_TYPE_F16 && type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 &&
+    if (type != GGML_TYPE_F16 && type != GGML_TYPE_F32 && type != GGML_TYPE_BF16 &&
+            type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 &&
             type != GGML_TYPE_IQ4_NL && type != GGML_TYPE_Q5_0 &&
-            type != GGML_TYPE_Q6_0 && type != GGML_TYPE_Q8_0) {
+            type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q6_0 &&
+            type != GGML_TYPE_Q6_1 && type != GGML_TYPE_Q8_0 &&
+            type != GGML_TYPE_Q3_0 && type != GGML_TYPE_Q3_1 &&
+            type != GGML_TYPE_Q2_0S && type != GGML_TYPE_Q2_1) {
         throw std::invalid_argument(
-                "remote attention cache overrides currently support f16, q4_0, q4_1, iq4_nl, q5_0, q6_0, or q8_0");
+                "remote attention cache overrides currently support f16, f32, bf16, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q8_0, q3_0, q3_1, q2_0s, or q2_1");
     }
     return type;
 }
@@ -3992,7 +4008,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_LAYERS"));
     add_opt(common_arg(
         {"--remote-attn-cache-type-k"}, "TYPE",
-        "optional K cache type for remote-attended layers (f16, q4_0, q4_1, iq4_nl, q5_0, q6_0, q8_0; experimental native kvarn4, saw_int4, turboquant_nc); "
+        "optional K cache type for remote-attended layers (f16, f32, bf16, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q8_0, q3_0, q3_1, q2_1, q2_0s; experimental native kvarn4, saw_int4, turboquant_nc); "
         "requires Vulkan or TCP position-split --remote-attn and a global KVarN cache; f16 requires TCP position split; unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
             if (!parse_remote_native_companion(value, params.remote_attn_native_cache_type_k, params.remote_attn_cache_type_k)) {
@@ -4002,7 +4018,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_K").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-cache-type-v"}, "TYPE",
-        "optional V cache type for remote-attended layers (f16, q4_0, q4_1, iq4_nl, q5_0, q6_0, q8_0; experimental native kvarn4, saw_int4, turboquant_nc); "
+        "optional V cache type for remote-attended layers (f16, f32, bf16, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q8_0, q3_0, q3_1, q2_1, q2_0s; experimental native kvarn4, saw_int4, turboquant_nc); "
         "unset preserves the global cache format",
         [](common_params & params, const std::string & value) {
             if (!parse_remote_native_companion(value, params.remote_attn_native_cache_type_v, params.remote_attn_cache_type_v)) {
@@ -4012,7 +4028,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_CACHE_TYPE_V").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--remote-attn-format", "--remote-attn-upload-format"}, "FORMAT",
-        "RPC upload format for remote attention: 'kvarn4'/'kvarn', 'fp16'/'f16', 'fp32'/'f32', 'q4'/'q4_0', 'q4_1'/'iq4_nl' (experimental TCP), 'q8'/'q8_0', 'saw_int4', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: kvarn4)",
+        "RPC upload format for remote attention: 'kvarn4'/'kvarn', 'fp16'/'f16', 'fp32'/'f32', 'bf16', 'q4'/'q4_0', 'q4_1', 'iq4_nl', 'q5_0'/'kvarn5', 'q5_1', 'q6_0'/'kvarn6', 'q6_1', 'q8'/'q8_0'/'kvarn8', 'q3_0'/'kvarn3', 'q3_1', 'q2_1', 'q2_0s'/'kvarn2'/'oscar_int2', 'saw_int4', 'turboquant_nc' (default: kvarn4)",
         [](common_params & params, const std::string & value) {
             params.remote_attn_format = value;
         }

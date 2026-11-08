@@ -150,6 +150,38 @@ groupshared float gs_acc[RKVA_MAX_WAVES * RKVA_GQA * RKVA_DIM];
 #include "rkva_decode_rowlane_template.hlsli"
 #endif
 
+#if ROWLANE_Q3_1
+#define ROWLANE_ENTRY CSRangeAttnQ3_1DecodeRowlane
+#define ROWLANE_ROW_HEAD RKVA_ROW_HEAD_Q3_1
+#define ROWLANE_LOAD load_q3_1
+#define ROWLANE_QUARTER_DIM quarter_dim_q3_1
+#include "rkva_decode_rowlane_template.hlsli"
+#endif
+
+#if ROWLANE_Q2_1
+#define ROWLANE_ENTRY CSRangeAttnQ2_1DecodeRowlane
+#define ROWLANE_ROW_HEAD RKVA_ROW_HEAD_Q2_1
+#define ROWLANE_LOAD load_q2_1
+#define ROWLANE_QUARTER_DIM quarter_dim_q2_1
+#include "rkva_decode_rowlane_template.hlsli"
+#endif
+
+#if ROWLANE_BF16
+#define ROWLANE_ENTRY CSRangeAttnBF16DecodeRowlane
+#define ROWLANE_ROW_HEAD 512
+#define ROWLANE_LOAD load_bf16
+#define ROWLANE_QUARTER_DIM quarter_dim_bf16
+#include "rkva_decode_rowlane_template.hlsli"
+#endif
+
+#if ROWLANE_F32
+#define ROWLANE_ENTRY CSRangeAttnF32DecodeRowlane
+#define ROWLANE_ROW_HEAD 1024
+#define ROWLANE_LOAD load_f32
+#define ROWLANE_QUARTER_DIM quarter_dim_f32
+#include "rkva_decode_rowlane_template.hlsli"
+#endif
+
 #if ROWLANE_SAW_INT4 || ROWLANE_BDR_INT4
 [numthreads(RKVA_THREADS, 1, 1)]
 void CSRangeAttnSawInt4DecodeRowlane(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {

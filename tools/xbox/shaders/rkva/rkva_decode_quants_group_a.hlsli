@@ -35,6 +35,34 @@ float4 load_f16(ByteAddressBuffer buffer, uint base, uint u) {
 }
 
 // =============================================================================
+// Format 1b: BF16 (512 bytes / 256 dimensions)
+// =============================================================================
+
+uint quarter_dim_bf16(uint u) {
+    return u * 4;
+}
+
+float4 load_bf16(ByteAddressBuffer buffer, uint base, uint u) {
+    uint2 packed = buffer.Load2(base + u * 8);
+    return float4(asfloat((packed.x & 65535u) << 16),
+                  asfloat(packed.x & 0xFFFF0000u),
+                  asfloat((packed.y & 65535u) << 16),
+                  asfloat(packed.y & 0xFFFF0000u));
+}
+
+// =============================================================================
+// Format 1c: F32 (1024 bytes / 256 dimensions)
+// =============================================================================
+
+uint quarter_dim_f32(uint u) {
+    return u * 4;
+}
+
+float4 load_f32(ByteAddressBuffer buffer, uint base, uint u) {
+    return asfloat(buffer.Load4(base + u * 16));
+}
+
+// =============================================================================
 // Format 2: Q5_0 / KVarN5 (176 bytes / 256 dimensions: 8 blocks x 22 bytes)
 // =============================================================================
 // Struct block_q5_0:

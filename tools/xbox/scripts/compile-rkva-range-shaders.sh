@@ -10,7 +10,8 @@ ALL_TARGETS=(attn attn_q4 attn_q8 attn_kvarn4 reduce attn_q4_opt reduce_opt redu
     attn_f16_opt attn_q8_opt attn_kvarn4_opt attn_kvarn4_prefix attn_kvarn4_opt_prefix
     attn_q4_mq2 attn_q4_mq4 attn_f16_mq2 attn_f16_mq4 attn_q8_mq2 attn_q8_mq4
     attn_kvarn4_mq2 attn_kvarn4_mq4 attn_q8_mq2_i8 reduce_q8_paired bulk_unpack_q_e4m3fn_raw bulk_pack_out_e4m3fn_raw bulk_unpack_q_fp8_raw bulk_unpack_q_f16 bulk_pack_out_f16 bulk_unpack_q_fp8 bulk_pack_out_fp8 bulk_unpack_q_e4m3fn bulk_pack_out_e4m3fn attn_kvarn4_decode_prefix attn_kvarn4_decode_rowlane attn_kvarn4_mq2_i8 attn_q4_decode_rowlane attn_q8_decode_rowlane
-    attn_f16_decode_rowlane attn_q4_1_decode_rowlane attn_q5_0_decode_rowlane attn_q5_1_decode_rowlane attn_q6_0_decode_rowlane attn_q6_1_decode_rowlane attn_iq4_nl_decode_rowlane attn_kvarn2_decode_rowlane attn_kvarn3_decode_rowlane attn_saw_int4_decode_rowlane attn_oscar_int2_decode_rowlane attn_turboquant_nc attn_q4_1_mq2 attn_iq4_nl_mq2 attn_saw_int4_mq2 attn_turboquant_nc_mq2)
+    attn_f16_decode_rowlane attn_q4_1_decode_rowlane attn_q5_0_decode_rowlane attn_q5_1_decode_rowlane attn_q6_0_decode_rowlane attn_q6_1_decode_rowlane attn_iq4_nl_decode_rowlane attn_kvarn2_decode_rowlane attn_kvarn3_decode_rowlane attn_saw_int4_decode_rowlane attn_oscar_int2_decode_rowlane attn_turboquant_nc attn_q4_1_mq2 attn_iq4_nl_mq2 attn_saw_int4_mq2 attn_turboquant_nc_mq2
+    attn_q3_1_decode_rowlane attn_q2_1_decode_rowlane attn_bf16_decode_rowlane attn_f32_decode_rowlane)
 if [[ $# -gt 0 ]]; then
     TARGETS=("$@")
 else
@@ -165,6 +166,26 @@ for target in "${TARGETS[@]}"; do
         entry=CSRangeAttnOscarInt2DecodeRowlane
         source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
         defines=(-D ROWLANE_OSCAR_INT2=1)
+    fi
+    if [[ "$target" == attn_q3_1_decode_rowlane ]]; then
+        entry=CSRangeAttnQ3_1DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_Q3_1=1)
+    fi
+    if [[ "$target" == attn_q2_1_decode_rowlane ]]; then
+        entry=CSRangeAttnQ2_1DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_Q2_1=1)
+    fi
+    if [[ "$target" == attn_bf16_decode_rowlane ]]; then
+        entry=CSRangeAttnBF16DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_BF16=1)
+    fi
+    if [[ "$target" == attn_f32_decode_rowlane ]]; then
+        entry=CSRangeAttnF32DecodeRowlane
+        source="$ROOT/shaders/rkva/rkva_range_attn_rowlane_matrix.hlsl"
+        defines=(-D ROWLANE_F32=1)
     fi
     # Experimental native MQ2: shared K/V dequantization, fixed Wave64/GQA6.
     if [[ "$target" =~ ^attn_(q4_1|iq4_nl|saw_int4|turboquant_nc)_mq2$ ]]; then

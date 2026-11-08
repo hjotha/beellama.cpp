@@ -63,17 +63,20 @@
     #define RKVA_HAS_KVARN4_DECODE_PREFIX_DXIL 0
 #endif
 #include "rkva_range_attn_kvarn4_prefix_dxil.h"
-// This opt-in remains off until Windows/GPU and model quality qualification.
-#ifndef RKVA_EXPERIMENTAL_LOW4
-#define RKVA_EXPERIMENTAL_LOW4 0
-#endif
-#if RKVA_EXPERIMENTAL_LOW4 && __has_include("rkva_range_attn_q4_1_decode_rowlane_dxil.h") && __has_include("rkva_range_attn_iq4_nl_decode_rowlane_dxil.h")
+#define RKVA_EXPERIMENTAL_LOW4 1
 #include "rkva_range_attn_q4_1_decode_rowlane_dxil.h"
 #include "rkva_range_attn_iq4_nl_decode_rowlane_dxil.h"
 #define RKVA_HAS_LOW4_DXIL 1
-#else
-#define RKVA_HAS_LOW4_DXIL 0
-#endif
+#include "rkva_range_attn_oscar_int2_decode_rowlane_dxil.h"
+#include "rkva_range_attn_q5_0_decode_rowlane_dxil.h"
+#include "rkva_range_attn_q5_1_decode_rowlane_dxil.h"
+#include "rkva_range_attn_q6_0_decode_rowlane_dxil.h"
+#include "rkva_range_attn_q6_1_decode_rowlane_dxil.h"
+#include "rkva_range_attn_kvarn3_decode_rowlane_dxil.h"
+#include "rkva_range_attn_q3_1_decode_rowlane_dxil.h"
+#include "rkva_range_attn_q2_1_decode_rowlane_dxil.h"
+#include "rkva_range_attn_bf16_decode_rowlane_dxil.h"
+#include "rkva_range_attn_f32_decode_rowlane_dxil.h"
 // Experimental MQ2 stays off until native Windows/GPU and quality qualification.
 #ifndef RKVA_EXPERIMENTAL_NATIVE_MQ
 #define RKVA_EXPERIMENTAL_NATIVE_MQ 0
@@ -921,19 +924,50 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
 #else
     q4_decode_rowlane_status_ = "header not built (compile attn_q4_decode_rowlane)";
 #endif
-#if RKVA_HAS_LOW4_DXIL
-    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
-        pso.pRootSignature = range_attn_q4_opt_root_.Get();
-        pso.CS = {g_rkva_range_attn_q4_1_decode_rowlane_dxil,
-                  sizeof(g_rkva_range_attn_q4_1_decode_rowlane_dxil)};
-        if (FAILED(device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_q4_1_pso_))))
-            range_attn_q4_1_pso_.Reset();
-        pso.CS = {g_rkva_range_attn_iq4_nl_decode_rowlane_dxil,
-                  sizeof(g_rkva_range_attn_iq4_nl_decode_rowlane_dxil)};
-        if (FAILED(device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_iq4_nl_pso_))))
-            range_attn_iq4_nl_pso_.Reset();
+    struct NativeQuantSpec {
+        uint32_t storage;
+        const uint8_t* dxil;
+        size_t dxil_size;
+        const char* name;
+    };
+    const NativeQuantSpec specs[rkva_rprof::kNativeStorageCount] = {
+        { RKVA_RANGE_STORAGE_Q4_1, g_rkva_range_attn_q4_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q4_1_decode_rowlane_dxil), "q4_1" },
+        { RKVA_RANGE_STORAGE_IQ4_NL, g_rkva_range_attn_iq4_nl_decode_rowlane_dxil, sizeof(g_rkva_range_attn_iq4_nl_decode_rowlane_dxil), "iq4_nl" },
+        { RKVA_RANGE_STORAGE_SAW_INT4, g_rkva_range_attn_saw_int4_decode_rowlane_dxil, sizeof(g_rkva_range_attn_saw_int4_decode_rowlane_dxil), "saw_int4" },
+        { RKVA_RANGE_STORAGE_TURBOQUANT_NC, g_rkva_range_attn_turboquant_nc_dxil, sizeof(g_rkva_range_attn_turboquant_nc_dxil), "turboquant_nc" },
+        { RKVA_RANGE_STORAGE_OSCAR_INT2, g_rkva_range_attn_oscar_int2_decode_rowlane_dxil, sizeof(g_rkva_range_attn_oscar_int2_decode_rowlane_dxil), "oscar_int2" },
+        { RKVA_RANGE_STORAGE_Q5_0, g_rkva_range_attn_q5_0_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q5_0_decode_rowlane_dxil), "q5_0" },
+        { RKVA_RANGE_STORAGE_Q5_1, g_rkva_range_attn_q5_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q5_1_decode_rowlane_dxil), "q5_1" },
+        { RKVA_RANGE_STORAGE_Q6_0, g_rkva_range_attn_q6_0_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q6_0_decode_rowlane_dxil), "q6_0" },
+        { RKVA_RANGE_STORAGE_Q6_1, g_rkva_range_attn_q6_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q6_1_decode_rowlane_dxil), "q6_1" },
+        { RKVA_RANGE_STORAGE_Q3_0, g_rkva_range_attn_kvarn3_decode_rowlane_dxil, sizeof(g_rkva_range_attn_kvarn3_decode_rowlane_dxil), "q3_0" },
+        { RKVA_RANGE_STORAGE_Q3_1, g_rkva_range_attn_q3_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q3_1_decode_rowlane_dxil), "q3_1" },
+        { RKVA_RANGE_STORAGE_Q2_1, g_rkva_range_attn_q2_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q2_1_decode_rowlane_dxil), "q2_1" },
+        { RKVA_RANGE_STORAGE_BF16, g_rkva_range_attn_bf16_decode_rowlane_dxil, sizeof(g_rkva_range_attn_bf16_decode_rowlane_dxil), "bf16" },
+        { RKVA_RANGE_STORAGE_F32, g_rkva_range_attn_f32_decode_rowlane_dxil, sizeof(g_rkva_range_attn_f32_decode_rowlane_dxil), "f32" },
+    };
+    for (uint32_t i = 0; i < rkva_rprof::kNativeStorageCount; ++i) {
+        if (wave_lane_min_ == 64 && wave_lane_max_ == 64 && range_attn_q4_opt_root_) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+            desc.pRootSignature = range_attn_q4_opt_root_.Get();
+            desc.CS = { specs[i].dxil, specs[i].dxil_size };
+            HRESULT hr_pso = device_->CreateComputePipelineState(&desc, IID_PPV_ARGS(&range_attn_native_rowlane_pso_[i]));
+            if (FAILED(hr_pso)) {
+                range_attn_native_rowlane_pso_[i].Reset();
+                native_rowlane_status_[i] = "failed";
+            } else {
+                native_rowlane_status_[i] = "ready";
+            }
+        } else {
+            native_rowlane_status_[i] = "requires fixed wave64";
+        }
     }
-#endif
+    range_attn_q4_1_pso_ = range_attn_native_rowlane_pso_[0];
+    range_attn_iq4_nl_pso_ = range_attn_native_rowlane_pso_[1];
+    range_attn_saw_int4_decode_rowlane_pso_ = range_attn_native_rowlane_pso_[2];
+    range_attn_turboquant_nc_pso_ = range_attn_native_rowlane_pso_[3];
+    saw_int4_decode_rowlane_status_ = native_rowlane_status_[2];
+    turboquant_nc_status_ = native_rowlane_status_[3];
 #if RKVA_HAS_Q4_1_MQ2_DXIL
     if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
         pso.pRootSignature = range_attn_q4_opt_root_.Get();
@@ -965,45 +999,6 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
         if (FAILED(device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_native_mq2_pso_[3]))))
             range_attn_native_mq2_pso_[3].Reset();
     }
-#endif
-#if RKVA_HAS_SAW_INT4_DECODE_ROWLANE_DXIL
-    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
-        pso.pRootSignature = range_attn_q4_opt_root_.Get();
-        pso.CS = {g_rkva_range_attn_saw_int4_decode_rowlane_dxil,
-                  sizeof(g_rkva_range_attn_saw_int4_decode_rowlane_dxil)};
-        hr = device_->CreateComputePipelineState(
-            &pso, IID_PPV_ARGS(&range_attn_saw_int4_decode_rowlane_pso_));
-        if (FAILED(hr)) {
-            std::snprintf(text, sizeof(text), "saw_int4 decode rowlane pipeline state: 0x%08X",
-                          unsigned(hr));
-            saw_int4_decode_rowlane_status_ = text;
-            range_attn_saw_int4_decode_rowlane_pso_.Reset();
-        } else {
-            saw_int4_decode_rowlane_status_ = "ready";
-        }
-    } else {
-        saw_int4_decode_rowlane_status_ = "requires fixed wave64";
-    }
-#else
-    saw_int4_decode_rowlane_status_ = "header not built (compile attn_saw_int4_decode_rowlane)";
-#endif
-#if RKVA_HAS_TURBOQUANT_NC_DXIL
-    if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
-        pso.pRootSignature = range_attn_q4_opt_root_.Get();
-        pso.CS = {g_rkva_range_attn_turboquant_nc_dxil, sizeof(g_rkva_range_attn_turboquant_nc_dxil)};
-        hr = device_->CreateComputePipelineState(&pso, IID_PPV_ARGS(&range_attn_turboquant_nc_pso_));
-        if (FAILED(hr)) {
-            std::snprintf(text, sizeof(text), "turboquant_nc pipeline state: 0x%08X", unsigned(hr));
-            turboquant_nc_status_ = text;
-            range_attn_turboquant_nc_pso_.Reset();
-        } else {
-            turboquant_nc_status_ = "ready";
-        }
-    } else {
-        turboquant_nc_status_ = "requires fixed wave64";
-    }
-#else
-    turboquant_nc_status_ = "header not built (compile attn_turboquant_nc)";
 #endif
 }
 
@@ -1635,25 +1630,26 @@ std::string RemoteAttnEngine::get_memory_profile_json() {
     return rp::memory_json(rkva_memory_info(device_.Get()));
 }
 
+bool RemoteAttnEngine::native_extended_available(uint32_t storage) const {
+    const uint32_t idx = rkva_rprof::native_storage_index(storage);
+    if (idx >= rkva_rprof::kNativeStorageCount) return false;
+    if (!rkva_kvarn_range::valid_saw_int4_geometry(geo_.head_dim, geo_.n_head, geo_.n_head_kv)) return false;
+    if (wave_lane_min_ != 64 || wave_lane_max_ != 64) return false;
+    if (!range_attn_q4_opt_root_ || !range_reduce_root_) return false;
+    if (!range_reduce_opt_pso_ && !range_reduce_pso_) return false;
+    return bool(range_attn_native_rowlane_pso_[idx]);
+}
+
 bool RemoteAttnEngine::native_low4_available(uint32_t storage) const {
-    if (!RKVA_HAS_LOW4_DXIL || !rkva_kvarn_range::low4_storage(storage) ||
-        !rkva_kvarn_range::valid_saw_int4_geometry(geo_.head_dim, geo_.n_head, geo_.n_head_kv) ||
-        wave_lane_min_ != 64 || wave_lane_max_ != 64 || !range_attn_q4_opt_root_ ||
-        !range_reduce_root_ || (!range_reduce_opt_pso_ && !range_reduce_pso_)) return false;
-    return storage == RKVA_RANGE_STORAGE_Q4_1 ? bool(range_attn_q4_1_pso_) : bool(range_attn_iq4_nl_pso_);
+    return native_extended_available(storage);
 }
 
 bool RemoteAttnEngine::native_saw_int4_available() const {
-    return rkva_kvarn_range::valid_saw_int4_geometry(geo_.head_dim, geo_.n_head, geo_.n_head_kv) &&
-           range_attn_saw_int4_decode_rowlane_pso_ && range_attn_q4_opt_root_ && range_reduce_root_ &&
-           (range_reduce_opt_pso_ || range_reduce_pso_);
+    return native_extended_available(RKVA_RANGE_STORAGE_SAW_INT4);
 }
 
 bool RemoteAttnEngine::native_turboquant_nc_available() const {
-    static_assert(rp::kStorageTurboquantNC == RKVA_RANGE_STORAGE_TURBOQUANT_NC, "TurboQuant NC profile/storage ABI");
-    return rkva_kvarn_range::valid_saw_int4_geometry(geo_.head_dim, geo_.n_head, geo_.n_head_kv) &&
-           range_attn_turboquant_nc_pso_ && range_attn_q4_opt_root_ && range_reduce_root_ &&
-           (range_reduce_opt_pso_ || range_reduce_pso_);
+    return native_extended_available(RKVA_RANGE_STORAGE_TURBOQUANT_NC);
 }
 
 std::string RemoteAttnEngine::get_range_profile_json() {
@@ -2270,21 +2266,19 @@ bool RemoteAttnEngine::attend(uint32_t session_id, uint32_t layer_abs, uint32_t 
 bool RemoteAttnEngine::configure_range(uint32_t id, uint32_t origin, uint32_t capacity,
                                        std::string* error, uint32_t storage) {
     Session* s = find_session(id);
+    const uint32_t nidx = rkva_rprof::native_storage_index(storage);
+    const bool is_native_ext = (nidx < rkva_rprof::kNativeStorageCount);
     if (!ready_ || !s || !s->valid || geo_.cache_bits_k != 16 || geo_.cache_bits_v != 16 ||
         geo_.domain != 0 || capacity != s->capacity || origin > uint32_t(INT32_MAX) - capacity ||
-        (storage > 2 && storage != RKVA_RANGE_STORAGE_SAW_INT4 && storage != RKVA_RANGE_STORAGE_TURBOQUANT_NC &&
-         !rkva_kvarn_range::low4_storage(storage)) ||
-        (rkva_kvarn_range::low4_storage(storage) && !native_low4_available(storage)) ||
-        (storage == RKVA_RANGE_STORAGE_SAW_INT4 && !native_saw_int4_available()) ||
-        (storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC && !native_turboquant_nc_available())) {
+        (!is_native_ext && storage > 2) ||
+        (is_native_ext && !native_extended_available(storage))) {
         return ::fail(error, "range config: invalid geometry/session/origin");
     }
+    const uint32_t head_bytes = rkva_kvarn_range::native_storage_head_bytes(storage);
     const uint64_t row_bytes = uint64_t(geo_.n_head_kv) *
-                               (rkva_kvarn_range::low4_storage(storage) ? rkva_kvarn_range::low4_head_bytes(storage) :
-                                storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC ? 132ull : storage == RKVA_RANGE_STORAGE_SAW_INT4
-                                    ? 136ull
-                                    : (storage ? uint64_t(geo_.head_dim / 32) * (storage == 1 ? 18 : 34)
-                                               : uint64_t(geo_.head_dim) * 2));
+                               (head_bytes ? uint64_t(head_bytes)
+                                           : (storage ? uint64_t(geo_.head_dim / 32) * (storage == 1 ? 18 : 34)
+                                                      : uint64_t(geo_.head_dim) * 2));
     const uint64_t half_stride = uint64_t(capacity) * row_bytes;
     const uint64_t bytes = 2 * half_stride * s->layer_kv.size();
     constexpr uint64_t budget = 4ull * 1024 * 1024 * 1024;
@@ -2721,13 +2715,12 @@ bool RemoteAttnEngine::upload_range(uint32_t id, uint32_t layer, uint32_t start_
         n_rows > s->capacity - start_row || (start_row && start_row != s->range_counts[layer])) {
         return ::fail(error, "range upload: invalid/noncontiguous rows");
     }
+    const uint32_t head_bytes = rkva_kvarn_range::native_storage_head_bytes(s->range_storage);
     const uint64_t row_bytes =
         uint64_t(geo_.n_head_kv) *
-        (rkva_kvarn_range::low4_storage(s->range_storage) ? rkva_kvarn_range::low4_head_bytes(s->range_storage) :
-         s->range_storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC ? 132ull : s->range_storage == RKVA_RANGE_STORAGE_SAW_INT4
-             ? 136ull
-             : (s->range_storage ? uint64_t(geo_.head_dim / 32) * (s->range_storage == 1 ? 18 : 34)
-                                 : uint64_t(geo_.head_dim) * 2));
+        (head_bytes ? uint64_t(head_bytes)
+                    : (s->range_storage ? uint64_t(geo_.head_dim / 32) * (s->range_storage == 1 ? 18 : 34)
+                                        : uint64_t(geo_.head_dim) * 2));
     const uint64_t bytes = uint64_t(n_rows) * row_bytes;
     if (rkva_kvarn_range::low4_storage(s->range_storage) &&
         !rkva_kvarn_range::valid_low4_planes(s->range_storage,
@@ -4040,19 +4033,13 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         }
         return true;
     };
-    if (rkva_kvarn_range::low4_storage(s->range_storage) ||
-        s->range_storage == RKVA_RANGE_STORAGE_SAW_INT4 || s->range_storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC) {
-        ID3D12PipelineState* pso = s->range_storage == RKVA_RANGE_STORAGE_Q4_1 ? range_attn_q4_1_pso_.Get() :
-            s->range_storage == RKVA_RANGE_STORAGE_IQ4_NL ? range_attn_iq4_nl_pso_.Get() : s->range_storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC
-            ? range_attn_turboquant_nc_pso_.Get() : range_attn_saw_int4_decode_rowlane_pso_.Get();
-        // Missing optional MQ PSO keeps the qualified per-query path. LOW4's
-        // own availability gate remains mandatory and is not bypassed by MQ.
-        const uint32_t mq_index = s->range_storage == RKVA_RANGE_STORAGE_Q4_1 ? 0u :
-            s->range_storage == RKVA_RANGE_STORAGE_IQ4_NL ? 1u :
-            s->range_storage == RKVA_RANGE_STORAGE_SAW_INT4 ? 2u : 3u;
+    const uint32_t nidx = rkva_rprof::native_storage_index(s->range_storage);
+    if (nidx < rkva_rprof::kNativeStorageCount) {
+        ID3D12PipelineState* pso = range_attn_native_rowlane_pso_[nidx].Get();
+        const uint32_t mq_index = nidx < 4 ? nidx : UINT32_MAX;
         const bool mq2 = pso && n_tokens >= 2 && q4_kernel_mode_ != rp::kModeReference &&
             geo_.head_dim == 256 && geo_.n_head == 6 * geo_.n_head_kv &&
-            range_attn_native_mq2_pso_[mq_index];
+            mq_index < 4 && range_attn_native_mq2_pso_[mq_index];
         if (mq2) pso = range_attn_native_mq2_pso_[mq_index].Get();
         const uint32_t query_groups = mq2 ? (n_tokens + 1u) / 2u : n_tokens;
         if (!pso || !range_attn_q4_opt_root_) {

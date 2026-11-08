@@ -20,12 +20,16 @@ public:
         : origin_(origin), capacity_(capacity), heads_(heads), type_(type) {
         if (!heads || heads > UINT32_MAX / head_dim || origin % 256 || !capacity ||
                 uint64_t(origin) + capacity > INT32_MAX ||
-                (type != GGML_TYPE_Q4_1 && type != GGML_TYPE_IQ4_NL))
-            throw std::invalid_argument("native Q4_1/IQ4_NL range geometry/type");
-        cuda_.configure("GGML_RKVA_LOW4_PRODUCER", type_, heads_, record_bytes(type_));
+                !record_bytes(type))
+            throw std::invalid_argument("native range geometry/type");
+        if (type_ == GGML_TYPE_Q4_1 || type_ == GGML_TYPE_IQ4_NL) {
+            cuda_.configure("GGML_RKVA_LOW4_PRODUCER", type_, heads_, record_bytes(type_));
+        }
     }
     static uint32_t record_bytes(ggml_type type) {
-        return type == GGML_TYPE_Q4_1 ? 160u : type == GGML_TYPE_IQ4_NL ? 144u : 0u;
+        if (type == GGML_TYPE_F32) return 1024u;
+        if (type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) return 512u;
+        return uint32_t(ggml_row_size(type, head_dim));
     }
     size_t row_bytes() const { return size_t(heads_) * record_bytes(type_); }
     uint32_t rows() const override { return rows_; }
@@ -58,15 +62,25 @@ public:
             if (!cuda_.copy(keys, values, rows_, count, dst)) return false;
         } else {
             for (const float * src : {keys, values}) {
-                if (ggml_quantize_chunk(type_, src, dst, 0, int64_t(count) * heads_, head_dim,
-                                        nullptr) != plane) return false;
-                const size_t block_bytes = type_ == GGML_TYPE_Q4_1 ? 20u : 18u;
-                for (size_t off = 0; off < plane; off += block_bytes) {
-                    uint16_t d; std::memcpy(&d, dst + off, sizeof(d));
-                    if ((d & 0x7c00u) == 0x7c00u) return false;
-                    if (type_ == GGML_TYPE_Q4_1) {
-                        uint16_t m; std::memcpy(&m, dst + off + 2, sizeof(m));
-                        if ((m & 0x7c00u) == 0x7c00u) return false;
+                if (type_ == GGML_TYPE_F32) {
+                    std::memcpy(dst, src, plane);
+                } else if (type_ == GGML_TYPE_BF16) {
+                    ggml_fp32_to_bf16_row(src, reinterpret_cast<ggml_bf16_t*>(dst), int64_t(count) * heads_ * head_dim);
+                } else if (type_ == GGML_TYPE_F16) {
+                    ggml_fp32_to_fp16_row(src, reinterpret_cast<ggml_fp16_t*>(dst), int64_t(count) * heads_ * head_dim);
+                } else {
+                    if (ggml_quantize_chunk(type_, src, dst, 0, int64_t(count) * heads_, head_dim,
+                                            nullptr) != plane) return false;
+                }
+                if (type_ == GGML_TYPE_Q4_1 || type_ == GGML_TYPE_IQ4_NL) {
+                    const size_t block_bytes = type_ == GGML_TYPE_Q4_1 ? 20u : 18u;
+                    for (size_t off = 0; off < plane; off += block_bytes) {
+                        uint16_t d; std::memcpy(&d, dst + off, sizeof(d));
+                        if ((d & 0x7c00u) == 0x7c00u) return false;
+                        if (type_ == GGML_TYPE_Q4_1) {
+                            uint16_t m; std::memcpy(&m, dst + off + 2, sizeof(m));
+                            if ((m & 0x7c00u) == 0x7c00u) return false;
+                        }
                     }
                 }
                 dst += plane;
