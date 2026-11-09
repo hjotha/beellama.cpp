@@ -478,6 +478,7 @@ extern "C" {
         LLAMA_REMOTE_COMPANION_KVARN4 = 2,
         LLAMA_REMOTE_COMPANION_SAW_INT4 = 3,
         LLAMA_REMOTE_COMPANION_TURBOQUANT_NC = 4,
+        LLAMA_REMOTE_COMPANION_OSCAR_INT2 = 5,
     };
 
     struct llama_context_params {

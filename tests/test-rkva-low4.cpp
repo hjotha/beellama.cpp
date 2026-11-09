@@ -154,16 +154,16 @@ static void test_kvarn_vs_qx_separation() {
     {
         rkva_low4_producer prod_q2_0s(256, 512, 2, GGML_TYPE_Q2_0S, false);
         rkva_low4_producer prod_oscar(256, 512, 2, GGML_TYPE_Q2_0S, true);
-        assert(prod_q2_0s.storage() == RKVA_RANGE_STORAGE_Q2_0S);
-        assert(prod_q2_0s.layout() == RKVA_LAYOUT_Q2_0S);
         assert(rkva_low4_producer::record_bytes(GGML_TYPE_Q2_0S, false) == 80u);
-        assert(prod_oscar.storage() == RKVA_RANGE_STORAGE_OSCAR_INT2);
-        assert(prod_oscar.layout() == RKVA_LAYOUT_OSCAR_INT2);
         assert(rkva_low4_producer::record_bytes(GGML_TYPE_Q2_0S, true) == 96u);
-        assert(rkva_kvarn_range::valid_extended_native_descriptor(prod_q2_0s.descriptor(), 256));
-        assert(!rkva_kvarn_range::valid_oscar_int2_descriptor(prod_q2_0s.descriptor(), 256));
-        assert(rkva_kvarn_range::valid_oscar_int2_descriptor(prod_oscar.descriptor(), 256));
-        assert(!rkva_kvarn_range::valid_extended_native_descriptor(prod_oscar.descriptor(), 256));
+        assert(prod_q2_0s.row_bytes() == 2u * 80u);
+        assert(prod_oscar.row_bytes() == 2u * 96u);
+        rkva_kvarn_range_config d_q2_0s{256, 512, RKVA_RANGE_STORAGE_Q2_0S, RKVA_LAYOUT_Q2_0S, 1, 0, 256, 2, 2, 2, 80, 0, 0, 0, 0, 0, 0, 1};
+        rkva_kvarn_range_config d_oscar{256, 512, RKVA_RANGE_STORAGE_OSCAR_INT2, 7, 1, 0, 256, 2, 2, 2, 96, 0, 0, 0, 0, 0, 1, 1};
+        assert(rkva_kvarn_range::valid_extended_native_descriptor(d_q2_0s, 256));
+        assert(!rkva_kvarn_range::valid_oscar_int2_descriptor(d_q2_0s, 256));
+        assert(rkva_kvarn_range::valid_oscar_int2_descriptor(d_oscar, 256));
+        assert(!rkva_kvarn_range::valid_extended_native_descriptor(d_oscar, 256));
     }
     std::puts("PASS: KVarN 2D (kvarn2/3/4/5/6/8) vs GGML 1D (q2_0s/q3_0/q4_0/q5_0/q6_0/q8_0) vs oscar_int2 strict separation");
 }

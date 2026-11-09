@@ -103,7 +103,7 @@ CAP_Q8_E4M3FN          = 1 << 56
 RKVA_STORAGE_F16           = 0
 RKVA_STORAGE_Q4_0          = 1 << 0
 RKVA_STORAGE_Q8_0          = 1 << 1
-RKVA_STORAGE_KVARN4        = 3
+RKVA_STORAGE_KVARN4        = 1 << 2
 RKVA_STORAGE_SAW_INT4      = 1 << 3
 RKVA_STORAGE_OSCAR_INT2    = 1 << 4
 RKVA_STORAGE_TURBOQUANT_NC = 1 << 5
@@ -398,8 +398,8 @@ FORMAT_SPECS = [
     },
 ]
 
-def make_request(op, session_id=0, layer_id=0, n_tokens=0, cycle_id=1, payload=b""):
-    hdr = struct.pack("<IHHQIIII", RKVA_MAGIC, RKVA_VERSION, op, cycle_id, session_id, layer_id, n_tokens, len(payload))
+def make_request(op, session_id=0, layer_id=0, n_tokens=0, cycle_id=1, payload=b"", version=RKVA_VERSION):
+    hdr = struct.pack("<IHHQIIII", RKVA_MAGIC, version, op, cycle_id, session_id, layer_id, n_tokens, len(payload))
     return hdr + payload
 
 def read_exact(sock, n):
@@ -411,8 +411,8 @@ def read_exact(sock, n):
         buf.extend(chunk)
     return bytes(buf)
 
-def transact(sock, op, session_id=0, layer_id=0, n_tokens=0, cycle_id=1, payload=b""):
-    req = make_request(op, session_id=session_id, layer_id=layer_id, n_tokens=n_tokens, cycle_id=cycle_id, payload=payload)
+def transact(sock, op, session_id=0, layer_id=0, n_tokens=0, cycle_id=1, payload=b"", version=RKVA_VERSION):
+    req = make_request(op, session_id=session_id, layer_id=layer_id, n_tokens=n_tokens, cycle_id=cycle_id, payload=payload, version=version)
     sock.sendall(req)
     resp_hdr_bytes = read_exact(sock, 56)
     magic, ver, rop, rcycle_id, status, rpayload_len, rx_us, prep_us, comp_us, resp_us = struct.unpack(
@@ -564,61 +564,91 @@ def test_xbox_all_quants(host="192.168.1.200", port=50054):
         sess_id_counter += 1
 
         sess_payload = struct.pack("<4I", sess_id, 0, capacity, RKVA_SESSION_RANGE)
-        st, _, _, _ = transact(sock, RKVA_CREATE_SESSION, session_id=sess_id, payload=sess_payload)
-        if st != 0:
-            results.append({"name": name, "status": "FAIL", "reason": f"CREATE_SESSION failed ({st})"})
-            continue
+        if kind != "f16_range":
+            st, _, _, _ = transact(sock, RKVA_CREATE_SESSION, session_id=sess_id, payload=sess_payload)
+            if st != 0:
+                results.append({"name": name, "status": "FAIL", "reason": f"CREATE_SESSION failed ({st})"})
+                continue
 
         try:
             if kind == "f16_range":
-                # Standard F16 range path: RKVA_RANGE_CONFIG -> RKVA_RANGE_UPLOAD -> RKVA_RANGE_ATTN
-                cfg_payload = struct.pack("<4I", origin, capacity, 0, 0)
-                st, _, _, _ = transact(sock, RKVA_RANGE_CONFIG, session_id=sess_id, payload=cfg_payload)
-                if st != 0:
-                    results.append({"name": name, "status": "FAIL", "reason": f"RANGE_CONFIG failed ({st})"})
-                    continue
+                # Standard F16 range path uses protocol version 2 (non-E4M3FN range session).
+                # Close v3 socket first because the Xbox RKVA server serves one TCP connection at a time.
+                sock.close()
+                sock_v2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock_v2.settimeout(60.0)
+                sock_v2.connect((host, port))
+                sock_v2.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                try:
+                    hello_v2 = struct.pack(
+                        "<16If2Q",
+                        (1 << RKVA_WIRE_F16), n_layer, n_head, n_head_kv, head_dim, max_ctx,
+                        16, 16, 128, 0,
+                        0, 2, 0, RKVA_DOMAIN_AUTO, 0, 0,
+                        kq_scale, 0, 0
+                    )
+                    st, _, _, _ = transact(sock_v2, RKVA_HELLO, payload=hello_v2, version=2)
+                    if st != 0:
+                        results.append({"name": name, "status": "FAIL", "reason": f"HELLO v2 failed ({st})"})
+                        continue
+                    st, _, _, _ = transact(sock_v2, RKVA_CREATE_SESSION, session_id=sess_id, payload=sess_payload, version=2)
+                    if st != 0:
+                        results.append({"name": name, "status": "FAIL", "reason": f"CREATE_SESSION v2 failed ({st})"})
+                        continue
+                    cfg_payload = struct.pack("<4I", origin, capacity, 0, 0)
+                    st, _, _, _ = transact(sock_v2, RKVA_RANGE_CONFIG, session_id=sess_id, payload=cfg_payload, version=2)
+                    if st != 0:
+                        results.append({"name": name, "status": "FAIL", "reason": f"RANGE_CONFIG failed ({st})"})
+                        continue
 
-                k_data = generate_f16_rows(capacity, n_head_kv, head_dim)
-                v_data = generate_f16_rows(capacity, n_head_kv, head_dim)
-                up_hdr = struct.pack("<4I", 0, capacity, RKVA_WIRE_F16, 0)
-                st, _, _, _ = transact(
-                    sock, RKVA_RANGE_UPLOAD, session_id=sess_id, layer_id=0, payload=up_hdr + k_data + v_data
-                )
-                if st != 0:
-                    results.append({"name": name, "status": "FAIL", "reason": f"RANGE_UPLOAD failed ({st})"})
-                    continue
+                    k_data = generate_f16_rows(capacity, n_head_kv, head_dim)
+                    v_data = generate_f16_rows(capacity, n_head_kv, head_dim)
+                    up_hdr = struct.pack("<4I", 0, capacity, RKVA_WIRE_F16, 0)
+                    st, _, _, _ = transact(
+                        sock_v2, RKVA_RANGE_UPLOAD, session_id=sess_id, layer_id=0, payload=up_hdr + k_data + v_data, version=2
+                    )
+                    if st != 0:
+                        results.append({"name": name, "status": "FAIL", "reason": f"RANGE_UPLOAD failed ({st})"})
+                        continue
 
-                # Decode nq=1
-                attn_hdr = struct.pack("<4I", RKVA_WIRE_F32, 0, 0, 0)
-                pos1 = struct.pack("<i", 255)
-                q1 = generate_q_f32(1, n_head, head_dim)
-                t0 = time.perf_counter()
-                st, _, resp1, _ = transact(
-                    sock, RKVA_RANGE_ATTN, session_id=sess_id, layer_id=0, n_tokens=1, payload=attn_hdr + pos1 + q1
-                )
-                t1 = time.perf_counter()
-                decode_us = (t1 - t0) * 1e6
-                if st != 0:
-                    results.append({"name": name, "status": "FAIL", "reason": f"RANGE_ATTN decode failed ({st})"})
-                    continue
-                out1_bytes = 1 * n_head * head_dim * 4
-                lse_vals = parse_f32_array(resp1[out1_bytes:])
-                if not all(math.isfinite(x) for x in lse_vals):
-                    results.append({"name": name, "status": "FAIL", "reason": "LSE NaN/Inf"})
-                    continue
+                    # Decode nq=1
+                    attn_hdr = struct.pack("<4I", RKVA_WIRE_F32, 0, 0, 0)
+                    pos1 = struct.pack("<i", 255)
+                    q1 = generate_q_f32(1, n_head, head_dim)
+                    t0 = time.perf_counter()
+                    st, _, resp1, _ = transact(
+                        sock_v2, RKVA_RANGE_ATTN, session_id=sess_id, layer_id=0, n_tokens=1, payload=attn_hdr + pos1 + q1, version=2
+                    )
+                    t1 = time.perf_counter()
+                    decode_us = (t1 - t0) * 1e6
+                    if st != 0:
+                        results.append({"name": name, "status": "FAIL", "reason": f"RANGE_ATTN decode failed ({st})"})
+                        continue
+                    out1_bytes = 1 * n_head * head_dim * 4
+                    lse_vals = parse_f32_array(resp1[out1_bytes:])
+                    if not all(math.isfinite(x) for x in lse_vals):
+                        results.append({"name": name, "status": "FAIL", "reason": "LSE NaN/Inf"})
+                        continue
 
-                # Prefill nq=8
-                pos8 = struct.pack("<8i", *range(248, 256))
-                q8 = generate_q_f32(8, n_head, head_dim)
-                t0 = time.perf_counter()
-                st, _, resp8, _ = transact(
-                    sock, RKVA_RANGE_ATTN, session_id=sess_id, layer_id=0, n_tokens=8, payload=attn_hdr + pos8 + q8
-                )
-                t1 = time.perf_counter()
-                prefill_us = (t1 - t0) * 1e6
-                if st != 0:
-                    results.append({"name": name, "status": "FAIL", "reason": f"RANGE_ATTN prefill failed ({st})"})
-                    continue
+                    # Prefill nq=8
+                    pos8 = struct.pack("<8i", *range(248, 256))
+                    q8 = generate_q_f32(8, n_head, head_dim)
+                    t0 = time.perf_counter()
+                    st, _, resp8, _ = transact(
+                        sock_v2, RKVA_RANGE_ATTN, session_id=sess_id, layer_id=0, n_tokens=8, payload=attn_hdr + pos8 + q8, version=2
+                    )
+                    t1 = time.perf_counter()
+                    prefill_us = (t1 - t0) * 1e6
+                    if st != 0:
+                        results.append({"name": name, "status": "FAIL", "reason": f"RANGE_ATTN prefill failed ({st})"})
+                        continue
+                finally:
+                    sock_v2.close()
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(60.0)
+                    sock.connect((host, port))
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    transact(sock, RKVA_HELLO, payload=hello_payload)
 
             elif kind == "kvarn_2d":
                 # True KVarN 2D 128x128 WHT + 16-iter Sinkhorn record path
@@ -668,6 +698,10 @@ def test_xbox_all_quants(host="192.168.1.200", port=50054):
                 pos1 = struct.pack("<i", 247)
                 q1 = generate_q_fp8_e4m3(1, n_head, head_dim)
                 bulk_payload1 = bulk_hdr1 + seg_hdr1 + u1_hdr + u1_data + attn_hdr1 + pos1 + q1
+
+                # Warm-up pass (allocates D3D12 upload/scratch buffers on first KVarN call)
+                transact(sock, RKVA_KVARN_RANGE_BULK_ATTN, session_id=sess_id, layer_id=0, n_tokens=1, payload=bulk_payload1)
+                transact(sock, RKVA_KVARN_RANGE_UPLOAD, session_id=sess_id, layer_id=0, payload=up_payload0)
 
                 t0 = time.perf_counter()
                 st, _, resp_data, _ = transact(
@@ -805,7 +839,8 @@ def test_xbox_all_quants(host="192.168.1.200", port=50054):
             })
 
         finally:
-            transact(sock, RKVA_DESTROY_SESSION, session_id=sess_id)
+            if kind != "f16_range":
+                transact(sock, RKVA_DESTROY_SESSION, session_id=sess_id)
 
     sock.close()
 

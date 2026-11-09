@@ -2459,7 +2459,8 @@ static std::unique_ptr<rkva_native_owner> rkva_new_native_owner(
         ggml_backend_remote_attn_context * ctx, bool force_cpu = false) {
     if (ctx->native_low4) {
         return std::unique_ptr<rkva_native_owner>(new rkva_low4_producer(
-                ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv, ctx->range_source_type,
+                ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv,
+                ctx->native_low4 == RKVA_RANGE_STORAGE_OSCAR_INT2 ? GGML_TYPE_Q2_0S : ctx->range_source_type,
                 ctx->native_low4 == RKVA_RANGE_STORAGE_OSCAR_INT2));
     }
     if (ctx->native_q4) {
@@ -4197,7 +4198,14 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->sock.assign(fd);
     const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    timeval tv { 30, 0 };
+    const int timeout_sec = []() {
+        if (const char * env = std::getenv("GGML_RKVA_SOCKET_TIMEOUT_SEC")) {
+            int v = std::atoi(env);
+            if (v > 0) return v;
+        }
+        return 120;
+    }();
+    timeval tv { timeout_sec, 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -4857,8 +4865,8 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     const char * wire_str = bulk ? (bulk_wire == RKVA_WIRE_FP8_E4M3FN ? "fp8_e4m3fn" :
                                     bulk_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
                                     bulk_wire == RKVA_WIRE_F16 ? "f16" : "f32") : "f32";
-    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN4 precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d wire=%s; original F32 producer, bounded resident rewind and paired FULL snapshots require negotiated capability\n",
-                  GGML_REMOTE_ATTN_NAME, precision_tail_tokens, descriptor.layout_version, int(serial_prefix), int(async_overlap), wire_str);
+    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN%u (record_bytes=%u) precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d wire=%s; original F32 producer, bounded resident rewind and paired FULL snapshots require negotiated capability\n",
+                  GGML_REMOTE_ATTN_NAME, bits, descriptor.record_bytes, precision_tail_tokens, descriptor.layout_version, int(serial_prefix), int(async_overlap), wire_str);
     return true;
 }
 
@@ -5067,10 +5075,17 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
             bulk_e4_cap = RKVA_CAP_NATIVE_BF16_BULK_E4M3FN;
             break;
         case GGML_TYPE_F32:
-            storage = RKVA_RANGE_STORAGE_F32;
-            layout = RKVA_LAYOUT_F32;
-            bulk_cap = RKVA_CAP_NATIVE_F32_BULK;
-            bulk_e4_cap = RKVA_CAP_NATIVE_F32_BULK_E4M3FN;
+            if (oscar_int2) {
+                storage = RKVA_RANGE_STORAGE_OSCAR_INT2;
+                layout = 7;
+                bulk_cap = RKVA_CAP_NATIVE_OSCAR_INT2_BULK;
+                bulk_e4_cap = RKVA_CAP_NATIVE_OSCAR_INT2_BULK_E4M3FN;
+            } else {
+                storage = RKVA_RANGE_STORAGE_F32;
+                layout = RKVA_LAYOUT_F32;
+                bulk_cap = RKVA_CAP_NATIVE_F32_BULK;
+                bulk_e4_cap = RKVA_CAP_NATIVE_F32_BULK_E4M3FN;
+            }
             break;
         default:
             return false;
@@ -5120,10 +5135,12 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
     const bool can_profile = (ctx->ack.reserved[0] & RKVA_CAP_RANGE_PROFILE) &&
                              (ctx->ack.supported_ops & (1u << RKVA_RANGE_PROFILE));
     if ((mode || profile) && !can_profile) return false;
+    const uint32_t bits = oscar_int2 ? 2u : 4u;
+    const uint32_t domain = oscar_int2 ? 1u : 0u;
     const rkva_kvarn_range_config descriptor {
         origin, capacity, storage, layout,
-        1, 0, rkva_low4_producer::head_dim, 2, 4, 4, rkva_low4_producer::record_bytes(source_type, oscar_int2),
-        0, 0, 0, 0, 0, 0, 1};
+        1, 0, rkva_low4_producer::head_dim, 2, bits, bits, rkva_low4_producer::record_bytes(oscar_int2 ? GGML_TYPE_Q2_0S : source_type, oscar_int2),
+        0, 0, 0, 0, 0, domain, 1};
     std::vector<uint8_t> reply;
     if (!rkva_transact(ctx, RKVA_KVARN_RANGE_CONFIG, ctx->active_session, 0, 0,
             &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
@@ -5466,7 +5483,7 @@ bool ggml_backend_remote_attn_configure_range(
         return false;
     }
     if (format_req && (!std::strcmp(format_req, "oscar_int2") || !std::strcmp(format_req, "oscar-int2"))) {
-        if (!rkva_configure_native_low4(ctx, origin, capacity, GGML_TYPE_Q2_0S, async_overlap, true)) {
+        if (!rkva_configure_native_low4(ctx, origin, capacity, cache_type, async_overlap, true)) {
             GGML_LOG_ERROR("%s: requested %s cannot be negotiated with matching remote K/V; refusing fallback\n",
                     GGML_REMOTE_ATTN_NAME, format_req);
             return false;

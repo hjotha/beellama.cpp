@@ -97,7 +97,8 @@ inline std::string validate_ranges(const std::vector<range_desc> & descs,
                                    const std::vector<uint32_t> & full_layers,
                                    int native_overflow_format = -1) {
     if (native_overflow_format != -1 && native_overflow_format != 0 &&
-            native_overflow_format != 4 && native_overflow_format != 5) {
+            native_overflow_format != 4 && native_overflow_format != 5 &&
+            native_overflow_format != 13) {
         return "formato nativo de overflow inválido";
     }
     if (!is_valid_p(p, c)) {

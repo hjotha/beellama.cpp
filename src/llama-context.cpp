@@ -695,6 +695,7 @@ llama_context::llama_context(
             return LLAMA_REMOTE_COMPANION_KVARN4;
         if (value == "saw_int4" || value == "saw-int4" || value == "saw4" || value == "bdr_int4") return LLAMA_REMOTE_COMPANION_SAW_INT4;
         if (value == "turboquant_nc" || value == "turboquant-nc" || value == "tqnc" || value == "turboquant_4bit_nc") return LLAMA_REMOTE_COMPANION_TURBOQUANT_NC;
+        if (value == "oscar_int2" || value == "oscar-int2" || value == "oscar2") return LLAMA_REMOTE_COMPANION_OSCAR_INT2;
         return LLAMA_REMOTE_COMPANION_NONE;
     };
     if (cparams.remote_attn_native_companion == LLAMA_REMOTE_COMPANION_AUTO) {
@@ -705,7 +706,7 @@ llama_context::llama_context(
                 native_format(cparams.remote_attn_upload_format) : LLAMA_REMOTE_COMPANION_NONE;
     }
     if (cparams.remote_attn_native_companion < LLAMA_REMOTE_COMPANION_NONE ||
-            cparams.remote_attn_native_companion > LLAMA_REMOTE_COMPANION_TURBOQUANT_NC ||
+            cparams.remote_attn_native_companion > LLAMA_REMOTE_COMPANION_OSCAR_INT2 ||
             (tcp_position_split && cparams.remote_attn_native_companion != LLAMA_REMOTE_COMPANION_NONE &&
              cparams.remote_attn_native_companion != native_format(cparams.remote_attn_upload_format))) {
         throw std::invalid_argument("native companion does not match the per-context upload format");
@@ -2328,7 +2329,9 @@ std::vector<ggml_backend_t> layer_backends;
                     }
                     const int native_format = native_cache->native_companion_format();
                     LLAMA_LOG_INFO("%s: native companion negotiated format=%s standard_cache=absent\n", __func__,
-                            native_format == 0 ? "kvarn4" : native_format == 4 ? "saw_int4" : "turboquant_nc");
+                            native_format == 0 ? (cparams.remote_attn_upload_format.empty() ? "kvarn4" : cparams.remote_attn_upload_format.c_str()) :
+                            native_format == 4 ? "saw_int4" :
+                            native_format == 5 ? "turboquant_nc" : "oscar_int2");
                     native_cache->set_native_companion_reset([this]() {
                         return backend_remote && ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
                     });

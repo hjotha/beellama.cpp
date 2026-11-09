@@ -74,7 +74,9 @@ static bool native_row_rpc_selected(const char * format) {
     return s && (!std::strcmp(s, "saw_int4") || !std::strcmp(s, "saw-int4") ||
                  !std::strcmp(s, "saw4") || !std::strcmp(s, "bdr_int4") ||
                  !std::strcmp(s, "turboquant_nc") || !std::strcmp(s, "turboquant-nc") ||
-                 !std::strcmp(s, "tqnc") || !std::strcmp(s, "turboquant_4bit_nc"));
+                 !std::strcmp(s, "tqnc") || !std::strcmp(s, "turboquant_4bit_nc") ||
+                 !std::strcmp(s, "oscar_int2") || !std::strcmp(s, "oscar-int2") ||
+                 !std::strcmp(s, "oscar2"));
 }
 
 static bool native_kvarn_records_rpc_selected(const char * format) {
@@ -96,6 +98,7 @@ static int selected_native_companion_format(bool rpc_position_split, uint32_t po
         if (selection == LLAMA_REMOTE_COMPANION_KVARN4) return 0;
         if (selection == LLAMA_REMOTE_COMPANION_SAW_INT4) return 4;
         if (selection == LLAMA_REMOTE_COMPANION_TURBOQUANT_NC) return 5;
+        if (selection == LLAMA_REMOTE_COMPANION_OSCAR_INT2) return 13;
         return -1;
     }
     const char * enabled = std::getenv("GGML_RKVA_NATIVE_COMPANION");
@@ -106,6 +109,7 @@ static int selected_native_companion_format(bool rpc_position_split, uint32_t po
     if (native_kvarn_records_rpc_selected(upload_format)) return 0;
     if (!native_row_rpc_selected(upload_format)) return -1;
     const char * format = selected_remote_upload_format(upload_format);
+    if (!std::strcmp(format, "oscar_int2") || !std::strcmp(format, "oscar-int2") || !std::strcmp(format, "oscar2")) return 13;
     return (!std::strcmp(format, "saw_int4") || !std::strcmp(format, "saw-int4") ||
             !std::strcmp(format, "saw4") || !std::strcmp(format, "bdr_int4")) ? 4 : 5;
 }

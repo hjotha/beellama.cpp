@@ -3455,6 +3455,7 @@ enum llama_remote_native_companion common_resolve_remote_native_companion(const 
             return LLAMA_REMOTE_COMPANION_KVARN4;
         if (value == "saw_int4" || value == "saw-int4" || value == "saw4" || value == "bdr_int4") return LLAMA_REMOTE_COMPANION_SAW_INT4;
         if (value == "turboquant_nc" || value == "turboquant-nc" || value == "tqnc" || value == "turboquant_4bit_nc") return LLAMA_REMOTE_COMPANION_TURBOQUANT_NC;
+        if (value == "oscar_int2" || value == "oscar-int2" || value == "oscar2") return LLAMA_REMOTE_COMPANION_OSCAR_INT2;
         return LLAMA_REMOTE_COMPANION_NONE;
     };
     auto native_selection = LLAMA_REMOTE_COMPANION_NONE;
