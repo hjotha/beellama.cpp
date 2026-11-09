@@ -80,7 +80,10 @@ static bool native_row_rpc_selected(const char * format) {
 static bool native_kvarn_records_rpc_selected(const char * format) {
     const char * s = selected_remote_upload_format(format);
     const char * enabled = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
-    return s && (!std::strcmp(s, "kvarn4") || !std::strcmp(s, "kvarn")) &&
+    return s && (!std::strcmp(s, "kvarn2") || !std::strcmp(s, "kvarn3") ||
+                 !std::strcmp(s, "kvarn4") || !std::strcmp(s, "kvarn5") ||
+                 !std::strcmp(s, "kvarn6") || !std::strcmp(s, "kvarn8") ||
+                 !std::strcmp(s, "kvarn")) &&
            enabled && !std::strcmp(enabled, "1");
 }
 
@@ -3268,10 +3271,17 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 // (O tipo do dispositivo Vulkan varia por backend; o nome é o
                 // identificador estável.)
                 if (position_split_p_ != 0) {
+                    const bool rpc_ext = rpc_position_split &&
+                        (key->type == GGML_TYPE_F16 || key->type == GGML_TYPE_F32 ||
+                         key->type == GGML_TYPE_BF16 || key->type == GGML_TYPE_Q4_1 ||
+                         key->type == GGML_TYPE_IQ4_NL || key->type == GGML_TYPE_Q5_0 ||
+                         key->type == GGML_TYPE_Q5_1 || key->type == GGML_TYPE_Q6_0 ||
+                         key->type == GGML_TYPE_Q6_1 || key->type == GGML_TYPE_Q3_0 ||
+                         key->type == GGML_TYPE_Q3_1 || key->type == GGML_TYPE_Q2_0S ||
+                         key->type == GGML_TYPE_Q2_1);
                     if (key->type != value->type ||
-                            (key->type != GGML_TYPE_Q4_0 && key->type != GGML_TYPE_Q8_0 &&
-                             !(rpc_position_split && (key->type == GGML_TYPE_F16 || key->type == GGML_TYPE_Q4_1 || key->type == GGML_TYPE_IQ4_NL)))) {
-                        throw std::invalid_argument("position-split overflow requires matching Q4_0, Q8_0 or RPC F16/Q4_1/IQ4_NL K/V");
+                            (key->type != GGML_TYPE_Q4_0 && key->type != GGML_TYPE_Q8_0 && !rpc_ext)) {
+                        throw std::invalid_argument("position-split overflow requires matching Q4_0, Q8_0 or RPC standard K/V");
                     }
                     const char * dev_name = key_dev ? ggml_backend_dev_name(key_dev) : nullptr;
                     const bool host_mirror = rpc_position_split &&
@@ -7675,6 +7685,7 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
                 local_key && local_key->type == GGML_TYPE_TQNC_K ? 5 :
                 local_key && local_key->type == GGML_TYPE_Q4_1 ? llama_position_split::kFormatQ4_1 :
                 local_key && local_key->type == GGML_TYPE_IQ4_NL ? llama_position_split::kFormatIQ4_NL :
+                local_key ? llama_position_split::kFormatExtended :
                 local_cache ? 255 : 0;
         out.push_back({layer, llama_position_split::kRangeLocal, 0, position_split_p_, 0, local_format});
         const auto * key = standard_cache ? standard_cache->get_k_storage(il) : nullptr;
@@ -7683,7 +7694,8 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
                 key && key->type == GGML_TYPE_Q8_0 ? 2 :
                 key && key->type == GGML_TYPE_F16 ? 3 :
                 key && key->type == GGML_TYPE_Q4_1 ? llama_position_split::kFormatQ4_1 :
-                key && key->type == GGML_TYPE_IQ4_NL ? llama_position_split::kFormatIQ4_NL : 255;
+                key && key->type == GGML_TYPE_IQ4_NL ? llama_position_split::kFormatIQ4_NL :
+                key ? llama_position_split::kFormatExtended : 255;
         out.push_back({layer, llama_position_split::kRangeOverflow, position_split_p_, kv_size, 1, format});
     }
     return out;

@@ -25,11 +25,13 @@ public:
     rkva_kvarn_producer(uint32_t origin, uint32_t capacity, uint32_t heads,
                         uint32_t iterations, ggml_backend_cpu_kvarn_store_direct_v1_t store,
                         uint32_t precision_tail_tokens = 128, bool compact_stage = false,
-                        bool force_cpu = false)
+                        bool force_cpu = false, uint32_t bits = 4)
         : origin_(origin), capacity_(capacity), heads_(heads), iterations_(iterations),
+          bits_(bits), record_bytes_(size_t(bits) * 2048 + 768),
           precision_tail_tokens_(precision_tail_tokens),
           compact_stage_(compact_stage && origin >= 128 && precision_tail_tokens >= 128), store_(store) {
         if (!store || !heads || !iterations ||
+                (bits != 2 && bits != 3 && bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
                 (precision_tail_tokens > capacity && precision_tail_tokens != 128) ||
                 origin % 128 || !capacity ||
                 uint64_t(origin) + capacity > INT32_MAX) throw std::invalid_argument("native KVarN geometry");
@@ -46,7 +48,7 @@ public:
         // that can still be published need host storage. Wire groups and the
         // protocol header keep their global numbering either way.
         record_base_group_ = cuda_ ? origin_ / 128 : 0;
-        records_k_.resize((groups - record_base_group_) * physical_heads() * record_bytes);
+        records_k_.resize((groups - record_base_group_) * physical_heads() * record_bytes_);
         records_v_.resize(records_k_.size());
         stage_k_.resize(size_t(384) * width());
         stage_v_.resize(stage_k_.size());
@@ -78,11 +80,12 @@ public:
         const uint32_t groups = rows_ / 128;
         const uint32_t origin_group = origin_ / 128;
         if (origin_group < record_base_group_) return false;
-        const size_t group_bytes = size_t(physical_heads()) * record_bytes;
+        const size_t group_bytes = size_t(physical_heads()) * record_bytes_;
         const size_t record_offset = size_t(origin_group - record_base_group_) * group_bytes;
         if (record_offset + size_t(groups) * group_bytes > records_k_.size()) return false;
+        const uint32_t packed_iters = bits_ == 4 ? iterations_ : (iterations_ | (bits_ << 16));
         view.layout = rkva_native_state::Layout{
-            origin_, capacity_, heads_, iterations_, precision_tail_tokens_,
+            origin_, capacity_, heads_, packed_iters, precision_tail_tokens_,
             compact_stage_ ? 1u : 0u, rows_, record_base_group_, generation};
         view.records_k = records_k_.data() + record_offset;
         view.records_v = records_v_.data() + record_offset;
@@ -110,12 +113,13 @@ public:
         if (!rkva_native_state::valid_ring(state, error))
             return false;
         const auto & layout = state.layout;
+        const uint32_t packed_iters = bits_ == 4 ? iterations_ : (iterations_ | (bits_ << 16));
         if (layout.origin != origin_ || layout.capacity != capacity_ || layout.heads != heads_ ||
-                layout.iterations != iterations_ ||
+                (layout.iterations != iterations_ && layout.iterations != packed_iters) ||
                 layout.precision_tail_tokens != precision_tail_tokens_ ||
                 layout.compact_stage != (compact_stage_ ? 1u : 0u) ||
                 layout.rows > capacity_) return reject("native state: producer geometry mismatch");
-        const size_t group_bytes = size_t(physical_heads()) * record_bytes;
+        const size_t group_bytes = size_t(physical_heads()) * record_bytes_;
         const uint32_t groups = layout.rows / 128;
         const size_t record_offset = size_t(origin_ / 128 - record_base_group_) * group_bytes;
         const size_t record_bytes = size_t(groups) * group_bytes;
@@ -237,11 +241,12 @@ public:
         prepared_values_.assign(values, values + size_t(count) * width());
         prepared_k_.resize(size_t(count) * width()); prepared_v_.resize(prepared_k_.size());
         const size_t groups = (prepared_begin_ + count) / 128 - prepared_begin_ / 128;
-        prepared_rk_.resize(groups * physical_heads() * record_bytes);
+        prepared_rk_.resize(groups * physical_heads() * record_bytes_);
         prepared_rv_.resize(prepared_rk_.size());
         const float * cuda_k = device_keys ? device_keys : keys;
         const float * cuda_v = device_values ? device_values : values;
-        if (!cuda_(cuda_k, cuda_v, prepared_begin_, count, heads_, iterations_, stage_k_.data(), stage_v_.data(),
+        const uint32_t packed_iters = bits_ == 4 ? iterations_ : (iterations_ | (bits_ << 16));
+        if (!cuda_(cuda_k, cuda_v, prepared_begin_, count, heads_, packed_iters, stage_k_.data(), stage_v_.data(),
                     prepared_k_.data(), prepared_v_.data(), prepared_rk_.data(), prepared_rv_.data())) return false;
         prepared_count_ = count;
         return true;
@@ -270,7 +275,7 @@ public:
         if (!record_span_valid(first_global / 128, last_global / 128 - first_global / 128) ||
                 !record_span_valid(uint64_t(origin_) / 128 + record_begin, record_groups)) return false;
         const size_t record_offset =
-            size_t(origin_ / 128 + record_begin - record_base_group_) * physical_heads() * record_bytes;
+            size_t(origin_ / 128 + record_begin - record_base_group_) * physical_heads() * record_bytes_;
         const size_t append_elements = size_t(count) * width();
         // Keep the high-water size as well as capacity: smaller subsequent
         // chunks are completely overwritten below and need no zero-fill.
@@ -289,13 +294,13 @@ public:
             auto * index = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
             auto * sk = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, 128, physical_heads(), 384);
             auto * sv = ggml_dup_tensor(ctx.get(), sk);
-            auto * rk = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I8, record_bytes, physical_heads(),
-                                          records_k_.size() / (record_bytes * physical_heads()));
+            auto * rk = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I8, record_bytes_, physical_heads(),
+                                          records_k_.size() / (record_bytes_ * physical_heads()));
             auto * rv = ggml_dup_tensor(ctx.get(), rk);
             sk->data = stage_k_.data(); sv->data = stage_v_.data();
             rk->data = records_k_.data(); rv->data = records_v_.data();
-            auto * kstore = ggml_kvarn_store(ctx.get(), current, index, sk, rk, 4, iterations_, false, 3);
-            auto * vstore = ggml_kvarn_store(ctx.get(), current, index, sv, rv, 4, iterations_, true, 3);
+            auto * kstore = ggml_kvarn_store(ctx.get(), current, index, sk, rk, bits_, iterations_, false, 3);
+            auto * vstore = ggml_kvarn_store(ctx.get(), current, index, sv, rv, bits_, iterations_, true, 3);
             for (auto * op : {kstore, vstore}) {
                 ggml_set_op_params_i32(op, 5, 2); // two physical slices per model KV head
                 ggml_set_op_params_i32(op, 8, 2); // canonical ping-pong tail slots
@@ -336,9 +341,9 @@ public:
             const size_t first_group = global / 128;
             const size_t groups = (global + count) / 128 - first_group;
             if (groups) {
-                const size_t dst = (first_group - record_base_group_) * physical_heads() * record_bytes;
-                const size_t src = (first_group - prepared_begin_ / 128) * physical_heads() * record_bytes;
-                const size_t bytes = groups * physical_heads() * record_bytes;
+                const size_t dst = (first_group - record_base_group_) * physical_heads() * record_bytes_;
+                const size_t src = (first_group - prepared_begin_ / 128) * physical_heads() * record_bytes_;
+                const size_t bytes = groups * physical_heads() * record_bytes_;
                 std::memcpy(records_k_.data() + dst, prepared_rk_.data() + src, bytes);
                 std::memcpy(records_v_.data() + dst, prepared_rv_.data() + src, bytes);
             }
@@ -367,7 +372,7 @@ public:
             payload.insert(payload.end(), begin, begin + bytes);
         };
         emit(&header, sizeof(header));
-        const size_t record_size = size_t(record_groups) * physical_heads() * record_bytes;
+        const size_t record_size = size_t(record_groups) * physical_heads() * record_bytes_;
         emit(records_k_.data() + record_offset, record_size);
         emit(records_v_.data() + record_offset, record_size);
         if (reset_snapshot) {
@@ -419,10 +424,12 @@ private:
     bool record_span_valid(uint64_t first_group, uint64_t group_count) const {
         if (first_group < record_base_group_) return false;
         const uint64_t first = first_group - record_base_group_;
-        const uint64_t groups = records_k_.size() / (record_bytes * size_t(physical_heads()));
+        const uint64_t groups = records_k_.size() / (record_bytes_ * size_t(physical_heads()));
         return first <= groups && group_count <= groups - first;
     }
-    uint32_t origin_, capacity_, heads_, iterations_, precision_tail_tokens_, rows_ = 0;
+    uint32_t origin_, capacity_, heads_, iterations_, bits_ = 4;
+    size_t record_bytes_ = 8960;
+    uint32_t precision_tail_tokens_, rows_ = 0;
     bool compact_stage_ = false;
     ggml_backend_cpu_kvarn_store_direct_v1_t store_;
     ggml_backend_cuda_kvarn_native_append_v1_t cuda_ = nullptr;

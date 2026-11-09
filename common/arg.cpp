@@ -463,6 +463,9 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
 }
 
 static ggml_type parse_remote_attn_standard_cache_type(const std::string & value) {
+    if (value == "oscar_int2" || value == "oscar-int2") {
+        return GGML_TYPE_Q2_0S;
+    }
     const ggml_type type = kv_cache_type_from_str(value);
     if (type != GGML_TYPE_F16 && type != GGML_TYPE_F32 && type != GGML_TYPE_BF16 &&
             type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 &&
@@ -472,13 +475,16 @@ static ggml_type parse_remote_attn_standard_cache_type(const std::string & value
             type != GGML_TYPE_Q3_0 && type != GGML_TYPE_Q3_1 &&
             type != GGML_TYPE_Q2_0S && type != GGML_TYPE_Q2_1) {
         throw std::invalid_argument(
-                "remote attention cache overrides currently support f16, f32, bf16, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q8_0, q3_0, q3_1, q2_0s, or q2_1");
+                "remote attention cache overrides currently support f16, f32, bf16, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q8_0, q3_0, q3_1, q2_0s, q2_1, or oscar_int2");
     }
     return type;
 }
 
 static bool parse_remote_native_companion(const std::string & value, std::string & native, ggml_type & standard) {
-    if (value != "kvarn4" && value != "saw_int4" && value != "turboquant_nc") {
+    if (value != "kvarn2" && value != "kvarn3" && value != "kvarn4" &&
+        value != "kvarn5" && value != "kvarn6" && value != "kvarn8" &&
+        value != "kvarn" && value != "saw_int4" && value != "bdr_int4" &&
+        value != "turboquant_nc" && value != "turboquant_4bit_nc") {
         native.clear();
         return false;
     }
@@ -4111,16 +4117,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REMOTE_ATTN_STATS"));
     add_opt(common_arg(
         {"--rkva-range-storage"}, "FORMAT",
-        "remote range representation: 'auto', 'kvarn4'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'q4'/'q4_0', 'q4_1'/'iq4_nl' (experimental TCP), 'q8'/'q8_0', 'saw_int4', 'oscar_int2', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: backend auto)",
+        "remote range representation: 'auto', 'kvarn2'/'kvarn3'/'kvarn4'/'kvarn5'/'kvarn6'/'kvarn8'/'kvarn', 'f16'/'fp16', 'f32'/'fp32', 'bf16', 'q4'/'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1', 'q6_0', 'q6_1', 'q8'/'q8_0', 'q3_0', 'q3_1', 'q2_0s'/'q2_0', 'q2_1', 'saw_int4'/'bdr_int4', 'oscar_int2', 'turboquant_nc'/'turboquant-nc'/'tqnc'/'turboquant_4bit_nc' (default: backend auto)",
         [](common_params & params, const std::string & value) {
-            if (value != "auto" && value != "kvarn4" && value != "kvarn" &&
-                value != "f16" && value != "fp16" && value != "f32" && value != "fp32" &&
-                value != "q4" && value != "q4_0" && value != "q4_1" && value != "iq4_nl" && value != "q8" && value != "q8_0" &&
+            if (value != "auto" && value != "kvarn2" && value != "kvarn3" && value != "kvarn4" &&
+                value != "kvarn5" && value != "kvarn6" && value != "kvarn8" && value != "kvarn" &&
+                value != "f16" && value != "fp16" && value != "f32" && value != "fp32" && value != "bf16" &&
+                value != "q4" && value != "q4_0" && value != "q4_1" && value != "iq4_nl" &&
+                value != "q5_0" && value != "q5_1" && value != "q6_0" && value != "q6_1" &&
+                value != "q8" && value != "q8_0" && value != "q3_0" && value != "q3_1" &&
+                value != "q2_0s" && value != "q2_0" && value != "q2_1" &&
                 value != "saw_int4" && value != "saw-int4" && value != "saw4" && value != "bdr_int4" &&
                 value != "oscar_int2" && value != "oscar-int2" && value != "oscar2" &&
                 value != "turboquant_nc" && value != "turboquant-nc" && value != "tqnc" &&
                 value != "turboquant_4bit_nc") {
-                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn4/f16/f32/q4_0/q4_1/iq4_nl/q8_0/saw_int4/oscar_int2/turboquant_nc");
+                throw std::invalid_argument("invalid --rkva-range-storage, expected auto/kvarn2..kvarn8/f16/f32/bf16/q4_0/q4_1/iq4_nl/q5_0/q5_1/q6_0/q6_1/q8_0/q3_0/q3_1/q2_0s/q2_1/saw_int4/oscar_int2/turboquant_nc");
             }
             params.rkva_range_storage = value;
 #if !defined(_WIN32)

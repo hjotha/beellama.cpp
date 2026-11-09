@@ -68,11 +68,12 @@
 #include "rkva_range_attn_iq4_nl_decode_rowlane_dxil.h"
 #define RKVA_HAS_LOW4_DXIL 1
 #include "rkva_range_attn_oscar_int2_decode_rowlane_dxil.h"
+#include "rkva_range_attn_q2_0s_decode_rowlane_dxil.h"
 #include "rkva_range_attn_q5_0_decode_rowlane_dxil.h"
 #include "rkva_range_attn_q5_1_decode_rowlane_dxil.h"
 #include "rkva_range_attn_q6_0_decode_rowlane_dxil.h"
 #include "rkva_range_attn_q6_1_decode_rowlane_dxil.h"
-#include "rkva_range_attn_kvarn3_decode_rowlane_dxil.h"
+#include "rkva_range_attn_q3_0_decode_rowlane_dxil.h"
 #include "rkva_range_attn_q3_1_decode_rowlane_dxil.h"
 #include "rkva_range_attn_q2_1_decode_rowlane_dxil.h"
 #include "rkva_range_attn_bf16_decode_rowlane_dxil.h"
@@ -940,11 +941,12 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
         { RKVA_RANGE_STORAGE_Q5_1, g_rkva_range_attn_q5_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q5_1_decode_rowlane_dxil), "q5_1" },
         { RKVA_RANGE_STORAGE_Q6_0, g_rkva_range_attn_q6_0_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q6_0_decode_rowlane_dxil), "q6_0" },
         { RKVA_RANGE_STORAGE_Q6_1, g_rkva_range_attn_q6_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q6_1_decode_rowlane_dxil), "q6_1" },
-        { RKVA_RANGE_STORAGE_Q3_0, g_rkva_range_attn_kvarn3_decode_rowlane_dxil, sizeof(g_rkva_range_attn_kvarn3_decode_rowlane_dxil), "q3_0" },
+        { RKVA_RANGE_STORAGE_Q3_0, g_rkva_range_attn_q3_0_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q3_0_decode_rowlane_dxil), "q3_0" },
         { RKVA_RANGE_STORAGE_Q3_1, g_rkva_range_attn_q3_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q3_1_decode_rowlane_dxil), "q3_1" },
         { RKVA_RANGE_STORAGE_Q2_1, g_rkva_range_attn_q2_1_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q2_1_decode_rowlane_dxil), "q2_1" },
         { RKVA_RANGE_STORAGE_BF16, g_rkva_range_attn_bf16_decode_rowlane_dxil, sizeof(g_rkva_range_attn_bf16_decode_rowlane_dxil), "bf16" },
         { RKVA_RANGE_STORAGE_F32, g_rkva_range_attn_f32_decode_rowlane_dxil, sizeof(g_rkva_range_attn_f32_decode_rowlane_dxil), "f32" },
+        { RKVA_RANGE_STORAGE_Q2_0S, g_rkva_range_attn_q2_0s_decode_rowlane_dxil, sizeof(g_rkva_range_attn_q2_0s_decode_rowlane_dxil), "q2_0s" },
     };
     for (uint32_t i = 0; i < rkva_rprof::kNativeStorageCount; ++i) {
         if (wave_lane_min_ == 64 && wave_lane_max_ == 64 && range_attn_q4_opt_root_) {
@@ -2336,7 +2338,7 @@ bool RemoteAttnEngine::configure_kvarn_range(uint32_t id, const rkva_kvarn_range
         return fail(error, "native configuration epochs exhausted");
     const uint64_t heads = uint64_t(geo_.n_head_kv) * 2;
     const uint64_t groups = (uint64_t(c.capacity) + 127) / 128;
-    const uint64_t records = groups * heads * 8960;
+    const uint64_t records = groups * heads * c.record_bytes;
     const uint64_t stage = 384 * heads * 128 * 2;
     // Revision 3 keeps a 256-row physical ring for the logical 128-row tail.
     const uint64_t tail =
@@ -2547,7 +2549,7 @@ bool RemoteAttnEngine::upload_kvarn_range(uint32_t id, uint32_t layer,
             rkva_kvarn_range::compact_stage_supported(s->range_descriptor))) {
         return ::fail(error, "KVarN range upload: invalid descriptor/coverage/snapshot");
     }
-    const uint64_t record_group_bytes = uint64_t(geo_.n_head_kv) * 2 * 8960;
+    const uint64_t record_group_bytes = uint64_t(geo_.n_head_kv) * 2 * s->range_descriptor.record_bytes;
     const uint64_t rec_bytes = uint64_t(u.record_groups) * record_group_bytes;
     const bool reset = (u.flags & 1) != 0;
     const bool prefix = rkva_kvarn_range::serial_prefix(s->range_descriptor);
@@ -3406,9 +3408,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
             attn.wire != segments.front().wire) return ::fail(error, "native E4: mixed wires");
         const bool e4 = attn.wire == RKVA_WIRE_FP8_E4M3FN;
         if (e4) {
-            const uint32_t layout = storage == RKVA_RANGE_STORAGE_Q4_0 ? 4 :
-                storage == RKVA_RANGE_STORAGE_SAW_INT4 ? 6 : storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC ? 8 :
-                storage == RKVA_RANGE_STORAGE_Q4_1 ? RKVA_LAYOUT_Q4_1 : storage == RKVA_RANGE_STORAGE_IQ4_NL ? RKVA_LAYOUT_IQ4_NL : 0;
+            const uint32_t layout = rkva_kvarn_range::native_storage_layout(storage);
             if (!rkva_e4_layout_capability(storage, layout)) return ::fail(error, "native E4: unsupported storage");
             const bool reset = (u.flags & RKVA_KVARN_UPLOAD_RESET) != 0;
             if (reset ? (i != 0 || u.append_begin != 0) : u.append_begin != e4_live)
@@ -4301,6 +4301,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                     // PSO. It is not bit-exact, so the qualified attn_kvarn4_mq2
                     // pipeline remains the default.
                     if (q_tile == rp::kKvarn4MqTile && mq_i8_ &&
+                        s->range_descriptor.key_bits == 4 &&
                         range_attn_kvarn4_mq_i8_pso_) {
                         mq_pso = range_attn_kvarn4_mq_i8_pso_.Get();
                         selected_int8_dot = true;
@@ -4378,7 +4379,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                                    rows,
                                    direct ? 1u : 0u,
                                    kvarn ? uint32_t(s->records_bytes) : 0u,
-                                   kvarn ? s->precision_tail_tokens : 0u};
+                                   kvarn ? (s->precision_tail_tokens | (s->range_descriptor.key_bits << 16)) : 0u};
         cmd_->SetComputeRootSignature(range_attn_fmt_opt_root_.Get());
         cmd_->SetPipelineState(fmt_pso);
         cmd_->SetComputeRoot32BitConstants(0, 12, params, 0);
@@ -4476,7 +4477,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
                                split_k,
                                s->range_storage,
                                uint32_t(s->records_bytes),
-                               s->precision_tail_tokens};
+                               s->precision_tail_tokens | (s->range_descriptor.key_bits << 16)};
     cmd_->SetComputeRootSignature(range_attn_root_.Get());
     cmd_->SetPipelineState(prefix ? range_attn_kvarn4_prefix_pso_.Get()
                                   : range_attn_pso_[s->range_storage].Get());

@@ -133,6 +133,9 @@ static constexpr uint64_t RKVA_CAP_NATIVE_OSCAR_INT2_BULK_E4M3FN = 1ull << 50;
 static constexpr uint64_t RKVA_CAP_NATIVE_Q2_1_BULK_E4M3FN = 1ull << 51;
 static constexpr uint64_t RKVA_CAP_NATIVE_BF16_BULK_E4M3FN = 1ull << 52;
 static constexpr uint64_t RKVA_CAP_NATIVE_F32_BULK_E4M3FN = 1ull << 53;
+static constexpr uint64_t RKVA_CAP_NATIVE_Q2_0S_BULK = 1ull << 54;
+static constexpr uint64_t RKVA_CAP_NATIVE_Q2_0S_BULK_E4M3FN = 1ull << 55;
+static constexpr uint64_t RKVA_CAP_NATIVE_Q8_BULK_E4M3FN = 1ull << 56;
 // Capability allocation in HELLO ack.reserved[0]:
 //   0..13  range/KVarN storage and bulk features
 //   14     RKVA_CAP_NATIVE_Q4_BULK (descriptor layout 4)
@@ -219,6 +222,7 @@ static constexpr uint32_t RKVA_RANGE_STORAGE_Q3_1 = 1u << 13;
 static constexpr uint32_t RKVA_RANGE_STORAGE_Q2_1 = 1u << 14;
 static constexpr uint32_t RKVA_RANGE_STORAGE_BF16 = 1u << 15;
 static constexpr uint32_t RKVA_RANGE_STORAGE_F32  = 1u << 16;
+static constexpr uint32_t RKVA_RANGE_STORAGE_Q2_0S = 1u << 17;
 static constexpr uint32_t RKVA_LAYOUT_Q4_1 = 9;
 static constexpr uint32_t RKVA_LAYOUT_IQ4_NL = 10;
 static constexpr uint32_t RKVA_LAYOUT_Q5_0 = 11;
@@ -230,10 +234,12 @@ static constexpr uint32_t RKVA_LAYOUT_Q3_1 = 16;
 static constexpr uint32_t RKVA_LAYOUT_Q2_1 = 17;
 static constexpr uint32_t RKVA_LAYOUT_BF16 = 18;
 static constexpr uint32_t RKVA_LAYOUT_F32  = 19;
+static constexpr uint32_t RKVA_LAYOUT_Q2_0S = 20;
 // Exact descriptor identity, not a bitwise storage test. Unknown layouts fail closed.
 static constexpr uint64_t rkva_e4_layout_capability(uint32_t storage, uint32_t layout) {
     return storage == RKVA_RANGE_STORAGE_KVARN4 && layout == 3 ? RKVA_CAP_KVARN_BULK_E4M3FN :
            storage == RKVA_RANGE_STORAGE_Q4_0 && layout == 4 ? RKVA_CAP_NATIVE_Q4_BULK_E4M3FN :
+           storage == RKVA_RANGE_STORAGE_Q8_0 && layout == 5 ? RKVA_CAP_NATIVE_Q8_BULK_E4M3FN :
            storage == RKVA_RANGE_STORAGE_SAW_INT4 && layout == 6 ? RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN :
            storage == RKVA_RANGE_STORAGE_OSCAR_INT2 && layout == 7 ? RKVA_CAP_NATIVE_OSCAR_INT2_BULK_E4M3FN :
            storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC && layout == 8 ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN :
@@ -247,7 +253,8 @@ static constexpr uint64_t rkva_e4_layout_capability(uint32_t storage, uint32_t l
            storage == RKVA_RANGE_STORAGE_Q3_1 && layout == RKVA_LAYOUT_Q3_1 ? RKVA_CAP_NATIVE_Q3_1_BULK_E4M3FN :
            storage == RKVA_RANGE_STORAGE_Q2_1 && layout == RKVA_LAYOUT_Q2_1 ? RKVA_CAP_NATIVE_Q2_1_BULK_E4M3FN :
            storage == RKVA_RANGE_STORAGE_BF16 && layout == RKVA_LAYOUT_BF16 ? RKVA_CAP_NATIVE_BF16_BULK_E4M3FN :
-           storage == RKVA_RANGE_STORAGE_F32  && layout == RKVA_LAYOUT_F32  ? RKVA_CAP_NATIVE_F32_BULK_E4M3FN : 0;
+           storage == RKVA_RANGE_STORAGE_F32  && layout == RKVA_LAYOUT_F32  ? RKVA_CAP_NATIVE_F32_BULK_E4M3FN :
+           storage == RKVA_RANGE_STORAGE_Q2_0S && layout == RKVA_LAYOUT_Q2_0S ? RKVA_CAP_NATIVE_Q2_0S_BULK_E4M3FN : 0;
 }
 static constexpr bool rkva_e4_layout_allowed(uint64_t caps, uint32_t storage, uint32_t layout) {
     const uint64_t required = rkva_e4_layout_capability(storage, layout);

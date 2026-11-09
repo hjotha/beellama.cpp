@@ -1,8 +1,8 @@
 // RKVA Group A rowlane dequantization formats for Xbox Series X (Wave64).
 // Formats:
 //   1. f16   - 512 bytes / 256 dims (256 fp16 elements)
-//   2. q5_0  - 176 bytes / 256 dims (8 blocks of 22 bytes: kvarn5)
-//   3. q6_0  - 208 bytes / 256 dims (8 blocks of 26 bytes: kvarn6)
+//   2. q5_0  - 176 bytes / 256 dims (8 blocks of 22 bytes: GGML block_q5_0, distinct from 2D WHT+Sinkhorn KVarN5)
+//   3. q6_0  - 208 bytes / 256 dims (8 blocks of 26 bytes: GGML block_q6_0, distinct from 2D WHT+Sinkhorn KVarN6)
 //
 // In Wave64 rowlane decode, 64 lanes map to 64 quarter-units u in [0, 63].
 // Each quarter-unit u loads 4 floats (float4) covering 4 dimensions given by quarter_dim(u).

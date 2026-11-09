@@ -129,6 +129,12 @@ inline uint64_t get_u64(const uint8_t* src) {
     return value;
 }
 
+inline bool valid_kvarn_bits(uint32_t bits) {
+    return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
+}
+inline uint32_t kvarn_record_bytes(uint32_t bits) {
+    return bits * 2048u + 768u;
+}
 inline bool valid_descriptor(const Descriptor& d, const Geometry& g) {
     return g.n_head && g.n_head_kv && g.n_head % g.n_head_kv == 0 && g.n_head_kv <= 256 &&
            g.head_dim == 256 && g.head_slices == 2 && g.max_ctx && g.n_layers &&
@@ -136,8 +142,8 @@ inline bool valid_descriptor(const Descriptor& d, const Geometry& g) {
            d.layout_version == 3 && d.origin % 128 == 0 && d.capacity > 0 &&
            d.capacity <= uint32_t(INT32_MAX) && d.origin <= uint32_t(INT32_MAX) - d.capacity &&
            d.token_group == 128 && d.record_dim == 128 && d.head_dim == 256 &&
-           d.head_slices == 2 && d.key_bits == 4 && d.value_bits == 4 &&
-           d.record_bytes == kRecordBytes && d.stage_groups == 3 && d.tail_groups == 2 &&
+           d.head_slices == 2 && d.key_bits == d.value_bits && valid_kvarn_bits(d.key_bits) &&
+           d.record_bytes == kvarn_record_bytes(d.key_bits) && d.stage_groups == 3 && d.tail_groups == 2 &&
            d.sink_tokens == 128 &&
            (!d.precision_tail_tokens || rkva_native_history_rows(d.precision_tail_tokens)) &&
            (d.precision_tail_tokens <= d.capacity || d.precision_tail_tokens == 128) &&
@@ -200,8 +206,11 @@ inline bool same_descriptor(const Descriptor& a, const Descriptor& b) {
 inline uint64_t record_group_bytes(const Geometry& g) {
     return uint64_t(g.n_head_kv) * 2ull * kRecordBytes;
 }
+inline uint64_t record_group_bytes(const Descriptor& d, const Geometry& g) {
+    return uint64_t(g.n_head_kv) * 2ull * (d.record_bytes ? d.record_bytes : kRecordBytes);
+}
 inline uint64_t record_stride_bytes(const Descriptor& d, const Geometry& g) {
-    return uint64_t((uint64_t(d.capacity) + 127) / 128) * record_group_bytes(g);
+    return uint64_t((uint64_t(d.capacity) + 127) / 128) * record_group_bytes(d, g);
 }
 inline uint64_t stage_bytes(const Geometry& g) {
     return uint64_t(kStageRows) * uint64_t(g.n_head_kv) * 256ull * sizeof(uint16_t);
@@ -304,7 +313,7 @@ inline bool build(const Geometry& g, const Descriptor& d, uint32_t live, uint64_
     std::memcpy(manifest.host_state_sha256, host_sha256, 32);
     manifest.layers = layers;
     const uint64_t groups = live / 128;
-    const uint64_t record = record_group_bytes(g);
+    const uint64_t record = record_group_bytes(d, g);
     const uint64_t record_base = record_stride_bytes(d, g);
     const uint64_t stage = stage_bytes(g);
     const uint64_t tail = tail_bytes(d, g);

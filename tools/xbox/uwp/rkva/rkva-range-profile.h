@@ -80,7 +80,8 @@ constexpr uint32_t kStorageQ3_1 = 1u << 13;
 constexpr uint32_t kStorageQ2_1 = 1u << 14;
 constexpr uint32_t kStorageBF16 = 1u << 15;
 constexpr uint32_t kStorageF32 = 1u << 16;
-constexpr uint32_t kNativeStorageCount = 14;
+constexpr uint32_t kStorageQ2_0S = 1u << 17;
+constexpr uint32_t kNativeStorageCount = 15;
 
 inline uint32_t native_storage_index(uint32_t storage) {
     switch (storage) {
@@ -98,6 +99,7 @@ inline uint32_t native_storage_index(uint32_t storage) {
     case kStorageQ2_1: return 11;
     case kStorageBF16: return 12;
     case kStorageF32: return 13;
+    case kStorageQ2_0S: return 14;
     default: return kNativeStorageCount;
     }
 }
@@ -118,6 +120,7 @@ inline const char* kernel_name(uint32_t storage, uint32_t mode) {
     if (storage == kStorageQ2_1) return "q2_1_rowlane";
     if (storage == kStorageBF16) return "bf16_rowlane";
     if (storage == kStorageF32) return "f32_rowlane";
+    if (storage == kStorageQ2_0S) return "q2_0s_rowlane";
     if (mode == kModeReference || !valid_mode(mode)) {
         return mode_name(mode);
     }

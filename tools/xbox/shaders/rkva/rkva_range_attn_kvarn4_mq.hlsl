@@ -118,6 +118,39 @@ cbuffer Params : register(b0) {
     uint records_bytes;
     uint precision_tail_tokens;
 };
+uint rkva_tail_tokens() { return precision_tail_tokens & 0xFFFFu; }
+uint rkva_kvarn_bits() { uint b = precision_tail_tokens >> 16; return b ? b : 4u; }
+uint rkva_pay_bytes() { return rkva_kvarn_bits() * 2048u; }
+uint rkva_rec_bytes() { return rkva_pay_bytes() + 768u; }
+
+uint kvarn_unpack1(ByteAddressBuffer buffer, uint base, uint index, uint bits) {
+    uint bit_pos = index * bits;
+    uint word_off = (bit_pos >> 5) * 4u;
+    uint shift = bit_pos & 31u;
+    uint mask = (1u << bits) - 1u;
+    if (shift + bits <= 32u) {
+        return (buffer.Load(base + word_off) >> shift) & mask;
+    } else {
+        uint2 w = buffer.Load2(base + word_off);
+        return ((w.x >> shift) | (w.y << (32u - shift))) & mask;
+    }
+}
+
+uint4 kvarn_unpack4(ByteAddressBuffer buffer, uint base, uint index, uint bits) {
+    uint bit_pos = index * bits;
+    uint word_off = (bit_pos >> 5) * 4u;
+    uint shift = bit_pos & 31u;
+    uint mask = (1u << bits) - 1u;
+    if (shift + 4u * bits <= 32u) {
+        uint w = buffer.Load(base + word_off) >> shift;
+        return uint4(w & mask, (w >> bits) & mask, (w >> (2u * bits)) & mask, (w >> (3u * bits)) & mask);
+    } else {
+        return uint4(kvarn_unpack1(buffer, base, index + 0u, bits),
+                     kvarn_unpack1(buffer, base, index + 1u, bits),
+                     kvarn_unpack1(buffer, base, index + 2u, bits),
+                     kvarn_unpack1(buffer, base, index + 3u, bits));
+    }
+}
 ByteAddressBuffer queries : register(t0);
 ByteAddressBuffer keys : register(t1);
 ByteAddressBuffer values : register(t2);
@@ -225,28 +258,29 @@ float4 load_stage4(ByteAddressBuffer buffer, uint row, uint kv_head, uint u) {
 float4 load_record4(ByteAddressBuffer buffer, bool value, uint row, uint kv_head, uint u) {
     uint group = row / 128, pos = row & 127;
     uint dim = (u & 31) * 4;
-    uint base = (group * n_head_kv * 2 + kv_head * 2 + (u >> 5)) * RKVA_RECORD;
+    uint bits = rkva_kvarn_bits();
+    uint pay_bytes = bits * 2048u;
+    uint rec_bytes = pay_bytes + 768u;
+    uint base = (group * n_head_kv * 2 + kv_head * 2 + (u >> 5)) * rec_bytes;
     float4 result;
     if (value) {
         uint index = pos * 128 + dim;
-        uint word = buffer.Load(base + (index / 8) * 4) >> ((index & 7) * 4);
-        float scale = half_at(buffer, base + 8192 + pos * 2);
-        float zero = half_at(buffer, base + 8448 + pos * 2);
-        float4 other = halves4(buffer.Load2(base + 8704 + dim * 2));
-        result.x = decode(word & 15u, scale, zero, other.x);
-        result.y = decode((word >> 4) & 15u, scale, zero, other.y);
-        result.z = decode((word >> 8) & 15u, scale, zero, other.z);
-        result.w = decode((word >> 12) & 15u, scale, zero, other.w);
+        uint4 qv = kvarn_unpack4(buffer, base, index, bits);
+        float scale = half_at(buffer, base + pay_bytes + pos * 2);
+        float zero = half_at(buffer, base + pay_bytes + 256u + pos * 2);
+        float4 other = halves4(buffer.Load2(base + pay_bytes + 512u + dim * 2));
+        result.x = decode(qv.x, scale, zero, other.x);
+        result.y = decode(qv.y, scale, zero, other.y);
+        result.z = decode(qv.z, scale, zero, other.z);
+        result.w = decode(qv.w, scale, zero, other.w);
     } else {
-        float4 scale = halves4(buffer.Load2(base + 8192 + dim * 2));
-        float4 zero = halves4(buffer.Load2(base + 8448 + dim * 2));
-        float other = half_at(buffer, base + 8704 + pos * 2);
-        uint shift = (pos & 7) * 4;
-        uint nib_base = base + (pos / 8) * 4;
-        result.x = decode((buffer.Load(nib_base + (dim + 0) * 64) >> shift) & 15u, scale.x, zero.x, other);
-        result.y = decode((buffer.Load(nib_base + (dim + 1) * 64) >> shift) & 15u, scale.y, zero.y, other);
-        result.z = decode((buffer.Load(nib_base + (dim + 2) * 64) >> shift) & 15u, scale.z, zero.z, other);
-        result.w = decode((buffer.Load(nib_base + (dim + 3) * 64) >> shift) & 15u, scale.w, zero.w, other);
+        float4 scale = halves4(buffer.Load2(base + pay_bytes + dim * 2));
+        float4 zero = halves4(buffer.Load2(base + pay_bytes + 256u + dim * 2));
+        float other = half_at(buffer, base + pay_bytes + 512u + pos * 2);
+        result.x = decode(kvarn_unpack1(buffer, base, (dim + 0) * 128 + pos, bits), scale.x, zero.x, other);
+        result.y = decode(kvarn_unpack1(buffer, base, (dim + 1) * 128 + pos, bits), scale.y, zero.y, other);
+        result.z = decode(kvarn_unpack1(buffer, base, (dim + 2) * 128 + pos, bits), scale.z, zero.z, other);
+        result.w = decode(kvarn_unpack1(buffer, base, (dim + 3) * 128 + pos, bits), scale.w, zero.w, other);
     }
     return result;
 }
@@ -343,7 +377,7 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
         uint causal_count = query_pos < int(origin) ? 0 : uint(query_pos) - origin + 1;
         uint limit = qi < n_query ? min(active_count, causal_count) : 0;
         window[j] = limit;
-        tail_begin[j] = limit - min(limit, precision_tail_tokens);
+        tail_begin[j] = limit - min(limit, rkva_tail_tokens());
         uint end = min(limit, split_end);
         act[j] = end > split_begin;
         end_q[j] = act[j] ? end : 0;
@@ -601,40 +635,40 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
 #else
     uint cached_group = 0xffffffffu;
     uint base = 0;
+    uint bits = rkva_kvarn_bits();
+    uint pay_bytes = bits * 2048u;
+    uint rec_bytes = pay_bytes + 768u;
     float4 kscale = float4(0, 0, 0, 0), kzero = kscale, vother = kscale;
     [loop] for (uint t0 = fast_lo + wave * RKVA_TILE; t0 < fast_hi; t0 += n_waves * RKVA_TILE) {
         uint rgroup = t0 / 128, pos0 = t0 & 127;
         if (rgroup != cached_group) {
-            base = (rgroup * n_head_kv * 2 + kv_head * 2 + (u >> 5)) * RKVA_RECORD;
-            kscale = halves4(keys.Load2(base + 8192 + dim * 2));
-            kzero = halves4(keys.Load2(base + 8448 + dim * 2));
-            vother = halves4(values.Load2(base + 8704 + dim * 2));
+            base = (rgroup * n_head_kv * 2 + kv_head * 2 + (u >> 5)) * rec_bytes;
+            kscale = halves4(keys.Load2(base + pay_bytes + dim * 2));
+            kzero = halves4(keys.Load2(base + pay_bytes + 256u + dim * 2));
+            vother = halves4(values.Load2(base + pay_bytes + 512u + dim * 2));
             cached_group = rgroup;
         }
-        uint4 kother_bits = keys.Load4(base + 8704 + pos0 * 2);
-        uint nib_base = base + (pos0 / 8) * 4;
-        uint kw[4] = {keys.Load(nib_base + (dim + 0) * 64), keys.Load(nib_base + (dim + 1) * 64),
-                      keys.Load(nib_base + (dim + 2) * 64), keys.Load(nib_base + (dim + 3) * 64)};
-        uint4 vscale_bits = values.Load4(base + 8192 + pos0 * 2);
-        uint4 vzero_bits = values.Load4(base + 8448 + pos0 * 2);
+        uint4 kother_bits = keys.Load4(base + pay_bytes + 512u + pos0 * 2);
+        uint4 vscale_bits = values.Load4(base + pay_bytes + pos0 * 2);
+        uint4 vzero_bits = values.Load4(base + pay_bytes + 256u + pos0 * 2);
         [unroll] for (uint h = 0; h < RKVA_TILE / RKVA_HALF; ++h) {
             float4 k_half[RKVA_HALF], v_half[RKVA_HALF];
             [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
                 uint tt = h * RKVA_HALF + t;
                 uint sh = (tt & 1) * 16;
                 float other = f16tof32((kother_bits[tt / 2] >> sh) & 65535u);
-                k_half[t].x = decode((kw[0] >> (4 * tt)) & 15u, kscale.x, kzero.x, other);
-                k_half[t].y = decode((kw[1] >> (4 * tt)) & 15u, kscale.y, kzero.y, other);
-                k_half[t].z = decode((kw[2] >> (4 * tt)) & 15u, kscale.z, kzero.z, other);
-                k_half[t].w = decode((kw[3] >> (4 * tt)) & 15u, kscale.w, kzero.w, other);
+                k_half[t].x = decode(kvarn_unpack1(keys, base, (dim + 0) * 128 + pos0 + tt, bits), kscale.x, kzero.x, other);
+                k_half[t].y = decode(kvarn_unpack1(keys, base, (dim + 1) * 128 + pos0 + tt, bits), kscale.y, kzero.y, other);
+                k_half[t].z = decode(kvarn_unpack1(keys, base, (dim + 2) * 128 + pos0 + tt, bits), kscale.z, kzero.z, other);
+                k_half[t].w = decode(kvarn_unpack1(keys, base, (dim + 3) * 128 + pos0 + tt, bits), kscale.w, kzero.w, other);
                 float scale = f16tof32((vscale_bits[tt / 2] >> sh) & 65535u);
                 float zero = f16tof32((vzero_bits[tt / 2] >> sh) & 65535u);
                 uint index = (pos0 + tt) * 128 + dim;
-                uint word = values.Load(base + (index / 8) * 4) >> ((index & 7) * 4);
-                v_half[t].x = decode(word & 15u, scale, zero, vother.x);
-                v_half[t].y = decode((word >> 4) & 15u, scale, zero, vother.y);
-                v_half[t].z = decode((word >> 8) & 15u, scale, zero, vother.z);
-                v_half[t].w = decode((word >> 12) & 15u, scale, zero, vother.w);
+                uint4 qv = kvarn_unpack4(values, base, index, bits);
+                v_half[t].x = decode(qv.x, scale, zero, vother.x);
+                v_half[t].y = decode(qv.y, scale, zero, vother.y);
+                v_half[t].z = decode(qv.z, scale, zero, vother.z);
+                v_half[t].w = decode(qv.w, scale, zero, vother.w);
             }
             [unroll] for (uint j = 0; j < RKVA_MQ_QT; ++j) {
                 [branch] if (act[j]) {

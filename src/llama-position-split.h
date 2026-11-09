@@ -52,6 +52,7 @@ inline constexpr uint32_t kRangeOverflow     = 1;
 // Logical range identities, distinct from RKVA storage bits/descriptor layouts.
 inline constexpr uint8_t kFormatQ4_1 = 6;
 inline constexpr uint8_t kFormatIQ4_NL = 7;
+inline constexpr uint8_t kFormatExtended = 8;
 
 inline float lse_neg_inf() {
     return -std::numeric_limits<float>::infinity();
@@ -135,13 +136,14 @@ inline std::string validate_ranges(const std::vector<range_desc> & descs,
         if (ovf->start != p || ovf->end != c) {
             return "faixa overflow deve ser [P,C)";
         }
-        if (local->backend != 0 || (local->format != 0 && local->format != 1 && local->format != 2 && local->format != 3 && local->format != 4 && local->format != 5 && local->format != kFormatQ4_1 && local->format != kFormatIQ4_NL)) {
-            return "faixa local deve ser CUDA (KVarN, Q4_0, Q8_0, F16, SAW INT4, NC, Q4_1 ou IQ4_NL)";
+        if (local->backend != 0 || (local->format != 0 && local->format != 1 && local->format != 2 && local->format != 3 && local->format != 4 && local->format != 5 && local->format != kFormatQ4_1 && local->format != kFormatIQ4_NL && local->format != kFormatExtended)) {
+            return "faixa local deve ser CUDA (KVarN, Q4_0, Q8_0, F16, SAW INT4, NC, Q4_1, IQ4_NL ou Extended)";
         }
         const bool valid_overflow_format = native_overflow_format >= 0 ?
                 ovf->format == native_overflow_format :
                 (ovf->format == 1 || ovf->format == 2 || ovf->format == 3 ||
-                 ovf->format == kFormatQ4_1 || ovf->format == kFormatIQ4_NL);
+                 ovf->format == kFormatQ4_1 || ovf->format == kFormatIQ4_NL ||
+                 ovf->format == kFormatExtended);
         if (ovf->backend != 1 || !valid_overflow_format) {
             return "formato ou backend da faixa overflow incompatível";
         }

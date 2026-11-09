@@ -497,6 +497,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                     { RKVA_RANGE_STORAGE_Q2_1,          RKVA_CAP_NATIVE_Q2_1_BULK,          RKVA_CAP_NATIVE_Q2_1_BULK_E4M3FN },
                     { RKVA_RANGE_STORAGE_BF16,          RKVA_CAP_NATIVE_BF16_BULK,          RKVA_CAP_NATIVE_BF16_BULK_E4M3FN },
                     { RKVA_RANGE_STORAGE_F32,           RKVA_CAP_NATIVE_F32_BULK,           RKVA_CAP_NATIVE_F32_BULK_E4M3FN },
+                    { RKVA_RANGE_STORAGE_Q2_0S,         RKVA_CAP_NATIVE_Q2_0S_BULK,         RKVA_CAP_NATIVE_Q2_0S_BULK_E4M3FN },
                 };
                 for (const auto& nc : kNativeCaps) {
                     if (state.engine->native_extended_available(nc.storage)) {
@@ -507,7 +508,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
                     }
                 }
                 if (state.e4_client) {
-                    ack.reserved[0] |= RKVA_CAP_KVARN_BULK_E4M3FN | RKVA_CAP_NATIVE_Q4_BULK_E4M3FN;
+                    ack.reserved[0] |= RKVA_CAP_KVARN_BULK_E4M3FN | RKVA_CAP_NATIVE_Q4_BULK_E4M3FN | RKVA_CAP_NATIVE_Q8_BULK_E4M3FN;
                 }
             }
             if (state.native_snapshot_client)

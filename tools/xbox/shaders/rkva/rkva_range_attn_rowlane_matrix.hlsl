@@ -1,15 +1,14 @@
 // RKVA v2 Wave64 rowlane decode attention matrix for Xbox Series X (RDNA2).
-// Implements dedicated Wave64 rowlane kernels across all requested formats:
-// - F16
-// - Q4_1
-// - Q5_0 / KVarN5
-// - Q5_1
-// - Q6_0 / KVarN6
-// - Q6_1
-// - IQ4_NL
-// - KVarN2 (Q2_0S)
-// - KVarN3 (Q3_0)
-// - KVarN8 (Q8_0)
+// Implements dedicated Wave64 rowlane kernels across 1D block/row formats
+// (distinct from 2D WHT + Sinkhorn KVarN2/3/4/5/6/8 records in rkva_range_attn_kvarn4*.hlsl):
+// - F16, BF16, F32
+// - Q4_1, IQ4_NL
+// - Q5_0, Q5_1
+// - Q6_0, Q6_1
+// - Q2_0S, Q2_1
+// - Q3_0, Q3_1
+// - Q8_0
+// - SAW_INT4 (BDR_INT4), OSCAR_INT2
 //
 // Each group owns (kv_head, query, split) and processes all RKVA_GQA query heads.
 // In Wave64 decode, 64 lanes map to 64 quarter-units (covering 256 dims).
@@ -126,7 +125,15 @@ groupshared float gs_acc[RKVA_MAX_WAVES * RKVA_GQA * RKVA_DIM];
 #include "rkva_decode_rowlane_template.hlsli"
 #endif
 
-#if ROWLANE_KVARN2 || ROWLANE_Q2_0S
+#if ROWLANE_Q2_0S
+#define ROWLANE_ENTRY CSRangeAttnQ2_0SDecodeRowlane
+#define ROWLANE_ROW_HEAD RKVA_ROW_HEAD_Q2_0S
+#define ROWLANE_LOAD load_q2_0s
+#define ROWLANE_QUARTER_DIM quarter_dim_q2_0s
+#include "rkva_decode_rowlane_template.hlsli"
+#endif
+
+#if ROWLANE_KVARN2
 #define ROWLANE_ENTRY CSRangeAttnKvarn2DecodeRowlane
 #define ROWLANE_ROW_HEAD RKVA_ROW_HEAD_KVARN2
 #define ROWLANE_LOAD load_kvarn2
@@ -134,7 +141,15 @@ groupshared float gs_acc[RKVA_MAX_WAVES * RKVA_GQA * RKVA_DIM];
 #include "rkva_decode_rowlane_template.hlsli"
 #endif
 
-#if ROWLANE_KVARN3 || ROWLANE_Q3_0
+#if ROWLANE_Q3_0
+#define ROWLANE_ENTRY CSRangeAttnQ3_0DecodeRowlane
+#define ROWLANE_ROW_HEAD RKVA_ROW_HEAD_Q3_0
+#define ROWLANE_LOAD load_q3_0
+#define ROWLANE_QUARTER_DIM quarter_dim_q3_0
+#include "rkva_decode_rowlane_template.hlsli"
+#endif
+
+#if ROWLANE_KVARN3
 #define ROWLANE_ENTRY CSRangeAttnKvarn3DecodeRowlane
 #define ROWLANE_ROW_HEAD RKVA_ROW_HEAD_KVARN3
 #define ROWLANE_LOAD load_kvarn3
