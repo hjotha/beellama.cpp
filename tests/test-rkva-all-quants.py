@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Test suite verifying that all KV cache quantization formats in beellama.cpp
-are supported by Xbox Remote Attention (RKVA), execute efficiently on the GPU,
-and produce valid numerical outputs.
+Live protocol smoke test for KV cache formats in Xbox Remote Attention (RKVA).
+This is not numerical or performance qualification: replies lack a full CPU
+attention oracle, and the 256-token KVarN case is covered by sink/stage/tail.
+RTT includes transport overhead and must not be reported as GPU kernel time.
 
 Clearly separates:
 - Standard GGML 1D 32-element block quantizations:
@@ -459,25 +460,30 @@ def generate_quant_bytes(name, head_bytes, n_heads, n_rows, is_k=True):
     return bytes(data)
 
 def generate_kvarn_records(bits, record_bytes, n_head_kv, n_groups):
-    """Generate valid KVarN 2D WHT + Sinkhorn records (packed bit-planes + s1, s2, mu FP16 metadata)."""
+    """Generate synthetic records: packed codes + scale, zero, other FP16 metadata.
+
+    These records are not a quantization of the separately generated stage/tail.
+    They are useful for protocol smoke tests, not a quality reference.
+    """
     heads = n_head_kv * 2  # 2 slices of 128 per head_dim=256
     total = n_groups * heads * record_bytes
     data = bytearray(total)
     q_bytes = bits * 2048
     s_fp16 = struct.pack("<e", 0.05)
-    mu_fp16 = struct.pack("<e", 0.0)
+    zero_fp16 = struct.pack("<e", -0.1)
+    other_fp16 = struct.pack("<e", 1.0)
     # Fill bit-planes with alternating pattern so dequantized values are non-trivial
     for g in range(n_groups):
         for h in range(heads):
             base = (g * heads + h) * record_bytes
             for i in range(0, q_bytes, 4):
                 data[base + i : base + i + 4] = b"\x55\xaa\x55\xaa"
-            # s1 (128 FP16), s2 (128 FP16), mu (128 FP16) = 768 bytes
+            # scale (128 FP16), zero (128 FP16), other (128 FP16) = 768 bytes
             meta = base + q_bytes
             for idx in range(128):
                 data[meta + idx * 2 : meta + idx * 2 + 2] = s_fp16
-                data[meta + 256 + idx * 2 : meta + 256 + idx * 2 + 2] = s_fp16
-                data[meta + 512 + idx * 2 : meta + 512 + idx * 2 + 2] = mu_fp16
+                data[meta + 256 + idx * 2 : meta + 256 + idx * 2 + 2] = zero_fp16
+                data[meta + 512 + idx * 2 : meta + 512 + idx * 2 + 2] = other_fp16
     return bytes(data)
 
 def generate_f16_rows(n_rows, n_head_kv, head_dim=256):
@@ -863,14 +869,14 @@ def test_xbox_all_quants(host="192.168.1.200", port=50054):
     print("=" * 112)
 
     if all_passed:
-        print(f"\n>>> ALL {len(results)} KV CACHE QUANTIZATION FORMATS SUCCESSFULLY VERIFIED ON XBOX SERIES X! <<<")
+        print(f"\n>>> {len(results)} FORMAT PROTOCOL SMOKE TESTS PASSED; NUMERICS AND GPU PERFORMANCE NOT QUALIFIED. <<<")
     else:
         print("\n>>> SOME FORMATS FAILED VERIFICATION. <<<")
     return all_passed
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="192.168.1.200")
+    parser.add_argument("--host", required=True, help="explicitly authorized Xbox test endpoint")
     parser.add_argument("--port", type=int, default=50054)
     args = parser.parse_args()
     ok = test_xbox_all_quants(args.host, args.port)

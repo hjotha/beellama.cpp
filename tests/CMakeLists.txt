@@ -18,6 +18,9 @@ if (Python3_Interpreter_FOUND)
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/xbox/tests/native_companion_hardware.py --self-test)
         set_tests_properties(test-server-prompt-cleanup test-adaptive-native-companion test-legacy-native-stream-layout test-rkva-companion-context test-native-companion-acceptance test-native-companion-hardware-self-test PROPERTIES LABELS main TIMEOUT 60)
     endif()
+    add_test(NAME test-rkva-quant-unpack
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/xbox/tests/test_rkva_quant_unpack.py)
+    set_tests_properties(test-rkva-quant-unpack PROPERTIES LABELS main TIMEOUT 30)
     add_test(NAME test-rkva-rowlane-uniform
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-rkva-rowlane-uniform.py)
     set_tests_properties(test-rkva-rowlane-uniform PROPERTIES LABELS main TIMEOUT 30)
@@ -1232,6 +1235,7 @@ if (UNIX)
         ENVIRONMENT "CUDA_VISIBLE_DEVICES=;GGML_VK_VISIBLE_DEVICES=")
 endif()
 llama_build_and_test(test-rkva-kvarn-producer.cpp)
+llama_build_and_test(test-rkva-format-selection.cpp)
 llama_build_and_test(test-rkva-native-state.cpp)
 target_include_directories(test-rkva-native-state PRIVATE
     ${PROJECT_SOURCE_DIR}/ggml/src/ggml-remote-attn)

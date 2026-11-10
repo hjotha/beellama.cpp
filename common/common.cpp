@@ -3465,7 +3465,10 @@ enum llama_remote_native_companion common_resolve_remote_native_companion(const 
             throw std::invalid_argument("native remote companion requires matching K/V and an explicitly enabled native upload format");
         }
         native_selection = format_id(native_k);
-        if (native_selection == LLAMA_REMOTE_COMPANION_NONE || native_selection != format_id(selected))
+        if (native_selection == LLAMA_REMOTE_COMPANION_NONE || native_selection != format_id(selected) ||
+                (native_selection == LLAMA_REMOTE_COMPANION_KVARN4 &&
+                 (native_k == "kvarn" ? "kvarn4" : native_k) !=
+                 (selected == "kvarn" ? "kvarn4" : selected)))
             throw std::invalid_argument("native remote companion must match the selected upload format");
     } else if (!remote_cache_k && !remote_cache_v && params.kv_position_split_p != 0) {
         const char * legacy = std::getenv("GGML_RKVA_NATIVE_COMPANION");

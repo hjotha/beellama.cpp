@@ -146,6 +146,12 @@ static void test_kvarn_vs_qx_separation() {
         assert(!rkva_kvarn_range::valid_q8_descriptor(kd, 256));
         assert(!rkva_kvarn_range::valid_q4_descriptor(kd, 256));
         assert(!rkva_kvarn_range::valid_extended_native_descriptor(kd, 256));
+        auto tail_boundary = kd;
+        tail_boundary.capacity = 131072;
+        tail_boundary.precision_tail_tokens = 65535;
+        assert(rkva_kvarn_range::valid_descriptor(tail_boundary, 256));
+        tail_boundary.precision_tail_tokens = 65536;
+        assert(!rkva_kvarn_range::valid_descriptor(tail_boundary, 256));
         auto bad_rec = kd;
         bad_rec.record_bytes = 272; // q8_0 head_bytes must NOT be accepted as kvarn8!
         assert(!rkva_kvarn_range::valid_descriptor(bad_rec, 256));
@@ -168,9 +174,47 @@ static void test_kvarn_vs_qx_separation() {
     std::puts("PASS: KVarN 2D (kvarn2/3/4/5/6/8) vs GGML 1D (q2_0s/q3_0/q4_0/q5_0/q6_0/q8_0) vs oscar_int2 strict separation");
 }
 
+static void test_extended_producer_bytes() {
+    // Compare actual upload bytes to the canonical GGML encoder, with nonzero,
+    // mixed-sign data and token/head boundaries. This is CPU codec coverage.
+    for (auto type : {GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1, GGML_TYPE_Q3_0, GGML_TYPE_Q3_1,
+                      GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q6_0, GGML_TYPE_Q6_1,
+                      GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        for (uint32_t heads : {1u, 3u}) for (uint32_t count : {1u, 2u, 127u, 128u, 129u}) {
+            rkva_low4_producer producer(256, 512, heads, type);
+            const size_t n = size_t(count) * heads * 256;
+            std::vector<float> k(n), v(n);
+            for (size_t i = 0; i < n; ++i) {
+                k[i] = std::sin(float(i) * .017f) * 17.f - 2.f;
+                v[i] = std::cos(float(i) * .021f) * 9.f + 1.f;
+            }
+            std::vector<int32_t> positions(count);
+            for (uint32_t i = 0; i < count; ++i) positions[i] = 256 + i;
+            std::vector<uint8_t> packet;
+            assert(producer.prepare(k.data(), v.data(), positions.data(), count));
+            assert(producer.append(k.data(), v.data(), positions.data(), count, true, packet));
+            const size_t plane = size_t(count) * producer.row_bytes();
+            assert(packet.size() == sizeof(rkva_kvarn_range_upload) + 2 * plane);
+            size_t offset = sizeof(rkva_kvarn_range_upload);
+            for (const auto * input : {k.data(), v.data()}) {
+                std::vector<uint8_t> expected(plane);
+                assert(ggml_quantize_chunk(type, input, expected.data(), 0, count * heads, 256, nullptr) == plane);
+                assert(std::memcmp(packet.data() + offset, expected.data(), plane) == 0);
+                offset += plane;
+            }
+            assert(producer.rewind(0));
+            std::vector<uint8_t> repeated;
+            assert(producer.append(k.data(), v.data(), positions.data(), count, true, repeated));
+            assert(packet == repeated);
+        }
+    }
+    std::puts("PASS: 100 extended-format byte-exact producer/rewind cases");
+}
+
 int main() {
     ggml_backend_load_all();
     ggml_context * init = ggml_init({1u << 16, nullptr, true}); assert(init);
+    test_extended_producer_bytes();
     test_wire_validation();
     test_format(GGML_TYPE_Q4_1); test_format(GGML_TYPE_IQ4_NL);
     test_kvarn_vs_qx_separation();

@@ -4656,10 +4656,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
             ctx->geo.head_dim != 256 || ctx->geo.n_head_kv == 0 ||
             ctx->geo.group_tokens != 128 || ctx->geo.sinkhorn_iters == 0 ||
             ctx->geo.tail_type != 0 || ctx->geo.has_sinks || ctx->geo.swa ||
-            (source_type != GGML_TYPE_Q4_0 && source_type != GGML_TYPE_Q8_0 &&
-             source_type != GGML_TYPE_F32 && source_type != GGML_TYPE_Q2_0S &&
-             source_type != GGML_TYPE_Q3_0 && source_type != GGML_TYPE_Q5_0 &&
-             source_type != GGML_TYPE_Q6_0)) return false;
+            source_type != GGML_TYPE_F32) return false;
     if (const char * fuse = std::getenv("GGML_RKVA_RANGE_FUSE")) {
         if (std::strcmp(fuse, "auto") && std::strcmp(fuse, "0")) return false;
     }
@@ -4678,6 +4675,10 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     if (ctx->native_tail_override != UINT32_MAX)
         precision_tail_tokens = ctx->native_tail_override == 128 ? 128 :
                 std::min(ctx->native_tail_override, capacity);
+    if (precision_tail_tokens > RKVA_NATIVE_MAX_PRECISION_TAIL) {
+        GGML_LOG_ERROR("%s: native KVarN precision tail exceeds the 16-bit shader field; refusing truncation\n", GGML_REMOTE_ATTN_NAME);
+        return false;
+    }
     const bool rewind_v2 = (ctx->ack.reserved[0] & RKVA_CAP_KVARN_REWIND) &&
                            (ctx->ack.supported_ops & (1u << RKVA_KVARN_RANGE_REWIND));
     const bool serial_prefix = rewind_v2 && (ctx->ack.reserved[0] & RKVA_CAP_KVARN_SERIAL_PREFIX);
@@ -4968,12 +4969,10 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
         uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap,
         bool oscar_int2 = false) {
     const char * experimental = std::getenv("GGML_RKVA_EXPERIMENTAL_LOW4");
-    if ((source_type == GGML_TYPE_Q4_1 || source_type == GGML_TYPE_IQ4_NL) && (!experimental || std::strcmp(experimental, "1"))) {
-        const char * fmt = rkva_get_upload_format(ctx);
-        if (!fmt || (std::strcmp(fmt, "q4_1") != 0 && std::strcmp(fmt, "iq4_nl") != 0)) {
-            GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL requires GGML_RKVA_EXPERIMENTAL_LOW4=1; no fallback\n", GGML_REMOTE_ATTN_NAME);
-            return false;
-        }
+    if ((source_type == GGML_TYPE_Q4_1 || source_type == GGML_TYPE_IQ4_NL) &&
+            (!experimental || std::strcmp(experimental, "1"))) {
+        GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL requires GGML_RKVA_EXPERIMENTAL_LOW4=1; no fallback\n", GGML_REMOTE_ATTN_NAME);
+        return false;
     }
     const char * producer = std::getenv("GGML_RKVA_LOW4_PRODUCER");
     if (!producer) {
@@ -4989,6 +4988,10 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
     }
     const bool cuda_producer = producer && !std::strcmp(producer, "cuda");
     if (cuda_producer) {
+        if (oscar_int2 || (source_type != GGML_TYPE_Q4_1 && source_type != GGML_TYPE_IQ4_NL)) {
+            GGML_LOG_ERROR("%s: requested native row format has no CUDA producer; refusing CPU fallback\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
         auto reg = ggml_backend_reg_by_name("CUDA");
         if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_low4_native_prepare_v1") ||
                 ctx->geo.n_head_kv == 0 || ctx->geo.n_head_kv > 32) {
@@ -5100,7 +5103,7 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
             !storage || !capacity ||
             origin % 256 || uint64_t(origin) + capacity > INT32_MAX ||
             ctx->geo.max_ctx != capacity || ctx->geo.head_dim != rkva_low4_producer::head_dim ||
-            ctx->geo.n_head_kv == 0 || ctx->geo.n_head == 0 || ctx->geo.n_layer_remote == 0 ||
+            ctx->geo.n_head_kv == 0 || uint64_t(ctx->geo.n_head) != 6ull * ctx->geo.n_head_kv || ctx->geo.n_layer_remote == 0 ||
             ctx->geo.domain != GGML_REMOTE_ATTN_DOMAIN_AUTO ||
             ctx->geo.has_sinks || ctx->geo.swa) {
         return false;
@@ -5397,10 +5400,9 @@ bool ggml_remote_attn_companion_format_matches(const char * format, ggml_type so
         return source_type == GGML_TYPE_F32 || source_type == GGML_TYPE_Q4_0 || source_type == GGML_TYPE_Q8_0 || source_type == GGML_TYPE_F16;
     }
     if (rkva_kvarn_format_bits(format) != 0) {
-        return source_type == GGML_TYPE_F32 || source_type == GGML_TYPE_Q4_0 ||
-               source_type == GGML_TYPE_Q8_0 || source_type == GGML_TYPE_Q2_0S ||
-               source_type == GGML_TYPE_Q3_0 || source_type == GGML_TYPE_Q5_0 ||
-               source_type == GGML_TYPE_Q6_0;
+        // KVarN is produced from original projections, never from an already
+        // quantized GGML companion. The bit width selects the record codec.
+        return source_type == GGML_TYPE_F32;
     }
     if (!std::strcmp(format, "saw_int4") || !std::strcmp(format, "saw-int4") ||
             !std::strcmp(format, "saw4") || !std::strcmp(format, "bdr_int4") ||
@@ -5913,7 +5915,8 @@ bool ggml_backend_remote_attn_native_kvarn_state_read_bounded(
                              current->native_tail_tokens >= 128;
         return header.layers == current->geo.n_layer_remote && layout.origin == current->range_origin &&
             layout.capacity == current->range_capacity && layout.heads == current->geo.n_head_kv &&
-            layout.iterations == current->geo.sinkhorn_iters &&
+            rkva_native_state::quantization_matches(layout, current->geo.sinkhorn_iters,
+                current->native_descriptor.key_bits) &&
             layout.precision_tail_tokens == current->native_tail_tokens &&
             layout.compact_stage == (compact ? 1u : 0u) && layout.rows &&
             layout.rows <= layout.capacity && rkva_kvarn_generation_mutable(layout.saved_generation);
@@ -5933,7 +5936,8 @@ bool ggml_backend_remote_attn_native_kvarn_state_read_bounded(
         if (!state.valid || layout.origin != ctx->range_origin ||
                 layout.capacity != ctx->range_capacity ||
                 layout.heads != ctx->geo.n_head_kv ||
-                layout.iterations != ctx->geo.sinkhorn_iters ||
+                !rkva_native_state::quantization_matches(layout, ctx->geo.sinkhorn_iters,
+                    ctx->native_descriptor.key_bits) ||
                 layout.precision_tail_tokens != ctx->native_tail_tokens ||
                 layout.compact_stage != (compact ? 1u : 0u) ||
                 layout.rows != rows || layout.saved_generation != generation ||

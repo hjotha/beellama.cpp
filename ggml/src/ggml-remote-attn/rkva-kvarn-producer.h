@@ -30,8 +30,9 @@ public:
           bits_(bits), record_bytes_(size_t(bits) * 2048 + 768),
           precision_tail_tokens_(precision_tail_tokens),
           compact_stage_(compact_stage && origin >= 128 && precision_tail_tokens >= 128), store_(store) {
-        if (!store || !heads || !iterations ||
+        if (!store || !heads || !iterations || iterations > 0xffffu ||
                 (bits != 2 && bits != 3 && bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
+                precision_tail_tokens > RKVA_NATIVE_MAX_PRECISION_TAIL ||
                 (precision_tail_tokens > capacity && precision_tail_tokens != 128) ||
                 origin % 128 || !capacity ||
                 uint64_t(origin) + capacity > INT32_MAX) throw std::invalid_argument("native KVarN geometry");
@@ -83,7 +84,7 @@ public:
         const size_t group_bytes = size_t(physical_heads()) * record_bytes_;
         const size_t record_offset = size_t(origin_group - record_base_group_) * group_bytes;
         if (record_offset + size_t(groups) * group_bytes > records_k_.size()) return false;
-        const uint32_t packed_iters = bits_ == 4 ? iterations_ : (iterations_ | (bits_ << 16));
+        const uint32_t packed_iters = rkva_native_state::packed_iterations(iterations_, bits_);
         view.layout = rkva_native_state::Layout{
             origin_, capacity_, heads_, packed_iters, precision_tail_tokens_,
             compact_stage_ ? 1u : 0u, rows_, record_base_group_, generation};
@@ -113,9 +114,8 @@ public:
         if (!rkva_native_state::valid_ring(state, error))
             return false;
         const auto & layout = state.layout;
-        const uint32_t packed_iters = bits_ == 4 ? iterations_ : (iterations_ | (bits_ << 16));
         if (layout.origin != origin_ || layout.capacity != capacity_ || layout.heads != heads_ ||
-                (layout.iterations != iterations_ && layout.iterations != packed_iters) ||
+                !rkva_native_state::quantization_matches(layout, iterations_, bits_) ||
                 layout.precision_tail_tokens != precision_tail_tokens_ ||
                 layout.compact_stage != (compact_stage_ ? 1u : 0u) ||
                 layout.rows > capacity_) return reject("native state: producer geometry mismatch");
@@ -245,7 +245,7 @@ public:
         prepared_rv_.resize(prepared_rk_.size());
         const float * cuda_k = device_keys ? device_keys : keys;
         const float * cuda_v = device_values ? device_values : values;
-        const uint32_t packed_iters = bits_ == 4 ? iterations_ : (iterations_ | (bits_ << 16));
+        const uint32_t packed_iters = rkva_native_state::packed_iterations(iterations_, bits_);
         if (!cuda_(cuda_k, cuda_v, prepared_begin_, count, heads_, packed_iters, stage_k_.data(), stage_v_.data(),
                     prepared_k_.data(), prepared_v_.data(), prepared_rk_.data(), prepared_rv_.data())) return false;
         prepared_count_ = count;
@@ -416,7 +416,6 @@ public:
     }
 
 private:
-    static constexpr size_t record_bytes = 8960;
     size_t width() const { return size_t(heads_) * 256; }
     uint32_t physical_heads() const { return heads_ * 2; }
     // Wire and protocol groups stay global; only the host sink may start at a

@@ -308,7 +308,7 @@ class EngineWiring(unittest.TestCase):
 
     def test_native_rows_envelope_lifecycle(self) -> None:
         body = function_body(self.engine, "bool RemoteAttnEngine::attend_native_rows")
-        self.assertIn("envelope.storage = uint8_t(storage);", body)
+        self.assertIn("envelope.storage = storage;", body)
         self.assertIn("envelope.serial_prefix = 0;", body)
         self.assertIn("envelope.wire = segments.front().wire;", body)
         self.assertIn("envelope.cycle_id = cycle_id;", body)
@@ -428,7 +428,7 @@ class EngineWiring(unittest.TestCase):
         self.assertEqual(upload.count("cmd_->CopyBufferRegion("), 2)
 
         attn = function_body(self.engine, "bool RemoteAttnEngine::attend_range")
-        self.assertIn("seg.storage = uint8_t(s->range_storage);", attn)
+        self.assertIn("seg.storage = s->range_storage;", attn)
         self.assertIn("seg.serial_prefix = prefix ? 1 : 0;", attn)
         self.assertIn("seg.optimized = 1;", attn)
         self.assertIn("seg.split_k = split_k;", attn)

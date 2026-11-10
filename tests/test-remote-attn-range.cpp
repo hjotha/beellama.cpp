@@ -345,7 +345,7 @@ struct loopback {
                             assert(payload.size() >= sizeof(u)); std::memcpy(&u, payload.data(), sizeof(u));
                             assert(req.layer_id < native_counts.size());
                             const uint64_t native_width = uint64_t(geometry.n_head_kv) * 256;
-                            const uint64_t record_bytes = uint64_t(u.record_groups) * geometry.n_head_kv * 2 * 8960;
+                            const uint64_t record_bytes = uint64_t(u.record_groups) * geometry.n_head_kv * 2 * native_descriptor.record_bytes;
                             const uint64_t stage_rows = u.flags ? 384 : u.append_rows;
                             const uint64_t tail_rows = native_descriptor.precision_tail_tokens ?
                                 (u.flags ? std::min(u.live_count, native_descriptor.precision_tail_tokens) : u.append_rows) : 0;
@@ -1802,13 +1802,15 @@ static void test_native_rewind() {
 // parser and the staged owner commit over TCP; the Xbox disk codec remains in
 // the MSVC/D3D12 build.
 static void test_native_snapshot_transport(bool e4 = false, uint32_t tail = 128,
-                                           bool tail_from_env = false, bool store_test = false) {
-    storage_env native("kvarn4");
+                                           bool tail_from_env = false, bool store_test = false,
+                                           uint32_t bits = 4) {
+    const std::string format = "kvarn" + std::to_string(bits);
+    storage_env native(format.c_str());
     storage_env experimental("1", "GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     storage_env fusion("0", "GGML_RKVA_RANGE_FUSE");
     storage_env legacy_bulk(e4 ? "1" : "0", "GGML_RKVA_NATIVE_BULK");
     storage_env wire(e4 ? "fp8_e4m3fn" : nullptr, "GGML_RKVA_WIRE_FORMAT");
-    storage_env upload("kvarn4", "GGML_RKVA_UPLOAD_FORMAT");
+    storage_env upload(format.c_str(), "GGML_RKVA_UPLOAD_FORMAT");
     storage_env acceleration("0", "GGML_RKVA_CUDA_FP8");
     storage_env legacy_async("0", "GGML_RKVA_ASYNC_LOCAL_REMOTE");
     const std::string tail_env = tail_from_env ? std::to_string(tail) : "128";
@@ -5348,7 +5350,8 @@ int main() {
     }
     if (std::getenv("GGML_RKVA_E4_TEST_ONLY")) {
         test_native_bulk_e4m3fn();
-        test_native_snapshot_transport();
+        for (uint32_t bits : {2u, 3u, 4u, 5u, 6u, 8u})
+            test_native_snapshot_transport(false, 128, false, false, bits);
         test_native_snapshot_transport(true);
         std::puts("PASS: E4M3FN v3 negotiation, CPU sync/async wire and fail-closed checks");
         return 0;
@@ -5442,7 +5445,8 @@ int main() {
     test_server_ahead_lineage(false, false);
     test_server_ahead_lineage(false, true);
     test_native_rewind();
-    test_native_snapshot_transport();
+    for (uint32_t bits : {2u, 3u, 4u, 5u, 6u, 8u})
+        test_native_snapshot_transport(false, 128, false, false, bits);
     test_failure_retirement();
     test_async_failure_two_slots();
     test_native_query_prefix_chunks();

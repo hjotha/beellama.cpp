@@ -301,7 +301,7 @@ struct BulkSegmentProfile {
     uint8_t optimized = 0;
     // Route identity of the segment. Defaults are the KVarN bulk envelope;
     // native-row callers overwrite both from their actual storage/callpath.
-    uint8_t storage = rp::kStorageKvarn4;
+    uint32_t storage = rp::kStorageKvarn4;
     uint8_t serial_prefix = 1;
     uint8_t wire = RKVA_WIRE_F32; // native-row Q wire; KVarN packs it per envelope
     uint8_t has_upload = 0;       // segment recorded upload copies
@@ -2792,7 +2792,7 @@ bool RemoteAttnEngine::upload_range(uint32_t id, uint32_t layer, uint32_t start_
         seg.append_rows = n_rows;
         seg.live_count = start_row + n_rows;
         seg.has_upload = 1;
-        seg.storage = uint8_t(s->range_storage);
+        seg.storage = s->range_storage;
         seg.serial_prefix = 0;
     }
     timer.mark(rp::kCpuRecord);
@@ -2804,7 +2804,7 @@ bool RemoteAttnEngine::upload_range(uint32_t id, uint32_t layer, uint32_t start_
     s->range_counts[layer] = start_row + n_rows;
     if (prof) {
         sample.kind = rp::kUpload;
-        sample.storage = uint8_t(s->range_storage);
+        sample.storage = s->range_storage;
         sample.mode = uint8_t(q4_kernel_mode_);
         sample.alloc_grew = grow;
         sample.n_tokens = n_rows;
@@ -3310,7 +3310,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
     envelope.cycle_id = cycle_id;
     envelope.session_id = id;
     envelope.layer = layer;
-    envelope.storage = uint8_t(storage);
+    envelope.storage = storage;
     envelope.serial_prefix = 0;
     envelope.wire = RKVA_WIRE_F32;
     FailedCallGuard guard{prof ? &profile_->recorder.counters.failed_calls : nullptr};
@@ -3566,7 +3566,7 @@ bool RemoteAttnEngine::attend_native_rows(uint32_t id, uint32_t layer, uint32_t 
         if (prof) {
             profile_->bulk.segment_index = static_cast<uint32_t>(i);
             auto& p = profile_->bulk.segments[i];
-            p.storage = uint8_t(storage);
+            p.storage = storage;
             p.serial_prefix = 0;
             p.wire = uint8_t(seg.wire);
             p.has_upload = seg.append_rows ? 1 : 0;
@@ -3996,7 +3996,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         if (bulk_recording_) {
             if (bulk_prof) {
                 auto& seg = profile_->bulk.segments[profile_->bulk.segment_index];
-                seg.storage = uint8_t(s->range_storage);
+                seg.storage = s->range_storage;
                 seg.serial_prefix = prefix ? 1 : 0;
                 seg.record_attn_ns += elapsed_ns(t_rec_start, prof_clock::now());
                 seg.dispatches = dispatches;
@@ -4024,7 +4024,7 @@ bool RemoteAttnEngine::attend_range(uint32_t id, uint32_t layer, uint32_t n_toke
         timer.mark(rp::kCpuReadback);
         if (prof) {
             sample.kind = rp::kAttention;
-            sample.storage = uint8_t(s->range_storage);
+            sample.storage = s->range_storage;
             sample.serial_prefix = prefix;
             sample.mode = uint8_t(q4_kernel_mode_);
             sample.alloc_grew = grow;

@@ -34,7 +34,7 @@ struct Fixture {
     std::vector<int32_t> positions;
     std::unique_ptr<rkva_kvarn_producer> producer;
 
-    explicit Fixture(uint32_t precision_tail, bool compact = false, uint32_t total = 900)
+    explicit Fixture(uint32_t precision_tail, bool compact = false, uint32_t total = 900, uint32_t bits = 4)
         : tail(precision_tail), compact_stage(compact) {
         auto * reg = ggml_backend_cpu_reg();
         store = reinterpret_cast<ggml_backend_cpu_kvarn_store_direct_v1_t>(
@@ -52,7 +52,7 @@ struct Fixture {
             }
         }
         producer = std::make_unique<rkva_kvarn_producer>(
-            kOrigin, kCapacity, kHeads, kIterations, store, tail, compact);
+            kOrigin, kCapacity, kHeads, kIterations, store, tail, compact, true, bits);
     }
 
     void append(uint32_t first, uint32_t count, bool reset = false,
@@ -134,6 +134,49 @@ void test_roundtrip(uint32_t tail) {
         assert(!layers[0].tail_k.empty());
     } else {
         assert(layers[0].tail_k.empty() && layers[0].tail_v.empty());
+    }
+}
+
+void test_quantized_state_identity() {
+    for (uint32_t bits : {2u, 3u, 4u, 5u, 6u, 8u}) {
+        Fixture source(128, false, 900, bits);
+        source.append(0, 127); // No records yet: geometry must still reject cross-format imports.
+        const auto early = export_one(*source.producer, 0x100000001ull);
+        rkva_native_state::View view;
+        assert(source.producer->state_export(0x100000001ull, view));
+        assert(rkva_native_state::quantization_matches(view.layout, kIterations, bits));
+        assert(!rkva_native_state::quantization_matches(view.layout, kIterations + 1, bits));
+        for (uint32_t invalid : {1u, 7u, 9u, 65535u}) {
+            auto bad = view.layout;
+            bad.iterations = kIterations | (invalid << 16);
+            assert(!rkva_native_state::valid_layout(bad, nullptr));
+        }
+        auto no_iterations = view.layout;
+        no_iterations.iterations = bits << 16;
+        assert(!rkva_native_state::valid_layout(no_iterations, nullptr));
+        for (uint32_t target : {2u, 3u, 4u, 5u, 6u, 8u}) {
+            Fixture destination(128, false, 900, target);
+            std::vector<rkva_native_state::Storage> layers;
+            std::string error;
+            assert(rkva_native_state::read_set(early, layers, &error));
+            assert(rkva_native_state::quantization_matches(layers.front().layout, kIterations, target) == (bits == target));
+            assert(destination.producer->state_import(layers.front(), &error) == (bits == target));
+        }
+        source.append(127, 386);
+        const auto saved = export_one(*source.producer, 0x100000002ull);
+        Fixture restored(128, false, 900, bits);
+        import_one(*restored.producer, saved);
+        assert(export_one(*restored.producer, 0x100000002ull) == saved);
+        source.append(513, 128);
+        restored.append(513, 128);
+        assert(export_one(*source.producer, 0x100000003ull) ==
+               export_one(*restored.producer, 0x100000003ull));
+        assert(source.producer->rewind(513));
+        assert(restored.producer->rewind(513));
+        source.append(513, 128);
+        restored.append(513, 128);
+        assert(export_one(*source.producer, 0x100000004ull) ==
+               export_one(*restored.producer, 0x100000004ull));
     }
 }
 
@@ -441,6 +484,7 @@ void test_reset_coverage_and_seals() {
 } // namespace
 
 int main() {
+    test_quantized_state_identity();
     test_roundtrip(128);
     test_roundtrip(0);
     for (uint32_t tail : {1u, 127u, 129u, 255u, 256u, 257u, 513u}) test_roundtrip(tail);

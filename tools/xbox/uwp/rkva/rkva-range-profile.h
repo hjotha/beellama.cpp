@@ -439,7 +439,7 @@ enum GpuStage : uint8_t { kGpuStage0 = 0, kGpuStage1, kGpuStage2, kGpuStageCount
 
 struct Sample {
     uint8_t kind = kUpload;
-    uint8_t storage = 0;
+    uint32_t storage = 0;
     uint8_t optimized = 0;
     uint8_t mode = 0;
     uint8_t gpu_valid = 0;
@@ -584,7 +584,7 @@ struct BulkEnvelopeSample {
     // Envelope route identity: KVarN bulk envelopes are storage 3 with the
     // serial-prefix descriptor; native-row envelopes carry their real Q4_0/Q8_0
     // storage and serial_prefix 0. Defaults preserve the KVarN schema.
-    uint8_t storage = kStorageKvarn4;
+    uint32_t storage = kStorageKvarn4;
     uint8_t serial_prefix = 1;
     uint32_t segment_count = 0;
     uint32_t total_queries = 0;
@@ -724,6 +724,8 @@ inline const char* storage_name(uint32_t storage) {
         return "bf16";
     case kStorageF32:
         return "f32";
+    case kStorageQ2_0S:
+        return "q2_0s";
     default:
         return "unknown";
     }
@@ -977,7 +979,9 @@ class Recorder {
         const uint32_t native_storages[] = {
             kStorageQ4_1, kStorageIQ4_NL, kStorageSawInt4, kStorageTurboquantNC,
             kStorageOscarInt2, kStorageQ5_0, kStorageQ5_1, kStorageQ6_0, kStorageQ6_1,
-            kStorageQ3_0, kStorageQ3_1, kStorageQ2_1, kStorageBF16, kStorageF32};
+            kStorageQ3_0, kStorageQ3_1, kStorageQ2_1, kStorageBF16, kStorageF32, kStorageQ2_0S};
+        static_assert(sizeof(native_storages) / sizeof(native_storages[0]) == kNativeStorageCount,
+                      "native profile storage table must cover every counter");
         for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
             std::snprintf(buf, sizeof(buf),
                           "%s\"%s\":{\"optimized_calls\":%llu,\"reference_calls\":%llu,\"mq2_calls\":%llu}",

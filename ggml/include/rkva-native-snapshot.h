@@ -145,6 +145,7 @@ inline bool valid_descriptor(const Descriptor& d, const Geometry& g) {
            d.head_slices == 2 && d.key_bits == d.value_bits && valid_kvarn_bits(d.key_bits) &&
            d.record_bytes == kvarn_record_bytes(d.key_bits) && d.stage_groups == 3 && d.tail_groups == 2 &&
            d.sink_tokens == 128 &&
+           d.precision_tail_tokens <= RKVA_NATIVE_MAX_PRECISION_TAIL &&
            (!d.precision_tail_tokens || rkva_native_history_rows(d.precision_tail_tokens)) &&
            (d.precision_tail_tokens <= d.capacity || d.precision_tail_tokens == 128) &&
            d.wht_version == 1 && d.domain == 1 && d.record_policy == 1;

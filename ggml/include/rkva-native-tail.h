@@ -2,6 +2,9 @@
 
 #include <cstdint>
 
+// The shader constant shares its 32-bit word with the KVarN bit width.
+inline constexpr uint32_t RKVA_NATIVE_MAX_PRECISION_TAIL = 0xffffu;
+
 // The history ring must cover the exact tail and up to 128 rows of rewind or
 // in-flight serial-prefix queries. Zero indicates an unrepresentable size.
 inline uint32_t rkva_native_history_rows(uint32_t tail_tokens) {

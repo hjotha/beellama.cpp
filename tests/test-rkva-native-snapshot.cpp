@@ -29,7 +29,7 @@ std::vector<LayerCoverage> coverage(uint32_t layers, uint32_t live) {
     std::vector<LayerCoverage> result(layers);
     for (auto & layer : result) {
         layer.tail_begin = live - 128;
-        layer.stage_begin = (live - 1) / 128 * 128 - 128;
+        layer.stage_begin = live > 128 ? (live - 1) / 128 * 128 - 128 : 0;
         layer.record_groups = live / 128;
         layer.ready = 1;
     }
@@ -43,6 +43,39 @@ Manifest build_ok(uint32_t live = 513) {
     assert(build(geometry(), descriptor(), live, 0x700000001ull, sha.data(),
                  coverage(2, live), manifest, &error));
     return manifest;
+}
+
+void test_all_bit_widths() {
+    const auto g = geometry();
+    const auto sha = host_sha();
+    for (uint32_t bits : {2u, 3u, 4u, 5u, 6u, 8u}) {
+        auto d = descriptor();
+        d.key_bits = d.value_bits = bits;
+        d.record_bytes = kvarn_record_bytes(bits);
+        for (uint32_t live : {128u, 129u, 513u}) {
+            Manifest manifest;
+            std::string error;
+            assert(build(g, d, live, 0x700000001ull, sha.data(), coverage(2, live), manifest, &error));
+            assert(manifest.chunks.front().bytes == uint64_t(live / 128) * g.n_head_kv * 2 * d.record_bytes);
+            assert(manifest.chunks[1].offset == uint64_t(d.capacity / 128) * g.n_head_kv * 2 * d.record_bytes);
+            std::vector<uint8_t> encoded;
+            assert(encode(manifest, encoded, &error));
+            Manifest decoded;
+            assert(decode(encoded, decoded, &error));
+            assert(same_descriptor(decoded.descriptor, d));
+        }
+        auto tail_boundary = d;
+        tail_boundary.capacity = 131072;
+        tail_boundary.precision_tail_tokens = 65535;
+        auto large_geometry = g; large_geometry.max_ctx = 131072;
+        assert(valid_descriptor(tail_boundary, large_geometry));
+        tail_boundary.precision_tail_tokens = 65536;
+        assert(!valid_descriptor(tail_boundary, large_geometry));
+        auto bad = d; bad.value_bits = bits == 4 ? 2 : 4;
+        assert(!valid_descriptor(bad, g));
+        bad = d; bad.record_bytes += 2048;
+        assert(!valid_descriptor(bad, g));
+    }
 }
 
 void test_layout() {
@@ -346,6 +379,7 @@ void test_chunk_splitting() {
 } // namespace
 
 int main() {
+    test_all_bit_widths();
     test_layout();
     test_flexible_tail_layouts();
     test_roundtrip_and_validate();

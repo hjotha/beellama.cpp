@@ -118,6 +118,7 @@ struct Layout {
     uint32_t origin = 0;
     uint32_t capacity = 0;
     uint32_t heads = 0;
+    // Low 16 bits: Sinkhorn iterations; high 16 bits: record bits (0 means legacy 4-bit).
     uint32_t iterations = 0;
     uint32_t precision_tail_tokens = 0;
     uint32_t compact_stage = 0;
@@ -161,6 +162,20 @@ inline uint64_t width(const Layout& layout) {
 inline uint32_t layout_bits(const Layout& layout) {
     const uint32_t b = layout.iterations >> 16;
     return b ? b : 4u;
+}
+inline uint32_t layout_iterations(const Layout& layout) {
+    return layout.iterations & 0xffffu;
+}
+inline uint32_t packed_iterations(uint32_t iterations, uint32_t bits) {
+    return iterations | (bits == 4 ? 0u : bits << 16);
+}
+inline bool quantization_matches(const Layout& layout, uint32_t iterations, uint32_t bits) {
+    return layout_iterations(layout) == iterations && layout_bits(layout) == bits;
+}
+inline bool valid_quantization(const Layout& layout) {
+    const uint32_t bits = layout_bits(layout);
+    return layout_iterations(layout) != 0 &&
+        (bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8);
 }
 inline uint64_t record_group_bytes(const Layout& layout) {
     const uint64_t rec_bytes = uint64_t(layout_bits(layout)) * 2048ull + 768ull;
@@ -208,7 +223,7 @@ inline bool valid_layout(const Layout& layout, std::string* error) {
     if (!little_endian())
         return reject("native state: big-endian hosts are unsupported");
     if (!layout.origin || !layout.capacity || !layout.heads ||
-        !layout.iterations || layout.origin % 128 ||
+        !valid_quantization(layout) || layout.origin % 128 ||
         uint64_t(layout.origin) + layout.capacity > uint32_t(INT32_MAX) ||
         layout.heads > kMaxHeads ||
         !original_rows(layout) ||

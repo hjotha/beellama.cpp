@@ -31,6 +31,7 @@ inline bool valid_descriptor(const rkva_kvarn_range_config& c, uint32_t dimensio
            c.record_bytes == kvarn_record_bytes(c.key_bits) && c.stage_groups == 3 &&
            c.tail_groups == 2 && c.sink_tokens == 128 &&
            (c.layout_version == 3 || c.precision_tail_tokens == 0 || c.precision_tail_tokens == 128) &&
+           c.precision_tail_tokens <= RKVA_NATIVE_MAX_PRECISION_TAIL &&
            (!c.precision_tail_tokens || rkva_native_history_rows(c.precision_tail_tokens)) && c.wht_version == 1 &&
            (c.precision_tail_tokens <= c.capacity || c.precision_tail_tokens == 128) &&
            c.domain == 1 && c.record_policy == 1;

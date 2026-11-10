@@ -417,7 +417,7 @@ int main() {
         const char* kernels[] = {"q4_1_mq2", "iq4_nl_mq2", "saw_int4_mq2", "turboquant_nc_mq2"};
         Recorder native;
         native.configure(32);
-        for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
+        for (uint32_t i = 0; i < sizeof(storages) / sizeof(storages[0]); ++i) {
             Sample sample;
             sample.kind = kAttention;
             sample.storage = uint8_t(storages[i]);
@@ -453,13 +453,53 @@ int main() {
             assert(native.counters.reference_by_storage[i] == 0);
         }
         const std::string report = native.json(Header{});
-        for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
+        for (uint32_t i = 0; i < sizeof(storages) / sizeof(storages[0]); ++i) {
             const std::string counts = std::string("\"") + names[i] + "\":{\"optimized_calls\":" +
                 std::to_string(i + 2) + ",\"reference_calls\":1,\"mq2_calls\":" + std::to_string(i + 1) + "}";
             assert(report.find(counts) != std::string::npos);
             assert(report.find(std::string("optimized-") + kernels[i]) != std::string::npos);
         }
         assert(report.find("optimized-invalid") == std::string::npos);
+    }
+
+    // Every native row format has a distinct JSON name and full-width storage ID.
+    {
+        const uint32_t storages[] = {
+            kStorageQ4_1, kStorageIQ4_NL, kStorageSawInt4, kStorageTurboquantNC,
+            kStorageOscarInt2, kStorageQ5_0, kStorageQ5_1, kStorageQ6_0, kStorageQ6_1,
+            kStorageQ3_0, kStorageQ3_1, kStorageQ2_1, kStorageBF16, kStorageF32, kStorageQ2_0S};
+        const char* names[] = {"q4_1", "iq4_nl", "saw_int4", "turboquant_nc", "oscar_int2",
+            "q5_0", "q5_1", "q6_0", "q6_1", "q3_0", "q3_1", "q2_1", "bf16", "f32", "q2_0s"};
+        static_assert(sizeof(storages) / sizeof(storages[0]) == kNativeStorageCount, "all native formats");
+        static_assert(sizeof(names) / sizeof(names[0]) == kNativeStorageCount, "all native names");
+        Recorder native;
+        native.configure(32);
+        for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
+            assert(native_storage_index(storages[i]) == i);
+            assert(std::strcmp(storage_name(storages[i]), names[i]) == 0);
+            BulkEnvelopeSample envelope;
+            envelope.storage = storages[i];
+            assert(envelope.storage == storages[i]);
+            Sample sample;
+            sample.kind = kAttention;
+            sample.storage = storages[i];
+            sample.optimized = 1;
+            sample.n_tokens = 1;
+            sample.rows = 257;
+            count_attention_sample(native.counters, sample);
+            native.record(sample);
+            sample.optimized = 0;
+            count_attention_sample(native.counters, sample);
+            assert(native.counters.native_optimized[i] == 1);
+            assert(native.counters.native_reference[i] == 1);
+        }
+        const std::string report = native.json(Header{});
+        for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
+            const std::string counts = std::string("\"") + names[i] +
+                "\":{\"optimized_calls\":1,\"reference_calls\":1,\"mq2_calls\":0}";
+            assert(report.find(counts) != std::string::npos);
+        }
+        assert(report.find("\"unknown\":") == std::string::npos);
     }
 
     // Ring: fixed capacity, overwrites oldest, counts everything.

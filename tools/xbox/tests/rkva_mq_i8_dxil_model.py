@@ -233,6 +233,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('assembly', type=Path)
     ap.add_argument('--require-uniform-reads', action='store_true')
+    ap.add_argument('--packed-kvarn-bits', action='store_true',
+                    help='exercise the current host ABI: tail | (key_bits << 16)')
     args = ap.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import rkva_kvarn_serial_prefix_model as sp
@@ -259,7 +261,7 @@ def main():
             3: np.array([sp.ORIGIN + live - 2, sp.ORIGIN + live - 1], U),
         }
         cb = [2, live, 24, 4, 256, F(1 / 16).view(U), sp.ORIGIN,
-              1, live, 1, len(records[0]), 128]
+              1, live, 1, len(records[0]), 128 | ((4 << 16) if args.packed_kvarn_bits else 0)]
         fast_hi = min((live - 1) & ~127, live - 1 - 128) & ~7
         for kv in (0, 3):
             planes = [[Q.record_planes(b) for b in canon.record(g, False)[2*kv:2*kv+2]]

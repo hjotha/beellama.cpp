@@ -312,12 +312,30 @@ void tile_scores(uint base, uint pos0, uint u, float4 q[RKVA_GQA],
         other[2 * p] = f16tof32(other_bits[p] & 65535u);
         other[2 * p + 1] = f16tof32(other_bits[p] >> 16);
     }
+    // Preserve the qualified four-load KVarN4 tile. Generic bit widths may
+    // cross dword boundaries; do not reload each of the eight 4-bit tokens.
+    uint4 packed4 = uint4(0, 0, 0, 0);
+    [branch] if (bits == 4u) {
+        uint nib_base = base + (pos0 / 8u) * 4u;
+        packed4 = uint4(keys.Load(nib_base + (dim + 0u) * 64u),
+                        keys.Load(nib_base + (dim + 1u) * 64u),
+                        keys.Load(nib_base + (dim + 2u) * 64u),
+                        keys.Load(nib_base + (dim + 3u) * 64u));
+    }
     [unroll] for (uint t = 0; t < RKVA_TILE; ++t) {
         float4 k;
-        k.x = decode(kvarn_unpack1(keys, base, (dim + 0) * 128 + pos0 + t, bits), scale.x, zero.x, other[t]);
-        k.y = decode(kvarn_unpack1(keys, base, (dim + 1) * 128 + pos0 + t, bits), scale.y, zero.y, other[t]);
-        k.z = decode(kvarn_unpack1(keys, base, (dim + 2) * 128 + pos0 + t, bits), scale.z, zero.z, other[t]);
-        k.w = decode(kvarn_unpack1(keys, base, (dim + 3) * 128 + pos0 + t, bits), scale.w, zero.w, other[t]);
+        [branch] if (bits == 4u) {
+            uint4 quant = (packed4 >> (4u * t)) & 15u;
+            k.x = decode(quant.x, scale.x, zero.x, other[t]);
+            k.y = decode(quant.y, scale.y, zero.y, other[t]);
+            k.z = decode(quant.z, scale.z, zero.z, other[t]);
+            k.w = decode(quant.w, scale.w, zero.w, other[t]);
+        } else {
+            k.x = decode(kvarn_unpack1(keys, base, (dim + 0) * 128 + pos0 + t, bits), scale.x, zero.x, other[t]);
+            k.y = decode(kvarn_unpack1(keys, base, (dim + 1) * 128 + pos0 + t, bits), scale.y, zero.y, other[t]);
+            k.z = decode(kvarn_unpack1(keys, base, (dim + 2) * 128 + pos0 + t, bits), scale.z, zero.z, other[t]);
+            k.w = decode(kvarn_unpack1(keys, base, (dim + 3) * 128 + pos0 + t, bits), scale.w, zero.w, other[t]);
+        }
         [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
             score[g * RKVA_TILE + t] += dot(q[g], k);
         }
@@ -719,15 +737,31 @@ void CSRangeAttnKvarn4Decode(uint tid : SV_GroupIndex, uint3 group : SV_GroupID)
             other[2 * p + 1] = f16tof32(other_bits[p] >> 16);
         }
 
+        uint4 packed4 = uint4(0, 0, 0, 0);
+        [branch] if (bits == 4u) {
+            uint nib_base = base_k + (pos0 / 8u) * 4u;
+            packed4 = uint4(keys.Load(nib_base + (dim + 0u) * 64u),
+                            keys.Load(nib_base + (dim + 1u) * 64u),
+                            keys.Load(nib_base + (dim + 2u) * 64u),
+                            keys.Load(nib_base + (dim + 3u) * 64u));
+        }
         float score[RKVA_GQA * RKVA_TILE];
         [unroll] for (uint i = 0; i < RKVA_GQA * RKVA_TILE; ++i) score[i] = 0;
 
         [unroll] for (uint t = 0; t < RKVA_TILE; ++t) {
             float4 k_val;
-            k_val.x = decode(kvarn_unpack1(keys, base_k, (dim + 0) * 128 + pos0 + t, bits), k_scale.x, k_zero.x, other[t]);
-            k_val.y = decode(kvarn_unpack1(keys, base_k, (dim + 1) * 128 + pos0 + t, bits), k_scale.y, k_zero.y, other[t]);
-            k_val.z = decode(kvarn_unpack1(keys, base_k, (dim + 2) * 128 + pos0 + t, bits), k_scale.z, k_zero.z, other[t]);
-            k_val.w = decode(kvarn_unpack1(keys, base_k, (dim + 3) * 128 + pos0 + t, bits), k_scale.w, k_zero.w, other[t]);
+            [branch] if (bits == 4u) {
+                uint4 quant = (packed4 >> (4u * t)) & 15u;
+                k_val.x = decode(quant.x, k_scale.x, k_zero.x, other[t]);
+                k_val.y = decode(quant.y, k_scale.y, k_zero.y, other[t]);
+                k_val.z = decode(quant.z, k_scale.z, k_zero.z, other[t]);
+                k_val.w = decode(quant.w, k_scale.w, k_zero.w, other[t]);
+            } else {
+                k_val.x = decode(kvarn_unpack1(keys, base_k, (dim + 0) * 128 + pos0 + t, bits), k_scale.x, k_zero.x, other[t]);
+                k_val.y = decode(kvarn_unpack1(keys, base_k, (dim + 1) * 128 + pos0 + t, bits), k_scale.y, k_zero.y, other[t]);
+                k_val.z = decode(kvarn_unpack1(keys, base_k, (dim + 2) * 128 + pos0 + t, bits), k_scale.z, k_zero.z, other[t]);
+                k_val.w = decode(kvarn_unpack1(keys, base_k, (dim + 3) * 128 + pos0 + t, bits), k_scale.w, k_zero.w, other[t]);
+            }
             [unroll] for (uint g = 0; g < RKVA_GQA; ++g) {
                 score[g * RKVA_TILE + t] = dot(q[g], k_val);
             }
