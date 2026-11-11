@@ -220,8 +220,13 @@ def main():
                   '--points', args.points,
                   '--context', args.context,
                   '--n-predict', args.n_predict,
+                  '--repeat-prompt',
                   '--threads', args.threads,
                   '--seed', args.seed,
+                  '--batch-size', '1024',
+                  '--ubatch', '512',
+                  '--wavefront-tile', '256',
+                  '--wavefront-tiles', '2',
                   '--range-kernel', 'fine',
                   '--cuda-fp8', 'mapped',
                   '--tcp-prefetch',
@@ -239,7 +244,7 @@ def main():
         plan.append({
             'arm': arm,
             'toggle': flag_cmd or None,
-            'probe': probe_base + ['--output', str(pathlib.Path(out_dir) / 'probe.json')],
+            'probe': probe_base + ['--output', str(pathlib.Path(args.output) / 'probe' / arm / 'probe.json')],
             'bench': bench_base + ['--output', out_dir],
         })
     plan.append({'arm': 'restore', 'toggle': args.disable_cmd or None})
@@ -285,12 +290,13 @@ def main():
             if steps[-1]['returncode'] != 0:
                 raise RuntimeError(f'{arm}: flag toggle failed: {flag_cmd}')
             out_dir = pathlib.Path(args.output) / arm
-            out_dir.mkdir(parents=True, exist_ok=True)
-            probe_step = run(probe_base + ['--output', str(out_dir / 'probe.json')],
+            probe_dir = pathlib.Path(args.output) / 'probe' / arm
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            probe_step = run(probe_base + ['--output', str(probe_dir / 'probe.json')],
                              logs / f'{arm}-probe.log', args.timeout)
             probe_step['arm'] = arm + '/probe'
             steps.append(probe_step)
-            errors[arm] = probe_error_floor(out_dir / 'probe.json')
+            errors[arm] = probe_error_floor(probe_dir / 'probe.json')
             bench_step = run(bench_base + ['--output', str(out_dir), '--execute'],
                              logs / f'{arm}-bench.log', args.timeout)
             bench_step['arm'] = arm + '/bench'
