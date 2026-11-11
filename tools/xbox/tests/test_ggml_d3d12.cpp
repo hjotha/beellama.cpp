@@ -99,6 +99,8 @@ TEST_CASE("ggml_d3d12: weight types") {
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q5_K));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q6_K));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q8_0));
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_Q2_K));
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_Q3_K));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F16));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F32));
 }
@@ -532,6 +534,12 @@ TEST_CASE("ggml_d3d12: kernel emulation matches ggml dequantizers") {
         // Coder-3B ffn_down width: 43 super-blocks, 9030-byte rows.
         {GGML_TYPE_Q6_K, 3, 11008},
         {GGML_TYPE_Q4_0, 5, 2304},
+        // GSQ Q2_K_XL: Q2_K/Q3_K weight types, including a 9-block Q3_K row
+        // (990 B, so odd rows start 2-byte aligned and exercise ld32).
+        {GGML_TYPE_Q2_K, 13, 2560},
+        {GGML_TYPE_Q2_K, 5, 2304},
+        {GGML_TYPE_Q3_K, 13, 2560},
+        {GGML_TYPE_Q3_K, 6, 2304},
         // Qwen3.5-4B attention and SSM projections: 2560 and 4096 wide.
         {GGML_TYPE_Q5_K, 5, 2560},
         {GGML_TYPE_Q5_K, 3, 4096},

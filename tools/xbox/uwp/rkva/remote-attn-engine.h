@@ -32,6 +32,7 @@
 #include "rkva-execution-lifetime.h"
 #include "rkva-hello-telemetry.h"
 #include "rkva-lazy-int8-policy.h"
+#include "rkva-range-profile.h"
 #include <d3d12.h>
 #include <wrl/client.h>
 
@@ -203,6 +204,7 @@ class RemoteAttnEngine {
                          std::string* error, uint64_t cycle_id);
     bool native_saw_int4_available() const;
     bool native_turboquant_nc_available() const;
+    bool native_extended_available(uint32_t storage) const;
     bool attend_q4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                             size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
                             uint64_t cycle_id);
@@ -367,6 +369,8 @@ class RemoteAttnEngine {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> range_reduce_root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_pso_[4];
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_q4_1_pso_, range_attn_iq4_nl_pso_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_native_rowlane_pso_[rkva_rprof::kNativeStorageCount];
+    std::string native_rowlane_status_[rkva_rprof::kNativeStorageCount];
     // Q4_1, IQ4_NL, SAW-INT4, TurboQuant NC, respectively; experimental opt-in.
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_attn_native_mq2_pso_[4];
     Microsoft::WRL::ComPtr<ID3D12PipelineState> range_reduce_pso_;

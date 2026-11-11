@@ -15,13 +15,20 @@
 // unchanged.
 
 namespace rkva_kvarn_range {
+inline bool valid_kvarn_bits(uint32_t bits) {
+    return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
+}
+inline uint32_t kvarn_record_bytes(uint32_t bits) {
+    return bits * 2048u + 768u;
+}
 inline bool valid_descriptor(const rkva_kvarn_range_config& c, uint32_t dimension) {
     return c.storage == RKVA_RANGE_STORAGE_KVARN4 &&
            (c.layout_version == 1 || c.layout_version == 2 || c.layout_version == 3) &&
            c.origin % 128 == 0 && c.capacity > 0 && c.capacity <= uint32_t(INT32_MAX) &&
            c.origin <= uint32_t(INT32_MAX) - c.capacity && dimension == 256 &&
            c.token_group == 128 && c.record_dim == 128 && c.head_dim == 256 && c.head_slices == 2 &&
-           c.key_bits == 4 && c.value_bits == 4 && c.record_bytes == 8960 && c.stage_groups == 3 &&
+           c.key_bits == c.value_bits && valid_kvarn_bits(c.key_bits) &&
+           c.record_bytes == kvarn_record_bytes(c.key_bits) && c.stage_groups == 3 &&
            c.tail_groups == 2 && c.sink_tokens == 128 &&
            (c.layout_version == 3 || c.precision_tail_tokens == 0 || c.precision_tail_tokens == 128) &&
            (!c.precision_tail_tokens || rkva_native_history_rows(c.precision_tail_tokens)) && c.wht_version == 1 &&
@@ -62,14 +69,62 @@ inline bool valid_q4_upload(const rkva_kvarn_range_upload& u, uint32_t capacity,
     return u.append_begin == previous_live && u.append_rows == u.live_count - previous_live;
 }
 
+
+inline uint32_t native_storage_head_bytes(uint32_t storage) {
+    switch (storage) {
+    case RKVA_RANGE_STORAGE_Q2_0S:         return 80u;
+    case RKVA_RANGE_STORAGE_Q2_1:          return 96u;
+    case RKVA_RANGE_STORAGE_OSCAR_INT2:    return 96u;
+    case RKVA_RANGE_STORAGE_Q3_0:          return 112u;
+    case RKVA_RANGE_STORAGE_Q3_1:          return 128u;
+    case RKVA_RANGE_STORAGE_TURBOQUANT_NC: return 132u;
+    case RKVA_RANGE_STORAGE_SAW_INT4:      return 136u;
+    case RKVA_RANGE_STORAGE_Q4_0:          return 144u;
+    case RKVA_RANGE_STORAGE_IQ4_NL:        return 144u;
+    case RKVA_RANGE_STORAGE_Q4_1:          return 160u;
+    case RKVA_RANGE_STORAGE_Q5_0:          return 176u;
+    case RKVA_RANGE_STORAGE_Q5_1:          return 192u;
+    case RKVA_RANGE_STORAGE_Q6_0:          return 208u;
+    case RKVA_RANGE_STORAGE_Q6_1:          return 224u;
+    case RKVA_RANGE_STORAGE_Q8_0:          return 272u;
+    case RKVA_RANGE_STORAGE_BF16:          return 512u;
+    case RKVA_RANGE_STORAGE_F32:           return 1024u;
+    default: return 0u;
+    }
+}
+
+inline uint32_t native_storage_layout(uint32_t storage) {
+    switch (storage) {
+    case RKVA_RANGE_STORAGE_Q4_0:          return 4u;
+    case RKVA_RANGE_STORAGE_Q8_0:          return 5u;
+    case RKVA_RANGE_STORAGE_SAW_INT4:      return 6u;
+    case RKVA_RANGE_STORAGE_OSCAR_INT2:    return 7u;
+    case RKVA_RANGE_STORAGE_TURBOQUANT_NC: return 8u;
+    case RKVA_RANGE_STORAGE_Q4_1:          return RKVA_LAYOUT_Q4_1;
+    case RKVA_RANGE_STORAGE_IQ4_NL:        return RKVA_LAYOUT_IQ4_NL;
+    case RKVA_RANGE_STORAGE_Q5_0:          return RKVA_LAYOUT_Q5_0;
+    case RKVA_RANGE_STORAGE_Q5_1:          return RKVA_LAYOUT_Q5_1;
+    case RKVA_RANGE_STORAGE_Q6_0:          return RKVA_LAYOUT_Q6_0;
+    case RKVA_RANGE_STORAGE_Q6_1:          return RKVA_LAYOUT_Q6_1;
+    case RKVA_RANGE_STORAGE_Q3_0:          return RKVA_LAYOUT_Q3_0;
+    case RKVA_RANGE_STORAGE_Q3_1:          return RKVA_LAYOUT_Q3_1;
+    case RKVA_RANGE_STORAGE_Q2_1:          return RKVA_LAYOUT_Q2_1;
+    case RKVA_RANGE_STORAGE_BF16:          return RKVA_LAYOUT_BF16;
+    case RKVA_RANGE_STORAGE_F32:           return RKVA_LAYOUT_F32;
+    case RKVA_RANGE_STORAGE_Q2_0S:         return RKVA_LAYOUT_Q2_0S;
+    default: return 0u;
+    }
+}
+
 // Layouts 9/10 are native GGML Q4_1 / IQ4_NL. A distinct descriptor is
 // mandatory even though IQ4_NL and Q4_0 have the same byte count.
 inline bool low4_storage(uint32_t storage) {
     return storage == RKVA_RANGE_STORAGE_Q4_1 || storage == RKVA_RANGE_STORAGE_IQ4_NL;
 }
 inline uint32_t low4_head_bytes(uint32_t storage) {
-    return storage == RKVA_RANGE_STORAGE_Q4_1 ? 160u :
-           storage == RKVA_RANGE_STORAGE_IQ4_NL ? 144u : 0u;
+    const uint32_t b = native_storage_head_bytes(storage);
+    return b ? b : (storage == RKVA_RANGE_STORAGE_Q4_1 ? 160u :
+                    storage == RKVA_RANGE_STORAGE_IQ4_NL ? 144u : 0u);
 }
 inline uint64_t low4_row_bytes(uint32_t storage, uint32_t heads) {
     return uint64_t(heads) * low4_head_bytes(storage);
@@ -86,14 +141,16 @@ inline bool valid_low4_descriptor(const rkva_kvarn_range_config& c, uint32_t dim
 }
 inline bool valid_low4_upload(const rkva_kvarn_range_upload& u, uint32_t capacity,
                              uint32_t previous_live) {
-    return u.append_rows > 0 && previous_live <= capacity &&
+    return previous_live <= capacity &&
            u.append_begin <= u.live_count && u.append_rows <= u.live_count - u.append_begin &&
            uint64_t(u.append_begin) + u.append_rows == u.live_count &&
            valid_q4_upload(u, capacity, previous_live);
 }
 
 inline bool valid_low4_planes(uint32_t storage, const uint8_t * k, const uint8_t * v, size_t head_rows) {
-    if (!low4_storage(storage) || !k || !v || !head_rows || head_rows > SIZE_MAX / low4_head_bytes(storage)) return false;
+    if (!low4_storage(storage)) return false;
+    if (!head_rows) return true;
+    if (!k || !v || head_rows > SIZE_MAX / low4_head_bytes(storage)) return false;
     const size_t block_bytes = storage == RKVA_RANGE_STORAGE_Q4_1 ? 20u : 18u;
     for (const uint8_t * plane : {k, v}) {
         for (size_t off = 0; off < head_rows * low4_head_bytes(storage); off += block_bytes) {
@@ -241,6 +298,26 @@ inline bool valid_oscar_int2_upload(const rkva_kvarn_range_upload& u, uint32_t c
         return u.append_begin == 0 && u.append_rows == u.live_count;
     }
     return u.append_begin == previous_live && u.append_rows == u.live_count - previous_live;
+}
+
+
+inline bool is_extended_native_storage(uint32_t storage) {
+    return storage == RKVA_RANGE_STORAGE_Q5_0 || storage == RKVA_RANGE_STORAGE_Q5_1 ||
+           storage == RKVA_RANGE_STORAGE_Q6_0 || storage == RKVA_RANGE_STORAGE_Q6_1 ||
+           storage == RKVA_RANGE_STORAGE_Q3_0 || storage == RKVA_RANGE_STORAGE_Q3_1 ||
+           storage == RKVA_RANGE_STORAGE_Q2_0S || storage == RKVA_RANGE_STORAGE_Q2_1 ||
+           storage == RKVA_RANGE_STORAGE_BF16 || storage == RKVA_RANGE_STORAGE_F32;
+}
+
+inline bool valid_extended_native_descriptor(const rkva_kvarn_range_config& c, uint32_t dimension) {
+    return is_extended_native_storage(c.storage) &&
+           c.layout_version == native_storage_layout(c.storage) &&
+           c.origin % 256 == 0 && c.capacity > 0 && c.capacity <= uint32_t(INT32_MAX) &&
+           c.origin <= uint32_t(INT32_MAX) - c.capacity && dimension == 256 &&
+           c.token_group == 1 && c.record_dim == 0 && c.head_dim == 256 && c.head_slices == 2 &&
+           c.record_bytes == native_storage_head_bytes(c.storage) &&
+           c.stage_groups == 0 && c.tail_groups == 0 && c.sink_tokens == 0 &&
+           c.precision_tail_tokens == 0 && c.wht_version == 0 && c.domain == 0 && c.record_policy == 1;
 }
 // OMIT_STAGE is safe only when the exact tail covers every incomplete group
 // and global group 0 (whose sink uses stage) is outside this overflow range.

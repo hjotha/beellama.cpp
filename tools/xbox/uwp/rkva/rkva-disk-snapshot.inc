@@ -468,7 +468,7 @@ bool RemoteAttnEngine::disk_snapshot(uint32_t id, const std::string& local_folde
         for (uint32_t kind = 0; kind < 2; ++kind) {
             const uint64_t base = kind * s->half_stride;
             if (s->range_storage == 3) {
-                add_span(layer, base, uint64_t(groups) * geo_.n_head_kv * 2 * 8960);
+                add_span(layer, base, uint64_t(groups) * geo_.n_head_kv * 2 * s->range_descriptor.record_bytes);
                 add_span(layer, base + s->records_bytes, s->stage_bytes);
                 add_span(layer, base + s->records_bytes + s->stage_bytes,
                          uint64_t(std::min(rows, s->precision_tail_tokens)) * row_bytes);

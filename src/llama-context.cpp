@@ -690,9 +690,12 @@ llama_context::llama_context(
     cparams.remote_attn_wire_format_set = selected_wire != nullptr;
     cparams.remote_attn_wire_format = selected_wire ? selected_wire : "";
     const auto native_format = [](const std::string & value) {
-        if (value == "kvarn4" || value == "kvarn") return LLAMA_REMOTE_COMPANION_KVARN4;
+        if (value == "kvarn2" || value == "kvarn3" || value == "kvarn4" ||
+            value == "kvarn5" || value == "kvarn6" || value == "kvarn8" || value == "kvarn")
+            return LLAMA_REMOTE_COMPANION_KVARN4;
         if (value == "saw_int4" || value == "saw-int4" || value == "saw4" || value == "bdr_int4") return LLAMA_REMOTE_COMPANION_SAW_INT4;
         if (value == "turboquant_nc" || value == "turboquant-nc" || value == "tqnc" || value == "turboquant_4bit_nc") return LLAMA_REMOTE_COMPANION_TURBOQUANT_NC;
+        if (value == "oscar_int2" || value == "oscar-int2" || value == "oscar2") return LLAMA_REMOTE_COMPANION_OSCAR_INT2;
         return LLAMA_REMOTE_COMPANION_NONE;
     };
     if (cparams.remote_attn_native_companion == LLAMA_REMOTE_COMPANION_AUTO) {
@@ -703,7 +706,7 @@ llama_context::llama_context(
                 native_format(cparams.remote_attn_upload_format) : LLAMA_REMOTE_COMPANION_NONE;
     }
     if (cparams.remote_attn_native_companion < LLAMA_REMOTE_COMPANION_NONE ||
-            cparams.remote_attn_native_companion > LLAMA_REMOTE_COMPANION_TURBOQUANT_NC ||
+            cparams.remote_attn_native_companion > LLAMA_REMOTE_COMPANION_OSCAR_INT2 ||
             (tcp_position_split && cparams.remote_attn_native_companion != LLAMA_REMOTE_COMPANION_NONE &&
              cparams.remote_attn_native_companion != native_format(cparams.remote_attn_upload_format))) {
         throw std::invalid_argument("native companion does not match the per-context upload format");
@@ -726,17 +729,22 @@ llama_context::llama_context(
             return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
                     type == GGML_TYPE_Q6_0 || type == GGML_TYPE_Q8_0;
         };
+        const auto is_tcp_ext = [](ggml_type type) {
+            return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || type == GGML_TYPE_BF16 ||
+                   type == GGML_TYPE_Q4_1 || type == GGML_TYPE_IQ4_NL ||
+                   type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q6_1 ||
+                   type == GGML_TYPE_Q3_0 || type == GGML_TYPE_Q3_1 ||
+                   type == GGML_TYPE_Q2_0S || type == GGML_TYPE_Q2_1;
+        };
         const bool formats_supported =
                 (is_qx(cparams.remote_attn_cache_type_k) && is_qx(cparams.remote_attn_cache_type_v)) ||
                 (tcp_position_split && cparams.remote_attn_cache_type_k == cparams.remote_attn_cache_type_v &&
-                 (cparams.remote_attn_cache_type_k == GGML_TYPE_F16 ||
-                  cparams.remote_attn_cache_type_k == GGML_TYPE_Q4_1 ||
-                  cparams.remote_attn_cache_type_k == GGML_TYPE_IQ4_NL));
+                 is_tcp_ext(cparams.remote_attn_cache_type_k));
         const bool local_format_supported =
                 (cparams.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) ||
                 (split_requested && (is_qx(params.type_k) || params.type_k == GGML_TYPE_F16 ||
                  (tcp_position_split && params.type_k == params.type_v &&
-                  (params.type_k == GGML_TYPE_Q4_1 || params.type_k == GGML_TYPE_IQ4_NL)) ||
+                  is_tcp_ext(params.type_k)) ||
                  (params.type_k == GGML_TYPE_SAW_INT4 && params.type_v == GGML_TYPE_SAW_INT4) ||
                  (params.type_k == GGML_TYPE_TQNC_K && params.type_v == GGML_TYPE_TQNC_V)));
         if (!local_attn_dev || !cparams.remote_attn_enabled || model.arch != LLM_ARCH_QWEN35 ||
@@ -2125,7 +2133,10 @@ std::vector<ggml_backend_t> layer_backends;
             if (tcp_position_split) {
                 const char * storage = cparams.remote_attn_upload_format.c_str();
                 const bool native_kvarn = storage &&
-                    (!std::strcmp(storage, "kvarn4") || !std::strcmp(storage, "kvarn"));
+                    (!std::strcmp(storage, "kvarn2") || !std::strcmp(storage, "kvarn3") ||
+                     !std::strcmp(storage, "kvarn4") || !std::strcmp(storage, "kvarn5") ||
+                     !std::strcmp(storage, "kvarn6") || !std::strcmp(storage, "kvarn8") ||
+                     !std::strcmp(storage, "kvarn"));
                 if (native_kvarn && cparams.kv_tail_type != GGML_TYPE_F16)
                     throw std::runtime_error("native Xbox KVarN4 requires an F16 precision tail");
                 if (mixed_additional_tail_requested) {
@@ -2318,7 +2329,9 @@ std::vector<ggml_backend_t> layer_backends;
                     }
                     const int native_format = native_cache->native_companion_format();
                     LLAMA_LOG_INFO("%s: native companion negotiated format=%s standard_cache=absent\n", __func__,
-                            native_format == 0 ? "kvarn4" : native_format == 4 ? "saw_int4" : "turboquant_nc");
+                            native_format == 0 ? (cparams.remote_attn_upload_format.empty() ? "kvarn4" : cparams.remote_attn_upload_format.c_str()) :
+                            native_format == 4 ? "saw_int4" :
+                            native_format == 5 ? "turboquant_nc" : "oscar_int2");
                     native_cache->set_native_companion_reset([this]() {
                         return backend_remote && ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
                     });

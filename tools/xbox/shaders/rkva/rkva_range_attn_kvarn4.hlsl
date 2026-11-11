@@ -14,7 +14,7 @@
 #if RKVA_SERIAL_PREFIX
 static uint rkva_window; // per-thread q_count, set once in the entry point
 #define RKVA_WINDOW rkva_window
-#define RKVA_TAIL_MASK ((1u << (firstbithigh(max(256u, precision_tail_tokens + 128u) - 1u) + 1u)) - 1u)
+#define RKVA_TAIL_MASK ((1u << (firstbithigh(max(256u, (precision_tail_tokens & 0xFFFFu) + 128u) - 1u) + 1u)) - 1u)
 #else
 #define RKVA_WINDOW active_count
 #define RKVA_TAIL_MASK 127u
@@ -24,6 +24,8 @@ cbuffer Params : register(b0) {
     float kq_scale;
     uint origin, split_k, cache_storage, records_bytes, precision_tail_tokens;
 };
+uint rkva_tail_tokens() { return precision_tail_tokens & 0xFFFFu; }
+uint rkva_kvarn_bits() { uint b = precision_tail_tokens >> 16; return b ? b : 4u; }
 ByteAddressBuffer queries : register(t0);
 ByteAddressBuffer keys : register(t1);
 ByteAddressBuffer values : register(t2);
@@ -56,6 +58,18 @@ float half_at(ByteAddressBuffer buffer, uint byte_offset) {
     uint bits = buffer.Load(byte_offset & ~3u);
     return f16tof32((bits >> ((byte_offset & 2u) * 8)) & 65535u);
 }
+uint kvarn_unpack1(ByteAddressBuffer buffer, uint base, uint index, uint bits) {
+    uint bit_pos = index * bits;
+    uint word_off = (bit_pos >> 5) * 4u;
+    uint shift = bit_pos & 31u;
+    uint mask = (1u << bits) - 1u;
+    if (shift + bits <= 32u) {
+        return (buffer.Load(base + word_off) >> shift) & mask;
+    } else {
+        uint2 w = buffer.Load2(base + word_off);
+        return ((w.x >> shift) | (w.y << (32u - shift))) & mask;
+    }
+}
 float load_native(ByteAddressBuffer buffer, bool value, uint token, uint head,
                   uint dim, uint slice, uint live_group) {
     uint group = token / 128, pos = token & 127;
@@ -69,14 +83,16 @@ float load_native(ByteAddressBuffer buffer, bool value, uint token, uint head,
         uint element = ((slot * 128 + pos) * physical_heads + physical_head) * 128 + dim;
         return half_at(buffer, records_bytes + element * 2);
     }
-    uint base = (group * physical_heads + physical_head) * 8960;
+    uint bits = rkva_kvarn_bits();
+    uint pay_bytes = bits * 2048u;
+    uint rec_bytes = pay_bytes + 768u;
+    uint base = (group * physical_heads + physical_head) * rec_bytes;
     uint row = value ? pos : dim, col = value ? dim : pos;
     uint index = row * 128 + col;
-    uint packed = buffer.Load(base + (index / 8) * 4);
-    uint quant = (packed >> ((index & 7) * 4)) & 15;
-    float scale = half_at(buffer, base + 8192 + row * 2);
-    float zero = half_at(buffer, base + 8448 + row * 2);
-    float other = half_at(buffer, base + 8704 + col * 2);
+    uint quant = kvarn_unpack1(buffer, base, index, bits);
+    float scale = half_at(buffer, base + pay_bytes + row * 2);
+    float zero = half_at(buffer, base + pay_bytes + 256u + row * 2);
+    float other = half_at(buffer, base + pay_bytes + 512u + col * 2);
     precise float affine = float(quant) * scale + zero;
     return affine * other;
 }
@@ -106,7 +122,7 @@ void CSRangeAttn(uint lane : SV_GroupIndex, uint3 group : SV_GroupID) {
     float denom = 0, maximum = -3.402823466e38f;
     uint wave_size = WaveGetLaneCount();
     uint live_group = RKVA_WINDOW ? (RKVA_WINDOW - 1) / 128 : 0;
-    uint tail_begin = RKVA_WINDOW - min(RKVA_WINDOW, precision_tail_tokens);
+    uint tail_begin = RKVA_WINDOW - min(RKVA_WINDOW, rkva_tail_tokens());
     [loop] for (uint row = begin; row < end; ++row) {
         bool exact = row >= tail_begin;
         float k0 = exact ? load_tail(keys, row, kv_head, lane, tail_begin) :
