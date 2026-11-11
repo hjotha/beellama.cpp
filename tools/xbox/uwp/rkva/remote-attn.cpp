@@ -426,12 +426,22 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         g.max_ctx = hello.max_ctx;
         g.n_layers = hello.n_layer_remote;
 
-        state.engine = std::make_unique<RemoteAttnEngine>();
         const bool lazy_int8 = std::ifstream(g_snapshot_local_folder + "\\rkva-lazy-int8-init.flag").good();
-        state.engine->set_lazy_int8_init(lazy_int8);
         std::string engine_error;
         const auto engine_started = clock_type::now();
-        const bool initialized = state.engine->initialize(g, &engine_error);
+        // Reuse the live engine when the geometry is unchanged: its PSOs (and
+        // any lazily compiled format family) are already on the device, so the
+        // handshake costs a millisecond instead of tens of seconds.
+        const bool reuse_engine = state.engine && state.engine->matches_geometry(g);
+        bool initialized = true;
+        if (reuse_engine) {
+            state.engine->reset_for_hello();
+            state.engine->set_lazy_int8_init(lazy_int8); // no-op once ready
+        } else {
+            state.engine = std::make_unique<RemoteAttnEngine>();
+            state.engine->set_lazy_int8_init(lazy_int8);
+            initialized = state.engine->initialize(g, &engine_error);
+        }
         const uint64_t engine_us = elapsed_us(engine_started);
         if (!initialized) {
             event(g_log_path, rkva_hello_telemetry::event(false, req.cycle_id, evict_us,
@@ -1995,7 +2005,11 @@ void serve_remote_attn(const std::string& local_folder) {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.hello_done = false;
             state.sessions.clear();
-            state.engine.reset(); // freed and re-created at the next HELLO
+            // Keep the engine (device, PSOs, lazy format families) across
+            // connections: only its per-session KV is dropped, so a later HELLO
+            // with the same geometry skips the PSO compile entirely.
+            if (state.engine)
+                state.engine->reset_for_hello();
             state.engine_f16 = false;
         }
         client_loop(client, state, log_path);

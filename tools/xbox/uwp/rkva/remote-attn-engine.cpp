@@ -1803,6 +1803,28 @@ bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
     return true;
 }
 
+bool RemoteAttnEngine::matches_geometry(const Geometry& geo) const {
+    if (!ready_)
+        return false;
+    return geo_.n_head == geo.n_head && geo_.n_head_kv == geo.n_head_kv &&
+           geo_.head_dim == geo.head_dim && geo_.head_slices == geo.head_slices &&
+           geo_.cache_bits_k == geo.cache_bits_k && geo_.cache_bits_v == geo.cache_bits_v &&
+           geo_.group_tokens == geo.group_tokens && geo_.sinkhorn_iters == geo.sinkhorn_iters &&
+           geo_.tail_tokens == geo.tail_tokens && geo_.tail_groups == geo.tail_groups &&
+           geo_.stage_groups == geo.stage_groups && geo_.domain == geo.domain &&
+           geo_.kq_scale == geo.kq_scale && geo_.max_ctx == geo.max_ctx &&
+           geo_.n_layers == geo.n_layers;
+}
+
+void RemoteAttnEngine::reset_for_hello() {
+    // Per-session KV is the only HELLO-scoped allocation. The D3D12 device, root
+    // signatures, required/Q4 PSOs and any lazily built format family survive, so
+    // a later HELLO with the same geometry skips the whole PSO compile.
+    sessions_.clear();
+    allocated_bytes_ = 0;
+    init_timings_ = {};
+}
+
 RemoteAttnEngine::Session* RemoteAttnEngine::find_session(uint32_t session_id) {
     for (auto& s : sessions_) {
         if (s && s->id == session_id) {

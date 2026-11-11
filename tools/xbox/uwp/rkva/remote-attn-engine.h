@@ -112,6 +112,12 @@ class RemoteAttnEngine {
     // scratch buffers. Session KV resources are allocated per create_session.
     // A failed initialize never leaves the engine half-enabled.
     bool initialize(const Geometry& geo, std::string* error);
+    // True when the live engine was initialized with this exact geometry, so a
+    // new HELLO may reuse it (and its compiled PSOs) instead of re-creating it.
+    bool matches_geometry(const Geometry& geo) const;
+    // Drop every per-session KV allocation and the per-HELLO telemetry while
+    // keeping the device, root signatures and all compiled PSOs alive.
+    void reset_for_hello();
     const InitTimings& init_timings() const { return init_timings_; }
     bool submission_unconfirmed() const {
         return unconfirmed_submission_;
