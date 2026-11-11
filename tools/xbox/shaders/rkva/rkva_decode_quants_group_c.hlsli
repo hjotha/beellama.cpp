@@ -3,9 +3,9 @@
 
 // RKVA Group C rowlane dequantization formats (Wave64 on RDNA2 / Xbox Series X):
 // 1. iq4_nl (144 bytes / 256 dims: 8 blocks of 18 bytes. d fp16 + 16 bytes qs. x = d * kvalues_iq4nl[q])
-// 2. kvarn2 (q2_0s) (80 bytes / 256 dims: 8 blocks of 10 bytes. d fp16 + 8 bytes qs with 2-bit planes. x = (q - 2) * d)
-// 3. kvarn3 (q3_0) (112 bytes / 256 dims: 8 blocks of 14 bytes. d fp16 + 4 bytes qh + 8 bytes qs. x = (q - 4) * d)
-// 4. kvarn8 (q8_0) (272 bytes / 256 dims: 8 blocks of 34 bytes. d fp16 + 32 bytes qs int8. x = q * d)
+// 2. q2_0s  (80 bytes / 256 dims: 8 blocks of 10 bytes. d fp16 + 8 bytes qs with 2-bit planes. x = (q - 2) * d; distinct from 2D WHT+Sinkhorn KVarN2 and OSCAR INT2)
+// 3. q3_0   (112 bytes / 256 dims: 8 blocks of 14 bytes. d fp16 + 4 bytes qh + 8 bytes qs. x = (q - 4) * d; distinct from 2D WHT+Sinkhorn KVarN3)
+// 4. q8_0   (272 bytes / 256 dims: 8 blocks of 34 bytes. d fp16 + 32 bytes qs int8. x = q * d; distinct from 2D WHT+Sinkhorn KVarN8)
 
 #define RKVA_ROW_HEAD_IQ4_NL 144
 #define RKVA_ROW_HEAD_Q2_0S   80

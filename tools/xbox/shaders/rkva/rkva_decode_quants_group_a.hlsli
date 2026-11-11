@@ -1,8 +1,8 @@
 // RKVA Group A rowlane dequantization formats for Xbox Series X (Wave64).
 // Formats:
 //   1. f16   - 512 bytes / 256 dims (256 fp16 elements)
-//   2. q5_0  - 176 bytes / 256 dims (8 blocks of 22 bytes: kvarn5)
-//   3. q6_0  - 208 bytes / 256 dims (8 blocks of 26 bytes: kvarn6)
+//   2. q5_0  - 176 bytes / 256 dims (8 blocks of 22 bytes: GGML block_q5_0, distinct from 2D WHT+Sinkhorn KVarN5)
+//   3. q6_0  - 208 bytes / 256 dims (8 blocks of 26 bytes: GGML block_q6_0, distinct from 2D WHT+Sinkhorn KVarN6)
 //
 // In Wave64 rowlane decode, 64 lanes map to 64 quarter-units u in [0, 63].
 // Each quarter-unit u loads 4 floats (float4) covering 4 dimensions given by quarter_dim(u).
@@ -32,6 +32,34 @@ float4 load_f16(ByteAddressBuffer buffer, uint base, uint u) {
     uint2 packed = buffer.Load2(base + u * 8);
     return float4(f16tof32(packed.x & 65535u), f16tof32(packed.x >> 16),
                   f16tof32(packed.y & 65535u), f16tof32(packed.y >> 16));
+}
+
+// =============================================================================
+// Format 1b: BF16 (512 bytes / 256 dimensions)
+// =============================================================================
+
+uint quarter_dim_bf16(uint u) {
+    return u * 4;
+}
+
+float4 load_bf16(ByteAddressBuffer buffer, uint base, uint u) {
+    uint2 packed = buffer.Load2(base + u * 8);
+    return float4(asfloat((packed.x & 65535u) << 16),
+                  asfloat(packed.x & 0xFFFF0000u),
+                  asfloat((packed.y & 65535u) << 16),
+                  asfloat(packed.y & 0xFFFF0000u));
+}
+
+// =============================================================================
+// Format 1c: F32 (1024 bytes / 256 dimensions)
+// =============================================================================
+
+uint quarter_dim_f32(uint u) {
+    return u * 4;
+}
+
+float4 load_f32(ByteAddressBuffer buffer, uint base, uint u) {
+    return asfloat(buffer.Load4(base + u * 16));
 }
 
 // =============================================================================

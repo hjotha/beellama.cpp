@@ -3677,10 +3677,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                      params.remote_attn_cache_type_k != GGML_TYPE_F16 &&
                                      !(cparams.remote_attn_position_split &&
                                        (params.remote_attn_cache_type_k == GGML_TYPE_Q4_1 ||
-                                        params.remote_attn_cache_type_k == GGML_TYPE_IQ4_NL))) ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_IQ4_NL ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_Q5_0 ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_Q5_1 ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_Q6_0 ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_Q6_1 ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_Q3_0 ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_Q3_1 ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_Q2_0S ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_Q2_1 ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_BF16 ||
+                                        params.remote_attn_cache_type_k == GGML_TYPE_F32))) ||
                                         params.remote_attn_cache_type_v != params.remote_attn_cache_type_k)) {
                                     throw std::invalid_argument(
-                                            "position-split KV exige K/V remotos do mesmo tipo: Q4_0, Q8_0, F16 ou Q4_1/IQ4_NL TCP");
+                                            "position-split KV exige K/V remotos do mesmo tipo: Q4_0, Q8_0, F16 ou formato TCP suportado");
                                 }
                                 // O backend de overflow é validado pelos buffers
                                 // reais no ctor do cache (todas as camadas Q4

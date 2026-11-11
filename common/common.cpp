@@ -3450,9 +3450,12 @@ enum llama_remote_native_companion common_resolve_remote_native_companion(const 
         throw std::invalid_argument("positional RPC companion K/V must match the selected remote KV format");
     }
     const auto format_id = [](const std::string & value) {
-        if (value == "kvarn4" || value == "kvarn") return LLAMA_REMOTE_COMPANION_KVARN4;
+        if (value == "kvarn2" || value == "kvarn3" || value == "kvarn4" ||
+            value == "kvarn5" || value == "kvarn6" || value == "kvarn8" || value == "kvarn")
+            return LLAMA_REMOTE_COMPANION_KVARN4;
         if (value == "saw_int4" || value == "saw-int4" || value == "saw4" || value == "bdr_int4") return LLAMA_REMOTE_COMPANION_SAW_INT4;
         if (value == "turboquant_nc" || value == "turboquant-nc" || value == "tqnc" || value == "turboquant_4bit_nc") return LLAMA_REMOTE_COMPANION_TURBOQUANT_NC;
+        if (value == "oscar_int2" || value == "oscar-int2" || value == "oscar2") return LLAMA_REMOTE_COMPANION_OSCAR_INT2;
         return LLAMA_REMOTE_COMPANION_NONE;
     };
     auto native_selection = LLAMA_REMOTE_COMPANION_NONE;
@@ -3486,7 +3489,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     };
     const bool tcp_position_split = params.kv_position_split_p != 0 && !params.remote_attn_host.empty() &&
             !common_remote_attn_is_local_vulkan(params.remote_attn_host);
-    const auto is_low4 = [](ggml_type type) { return type == GGML_TYPE_Q4_1 || type == GGML_TYPE_IQ4_NL; };
+    const auto is_low4 = [](ggml_type type) {
+        return type == GGML_TYPE_Q4_1 || type == GGML_TYPE_IQ4_NL ||
+               type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q6_1 ||
+               type == GGML_TYPE_Q3_0 || type == GGML_TYPE_Q3_1 ||
+               type == GGML_TYPE_Q2_0S || type == GGML_TYPE_Q2_1 ||
+               type == GGML_TYPE_BF16 || type == GGML_TYPE_F32;
+    };
     if ((is_low4(params.remote_attn_cache_type_k) || is_low4(params.remote_attn_cache_type_v)) &&
         (!tcp_position_split || params.remote_attn_cache_type_k != params.remote_attn_cache_type_v))
         throw std::invalid_argument("remote Q4_1/IQ4_NL requires matching TCP position-split K/V");

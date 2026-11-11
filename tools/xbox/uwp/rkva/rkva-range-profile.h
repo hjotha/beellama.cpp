@@ -70,7 +70,18 @@ constexpr uint32_t kStorageQ4_1 = 1u << 6;
 constexpr uint32_t kStorageIQ4_NL = 1u << 7;
 constexpr uint32_t kStorageSawInt4 = 1u << 3;
 constexpr uint32_t kStorageTurboquantNC = 1u << 5;
-constexpr uint32_t kNativeStorageCount = 4;
+constexpr uint32_t kStorageOscarInt2 = 1u << 4;
+constexpr uint32_t kStorageQ5_0 = 1u << 8;
+constexpr uint32_t kStorageQ5_1 = 1u << 9;
+constexpr uint32_t kStorageQ6_0 = 1u << 10;
+constexpr uint32_t kStorageQ6_1 = 1u << 11;
+constexpr uint32_t kStorageQ3_0 = 1u << 12;
+constexpr uint32_t kStorageQ3_1 = 1u << 13;
+constexpr uint32_t kStorageQ2_1 = 1u << 14;
+constexpr uint32_t kStorageBF16 = 1u << 15;
+constexpr uint32_t kStorageF32 = 1u << 16;
+constexpr uint32_t kStorageQ2_0S = 1u << 17;
+constexpr uint32_t kNativeStorageCount = 15;
 
 inline uint32_t native_storage_index(uint32_t storage) {
     switch (storage) {
@@ -78,6 +89,17 @@ inline uint32_t native_storage_index(uint32_t storage) {
     case kStorageIQ4_NL: return 1;
     case kStorageSawInt4: return 2;
     case kStorageTurboquantNC: return 3;
+    case kStorageOscarInt2: return 4;
+    case kStorageQ5_0: return 5;
+    case kStorageQ5_1: return 6;
+    case kStorageQ6_0: return 7;
+    case kStorageQ6_1: return 8;
+    case kStorageQ3_0: return 9;
+    case kStorageQ3_1: return 10;
+    case kStorageQ2_1: return 11;
+    case kStorageBF16: return 12;
+    case kStorageF32: return 13;
+    case kStorageQ2_0S: return 14;
     default: return kNativeStorageCount;
     }
 }
@@ -88,6 +110,17 @@ inline const char* kernel_name(uint32_t storage, uint32_t mode) {
     if (storage == kStorageIQ4_NL) return "iq4_nl_rowlane";
     if (storage == kStorageSawInt4) return "saw_int4_rowlane";
     if (storage == kStorageTurboquantNC) return "turboquant_nc";
+    if (storage == kStorageOscarInt2) return "oscar_int2_rowlane";
+    if (storage == kStorageQ5_0) return "q5_0_rowlane";
+    if (storage == kStorageQ5_1) return "q5_1_rowlane";
+    if (storage == kStorageQ6_0) return "q6_0_rowlane";
+    if (storage == kStorageQ6_1) return "q6_1_rowlane";
+    if (storage == kStorageQ3_0) return "q3_0_rowlane";
+    if (storage == kStorageQ3_1) return "q3_1_rowlane";
+    if (storage == kStorageQ2_1) return "q2_1_rowlane";
+    if (storage == kStorageBF16) return "bf16_rowlane";
+    if (storage == kStorageF32) return "f32_rowlane";
+    if (storage == kStorageQ2_0S) return "q2_0s_rowlane";
     if (mode == kModeReference || !valid_mode(mode)) {
         return mode_name(mode);
     }
@@ -671,6 +704,26 @@ inline const char* storage_name(uint32_t storage) {
         return "saw_int4";
     case kStorageTurboquantNC:
         return "turboquant_nc";
+    case kStorageOscarInt2:
+        return "oscar_int2";
+    case kStorageQ5_0:
+        return "q5_0";
+    case kStorageQ5_1:
+        return "q5_1";
+    case kStorageQ6_0:
+        return "q6_0";
+    case kStorageQ6_1:
+        return "q6_1";
+    case kStorageQ3_0:
+        return "q3_0";
+    case kStorageQ3_1:
+        return "q3_1";
+    case kStorageQ2_1:
+        return "q2_1";
+    case kStorageBF16:
+        return "bf16";
+    case kStorageF32:
+        return "f32";
     default:
         return "unknown";
     }
@@ -921,7 +974,10 @@ class Recorder {
         }
         o += '}';
         o += ",\"native_row_attention\":{";
-        const uint32_t native_storages[] = {kStorageQ4_1, kStorageIQ4_NL, kStorageSawInt4, kStorageTurboquantNC};
+        const uint32_t native_storages[] = {
+            kStorageQ4_1, kStorageIQ4_NL, kStorageSawInt4, kStorageTurboquantNC,
+            kStorageOscarInt2, kStorageQ5_0, kStorageQ5_1, kStorageQ6_0, kStorageQ6_1,
+            kStorageQ3_0, kStorageQ3_1, kStorageQ2_1, kStorageBF16, kStorageF32};
         for (uint32_t i = 0; i < kNativeStorageCount; ++i) {
             std::snprintf(buf, sizeof(buf),
                           "%s\"%s\":{\"optimized_calls\":%llu,\"reference_calls\":%llu,\"mq2_calls\":%llu}",

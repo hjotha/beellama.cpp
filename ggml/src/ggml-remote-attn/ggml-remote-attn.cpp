@@ -1570,9 +1570,21 @@ static const char * rkva_get_upload_format(const ggml_backend_remote_attn_contex
     return std::getenv("GGML_RKVA_RANGE_STORAGE");
 }
 
+static uint32_t rkva_kvarn_format_bits(const char * fmt) {
+    if (!fmt) return 0;
+    if (!std::strcmp(fmt, "kvarn2")) return 2;
+    if (!std::strcmp(fmt, "kvarn3")) return 3;
+    if (!std::strcmp(fmt, "kvarn4") || !std::strcmp(fmt, "kvarn")) return 4;
+    if (!std::strcmp(fmt, "kvarn5")) return 5;
+    if (!std::strcmp(fmt, "kvarn6")) return 6;
+    if (!std::strcmp(fmt, "kvarn8")) return 8;
+    return 0;
+}
+
 static uint64_t rkva_requested_e4_capability(const char * fmt) {
     if (!fmt) return 0;
-    if (!std::strcmp(fmt, "kvarn4") || !std::strcmp(fmt, "kvarn")) return RKVA_CAP_KVARN_BULK_E4M3FN;
+    if (rkva_kvarn_format_bits(fmt) != 0) return RKVA_CAP_KVARN_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q8_0") || !std::strcmp(fmt, "q8")) return RKVA_CAP_NATIVE_Q8_BULK_E4M3FN;
     if (!std::strcmp(fmt, "q4_0") || !std::strcmp(fmt, "q4")) return RKVA_CAP_NATIVE_Q4_BULK_E4M3FN;
     if (!std::strcmp(fmt, "q4_1")) return RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN;
     if (!std::strcmp(fmt, "iq4_nl")) return RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN;
@@ -1580,20 +1592,47 @@ static uint64_t rkva_requested_e4_capability(const char * fmt) {
         !std::strcmp(fmt, "saw4") || !std::strcmp(fmt, "bdr_int4")) return RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN;
     if (!std::strcmp(fmt, "turboquant_nc") || !std::strcmp(fmt, "turboquant-nc") ||
         !std::strcmp(fmt, "tqnc") || !std::strcmp(fmt, "turboquant_4bit_nc")) return RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q5_0")) return RKVA_CAP_NATIVE_Q5_0_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q5_1")) return RKVA_CAP_NATIVE_Q5_1_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q6_0")) return RKVA_CAP_NATIVE_Q6_0_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q6_1")) return RKVA_CAP_NATIVE_Q6_1_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q3_0")) return RKVA_CAP_NATIVE_Q3_0_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q3_1")) return RKVA_CAP_NATIVE_Q3_1_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q2_1")) return RKVA_CAP_NATIVE_Q2_1_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "q2_0s") || !std::strcmp(fmt, "q2_0")) return RKVA_CAP_NATIVE_Q2_0S_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "oscar_int2") || !std::strcmp(fmt, "oscar-int2")) return RKVA_CAP_NATIVE_OSCAR_INT2_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "bf16")) return RKVA_CAP_NATIVE_BF16_BULK_E4M3FN;
+    if (!std::strcmp(fmt, "f32")) return RKVA_CAP_NATIVE_F32_BULK_E4M3FN;
     return 0;
 }
 
 static bool rkva_prefetch_wire_allowed(const ggml_backend_remote_attn_context * ctx, rkva_wire wire) {
     if (wire != ctx->range_wire) return false;
     if (wire == RKVA_WIRE_FP8) return true;
-    return wire == RKVA_WIRE_FP8_E4M3FN && ctx->protocol_version == RKVA_VERSION &&
-        ctx->e4_requested && (ctx->ack.reserved[0] &
-            (ctx->native_low4 == RKVA_RANGE_STORAGE_Q4_1 ? RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN :
-             ctx->native_low4 == RKVA_RANGE_STORAGE_IQ4_NL ? RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN :
-             ctx->native_q4 ? RKVA_CAP_NATIVE_Q4_BULK_E4M3FN :
-             ctx->native_saw_int4 ? RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN :
-             ctx->native_turboquant_nc ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN :
-             ctx->native_q8 ? 0 : RKVA_CAP_KVARN_BULK_E4M3FN));
+    if (wire != RKVA_WIRE_FP8_E4M3FN || ctx->protocol_version != RKVA_VERSION || !ctx->e4_requested) return false;
+    uint32_t storage = 0;
+    uint32_t layout = 0;
+    if (ctx->native_low4) {
+        storage = ctx->native_low4;
+        layout = ctx->native_descriptor.layout_version;
+    } else if (ctx->native_q4) {
+        storage = RKVA_RANGE_STORAGE_Q4_0;
+        layout = 4;
+    } else if (ctx->native_q8) {
+        storage = RKVA_RANGE_STORAGE_Q8_0;
+        layout = 5;
+    } else if (ctx->native_saw_int4) {
+        storage = RKVA_RANGE_STORAGE_SAW_INT4;
+        layout = 6;
+    } else if (ctx->native_turboquant_nc) {
+        storage = RKVA_RANGE_STORAGE_TURBOQUANT_NC;
+        layout = 8;
+    } else if (ctx->range_native_kvarn) {
+        storage = RKVA_RANGE_STORAGE_KVARN4;
+        layout = ctx->native_descriptor.layout_version;
+    }
+    const uint64_t req = rkva_e4_layout_capability(storage, layout);
+    return req != 0 && (ctx->ack.reserved[0] & req) != 0;
 }
 
 // The worker thread has sole ownership of ctx->sock. Network transmit/receive
@@ -2420,7 +2459,9 @@ static std::unique_ptr<rkva_native_owner> rkva_new_native_owner(
         ggml_backend_remote_attn_context * ctx, bool force_cpu = false) {
     if (ctx->native_low4) {
         return std::unique_ptr<rkva_native_owner>(new rkva_low4_producer(
-                ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv, ctx->range_source_type));
+                ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv,
+                ctx->native_low4 == RKVA_RANGE_STORAGE_OSCAR_INT2 ? GGML_TYPE_Q2_0S : ctx->range_source_type,
+                ctx->native_low4 == RKVA_RANGE_STORAGE_OSCAR_INT2));
     }
     if (ctx->native_q4) {
         return std::unique_ptr<rkva_native_owner>(new rkva_q4_producer(
@@ -2441,7 +2482,8 @@ static std::unique_ptr<rkva_native_owner> rkva_new_native_owner(
     return std::unique_ptr<rkva_native_owner>(new rkva_kvarn_producer(
             ctx->range_origin, ctx->range_capacity, ctx->geo.n_head_kv,
             ctx->geo.sinkhorn_iters, ctx->native_store, ctx->native_tail_tokens,
-            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) && ctx->native_serial_prefix, force_cpu));
+            (ctx->ack.reserved[0] & RKVA_CAP_KVARN_COMPACT_STAGE) && ctx->native_serial_prefix, force_cpu,
+            ctx->native_descriptor.key_bits ? ctx->native_descriptor.key_bits : 4u));
 }
 
 static bool rkva_native_kvarn_stage_append(
@@ -4103,8 +4145,7 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     }
     if (!ctx->wire_options_fixed && !rkva_capture_wire_options(ctx, nullptr)) return false;
     const char * requested_storage = ctx->upload_format.empty() ? nullptr : ctx->upload_format.c_str();
-    const bool env_native_kvarn = requested_storage &&
-            (!std::strcmp(requested_storage, "kvarn4") || !std::strcmp(requested_storage, "kvarn"));
+    const bool env_native_kvarn = rkva_kvarn_format_bits(requested_storage) != 0;
     if (ctx->native_tail_override == UINT32_MAX && env_native_kvarn) {
         if (const char * tail = std::getenv("GGML_RKVA_NATIVE_TAIL_TOKENS")) {
             if (!*tail || !std::all_of(tail, tail + std::strlen(tail), [](unsigned char c) {
@@ -4157,7 +4198,14 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     ctx->sock.assign(fd);
     const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    timeval tv { 30, 0 };
+    const int timeout_sec = []() {
+        if (const char * env = std::getenv("GGML_RKVA_SOCKET_TIMEOUT_SEC")) {
+            int v = std::atoi(env);
+            if (v > 0) return v;
+        }
+        return 120;
+    }();
+    timeval tv { timeout_sec, 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -4231,12 +4279,28 @@ bool ggml_backend_remote_attn_connect(ggml_backend_t backend) {
     if (ctx->e4_requested) {
         const uint64_t e4_cap = rkva_requested_e4_capability(rkva_get_upload_format(ctx));
         const bool kvarn = e4_cap == RKVA_CAP_KVARN_BULK_E4M3FN;
-        const uint64_t storage_caps = kvarn ? RKVA_CAP_RANGE_KVARN4 | RKVA_CAP_KVARN_REWIND | RKVA_CAP_KVARN_SERIAL_PREFIX :
-            e4_cap == RKVA_CAP_NATIVE_Q4_BULK_E4M3FN ? RKVA_CAP_RANGE_Q4_0 | RKVA_CAP_NATIVE_Q4_BULK :
-            e4_cap == RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN ? RKVA_CAP_NATIVE_SAW_INT4_BULK :
-            e4_cap == RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN ? RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK :
-            e4_cap == RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN ? RKVA_CAP_NATIVE_Q4_1_BULK :
-            e4_cap == RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN ? RKVA_CAP_NATIVE_IQ4_NL_BULK : 0;
+        uint64_t storage_caps = 0;
+        switch (e4_cap) {
+            case RKVA_CAP_KVARN_BULK_E4M3FN: storage_caps = RKVA_CAP_RANGE_KVARN4 | RKVA_CAP_KVARN_REWIND | RKVA_CAP_KVARN_SERIAL_PREFIX; break;
+            case RKVA_CAP_NATIVE_Q4_BULK_E4M3FN: storage_caps = RKVA_CAP_RANGE_Q4_0 | RKVA_CAP_NATIVE_Q4_BULK; break;
+            case RKVA_CAP_NATIVE_Q8_BULK_E4M3FN: storage_caps = RKVA_CAP_RANGE_Q8_0 | RKVA_CAP_NATIVE_Q8_BULK; break;
+            case RKVA_CAP_NATIVE_SAW_INT4_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_SAW_INT4_BULK; break;
+            case RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_TURBOQUANT_NC_BULK; break;
+            case RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q4_1_BULK; break;
+            case RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_IQ4_NL_BULK; break;
+            case RKVA_CAP_NATIVE_Q5_0_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q5_0_BULK; break;
+            case RKVA_CAP_NATIVE_Q5_1_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q5_1_BULK; break;
+            case RKVA_CAP_NATIVE_Q6_0_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q6_0_BULK; break;
+            case RKVA_CAP_NATIVE_Q6_1_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q6_1_BULK; break;
+            case RKVA_CAP_NATIVE_Q3_0_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q3_0_BULK; break;
+            case RKVA_CAP_NATIVE_Q3_1_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q3_1_BULK; break;
+            case RKVA_CAP_NATIVE_Q2_1_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q2_1_BULK; break;
+            case RKVA_CAP_NATIVE_Q2_0S_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_Q2_0S_BULK; break;
+            case RKVA_CAP_NATIVE_OSCAR_INT2_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_OSCAR_INT2_BULK; break;
+            case RKVA_CAP_NATIVE_BF16_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_BF16_BULK; break;
+            case RKVA_CAP_NATIVE_F32_BULK_E4M3FN: storage_caps = RKVA_CAP_NATIVE_F32_BULK; break;
+            default: break;
+        }
         const uint64_t caps = e4_cap | storage_caps | RKVA_CAP_KVARN_BULK_ATTN;
         const uint32_t ops = (1u << RKVA_KVARN_RANGE_CONFIG) | (1u << RKVA_KVARN_RANGE_UPLOAD) |
             (1u << (kvarn ? RKVA_KVARN_RANGE_REWIND : RKVA_REWIND)) | (1u << RKVA_KVARN_RANGE_BULK_ATTN);
@@ -4579,11 +4643,13 @@ static bool rkva_async_local_remote_option(bool & async_overlap, bool & explicit
 }
 
 static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
-        uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap) {
+        uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap,
+        uint32_t bits = 4) {
     const char * experimental = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
     constexpr uint32_t required = (1u << RKVA_KVARN_RANGE_CONFIG) |
                                   (1u << RKVA_KVARN_RANGE_UPLOAD) | (1u << RKVA_RANGE_ATTN);
     if (!experimental || std::strcmp(experimental, "1") || !ctx->connected || ctx->failed ||
+            (bits != 2 && bits != 3 && bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
             ctx->active_session == RKVA_SESSION_NONE || !(ctx->ack.reserved[0] & RKVA_CAP_RANGE_KVARN4) ||
             (ctx->ack.supported_ops & required) != required || origin == 0 || origin % 128 || !capacity ||
             uint64_t(origin) + capacity > INT32_MAX || ctx->geo.max_ctx != capacity ||
@@ -4591,7 +4657,9 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
             ctx->geo.group_tokens != 128 || ctx->geo.sinkhorn_iters == 0 ||
             ctx->geo.tail_type != 0 || ctx->geo.has_sinks || ctx->geo.swa ||
             (source_type != GGML_TYPE_Q4_0 && source_type != GGML_TYPE_Q8_0 &&
-             source_type != GGML_TYPE_F32)) return false;
+             source_type != GGML_TYPE_F32 && source_type != GGML_TYPE_Q2_0S &&
+             source_type != GGML_TYPE_Q3_0 && source_type != GGML_TYPE_Q5_0 &&
+             source_type != GGML_TYPE_Q6_0)) return false;
     if (const char * fuse = std::getenv("GGML_RKVA_RANGE_FUSE")) {
         if (std::strcmp(fuse, "auto") && std::strcmp(fuse, "0")) return false;
     }
@@ -4756,7 +4824,7 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     }
     const rkva_kvarn_range_config descriptor {
         origin, capacity, RKVA_RANGE_STORAGE_KVARN4, serial_prefix ? 3u : rewind_v2 ? 2u : 1u,
-        128, 128, 256, 2, 4, 4, 8960, 3, 2, 128, precision_tail_tokens, 1, 1, 1};
+        128, 128, 256, 2, bits, bits, bits * 2048u + 768u, 3, 2, 128, precision_tail_tokens, 1, 1, 1};
     std::vector<uint8_t> reply;
     if (!rkva_transact(ctx, RKVA_KVARN_RANGE_CONFIG, ctx->active_session, 0, 0,
             &descriptor, sizeof(descriptor), reply, rewind_v2 ? sizeof(uint64_t) : 0) ||
@@ -4797,8 +4865,8 @@ static bool rkva_configure_native_kvarn(ggml_backend_remote_attn_context * ctx,
     const char * wire_str = bulk ? (bulk_wire == RKVA_WIRE_FP8_E4M3FN ? "fp8_e4m3fn" :
                                     bulk_wire == RKVA_WIRE_FP8 ? "fp8_e5m2" :
                                     bulk_wire == RKVA_WIRE_F16 ? "f16" : "f32") : "f32";
-    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN4 precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d wire=%s; original F32 producer, bounded resident rewind and paired FULL snapshots require negotiated capability\n",
-                  GGML_REMOTE_ATTN_NAME, precision_tail_tokens, descriptor.layout_version, int(serial_prefix), int(async_overlap), wire_str);
+    GGML_LOG_WARN("%s: EXPERIMENTAL native KVarN%u (record_bytes=%u) precision_tail=%u descriptor=%u serial_prefix=%d async_overlap=%d wire=%s; original F32 producer, bounded resident rewind and paired FULL snapshots require negotiated capability\n",
+                  GGML_REMOTE_ATTN_NAME, bits, descriptor.record_bytes, precision_tail_tokens, descriptor.layout_version, int(serial_prefix), int(async_overlap), wire_str);
     return true;
 }
 
@@ -4897,11 +4965,15 @@ static bool rkva_configure_native_q4(ggml_backend_remote_attn_context * ctx,
 }
 
 static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
-        uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap) {
+        uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap,
+        bool oscar_int2 = false) {
     const char * experimental = std::getenv("GGML_RKVA_EXPERIMENTAL_LOW4");
-    if (!experimental || std::strcmp(experimental, "1")) {
-        GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL requires GGML_RKVA_EXPERIMENTAL_LOW4=1; no fallback\n", GGML_REMOTE_ATTN_NAME);
-        return false;
+    if ((source_type == GGML_TYPE_Q4_1 || source_type == GGML_TYPE_IQ4_NL) && (!experimental || std::strcmp(experimental, "1"))) {
+        const char * fmt = rkva_get_upload_format(ctx);
+        if (!fmt || (std::strcmp(fmt, "q4_1") != 0 && std::strcmp(fmt, "iq4_nl") != 0)) {
+            GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL requires GGML_RKVA_EXPERIMENTAL_LOW4=1; no fallback\n", GGML_REMOTE_ATTN_NAME);
+            return false;
+        }
     }
     const char * producer = std::getenv("GGML_RKVA_LOW4_PRODUCER");
     if (!producer) {
@@ -4912,7 +4984,7 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
         }
     }
     if (producer && std::strcmp(producer, "cpu") && std::strcmp(producer, "cuda")) {
-        GGML_LOG_ERROR("%s: native Q4_1/IQ4_NL producer must be cpu or cuda\n", GGML_REMOTE_ATTN_NAME);
+        GGML_LOG_ERROR("%s: native low4 producer must be cpu or cuda\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
     const bool cuda_producer = producer && !std::strcmp(producer, "cuda");
@@ -4924,28 +4996,118 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
             return false;
         }
     }
-    const bool q41 = source_type == GGML_TYPE_Q4_1;
-    const uint32_t storage = q41 ? RKVA_RANGE_STORAGE_Q4_1 : RKVA_RANGE_STORAGE_IQ4_NL;
-    const uint32_t layout = q41 ? RKVA_LAYOUT_Q4_1 : RKVA_LAYOUT_IQ4_NL;
-    const uint64_t caps = (q41 ? RKVA_CAP_NATIVE_Q4_1_BULK : RKVA_CAP_NATIVE_IQ4_NL_BULK) |
-                              RKVA_CAP_KVARN_BULK_ATTN | (ctx->e4_requested ?
-                              (q41 ? RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN : RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN) :
-                              RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE);
+    uint32_t storage = 0;
+    uint32_t layout = 0;
+    uint64_t bulk_cap = 0;
+    uint64_t bulk_e4_cap = 0;
+    switch (source_type) {
+        case GGML_TYPE_Q4_1:
+            storage = RKVA_RANGE_STORAGE_Q4_1;
+            layout = RKVA_LAYOUT_Q4_1;
+            bulk_cap = RKVA_CAP_NATIVE_Q4_1_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_Q4_1_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_IQ4_NL:
+            storage = RKVA_RANGE_STORAGE_IQ4_NL;
+            layout = RKVA_LAYOUT_IQ4_NL;
+            bulk_cap = RKVA_CAP_NATIVE_IQ4_NL_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_IQ4_NL_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_Q5_0:
+            storage = RKVA_RANGE_STORAGE_Q5_0;
+            layout = RKVA_LAYOUT_Q5_0;
+            bulk_cap = RKVA_CAP_NATIVE_Q5_0_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_Q5_0_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_Q5_1:
+            storage = RKVA_RANGE_STORAGE_Q5_1;
+            layout = RKVA_LAYOUT_Q5_1;
+            bulk_cap = RKVA_CAP_NATIVE_Q5_1_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_Q5_1_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_Q6_0:
+            storage = RKVA_RANGE_STORAGE_Q6_0;
+            layout = RKVA_LAYOUT_Q6_0;
+            bulk_cap = RKVA_CAP_NATIVE_Q6_0_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_Q6_0_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_Q6_1:
+            storage = RKVA_RANGE_STORAGE_Q6_1;
+            layout = RKVA_LAYOUT_Q6_1;
+            bulk_cap = RKVA_CAP_NATIVE_Q6_1_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_Q6_1_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_Q3_0:
+            storage = RKVA_RANGE_STORAGE_Q3_0;
+            layout = RKVA_LAYOUT_Q3_0;
+            bulk_cap = RKVA_CAP_NATIVE_Q3_0_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_Q3_0_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_Q3_1:
+            storage = RKVA_RANGE_STORAGE_Q3_1;
+            layout = RKVA_LAYOUT_Q3_1;
+            bulk_cap = RKVA_CAP_NATIVE_Q3_1_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_Q3_1_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_Q2_1:
+            storage = RKVA_RANGE_STORAGE_Q2_1;
+            layout = RKVA_LAYOUT_Q2_1;
+            bulk_cap = RKVA_CAP_NATIVE_Q2_1_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_Q2_1_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_Q2_0S:
+            if (oscar_int2) {
+                storage = RKVA_RANGE_STORAGE_OSCAR_INT2;
+                layout = 7;
+                bulk_cap = RKVA_CAP_NATIVE_OSCAR_INT2_BULK;
+                bulk_e4_cap = RKVA_CAP_NATIVE_OSCAR_INT2_BULK_E4M3FN;
+            } else {
+                storage = RKVA_RANGE_STORAGE_Q2_0S;
+                layout = RKVA_LAYOUT_Q2_0S;
+                bulk_cap = RKVA_CAP_NATIVE_Q2_0S_BULK;
+                bulk_e4_cap = RKVA_CAP_NATIVE_Q2_0S_BULK_E4M3FN;
+            }
+            break;
+        case GGML_TYPE_BF16:
+            storage = RKVA_RANGE_STORAGE_BF16;
+            layout = RKVA_LAYOUT_BF16;
+            bulk_cap = RKVA_CAP_NATIVE_BF16_BULK;
+            bulk_e4_cap = RKVA_CAP_NATIVE_BF16_BULK_E4M3FN;
+            break;
+        case GGML_TYPE_F32:
+            if (oscar_int2) {
+                storage = RKVA_RANGE_STORAGE_OSCAR_INT2;
+                layout = 7;
+                bulk_cap = RKVA_CAP_NATIVE_OSCAR_INT2_BULK;
+                bulk_e4_cap = RKVA_CAP_NATIVE_OSCAR_INT2_BULK_E4M3FN;
+            } else {
+                storage = RKVA_RANGE_STORAGE_F32;
+                layout = RKVA_LAYOUT_F32;
+                bulk_cap = RKVA_CAP_NATIVE_F32_BULK;
+                bulk_e4_cap = RKVA_CAP_NATIVE_F32_BULK_E4M3FN;
+            }
+            break;
+        default:
+            return false;
+    }
+    const uint64_t caps = bulk_cap | RKVA_CAP_KVARN_BULK_ATTN |
+                              (ctx->e4_requested ? bulk_e4_cap :
+                              (RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE));
     constexpr uint32_t required = (1u << RKVA_KVARN_RANGE_CONFIG) |
                                   (1u << RKVA_KVARN_RANGE_UPLOAD) |
                                   (1u << RKVA_KVARN_RANGE_BULK_ATTN);
     if (!ctx->connected || ctx->failed || ctx->active_session == RKVA_SESSION_NONE ||
-            (source_type != GGML_TYPE_Q4_1 && source_type != GGML_TYPE_IQ4_NL) || !capacity ||
+            !storage || !capacity ||
             origin % 256 || uint64_t(origin) + capacity > INT32_MAX ||
             ctx->geo.max_ctx != capacity || ctx->geo.head_dim != rkva_low4_producer::head_dim ||
-            ctx->geo.n_head_kv == 0 || uint64_t(ctx->geo.n_head) != 6ull * ctx->geo.n_head_kv || ctx->geo.n_layer_remote == 0 ||
+            ctx->geo.n_head_kv == 0 || ctx->geo.n_head == 0 || ctx->geo.n_layer_remote == 0 ||
             ctx->geo.domain != GGML_REMOTE_ATTN_DOMAIN_AUTO ||
             ctx->geo.has_sinks || ctx->geo.swa) {
         return false;
     }
     if ((ctx->ack.reserved[0] & caps) != caps || (ctx->ack.supported_ops & required) != required) {
-        GGML_LOG_INFO("%s: native Q4_1/IQ4_NL bulk is not advertised by the negotiated server; "
-                "refusing fallback\n", GGML_REMOTE_ATTN_NAME);
+        GGML_LOG_INFO("%s: native %s bulk is not advertised by the negotiated server; "
+                "refusing fallback\n", GGML_REMOTE_ATTN_NAME, oscar_int2 ? "oscar_int2" : ggml_type_name(source_type));
         return false;
     }
     // New layouts require the explicitly negotiated FP8 bulk path. A missing
@@ -4963,8 +5125,8 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
             !std::strcmp(selected_wire, "auto") ||
             (selected_is_bulk && !std::strcmp(selected_wire, "1"));
     if (!fp8_selected) {
-        GGML_LOG_INFO("%s: native Q4_1/IQ4_NL bulk requires the FP8 activation wire; "
-                "refusing fallback\n", GGML_REMOTE_ATTN_NAME);
+        GGML_LOG_INFO("%s: native %s bulk requires the FP8 activation wire; "
+                "refusing fallback\n", GGML_REMOTE_ATTN_NAME, oscar_int2 ? "oscar_int2" : ggml_type_name(source_type));
         return false;
     }
     uint32_t mode = 0;
@@ -4973,10 +5135,12 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
     const bool can_profile = (ctx->ack.reserved[0] & RKVA_CAP_RANGE_PROFILE) &&
                              (ctx->ack.supported_ops & (1u << RKVA_RANGE_PROFILE));
     if ((mode || profile) && !can_profile) return false;
+    const uint32_t bits = oscar_int2 ? 2u : 4u;
+    const uint32_t domain = oscar_int2 ? 1u : 0u;
     const rkva_kvarn_range_config descriptor {
         origin, capacity, storage, layout,
-        1, 0, rkva_low4_producer::head_dim, 2, 4, 4, rkva_low4_producer::record_bytes(source_type),
-        0, 0, 0, 0, 0, 0, 1};
+        1, 0, rkva_low4_producer::head_dim, 2, bits, bits, rkva_low4_producer::record_bytes(oscar_int2 ? GGML_TYPE_Q2_0S : source_type, oscar_int2),
+        0, 0, 0, 0, 0, domain, 1};
     std::vector<uint8_t> reply;
     if (!rkva_transact(ctx, RKVA_KVARN_RANGE_CONFIG, ctx->active_session, 0, 0,
             &descriptor, sizeof(descriptor), reply, 0) || !reply.empty()) return false;
@@ -5005,11 +5169,11 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
     ctx->range_fused = false;
     ctx->range_profile = profile;
     ctx->range_kernel_mode = mode;
-    if (!rkva_range_apply_control(ctx, ggml_type_name(source_type), generic)) return false;
-    GGML_LOG_WARN("%s: experimental native %s descriptor=%u origin=%u capacity=%u async_overlap=%d "
+    if (!rkva_range_apply_control(ctx, oscar_int2 ? "oscar_int2" : ggml_type_name(source_type), generic)) return false;
+    GGML_LOG_WARN("%s: native %s descriptor=%u origin=%u capacity=%u async_overlap=%d "
             "wire=%s; %s producer, native packed Xbox rowlane, no stage/tail; "
-            "suffix rollback uses op8; GPU/model qualification still required\n",
-            GGML_REMOTE_ATTN_NAME, ggml_type_name(source_type), layout, origin, capacity, int(async_overlap),
+            "suffix rollback uses op8\n",
+            GGML_REMOTE_ATTN_NAME, oscar_int2 ? "oscar_int2" : ggml_type_name(source_type), layout, origin, capacity, int(async_overlap),
             e4_selected ? "fp8_e4m3fn" : "fp8_e5m2", cuda_producer ? "experimental CUDA" : "CPU GGML");
     return true;
 }
@@ -5022,9 +5186,9 @@ static bool rkva_configure_native_low4(ggml_backend_remote_attn_context * ctx,
 // otherwise the caller keeps the synchronous Q8 range path.
 static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
         uint32_t origin, uint32_t capacity, ggml_type source_type, bool async_overlap) {
-    constexpr uint64_t caps = RKVA_CAP_RANGE_Q8_0 | RKVA_CAP_NATIVE_Q8_BULK |
-                              RKVA_CAP_KVARN_BULK_ATTN | RKVA_CAP_KVARN_BULK_FP8 |
-                              RKVA_CAP_KVARN_BULK_FP8_RNE;
+    const uint64_t caps = RKVA_CAP_RANGE_Q8_0 | RKVA_CAP_NATIVE_Q8_BULK |
+                          RKVA_CAP_KVARN_BULK_ATTN | (ctx->e4_requested ? RKVA_CAP_NATIVE_Q8_BULK_E4M3FN :
+                          (RKVA_CAP_KVARN_BULK_FP8 | RKVA_CAP_KVARN_BULK_FP8_RNE));
     constexpr uint32_t required = (1u << RKVA_KVARN_RANGE_CONFIG) |
                                   (1u << RKVA_KVARN_RANGE_UPLOAD) |
                                   (1u << RKVA_KVARN_RANGE_BULK_ATTN);
@@ -5039,7 +5203,7 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
     }
     if ((ctx->ack.reserved[0] & caps) != caps || (ctx->ack.supported_ops & required) != required) {
         GGML_LOG_INFO("%s: native Q8_0 bulk is not advertised by the negotiated server; "
-                "using the synchronous range path\n", GGML_REMOTE_ATTN_NAME);
+                "%s\n", GGML_REMOTE_ATTN_NAME, ctx->e4_requested ? "refusing E4 fallback" : "using the synchronous range path");
         return false;
     }
     // Layout 5 mandates the FP8 Q/OUT activation wire. Follow the same option
@@ -5051,7 +5215,9 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
     const char * selected_wire = wire_option ? wire_option :
             bulk_wire_option ? bulk_wire_option : bulk_option;
     const bool selected_is_bulk = !wire_option && !bulk_wire_option;
-    const bool fp8_selected = !selected_wire ||
+    const bool e4_selected = selected_wire && !std::strcmp(selected_wire, "fp8_e4m3fn");
+    if (e4_selected != ctx->e4_requested || (e4_selected && ctx->protocol_version != RKVA_VERSION)) return false;
+    const bool fp8_selected = e4_selected || !selected_wire ||
             !std::strcmp(selected_wire, "fp8") || !std::strcmp(selected_wire, "fp8_e5m2") ||
             !std::strcmp(selected_wire, "auto") ||
             (selected_is_bulk && !std::strcmp(selected_wire, "1"));
@@ -5089,7 +5255,7 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
     ctx->native_layers.clear();
     ctx->native_layers.resize(ctx->geo.n_layer_remote);
     ctx->range_source_type = source_type;
-    ctx->range_wire = RKVA_WIRE_FP8; // Q/OUT only; op16 carries Q8_0 rows
+    ctx->range_wire = e4_selected ? RKVA_WIRE_FP8_E4M3FN : RKVA_WIRE_FP8; // Q/OUT only; op16 carries Q8_0 rows
     ctx->range_origin = origin;
     ctx->range_capacity = capacity;
     ++ctx->range_epoch;
@@ -5099,9 +5265,10 @@ static bool rkva_configure_native_q8(ggml_backend_remote_attn_context * ctx,
     ctx->range_kernel_mode = mode;
     if (!rkva_range_apply_control(ctx, "q8_0", generic)) return false;
     GGML_LOG_WARN("%s: native Q8_0 bulk descriptor=5 origin=%u capacity=%u async_overlap=%d "
-            "wire=fp8_e5m2; host CPU q8_0 producer, no KVarN records/stage/tail, "
+            "wire=%s; host CPU q8_0 producer, no KVarN records/stage/tail, "
             "suffix rollback uses the range trim (op8)\n",
-            GGML_REMOTE_ATTN_NAME, origin, capacity, int(async_overlap));
+            GGML_REMOTE_ATTN_NAME, origin, capacity, int(async_overlap),
+            e4_selected ? "fp8_e4m3fn" : "fp8_e5m2");
     return true;
 }
 
@@ -5213,14 +5380,29 @@ bool ggml_remote_attn_companion_format_matches(const char * format, ggml_type so
     if (!std::strcmp(format, "q4") || !std::strcmp(format, "q4_0")) return source_type == GGML_TYPE_Q4_0;
     if (!std::strcmp(format, "q4_1")) return source_type == GGML_TYPE_Q4_1;
     if (!std::strcmp(format, "iq4_nl")) return source_type == GGML_TYPE_IQ4_NL;
+    if (!std::strcmp(format, "q5_0")) return source_type == GGML_TYPE_Q5_0;
+    if (!std::strcmp(format, "q5_1")) return source_type == GGML_TYPE_Q5_1;
+    if (!std::strcmp(format, "q6_0")) return source_type == GGML_TYPE_Q6_0;
+    if (!std::strcmp(format, "q6_1")) return source_type == GGML_TYPE_Q6_1;
+    if (!std::strcmp(format, "q3_0")) return source_type == GGML_TYPE_Q3_0;
+    if (!std::strcmp(format, "q3_1")) return source_type == GGML_TYPE_Q3_1;
+    if (!std::strcmp(format, "q2_1")) return source_type == GGML_TYPE_Q2_1;
+    if (!std::strcmp(format, "q2_0s") || !std::strcmp(format, "q2_0")) return source_type == GGML_TYPE_Q2_0S;
+    if (!std::strcmp(format, "oscar_int2") || !std::strcmp(format, "oscar-int2")) return source_type == GGML_TYPE_Q2_0S || source_type == GGML_TYPE_F32;
     if (!std::strcmp(format, "q8") || !std::strcmp(format, "q8_0")) return source_type == GGML_TYPE_Q8_0;
+    if (!std::strcmp(format, "bf16")) return source_type == GGML_TYPE_BF16;
     if (!std::strcmp(format, "f16") || !std::strcmp(format, "fp16")) return source_type == GGML_TYPE_F16;
     // Explicit F32 upload is a diagnostic wire conversion, not a KV cache type.
     if (!std::strcmp(format, "f32") || !std::strcmp(format, "fp32")) {
-        return source_type == GGML_TYPE_Q4_0 || source_type == GGML_TYPE_Q8_0 || source_type == GGML_TYPE_F16;
+        return source_type == GGML_TYPE_F32 || source_type == GGML_TYPE_Q4_0 || source_type == GGML_TYPE_Q8_0 || source_type == GGML_TYPE_F16;
     }
-    if (!std::strcmp(format, "kvarn4") || !std::strcmp(format, "kvarn") ||
-            !std::strcmp(format, "saw_int4") || !std::strcmp(format, "saw-int4") ||
+    if (rkva_kvarn_format_bits(format) != 0) {
+        return source_type == GGML_TYPE_F32 || source_type == GGML_TYPE_Q4_0 ||
+               source_type == GGML_TYPE_Q8_0 || source_type == GGML_TYPE_Q2_0S ||
+               source_type == GGML_TYPE_Q3_0 || source_type == GGML_TYPE_Q5_0 ||
+               source_type == GGML_TYPE_Q6_0;
+    }
+    if (!std::strcmp(format, "saw_int4") || !std::strcmp(format, "saw-int4") ||
             !std::strcmp(format, "saw4") || !std::strcmp(format, "bdr_int4") ||
             !std::strcmp(format, "turboquant_nc") || !std::strcmp(format, "turboquant-nc") ||
             !std::strcmp(format, "tqnc") || !std::strcmp(format, "turboquant_4bit_nc")) {
@@ -5233,7 +5415,7 @@ bool ggml_remote_attn_native_companion_requested(void) {
     const char * option = std::getenv("GGML_RKVA_NATIVE_COMPANION");
     const char * format = rkva_get_upload_format();
     if (!option || std::strcmp(option, "1") || !format) return false;
-    if (!std::strcmp(format, "kvarn4") || !std::strcmp(format, "kvarn")) {
+    if (rkva_kvarn_format_bits(format) != 0) {
         const char * enabled = std::getenv("GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL");
         return enabled && !std::strcmp(enabled, "1");
     }
@@ -5274,8 +5456,8 @@ bool ggml_backend_remote_attn_configure_range(
         GGML_LOG_ERROR("%s: E4M3FN requires an explicitly supported native layout\n", GGML_REMOTE_ATTN_NAME);
         return false;
     }
-    if (format_req && (!std::strcmp(format_req, "kvarn4") || !std::strcmp(format_req, "kvarn"))) {
-        if (!rkva_configure_native_kvarn(ctx, origin, capacity, cache_type, async_overlap)) return false;
+    if (const uint32_t kvarn_bits = rkva_kvarn_format_bits(format_req)) {
+        if (!rkva_configure_native_kvarn(ctx, origin, capacity, cache_type, async_overlap, kvarn_bits)) return false;
         rkva_breaker_note_configured(ctx);
         return true;
     }
@@ -5300,9 +5482,27 @@ bool ggml_backend_remote_attn_configure_range(
                 GGML_REMOTE_ATTN_NAME);
         return false;
     }
-    if (format_req && (!std::strcmp(format_req, "q4_1") || !std::strcmp(format_req, "iq4_nl"))) {
-        const ggml_type expected = !std::strcmp(format_req, "q4_1") ? GGML_TYPE_Q4_1 : GGML_TYPE_IQ4_NL;
-        if (cache_type != expected || !rkva_configure_native_low4(ctx, origin, capacity, cache_type, async_overlap)) {
+    if (format_req && (!std::strcmp(format_req, "oscar_int2") || !std::strcmp(format_req, "oscar-int2"))) {
+        if (!rkva_configure_native_low4(ctx, origin, capacity, cache_type, async_overlap, true)) {
+            GGML_LOG_ERROR("%s: requested %s cannot be negotiated with matching remote K/V; refusing fallback\n",
+                    GGML_REMOTE_ATTN_NAME, format_req);
+            return false;
+        }
+        rkva_breaker_note_configured(ctx);
+        return true;
+    }
+    if (format_req && (!std::strcmp(format_req, "q4_1") || !std::strcmp(format_req, "iq4_nl") ||
+                       !std::strcmp(format_req, "q5_0") ||
+                       !std::strcmp(format_req, "q5_1") ||
+                       !std::strcmp(format_req, "q6_0") ||
+                       !std::strcmp(format_req, "q6_1") ||
+                       !std::strcmp(format_req, "q3_0") ||
+                       !std::strcmp(format_req, "q3_1") ||
+                       !std::strcmp(format_req, "q2_1") ||
+                       !std::strcmp(format_req, "q2_0s") || !std::strcmp(format_req, "q2_0") ||
+                       !std::strcmp(format_req, "bf16") ||
+                       (!std::strcmp(format_req, "f32") && cache_type == GGML_TYPE_F32))) {
+        if (!rkva_configure_native_low4(ctx, origin, capacity, cache_type, async_overlap, false)) {
             GGML_LOG_ERROR("%s: requested %s cannot be negotiated with matching remote K/V; refusing fallback\n",
                     GGML_REMOTE_ATTN_NAME, format_req);
             return false;
@@ -5324,7 +5524,7 @@ bool ggml_backend_remote_attn_configure_range(
             rkva_breaker_note_configured(ctx);
             return true;
         }
-        if (ctx->failed) return false;
+        if (ctx->failed || ctx->e4_requested) return false;
         // Not negotiated (old server or missing bulk caps): keep the current
         // synchronous range upload path below, unchanged.
     }
@@ -6083,9 +6283,11 @@ ggml_backend_t ggml_backend_remote_attn_kvarn_stage_take_for_format(ggml_remote_
             canonical_wire(wire_format) != canonical_wire(rkva_optional_cstr(ctx->wire_format)) ||
             !env_matches(ctx->bulk_wire_option, std::getenv("GGML_RKVA_NATIVE_BULK_WIRE")) ||
             !env_matches(ctx->bulk_option, std::getenv("GGML_RKVA_NATIVE_BULK"))) return nullptr;
-    if (!upload_format || (std::strcmp(upload_format, "kvarn4") && std::strcmp(upload_format, "kvarn"))) return nullptr;
+    const uint32_t req_bits = rkva_kvarn_format_bits(upload_format);
+    const uint32_t fmt_bits = rkva_kvarn_format_bits(format);
+    if (!req_bits || !fmt_bits || req_bits != fmt_bits) return nullptr;
     if (!ctx->connected || ctx->failed || !ctx->range_configured || !ctx->range_native_kvarn ||
-            ctx->active_session != 0 || !format || (std::strcmp(format, "kvarn4") && std::strcmp(format, "kvarn")) ||
+            ctx->active_session != 0 ||
             ctx->host != host || ctx->port != port || ctx->range_origin != origin ||
             ctx->range_capacity != capacity || ctx->range_source_type != cache_type ||
             ctx->native_tail_tokens != native_tail_tokens ||
@@ -6397,7 +6599,7 @@ const char * ggml_backend_remote_attn_stats_json(ggml_backend_t backend) {
         (unsigned long long) s.range_upload_calls, (unsigned long long) s.range_upload_rows,
         (unsigned long long) s.range_attn_calls, ctx->range_origin, ctx->range_capacity,
         (long long) s.range_query_min, (long long) s.range_query_max,
-        ctx->native_low4 ? ggml_type_name(ctx->range_source_type) : ctx->native_turboquant_nc ? "turboquant_nc" : ctx->native_saw_int4 ? "saw_int4" : ctx->native_q4 ? "q4_0" : ctx->native_q8 ? "q8_0" : ctx->range_native_kvarn ? "kvarn4" : ctx->range_wire == RKVA_WIRE_Q4_0 ? "q4_0" : ctx->range_wire == RKVA_WIRE_Q8_0 ? "q8_0" : "f16",
+        ctx->native_low4 == RKVA_RANGE_STORAGE_OSCAR_INT2 ? "oscar_int2" : ctx->native_low4 ? ggml_type_name(ctx->range_source_type) : ctx->native_turboquant_nc ? "turboquant_nc" : ctx->native_saw_int4 ? "saw_int4" : ctx->native_q4 ? "q4_0" : ctx->native_q8 ? "q8_0" : ctx->range_native_kvarn ? (ctx->native_descriptor.key_bits == 8 ? "kvarn8" : ctx->native_descriptor.key_bits == 6 ? "kvarn6" : ctx->native_descriptor.key_bits == 5 ? "kvarn5" : ctx->native_descriptor.key_bits == 3 ? "kvarn3" : ctx->native_descriptor.key_bits == 2 ? "kvarn2" : "kvarn4") : ctx->range_wire == RKVA_WIRE_Q4_0 ? "q4_0" : ctx->range_wire == RKVA_WIRE_Q8_0 ? "q8_0" : "f16",
         ctx->range_native_kvarn ? "projected_f32" : ctx->range_configured ? ggml_type_name(ctx->range_source_type) : "none",
         (unsigned long long) s.range_upload_bytes, ctx->range_native_kvarn ? ctx->native_tail_tokens : 0);
     ctx->stats_json = buf;

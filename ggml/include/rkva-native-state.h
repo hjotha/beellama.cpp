@@ -158,8 +158,13 @@ struct Storage {
 inline uint64_t width(const Layout& layout) {
     return uint64_t(layout.heads) * 256ull;
 }
+inline uint32_t layout_bits(const Layout& layout) {
+    const uint32_t b = layout.iterations >> 16;
+    return b ? b : 4u;
+}
 inline uint64_t record_group_bytes(const Layout& layout) {
-    return uint64_t(layout.heads) * 2ull * 8960ull;
+    const uint64_t rec_bytes = uint64_t(layout_bits(layout)) * 2048ull + 768ull;
+    return uint64_t(layout.heads) * 2ull * rec_bytes;
 }
 inline uint32_t complete_groups(const Layout& layout) {
     return layout.rows / 128;

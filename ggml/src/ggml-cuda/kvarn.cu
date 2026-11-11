@@ -856,16 +856,17 @@ static __global__ void kvarn_native_rotate_kernel(
 
 static __global__ void kvarn_native_seal_kernel(
         const half * stage, const half * rotated, uint8_t * records,
-        uint32_t begin, int count, int heads, int groups, int iterations) {
+        uint32_t begin, int count, int heads, int groups, int iterations, int bits) {
     extern __shared__ float shared[];
     const int group = begin / 128 + blockIdx.x, hs = blockIdx.y, kind = blockIdx.z;
     const int physical_heads = heads * 2;
     const size_t width = size_t(heads) * 256;
+    const size_t rec_bytes = size_t(bits) * 2048 + 768;
     // The canonical non-SWA store keeps group zero as the permanent sink;
     // eager records are sealed only for groups greater than zero.
     if (group == 0) {
-        uint8_t * record = records + ((size_t(kind) * groups + blockIdx.x) * physical_heads + hs) * 8960;
-        for (int i = threadIdx.x; i < 8960; i += blockDim.x) record[i] = 0;
+        uint8_t * record = records + ((size_t(kind) * groups + blockIdx.x) * physical_heads + hs) * rec_bytes;
+        for (int i = threadIdx.x; i < int(rec_bytes); i += blockDim.x) record[i] = 0;
         return;
     }
     for (int i = threadIdx.x; i < KVAR_N_TILE_VALUES; i += blockDim.x) {
@@ -880,8 +881,8 @@ static __global__ void kvarn_native_seal_kernel(
         }
     }
     __syncthreads();
-    kvarn_quantize_tile(records + ((size_t(kind) * groups + blockIdx.x) * physical_heads + hs) * 8960,
-                        4, iterations, shared);
+    kvarn_quantize_tile(records + ((size_t(kind) * groups + blockIdx.x) * physical_heads + hs) * rec_bytes,
+                        bits, iterations, shared);
 }
 
 bool ggml_cuda_kvarn_native_append(
@@ -890,8 +891,11 @@ bool ggml_cuda_kvarn_native_append(
         const ggml_fp16_t * stage_k, const ggml_fp16_t * stage_v,
         ggml_fp16_t * append_k, ggml_fp16_t * append_v,
         void * records_k, void * records_v) {
+    const uint32_t bits = (iterations >> 16) ? (iterations >> 16) : 4u;
+    const uint32_t iters = iterations & 0xFFFFu;
     if (!keys || !values || !stage_k || !stage_v || !append_k || !append_v ||
-            !count || count > 512 || !heads || heads > 32 || !iterations || iterations > 128 ||
+            !count || count > 512 || !heads || heads > 32 || !iters || iters > 128 ||
+            (bits != 2 && bits != 3 && bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
             uint64_t(global_begin) + count > INT32_MAX) return false;
     const uint32_t groups = (global_begin + count) / 128 - global_begin / 128;
     if (groups && (!records_k || !records_v)) return false;
@@ -925,7 +929,8 @@ bool ggml_cuda_kvarn_native_append(
     const bool needs_stage = groups && global_begin % 128;
     const size_t stage_bytes = needs_stage ? size_t(384) * width * sizeof(half) : 0;
     const size_t append_bytes = size_t(count) * width * sizeof(half);
-    const size_t record_bytes = size_t(groups) * heads * 2 * 8960;
+    const size_t rec_size = size_t(bits) * 2048 + 768;
+    const size_t record_bytes = size_t(groups) * heads * 2 * rec_size;
     const size_t bytes = 2 * (input_bytes + stage_bytes + append_bytes + record_bytes);
     // Release the bulk-prefill reservation when singleton decode begins.
     if (count == 1 && scratch.data && scratch.bytes > bytes * 4) {
@@ -981,7 +986,7 @@ bool ggml_cuda_kvarn_native_append(
     }
     kvarn_native_rotate_kernel<<<dim3(count, heads, 2), 128, 128 * sizeof(float), stream>>>(input, rotated, count, heads);
     if (groups) kvarn_native_seal_kernel<<<dim3(groups, heads * 2, 2), 128, KVAR_N_SHARED_BYTES, stream>>>(
-            stage, rotated, records, global_begin, count, heads, groups, iterations);
+            stage, rotated, records, global_begin, count, heads, groups, int(iters), int(bits));
     const bool ok = cudaGetLastError() == cudaSuccess &&
         download(append_k, rotated, append_bytes) && download(append_v, rotated + size_t(count) * width, append_bytes) &&
         download(records_k, records, record_bytes) && download(records_v, records + record_bytes, record_bytes);

@@ -230,22 +230,48 @@ inline bool turboquant_nc_planes_valid(const uint8_t* k, const uint8_t* v, size_
 inline bool native_e4_planes_valid(uint32_t storage, const uint8_t* k, const uint8_t* v, size_t heads) {
     if (rkva_kvarn_range::low4_storage(storage)) return rkva_kvarn_range::valid_low4_planes(storage, k, v, heads);
     if (storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC) return turboquant_nc_planes_valid(k, v, heads);
-    if (storage != RKVA_RANGE_STORAGE_Q4_0 && storage != RKVA_RANGE_STORAGE_SAW_INT4) return false;
-    if (heads && (!k || !v)) return false;
+    const size_t head_bytes = rkva_kvarn_range::native_storage_head_bytes(storage);
+    if (!head_bytes) return false;
+    if (!heads) return true;
+    if (!k || !v) return false;
     for (const auto* plane : {k, v}) {
         for (size_t h = 0; h < heads; ++h) {
-            if (storage == RKVA_RANGE_STORAGE_Q4_0) {
-                for (size_t block = 0; block < 8; ++block) {
-                    uint16_t scale;
-                    std::memcpy(&scale, plane + h * 144 + block * 18, sizeof(scale));
-                    if (!f16_bits_finite(scale)) return false;
-                }
-            } else {
+            const uint8_t* row = plane + h * head_bytes;
+            if (storage == RKVA_RANGE_STORAGE_SAW_INT4) {
                 float scale, zero;
-                std::memcpy(&scale, plane + h * 136 + 128, sizeof(scale));
-                std::memcpy(&zero, plane + h * 136 + 132, sizeof(zero));
+                std::memcpy(&scale, row + 128, sizeof(scale));
+                std::memcpy(&zero, row + 132, sizeof(zero));
                 if (!std::isfinite(scale) || !std::isfinite(zero) || scale < 0.0f ||
                     !std::isfinite(scale * (0.0f - zero)) || !std::isfinite(scale * (15.0f - zero))) return false;
+            } else if (storage == RKVA_RANGE_STORAGE_BF16) {
+                for (size_t d = 0; d < 256; ++d) {
+                    uint16_t val;
+                    std::memcpy(&val, row + d * 2, sizeof(val));
+                    if ((val & 0x7f80u) == 0x7f80u) return false;
+                }
+            } else if (storage == RKVA_RANGE_STORAGE_F32) {
+                for (size_t d = 0; d < 256; ++d) {
+                    float val;
+                    std::memcpy(&val, row + d * 4, sizeof(val));
+                    if (!std::isfinite(val)) return false;
+                }
+            } else {
+                const size_t block_bytes = head_bytes / 8;
+                const bool has_min = (storage == RKVA_RANGE_STORAGE_OSCAR_INT2 ||
+                                      storage == RKVA_RANGE_STORAGE_Q2_1 ||
+                                      storage == RKVA_RANGE_STORAGE_Q3_1 ||
+                                      storage == RKVA_RANGE_STORAGE_Q5_1 ||
+                                      storage == RKVA_RANGE_STORAGE_Q6_1);
+                for (size_t block = 0; block < 8; ++block) {
+                    uint16_t scale;
+                    std::memcpy(&scale, row + block * block_bytes, sizeof(scale));
+                    if (!f16_bits_finite(scale)) return false;
+                    if (has_min) {
+                        uint16_t min_val;
+                        std::memcpy(&min_val, row + block * block_bytes + 2, sizeof(min_val));
+                        if (!f16_bits_finite(min_val)) return false;
+                    }
+                }
             }
         }
     }
@@ -254,9 +280,7 @@ inline bool native_e4_planes_valid(uint32_t storage, const uint8_t* k, const uin
 inline bool validate_native_e4(const uint8_t* data, size_t bytes, uint32_t nq, uint32_t storage,
                                uint32_t heads, uint32_t kv_heads, uint32_t capacity,
                                uint32_t live, bool check_live) {
-    const size_t row = storage == RKVA_RANGE_STORAGE_Q4_0 ? 144 :
-                       storage == RKVA_RANGE_STORAGE_SAW_INT4 ? 136 :
-                       storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC ? 132 : rkva_kvarn_range::low4_head_bytes(storage);
+    const size_t row = rkva_kvarn_range::native_storage_head_bytes(storage);
     if (!data || bytes < sizeof(rkva_kvarn_range_bulk) || !row || !nq || nq > 256 ||
         !heads || heads > 256 || !kv_heads || kv_heads > 256 || !capacity || live > capacity) return false;
     rkva_kvarn_range_bulk header;
@@ -274,9 +298,12 @@ inline bool validate_native_e4(const uint8_t* data, size_t bytes, uint32_t nq, u
         rkva_kvarn_range_upload upload;
         std::memcpy(&upload, data + off, sizeof(upload));
         const bool valid = rkva_kvarn_range::low4_storage(storage) ? rkva_kvarn_range::valid_low4_upload(upload, capacity, upload.append_begin) :
-            storage == RKVA_RANGE_STORAGE_Q4_0 ? rkva_kvarn_range::valid_q4_upload(upload, capacity, upload.append_begin) :
+            storage == RKVA_RANGE_STORAGE_Q8_0 ? rkva_kvarn_range::valid_q8_upload(upload, capacity, upload.append_begin) :
             storage == RKVA_RANGE_STORAGE_SAW_INT4 ? rkva_kvarn_range::valid_saw_int4_upload(upload, capacity, upload.append_begin) :
-                rkva_kvarn_range::valid_turboquant_nc_upload(upload, capacity, upload.append_begin);
+            storage == RKVA_RANGE_STORAGE_TURBOQUANT_NC ? rkva_kvarn_range::valid_turboquant_nc_upload(upload, capacity, upload.append_begin) :
+            storage == RKVA_RANGE_STORAGE_OSCAR_INT2 ? rkva_kvarn_range::valid_oscar_int2_upload(upload, capacity, upload.append_begin) :
+            (storage == RKVA_RANGE_STORAGE_Q4_0 || rkva_kvarn_range::is_extended_native_storage(storage))
+                ? rkva_kvarn_range::valid_q4_upload(upload, capacity, upload.append_begin) : false;
         const bool reset = (upload.flags & RKVA_KVARN_UPLOAD_RESET) != 0;
         const uint64_t plane = uint64_t(upload.append_rows) * kv_heads * row;
         if (!valid || uint64_t(upload.append_begin) + upload.append_rows != upload.live_count ||
@@ -518,7 +545,7 @@ inline bool validate_wire(const uint8_t* data, size_t bytes, uint32_t n_queries,
         if ((reset && i) || (!reset && u.append_rows != wire.n_queries))
             return false;
         const uint64_t row_bytes = uint64_t(n_head_kv) * 256 * 2;
-        const uint64_t records = uint64_t(u.record_groups) * n_head_kv * 2 * 8960;
+        const uint64_t records = uint64_t(u.record_groups) * n_head_kv * 2 * descriptor.record_bytes;
         const uint64_t stage = uint64_t(rkva_kvarn_range::upload_stage_rows(u)) * row_bytes;
         const uint64_t tail_rows =
             descriptor.precision_tail_tokens

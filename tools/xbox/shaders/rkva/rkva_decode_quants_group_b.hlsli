@@ -108,4 +108,60 @@ float4 load_q6_1(ByteAddressBuffer buffer, uint base, uint u) {
     return q * d + m;
 }
 
+#define RKVA_ROW_HEAD_Q3_1   128
+#define RKVA_ROW_HEAD_Q2_1   96
+
+uint quarter_dim_q3_1(uint u) {
+    return u * 4;
+}
+
+uint quarter_dim_q2_1(uint u) {
+    return u * 4;
+}
+
+// Branchless aligned Q3_1 dequantization: 16-byte block alignment (4 dwords).
+// Struct block_q3_1: ggml_half d, m (4 bytes); uint8_t qh[4] (4 bytes); uint8_t qs[8] (8 bytes).
+// Reads 4 floats at quarter-unit u in [0, 63] from ByteAddressBuffer at offset base.
+float4 load_q3_1(ByteAddressBuffer buffer, uint base, uint u) {
+    uint b = u >> 3;
+    uint block_addr = base + b * 16;
+    uint h = u & 1;
+
+    uint2 dm_qh = buffer.Load2(block_addr);
+    float d = f16tof32(dm_qh.x & 0xFFFFu);
+    float m = f16tof32(dm_qh.x >> 16);
+    uint qh = dm_qh.y;
+
+    uint qs_word = buffer.Load(block_addr + 8 + h * 4);
+    uint plane = (u >> 1) & 3;
+    uint w = qs_word >> (plane * 2);
+    float4 q_low = float4(w & 3u, (w >> 8) & 3u, (w >> 16) & 3u, (w >> 24) & 3u);
+
+    uint j0 = (u & 7) * 4;
+    uint qh_bits = (qh >> j0) & 15u;
+    float4 q_high = float4(qh_bits & 1u, (qh_bits >> 1) & 1u, (qh_bits >> 2) & 1u, (qh_bits >> 3) & 1u);
+
+    float4 q = q_low + q_high * 4.0f;
+    return q * d + m;
+}
+
+// Branchless aligned Q2_1 dequantization: 12-byte block alignment (3 dwords).
+// Struct block_q2_1: ggml_half d, m (4 bytes); uint8_t qs[8] (8 bytes).
+// Reads 4 floats at quarter-unit u in [0, 63] from ByteAddressBuffer at offset base.
+float4 load_q2_1(ByteAddressBuffer buffer, uint base, uint u) {
+    uint b = u >> 3;
+    uint block_addr = base + b * 12;
+    uint h = u & 1;
+
+    uint2 dm_qs0 = buffer.Load2(block_addr);
+    float d = f16tof32(dm_qs0.x & 0xFFFFu);
+    float m = f16tof32(dm_qs0.x >> 16);
+
+    uint qs_word = (h == 0) ? dm_qs0.y : buffer.Load(block_addr + 8);
+    uint plane = (u >> 1) & 3;
+    uint w = qs_word >> (plane * 2);
+    float4 q = float4(w & 3u, (w >> 8) & 3u, (w >> 16) & 3u, (w >> 24) & 3u);
+    return q * d + m;
+}
+
 #endif // RKVA_DECODE_QUANTS_GROUP_B_HLSLI
