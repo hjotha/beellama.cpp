@@ -33,15 +33,25 @@ D3d12MatmulDesc decode_desc(ggml_type t, std::int64_t n, std::int64_t k) {
 
 // Max |emulated - reference| / max |reference| for one type and shape, with
 // padded activation/output strides. Reference: ggml's own dequantizer, double sums.
-double emulate_rel_err(ggml_type t, int n, int k, int ncols, std::size_t x_pad, std::size_t y_pad) {
+// `random_blocks` fills the weight rows with random valid block bytes through the
+// same generator the selftest uses: IQ quantization needs an importance matrix,
+// so ggml_quantize_chunk cannot produce IQ weights.
+double emulate_rel_err(ggml_type t, int n, int k, int ncols, std::size_t x_pad,
+                       std::size_t y_pad, bool random_blocks = false) {
     std::mt19937 rng(42u + static_cast<unsigned>(n * 7 + k + ncols));
     std::uniform_real_distribution<float> uni(-1.f, 1.f);
-    std::vector<float> wf(static_cast<std::size_t>(n) * k);
-    for (float& v : wf)
-        v = uni(rng);
     const std::size_t row_bytes = ggml_row_size(t, k);
     std::vector<std::uint8_t> q(row_bytes * n + 8); // slack: 2-byte-aligned dword reads
-    ggml_quantize_chunk(t, wf.data(), q.data(), 0, n, k, nullptr);
+    if (random_blocks) {
+        std::mt19937 wrng(9001u + static_cast<unsigned>(n * 7 + k + ncols));
+        if (!d3d12_gen_weights(t, n, k, wrng, q.data()))
+            return 1e9;
+    } else {
+        std::vector<float> wf(static_cast<std::size_t>(n) * k);
+        for (float& v : wf)
+            v = uni(rng);
+        ggml_quantize_chunk(t, wf.data(), q.data(), 0, n, k, nullptr);
+    }
 
     const std::size_t x_stride = static_cast<std::size_t>(k) + x_pad;
     const std::size_t y_stride = static_cast<std::size_t>(n) + y_pad;
@@ -101,6 +111,21 @@ TEST_CASE("ggml_d3d12: weight types") {
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q8_0));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q2_K));
     CHECK(d3d12_weight_type_supported(GGML_TYPE_Q3_K));
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ2_S));
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ3_XXS));
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ3_S));
+    CHECK(d3d12_weight_type_supported(GGML_TYPE_IQ4_XS));
+    CHECK(d3d12_iq_weight_type(GGML_TYPE_IQ2_S));
+    CHECK(d3d12_iq_weight_type(GGML_TYPE_IQ3_XXS));
+    CHECK(d3d12_iq_weight_type(GGML_TYPE_IQ3_S));
+    CHECK(d3d12_iq_weight_type(GGML_TYPE_IQ4_XS));
+    CHECK_FALSE(d3d12_iq_weight_type(GGML_TYPE_Q4_K));
+    CHECK_FALSE(d3d12_iq_weight_type(GGML_TYPE_Q3_K));
+    // IQ formats the GSQ file does not use stay on the CPU.
+    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ2_XXS));
+    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ2_XS));
+    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ1_S));
+    CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_IQ4_NL));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F16));
     CHECK_FALSE(d3d12_weight_type_supported(GGML_TYPE_F32));
 }
@@ -122,6 +147,20 @@ TEST_CASE("ggml_d3d12: supports_op rules for MUL_MAT") {
     CHECK_FALSE(d3d12_mm_supported(empty));
     empty.src0_in_weight_buffer = true;
     empty.src0_type = GGML_TYPE_IQ4_NL;
+    CHECK_FALSE(d3d12_mm_supported(empty));
+    // The GSQ IQ types are accepted at Qwen3.5-4B widths and prefill widths.
+    empty.src0_type = GGML_TYPE_IQ2_S;
+    CHECK(d3d12_mm_supported(empty));
+    empty.ne11 = 512;
+    CHECK(d3d12_mm_supported(empty));
+    empty.ne11 = 0;
+    empty.src0_type = GGML_TYPE_IQ3_XXS;
+    CHECK(d3d12_mm_supported(empty));
+    empty.src0_type = GGML_TYPE_IQ3_S;
+    CHECK(d3d12_mm_supported(empty));
+    empty.src0_type = GGML_TYPE_IQ4_XS;
+    CHECK(d3d12_mm_supported(empty));
+    empty.src0_type = GGML_TYPE_IQ2_XXS;
     CHECK_FALSE(d3d12_mm_supported(empty));
     empty.src0_type = GGML_TYPE_Q6_K;
     empty.src1_type = GGML_TYPE_F16;
@@ -556,6 +595,29 @@ TEST_CASE("ggml_d3d12: kernel emulation matches ggml dequantizers") {
         CHECK(emulate_rel_err(c.t, c.n, c.k, 3, 5, 7) <= 1e-4);
         CHECK(emulate_rel_err(c.t, c.n, c.k, 5, 1, 9) <= 1e-4);
     }
+    // IQ formats of the GSQ Q2_K_XL: random valid block bytes (no imatrix), on
+    // real widths plus a 9-block row so odd rows start 2-byte aligned.
+    const Case iq_cases[] = {
+        {GGML_TYPE_IQ2_S, 9, 2304},
+        {GGML_TYPE_IQ2_S, 5, 2560},
+        {GGML_TYPE_IQ2_S, 3, 9216},
+        {GGML_TYPE_IQ3_XXS, 7, 2304},
+        {GGML_TYPE_IQ3_XXS, 5, 2560},
+        {GGML_TYPE_IQ3_S, 6, 2304},
+        {GGML_TYPE_IQ3_S, 5, 2560},
+        {GGML_TYPE_IQ4_XS, 5, 2304},
+        {GGML_TYPE_IQ4_XS, 3, 9216},
+    };
+    for (const auto& c : iq_cases) {
+        CAPTURE(ggml_type_name(c.t));
+        CAPTURE(c.k);
+        CHECK(emulate_rel_err(c.t, c.n, c.k, 1, 0, 0, true) <= 1e-4);
+        CHECK(emulate_rel_err(c.t, c.n, c.k, 7, 12, 3, true) <= 1e-4);
+        CHECK(emulate_rel_err(c.t, c.n, c.k, 3, 5, 7, true) <= 1e-4);
+    }
+    CHECK(ggml_row_size(GGML_TYPE_IQ2_S, 2304) % 4 == 2);
+    CHECK(ggml_row_size(GGML_TYPE_IQ3_XXS, 2304) % 4 == 2);
+    CHECK(ggml_row_size(GGML_TYPE_IQ3_S, 2304) % 4 == 2);
     CHECK(ggml_row_size(GGML_TYPE_Q6_K, 11008) % 4 == 2); // the case the ld32 trick covers
     // Q5_K blocks are 176 B, so every dword the shader reads stays inside a block
     // and its loads need no alignment trick.
@@ -598,6 +660,8 @@ TEST_CASE("ggml_d3d12: bounded weight generation is byte-identical to one-shot")
         {GGML_TYPE_Q5_K, 3000, 4096}, // three chunks
         {GGML_TYPE_Q6_K, 4096, 2560}, // three chunks
         {GGML_TYPE_Q8_0, 13, 5120},   // MTP eh_proj rows
+        {GGML_TYPE_IQ2_S, 9, 2304},   // IQ random-block path (no imatrix)
+        {GGML_TYPE_IQ4_XS, 5, 2304},
     };
     for (const auto& c : cases) {
         const std::size_t bytes = ggml_row_size(c.t, c.k) * static_cast<std::size_t>(c.n);

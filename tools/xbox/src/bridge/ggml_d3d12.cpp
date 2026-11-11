@@ -23,6 +23,8 @@
     #include "ggml-alloc.h"
     #include "ggml-backend.h"
     #include "ggml-cpu.h"
+    // IQ grid/codebook blob (host emulation + the t1 buffer upload).
+    #include "ggml_d3d12_iq_tables.h"
 
 // Exact CPU reference kernel: ggml-cpu/vec.h declares it inside extern "C".
 // Declared at global scope so the call links to the C symbol (a declaration
@@ -42,7 +44,15 @@ bool d3d12_empty_fill_supported(const ggml_tensor* op) {
 bool d3d12_weight_type_supported(ggml_type t) {
     return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
            t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q2_K ||
-           t == GGML_TYPE_Q3_K;
+           t == GGML_TYPE_Q3_K || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ3_XXS ||
+           t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_XS;
+}
+
+// IQ weights read their grids from the t1 table buffer (see
+// ggml_d3d12_iq_common.hlsli); the backend binds it only for these types.
+bool d3d12_iq_weight_type(ggml_type t) {
+    return t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ3_S ||
+           t == GGML_TYPE_IQ4_XS;
 }
 
 static bool s_q8_enabled = true;
@@ -524,6 +534,110 @@ void q3k_scales(const std::uint8_t* w, std::uint32_t bb, std::uint32_t* aux) {
 float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, std::uint32_t blk,
                    std::uint32_t itid, const float* x) {
     const float* xe = x + blk * 256u;
+
+    // --- IQ tables: same bytes the shader reads through root SRV t1 ---------
+    auto iq32 = [](std::uint32_t off) {
+        std::uint32_t v;
+        std::memcpy(&v, kD3d12IqTable + off, 4);
+        return v;
+    };
+    auto iq8 = [](std::uint32_t off) { return static_cast<std::uint32_t>(kD3d12IqTable[off]); };
+    // iq_grid4 + dot: four packed grid bytes, each negated by its sign bit.
+    auto dot4 = [](std::uint32_t packed, std::uint32_t signs, std::uint32_t sbase,
+                   const float* xs) {
+        float acc = 0.f;
+        for (std::uint32_t i = 0; i < 4u; ++i) {
+            const float v = static_cast<float>((packed >> (8u * i)) & 0xffu);
+            acc += (((signs >> (sbase + i)) & 1u) ? -v : v) * xs[i];
+        }
+        return acc;
+    };
+    // iq4nl4 + dot: kvalues_iq4nl is stored as float32 in the table blob.
+    auto dot4nl = [](std::uint32_t packed, std::uint32_t sh, const float* xs) {
+        float acc = 0.f;
+        for (std::uint32_t i = 0; i < 4u; ++i) {
+            const std::uint32_t nib = (packed >> (sh + 8u * i)) & 0xFu;
+            float v;
+            std::memcpy(&v, kD3d12IqTable + kD3d12Iq4nl + nib * 4u, 4);
+            acc += v * xs[i];
+        }
+        return acc;
+    };
+
+    if (t == GGML_TYPE_IQ2_S) {
+        const std::uint32_t e0 = itid * 16u;
+        const std::uint32_t ib32 = itid >> 1, half = itid & 1u, lb = half * 2u;
+        const std::uint32_t bb = row_off + blk * 82u;
+        const float d = h2f(ld16(w, bb));
+        const std::uint32_t sc = w[bb + 74u + ib32];
+        const std::uint32_t qh = w[bb + 66u + ib32];
+        const std::uint32_t qi = ld16(w, bb + 2u + 4u * ib32 + lb);
+        const std::uint32_t sg = ld16(w, bb + 34u + 4u * ib32 + lb);
+        const std::uint32_t idx0 = (qi & 0xffu) | ((qh << (8u - 2u * lb)) & 0x300u);
+        const std::uint32_t idx1 = (qi >> 8u) | ((qh << (8u - 2u * (lb + 1u))) & 0x300u);
+        const std::uint32_t o0 = kD3d12Iq2sGrid + idx0 * 8u;
+        const std::uint32_t o1 = kD3d12Iq2sGrid + idx1 * 8u;
+        const float dg = d * (0.5f + static_cast<float>(half ? (sc >> 4u) : (sc & 0xFu))) * 0.25f;
+        return dg * (dot4(iq32(o0), sg & 0xffu, 0u, xe + e0) +
+                     dot4(iq32(o0 + 4u), sg & 0xffu, 4u, xe + e0 + 4u) +
+                     dot4(iq32(o1), sg >> 8u, 0u, xe + e0 + 8u) +
+                     dot4(iq32(o1 + 4u), sg >> 8u, 4u, xe + e0 + 12u));
+    }
+    if (t == GGML_TYPE_IQ3_XXS) {
+        const std::uint32_t e0 = itid * 16u;
+        const std::uint32_t ib32 = itid >> 1, lb = (itid & 1u) * 2u;
+        const std::uint32_t bb = row_off + blk * 98u;
+        const float d = h2f(ld16(w, bb));
+        const std::uint32_t aux = ld32(w, bb + 66u + 4u * ib32);
+        const std::uint32_t q4 = ld32(w, bb + 2u + 8u * ib32 + 2u * lb);
+        const std::uint32_t s0 = iq8(kD3d12IqSigns + ((aux >> (7u * lb)) & 127u));
+        const std::uint32_t s1 = iq8(kD3d12IqSigns + ((aux >> (7u * (lb + 1u))) & 127u));
+        const std::uint32_t g0 = kD3d12Iq3xxsGrid + (q4 & 0xffu) * 4u;
+        const std::uint32_t g1 = kD3d12Iq3xxsGrid + ((q4 >> 8u) & 0xffu) * 4u;
+        const std::uint32_t g2 = kD3d12Iq3xxsGrid + ((q4 >> 16u) & 0xffu) * 4u;
+        const std::uint32_t g3 = kD3d12Iq3xxsGrid + ((q4 >> 24u) & 0xffu) * 4u;
+        const float db = d * (0.5f + static_cast<float>(aux >> 28u)) * 0.5f;
+        return db * (dot4(iq32(g0), s0, 0u, xe + e0) + dot4(iq32(g1), s0, 4u, xe + e0 + 4u) +
+                     dot4(iq32(g2), s1, 0u, xe + e0 + 8u) + dot4(iq32(g3), s1, 4u, xe + e0 + 12u));
+    }
+    if (t == GGML_TYPE_IQ3_S) {
+        const std::uint32_t e0 = itid * 16u;
+        const std::uint32_t m = itid >> 2, second = (itid >> 1) & 1u, lb = (itid & 1u) * 2u;
+        const std::uint32_t bb = row_off + blk * 110u;
+        const float d = h2f(ld16(w, bb));
+        const std::uint32_t h = w[bb + 66u + 2u * m + second];
+        const std::uint32_t q4 = ld32(w, bb + 2u + 16u * m + 8u * second + 2u * lb);
+        const std::uint32_t sg = ld16(w, bb + 74u + 8u * m + 4u * second + lb);
+        const std::uint32_t sc = w[bb + 106u + m];
+        const std::uint32_t i0 = (q4 & 0xffu) | ((h << (8u - 2u * lb)) & 256u);
+        const std::uint32_t i1 = ((q4 >> 8u) & 0xffu) | ((h << (7u - 2u * lb)) & 256u);
+        const std::uint32_t i2 = ((q4 >> 16u) & 0xffu) | ((h << (6u - 2u * lb)) & 256u);
+        const std::uint32_t i3 = ((q4 >> 24u) & 0xffu) | ((h << (5u - 2u * lb)) & 256u);
+        const std::uint32_t g0 = kD3d12Iq3sGrid + i0 * 4u;
+        const std::uint32_t g1 = kD3d12Iq3sGrid + i1 * 4u;
+        const std::uint32_t g2 = kD3d12Iq3sGrid + i2 * 4u;
+        const std::uint32_t g3 = kD3d12Iq3sGrid + i3 * 4u;
+        const float db = d * (1.f + 2.f * static_cast<float>(second ? (sc >> 4u) : (sc & 0xFu)));
+        return db * (dot4(iq32(g0), sg & 0xffu, 0u, xe + e0) +
+                     dot4(iq32(g1), sg & 0xffu, 4u, xe + e0 + 4u) +
+                     dot4(iq32(g2), sg >> 8u, 0u, xe + e0 + 8u) +
+                     dot4(iq32(g3), sg >> 8u, 4u, xe + e0 + 12u));
+    }
+    if (t == GGML_TYPE_IQ4_XS) {
+        const std::uint32_t e0 = itid * 16u;
+        const std::uint32_t ib = itid >> 1, sh = (itid & 1u) * 4u;
+        const std::uint32_t bb = row_off + blk * 136u;
+        const float d = h2f(ld16(w, bb));
+        const std::uint32_t sl = w[bb + 4u + (ib >> 1)];
+        const std::uint32_t ls =
+            ((sl >> (4u * (ib & 1u))) & 0xFu) | (((ld16(w, bb + 2u) >> (2u * ib)) & 3u) << 4u);
+        const std::uint32_t qb = bb + 8u + 16u * ib;
+        const float dl = d * (static_cast<float>(ls) - 32.f);
+        return dl * (dot4nl(ld32(w, qb), sh, xe + e0) + dot4nl(ld32(w, qb + 4u), sh, xe + e0 + 4u) +
+                     dot4nl(ld32(w, qb + 8u), sh, xe + e0 + 8u) +
+                     dot4nl(ld32(w, qb + 12u), sh, xe + e0 + 12u));
+    }
+
     if (t == GGML_TYPE_Q4_0) {
         const std::uint32_t b = itid >> 1, h = itid & 1u;
         const std::uint32_t e_lo = 32u * b + 8u * h, e_hi = e_lo + 16u;
@@ -753,12 +867,59 @@ void d3d12_q6_tile_emulate(const std::uint8_t* w, std::size_t w_row_bytes, const
     }
 }
 
+// IQ weights cannot be produced by ggml_quantize_chunk without an importance
+// matrix, so the selftest/bench generator fills every block with rng bytes and
+// only patches the fp16 block scale at offset 0 to a finite value. Every index
+// field in these formats spans its full byte range, so random bytes are valid
+// block data; the dequantizer reference then validates the kernels end to end.
+namespace {
+bool iq_gen_weights(ggml_type t, int n, int k, std::mt19937& rng, void* dst) {
+    std::size_t block_bytes = 0;
+    switch (t) {
+    case GGML_TYPE_IQ2_S:
+        block_bytes = 82;
+        break;
+    case GGML_TYPE_IQ3_XXS:
+        block_bytes = 98;
+        break;
+    case GGML_TYPE_IQ3_S:
+        block_bytes = 110;
+        break;
+    case GGML_TYPE_IQ4_XS:
+        block_bytes = 136;
+        break;
+    default:
+        return false;
+    }
+    const std::size_t row_bytes = ggml_row_size(t, k);
+    if (row_bytes == 0 || row_bytes % block_bytes != 0)
+        return false;
+    const ggml_fp16_t d = ggml_fp32_to_fp16(0.0625f);
+    const std::uint8_t d_lo = static_cast<std::uint8_t>(d & 0xffu);
+    const std::uint8_t d_hi = static_cast<std::uint8_t>(d >> 8);
+    auto* out = static_cast<std::uint8_t*>(dst);
+    for (int r = 0; r < n; ++r) {
+        std::uint8_t* row = out + static_cast<std::size_t>(r) * row_bytes;
+        for (std::size_t b = 0; b < row_bytes; b += block_bytes) {
+            std::uint8_t* blk = row + b;
+            for (std::size_t i = 0; i < block_bytes; ++i)
+                blk[i] = static_cast<std::uint8_t>(rng() & 0xffu);
+            blk[0] = d_lo;
+            blk[1] = d_hi;
+        }
+    }
+    return true;
+}
+} // namespace
+
 bool d3d12_gen_weights(ggml_type t, int n, int k, std::mt19937& rng, void* dst) {
     if (!dst || n <= 0 || k <= 0 || !d3d12_weight_type_supported(t))
         return false;
     const std::int64_t blck = ggml_blck_size(t);
     if (blck <= 0 || k % blck != 0)
         return false;
+    if (d3d12_iq_weight_type(t))
+        return iq_gen_weights(t, n, k, rng, dst);
     const std::size_t row_bytes = ggml_row_size(t, k);
     if (row_bytes == 0)
         return false;
@@ -792,6 +953,8 @@ bool d3d12_gen_weights_reference(ggml_type t, int n, int k, std::mt19937& rng, v
     const std::int64_t blck = ggml_blck_size(t);
     if (blck <= 0 || k % blck != 0)
         return false;
+    if (d3d12_iq_weight_type(t))
+        return iq_gen_weights(t, n, k, rng, dst);
     const std::size_t row_bytes = ggml_row_size(t, k);
     if (row_bytes == 0)
         return false;
@@ -994,17 +1157,26 @@ bool d3d12_shape_drain(const char*) {
         #include "ggml-alloc.h"
         #include "ggml-backend-impl.h"
         #include "ggml-backend.h"
+        #include "ggml_d3d12_add_dxil.h"
         #include "ggml_d3d12_gated_delta_net_dxil.h"
+        #include "ggml_d3d12_mmv_iq2_s_t128_dxil.h"
+        #include "ggml_d3d12_mmv_iq2_s_t64_dxil.h"
+        #include "ggml_d3d12_mmv_iq3_s_t128_dxil.h"
+        #include "ggml_d3d12_mmv_iq3_s_t64_dxil.h"
+        #include "ggml_d3d12_mmv_iq3_xxs_t128_dxil.h"
+        #include "ggml_d3d12_mmv_iq3_xxs_t64_dxil.h"
+        #include "ggml_d3d12_mmv_iq4_xs_t128_dxil.h"
+        #include "ggml_d3d12_mmv_iq4_xs_t64_dxil.h"
+        #include "ggml_d3d12_mmv_q2_k_t128_dxil.h"
+        #include "ggml_d3d12_mmv_q2_k_t64_dxil.h"
+        #include "ggml_d3d12_mmv_q3_k_t128_dxil.h"
+        #include "ggml_d3d12_mmv_q3_k_t64_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t128_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t64_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t128_2col_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t128_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t64_2col_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t64_dxil.h"
-        #include "ggml_d3d12_mmv_q2_k_t128_dxil.h"
-        #include "ggml_d3d12_mmv_q2_k_t64_dxil.h"
-        #include "ggml_d3d12_mmv_q3_k_t128_dxil.h"
-        #include "ggml_d3d12_mmv_q3_k_t64_dxil.h"
         #include "ggml_d3d12_mmv_q5_k_t128_dxil.h"
         #include "ggml_d3d12_mmv_q5_k_t64_dxil.h"
         #include "ggml_d3d12_mmv_q6_k_t128_2col_dxil.h"
@@ -1015,7 +1187,6 @@ bool d3d12_shape_drain(const char*) {
         #include "ggml_d3d12_mmv_q6_k_t64_dxil.h"
         #include "ggml_d3d12_mmv_q8_0_t128_dxil.h"
         #include "ggml_d3d12_mmv_q8_0_t64_dxil.h"
-        #include "ggml_d3d12_add_dxil.h"
         #include "ggml_d3d12_mul_dxil.h"
         #include "ggml_d3d12_rms_norm_dxil.h"
         #include "ggml_d3d12_silu_dxil.h"
@@ -1036,7 +1207,11 @@ enum Pso {
     kPsoQ80 = 4,
     kPsoQ2K = 5,
     kPsoQ3K = 6,
-    kPsoCount = 7
+    kPsoIq2S = 7,
+    kPsoIq3Xxs = 8,
+    kPsoIq3S = 9,
+    kPsoIq4Xs = 10,
+    kPsoCount = 11
 };
 
 int pso_for(ggml_type t) {
@@ -1055,6 +1230,14 @@ int pso_for(ggml_type t) {
         return kPsoQ2K;
     case GGML_TYPE_Q3_K:
         return kPsoQ3K;
+    case GGML_TYPE_IQ2_S:
+        return kPsoIq2S;
+    case GGML_TYPE_IQ3_XXS:
+        return kPsoIq3Xxs;
+    case GGML_TYPE_IQ3_S:
+        return kPsoIq3S;
+    case GGML_TYPE_IQ4_XS:
+        return kPsoIq4Xs;
     default:
         return -1;
     }
@@ -1091,6 +1274,10 @@ struct Gpu {
     ComPtr<ID3D12Resource> ts_rb;
     ComPtr<ID3D12Resource> staging;  // weight upload ring (kStagingBytes)
     ComPtr<ID3D12Resource> readback; // get_tensor on weights (kStagingBytes)
+    // IQ grid/codebook blob, bound as root SRV t1 for the IQ matmul kernels.
+    // UPLOAD heap, mapped for the process lifetime (11456 B).
+    ComPtr<ID3D12Resource> iq_table;
+    D3D12_GPU_VIRTUAL_ADDRESS iq_table_va = 0;
     std::uint8_t* staging_ptr = nullptr;
     std::uint8_t* readback_ptr = nullptr;
     d3d12c::QueueFence fence;
@@ -1208,11 +1395,15 @@ ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, std::string* err
         p[2].Descriptor.ShaderRegister = 0;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; // u1 activations
         p[3].Descriptor.ShaderRegister = 1;
+        // t1: IQ grid/codebook table buffer. The Q4/Q5/Q6 kernels never declare
+        // it, so this extra root parameter is compatible with their PSOs.
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        p[4].Descriptor.ShaderRegister = 1;
     }
     for (auto& q : p)
         q.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC desc = {};
-    desc.NumParameters = gdn ? 8 : 4;
+    desc.NumParameters = gdn ? 8 : 5;
     desc.pParameters = p;
     auto serialize = d3d12_dyn::SerializeRootSignature();
     if (!serialize) {
@@ -1275,7 +1466,11 @@ bool init_gpu(Gpu& g) {
                                        {kGgmlD3d12MmvQ6KT64Dxil, kGgmlD3d12MmvQ6KT128Dxil},
                                        {kGgmlD3d12MmvQ80T64Dxil, kGgmlD3d12MmvQ80T128Dxil},
                                        {kGgmlD3d12MmvQ2KT64Dxil, kGgmlD3d12MmvQ2KT128Dxil},
-                                       {kGgmlD3d12MmvQ3KT64Dxil, kGgmlD3d12MmvQ3KT128Dxil}};
+                                       {kGgmlD3d12MmvQ3KT64Dxil, kGgmlD3d12MmvQ3KT128Dxil},
+                                       {kGgmlD3d12MmvIq2ST64Dxil, kGgmlD3d12MmvIq2ST128Dxil},
+                                       {kGgmlD3d12MmvIq3XxsT64Dxil, kGgmlD3d12MmvIq3XxsT128Dxil},
+                                       {kGgmlD3d12MmvIq3ST64Dxil, kGgmlD3d12MmvIq3ST128Dxil},
+                                       {kGgmlD3d12MmvIq4XsT64Dxil, kGgmlD3d12MmvIq4XsT128Dxil}};
     const size_t sizes[kPsoCount][2] = {
         {kGgmlD3d12MmvQ40T64DxilSize, kGgmlD3d12MmvQ40T128DxilSize},
         {kGgmlD3d12MmvQ4KT64DxilSize, kGgmlD3d12MmvQ4KT128DxilSize},
@@ -1283,7 +1478,11 @@ bool init_gpu(Gpu& g) {
         {kGgmlD3d12MmvQ6KT64DxilSize, kGgmlD3d12MmvQ6KT128DxilSize},
         {kGgmlD3d12MmvQ80T64DxilSize, kGgmlD3d12MmvQ80T128DxilSize},
         {kGgmlD3d12MmvQ2KT64DxilSize, kGgmlD3d12MmvQ2KT128DxilSize},
-        {kGgmlD3d12MmvQ3KT64DxilSize, kGgmlD3d12MmvQ3KT128DxilSize}};
+        {kGgmlD3d12MmvQ3KT64DxilSize, kGgmlD3d12MmvQ3KT128DxilSize},
+        {kGgmlD3d12MmvIq2ST64DxilSize, kGgmlD3d12MmvIq2ST128DxilSize},
+        {kGgmlD3d12MmvIq3XxsT64DxilSize, kGgmlD3d12MmvIq3XxsT128DxilSize},
+        {kGgmlD3d12MmvIq3ST64DxilSize, kGgmlD3d12MmvIq3ST128DxilSize},
+        {kGgmlD3d12MmvIq4XsT64DxilSize, kGgmlD3d12MmvIq4XsT128DxilSize}};
     for (int i = 0; i < kPsoCount; ++i) {
         for (int wd = 0; wd < 2; ++wd) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
@@ -1410,6 +1609,17 @@ bool init_gpu(Gpu& g) {
     if (FAILED(g.readback->Map(0, nullptr, &p)))
         return false;
     g.readback_ptr = static_cast<std::uint8_t*>(p);
+    // IQ grid/codebook blob for root SRV t1: 11456 B, uploaded once. The UPLOAD
+    // heap mapping stays alive for the backend lifetime (it is read by the GPU).
+    g.iq_table = d3d12c::create_buffer(g.device.Get(), kD3d12IqTableBytes, D3D12_HEAP_TYPE_UPLOAD,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                       "iq-tables", &err);
+    if (!g.iq_table)
+        return false;
+    if (FAILED(g.iq_table->Map(0, nullptr, &p)))
+        return false;
+    std::memcpy(p, kD3d12IqTable, kD3d12IqTableBytes);
+    g.iq_table_va = g.iq_table->GetGPUVirtualAddress();
     return true;
 }
 
@@ -2264,6 +2474,8 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 ++g.n_matmuls_2col;
             cl->SetComputeRoot32BitConstants(0, 8, c, 0);
             cl->SetComputeRootShaderResourceView(1, tensor_va(w));
+            if (d3d12_iq_weight_type(w->type))
+                cl->SetComputeRootShaderResourceView(4, g.iq_table_va); // t1 IQ grids
             cl->SetComputeRootUnorderedAccessView(2, tensor_va(node));
             cl->SetComputeRootUnorderedAccessView(3, tensor_va(x));
             cl->Dispatch(d.groups_x, d.groups_y, 1);
@@ -3421,6 +3633,14 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         {GGML_TYPE_Q3_K, "q3_k", 2560, 4096, 1},
         {GGML_TYPE_Q3_K, "q3_k", 1024, 2560, 7},
         {GGML_TYPE_Q3_K, "q3_k", 6, 2304, 1},
+        // GSQ Q2_K_XL IQ tensors (attn_gate/k/q, ffn gate/up/down), fed with
+        // random valid block bytes since IQ quantization needs an imatrix.
+        {GGML_TYPE_IQ2_S, "iq2_s", 9216, 2560, 1},
+        {GGML_TYPE_IQ2_S, "iq2_s", 9216, 2560, 7},
+        {GGML_TYPE_IQ3_XXS, "iq3_xxs", 8192, 2560, 1},
+        {GGML_TYPE_IQ3_XXS, "iq3_xxs", 1024, 2560, 1},
+        {GGML_TYPE_IQ3_S, "iq3_s", 9216, 2560, 1},
+        {GGML_TYPE_IQ4_XS, "iq4_xs", 2560, 9216, 1},
         {GGML_TYPE_Q4_K, "q4_k", 11008, 2048, 1},
         {GGML_TYPE_Q4_K, "q4_k", 2048, 11008, 1},
         {GGML_TYPE_Q5_K, "q5_k", 11008, 2048, 1},

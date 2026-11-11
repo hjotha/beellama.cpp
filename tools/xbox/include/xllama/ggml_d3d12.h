@@ -45,6 +45,9 @@ inline constexpr std::uint32_t kD3d12MaxGroups = 65535;
 // Weight types the backend runs.
 bool d3d12_weight_type_supported(ggml_type t);
 
+// Supported types whose grids live in the t1 table buffer (IQ quants).
+bool d3d12_iq_weight_type(ggml_type t);
+
 // Same-package Q8_0 CPU/GPU comparison. Default ON; set before loading the
 // model so the loader's buffer probe and execution use the same placement.
 void d3d12_set_q8_enabled(bool enabled);
