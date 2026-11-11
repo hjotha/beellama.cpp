@@ -109,6 +109,15 @@ void event(const std::string& path, const std::string& message) {
 std::string g_log_path;
 std::string g_snapshot_local_folder;
 
+// Optional coexistence: keep the local llama.cpp session resident while an
+// RKVA host is connected. Default OFF preserves the shipped behaviour (HELLO
+// and CREATE_SESSION evict the local session to free the game heap for the
+// remote KV). Enable with LocalState\rkva-keep-local.flag only when the local
+// model is small enough to fit next to the remote KV.
+bool keep_local_session_enabled() {
+    return std::ifstream(g_snapshot_local_folder + "\\rkva-keep-local.flag").good();
+}
+
 void event_engine_error(const std::string& message) {
     std::string safe;
     safe.reserve(message.size());
@@ -402,7 +411,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
             (hello.proto_flags & RKVA_PROTO_NATIVE_SNAPSHOT_STORE) != 0;
 
         const auto evict_started = clock_type::now();
-        evict_local_session();
+        if (!keep_local_session_enabled()) evict_local_session();
         const uint64_t evict_us = elapsed_us(evict_started);
 
         // cache_bits 0 or 16 -> F16 bring-up path; 2..8 -> KVarN native.
@@ -529,7 +538,7 @@ int handle_request(remote_state& state, const rkva_request& req, const std::vect
         if (req.payload_bytes != sizeof(rkva_session_req)) {
             return RKVA_ERR_BAD_PAYLOAD;
         }
-        evict_local_session();
+        if (!keep_local_session_enabled()) evict_local_session();
         rkva_session_req sr{};
         std::memcpy(&sr, input.data(), sizeof(sr));
         if (!state.hello_done || !state.engine) {
