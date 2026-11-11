@@ -41,7 +41,8 @@ bool d3d12_empty_fill_supported(const ggml_tensor* op) {
 
 bool d3d12_weight_type_supported(ggml_type t) {
     return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
-           t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q8_0;
+           t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q2_K ||
+           t == GGML_TYPE_Q3_K;
 }
 
 static bool s_q8_enabled = true;
@@ -492,6 +493,33 @@ void q4k_scale_min(std::uint32_t j, const std::uint8_t* sc, float* d, float* m) 
     *m = static_cast<float>(mm);
 }
 
+void q2_4(std::uint32_t word, std::uint32_t shift, float* out) {
+    for (std::uint32_t i = 0; i < 4; ++i)
+        out[i] = static_cast<float>((word >> (shift + 8u * i)) & 3u);
+}
+
+void q3_4(std::uint32_t qword, std::uint32_t shift, std::uint32_t m, std::uint32_t hword,
+          float* out) {
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const std::uint32_t low = (qword >> (shift + 8u * i)) & 3u;
+        const std::uint32_t high = (hword >> (8u * i)) & 0xFFu;
+        out[i] = static_cast<float>(static_cast<int>(low)) - ((high & m) ? 0.f : 4.f);
+    }
+}
+
+// Unpack the 12 Q3_K scale bytes into the 16 six-bit scale bytes, exactly as
+// dequantize_row_q3_K's aux[4] mask shuffle.
+void q3k_scales(const std::uint8_t* w, std::uint32_t bb, std::uint32_t* aux) {
+    const std::uint32_t s0 = ld32(w, bb + 96u);
+    const std::uint32_t s1 = ld32(w, bb + 100u);
+    const std::uint32_t s2 = ld32(w, bb + 104u);
+    const std::uint32_t tmp = s2;
+    aux[0] = (s0 & 0x0f0f0f0fu) | (((tmp >> 0u) & 0x03030303u) << 4u);
+    aux[1] = (s1 & 0x0f0f0f0fu) | (((tmp >> 2u) & 0x03030303u) << 4u);
+    aux[2] = ((s0 >> 4u) & 0x0f0f0f0fu) | (((tmp >> 4u) & 0x03030303u) << 4u);
+    aux[3] = ((s1 >> 4u) & 0x0f0f0f0fu) | (((tmp >> 6u) & 0x03030303u) << 4u);
+}
+
 // One thread's contribution for one row and one 256-element chunk.
 float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, std::uint32_t blk,
                    std::uint32_t itid, const float* x) {
@@ -560,6 +588,64 @@ float thread_chunk(ggml_type t, const std::uint8_t* w, std::uint32_t row_off, st
             sxh += xe[e_hi + i] + xe[e_hi + 4 + i];
         }
         return d1 * lo - m1 * sxl + d2 * hi - m2 * sxh;
+    }
+    if (t == GGML_TYPE_Q2_K) {
+        const std::uint32_t il = itid >> 2, ir = itid & 3u;
+        const std::uint32_t e_lo = il * 64u + ir * 8u, e_hi = e_lo + 32u;
+        const std::uint32_t bb = row_off + blk * 84u;
+        const float d = h2f(ld16(w, bb + 80u)), dmin = h2f(ld16(w, bb + 82u));
+        const std::uint32_t si_lo = 4u * il + (ir >= 2u ? 1u : 0u);
+        const std::uint32_t si_hi = 4u * il + 2u + (ir >= 2u ? 1u : 0u);
+        const std::uint32_t sc_lo = w[bb + si_lo], sc_hi = w[bb + si_hi];
+        const std::uint32_t qbase = 16u + ((il & 2u) ? 32u : 0u) + ir * 8u;
+        const std::uint32_t qa = ld32(w, bb + qbase), qb = ld32(w, bb + qbase + 4u);
+        const std::uint32_t sl = (il & 1u) ? 4u : 0u, sh = sl + 2u;
+        float lo0[4], lo1[4], hi0[4], hi1[4];
+        q2_4(qa, sl, lo0);
+        q2_4(qb, sl, lo1);
+        q2_4(qa, sh, hi0);
+        q2_4(qb, sh, hi1);
+        float lo = 0.f, hi = 0.f, sxl = 0.f, sxh = 0.f;
+        for (std::uint32_t i = 0; i < 4u; ++i) {
+            lo += lo0[i] * xe[e_lo + i] + lo1[i] * xe[e_lo + 4u + i];
+            hi += hi0[i] * xe[e_hi + i] + hi1[i] * xe[e_hi + 4u + i];
+            sxl += xe[e_lo + i] + xe[e_lo + 4u + i];
+            sxh += xe[e_hi + i] + xe[e_hi + 4u + i];
+        }
+        return d * static_cast<float>(sc_lo & 0xFu) * lo -
+               dmin * static_cast<float>(sc_lo >> 4u) * sxl +
+               d * static_cast<float>(sc_hi & 0xFu) * hi -
+               dmin * static_cast<float>(sc_hi >> 4u) * sxh;
+    }
+    if (t == GGML_TYPE_Q3_K) {
+        const std::uint32_t il = itid >> 2, ir = itid & 3u;
+        const std::uint32_t e_lo = il * 64u + ir * 8u, e_hi = e_lo + 32u;
+        const std::uint32_t bb = row_off + blk * 110u;
+        const std::uint32_t qbase = 32u + ((il & 2u) ? 32u : 0u) + ir * 8u;
+        const std::uint32_t qa = ld32(w, bb + qbase), qb = ld32(w, bb + qbase + 4u);
+        const std::uint32_t ha = ld32(w, bb + ir * 8u), hb = ld32(w, bb + ir * 8u + 4u);
+        const std::uint32_t sl = (il & 1u) ? 4u : 0u, sh = sl + 2u;
+        const std::uint32_t ml = 1u << (2u * il), mh = 1u << (2u * il + 1u);
+        float lo0[4], lo1[4], hi0[4], hi1[4];
+        q3_4(qa, sl, ml, ha, lo0);
+        q3_4(qb, sl, ml, hb, lo1);
+        q3_4(qa, sh, mh, ha, hi0);
+        q3_4(qb, sh, mh, hb, hi1);
+        std::uint32_t aux[4];
+        q3k_scales(w, bb, aux);
+        const std::uint32_t si_lo = 4u * il + (ir >= 2u ? 1u : 0u);
+        const std::uint32_t si_hi = 4u * il + 2u + (ir >= 2u ? 1u : 0u);
+        const float d = h2f(ld16(w, bb + 108u));
+        const float scl = static_cast<float>(
+            static_cast<int>((aux[si_lo >> 2] >> ((si_lo & 3u) * 8u)) & 0xFFu) - 32);
+        const float sch = static_cast<float>(
+            static_cast<int>((aux[si_hi >> 2] >> ((si_hi & 3u) * 8u)) & 0xFFu) - 32);
+        float lo = 0.f, hi = 0.f;
+        for (std::uint32_t i = 0; i < 4u; ++i) {
+            lo += lo0[i] * xe[e_lo + i] + lo1[i] * xe[e_lo + 4u + i];
+            hi += hi0[i] * xe[e_hi + i] + hi1[i] * xe[e_hi + 4u + i];
+        }
+        return d * (scl * lo + sch * hi);
     }
     if (t == GGML_TYPE_Q8_0) {
         const std::uint32_t b = itid >> 1, h = itid & 1u;
@@ -915,6 +1001,10 @@ bool d3d12_shape_drain(const char*) {
         #include "ggml_d3d12_mmv_q4_k_t128_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t64_2col_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t64_dxil.h"
+        #include "ggml_d3d12_mmv_q2_k_t128_dxil.h"
+        #include "ggml_d3d12_mmv_q2_k_t64_dxil.h"
+        #include "ggml_d3d12_mmv_q3_k_t128_dxil.h"
+        #include "ggml_d3d12_mmv_q3_k_t64_dxil.h"
         #include "ggml_d3d12_mmv_q5_k_t128_dxil.h"
         #include "ggml_d3d12_mmv_q5_k_t64_dxil.h"
         #include "ggml_d3d12_mmv_q6_k_t128_2col_dxil.h"
@@ -938,7 +1028,16 @@ namespace {
 
 using d3d12c::ComPtr;
 
-enum Pso { kPsoQ40 = 0, kPsoQ4K = 1, kPsoQ5K = 2, kPsoQ6K = 3, kPsoQ80 = 4, kPsoCount = 5 };
+enum Pso {
+    kPsoQ40 = 0,
+    kPsoQ4K = 1,
+    kPsoQ5K = 2,
+    kPsoQ6K = 3,
+    kPsoQ80 = 4,
+    kPsoQ2K = 5,
+    kPsoQ3K = 6,
+    kPsoCount = 7
+};
 
 int pso_for(ggml_type t) {
     switch (t) {
@@ -952,6 +1051,10 @@ int pso_for(ggml_type t) {
         return kPsoQ6K;
     case GGML_TYPE_Q8_0:
         return kPsoQ80;
+    case GGML_TYPE_Q2_K:
+        return kPsoQ2K;
+    case GGML_TYPE_Q3_K:
+        return kPsoQ3K;
     default:
         return -1;
     }
@@ -1170,13 +1273,17 @@ bool init_gpu(Gpu& g) {
                                        {kGgmlD3d12MmvQ4KT64Dxil, kGgmlD3d12MmvQ4KT128Dxil},
                                        {kGgmlD3d12MmvQ5KT64Dxil, kGgmlD3d12MmvQ5KT128Dxil},
                                        {kGgmlD3d12MmvQ6KT64Dxil, kGgmlD3d12MmvQ6KT128Dxil},
-                                       {kGgmlD3d12MmvQ80T64Dxil, kGgmlD3d12MmvQ80T128Dxil}};
+                                       {kGgmlD3d12MmvQ80T64Dxil, kGgmlD3d12MmvQ80T128Dxil},
+                                       {kGgmlD3d12MmvQ2KT64Dxil, kGgmlD3d12MmvQ2KT128Dxil},
+                                       {kGgmlD3d12MmvQ3KT64Dxil, kGgmlD3d12MmvQ3KT128Dxil}};
     const size_t sizes[kPsoCount][2] = {
         {kGgmlD3d12MmvQ40T64DxilSize, kGgmlD3d12MmvQ40T128DxilSize},
         {kGgmlD3d12MmvQ4KT64DxilSize, kGgmlD3d12MmvQ4KT128DxilSize},
         {kGgmlD3d12MmvQ5KT64DxilSize, kGgmlD3d12MmvQ5KT128DxilSize},
         {kGgmlD3d12MmvQ6KT64DxilSize, kGgmlD3d12MmvQ6KT128DxilSize},
-        {kGgmlD3d12MmvQ80T64DxilSize, kGgmlD3d12MmvQ80T128DxilSize}};
+        {kGgmlD3d12MmvQ80T64DxilSize, kGgmlD3d12MmvQ80T128DxilSize},
+        {kGgmlD3d12MmvQ2KT64DxilSize, kGgmlD3d12MmvQ2KT128DxilSize},
+        {kGgmlD3d12MmvQ3KT64DxilSize, kGgmlD3d12MmvQ3KT128DxilSize}};
     for (int i = 0; i < kPsoCount; ++i) {
         for (int wd = 0; wd < 2; ++wd) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
@@ -3305,6 +3412,15 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     const SelftestCase cases[] = {
         {GGML_TYPE_Q4_0, "q4_0", 8192, 2048, 1},
         {GGML_TYPE_Q4_0, "q4_0", 2048, 8192, 1},
+        // GSQ Q2_K_XL support: both new K-quants on real Qwen3.5-4B widths,
+        // including the 9-block Q3_K row that starts 2-byte aligned.
+        {GGML_TYPE_Q2_K, "q2_k", 2048, 2560, 1},
+        {GGML_TYPE_Q2_K, "q2_k", 2560, 4096, 1},
+        {GGML_TYPE_Q2_K, "q2_k", 1024, 2560, 7},
+        {GGML_TYPE_Q3_K, "q3_k", 2048, 2560, 1},
+        {GGML_TYPE_Q3_K, "q3_k", 2560, 4096, 1},
+        {GGML_TYPE_Q3_K, "q3_k", 1024, 2560, 7},
+        {GGML_TYPE_Q3_K, "q3_k", 6, 2304, 1},
         {GGML_TYPE_Q4_K, "q4_k", 11008, 2048, 1},
         {GGML_TYPE_Q4_K, "q4_k", 2048, 11008, 1},
         {GGML_TYPE_Q5_K, "q5_k", 11008, 2048, 1},
