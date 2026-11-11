@@ -901,6 +901,10 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
 // (n_splits ~ 1728) would otherwise reserve ~226 MiB permanently and starve
 // the following kvarn prefill windows. Wider batches retain direct record
 // attention through MMA, or the portable native route when LSE requires it.
+// The pool also keeps one segment per distinct n_q, so letting the MTP
+// verification batch span 1..8 at depth reserved ~226 MiB of variants on a
+// 12 GB card and starved decode. The budget applies to every path, not only
+// to LSE/position-split attention.
 static int ggml_cuda_fattn_kvarn_split_max_q(
         const ggml_cuda_fattn_kvarn_plan & plan, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -913,12 +917,6 @@ static int ggml_cuda_fattn_kvarn_split_max_q(
     }
     size_t budget = size_t(64) << 20;
     const char * env = getenv("GGML_CUDA_KVARN_SPLIT_PARTIAL_MB");
-    // The automatic reserve addresses position-split attention's extra LSE
-    // and remote staging pressure. Preserve the qualified query tiles for
-    // ordinary single-device attention; an explicit budget still opts it in.
-    if (env == nullptr && !ggml_cuda_fattn_lse_requested(dst)) {
-        return qualified_max;
-    }
     if (env != nullptr) {
         const long mb = atol(env);
         if (mb > 0) {
