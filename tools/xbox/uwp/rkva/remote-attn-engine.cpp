@@ -1008,7 +1008,7 @@ void RemoteAttnEngine::create_q4_opt_pipelines() {
 // Q4 prerequisites (wave ops, lanes, geometry, opt reducer and partials) and one
 // 12-constant root signature; each PSO is created and reported on its own, and a
 // missing PSO keeps that storage on its reference kernel.
-void RemoteAttnEngine::create_format_opt_pipelines() {
+void RemoteAttnEngine::create_format_opt_pipelines(uint32_t storage) {
     if (!range_attn_q4_opt_pso_ || !range_reduce_opt_pso_) {
         const std::string why = "requires the q4 optimized prerequisites: " + q4_opt_status_;
         fmt_opt_status_[rp::kStorageF16] = why;
@@ -1033,8 +1033,11 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         }
         return;
     }
-    auto serialize = xllama::d3d12_dyn::SerializeRootSignature();
-    // 12 constants (Q4 opt layout + records_bytes, precision_tail_tokens),
+    char text[96];
+    HRESULT hr = E_FAIL;
+    if (!range_attn_fmt_opt_root_) {
+        auto serialize = xllama::d3d12_dyn::SerializeRootSignature();
+        // 12 constants (Q4 opt layout + records_bytes, precision_tail_tokens),
     // SRV t0..t3, UAV u0 (partials) and u1 (direct output).
     D3D12_ROOT_PARAMETER params[7] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -1056,8 +1059,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
     desc.pParameters = params;
     ComPtr<ID3DBlob> blob;
     ComPtr<ID3DBlob> messages;
-    char text[96];
-    HRESULT hr = serialize ? serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &messages)
+    hr = serialize ? serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &messages)
                            : E_NOINTERFACE;
     if (SUCCEEDED(hr)) {
         hr = device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
@@ -1088,6 +1090,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         }
         return;
     }
+    } // !range_attn_fmt_opt_root_
     const auto create_format_pso = [&](const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc,
                                        ComPtr<ID3D12PipelineState>& out,
                                        rkva_hello_telemetry::FormatPso id) {
@@ -1108,6 +1111,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
          sizeof(g_rkva_range_attn_kvarn4_opt_dxil)},
     };
     for (const Kernel& k : kernels) {
+        if (k.storage != storage) continue; // only the negotiated storage
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
         pso.pRootSignature = range_attn_fmt_opt_root_.Get();
         pso.CS = {k.bytecode, k.size};
@@ -1123,6 +1127,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
             fmt_opt_status_[k.storage] = "ready";
         }
     }
+    if (storage == rp::kStorageKvarn4) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC prefix = {};
     prefix.pRootSignature = range_attn_fmt_opt_root_.Get();
     prefix.CS = {g_rkva_range_attn_kvarn4_opt_prefix_dxil,
@@ -1228,6 +1233,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         kvarn4_decode_rowlane_status_ = "header not built (compile attn_kvarn4_decode_rowlane)";
 #endif
     }
+    } // storage == kStorageKvarn4
     // F16 / Q8_0 multi-query tiles: same root signature, one PSO per (storage, tile).
     const struct {
         uint32_t storage;
@@ -1243,6 +1249,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
         {rp::kStorageQ8, 1, g_rkva_range_attn_q8_mq4_dxil, sizeof(g_rkva_range_attn_q8_mq4_dxil)},
     };
     for (const auto& k : mq_kernels) {
+        if (k.storage != storage) continue; // only the negotiated storage
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
         pso.pRootSignature = range_attn_fmt_opt_root_.Get();
         pso.CS = {k.bytecode, k.size};
@@ -1260,6 +1267,7 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
             fmt_mq_status_[k.storage][k.index] = "ready";
         }
     }
+    if (storage == rp::kStorageQ8) {
 #if RKVA_HAS_Q8_DECODE_ROWLANE_DXIL
     if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
@@ -1279,6 +1287,8 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
 #else
     q8_decode_rowlane_status_ = "header not built (compile attn_q8_decode_rowlane)";
 #endif
+    } // storage == kStorageQ8
+    if (storage == rp::kStorageF16) {
 #if RKVA_HAS_F16_DECODE_ROWLANE_DXIL
     if (wave_lane_min_ == 64 && wave_lane_max_ == 64) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
@@ -1298,15 +1308,28 @@ void RemoteAttnEngine::create_format_opt_pipelines() {
 #else
     f16_decode_rowlane_status_ = "header not built (compile attn_f16_decode_rowlane)";
 #endif
-    if (q8_mq_i8_policy_.during_initialize(lazy_int8_init_)) {
+    } // storage == kStorageF16
+    if (storage == rp::kStorageQ8 && q8_mq_i8_policy_.during_initialize(lazy_int8_init_)) {
         create_q8_mq_i8_pipeline();
-    } else {
+    } else if (storage == rp::kStorageQ8) {
 #if RKVA_HAS_Q8_MQ2_I8_DXIL
         q8_mq_i8_status_ = "deferred until enabled";
 #else
         q8_mq_i8_status_ = "header not built (compile attn_q8_mq2_i8)";
 #endif
     }
+}
+
+bool RemoteAttnEngine::ensure_format_pipelines(uint32_t storage) {
+    if (storage >= rp::kStorageCount)
+        return false;
+    if (format_ready_[storage])
+        return true;
+    // One attempt per storage per engine. A PSO that fails to compile keeps its
+    // reference kernel; retrying it on every range config would only add latency.
+    format_ready_[storage] = true;
+    create_format_opt_pipelines(storage);
+    return true;
 }
 
 void RemoteAttnEngine::create_kvarn4_mq_i8_pipeline() {
@@ -1770,9 +1793,10 @@ bool RemoteAttnEngine::initialize(const Geometry& geo, std::string* error) {
     const auto q4_started = prof_clock::now();
     create_q4_opt_pipelines();
     init_timings_.q4_psos_us = elapsed_ns(q4_started, prof_clock::now()) / 1000;
-    const auto format_started = prof_clock::now();
-    create_format_opt_pipelines();
-    init_timings_.format_psos_us = elapsed_ns(format_started, prof_clock::now()) / 1000;
+    // Format PSO families are created on demand by ensure_format_pipelines()
+    // from the range-config RPC that negotiates the storage. HELLO pays only the
+    // required + Q4 prerequisites, never all 14 format PSOs.
+    init_timings_.format_psos_us = 0;
     // Initial scratch for a modest prefill chunk; grown on demand.
     scratch_tokens_ = 0;
     ready_ = true;
@@ -2276,6 +2300,8 @@ bool RemoteAttnEngine::configure_range(uint32_t id, uint32_t origin, uint32_t ca
         (is_native_ext && !native_extended_available(storage))) {
         return ::fail(error, "range config: invalid geometry/session/origin");
     }
+    // Storage is negotiated here (legacy F16/Q4_0/Q8_0): compile only its family.
+    ensure_format_pipelines(storage);
     const uint32_t head_bytes = rkva_kvarn_range::native_storage_head_bytes(storage);
     const uint64_t row_bytes = uint64_t(geo_.n_head_kv) *
                                (head_bytes ? uint64_t(head_bytes)
@@ -2329,6 +2355,10 @@ bool RemoteAttnEngine::configure_kvarn_range(uint32_t id, const rkva_kvarn_range
         !rkva_kvarn_range::valid_descriptor(c, geo_.head_dim)) {
         return ::fail(error, "KVarN range: unsupported descriptor/session");
     }
+    // KVarN4 is the negotiated storage for the native range path; compile its
+    // optimized family (opt/prefix/mq2/mq4/decode/rowlane) only now.
+    if (c.storage == RKVA_RANGE_STORAGE_KVARN4)
+        ensure_format_pipelines(rp::kStorageKvarn4);
     // Revision 3 fails closed without its own kernel: the revision 1/2 PSOs read
     // the resident image and a 128-row ring, never the serial prefix.
     if (rkva_kvarn_range::serial_prefix(c) && !range_attn_kvarn4_prefix_pso_)

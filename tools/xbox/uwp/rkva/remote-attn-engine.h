@@ -205,6 +205,10 @@ class RemoteAttnEngine {
     bool native_saw_int4_available() const;
     bool native_turboquant_nc_available() const;
     bool native_extended_available(uint32_t storage) const;
+    // Lazily create the optimized format PSO family for one negotiated storage
+    // (0=F16, 1=Q4_0, 2=Q8_0, 3=KVarN4). Called from the range-config RPCs so
+    // HELLO only pays the required + Q4 prerequisites, never all 14 formats.
+    bool ensure_format_pipelines(uint32_t storage);
     bool attend_q4_bulk_fp8(uint32_t id, uint32_t layer, uint32_t n_tokens, const uint8_t* data,
                             size_t bytes, uint8_t* out_fp8, float* lse, std::string* error,
                             uint64_t cycle_id);
@@ -302,8 +306,9 @@ class RemoteAttnEngine {
     HRESULT try_create_buffer(uint64_t bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
                               D3D12_RESOURCE_STATES state, Buffer* out);
     void create_q4_opt_pipelines();
-    // F16/Q8_0/KVarN4 optimized pipelines; needs the Q4 opt prerequisites.
-    void create_format_opt_pipelines();
+    // F16/Q8_0/KVarN4 optimized pipelines for ONE storage; needs the Q4 opt
+    // prerequisites. storage = rp::kStorage*.
+    void create_format_opt_pipelines(uint32_t storage);
     void create_kvarn4_mq_i8_pipeline();
     void create_q8_mq_i8_pipeline();
     void create_bulk_f16_pipelines();
@@ -337,6 +342,9 @@ class RemoteAttnEngine {
     uint32_t groups_per_stream_ = 0;
 
     bool ready_ = false;
+    // One-shot guard per negotiated storage: the format PSO family is created on
+    // the first range-config RPC that asks for it (never eagerly at HELLO).
+    bool format_ready_[rkva_rprof::kStorageCount] = {};
     Geometry geo_;
     InitTimings init_timings_;
 
