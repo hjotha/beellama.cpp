@@ -4187,6 +4187,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_RKVA_PREFILL_QUERY_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--rkva-bulk-segment"}, "N",
+        "native KVarN4 prefill query segment size, 8 uses the MQ2 prefix PSO (default: 8)",
+        [](common_params & params, int value) {
+            if (value != 8 && value != 16 && value != 32 && value != 64 && value != 128) {
+                throw std::invalid_argument("--rkva-bulk-segment must be 8, 16, 32, 64 or 128");
+            }
+            params.rkva_bulk_segment = value;
+#if !defined(_WIN32)
+            setenv("GGML_RKVA_BULK_SEGMENT", std::to_string(value).c_str(), 1);
+#else
+            _putenv_s("GGML_RKVA_BULK_SEGMENT", std::to_string(value).c_str());
+#endif
+        }
+    ).set_env("LLAMA_ARG_RKVA_BULK_SEGMENT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--rkva-tcp-prefetch"},
         {"--no-rkva-tcp-prefetch"},
         "enable experimental RKVA TCP prefetch window (default: disabled, backend GGML_RKVA_TCP_PREFETCH=1)",

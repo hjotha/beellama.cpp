@@ -1030,6 +1030,7 @@ struct common_params {
     std::string rkva_range_kernel = "";  // GGML_RKVA_RANGE_KERNEL
     std::string rkva_range_fuse = "";    // GGML_RKVA_RANGE_FUSE ("0"/"1"/"auto")
     int32_t rkva_prefill_query_chunk = -1; // GGML_RKVA_PREFILL_QUERY_CHUNK (0 or 8)
+    int32_t rkva_bulk_segment = 8;       // GGML_RKVA_BULK_SEGMENT (8/16/32/64/128)
     bool rkva_tcp_prefetch = false;      // GGML_RKVA_TCP_PREFETCH (exact "1")
     bool rkva_disk_snapshots = false;    // GGML_RKVA_DISK_SNAPSHOTS (exact "1")
     // snapshots / restore (server-context.cpp)

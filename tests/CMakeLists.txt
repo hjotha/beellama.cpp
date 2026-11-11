@@ -1876,6 +1876,7 @@ set_property(TEST test-rkva-qual-probe-guard-off PROPERTY LABELS main)
 
 # Native Q4_1/IQ4_NL CPU format contracts (no GPU qualification).
 llama_build_and_test(test-rkva-low4.cpp)
+llama_build_and_test(test-rkva-bulk-segments.cpp)
 # Host oracle and mocked transaction tests; not CUDA execution.
 llama_build_and_test(test-rkva-low4-native-reference.cpp)
 llama_build_and_test(test-rkva-low4-gpu-producer.cpp)

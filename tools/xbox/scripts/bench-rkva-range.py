@@ -41,7 +41,7 @@ PINNED_ENV = {
     'GGML_KVARN_WINDOW_CHUNK': '4096',
     'GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL': '1',
     'GGML_RKVA_NATIVE_PRODUCER': 'cuda', 'GGML_RKVA_RANGE_STORAGE': 'kvarn4',
-    'GGML_RKVA_RANGE_KERNEL': 'fine', 'GGML_RKVA_RANGE_FUSE': '0',
+    'GGML_RKVA_RANGE_KERNEL': 'fine', 'GGML_RKVA_RANGE_FUSE': '0', 'GGML_RKVA_BULK_SEGMENT': '8',
     'GGML_RKVA_NATIVE_TAIL_TOKENS': '128', 'GGML_RKVA_PREFILL_QUERY_CHUNK': '8',
     'GGML_RKVA_NATIVE_BULK': 'f16', 'GGML_RKVA_WIRE_FORMAT': 'fp8',
     'GGML_RKVA_WIRE_STRICT': '1', 'GGML_RKVA_ASYNC_LOCAL_REMOTE': '1',
@@ -196,6 +196,10 @@ def parser():
                    help='lossless CUDA binary-F16 mask transport; controls pin OFF, default removes the core override')
     p.add_argument('--range-kernel', choices=('fine', 'balanced'), default='fine',
                    help='fine uses MQ2 and finer decode splits; balanced uses MQ4 and coarser decode splits')
+    p.add_argument('--bulk-segment', type=int, choices=(8, 16, 32, 64, 128), default=8,
+                   help='native KVarN4 prefill query segment (8 uses the MQ2 prefix PSO)')
+    p.add_argument('--range-fuse', choices=('0', '1', 'auto'), default='0',
+                   help='RKVA range upload+attn fusion (auto lets the host decide)')
     p.add_argument('--n-predict', type=int, default=256)
     p.add_argument('--threads', type=int, required=True)
     p.add_argument('--threads-batch', type=int)
@@ -587,6 +591,8 @@ def pinned_environment(args):
     if args.mask_pack != 'default':
         values['GGML_CUDA_MASK_PACK'] = '0' if args.mask_pack == 'off' else '1'
     values['GGML_RKVA_RANGE_KERNEL'] = args.range_kernel
+    values['GGML_RKVA_BULK_SEGMENT'] = str(args.bulk_segment)
+    values['GGML_RKVA_RANGE_FUSE'] = args.range_fuse
     return values
 
 
@@ -649,6 +655,8 @@ def prefix_contract(args, tokens, model):
     # run environment; reuse never claims a new cold-prefix qualification.
     prefix_env['GGML_RKVA_CUDA_FP8'] = 'prefill'
     prefix_env['GGML_RKVA_RANGE_KERNEL'] = 'fine'  # no remote kernel executes inside the local prefix
+    prefix_env.pop('GGML_RKVA_BULK_SEGMENT', None)
+    prefix_env.pop('GGML_RKVA_RANGE_FUSE', None)
     return {'schema': 1, 'codec': 'llama-state-seq-file', 'model_sha256': model['sha256'],
             'requested_prefix_sha256': token_hash(tokens[:args.p]), 'P': args.p, 'context': args.context,
             'slot': 0, 'batch': args.frozen_prefix_batch or args.batch, 'physical_prefix_ubatch': 256, 'flash_attn': 'on', 'n_rs_seq': 0,

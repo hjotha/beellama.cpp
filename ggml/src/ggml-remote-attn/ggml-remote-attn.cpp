@@ -1122,6 +1122,7 @@ struct ggml_backend_remote_attn_context {
     bool native_saw_int4 = false;      // layout 6: SAW-INT4 rows in the native bulk pipeline
     bool native_turboquant_nc = false; // layout 8: TurboQuant NC rows in the native bulk pipeline
     bool native_serial_prefix = false;
+    uint32_t bulk_segment = 8; // native prefill query segment (8 uses the MQ2 prefix PSO)
     bool native_bulk = false;
     uint64_t native_generation = 0;
     rkva_kvarn_range_config native_descriptor {};
@@ -2597,7 +2598,8 @@ static bool rkva_run_native_range(ggml_backend_remote_attn_context * ctx, ggml_t
         // prefill uses eight, verification batches keep their actual shape.
         const bool native_rows = ctx->native_low4 || ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc;
         const auto chunks = rkva_bulk_segments(nq, native_rows || ctx->native_serial_prefix,
-                !native_rows && ctx->native_serial_prefix && cached.rows == 0, ctx->native_tail_tokens);
+                !native_rows && ctx->native_serial_prefix && cached.rows < 512, ctx->native_tail_tokens,
+                ctx->bulk_segment);
         std::vector<uint8_t> bulk_payload;
         const uint32_t segments = uint32_t(chunks.size());
         if (ctx->native_bulk) {
@@ -2896,7 +2898,8 @@ static bool rkva_prepare_native_bulk_job(
         }
         const bool native_rows = ctx->native_low4 || ctx->native_q4 || ctx->native_q8 || ctx->native_saw_int4 || ctx->native_turboquant_nc;
         const auto chunks = rkva_bulk_segments(nq, native_rows || ctx->native_serial_prefix,
-                !native_rows && ctx->native_serial_prefix && slot.start_rows == 0, ctx->native_tail_tokens);
+                !native_rows && ctx->native_serial_prefix && slot.start_rows < 512, ctx->native_tail_tokens,
+                ctx->bulk_segment);
         const uint32_t segments = uint32_t(chunks.size());
         if (ctx->native_generation > UINT64_MAX - segments) {
             ctx->failed = true;
@@ -4019,6 +4022,16 @@ ggml_backend_t ggml_backend_remote_attn_init(const char * host, uint16_t port) {
     ggml_backend_remote_attn_init_globals();
 
     auto * ctx = new ggml_backend_remote_attn_context();
+    if (const char * bulk = std::getenv("GGML_RKVA_BULK_SEGMENT")) {
+        const int value = std::atoi(bulk);
+        if (value == 8 || value == 16 || value == 32 || value == 64 || value == 128) {
+            ctx->bulk_segment = (uint32_t) value;
+        } else {
+            GGML_LOG_ERROR("%s: GGML_RKVA_BULK_SEGMENT must be 8, 16, 32, 64 or 128\n", GGML_REMOTE_ATTN_NAME);
+            delete ctx;
+            return nullptr;
+        }
+    }
     const char * prefill_chunk = std::getenv("GGML_RKVA_PREFILL_QUERY_CHUNK");
     if (prefill_chunk && std::strcmp(prefill_chunk, "0") != 0) {
         if (std::strcmp(prefill_chunk, "8") != 0) {
