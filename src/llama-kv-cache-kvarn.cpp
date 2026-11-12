@@ -392,7 +392,7 @@ std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
             }
             result.push_back(desc);
             if (cache.native_companion_enabled() && cache.native_companion_format() == 0) {
-                if (partial || desc.k_bits != 4 || desc.v_bits != 4 ||
+                if (desc.k_bits != 4 || desc.v_bits != 4 ||
                         layer.head_dim_k != 256 || layer.head_dim_v != 256) {
                     throw kv_mixed_error("native external KVarN4 snapshot requires a full compatible local KVarN4 layout");
                 }
@@ -400,12 +400,12 @@ std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
                 desc.range_id = overflow_range;
                 desc.range_start = cache.position_split_p();
                 desc.range_end = cache.get_kv_size();
-                desc.payload_mode = mode_full;
+                desc.payload_mode = partial ? mode_resident_reference : mode_full;
                 desc.payload_cells = compact_overflow_rows;
                 desc.payload_rows = compact_overflow_rows;
                 desc.payload_bytes = 0;
                 desc.payload_checksum = 0;
-                if (payload_size(layer.layer_id, overflow_range) != 0) {
+                if (!partial && payload_size(layer.layer_id, overflow_range) != 0) {
                     throw kv_mixed_error("native external KVarN4 must not contain inline overflow bytes");
                 }
                 result.push_back(desc);
@@ -472,13 +472,16 @@ std::vector<llama_kv_mixed::layer_desc> mixed_state_layer_descs(
 std::vector<llama_kv_mixed::cell_entry> mixed_state_cells(
         const llama_kv_cache * metadata, llama_seq_id seq_id, uint32_t & row_count) {
     using namespace llama_kv_mixed;
-    if (!metadata || metadata->get_n_stream() != 1) {
+    if (!metadata) {
+        throw kv_mixed_error("mixed state requires metadata");
+    }
+    if (seq_id < 0 && metadata->get_n_stream() != 1) {
         throw kv_mixed_error("mixed state requires one shared metadata stream");
     }
     if (seq_id < -1 || (seq_id >= 0 && uint32_t(seq_id) >= LLAMA_MAX_SEQ)) {
         throw kv_mixed_error("mixed state sequence id is out of range");
     }
-    const auto & cells = metadata->get_cells(0);
+    const auto & cells = (seq_id >= 0) ? metadata->get_cells(seq_id) : metadata->get_cells(0);
     uint32_t used_end = 0;
     row_count = 0;
     for (uint32_t cell = 0; cell < cells.size(); ++cell) {
@@ -4879,20 +4882,33 @@ bool llama_kv_cache_kvarn::native_kvarn_checkpoint_unavailable() const {
 }
 
 bool llama_kv_cache_kvarn::state_seq_can_save(llama_seq_id seq_id) const {
-    return !native_companion_enabled() && !native_kvarn_checkpoint_unavailable() && stream_is_exclusive_for(seq_id);
+    return state_seq_can_save(seq_id, 0);
 }
 
 bool llama_kv_cache_kvarn::state_seq_can_restore(llama_seq_id seq_id) const {
-    return !native_companion_enabled() && !native_kvarn_checkpoint_unavailable() && stream_is_exclusive_for(seq_id);
+    return state_seq_can_restore(seq_id, 0);
 }
 
 bool llama_kv_cache_kvarn::state_seq_can_save(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max) {
+        return false;
+    }
+    if (has_pending_stream_copies() || !stream_is_exclusive_for(seq_id)) {
+        return false;
+    }
     if (native_companion_enabled()) {
-        return native_companion_format_ == 0 && native_companion_negotiated_ &&
-                flags == LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL && seq_id == 0 &&
-                metadata->seq_pos_max(0) >= llama_pos(position_split_p_) &&
-                !has_pending_stream_copies() && stream_is_exclusive_for(seq_id);
+        if (native_companion_format_ != 0 || !native_companion_negotiated_) {
+            return false;
+        }
+        constexpr uint32_t supported = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+                LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL;
+        if ((uint32_t(flags) & ~supported) != 0 ||
+                ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
+                 (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
+            return false;
+        }
+        return true;
     }
     if (seq_id < 0 ||
             (native_kvarn_checkpoint_unavailable() && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))) {
@@ -4915,18 +4931,33 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
 
 bool llama_kv_cache_kvarn::state_seq_can_restore(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max) {
+        return false;
+    }
+    if (has_pending_stream_copies() || !stream_is_exclusive_for(seq_id)) {
+        return false;
+    }
     if (native_companion_enabled()) {
-        return native_companion_format_ == 0 && native_companion_negotiated_ &&
-                flags == LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL && seq_id == 0 &&
-                !has_pending_stream_copies() && stream_is_exclusive_for(seq_id);
+        if (native_companion_format_ != 0 || !native_companion_negotiated_) {
+            return false;
+        }
+        constexpr uint32_t supported = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+                LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL;
+        if ((uint32_t(flags) & ~supported) != 0 ||
+                ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
+                 (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0)) {
+            return false;
+        }
+        return true;
     }
     if (flags == LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) {
         // This only admits the outer, authenticated native file path. A
         // logical clear does not clear the historical native-owner latch, but
         // it can prepare an empty destination for an independently restored
         // owner. The context must also prove the remote owner is absent.
-        return native_kvarn_rpc_experimental_ && position_split_enabled() && seq_id == 0 &&
-               metadata->seq_pos_max(0) < 0 && !has_pending_stream_copies() &&
+        return native_kvarn_rpc_experimental_ && position_split_enabled() &&
+               seq_id >= 0 && uint32_t(seq_id) < n_seq_max &&
+               metadata->seq_pos_max(seq_id) < 0 && !has_pending_stream_copies() &&
                stream_is_exclusive_for(seq_id);
     }
     if (seq_id < 0 || (native_kvarn_checkpoint_unavailable() &&
@@ -5400,7 +5431,7 @@ void llama_kv_cache_kvarn::state_write_mixed(
     }
     if (native_kvarn_rpc_experimental_ &&
             !(flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL))) {
-        const auto & cells = metadata->get_cells(uint32_t(0));
+        const auto & cells = (seq_id >= 0) ? metadata->get_cells(seq_id) : metadata->get_cells(uint32_t(0));
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.is_empty(i) && cells.pos_get(i) >= int64_t(position_split_p_)) {
                 throw std::runtime_error("native KVarN4 overflow has no FULL snapshot codec; refusing standard-cache bookkeeping save");
@@ -5519,14 +5550,14 @@ void llama_kv_cache_kvarn::state_write_mixed(
             standard_cache->state_write_shared_payload(split, seq_id, partial);
         }
     } else if (native_companion_enabled()) {
-        const uint32_t empty_overflow[] = {1u, 1u, 0u};
-        split.write(empty_overflow, sizeof(empty_overflow));
+        const uint32_t empty_overflow[] = {partial ? 0u : 1u, 1u, 0u};
+        split.write(empty_overflow, partial ? 2 * sizeof(uint32_t) : sizeof(empty_overflow));
     }
 
     uint32_t payload_rows = 0;
     auto cells = mixed_state_cells(metadata.get(), seq_id, payload_rows);
     if (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) {
-        llama_validate_native_prefix(cells, io.native_expected_tokens(), metadata->get_size(), position_split_p_);
+        llama_validate_native_prefix(cells, io.native_expected_tokens(), metadata->get_size(), position_split_p_, seq_id);
     }
     const uint32_t payload_cells = uint32_t(cells.size());
     // F4 v2: the manifest now keys payload sizes by the packed range key
@@ -5655,8 +5686,8 @@ void llama_kv_cache_kvarn::state_read_mixed(
     const bool requested_partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
     const bool native_full = (flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) != 0;
     if (native_full && (native_row_rpc_experimental_ || !native_kvarn_rpc_experimental_ || !position_split_enabled() ||
-            requested_partial || (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) || seq_id != 0)) {
-        throw std::invalid_argument("native FULL memory restore requires a single native split sequence");
+            requested_partial || (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) || seq_id < 0 || uint32_t(seq_id) >= n_seq_max)) {
+        throw std::invalid_argument("native FULL memory restore requires a valid native split sequence");
     }
     if (seq_id < -1 || (requested_partial && seq_id < 0) ||
             ((flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && seq_id < 0) ||
@@ -5762,7 +5793,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
     }
 
     if (native_full) {
-        llama_validate_native_prefix(parsed.cells(), io.native_expected_tokens(), metadata->get_size(), position_split_p_);
+        llama_validate_native_prefix(parsed.cells(), io.native_expected_tokens(), metadata->get_size(), position_split_p_, seq_id);
     }
 
     mixed_manifest manifest;
@@ -6021,7 +6052,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
         // physical cell identities must still name the same live rows; an
         // append beyond this prefix remains valid, while slot reuse or a
         // changed prefix fails closed.
-        const auto & current_cells = metadata->get_cells(0);
+        const auto & current_cells = (seq_id >= 0) ? metadata->get_cells(seq_id) : metadata->get_cells(0);
         for (uint32_t cell_index = 0; cell_index < parsed.cells().size(); ++cell_index) {
             const cell_entry & saved = parsed.cells()[cell_index];
             if (saved.pos < 0) {
@@ -6084,7 +6115,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
     llama_kv_cache::slot_info_vec_t restored_sinfos;
     const auto validate_prepared_cells = [&](const llama_kv_cache & prepared,
             const std::unordered_map<uint32_t, uint32_t> & cell_remap) {
-        const auto & prepared_cells = prepared.get_cells(0);
+        const auto & prepared_cells = (seq_id >= 0) ? prepared.get_cells(seq_id) : prepared.get_cells(0);
         for (uint32_t source_cell = 0; source_cell < parsed.cells().size(); ++source_cell) {
             const cell_entry & saved = parsed.cells()[source_cell];
             if (saved.pos < 0) {
@@ -6132,9 +6163,10 @@ void llama_kv_cache_kvarn::state_read_mixed(
         resident_sinfos.resize(1);
         auto & slot = resident_sinfos[0];
         if (!resident_cells.empty()) {
-            slot.s0 = slot.s1 = 0;
+            const uint32_t target_stream = (seq_id >= 0) ? metadata->get_stream_for_seq(seq_id) : 0;
+            slot.s0 = slot.s1 = target_stream;
             slot.resize(1);
-            slot.strm[0] = 0;
+            slot.strm[0] = target_stream;
             slot.idxs[0] = std::move(resident_cells);
         }
         if (sinfos_in && (sinfos_in->size() != 1 ||
@@ -6164,7 +6196,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
         state_read_kvarn_body(reader, seq_id, flags, &restored_sinfos, placement, validate_prepared_cells);
     }
     uint64_t restored_rows = 0;
-    if (restored_sinfos.size() != 1) {
+    if (restored_sinfos.empty() || (restored_sinfos.size() != 1 && restored_sinfos.size() != n_stream)) {
         throw kv_mixed_error("mixed KVarN metadata restored an unexpected stream count");
     }
     for (const auto & sinfo : restored_sinfos) {
@@ -6212,6 +6244,15 @@ void llama_kv_cache_kvarn::state_read_mixed(
         reader.read(trailer, sizeof(trailer));
         if (trailer[0] != 1 || trailer[1] != 1 || trailer[2] != 0) {
             throw kv_mixed_error("empty split overflow trailer contains occupied rows or incompatible stream/kind");
+        }
+    } else if (partial && native_companion_enabled()) {
+        if (reader.remaining() != 2*sizeof(uint32_t)) {
+            throw kv_mixed_error("partial native overflow has a missing or noncanonical trailer");
+        }
+        uint32_t trailer[2];
+        reader.read(trailer, sizeof(trailer));
+        if (trailer[0] != 0 || trailer[1] != 1) {
+            throw kv_mixed_error("partial native overflow trailer contains incompatible stream/kind");
         }
     } else if (standard_cache && reader.remaining() > 0) {
         standard_cache->state_read_shared_payload(reader, seq_id, partial, restored_sinfos);
@@ -6489,7 +6530,7 @@ std::string llama_kv_cache_kvarn::live_layer_table(llama_seq_id seq_id) const {
     std::vector<uint32_t> live_rows;
     llama_pos pmin = -1, pmax = -1;
     if (metadata) {
-        const auto & cells = metadata->get_cells(0);
+        const auto & cells = (seq_id >= 0) ? metadata->get_cells(seq_id) : metadata->get_cells(0);
         for (uint32_t cell = 0; cell < cells.size(); ++cell) {
             if (cells.is_empty(cell)) { continue; }
             if (!cells.seq_get_all(cell).test(seq_id)) { continue; }
@@ -6717,7 +6758,7 @@ bool llama_kv_cache_kvarn::probe_mutation(llama_seq_id seq_id, int layer_index,
     std::vector<uint32_t> live_groups;
     uint32_t first_live_cell = UINT32_MAX;
     if (metadata) {
-        const auto & cells = metadata->get_cells(0);
+        const auto & cells = (seq_id >= 0) ? metadata->get_cells(seq_id) : metadata->get_cells(0);
         for (uint32_t cell = 0; cell < cells.size(); ++cell) {
             if (cells.is_empty(cell) || !cells.seq_get_all(cell).test(seq_id)) { continue; }
             if (first_live_cell == UINT32_MAX) { first_live_cell = cell; }
@@ -6816,7 +6857,7 @@ bool llama_kv_cache_kvarn::probe_head_span(llama_seq_id seq_id, int layer_index,
     // Enumerate the REAL cells this sequence owns (not a front..back range).
     std::vector<uint32_t> own;
     if (metadata) {
-        const auto & cells = metadata->get_cells(0);
+        const auto & cells = (seq_id >= 0) ? metadata->get_cells(seq_id) : metadata->get_cells(0);
         for (uint32_t c = 0; c < cells.size(); ++c) {
             if (cells.is_empty(c)) { continue; }
             if (!cells.seq_get_all(c).test(seq_id)) { continue; }
@@ -7207,7 +7248,7 @@ void llama_kv_cache_kvarn::state_read_pure_to_mixed_import(
             const std::unordered_map<uint32_t, uint32_t> &) {
         // `prepared` holds destination coordinates already, so they are read
         // directly: remapping again would double-remap and misjudge P.
-        const auto & cells = prepared.get_cells(0);
+        const auto & cells = (seq_id >= 0) ? prepared.get_cells(seq_id) : prepared.get_cells(0);
         uint32_t occupied = 0;
         for (uint32_t cell = 0; cell < cells.size(); ++cell) {
             if (cells.is_empty(cell)) {

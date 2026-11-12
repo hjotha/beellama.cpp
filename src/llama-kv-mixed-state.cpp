@@ -248,7 +248,8 @@ void validate_desc(layer_desc & d, bool serializing) {
             if (d.layout == layout_kvarn_native_external_v1 &&
                     (d.range_id != llama_position_split::kRangeOverflow || d.k_bits != 4 || d.v_bits != 4 ||
                      d.token_group != 128 || d.head_dim_k != 256 || d.head_dim_v != 256 ||
-                     d.payload_mode != mode_full || d.payload_bytes != 0 || d.payload_checksum != 0 ||
+                     (d.payload_mode != mode_full && d.payload_mode != mode_resident_reference) ||
+                     d.payload_bytes != 0 || d.payload_checksum != 0 ||
                      d.payload_cells != d.payload_rows || d.owner != owner_target)) {
                 throw kv_mixed_error(where + ": invalid native external KVarN4 descriptor");
             }

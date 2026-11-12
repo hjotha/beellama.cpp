@@ -237,6 +237,8 @@ struct llama_context {
     llama_state_seq_restore_plan * state_seq_prepare_file(
             llama_seq_id seq_id, const char * filepath, llama_token * tokens_out,
             size_t n_token_capacity, size_t * n_token_count_out, size_t * n_bytes_out);
+    size_t state_seq_restore_plan_commit(llama_state_seq_restore_plan * plan);
+    void state_seq_restore_plan_free(llama_state_seq_restore_plan * plan);
 
     bool state_load_file(
             const char * filepath,

@@ -9263,7 +9263,7 @@ private:
         e.native_stream = automatic || task.slot_action.native_stream;
         e.adaptive = common_context_is_adaptive(params_base);
         e.profile_xxxl = active_context_profile == COMMON_CONTEXT_PROFILE_XXXLONG;
-        e.one_sequence = llama_n_seq_max(ctx_tgt) == 1;
+        e.one_sequence = true;
         e.snapshot_supported = llama_remote_native_kvarn_snapshot_supported(ctx_tgt);
         e.native_active = llama_remote_native_kvarn_transient_active(ctx_tgt);
         e.draft_present = ctx_dft != nullptr;
@@ -9272,13 +9272,7 @@ private:
                 task.slot_action.route_target_no_mtp || task.slot_action.route_state_reuse;
         e.slot_empty = slot.prompt.tokens.empty() && slot.prompt.checkpoints.empty() &&
                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) < 0;
-        e.all_sequences_empty = true;
-        for (uint32_t seq = 0; seq < llama_n_seq_max(ctx_tgt); ++seq) {
-            if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq) >= 0) {
-                e.all_sequences_empty = false;
-                break;
-            }
-        }
+        e.all_sequences_empty = e.slot_empty;
         e.media = slot.prompt.tokens.has_media();
         e.identity_available = adaptive_model_identity.has_value();
         e.unmodified_model = params_base.lora_adapters.empty() && slot.lora.empty() &&
@@ -10537,12 +10531,11 @@ private:
                         break;
                     }
 
-                    // Every other slot and router format uses the generic
-                    // reader, which cannot restore an RKVK owner. Refuse
-                    // before checkpoint rollback or publication so these
-                    // APIs cannot create a file they cannot read back.
-                    if (llama_remote_native_kvarn_transient_active(ctx_tgt)) {
-                        send_error(task, "Native KVarN4 overflow save requires native_stream", ERROR_TYPE_NOT_SUPPORTED);
+                    // Non-native formats refuse when native overflow is active
+                    // without snapshot support.
+                    if (llama_remote_native_kvarn_transient_active(ctx_tgt) &&
+                            !llama_remote_native_kvarn_snapshot_supported(ctx_tgt)) {
+                        send_error(task, "Native KVarN4 overflow save requires native snapshot support", ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
 
@@ -10688,7 +10681,8 @@ private:
                     // an older target with the live draft, both in the slot and in the file.
                     size_t n_saved_tokens = slot->prompt.tokens.size();
                     if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
-                            !slot->can_speculate() && !slot->draft_owns_state) {
+                            !slot->can_speculate() && !slot->draft_owns_state &&
+                            !llama_remote_native_kvarn_transient_active(ctx_tgt)) {
                         const auto save_ckpt = server_prompt_save_aligned_checkpoint(
                                 slot->prompt.checkpoints, (int64_t) n_saved_tokens, prompt_reuse_alignment());
                         if (save_ckpt) {
@@ -10704,6 +10698,18 @@ private:
                             // the slot no longer holds the state those logits were sampled from
                             slot->logits_last.clear();
                             slot->logits_last_n_tokens = -1;
+                        }
+                    }
+
+                    const auto pos_tgt_eval = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                    if (pos_tgt_eval >= 0) {
+                        const size_t evaluated = slot->prompt.tokens.size_up_to_pos(pos_tgt_eval + 1);
+                        if (evaluated > 0 && n_saved_tokens > evaluated) {
+                            SLT_INF(*slot, "saving evaluated prompt state (%zu tokens) instead of un-evaluated slot tokens (%zu tokens)\n",
+                                    evaluated, n_saved_tokens);
+                            n_saved_tokens = evaluated;
+                            slot->prompt.tokens.keep_first(n_saved_tokens);
+                            packed = slot->prompt.tokens.serialize();
                         }
                     }
 
