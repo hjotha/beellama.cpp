@@ -173,6 +173,7 @@ GGML_API bool ggml_backend_remote_attn_trim(
 GGML_API bool ggml_backend_remote_attn_configure_range(
         ggml_backend_t backend, uint32_t origin, uint32_t capacity, enum ggml_type cache_type);
 GGML_API void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend);
+GGML_API void ggml_backend_remote_attn_invalidate_session(ggml_backend_t backend, uint32_t session_id);
 
 // Explicit experimental native producer (GGML_RKVA_RANGE_STORAGE=kvarn4 and
 // GGML_RKVA_NATIVE_KVARN4_EXPERIMENTAL=1). Original projected F32 sources;

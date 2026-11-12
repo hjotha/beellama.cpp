@@ -248,6 +248,7 @@ public:
     // have local history is exactly the dual-range builder, which must read
     // the local tail (plan 3.4) even though its current range is overflow.
     bool local_tail_available() const;
+    llama_seq_id current_seq_id() const;
     // F3: acesso ao cache proprietário para leitura por faixa (listas de
     // células, máscaras e índices). O grafo usa somente métodos const.
     const llama_kv_cache_kvarn * get_kvarn_cache() const { return cache; }
@@ -712,10 +713,13 @@ public:
     // for inválida ou qualquer célula estiver fora do contrato.
     bool position_split_live_cells(
             llama_position_split::range_kind range,
-            std::vector<uint32_t> & cells_out) const;
+            std::vector<uint32_t> & cells_out,
+            llama_seq_id seq_id = 0) const;
     // Equivalent occupancy predicate, using the sequence's maintained position
     // extrema instead of allocating and sorting the full live-cell list.
-    bool position_split_has_live_cells(llama_position_split::range_kind range) const;
+    bool position_split_has_live_cells(
+            llama_position_split::range_kind range,
+            llama_seq_id seq_id = 0) const;
     // Additive handoff accessor: raw standard-cache storage for remote layers
     // (rawstorage token rows; the attention views are permuted).
     llama_kv_cache * get_standard_cache() const { return standard_cache.get(); }

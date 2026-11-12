@@ -1131,6 +1131,17 @@ struct ggml_backend_remote_attn_context {
     std::vector<std::unique_ptr<rkva_native_owner>> native_layers;
     std::unique_ptr<rkva_pending_native_state> pending_native_state;
 
+    struct rkva_session_record {
+        uint32_t session_id = 0;
+        bool range_configured = false;
+        uint64_t range_epoch = 1;
+        uint64_t native_generation = 0;
+        rkva_kvarn_range_config native_descriptor {};
+        std::vector<range_layer> range_layers;
+        std::vector<std::unique_ptr<rkva_native_owner>> native_layers;
+    };
+    std::unordered_map<uint32_t, rkva_session_record> sessions;
+
     // reusable pinned-ish staging (grow-only; never freed per token)
     std::vector<uint8_t> payload_tx;
     std::vector<uint8_t> payload_rx;
@@ -1849,6 +1860,14 @@ static void rkva_destroy_poisoned_state_locked(ggml_backend_remote_attn_context 
     }
     ctx->native_layers.clear();
     ctx->range_layers.clear();
+    for (auto & entry : ctx->sessions) {
+        for (auto & owner : entry.second.native_layers) {
+            owner.reset();
+        }
+        entry.second.native_layers.clear();
+        entry.second.range_layers.clear();
+    }
+    ctx->sessions.clear();
     ctx->native_store = nullptr;
     ctx->native_low4 = 0;
     ctx->native_q4 = false;
@@ -4376,6 +4395,20 @@ bool ggml_backend_remote_attn_destroy_session(ggml_backend_t backend, uint32_t s
     if (!ctx->connected || ctx->failed) {
         return false;
     }
+    if (ctx->active_session == session_id) {
+        for (auto & owner : ctx->native_layers) owner.reset();
+        ctx->native_layers.clear();
+        ctx->range_layers.clear();
+        ctx->range_configured = false;
+        ctx->active_session = RKVA_SESSION_NONE;
+    }
+    auto it = ctx->sessions.find(session_id);
+    if (it != ctx->sessions.end()) {
+        for (auto & owner : it->second.native_layers) owner.reset();
+        it->second.native_layers.clear();
+        it->second.range_layers.clear();
+        ctx->sessions.erase(it);
+    }
     std::vector<uint8_t> out;
     return rkva_transact(ctx, RKVA_DESTROY_SESSION, session_id, 0, 0, nullptr, 0, out, 0);
 }
@@ -4394,18 +4427,29 @@ bool ggml_backend_remote_attn_reset(ggml_backend_t backend, uint32_t session_id)
         rkva_destroy_poisoned_state_locked(ctx); // drained lock: safe
         return false;
     }
-    ++ctx->range_epoch;
     std::vector<uint8_t> out;
     if (!rkva_transact(ctx, RKVA_RESET, session_id, 0, 0, nullptr, 0, out, 0) || !out.empty()) {
         rkva_poison_remote_state_locked(ctx);
         rkva_destroy_poisoned_state_locked(ctx);
         return false;
     }
-    if (ctx->range_native_kvarn) {
-        if (ctx->native_generation == UINT64_MAX) { ctx->failed = true; return false; }
-        ++ctx->native_generation;
-        for (auto & owner : ctx->native_layers) owner.reset();
-        ctx->range_layers.assign(ctx->native_layers.size(), {});
+    if (ctx->active_session == session_id) {
+        ++ctx->range_epoch;
+        if (ctx->range_native_kvarn) {
+            if (ctx->native_generation == UINT64_MAX) { ctx->failed = true; return false; }
+            ++ctx->native_generation;
+            for (auto & owner : ctx->native_layers) owner.reset();
+            ctx->range_layers.assign(ctx->native_layers.size(), {});
+        }
+    } else {
+        auto it = ctx->sessions.find(session_id);
+        if (it != ctx->sessions.end()) {
+            ++it->second.range_epoch;
+            if (it->second.native_generation == UINT64_MAX) { ctx->failed = true; return false; }
+            ++it->second.native_generation;
+            for (auto & owner : it->second.native_layers) owner.reset();
+            it->second.range_layers.assign(it->second.native_layers.size(), {});
+        }
     }
     return true;
 }
@@ -4554,15 +4598,63 @@ bool ggml_backend_remote_attn_trim(ggml_backend_t backend, uint32_t session_id, 
     if (!ctx->connected || ctx->failed) {
         return false;
     }
+    const uint32_t prev_session = ctx->active_session;
+    if (prev_session != session_id) {
+        if (ctx->active_session != RKVA_SESSION_NONE) {
+            auto & cur = ctx->sessions[ctx->active_session];
+            cur.session_id = ctx->active_session;
+            cur.range_configured = ctx->range_configured;
+            cur.range_epoch = ctx->range_epoch.load();
+            cur.native_generation = ctx->native_generation;
+            cur.native_descriptor = ctx->native_descriptor;
+            cur.range_layers = std::move(ctx->range_layers);
+            cur.native_layers = std::move(ctx->native_layers);
+        }
+        ctx->active_session = session_id;
+        auto it = ctx->sessions.find(session_id);
+        if (it != ctx->sessions.end()) {
+            ctx->range_configured = it->second.range_configured;
+            ctx->range_epoch.store(it->second.range_epoch);
+            ctx->native_generation = it->second.native_generation;
+            ctx->native_descriptor = it->second.native_descriptor;
+            ctx->range_layers = std::move(it->second.range_layers);
+            ctx->native_layers = std::move(it->second.native_layers);
+        }
+    }
+    bool result = false;
     if (ctx->range_configured) {
         if (ctx->range_native_kvarn) {
-            return rkva_native_rewind_locked(ctx, session_id, pos0);
+            result = rkva_native_rewind_locked(ctx, session_id, pos0);
+        } else {
+            result = rkva_trim_range_locked(ctx, session_id, pos0);
         }
-        return rkva_trim_range_locked(ctx, session_id, pos0);
+    } else {
+        rkva_trim_req req { pos0 };
+        std::vector<uint8_t> out;
+        result = rkva_transact(ctx, RKVA_REWIND, session_id, 0, 0, &req, sizeof(req), out, 0);
     }
-    rkva_trim_req req { pos0 };
-    std::vector<uint8_t> out;
-    return rkva_transact(ctx, RKVA_REWIND, session_id, 0, 0, &req, sizeof(req), out, 0);
+    if (prev_session != session_id && prev_session != RKVA_SESSION_NONE) {
+        auto & cur = ctx->sessions[ctx->active_session];
+        cur.session_id = ctx->active_session;
+        cur.range_configured = ctx->range_configured;
+        cur.range_epoch = ctx->range_epoch.load();
+        cur.native_generation = ctx->native_generation;
+        cur.native_descriptor = ctx->native_descriptor;
+        cur.range_layers = std::move(ctx->range_layers);
+        cur.native_layers = std::move(ctx->native_layers);
+
+        ctx->active_session = prev_session;
+        auto it = ctx->sessions.find(prev_session);
+        if (it != ctx->sessions.end()) {
+            ctx->range_configured = it->second.range_configured;
+            ctx->range_epoch.store(it->second.range_epoch);
+            ctx->native_generation = it->second.native_generation;
+            ctx->native_descriptor = it->second.native_descriptor;
+            ctx->range_layers = std::move(it->second.range_layers);
+            ctx->native_layers = std::move(it->second.native_layers);
+        }
+    }
+    return result;
 }
 
 // Generic opt-in is separate from the historical Q4-only setting. A server
@@ -6156,6 +6248,9 @@ void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {
     {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         ++ctx->range_epoch;
+        for (auto & entry : ctx->sessions) {
+            ++entry.second.range_epoch;
+        }
     }
     {
         std::lock_guard<std::mutex> alock(ctx->async_mutex);
@@ -6173,6 +6268,20 @@ void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {
     }
     ctx->async_cv.notify_all();
     rkva_async_drain(ctx);
+}
+
+void ggml_backend_remote_attn_invalidate_session(ggml_backend_t backend, uint32_t session_id) {
+    if (!backend || ggml_backend_is_local_split(backend)) return;
+    auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->active_session == session_id) {
+        ++ctx->range_epoch;
+    } else {
+        auto it = ctx->sessions.find(session_id);
+        if (it != ctx->sessions.end()) {
+            ++it->second.range_epoch;
+        }
+    }
 }
 
 bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend) {
@@ -6526,11 +6635,36 @@ void ggml_backend_remote_attn_set_active_session(ggml_backend_t backend, uint32_
     }
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
     auto lock = rkva_lock_ctx_drained(ctx);
-    if (ctx->active_session != session_id) {
-        ctx->range_configured = false;
-        ++ctx->range_epoch;
+    if (ctx->active_session == session_id) {
+        return;
+    }
+    if (ctx->active_session != RKVA_SESSION_NONE) {
+        auto & cur = ctx->sessions[ctx->active_session];
+        cur.session_id = ctx->active_session;
+        cur.range_configured = ctx->range_configured;
+        cur.range_epoch = ctx->range_epoch.load();
+        cur.native_generation = ctx->native_generation;
+        cur.native_descriptor = ctx->native_descriptor;
+        cur.range_layers = std::move(ctx->range_layers);
+        cur.native_layers = std::move(ctx->native_layers);
     }
     ctx->active_session = session_id;
+    auto it = ctx->sessions.find(session_id);
+    if (it != ctx->sessions.end()) {
+        ctx->range_configured = it->second.range_configured;
+        ctx->range_epoch.store(it->second.range_epoch);
+        ctx->native_generation = it->second.native_generation;
+        ctx->native_descriptor = it->second.native_descriptor;
+        ctx->range_layers = std::move(it->second.range_layers);
+        ctx->native_layers = std::move(it->second.native_layers);
+    } else {
+        ctx->range_configured = false;
+        ctx->range_epoch.store(1);
+        ctx->native_generation = 0;
+        ctx->native_descriptor = {};
+        ctx->range_layers.clear();
+        ctx->native_layers.clear();
+    }
 }
 
 bool ggml_backend_remote_attn_failed(ggml_backend_t backend) {

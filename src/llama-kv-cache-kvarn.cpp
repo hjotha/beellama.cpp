@@ -271,8 +271,9 @@ static llama_position_split::range_kind position_split_current_ubatch_range(
 // apenas o prefixo abaixo de P.
 static void require_position_split_local_history(
         const llama_kv_cache_kvarn * cache,
-        const char * operation) {
-    if (cache->get_metadata_cache()->seq_pos_max(0) >= llama_pos(cache->position_split_p())) {
+        const char * operation,
+        llama_seq_id seq_id = 0) {
+    if (cache->get_metadata_cache()->seq_pos_max(seq_id) >= llama_pos(cache->position_split_p())) {
         throw std::runtime_error(
                 std::string(operation) +
                 ": histórico de overflow sem rollback antes de acesso local");
@@ -694,6 +695,17 @@ bool llama_kv_cache_kvarn_context::current_position_split_range(
     range = position_split_current_ubatch_range(
             base_ptr->get_ubatch(), cache->position_split_p(), cache->get_kv_size());
     return range != llama_position_split::range_kind::INVALID;
+}
+
+llama_seq_id llama_kv_cache_kvarn_context::current_seq_id() const {
+    const llama_kv_cache_context * base_ptr = base();
+    if (base_ptr && base_ptr->has_valid_current_ubatch()) {
+        const auto & ub = base_ptr->get_ubatch();
+        if (ub.n_tokens > 0 && ub.n_seq_id && ub.seq_id && ub.seq_id[0]) {
+            return ub.seq_id[0][0];
+        }
+    }
+    return 0;
 }
 
 bool llama_kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
@@ -1853,12 +1865,12 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_attention(
         // Sem ubatch válido (reserva de grafo), usa a rota legada por camada.
         if (have_range) {
             if (range == llama_position_split::range_kind::LOCAL) {
-                require_position_split_local_history(cache, "position-split KV read");
+                require_position_split_local_history(cache, "position-split KV read", current_seq_id());
                 use_standard_route = false;
             } else {
                 std::vector<uint32_t> local_cells;
                 const bool has_local = cache->position_split_live_cells(
-                    llama_position_split::range_kind::LOCAL, local_cells) &&
+                    llama_position_split::range_kind::LOCAL, local_cells, current_seq_id()) &&
                     !local_cells.empty();
                 if (has_local) {
                     throw std::runtime_error("position-split KV: leitura acima de P exige as duas faixas e o merge (F3)");
@@ -1933,12 +1945,12 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
         // F2b/F3: leitura por faixa (ver get_k_for_attention).
         if (have_range) {
             if (range == llama_position_split::range_kind::LOCAL) {
-                require_position_split_local_history(cache, "position-split KV read");
+                require_position_split_local_history(cache, "position-split KV read", current_seq_id());
                 use_standard_route = false;
             } else {
                 std::vector<uint32_t> local_cells;
                 const bool has_local = cache->position_split_live_cells(
-                    llama_position_split::range_kind::LOCAL, local_cells) &&
+                    llama_position_split::range_kind::LOCAL, local_cells, current_seq_id()) &&
                     !local_cells.empty();
                 if (has_local) {
                     throw std::runtime_error("position-split KV: leitura acima de P exige as duas faixas e o merge (F3)");
@@ -2024,7 +2036,7 @@ bool llama_kv_cache_kvarn_context::local_tail_available() const {
     // history: that is precisely the dual-range builder (plan 3.3/3.4), where
     // fa1 must produce a body+tail local O/LSE. An overflow-only ubatch has no
     // local keys at all, so it stays tail-free (plan 3.1).
-    return cache->position_split_has_live_cells(llama_position_split::range_kind::LOCAL);
+    return cache->position_split_has_live_cells(llama_position_split::range_kind::LOCAL, current_seq_id());
 }
 
 bool llama_kv_cache_kvarn_context::tail_on_layer(int32_t il) const {
@@ -2342,7 +2354,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
                 return cache->standard_cpy_k(ctx, k_cur, k_idxs, shared_il, current_sinfo());
             }
             if (cache->has_local_standard_cache()) {
-                require_position_split_local_history(cache, "position-split KV store");
+                require_position_split_local_history(cache, "position-split KV store", current_seq_id());
                 auto * position_result = cache->local_standard_cpy_k(ctx, k_cur, k_idxs, shared_il, current_sinfo());
                 stored_k[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
                         llama_position_split::kRangeLocal)] = position_result;
@@ -2351,7 +2363,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
             if (!cache->uses_kvarn_layer(shared_il)) {
                 throw std::runtime_error("position-split KV sem faixa KVarN para a camada local");
             }
-            require_position_split_local_history(cache, "position-split KV store");
+            require_position_split_local_history(cache, "position-split KV store", current_seq_id());
             auto * position_result = cache->store(ctx, k_cur, k_idxs, shared_il, current_sinfo(), false);
             if (getenv("LLAMA_KVARN_STORE_TRACE") != nullptr) {
                 std::fprintf(stderr,
@@ -2410,7 +2422,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
                 return cache->standard_cpy_v(ctx, v_cur, v_idxs, shared_il, current_sinfo());
             }
             if (cache->has_local_standard_cache()) {
-                require_position_split_local_history(cache, "position-split KV store");
+                require_position_split_local_history(cache, "position-split KV store", current_seq_id());
                 auto * position_result = cache->local_standard_cpy_v(ctx, v_cur, v_idxs, shared_il, current_sinfo());
                 stored_v[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
                         llama_position_split::kRangeLocal)] = position_result;
@@ -2419,7 +2431,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
             if (!cache->uses_kvarn_layer(shared_il)) {
                 throw std::runtime_error("position-split KV sem faixa KVarN para a camada local");
             }
-            require_position_split_local_history(cache, "position-split KV store");
+            require_position_split_local_history(cache, "position-split KV store", current_seq_id());
             auto * position_result = cache->store(ctx, v_cur, v_idxs, shared_il, current_sinfo(), true);
             stored_v[llama_kv_cache_kvarn_context::store_slot_probe::range_store_key(cache->mapped_layer_id(shared_il),
                     llama_position_split::kRangeLocal)] = position_result;
@@ -3244,8 +3256,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 !standard_layer_filter || !standard_device_for_layer) {
             throw std::invalid_argument("mixed KVarN/standard KV requires paired types and remote layer/device filters");
         }
-        if (swa || n_seq_max != 1 || n_stream != 1) {
-            throw std::invalid_argument("mixed KVarN/standard KV currently requires non-SWA and one sequence");
+        if (swa || (n_seq_max != 1 && unified) || (n_stream != 1 && unified)) {
+            throw std::invalid_argument("mixed KVarN/standard KV currently requires non-SWA and one sequence or non-unified multi-sequence");
         }
         standard_cache = std::make_unique<llama_kv_cache>(
                 model, hparams, standard_type_k, standard_type_v, standard_v_trans,
@@ -3311,8 +3323,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const bool use_local_standard = params.type == LLAMA_KVARN_TYPE_DISABLED &&
             local_type_k != GGML_TYPE_COUNT && local_type_v != GGML_TYPE_COUNT;
     if (use_local_standard) {
-        if (swa || n_seq_max != 1 || n_stream != 1) {
-            throw std::invalid_argument("standard local KV with position-split currently requires non-SWA and one sequence");
+        if (swa || (n_seq_max != 1 && unified) || (n_stream != 1 && unified)) {
+            throw std::invalid_argument("standard local KV with position-split currently requires non-SWA and one sequence or non-unified multi-sequence");
         }
         local_cache = std::make_unique<llama_kv_cache>(
                 model, hparams, local_type_k, local_type_v, standard_v_trans,
@@ -3669,8 +3681,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         if (position_split_error_.empty() && swa) {
             position_split_error_ = "position-split exige cache não-SWA";
         }
-        if (position_split_error_.empty() && (n_seq_max != 1 || n_stream != 1)) {
-            position_split_error_ = "position-split exige uma única sequência";
+        if (position_split_error_.empty() && (n_seq_max > 1 && n_stream == 1)) {
+            position_split_error_ = "position-split exige uma única sequência ou non-unified multi-sequence";
         }
         if (position_split_error_.empty() && !standard_cache && !native_companion_enabled()) {
             position_split_error_ = "position-split exige a faixa overflow Q4 por camada full";
@@ -4367,7 +4379,11 @@ bool llama_kv_cache_kvarn::invalidate_prefix_on_write(const llama_ubatch & ubatc
     if (!position_split_enabled() || (!standard_cache && !native_companion_enabled())) {
         return false;
     }
-    const auto prior_max = metadata->seq_pos_max(0);
+    llama_seq_id target_seq = 0;
+    if (ubatch.n_tokens > 0 && ubatch.n_seq_id && ubatch.seq_id && ubatch.seq_id[0]) {
+        target_seq = ubatch.seq_id[0][0];
+    }
+    const auto prior_max = metadata->seq_pos_max(target_seq);
     llama_pos dirty_from = std::numeric_limits<llama_pos>::max();
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (ubatch.pos[i] <= prior_max) dirty_from = std::min(dirty_from, ubatch.pos[i]);
@@ -4431,9 +4447,13 @@ void llama_kv_cache_kvarn::clear(bool data) {
 }
 
 bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    if (native_companion_enabled() && metadata->seq_pos_max(0) >= llama_pos(position_split_p_)) {
-        return (seq_id <= 0 && p0 <= 0 && p1 < 0) ||
-                (seq_id == 0 && p0 > metadata->seq_pos_max(0) && (p1 < 0 || p1 >= p0));
+    if (native_companion_enabled()) {
+        const llama_pos current_pos_max = (seq_id >= 0 && uint32_t(seq_id) < n_seq_max)
+                ? metadata->seq_pos_max(seq_id) : -1;
+        if (current_pos_max >= llama_pos(position_split_p_)) {
+            return (seq_id < int64_t(n_seq_max) && p0 <= 0 && p1 < 0) ||
+                    (seq_id >= 0 && uint32_t(seq_id) < n_seq_max && p0 > current_pos_max && (p1 < 0 || p1 >= p0));
+        }
     }
     // Remember live native ownership before an allowed full logical clear.
     (void) native_kvarn_checkpoint_unavailable();
@@ -4652,7 +4672,8 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
-    if (native_companion_enabled() && metadata->seq_pos_max(0) >= llama_pos(position_split_p_)) {
+    const llama_seq_id target_seq = (seq_id >= 0 && uint32_t(seq_id) < n_seq_max) ? seq_id : 0;
+    if (native_companion_enabled() && metadata->seq_pos_max(target_seq) >= llama_pos(position_split_p_)) {
         return false;
     }
     if (position_split_enabled()) {
@@ -4846,8 +4867,14 @@ bool llama_kv_cache_kvarn::native_kvarn_checkpoint_unavailable() const {
     // FULL persistence has no native codec. Once native rows have existed,
     // logical metadata alone cannot authorize a FULL bookkeeping snapshot.
     // Resident PARTIAL eligibility separately requires exact owner preflight.
-    native_kvarn_overflow_seen_ = native_kvarn_overflow_seen_ ||
-            metadata->seq_pos_max(0) >= int64_t(position_split_p_);
+    if (!native_kvarn_overflow_seen_) {
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            if (metadata->seq_pos_max(s) >= int64_t(position_split_p_)) {
+                native_kvarn_overflow_seen_ = true;
+                break;
+            }
+        }
+    }
     return native_kvarn_overflow_seen_;
 }
 
@@ -5384,7 +5411,7 @@ void llama_kv_cache_kvarn::state_write_mixed(
     // a PURE destination has no standard_cache by definition and must never be
     // forced to invent remote ownership (plan 3.6: pure stays no-remote).
     if ((standard_cache == nullptr && position_split_enabled() && !native_companion_enabled()) ||
-            migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
+            migration_enabled || swa || (n_stream == 1 && n_seq_max > 1)) {
         throw std::runtime_error(
                 "mixed state requires static non-SWA one-stream KV ownership"
                 " (and an overflow companion in split mode)");
@@ -5613,7 +5640,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
     // a PURE destination has no standard_cache by definition and must never be
     // forced to invent remote ownership (plan 3.6: pure stays no-remote).
     if ((standard_cache == nullptr && position_split_enabled() && !native_companion_enabled()) ||
-            migration_enabled || swa || n_stream != 1 || n_seq_max != 1) {
+            migration_enabled || swa || (n_stream == 1 && n_seq_max > 1)) {
         throw std::runtime_error(
                 "mixed state requires static non-SWA one-stream KV ownership"
                 " (and an overflow companion in split mode)");
@@ -7706,17 +7733,19 @@ std::vector<llama_position_split::range_desc> llama_kv_cache_kvarn::position_spl
 }
 
 bool llama_kv_cache_kvarn::position_split_has_live_cells(
-        llama_position_split::range_kind range) const {
-    if (!position_split_enabled() || n_seq_max != 1 ||
+        llama_position_split::range_kind range,
+        llama_seq_id seq_id) const {
+    if (!position_split_enabled() || (n_seq_max > 1 && n_stream == 1) ||
             (range != llama_position_split::range_kind::LOCAL &&
              range != llama_position_split::range_kind::OVERFLOW_RANGE)) {
         return false;
     }
-    const auto & cells = metadata->get_cells(0);
+    const llama_seq_id target_seq = (seq_id < 0 || (uint32_t)seq_id >= n_seq_max) ? 0 : seq_id;
+    const auto & cells = metadata->get_cells(target_seq);
     const auto first = llama_position_split::range_for_pos(
-            cells.seq_pos_min(0), position_split_p_, kv_size).kind;
+            cells.seq_pos_min(target_seq), position_split_p_, kv_size).kind;
     const auto last = llama_position_split::range_for_pos(
-            cells.seq_pos_max(0), position_split_p_, kv_size).kind;
+            cells.seq_pos_max(target_seq), position_split_p_, kv_size).kind;
     // Both extrema must be valid: a later invalid overflow cell used to
     // invalidate even a nonempty LOCAL query. Ignore cells owned only by other
     // sequences, just as the list-producing helper does.
@@ -7729,7 +7758,8 @@ bool llama_kv_cache_kvarn::position_split_has_live_cells(
 
 bool llama_kv_cache_kvarn::position_split_live_cells(
         llama_position_split::range_kind range,
-        std::vector<uint32_t> & cells_out) const {
+        std::vector<uint32_t> & cells_out,
+        llama_seq_id seq_id) const {
     cells_out.clear();
     if (!position_split_enabled()) {
         return false;
@@ -7738,14 +7768,15 @@ bool llama_kv_cache_kvarn::position_split_live_cells(
             range != llama_position_split::range_kind::OVERFLOW_RANGE) {
         return false;
     }
-    if (n_seq_max != 1) {
+    if (n_seq_max > 1 && n_stream == 1) {
         return false;
     }
-    const auto & cells = metadata->get_cells(0);
+    const llama_seq_id target_seq = (seq_id < 0 || (uint32_t)seq_id >= n_seq_max) ? 0 : seq_id;
+    const auto & cells = metadata->get_cells(target_seq);
     std::vector<std::pair<llama_pos, uint32_t>> ordered;
     ordered.reserve(cells.size());
     for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-        if (cells.is_empty(cell) || !cells.seq_has(cell, 0)) {
+        if (cells.is_empty(cell) || !cells.seq_has(cell, target_seq)) {
             continue;
         }
         const llama_pos pos = cells.pos_get(cell);

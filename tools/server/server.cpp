@@ -154,6 +154,10 @@ static bool server_prepare_params(common_params & params, server_role_type role_
         }
     }
 
+    if (params.n_parallel > 1 && (params.kv_position_split_p > 0 || !params.remote_attn_host.empty())) {
+        params.kv_unified = false;
+    }
+
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
     // or with -c 0 for max context
     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&

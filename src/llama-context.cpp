@@ -2267,28 +2267,31 @@ std::vector<ggml_backend_t> layer_backends;
                             __func__, params.remote_attn_host, (unsigned) params.remote_attn_port));
                     }
                 } else {
+                    for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
+                        const bool created = tcp_position_split ?
+                                ggml_backend_remote_attn_create_range_session(
+                                    backend_remote, s, s, geo.max_ctx) :
+                                ggml_backend_remote_attn_create_session(
+                                    backend_remote, s, s, geo.max_ctx);
+                        if (!created) {
+                            ggml_remote_attn_deactivate(backend_remote);
+                            ggml_backend_free(backend_remote);
+                            backend_remote = nullptr;
+                            throw std::runtime_error(format("%s: remote-attn CREATE_SESSION %u failed", __func__, s));
+                        }
+                        ggml_backend_remote_attn_set_active_session(backend_remote, s);
+                        if (tcp_position_split && !ggml_backend_remote_attn_configure_range(
+                                backend_remote, cparams.kv_position_split_p, geo.max_ctx,
+                                cparams.remote_attn_native_companion != LLAMA_REMOTE_COMPANION_NONE ? GGML_TYPE_F32 :
+                                        cparams.remote_attn_cache_type_k)) {
+                            ggml_remote_attn_deactivate(backend_remote);
+                            ggml_backend_free(backend_remote);
+                            backend_remote = nullptr;
+                            throw std::runtime_error("RKVA server does not support positional OUT/LSE ranges");
+                        }
+                    }
                     remote_attn_session = 0;
-                    const bool created = tcp_position_split ?
-                            ggml_backend_remote_attn_create_range_session(
-                                backend_remote, remote_attn_session, 0, geo.max_ctx) :
-                            ggml_backend_remote_attn_create_session(
-                                backend_remote, remote_attn_session, 0, geo.max_ctx);
-                    if (!created) {
-                        ggml_remote_attn_deactivate(backend_remote);
-                        ggml_backend_free(backend_remote);
-                        backend_remote = nullptr;
-                        throw std::runtime_error(format("%s: remote-attn CREATE_SESSION failed", __func__));
-                    }
-                    ggml_backend_remote_attn_set_active_session(backend_remote, remote_attn_session);
-                    if (tcp_position_split && !ggml_backend_remote_attn_configure_range(
-                            backend_remote, cparams.kv_position_split_p, geo.max_ctx,
-                            cparams.remote_attn_native_companion != LLAMA_REMOTE_COMPANION_NONE ? GGML_TYPE_F32 :
-                                    cparams.remote_attn_cache_type_k)) {
-                        ggml_remote_attn_deactivate(backend_remote);
-                        ggml_backend_free(backend_remote);
-                        backend_remote = nullptr;
-                        throw std::runtime_error("RKVA server does not support positional OUT/LSE ranges");
-                    }
+                    ggml_backend_remote_attn_set_active_session(backend_remote, 0);
                     if (tcp_position_split) {
                         LLAMA_LOG_INFO("%s: RKVA position split: CUDA [0,%u), Xbox [%u,%u), %d layers; no ATTN RPC below P\n",
                                 __func__, cparams.kv_position_split_p, cparams.kv_position_split_p,
@@ -2359,14 +2362,25 @@ std::vector<ggml_backend_t> layer_backends;
                 if (cparams.remote_attn_position_split) {
                     memory->set_on_seq_rm([this](llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                         if (!backend_remote) return true;
-                        if (remote_native_kvarn_enabled() && p0 <= 0 && p1 < 0) {
-                            return ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
-                        }
-                        if (seq_id != 0 || p0 < 0 || p1 >= 0) {
+                        if (seq_id < 0) {
+                            if (remote_native_kvarn_enabled() && p0 <= 0 && p1 < 0) {
+                                for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
+                                    ggml_backend_remote_attn_reset(backend_remote, s);
+                                }
+                                return true;
+                            }
                             ggml_backend_remote_attn_invalidate_range(backend_remote);
                             return true;
                         }
-                        return ggml_backend_remote_attn_trim(backend_remote, remote_attn_session, p0);
+                        const uint32_t target_sess = (uint32_t) seq_id;
+                        if (remote_native_kvarn_enabled() && p0 <= 0 && p1 < 0) {
+                            return ggml_backend_remote_attn_reset(backend_remote, target_sess);
+                        }
+                        if (p0 < 0 || p1 >= 0) {
+                            ggml_backend_remote_attn_invalidate_session(backend_remote, target_sess);
+                            return true;
+                        }
+                        return ggml_backend_remote_attn_trim(backend_remote, target_sess, p0);
                     });
                 }
                 if (native_owner_clears_remote) {
@@ -2379,7 +2393,9 @@ std::vector<ggml_backend_t> layer_backends;
                         if (ggml_backend_is_local_split(backend_remote)) {
                             ggml_backend_local_split_reset(backend_remote, remote_attn_session);
                         } else {
-                            ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
+                            for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
+                                ggml_backend_remote_attn_reset(backend_remote, s);
+                            }
                         }
                     }
                 });
@@ -4319,9 +4335,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }();
     const int64_t prep_start = profile_prep ? ggml_time_us() : 0;
     llama_memory_context_finish_guard memory_finish_guard(mctx);
+    if (backend_remote && cparams.remote_attn_position_split && ubatch.n_tokens > 0 &&
+            ubatch.n_seq_id && ubatch.seq_id && ubatch.seq_id[0]) {
+        const uint32_t active_seq = (uint32_t) ubatch.seq_id[0][0];
+        ggml_backend_remote_attn_set_active_session(backend_remote, active_seq);
+    }
     if (mctx && memory && backend_remote && cparams.remote_attn_position_split &&
             memory->invalidate_prefix_on_write(ubatch)) {
-        ggml_backend_remote_attn_invalidate_range(backend_remote);
+        if (ubatch.n_tokens > 0 && ubatch.n_seq_id && ubatch.seq_id && ubatch.seq_id[0]) {
+            ggml_backend_remote_attn_invalidate_session(backend_remote, (uint32_t) ubatch.seq_id[0][0]);
+        } else {
+            ggml_backend_remote_attn_invalidate_range(backend_remote);
+        }
     }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -8144,22 +8169,23 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
         }
 
         if (partial &&
-                cparams.remote_attn_position_split && backend_remote && seq_id == 0) {
+                cparams.remote_attn_position_split && backend_remote && seq_id >= 0 && (uint32_t)seq_id < cparams.n_seq_max) {
             // Mixed partial restore already checked owner identity/generation
             // and resident cell references. Publish a remote suffix trim only
             // after the entire memory restore commits successfully.
             io.on_commit([this, seq_id]() {
+                const uint32_t sess = (uint32_t) seq_id;
                 if (!memory->supports_resident_prefix_restore()) {
-                    ggml_backend_remote_attn_invalidate_range(backend_remote);
+                    ggml_backend_remote_attn_invalidate_session(backend_remote, sess);
                     return;
                 }
                 if (remote_native_kvarn_enabled() &&
                         !ggml_backend_remote_attn_native_kvarn_can_restore(backend_remote,
                             memory->seq_pos_max(seq_id) + 1)) {
-                    ggml_backend_remote_attn_invalidate_range(backend_remote);
+                    ggml_backend_remote_attn_invalidate_session(backend_remote, sess);
                     throw std::runtime_error("native KV partial restore lacks matching live prefix or retained original rows");
                 }
-                if (!ggml_backend_remote_attn_trim(backend_remote, remote_attn_session,
+                if (!ggml_backend_remote_attn_trim(backend_remote, sess,
                             memory->seq_pos_max(seq_id) + 1)) {
                     throw std::runtime_error("remote KV partial-restore trim failed");
                 }

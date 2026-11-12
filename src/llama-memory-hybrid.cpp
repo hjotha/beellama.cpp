@@ -371,8 +371,9 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(
         while (true) {
             llama_ubatch ubatch;
 
-            if (embd_all) {
-                // if all tokens are output, split by sequence
+            const bool split_by_seq = embd_all || (position_split_p > 0 && mem_attn->get_kv_n_stream() > 1);
+            if (split_by_seq) {
+                // if all tokens are output or non-unified position-split, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)

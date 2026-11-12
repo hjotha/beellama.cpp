@@ -2065,8 +2065,9 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
+        const bool split_by_seq = embd_all || (allocation_position_split_p > 0 && n_stream > 1);
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : split_by_seq ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -2567,7 +2568,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         /*.group_stage_slots =*/ { },
     };
 
-    if (allocation_position_split_p != 0 && n_stream != 1) {
+    if (allocation_position_split_p != 0 && n_stream != n_seq_max) {
         return {};
     }
 
@@ -2886,7 +2887,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     range_begin, range_end)) {
             return {};
         }
-        if (allocation_position_split_p != 0 && n_stream != 1) {
+        if (allocation_position_split_p != 0 && n_stream != n_seq_max) {
             return {};
         }
 
@@ -8222,8 +8223,13 @@ void llama_kv_cache::set_input_kq_mask_tail_mapped(
     GGML_ASSERT(body->ne[0] == n_kv);
     std::vector<int32_t> physical_to_read;
     if (!read_cells.empty()) {
-        GGML_ASSERT(n_stream == 1 && read_cells.size() == n_kv);
-        physical_to_read.assign(v_cells[0].size(), -1);
+        GGML_ASSERT((n_stream == 1 || n_stream == n_seq_max) && read_cells.size() == n_kv);
+        const llama_seq_id target_seq = (ubatch && ubatch->n_tokens > 0 && ubatch->n_seq_id && ubatch->seq_id && ubatch->seq_id[0])
+                ? ubatch->seq_id[0][0] : 0;
+        const uint32_t stream_idx = (target_seq >= 0 && size_t(target_seq) < seq_to_stream.size())
+                ? seq_to_stream[target_seq] : 0;
+        GGML_ASSERT(stream_idx < v_cells.size());
+        physical_to_read.assign(v_cells[stream_idx].size(), -1);
         for (uint32_t read = 0; read < n_kv; ++read) {
             if (read_cells[read] >= 0) {
                 GGML_ASSERT(uint64_t(read_cells[read]) < physical_to_read.size());

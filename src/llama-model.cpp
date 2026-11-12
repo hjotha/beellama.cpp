@@ -3112,8 +3112,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
             throw std::invalid_argument("position-split KV não suporta contexto MTP");
         }
-        if (cparams.n_seq_max != 1) {
-            throw std::invalid_argument("position-split KV exige uma única sequência");
+        if (cparams.n_seq_max != 1 && cparams.kv_unified) {
+            throw std::invalid_argument("position-split KV exige uma única sequência ou non-unified multi-sequence");
         }
         if (!llama_position_split::is_valid_p(cparams.kv_position_split_p, cparams.n_ctx_seq)) {
             throw std::invalid_argument(format(

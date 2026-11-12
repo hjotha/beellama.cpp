@@ -151,10 +151,17 @@ static bool split_packed_map_still_valid(
     // compares metadata cell order, not compact Qx physical rows; only packed
     // view construction calls payload_row_for_cell().
     const auto * kvarn_cache = kvarn_ctx->get_kvarn_cache();
+    llama_seq_id seq_id = 0;
+    if (attn_mctx && attn_mctx->has_valid_current_ubatch()) {
+        const auto & ub = attn_mctx->get_ubatch();
+        if (ub.n_tokens > 0 && ub.n_seq_id && ub.seq_id && ub.seq_id[0]) {
+            seq_id = ub.seq_id[0][0];
+        }
+    }
     std::vector<uint32_t> ovf;
     if (!kvarn_cache ||
         !kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::OVERFLOW_RANGE, ovf)) {
+                    llama_position_split::range_kind::OVERFLOW_RANGE, ovf, seq_id)) {
         return false;
     }
     // Capacity-stable extent: the live run may grow up to the baked extent while
@@ -1004,11 +1011,15 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         }
         const uint32_t payload_origin = standard_cache ? standard_cache->get_payload_row_origin() : kvarn_cache->position_split_p();
         const uint32_t payload_size = standard_cache ? standard_cache->get_payload_size() : kvarn_cache->get_kv_size() - payload_origin;
+        llama_seq_id seq_id = 0;
+        if (ubatch && ubatch->n_tokens > 0 && ubatch->n_seq_id && ubatch->seq_id && ubatch->seq_id[0]) {
+            seq_id = ubatch->seq_id[0][0];
+        }
         std::vector<uint32_t> local_cells, overflow_cells;
         GGML_ASSERT(kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::LOCAL, local_cells));
+                    llama_position_split::range_kind::LOCAL, local_cells, seq_id));
         GGML_ASSERT(kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells));
+                    llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells, seq_id));
         split_local_cells = std::move(local_cells);
         split_overflow_cells = std::move(overflow_cells);
         const auto * metadata = kvarn_cache->get_metadata_cache();
@@ -1028,7 +1039,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
             GGML_ASSERT(int64_t(ubatch->n_tokens) == n_q);
             GGML_ASSERT(ubatch->n_pos >= 1 && ubatch->pos != nullptr);
             std::vector<float> host(size_t(n_cap*n_q), -INFINITY);
-            const auto & all_cells = metadata->get_cells(0);
+            const auto & all_cells = metadata->get_cells(seq_id);
             for (int64_t qi = 0; qi < n_q; ++qi) {
                 const llama_pos p_q = ubatch->pos[qi];
                 for (size_t ki = 0; ki < cells.size(); ++ki) {
@@ -1105,7 +1116,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
                 if (cparams.remote_attn_position_split) {
                     const auto expected = kvarn_cache->position_split_p() + uint32_t(i);
                     if (global_cell != expected || physical_row != i ||
-                            metadata->get_cells(0).pos_get(global_cell) != llama_pos(expected)) {
+                            metadata->get_cells(seq_id).pos_get(global_cell) != llama_pos(expected)) {
                         throw std::runtime_error("RKVA range requires a contiguous, unshifted single-sequence overflow");
                     }
                     host_cells[i] = int32_t(global_cell);
@@ -1214,12 +1225,16 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         bool split_ok = kvarn && kvarn->position_split_enabled();
         std::vector<uint32_t> local_cells, overflow_cells;
         if (split_ok) {
+            llama_seq_id seq_id = 0;
+            if (params.ubatch.n_tokens > 0 && params.ubatch.n_seq_id && params.ubatch.seq_id && params.ubatch.seq_id[0]) {
+                seq_id = params.ubatch.seq_id[0][0];
+            }
             const auto * kvarn_cache = kvarn->get_kvarn_cache();
             split_ok = kvarn_cache &&
                 kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::LOCAL, local_cells) &&
+                    llama_position_split::range_kind::LOCAL, local_cells, seq_id) &&
                 kvarn_cache->position_split_live_cells(
-                    llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells);
+                    llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells, seq_id);
         }
         const int64_t n_q = params.ubatch.n_tokens;
         split_ok = split_ok &&
@@ -5692,6 +5707,9 @@ ggml_tensor * llm_graph_context::build_attn_position_split_rpc_complete(
     const int64_t n_qh = lse1->ne[0];
     const int64_t n_q = lse1->ne[1];
     const int64_t n_b = lse1->ne[2];
+    if (lse2->ne[2] != n_b || lse2->ne[1] != n_q) {
+        lse2 = ggml_reshape_3d(ctx0, lse2, n_qh, n_q, n_b);
+    }
     GGML_ASSERT(lse2->ne[0] == n_qh && lse2->ne[1] == n_q && lse2->ne[2] == n_b);
     const int64_t head_dim = q_cur->ne[0];
     // build_attn_mha returns O flattened as [(D*H), (Q*B)]; restore 4D.
@@ -6822,6 +6840,9 @@ if (std::getenv("F5_LAYER_CAPTURE") != nullptr) {
     const int64_t n_qh = lse1->ne[0];
     const int64_t n_q = lse1->ne[1];
     const int64_t n_b = lse1->ne[2];
+    if (lse2->ne[2] != n_b || lse2->ne[1] != n_q) {
+        lse2 = ggml_reshape_3d(ctx0, lse2, n_qh, n_q, n_b);
+    }
     GGML_ASSERT(lse2->ne[0] == n_qh && lse2->ne[1] == n_q && lse2->ne[2] == n_b);
     const int64_t head_dim = q_cur->ne[0];
     // build_attn_mha returns O flattened as [(D*H), (Q*B)]; restore 4D.
