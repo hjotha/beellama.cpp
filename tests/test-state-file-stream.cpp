@@ -38,6 +38,96 @@ static void decode(llama_context * ctx, const llama_tokens & tokens, int start =
     }
 }
 
+static void test_stream_failure_isolated(llama_model * model, const server_model_identity & identity,
+                                         const std::string & directory, const llama_tokens & tokens) {
+    auto params = llama_context_default_params();
+    params.n_ctx = 512; params.n_batch = params.n_ubatch = 256; params.n_seq_max = 2;
+    params.kv_unified = false; params.n_threads = params.n_threads_batch = 2;
+    params.type_k = params.type_v = GGML_TYPE_Q4_0;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; params.offload_kqv = false;
+    llama_context_ptr source(llama_init_from_model(model, params));
+    llama_context_ptr dest(llama_init_from_model(model, params));
+    require(source && dest, "multi-slot contexts failed");
+    decode(source.get(), tokens);
+    decode(dest.get(), tokens);
+    const auto path = directory + "/multi-slot-stream.bin";
+    server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX);
+    const auto file = server_route_state_read(path, SIZE_MAX, 1024);
+    llama_tokens restored(tokens.size());
+    size_t count = 0;
+    const auto restore = [&](uint64_t checksum) {
+        return llama_state_seq_load_file_streaming(dest.get(), path.c_str(), 1, restored.data(), restored.size(),
+                                                   &count, file.state_bytes, checksum);
+    };
+    require(!restore(file.state_checksum ^ 1) && llama_memory_seq_pos_max(llama_get_memory(dest.get()), 0) ==
+            llama_pos(tokens.size() - 1), "checksum failure cleared another slot");
+#ifndef _WIN32
+    setenv("LLAMA_TEST_STATE_FILE_COMMIT_FAIL_AFTER", "1", 1);
+    const size_t failed = restore(file.state_checksum);
+    unsetenv("LLAMA_TEST_STATE_FILE_COMMIT_FAIL_AFTER");
+    require(!failed && llama_memory_seq_pos_max(llama_get_memory(dest.get()), 0) == llama_pos(tokens.size() - 1) &&
+            llama_memory_seq_pos_max(llama_get_memory(dest.get()), 1) == -1,
+            "late failure changed another slot or left the destination live");
+#endif
+    require(restore(file.state_checksum) == file.state_bytes && count == tokens.size() && restored == tokens &&
+            llama_memory_seq_pos_max(llama_get_memory(dest.get()), 0) == llama_pos(tokens.size() - 1),
+            "multi-slot restore changed the other slot");
+
+    const auto generic_path = directory + "/multi-slot-generic.bin";
+    const size_t generic_bytes = llama_state_seq_save_file(source.get(), generic_path.c_str(), 0,
+                                                            tokens.data(), tokens.size());
+    require(generic_bytes > 0, "multi-slot generic save failed");
+    const auto sequence = [&](llama_seq_id seq) {
+        const size_t n = llama_state_seq_get_size(dest.get(), seq);
+        require(n > 0, "multi-slot sequence size unavailable");
+        std::vector<uint8_t> result(n);
+        require(llama_state_seq_get_data(dest.get(), result.data(), result.size(), seq) == n,
+                "multi-slot sequence capture failed");
+        return result;
+    };
+    const auto other_before = sequence(0);
+    count = 0;
+    size_t prepared_bytes = 0;
+    std::unique_ptr<llama_state_seq_restore_plan, decltype(&llama_state_seq_restore_plan_free)> plan(
+            llama_state_seq_prepare_file(dest.get(), generic_path.c_str(), 1, restored.data(), restored.size(),
+                                         &count, &prepared_bytes), llama_state_seq_restore_plan_free);
+    require(plan && count == tokens.size() && prepared_bytes == generic_bytes && restored == tokens,
+            "generic local cross-slot prepare failed");
+    require(llama_state_seq_restore_plan_commit(plan.get()) == generic_bytes && sequence(0) == other_before &&
+            llama_memory_seq_pos_max(llama_get_memory(dest.get()), 1) == llama_pos(tokens.size() - 1),
+            "generic local cross-slot commit changed another slot");
+    plan.reset();
+
+    const auto bad_path = directory + "/multi-slot-generic-rkvk.bin";
+    std::filesystem::copy_file(generic_path, bad_path);
+    {
+        std::ofstream out(bad_path, std::ios::binary | std::ios::app);
+        const uint32_t magic = rkva_native_state::kMagic;
+        const uint8_t bytes[] = {uint8_t(magic), uint8_t(magic >> 8), uint8_t(magic >> 16), uint8_t(magic >> 24)};
+        require(bool(out.write(reinterpret_cast<const char *>(bytes), sizeof(bytes))), "RKVK fixture write failed");
+    }
+    const auto destination_before = sequence(1);
+    count = prepared_bytes = 0;
+    plan.reset(llama_state_seq_prepare_file(dest.get(), bad_path.c_str(), 1, restored.data(), restored.size(),
+                                            &count, &prepared_bytes));
+    require(!plan && count == 0 && prepared_bytes == 0 && sequence(0) == other_before &&
+            sequence(1) == destination_before, "generic RKVK prepare changed a live slot");
+    count = 0;
+    require(!llama_state_seq_load_file(dest.get(), bad_path.c_str(), 1, restored.data(), restored.size(), &count) &&
+            count == 0 && sequence(0) == other_before && sequence(1) == destination_before,
+            "generic RKVK load changed a live slot");
+    require(llama_memory_seq_rm(llama_get_memory(dest.get()), 1, -1, -1), "multi-slot test clear failed");
+    std::ifstream bad(bad_path, std::ios::binary);
+    std::vector<char> bad_bytes(generic_bytes + sizeof(uint32_t));
+    require(bool(bad.read(bad_bytes.data(), bad_bytes.size())), "RKVK fixture read failed");
+    count = 0;
+    require(!llama_state_seq_load_file_streaming(dest.get(), bad_path.c_str(), 1, restored.data(), restored.size(),
+                    &count, bad_bytes.size(), XXH64(bad_bytes.data(), bad_bytes.size(), 0)) &&
+            count == 0 && sequence(0) == other_before &&
+            llama_memory_seq_pos_max(llama_get_memory(dest.get()), 1) == -1,
+            "generic streaming RKVK load changed another slot");
+}
+
 static llama_token greedy(llama_context * ctx) {
     const int count = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
     const float * logits = llama_get_logits_ith(ctx, -1);
@@ -156,6 +246,18 @@ static void standard_tail_model(llama_model * model, const server_model_identity
                                      &legacy_count) == file.state_bytes &&
             legacy_count == tokens.size() && legacy_tokens == tokens,
             "legacy standard tail file restore regressed");
+    const std::string packed_path = directory + "/packed-tokens.bin";
+    llama_tokens packed = {LLAMA_TOKEN_NULL, 0, 3, 0, 1, 2, 3};
+    require(llama_state_seq_save_file(source.get(), packed_path.c_str(), 0, packed.data(), packed.size()) > 0,
+            "packed token state save failed");
+    llama_context_ptr packed_destination(llama_init_from_model(model, params));
+    size_t packed_count = 0, restored_count = 0;
+    require(packed_destination && llama_state_seq_load_file(packed_destination.get(), packed_path.c_str(), 0,
+            nullptr, 0, &packed_count) > 0 && packed_count == packed.size(), "packed token count query failed");
+    llama_tokens packed_out(packed_count);
+    require(llama_state_seq_load_file(packed_destination.get(), packed_path.c_str(), 0, packed_out.data(),
+            packed_out.size(), &restored_count) > 0 && restored_count == packed_count && packed_out == packed,
+            "packed token state restore count changed");
     const auto restore = [&](llama_context * ctx, const std::string & name, uint64_t checksum) {
         llama_tokens restored(tokens.size()); size_t count = 99;
         const size_t n = llama_state_seq_load_file_streaming(ctx, name.c_str(), 0, restored.data(), restored.size(),
@@ -526,6 +628,7 @@ int main(int argc, char ** argv) {
 
         const auto identity = server_model_identity::prepare(argv[1], {});
         standard_tail_model(model.get(), identity, dir, tokens);
+        test_stream_failure_isolated(model.get(), identity, dir, tokens);
         const std::string path = dir + "/route.bin";
         const size_t written = server_route_state_save(source.get(), 0, tokens, identity, path, SIZE_MAX);
         const auto file = server_route_state_read(path, SIZE_MAX, 1024);

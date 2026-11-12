@@ -11,16 +11,18 @@ static void test_low4_negotiation() {
         loopback server(false, true, false, false, false, false, 0, 0, true, 8 | 32,
                         failure == 0 ? 0 : storage);
         auto* backend = ggml_backend_remote_attn_init("127.0.0.1", server.port);
-        ggml_remote_attn_geometry geo{1, failure == 3 ? 2u : 6u, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.f/16};
+        ggml_remote_attn_geometry geo{1, failure == 3 ? 0u : 6u, 1, 256, 512, 0, 0, 128, 3, 128, 2, 0, 0, false, false, 1.f/16};
         assert(ggml_backend_remote_attn_set_geometry(backend, &geo));
         assert(ggml_backend_remote_attn_connect(backend));
         assert(ggml_backend_remote_attn_create_range_session(backend, 0, 0, 512));
         ggml_backend_remote_attn_set_active_session(backend, 0);
-        assert(!ggml_backend_remote_attn_configure_range(backend, 256, 512,
-                failure == 2 ? GGML_TYPE_Q4_0 : type));
+        const bool configured = ggml_backend_remote_attn_configure_range(backend, 256, 512,
+                failure == 2 ? GGML_TYPE_Q4_0 : type);
+        assert(configured == (failure == 1)); // explicit format selects the supported codec
         {
             std::lock_guard<std::mutex> lock(server.mutex);
-            assert(server.native_descriptor.layout_version == 0);
+            assert(server.native_descriptor.layout_version ==
+                    (failure == 1 ? (type == GGML_TYPE_Q4_1 ? RKVA_LAYOUT_Q4_1 : RKVA_LAYOUT_IQ4_NL) : 0));
             assert(server.range.capacity == 0); // no F16/Q4_0 fallback
         }
         ggml_backend_free(backend);

@@ -124,6 +124,9 @@ public:
 
     int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
 
+    bool can_seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) const override {
+        return mem_attn->can_seq_cp(src, dst, p0, p1) && mem_recr->can_seq_cp(src, dst, p0, p1);
+    }
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;

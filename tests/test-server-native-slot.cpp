@@ -94,36 +94,41 @@ void test_automatic_prefix() {
 void test_failed_restore_cleanup() {
     struct slot {
         bool memory_cleared = false;
-        bool expect_memory_cleared = true;
         bool prompt_present = true;
         bool logits_present = true;
+        bool prompt_cleanup_failed = false;
+        bool cleanup_result = true;
+        bool cleanup_throws = false;
+        int cleanup_calls = 0;
         int speculative_resets = 0;
+        bool prompt_clear() {
+            ++cleanup_calls;
+            if (cleanup_throws) throw std::runtime_error("memory clear failed");
+            if (!cleanup_result) return false;
+            memory_cleared = true;
+            prompt_forget_memory();
+            return true;
+        }
         void prompt_forget_memory() {
-            if (expect_memory_cleared) assert(memory_cleared);
             prompt_present = false;
             logits_present = false;
             ++speculative_resets;
         }
     } s;
-    int memory_clears = 0;
-    int remote_resets = 0;
-    server_native_slot::clear_failed_restore(s, [&]() {
-        ++memory_clears;
-        ++remote_resets; // actual memory clear invokes the remote reset hook
-        s.memory_cleared = true;
-    });
-    assert(memory_clears == 1 && remote_resets == 1);
+    slot other;
+    assert(server_native_slot::clear_failed_restore(s));
+    assert(s.cleanup_calls == 1 && s.memory_cleared && !s.prompt_cleanup_failed);
     assert(!s.prompt_present && !s.logits_present && s.speculative_resets == 1);
+    assert(other.prompt_present && other.logits_present && !other.memory_cleared);
 
     slot failed;
-    failed.expect_memory_cleared = false;
-    bool thrown = false;
-    try {
-        server_native_slot::clear_failed_restore(failed, [&]() {
-            throw std::runtime_error("memory clear failed");
-        });
-    } catch (const std::runtime_error &) { thrown = true; }
-    assert(thrown && !failed.prompt_present && !failed.logits_present && failed.speculative_resets == 1);
+    failed.cleanup_result = false;
+    assert(!server_native_slot::clear_failed_restore(failed));
+    assert(failed.prompt_cleanup_failed && !failed.prompt_present && !failed.logits_present);
+    slot throwing;
+    throwing.cleanup_throws = true;
+    assert(!server_native_slot::clear_failed_restore(throwing));
+    assert(throwing.prompt_cleanup_failed && !throwing.prompt_present && !throwing.logits_present);
 }
 
 server_native_slot::Eligibility valid_save() {
@@ -169,6 +174,22 @@ void test_eligibility() {
     assert(reject([](auto & x) { x.identity_available = false; }));
     assert(reject([](auto & x) { x.unmodified_model = false; }));
     assert(reject([](auto & x) { x.text_only = false; }));
+
+    auto multi = valid_save();
+    multi.adaptive = false;
+    multi.profile_xxxl = false;
+    multi.nonadaptive_multislot = true;
+    assert(server_native_slot::save_allowed(multi, &error));
+    multi.native_active = false;
+    assert(server_native_slot::restore_allowed(multi, &error));
+    multi.nonadaptive_multislot = false;
+    assert(!server_native_slot::restore_allowed(multi, &error));
+    multi.nonadaptive_multislot = true;
+    multi.draft_present = true;
+    assert(!server_native_slot::restore_allowed(multi, &error));
+    multi.draft_present = false;
+    multi.snapshot_supported = false;
+    assert(!server_native_slot::restore_allowed(multi, &error));
 
     auto restore = valid_save();
     restore.native_active = false;

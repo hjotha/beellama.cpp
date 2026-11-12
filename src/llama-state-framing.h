@@ -18,6 +18,10 @@ enum class trailing {
     unknown,
 };
 
+inline bool native_trailer_allowed(bool require_native, bool snapshot_supported, uint32_t n_seq_max) {
+    return require_native || (snapshot_supported && n_seq_max == 1);
+}
+
 inline trailing classify(const uint8_t * data, size_t size) {
     if (size == 0) {
         return trailing::none;

@@ -9,8 +9,10 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "server-native-ram-transaction.h"
 #include "../../src/llama-state-rollback.h"
 #include "src/llama-ext.h"
+#include "src/llama-context.h"
 #define XXH_STATIC_LINKING_ONLY
 #include "hash/xxhash/xxhash.h"
 
@@ -1905,6 +1907,8 @@ uint64_t server_prompt_cache_state::digest() const {
         add(v.data(), n);
     };
     add(&model_instance, sizeof(model_instance));
+    add(&native_ram, sizeof(native_ram));
+    add(native_sha256.data(), native_sha256.size());
     add(layout_tgt.data(), layout_tgt.size());
     add(layout_dft.data(), layout_dft.size());
     add(&pos_tgt, sizeof(pos_tgt));
@@ -2130,12 +2134,108 @@ void server_prompt_cache::release_transient(size_t bytes) {
     transient_bytes = bytes >= transient_bytes ? 0 : transient_bytes - bytes;
 }
 
+namespace {
+// shortcut: these are the existing native-slot admission estimates, not an
+// allocator-enforced quota. Frames and token copies are reserved separately.
+uint64_t native_ram_workspace(llama_context * ctx, bool restore) {
+    return (restore ? 48ull : 16ull)*1024*1024 + uint64_t(llama_n_ctx_seq(ctx))*(restore ? 512 : 16);
+}
+struct prompt_cache_reservation {
+    server_prompt_cache & cache;
+    size_t held = 0;
+    explicit prompt_cache_reservation(server_prompt_cache & cache) : cache(cache) {}
+    bool add(size_t n, bool evict = false) {
+        if (n > SIZE_MAX-held || !(evict ? cache.reserve_transient(n) : cache.reserve_transient_without_eviction(n))) return false;
+        held += n;
+        return true;
+    }
+    ~prompt_cache_reservation() { cache.release_transient(held); }
+};
+}
+
+bool server_prompt_cache::save_native(const server_prompt & prompt, llama_context * ctx, llama_seq_id id,
+                                     size_t evaluated, llama_pos pos) {
+    if (!limit_size || evaluated > UINT32_MAX) { last_reason = "native RAM cache requires a finite budget"; return false; }
+    try {
+        prompt_cache_reservation reservation(*this);
+        const uint64_t workspace = native_ram_workspace(ctx, false);
+        if (workspace > SIZE_MAX || !reservation.add(size_t(workspace), true)) {
+            last_reason = "native RAM save workspace exceeds cache budget"; return false;
+        }
+        size_t bytes = 0;
+        auto status = llama_state_seq_native_ram_size(ctx, id, uint32_t(evaluated), workspace, &bytes);
+        if (status != LLAMA_NATIVE_RAM_OK) {
+            native_context_invalidated |= status == LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+            last_reason = "native RAM size refused or invalidated context"; return false;
+        }
+        server_prompt_cache_state candidate;
+        candidate.native_ram = true;
+        candidate.model = llama_get_model(ctx);
+        candidate.model_instance = llama_model_mtp_weights_get_info(candidate.model).model_instance;
+        candidate.layout_tgt = common_prompt_cache_layout(ctx);
+        candidate.pos_tgt = pos;
+        for (const auto & c : prompt.checkpoints) {
+            if (c->host_only() && c->compatible_tgt(ctx) && c->n_tokens <= int64_t(evaluated) && c->pos_max <= pos)
+                candidate.prompt.checkpoints.push_back(c);
+        }
+        const size_t token_bytes = prompt.tokens.cache_size(true), digest_bytes = prompt.tokens.digest_workspace();
+        if (bytes > SIZE_MAX-token_bytes || bytes+token_bytes > SIZE_MAX-digest_bytes ||
+                bytes+token_bytes+digest_bytes > SIZE_MAX-candidate.size() ||
+                !reservation.add(bytes+token_bytes+digest_bytes+candidate.size(), true)) {
+            last_reason = "native RAM frame exceeds cache budget"; return false;
+        }
+        candidate.prompt.tokens = prompt.tokens.clone_for_cache();
+        candidate.prompt.tokens.keep_first(evaluated);
+        candidate.data.main.resize(bytes);
+        status = llama_state_seq_native_ram_write(ctx, id, uint32_t(evaluated), candidate.data.main.data(),
+                candidate.data.main.size(), candidate.native_sha256.data(), workspace);
+        if (status != LLAMA_NATIVE_RAM_OK) {
+            native_context_invalidated |= status == LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+            last_reason = "native RAM write refused or invalidated context"; return false;
+        }
+        candidate.checksum = candidate.digest();
+        states.push_back(std::move(candidate));
+        const auto inserted = std::prev(states.end());
+        for (auto it = states.begin(); it != inserted;) {
+            if (it->native_ram && it->model == inserted->model && it->model_instance == inserted->model_instance &&
+                    it->layout_tgt == inserted->layout_tgt && it->prompt.tokens.size() == evaluated &&
+                    it->prompt.tokens.get_common_prefix(inserted->prompt.tokens) == evaluated) it = states.erase(it);
+            else ++it;
+        }
+        last_reason = "native RAM snapshot saved";
+        return true;
+    } catch (const std::exception & e) { last_reason = e.what(); return false; }
+}
+
 bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
         common_speculative * spec, llama_seq_id id_slot) {
     last_reason.clear();
     if (prompt.tokens.empty()) {
         last_reason = "empty prompt";
         return false;
+    }
+    const auto split_p = ctx_tgt->get_cparams().kv_position_split_p;
+    const auto native_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot);
+    if (llama_n_seq_max(ctx_tgt) > 1 && split_p && native_pos >= llama_pos(split_p)) {
+        // Capabilities and native owners belong to the active remote session.
+        // Select this slot before deciding whether the native frame is required.
+        (void) ctx_tgt->remote_native_kvarn_transient_active_seq(id_slot);
+        if (ctx_tgt->remote_attn_backend_failed()) {
+            native_context_invalidated = true;
+            last_reason = "remote attention backend is invalidated";
+            return false;
+        }
+        if (server_native_ram_cache_route(llama_n_seq_max(ctx_tgt), split_p, native_pos,
+                                          ctx_tgt->remote_native_kvarn_records_enabled())) {
+            if (ctx_dft || spec || prompt.tokens.has_media()) {
+                last_reason = "native RAM cache does not support draft, speculation or media"; return false;
+            }
+            const size_t evaluated = prompt.tokens.size_up_to_pos(native_pos + 1);
+            if (!evaluated || prompt.tokens.pos_next(evaluated) != native_pos + 1) {
+                last_reason = "native RAM prompt positions do not match"; return false;
+            }
+            return save_native(prompt, ctx_tgt, id_slot, evaluated, native_pos);
+        }
     }
     llama_synchronize(ctx_tgt);
     if (ctx_dft) { llama_synchronize(ctx_dft); }
@@ -2169,7 +2269,10 @@ bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx
         candidate.layout_dft = ctx_dft ? common_prompt_cache_layout(ctx_dft) : "";
         candidate.pos_tgt = pos_tgt;
         candidate.pos_dft = pos_dft;
-        common_speculative_get_state(spec, id_slot, candidate.data.spec);
+        if (spec && common_speculative_capture_state(spec, id_slot, candidate.data.spec, pos_tgt) ==
+                common_speculative_capture_status::error) {
+            return failed("speculative state cannot be safely captured");
+        }
         const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t n_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
         for (const auto & c : prompt.checkpoints) {
@@ -2219,10 +2322,89 @@ bool server_prompt_cache::save(const server_prompt & prompt, llama_context * ctx
     }
 }
 
-static void prompt_cache_clear(llama_context * tgt, llama_context * dft, common_speculative * spec, llama_seq_id seq) {
-    llama_memory_seq_rm(llama_get_memory(tgt), seq, -1, -1);
-    if (dft) { llama_memory_seq_rm(llama_get_memory(dft), seq, -1, -1); }
-    common_speculative_set_state(spec, seq, {});
+static bool prompt_cache_clear(llama_context * tgt, llama_context * dft, common_speculative * spec, llama_seq_id seq) {
+    try {
+        if (llama_remote_attn_backend_failed(tgt) || (dft && llama_remote_attn_backend_failed(dft))) return false;
+        if (!llama_memory_seq_rm(llama_get_memory(tgt), seq, -1, -1)) return false;
+        if (dft && !llama_memory_seq_rm(llama_get_memory(dft), seq, -1, -1)) return false;
+        if (llama_remote_attn_backend_failed(tgt) || (dft && llama_remote_attn_backend_failed(dft))) return false;
+        return !spec || common_speculative_clear_state(spec, seq);
+    } catch (...) {
+        return false;
+    }
+}
+
+server_prompt_cache_result server_prompt_cache::restore_native(server_prompt & prompt,
+        const server_prompt_cache_state & state, llama_context * ctx, llama_seq_id id, bool copy_prompt) {
+    auto reject = [&](const char * why) { last_reason = why; return server_prompt_cache_result::unchanged; };
+    auto invalid = [&](const char * why) { native_context_invalidated = true; return reject(why); };
+    if (!limit_size || state.pos_tgt < 0 || state.prompt.tokens.empty() || state.prompt.tokens.has_media() ||
+            state.prompt.tokens.pos_next() != state.pos_tgt + 1 ||
+            state.pos_tgt >= llama_pos(llama_n_ctx_seq(ctx)) || state.data.main.empty() ||
+            state.layout_tgt != common_prompt_cache_layout(ctx)) return reject("native RAM frame is incompatible");
+    bool clearing_started = false;
+    try {
+        prompt_cache_reservation storage(*this);
+        const size_t token_bytes = copy_prompt ? state.prompt.tokens.cache_size(true) : 0;
+        const size_t digest_bytes = state.prompt.tokens.digest_workspace();
+        const size_t checkpoint_bytes = state.prompt.checkpoints.size()*sizeof(void *)*2;
+        if (token_bytes > SIZE_MAX-digest_bytes || token_bytes+digest_bytes > SIZE_MAX-checkpoint_bytes ||
+                !storage.add(token_bytes+digest_bytes+checkpoint_bytes)) return reject("native RAM token workspace unavailable");
+        if (state.digest() != state.checksum) {
+            restore_invalid = true;
+            return reject("native RAM integrity check failed");
+        }
+        server_prompt candidate;
+        if (copy_prompt) candidate = state.prompt.clone();
+        const llama_pos old_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), id);
+        std::vector<uint8_t> backup;
+        std::array<uint8_t, 32> backup_sha{};
+        uint32_t old_evaluated = 0;
+        if (old_pos >= 0) {
+            const size_t evaluated = prompt.tokens.size_up_to_pos(old_pos+1);
+            if (prompt.tokens.has_media() || !evaluated || evaluated > UINT32_MAX ||
+                    prompt.tokens.pos_next(evaluated) != old_pos+1) return reject("native RAM destination cannot be backed up");
+            old_evaluated = uint32_t(evaluated);
+            prompt_cache_reservation save_work(*this);
+            const uint64_t workspace = native_ram_workspace(ctx, false);
+            if (workspace > SIZE_MAX || !save_work.add(size_t(workspace))) return reject("native RAM backup workspace unavailable");
+            size_t bytes = 0;
+            auto result = llama_state_seq_native_ram_size(ctx, id, old_evaluated, workspace, &bytes);
+            if (result == LLAMA_NATIVE_RAM_FAILED_INVALIDATED) return invalid("native RAM backup size invalidated context");
+            if (result != LLAMA_NATIVE_RAM_OK || !storage.add(bytes)) return reject("native RAM destination backup unavailable");
+            backup.resize(bytes);
+            result = llama_state_seq_native_ram_write(ctx, id, old_evaluated, backup.data(), backup.size(), backup_sha.data(), workspace);
+            if (result == LLAMA_NATIVE_RAM_FAILED_INVALIDATED) return invalid("native RAM backup invalidated context");
+            if (result != LLAMA_NATIVE_RAM_OK) return reject("native RAM destination backup refused");
+        } else if (!prompt.tokens.empty()) return reject("native RAM destination tokens lack resident state");
+        const size_t used = size();
+        if (used >= limit_size) return reject("native RAM restore scratch unavailable");
+        const size_t scratch = limit_size-used;
+        prompt_cache_reservation restore_work(*this);
+        if (scratch == UINT64_MAX || scratch < native_ram_workspace(ctx, true) || !restore_work.add(scratch))
+            return reject("native RAM restore workspace unavailable");
+        auto frame = [&](bool old, bool validate) {
+            const auto & data = old ? backup : state.data.main;
+            const auto * sha = old ? backup_sha.data() : state.native_sha256.data();
+            const uint32_t n = old ? old_evaluated : uint32_t(state.prompt.tokens.size());
+            if (validate) return llama_state_seq_native_ram_validate(ctx, id, n, data.data(), data.size(), sha, scratch);
+            clearing_started = true;
+            return llama_state_seq_native_ram_restore(ctx, id, n, data.data(), data.size(), sha, scratch);
+        };
+        const auto result = server_native_ram_transaction(old_pos >= 0,
+            [&](bool old) { return frame(old, true); },
+            [&] { clearing_started = true; return llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1); },
+            [&](bool old) { return frame(old, false); });
+        if (result == server_native_ram_transaction_result::invalidated) return invalid("native RAM transaction invalidated context");
+        if (result != server_native_ram_transaction_result::restored) return reject("native RAM restore cleanly refused");
+        if (copy_prompt) prompt = std::move(candidate);
+        last_reason = "native RAM snapshot restored";
+        return server_prompt_cache_result::hit;
+    } catch (const std::exception & e) {
+        if (clearing_started) return invalid("native RAM exception after destination clear");
+        last_reason = e.what();
+        return server_prompt_cache_result::unchanged;
+    }
 }
 
 server_prompt_cache_result server_prompt_cache::restore(server_prompt & prompt, const server_prompt_cache_state & state,
@@ -2257,6 +2439,10 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
     };
     if (state.model != llama_get_model(ctx_tgt) || state.model_instance != info.model_instance) {
         return miss("snapshot model differs");
+    }
+    if (state.native_ram) {
+        if (ctx_dft || spec) return server_prompt_cache_result::unchanged;
+        return restore_native(prompt, state, ctx_tgt, id_slot, copy_prompt);
     }
     const std::string target_layout = common_prompt_cache_layout(ctx_tgt);
     // Native KVarN layout imports preserve the local representation. The
@@ -2382,6 +2568,7 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
         bool captured = false;
         bool carry_captured = false;
         bool carry_present = false;
+        bool & context_invalidated;
 
         // Resident iff the context reports a position range, not merely bytes.
         static bool resident(llama_context * c, llama_seq_id q, llama_tokens & toks) {
@@ -2417,8 +2604,8 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
 
         destination_guard(llama_context * t, llama_context * d, common_speculative * sp, llama_seq_id q,
                           const llama_tokens & resident_tgt, const llama_tokens & resident_dft,
-                          std::string spool_dir)
-            : tgt(t), dft(d), spec(sp), seq(q), spool(std::move(spool_dir)) {
+                          std::string spool_dir, bool & invalidated)
+            : tgt(t), dft(d), spec(sp), seq(q), spool(std::move(spool_dir)), context_invalidated(invalidated) {
             (void) spool;
             // Residency is decided by POSITIONS. An empty caller token list while
             // positions are resident is INCONSISTENT metadata and must fail closed,
@@ -2435,9 +2622,12 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
             // it, so it must be captured (and be allowed to block mutation) even
             // when both KV sequences are empty.
             if (spec) {
-                carry_captured = common_speculative_get_state(spec, seq, carry);
-                carry_present = carry_captured && !carry.empty();
-                if (spec && !carry_captured) {
+                carry_pos = llama_memory_seq_pos_max(llama_get_memory(tgt), seq);
+                const auto carry_status = common_speculative_capture_state(spec, seq, carry, carry_pos);
+                carry_captured = carry_status != common_speculative_capture_status::error;
+                carry_present = carry_status == common_speculative_capture_status::present;
+                if (!carry_captured || (carry_present && carry_pos < 0)) {
+                    carry_captured = false;
                     return; // cannot describe the resident carry -> fail closed
                 }
             }
@@ -2506,6 +2696,9 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
         // Safe to clear+load only when there was nothing resident, or the full
         // resident transaction was captured and can be streamed back.
         bool may_mutate() const {
+            if (spec && !carry_captured) {
+                return false;
+            }
             if (!tgt_had_state && !dft_had_state && !carry_present) {
                 return true; // nothing to lose
             }
@@ -2521,7 +2714,10 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
         rollback_result rollback() {
             // Always clear first: a refused restore may have left PARTIAL state
             // even when the destination started empty.
-            prompt_cache_clear(tgt, dft, spec, seq);
+            if (!prompt_cache_clear(tgt, dft, spec, seq)) {
+                context_invalidated = true;
+                return rollback_result::lost;
+            }
             if (!captured) {
                 return (tgt_had_state || dft_had_state || carry_present)
                         ? rollback_result::lost : rollback_result::not_attempted;
@@ -2540,8 +2736,10 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
                            llama_state_rollback::rollback_result::restored;
             }
             if (ok && spec && carry_captured) {
-                ok = common_speculative_set_state(spec, seq, carry, carry_pos);
+                ok = carry_present ? common_speculative_set_state(spec, seq, carry, carry_pos) :
+                                     common_speculative_clear_state(spec, seq);
             }
+            if (!ok) context_invalidated = true;
             return ok ? rollback_result::restored : rollback_result::lost;
         }
     } guard(ctx_tgt, ctx_dft, spec, id_slot,
@@ -2551,14 +2749,18 @@ server_prompt_cache_result server_prompt_cache::restore_impl(server_prompt & pro
             // rollback still validates the restored token count and position and
             // reports `lost` rather than claiming success if that is wrong.
             prompt.tokens.get_text_tokens(),
-            rollback_spool);
+            rollback_spool, native_context_invalidated);
 
     if (!guard.may_mutate()) {
         return miss("destination state could not be captured for rollback; refusing before mutation");
     }
 
     timer.begin_commit();
-    prompt_cache_clear(ctx_tgt, ctx_dft, spec, id_slot);
+    if (!prompt_cache_clear(ctx_tgt, ctx_dft, spec, id_slot)) {
+        native_context_invalidated = true;
+        last_reason = "prompt cache destination clear failed; context invalidated";
+        return server_prompt_cache_result::unchanged;
+    }
     bool target_ok = false;
     if (converted_mode) {
         // The cached payload is a q4 sequence state (data form); the destination
@@ -2666,6 +2868,7 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
     }
     native_rollback_limit = std::min(native_rollback_limit, rollback);
     const auto info = llama_model_mtp_weights_get_info(llama_get_model(ctx_tgt));
+    for (;;) {
     auto best = states.end();
     int best_lcp = prompt.tokens.get_common_prefix(tokens_new);
     float best_keep = prompt.tokens.empty() ? -1.0f : float(best_lcp) / prompt.tokens.size();
@@ -2757,6 +2960,10 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
     if (result == server_prompt_cache_result::needs_bootstrap) {
         result = restore_impl(prompt, *best, ctx_tgt, ctx_dft, spec, id_slot, info.managed, true, timings);
     }
+    if (best->native_ram && result == server_prompt_cache_result::unchanged && restore_invalid) {
+        best->quarantined = true;
+        continue;
+    }
     if (result == server_prompt_cache_result::miss && restore_invalid) { best->quarantined = true; }
     if (result == server_prompt_cache_result::hit || result == server_prompt_cache_result::needs_bootstrap) {
         if (info.managed) { states.splice(states.end(), states, best); }
@@ -2766,6 +2973,7 @@ server_prompt_cache_result server_prompt_cache::load(server_prompt & prompt, con
         }
     }
     return result;
+    }
 }
 
 void server_prompt_cache::update() {

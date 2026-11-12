@@ -7,6 +7,7 @@
 #define main hybrid_state_existing_main
 #include "test-hybrid-rpc-prefix-state.cpp"
 #undef main
+#include "../src/llama-rollback.h"
 
 int main() {
     storage_env upload("kvarn4", "GGML_RKVA_UPLOAD_FORMAT");
@@ -53,7 +54,8 @@ int main() {
     assert(attn->native_companion_enabled() && !attn->has_standard_cache());
     attn->set_negotiated_native_rpc_owner(true);
     attn->set_native_kvarn_rewind_capable(true);
-    attn->set_native_kvarn_rewind_preflight([backend](llama_pos pos) {
+    attn->set_native_kvarn_rewind_preflight([backend](llama_seq_id seq, llama_pos pos) {
+        ggml_backend_remote_attn_set_active_session(backend, uint32_t(seq));
         return ggml_backend_remote_attn_native_kvarn_can_restore(backend, pos);
     });
     attn->set_native_companion_reset([backend]() {
@@ -83,10 +85,27 @@ int main() {
     assert(attn->seq_pos_max(0) == attn_before && hybrid.get_mem_recr()->seq_pos_max(0) == recurrent_before);
     { std::lock_guard<std::mutex> lock(peer.mutex); assert(peer.packet_ops.size() == before); }
 
-    // Probe the lower-level transaction independently: the peer commits a
-    // rewind and loses the ACK, making the host's old ownership unusable.
+    // Simulate local suffix removal after an acknowledged upload. The same
+    // helper used by decode must notify the real peer; a lost rewind ACK
+    // poisons the backend and makes the full-reset fallback fail closed.
     peer.drop_native_rewind_ack = true;
-    assert(!ggml_backend_remote_attn_trim(backend, 0, 257));
+    int local_rows = 258;
+    int suffix_notifications = 0, full_notifications = 0;
+    const auto rollback = llama_rollback_sequence_after_decode_failure(
+        [&](llama_seq_id seq, llama_pos p0, llama_pos p1) {
+            return llama_rollback_remove_and_notify(
+                [&](llama_seq_id, llama_pos first, llama_pos) {
+                    local_rows = first < 0 ? 0 : first;
+                    return true;
+                },
+                [&](llama_seq_id id, llama_pos first, llama_pos) {
+                    if (first < 0) { ++full_notifications; return ggml_backend_remote_attn_reset(backend, uint32_t(id)); }
+                    ++suffix_notifications;
+                    return ggml_backend_remote_attn_trim(backend, uint32_t(id), first);
+                }, seq, p0, p1);
+        }, 0, 257);
+    assert(rollback == LLAMA_ROLLBACK_NONE && local_rows == 0 && suffix_notifications == 1 && full_notifications == 1);
+    assert(llama_decode_aborted_code(true, ggml_backend_remote_attn_failed(backend)) == -4);
     assert(ggml_backend_remote_attn_failed(backend));
     assert(!ggml_backend_remote_attn_connected(backend));
     assert(!ggml_backend_remote_attn_native_kvarn_has_state(backend));

@@ -171,6 +171,7 @@ public:
 
     int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
 
+    bool can_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -196,7 +197,9 @@ public:
     bool state_streaming_restore_supported() const override;
 
     bool state_partial_retained(std::vector<const llama_memory_i *> & out) const override {
-        if (other) { out.push_back(this); }
+        if (other || (!tail_metadata_only && !has_tail_overlay() && !requires_state_for_partial_restore())) {
+            out.push_back(this);
+        }
         return true;
     }
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

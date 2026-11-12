@@ -49,6 +49,11 @@ public:
 
     int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
 
+    bool can_seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) const override {
+        return src >= 0 && dst >= 0 && uint32_t(src) < size && uint32_t(dst) < size &&
+                uint32_t(src) < n_seq_max && uint32_t(dst) < n_seq_max &&
+                (src == dst || (p0 <= 0 && p1 < 0 && rs_idx[src] == 0 && rs_idx[dst] == 0));
+    }
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;

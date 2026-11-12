@@ -15,6 +15,8 @@ LLAMA_API bool llama_remote_native_kvarn_enabled(const struct llama_context * ct
 // separate snapshot capability below; a Q4 bookkeeping snapshot is not native
 // state.
 LLAMA_API bool llama_remote_native_kvarn_transient_active(const struct llama_context * ctx);
+// Selects the given sequence's remote session before inspecting its owner.
+LLAMA_API bool llama_remote_native_kvarn_transient_active_seq(struct llama_context * ctx, llama_seq_id seq_id);
 // True only for the supported revision-3 envelope (single sequence, n_rs_seq=0,
 // opt-in disk snapshots, negotiated native snapshot capability). Other native
 // combinations retain the fail-closed FULL save/restore guards.

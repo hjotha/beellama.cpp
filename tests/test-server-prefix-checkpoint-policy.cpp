@@ -34,6 +34,19 @@ static batch_fixture simulate_batches(const char * opt_in, size_t initial, size_
 
 int main() {
     using namespace server_prefix_checkpoint_policy;
+    REQUIRE(!may_adopt_owner(true, false));
+    REQUIRE(may_adopt_owner(true, true));
+    REQUIRE(may_adopt_owner(false, false));
+    REQUIRE(may_load_sidecar(false, 4));
+    REQUIRE(may_load_sidecar(true, 1));
+    REQUIRE(!may_load_sidecar(true, 4));
+    REQUIRE(skip_single_native_prefill(1, 8192, true, true, 128));
+    REQUIRE(!skip_single_native_prefill(4, 8192, true, true, 128));
+    REQUIRE(!skip_single_native_prefill(1, 0, true, true, 128));
+    REQUIRE(!skip_single_native_prefill(1, 8192, false, true, 128));
+    REQUIRE(!skip_single_native_prefill(1, 8192, true, false, 128));
+    REQUIRE(!skip_single_native_prefill(1, 8192, true, true, 0));
+    REQUIRE(!skip_single_native_prefill(1, 8192, true, true, -1));
     REQUIRE(decide(nullptr, true, 102400, 102400, 0, 102401, 98304) == action::proceed);
     REQUIRE(decide("true", true, 102400, 102400, 0, 102401, 98304) == action::proceed);
     REQUIRE(decide("1", false, 102400, 102400, 0, 102401, 98304) == action::proceed);

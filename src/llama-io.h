@@ -73,6 +73,13 @@ public:
     virtual uint32_t native_expected_tokens() const { return native_expected_tokens_; }
     virtual void set_native_expected_tokens(uint32_t count) { native_expected_tokens_ = count; }
 
+    // Only a cancelled RAM validation may simulate clearing the destination.
+    virtual bool native_ram_validate_only() const { return native_ram_validate_only_; }
+    virtual void set_native_ram_validate_only(bool value) { native_ram_validate_only_ = value; }
+
+    uint64_t native_ram_scratch_limit() const { return native_ram_scratch_limit_; }
+    void set_native_ram_scratch_limit(uint64_t limit) { native_ram_scratch_limit_ = limit; }
+
     // True only when tensor payloads are indexed with bounded staging and
     // installed on commit, rather than retained in RAM during parsing.
     virtual bool has_bounded_tensor_reads() const { return false; }
@@ -81,6 +88,8 @@ public:
 
 private:
     uint32_t native_expected_tokens_ = 0;
+    uint64_t native_ram_scratch_limit_ = 0;
+    bool native_ram_validate_only_ = false;
 };
 
 // F4 §3.6: replays a short prefix that was already consumed from `inner` and
@@ -150,6 +159,8 @@ public:
     }
     uint32_t native_expected_tokens() const override { return m_inner.native_expected_tokens(); }
     void set_native_expected_tokens(uint32_t count) override { m_inner.set_native_expected_tokens(count); }
+    bool native_ram_validate_only() const override { return m_inner.native_ram_validate_only(); }
+    void set_native_ram_validate_only(bool value) override { m_inner.set_native_ram_validate_only(value); }
     bool peek(void * dst, size_t size) override {
         if (m_offset + size > m_prefix.size()) {
             return false;

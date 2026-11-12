@@ -47,6 +47,10 @@ int main() {
            llama_state_framing::trailing::unknown);
     assert(llama_state_framing::classify(sckp, 3) ==
            llama_state_framing::trailing::truncated);
+    assert(llama_state_framing::native_trailer_allowed(true, true, 4));
+    assert(!llama_state_framing::native_trailer_allowed(false, true, 4));
+    assert(!llama_state_framing::native_trailer_allowed(false, false, 4));
+    assert(llama_state_framing::native_trailer_allowed(false, true, 1));
 
     const fs::path root = fs::temp_directory_path() /
         (std::string("rkva-native-save-") + std::to_string((unsigned long long) ggml_time_us()));

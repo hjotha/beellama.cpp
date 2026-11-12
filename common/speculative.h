@@ -172,6 +172,11 @@ void common_speculative_shadow_end_request(common_speculative * spec, llama_seq_
 // For single-head MTP, empty data with expected_pos < 0 explicitly resets the carry;
 // the caller must separately clear any target/draft KV after a failed restore.
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+enum class common_speculative_capture_status { present, empty, error };
+// Unlike get_state, this distinguishes a known empty carry from an unknown or failed capture.
+common_speculative_capture_status common_speculative_capture_state(
+        common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data, llama_pos expected_pos = -1);
+bool common_speculative_clear_state(common_speculative * spec, llama_seq_id seq_id);
 bool common_speculative_validate_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data,
         llama_pos expected_pos = -1);

@@ -22,6 +22,17 @@ static void speculative_rollback_checkpoint_boundary() {
     assert( server_prompt_reuse_requires_checkpoint_search(false, 512, 512));
     assert( server_prompt_reuse_requires_checkpoint_search(true, 0, 528));
 
+    // A restored entry is only the source of a hit if rollback retained tokens.
+    std::string source = "ram";
+    server_prompt_cache_commit_source(source, 0);
+    assert(source == "none");
+    source = "ram";
+    server_prompt_cache_commit_source(source, 8);
+    assert(source == "ram");
+    source = "disk";
+    server_prompt_cache_commit_source(source, 0);
+    assert(source == "none");
+
     // A checkpoint may still match the request but extend beyond the restored
     // MTP continuation state. Ordinary checkpoints only need the shared prefix.
     assert(!server_prompt_checkpoint_must_prune(false, 100, 101, 100, 120, 100));
@@ -517,9 +528,31 @@ static void server_post_preflight_mutation_failure_clears_both_contexts() {
     };
     llama_pos planned_p0 = -1;
     const auto result = test_seq_rm_suffix(0, 5626, prompt_tokens, io, planned_p0);
-    assert(result == COMMON_MEMORY_SEQ_RM_MUTATION_FAILED);
+    assert(result == COMMON_MEMORY_SEQ_RM_FULL_REPROCESS);
+    assert(planned_p0 == 0);
     assert(main_partial && draft_partial);
     assert(main_cleared && draft_cleared);
+}
+
+static void server_failed_recovery_reports_mutation_failure() {
+    server_tokens prompt_tokens(llama_tokens(16, 1), false);
+    bool target_clear = false;
+    bool draft_clear = false;
+    const common_memory_seq_rm_io io {
+        /*.has_draft =*/ true,
+        /*.plan =*/ [](common_memory_context_kind, llama_seq_id, llama_pos, llama_pos,
+                       llama_pos &, llama_pos &) { return false; },
+        /*.can_remove =*/ [](common_memory_context_kind, llama_seq_id, llama_pos, llama_pos) { return false; },
+        /*.remove =*/ [&](common_memory_context_kind kind, llama_seq_id, llama_pos p0, llama_pos p1) {
+            assert(p0 == -1 && p1 == -1);
+            if (kind == COMMON_MEMORY_CONTEXT_TARGET) { target_clear = true; return false; }
+            draft_clear = true;
+            return true;
+        },
+    };
+    llama_pos planned_p0 = -1;
+    assert(test_seq_rm_suffix(0, 8, prompt_tokens, io, planned_p0) == COMMON_MEMORY_SEQ_RM_MUTATION_FAILED);
+    assert(target_clear && draft_clear && planned_p0 == -1);
 }
 
 static void server_planned_removal_preserves_atomic_media_chunks() {
@@ -660,6 +693,7 @@ int main() {
     slot_save_prefers_only_the_last_aligned_checkpoint();
     speculative_draft_rollback_uses_draft_axis_and_recovers();
     server_unsupported_removal_falls_back_to_full_reprocess();
+    server_failed_recovery_reports_mutation_failure();
     server_post_preflight_mutation_failure_clears_both_contexts();
     server_planned_removal_preserves_atomic_media_chunks();
     cache_phase_timings_are_public();

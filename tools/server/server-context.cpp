@@ -19,6 +19,7 @@
 #include "server-model-identity.h"
 #include "server-slot-budget.h"
 #include "server-native-slot.h"
+#include "server-native-ram-transaction.h"
 #include "server-native-refs.h"
 #include "server-native-rotation.h"
 #include "ggml-remote-attn-trace.h"
@@ -1968,8 +1969,8 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (clear_context_on_release || task->is_child() || task->is_stateless() || audio_stream ||
-                    task->type == SERVER_TASK_TYPE_TTS) {
+            if (!prompt_cleanup_failed && (clear_context_on_release || task->is_child() || task->is_stateless() || audio_stream ||
+                    task->type == SERVER_TASK_TYPE_TTS)) {
                 (void) prompt_clear(); // failure quarantines this slot before its next assignment
             }
 
@@ -3331,11 +3332,11 @@ static adaptive_slot_snapshot_blob adaptive_slot_capture(
     // [TAG_ADAPTIVE_SLOT_OWNER] Stamp the mixed-KVarN ownership this payload is
     // bound to so a later restore into a transitioned profile context can adopt
     // it before importing.
-    snapshot.owner_epoch_tgt = llama_kvarn_state_owner_epoch(ctx_tgt);
-    snapshot.owner_id_tgt    = llama_kvarn_state_owner_id(ctx_tgt);
+    snapshot.owner_epoch_tgt = llama_kvarn_state_owner_epoch_seq(ctx_tgt, slot.id);
+    snapshot.owner_id_tgt    = llama_kvarn_state_owner_id_seq(ctx_tgt, slot.id);
     if (ctx_dft) {
-        snapshot.owner_epoch_dft = llama_kvarn_state_owner_epoch(ctx_dft);
-        snapshot.owner_id_dft    = llama_kvarn_state_owner_id(ctx_dft);
+        snapshot.owner_epoch_dft = llama_kvarn_state_owner_epoch_seq(ctx_dft, slot.id);
+        snapshot.owner_id_dft    = llama_kvarn_state_owner_id_seq(ctx_dft, slot.id);
     }
 
     snapshot.pos_tgt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
@@ -3409,7 +3410,7 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
         llama_context * ctx_tgt,
         llama_context * ctx_dft,
         const server_tokens & tokens,
-        bool & dropped) {
+        llama_seq_id seq_id, bool & dropped) {
     const auto valid_bounds = [](const auto & bounds) {
         for (size_t i = 0; i < bounds.size(); i += 2) {
             const auto begin = bounds[i];
@@ -3450,8 +3451,8 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
     // snapshot's owners, which the caller adopted into this context before the
     // full-state import; stamp the same values so the checkpoints remain
     // replayable after cross-profile transitions.
-    checkpoint->owner_epoch = llama_kvarn_state_owner_epoch(ctx_tgt);
-    checkpoint->owner_id    = llama_kvarn_state_owner_id(ctx_tgt);
+    checkpoint->owner_epoch = llama_kvarn_state_owner_epoch_seq(ctx_tgt, seq_id);
+    checkpoint->owner_id    = llama_kvarn_state_owner_id_seq(ctx_tgt, seq_id);
     checkpoint->pos_min = source.pos_min;
     checkpoint->pos_max = source.pos_max;
     checkpoint->flags_tgt = source.flags_tgt;
@@ -3488,20 +3489,21 @@ static std::shared_ptr<common_prompt_checkpoint> adaptive_slot_make_checkpoint(
 // re-creates the destination context with a fresh process-random owner id and
 // an advanced epoch, so adopt the capture-time values before the replay. The
 // fine-grained payload validation still fails closed on any mismatch.
-static void adopt_checkpoint_owner(llama_context * ctx, const common_prompt_checkpoint & checkpoint, const char * label) {
-    if (!ctx || checkpoint.owner_epoch == 0) {
+static void adopt_checkpoint_owner(llama_context * ctx, llama_seq_id seq_id, bool position_split, bool restored_full, const common_prompt_checkpoint & checkpoint, const char * label) {
+    if (!ctx || checkpoint.owner_epoch == 0 ||
+            !server_prefix_checkpoint_policy::may_adopt_owner(position_split, restored_full)) {
         return;
     }
-    const uint64_t id_now = llama_kvarn_state_owner_id(ctx);
+    const uint64_t id_now = llama_kvarn_state_owner_id_seq(ctx, seq_id);
     if (checkpoint.owner_id != 0 && id_now != 0 && checkpoint.owner_id != id_now) {
-        if (llama_kvarn_adopt_state_owner_id(ctx, checkpoint.owner_id)) {
+        if (llama_kvarn_adopt_state_owner_id_seq(ctx, seq_id, checkpoint.owner_id)) {
             SRV_INF("adopted checkpoint %s owner id %llu (was %llu)\n", label,
                     (unsigned long long) checkpoint.owner_id, (unsigned long long) id_now);
         }
     }
-    const uint64_t epoch_now = llama_kvarn_state_owner_epoch(ctx);
+    const uint64_t epoch_now = llama_kvarn_state_owner_epoch_seq(ctx, seq_id);
     if (epoch_now != 0 && checkpoint.owner_epoch != epoch_now) {
-        if (llama_kvarn_adopt_state_owner_epoch(ctx, checkpoint.owner_epoch)) {
+        if (llama_kvarn_adopt_state_owner_epoch_seq(ctx, seq_id, checkpoint.owner_epoch)) {
             SRV_INF("adopted checkpoint %s lineage epoch %llu (was %llu)\n", label,
                     (unsigned long long) checkpoint.owner_epoch, (unsigned long long) epoch_now);
         }
@@ -3595,16 +3597,16 @@ static bool adaptive_slot_restore(
         if (!ctx || (owner_id == 0 && owner_epoch == 0)) {
             return true;
         }
-        const uint64_t id_now = llama_kvarn_state_owner_id(ctx);
+        const uint64_t id_now = llama_kvarn_state_owner_id_seq(ctx, slot.id);
         if (owner_id != 0 && id_now != 0 && owner_id != id_now) {
-            if (!llama_kvarn_adopt_state_owner_id(ctx, owner_id)) {
+            if (!llama_kvarn_adopt_state_owner_id_seq(ctx, slot.id, owner_id)) {
                 error = std::string("adaptive slot ") + label + " owner id is not adoptable";
                 return false;
             }
         }
-        const uint64_t epoch_now = llama_kvarn_state_owner_epoch(ctx);
+        const uint64_t epoch_now = llama_kvarn_state_owner_epoch_seq(ctx, slot.id);
         if (owner_epoch != 0 && epoch_now != 0 && owner_epoch != epoch_now) {
-            if (!llama_kvarn_adopt_state_owner_epoch(ctx, owner_epoch)) {
+            if (!llama_kvarn_adopt_state_owner_epoch_seq(ctx, slot.id, owner_epoch)) {
                 error = std::string("adaptive slot ") + label + " owner epoch is not adoptable";
                 return false;
             }
@@ -3686,12 +3688,12 @@ static bool adaptive_slot_restore(
         previous_pos_max = source.pos_max;
 
         auto checkpoint = adaptive_slot_make_checkpoint(
-            source, snapshot, ctx_tgt, ctx_dft, candidate.tokens, dropped_checkpoint);
+            source, snapshot, ctx_tgt, ctx_dft, candidate.tokens, slot.id, dropped_checkpoint);
         if (!checkpoint) {
             continue;
         }
 
-        adopt_checkpoint_owner(ctx_tgt, *checkpoint, "slot snapshot target");
+        adopt_checkpoint_owner(ctx_tgt, slot.id, slot.position_split_p > 0, true, *checkpoint, "slot snapshot target");
         const bool target_restored = checkpoint->restore_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         const bool target_bounds = target_restored &&
             llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id) == checkpoint->pos_min &&
@@ -5196,6 +5198,9 @@ private:
     // Returns false (caller keeps the synthesized fallback) when the sidecar is absent, invalid
     // or carries no compatible checkpoint.
     bool load_slot_checkpoints_from_sidecar(server_slot & slot, const std::string & state_path) {
+        if (!server_prefix_checkpoint_policy::may_load_sidecar(slot.position_split_p > 0, llama_n_seq_max(ctx_tgt))) {
+            return false;
+        }
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
                 ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
             return false;
@@ -5239,9 +5244,9 @@ private:
         }
         // Owner id first: every partial payload is owner-bound and the fresh
         // process has a different (process-random) id.
-        const uint64_t id_now = llama_kvarn_state_owner_id(ctx_tgt);
+        const uint64_t id_now = llama_kvarn_state_owner_id_seq(ctx_tgt, slot.id);
         if (owner_id != 0 && owner_id != id_now) {
-            if (llama_kvarn_adopt_state_owner_id(ctx_tgt, owner_id)) {
+            if (llama_kvarn_adopt_state_owner_id_seq(ctx_tgt, slot.id, owner_id)) {
                 SLT_INF(slot, "adopted durable checkpoint owner id %llu (was %llu)\n",
                         (unsigned long long) owner_id, (unsigned long long) id_now);
             } else {
@@ -5249,9 +5254,9 @@ private:
                         (unsigned long long) owner_id, (unsigned long long) id_now);
             }
         }
-        const uint64_t epoch_now = llama_kvarn_state_owner_epoch(ctx_tgt);
+        const uint64_t epoch_now = llama_kvarn_state_owner_epoch_seq(ctx_tgt, slot.id);
         if (adopt_epoch != 0 && adopt_epoch != epoch_now) {
-            if (llama_kvarn_adopt_state_owner_epoch(ctx_tgt, adopt_epoch)) {
+            if (llama_kvarn_adopt_state_owner_epoch_seq(ctx_tgt, slot.id, adopt_epoch)) {
                 SLT_INF(slot, "adopted durable checkpoint lineage epoch %llu (was %llu, save-time %llu)\n",
                         (unsigned long long) adopt_epoch, (unsigned long long) epoch_now,
                         (unsigned long long) owner_epoch);
@@ -5766,7 +5771,9 @@ private:
     // never between sampled generation tokens.
     void auto_save_slot_if_useful(server_slot & slot, const char * reason = "discard",
             bool split_prefix = false) {
-        if (llama_remote_native_kvarn_transient_active(ctx_tgt)) {
+        if (llama_remote_native_kvarn_transient_active_seq(ctx_tgt, slot.id) ||
+                (slot.position_split_p > 0 && llama_remote_native_kvarn_enabled(ctx_tgt) &&
+                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) >= int64_t(slot.position_split_p))) {
             // The unified auto-cache restore path has no native-restore RAM
             // reservation or native owner admission. Native overflow is
             // captured only by the explicit API and, when
@@ -5996,7 +6003,7 @@ private:
                 slot.task->params.cache_prompt && !slot.prompt.tokens.has_media();
         facts.slot_quiescent      = slot.is_processing() && slot.state == SLOT_STATE_GENERATING;
         facts.native_overflow     = ctx_tgt != nullptr &&
-                llama_remote_native_kvarn_transient_active(ctx_tgt);
+                llama_remote_native_kvarn_transient_active_seq(ctx_tgt, slot.id);
         auto skip = server_native_slot::automatic_save_decision(facts);
         if (skip != server_native_slot::automatic_save_skip::none) {
             SLT_INF(slot, "auto-save native overflow skipped: %s\n",
@@ -6138,7 +6145,12 @@ private:
 #if defined(LLAMA_F4_TEST_LOGIT_CAPTURE)
         capture_identity = std::getenv("F4_TEST_LOGIT_CAPTURE") != nullptr;
 #endif
-        if (adaptive || params.slot_save_auto || capture_identity || std::getenv("LLAMA_SERVER_ROUTER_STATE")) {
+        const bool native_multislot_snapshots = !adaptive && params.n_parallel > 1 &&
+                !params.slot_save_path.empty() && server_effective_position_split_p(params) > 0 &&
+                !params.remote_attn_host.empty() &&
+                common_resolve_remote_native_companion(params) != LLAMA_REMOTE_COMPANION_NONE;
+        if (adaptive || params.slot_save_auto || capture_identity || native_multislot_snapshots ||
+                std::getenv("LLAMA_SERVER_ROUTER_STATE")) {
             adaptive_model_identity.reset();
             try {
                 prepared_identity.emplace(server_model_identity::prepare(params.model.path, params.kv_overrides));
@@ -6895,10 +6907,17 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
-            return process_single_task(std::move(task), is_yielding);
+            if (!is_yielding) handle_shared_remote_failure();
+            const bool handled = process_single_task(std::move(task), is_yielding);
+            // While yielding a decode is still running; finish it before
+            // invalidating slots or releasing their state.
+            if (!is_yielding) handle_shared_remote_failure();
+            return handled;
         });
         queue_tasks.on_update_slots([this]() {
+            if (handle_shared_remote_failure()) return;
             update_slots();
+            handle_shared_remote_failure();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -7497,6 +7516,7 @@ private:
         }
         if (!slot->prompt.tokens.empty()) {
             slot->prompt_save(*prompt_cache);
+            if (handle_native_cache_invalidation()) return false;
             prompt_cache->update();
         }
         const auto cand = auto_index_lookup(req);
@@ -7581,6 +7601,7 @@ private:
             for (auto & slot : slots) {
                 if (!slot.prompt.tokens.empty()) {
                     slot.prompt_save(*prompt_cache);
+                    if (handle_native_cache_invalidation()) return false;
                 }
             }
             prompt_cache->update();
@@ -7756,6 +7777,12 @@ private:
         return true;
     }
 
+    bool clear_cache_slot(server_slot & slot) {
+        if (slot.prompt_clear()) return true;
+        handle_shared_remote_failure();
+        return false;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         if (elastic_paged_context && !has_context_reservation(task)) {
             SRV_DBG("%s", "deferring task: paged KV reservation exceeds an active admission limit\n");
@@ -7895,7 +7922,7 @@ private:
                     update_cache = false;
                 } else {
                     // Reset the peer before any cold replay into this context.
-                    if (!ret->prompt_clear()) return ret;
+                    if (!clear_cache_slot(*ret)) return ret;
                     SRV_WRN("%s", "RKVA ahead unavailable; reset peer and use normal prompt restore\n");
                 }
                 rkva_ahead_adopted_ = false;
@@ -7936,6 +7963,7 @@ private:
 
                 int64_t t_phase = ggml_time_us();
                 const auto * admitted = ret->prompt_save(*prompt_cache);
+                if (handle_native_cache_invalidation()) return ret;
                 ret->stats.cache_ram_save_ms = (ggml_time_us() - t_phase) / 1000.0;
 
                 t_phase = ggml_time_us();
@@ -7943,6 +7971,7 @@ private:
                     auto cache_result = ret->prompt_load_result(
                             *prompt_cache, task.tokens, admitted, prompt_reuse_alignment(),
                             uses_mtp() ? 0 : UINT32_MAX);
+                    if (handle_native_cache_invalidation()) return ret;
                     if (cache_result == server_prompt_cache_result::hit && rkva_ahead_ &&
                             rkva_ahead_->valid() && rkva_ahead_checkpoint_ &&
                             rkva_ahead_checkpoint_->owner_id == rkva_ahead_owner_id_ &&
@@ -7958,7 +7987,7 @@ private:
                                     ret->prompt.tokens.get_tokens().begin()) &&
                             std::equal(rkva_ahead_->tokens().begin(), rkva_ahead_->tokens().end(),
                                     task.tokens.get_tokens().begin())) {
-                        adopt_checkpoint_owner(ret->ctx_tgt, *rkva_ahead_checkpoint_, "ahead restored prefix");
+                        adopt_checkpoint_owner(ret->ctx_tgt, ret->id, ret->position_split_p > 0, true, *rkva_ahead_checkpoint_, "ahead restored prefix");
                         const llama_pos target = llama_pos(rkva_ahead_->target());
                         if (llama_kvarn_state_owner_id(ret->ctx_tgt) != rkva_ahead_owner_id_ ||
                                 llama_kvarn_state_owner_epoch(ret->ctx_tgt) != rkva_ahead_owner_epoch_ ||
@@ -7966,7 +7995,7 @@ private:
                                         nullptr, true, false, false) ||
                                 !ret->mem.seq_rm(ret->id, target, -1)) {
                             rkva_ahead_->invalidate();
-                            if (!ret->prompt_clear()) return ret;
+                            if (!clear_cache_slot(*ret)) return ret;
                             cache_result = server_prompt_cache_result::unchanged;
                             SRV_WRN("%s", "RKVA ahead checkpoint restore failed; clearing the local prefix\n");
                         } else {
@@ -7980,7 +8009,7 @@ private:
                              (cache_result == server_prompt_cache_result::unchanged && ret->prompt.tokens.empty()))) {
                         // A rejected cache entry leaves no reusable slot state.
                         // Handoff installs only into an empty private candidate.
-                        if (!ret->prompt_clear()) return ret;
+                        if (!clear_cache_slot(*ret)) return ret;
                         // One-way PURE KVarN -> MIXED handoff: the prompt-cache
                         // load rejected the pure snapshot for the mixed target;
                         // attempt bounded prefix reuse before the cold path.
@@ -8047,11 +8076,13 @@ private:
                     } else if (cache_result == server_prompt_cache_result::needs_bootstrap) {
                         ret->bootstrap_pending = true;
                         ret->just_restored = true;
+                        ret->prompt_cache_source = "ram";
                         SLT_INF(*ret, "%s", "target-only cache hit requires MTP bootstrap suffix\n");
                     } else if (cache_result == server_prompt_cache_result::hit) {
                         ret->just_restored = true;
+                        ret->prompt_cache_source = "ram";
                     } else if (cache_result != server_prompt_cache_result::unchanged) {
-                        if (!ret->prompt_clear()) return ret;
+                        if (!clear_cache_slot(*ret)) return ret;
                     }
                 }
                 ret->stats.cache_ram_load_ms = (ggml_time_us() - t_phase) / 1000.0;
@@ -8360,7 +8391,7 @@ private:
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
         } else {
-            slot.state = slot.task->is_child()
+            slot.state = slot.task->is_child() && !(slot.position_split_p > 0 && llama_n_seq_max(ctx_tgt) > 1)
                 ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
                 : SLOT_STATE_STARTED;
         }
@@ -9120,6 +9151,10 @@ private:
             if (prompt_cache && slot->prompt_save(*prompt_cache)) {
                 prompt_cache->update();
             }
+            if (handle_native_cache_invalidation()) {
+                send_error(parent_task, "native RAM cache invalidated the context", ERROR_TYPE_SERVER);
+                return false;
+            }
 
             int id_child = parent_task.child_tasks[idx].id;
             if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
@@ -9142,6 +9177,13 @@ private:
 
 // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        if (server_prefix_checkpoint_policy::skip_single_native_prefill(
+                llama_n_seq_max(ctx_tgt), ctx_tgt->get_cparams().kv_position_split_p,
+                ctx_tgt->get_cparams().remote_attn_position_split,
+                ctx_tgt->get_cparams().remote_attn_native_companion != LLAMA_REMOTE_COMPANION_NONE,
+                n_tokens_cur)) {
+            return;
+        }
         const int id_task = slot.task ? slot.task->id : -1;
 
         const int64_t n_tokens_checkpoint = slot.prompt.n_tokens() - n_tokens_cur;
@@ -9166,8 +9208,8 @@ private:
         // instant the payload is captured; the epoch can advance between the
         // checkpoint creation and a later SLOT_SAVE, so the per-checkpoint value
         // is the only one a future replay must adopt.
-        cur.owner_epoch = llama_kvarn_state_owner_epoch(ctx_tgt);
-        cur.owner_id    = llama_kvarn_state_owner_id(ctx_tgt);
+        cur.owner_epoch = llama_kvarn_state_owner_epoch_seq(ctx_tgt, slot.id);
+        cur.owner_id    = llama_kvarn_state_owner_id_seq(ctx_tgt, slot.id);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -9263,9 +9305,12 @@ private:
         e.native_stream = automatic || task.slot_action.native_stream;
         e.adaptive = common_context_is_adaptive(params_base);
         e.profile_xxxl = active_context_profile == COMMON_CONTEXT_PROFILE_XXXLONG;
-        e.one_sequence = true;
+        e.nonadaptive_multislot = !automatic && !e.adaptive && task.slot_action.native_stream &&
+                slot.position_split_p > 0 && llama_n_seq_max(ctx_tgt) > 1 &&
+                llama_remote_native_kvarn_enabled(ctx_tgt);
+        e.one_sequence = llama_n_seq_max(ctx_tgt) == 1 || e.nonadaptive_multislot;
         e.snapshot_supported = llama_remote_native_kvarn_snapshot_supported(ctx_tgt);
-        e.native_active = llama_remote_native_kvarn_transient_active(ctx_tgt);
+        e.native_active = llama_remote_native_kvarn_transient_active_seq(ctx_tgt, slot.id);
         e.draft_present = ctx_dft != nullptr;
         e.can_speculate = slot.can_speculate();
         e.incompatible_route_flags = task.slot_action.route_state_transfer ||
@@ -9273,6 +9318,14 @@ private:
         e.slot_empty = slot.prompt.tokens.empty() && slot.prompt.checkpoints.empty() &&
                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) < 0;
         e.all_sequences_empty = e.slot_empty;
+        if (!e.nonadaptive_multislot) {
+            for (uint32_t seq = 0; seq < llama_n_seq_max(ctx_tgt); ++seq) {
+                if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq) >= 0) {
+                    e.all_sequences_empty = false;
+                    break;
+                }
+            }
+        }
         e.media = slot.prompt.tokens.has_media();
         e.identity_available = adaptive_model_identity.has_value();
         e.unmodified_model = params_base.lora_adapters.empty() && slot.lora.empty() &&
@@ -9432,7 +9485,7 @@ private:
             // exclusive store lock. Any later failure leaves it pending for
             // reconciliation; the journal is never rewritten or deleted by
             // host-file eviction.
-            const bool native_pair = llama_remote_native_kvarn_transient_active(ctx_tgt);
+            const bool native_pair = llama_remote_native_kvarn_transient_active_seq(ctx_tgt, slot.id);
             const auto registry_lock_held = [&store](const std::string & path) {
                 return store.owns_exclusive_for(path);
             };
@@ -9744,12 +9797,12 @@ private:
                     &native_slot_cache_reservation::reserve, &reservation);
             // From this point the core may send a restore/reset and poison the
             // backend even if it returns zero. Never retry a local candidate.
+            mutated = true;
             const size_t read = server_native_slot::invoke_native_loader(loader_called, [&]() {
                 return llama_state_seq_load_file_streaming_native(ctx_tgt,
                         state_path.c_str(), slot.id, loaded.data(), loaded.size(),
                         &count, file.state_bytes, file.state_checksum);
             });
-            mutated = read != 0;
             if (read != file.state_bytes || count != file.tokens.size() || loaded != file.tokens ||
                     !llama_state_seq_restore_was_native(ctx_tgt) ||
                     llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != file.position) {
@@ -9780,9 +9833,9 @@ private:
             return true;
         } catch (const std::bad_alloc &) {
             if (mutated) {
-                server_native_slot::clear_failed_restore(slot, [&]() {
-                    llama_memory_clear(llama_get_memory(ctx_tgt), true);
-                });
+                if (!server_native_slot::clear_failed_restore(slot)) {
+                    SLT_ERR(slot, "%s", "native restore cleanup failed; slot quarantined\n");
+                }
             }
             if (automatic) {
                 SLT_WRN(slot, "%s", "auto-restore: native streaming allocation failed\n");
@@ -9791,9 +9844,9 @@ private:
             }
         } catch (const std::exception & err) {
             if (mutated) {
-                server_native_slot::clear_failed_restore(slot, [&]() {
-                    llama_memory_clear(llama_get_memory(ctx_tgt), true);
-                });
+                if (!server_native_slot::clear_failed_restore(slot)) {
+                    SLT_ERR(slot, "%s", "native restore cleanup failed; slot quarantined\n");
+                }
             }
             if (automatic) {
                 SLT_WRN(slot, "auto-restore: native streaming failed: %s\n", err.what());
@@ -10362,6 +10415,7 @@ private:
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
                                 const bool saved = slot.prompt_save(*prompt_cache);
+                                if (handle_native_cache_invalidation()) break;
                                 if (saved) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
@@ -10373,7 +10427,13 @@ private:
                                 // another logical sequence owns the shared stream.
                                 if (params_base.kv_unified && saved) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
+                                    const bool cleared = slot.prompt_clear();
+                                    if (!server_native_ram_idle_clear_safe(cleared,
+                                            [&] { return llama_remote_attn_backend_failed(ctx_tgt); },
+                                            [&] {
+                                                prompt_cache->native_context_invalidated = true;
+                                                handle_native_cache_invalidation();
+                                            })) break;
                                 }
                             }
                         }
@@ -10528,6 +10588,15 @@ private:
                     // absent.
                     if (task.slot_action.native_stream) {
                         save_native_stream_slot(task, *slot);
+                        break;
+                    }
+
+                    if (slot->position_split_p > 0 && llama_remote_native_kvarn_enabled(ctx_tgt) &&
+                            (llama_remote_native_kvarn_transient_active_seq(ctx_tgt, slot->id) ||
+                             llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) >=
+                                     int64_t(slot->position_split_p))) {
+                        send_error(task, "Native overflow save requires native_stream=true for registered publication",
+                                   ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
 
@@ -10686,7 +10755,7 @@ private:
                         const auto save_ckpt = server_prompt_save_aligned_checkpoint(
                                 slot->prompt.checkpoints, (int64_t) n_saved_tokens, prompt_reuse_alignment());
                         if (save_ckpt) {
-                            adopt_checkpoint_owner(ctx_tgt, *save_ckpt, "slot save target");
+                            adopt_checkpoint_owner(ctx_tgt, slot->id, slot->position_split_p > 0, false, *save_ckpt, "slot save target");
                         }
                         if (save_ckpt && save_ckpt->restore_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                             SLT_INF(*slot, "saving aligned prompt state (%d tokens) instead of the full slot state (%zu tokens)\n",
@@ -10776,12 +10845,12 @@ private:
                                     *checkpoint, ctx_dft, evaluated, pos_tgt));
                             ckpt_epochs.push_back(checkpoint->owner_epoch != 0
                                     ? checkpoint->owner_epoch
-                                    : llama_kvarn_state_owner_epoch(ctx_tgt));
+                                    : llama_kvarn_state_owner_epoch_seq(ctx_tgt, slot->id));
                         }
                         if (!ckpt_blobs.empty()) {
                             if (slot_checkpoints_write(ckpt_sidecar, ckpt_blobs, ckpt_epochs,
-                                    llama_kvarn_state_owner_epoch(ctx_tgt),
-                                    llama_kvarn_state_owner_id(ctx_tgt))) {
+                                    llama_kvarn_state_owner_epoch_seq(ctx_tgt, slot->id),
+                                    llama_kvarn_state_owner_id_seq(ctx_tgt, slot->id))) {
                                 SLT_INF(*slot, "persisted %zu context checkpoint(s) alongside the slot state\n",
                                         ckpt_blobs.size());
                             } else {
@@ -11226,11 +11295,13 @@ private:
 
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
+            if (shared_remote_failed()) return;
             try {
                 callback(slot);
             } catch (const std::exception & e) {
                 SLT_ERR(slot, "got exception: %s\n", e.what());
                 send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                if (shared_remote_failed()) slot.prompt_cleanup_failed = true;
                 slot.release();
             }
         }
@@ -11238,11 +11309,13 @@ private:
 
     void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
+            if (shared_remote_failed()) return;
             try {
                 callback(*slot);
             } catch (const std::exception & e) {
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                if (shared_remote_failed()) slot->prompt_cleanup_failed = true;
                 slot->release();
             }
         }
@@ -11255,6 +11328,32 @@ private:
                 slot.release();
             }
         }
+    }
+
+    bool shared_remote_failed() const {
+        return (ctx_tgt && llama_remote_attn_backend_failed(ctx_tgt)) ||
+               (ctx_dft && llama_remote_attn_backend_failed(ctx_dft));
+    }
+
+    bool handle_shared_remote_failure() {
+        if (!shared_remote_failed()) return false;
+        if (prompt_cache) prompt_cache->native_context_invalidated = true;
+        // The flags are set before abort so later queue/phase checks are
+        // idempotent and released slots never try another remote clear.
+        if (adaptive_context_unavailable && std::all_of(slots.begin(), slots.end(),
+                [](const server_slot & slot) { return slot.prompt_cleanup_failed; })) return true;
+        server_native_ram_invalidate_shared_context(slots, adaptive_context_unavailable,
+                [&] { publish_adaptive_status(); },
+                [&] { abort_all_slots("remote attention failure invalidated the shared context"); });
+        return true;
+    }
+
+    bool handle_native_cache_invalidation() {
+        if (!prompt_cache || !prompt_cache->native_context_invalidated) return false;
+        server_native_ram_invalidate_shared_context(slots, adaptive_context_unavailable,
+                [&] { publish_adaptive_status(); },
+                [&] { abort_all_slots("native RAM cache invalidated the shared context"); });
+        return true;
     }
 
     // @ngxson : for debugging only
@@ -11405,19 +11504,21 @@ private:
             pre_decode();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
-            abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+            if (!handle_shared_remote_failure()) abort_all_slots("pre_decode() failed: " + std::string(e.what()));
 
             // the batch is half-built and not rendered, skip now to avoid UB
             return;
         }
+        if (handle_shared_remote_failure()) return;
 
         // note: TTS slots bypass the shared batch entirely
         try {
             process_tts_slots();
         } catch (const std::exception & e) {
             SRV_ERR("process_tts_slots() failed: %s\n", e.what());
-            abort_all_slots("process_tts_slots() failed: " + std::string(e.what()));
+            if (!handle_shared_remote_failure()) abort_all_slots("process_tts_slots() failed: " + std::string(e.what()));
         }
+        if (handle_shared_remote_failure()) return;
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
@@ -11451,6 +11552,7 @@ private:
                 batch.render(off, n_tokens);
                 bool retry_cold = false;
                 bool ok = decode(n_batch, off, retry_cold);
+                if (handle_shared_remote_failure()) return;
                 if (retry_cold) {
                     batch.clear();
                     return;
@@ -11471,16 +11573,17 @@ private:
                 }
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
-                abort_all_slots("decode() failed: " + std::string(e.what()));
+                if (!handle_shared_remote_failure()) abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off);
+                if (handle_shared_remote_failure()) return;
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
-                abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                if (!handle_shared_remote_failure()) abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
         }
@@ -11636,6 +11739,8 @@ private:
             }
         });
 
+        if (shared_remote_failed()) return;
+
         // start populating the batch for this iteration
         batch.clear();
 
@@ -11760,6 +11865,8 @@ private:
             }
         });
 
+        if (shared_remote_failed()) return;
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t t_draft_start = ggml_time_us();
@@ -11767,6 +11874,7 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            if (shared_remote_failed()) return;
             dflash_trace("draft_call", trace_draft_start, dflash_trace_tick_us(), (int) drafting.size());
             const float shared_draft_ms = (ggml_time_us() - t_draft_start) / 1000.0f;
             if (dflash_shadow_trace_enabled()) {
@@ -11837,6 +11945,7 @@ private:
                 const auto rollback = server_speculative_draft_rollback(
                         rm_p0, rollback_io, applied_p0);
                 if (rollback == SERVER_SPECULATIVE_DRAFT_ROLLBACK_FAILED) {
+                    if (shared_remote_failed()) return;
                     GGML_ABORT("failed to remove draft sequence %d from %d\n", slot.id, rm_p0);
                 }
                 if (rollback == SERVER_SPECULATIVE_DRAFT_ROLLBACK_WIDENED) {
@@ -11898,6 +12007,8 @@ private:
                 }
             }
         });
+
+        if (shared_remote_failed()) return;
 
         // update the batch with the sampled/drafted tokens
         const int64_t trace_batch_start = dflash_trace_tick_us();
@@ -12476,7 +12587,7 @@ private:
                                     if (!do_reset) {
                                         // PARTIAL_ONLY leaves future attention KV present until suffix removal below.
                                         const auto & checkpoint = **it;
-                                        adopt_checkpoint_owner(ctx_tgt, checkpoint, "reuse target");
+                                        adopt_checkpoint_owner(ctx_tgt, slot.id, slot.position_split_p > 0, false, checkpoint, "reuse target");
                                         do_reset = !checkpoint.restore_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         const auto draft_restore = do_reset ? common_checkpoint_restore::failed :
                                             checkpoint.restore_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -12555,6 +12666,7 @@ private:
                                                 fail_slot(slot, "failed to clear memory before cold prefill");
                                                 return;
                                             }
+                                            server_prompt_cache_commit_source(slot.prompt_cache_source, 0);
                                             common_speculative_set_state(spec.get(), slot.id, {});
                                             if (retry_native_snapshot) {
                                                 slot.prompt_reset_after_memory_clear();
@@ -12651,7 +12763,7 @@ private:
                     const auto seq_rm_result = slot.mem.seq_rm_suffix(
                             slot.id, p0, normalize_p0, planned_p0);
                     if (seq_rm_result == COMMON_MEMORY_SEQ_RM_MUTATION_FAILED) {
-                        slot.prompt_reset_after_memory_clear();
+                        slot.prompt_cleanup_failed = true;
                         send_error(slot, "internal prompt-cache rollback failure", ERROR_TYPE_SERVER);
                         slot.release();
                         return;
@@ -12685,6 +12797,7 @@ private:
                         // FULL_REPROCESS has already cleared the prompt; failed
                         // mutations return above without publishing a cache hit.
                         slot.stats.n_prompt_cached = slot.prompt.tokens.size_up_to_pos(planned_p0);
+                        server_prompt_cache_commit_source(slot.prompt_cache_source, slot.stats.n_prompt_cached);
                         metrics.add_prompt_cached(slot.stats.n_prompt_cached);
                         slot.prompt_cache_metrics_pending = false;
                     }

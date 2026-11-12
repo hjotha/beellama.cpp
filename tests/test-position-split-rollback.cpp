@@ -84,6 +84,26 @@ int main() {
     check(llama_decode_aborted_code(true,  false) == -4, "D rollback-failed terminal");
     check(llama_decode_aborted_code(false, true)  == -4, "D remote-failed terminal");
     check(llama_decode_aborted_code(true,  true)  == -4, "D both-failed terminal");
+    // An acknowledged upload can leave remote rows after the local failed
+    // ubatch is removed. A denied TRIM must trigger full invalidation.
+    {
+        int local_rows = 101, remote_rows = 101, trims = 0, resets = 0;
+        const auto remove = [&](llama_seq_id, llama_pos p0, llama_pos) {
+            local_rows = p0 < 0 ? 0 : p0;
+            return true;
+        };
+        const auto notify = [&](llama_seq_id, llama_pos p0, llama_pos) {
+            if (p0 >= 0) { ++trims; return false; }
+            ++resets; remote_rows = 0; return true;
+        };
+        const auto r = llama_rollback_sequence_after_decode_failure(
+                [&](llama_seq_id id, llama_pos p0, llama_pos p1) {
+                    return llama_rollback_remove_and_notify(remove, notify, id, p0, p1);
+                }, 0, 100);
+        check(r == LLAMA_ROLLBACK_FULL && trims == 1 && resets == 1, "E denied trim falls back to reset");
+        check(local_rows == 0 && remote_rows == 0 && llama_decode_aborted_code(true, false) == -4,
+              "E full reset prevents retry with stale owner");
+    }
     // C: cleanup policy (no abort on empty/full-clear refusals; partial fails).
     check( common_seq_rm_cleanup_tolerated(true,  false), "C removed");
     check( common_seq_rm_cleanup_tolerated(false, true), "C empty full tolerated");

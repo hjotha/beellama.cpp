@@ -10,6 +10,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <functional>
 #include <initializer_list>
 #include <vector>
@@ -20,6 +21,12 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+
+// Thrown only before seq_cp has changed any memory or staged copy.
+class llama_memory_seq_cp_rejected : public std::logic_error {
+public:
+    using std::logic_error::logic_error;
+};
 
 struct llama_state_q4_source;
 struct llama_state_q4_info;
@@ -273,6 +280,8 @@ struct llama_memory_i {
     // Returns the total number of cells at the position (may exceed n_max).
     virtual int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) = 0;
 
+    // Opt-in: unchecked implementations may assert or silently ignore copies.
+    virtual bool can_seq_cp(llama_seq_id, llama_seq_id, llama_pos, llama_pos) const { return false; }
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
 
     virtual void seq_keep(llama_seq_id seq_id) = 0;

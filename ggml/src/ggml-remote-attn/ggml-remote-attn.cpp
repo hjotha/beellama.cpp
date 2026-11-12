@@ -1005,6 +1005,7 @@ struct rkva_pending_native_state {
     std::vector<rkva_native_state::Storage> layers;
     uint32_t rows = 0;
     uint64_t saved_generation = 0;
+    uint32_t session = RKVA_SESSION_NONE;
 };
 
 struct ggml_backend_remote_attn_context {
@@ -6035,6 +6036,7 @@ bool ggml_backend_remote_attn_native_kvarn_state_read_bounded(
     if (!rkva_kvarn_generation_mutable(generation)) return false;
     pending->rows = rows;
     pending->saved_generation = generation;
+    pending->session = ctx->active_session;
     ctx->pending_native_state = std::move(pending);
     *live_rows = rows;
     *saved_generation = generation;
@@ -6171,7 +6173,8 @@ bool ggml_backend_remote_attn_native_kvarn_state_commit(
         return false;
     auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
     auto lock = rkva_lock_ctx_drained(ctx);
-    if (!ctx->pending_native_state || ctx->pending_native_state->layers.size() != ctx->geo.n_layer_remote ||
+    if (!ctx->pending_native_state || ctx->pending_native_state->session != ctx->active_session ||
+            ctx->pending_native_state->layers.size() != ctx->geo.n_layer_remote ||
             ctx->native_layers.size() != ctx->geo.n_layer_remote)
         return false;
     auto & pending = *ctx->pending_native_state;
@@ -6216,6 +6219,126 @@ bool ggml_backend_remote_attn_native_kvarn_state_commit(
     }
     ctx->pending_native_state.reset();
     return true;
+}
+
+bool ggml_backend_remote_attn_native_kvarn_rehydrate_pending(
+        ggml_backend_t backend, uint64_t max_scratch_bytes) {
+    if (!backend || ggml_backend_is_local_split(backend)) return false;
+    auto * ctx = static_cast<ggml_backend_remote_attn_context *>(backend->context);
+    auto lock = rkva_lock_ctx_drained(ctx);
+    if (!ctx->connected || ctx->failed || !ctx->range_configured || !ctx->range_native_kvarn ||
+            !ctx->native_serial_prefix || ctx->native_descriptor.layout_version != 3 ||
+            ctx->native_descriptor.key_bits != 4 || ctx->native_descriptor.value_bits != 4 ||
+            !ctx->native_store || ctx->active_session == RKVA_SESSION_NONE ||
+            !ctx->pending_native_state || ctx->pending_native_state->session != ctx->active_session ||
+            ctx->pending_native_state->layers.size() != ctx->geo.n_layer_remote ||
+            ctx->native_layers.size() != ctx->geo.n_layer_remote ||
+            ctx->range_layers.size() != ctx->native_layers.size() || ctx->range_epoch == UINT64_MAX ||
+            !rkva_kvarn_generation_mutable(ctx->native_generation) ||
+            uint64_t(uint32_t(ctx->native_generation)) + 1 + ctx->geo.n_layer_remote >= UINT32_MAX) {
+        return false;
+    }
+    for (size_t i = 0; i < ctx->native_layers.size(); ++i) {
+        if ((ctx->native_layers[i] && ctx->native_layers[i]->rows()) || ctx->range_layers[i].rows) {
+            return false;
+        }
+    }
+    auto & pending = *ctx->pending_native_state;
+    if (pending.layers.empty() || !pending.rows) return false;
+    const auto layout = pending.layers.front().layout;
+    const uint64_t records = rkva_native_state::records_bytes(layout);
+    const uint64_t stage = layout.compact_stage ? 0 : rkva_native_state::stage_bytes(layout);
+    const uint64_t tail_rows = std::min(layout.rows, layout.precision_tail_tokens);
+    const uint64_t row_bytes = rkva_native_state::width(layout) * sizeof(uint16_t);
+    const uint64_t tail = tail_rows * row_bytes;
+    const uint64_t frame_bytes = rkva_native_state::saturating_add(sizeof(rkva_kvarn_range_upload),
+            rkva_native_state::saturating_mul(2, rkva_native_state::saturating_add(
+                    rkva_native_state::saturating_add(records, stage), tail)));
+    const uint64_t owners_bytes = rkva_native_state::saturating_mul(
+            rkva_native_state::owner_storage_bytes(layout), pending.layers.size());
+    const uint64_t margin = rkva_native_state::saturating_add(8ull << 20,
+            rkva_native_state::saturating_mul(pending.layers.size(), 1ull << 20));
+    const uint64_t required = rkva_native_state::saturating_add(
+            rkva_native_state::saturating_add(owners_bytes, frame_bytes), margin);
+    if (frame_bytes > (256u << 20) || frame_bytes > SIZE_MAX ||
+            required == UINT64_MAX || required > max_scratch_bytes) return false;
+
+    bool remote_mutated = false;
+    try {
+        std::vector<std::unique_ptr<rkva_native_owner>> owners;
+        std::vector<rkva_native_state::View> views;
+        std::vector<ggml_backend_remote_attn_context::range_layer> ranges(ctx->range_layers.size());
+        std::vector<uint8_t> payload(size_t(frame_bytes), 0), reply;
+        owners.reserve(pending.layers.size());
+        views.reserve(pending.layers.size());
+        for (auto & state : pending.layers) {
+            auto owner = rkva_new_native_owner(ctx);
+            std::string error;
+            if (!owner || !owner->state_import(state, &error)) {
+                ctx->pending_native_state.reset();
+                return false;
+            }
+            rkva_native_state::View view;
+            if (!owner->state_export(ctx->native_generation, view) || view.layout.rows != pending.rows) {
+                ctx->pending_native_state.reset();
+                return false;
+            }
+            views.push_back(view);
+            owners.push_back(std::move(owner));
+        }
+        const uint32_t rows = pending.rows;
+        const uint64_t next_epoch = ctx->range_epoch + 1;
+        const uint32_t session = ctx->active_session;
+        ctx->pending_native_state.reset();
+        remote_mutated = true;
+        if (!rkva_transact(ctx, RKVA_RESET, session, 0, 0, nullptr, 0, reply, 0) || !reply.empty()) {
+            rkva_poison_remote_state_locked(ctx);
+            rkva_destroy_poisoned_state_locked(ctx);
+            return false;
+        }
+        uint64_t generation = ctx->native_generation + 1;
+        for (size_t il = 0; il < views.size(); ++il) {
+            const auto & view = views[il];
+            const rkva_kvarn_range_upload header {rows, 0, rows / 128,
+                RKVA_KVARN_UPLOAD_RESET | (layout.compact_stage ? RKVA_KVARN_UPLOAD_OMIT_STAGE : 0u),
+                0, 0, {0, 0}};
+            size_t offset = 0;
+            const auto append = [&](const void * data, size_t size) {
+                if (size) std::memcpy(payload.data() + offset, data, size);
+                offset += size;
+            };
+            append(&header, sizeof(header));
+            append(view.records_k, size_t(records)); append(view.records_v, size_t(records));
+            if (stage) { append(view.stage_k, size_t(stage)); append(view.stage_v, size_t(stage)); }
+            for (const uint8_t * plane : {view.tail_k, view.tail_v}) {
+                for (uint32_t row = rows - uint32_t(tail_rows); row < rows; ++row) {
+                    append(plane + size_t(row % layout.precision_tail_tokens) * size_t(row_bytes), size_t(row_bytes));
+                }
+            }
+            if (offset != payload.size() ||
+                    !rkva_transact(ctx, RKVA_KVARN_RANGE_UPLOAD, session, uint32_t(il), 0,
+                            payload.data(), uint32_t(payload.size()), reply, 0) || !reply.empty()) {
+                rkva_poison_remote_state_locked(ctx);
+                rkva_destroy_poisoned_state_locked(ctx);
+                return false;
+            }
+            ++generation;
+            ranges[il].epoch = next_epoch;
+            ranges[il].rows = rows;
+        }
+        ctx->native_layers.swap(owners);
+        ctx->range_layers.swap(ranges);
+        ctx->range_epoch.store(next_epoch);
+        ctx->native_generation = generation;
+        return true;
+    } catch (...) {
+        ctx->pending_native_state.reset();
+        if (remote_mutated) {
+            rkva_poison_remote_state_locked(ctx);
+            rkva_destroy_poisoned_state_locked(ctx);
+        }
+        return false;
+    }
 }
 
 void ggml_backend_remote_attn_native_kvarn_state_abort(ggml_backend_t backend) {
@@ -6273,15 +6396,29 @@ void ggml_backend_remote_attn_invalidate_range(ggml_backend_t backend) {
 void ggml_backend_remote_attn_invalidate_session(ggml_backend_t backend, uint32_t session_id) {
     if (!backend || ggml_backend_is_local_split(backend)) return;
     auto * ctx = (ggml_backend_remote_attn_context *) backend->context;
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    if (ctx->active_session == session_id) {
-        ++ctx->range_epoch;
-    } else {
-        auto it = ctx->sessions.find(session_id);
-        if (it != ctx->sessions.end()) {
-            ++it->second.range_epoch;
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        if (ctx->active_session == session_id) {
+            ++ctx->range_epoch;
+        } else {
+            auto it = ctx->sessions.find(session_id);
+            if (it != ctx->sessions.end()) ++it->second.range_epoch;
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(ctx->async_mutex);
+        for (auto & s : ctx->async_slots) {
+            if (s.session == session_id && s.state == rkva_slot_state::PENDING) {
+                if (s.cohort_count) {
+                    ctx->failed = true;
+                    ctx->connected = false;
+                }
+                s.state = rkva_slot_state::DONE_ERR;
+            }
+        }
+    }
+    ctx->async_cv.notify_all();
+    rkva_async_drain(ctx);
 }
 
 bool ggml_backend_remote_attn_native_kvarn_enabled(ggml_backend_t backend) {

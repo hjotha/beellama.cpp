@@ -1,6 +1,7 @@
 #include "common.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-model.h"
 #include "server-task.h"
 #include "speculative.h"
 
@@ -24,6 +25,132 @@
 // Same ceiling as the planned production scenario; buffers are allocated only as used.
 // Failure/eviction cases below still derive their smaller bounds from actual snapshot sizes.
 static constexpr int32_t cache_budget_mib = 2048;
+
+static void test_eagle_capture(llama_model * model, llama_context * target, llama_context * draft,
+                               const common_params_speculative & params) {
+    // Synthetic EAGLE driver: test only deferred-boundary ownership, not inference.
+    auto saved_layers = model->target_layer_ids;
+    model->target_layer_ids = {0, 1, 2};
+    {
+        auto eagle_params = params;
+        eagle_params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 };
+        eagle_params.draft.ctx_tgt = target;
+        eagle_params.draft.ctx_dft = draft;
+        common_speculative_ptr eagle(common_speculative_init(eagle_params, 1));
+        CHECK(eagle);
+        std::vector<uint8_t> captured;
+        CHECK(common_speculative_capture_state(eagle.get(), 0, captured) == common_speculative_capture_status::empty);
+        CHECK(common_speculative_capture_state(eagle.get(), -1, captured) == common_speculative_capture_status::error);
+        CHECK(common_speculative_capture_state(eagle.get(), 1, captured) == common_speculative_capture_status::error);
+        const llama_pos position = 3;
+        std::vector<uint8_t> state(sizeof(position) + size_t(llama_model_n_embd_out(model))*sizeof(float));
+        std::memcpy(state.data(), &position, sizeof(position));
+        CHECK(common_speculative_set_state(eagle.get(), 0, state, position));
+        CHECK(common_speculative_capture_state(eagle.get(), 0, captured, position) == common_speculative_capture_status::present);
+        CHECK(captured == state);
+        const auto valid_state = state;
+        CHECK(common_speculative_capture_state(eagle.get(), 0, captured, position + 1) == common_speculative_capture_status::error);
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        std::memcpy(state.data() + sizeof(position), &nan, sizeof(nan));
+        CHECK(!common_speculative_set_state(eagle.get(), 0, state, position));
+        CHECK(common_speculative_capture_state(eagle.get(), 0, captured, position) == common_speculative_capture_status::present && captured == valid_state);
+        const float inf = std::numeric_limits<float>::infinity();
+        std::memcpy(state.data() + sizeof(position), &inf, sizeof(inf));
+        CHECK(!common_speculative_set_state(eagle.get(), 0, state, position));
+        state = valid_state;
+        state.pop_back();
+        CHECK(!common_speculative_set_state(eagle.get(), 0, state, position));
+        CHECK(common_speculative_capture_state(eagle.get(), 0, captured, position) == common_speculative_capture_status::present && captured == valid_state);
+        CHECK(common_speculative_clear_state(eagle.get(), 0));
+        CHECK(common_speculative_capture_state(eagle.get(), 0, captured) == common_speculative_capture_status::empty);
+        const auto saved_arch = model->arch;
+        model->arch = LLM_ARCH_LLAMA;
+        CHECK(common_speculative_capture_state(eagle.get(), 0, captured) == common_speculative_capture_status::empty);
+        CHECK(common_speculative_clear_state(eagle.get(), 0));
+        model->arch = saved_arch;
+    }
+    model->target_layer_ids = std::move(saved_layers);
+}
+
+static void test_native_corrupt_entry_retry(llama_context * ctx) {
+    llama_batch batch = llama_batch_init(8, 0, 1);
+    for (int i = 0; i < 4; ++i) common_batch_add(batch, i + 1, i, {0}, true);
+    CHECK(llama_decode(ctx, batch) == 0);
+    server_prompt saved;
+    saved.tokens = server_tokens(llama_tokens {1, 2, 3, 4}, false);
+    server_prompt_cache cache(cache_budget_mib, 0);
+    CHECK(cache.save(saved, ctx, nullptr, nullptr, 0));
+    auto & good = cache.states.front();
+
+    cache.states.emplace_back();
+    auto & bad = cache.states.back();
+    bad.model = good.model;
+    bad.model_instance = good.model_instance;
+    bad.layout_tgt = good.layout_tgt;
+    bad.pos_tgt = 4;
+    bad.native_ram = true;
+    bad.prompt.tokens = server_tokens(llama_tokens {1, 2, 3, 4, 5}, false);
+    bad.data.main = good.data.main;
+    bad.checksum = bad.digest();
+    CHECK(!bad.data.main.empty());
+    bad.data.main[0] ^= 1;
+
+    CHECK(llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1));
+    common_batch_clear(batch);
+    common_batch_add(batch, 9, 0, {0}, true);
+    CHECK(llama_decode(ctx, batch) == 0);
+    server_prompt live;
+    live.tokens = server_tokens(llama_tokens {9}, false);
+    server_tokens request(llama_tokens {1, 2, 3, 4, 5, 6}, false);
+    const size_t bytes = llama_state_seq_get_size(ctx, 0);
+    std::vector<uint8_t> before(bytes), after(bytes);
+    CHECK(bytes && llama_state_seq_get_data(ctx, before.data(), bytes, 0) == bytes);
+
+    // With no usable alternative, quarantine must leave the live sequence intact.
+    good.quarantined = true;
+    CHECK(cache.load(live, request, ctx, nullptr, nullptr, 0) == server_prompt_cache_result::unchanged);
+    CHECK(bad.quarantined && live.tokens.get_tokens() == llama_tokens({9}));
+    CHECK(llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == 0);
+    CHECK(llama_state_seq_get_data(ctx, after.data(), bytes, 0) == bytes && before == after);
+
+    // The same corrupt first choice must not hide the valid shorter entry.
+    good.quarantined = false;
+    bad.quarantined = false;
+    CHECK(cache.load(live, request, ctx, nullptr, nullptr, 0) == server_prompt_cache_result::hit);
+    CHECK(bad.quarantined && live.tokens.get_tokens() == llama_tokens({1, 2, 3, 4}));
+    CHECK(llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == 3);
+
+    server_prompt_cache clear_failure(cache_budget_mib, 0);
+    CHECK(clear_failure.save(live, ctx, nullptr, nullptr, 0));
+    CHECK(llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1));
+    common_batch_clear(batch);
+    common_batch_add(batch, 9, 0, {0}, true);
+    CHECK(llama_decode(ctx, batch) == 0);
+    live.tokens = server_tokens(llama_tokens {9}, false);
+    int clear_calls = 0;
+    llama_get_memory(ctx)->set_on_seq_rm([&](llama_seq_id, llama_pos, llama_pos) {
+        ++clear_calls;
+        return false;
+    });
+    CHECK(clear_failure.restore(live, clear_failure.states.front(), ctx, nullptr, nullptr, 0) == server_prompt_cache_result::unchanged);
+    CHECK(clear_calls == 1 && clear_failure.native_context_invalidated && live.tokens.get_tokens() == llama_tokens({9}));
+
+    // A failed cleanup during rollback also invalidates the shared context.
+    llama_get_memory(ctx)->set_on_seq_rm({});
+    CHECK(llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1));
+    CHECK(llama_decode(ctx, batch) == 0);
+    clear_failure.native_context_invalidated = false;
+    auto & invalid = clear_failure.states.front();
+    invalid.data.main.pop_back();
+    invalid.checksum = invalid.digest();
+    clear_calls = 0;
+    llama_get_memory(ctx)->set_on_seq_rm([&](llama_seq_id, llama_pos, llama_pos) { return ++clear_calls == 1; });
+    CHECK(clear_failure.restore(live, invalid, ctx, nullptr, nullptr, 0) == server_prompt_cache_result::miss);
+    CHECK(clear_calls == 2 && clear_failure.native_context_invalidated && live.tokens.get_tokens() == llama_tokens({9}));
+    llama_get_memory(ctx)->set_on_seq_rm({});
+    CHECK(llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1));
+    llama_batch_free(batch);
+}
 
 static server_tokens media_tokens(const std::string & id) {
     // Real MTMD v2 placeholder metadata: one 3x2 M-RoPE image, six tokens and three positions.
@@ -71,6 +198,7 @@ static void test_media_cache(llama_context * ctx) {
     CHECK(llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == 3);
     CHECK(!cache.save(prompt, ctx, nullptr, nullptr, 0));
     CHECK(cache.states.size() == 1 && cache.states.front().checksum == checksum);
+    CHECK(llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1));
     server_prompt restored;
     CHECK(cache.restore(restored, cache.states.front(), ctx, nullptr, nullptr, 0) == server_prompt_cache_result::hit);
     CHECK(restored.n_tokens() == 8 && restored.tokens.pos_next() == 5);
@@ -143,12 +271,12 @@ static void run_cleanup_refusal(llama_context * ctx, const std::string & mode) {
     // Wildcard -1 is supported by the memory API but is deliberately outside
     // the common helper's already-empty, valid-single-sequence exception.
     const auto seq_id = mode == "cleanup-fail-wildcard" ? -1 : 0;
-    memory.seq_rm(seq_id, mode == "cleanup-fail-partial" ? 0 : -1,
-                  mode == "cleanup-fail-partial" ? 1 : -1);
-    CHECK(false && "cleanup refusal unexpectedly returned");
+    CHECK(!memory.seq_rm(seq_id, mode == "cleanup-fail-partial" ? 0 : -1,
+                         mode == "cleanup-fail-partial" ? 1 : -1));
+    mem->set_on_seq_rm({});
 }
 
-static void test_cleanup_refusal_deaths(const char * executable, const char * model) {
+static void test_cleanup_refusals(const char * executable, const char * model) {
 #if !defined(_WIN32)
     for (const char * mode : {"cleanup-fail-nonempty", "cleanup-fail-partial", "cleanup-fail-wildcard"}) {
         int output[2];
@@ -176,15 +304,15 @@ static void test_cleanup_refusal_deaths(const char * executable, const char * mo
         int status = 0;
         pid_t waited;
         do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
-        CHECK(waited == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+        CHECK(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
         CHECK(captured.find(std::string("RESET refusal reached (") + mode + ")") != std::string::npos);
-        CHECK(captured.find("failed to remove sequence") != std::string::npos);
-        fprintf(stderr, "cache cleanup CPU death: %s preserves SIGABRT on refused non-noop removal\n", mode);
+        CHECK(captured.find("propagating failure without abort") != std::string::npos);
+        fprintf(stderr, "cache cleanup CPU: %s propagates refused non-noop removal\n", mode);
     }
 #else
     (void) executable;
     (void) model;
-    fprintf(stderr, "cache cleanup CPU death: POSIX fork/exec cases skipped on Windows\n");
+    fprintf(stderr, "cache cleanup CPU: POSIX fork/exec cases skipped on Windows\n");
 #endif
 }
 
@@ -218,16 +346,21 @@ static void test_legacy_no_carry(common_init_result & init, const common_params 
     plain.update_pos(4, 0, 3);
     plain.update_tgt(init.context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     plain.update_dft(draft.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-    CHECK(plain.retained_count_tgt == 0 && plain.retained_count_dft == 0);
+    CHECK(plain.retained_count_tgt == 1 && plain.retained_count_dft == 1);
     CHECK(llama_memory_seq_rm(llama_get_memory(init.context()), 0, -1, -1));
     CHECK(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, -1, -1));
-    CHECK(plain.restore_tgt(init.context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-    CHECK(plain.restore_dft(draft.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == common_checkpoint_restore::restored);
+    CHECK(!plain.restore_tgt(init.context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    CHECK(plain.restore_dft(draft.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == common_checkpoint_restore::missing_base);
+    CHECK(llama_memory_seq_pos_max(llama_get_memory(init.context()), 0) == -1);
+    CHECK(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 0) == -1);
+    CHECK(llama_decode(init.context(), batch) == 0);
+    CHECK(llama_decode(draft.get(), batch) == 0);
     CHECK(llama_memory_seq_pos_max(llama_get_memory(init.context()), 0) == 3);
     CHECK(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 0) == 3);
-    fprintf(stderr, "cache plain KV: PARTIAL_ONLY restores target/draft attention from empty contexts, retained_components=0\n");
+    fprintf(stderr, "cache plain KV: PARTIAL_ONLY refuses missing retained target/draft attention\n");
     std::vector<uint8_t> carry;
     CHECK(!common_speculative_get_state(spec.get(), 0, carry) && carry.empty());
+    CHECK(common_speculative_capture_state(spec.get(), 0, carry) == common_speculative_capture_status::empty);
     server_prompt prompt;
     prompt.tokens = server_tokens(tokens, false);
     server_prompt_cache cache(cache_budget_mib, 0);
@@ -326,9 +459,10 @@ int main(int argc, char ** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const bool cleanup_refusal = mode == "cleanup-fail-nonempty" || mode == "cleanup-fail-partial" || mode == "cleanup-fail-wildcard";
     const bool cleanup_only = mode == "cleanup";
-    CHECK(argc == 2 || (argc == 3 && (mode == "legacy" || mode == "iswa" || cleanup_only || cleanup_refusal)));
+    const bool native_integrity = mode == "native-integrity";
+    CHECK(argc == 2 || (argc == 3 && (mode == "legacy" || mode == "iswa" || cleanup_only || cleanup_refusal || native_integrity)));
     const bool iswa = mode == "iswa";
-    const bool legacy = argc == 3;
+    const bool legacy = argc == 3 && !native_integrity;
     llama_backend_init();
     common_params params;
     params.model.path = argv[1];
@@ -347,14 +481,25 @@ int main(int argc, char ** argv) {
     params.n_outputs_max = params.n_outputs_max_per_seq = 32;
     auto init = common_init_from_params(params);
     CHECK(init && init->context());
-    if (cleanup_refusal) { run_cleanup_refusal(init->context(), mode); }
+    if (native_integrity) {
+        test_native_corrupt_entry_retry(init->context());
+        init.reset();
+        llama_backend_free();
+        return 0;
+    }
+    if (cleanup_refusal) {
+        run_cleanup_refusal(init->context(), mode);
+        init.reset();
+        llama_backend_free();
+        return 0;
+    }
     if (legacy) {
         if (cleanup_only) { test_cleanup_only(*init, params); }
         else if (iswa) { test_iswa(*init, params); }
         else { test_legacy_no_carry(*init, params); }
         init.reset();
         llama_backend_free();
-        if (!iswa) { test_cleanup_refusal_deaths(argv[0], argv[1]); }
+        if (!iswa) { test_cleanup_refusals(argv[0], argv[1]); }
         return 0;
     }
     auto * model = init->model();
@@ -371,6 +516,36 @@ int main(int argc, char ** argv) {
         CHECK(spec);
     };
     make_draft();
+    std::vector<uint8_t> capture_probe;
+    CHECK(common_speculative_capture_state(nullptr, 0, capture_probe) == common_speculative_capture_status::error);
+    CHECK(common_speculative_capture_state(spec.get(), -1, capture_probe) == common_speculative_capture_status::error);
+    CHECK(common_speculative_capture_state(spec.get(), 0, capture_probe) == common_speculative_capture_status::empty && capture_probe.empty());
+    {
+        common_params_speculative simple_params;
+        simple_params.types = { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE };
+        common_speculative_ptr simple(common_speculative_init(simple_params, 1));
+        CHECK(simple);
+        CHECK(common_speculative_capture_state(simple.get(), 0, capture_probe) == common_speculative_capture_status::empty);
+        CHECK(common_speculative_capture_state(simple.get(), -1, capture_probe) == common_speculative_capture_status::error);
+        CHECK(common_speculative_clear_state(simple.get(), 0));
+    }
+    {
+        // Exercise chain-head policy without running a synthetic multihead graph.
+        auto chain_params = params.speculative;
+        chain_params.draft.ctx_tgt = init->context();
+        chain_params.draft.ctx_dft = draft->context();
+        const auto layers = model->hparams.n_layer_nextn;
+        model->hparams.n_layer_nextn = 2;
+        common_speculative_ptr chain(common_speculative_init(chain_params, 1));
+        model->hparams.n_layer_nextn = layers;
+        CHECK(chain);
+        CHECK(common_speculative_capture_state(chain.get(), 0, capture_probe) == common_speculative_capture_status::error);
+        CHECK(!common_speculative_validate_state(chain.get(), 0, {}));
+        CHECK(!common_speculative_prepare_state(chain.get(), 0, nullptr, 0));
+        CHECK(!common_speculative_clear_state(chain.get(), 0));
+        CHECK(!common_speculative_set_state(chain.get(), 0, {}, -1));
+        CHECK(!common_speculative_set_state(chain.get(), 0, {}, 3));
+    }
     llama_batch batch = llama_batch_init(32, 0, 1);
     int evaluated_tokens = 0;
     auto decode = [&](int first, int end) {
@@ -389,6 +564,29 @@ int main(int argc, char ** argv) {
     checkpoint->update_dft(draft->context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     checkpoint->update_spec(spec.get(), 0);
     CHECK(!checkpoint->data_spec.empty() && checkpoint->draft_base_valid);
+    CHECK(common_speculative_capture_state(spec.get(), 0, capture_probe) == common_speculative_capture_status::present && !capture_probe.empty());
+    CHECK(common_speculative_capture_state(spec.get(), 0, capture_probe, checkpoint->pos_max + 1) == common_speculative_capture_status::error);
+    auto nonfinite_carry = checkpoint->data_spec;
+    auto * finite_plan = common_speculative_prepare_state(spec.get(), 0, nonfinite_carry.data(), nonfinite_carry.size());
+    CHECK(finite_plan);
+    common_speculative_state_restore_plan_free(finite_plan);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::memcpy(nonfinite_carry.data() + 4*sizeof(uint32_t), &nan, sizeof(nan));
+    CHECK(!common_speculative_prepare_state(spec.get(), 0, nonfinite_carry.data(), nonfinite_carry.size()));
+    {
+        auto mixed_params = params.speculative;
+        mixed_params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE };
+        mixed_params.draft.ctx_tgt = init->context();
+        mixed_params.draft.ctx_dft = draft->context();
+        common_speculative_ptr mixed(common_speculative_init(mixed_params, 1));
+        CHECK(mixed);
+        CHECK(common_speculative_capture_state(mixed.get(), 0, capture_probe) == common_speculative_capture_status::empty);
+        CHECK(common_speculative_capture_state(mixed.get(), -1, capture_probe) == common_speculative_capture_status::error);
+        CHECK(common_speculative_set_state(mixed.get(), 0, checkpoint->data_spec, checkpoint->pos_max));
+        CHECK(common_speculative_capture_state(mixed.get(), 0, capture_probe) == common_speculative_capture_status::present);
+        CHECK(common_speculative_clear_state(mixed.get(), 0));
+        CHECK(common_speculative_capture_state(mixed.get(), 0, capture_probe) == common_speculative_capture_status::empty);
+    }
     prompt.checkpoints.push_back(checkpoint);
     // Restore recurrent/carry state at its checkpoint position while attention still contains future KV.
     decode(4, 6);
@@ -420,12 +618,31 @@ int main(int argc, char ** argv) {
     const auto initial_weights = llama_model_mtp_weights_get_info(model);
     CHECK(initial_weights.model_load_count == 1);
     const auto original_checksum = cache.states.front().checksum;
-    server_prompt restored;
-    CHECK(cache.restore(restored, cache.states.front(), init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::hit);
+    server_prompt restored = prompt.clone();
+    const auto first_restore = cache.restore(restored, cache.states.front(), init->context(), draft->context(), spec.get(), 0);
+    if (first_restore != server_prompt_cache_result::hit) fprintf(stderr, "initial cache restore: %s\n", cache.last_reason.c_str());
+    CHECK(first_restore == server_prompt_cache_result::hit);
     CHECK(restored.n_tokens() == 4 && cache.states.front().checksum == original_checksum);
 
     // A corrupt source is rejected before live mutation.
     auto & source = cache.states.front();
+    {
+        common_params_speculative unknown_params;
+        unknown_params.types = { COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K };
+        common_speculative_ptr unknown(common_speculative_init(unknown_params, 1));
+        CHECK(unknown);
+        CHECK(common_speculative_capture_state(unknown.get(), 0, capture_probe) == common_speculative_capture_status::error);
+        CHECK(llama_memory_seq_rm(llama_get_memory(init->context()), 0, -1, -1));
+        CHECK(llama_memory_seq_rm(llama_get_memory(draft->context()), 0, -1, -1));
+        server_prompt empty;
+        CHECK(cache.restore(empty, source, init->context(), draft->context(), unknown.get(), 0) == server_prompt_cache_result::miss);
+        CHECK(cache.last_reason == "destination state could not be captured for rollback; refusing before mutation");
+        CHECK(empty.tokens.empty() && llama_memory_seq_pos_max(llama_get_memory(init->context()), 0) == -1 &&
+                llama_memory_seq_pos_max(llama_get_memory(draft->context()), 0) == -1);
+        CHECK(common_speculative_clear_state(spec.get(), 0));
+        CHECK(cache.restore(empty, source, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::hit);
+        restored = std::move(empty);
+    }
     source.data.main[0] ^= 1;
     CHECK(cache.restore(restored, source, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::miss);
     CHECK(llama_memory_seq_pos_max(llama_get_memory(init->context()), 0) == 3);
@@ -435,17 +652,30 @@ int main(int argc, char ** argv) {
     // Recomputed integrity metadata lets each malformed component reach its actual import path.
     std::vector<uint8_t> * components[] = { &source.data.main, &source.data.drft, &source.data.spec };
     const char * failures[] = { "target restore failed", "draft restore failed", "MTP carry restore failed" };
+    const auto resident_bytes = [](llama_context * ctx) {
+        const size_t size = llama_state_seq_get_size(ctx, 0);
+        std::vector<uint8_t> bytes(size);
+        CHECK(size && llama_state_seq_get_data(ctx, bytes.data(), size, 0) == size);
+        return bytes;
+    };
     for (size_t i = 0; i < 3; ++i) {
+        const auto target_before = resident_bytes(init->context());
+        const auto draft_before = resident_bytes(draft->context());
+        const auto prompt_before = restored.tokens.get_tokens();
+        std::vector<uint8_t> carry_before;
+        CHECK(common_speculative_get_state(spec.get(), 0, carry_before) && !carry_before.empty());
         const uint8_t last_byte = components[i]->back();
         components[i]->pop_back();
         source.checksum = source.digest();
         CHECK(cache.restore(restored, source, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::miss);
         CHECK(cache.last_reason == failures[i]);
-        CHECK(llama_memory_seq_pos_max(llama_get_memory(init->context()), 0) == -1);
-        CHECK(llama_memory_seq_pos_max(llama_get_memory(draft->context()), 0) == -1);
-        CHECK(restored.tokens.empty());
+        CHECK(llama_memory_seq_pos_max(llama_get_memory(init->context()), 0) == 3);
+        CHECK(llama_memory_seq_pos_max(llama_get_memory(draft->context()), 0) == 3);
+        CHECK(restored.tokens.get_tokens() == prompt_before);
+        CHECK(resident_bytes(init->context()) == target_before);
+        CHECK(resident_bytes(draft->context()) == draft_before);
         std::vector<uint8_t> after_failure;
-        CHECK(!common_speculative_get_state(spec.get(), 0, after_failure) && after_failure.empty());
+        CHECK(common_speculative_get_state(spec.get(), 0, after_failure) && after_failure == carry_before);
         components[i]->push_back(last_byte);
         source.checksum = original_checksum;
         CHECK(source.digest() == original_checksum);
@@ -458,6 +688,18 @@ int main(int argc, char ** argv) {
         CHECK(common_speculative_set_state(spec.get(), 0, {}));
         CHECK(!variants.save(restored, init->context(), draft->context(), spec.get(), 0));
         CHECK(variants.states.size() == 1 && !variants.states.front().data.spec.empty());
+        CHECK(common_speculative_capture_state(spec.get(), 0, capture_probe) == common_speculative_capture_status::empty);
+        const auto target_before = resident_bytes(init->context());
+        const auto draft_before = resident_bytes(draft->context());
+        const auto removed = source.data.main.back();
+        source.data.main.pop_back();
+        source.checksum = source.digest();
+        CHECK(cache.restore(restored, source, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::miss);
+        CHECK(cache.last_reason == "target restore failed");
+        CHECK(resident_bytes(init->context()) == target_before && resident_bytes(draft->context()) == draft_before);
+        CHECK(common_speculative_capture_state(spec.get(), 0, capture_probe) == common_speculative_capture_status::empty);
+        source.data.main.push_back(removed);
+        source.checksum = original_checksum;
         CHECK(cache.restore(restored, source, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::hit);
     }
 
@@ -470,15 +712,15 @@ int main(int argc, char ** argv) {
         CHECK(llama_memory_seq_rm(llama_get_memory(draft->context()), 0, -1, -1));
         CHECK(checkpoint->restore_tgt(init->context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
         const auto before = llama_memory_seq_pos_max(llama_get_memory(init->context()), 0);
-        // Qwen's MTP head uses plain KV: PARTIAL_ONLY carries its entire attention.
-        CHECK(checkpoint->retained_count_tgt == 1 && checkpoint->retained_count_dft == 0);
-        CHECK(checkpoint->restore_dft(draft->context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == common_checkpoint_restore::restored);
-        CHECK(llama_memory_seq_pos_max(llama_get_memory(draft->context()), 0) == 3);
+        // Plain draft KV is omitted by PARTIAL_ONLY and must still be resident.
+        CHECK(checkpoint->retained_count_tgt == 1 && checkpoint->retained_count_dft == 1);
+        CHECK(checkpoint->restore_dft(draft->context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == common_checkpoint_restore::missing_base);
+        CHECK(llama_memory_seq_pos_max(llama_get_memory(draft->context()), 0) == -1);
         CHECK(llama_memory_seq_pos_max(llama_get_memory(init->context()), 0) == before);
         auto unknown = *checkpoint;
         unknown.retained_count_tgt = UINT32_MAX;
         CHECK(!unknown.restore_tgt(init->context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-        fprintf(stderr, "cache Qwen MTP: target retained_components=1, draft=0; missing draft attention restored from PARTIAL_ONLY; unknown capability refused\n");
+        fprintf(stderr, "cache Qwen MTP: missing retained draft attention and unknown capability refused\n");
         CHECK(cache.restore(restored, source, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::hit);
     }
     {
@@ -489,6 +731,9 @@ int main(int argc, char ** argv) {
         const auto byte = bad.data.main.back();
         bad.data.main.pop_back();
         bad.checksum = bad.digest();
+        CHECK(llama_memory_seq_rm(llama_get_memory(init->context()), 0, -1, -1));
+        CHECK(llama_memory_seq_rm(llama_get_memory(draft->context()), 0, -1, -1));
+        CHECK(common_speculative_clear_state(spec.get(), 0));
         server_prompt empty;
         server_tokens next(llama_tokens {1, 2, 3, 4, 5}, false);
         CHECK(poison.load(empty, next, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::miss);
@@ -507,6 +752,7 @@ int main(int argc, char ** argv) {
         server_prompt_cache valid(cache_budget_mib, 0);
         CHECK(valid.save(five, init->context(), draft->context(), spec.get(), 0));
         const auto checksum = valid.states.front().checksum;
+        restored.tokens = five.tokens.clone_for_cache();
         CHECK(cache.restore(restored, source, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::hit);
         common_batch_clear(batch);
         common_batch_add(batch, 5, 4, {0}, true);
@@ -514,6 +760,10 @@ int main(int argc, char ** argv) {
         CHECK(!common_speculative_is_ready(spec.get(), 0, 5));
         CHECK(!valid.save(five, init->context(), draft->context(), spec.get(), 0));
         CHECK(valid.states.size() == 1 && valid.states.front().checksum == checksum);
+        restored.tokens = five.tokens.clone_for_cache();
+        CHECK(valid.restore(restored, valid.states.front(), init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::miss);
+        CHECK(valid.last_reason == "destination state could not be captured for rollback; refusing before mutation");
+        CHECK(common_speculative_clear_state(spec.get(), 0));
         CHECK(valid.restore(restored, valid.states.front(), init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::hit);
         CHECK(cache.restore(restored, source, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::hit);
         common_batch_clear(batch);
@@ -529,6 +779,7 @@ int main(int argc, char ** argv) {
         CHECK(seed.restore_dft(draft->context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == common_checkpoint_restore::restored);
         CHECK(common_speculative_is_ready(spec.get(), 0, 5));
         decode(5, 6);
+        restored.tokens = server_tokens(llama_tokens {1, 2, 3, 4, 5, 6}, false);
         CHECK(llama_memory_seq_pos_max(llama_get_memory(draft->context()), 0) == 5);
         CHECK(seed.restore_tgt(init->context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
         CHECK(seed.restore_dft(draft->context(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == common_checkpoint_restore::restored);
@@ -628,7 +879,7 @@ int main(int argc, char ** argv) {
     auto & full = cache.states.back();
     ++full.model_instance;
     CHECK(cache.restore(restored, full, init->context(), draft->context(), spec.get(), 0) == server_prompt_cache_result::miss);
-    CHECK(cache.last_reason == "snapshot model or attention layout differs");
+    CHECK(cache.last_reason == "snapshot model differs");
     --full.model_instance;
     const auto saved_pos = full.pos_tgt;
     full.pos_tgt = llama_n_ctx_seq(init->context());
@@ -668,7 +919,16 @@ int main(int argc, char ** argv) {
     CHECK(llama_model_mtp_weights_get_info(model).model_load_count == 1);
     fprintf(stderr, "cache: main model loads=1, additional MTP CPU backing=%zu bytes\n", initial_weights.host_bytes);
     llama_synchronize(draft->context());
-    spec.reset(); draft.reset(); init.reset();
+    spec.reset(); draft.reset();
+    {
+        llama_context_ptr scratch(llama_init_from_model(model, common_context_params_to_llama(params)));
+        CHECK(scratch);
+        test_native_corrupt_entry_retry(scratch.get());
+        llama_context_ptr scratch_draft(llama_init_from_model(model, common_context_params_to_llama(params)));
+        CHECK(scratch_draft);
+        test_eagle_capture(model, scratch.get(), scratch_draft.get(), params.speculative);
+    }
+    init.reset();
     llama_batch_free(batch);
     llama_backend_free();
 }

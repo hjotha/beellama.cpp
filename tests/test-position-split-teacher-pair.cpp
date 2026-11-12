@@ -53,6 +53,9 @@ struct options {
     std::string model_sha256;
     std::string build_id;
     std::string prefix_state_in;
+    std::string prefill_cadence_file;
+    std::vector<int> prefill_cadence;
+    bool allow_graph_reuse = false;
     bool prefix_state_out = false;
     bool diagnostic_p_above_target = false;
     std::string checkpoint_method = "full";
@@ -183,6 +186,8 @@ void usage() {
         "  --paired-layered-baseline         require P=0 and explicit remote layers; calibrated-baseline diagnostic only\n"
         "  --paired-fixed-current-kv         capture GPU K/V and replay exact bytes into the CPU reference; required for structural protocol eligibility\n"
         "  --paired-quality-only             capture consecutive GPU teacher-forced logits only; no CPU replay or structural/calibration eligibility\n"
+        "  --paired-prefill-cadence FILE     quality-only diagnostic: JSON array of explicit prefill batch sizes, summing to --paired-start\n"
+        "  --paired-allow-graph-reuse       explicit cadence diagnostic: do not disable graph reuse\n"
         "  --paired-prefix-state-in FILE     diagnostic only: import validated prefix for quality-only or verified full CPU fixed-KV replay\n"
         "  --paired-prefix-state-out         diagnostic: save native prefix before first captured token in output dir\n"
         "  --paired-diagnostic-p105216       allow P=105216 for quality-only ablation, never protocol acceptance\n"
@@ -357,9 +362,9 @@ struct runner {
         reference_cpu(false);
     }
 
-    void decode(int begin, int count) {
+    void decode(int begin, int count, bool want_logits = true) {
         common_batch_clear(batch);
-        for (int i = 0; i < count; ++i) { common_batch_add(batch, tokens.at(size_t(begin+i)), begin+i, {0}, i == count-1); }
+        for (int i = 0; i < count; ++i) { common_batch_add(batch, tokens.at(size_t(begin+i)), begin+i, {0}, want_logits && i == count-1); }
         const int rc = llama_decode(ctx, batch);
         llama_synchronize(ctx);
         require(rc == 0, "teacher decode failed at position " + std::to_string(begin) + ", rc=" + std::to_string(rc));
@@ -513,7 +518,7 @@ struct runner {
             {"prefix_tokens", n-1}, {"checkpoint_method", opt.quality_only ? "none_quality_trajectory" : opt.checkpoint_method},
             {"checkpoint_xxh64", checkpoint_hash}, {"prefix_proof", prefix_proof},
             {"sampling", opt.quality_only
-                ? "GPU-only teacher-forced trajectory; each point decodes exactly token[N-1] from the preceding GPU state"
+                ? (opt.prefill_cadence.empty() ? "GPU-only teacher-forced trajectory; each point decodes exactly token[N-1] from the preceding GPU state" : "GPU-only explicit prefill batches; first point captures the last batch logits, later points decode one fixed teacher token")
                 : "teacher-forced; selected reference arm and GPU candidate both decode exactly token[N-1], then score ground truth token[N]"},
             {"reference_arm", opt.quality_only ? "gpu_quality_only" : opt.reference},
             {"quality_only", opt.quality_only},
@@ -554,7 +559,17 @@ struct runner {
         report["ranges"].push_back(range_report);
         auto & current = report["ranges"].back();
         for (int n = start; n < start+opt.count; ++n) {
-            gpu_prefix(n-1);
+            const auto began_prefill = std::chrono::steady_clock::now();
+            const bool explicit_prefill = !opt.prefill_cadence.empty() && n == start;
+            if (explicit_prefill) {
+                for (size_t i = 0; i < opt.prefill_cadence.size(); ++i) {
+                    const int count = opt.prefill_cadence[i];
+                    decode(past, count, i + 1 == opt.prefill_cadence.size());
+                    past += count;
+                }
+            } else {
+                gpu_prefix(n-1);
+            }
             if (opt.prefix_state_out && n == opt.starts.front()) {
                 const fs::path cache = path("prefix-cache.bin");
                 require(!fs::exists(cache), "prefix cache output already exists");
@@ -566,10 +581,11 @@ struct runner {
             }
             if (opt.quality_only) {
                 json row = {{"n", n}, {"state", "running"}, {"checkpoint_method", "none_quality_trajectory"},
-                            {"prefix_occupancy", past}, {"reference_arm", "gpu_quality_only"}};
+                            {"prefix_occupancy", explicit_prefill ? n-1 : past}, {"reference_arm", "gpu_quality_only"},
+                            {"explicit_prefill", explicit_prefill}};
                 current["rows"].push_back(row); publish();
-                const auto began = std::chrono::steady_clock::now();
-                decode(past, 1);
+                const auto began = explicit_prefill ? began_prefill : std::chrono::steady_clock::now();
+                if (!explicit_prefill) { decode(past, 1); }
                 const double gpu_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count();
                 const auto gpu_logits = logits();
                 const json proof = {{"verified", false},
@@ -580,7 +596,7 @@ struct runner {
                 completed["gpu_decode_seconds"] = gpu_seconds;
                 completed["gpu_logits_count"] = gpu_logits.size();
                 completed["quality_capture"] = "range-N/gpu/cap.gpu.nN logits and exact teacher prefix";
-                ++past;
+                if (!explicit_prefill) { ++past; }
                 publish();
                 std::fprintf(stderr, "paired: N=%d quality_only=gpu prefix_occupancy=%d GPU=%.3fs\n",
                              n, n-1, gpu_seconds);
@@ -833,8 +849,36 @@ struct runner {
                     uint64_t(start)+uint64_t(opt.count)-1 < tokens.size(), "invalid, overlapping, or out-of-capacity teacher range");
             previous_end = start+opt.count-1;
         }
+        if (!opt.prefill_cadence_file.empty()) {
+            require(opt.quality_only && opt.starts.size() == 1 && opt.prefix_state_in.empty() && !opt.prefix_state_out,
+                    "explicit prefill cadence requires quality-only, one range, and no prefix import/export");
+            std::ifstream in(opt.prefill_cadence_file);
+            require(bool(in), "cannot open prefill cadence file");
+            const json cadence = json::parse(in);
+            require(cadence.is_array() && !cadence.empty(), "prefill cadence must be a non-empty JSON array");
+            int64_t position = 0;
+            for (const auto & item : cadence) {
+                require(item.is_number_integer(), "prefill cadence entries must be positive integers");
+                if (!item.is_number_unsigned()) {
+                    require(item.get<int64_t>() > 0, "prefill cadence entries must be positive integers");
+                }
+                const uint64_t count = item.get<uint64_t>();
+                require(count > 0, "prefill cadence entries must be positive integers");
+                require(count <= uint64_t(params.n_batch) && count <= uint64_t(params.n_ubatch) &&
+                        count <= uint64_t(opt.starts.front()) && position + int64_t(count) <= opt.starts.front(),
+                        "prefill batch exceeds batch/ubatch or prompt bounds");
+                const int64_t next = position + int64_t(count);
+                const int64_t p = params.kv_position_split_p;
+                require(p == 0 || !(position < p && next > p), "prefill batch crosses split P");
+                opt.prefill_cadence.push_back(int(count));
+                position = next;
+            }
+            require(position == opt.starts.front(), "prefill cadence must sum to paired-start");
+        }
+        require(!opt.allow_graph_reuse || !opt.prefill_cadence.empty(),
+                "graph reuse override requires explicit prefill cadence");
         reference_cpu(false);
-        common_set_env("LLAMA_GRAPH_REUSE_DISABLE", "1");
+        common_set_env("LLAMA_GRAPH_REUSE_DISABLE", opt.allow_graph_reuse ? "" : "1");
         if (opt.quality_only) {
             common_set_env("F4_TRACE_CAPTURE", "");
             common_set_env("F4_NODE_DUMP", "");
@@ -885,6 +929,8 @@ struct runner {
             {"compiled_commit", llama_commit()}, {"compiled_build", llama_build_info()},
             {"n_rs_seq", llama_n_rs_seq(ctx)}, {"teacher_file", file_observation(opt.tokens_file)},
             {"token_format", opt.token_format}, {"starts", opt.starts}, {"count", opt.count},
+            {"explicit_prefill_cadence", opt.prefill_cadence},
+            {"graph_reuse_allowed", opt.allow_graph_reuse},
             {"checkpoint_method", opt.quality_only ? "none_quality_trajectory" : opt.checkpoint_method},
             {"state_spool_directory", opt.quality_only ? json(nullptr) : json(path("native-spool").string())},
             {"full_prefix_verification", opt.verify_full_prefix}, {"fixed_current_kv", opt.fixed_current_kv}};
@@ -962,6 +1008,7 @@ int main(int argc, char ** argv) {
             if (flag == "--paired-layered-baseline") { run.opt.layered_baseline = true; continue; }
             if (flag == "--paired-fixed-current-kv") { run.opt.fixed_current_kv = true; continue; }
             if (flag == "--paired-quality-only") { run.opt.quality_only = true; continue; }
+            if (flag == "--paired-allow-graph-reuse") { run.opt.allow_graph_reuse = true; continue; }
             if (flag == "--paired-prefix-state-out") { run.opt.prefix_state_out = true; continue; }
             if (flag == "--paired-diagnostic-p105216") { run.opt.diagnostic_p_above_target = true; continue; }
             if (flag.compare(0, 9, "--paired-") != 0) { common_args.push_back(argv[i]); continue; }
@@ -973,6 +1020,7 @@ int main(int argc, char ** argv) {
             else if (flag == "--paired-model-sha256") { run.opt.model_sha256 = value; }
             else if (flag == "--paired-build-id") { run.opt.build_id = value; }
             else if (flag == "--paired-prefix-state-in") { run.opt.prefix_state_in = value; }
+            else if (flag == "--paired-prefill-cadence") { run.opt.prefill_cadence_file = value; }
             else if (flag == "--paired-checkpoint") { run.opt.checkpoint_method = value; }
             else if (flag == "--paired-reference") { run.opt.reference = value; }
             else if (flag == "--paired-start") { run.opt.starts.push_back(std::stoi(value)); }
@@ -1008,7 +1056,7 @@ int main(int argc, char ** argv) {
             {"structural_gate_evaluated", false},
             {"checkpoint_method", run.opt.quality_only ? "none_quality_trajectory" : run.opt.checkpoint_method},
             {"protocol", run.opt.quality_only
-                ? "GPU prefix -> exactly one GPU teacher decode per consecutive position -> capture full-vocabulary logits and teacher prefix -> advance same GPU trajectory; no CPU arm, native save/restore, or structural/calibration eligibility"
+                ? (run.opt.prefill_cadence_file.empty() ? "GPU prefix -> exactly one GPU teacher decode per consecutive position -> capture full-vocabulary logits and teacher prefix -> advance same GPU trajectory; no CPU arm, native save/restore, or structural/calibration eligibility" : "explicit prefill calls -> capture last batch logits -> fixed teacher token per subsequent position; no CPU arm, native save/restore, or structural/calibration eligibility")
                 : (run.opt.fixed_current_kv
                 ? "GPU prefix -> capture GPU post-RoPE current K/V -> GPU teacher step and save post-N native state -> restore exact pre-N state -> CPU teacher step with byte-exact frozen GPU current K/V before cache store -> restore exact GPU post-N state; only GPU trajectory advances"
                 : "diagnostic only: natural selected reference-arm teacher decode and native restore followed by GPU candidate; current K/V may differ downstream")},

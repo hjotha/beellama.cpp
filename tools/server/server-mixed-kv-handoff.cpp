@@ -224,8 +224,10 @@ source_capture capture_source(llama_context * ctx) {
     out.memory_bytes = allocation_bytes(memory);
     out.recurrent_bytes = allocation_bytes(hybrid->get_mem_recr());
     out.valid = true;
-    out.source_owner_id = kvarn->mixed_state_owner_id();
-    out.source_owner_epoch = kvarn->mixed_state_owner_epoch();
+    for (uint32_t seq = 0; seq < llama_n_seq_max(ctx); ++seq) {
+        out.source_owner_ids.push_back(kvarn->mixed_state_owner_id(seq));
+        out.source_owner_epochs.push_back(kvarn->mixed_state_owner_epoch(seq));
+    }
     out.cparams = ctx->get_cparams();
     // Deterministic memory params: mem_other is nullptr and swa_full false
     // (the handoff source is single-stream non-SWA; swa_full would reserve a
@@ -384,6 +386,12 @@ result try_handoff_impl(const input & in, result & out,
     if (in.has_mtmd) {
         return fail("MTMD token mapping is unsupported by the handoff");
     }
+    if (in.seq_id < 0 || size_t(in.seq_id) >= in.source->source_owner_ids.size() ||
+            size_t(in.seq_id) >= in.source->source_owner_epochs.size()) {
+        return fail("handoff source sequence is out of range");
+    }
+    const uint64_t source_owner_id = in.source->source_owner_ids[in.seq_id];
+    const uint64_t source_owner_epoch = in.source->source_owner_epochs[in.seq_id];
     auto * hybrid = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(in.ctx_tgt));
     auto * kvarn = hybrid
             ? dynamic_cast<llama_kv_cache_kvarn *>(hybrid->get_mem_attn_base()) : nullptr;
@@ -460,9 +468,8 @@ result try_handoff_impl(const input & in, result & out,
         out.marker = handoff_marker_no_source();
         return out;
     }
-    if (native_split && (in.source->source_owner_id == 0 || in.source->source_owner_epoch == 0 ||
-            checkpoint->owner_id != in.source->source_owner_id ||
-            checkpoint->owner_epoch != in.source->source_owner_epoch)) {
+    if (native_split && (source_owner_id == 0 || source_owner_epoch == 0 ||
+            checkpoint->owner_id != source_owner_id || checkpoint->owner_epoch != source_owner_epoch)) {
         return fail("native split checkpoint does not match captured source owner and epoch");
     }
 
@@ -601,10 +608,10 @@ result try_handoff_impl(const input & in, result & out,
             // original snapshot. As with durable checkpoint restore, reconnect
             // its lineage before replaying an owner-bound partial. Keep all
             // per-cell/reference checks in the authoritative reader enabled.
-            if (in.source->source_owner_id == 0 || checkpoint->owner_epoch == 0 ||
-                    checkpoint->owner_epoch != in.source->source_owner_epoch ||
-                    !source_kvarn->adopt_state_owner_id(in.source->source_owner_id) ||
-                    !source_kvarn->adopt_state_owner_epoch(checkpoint->owner_epoch)) {
+            if (source_owner_id == 0 || checkpoint->owner_epoch == 0 ||
+                    checkpoint->owner_epoch != source_owner_epoch ||
+                    !source_kvarn->adopt_state_owner_id(source_owner_id, in.seq_id) ||
+                    !source_kvarn->adopt_state_owner_epoch(checkpoint->owner_epoch, in.seq_id)) {
                 return fail("partial checkpoint does not match the captured source lineage");
             }
             source_kvarn->state_read_sinfo(partial_io, in.seq_id,

@@ -2883,10 +2883,8 @@ common_memory_seq_rm_result common_memory_seq_rm_suffix(
         const bool clear_target = io.remove(COMMON_MEMORY_CONTEXT_TARGET, seq_id, -1, -1);
         const bool clear_draft = !io.has_draft ||
                 io.remove(COMMON_MEMORY_CONTEXT_DRAFT, seq_id, -1, -1);
-        if (!clear_target || !clear_draft) {
-            GGML_ABORT("sequence-removal recovery failed to clear a complete slot sequence");
-        }
-        planned_p0 = 0;
+        if (clear_target && clear_draft) planned_p0 = 0;
+        return clear_target && clear_draft;
     };
 
     llama_pos target_p0 = requested_p0;
@@ -2904,8 +2902,7 @@ common_memory_seq_rm_result common_memory_seq_rm_suffix(
                            seq_id, requested_p0, int(target_planned), target_p0, target_p1,
                            int(io.has_draft), int(draft_planned), draft_p0, draft_p1);
         }
-        clear_complete_sequences();
-        return COMMON_MEMORY_SEQ_RM_FULL_REPROCESS;
+        return clear_complete_sequences() ? COMMON_MEMORY_SEQ_RM_FULL_REPROCESS : COMMON_MEMORY_SEQ_RM_MUTATION_FAILED;
     }
 
     planned_p0 = io.has_draft ? std::min(target_p0, draft_p0) : target_p0;
@@ -2921,8 +2918,7 @@ common_memory_seq_rm_result common_memory_seq_rm_suffix(
                            seq_id, requested_p0, planned_p0, int(target_accepts),
                            int(io.has_draft), int(draft_accepts));
         }
-        clear_complete_sequences();
-        return COMMON_MEMORY_SEQ_RM_FULL_REPROCESS;
+        return clear_complete_sequences() ? COMMON_MEMORY_SEQ_RM_FULL_REPROCESS : COMMON_MEMORY_SEQ_RM_MUTATION_FAILED;
     }
 
     const bool target_removed = io.remove(
@@ -2930,8 +2926,7 @@ common_memory_seq_rm_result common_memory_seq_rm_suffix(
     const bool draft_removed = target_removed && (!io.has_draft || io.remove(
             COMMON_MEMORY_CONTEXT_DRAFT, seq_id, planned_p0, -1));
     if (!target_removed || !draft_removed) {
-        clear_complete_sequences();
-        return COMMON_MEMORY_SEQ_RM_MUTATION_FAILED;
+        return clear_complete_sequences() ? COMMON_MEMORY_SEQ_RM_FULL_REPROCESS : COMMON_MEMORY_SEQ_RM_MUTATION_FAILED;
     }
 
     return COMMON_MEMORY_SEQ_RM_APPLIED;

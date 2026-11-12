@@ -2650,6 +2650,30 @@ static void set_native_split_indices(ggml_tensor * dst, const llama_ubatch * uba
     ggml_backend_tensor_set(dst, indices.data(), 0, indices.size() * sizeof(int64_t));
 }
 
+static bool set_split_local_kvarn_indices(ggml_tensor * dst, const llama_ubatch * ubatch,
+        const llama_kv_cache::slot_info & sinfo, const llama_kv_cache_kvarn * cache) {
+    if (!cache->position_split_enabled() || cache->get_kv_n_stream() <= 1 || cache->is_swa() ||
+            !ubatch->pos || position_split_current_ubatch_range(*ubatch, cache->position_split_p(),
+                    cache->get_kv_size()) != llama_position_split::range_kind::LOCAL) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_I64 || dst->ne[0] < ubatch->n_tokens ||
+            ubatch->n_tokens != sinfo.size()*sinfo.n_stream()) {
+        throw std::runtime_error("invalid local split KVarN indices");
+    }
+    const uint32_t capacity = cache->position_split_local_capacity();
+    std::vector<int64_t> indices(ubatch->n_tokens);
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t i = 0; i < sinfo.size(); ++i) {
+            const uint32_t cell = sinfo.idxs[s][i];
+            if (cell >= capacity) throw std::runtime_error("local split KVarN cell outside local capacity");
+            indices[s*sinfo.size() + i] = int64_t(sinfo.strm[s])*capacity + cell;
+        }
+    }
+    ggml_backend_tensor_set(dst, indices.data(), 0, indices.size()*sizeof(int64_t));
+    return true;
+}
+
 void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->position_split_enabled() && ubatch->pos &&
             position_split_current_ubatch_range(*ubatch, cache->position_split_p(), cache->get_kv_size()) ==
@@ -2665,6 +2689,7 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const lla
         cache->get_local_cache()->set_input_k_idxs(dst, ubatch, current_sinfo());
         return;
     }
+    if (set_split_local_kvarn_indices(dst, ubatch, current_sinfo(), cache)) return;
     if (cache->is_swa()) {
         GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
         int64_t * data = (int64_t *) dst->data;
@@ -2707,6 +2732,7 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const lla
         cache->get_local_cache()->set_input_v_idxs(dst, ubatch, current_sinfo());
         return;
     }
+    if (set_split_local_kvarn_indices(dst, ubatch, current_sinfo(), cache)) return;
     if (cache->is_swa()) {
         set_input_k_idxs(dst, ubatch);
         return;
@@ -2749,6 +2775,7 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, c
         cache->get_local_cache()->set_input_k_idxs_backend(dst, ubatch, current_sinfo());
         return;
     }
+    if (set_split_local_kvarn_indices(dst, ubatch, current_sinfo(), cache)) return;
     if (cache->is_swa()) {
         const auto & sinfo = current_sinfo();
         GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
@@ -2791,6 +2818,7 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs_backend(ggml_tensor * dst, c
         cache->get_local_cache()->set_input_v_idxs_backend(dst, ubatch, current_sinfo());
         return;
     }
+    if (set_split_local_kvarn_indices(dst, ubatch, current_sinfo(), cache)) return;
     if (cache->is_swa()) {
         const auto & sinfo = current_sinfo();
         GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
@@ -3213,7 +3241,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     exact_tail_tokens_requested(tail_tokens_requested),
     exact_tail_type_requested(tail_type_requested),
     exact_tail_type(tail_type_requested),
-    state_owner_id(next_mixed_state_owner_id()),
+    state_owners(n_stream),
     metadata(std::make_unique<llama_kv_cache>(
         model,
         hparams,
@@ -3240,6 +3268,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         tail_rollback_tokens)),
     migration_enabled(bool(migration_device_for_layer)) {
     GGML_ASSERT(n_stream > 0);
+    for (auto & owner : state_owners) owner.id = next_mixed_state_owner_id();
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
     GGML_ASSERT(stage_groups >= 2 && "KVarN stage depth must be at least 2");
     GGML_ASSERT(tail_groups >= 1 && tail_groups <= stage_groups &&
@@ -4370,12 +4399,47 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_kv_batch(const std::vector<l
             this, std::make_unique<llama_kv_cache_context>(metadata.get(), std::move(sinfos), ubatches));
 }
 
-void llama_kv_cache_kvarn::dirty_state_prefix(llama_pos pos) {
-    if (state_owner_epoch == UINT64_MAX) {
+llama_kv_cache_kvarn::state_owner & llama_kv_cache_kvarn::owner_for_seq(llama_seq_id seq) {
+    if (seq < 0 || uint32_t(seq) >= n_seq_max) throw std::out_of_range("invalid sequence owner");
+    return state_owners.at(metadata->get_stream_for_seq(seq));
+}
+
+const llama_kv_cache_kvarn::state_owner & llama_kv_cache_kvarn::owner_for_seq(llama_seq_id seq) const {
+    if (seq < 0 || uint32_t(seq) >= n_seq_max) throw std::out_of_range("invalid sequence owner");
+    return state_owners.at(metadata->get_stream_for_seq(seq));
+}
+
+uint64_t llama_kv_cache_kvarn::mixed_state_owner_id(llama_seq_id seq) const {
+    return seq >= 0 && uint32_t(seq) < n_seq_max ? owner_for_seq(seq).id : 0;
+}
+
+uint64_t llama_kv_cache_kvarn::mixed_state_owner_epoch(llama_seq_id seq) const {
+    return seq >= 0 && uint32_t(seq) < n_seq_max ? owner_for_seq(seq).epoch : 0;
+}
+
+bool llama_kv_cache_kvarn::adopt_state_owner_epoch(uint64_t epoch, llama_seq_id seq) {
+    if (!epoch || epoch == UINT64_MAX || seq < 0 || uint32_t(seq) >= n_seq_max) return false;
+    auto & owner = owner_for_seq(seq);
+    owner.epoch = epoch;
+    owner.lineage.reset(epoch);
+    return true;
+}
+
+bool llama_kv_cache_kvarn::adopt_state_owner_id(uint64_t id, llama_seq_id seq) {
+    if (!id || seq < 0 || uint32_t(seq) >= n_seq_max) return false;
+    auto & owner = owner_for_seq(seq);
+    owner.id = id;
+    owner.lineage.reset(owner.epoch);
+    return true;
+}
+
+void llama_kv_cache_kvarn::dirty_state_prefix(llama_seq_id seq, llama_pos pos) {
+    auto & owner = owner_for_seq(seq);
+    if (owner.epoch == UINT64_MAX) {
         throw std::overflow_error("mixed KV state owner epoch exhausted");
     }
-    prefix_lineage.invalidate_from(state_owner_epoch + 1, std::max<llama_pos>(0, pos));
-    ++state_owner_epoch;
+    owner.lineage.invalidate_from(owner.epoch + 1, std::max<llama_pos>(0, pos));
+    ++owner.epoch;
 }
 
 bool llama_kv_cache_kvarn::invalidate_prefix_on_write(const llama_ubatch & ubatch) {
@@ -4394,7 +4458,7 @@ bool llama_kv_cache_kvarn::invalidate_prefix_on_write(const llama_ubatch & ubatc
     if (dirty_from == std::numeric_limits<llama_pos>::max()) return false;
     // Even identical token/position IDs cannot prove unchanged K/V. Scan the
     // entire ubatch: callers outside the server may supply unordered positions.
-    dirty_state_prefix(dirty_from);
+    dirty_state_prefix(target_seq, dirty_from);
     return true;
 }
 
@@ -4417,6 +4481,9 @@ llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() 
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {
+    for (const auto & owner : state_owners) {
+        if (owner.epoch == UINT64_MAX) throw std::overflow_error("mixed KV state owner epoch exhausted");
+    }
     if (native_companion_enabled() && native_companion_negotiated_) {
         if (!native_companion_reset_ || !native_companion_reset_()) {
             throw std::runtime_error("native-only overflow clear requires a successful remote-owner reset");
@@ -4427,12 +4494,8 @@ void llama_kv_cache_kvarn::clear(bool data) {
     (void) native_kvarn_checkpoint_unavailable();
     drain_prefill_migration();
     pending_stream_copies = {};
-    if (standard_cache) {
-        if (state_owner_epoch == UINT64_MAX) {
-            throw std::overflow_error("mixed KV state owner epoch exhausted");
-        }
-        ++state_owner_epoch;
-        prefix_lineage.reset(state_owner_epoch);
+    for (auto & owner : state_owners) {
+        owner.lineage.reset(++owner.epoch);
     }
     if (local_cache) local_cache->clear(data);
     if (standard_cache) standard_cache->clear(data);
@@ -4489,7 +4552,7 @@ bool llama_kv_cache_kvarn::can_remove(llama_seq_id seq_id, llama_pos p0, llama_p
             // is safe. Interior edits and larger removals stay fail-closed.
             if (!native_kvarn_rewind_capable_ || p1 >= 0 ||
                     metadata->seq_pos_max(seq_id) - std::max(norm_p0, llama_pos(position_split_p_)) + 1 > 128 ||
-                    !native_kvarn_rewind_preflight_ || !native_kvarn_rewind_preflight_(norm_p0)) {
+                    !native_kvarn_rewind_preflight_ || !native_kvarn_rewind_preflight_(seq_id, norm_p0)) {
                 return false;
             }
         }
@@ -4631,11 +4694,12 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
             return false;
         }
         const bool full_clear = p0 <= 0 && p1 < 0;
-        if (full_clear && state_owner_epoch == UINT64_MAX) {
-            throw std::overflow_error("mixed KV state owner epoch exhausted");
+        if (full_clear) for (uint32_t s = 0; s < n_stream; ++s) {
+            if ((seq_id < 0 || s == metadata->get_stream_for_seq(seq_id)) && state_owners[s].epoch == UINT64_MAX)
+                throw std::overflow_error("mixed KV state owner epoch exhausted");
         }
         if (!full_clear && p0 <= metadata->seq_pos_max(seq_id)) {
-            dirty_state_prefix(p0);
+            dirty_state_prefix(seq_id, p0);
         }
         drain_prefill_migration();
         apply_pending_stream_copies(nullptr);
@@ -4646,8 +4710,12 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
             local_cache->seq_rm(seq_id, p0, p1) : true;
         const bool removed = metadata_removed && companion_removed && local_removed;
         if (removed && full_clear) {
-            ++state_owner_epoch;
-            prefix_lineage.reset(state_owner_epoch);
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                if (seq_id < 0 || s == metadata->get_stream_for_seq(seq_id)) {
+                    auto & owner = state_owners[s];
+                    owner.lineage.reset(++owner.epoch);
+                }
+            }
         }
         if (removed && migration_enabled) migration_mirror_stale = true;
         return removed;
@@ -4710,7 +4778,7 @@ bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {
                 }
             }
         }
-        dirty_state_prefix(cell_pos);
+        dirty_state_prefix(seq_id, cell_pos);
         drain_prefill_migration();
         apply_pending_stream_copies(nullptr);
         const bool removed = metadata->seq_rm_cell(seq_id, cell_idx);
@@ -4741,25 +4809,41 @@ int llama_kv_cache_kvarn::cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint3
     return metadata->cells_at_pos(seq_id, pos, cell_indices, n_max);
 }
 
-void llama_kv_cache_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    drain_prefill_migration();
-    apply_pending_stream_copies(nullptr);
+bool llama_kv_cache_kvarn::can_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
+    if (seq_id_src < 0 || seq_id_dst < 0 || uint32_t(seq_id_src) >= n_seq_max || uint32_t(seq_id_dst) >= n_seq_max) {
+        return false;
+    }
+    if (seq_id_src == seq_id_dst) return true;
+    // The memory object cannot prove that either physical session's remote
+    // owner is empty from local positions or the lazy historical latch.
+    if (native_kvarn_rpc_experimental_ && position_split_enabled()) {
+        return false;
+    }
     const uint32_t stream_src = metadata->get_stream_for_seq(seq_id_src);
     const uint32_t stream_dst = metadata->get_stream_for_seq(seq_id_dst);
+    if (stream_src != stream_dst) {
+        if (p0 > 0 || (p1 >= 0 && uint64_t(p1) < get_kv_size())) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (!can_seq_cp(seq_id_src, seq_id_dst, p0, p1)) {
+        throw llama_memory_seq_cp_rejected("KVarN cross-stream copy range is unsupported");
+    }
+    if (seq_id_src == seq_id_dst) return;
+    const uint32_t stream_src = metadata->get_stream_for_seq(seq_id_src);
+    const uint32_t stream_dst = metadata->get_stream_for_seq(seq_id_dst);
+    drain_prefill_migration();
+    apply_pending_stream_copies(nullptr);
+
+    if (position_split_enabled() && stream_src != stream_dst) {
+        dirty_state_prefix(seq_id_dst, 0);
+    }
 
     if (stream_src != stream_dst) {
-        bool is_full = true;
-
-        if (p0 > 0 && p0 + 1 < (int) get_kv_size()) {
-            is_full = false;
-        }
-
-        if (p1 > 0 && p1 + 1 < (int) get_kv_size()) {
-            is_full = false;
-        }
-
-        GGML_ASSERT(is_full && "KVarN cross-stream seq_cp() is only supported for full KV buffers");
-
         pending_stream_copies.ssrc.push_back(stream_src);
         pending_stream_copies.sdst.push_back(stream_dst);
     }
@@ -4778,8 +4862,18 @@ void llama_kv_cache_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_d
 }
 
 void llama_kv_cache_kvarn::seq_keep(llama_seq_id seq_id) {
-    if (position_split_enabled() && seq_id != 0) {
-        dirty_state_prefix(0);
+    if (position_split_enabled() && !(n_seq_max == 1 && seq_id == 0)) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            if (s != metadata->get_stream_for_seq(seq_id) || n_stream == 1) {
+                if (state_owners[s].epoch == UINT64_MAX) throw std::overflow_error("mixed KV state owner epoch exhausted");
+            }
+        }
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            if (s != metadata->get_stream_for_seq(seq_id) || n_stream == 1) {
+                auto & owner = state_owners[s];
+                owner.lineage.reset(++owner.epoch);
+            }
+        }
     }
     drain_prefill_migration();
     apply_pending_stream_copies(nullptr);
@@ -4901,6 +4995,8 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
         if (native_companion_format_ != 0 || !native_companion_negotiated_) {
             return false;
         }
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && !native_kvarn_rewind_capable_ &&
+                metadata->seq_pos_max(seq_id) >= llama_pos(position_split_p_)) return false;
         constexpr uint32_t supported = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
                 LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL;
         if ((uint32_t(flags) & ~supported) != 0 ||
@@ -4941,6 +5037,8 @@ bool llama_kv_cache_kvarn::state_seq_can_restore(
         if (native_companion_format_ != 0 || !native_companion_negotiated_) {
             return false;
         }
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && !native_kvarn_rewind_capable_ &&
+                metadata->seq_pos_max(seq_id) >= llama_pos(position_split_p_)) return false;
         constexpr uint32_t supported = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
                 LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED | LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL;
         if ((uint32_t(flags) & ~supported) != 0 ||
@@ -5532,7 +5630,7 @@ void llama_kv_cache_kvarn::state_write_mixed(
         std::vector<uint32_t> overflow_cells;
         bool empty_split_overflow = false;
         if (position_split_enabled() && !partial) {
-            if (!position_split_live_cells(llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells)) {
+            if (!position_split_live_cells(llama_position_split::range_kind::OVERFLOW_RANGE, overflow_cells, seq_id < 0 ? 0 : seq_id)) {
                 throw llama_kv_mixed::kv_mixed_error("split state writer cannot validate overflow occupancy");
             }
             empty_split_overflow = overflow_cells.empty();
@@ -5583,8 +5681,8 @@ void llama_kv_cache_kvarn::state_write_mixed(
     input.metadata = manifest.data();
     input.metadata_size = manifest.size();
     input.flags = partial ? llama_kv_mixed::snapshot_flags::partial : llama_kv_mixed::snapshot_flags::full;
-    input.owner_epoch = partial ? state_owner_epoch : 0;
-    input.owner_id = partial ? state_owner_id : 0;
+    input.owner_epoch = partial ? owner_for_seq(seq_id).epoch : 0;
+    input.owner_id = partial ? owner_for_seq(seq_id).id : 0;
     // F4 v2: only a split cache emits the envelope, and it refuses to save
     // without a stamped model/RoPE identity so a restore can never guess.
     if (position_split_enabled()) {
@@ -5697,8 +5795,9 @@ void llama_kv_cache_kvarn::state_read_mixed(
     if (has_pending_stream_copies() || (migration_copies && !migration_copies->drain())) {
         throw std::runtime_error("mixed KV state cannot be restored while a stream copy is pending");
     }
-    if (state_owner_epoch == UINT64_MAX) {
-        throw std::overflow_error("mixed KV state owner epoch exhausted");
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if ((seq_id < 0 || s == metadata->get_stream_for_seq(seq_id)) && state_owners[s].epoch == UINT64_MAX)
+            throw std::overflow_error("mixed KV state owner epoch exhausted");
     }
 
     // Bound the incoming frame by the actual persistent K/V allocations plus a
@@ -5793,7 +5892,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
     }
 
     if (native_full) {
-        llama_validate_native_prefix(parsed.cells(), io.native_expected_tokens(), metadata->get_size(), position_split_p_, seq_id);
+        llama_validate_native_prefix(parsed.cells(), io.native_expected_tokens(), metadata->get_size(), position_split_p_, -1);
     }
 
     mixed_manifest manifest;
@@ -5813,7 +5912,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
         // recurrent staging or any commit callback can mutate the destination.
         const bool needs_native_prefix = frontier > llama_pos(position_split_p_) || native_kvarn_checkpoint_unavailable();
         if (needs_native_prefix && (!native_kvarn_rewind_capable_ || !native_kvarn_rewind_preflight_ ||
-                !native_kvarn_rewind_preflight_(frontier))) {
+                !native_kvarn_rewind_preflight_(seq_id, frontier))) {
             throw kv_mixed_error("native partial restore is outside the retained original prefix window");
         }
     }
@@ -6033,14 +6132,14 @@ void llama_kv_cache_kvarn::state_read_mixed(
     }
     if (partial) {
         if (position_split_enabled() && standard_cache) {
-            if (!prefix_lineage.can_restore(parsed.owner_epoch(), saved_prefix_max)) {
+            if (!owner_for_seq(seq_id).lineage.can_restore(parsed.owner_epoch(), saved_prefix_max)) {
                 throw kv_mixed_error("mixed partial snapshot prefix was changed or its lineage expired");
             }
             expected.owner_epoch = parsed.owner_epoch();
         } else {
-            expected.owner_epoch = state_owner_epoch;
+            expected.owner_epoch = owner_for_seq(seq_id).epoch;
         }
-        expected.owner_id = state_owner_id;
+        expected.owner_id = owner_for_seq(seq_id).id;
     }
     parsed.validate_expected_snapshot(expected, parse_opts);
 
@@ -6112,6 +6211,7 @@ void llama_kv_cache_kvarn::state_read_mixed(
     reader_limits.max_fixup_staging = 64u << 20;
     reader_limits.hash_borrowed = true;
     split_reader reader(std::move(manifest), std::move(spans), reader_limits);
+    reader.set_native_ram_validate_only(native_full && io.native_ram_validate_only());
     llama_kv_cache::slot_info_vec_t restored_sinfos;
     const auto validate_prepared_cells = [&](const llama_kv_cache & prepared,
             const std::unordered_map<uint32_t, uint32_t> & cell_remap) {
@@ -6179,8 +6279,11 @@ void llama_kv_cache_kvarn::state_read_mixed(
     if (local_cache) {
         auto metadata_prepared = make_metadata_cache();
         const bool self_contained = (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0;
-        if (seq_id >= 0 && ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 || self_contained)) {
+        if (seq_id >= 0 && (n_stream > 1 || (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 || self_contained)) {
             metadata_prepared->clone_logical_state_from(*metadata);
+        }
+        if (native_full && reader.native_ram_validate_only() && !metadata_prepared->seq_rm(seq_id, -1, -1)) {
+            throw kv_mixed_error("native RAM validation cannot simulate destination clear");
         }
         metadata_prepared->state_read_sinfo(reader, seq_id, flags, &restored_sinfos, placement);
         const auto & state_cell_remap_pairs = metadata_prepared->get_state_cell_remap();
@@ -6264,17 +6367,25 @@ void llama_kv_cache_kvarn::state_read_mixed(
         throw kv_mixed_error("mixed state I/O manifest contains trailing legacy bytes");
     }
     if (!partial) {
-        reader.on_commit([this]() {
-            ++state_owner_epoch;
-            prefix_lineage.reset(state_owner_epoch);
+        reader.on_commit([this, seq_id]() {
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                if (seq_id < 0 || s == metadata->get_stream_for_seq(seq_id)) {
+                    auto & owner = state_owners[s];
+                    owner.lineage.reset(++owner.epoch);
+                }
+            }
         });
     } else if (position_split_enabled() && standard_cache) {
-        prefix_lineage.reserve_change(); // no allocation after restore starts committing
-        reader.on_commit([this, saved_prefix_max]() {
-            dirty_state_prefix(llama_pos(saved_prefix_max + 1));
+        owner_for_seq(seq_id).lineage.reserve_change(); // no allocation after restore starts committing
+        reader.on_commit([this, seq_id, saved_prefix_max]() {
+            dirty_state_prefix(seq_id, llama_pos(saved_prefix_max + 1));
         });
     }
-    reader.defer_to(io);
+    if (io.native_ram_validate_only() && native_full) {
+        reader.cancel();
+    } else {
+        reader.defer_to(io);
+    }
     if (sinfos_out) {
         *sinfos_out = std::move(restored_sinfos);
     }
@@ -7302,8 +7413,12 @@ void llama_kv_cache_kvarn::state_read_kvarn_body(
     // outer state reader commits its queued tensor writes.
     auto metadata_prepared = make_metadata_cache();
     const bool self_contained = (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0;
-    if (seq_id >= 0 && ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 || self_contained)) {
+    if (seq_id >= 0 && (n_stream > 1 || (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 || self_contained)) {
         metadata_prepared->clone_logical_state_from(*metadata);
+    }
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_NATIVE_FULL) && io.native_ram_validate_only() &&
+            !metadata_prepared->seq_rm(seq_id, -1, -1)) {
+        throw std::runtime_error("native RAM validation cannot simulate destination clear");
     }
     if (self_contained) {
         metadata_prepared->set_state_remap_group_size(KVAR_N_GROUP);

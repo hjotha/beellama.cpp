@@ -16,6 +16,30 @@
 
 struct ggml_remote_attn_kvarn_stage;
 struct llama_ubatch;
+
+enum llama_native_ram_restore_result {
+    LLAMA_NATIVE_RAM_FAILED_INVALIDATED = -1,
+    LLAMA_NATIVE_RAM_REJECTED_CLEAN = 0,
+    LLAMA_NATIVE_RAM_RESTORED = 1,
+    LLAMA_NATIVE_RAM_OK = LLAMA_NATIVE_RAM_RESTORED,
+};
+
+// Native RAM frames are target-only, KVarN4 revision-3 state. The caller must
+// reserve the stated workspace separately from frame and backup storage. The
+// source and digest must remain immutable until each synchronous call returns.
+LLAMA_API llama_native_ram_restore_result llama_state_seq_native_ram_size(struct llama_context * ctx, llama_seq_id seq_id,
+        uint32_t evaluated, uint64_t workspace_limit, size_t * size_out);
+LLAMA_API llama_native_ram_restore_result llama_state_seq_native_ram_write(struct llama_context * ctx, llama_seq_id seq_id,
+        uint32_t evaluated, uint8_t * dst, size_t capacity, uint8_t sha256[32], uint64_t workspace_limit);
+LLAMA_API llama_native_ram_restore_result llama_state_seq_native_ram_validate(struct llama_context * ctx, llama_seq_id seq_id,
+        uint32_t evaluated, const uint8_t * src, size_t size, const uint8_t sha256[32], uint64_t scratch_limit);
+// Restore requires an empty destination. FAILED_INVALIDATED means that remote
+// or local mutation may have begun and the caller must quarantine the slot;
+// a failed shared backend also invalidates all other sessions on that backend.
+LLAMA_API llama_native_ram_restore_result llama_state_seq_native_ram_restore(struct llama_context * ctx,
+        llama_seq_id seq_id, uint32_t evaluated, const uint8_t * src, size_t size,
+        const uint8_t sha256[32], uint64_t scratch_limit);
+LLAMA_API bool llama_remote_attn_backend_failed(const struct llama_context * ctx);
 // One-shot, thread-local offer for the next context constructor. The caller
 // retains the stage handle and must clear an unconsumed offer on failure.
 LLAMA_API bool llama_remote_attn_offer_kvarn_stage(ggml_remote_attn_kvarn_stage * stage);
@@ -134,6 +158,11 @@ LLAMA_API uint64_t llama_kvarn_state_owner_id(struct llama_context * ctx);
 // Adopt `owner_id` as the current mixed KVarN owner id (see above). Returns true when the
 // id is now in effect; 0 is refused.
 LLAMA_API bool llama_kvarn_adopt_state_owner_id(struct llama_context * ctx, uint64_t owner_id);
+
+LLAMA_API uint64_t llama_kvarn_state_owner_epoch_seq(struct llama_context * ctx, llama_seq_id seq_id);
+LLAMA_API bool llama_kvarn_adopt_state_owner_epoch_seq(struct llama_context * ctx, llama_seq_id seq_id, uint64_t epoch);
+LLAMA_API uint64_t llama_kvarn_state_owner_id_seq(struct llama_context * ctx, llama_seq_id seq_id);
+LLAMA_API bool llama_kvarn_adopt_state_owner_id_seq(struct llama_context * ctx, llama_seq_id seq_id, uint64_t owner_id);
 
 // Managed MTP target, owner-thread only. Zero means no tracked unmasked NextN decode.
 // State imports, failed/new decodes, encode, output reservation and a NextN mode change invalidate the ID.

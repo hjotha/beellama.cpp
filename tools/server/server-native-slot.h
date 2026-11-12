@@ -66,28 +66,24 @@ inline bool generic_route_eligible(bool has_marker, bool native_remote, bool leg
     return has_marker ? !native_remote : !legacy_mixed;
 }
 
-// Native streaming runs only with a single target sequence. Once a restore
-// has mutated it, clear the entire memory exactly once (which invokes the
-// remote reset hook), then forget the slot's bookkeeping. Calling the normal
-// slot prompt_clear first would also remove the sequence and send a second
-// reset to the peer.
-template <class Slot, class ClearMemory>
-void clear_failed_restore(Slot & slot, ClearMemory clear_memory) {
+// A failed restore may have installed a remote owner. Clear only its slot;
+// quarantine it if the clear or remote reset cannot be confirmed.
+template <class Slot>
+bool clear_failed_restore(Slot & slot) {
     try {
-        clear_memory();
+        if (slot.prompt_clear()) return true;
     } catch (...) {
-        // A throwing clear may already have changed memory. Never leave slot
-        // metadata claiming the old state is still usable.
-        slot.prompt_forget_memory();
-        throw;
     }
+    slot.prompt_cleanup_failed = true;
     slot.prompt_forget_memory();
+    return false;
 }
 
 struct Eligibility {
     bool native_stream = false;
     bool adaptive = false;
     bool profile_xxxl = false;
+    bool nonadaptive_multislot = false;
     bool one_sequence = false;
     bool snapshot_supported = false;
     bool native_active = false; // SAVE only
@@ -109,9 +105,9 @@ inline bool save_allowed(const Eligibility & e, std::string * error) {
     };
     if (!e.native_stream)
         return reject("native_stream is required");
-    if (!e.adaptive)
+    if (!e.adaptive && !e.nonadaptive_multislot)
         return reject("native streaming slots require the adaptive server");
-    if (!e.profile_xxxl)
+    if (e.adaptive && !e.profile_xxxl)
         return reject("native streaming slots require the xxxl adaptive profile (select it with a small completion budget, then erase the target slot)");
     if (e.draft_present || e.can_speculate)
         return reject("native streaming slots are target-only; MTP/draft state is unsupported");
@@ -141,9 +137,9 @@ inline bool restore_allowed(const Eligibility & e, std::string * error) {
     };
     if (!e.native_stream)
         return reject("native_stream is required");
-    if (!e.adaptive)
+    if (!e.adaptive && !e.nonadaptive_multislot)
         return reject("native streaming slots require the adaptive server");
-    if (!e.profile_xxxl)
+    if (e.adaptive && !e.profile_xxxl)
         return reject("native streaming slots require the xxxl adaptive profile (select it with a small completion budget, then erase the target slot)");
     if (e.draft_present || e.can_speculate)
         return reject("native streaming slots are target-only; MTP/draft state is unsupported");

@@ -8,7 +8,7 @@
 
 // A native snapshot represents the complete evaluated prefix. A matching
 // RKVK row count is insufficient if its memory body has missing or duplicate
-// logical positions, or if it names a different sequence.
+// logical positions, or if its cells belong to different sequences.
 inline void llama_validate_native_prefix(const std::vector<llama_kv_mixed::cell_entry> & cells,
         uint32_t count, uint32_t capacity, uint32_t split, llama_seq_id expected_seq = 0) {
     if (count <= split || count > capacity) {
@@ -16,14 +16,18 @@ inline void llama_validate_native_prefix(const std::vector<llama_kv_mixed::cell_
     }
     std::vector<uint8_t> seen(count, 0);
     uint32_t occupied = 0;
+    llama_seq_id source_seq = expected_seq;
     for (const auto & cell : cells) {
         if (cell.pos == -1 && cell.seq_ids.empty()) continue;
         if (cell.pos < 0) {
             throw std::runtime_error("native FULL body has an invalid empty cell");
         }
         const auto pos = uint32_t(cell.pos);
-        if (pos >= count || seen[pos] || cell.seq_ids.size() != 1 ||
-                (expected_seq >= 0 && cell.seq_ids[0] != expected_seq)) {
+        if (cell.seq_ids.size() != 1 || cell.seq_ids[0] < 0) {
+            throw std::runtime_error("native FULL body cells do not match the evaluated prefix");
+        }
+        if (source_seq < 0) source_seq = cell.seq_ids[0];
+        if (pos >= count || seen[pos] || cell.seq_ids[0] != source_seq) {
             throw std::runtime_error("native FULL body cells do not match the evaluated prefix");
         }
         seen[pos] = 1;

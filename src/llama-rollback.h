@@ -20,7 +20,7 @@ static inline int llama_decode_aborted_code(bool rollback_failed, bool remote_fa
 // After a decode failure, try to remove the suffix first. If the memory refuses
 // (position-split exact reservation), invalidate the whole sequence instead of
 // leaving a partially applied KV. The callback owns the seq_rm primitive and
-// must run the on_seq_rm callback for the full clear.
+// must run the on_seq_rm callback for both suffix removal and full clear.
 template <typename SeqRm>
 inline llama_rollback_result llama_rollback_sequence_after_decode_failure(
         SeqRm && seq_rm, llama_seq_id seq_id, llama_pos pos_min) {
@@ -31,4 +31,10 @@ inline llama_rollback_result llama_rollback_sequence_after_decode_failure(
         return LLAMA_ROLLBACK_FULL;
     }
     return LLAMA_ROLLBACK_NONE;
+}
+
+template <typename Remove, typename Notify>
+inline bool llama_rollback_remove_and_notify(
+        Remove && remove, Notify && notify, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return remove(seq_id, p0, p1) && notify(seq_id, p0, p1);
 }

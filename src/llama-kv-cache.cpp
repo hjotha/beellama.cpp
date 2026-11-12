@@ -423,7 +423,10 @@ const  layer_reuse_cb & reuse,
     }
 
     if (payload_row_origin != 0) {
-        if (!other || !own_payload_with_shared_cells || n_stream != 1 || n_seq_max != 1 ||
+        if (n_stream != 1 || n_seq_max != 1) {
+            throw std::invalid_argument("compact Qx position-split companion does not support multiple sequences");
+        }
+        if (!other || !own_payload_with_shared_cells ||
                 v_trans || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE ||
                 tail_tokens != 0 || tail_rollback_tokens != 0 || tail_metadata_only ||
                 payload_row_origin >= kv_size || payload_row_origin % n_pad != 0 ||
@@ -1734,6 +1737,14 @@ void llama_kv_cache::materialize_pending_copies() {
         tail->commit_seq_cp();
     }
     sc_info = {};
+}
+
+bool llama_kv_cache::can_seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) const {
+    if (src < 0 || dst < 0 || size_t(src) >= seq_to_stream.size() || size_t(dst) >= seq_to_stream.size()) return false;
+    if (src == dst) return true;
+    if (other) return false; // shared-cell follower does not perform the copy
+    if (seq_to_stream[src] == seq_to_stream[dst]) return true;
+    return p0 <= 0 && (p1 < 0 || uint64_t(p1) >= get_size());
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

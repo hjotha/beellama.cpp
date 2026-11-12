@@ -466,7 +466,8 @@ public:
     bool get_can_shift() const override;
     bool invalidate_prefix_on_write(const llama_ubatch & ubatch) override;
     bool supports_resident_prefix_restore() const override {
-        return position_split_enabled() && standard_cache &&
+        return position_split_enabled() && (standard_cache ||
+                (native_companion_enabled() && native_companion_format_ == 0 && native_companion_negotiated_)) &&
                 (!native_kvarn_rpc_experimental_ || native_kvarn_rewind_capable_);
     }
     // Called after HELLO/CONFIG succeeds and before any sequence is populated.
@@ -474,7 +475,7 @@ public:
     void set_negotiated_native_rpc_owner(bool has_record_snapshot_codec, uint32_t global_tail_tokens = 0);
     uint32_t native_global_tail_tokens() const { return native_global_tail_tokens_; }
     void set_native_kvarn_rewind_capable(bool capable) { native_kvarn_rewind_capable_ = capable; }
-    void set_native_kvarn_rewind_preflight(std::function<bool(llama_pos)> preflight) {
+    void set_native_kvarn_rewind_preflight(std::function<bool(llama_seq_id, llama_pos)> preflight) {
         native_kvarn_rewind_preflight_ = std::move(preflight);
     }
     void set_native_companion_reset(std::function<bool()> reset) {
@@ -490,6 +491,7 @@ public:
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
     bool seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) override;
     int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
+    bool can_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const override;
     void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id) override;
     GGML_NORETURN void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -730,34 +732,20 @@ public:
     std::vector<llama_kv_cache_standard_layer_layout> standard_layer_layout() const;
     std::vector<llama_kv_cache_standard_layer_layout> local_standard_layer_layout() const;
     std::vector<llama_kv_cache_kvarn_layer_layout> kvarn_layer_layout() const;
-    uint64_t mixed_state_owner_id() const { return state_owner_id; }
-    uint64_t mixed_state_owner_epoch() const { return state_owner_epoch; }
+    uint64_t mixed_state_owner_id(llama_seq_id seq = 0) const;
+    uint64_t mixed_state_owner_epoch(llama_seq_id seq = 0) const;
     // [TAG_SLOT_SAVE_CHECKPOINTS] Adopt the lineage epoch carried by a durable checkpoint
     // companion. Server restore/handoff flows call this only after the full state that
     // produced those partial snapshots was loaded into this cache; every replay still passes
     // the fine-grained reference/identity validation.
-    bool adopt_state_owner_epoch(uint64_t epoch) {
-        if (epoch == 0 || epoch == UINT64_MAX) {
-            return false;
-        }
-        state_owner_epoch = epoch;
-        prefix_lineage.reset(epoch);
-        return true;
-    }
+    bool adopt_state_owner_epoch(uint64_t epoch, llama_seq_id seq = 0);
     // [TAG_SLOT_SAVE_CHECKPOINTS] Adopt the owner id carried by a durable
     // checkpoint companion (payloads are owner-bound; the full-state restore
     // recreates the cells but not the process-random owner id). Server
     // restore/handoff flows call this only after loading the state the
     // checkpoints were captured from; every replay still passes the
     // fine-grained cell-reference validation.
-    bool adopt_state_owner_id(uint64_t owner_id) {
-        if (owner_id == 0) {
-            return false;
-        }
-        state_owner_id = owner_id;
-        prefix_lineage.reset(state_owner_epoch);
-        return true;
-    }
+    bool adopt_state_owner_id(uint64_t owner_id, llama_seq_id seq = 0);
     // F4 v2: stable model/RoPE identity stamped into the position_split envelope
     // by the caller that built this cache. A snapshot saved under one identity is
     // refused by a cache with a different one, before any staging happens.
@@ -970,7 +958,7 @@ private:
     bool native_row_rpc_experimental_;
     uint32_t native_global_tail_tokens_ = 0;
     bool native_kvarn_rewind_capable_ = false;
-    std::function<bool(llama_pos)> native_kvarn_rewind_preflight_;
+    std::function<bool(llama_seq_id, llama_pos)> native_kvarn_rewind_preflight_;
     std::function<bool()> native_companion_reset_;
     bool native_kvarn_checkpoint_unavailable() const;
     mutable bool native_kvarn_overflow_seen_ = false;
@@ -989,10 +977,15 @@ private:
     const uint32_t exact_tail_tokens_requested;
     const ggml_type exact_tail_type_requested;
     ggml_type exact_tail_type;
-    uint64_t state_owner_id;
-    uint64_t state_owner_epoch = 1;
-    llama_kv_prefix_lineage prefix_lineage;
-    void dirty_state_prefix(llama_pos pos);
+    struct state_owner {
+        uint64_t id = 0;
+        uint64_t epoch = 1;
+        llama_kv_prefix_lineage lineage;
+    };
+    std::vector<state_owner> state_owners;
+    state_owner & owner_for_seq(llama_seq_id seq);
+    const state_owner & owner_for_seq(llama_seq_id seq) const;
+    void dirty_state_prefix(llama_seq_id seq, llama_pos pos);
     // F4 v2: model/RoPE identity for the position_split envelope. Zero means
     // "not stamped"; a split cache refuses to save without it.
     uint64_t state_model_id = 0;

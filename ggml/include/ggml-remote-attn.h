@@ -302,6 +302,13 @@ GGML_API bool ggml_backend_remote_attn_native_kvarn_remote_restore(
         uint64_t saved_generation, uint64_t * new_generation);
 GGML_API bool ggml_backend_remote_attn_native_kvarn_state_commit(
         ggml_backend_t backend, uint64_t new_generation);
+// Rehydrate a previously validated pending RKVK set into the currently active,
+// empty session using RESET and per-layer native uploads, without disk snapshots.
+// The caller must reserve at least max_scratch_bytes in addition to the pending
+// state and must not use the session concurrently. A failed RPC poisons the
+// connection; after any failure, re-read the RKVK before retrying.
+GGML_API bool ggml_backend_remote_attn_native_kvarn_rehydrate_pending(
+        ggml_backend_t backend, uint64_t max_scratch_bytes);
 GGML_API void ggml_backend_remote_attn_native_kvarn_state_abort(ggml_backend_t backend);
 GGML_API void ggml_backend_remote_attn_native_kvarn_discard(ggml_backend_t backend);
 

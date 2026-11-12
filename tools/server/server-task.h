@@ -83,6 +83,10 @@ static inline bool server_prompt_reuse_requires_checkpoint_search(
     return state_required || pos_min >= pos_min_threshold;
 }
 
+static inline void server_prompt_cache_commit_source(std::string & source, size_t reused_tokens) {
+    if (!reused_tokens) source = "none";
+}
+
 static inline bool server_prompt_checkpoint_must_prune(
         bool mtp, llama_pos pos_max, int64_t n_tokens,
         llama_pos pos_next, int64_t n_prefix, int64_t n_past) {
@@ -1037,6 +1041,8 @@ struct server_prompt_cache_state {
     llama_pos pos_tgt = -1;
     llama_pos pos_dft = -1;
     uint64_t checksum = 0;
+    bool native_ram = false;
+    std::array<uint8_t, 32> native_sha256{};
     bool quarantined = false;
 
     bool has_draft() const { return !data.drft.empty(); }
@@ -1100,6 +1106,7 @@ uint64_t admission_attempts = 0;
     size_t n_tokens() const;
 
     std::string last_reason;
+    bool native_context_invalidated = false;
 
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
             common_speculative * spec, llama_seq_id id_slot);
@@ -1127,6 +1134,9 @@ uint64_t admission_attempts = 0;
 private:
     size_t transient_bytes = 0;
     bool restore_invalid = false;
+    bool save_native(const server_prompt &, llama_context *, llama_seq_id, size_t, llama_pos);
+    server_prompt_cache_result restore_native(server_prompt &, const server_prompt_cache_state &,
+                                              llama_context *, llama_seq_id, bool);
     server_prompt_cache_result restore_impl(server_prompt & prompt, const server_prompt_cache_state & state,
             llama_context * ctx_tgt, llama_context * ctx_dft, common_speculative * spec, llama_seq_id id_slot,
             bool copy_prompt, bool allow_bootstrap, server_prompt_restore_timings * timings = nullptr);

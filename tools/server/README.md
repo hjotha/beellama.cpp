@@ -2889,3 +2889,20 @@ A limited native Xbox smoke test verified a same-geometry checkpoint round trip,
 including the serialized state and continuation distributions. Qualification
 for another deployment should cover its model, geometry and batch segmentation,
 as well as publication failures and quota handling in a separate test store.
+
+### Native position split with multiple slots
+
+Negotiated native KVarN4 position-split sessions can use independent parallel
+slots. For multiple slots, native overflow slot files must use the explicit `native_stream` save and
+restore path, which keeps the host file paired with its remote snapshot. A lost
+acknowledgement during a remote mutation invalidates the shared context and
+cancels its active slots; the context must then be recreated. An active MTP
+profile cannot be combined with position split.
+
+Floating-point and quantized kernels can produce different logits when a cached
+prefix and a cold prefill use different batch partitions. This also occurs on
+the single-slot baseline: identical seeds do not guarantee identical generated
+tokens across those two execution paths. To check snapshot or RAM-cache
+integrity, compare the restored continuation with the same live prefix and
+batching, and check unrelated slots separately; a cold comparison is useful for
+measuring numerical variation but is not a bit-exact state-restore oracle.

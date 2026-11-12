@@ -1081,7 +1081,24 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
-    // Copy all tokens that belong to the specified sequence to another sequence
+    enum llama_memory_seq_cp_result {
+        LLAMA_MEMORY_SEQ_CP_OK = 0,
+        LLAMA_MEMORY_SEQ_CP_REJECTED_CLEAN = 1,
+        LLAMA_MEMORY_SEQ_CP_FAILED_INVALIDATED = 2,
+    };
+
+    // Checked copy: REJECTED_CLEAN leaves both sequences unchanged (including
+    // when this memory backend has no checked-copy support). On
+    // FAILED_INVALIDATED the caller must discard the affected context.
+    LLAMA_API enum llama_memory_seq_cp_result llama_memory_seq_cp_checked(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Copy all tokens that belong to the specified sequence to another sequence.
+    // This legacy void API terminates on failure; use the checked API to recover.
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
     LLAMA_API void llama_memory_seq_cp(

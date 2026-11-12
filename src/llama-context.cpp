@@ -11,6 +11,7 @@
 #include "llama-position-split.h"
 #include "llama-wavefront.h"
 #include "llama-io.h"
+#include "llama-io-native-ram.h"
 #include "llama-io-file.h"
 #include "llama-native-save-file.h"
 #include "llama-state-framing.h"
@@ -30,6 +31,7 @@
 #include "rkva-snapshot-digest.h"
 #include "llama-remote-snapshot.h"
 #include "ggml-local-split.h"
+#include "../ggml/src/ggml-remote-attn/remote-attn-protocol.h"
 
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -2323,7 +2325,8 @@ std::vector<ggml_backend_t> layer_backends;
                 native_cache->set_negotiated_native_rpc_owner(remote_native_kvarn_records_enabled(),
                         mixed_additional_tail_requested ? cparams.kv_tail_tokens : 0);
                 native_cache->set_native_kvarn_rewind_capable(remote_native_kvarn_can_rewind());
-                native_cache->set_native_kvarn_rewind_preflight([this](llama_pos p0) {
+                native_cache->set_native_kvarn_rewind_preflight([this](llama_seq_id seq_id, llama_pos p0) {
+                    if (backend_remote && seq_id >= 0) ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
                     return backend_remote && ggml_backend_remote_attn_native_kvarn_can_restore(backend_remote, p0);
                 });
                 if (native_cache->native_companion_enabled()) {
@@ -2336,7 +2339,11 @@ std::vector<ggml_backend_t> layer_backends;
                             native_format == 4 ? "saw_int4" :
                             native_format == 5 ? "turboquant_nc" : "oscar_int2");
                     native_cache->set_native_companion_reset([this]() {
-                        return backend_remote && ggml_backend_remote_attn_reset(backend_remote, remote_attn_session);
+                        if (!backend_remote) return false;
+                        for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
+                            if (!ggml_backend_remote_attn_reset(backend_remote, s)) return false;
+                        }
+                        return true;
                     });
                     native_owner_clears_remote = true;
                 }
@@ -2365,7 +2372,7 @@ std::vector<ggml_backend_t> layer_backends;
                         if (seq_id < 0) {
                             if (remote_native_kvarn_enabled() && p0 <= 0 && p1 < 0) {
                                 for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
-                                    ggml_backend_remote_attn_reset(backend_remote, s);
+                                    if (!ggml_backend_remote_attn_reset(backend_remote, s)) return false;
                                 }
                                 return true;
                             }
@@ -4335,7 +4342,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }();
     const int64_t prep_start = profile_prep ? ggml_time_us() : 0;
     llama_memory_context_finish_guard memory_finish_guard(mctx);
-    if (backend_remote && cparams.remote_attn_position_split && ubatch.n_tokens > 0 &&
+    if (backend_remote && cparams.remote_attn_position_split && cparams.n_seq_max > 1 && ubatch.n_tokens > 0 &&
             ubatch.n_seq_id && ubatch.seq_id && ubatch.seq_id[0]) {
         const uint32_t active_seq = (uint32_t) ubatch.seq_id[0][0];
         ggml_backend_remote_attn_set_active_session(backend_remote, active_seq);
@@ -4809,6 +4816,14 @@ bool llama_context::remote_native_companion_failed() const {
     return native_cache && native_cache->native_companion_enabled();
 }
 
+bool llama_context::remote_attn_backend_failed() const {
+    return backend_remote && ggml_backend_remote_attn_failed(backend_remote);
+}
+
+bool llama_remote_attn_backend_failed(const llama_context * ctx) {
+    return ctx && ctx->remote_attn_backend_failed();
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (wavefront_poisoned) {
         LLAMA_LOG_ERROR("RKVA wavefront: refusing reuse of a failed tiled context\n");
@@ -5101,10 +5116,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 const llama_rollback_result rollback = llama_rollback_sequence_after_decode_failure(
                     [&](llama_seq_id seq, llama_pos p0, llama_pos p1) {
-                        if (p0 < 0 && p1 < 0) {
-                            return memory->seq_rm(seq, p0, p1) && memory->run_on_seq_rm(seq, p0, p1);
-                        }
-                        return memory->seq_rm(seq, p0, p1);
+                        return llama_rollback_remove_and_notify(
+                                [&](llama_seq_id id, llama_pos first, llama_pos last) {
+                                    return memory->seq_rm(id, first, last);
+                                },
+                                [&](llama_seq_id id, llama_pos first, llama_pos last) {
+                                    return memory->run_on_seq_rm(id, first, last);
+                                }, seq, p0, p1);
                     }, s, pos_min[s]);
                 if (rollback == LLAMA_ROLLBACK_FULL) {
                     LLAMA_LOG_WARN("%s: suffix removal refused for seq_id=%d; invalidated the whole sequence\n", __func__, s);
@@ -6299,6 +6317,9 @@ public:
     }
 
     void commit() override {
+        if (native_ram_validate_only()) {
+            throw std::logic_error("native RAM validation cannot commit");
+        }
         for (const auto & rinfo : rinfos) {
             if (rinfo.clear) {
                 ggml_backend_tensor_memset(rinfo.tensor, 0, rinfo.offset, rinfo.size);
@@ -7046,6 +7067,165 @@ if (seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || !memory || !memory->s
     }
 }
 
+namespace {
+class llama_io_write_native_ram final : public llama_io_write_i {
+public:
+    llama_io_write_native_ram(uint8_t * dst, size_t capacity) : dst_(dst), capacity_(capacity) {}
+    void write(const void * src, size_t size) override {
+        if (size > capacity_ - written_) throw std::runtime_error("native RAM frame exceeds capacity");
+        if (size) std::memcpy(dst_ + written_, src, size);
+        written_ += size;
+    }
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > capacity_ - written_) throw std::runtime_error("native RAM tensor exceeds capacity");
+        if (size) ggml_backend_tensor_get(tensor, dst_ + written_, offset, size);
+        written_ += size;
+    }
+    size_t n_bytes() override { return written_; }
+private:
+    uint8_t * dst_;
+    size_t capacity_;
+    size_t written_ = 0;
+};
+
+uint64_t native_ram_workspace(uint32_t n_ctx, bool restoring) {
+    // shortcut: metadata workspace follows the existing native-slot estimate; use an allocation-tracked quota for strict bounds.
+    return rkva_native_state::saturating_add(restoring ? 48ull << 20 : 16ull << 20,
+            rkva_native_state::saturating_mul(n_ctx, restoring ? 512 : 16));
+}
+}
+
+size_t llama_context::state_seq_native_ram_size(llama_seq_id seq_id, uint32_t evaluated, uint64_t workspace_limit) {
+    if (!backend_remote || !memory || native_restore_pending || seq_id < 0 ||
+            uint32_t(seq_id) >= cparams.n_seq_max || evaluated <= cparams.kv_position_split_p ||
+            evaluated > cparams.n_ctx_seq || workspace_limit == UINT64_MAX ||
+            native_ram_workspace(cparams.n_ctx_seq, false) > workspace_limit ||
+            (cparams.remote_attn_upload_format != "kvarn4" && cparams.remote_attn_upload_format != "kvarn")) return 0;
+    ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
+    if (!remote_native_kvarn_snapshot_supported() || !remote_native_kvarn_records_enabled() ||
+            memory->seq_pos_max(seq_id) != llama_pos(evaluated - 1)) return 0;
+    try {
+        llama_io_write_dummy io(false);
+        io.set_native_expected_tokens(evaluated);
+        io.write(nullptr, llama_native_ram_frame::header_bytes);
+        return state_seq_write_data(io, seq_id, 0);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return 0;
+    }
+}
+
+int llama_context::state_seq_native_ram_write(llama_seq_id seq_id, uint32_t evaluated, uint8_t * dst,
+        size_t capacity, uint8_t sha256[32], uint64_t workspace_limit) {
+    if (!dst || !sha256) return LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    const size_t expected = state_seq_native_ram_size(seq_id, evaluated, workspace_limit);
+    if (!expected || expected != capacity) {
+        return remote_attn_backend_failed() ? LLAMA_NATIVE_RAM_FAILED_INVALIDATED : LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    }
+    try {
+        if (llama_memory_status_is_fail(memory_update(false))) return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+        uint8_t header[llama_native_ram_frame::header_bytes]{};
+        llama_native_ram_frame::write_header(header, uint32_t(seq_id), evaluated, capacity);
+        {
+            llama_io_write_native_ram io(dst, capacity);
+            io.set_native_expected_tokens(evaluated);
+            io.write(header, sizeof(header));
+            if (state_seq_write_data(io, seq_id, 0) != capacity) return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+        }
+        if (memory->seq_pos_max(seq_id) != llama_pos(evaluated - 1)) return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+        const auto digest = rkva_snapshot::digest(dst, capacity);
+        std::memcpy(sha256, digest.data(), digest.size());
+        return LLAMA_NATIVE_RAM_OK;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+    }
+}
+
+int llama_context::state_seq_native_ram_load(llama_seq_id seq_id, uint32_t evaluated, const uint8_t * src,
+        size_t size, const uint8_t sha256[32], uint64_t scratch_limit, bool validate_only) {
+    if (backend_remote && ggml_backend_remote_attn_failed(backend_remote)) return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+    if (!backend_remote || !memory || !src || !sha256 || native_restore_pending ||
+            seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max || size < llama_native_ram_frame::header_bytes ||
+            evaluated <= cparams.kv_position_split_p || evaluated > cparams.n_ctx_seq ||
+            scratch_limit == UINT64_MAX || native_ram_workspace(cparams.n_ctx_seq, true) > scratch_limit ||
+            (cparams.remote_attn_upload_format != "kvarn4" && cparams.remote_attn_upload_format != "kvarn"))
+        return LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    if (!llama_native_ram_frame::validate(src, size, evaluated, LLAMA_MAX_SEQ, sha256))
+        return LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
+    if (ggml_backend_remote_attn_failed(backend_remote)) return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+    if (!remote_native_kvarn_snapshot_supported() || !remote_native_kvarn_records_enabled() ||
+            (!validate_only && (memory->seq_pos_max(seq_id) >= 0 || remote_native_kvarn_transient_active())))
+        return LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    const uint64_t previous_decode_id = nextn_decode_id;
+    const bool previous_restore_committed = native_restore_committed;
+    bool rehydrated = false;
+    try {
+        llama_io_read_host io(src, size);
+        io.set_native_ram_scratch_limit(scratch_limit);
+        io.set_native_ram_validate_only(validate_only);
+        uint8_t header[llama_native_ram_frame::header_bytes];
+        io.read(header, sizeof(header));
+        const size_t nread = state_seq_read_data(io, seq_id, 0, evaluated, true, validate_only);
+        if (nread != size || !native_restore_pending || native_restore_rows != evaluated - cparams.kv_position_split_p) {
+            throw std::runtime_error("native RAM frame extent or owner rows differ");
+        }
+        if (validate_only) {
+            io.cancel();
+            abort_pending_native_restore();
+            nextn_decode_id = previous_decode_id;
+            native_restore_committed = previous_restore_committed;
+            return LLAMA_NATIVE_RAM_RESTORED;
+        }
+        const uint64_t workspace = native_ram_workspace(cparams.n_ctx_seq, true);
+        if (!ggml_backend_remote_attn_native_kvarn_rehydrate_pending(backend_remote, scratch_limit - workspace)) {
+            abort_pending_native_restore();
+            if (!ggml_backend_remote_attn_failed(backend_remote)) {
+                nextn_decode_id = previous_decode_id;
+                native_restore_committed = previous_restore_committed;
+            }
+            return ggml_backend_remote_attn_failed(backend_remote) ?
+                    LLAMA_NATIVE_RAM_FAILED_INVALIDATED : LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+        }
+        rehydrated = true;
+        native_restore_pending = false;
+        native_restore_committed = true;
+        io.commit();
+        if (memory->seq_pos_max(seq_id) != llama_pos(evaluated - 1)) {
+            throw std::runtime_error("native RAM restore position differs");
+        }
+        return LLAMA_NATIVE_RAM_RESTORED;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        abort_pending_native_restore();
+        if (!rehydrated) {
+            if (!ggml_backend_remote_attn_failed(backend_remote)) {
+                nextn_decode_id = previous_decode_id;
+                native_restore_committed = previous_restore_committed;
+            }
+            return ggml_backend_remote_attn_failed(backend_remote) ?
+                    LLAMA_NATIVE_RAM_FAILED_INVALIDATED : LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+        }
+        try { (void) memory->seq_rm(seq_id, -1, -1); } catch (...) {}
+        (void) ggml_backend_remote_attn_reset(backend_remote, uint32_t(seq_id));
+        return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+    } catch (...) {
+        abort_pending_native_restore();
+        if (!rehydrated) {
+            if (!ggml_backend_remote_attn_failed(backend_remote)) {
+                nextn_decode_id = previous_decode_id;
+                native_restore_committed = previous_restore_committed;
+            }
+            return ggml_backend_remote_attn_failed(backend_remote) ?
+                    LLAMA_NATIVE_RAM_FAILED_INVALIDATED : LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+        }
+        try { (void) memory->seq_rm(seq_id, -1, -1); } catch (...) {}
+        (void) ggml_backend_remote_attn_reset(backend_remote, uint32_t(seq_id));
+        return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+    }
+}
+
 llama_state_seq_restore_plan * llama_context::state_seq_prepare_data(
         llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     if (src == nullptr || size == 0 ||
@@ -7113,7 +7293,8 @@ llama_state_seq_restore_plan * llama_context::state_seq_prepare_file(
         if (backend_remote && seq_id >= 0) {
             ggml_backend_remote_attn_set_active_session(backend_remote, (uint32_t)seq_id);
         }
-        const bool require_native = remote_native_kvarn_snapshot_supported() && (actual_count > cparams.kv_position_split_p);
+        const bool require_native = cparams.n_seq_max == 1 && remote_native_kvarn_snapshot_supported() &&
+                actual_count > cparams.kv_position_split_p;
         if (!state_seq_read_data(*plan->io, seq_id, 0, actual_count, require_native)) {
             throw std::runtime_error("unable to prepare sequence state file");
         }
@@ -7220,9 +7401,11 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 
     // load the prompt
     uint32_t loaded_token_count = 0;
+    uint32_t evaluated_token_count = 0;
     {
         const uint32_t n_token_count = file.read_u32();
         loaded_token_count = n_token_count;
+        evaluated_token_count = n_token_count;
         const size_t token_begin = file.tell();
         const size_t file_size = file.size();
         if (token_begin > file_size ||
@@ -7250,7 +7433,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 
         file.read_raw(tokens_out, token_bytes);
         if (n_token_count >= 3 && tokens_out[0] == LLAMA_TOKEN_NULL) {
-            loaded_token_count = reinterpret_cast<const uint32_t *>(tokens_out)[2];
+            evaluated_token_count = reinterpret_cast<const uint32_t *>(tokens_out)[2];
         }
     }
 
@@ -7258,16 +7441,17 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     {
         const size_t state_size = file.size() - file.tell();
         const size_t state_begin = file.tell();
+        if (backend_remote && seq_id >= 0 && uint32_t(seq_id) < cparams.n_seq_max) {
+            ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
+        }
         const bool native_before = remote_native_kvarn_transient_active();
         llama_io_read_file io(&file);
         size_t nread = 0;
         try {
-            if (backend_remote && seq_id >= 0) {
-                ggml_backend_remote_attn_set_active_session(backend_remote, (uint32_t)seq_id);
-            }
             const bool require_native_for_load = require_native ||
-                    (remote_native_kvarn_snapshot_supported() && loaded_token_count > cparams.kv_position_split_p);
-            nread = state_seq_read_data(io, seq_id, 0, loaded_token_count, require_native_for_load);
+                    (cparams.n_seq_max == 1 && remote_native_kvarn_snapshot_supported() &&
+                     evaluated_token_count > cparams.kv_position_split_p);
+            nread = state_seq_read_data(io, seq_id, 0, evaluated_token_count, require_native_for_load);
         } catch (...) {
             abort_pending_native_restore();
             if (!native_before && remote_native_kvarn_transient_active() && backend_remote) {
@@ -7309,6 +7493,9 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count,
         llama_state_seq_save_preflight_fn preflight, void * user) {
+    if (backend_remote && seq_id >= 0 && uint32_t(seq_id) < cparams.n_seq_max) {
+        ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
+    }
     // A negotiated native FULL save is the only save path that persists the
     // revision-3 owner state. The legacy guard deliberately refuses a FULL
     // bookkeeping snapshot once native rows exist; allow the selective path
@@ -7696,6 +7883,12 @@ bool llama_context::remote_native_kvarn_transient_active() const {
     return backend_remote && ggml_backend_remote_attn_native_kvarn_has_state(backend_remote);
 }
 
+bool llama_context::remote_native_kvarn_transient_active_seq(llama_seq_id seq_id) const {
+    if (!backend_remote || seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max) return false;
+    ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
+    return remote_native_kvarn_transient_active();
+}
+
 bool llama_context::remote_native_kvarn_snapshot_supported() const {
     return cparams.remote_attn_position_split &&
            cparams.n_rs_seq == 0 && backend_remote &&
@@ -7751,6 +7944,10 @@ bool llama_remote_native_kvarn_transient_active(const llama_context * ctx) {
     return ctx && ctx->remote_native_kvarn_transient_active();
 }
 
+bool llama_remote_native_kvarn_transient_active_seq(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx && ctx->remote_native_kvarn_transient_active_seq(seq_id);
+}
+
 bool llama_remote_native_kvarn_snapshot_supported(const llama_context * ctx) {
     return ctx && ctx->remote_native_kvarn_snapshot_supported();
 }
@@ -7793,6 +7990,9 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         bool require_native) {
     if (!count_out) { return 0; }
     *count_out = 0;
+    if (backend_remote && seq_id >= 0 && uint32_t(seq_id) < cparams.n_seq_max) {
+        ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
+    }
     // After a successful remote RESET the logical destination and the native
     // owner can both be empty while the memory's historical overflow latch
     // remains set. Admit an ordinary local-prefix file through the empty-owner
@@ -7829,6 +8029,7 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
             }
         }
     }
+    bool commit_started = false;
     try {
         if (backend_remote && seq_id >= 0) {
             ggml_backend_remote_attn_set_active_session(backend_remote, (uint32_t)seq_id);
@@ -7891,6 +8092,7 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
                     (io.n_bytes() != state_size
                         ? "" : " expected=" + std::to_string(checksum)) + "]");
         }
+        commit_started = true;
         if (native_restore_pending) {
             uint8_t prefix_sha256[32] = {};
             if (!llama_native_save::hash_file_prefix(file, state_end, prefix_sha256) ||
@@ -7916,14 +8118,15 @@ size_t llama_context::state_seq_load_file_streaming(llama_seq_id seq_id, const c
         // Also covers a throwing publication callback. Tensor bytes become
         // unreachable, so a partial restore can never be advertised as a hit.
         abort_pending_native_restore();
-        // clear invokes the context's remote-reset hook exactly once; a
-        // refused reset poisons the remote backend rather than reusing it.
         try {
-            memory->clear(false);
+            if (commit_started && (!memory->seq_rm(seq_id, -1, -1) ||
+                    !memory->run_on_seq_rm(seq_id, -1, -1))) {
+                throw std::runtime_error("destination sequence cleanup refused");
+            }
         } catch (const std::exception & clear_error) {
             LLAMA_LOG_ERROR("%s: failed to clear destination after restore failure: %s\n", __func__, clear_error.what());
         }
-        LLAMA_LOG_ERROR("%s: %s; empty destination cleared\n", __func__, error.what());
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
         return 0;
     }
 }
@@ -7994,6 +8197,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
         uint8_t native_sha256[32], bool * native_sha256_valid) {
+    if (backend_remote && seq_id >= 0 && uint32_t(seq_id) < cparams.n_seq_max) {
+        ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
+    }
     if (native_sha256_valid) *native_sha256_valid = false;
     const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
     const bool native_active = !partial && remote_native_kvarn_enabled() &&
@@ -8081,7 +8287,10 @@ bool llama_context::commit_pending_native_restore(const uint8_t prefix_sha256[32
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
-        uint32_t evaluated_tokens, bool require_native) {
+        uint32_t evaluated_tokens, bool require_native, bool native_ram_preflight) {
+    if (backend_remote && seq_id >= 0 && uint32_t(seq_id) < cparams.n_seq_max) {
+        ggml_backend_remote_attn_set_active_session(backend_remote, uint32_t(seq_id));
+    }
     const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
     // This bit is an internal promise made by the file reader, never a way
     // for callers of the in-memory restore APIs to bypass overflow guards.
@@ -8090,7 +8299,10 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     }
     const bool native_file_body = !partial && evaluated_tokens > cparams.kv_position_split_p &&
             remote_native_kvarn_records_enabled();
-    if (remote_native_kvarn_transient_active() && (!partial || !remote_native_kvarn_can_rewind())) {
+    if (native_file_body && cparams.n_seq_max > 1 && !require_native) {
+        throw std::runtime_error("native KVarN4 multi-slot restore requires explicit native streaming");
+    }
+    if (!native_ram_preflight && remote_native_kvarn_transient_active() && (!partial || !remote_native_kvarn_can_rewind())) {
         throw std::runtime_error("native KVarN4 overflow non-sequence restore is unsupported; use the sequence state file API");
     }
     nextn_decode_id = 0;
@@ -8126,7 +8338,8 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                         // restore peak or enforce native owner admission. Even
                         // an explicitly saved native file may be discovered by
                         // the automatic index, so fail before reading its body.
-                        if (!require_native && !remote_native_kvarn_snapshot_supported()) {
+                        if (!llama_state_framing::native_trailer_allowed(
+                                    require_native, remote_native_kvarn_snapshot_supported(), cparams.n_seq_max)) {
                             throw std::runtime_error("native KVarN4 overflow restore requires explicit native streaming");
                         }
                         uint8_t native_header[rkva_native_state::kHeaderBytes];
@@ -8139,9 +8352,26 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                             throw std::runtime_error("native KVarN4 overflow trailer header is invalid");
                         }
                         const uint64_t peak = rkva_native_state::restore_peak_bytes(header);
+                        if (io.native_ram_scratch_limit()) {
+                            const auto & layout = header.layout;
+                            const uint64_t rows = std::min(layout.rows, layout.precision_tail_tokens);
+                            const uint64_t tail = rkva_native_state::saturating_mul(rows,
+                                    rkva_native_state::saturating_mul(rkva_native_state::width(layout), sizeof(uint16_t)));
+                            const uint64_t stage = layout.compact_stage ? 0 : rkva_native_state::stage_bytes(layout);
+                            const uint64_t frame = rkva_native_state::saturating_add(sizeof(rkva_kvarn_range_upload),
+                                    rkva_native_state::saturating_mul(2, rkva_native_state::saturating_add(
+                                            rkva_native_state::saturating_add(rkva_native_state::records_bytes(layout), stage), tail)));
+                            const uint64_t workspace = rkva_native_state::saturating_add(48ull << 20,
+                                    rkva_native_state::saturating_mul(cparams.n_ctx_seq, 512));
+                            const uint64_t total = rkva_native_state::saturating_add(workspace,
+                                    rkva_native_state::saturating_add(peak, frame));
+                            if (frame > (256ull << 20) || total == UINT64_MAX || total > io.native_ram_scratch_limit()) {
+                                throw std::runtime_error("native RAM restore scratch admission rejected");
+                            }
+                        }
                         if (peak == UINT64_MAX || peak > SIZE_MAX ||
-                                (header.payload_bytes > (4ull << 30) && !native_restore_reserve) ||
-                                (native_restore_reserve &&
+                                (header.payload_bytes > (4ull << 30) && !native_restore_reserve && !io.native_ram_scratch_limit()) ||
+                                (!io.native_ram_scratch_limit() && native_restore_reserve &&
                                  !native_restore_reserve(native_restore_reserve_user, size_t(peak)))) {
                             throw std::runtime_error("native KVarN4 overflow restore RAM reservation rejected");
                         }
@@ -8219,6 +8449,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
             // after the entire memory restore commits successfully.
             io.on_commit([this, seq_id]() {
                 const uint32_t sess = (uint32_t) seq_id;
+                ggml_backend_remote_attn_set_active_session(backend_remote, sess);
                 if (!memory->supports_resident_prefix_restore()) {
                     ggml_backend_remote_attn_invalidate_session(backend_remote, sess);
                     return;
@@ -8239,7 +8470,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
             // Register after memory's callbacks so failed/prepared restores do
             // not invalidate the live graph. Partial speculative checkpoints
             // retain their existing graph-reuse behavior.
-            io.on_commit([this]() {
+            io.on_commit([this, seq_id]() {
                 for (auto & res : gf_res_prev) { if (res) res->reset(); }
             gf_res_prev_active = nullptr;
                 // A committed native FULL restore has already installed owner
@@ -8247,7 +8478,11 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
                 // Invalidating here would make the first native append reject
                 // the restored owner. Standard FULL restores still resync.
                 if (!native_restore_committed && cparams.remote_attn_position_split && backend_remote) {
-                    ggml_backend_remote_attn_invalidate_range(backend_remote);
+                    if (seq_id >= 0) {
+                        ggml_backend_remote_attn_invalidate_session(backend_remote, uint32_t(seq_id));
+                    } else {
+                        ggml_backend_remote_attn_invalidate_range(backend_remote);
+                    }
                 }
             });
         }
@@ -9358,17 +9593,50 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1) && mem->run_on_seq_rm(seq_id, p0, p1);
 }
 
-void llama_memory_seq_cp(
+llama_memory_seq_cp_result llama_memory_seq_cp_checked(
         llama_memory_t mem,
           llama_seq_id seq_id_src,
           llama_seq_id seq_id_dst,
              llama_pos p0,
              llama_pos p1) {
     if (!mem) {
-        return;
+        return LLAMA_MEMORY_SEQ_CP_OK;
     }
+    try {
+        if (!mem->can_seq_cp(seq_id_src, seq_id_dst, p0, p1)) {
+            LLAMA_LOG_WARN("%s: copy rejected before mutation\n", __func__);
+            return LLAMA_MEMORY_SEQ_CP_REJECTED_CLEAN;
+        }
+        mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        return LLAMA_MEMORY_SEQ_CP_OK;
+    } catch (const llama_memory_seq_cp_rejected & error) {
+        // A composite may have changed an earlier component before a later
+        // component rejected; only the top-level preflight is a clean refusal.
+        LLAMA_LOG_ERROR("%s: copy rejected after preflight; context may be invalid: %s\n", __func__, error.what());
+        return LLAMA_MEMORY_SEQ_CP_FAILED_INVALIDATED;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: copy failed; context may be invalid: %s\n", __func__, error.what());
+        return LLAMA_MEMORY_SEQ_CP_FAILED_INVALIDATED;
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: copy failed; context may be invalid (unknown exception)\n", __func__);
+        return LLAMA_MEMORY_SEQ_CP_FAILED_INVALIDATED;
+    }
+}
 
-    mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+void llama_memory_seq_cp(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) return;
+    try {
+        mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    } catch (const std::exception & error) {
+        GGML_ABORT("sequence copy failed: %s; use llama_memory_seq_cp_checked to handle errors\n", error.what());
+    } catch (...) {
+        GGML_ABORT("sequence copy failed with an unknown exception; use llama_memory_seq_cp_checked to handle errors\n");
+    }
 }
 
 void llama_memory_seq_keep(
@@ -9519,6 +9787,53 @@ bool llama_state_save_file(llama_context * ctx, const char * path_session, const
 
 size_t llama_state_seq_get_size(llama_context * ctx, llama_seq_id seq_id) {
     return llama_state_seq_get_size_ext(ctx, seq_id, 0);
+}
+
+llama_native_ram_restore_result llama_state_seq_native_ram_size(llama_context * ctx, llama_seq_id seq_id,
+        uint32_t evaluated, uint64_t workspace_limit, size_t * size_out) {
+    if (size_out) *size_out = 0;
+    if (!ctx || !size_out) return LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    try {
+        ctx->synchronize();
+        if (ctx->remote_attn_backend_failed()) return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+        const size_t result = ctx->state_seq_native_ram_size(seq_id, evaluated, workspace_limit);
+        if (!result) return ctx->remote_attn_backend_failed() ?
+                LLAMA_NATIVE_RAM_FAILED_INVALIDATED : LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+        *size_out = result;
+        return LLAMA_NATIVE_RAM_OK;
+    } catch (...) { return LLAMA_NATIVE_RAM_FAILED_INVALIDATED; }
+}
+
+llama_native_ram_restore_result llama_state_seq_native_ram_write(llama_context * ctx, llama_seq_id seq_id, uint32_t evaluated,
+        uint8_t * dst, size_t capacity, uint8_t sha256[32], uint64_t workspace_limit) {
+    if (!ctx) return LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    try {
+        ctx->synchronize();
+        if (ctx->remote_attn_backend_failed()) return LLAMA_NATIVE_RAM_FAILED_INVALIDATED;
+        return static_cast<llama_native_ram_restore_result>(
+                ctx->state_seq_native_ram_write(seq_id, evaluated, dst, capacity, sha256, workspace_limit));
+    } catch (...) { return LLAMA_NATIVE_RAM_FAILED_INVALIDATED; }
+}
+
+llama_native_ram_restore_result llama_state_seq_native_ram_validate(llama_context * ctx, llama_seq_id seq_id, uint32_t evaluated,
+        const uint8_t * src, size_t size, const uint8_t sha256[32], uint64_t scratch_limit) {
+    if (!ctx) return LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    try {
+        ctx->synchronize();
+        return static_cast<llama_native_ram_restore_result>(ctx->state_seq_native_ram_load(
+                seq_id, evaluated, src, size, sha256, scratch_limit, true));
+    } catch (...) { return LLAMA_NATIVE_RAM_FAILED_INVALIDATED; }
+}
+
+llama_native_ram_restore_result llama_state_seq_native_ram_restore(llama_context * ctx,
+        llama_seq_id seq_id, uint32_t evaluated, const uint8_t * src, size_t size,
+        const uint8_t sha256[32], uint64_t scratch_limit) {
+    if (!ctx) return LLAMA_NATIVE_RAM_REJECTED_CLEAN;
+    try {
+        ctx->synchronize();
+        return static_cast<llama_native_ram_restore_result>(ctx->state_seq_native_ram_load(
+                seq_id, evaluated, src, size, sha256, scratch_limit, false));
+    } catch (...) { return LLAMA_NATIVE_RAM_FAILED_INVALIDATED; }
 }
 
 size_t llama_state_seq_get_data(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id) {
@@ -10006,23 +10321,39 @@ static llama_kv_cache_kvarn * llama_kvarn_mixed_cache(llama_context * ctx) {
 }
 
 uint64_t llama_kvarn_state_owner_epoch(llama_context * ctx) {
+    return llama_kvarn_state_owner_epoch_seq(ctx, 0);
+}
+
+uint64_t llama_kvarn_state_owner_epoch_seq(llama_context * ctx, llama_seq_id seq_id) {
     auto * kvarn = llama_kvarn_mixed_cache(ctx);
-    return kvarn ? kvarn->mixed_state_owner_epoch() : 0;
+    return kvarn ? kvarn->mixed_state_owner_epoch(seq_id) : 0;
 }
 
 bool llama_kvarn_adopt_state_owner_epoch(llama_context * ctx, uint64_t epoch) {
+    return llama_kvarn_adopt_state_owner_epoch_seq(ctx, 0, epoch);
+}
+
+bool llama_kvarn_adopt_state_owner_epoch_seq(llama_context * ctx, llama_seq_id seq_id, uint64_t epoch) {
     auto * kvarn = llama_kvarn_mixed_cache(ctx);
-    return kvarn ? kvarn->adopt_state_owner_epoch(epoch) : false;
+    return kvarn ? kvarn->adopt_state_owner_epoch(epoch, seq_id) : false;
 }
 
 uint64_t llama_kvarn_state_owner_id(llama_context * ctx) {
+    return llama_kvarn_state_owner_id_seq(ctx, 0);
+}
+
+uint64_t llama_kvarn_state_owner_id_seq(llama_context * ctx, llama_seq_id seq_id) {
     auto * kvarn = llama_kvarn_mixed_cache(ctx);
-    return kvarn ? kvarn->mixed_state_owner_id() : 0;
+    return kvarn ? kvarn->mixed_state_owner_id(seq_id) : 0;
 }
 
 bool llama_kvarn_adopt_state_owner_id(llama_context * ctx, uint64_t owner_id) {
+    return llama_kvarn_adopt_state_owner_id_seq(ctx, 0, owner_id);
+}
+
+bool llama_kvarn_adopt_state_owner_id_seq(llama_context * ctx, llama_seq_id seq_id, uint64_t owner_id) {
     auto * kvarn = llama_kvarn_mixed_cache(ctx);
-    return kvarn ? kvarn->adopt_state_owner_id(owner_id) : false;
+    return kvarn ? kvarn->adopt_state_owner_id(owner_id, seq_id) : false;
 }
 
 bool llama_kvarn_probe_head_span(llama_context * ctx, llama_seq_id seq_id, int layer_index,

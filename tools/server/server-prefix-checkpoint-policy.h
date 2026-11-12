@@ -10,6 +10,21 @@ namespace server_prefix_checkpoint_policy {
 
 enum class action { proceed, save };
 
+inline bool may_adopt_owner(bool position_split, bool restored_full) {
+    return !position_split || restored_full;
+}
+
+inline bool may_load_sidecar(bool position_split, uint32_t sequences) {
+    return !position_split || sequences <= 1;
+}
+
+// Match main's native-companion prompt-prefill policy for one slot, while
+// retaining explicit, speculative, and post-restore checkpoints.
+inline bool skip_single_native_prefill(uint32_t sequences, uint32_t split_p,
+                                      bool remote_split, bool native_companion, int64_t queued_tokens) {
+    return sequences == 1 && split_p > 0 && remote_split && native_companion && queued_tokens > 0;
+}
+
 // New split-prefix names encode P and C. This is only a conservative index
 // prefilter, not authentication: the state reader validates the actual frame.
 // Non-matching names are existing cache files and retain their old behavior.

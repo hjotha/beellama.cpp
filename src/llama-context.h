@@ -205,6 +205,11 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+    size_t state_seq_native_ram_size(llama_seq_id seq_id, uint32_t evaluated, uint64_t workspace_limit);
+    int state_seq_native_ram_write(llama_seq_id seq_id, uint32_t evaluated, uint8_t * dst,
+            size_t capacity, uint8_t sha256[32], uint64_t workspace_limit);
+    int state_seq_native_ram_load(llama_seq_id seq_id, uint32_t evaluated, const uint8_t * src,
+            size_t size, const uint8_t sha256[32], uint64_t scratch_limit, bool validate_only);
     llama_state_seq_restore_plan * state_seq_prepare_data(
             llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
@@ -270,9 +275,11 @@ struct llama_context {
     bool remote_disk_snapshot_enabled() const;
     bool remote_native_kvarn_enabled() const;
     bool remote_native_companion_failed() const;
+    bool remote_attn_backend_failed() const;
     bool remote_native_kvarn_records_enabled() const;
     bool remote_native_kvarn_can_rewind() const;
     bool remote_native_kvarn_transient_active() const;
+    bool remote_native_kvarn_transient_active_seq(llama_seq_id seq_id) const;
     bool remote_native_kvarn_snapshot_supported() const;
     bool remote_native_store_supported() const;
     bool remote_native_store_status(const uint8_t * keys, uint32_t count, ggml_remote_native_store_info * info);
@@ -391,7 +398,8 @@ private:
                                 uint8_t native_sha256[32] = nullptr,
                                 bool * native_sha256_valid = nullptr);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags,
-                                uint32_t evaluated_tokens = 0, bool require_native = false);
+                                uint32_t evaluated_tokens = 0, bool require_native = false,
+                                bool native_ram_preflight = false);
     bool commit_pending_native_restore(const uint8_t prefix_sha256[32]);
     void abort_pending_native_restore();
 
