@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "../ggml-prefill-reference.h"
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 
@@ -343,6 +344,7 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
         (int64_t) (beta->nb[3] / sizeof(float)),
         1.0f / sqrtf((float) S_v),
         g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
+        0, 0,
     };
 }
 
@@ -500,6 +502,67 @@ static void ggml_cuda_op_gated_delta_net_impl(
             uintptr_t boundary = 0;
             if (ggml_cuda_gdn_prefix_slot_guard(uintptr_t(state_d), stride_bytes, state_bytes,
                     size_t(K), forbidden, sizeof(forbidden)/sizeof(forbidden[0]), boundary)) {
+                // Keep the same scalar/MMA boundaries as the two aligned reference blocks.
+                if (ggml_prefill_reference_get(dst) == GGML_PREFILL_REFERENCE_SHIFTED &&
+                        n_tokens == 256 && K <= 16) {
+                    const int64_t first_prefix = ((128 - (K - 1))/16)*16;
+                    bool slots_safe = first_prefix >= 64;
+                    for (int j = 1; j < K; ++j) {
+                        uintptr_t checked = 0;
+                        slots_safe = slots_safe && ggml_cuda_gdn_prefix_slot_guard(
+                                uintptr_t(state_d), stride_bytes, state_bytes, size_t(j + 1),
+                                forbidden, sizeof(forbidden)/sizeof(forbidden[0]), checked);
+                    }
+                    if (slots_safe) {
+                        ggml_cuda_pool_alloc<float> reference_slots(ctx.pool(), size_t(K)*state_bytes/sizeof(float));
+                        const int64_t reference_stride = int64_t(state_bytes/sizeof(float));
+                        ggml_cuda_gdn_mma_args reference = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                        reference.n_tokens = first_prefix;
+                        reference.state_out = reference_slots.get() + int64_t(K - 1)*reference_stride;
+                        if (ggml_cuda_gdn_mma_launch(ctx.device, reference, stream)) {
+                            const int64_t first_suffix = 128 - first_prefix;
+                            launch_gated_delta_net<false, true, false, false>(
+                                q_d + size_t(first_prefix)*size_t(sq2), k_d + size_t(first_prefix)*size_t(sq2),
+                                v_d + size_t(first_prefix)*size_t(sv2), g_d + size_t(first_prefix)*size_t(sb2),
+                                b_d + size_t(first_prefix)*size_t(sb2), nullptr, nullptr,
+                                reference_slots.get() + int64_t(K - 1)*reference_stride,
+                                dst_d + size_t(first_prefix)*size_t(H)*128, reference_slots.get(),
+                                S_v, H, first_suffix, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                                sb1, sb2, sb3, neqk1, rq3, scale, reference_stride, K, nullptr, 0, stream);
+                            reference.q = q_d + size_t(128)*size_t(sq2);
+                            reference.k = k_d + size_t(128)*size_t(sq2);
+                            reference.v = v_d + size_t(128)*size_t(sv2);
+                            reference.g = g_d + size_t(128)*size_t(sb2);
+                            reference.beta = b_d + size_t(128)*size_t(sb2);
+                            reference.state = reference_slots.get();
+                            reference.n_tokens = 128;
+                            reference.dst = dst_d + size_t(128)*size_t(H)*128;
+                            reference.state_out = state_d;
+                            reference.reference_snapshots = K;
+                            reference.reference_slot_stride = state_slot_stride;
+                            if (ggml_cuda_gdn_mma_launch(ctx.device, reference, stream)) {
+                                return;
+                            }
+                        }
+                    }
+                }
+                // Reuse the last MMA tile to write the retained intermediate states.
+                if (ggml_prefill_reference_get(dst) == GGML_PREFILL_REFERENCE_FIRST && n_tokens == 128 && K > 1 && K <= 16) {
+                    bool slots_safe = true;
+                    for (int j = 1; j < K; ++j) {
+                        uintptr_t checked = 0;
+                        slots_safe = slots_safe && ggml_cuda_gdn_prefix_slot_guard(
+                                uintptr_t(state_d), stride_bytes, state_bytes, size_t(j + 1),
+                                forbidden, sizeof(forbidden)/sizeof(forbidden[0]), checked);
+                    }
+                    if (slots_safe) {
+                        ggml_cuda_gdn_mma_args reference = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                        reference.state_out = state_d;
+                        reference.reference_snapshots = K;
+                        reference.reference_slot_stride = state_slot_stride;
+                        if (ggml_cuda_gdn_mma_launch(ctx.device, reference, stream)) return;
+                    }
+                }
                 const int64_t suffix = n_tokens - prefix;
                 ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
                 args.n_tokens = prefix;

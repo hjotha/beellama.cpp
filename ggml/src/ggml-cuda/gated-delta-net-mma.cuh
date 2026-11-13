@@ -30,6 +30,8 @@ struct ggml_cuda_gdn_mma_args {
     int64_t sb3;
     float   scale;
     bool    eligible;
+    int     reference_snapshots;
+    int64_t reference_slot_stride;
 };
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);

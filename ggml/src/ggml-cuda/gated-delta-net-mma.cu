@@ -330,6 +330,29 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 }
             }
         }
+        // Snapshot this tile without changing the state used for the final output.
+        if (a.reference_snapshots > 1 && t0 + C >= a.n_tokens) {
+            for (int back = 1; back < a.reference_snapshots; ++back) {
+                const int snapshot_valid = valid - back;
+                for (int i = tid; i < C * V; i += 256) {
+                    const int t = i / V, v = i % V, index = s.scratch.solved.index(t, v);
+                    const float x = __bfloat162float(s.scratch.solved.hi[index]) + __bfloat162float(s.scratch.solved.lo[index]);
+                    s.delta.store(t, v, t < snapshot_valid ? x * expf(s.prefix[snapshot_valid - 1] - s.prefix[t]) : 0.f);
+                }
+                __syncthreads();
+                const float snapshot_decay = expf(s.prefix[snapshot_valid - 1]);
+                for (int j = 0; j < PER_WARP; ++j) {
+                    const int ti = warp + j * WARPS, r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
+                    acc snap = state[j];
+                    for (int i = 0; i < acc::ne; ++i) snap.x[i] *= snapshot_decay;
+                    product<C, true, true>(snap, s.k, s.delta, r, c);
+                    for (int i = 0; i < acc::ne; ++i) {
+                        a.state_out[back*a.reference_slot_stride + soff + (v0 + c + acc::get_j(i))*D + r + acc::get_i(i)] = snap.x[i];
+                    }
+                }
+                __syncthreads();
+            }
+        }
         // S = decay(chunk) * S + K^T * (solved * decay to chunk end)
         for (int i = tid; i < C * V; i += 256) {
             const int   t = i / V, v = i % V, j = s.scratch.solved.index(t, v);

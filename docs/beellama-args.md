@@ -7,6 +7,12 @@ limits, and measurement guidance.
 
 ## KVarN cache types and SWA overrides
 
+Prefill and decode can use different floating-point reduction paths. Reusing a
+cache or snapshot therefore does not guarantee bit-identical logits or generated
+tokens compared with recomputing the same prefix cold. The local CUDA Qwen3.5
+KVarN alignment covers only selected prefill partitions; it does not remove
+this variation for previously generated tokens or for remote attention.
+
 ### Experimental placement by occupied position
 
 `llama-server --kv-position-split-p P` (INI `kv-position-split-p`, environment

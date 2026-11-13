@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "../ggml/src/ggml-prefill-reference.h"
 #include "ggml-backend.h"
 #include "llama-kv-cache-tail.h"
 
@@ -512,12 +513,12 @@ static std::vector<float> run_attached_tail_attention(
         bool export_lse = false,
         bool packed_body = false,
         tail_mask_case mask_case = tail_mask_case::visible,
-        bool poison_underflow = false) {
+        bool poison_underflow = false, int reference_case = 0) {
     const int64_t d = model_shape ? 256 : 128;
     const int64_t n_q_head = model_shape ? 24 : 2;
     const int64_t n_kv_head = model_shape ? 4 : 1;
-    const int64_t n_tail = model_shape ? 128 : 8;
-    const int64_t n_current = model_shape ? 32 : 4;
+    const int64_t n_tail = reference_case ? 384 : model_shape ? 128 : 8;
+    const int64_t n_current = reference_case ? 256 : model_shape ? 32 : 4;
     const int64_t n_history = segmented ? n_tail - n_current : n_tail;
     const int64_t n_kv = model_shape ? 256 : std::max<int64_t>(64, n_query);
     ggml_init_params params = { 64*1024*1024, nullptr, true };
@@ -552,6 +553,7 @@ static std::vector<float> run_attached_tail_attention(
         out = ggml_kv_tail_attention_merge(
                 ctx, out, kt, vt, tail_mask, query_order, run_desc);
     }
+    if (reference_case == 1 || reference_case == 3) ggml_prefill_reference_set(out, GGML_PREFILL_REFERENCE_SHIFTED);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     ggml_tensor * lse = export_lse ? ggml_flash_attn_ext_lse_out(ctx, out) : nullptr;
 
@@ -572,6 +574,8 @@ static std::vector<float> run_attached_tail_attention(
     std::vector<float> kt_current_data(segmented ? ggml_nelements(kt_current_storage) : 0);
     std::vector<float> vt_current_data(segmented ? ggml_nelements(vt_current_storage) : 0);
     for (size_t i = 0; i < q_data.size(); ++i) q_data[i] = 0.002f*float(1 + i%19);
+    if (reference_case) for (int64_t h = 0; h < n_q_head; ++h) for (int64_t iq = 0; iq < n_query; ++iq) for (int64_t j = 0; j < d; ++j)
+        q_data[size_t(j + d*(iq + n_query*h))] = 0.2f*std::sin(float((j + 1)*(h + 3)%997)*0.019f);
     for (size_t i = 0; i < k_data.size(); ++i) k_data[i] = 0.003f*float(int(i%17) - 8);
     for (size_t i = 0; i < v_data.size(); ++i) v_data[i] = 0.004f*float(int(i%23) - 11);
     for (size_t i = 0; i < kt_data.size(); ++i) kt_data[i] = 0.005f*float(int(i%13) - 6);
@@ -627,6 +631,17 @@ static std::vector<float> run_attached_tail_attention(
             }
         }
     }
+    if (reference_case) {
+        std::fill(mask_data.begin(), mask_data.end(), ggml_fp32_to_fp16(-INFINITY));
+        std::fill(tail_mask_data.begin(), tail_mask_data.end(), ggml_fp32_to_fp16(-INFINITY));
+        const int origin = reference_case == 1 ? 112 : reference_case == 2 ? 240 : reference_case == 3 ? 136 : 8;
+        for (int slot = 1; slot <= 128; ++slot) {
+            const int col = origin + slot;
+            GGML_ASSERT(col < n_tail);
+            run_data[size_t(6 + col)] = slot;
+            for (int64_t iq = 0; iq < n_query; ++iq) tail_mask_data[size_t(col + n_tail*iq)] = ggml_fp32_to_fp16(0.0f);
+        }
+    }
     if (mask_case == tail_mask_case::fully_hidden) {
         std::fill(mask_data.begin(), mask_data.end(), ggml_fp32_to_fp16(-INFINITY));
     }
@@ -652,6 +667,18 @@ static std::vector<float> run_attached_tail_attention(
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     return result;
+}
+
+static void test_reference_tail_partition(ggml_backend_t gpu) {
+    auto run = [&](int scenario) { return run_attached_tail_attention(gpu, 256, GGML_TYPE_Q4_0, GGML_TYPE_F16, true, true, false, false, tail_mask_case::visible, false, scenario); };
+    const auto first = run(1), first_reference = run(2), second = run(3), second_reference = run(4);
+    constexpr size_t row = 256*24;
+    if (first.size() < row*256 || first_reference.size() < row*256 || second.size() < row*256 || second_reference.size() < row*256 ||
+            std::memcmp(first.data() + 112*row, first_reference.data() + 240*row, row*sizeof(float)) ||
+            std::memcmp(second.data() + 136*row, second_reference.data() + 8*row, row*sizeof(float))) {
+        fail("reference-tail partition changed attention output");
+    }
+    std::puts("reference-tail partition passed");
 }
 
 static void test_bounded_attached_tail_attention(ggml_backend_t gpu, ggml_backend_t cpu) {
@@ -1204,6 +1231,11 @@ int main() {
     if (backend) {
         ggml_backend_t reference = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         test_bounded_attached_tail_attention(backend, reference);
+        auto dev = ggml_backend_get_device(backend);
+        auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        using reference_capability_fn = bool (*)(ggml_backend_dev_t);
+        auto cap = reg ? reinterpret_cast<reference_capability_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_prefill_reference_supported")) : nullptr;
+        if (cap && cap(dev)) test_reference_tail_partition(backend);
         test_q4_tail_runtime_refusal(backend);
         ggml_backend_free(reference);
         test_attention_graph(backend);

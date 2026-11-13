@@ -2,6 +2,7 @@
 #include "llama-cuda-graph-policy.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-prefill-reference.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-ext.h"
@@ -4335,6 +4336,38 @@ static const char * rkva_wavefront_fallback(const llm_graph_params & params, boo
     return nullptr;
 }
 
+static bool llama_prefill_reference_backend_supported(const llama_model & model) {
+    if (model.n_devices() != 1 || model.n_gpu_layers() <= model.hparams.n_layer_all) return false;
+    ggml_backend_dev_t dev = model.dev_layer(0);
+    if (!dev || model.dev_output() != dev) return false;
+    for (uint32_t il = 1; il < model.hparams.n_layer(); ++il) if (model.dev_layer(il) != dev) return false;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using capability_fn = bool (*)(ggml_backend_dev_t);
+    auto * capability = reg ? reinterpret_cast<capability_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_prefill_reference_supported")) : nullptr;
+    return capability && capability(dev);
+}
+
+static bool llama_prefill_reference_attention_supported(const ggml_tensor * t, uint32_t count) {
+    if (!t || t->op != GGML_OP_FLASH_ATTN_EXT || !t->src[0] || t->src[0]->ne[1] != count) return false;
+    const ggml_tensor * q = t->src[0], * kb = t->src[1], * vb = t->src[2];
+    const ggml_tensor * kt = t->src[5], * vt = t->src[6], * mt = t->src[7], * qo = t->src[8], * rd = t->src[9];
+    if (!kb || !vb || !t->src[3] || !kt || !vt || !mt || !qo || !rd || !t->src[10] || !t->src[11] || t->src[4]) return false;
+    const int history = t->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS];
+    const int64_t history_slots = history > 0 ? history : kt->ne[1];
+    if ((history_slots != 128 && history_slots != 129 && history_slots != 134) || ggml_flash_attn_ext_get_lse_out(t) ||
+            t->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS] ||
+            q->type != GGML_TYPE_F32 || q->ne[0] != 256 || q->ne[2] != 24 || q->ne[3] != 1 ||
+            t->ne[0] != 256 || kt->type != GGML_TYPE_F16 || vt->type != GGML_TYPE_F16 ||
+            kt->ne[2] != 4 || vt->ne[2] != 4 || mt->type != GGML_TYPE_F16 || mt->ne[0] != 128 + count ||
+            qo->type != GGML_TYPE_I32 || qo->ne[0] != count || qo->ne[1] != 1 ||
+            rd->type != GGML_TYPE_I32 || rd->ne[0] != 6 + mt->ne[0] || rd->ne[1] != 1) return false;
+    auto kvarn_view = [](const ggml_tensor * v) {
+        while (v && (v->op == GGML_OP_RESHAPE || v->op == GGML_OP_PERMUTE)) v = v->src[0];
+        return v && v->op == GGML_OP_KVARN_VIEW;
+    };
+    return kvarn_view(kb) && kvarn_view(vb);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     static const bool profile_prep = [] {
         const char * value = std::getenv("LLAMA_GRAPH_PREP_PROFILE");
@@ -4468,6 +4501,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (mctx) {
         mctx->graph_compute_start();
+    }
+    // shortcut: align only validated single-sequence 128/256 Qwen3.5 KVarN tiles; extend after other layouts are tested.
+    if (model.arch == LLM_ARCH_QWEN35 && model.hparams.n_embd == 5120 && model.hparams.n_layer() == 64 &&
+            gtype != LLM_GRAPH_TYPE_DECODER_MTP && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+            cparams.n_ubatch == 256 && (ubatch.n_tokens == 128 || ubatch.n_tokens == 256)) {
+        const auto * hybrid = dynamic_cast<const llama_memory_hybrid_context *>(mctx);
+        const auto * kvarn = hybrid ? dynamic_cast<const llama_kv_cache_kvarn_context *>(hybrid->get_attn()) : nullptr;
+        const bool one_seq = ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 && ubatch.token && !ubatch.embd && !ubatch.type &&
+                ubatch.n_seq_tokens == ubatch.n_tokens && ubatch.pos && ubatch.n_seq_id && ubatch.seq_id &&
+                ubatch.seq_id[0] && ubatch.n_seq_id[0] == 1;
+        bool contiguous = one_seq && ubatch.pos[0] >= 0 && ubatch.pos[0] % 128 == 0;
+        for (uint32_t j = 0; contiguous && j < ubatch.n_tokens; ++j) {
+            contiguous = ubatch.n_seq_id[j] == 1 && ubatch.seq_id[j] && ubatch.seq_id[j][0] == ubatch.seq_id[0][0] &&
+                    int64_t(ubatch.pos[j]) == int64_t(ubatch.pos[0]) + j;
+        }
+        static const bool prefix_mma_mode_two = [] { const char * mode = std::getenv("GGML_CUDA_GDN_PREFIX_MMA"); return mode && std::strcmp(mode, "2") == 0; }();
+        const bool eligible = contiguous && !backend_remote && cparams.causal_attn && prefix_mma_mode_two &&
+                llama_prefill_reference_backend_supported(model) && kvarn &&
+                kvarn->get_tail_tokens() == 128 && kvarn->get_tail_type() == GGML_TYPE_F16;
+        ggml_prefill_reference_plan plan = GGML_PREFILL_REFERENCE_DEFAULT;
+        if (eligible && ubatch.n_tokens == 128) plan = ubatch.pos[0] % 256 == 0 ? GGML_PREFILL_REFERENCE_FIRST : GGML_PREFILL_REFERENCE_SECOND;
+        if (eligible && ubatch.n_tokens == 256 && ubatch.pos[0] % 256 == 128) plan = GGML_PREFILL_REFERENCE_SHIFTED;
+        if (plan != GGML_PREFILL_REFERENCE_DEFAULT) {
+            bool seen_attention = false, supported = true;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const auto * t = ggml_graph_node(gf, i);
+                if (!t || t->op != GGML_OP_FLASH_ATTN_EXT || !t->src[0] || t->src[0]->ne[1] != ubatch.n_tokens) continue;
+                seen_attention = true;
+                supported = supported && llama_prefill_reference_attention_supported(t, ubatch.n_tokens);
+            }
+            if (!seen_attention || !supported) plan = GGML_PREFILL_REFERENCE_DEFAULT;
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            auto * t = ggml_graph_node(gf, i);
+            if (!t || !t->src[0]) continue;
+            if (t->op == GGML_OP_FLASH_ATTN_EXT && t->src[0]->ne[1] == ubatch.n_tokens && t->src[0]->ne[3] == 1) { ggml_prefill_reference_set(t, plan); continue; }
+            if (t->op == GGML_OP_GATED_DELTA_NET && t->src[2] && t->src[2]->ne[2] == ubatch.n_tokens && t->src[2]->ne[3] == 1) { ggml_prefill_reference_set(t, plan); continue; }
+            if (t->op == GGML_OP_MUL_MAT && t->ne[1] == ubatch.n_tokens && t->ne[2] == 1 && t->ne[3] == 1 && std::strncmp(t->src[0]->name, "blk.", 4) == 0) ggml_prefill_reference_set(t, plan);
+        }
     }
     f4_dump_next_eval();
     static const bool f5_stage_timing = [] {

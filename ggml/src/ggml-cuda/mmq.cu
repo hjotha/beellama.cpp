@@ -6,6 +6,11 @@
 #include <cstdint>
 #include <cstdlib>
 
+static int ggml_cuda_prefill_reference_origin(const ggml_tensor * dst) {
+    const auto plan = ggml_prefill_reference_get(dst);
+    return plan == GGML_PREFILL_REFERENCE_FIRST ? 0 : plan == GGML_PREFILL_REFERENCE_SECOND ? 128 : -1;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -340,7 +345,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, J_best};
+            ne1, J_best, ggml_cuda_prefill_reference_origin(dst)};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -419,7 +424,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best};
+        ne12, J_best, ggml_cuda_prefill_reference_origin(dst)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
@@ -511,7 +516,7 @@ void ggml_cuda_mul_mat_q_fused_two(
             src0->ne[0], src0->ne[1], dst->ne[1], (int64_t)(src0->nb[1]/ts0), ne11, (int64_t)(dst->nb[1]/sizeof(float)),
             src0->ne[2], ne12, (int64_t)(src0->nb[2]/ts0), stride_q_channel, (int64_t)(dst->nb[2]/sizeof(float)),
             src0->ne[3], ne13, (int64_t)(src0->nb[3]/ts0), stride_q_sample, (int64_t)(dst->nb[3]/sizeof(float)),
-            dst->ne[1], ggml_cuda_mmq_q8_config(src0->type, fallback, cc, ne11).J};
+            dst->ne[1], ggml_cuda_mmq_q8_config(src0->type, fallback, cc, ne11).J, ggml_cuda_prefill_reference_origin(dst)};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     };
     launch_one(src0_a, dst_a);

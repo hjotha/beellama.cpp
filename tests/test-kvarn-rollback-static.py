@@ -46,18 +46,19 @@ def main() -> None:
     context = CONTEXT.read_text(encoding="utf-8")
     full_restore = function_body(context, "size_t llama_context::state_read_data(")
     seq_restore = function_body(context, "size_t llama_context::state_seq_read_data(")
-    invalidate = "io.on_commit([this]()"
-    for body, read in (
-        (full_restore, "memory->state_read(io);"),
-        (seq_restore, "memory->state_read(io, seq_id, flags);"),
+    full_seq_guard = function_body(seq_restore, "if (!partial) {\n            // Register after memory's callbacks")
+    assert "const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;" in seq_restore
+    for body, callback_scope, read, invalidate in (
+        (full_restore, full_restore, "memory->state_read(io);", "io.on_commit([this]()"),
+        (seq_restore, full_seq_guard, "memory->state_read(io, seq_id, memory_flags);", "io.on_commit([this, seq_id]()"),
     ):
-        assert body.count(invalidate) == 1, (
+        assert callback_scope.count(invalidate) == 1, (
             "FULL restore must invalidate graph placement only through its commit callback"
         )
-        assert body.index(read) < body.index(invalidate), (
+        assert body.index(read) < body.rindex(invalidate), (
             "graph invalidation must follow successful memory parsing and its commit callbacks"
         )
-        callback = function_body(body, invalidate)
+        callback = function_body(callback_scope, invalidate)
         assert re.search(
             r"for\s*\(auto\s*&\s*res\s*:\s*gf_res_prev\)\s*\{\s*if\s*\(res\)\s*res->reset\(\);\s*\}",
             callback,
@@ -72,11 +73,6 @@ def main() -> None:
         assert "LLM_ARCH_DFLASH" not in body, (
             "FULL graph invalidation must apply to every model architecture"
         )
-    partial_guard = function_body(seq_restore, "if (!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))")
-    assert invalidate in partial_guard, (
-        "PARTIAL_ONLY speculative restores must retain their existing graph-reuse behavior"
-    )
-
     # Resetting the result must actually force the existing scheduler/store-slot
     # rebuild path, rather than merely clearing logits or ordinary input values.
     graph = GRAPH.read_text(encoding="utf-8")
