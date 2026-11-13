@@ -441,6 +441,7 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual(bench.request_body([1], 1, 1234, warm=True, temperature=1)['temperature'], 0)
             self.assertEqual(bench.pinned_environment(args)['GGML_RKVA_WIRE_FORMAT'], 'fp8_e4m3fn')
             self.assertEqual(bench.pinned_environment(args)['GGML_CUDA_GDN_PREFIX_MMA'], '2')
+            self.assertEqual(bench.pinned_environment(args)['GGML_RKVA_DISK_SNAPSHOTS'], '1')
             self.assertEqual(bench.pinned_environment(args)[bench.GRAPH_GUARD_KEY], '18')
             command = bench.server_command(args, 12345)
             self.assertEqual(command[command.index('--remote-attn-wire-format') + 1], 'fp8_e4m3fn')

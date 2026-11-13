@@ -589,7 +589,7 @@ def pinned_environment(args):
     values['GGML_RKVA_WIRE_FORMAT'] = getattr(args, 'wire_format', 'fp8')
     if getattr(args, 'production_profile', False):
         values.update({'GGML_GDN_RAW_GATES_DISABLE': '1', 'GGML_CUDA_GDN_PREFIX_MMA': '2',
-                       'GGML_RKVA_NATIVE_ROTATE_SINGLE_OWNER': '1'})
+                       'GGML_RKVA_NATIVE_ROTATE_SINGLE_OWNER': '1', 'GGML_RKVA_DISK_SNAPSHOTS': '1'})
     values['LLAMA_N256_LOOKAHEAD'] = '1' if args.n256_lookahead else '0'
     values['GGML_RKVA_WAVEFRONT_TILE'] = str(args.wavefront_tile)
     values['GGML_RKVA_WAVEFRONT_RPC_BATCH'] = '1'
