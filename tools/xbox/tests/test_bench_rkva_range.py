@@ -432,6 +432,30 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
                          bench.prefix_contract(on, [1] * on.p, {'sha256': 'model'}))
 
+    def test_temperature_wire_and_production_profile_are_explicit(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            args = bench.validate(bench.parser().parse_args(self.arguments + [
+                '--temperature', '0', '--wire-format', 'fp8_e4m3fn',
+                '--graph-headroom-mib', '18', '--production-profile']))
+            self.assertEqual(bench.request_body([1, 2], 32, 1234, temperature=args.temperature)['temperature'], 0)
+            self.assertEqual(bench.request_body([1], 1, 1234, warm=True, temperature=1)['temperature'], 0)
+            self.assertEqual(bench.pinned_environment(args)['GGML_RKVA_WIRE_FORMAT'], 'fp8_e4m3fn')
+            self.assertEqual(bench.pinned_environment(args)['GGML_CUDA_GDN_PREFIX_MMA'], '2')
+            self.assertEqual(bench.pinned_environment(args)[bench.GRAPH_GUARD_KEY], '18')
+            command = bench.server_command(args, 12345)
+            self.assertEqual(command[command.index('--remote-attn-wire-format') + 1], 'fp8_e4m3fn')
+            lines = ['n_batch = 256\n', 'n_ubatch = 256\n',
+                     'KVarN position-split: P=256 C=1024 local=256 overflow=768\n',
+                     'EXPERIMENTAL native KVarN4 precision_tail=128 async_overlap=1 wire=fp8_e4m3fn\n']
+            self.assertEqual(bench.validate_startup(args, lines), [])
+            with self.assertRaises(RuntimeError):
+                bench.validate_startup(args, [line.replace('fp8_e4m3fn', 'fp8_e5m2') for line in lines])
+        for temperature in ('-0.1', '2.1', 'nan'):
+            with self.subTest(temperature=temperature), self.assertRaises(ValueError):
+                bench.validate(bench.parser().parse_args(self.arguments + ['--temperature', temperature]))
+        with mock.patch.dict(os.environ, {bench.GRAPH_GUARD_KEY: '128'}), self.assertRaises(ValueError):
+            bench.memory_policy(18)
+
     def test_current_readiness_log_and_private_port_are_exact(self):
         from types import SimpleNamespace
         for address, expected in [('127.0.0.1:12345', True), ('127.0.0.1:123456', False), ('0.0.0.0:12345', False)]:

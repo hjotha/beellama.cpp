@@ -32,12 +32,12 @@ ANCHORS = {
     'global_kvarn4': "'--cache-type-k', 'kvarn4'",
     'remote_q4': "'--remote-attn-cache-type-k', 'q4_0'",
     'upload_kvarn4': "'--remote-attn-format', 'kvarn4'",
-    'wire_fp8': "'--remote-attn-wire-format', 'fp8'",
+    'wire_fp8': "getattr(args, 'wire_format', 'fp8')",
     'producer_cuda': "'GGML_RKVA_NATIVE_PRODUCER': 'cuda'",
     'contract_tail': "'native_kvarn_bits': 4, 'tail': 128, 'window': 4096",
     'startup_kvar4': 'EXPERIMENTAL native KVarN4',
     'startup_tail': 'precision_tail=128',
-    'measured_temp': "'temperature': 0 if warm else 1.0",
+    'measured_temp': "'temperature': 0 if warm else temperature",
     'bounded_warm': 'p - 128 <= cache <= p',
 }
 

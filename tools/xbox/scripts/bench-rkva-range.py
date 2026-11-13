@@ -54,9 +54,9 @@ PINNED_ENV = {
 }
 
 
-def memory_policy():
+def memory_policy(headroom_mib=GRAPH_GUARD_MIB):
     # common.cuh reads this one variable with atoi(), defaulting to 18 MiB.
-    # Freeze 128 for both arms; never silently weaken a stricter inherited guard.
+    # Default to 128; an explicit value must not weaken the source or inherited guard.
     source = ROOT / 'ggml/src/ggml-cuda/common.cuh'
     source_bytes = source.read_bytes()
     match = re.search(rb'const int headroom_mb\s*=\s*env\s*!=\s*nullptr\s*\?\s*atoi\(env\)\s*:\s*(\d+)\s*;', source_bytes)
@@ -66,13 +66,13 @@ def memory_policy():
     inherited = os.environ.get(GRAPH_GUARD_KEY)
     if inherited is not None and (not inherited.isdecimal() or not inherited.isascii()):
         raise ValueError('inherited CUDA graph guard must be a nonnegative integer MiB value')
-    if max(default, int(inherited or 0)) > GRAPH_GUARD_MIB:
-        raise ValueError('fixed 128 MiB graph guard would lower a stricter source/inherited policy; refusing')
-    return {'variable': GRAPH_GUARD_KEY, 'effective_mib': GRAPH_GUARD_MIB,
+    if type(headroom_mib) is not int or headroom_mib < 0 or max(default, int(inherited or 0)) > headroom_mib:
+        raise ValueError('graph guard would lower a stricter source/inherited policy; refusing')
+    return {'variable': GRAPH_GUARD_KEY, 'effective_mib': headroom_mib,
             'source_default_mib': default, 'inherited_value': inherited,
             'source': str(source), 'source_symbol': 'ggml_backend_cuda_context::cuda_graph_memory_headroom_bytes',
             'source_sha256': hashlib.sha256(source_bytes).hexdigest(),
-            'rule': 'same explicit 128 MiB in both arms; stricter inherited/source policy is rejected, never lowered'}
+            'rule': 'same explicit headroom in both arms; stricter inherited/source policy is rejected, never lowered'}
 
 
 def bootstrap_f16_confirmed_fp8(lines, index):
@@ -85,7 +85,7 @@ def bootstrap_f16_confirmed_fp8(lines, index):
         if 'RemoteAttn: connected to ' in line:
             return False
         if 'EXPERIMENTAL native KVarN4' in line:
-            return bool(re.search(r'EXPERIMENTAL native KVarN4[^\n]*precision_tail=128[^\n]*async_overlap=1[^\n]*wire=fp8_e5m2\b', line))
+            return bool(re.search(r'EXPERIMENTAL native KVarN4[^\n]*precision_tail=128[^\n]*async_overlap=1[^\n]*wire=fp8_(?:e5m2|e4m3fn)\b', line))
     return False
 
 
@@ -104,7 +104,8 @@ def classify_logs(lines):
 
 def validate_startup(args, lines):
     text = ''.join(lines)
-    if not re.search(r'EXPERIMENTAL native KVarN4[^\n]*precision_tail=128[^\n]*async_overlap=1[^\n]*wire=fp8_e5m2', text):
+    wire = 'fp8_e4m3fn' if getattr(args, 'wire_format', 'fp8') == 'fp8_e4m3fn' else 'fp8_e5m2'
+    if not re.search(r'EXPERIMENTAL native KVarN4[^\n]*precision_tail=128[^\n]*async_overlap=1[^\n]*wire=' + wire + r'\b', text):
         raise RuntimeError('required native KVarN4/tail128/async1/FP8 negotiation was not confirmed')
     if not re.search(r'position-split: P=' + str(args.p) + r' C=' + str(args.context) + r'\b', text):
         raise RuntimeError('effective P/C geometry was not confirmed in server logs')
@@ -196,7 +197,12 @@ def parser():
                    help='lossless CUDA binary-F16 mask transport; controls pin OFF, default removes the core override')
     p.add_argument('--range-kernel', choices=('fine', 'balanced'), default='fine',
                    help='fine uses MQ2 and finer decode splits; balanced uses MQ4 and coarser decode splits')
+    p.add_argument('--wire-format', choices=('fp8', 'fp8_e4m3fn'), default='fp8')
+    p.add_argument('--graph-headroom-mib', type=int, default=GRAPH_GUARD_MIB)
+    p.add_argument('--production-profile', action='store_true', help='use the production GDN and native owner settings')
     p.add_argument('--n-predict', type=int, default=256)
+    p.add_argument('--temperature', type=float, default=1.0,
+                   help='sampling temperature for measured points; warm prefix stays 0')
     p.add_argument('--threads', type=int, required=True)
     p.add_argument('--threads-batch', type=int)
     p.add_argument('--cache-ram', type=int, default=4096, help='MiB; only this fresh child\'s RAM cache')
@@ -231,6 +237,8 @@ def validate(args):
         raise ValueError('batch must be a positive multiple of ubatch')
     if args.n_predict < 2 or min(args.points) < args.p or max(args.points) + args.n_predict >= args.context:
         raise ValueError('points must be >= P and leave n-predict >= 2 output slots within context')
+    if not 0.0 <= getattr(args, 'temperature', 1.0) <= 2.0:
+        raise ValueError('temperature must be between 0 and 2')
     if args.threads <= 0 or (args.threads_batch is not None and args.threads_batch <= 0):
         raise ValueError('thread counts must be positive')
     if args.cache_ram < 0 or min(args.startup_timeout, args.request_timeout) <= 0:
@@ -267,7 +275,7 @@ def validate(args):
             raise ValueError('cross-batch frozen reuse requires B1024 and an existing B512 prefix snapshot')
         if Path(args.prefix_snapshot).name in ('', '.', '..'):
             raise ValueError('prefix snapshot must name a file')
-    memory_policy()
+    memory_policy(getattr(args, 'graph_headroom_mib', GRAPH_GUARD_MIB))
     args.library_dir = [str(Path(p).resolve(strict=True)) for p in args.library_dir]
     if any(not Path(p).is_dir() for p in args.library_dir):
         raise ValueError('library-dir must be a directory')
@@ -284,7 +292,7 @@ def server_command(args, port):
             '--flash-attn', 'on', '--fit', 'off', '--cache-type-k', 'kvarn4', '--cache-type-v', 'kvarn4',
             '--remote-attn', args.xbox_host, '--kv-position-split-p', str(args.p),
             '--remote-attn-layers', 'full', '--remote-attn-cache-type-k', 'q4_0', '--remote-attn-cache-type-v', 'q4_0',
-            '--remote-attn-format', 'kvarn4', '--remote-attn-wire-format', 'fp8', '--remote-attn-stats',
+            '--remote-attn-format', 'kvarn4', '--remote-attn-wire-format', getattr(args, 'wire_format', 'fp8'), '--remote-attn-stats',
             '--spec-type', 'none', '--spec-draft-n-max', '0', '--cache-ram', str(args.cache_ram),
             '--ctx-checkpoints', '1',
             '--no-context-shift', '--no-webui', '--metrics', '--verbosity', '4']
@@ -577,6 +585,11 @@ def loaded_libraries(pid):
 
 def pinned_environment(args):
     values = dict(PINNED_ENV)
+    values[GRAPH_GUARD_KEY] = str(getattr(args, 'graph_headroom_mib', GRAPH_GUARD_MIB))
+    values['GGML_RKVA_WIRE_FORMAT'] = getattr(args, 'wire_format', 'fp8')
+    if getattr(args, 'production_profile', False):
+        values.update({'GGML_GDN_RAW_GATES_DISABLE': '1', 'GGML_CUDA_GDN_PREFIX_MMA': '2',
+                       'GGML_RKVA_NATIVE_ROTATE_SINGLE_OWNER': '1'})
     values['LLAMA_N256_LOOKAHEAD'] = '1' if args.n256_lookahead else '0'
     values['GGML_RKVA_WAVEFRONT_TILE'] = str(args.wavefront_tile)
     values['GGML_RKVA_WAVEFRONT_RPC_BATCH'] = '1'
@@ -613,7 +626,7 @@ def environment(args, output):
     # Drop inherited model/backend overrides, not just the few historical flags.
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('LLAMA_', 'GGML_', 'XLLAMA_', 'CUDA_')) or k == 'CUDA_VISIBLE_DEVICES'}
-    memory_policy()  # refuse rather than erase a stricter inherited graph guard
+    memory_policy(getattr(args, 'graph_headroom_mib', GRAPH_GUARD_MIB))  # never lower a stricter inherited guard
     env.update(pinned_environment(args))
     env['OMP_NUM_THREADS'] = str(args.threads)
     env['OMP_DYNAMIC'] = 'FALSE'
@@ -631,8 +644,8 @@ def environment(args, output):
     return env, frozen
 
 
-def request_body(tokens, count, seed, warm=False):
-    return {'prompt': tokens, 'n_predict': count, 'temperature': 0 if warm else 1.0,
+def request_body(tokens, count, seed, warm=False, temperature=1.0):
+    return {'prompt': tokens, 'n_predict': count, 'temperature': 0 if warm else temperature,
             'seed': seed, 'top_p': .95, 'top_k': 20, 'min_p': 0.0, 'repeat_penalty': 1.0,
             'presence_penalty': 0.0, 'ignore_eos': True, 'cache_prompt': True,
             'id_slot': 0, 'stream': False, 'return_tokens': True}
@@ -747,7 +760,7 @@ def run(args, tokens, stream_info):
                 'host': {'hostname': socket.gethostname(), 'platform': platform.platform()},
                 'decode_timing_semantics': 'predicted_n - 1 timed steps; first token from prefill',
                 'comparison': 'fresh baseline only; no historical TPS equivalence is asserted',
-                'memory_policy': memory_policy(), 'n256_capability': n256_capability(args),
+                'memory_policy': memory_policy(getattr(args, 'graph_headroom_mib', GRAPH_GUARD_MIB)), 'n256_capability': n256_capability(args),
                 'wavefront_campaign': wavefront_campaign(args),
                 'local_input_reuse_scope': {
                     'requested': args.local_input_reuse,
@@ -807,7 +820,7 @@ def run(args, tokens, stream_info):
         if not args.prefix_only:
             requests += [(f'point-{n}', n, args.n_predict, False) for n in args.points]
         for label, length, count, warm in requests:
-            body = request_body(tokens[:length], count, args.seed, warm)
+            body = request_body(tokens[:length], count, args.seed, warm, getattr(args, 'temperature', 1.0))
             write_json(output / f'{label}.request.json', body)
             start = drain.index()
             print(f'{now()} {label}: prompt={length}, requested outputs={count}', flush=True)
@@ -942,7 +955,7 @@ def main(argv=None):
                               'prefix_cache_intent': ('reuse-or-create ' + args.prefix_snapshot) if args.prefix_snapshot else None,
                               'purpose': 'prefix-cache-only; no TPS' if args.prefix_only else 'range benchmark',
                               'command_preview': server_command(args, '<unique-loopback-port>'),
-                              'pinned_environment': pinned_environment(args), 'memory_policy': memory_policy(),
+                              'pinned_environment': pinned_environment(args), 'memory_policy': memory_policy(args.graph_headroom_mib),
                               'n256_capability': n256_capability(args), 'wavefront_campaign': wavefront_campaign(args),
                               'provenance': 'model/binary/libs/git hashes frozen on --execute before launch'}, indent=2))
             return 0
