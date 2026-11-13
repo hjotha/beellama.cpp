@@ -52,6 +52,12 @@ PINNED_ENV = {
     'GGML_CUDA_MASK_PACK': '0',
     'LLAMA_N256_LOOKAHEAD': '0', 'LLAMA_SERVER_F5_PER_TOKEN_TIMING': '1',
 }
+PRODUCTION_ENV = {
+    'GGML_GDN_RAW_GATES_DISABLE': '1',
+    'GGML_CUDA_GDN_PREFIX_MMA': '2',
+    'GGML_RKVA_NATIVE_ROTATE_SINGLE_OWNER': '1',
+    'GGML_RKVA_DISK_SNAPSHOTS': '1',
+}
 
 
 def memory_policy(headroom_mib=GRAPH_GUARD_MIB):
@@ -588,8 +594,7 @@ def pinned_environment(args):
     values[GRAPH_GUARD_KEY] = str(getattr(args, 'graph_headroom_mib', GRAPH_GUARD_MIB))
     values['GGML_RKVA_WIRE_FORMAT'] = getattr(args, 'wire_format', 'fp8')
     if getattr(args, 'production_profile', False):
-        values.update({'GGML_GDN_RAW_GATES_DISABLE': '1', 'GGML_CUDA_GDN_PREFIX_MMA': '2',
-                       'GGML_RKVA_NATIVE_ROTATE_SINGLE_OWNER': '1', 'GGML_RKVA_DISK_SNAPSHOTS': '1'})
+        values.update(PRODUCTION_ENV)
     values['LLAMA_N256_LOOKAHEAD'] = '1' if args.n256_lookahead else '0'
     values['GGML_RKVA_WAVEFRONT_TILE'] = str(args.wavefront_tile)
     values['GGML_RKVA_WAVEFRONT_RPC_BATCH'] = '1'
@@ -638,7 +643,7 @@ def environment(args, output):
         env[key] = str(folder)
     if args.trace:
         env['GGML_RKVA_TRACE_FILE'] = str(output / 'rkva-trace')
-    frozen = {k: v for k, v in env.items() if k in PINNED_ENV or k in ('GGML_RKVA_PROFILE', 'GGML_RKVA_TRACE_FILE',
+    frozen = {k: v for k, v in env.items() if k in PINNED_ENV or k in PRODUCTION_ENV or k in ('GGML_RKVA_PROFILE', 'GGML_RKVA_TRACE_FILE',
               'LD_LIBRARY_PATH', 'LD_PRELOAD', 'TMPDIR', 'CUDA_CACHE_PATH', 'XDG_CACHE_HOME', 'CUDA_VISIBLE_DEVICES',
               'OMP_NUM_THREADS', 'OMP_DYNAMIC')}
     return env, frozen

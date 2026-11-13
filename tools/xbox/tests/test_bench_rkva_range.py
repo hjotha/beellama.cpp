@@ -443,6 +443,12 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual(bench.pinned_environment(args)['GGML_CUDA_GDN_PREFIX_MMA'], '2')
             self.assertEqual(bench.pinned_environment(args)['GGML_RKVA_DISK_SNAPSHOTS'], '1')
             self.assertEqual(bench.pinned_environment(args)[bench.GRAPH_GUARD_KEY], '18')
+            output = self.root / 'production-env'
+            output.mkdir()
+            actual, frozen = bench.environment(args, output)
+            for key, value in bench.PRODUCTION_ENV.items():
+                self.assertEqual(actual[key], value)
+                self.assertEqual(frozen[key], value)
             command = bench.server_command(args, 12345)
             self.assertEqual(command[command.index('--remote-attn-wire-format') + 1], 'fp8_e4m3fn')
             lines = ['n_batch = 256\n', 'n_ubatch = 256\n',
