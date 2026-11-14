@@ -928,6 +928,7 @@ else()
     message(STATUS "Skipping test-kv-mixed-io: requires GNU/Linux --wrap and a linked CPU backend")
 endif()
 llama_build_and_test(test-prefill-reference.cpp)
+llama_build_and_test(test-rkva-prefill-input-reuse.cpp)
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-std-kv-tail-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

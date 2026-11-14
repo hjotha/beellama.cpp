@@ -197,8 +197,11 @@ def parser():
                    help='mapped also uses CUDA mapped-host FP8 helpers for nq<=9; requires independent decode quality/TPS checks')
     p.add_argument('--tcp-prefetch', action='store_true',
                    help='experimental two-frame FP8 prefill transport; requires runtime overlap counters')
-    p.add_argument('--local-input-reuse', action='store_true',
+    reuse = p.add_mutually_exclusive_group()
+    reuse.add_argument('--local-input-reuse', action='store_true',
                    help='reuse byte-identical local masks/indices on device; requires actual skipped-copy counters')
+    reuse.add_argument('--prefill-input-reuse', action='store_true',
+                   help='reuse local inputs only for batches with more than one token')
     p.add_argument('--mask-pack', choices=('off', 'on', 'default'), default='off',
                    help='lossless CUDA binary-F16 mask transport; controls pin OFF, default removes the core override')
     p.add_argument('--range-kernel', choices=('fine', 'balanced'), default='fine',
@@ -600,7 +603,7 @@ def pinned_environment(args):
     values['GGML_RKVA_WAVEFRONT_RPC_BATCH'] = '1'
     values['GGML_RKVA_CUDA_FP8'] = args.cuda_fp8
     values['GGML_RKVA_TCP_PREFETCH'] = '1' if args.tcp_prefetch else '0'
-    values['GGML_RKVA_LOCAL_INPUT_REUSE'] = '1' if args.local_input_reuse else '0'
+    values['GGML_RKVA_LOCAL_INPUT_REUSE'] = '1' if args.local_input_reuse else ('prefill' if args.prefill_input_reuse else '0')
     values.pop('GGML_CUDA_MASK_PACK', None)
     if args.mask_pack != 'default':
         values['GGML_CUDA_MASK_PACK'] = '0' if args.mask_pack == 'off' else '1'
@@ -768,7 +771,7 @@ def run(args, tokens, stream_info):
                 'memory_policy': memory_policy(getattr(args, 'graph_headroom_mib', GRAPH_GUARD_MIB)), 'n256_capability': n256_capability(args),
                 'wavefront_campaign': wavefront_campaign(args),
                 'local_input_reuse_scope': {
-                    'requested': args.local_input_reuse,
+                    'requested': args.local_input_reuse or args.prefill_input_reuse,
                     'indices': 'local I64 map; byte-exact final host contents',
                     'masks': 'serial/two-tile inputs; N1 at all geometries; four-tile prefill retains ordinary copies',
                     'four_tile_prefill_masks_cacheable': False}}
@@ -938,7 +941,7 @@ def run(args, tokens, stream_info):
             if args.tcp_prefetch and not args.prefix_only and not manifest['tcp_prefetch_activation']['two_frame_overlap_confirmed']:
                 result.update(status='failed', error='TCP prefetch requested but completed two-frame overlap was not proved')
             manifest['local_input_reuse_activation'] = local_input_reuse_activation(drain.lines)
-            if args.local_input_reuse and not args.prefix_only and not manifest['local_input_reuse_activation']['actual_reuse_confirmed']:
+            if (args.local_input_reuse or args.prefill_input_reuse) and not args.prefix_only and not manifest['local_input_reuse_activation']['actual_reuse_confirmed']:
                 result.update(status='failed', error='local input reuse requested but actual skipped copies were not proved')
         if result['status'] != 'passed':
             for point in result['points']:

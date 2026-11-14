@@ -406,10 +406,14 @@ class ProvenanceTests(unittest.TestCase):
     def test_local_input_reuse_is_explicit_and_keeps_prefix_codec(self):
         off = bench.validate(bench.parser().parse_args(self.arguments))
         on = bench.validate(bench.parser().parse_args(self.arguments + ['--local-input-reuse']))
+        prefill = bench.validate(bench.parser().parse_args(self.arguments + ['--prefill-input-reuse']))
         self.assertEqual(bench.pinned_environment(off)['GGML_RKVA_LOCAL_INPUT_REUSE'], '0')
         self.assertEqual(bench.pinned_environment(on)['GGML_RKVA_LOCAL_INPUT_REUSE'], '1')
+        self.assertEqual(bench.pinned_environment(prefill)['GGML_RKVA_LOCAL_INPUT_REUSE'], 'prefill')
         self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
                          bench.prefix_contract(on, [1] * on.p, {'sha256': 'model'}))
+        self.assertEqual(bench.prefix_contract(off, [1] * off.p, {'sha256': 'model'}),
+                         bench.prefix_contract(prefill, [1] * prefill.p, {'sha256': 'model'}))
 
     def test_lossless_mask_transport_has_explicit_controls_and_true_default(self):
         off = bench.validate(bench.parser().parse_args(self.arguments))

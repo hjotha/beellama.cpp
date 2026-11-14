@@ -23,6 +23,7 @@
 #include "llama-memory-recurrent.h"
 #include "llama-position-split-merge.h"
 #include "llama-recurrent-zero.h"
+#include "llama-rkva-local-input-reuse.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -4631,8 +4632,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                 ggml_set_name(inp->self_kq_mask_local, "attn_inp_kq_mask_local");
                 if (inp->self_kq_mask_local->type == GGML_TYPE_F16) inp->self_kq_mask_local->flags |= GGML_TENSOR_FLAG_BINARY_MASK;
                 const char * reuse_local_inputs = std::getenv("GGML_RKVA_LOCAL_INPUT_REUSE");
-                const bool cache_local_inputs = cparams.remote_attn_position_split &&
-                        reuse_local_inputs && std::strcmp(reuse_local_inputs, "1") == 0;
+                const bool cache_local_inputs = llama_rkva_local_input_reuse(
+                        reuse_local_inputs, cparams.remote_attn_position_split, n_q);
                 // Four-tile parents reuse mask workspace between tile pairs.
                 // Keeping all four copies resident would defeat that aliasing
                 // and can cross the CUDA graph headroom guard on a 12 GiB GPU.
@@ -5836,8 +5837,8 @@ std::unique_ptr<llm_graph_input_attn_kv> llm_graph_context::build_wavefront_attn
     // Views need explicit intent; the scheduler still compares the final host
     // bytes after the parent and tile tail writers have both finished.
     const char * reuse_local_inputs = std::getenv("GGML_RKVA_LOCAL_INPUT_REUSE");
-    if (ubatch.n_tokens <= 512 && cparams.remote_attn_position_split && reuse_local_inputs &&
-            std::strcmp(reuse_local_inputs, "1") == 0) {
+    if (ubatch.n_tokens <= 512 && llama_rkva_local_input_reuse(
+            reuse_local_inputs, cparams.remote_attn_position_split, ubatch.n_tokens)) {
         ggml_set_input_cacheable(result->self_kq_mask_local);
     }
     result->self_kq_mask_tail = slice_rows(parent->self_kq_mask_tail);
