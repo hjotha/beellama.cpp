@@ -772,7 +772,7 @@ bool ggml_cuda_fattn_kvarn_wide_mma_supported(
 #endif
 
 template <int DKQ, int DV, int ncols1, int ncols2>
-void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+bool ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_fattn_kvarn_plan plan;
     GGML_ASSERT(ggml_cuda_fattn_kvarn_view_supported(ctx.device, dst, &plan));
 
@@ -862,15 +862,16 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
 
     if (ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case<DKQ, DV, ncols1, ncols2>(
             ctx, dst, plan, nbytes_shared_total_f16, logit_softcap != 0.0f)) {
-        return;
+        return true;
     }
 
-    // Position-split LSE (plan §3.4) is exported by the windowed path above.
-    // The generic MMA launch below publishes no (max, denom) metadata. Abort
-    // loudly (fail-closed) instead of running silently without LSE; the
-    // launch_case pre-check routes LSE ops to portable whenever the
-    // documented windowed gate does not apply, so reaching here means VRAM
-    // pressure declined the windowed chunks (max_chunk < 256).
+    // The compact-tail body also needs the precise path when it exports metadata.
+    if (ggml_cuda_fattn_kvarn_windowed_lse_applies(dst) &&
+            (ggml_cuda_fattn_lse_requested(dst) || (dst->src[5] == nullptr && dst->src[8] != nullptr))) {
+        return false;
+    }
+
+    // LSE outside the windowed contract must never reach the generic launch.
     if (ggml_cuda_fattn_lse_requested(dst)) {
         GGML_ABORT("position-split LSE requested but KVarN windowed path declined (VRAM pressure?)");
     }
@@ -886,8 +887,9 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, false, warp_size_host);
     dst->src[1] = orig_k;
     dst->src[2] = orig_v;
+    return true;
 }
 
 #define DECL_FATTN_MMA_KVARN_CASE(DKQ, DV, ncols1, ncols2)                         \
-    template void ggml_cuda_flash_attn_ext_mma_kvarn_case                          \
+    template bool ggml_cuda_flash_attn_ext_mma_kvarn_case                          \
     <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)

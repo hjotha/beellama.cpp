@@ -984,7 +984,7 @@ static bool ggml_cuda_fattn_kvarn_mma_case_eligible(ggml_backend_cuda_context & 
 template <int DKQ, int DV, int ncols1, int ncols2>
 static bool ggml_cuda_flash_attn_ext_mma_kvarn_launch_case(
         ggml_backend_cuda_context & ctx,
-        ggml_tensor * dst) {
+        ggml_tensor * dst, bool & window_declined) {
     if (!ggml_cuda_fattn_kvarn_mma_case_eligible<DKQ, DV, ncols1, ncols2>(ctx)) {
         return false;
     }
@@ -995,37 +995,44 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_launch_case(
         // (combine/post-pass LSE) instead of the silent generic MMA launch.
         return false;
     }
-    ggml_cuda_flash_attn_ext_mma_kvarn_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
-    return true;
+    if (ggml_cuda_flash_attn_ext_mma_kvarn_case<DKQ, DV, ncols1, ncols2>(ctx, dst)) {
+        return true;
+    }
+    if (!ggml_cuda_flash_attn_ext_kvarn_portable_supported(ctx.device, dst)) {
+        GGML_ABORT("KVarN windowed path declined and no precise portable route is available");
+    }
+    window_declined = true;
+    return false;
 }
 
 template <int DKQ, int DV, int ncols2>
-static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool & window_declined) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst, window_declined);
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst, window_declined);
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) {
-        return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst, window_declined);
     }
 
-    return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+    return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst, window_declined);
 }
 
 template <int DKQ, int DV>
 static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(
-        ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool & wide_mma) {
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool & wide_mma, bool & window_declined) {
     GGML_UNUSED(wide_mma); // The MUSA build does not instantiate the wide case.
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
@@ -1046,29 +1053,29 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2(
         if (use_gqa_opt && use_wide_shape &&
             ggml_cuda_fattn_kvarn_mma_case_eligible<DKQ, DV, 16, 8>(ctx) &&
             ggml_cuda_fattn_kvarn_wide_mma_supported<DKQ, DV, 16, 8>(ctx, dst)) {
-            wide_mma = ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16, 8>(ctx, dst);
+            wide_mma = ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16, 8>(ctx, dst, window_declined);
             return wide_mma;
         }
     }
 #endif
 
     if (use_gqa_opt && gqa_ratio > 4) {
-        return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+        return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 8>(ctx, dst, window_declined);
     }
 
     if (use_gqa_opt && gqa_ratio > 2) {
-        return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 4>(ctx, dst, window_declined);
     }
 
     if (use_gqa_opt && gqa_ratio > 1) {
-        return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+        return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 2>(ctx, dst, window_declined);
     }
 
-    return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+    return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1<DKQ, DV, 1>(ctx, dst, window_declined);
 }
 
 static bool ggml_cuda_flash_attn_ext_mma_kvarn(
-        ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool & wide_mma) {
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool & wide_mma, bool & window_declined) {
     wide_mma = false;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
@@ -1076,13 +1083,13 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn(
     switch (Q->ne[0]) {
         case 128:
             GGML_ASSERT(V->ne[0] == 128);
-            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<128, 128>(ctx, dst, wide_mma);
+            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<128, 128>(ctx, dst, wide_mma, window_declined);
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
-            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<256, 256>(ctx, dst, wide_mma);
+            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<256, 256>(ctx, dst, wide_mma, window_declined);
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
-            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<512, 512>(ctx, dst, wide_mma);
+            return ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols2<512, 512>(ctx, dst, wide_mma, window_declined);
         default:
             GGML_ABORT("unsupported KVarN native FlashAttention head_dim");
     }
@@ -1344,6 +1351,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         ggml_cuda_fattn_kvarn_portable_supported(plan, dst);
     bool generic_shape_supported = false;
     bool wide_mma = false;
+    bool window_declined = false;
 #if defined(GGML_USE_HIP)
     // RDNA3 (gfx11) WMMA prompt tiles accumulate in fp32 for DV=128/256
     // (mirroring the proven DV=80/112 fp32-PV tiles), so on fp32-tile arches
@@ -1370,8 +1378,8 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     }
 #endif
     if (capabilities.generic_mma && Q->ne[0] != 64) {
-        generic_shape_supported = ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst, wide_mma);
-        if (!generic_shape_supported) {
+        generic_shape_supported = ggml_cuda_flash_attn_ext_mma_kvarn(ctx, dst, wide_mma, window_declined);
+        if (!generic_shape_supported && !window_declined) {
             g_kvarn_route_generic_shape_rejected.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -1405,7 +1413,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     g_kvarn_route_portable_native.fetch_add(1, std::memory_order_relaxed);
     ggml_cuda_fattn_kvarn_debug_route(
         ctx.device, plan, dst, entry_path, "portable-native",
-        capabilities.generic_mma ? "generic_shape_rejected" : "shape-fallback");
+        window_declined ? "window-budget" : (capabilities.generic_mma ? "generic_shape_rejected" : "shape-fallback"));
     return ggml_cuda_flash_attn_ext_kvarn_portable(ctx, dst, plan);
 }
 

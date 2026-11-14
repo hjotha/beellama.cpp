@@ -139,10 +139,10 @@ static inline bool ggml_cuda_fattn_kvarn_windowed_lse_applies(const ggml_tensor 
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2>
-void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+bool ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 #define DECL_FATTN_MMA_KVARN_CASE_EXTERN(DKQ, DV, ncols1, ncols2)                  \
-    extern template void ggml_cuda_flash_attn_ext_mma_kvarn_case                  \
+    extern template bool ggml_cuda_flash_attn_ext_mma_kvarn_case                  \
     <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
 #define DECL_FATTN_MMA_KVARN_CASE_ALL_NCOLS2(DKQ, DV, ncols)     \

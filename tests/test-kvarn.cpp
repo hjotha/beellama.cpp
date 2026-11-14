@@ -7726,6 +7726,9 @@ int main() {
     }
 
     if (std::getenv("GGML_KVARN_TEST_VRAM_PRESSURE_ONLY") != nullptr) {
+        scoped_test_env window("GGML_KVARN_WINDOW", nullptr);
+        scoped_test_env chunk("GGML_KVARN_WINDOW_CHUNK", "1024");
+        scoped_test_env headroom("GGML_CUDA_GRAPH_RECOVERY_HEADROOM_MB", "18");
         ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
         require(backend != nullptr, "VRAM pressure test requires a GPU backend");
         g_test_cuda_pressure_free_mib = 64;
@@ -7734,7 +7737,61 @@ int main() {
                 false, nullptr, false, 0, true);
         require(std::all_of(output.begin(), output.end(), [](float value) { return std::isfinite(value); }),
                 "VRAM pressure test produced non-finite output");
+        g_test_cuda_pressure_free_mib = 0;
+        const char * warm_device = ggml_backend_dev_name(ggml_backend_get_device(backend));
+        const bool cuda_pressure = warm_device && std::strncmp(warm_device, "CUDA", 4) == 0;
+        if (cuda_pressure) {
+            (void) test_native_flash_attention_output(
+                    backend, true, true, 256, 4, 4, 256, 24, 4, 512, 5,
+                    false, nullptr, false, 128, true, GGML_TYPE_F16);
+        }
         ggml_backend_free(backend);
+
+        // A fresh pool must not silently fall back to imprecise MMA when the window cannot fit.
+        for (int variant = 0; cuda_pressure && variant < 3; ++variant) {
+            backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, true);
+            const auto route_fns = get_kvarn_route_stats_fns(backend);
+            require(route_fns.first && route_fns.second, "VRAM pressure test requires CUDA route telemetry");
+            route_fns.first();
+            g_test_cuda_pressure_free_mib = 8;
+            lse_fp64_reference reference;
+            std::vector<float> lse;
+            const auto actual = test_native_flash_attention_output(
+                    backend, true, true, 256, 4, 4, 256, 24, 4, 512, 5,
+                    false, nullptr, false, variant == 2 ? 0 : 128, true, GGML_TYPE_F16, 0,
+                    false, false, -1, false, false, false, 0, false, {},
+                    variant == 0 ? nullptr : &lse, &reference);
+            g_test_cuda_pressure_free_mib = 0;
+            auto routes = make_test_kvarn_route_stats();
+            route_fns.second(&routes);
+            require(routes.portable_native > 0, "VRAM pressure did not select precise portable attention");
+            require(routes.generic_shape_rejected == 0, "VRAM pressure was reported as an unsupported shape");
+            require(actual.size() == reference.o.size(), "VRAM pressure FP64 output size differs");
+            double squared_error = 0.0, squared_reference = 0.0;
+            for (size_t i = 0; i < actual.size(); ++i) {
+                require(std::isfinite(actual[i]) && std::isfinite(reference.o[i]),
+                        "VRAM pressure output contains non-finite values");
+                const double error = double(actual[i]) - reference.o[i];
+                squared_error += error * error;
+                squared_reference += reference.o[i] * reference.o[i];
+            }
+            require(squared_reference > 0.0 && std::sqrt(squared_error / squared_reference) <= 1e-3,
+                    "VRAM pressure attention exceeds the FP64 NRMSE limit");
+            if (variant != 0) {
+                require(lse.size() == reference.lse.size(), "VRAM pressure LSE size differs");
+                for (size_t i = 0; i < lse.size(); ++i) {
+                    if (reference.row_has_keys[i]) {
+                        require(std::isfinite(lse[i]) && std::isfinite(reference.lse[i]) &&
+                                std::fabs(double(lse[i]) - reference.lse[i]) <= 1e-2,
+                                "VRAM pressure LSE exceeds the FP64 limit");
+                    } else {
+                        require(lse[i] == -INFINITY && reference.lse[i] == -INFINITY,
+                                "VRAM pressure masked LSE differs");
+                    }
+                }
+            }
+            ggml_backend_free(backend);
+        }
         std::printf("test-kvarn: VRAM pressure attention OK\n");
         return 0;
     }
