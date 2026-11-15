@@ -57,6 +57,9 @@
 #if RKVA_MQ_QT != 2 && RKVA_MQ_QT != 4
 #error "native KVarN4 multi-query tile supports RKVA_MQ_QT == 2 or 4 only"
 #endif
+#ifndef RKVA_MQ_PACKED_K4
+#define RKVA_MQ_PACKED_K4 1
+#endif
 #define RKVA_QG (RKVA_MQ_QT * RKVA_GQA)
 #define RKVA_PAIR_QG (2 * RKVA_GQA)
 #define RKVA_KIND_NONE 0u
@@ -651,16 +654,41 @@ void CSRangeAttnKvarn4Mq(uint tid : SV_GroupIndex, uint3 group : SV_GroupID) {
         uint4 kother_bits = keys.Load4(base + pay_bytes + 512u + pos0 * 2);
         uint4 vscale_bits = values.Load4(base + pay_bytes + pos0 * 2);
         uint4 vzero_bits = values.Load4(base + pay_bytes + 256u + pos0 * 2);
+#if RKVA_MQ_PACKED_K4 && RKVA_MQ_QT == 2
+        // Eight aligned 4-bit rows share one word for each of four dimensions.
+        uint4 kpacked = uint4(0, 0, 0, 0);
+        if (bits == 4u) {
+            uint koff = base + ((dim * 128u + pos0) >> 1u);
+            kpacked = uint4(keys.Load(koff), keys.Load(koff + 64u),
+                            keys.Load(koff + 128u), keys.Load(koff + 192u));
+        }
+#endif
         [unroll] for (uint h = 0; h < RKVA_TILE / RKVA_HALF; ++h) {
             float4 k_half[RKVA_HALF], v_half[RKVA_HALF];
             [unroll] for (uint t = 0; t < RKVA_HALF; ++t) {
                 uint tt = h * RKVA_HALF + t;
                 uint sh = (tt & 1) * 16;
                 float other = f16tof32((kother_bits[tt / 2] >> sh) & 65535u);
+#if RKVA_MQ_PACKED_K4 && RKVA_MQ_QT == 2
+                uint4 kq;
+                if (bits == 4u) {
+                    kq = (kpacked >> (tt * 4u)) & 15u;
+                } else {
+                    kq = uint4(kvarn_unpack1(keys, base, (dim + 0) * 128 + pos0 + tt, bits),
+                               kvarn_unpack1(keys, base, (dim + 1) * 128 + pos0 + tt, bits),
+                               kvarn_unpack1(keys, base, (dim + 2) * 128 + pos0 + tt, bits),
+                               kvarn_unpack1(keys, base, (dim + 3) * 128 + pos0 + tt, bits));
+                }
+                k_half[t].x = decode(kq.x, kscale.x, kzero.x, other);
+                k_half[t].y = decode(kq.y, kscale.y, kzero.y, other);
+                k_half[t].z = decode(kq.z, kscale.z, kzero.z, other);
+                k_half[t].w = decode(kq.w, kscale.w, kzero.w, other);
+#else
                 k_half[t].x = decode(kvarn_unpack1(keys, base, (dim + 0) * 128 + pos0 + tt, bits), kscale.x, kzero.x, other);
                 k_half[t].y = decode(kvarn_unpack1(keys, base, (dim + 1) * 128 + pos0 + tt, bits), kscale.y, kzero.y, other);
                 k_half[t].z = decode(kvarn_unpack1(keys, base, (dim + 2) * 128 + pos0 + tt, bits), kscale.z, kzero.z, other);
                 k_half[t].w = decode(kvarn_unpack1(keys, base, (dim + 3) * 128 + pos0 + tt, bits), kscale.w, kzero.w, other);
+#endif
                 float scale = f16tof32((vscale_bits[tt / 2] >> sh) & 65535u);
                 float zero = f16tof32((vzero_bits[tt / 2] >> sh) & 65535u);
                 uint index = (pos0 + tt) * 128 + dim;
