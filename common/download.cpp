@@ -1644,19 +1644,28 @@ struct bg_write_item {
     std::vector<uint8_t> data;
 };
 
+struct bg_deferred_chunk {
+    uint16_t file_idx = 0;
+    size_t   offset   = 0;
+    size_t   len      = 0;
+};
+
 // Bounded write-behind queue for disk-mode=background. It is shared with the finalizer
 // thread so that the loader can return (model ready in VRAM) while the disk catches up.
+// If the network + PCIe DMA outpaces the disk and fills MAX_QUEUE_BYTES, excess chunks
+// are recorded in `deferred` instead of blocking the VRAM stream, and backfilled by the
+// background finalizer thread after the model is already live in VRAM.
 struct bg_tee {
     static constexpr size_t MAX_QUEUE_BYTES = size_t(512) * 1024 * 1024;
 
-    std::mutex                mtx;
-    std::condition_variable   cv_nonempty;
-    std::condition_variable   cv_space;
-    std::deque<bg_write_item> queue;
-    size_t                    queued_bytes = 0; // includes the items currently being written
-    bool                      stop = false;
-    std::atomic<bool>         error{false};
-    std::vector<std::thread>  writers;
+    std::mutex                     mtx;
+    std::condition_variable        cv_nonempty;
+    std::deque<bg_write_item>      queue;
+    std::vector<bg_deferred_chunk> deferred;
+    size_t                         queued_bytes = 0; // includes the items currently being written
+    bool                           stop = false;
+    std::atomic<bool>              error{false};
+    std::vector<std::thread>       writers;
 
     void start(int n) {
         for (int i = 0; i < n; ++i) {
@@ -1686,25 +1695,31 @@ struct bg_tee {
                 std::lock_guard<std::mutex> lock(mtx);
                 queued_bytes -= item.data.size();
             }
-            cv_space.notify_all();
         }
     }
 
-    // returns false if the stream was aborted or the disk failed
-    bool push(bg_write_item && item, const std::atomic<bool> & abort) {
-        std::unique_lock<std::mutex> lock(mtx);
-        while (!(queued_bytes == 0 || queued_bytes + item.data.size() <= MAX_QUEUE_BYTES)) {
-            if (abort.load(std::memory_order_relaxed) || error.load(std::memory_order_relaxed)) {
-                return false;
-            }
-            cv_space.wait_for(lock, std::chrono::milliseconds(100));
-        }
+    // Non-blocking: queues the chunk in RAM if within budget, otherwise defers it for background backfill.
+    bool push_or_defer(uint16_t file_idx, int fd, size_t offset, const uint8_t * data, size_t len,
+                       const std::atomic<bool> & abort) {
         if (abort.load(std::memory_order_relaxed) || error.load(std::memory_order_relaxed)) {
             return false;
         }
-        queued_bytes += item.data.size();
-        queue.push_back(std::move(item));
-        lock.unlock();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (queued_bytes + len > MAX_QUEUE_BYTES) {
+                deferred.push_back({file_idx, offset, len});
+                return true;
+            }
+            queued_bytes += len;
+        }
+        bg_write_item item;
+        item.fd     = fd;
+        item.offset = offset;
+        item.data.assign(data, data + len);
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            queue.push_back(std::move(item));
+        }
         cv_nonempty.notify_one();
         return true;
     }
@@ -2100,6 +2115,30 @@ std::vector<std::string> common_download_get_stream_splits(const std::string & f
     return out;
 }
 
+bool common_download_get_stream_file_infos(
+        const std::string & first_path,
+        std::vector<common_download_stream_file_info> & out_infos) {
+    std::lock_guard<std::mutex> lock(g_stream_mtx);
+    out_infos.clear();
+    auto it = g_stream_sessions.find(first_path);
+    if (it == g_stream_sessions.end() || it->second->consumed || it->second->files.empty()) {
+        return false;
+    }
+    out_infos.reserve(it->second->files.size());
+    for (const auto & fs : it->second->files) {
+        common_download_stream_file_info info;
+        info.temp_path  = fs->temp_path;
+        info.local_path = fs->task.local_path;
+        info.final_path = fs->final_path;
+        info.etag       = fs->resolved.etag;
+        info.url        = fs->task.url;
+        info.total_size = fs->resolved.total_size;
+        info.header_end = fs->header_end;
+        out_infos.push_back(std::move(info));
+    }
+    return true;
+}
+
 std::string common_download_stream_final_path(const std::string & temp_path) {
     std::lock_guard<std::mutex> lock(g_stream_mtx);
     auto it = g_stream_final_paths.find(temp_path);
@@ -2227,11 +2266,7 @@ bool common_download_stream_loader(
                         break;
                     }
                 } else if (tee) {
-                    bg_write_item item;
-                    item.fd     = fs.fd;
-                    item.offset = ch.offset;
-                    item.data.assign(dst, dst + ch.len);
-                    if (!tee->push(std::move(item), failed)) {
+                    if (!tee->push_or_defer(ch.file_idx, fs.fd, ch.offset, dst, ch.len, failed)) {
                         failed.store(true, std::memory_order_relaxed);
                         break;
                     }
@@ -2253,9 +2288,42 @@ bool common_download_stream_loader(
     }
 
     if (tee) {
-        // The model is complete in VRAM; drain the disk queue and publish the file in the background.
-        std::thread fin_thread([sess, tee]() {
+        // The model is complete in VRAM; drain the disk queue and backfill any deferred chunks in the background.
+        std::thread fin_thread([sess, tee, chunk_sz]() {
             tee->finish();
+            if (!tee->error.load() && !tee->deferred.empty()) {
+                LOG_INF("%s: backfilling %zu deferred disk chunk(s) in background after VRAM load\n",
+                        __func__, tee->deferred.size());
+                std::atomic<size_t> next_def{0};
+                const int n_bg_fetch = static_cast<int>(std::min<size_t>(4, tee->deferred.size()));
+                std::vector<std::thread> bf_threads;
+                bf_threads.reserve(n_bg_fetch);
+                for (int bw = 0; bw < n_bg_fetch; ++bw) {
+                    bf_threads.emplace_back([&]() {
+                        stream_conn conn;
+                        std::vector<uint8_t> buf(chunk_sz);
+                        while (!tee->error.load(std::memory_order_relaxed)) {
+                            const size_t idx = next_def.fetch_add(1, std::memory_order_relaxed);
+                            if (idx >= tee->deferred.size()) {
+                                break;
+                            }
+                            const auto & dc = tee->deferred[idx];
+                            auto & fs = *sess->files[dc.file_idx];
+                            if (buf.size() < dc.len) {
+                                buf.resize(dc.len);
+                            }
+                            if (!stream_fetch(conn, fs, dc.file_idx, dc.offset, dc.len, buf.data(), &tee->error) ||
+                                !pwrite_all_fd(fs.fd, buf.data(), dc.len, dc.offset)) {
+                                tee->error.store(true, std::memory_order_relaxed);
+                                break;
+                            }
+                        }
+                    });
+                }
+                for (auto & t : bf_threads) {
+                    t.join();
+                }
+            }
             const bool disk_ok = !tee->error.load();
             if (!disk_ok) {
                 LOG_ERR("%s: background disk tee failed; the streamed file will not be cached\n", __func__);

@@ -194,6 +194,21 @@ void * common_download_get_stream_session_ud(const std::string & first_path);
 // Release a prepared-but-unused stream session (lock, fd, temp file). No-op once the loader consumed it.
 void common_download_stream_abort(const std::string & first_path);
 
+struct common_download_stream_file_info {
+    std::string temp_path;
+    std::string local_path;
+    std::string final_path;
+    std::string etag;
+    std::string url;
+    size_t      total_size = 0;
+    size_t      header_end = 0;
+};
+
+// Inspect file metadata of an active (unconsumed) stream session without consuming it.
+bool common_download_get_stream_file_infos(
+    const std::string & first_path,
+    std::vector<common_download_stream_file_info> & out_infos);
+
 // Return all shard temp paths for an active multi-part stream session (empty if not found or single-file).
 std::vector<std::string> common_download_get_stream_splits(const std::string & first_path);
 

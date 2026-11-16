@@ -1,5 +1,6 @@
 #include "server-model-identity.h"
 
+#include "download.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "hash/hash.h"
@@ -142,11 +143,33 @@ bool server_model_identity::equal(const source & a, const source & b) {
 
 void server_model_identity::verify_sources() const {
     if (sources.empty() || digest.empty()) { throw std::runtime_error("model identity was not prepared"); }
+    if (streamed) {
+        return;
+    }
     for (const auto & source : sources) {
         if (!equal(source, capture(source.loader_path))) {
             throw std::runtime_error("model identity source changed during hashing/loading: " + source.loader_path);
         }
     }
+}
+
+static std::string compute_etag_header_identity(FILE * file, size_t data_offset, uint64_t total_size, const std::string & etag) {
+    if (std::fseek(file, 0, SEEK_SET) != 0) {
+        throw std::runtime_error("cannot rewind GGUF header for identity hash");
+    }
+    const size_t header_len = std::min<size_t>(data_offset, size_t(128) * 1024 * 1024);
+    std::string buf;
+    buf.reserve(header_len + etag.size() + 64);
+    append_string(buf, "gguf-etag-identity-v1");
+    append_u64(buf, total_size);
+    append_string(buf, etag);
+    append_u64(buf, header_len);
+    const size_t base = buf.size();
+    buf.resize(base + header_len);
+    if (header_len > 0 && std::fread(&buf[base], 1, header_len, file) != header_len) {
+        throw std::runtime_error("cannot read GGUF header for identity hash");
+    }
+    return hash_sha256_hex(buf.data(), buf.size());
 }
 
 server_model_identity server_model_identity::prepare(const std::string & loader_path,
@@ -155,6 +178,36 @@ server_model_identity server_model_identity::prepare(const std::string & loader_
     const auto typed = first_overrides(overrides);
     std::string material = "llama-prompt-cache-model-v1";
     append_string(material, canonical_overrides(typed));
+
+    std::vector<common_download_stream_file_info> stream_infos;
+    if (common_download_get_stream_file_infos(loader_path, stream_infos) && !stream_infos.empty()) {
+        result.streamed = true;
+        append_u64(material, stream_infos.size());
+        for (size_t index = 0; index < stream_infos.size(); ++index) {
+            const auto & sinfo = stream_infos[index];
+            std::unique_ptr<FILE, int (*)(FILE *)> file(ggml_fopen(sinfo.temp_path.c_str(), "rb"), &std::fclose);
+            if (!file) {
+                throw std::runtime_error("cannot open streamed model identity source: " + sinfo.temp_path);
+            }
+            std::unique_ptr<gguf_context, decltype(&gguf_free)> meta(
+                gguf_init_from_file_ptr(file.get(), {true, nullptr}), &gguf_free);
+            if (!meta) {
+                throw std::runtime_error("cannot read streamed model identity GGUF: " + sinfo.temp_path);
+            }
+            const size_t data_offset = gguf_get_data_offset(meta.get());
+            const std::string tag = !sinfo.etag.empty() ? sinfo.etag : sinfo.url;
+            const std::string file_hash = compute_etag_header_identity(file.get(), data_offset, sinfo.total_size, tag);
+            append_u64(material, sinfo.total_size);
+            append_string(material, file_hash);
+            source src{};
+            src.loader_path    = sinfo.temp_path;
+            src.canonical_path = sinfo.final_path.empty() ? sinfo.local_path : sinfo.final_path;
+            src.symlink        = false;
+            result.sources.push_back(std::move(src));
+        }
+        result.digest = hash_sha256_hex(material.data(), material.size());
+        return result;
+    }
     // Keep the loader-visible name. Canonicalizing first changes inferred shard siblings.
     std::vector<std::string> paths {std::filesystem::absolute(loader_path).string()};
     for (size_t index = 0; index < paths.size(); ++index) {
@@ -218,7 +271,19 @@ server_model_identity server_model_identity::prepare(const std::string & loader_
         }
 #endif
         if (file_hash.empty()) {
-            file_hash = hash_sha256_hex(file.get());
+            const size_t data_offset = gguf_get_data_offset(meta.get());
+            std::string etag;
+            {
+                std::ifstream ef(paths[index] + ".etag");
+                if (ef) {
+                    std::getline(ef, etag);
+                }
+            }
+            if (!etag.empty()) {
+                file_hash = compute_etag_header_identity(file.get(), data_offset, before.file[2], etag);
+            } else {
+                file_hash = hash_sha256_hex(file.get());
+            }
 #ifndef _WIN32
             std::error_code wec;
             const std::string tmp_path = cache_path + ".tmp";
